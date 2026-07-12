@@ -85,12 +85,30 @@ pub async fn run_update_from_join(
     // Dispatch to the TARGET's core: the join-map is now built from the shipped
     // source rows, so the update lands correctly regardless of where the source
     // collection's vShard lives.
-    dispatch_local(
+    let resp = dispatch_local(
         state,
         args.tenant_id,
         args.database_id,
         args.target_collection,
         plan,
     )
-    .await
+    .await?;
+
+    // `dispatch_local` bypasses the pgwire autocommit funnel's post-apply redo
+    // minting, so an update landing on a vector-indexed target carries its
+    // per-row `Put` write-set (surrogate + post-image) back here unconsumed.
+    // Mint it now: without this durable redo, a WAL-only restart rebuilds the
+    // HNSW from the pre-update `Put` records and resurrects the stale
+    // embeddings (`sparse.put` reconciled storage + overlays but minted no WAL
+    // redo carrying the new body). Empty on non-vector targets, so this is a
+    // no-op there.
+    crate::control::server::wal_dispatch::mint_dispatch_local_redo(
+        &state.wal,
+        args.tenant_id,
+        args.database_id,
+        args.target_collection,
+        &resp,
+    )?;
+
+    Ok(resp)
 }

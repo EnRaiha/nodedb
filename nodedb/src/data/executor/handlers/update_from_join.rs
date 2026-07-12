@@ -11,7 +11,7 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
@@ -211,6 +211,14 @@ impl CoreLoop {
         };
 
         let mut affected = 0u64;
+        // One post-apply `Put` redo entry per updated row on a vector collection.
+        // Each row's `sparse.put` above reconciled storage + the btree/FTS/graph
+        // overlays but minted no WAL redo carrying the new body, so a WAL-only
+        // restart would rebuild the HNSW from the pre-update `Put` records and
+        // resurrect the stale embeddings. Carrying the surrogate + post-image back
+        // lets the Control Plane mint a durable `Put` redo per row. Only populated
+        // when the collection has a vector index.
+        let mut write_set: Vec<WriteSetEntry> = Vec::new();
         let mut returned_docs: Vec<serde_json::Value> = if returning.is_some() {
             Vec::with_capacity(target_doc_ids.len())
         } else {
@@ -337,13 +345,17 @@ impl CoreLoop {
                     doc_id,
                     &updated_bytes,
                 );
+                // Parsed once and reused below for both the reindex and the
+                // write-set entry (the row's doc_id is the hex-encoded
+                // surrogate storage key).
+                let row_surrogate = crate::engine::document::store::doc_id_to_surrogate(doc_id);
                 // Re-index the row's vectors from the new body (soft-delete the
                 // old HNSW node + insert the new one, keyed by the stable
-                // surrogate). No-op unless the collection has a vector field.
-                if has_vectors
-                    && let Some(surrogate) =
-                        crate::engine::document::store::doc_id_to_surrogate(doc_id)
-                {
+                // surrogate), then carry the surrogate + post-image back for a
+                // post-apply `Put` redo (`updated_bytes` is moved as its last
+                // use). Both are no-ops unless the collection has a vector
+                // field, so a non-vector collection pays nothing.
+                if has_vectors && let Some(surrogate) = row_surrogate {
                     self.update_reindex_vector_indexes(UpdateVectorReindex {
                         database_id,
                         tid,
@@ -353,6 +365,11 @@ impl CoreLoop {
                         new_body: &updated_bytes,
                         is_strict: strict_schema.is_some(),
                         has_vectors,
+                    });
+                    write_set.push(WriteSetEntry {
+                        surrogate: surrogate.as_u32(),
+                        is_delete: false,
+                        value: updated_bytes,
                     });
                 }
                 affected += 1;
@@ -365,7 +382,7 @@ impl CoreLoop {
             }
         }
 
-        if let Some(spec) = returning {
+        let mut response = if let Some(spec) = returning {
             match returning_rows::build_rows_payload(spec, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
                 Err(e) => self.response_error(
@@ -386,6 +403,10 @@ impl CoreLoop {
                     },
                 ),
             }
+        };
+        if !write_set.is_empty() {
+            response.write_set = write_set;
         }
+        response
     }
 }

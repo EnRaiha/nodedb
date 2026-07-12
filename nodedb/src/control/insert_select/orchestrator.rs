@@ -131,20 +131,13 @@ pub async fn run_insert_select(
             // restart rebuilds the HNSW from nothing for these rows (BatchInsert's
             // own WAL path mints no redo — row durability is redb-synchronous) and
             // the page's vectors are lost, not just stale.
-            if !resp.write_set.is_empty() {
-                let vshard_id = crate::types::VShardId::from_collection_in_database(
-                    database_id,
-                    target_collection,
-                );
-                crate::control::server::wal_dispatch::append_write_set_redo(
-                    &state.wal,
-                    tenant_id,
-                    vshard_id,
-                    database_id,
-                    target_collection,
-                    &resp.write_set,
-                )?;
-            }
+            crate::control::server::wal_dispatch::mint_dispatch_local_redo(
+                &state.wal,
+                tenant_id,
+                database_id,
+                target_collection,
+                &resp,
+            )?;
             total_inserted += decode_inserted(&resp.payload).unwrap_or(page_len);
             if resp.watermark_lsn > max_lsn {
                 max_lsn = resp.watermark_lsn;

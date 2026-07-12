@@ -19,7 +19,7 @@
 //! shape (`encode_document_put_record` / `encode_document_delete_record`) so
 //! `replay_document_redo` reconstructs it through the normal apply path.
 
-use crate::bridge::envelope::{PhysicalPlan, WriteSetEntry};
+use crate::bridge::envelope::{PhysicalPlan, Response, Status, WriteSetEntry};
 use crate::engine::document::store::surrogate_to_doc_id;
 use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::manager::WalManager;
@@ -35,15 +35,19 @@ use super::document::{encode_document_delete_record, encode_document_put_record}
 /// other plan (its durability is owned on the WAL-append path or elsewhere).
 ///
 /// Today `DocumentOp::PointUpdate`, `DocumentOp::Upsert`, `DocumentOp::BulkUpdate`,
-/// `DocumentOp::BulkDelete`, and `DocumentOp::BatchInsert` qualify. `BulkUpdate`
-/// carries one `Put` write-set entry per updated row (post-image); `BulkDelete`
-/// carries one `Delete` entry per removed row (surrogate only) — the shared
-/// `Delete` redo replays through `apply_point_delete`, whose cascade soft-deletes
-/// the row's HNSW nodes, so a deleted vector does not resurrect on a WAL-only
-/// restart. `BatchInsert` carries one `Put` entry per inserted row on a
-/// vector-indexed collection — `wal_append_document_op` returns `None` for
-/// `BatchInsert` (row durability is redb-synchronous), so without this the HNSW
-/// rebuild on restart would silently drop every batch-inserted row's vector.
+/// `DocumentOp::BulkDelete`, `DocumentOp::BatchInsert`, and
+/// `DocumentOp::UpdateFromJoin` qualify. `BulkUpdate` and `UpdateFromJoin` each
+/// carry one `Put` write-set entry per updated row (post-image), keyed to the
+/// join's write TARGET collection — `UpdateFromJoin` ships source rows across
+/// cores but writes only `target_collection`, so all entries in its write-set
+/// share that single collection; `BulkDelete` carries one `Delete` entry per
+/// removed row (surrogate only) — the shared `Delete` redo replays through
+/// `apply_point_delete`, whose cascade soft-deletes the row's HNSW nodes, so a
+/// deleted vector does not resurrect on a WAL-only restart. `BatchInsert`
+/// carries one `Put` entry per inserted row on a vector-indexed collection —
+/// `wal_append_document_op` returns `None` for `BatchInsert` (row durability is
+/// redb-synchronous), so without this the HNSW rebuild on restart would
+/// silently drop every batch-inserted row's vector.
 /// Additional post-apply redo variants (`Merge`) will extend this as their
 /// post-apply redo is built — do not add them until that handler support exists,
 /// or a write would be admitted with its guard held for a redo that is never
@@ -59,6 +63,11 @@ pub fn plan_post_apply_redo(plan: &PhysicalPlan) -> Option<String> {
         Some(collection.clone())
     } else if let PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. }) = plan {
         Some(collection.clone())
+    } else if let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
+        target_collection, ..
+    }) = plan
+    {
+        Some(target_collection.clone())
     } else {
         None
     }
@@ -94,6 +103,33 @@ pub fn append_write_set_redo(
         last = Some(lsn);
     }
     Ok(last)
+}
+
+/// Mint the post-apply redo for a `dispatch_local` response, i.e. one built
+/// outside the pgwire autocommit funnel's own `submit_to_data_plane` redo
+/// minting (`insert_select` / `update_from_join_orchestrator`'s DP→CP→DP
+/// round trips). No-op when the response is not `Ok` or carries no
+/// write-set (the common case: a non-vector-indexed collection).
+pub fn mint_dispatch_local_redo(
+    wal: &WalManager,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    collection: &str,
+    resp: &Response,
+) -> crate::Result<()> {
+    if resp.status != Status::Ok || resp.write_set.is_empty() {
+        return Ok(());
+    }
+    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    append_write_set_redo(
+        wal,
+        tenant_id,
+        vshard_id,
+        database_id,
+        collection,
+        &resp.write_set,
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -143,6 +179,22 @@ mod tests {
             returning: None::<ReturningSpec>,
             ollp_predicted_surrogates: None,
             ollp_predicted_edges: None,
+        });
+        assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
+    }
+
+    #[test]
+    fn update_from_join_is_post_apply_redo() {
+        let plan = PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
+            target_collection: "docs".to_string(),
+            source_collection: "src".to_string(),
+            source_alias: "s".to_string(),
+            target_join_col: "sku".to_string(),
+            source_join_col: "sku".to_string(),
+            updates: Vec::new(),
+            target_filters: Vec::new(),
+            returning: None::<ReturningSpec>,
+            source_rows: None,
         });
         assert_eq!(plan_post_apply_redo(&plan).as_deref(), Some("docs"));
     }
