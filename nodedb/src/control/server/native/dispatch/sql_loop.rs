@@ -79,9 +79,10 @@ pub(super) async fn run_dispatch_loop(
         // and statement-time constraint errors. Outside a transaction block,
         // `route_in_tx_write` always returns `Read(task)` unchanged, so the
         // autocommit path is untouched.
-        // In-transaction MERGE is resolved + staged at STATEMENT time by the
-        // MERGE expander (read-your-own-writes for later statements in the same
-        // txn); every other task falls through to the neutral staging gate.
+        // In-transaction `MERGE` and `UPDATE ... FROM` are resolved + staged at
+        // STATEMENT time by the expander (read-your-own-writes for later
+        // statements in the same txn); every other task falls through to the
+        // neutral staging gate.
         let routed = match route_in_tx_expander(
             ctx.state,
             ctx.sessions,

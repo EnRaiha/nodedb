@@ -1,25 +1,29 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! COMMIT-time expansion of a staged in-transaction `UPDATE ... FROM <source>`.
+//! Resolve + emit the concrete point ops for one in-transaction
+//! `UPDATE ... FROM <source>`.
 //!
 //! A transactional `BEGIN; UPDATE t SET ... FROM s WHERE t.col = s.col; COMMIT`
-//! buffers the update as a single `DocumentOp::UpdateFromJoin` plan. Left intact,
-//! COMMIT's buffered-plan replay runs it through the legacy Data-Plane
+//! must not replay the raw `UpdateFromJoin` plan through the legacy Data-Plane
 //! passthrough, whose `execute_update_from_join` writes each matched row via a
 //! raw `sparse.put` in its OWN redb transaction — OUTSIDE the COMMIT batch's undo
 //! log (not atomic with sibling ops / ROLLBACK) and minting no batch-tracked op
 //! (so a vector/FTS-indexed target is reindexed live but the write does not ride
 //! the replicated, undo-tracked point-write path).
 //!
-//! This expander rewrites every staged `UpdateFromJoin` into concrete,
-//! surrogate-carrying `PointPut` writes BEFORE dispatch, exactly as
-//! [`super::orchestrator::run_update_from_join`] does for autocommit: it ships
-//! the source rows to the source's own core, dispatches the shared Data-Plane
-//! RESOLVE pass (the single classifier — never re-derived here), and reuses each
-//! EXISTING target row's registered surrogate. Because the concrete `PointPut`
-//! ops replace the `UpdateFromJoin` in the buffered list, they commit atomically
-//! with sibling ops (undo-tracked `tx_point_*` arms), ride the replicated
-//! point-write path, and index into every cross-engine index.
+//! Instead the update is resolved at STATEMENT time (`session::expander_stage`):
+//! this module ships the source rows to the source's own core, dispatches the
+//! shared Data-Plane RESOLVE pass (the single classifier — never re-derived
+//! here), and reuses each EXISTING target row's registered surrogate. It returns
+//! the resulting per-row `PointPut` tasks; the expander then stages + buffers each
+//! through the normal statement-time staging path, so they land in the
+//! transaction's overlay immediately (read-your-own-writes for later statements)
+//! and commit as indexed, replicated, undo-tracked point writes.
+//!
+//! Because the RESOLVE pass reads the TARGET as base ∪ overlay (the staged
+//! transaction's id is threaded through), an `UPDATE ... FROM` affects — and
+//! reuses the surrogate of — a row a prior statement in the same transaction
+//! staged.
 //!
 //! Unlike the MERGE expander this is UPDATE-only: `UPDATE ... FROM` never inserts
 //! or deletes, so there is no fresh-surrogate assignment and only a `PointPut`
@@ -42,78 +46,69 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 /// post-image body)`.
 type ResolvedUpdateArm = (String, Option<u32>, Vec<u8>);
 
-/// Expand every staged `DocumentOp::UpdateFromJoin` in `buffered` into concrete,
-/// surrogate-carrying `PointPut` tasks, preserving each update's position and
-/// passing every other task through untouched.
+/// Resolve one in-transaction `DocumentOp::UpdateFromJoin` task into the
+/// concrete, surrogate-carrying `PointPut` tasks its matched target rows expand
+/// to.
 ///
-/// Runs in the Control-Plane COMMIT path before dispatch classification, so the
-/// transaction commits concrete point writes rather than a re-played
-/// `UpdateFromJoin` through the legacy passthrough. (In-transaction `MERGE` is
-/// instead resolved + staged at STATEMENT time by
-/// `control::server::shared::session::expander_stage`.)
-pub(crate) async fn expand_staged_update_from_joins(
+/// `task` must be an `UpdateFromJoin` plan with `task.txn_id` set to the active
+/// transaction, so the RESOLVE pass (and its source scan) fold rows staged by
+/// earlier statements in the same transaction. The emitted point ops carry the
+/// same `txn_id` and target the TARGET collection's vShard (recomputed here so
+/// dispatch classification stays honest, exactly as the MERGE / `INSERT ...
+/// SELECT` expanders do). The caller stages + buffers each returned op.
+pub(crate) async fn resolve_and_emit_update_from_join_ops(
     state: &SharedState,
     tenant_id: TenantId,
-    buffered: Vec<PhysicalTask>,
+    task: &PhysicalTask,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    // Fast path: no staged UPDATE ... FROM to expand — return the buffer as-is.
-    if !buffered.iter().any(|t| {
-        matches!(
-            &t.plan,
-            PhysicalPlan::Document(DocumentOp::UpdateFromJoin { .. })
-        )
-    }) {
-        return Ok(buffered);
-    }
+    let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
+        target_collection, ..
+    }) = &task.plan
+    else {
+        // Callers only pass an `UpdateFromJoin` task; a mismatch is a bug.
+        return Err(crate::Error::PlanError {
+            detail: "resolve_and_emit_update_from_join_ops: non-UPDATE-FROM task".into(),
+        });
+    };
+    let target_collection = target_collection.clone();
 
-    let mut out: Vec<PhysicalTask> = Vec::with_capacity(buffered.len());
-    for task in buffered {
-        let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
-            target_collection, ..
-        }) = &task.plan
-        else {
-            out.push(task);
-            continue;
-        };
-        let target_collection = target_collection.clone();
+    let resolved = resolve_update_rows(state, tenant_id, task).await?;
 
-        let resolved = resolve_update_rows(state, tenant_id, &task).await?;
+    let catalog = state.credentials.catalog();
+    let target_bare = bare_collection_name(task.database_id, &target_collection);
+    let target = catalog
+        .get_collection(task.database_id, tenant_id.as_u64(), &target_bare)?
+        .ok_or_else(|| crate::Error::CollectionNotFound {
+            tenant_id,
+            collection: target_collection.clone(),
+        })?;
+    let target_pk = resolve_target_pk(&target)?;
 
-        let catalog = state.credentials.catalog();
-        let target_bare = bare_collection_name(task.database_id, &target_collection);
-        let target = catalog
-            .get_collection(task.database_id, tenant_id.as_u64(), &target_bare)?
-            .ok_or_else(|| crate::Error::CollectionNotFound {
-                tenant_id,
+    // Concrete writes land on the TARGET collection's vShard — that is where the
+    // updated rows live. Recomputing it (rather than reusing the staged task's
+    // vShard) keeps dispatch classification honest, exactly as the MERGE /
+    // `INSERT ... SELECT` expanders do.
+    let vshard_id = VShardId::from_collection_in_database(task.database_id, &target_collection);
+
+    let mut out: Vec<PhysicalTask> = Vec::with_capacity(resolved.len());
+    for (doc_id, surrogate_u32, body) in resolved {
+        let surrogate = require_surrogate(surrogate_u32, &doc_id, "UPDATE ... FROM")?;
+        let document_id = derive_document_id(&target_pk, &body, surrogate);
+        let pk_bytes = document_id.clone().into_bytes();
+        out.push(PhysicalTask {
+            tenant_id: task.tenant_id,
+            vshard_id,
+            database_id: task.database_id,
+            plan: PhysicalPlan::Document(DocumentOp::PointPut {
                 collection: target_collection.clone(),
-            })?;
-        let target_pk = resolve_target_pk(&target)?;
-
-        // Concrete writes land on the TARGET collection's vShard — that is where
-        // the updated rows live. Recomputing it (rather than reusing the staged
-        // task's vShard) keeps dispatch classification honest, exactly as the
-        // MERGE / `INSERT ... SELECT` expanders do.
-        let vshard_id = VShardId::from_collection_in_database(task.database_id, &target_collection);
-
-        for (doc_id, surrogate_u32, body) in resolved {
-            let surrogate = require_surrogate(surrogate_u32, &doc_id, "UPDATE ... FROM")?;
-            let document_id = derive_document_id(&target_pk, &body, surrogate);
-            let pk_bytes = document_id.clone().into_bytes();
-            out.push(PhysicalTask {
-                tenant_id: task.tenant_id,
-                vshard_id,
-                database_id: task.database_id,
-                plan: PhysicalPlan::Document(DocumentOp::PointPut {
-                    collection: target_collection.clone(),
-                    document_id,
-                    value: body,
-                    surrogate,
-                    pk_bytes,
-                }),
-                post_set_op: PostSetOp::None,
-                txn_id: task.txn_id,
-            });
-        }
+                document_id,
+                value: body,
+                surrogate,
+                pk_bytes,
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: task.txn_id,
+        });
     }
     Ok(out)
 }
@@ -140,7 +135,7 @@ async fn resolve_update_rows(
     else {
         // Callers only pass an `UpdateFromJoin` task; a mismatch is a bug.
         return Err(crate::Error::PlanError {
-            detail: "expand_staged_update_from_joins: resolve on non-UPDATE-FROM task".into(),
+            detail: "resolve_update_rows: resolve on non-UPDATE-FROM task".into(),
         });
     };
 

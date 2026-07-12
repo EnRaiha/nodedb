@@ -168,6 +168,11 @@ pub enum StagedTagKind {
     /// (`session::expander_stage`). `affected` is the total across all arms;
     /// pgwire renders the Postgres `MERGE <n>` command tag.
     Merge,
+    /// A statement-time in-transaction `UPDATE ... FROM <source>`, staged as
+    /// concrete `PointPut` ops by the UPDATE-FROM expander
+    /// (`session::expander_stage`). `affected` is the total matched target rows;
+    /// pgwire renders the `UPDATE <n>` command tag.
+    UpdateFromJoin,
     /// The staged handler computed a value rather than an affected-row count
     /// (`KvOp::Incr` / `IncrFloat` / `Cas` / `GetSet`). The caller forwards
     /// [`StagedWriteOutcome::payload`](super::super::session::staging_gate::

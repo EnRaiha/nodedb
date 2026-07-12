@@ -110,6 +110,9 @@ pub(super) fn tag_from_staged(kind: StagedTagKind, affected: usize) -> Tag {
         // Statement-time in-transaction MERGE: the Postgres command tag for a
         // MERGE is `MERGE <total-rows-affected>` across all arms.
         StagedTagKind::Merge => Tag::new("MERGE").with_rows(affected),
+        // Statement-time in-transaction `UPDATE ... FROM`: an UPDATE reports the
+        // Postgres `UPDATE <n>` command tag over the matched target rows.
+        StagedTagKind::UpdateFromJoin => Tag::new("UPDATE").with_rows(affected),
         // KV `Incr` / `IncrFloat` / `Cas` / `GetSet` never reach pgwire's
         // generic tag-rendering path today: their sole SQL surface (`SELECT
         // KV_INCR(..)` and friends, in `ddl/neutral/kv_atomic.rs`) reads

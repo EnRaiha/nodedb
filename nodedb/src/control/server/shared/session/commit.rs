@@ -105,34 +105,11 @@ pub async fn run_commit(
         }
     };
 
-    // In-transaction `MERGE` is resolved + staged into concrete, surrogate-
-    // carrying `PointInsert` / `PointPut` / `PointDelete` writes at STATEMENT
-    // time (`session::expander_stage`), so by COMMIT the buffer already holds
-    // those concrete point ops — no raw `Merge` plan remains to expand here.
-
-    // Expand any staged in-transaction `UPDATE ... FROM <source>` into concrete,
-    // surrogate-carrying `PointPut` writes BEFORE dispatch, so the transaction
-    // commits indexed, replicated, undo-tracked point ops rather than replaying a
-    // raw `UpdateFromJoin` through the legacy passthrough (which writes outside
-    // the COMMIT batch's undo log — not atomic with siblings / ROLLBACK). Runs
-    // after the `INSERT ... SELECT` expansion above; the two remaining
-    // COMMIT-time expansions are independent and order-insensitive. (MERGE no
-    // longer expands here at all — see the comment above.)
-    let buffered =
-        match crate::control::update_from_join_orchestrator::expand_staged_update_from_joins(
-            state,
-            identity.tenant_id,
-            buffered,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                return CommitOutcome::Aborted {
-                    reason: AbortReason::Dispatch(e),
-                };
-            }
-        };
+    // In-transaction `MERGE` and `UPDATE ... FROM <source>` are resolved + staged
+    // into concrete, surrogate-carrying point writes (`PointInsert` / `PointPut`
+    // / `PointDelete`) at STATEMENT time (`session::expander_stage`), so by COMMIT
+    // the buffer already holds those concrete point ops — no raw `Merge` or
+    // `UpdateFromJoin` plan remains to expand here.
 
     if !buffered.is_empty() {
         let tenant_id = identity.tenant_id;

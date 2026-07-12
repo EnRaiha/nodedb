@@ -23,11 +23,12 @@
 //!    instead of a local read, so cross-core `UPDATE ... FROM` is correct.
 //!
 //! In-transaction `UPDATE ... FROM` never reaches this autocommit orchestrator:
-//! it is buffered at statement time and expanded at COMMIT into concrete
-//! `PointPut` ops by
-//! [`super::expand_staged_update_from_join::expand_staged_update_from_joins`], so
-//! its writes commit atomically with sibling ops and index into every
-//! cross-engine index.
+//! it is resolved + staged at STATEMENT time into concrete `PointPut` ops by
+//! [`super::expand_staged_update_from_join::resolve_and_emit_update_from_join_ops`]
+//! (driven from `control::server::shared::session::expander_stage`), so its
+//! writes land in the transaction's overlay immediately (read-your-own-writes)
+//! and commit atomically with sibling ops, indexing into every cross-engine
+//! index.
 
 use nodedb_types::{DatabaseId, TenantId};
 

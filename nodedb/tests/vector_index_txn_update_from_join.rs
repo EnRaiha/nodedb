@@ -4,12 +4,12 @@
 //! vector-indexed target must be indexed (visible to vector search) and atomic —
 //! identical to autocommit `UPDATE ... FROM`.
 //!
-//! A transactional `UPDATE ... FROM` is buffered at statement time and expanded
-//! at COMMIT (`control::update_from_join_orchestrator::expand_staged_update_from_joins`)
-//! into concrete `PointPut` ops carrying each target row's existing surrogate.
-//! Before that expansion the buffered update replayed through the legacy
-//! Data-Plane passthrough, whose `sparse.put` ran in its own redb txn OUTSIDE the
-//! COMMIT batch's undo log — not atomic with siblings / ROLLBACK.
+//! A transactional `UPDATE ... FROM` is resolved + staged at STATEMENT time
+//! (`control::server::shared::session::expander_stage`) into concrete `PointPut`
+//! ops carrying each target row's existing surrogate, buffered for COMMIT's
+//! durable replay. Before that expansion the buffered update replayed through the
+//! legacy Data-Plane passthrough, whose `sparse.put` ran in its own redb txn
+//! OUTSIDE the COMMIT batch's undo log — not atomic with siblings / ROLLBACK.
 //!
 //! Restart durability of in-transaction writes is covered separately (it depends
 //! on the single-shard commit journaling a replayable transaction-redo record).

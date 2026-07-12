@@ -143,16 +143,13 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::MaterializeScan { .. },
         ) => false,
 
-        // Buffered. `UpdateFromJoin` is rewritten at COMMIT into concrete
-        // `PointPut` ops BEFORE dispatch by
-        // `control::update_from_join_orchestrator::expand_staged_update_from_joins`,
-        // so it commits indexed, replicated, undo-tracked point writes (not the
-        // passthrough). (`Merge` never reaches this predicate in a transaction:
-        // it is intercepted BEFORE `route_in_tx_write` and resolved + staged as
-        // concrete point ops at STATEMENT time by
-        // `control::server::shared::session::expander_stage`; this arm remains
-        // only for the autocommit-classification callers and exhaustiveness.)
-        // `BatchInsert` still replays through
+        // Buffered. Neither `Merge` nor `UpdateFromJoin` reaches this predicate in
+        // a transaction: both are intercepted BEFORE `route_in_tx_write` and
+        // resolved + staged as concrete point ops at STATEMENT time by
+        // `control::server::shared::session::expander_stage` (so they commit
+        // indexed, replicated, undo-tracked point writes, not the passthrough);
+        // these arms remain only for the autocommit-classification callers and
+        // exhaustiveness. `BatchInsert` still replays through
         // `exec_tx_passthrough`
         // (`data/executor/handlers/transaction/sub_plan.rs:165`) at COMMIT with
         // no reject arm: `to_replicated_entry` has no encoder arm for it (a

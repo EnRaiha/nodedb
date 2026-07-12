@@ -316,9 +316,9 @@ impl CoreLoop {
     }
 
     /// Encode the RESOLVE pass payload: a msgpack `Vec<(doc_id,
-    /// Option<surrogate_u32>, post_image_body)>` the COMMIT expander decodes and
-    /// rewrites into concrete `PointPut` ops (see
-    /// `control::update_from_join_orchestrator::expand_staged_update_from_joins`).
+    /// Option<surrogate_u32>, post_image_body)>` the statement-time expander
+    /// decodes and rewrites into concrete `PointPut` ops (see
+    /// `control::update_from_join_orchestrator::resolve_and_emit_update_from_join_ops`).
     fn encode_resolved_update_rows(
         &self,
         task: &ExecutionTask,

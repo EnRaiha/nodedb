@@ -53,11 +53,11 @@ impl NodeDbPgHandler {
         let user_id: Option<std::sync::Arc<str>> =
             Some(std::sync::Arc::from(identity.username.as_str()));
 
-        // In-transaction MERGE is resolved + staged at STATEMENT time by the
-        // MERGE expander (read-your-own-writes for later statements in the same
-        // txn); every other task falls through to the neutral staging gate. The
-        // expander dispatches each derived point op via the SAME closure, so it
-        // must be `Fn` — hence `user_id.clone()` per call.
+        // In-transaction `MERGE` and `UPDATE ... FROM` are resolved + staged at
+        // STATEMENT time by the expander (read-your-own-writes for later
+        // statements in the same txn); every other task falls through to the
+        // neutral staging gate. The expander dispatches each derived point op via
+        // the SAME closure, so it must be `Fn` — hence `user_id.clone()` per call.
         let routed =
             match route_in_tx_expander(&self.state, &self.sessions, addr, task, |stage_task| {
                 self.dispatch_task(stage_task, user_id.clone(), Some(identity))
