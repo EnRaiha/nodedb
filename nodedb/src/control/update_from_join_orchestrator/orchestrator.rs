@@ -23,8 +23,11 @@
 //!    instead of a local read, so cross-core `UPDATE ... FROM` is correct.
 //!
 //! In-transaction `UPDATE ... FROM` never reaches here: it is buffered for
-//! COMMIT replay and rejected at resolve (it has no staged per-surrogate
-//! post-image), exactly like in-transaction `MERGE`.
+//! COMMIT replay. In-transaction `MERGE`, by contrast, is now expanded at
+//! COMMIT into concrete point ops by
+//! `control::merge_orchestrator::expand_staged_merges`; the analogous
+//! COMMIT-time expansion for `UPDATE ... FROM` is not yet wired, so its
+//! in-transaction form still replays the buffered `UpdateFromJoin` plan.
 
 use nodedb_types::{DatabaseId, TenantId};
 

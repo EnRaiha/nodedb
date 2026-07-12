@@ -40,33 +40,23 @@
 //! and retries — the same predict-verify-retry contract the OLLP dependent-read
 //! path uses. Retries are bounded; exhaustion surfaces `OllpExhausted`.
 
-use nodedb_types::columnar::DocumentMode;
-use nodedb_types::{CollectionType, DatabaseId, Surrogate, TenantId, Value};
+use nodedb_types::{DatabaseId, TenantId};
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
-use crate::control::security::catalog::StoredCollection;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_plan::document::merge_types::MergeClauseOp;
+
+use super::target_surrogate::{
+    assign_target_surrogate, bare_collection_name, decode_resolve, resolve_target_pk,
+};
 
 /// Upper bound on resolve→apply retries under concurrent source/target drift.
 /// Mirrors the OLLP dependent-read retry ceiling: a merge whose matched /
 /// not-matched classification keeps changing every attempt is surfaced as
 /// `OllpExhausted` rather than looping forever.
 const MAX_MERGE_RETRIES: u32 = 10;
-
-/// How the target collection's primary key drives surrogate assignment for a
-/// merge-inserted row (mirrors the plain-`INSERT` identity path).
-enum TargetPk {
-    /// Auto-generated `_rowid` (no declared PK): every inserted row gets a
-    /// fresh, distinct surrogate.
-    AutoRowId,
-    /// A declared / built-in primary-key field: the fresh surrogate is
-    /// content-addressed on this field's value so a later point-get /
-    /// cross-engine resolve lands on the same identity.
-    Field(String),
-}
 
 /// Bundled arguments for [`run_merge`], mirroring the fields of the intercepted
 /// `DocumentOp::Merge` plan.
@@ -127,7 +117,7 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
         if resolve_resp.status != Status::Ok {
             return Ok(resolve_resp);
         }
-        let insert_rows = decode_resolve(&resolve_resp.payload)?;
+        let insert_rows = decode_resolve(&resolve_resp.payload)?.inserts;
 
         // Phase 2: assign a fresh, registered surrogate per inserted row.
         let mut resolved: Vec<(String, u32)> = Vec::with_capacity(insert_rows.len());
@@ -210,107 +200,4 @@ fn merge_plan(
         resolved_inserts,
         source_rows,
     })
-}
-
-/// Decode the RESOLVE pass payload into `(join_key, body_msgpack)` insert rows.
-fn decode_resolve(payload: &[u8]) -> crate::Result<Vec<(String, Vec<u8>)>> {
-    if payload.is_empty() {
-        return Ok(Vec::new());
-    }
-    zerompk::from_msgpack(payload).map_err(|e| crate::Error::Serialization {
-        format: "msgpack".into(),
-        detail: format!("merge resolve rows: {e}"),
-    })
-}
-
-/// Assign a fresh, registered surrogate for one merge-inserted row on the
-/// TARGET's primary key.
-fn assign_target_surrogate(
-    state: &SharedState,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
-    target_collection: &str,
-    target_pk: &TargetPk,
-    body: &[u8],
-) -> crate::Result<Surrogate> {
-    match target_pk {
-        TargetPk::AutoRowId => {
-            state
-                .surrogate_assigner
-                .assign_fresh(database_id, tenant_id, target_collection)
-        }
-        TargetPk::Field(field) => match extract_pk_value(body, field) {
-            Some(pk) if !pk.is_empty() => state.surrogate_assigner.assign(
-                database_id,
-                tenant_id,
-                target_collection,
-                pk.as_bytes(),
-            ),
-            // No usable key value: mint a fresh unique surrogate rather than
-            // collapsing every keyless inserted row onto one binding.
-            _ => state
-                .surrogate_assigner
-                .assign_fresh(database_id, tenant_id, target_collection),
-        },
-    }
-}
-
-/// Resolve how the target collection's primary key maps an inserted row to a
-/// surrogate, mirroring the plain-`INSERT` identity path.
-fn resolve_target_pk(target: &StoredCollection) -> crate::Result<TargetPk> {
-    match &target.collection_type {
-        CollectionType::Document(DocumentMode::Strict(schema)) => {
-            match schema.columns.iter().find(|c| c.primary_key) {
-                Some(col) if col.name == "_rowid" => Ok(TargetPk::AutoRowId),
-                Some(col) => Ok(TargetPk::Field(col.name.clone())),
-                None => Ok(TargetPk::AutoRowId),
-            }
-        }
-        CollectionType::Document(DocumentMode::Schemaless) => Ok(TargetPk::Field(
-            target
-                .declared_primary_key
-                .clone()
-                .unwrap_or_else(|| "id".to_string()),
-        )),
-        CollectionType::KeyValue(_) | CollectionType::Columnar(_) => Err(crate::Error::PlanError {
-            detail: format!(
-                "MERGE target '{}' must be a document collection",
-                target.name
-            ),
-        }),
-    }
-}
-
-/// Extract a stringified primary-key value from a MessagePack insert body.
-fn extract_pk_value(body: &[u8], field: &str) -> Option<String> {
-    let Value::Object(obj) = nodedb_types::value_from_msgpack(body).ok()? else {
-        return None;
-    };
-    value_to_pk_string(obj.get(field)?)
-}
-
-/// Stringify a scalar value into its primary-key byte form (mirrors the
-/// `sql_value_to_string` convention used by the plain-INSERT identity path).
-fn value_to_pk_string(v: &Value) -> Option<String> {
-    match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Integer(n) => Some(n.to_string()),
-        Value::Float(f) => Some(f.to_string()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Decimal(d) => Some(d.to_string()),
-        _ => None,
-    }
-}
-
-/// Strip the `{database_id}/` qualifier from a db-qualified collection name to
-/// recover the bare name the catalog keys collections by.
-fn bare_collection_name(database_id: DatabaseId, qualified: &str) -> String {
-    if database_id == DatabaseId::DEFAULT {
-        return qualified.to_string();
-    }
-    let prefix = format!("{}/", database_id.as_u64());
-    qualified
-        .strip_prefix(&prefix)
-        .unwrap_or(qualified)
-        .to_string()
 }

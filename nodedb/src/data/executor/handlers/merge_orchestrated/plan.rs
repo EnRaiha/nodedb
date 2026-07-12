@@ -34,6 +34,10 @@ pub(super) struct MergeUpdate {
 pub(super) struct MergeDelete {
     pub(super) doc_id: String,
     pub(super) surrogate: Option<Surrogate>,
+    /// The deleted target row as MessagePack, so the Control-Plane expander can
+    /// extract its primary key when rewriting the delete into a concrete
+    /// `PointDelete` for an in-transaction MERGE at COMMIT.
+    pub(super) body: Vec<u8>,
 }
 
 /// A NOT-MATCHED INSERT arm resolved to a new row.
@@ -149,6 +153,7 @@ impl CoreLoop {
                     MergeActionOp::Delete => deletes.push(MergeDelete {
                         doc_id: doc_id.clone(),
                         surrogate,
+                        body: encode_doc_body(&target_doc),
                     }),
                     // INSERT is not a target-row arm; DoNothing is a no-op.
                     MergeActionOp::Insert { .. } | MergeActionOp::DoNothing => {}

@@ -406,8 +406,9 @@ pub enum DocumentOp {
         /// resolve→apply TOCTOU) — and applies every arm's writes with these
         /// surrogates in ONE redb transaction (matched UPDATE + NOT-MATCHED
         /// INSERT share the txn; a UNIQUE violation rolls back the whole set).
-        /// `None` = the legacy per-row path used by in-transaction buffered
-        /// replay, whose own surrogate limitation is tracked separately.
+        /// `None` = the legacy per-row apply, now retained only as a fallback:
+        /// in-transaction MERGE is expanded at COMMIT into concrete point ops
+        /// (`control::merge_orchestrator::expand_staged_merges`) instead.
         #[serde(default)]
         resolved_inserts: Option<Vec<(String, u32)>>,
         /// Control-Plane-shipped source rows for cross-core MERGE. When `Some`,

@@ -143,13 +143,18 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | DocumentOp::MaterializeScan { .. },
         ) => false,
 
-        // Buffered: `to_replicated_entry` has no encoder arm for these (a
-        // deliberate divergence from the oracle, see module doc), but each
-        // reaches `exec_tx_passthrough`
-        // (`data/executor/handlers/transaction/sub_plan.rs:165`) at COMMIT
-        // with no reject arm. Buffering closes the prior atomicity gap
-        // (statement used to execute immediately and survive ROLLBACK) at
-        // the cost of RYOW loss + the no-undo gap (module doc).
+        // Buffered. `Merge` is rewritten at COMMIT into concrete
+        // `PointInsert` / `PointPut` / `PointDelete` ops by
+        // `control::merge_orchestrator::expand_staged_merges` BEFORE dispatch,
+        // so it commits indexed, replicated, undo-tracked point writes (not the
+        // passthrough). `BatchInsert` / `UpdateFromJoin` still replay through
+        // `exec_tx_passthrough`
+        // (`data/executor/handlers/transaction/sub_plan.rs:165`) at COMMIT with
+        // no reject arm: `to_replicated_entry` has no encoder arm for them (a
+        // deliberate divergence from the oracle, see module doc). Buffering
+        // closes the prior atomicity gap (statement used to execute immediately
+        // and survive ROLLBACK) at the cost of RYOW loss + the no-undo gap
+        // (module doc) for those two.
         PhysicalPlan::Document(
             DocumentOp::BatchInsert { .. }
             | DocumentOp::Merge { .. }

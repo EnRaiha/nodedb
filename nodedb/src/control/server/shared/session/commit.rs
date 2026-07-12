@@ -105,6 +105,27 @@ pub async fn run_commit(
         }
     };
 
+    // Expand any staged in-transaction `MERGE` into concrete, surrogate-carrying
+    // `PointInsert` / `PointPut` / `PointDelete` writes BEFORE dispatch, so the
+    // transaction commits indexed, replicated, undo-tracked point ops rather than
+    // replaying a raw `Merge` through the legacy passthrough (which writes
+    // unindexed, unreplicated, non-atomic rows). Runs after the INSERT ... SELECT
+    // expansion; the two are independent and order-insensitive.
+    let buffered = match crate::control::merge_orchestrator::expand_staged_merges(
+        state,
+        identity.tenant_id,
+        buffered,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            return CommitOutcome::Aborted {
+                reason: AbortReason::Dispatch(e),
+            };
+        }
+    };
+
     if !buffered.is_empty() {
         let tenant_id = identity.tenant_id;
 

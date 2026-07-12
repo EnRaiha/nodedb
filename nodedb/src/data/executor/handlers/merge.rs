@@ -44,7 +44,9 @@ pub(in crate::data::executor) struct MergeParams<'a> {
     /// Control-Plane-pre-assigned surrogates for the NOT-MATCHED insert rows,
     /// keyed by source join value (orchestrator phase 3). `Some` selects the
     /// atomic verify-and-apply path; `None` (with `resolve_only == false`)
-    /// selects the legacy per-row path used by in-transaction buffered replay.
+    /// selects the legacy per-row apply, retained only as a fallback — the
+    /// in-transaction MERGE that once used it is now expanded at COMMIT into
+    /// concrete point ops (`control::merge_orchestrator::expand_staged_merges`).
     pub resolved_inserts: Option<&'a [(String, u32)]>,
     /// Control-Plane-shipped source rows for cross-core MERGE. When `Some`, the
     /// source join-map is built from these pre-scanned
@@ -64,8 +66,9 @@ impl CoreLoop {
     ///   assignment (no writes).
     /// - `resolved_inserts.is_some()` → [`Self::execute_merge_apply`]: the
     ///   atomic apply with CP-assigned surrogates + resolve→apply drift verify.
-    /// - otherwise → `execute_merge_legacy`: the per-row path retained for
-    ///   in-transaction buffered replay.
+    /// - otherwise → `execute_merge_legacy`: the per-row apply retained only as
+    ///   a fallback (in-transaction MERGE is now expanded at COMMIT into
+    ///   concrete point ops before it could reach this path).
     pub(in crate::data::executor) fn execute_merge(
         &mut self,
         task: &ExecutionTask,
@@ -81,7 +84,9 @@ impl CoreLoop {
         self.execute_merge_legacy(task, tid, params)
     }
 
-    /// Legacy per-row MERGE execution (in-transaction buffered replay).
+    /// Legacy per-row MERGE apply, retained only as a fallback. In-transaction
+    /// MERGE (which formerly reached this via buffered replay) is now expanded
+    /// at COMMIT into concrete point ops before dispatch.
     fn execute_merge_legacy(
         &mut self,
         task: &ExecutionTask,
