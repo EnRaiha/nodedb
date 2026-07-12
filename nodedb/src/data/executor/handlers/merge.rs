@@ -45,8 +45,9 @@ pub(in crate::data::executor) struct MergeParams<'a> {
     /// keyed by source join value (orchestrator phase 3). `Some` selects the
     /// atomic verify-and-apply path; `None` (with `resolve_only == false`)
     /// selects the legacy per-row apply, retained only as a fallback — the
-    /// in-transaction MERGE that once used it is now expanded at COMMIT into
-    /// concrete point ops (`control::merge_orchestrator::expand_staged_merges`).
+    /// in-transaction MERGE that once used it is now resolved + staged at
+    /// statement time into concrete point ops
+    /// (`control::server::shared::session::expander_stage`).
     pub resolved_inserts: Option<&'a [(String, u32)]>,
     /// Control-Plane-shipped source rows for cross-core MERGE. When `Some`, the
     /// source join-map is built from these pre-scanned

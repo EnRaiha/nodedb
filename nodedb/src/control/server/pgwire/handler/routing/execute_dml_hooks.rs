@@ -43,6 +43,9 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         task: PhysicalTask,
     ) -> PgWireResult<TxnRouteOutcome> {
+        use crate::control::server::shared::session::expander_stage::{
+            ExpanderOutcome, route_in_tx_expander,
+        };
         use crate::control::server::shared::session::staging_gate::{
             InTxnRoute, StagingGateError, route_in_tx_write,
         };
@@ -50,11 +53,28 @@ impl NodeDbPgHandler {
         let user_id: Option<std::sync::Arc<str>> =
             Some(std::sync::Arc::from(identity.username.as_str()));
 
-        match route_in_tx_write(&self.sessions, addr, task, |stage_task| {
-            self.dispatch_task(stage_task, user_id, Some(identity))
-        })
-        .await
-        {
+        // In-transaction MERGE is resolved + staged at STATEMENT time by the
+        // MERGE expander (read-your-own-writes for later statements in the same
+        // txn); every other task falls through to the neutral staging gate. The
+        // expander dispatches each derived point op via the SAME closure, so it
+        // must be `Fn` — hence `user_id.clone()` per call.
+        let routed =
+            match route_in_tx_expander(&self.state, &self.sessions, addr, task, |stage_task| {
+                self.dispatch_task(stage_task, user_id.clone(), Some(identity))
+            })
+            .await
+            {
+                Ok(ExpanderOutcome::Handled(route)) => Ok(route),
+                Ok(ExpanderOutcome::Passthrough(task)) => {
+                    route_in_tx_write(&self.sessions, addr, *task, |stage_task| {
+                        self.dispatch_task(stage_task, user_id.clone(), Some(identity))
+                    })
+                    .await
+                }
+                Err(e) => Err(e),
+            };
+
+        match routed {
             Ok(InTxnRoute::Read(routed_task)) => Ok(TxnRouteOutcome::Proceed(routed_task)),
             Ok(InTxnRoute::Buffered) => Ok(TxnRouteOutcome::Handled(Response::Execution(
                 Tag::new("OK"),

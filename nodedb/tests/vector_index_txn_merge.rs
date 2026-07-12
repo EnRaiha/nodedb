@@ -3,10 +3,10 @@
 //! In-transaction `BEGIN; MERGE ...; COMMIT` must be indexed (visible to
 //! vector/FTS search) and atomic — identical to autocommit MERGE.
 //!
-//! A transactional MERGE is buffered at statement time and expanded at COMMIT
-//! (`control::merge_orchestrator::expand_staged_merges`) into concrete
+//! A transactional MERGE is resolved + staged at STATEMENT time
+//! (`control::server::shared::session::expander_stage`) into concrete
 //! `PointInsert` / `PointPut` / `PointDelete` ops carrying Control-Plane-assigned
-//! surrogates. Before that expansion the buffered MERGE replayed through the
+//! surrogates. Before that staging the buffered MERGE replayed through the
 //! legacy Data-Plane passthrough, which wrote NOT-MATCHED inserts with NO
 //! surrogate (never indexed — invisible to vector/FTS search) and ran outside
 //! the COMMIT batch's undo log (not atomic with siblings / ROLLBACK).

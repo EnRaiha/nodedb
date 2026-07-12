@@ -46,10 +46,11 @@ type ResolvedUpdateArm = (String, Option<u32>, Vec<u8>);
 /// surrogate-carrying `PointPut` tasks, preserving each update's position and
 /// passing every other task through untouched.
 ///
-/// Runs in the Control-Plane COMMIT path just after [`MERGE`
-/// expansion](crate::control::merge_orchestrator::expand_staged_merges) and
-/// before dispatch classification, so the transaction commits concrete point
-/// writes rather than a re-played `UpdateFromJoin` through the legacy passthrough.
+/// Runs in the Control-Plane COMMIT path before dispatch classification, so the
+/// transaction commits concrete point writes rather than a re-played
+/// `UpdateFromJoin` through the legacy passthrough. (In-transaction `MERGE` is
+/// instead resolved + staged at STATEMENT time by
+/// `control::server::shared::session::expander_stage`.)
 pub(crate) async fn expand_staged_update_from_joins(
     state: &SharedState,
     tenant_id: TenantId,

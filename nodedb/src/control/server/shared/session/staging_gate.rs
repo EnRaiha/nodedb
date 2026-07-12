@@ -171,7 +171,12 @@ where
 
 /// Stage a stageable write into the per-transaction overlay and classify its
 /// outcome. Split out of [`route_in_tx_write`] to keep that function short.
-async fn stage_write<F, Fut>(
+///
+/// Visible to the `session` module so the statement-time MERGE expander
+/// ([`super::expander_stage`]) can stage each of the concrete point ops it
+/// derives through the exact same overlay-dispatch + buffer path a plain
+/// in-transaction point write uses — no separate staging code to drift.
+pub(super) async fn stage_write<F, Fut>(
     sessions: &SessionStore,
     addr: &SocketAddr,
     task: PhysicalTask,

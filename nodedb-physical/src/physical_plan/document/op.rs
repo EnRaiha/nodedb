@@ -418,8 +418,8 @@ pub enum DocumentOp {
         /// surrogates in ONE redb transaction (matched UPDATE + NOT-MATCHED
         /// INSERT share the txn; a UNIQUE violation rolls back the whole set).
         /// `None` = the legacy per-row apply, now retained only as a fallback:
-        /// in-transaction MERGE is expanded at COMMIT into concrete point ops
-        /// (`control::merge_orchestrator::expand_staged_merges`) instead.
+        /// in-transaction MERGE is resolved + staged at statement time into
+        /// concrete point ops (`server::shared::session::expander_stage`) instead.
         #[serde(default)]
         resolved_inserts: Option<Vec<(String, u32)>>,
         /// Control-Plane-shipped source rows for cross-core MERGE. When `Some`,

@@ -14,6 +14,9 @@ use crate::control::server::response_shape::compose::{ShapeOutcome, shape_respon
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+use crate::control::server::shared::session::expander_stage::{
+    ExpanderOutcome, route_in_tx_expander,
+};
 use crate::control::server::shared::session::staging_gate::{
     InTxnRoute, StagedTagKind, StagingGateError, route_in_tx_write,
 };
@@ -76,60 +79,80 @@ pub(super) async fn run_dispatch_loop(
         // and statement-time constraint errors. Outside a transaction block,
         // `route_in_tx_write` always returns `Read(task)` unchanged, so the
         // autocommit path is untouched.
-        let task =
-            match route_in_tx_write(ctx.sessions, ctx.peer_addr, task, |stage_task| async move {
-                dispatch_task(ctx, stage_task).await.map(|(resp, _)| resp)
-            })
-            .await
-            {
-                Ok(InTxnRoute::Read(routed_task)) => *routed_task,
-                Ok(InTxnRoute::Buffered) => {
-                    total_affected += 1;
-                    continue;
-                }
-                Ok(InTxnRoute::Staged(outcome)) => {
-                    if matches!(outcome.kind, StagedTagKind::RawPayload)
-                        && !outcome.payload.is_empty()
-                    {
-                        let plan_kind = describe_plan(&plan_for_staged_response);
-                        match shape_response_materialized(
-                            &outcome.payload,
-                            &plan_for_staged_response,
-                            plan_kind,
-                            output_schema,
-                            ctx.state,
-                            database_id,
-                            ctx.tenant_id(),
-                        ) {
-                            Ok(ShapeOutcome::Rows(mut shaped)) => {
-                                if let Some(notice) = shaped.notice.take() {
-                                    warnings.push(notice);
-                                }
-                                let (cols, rows) = to_native_columns_rows(&shaped);
-                                if !cols.is_empty() && all_columns.is_none() {
-                                    all_columns = Some(cols);
-                                }
-                                all_rows.extend(rows);
+        // In-transaction MERGE is resolved + staged at STATEMENT time by the
+        // MERGE expander (read-your-own-writes for later statements in the same
+        // txn); every other task falls through to the neutral staging gate.
+        let routed = match route_in_tx_expander(
+            ctx.state,
+            ctx.sessions,
+            ctx.peer_addr,
+            task,
+            |stage_task| async move { dispatch_task(ctx, stage_task).await.map(|(resp, _)| resp) },
+        )
+        .await
+        {
+            Ok(ExpanderOutcome::Handled(route)) => Ok(route),
+            Ok(ExpanderOutcome::Passthrough(task)) => {
+                route_in_tx_write(
+                    ctx.sessions,
+                    ctx.peer_addr,
+                    *task,
+                    |stage_task| async move {
+                        dispatch_task(ctx, stage_task).await.map(|(resp, _)| resp)
+                    },
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        let task = match routed {
+            Ok(InTxnRoute::Read(routed_task)) => *routed_task,
+            Ok(InTxnRoute::Buffered) => {
+                total_affected += 1;
+                continue;
+            }
+            Ok(InTxnRoute::Staged(outcome)) => {
+                if matches!(outcome.kind, StagedTagKind::RawPayload) && !outcome.payload.is_empty()
+                {
+                    let plan_kind = describe_plan(&plan_for_staged_response);
+                    match shape_response_materialized(
+                        &outcome.payload,
+                        &plan_for_staged_response,
+                        plan_kind,
+                        output_schema,
+                        ctx.state,
+                        database_id,
+                        ctx.tenant_id(),
+                    ) {
+                        Ok(ShapeOutcome::Rows(mut shaped)) => {
+                            if let Some(notice) = shaped.notice.take() {
+                                warnings.push(notice);
                             }
-                            Ok(ShapeOutcome::Passthrough) => {
-                                total_affected += 1;
+                            let (cols, rows) = to_native_columns_rows(&shaped);
+                            if !cols.is_empty() && all_columns.is_none() {
+                                all_columns = Some(cols);
                             }
-                            Err(e) => return resp(shape_error_to_native(seq, &e)),
+                            all_rows.extend(rows);
                         }
-                    } else {
-                        total_affected += outcome.affected as u64;
+                        Ok(ShapeOutcome::Passthrough) => {
+                            total_affected += 1;
+                        }
+                        Err(e) => return resp(shape_error_to_native(seq, &e)),
                     }
-                    continue;
+                } else {
+                    total_affected += outcome.affected as u64;
                 }
-                Err(StagingGateError::Dispatch(e)) => return resp(error_to_native(seq, &e)),
-                Err(StagingGateError::Rejected { code }) => {
-                    let (_, sqlstate, message) = match code {
-                        Some(code) => error_code_to_sqlstate(&code),
-                        None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-                    };
-                    return resp(NativeResponse::error(seq, sqlstate, message));
-                }
-            };
+                continue;
+            }
+            Err(StagingGateError::Dispatch(e)) => return resp(error_to_native(seq, &e)),
+            Err(StagingGateError::Rejected { code }) => {
+                let (_, sqlstate, message) = match code {
+                    Some(code) => error_code_to_sqlstate(&code),
+                    None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
+                };
+                return resp(NativeResponse::error(seq, sqlstate, message));
+            }
+        };
 
         let plan_for_response = task.plan.clone();
         let task_vshard = task.vshard_id;

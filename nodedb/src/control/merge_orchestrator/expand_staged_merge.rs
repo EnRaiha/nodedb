@@ -1,30 +1,31 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! COMMIT-time expansion of a staged in-transaction `MERGE`.
+//! Resolve + emit the concrete point ops for one in-transaction `MERGE`.
 //!
-//! A transactional `BEGIN; MERGE INTO t USING s ...; COMMIT` buffers the merge
-//! as a single `DocumentOp::Merge` plan. Left intact, COMMIT's buffered-plan
-//! replay runs it through the legacy Data-Plane passthrough, which writes the
-//! NOT-MATCHED inserts under a raw `sparse.put` with NO surrogate (never indexed
-//! — invisible to vector/FTS search), whose `to_replicated_entry` returns `None`
-//! (the whole row is lost on a WAL-only restart), and outside the COMMIT batch's
-//! undo log (not atomic with sibling ops).
+//! A transactional `BEGIN; MERGE INTO t USING s ...; ...; COMMIT` must not
+//! replay the raw `Merge` plan through the legacy Data-Plane passthrough, which
+//! writes the NOT-MATCHED inserts under a raw `sparse.put` with NO surrogate
+//! (never indexed — invisible to vector/FTS search), whose `to_replicated_entry`
+//! returns `None` (the whole row is lost on a WAL-only restart), and outside the
+//! COMMIT batch's undo log (not atomic with sibling ops).
 //!
-//! This expander rewrites every staged `Merge` into concrete, per-row
-//! `PointInsert` / `PointPut` / `PointDelete` writes BEFORE dispatch, exactly as
-//! [`super::orchestrator::run_merge`] does for autocommit: it ships the source
-//! rows to the source's own core, dispatches the shared Data-Plane RESOLVE pass
-//! (the single classifier — never re-derived here), assigns each inserted row its
-//! OWN fresh, catalog-REGISTERED surrogate, and reuses the EXISTING target row's
-//! registered surrogate for updates/deletes. Because the concrete point ops
-//! replace the `Merge` in the buffered list, they commit atomically with sibling
-//! ops (undo-tracked `tx_point_*` arms), ride the replicated point-write path
-//! (durable across a WAL-only restart), and index into every cross-engine index —
-//! so all three defects of the legacy path vanish with no MERGE-specific undo,
-//! replication, or minting code.
+//! Instead the MERGE is resolved at STATEMENT time (`session::expander_stage`):
+//! this module ships the source rows to the source's own core, dispatches the
+//! shared Data-Plane RESOLVE pass (the single classifier — never re-derived
+//! here), assigns each inserted row its OWN fresh, catalog-REGISTERED surrogate,
+//! and reuses the EXISTING target row's registered surrogate for updates/deletes.
+//! It returns the resulting per-row `PointInsert` / `PointPut` / `PointDelete`
+//! tasks; the expander then stages + buffers each through the normal
+//! statement-time staging path, so they land in the transaction's overlay
+//! immediately (read-your-own-writes for later statements) and commit as
+//! indexed, replicated, undo-tracked point writes.
 //!
-//! Mirrors [`crate::control::insert_select::expand_staged`]; see its module doc
-//! for why concrete `PointInsert` (not `BatchInsert`) is emitted.
+//! Because the RESOLVE pass reads the TARGET as base ∪ overlay (the staged
+//! transaction's id is threaded through), a MERGE matches — and reuses the
+//! surrogate of — a row a prior statement in the same transaction staged.
+//!
+//! Mirrors [`super::orchestrator::run_merge`]'s identity derivation for
+//! autocommit; the two drivers share [`super::target_surrogate`].
 
 use nodedb_types::TenantId;
 
@@ -40,66 +41,55 @@ use super::target_surrogate::{
     derive_document_id, require_surrogate, resolve_target_pk,
 };
 
-/// Expand every staged `DocumentOp::Merge` in `buffered` into concrete,
-/// surrogate-carrying `PointInsert` / `PointPut` / `PointDelete` tasks,
-/// preserving each `Merge`'s position and passing every other task through
-/// untouched.
+/// Resolve one in-transaction `DocumentOp::Merge` task into the concrete,
+/// surrogate-carrying `PointInsert` / `PointPut` / `PointDelete` tasks its three
+/// arms expand to.
 ///
-/// Runs in the Control-Plane COMMIT path just after [`InsertSelect`
-/// expansion](crate::control::insert_select::expand_staged) and before dispatch
-/// classification, so the transaction commits concrete point writes rather than
-/// a re-played `Merge` through the legacy passthrough.
-pub(crate) async fn expand_staged_merges(
+/// `task` must be a `Merge` plan with `task.txn_id` set to the active
+/// transaction, so the RESOLVE pass (and its source scan) fold rows staged by
+/// earlier statements in the same transaction. The emitted point ops carry the
+/// same `txn_id` and target the TARGET collection's vShard (recomputed here so
+/// dispatch classification stays honest, exactly as the `INSERT ... SELECT`
+/// expander does). The caller stages + buffers each returned op.
+pub(crate) async fn resolve_and_emit_merge_ops(
     state: &SharedState,
     tenant_id: TenantId,
-    buffered: Vec<PhysicalTask>,
+    task: &PhysicalTask,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    // Fast path: no staged MERGE to expand — return the buffer as-is.
-    if !buffered
-        .iter()
-        .any(|t| matches!(&t.plan, PhysicalPlan::Document(DocumentOp::Merge { .. })))
-    {
-        return Ok(buffered);
-    }
+    let PhysicalPlan::Document(DocumentOp::Merge {
+        target_collection, ..
+    }) = &task.plan
+    else {
+        // Callers only pass a `Merge` task; a mismatch is a programmer error.
+        return Err(crate::Error::PlanError {
+            detail: "resolve_and_emit_merge_ops: non-MERGE task".into(),
+        });
+    };
+    let target_collection = target_collection.clone();
 
-    let mut out: Vec<PhysicalTask> = Vec::with_capacity(buffered.len());
-    for task in buffered {
-        let PhysicalPlan::Document(DocumentOp::Merge {
-            target_collection, ..
-        }) = &task.plan
-        else {
-            out.push(task);
-            continue;
-        };
-        let target_collection = target_collection.clone();
+    let arms = resolve_merge_arms(state, tenant_id, task).await?;
 
-        let arms = resolve_merge_arms(state, tenant_id, &task).await?;
+    let catalog = state.credentials.catalog();
+    let target_bare = bare_collection_name(task.database_id, &target_collection);
+    let target = catalog
+        .get_collection(task.database_id, tenant_id.as_u64(), &target_bare)?
+        .ok_or_else(|| crate::Error::CollectionNotFound {
+            tenant_id,
+            collection: target_collection.clone(),
+        })?;
+    let target_pk = resolve_target_pk(&target)?;
 
-        let catalog = state.credentials.catalog();
-        let target_bare = bare_collection_name(task.database_id, &target_collection);
-        let target = catalog
-            .get_collection(task.database_id, tenant_id.as_u64(), &target_bare)?
-            .ok_or_else(|| crate::Error::CollectionNotFound {
-                tenant_id,
-                collection: target_collection.clone(),
-            })?;
-        let target_pk = resolve_target_pk(&target)?;
-
-        // Concrete writes land on the TARGET collection's vShard — that is where
-        // the merged rows live. Recomputing it (rather than reusing the staged
-        // task's vShard) keeps dispatch classification honest, exactly as the
-        // `INSERT ... SELECT` expander does.
-        let vshard_id = VShardId::from_collection_in_database(task.database_id, &target_collection);
-        emit_arms(
-            state,
-            &task,
-            &target_collection,
-            &target_pk,
-            vshard_id,
-            arms,
-            &mut out,
-        )?;
-    }
+    let vshard_id = VShardId::from_collection_in_database(task.database_id, &target_collection);
+    let mut out: Vec<PhysicalTask> = Vec::new();
+    emit_arms(
+        state,
+        task,
+        &target_collection,
+        &target_pk,
+        vshard_id,
+        arms,
+        &mut out,
+    )?;
     Ok(out)
 }
 
@@ -124,7 +114,7 @@ async fn resolve_merge_arms(
     else {
         // Callers only pass a `Merge` task; a mismatch is a programmer error.
         return Err(crate::Error::PlanError {
-            detail: "expand_staged_merges: resolve on non-MERGE task".into(),
+            detail: "resolve_merge_arms: resolve on non-MERGE task".into(),
         });
     };
 

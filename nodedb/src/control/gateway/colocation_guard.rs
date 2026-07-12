@@ -21,11 +21,11 @@
 //! and autocommit `UPDATE ... FROM` by `control::update_from_join_orchestrator`;
 //! each scans the source on its own core and ships the rows into the plan, so no
 //! raw `DocumentOp::Merge` / `DocumentOp::UpdateFromJoin` reaches this guard.
-//! Their in-transaction forms are buffered for COMMIT and never route raw
-//! through this guard: in-transaction `MERGE` is expanded at COMMIT into
-//! concrete point ops (which target the target's own vShard) by
-//! `control::merge_orchestrator::expand_staged_merges`, and in-transaction
-//! `UPDATE ... FROM` likewise by
+//! Their in-transaction forms never route raw through this guard: in-transaction
+//! `MERGE` is resolved + staged at STATEMENT time into concrete point ops (which
+//! target the target's own vShard) by
+//! `control::server::shared::session::expander_stage`, and in-transaction
+//! `UPDATE ... FROM` is expanded at COMMIT by
 //! `control::update_from_join_orchestrator::expand_staged_update_from_joins`.
 //!
 //! This guards only the one remaining cross-collection WRITE op.
