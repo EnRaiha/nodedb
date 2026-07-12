@@ -73,7 +73,7 @@ impl CoreLoop {
 /// is sorted ascending by surrogate so the apply order is identical on every
 /// replica (`surrogate_to_doc_id` is monotonic in the surrogate, so sorting the
 /// surrogates sorts the doc-ids).
-pub(super) fn ollp_predicted_doc_ids(predicted: &[u32]) -> Vec<String> {
+pub(in crate::data::executor) fn ollp_predicted_doc_ids(predicted: &[u32]) -> Vec<String> {
     let mut surrogates: Vec<u32> = predicted.to_vec();
     surrogates.sort_unstable();
     surrogates

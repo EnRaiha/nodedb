@@ -27,22 +27,22 @@ impl CoreLoop {
     /// synthetic `txn_id`, reusing the exact same statement-time staging
     /// handlers a session `BEGIN..COMMIT` point write uses.
     ///
-    /// Only concrete, surrogate-carrying point ops are staged here: the
-    /// Document point family (`PointInsert` / `PointPut` / `PointDelete` /
+    /// Concrete, surrogate-carrying point ops are staged here: the Document
+    /// point family (`PointInsert` / `PointPut` / `PointDelete` /
     /// `PointUpdate` / `Upsert`), KV point ops, and GRAPH edge/label ops.
     /// These are also the only op shapes that reach Calvin buffering for the
     /// Document family in the first place — `MERGE` / `UPDATE ... FROM` /
     /// `INSERT ... SELECT` are already expanded to concrete point ops at
     /// statement time before Calvin buffering (`commit.rs`).
     ///
-    /// Deliberately NOT staged here: `DocumentOp::BulkUpdate` / `BulkDelete`,
-    /// and the columnar / spatial / timeseries predicate-write ops. Those
-    /// carry `ollp_predicted_surrogates` for cross-replica determinism and
-    /// need determinism-preserving staging that reconciles with the flush
-    /// apply — a separate follow-up unit. Falling through to a no-op here is
-    /// safe for THIS unit because nothing yet reads `txn_overlays` for
-    /// Calvin; the completeness guard (loudly rejecting an unstaged Calvin
-    /// write) lands in the resolve unit that consumes this overlay.
+    /// `DocumentOp::BulkUpdate` / `BulkDelete` (predicate DML) are also
+    /// staged, but via the predicted-surrogate-set primitives in
+    /// [`calvin_overlay_stage_bulk`][super::calvin_overlay_stage_bulk] rather
+    /// than a live predicate rescan — see that module's docs for the
+    /// determinism rationale. The columnar / spatial / timeseries
+    /// predicate-write ops remain unstaged — a separate follow-up unit.
+    /// Falling through to a no-op here for those is safe for THIS unit
+    /// because nothing yet reads `txn_overlays` for their Calvin path.
     pub(in crate::data::executor) fn stage_calvin_overlay(
         &mut self,
         task: &ExecutionTask,
@@ -106,6 +106,30 @@ impl CoreLoop {
                 let resp = self.stage_document_upsert(&ctx, value, on_conflict_updates);
                 Self::stage_result(&resp)
             }
+            PhysicalPlan::Document(DocumentOp::BulkDelete {
+                collection,
+                ollp_predicted_surrogates,
+                ..
+            }) => self.stage_calvin_bulk_delete(
+                task,
+                tid,
+                txn_id,
+                collection,
+                ollp_predicted_surrogates.as_deref(),
+            ),
+            PhysicalPlan::Document(DocumentOp::BulkUpdate {
+                collection,
+                updates,
+                ollp_predicted_surrogates,
+                ..
+            }) => self.stage_calvin_bulk_update(
+                task,
+                tid,
+                txn_id,
+                collection,
+                updates,
+                ollp_predicted_surrogates.as_deref(),
+            ),
             PhysicalPlan::Kv(op) => {
                 let resp = self.execute_stage_kv(task, tid, txn_id, op);
                 Self::stage_result(&resp)

@@ -173,7 +173,7 @@ impl CoreLoop {
     /// the row that trips the cap remain staged — the same
     /// stage-then-fail-on-overflow behavior `stage_put_capped` exhibits for a
     /// single point write, applied per matched row here.
-    pub(super) fn stage_bulk_put_capped(
+    pub(in crate::data::executor) fn stage_bulk_put_capped(
         &mut self,
         txn_id: TxnId,
         coll_key: &(DatabaseId, TenantId, String),

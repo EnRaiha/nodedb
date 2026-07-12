@@ -14,8 +14,6 @@
 //! `execute_resolve_txn` directly means the redo serialization logic itself is
 //! never duplicated.
 
-use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
-
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
@@ -28,16 +26,16 @@ impl CoreLoop {
     /// its encoded bytes, without touching any base engine.
     ///
     /// Errors (rather than silently dropping data or producing an empty
-    /// record) when:
-    /// - no `commit_pending` entry exists for `(epoch, position, vshard)` —
-    ///   the transaction was never staged (or was already flushed/dropped),
-    ///   and there is nothing to resolve;
-    /// - the staged plan set contains a `DocumentOp::BulkUpdate` /
-    ///   `BulkDelete`. `stage_calvin_overlay` deliberately does not stage
-    ///   these predicate writes into the overlay yet (see its module docs),
-    ///   so resolving them here would silently produce a redo record missing
-    ///   those rows. Aborting loudly is strictly better than a non-durable
-    ///   commit.
+    /// record) when no `commit_pending` entry exists for
+    /// `(epoch, position, vshard)` — the transaction was never staged (or was
+    /// already flushed/dropped), and there is nothing to resolve.
+    ///
+    /// `DocumentOp::BulkUpdate` / `BulkDelete` plans are staged into the
+    /// overlay by `stage_calvin_overlay` (via the predicted-surrogate-set
+    /// primitives in `calvin_overlay_stage_bulk`) the same as any other
+    /// write, so no separate completeness check is needed here — a plan
+    /// missing its required `ollp_predicted_surrogates` already failed loudly
+    /// at staging time, before it could ever reach `commit_pending`.
     pub(in crate::data::executor) fn execute_calvin_resolve(
         &self,
         task: &ExecutionTask,
@@ -63,27 +61,6 @@ impl CoreLoop {
             );
         };
 
-        if let Some(plan) = pending.plans.iter().find(|plan| {
-            matches!(
-                plan,
-                PhysicalPlan::Document(
-                    DocumentOp::BulkUpdate { .. } | DocumentOp::BulkDelete { .. }
-                )
-            )
-        }) {
-            return self.response_error(
-                task,
-                crate::Error::Internal {
-                    detail: format!(
-                        "calvin resolve: DocumentOp::BulkUpdate/BulkDelete not yet supported \
-                         for multi-shard redo durability (predicate writes need \
-                         determinism-preserving overlay staging); aborting rather than \
-                         committing non-durably: {plan:?}"
-                    ),
-                },
-            );
-        }
-
         let tid = pending.tenant_id.as_u64();
         let plans = &pending.plans;
         self.execute_resolve_txn(task, tid, synthetic_txn_id, plans)
@@ -94,6 +71,7 @@ impl CoreLoop {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan, UpdateValue};
     use nodedb_types::Surrogate;
     use nodedb_types::Value;
 
@@ -101,6 +79,7 @@ mod tests {
     use crate::bridge::envelope::{Admission, ExemptReason, Priority, Request, Status};
     use crate::data::executor::core_loop::tests::make_core_with_dir;
     use crate::data::executor::handlers::control::calvin::CalvinExecCtx;
+    use crate::engine::document::store::surrogate_to_doc_id;
     use crate::types::{DatabaseId, RequestId, TenantId, TraceId, VShardId};
     use crate::wal::RedoRecord;
 
@@ -157,15 +136,45 @@ mod tests {
         })
     }
 
-    fn bulk_update_plan(collection: &str) -> PhysicalPlan {
+    fn bulk_delete_plan(
+        collection: &str,
+        ollp_predicted_surrogates: Option<Vec<u32>>,
+    ) -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::BulkDelete {
+            collection: collection.to_string(),
+            filters: Vec::new(),
+            returning: None,
+            ollp_predicted_surrogates,
+            ollp_predicted_edges: None,
+        })
+    }
+
+    fn bulk_update_plan(
+        collection: &str,
+        updates: Vec<(String, UpdateValue)>,
+        ollp_predicted_surrogates: Option<Vec<u32>>,
+    ) -> PhysicalPlan {
         PhysicalPlan::Document(DocumentOp::BulkUpdate {
             collection: collection.to_string(),
             filters: Vec::new(),
-            updates: Vec::new(),
+            updates,
             returning: None,
-            ollp_predicted_surrogates: None,
+            ollp_predicted_surrogates,
             ollp_predicted_edges: None,
         })
+    }
+
+    /// Seed a row directly into base storage (bypassing Calvin staging), the
+    /// pre-existing state the predicate-write staging tests below apply
+    /// their predicted surrogate set against.
+    fn seed_row(core: &mut CoreLoop, collection: &str, surrogate: u32, field: &str, val: &str) {
+        let doc_id = surrogate_to_doc_id(Surrogate::new(surrogate));
+        let body = crate::data::executor::doc_format::canonicalize_document_for_storage(
+            &doc_value(field, val),
+        );
+        core.sparse
+            .put(DatabaseId::DEFAULT.as_u64(), 1, collection, &doc_id, &body)
+            .expect("seed row");
     }
 
     fn stage(
@@ -228,20 +237,162 @@ mod tests {
         assert_eq!(surrogate, 7);
     }
 
+    /// Decode every `Delete` sub-record's surrogate out of a resolved redo.
+    fn deleted_surrogates(record: &RedoRecord) -> Vec<u32> {
+        let mut out: Vec<u32> = record
+            .ops
+            .iter()
+            .map(|op| {
+                let (_collection, _doc_id, _prov, surrogate): (
+                    String,
+                    String,
+                    Option<nodedb_types::sync::wire::SyncProvenance>,
+                    u32,
+                ) = zerompk::from_msgpack(&op.payload).expect("decode document delete sub-record");
+                surrogate
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     #[test]
-    fn calvin_resolve_rejects_bulk_update() {
+    fn calvin_stages_bulk_delete_from_predicted_set() {
         let dir = tempfile::tempdir().unwrap();
         let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
         let task = make_task();
 
-        stage(&mut core, &task, 2, 0, &[bulk_update_plan("orders")]);
+        // Seed 3 rows; the predicted set names a known 2-row subset.
+        seed_row(&mut core, "orders", 10, "a", "1");
+        seed_row(&mut core, "orders", 11, "a", "1");
+        seed_row(&mut core, "orders", 12, "a", "1");
 
-        let resp = core.execute_calvin_resolve(&task, 2, 0);
+        stage(
+            &mut core,
+            &task,
+            3,
+            0,
+            &[bulk_delete_plan("orders", Some(vec![10, 12]))],
+        );
+
+        let resp = core.execute_calvin_resolve(&task, 3, 0);
+        assert_eq!(resp.status, Status::Ok, "resolve must succeed: {resp:?}");
+        let record = RedoRecord::from_bytes(resp.payload.as_bytes()).expect("decode redo record");
+        assert_eq!(
+            record.ops.len(),
+            2,
+            "exactly one Delete sub-record per predicted surrogate"
+        );
+        assert_eq!(deleted_surrogates(&record), vec![10, 12]);
+    }
+
+    #[test]
+    fn calvin_bulk_delete_ignores_drift_from_predicted_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let task = make_task();
+
+        // 3 rows exist in base and would ALL match an empty-predicate
+        // (match-everything) live rescan. The predicted set names only 2 of
+        // them -- if staging re-derived the row set via a live scan instead
+        // of trusting the predicted set, the redo would carry 3 deletes, not
+        // 2. This is the determinism proof: staging must key off the
+        // predicted set the flush applies, not a fresh predicate scan.
+        seed_row(&mut core, "orders", 20, "a", "1");
+        seed_row(&mut core, "orders", 21, "a", "1");
+        seed_row(&mut core, "orders", 22, "a", "1");
+
+        stage(
+            &mut core,
+            &task,
+            4,
+            0,
+            &[bulk_delete_plan("orders", Some(vec![20, 21]))],
+        );
+
+        let resp = core.execute_calvin_resolve(&task, 4, 0);
+        assert_eq!(resp.status, Status::Ok, "resolve must succeed: {resp:?}");
+        let record = RedoRecord::from_bytes(resp.payload.as_bytes()).expect("decode redo record");
+        assert_eq!(
+            record.ops.len(),
+            2,
+            "redo must reflect ONLY the predicted surrogates, not the live \
+             (drifted) match-everything set"
+        );
+        assert_eq!(deleted_surrogates(&record), vec![20, 21]);
+    }
+
+    #[test]
+    fn calvin_stages_bulk_update_matches_execute_bulk_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let task = make_task();
+
+        seed_row(&mut core, "orders", 30, "a", "1");
+        seed_row(&mut core, "orders", 31, "a", "1");
+
+        let literal = nodedb_types::json_to_msgpack(&serde_json::json!("2")).unwrap();
+        let updates = vec![("a".to_string(), UpdateValue::Literal(literal))];
+
+        stage(
+            &mut core,
+            &task,
+            5,
+            0,
+            &[bulk_update_plan("orders", updates, Some(vec![30, 31]))],
+        );
+
+        let resp = core.execute_calvin_resolve(&task, 5, 0);
+        assert_eq!(resp.status, Status::Ok, "resolve must succeed: {resp:?}");
+        let record = RedoRecord::from_bytes(resp.payload.as_bytes()).expect("decode redo record");
+        assert_eq!(record.ops.len(), 2, "one Put sub-record per predicted row");
+
+        // The expected post-image is the exact same decode -> apply -> encode
+        // pipeline `execute_bulk_update` runs for a plain literal assignment
+        // with no generated columns / strict schema in play.
+        let expected = crate::data::executor::doc_format::encode_to_msgpack(&serde_json::json!({
+            "a": "2"
+        }));
+
+        for op in &record.ops {
+            let (_collection, _doc_id, value, _prov, _surrogate): (
+                String,
+                String,
+                Vec<u8>,
+                Option<nodedb_types::sync::wire::SyncProvenance>,
+                u32,
+            ) = zerompk::from_msgpack(&op.payload).expect("decode document put sub-record");
+            assert_eq!(
+                value, expected,
+                "post-image must match execute_bulk_update's transform"
+            );
+        }
+    }
+
+    #[test]
+    fn calvin_bulk_missing_predicted_surrogates_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let task = make_task();
+
+        let ctx = CalvinExecCtx {
+            epoch: 6,
+            position: 0,
+            epoch_system_ms: 0,
+            is_group_leader: true,
+        };
+        let resp = core.execute_calvin_execute_static(
+            &task,
+            ctx,
+            &TenantId::new(1),
+            &[bulk_delete_plan("orders", None)],
+            &[],
+        );
         assert_eq!(
             resp.status,
             Status::Error,
-            "the completeness guard must reject an unstaged BulkUpdate rather \
-             than silently produce an empty redo record"
+            "staging a Calvin bulk predicate write with no predicted surrogate \
+             set must error loudly, never silently skip"
         );
     }
 

@@ -54,9 +54,23 @@ pub(in crate::control::cluster::calvin::scheduler::driver) enum CommitState {
     /// Awaiting the validate-and-stage response, whose `read_set_valid` carries
     /// the local commit vote that drives the flush-or-drop decision.
     Staged,
+    /// The txn committed and a `MetaOp::CalvinResolve` has been dispatched to
+    /// resolve its staged post-images into a replayable `RedoRecord`; awaiting
+    /// that response before the redo is WAL-appended and the flush dispatched.
+    AwaitingRedoResolve,
     /// A flush (`committed = true`) or drop (`committed = false`) has been
     /// dispatched; awaiting its response before the commit tail runs.
-    AwaitingResolve { committed: bool },
+    ///
+    /// `redo_lsn` is `Some(lsn)` when a `TransactionRedo` record was appended
+    /// for this commit's non-empty write set — `commit_apply_tail` then only
+    /// records write versions at it, since the redo record already IS the
+    /// applied marker. `None` for a drop, or a committed txn whose resolved
+    /// redo carried no ops (pure read / CRDT) — `commit_apply_tail` falls back
+    /// to appending a `CalvinApplied` marker in that case.
+    AwaitingResolve {
+        committed: bool,
+        redo_lsn: Option<crate::types::Lsn>,
+    },
 }
 
 /// A transaction that is blocked on lock acquisition.

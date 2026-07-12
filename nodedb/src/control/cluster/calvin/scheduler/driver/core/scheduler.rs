@@ -381,8 +381,15 @@ impl Scheduler {
                 self.resolve_staged_commit(txn_id, &response);
                 return;
             }
-            Some(CommitState::AwaitingResolve { committed }) => {
-                self.finish_resolved_commit(txn_id, response, committed);
+            Some(CommitState::AwaitingRedoResolve) => {
+                self.finish_redo_resolve(txn_id, response);
+                return;
+            }
+            Some(CommitState::AwaitingResolve {
+                committed,
+                redo_lsn,
+            }) => {
+                self.finish_resolved_commit(txn_id, response, committed, redo_lsn);
                 return;
             }
             None => {}
@@ -400,7 +407,7 @@ impl Scheduler {
                     .read_set_validation_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            self.commit_apply_tail(txn_id, response);
+            self.commit_apply_tail(txn_id, response, None);
         } else {
             tracing::warn!(
                 vshard_id = self.vshard_id,

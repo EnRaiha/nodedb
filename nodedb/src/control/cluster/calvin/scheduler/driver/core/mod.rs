@@ -17,6 +17,8 @@
 //!   `dispatch`'s local-plan filtering.
 //! - [`commit_resolve`] — verdict-driven flush-or-drop of a staged static
 //!   transaction, plus the shared commit tail.
+//! - [`commit_redo`] — resolves a committed staged transaction's post-images
+//!   into a replayable `TransactionRedo` WAL record ahead of the flush.
 //! - [`read_result`] — `CalvinReadResult` handling and barrier timeouts.
 //! - [`propose`] — propose `CalvinReadResult` Raft entries.
 //! - [`write_version_record`] — post-apply write-version recording for
@@ -35,6 +37,7 @@
 //!
 //! Never used for WAL-influencing values.
 
+pub mod commit_redo;
 pub mod commit_resolve;
 pub mod dispatch;
 pub mod process;

@@ -102,7 +102,7 @@ impl CoreLoop {
     /// `current_bytes` is the overlay-or-base current body; expressions in the
     /// patch are evaluated against it, so a same-transaction prior update is
     /// observed by a later `col = col + 1`.
-    pub(super) fn stage_apply_update(
+    pub(in crate::data::executor) fn stage_apply_update(
         &self,
         tid: u64,
         collection: &str,

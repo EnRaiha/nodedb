@@ -5,10 +5,12 @@
 //! A static Calvin dispatch STAGES its transaction on the Data Plane (validate
 //! the read-set + buffer the plans, no base mutation). Its executor response
 //! carries the local commit vote on `read_set_valid`. This module drives the
-//! second step: dispatch a flush (commit) or drop (abort) of the staged buffer,
-//! wait for its response, then run the commit tail (deposit applied result,
-//! append `CalvinApplied` WAL + record write versions, propose `CompletionAck`)
-//! for a flush, or ack-only for a drop.
+//! final step: dispatch a flush (commit, after `commit_redo` has WAL-appended
+//! the resolved `TransactionRedo`) or drop (abort) of the staged buffer, wait
+//! for its response, then run the commit tail (deposit applied result, record
+//! write versions — plus a `CalvinApplied` WAL fallback when no redo record
+//! was appended — propose `CompletionAck`) for a flush, or ack-only for a
+//! drop.
 
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -25,15 +27,19 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::MetaOp;
 
 impl Scheduler {
-    /// Resolve a staged transaction's local commit vote into a flush or drop.
+    /// Resolve a staged transaction's local commit vote into a redo-resolve
+    /// (commit) or a drop (abort).
     ///
     /// The staged executor response is validate-only: its `read_set_valid` is
     /// the local commit vote (`Some(true)` => commit, `Some(false)` => abort; a
-    /// defensive `None` is treated as commit). Dispatches the corresponding
-    /// flush/drop back to the same core, moves the txn to
-    /// [`CommitState::AwaitingResolve`], and bumps the flushed / dropped
-    /// counter. The commit tail runs later, in [`Self::finish_resolved_commit`],
-    /// once the flush/drop response arrives.
+    /// defensive `None` is treated as commit). On commit, dispatches
+    /// `MetaOp::CalvinResolve` and moves the txn to
+    /// [`CommitState::AwaitingRedoResolve`] — [`Self::finish_redo_resolve`]
+    /// WAL-appends the resolved redo and dispatches the flush from there. On
+    /// abort, dispatches the drop directly and moves the txn to
+    /// [`CommitState::AwaitingResolve`]. Bumps the flushed / dropped counter.
+    /// The commit tail runs later, in [`Self::finish_resolved_commit`], once
+    /// the flush/drop response arrives.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn resolve_staged_commit(
         &mut self,
         txn_id: TxnId,
@@ -49,8 +55,17 @@ impl Scheduler {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
-        if !self.dispatch_commit_resolution(txn_id, committed) {
-            // Flush/drop dispatch failed: complete the txn as an infra error so
+        let dispatched = if committed {
+            // Resolve the staged post-images into a replayable `RedoRecord`
+            // first; the redo is WAL-appended (in `finish_redo_resolve`) before
+            // the flush is dispatched, restoring restart durability for this
+            // vShard's slice of a multi-shard Calvin commit.
+            self.dispatch_calvin_resolve(txn_id)
+        } else {
+            self.dispatch_commit_resolution(txn_id, false, None)
+        };
+        if !dispatched {
+            // Resolve/drop dispatch failed: complete the txn as an infra error so
             // its locks release and the epoch advances rather than stalling. The
             // staged buffer is reclaimed by a later drop or on core teardown.
             self.metrics.record_executor_error();
@@ -62,7 +77,14 @@ impl Scheduler {
         }
 
         if let Some(pending) = self.pending.get_mut(&txn_id) {
-            pending.commit_state = Some(CommitState::AwaitingResolve { committed });
+            pending.commit_state = Some(if committed {
+                CommitState::AwaitingRedoResolve
+            } else {
+                CommitState::AwaitingResolve {
+                    committed: false,
+                    redo_lsn: None,
+                }
+            });
         }
 
         if committed {
@@ -91,10 +113,11 @@ impl Scheduler {
         txn_id: TxnId,
         response: Response,
         committed: bool,
+        redo_lsn: Option<crate::types::Lsn>,
     ) {
         if response.status == Status::Ok {
             if committed {
-                self.commit_apply_tail(txn_id, response);
+                self.commit_apply_tail(txn_id, response, redo_lsn);
             } else {
                 self.propose_sequencer_entry(
                     SequencerEntry::CompletionAck {
@@ -123,15 +146,24 @@ impl Scheduler {
         self.on_txn_complete(txn_id);
     }
 
-    /// Deposit the applied result, append the `CalvinApplied` WAL record +
-    /// record the apply's write versions, and propose the `CompletionAck`.
+    /// Deposit the applied result, durably mark the apply, record the apply's
+    /// write versions, and propose the `CompletionAck`.
     ///
     /// Shared by the flush-completion path and the direct-apply (dependent /
     /// active) apply path.
+    ///
+    /// `redo_lsn` is `Some(lsn)` when a `TransactionRedo` record was already
+    /// WAL-appended for this commit's non-empty write set (`finish_redo_resolve`)
+    /// — that record already IS the durable applied marker, so only write
+    /// versions are recorded at it. `None` (a drop, an empty-ops staged commit,
+    /// or the direct-apply dependent/active path, which carries no redo record)
+    /// falls back to appending a `CalvinApplied` marker here, exactly as before
+    /// this record existed.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn commit_apply_tail(
         &mut self,
         txn_id: TxnId,
         response: Response,
+        redo_lsn: Option<crate::types::Lsn>,
     ) {
         // Deposit the FULL applied Response (affected-count + watermark + any
         // RETURNING rows) into the local sidecar BEFORE proposing the replicated
@@ -185,25 +217,32 @@ impl Scheduler {
                 }
             }
         }
-        match self.shared.wal.append_calvin_applied(
-            crate::types::VShardId::new(self.vshard_id),
-            txn_id.epoch,
-            txn_id.position,
-        ) {
-            // The CalvinApplied WAL LSN is the committed write-LSN for this apply
-            // — the SAME shard-local WAL-LSN space fast-path writes and read
-            // watermarks use. Record the apply's per-key write versions at it now
-            // that it exists (it did not at dispatch time).
-            Ok(applied_lsn) => self.record_calvin_write_versions(txn_id, applied_lsn),
-            Err(e) => {
-                tracing::error!(
-                    vshard_id = self.vshard_id,
-                    epoch = txn_id.epoch,
-                    position = txn_id.position,
-                    error = %e,
-                    "calvin: failed to write CalvinApplied WAL record"
-                );
-            }
+        match redo_lsn {
+            // The TransactionRedo record already durably marks this apply — the
+            // SAME shard-local WAL-LSN space fast-path writes and read
+            // watermarks use. Record the apply's per-key write versions at it;
+            // no second (CalvinApplied) marker is written.
+            Some(lsn) => self.record_calvin_write_versions(txn_id, lsn),
+            None => match self.shared.wal.append_calvin_applied(
+                crate::types::VShardId::new(self.vshard_id),
+                txn_id.epoch,
+                txn_id.position,
+            ) {
+                // The CalvinApplied WAL LSN is the committed write-LSN for this
+                // apply — the SAME shard-local WAL-LSN space fast-path writes and
+                // read watermarks use. Record the apply's per-key write versions
+                // at it now that it exists (it did not at dispatch time).
+                Ok(applied_lsn) => self.record_calvin_write_versions(txn_id, applied_lsn),
+                Err(e) => {
+                    tracing::error!(
+                        vshard_id = self.vshard_id,
+                        epoch = txn_id.epoch,
+                        position = txn_id.position,
+                        error = %e,
+                        "calvin: failed to write CalvinApplied WAL record"
+                    );
+                }
+            },
         }
         self.propose_sequencer_entry(
             SequencerEntry::CompletionAck {
@@ -220,10 +259,20 @@ impl Scheduler {
     /// staged transaction's commit-pending buffer back to its core, registering
     /// a response bridge so the resolve response re-enters the completion loop.
     ///
+    /// `wal_lsn` is the just-appended `TransactionRedo` LSN for a flush whose
+    /// resolved redo carried ops (`Some`); `None` for a drop, or a flush whose
+    /// resolved redo was empty (falls back to the `CalvinApplied` marker in
+    /// `commit_apply_tail`).
+    ///
     /// Returns `false` if the dispatch failed (the caller then completes the txn
-    /// as an infra error). Mirrors the exempt, no-WAL-LSN dispatch shape of the
+    /// as an infra error). Mirrors the exempt dispatch shape of the
     /// static/active dispatch and the write-version record op.
-    fn dispatch_commit_resolution(&mut self, txn_id: TxnId, committed: bool) -> bool {
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn dispatch_commit_resolution(
+        &mut self,
+        txn_id: TxnId,
+        committed: bool,
+        wal_lsn: Option<crate::types::Lsn>,
+    ) -> bool {
         let Some(pending) = self.pending.get(&txn_id) else {
             return false;
         };
@@ -259,9 +308,10 @@ impl Scheduler {
             user_id: None,
             statement_digest: None,
             txn_id: None,
-            // A flush allocates its CalvinApplied WAL LSN post-apply (in
-            // `commit_apply_tail`), so no committed LSN is known here.
-            wal_lsn: None,
+            // The redo record (if any) was already WAL-appended by the caller
+            // before this dispatch — see `finish_redo_resolve` — so its LSN
+            // rides on the envelope here rather than being allocated post-apply.
+            wal_lsn,
             // Calvin resolves TTL instants via `epoch_system_ms`, not this
             // field — see `resolved_now_ms` precedence in the KV write handlers.
             resolved_now_ms: None,
