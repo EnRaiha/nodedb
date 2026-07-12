@@ -2,7 +2,7 @@
 
 use tracing::{debug, warn};
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
@@ -142,6 +142,14 @@ impl CoreLoop {
 
         // Delete each matching document with full cascade.
         let mut affected = 0u64;
+        // One post-apply `Delete` redo entry per removed row on a vector
+        // collection. The per-row `sparse.delete` above mints no WAL redo of its
+        // own, so a WAL-only restart would replay the row's original `INSERT`
+        // `Put` record back into the HNSW and resurrect its vector. Carrying the
+        // surrogate back lets the Control Plane mint a durable `Delete` redo whose
+        // replay soft-deletes the HNSW node through `apply_point_delete`. Only
+        // populated when the collection has a vector index.
+        let mut write_set: Vec<WriteSetEntry> = Vec::new();
         let mut returned_docs: Vec<serde_json::Value> = if returning.is_some() {
             Vec::with_capacity(apply_ids.len())
         } else {
@@ -171,8 +179,10 @@ impl CoreLoop {
                 .is_some()
             {
                 // Cascade: inverted index. doc_id is the hex-encoded surrogate
-                // (the redb storage key). Parse back for FTS removal.
-                match crate::engine::document::store::doc_id_to_surrogate(doc_id) {
+                // (the redb storage key). Parse back once for FTS removal and
+                // reused below for the write version + write-set entry.
+                let row_surrogate = crate::engine::document::store::doc_id_to_surrogate(doc_id);
+                match row_surrogate {
                     Some(surrogate) => {
                         if let Err(e) = self.inverted.remove_document(
                             task.request.database_id.as_u64(),
@@ -227,9 +237,19 @@ impl CoreLoop {
                 );
                 // Record the committed delete's write version against its
                 // surrogate + collection.
-                if let Some(surrogate) = crate::engine::document::store::doc_id_to_surrogate(doc_id)
-                {
+                if let Some(surrogate) = row_surrogate {
                     self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+                    // Carry the surrogate back for a post-apply `Delete` redo so
+                    // the removed vector node does not resurrect on a WAL-only
+                    // restart. Gated on `has_vectors` — a non-vector collection
+                    // pays nothing. A delete carries no post-image body.
+                    if has_vectors {
+                        write_set.push(WriteSetEntry {
+                            surrogate: surrogate.as_u32(),
+                            is_delete: true,
+                            value: Vec::new(),
+                        });
+                    }
                 }
                 affected += 1;
                 if let Some(doc) = pre_delete_doc {
@@ -246,28 +266,36 @@ impl CoreLoop {
 
         debug!(core = self.core_id, %collection, affected, "bulk delete complete");
 
-        if let Some(spec) = returning {
+        let mut response = if let Some(spec) = returning {
             match returning_rows::build_rows_payload(spec, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("RETURNING encode: {e}"),
-                    },
-                ),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("RETURNING encode: {e}"),
+                        },
+                    );
+                }
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
             match response_codec::encode_json(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                ),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    );
+                }
             }
+        };
+        if !write_set.is_empty() {
+            response.write_set = write_set;
         }
+        response
     }
 
     /// Compute the sorted ACTUAL implicit-edge set for the matched docs.

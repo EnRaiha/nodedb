@@ -2,7 +2,7 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
@@ -180,6 +180,14 @@ impl CoreLoop {
 
         // Apply updates to each matching document.
         let mut affected = 0u64;
+        // One post-apply `Put` redo entry per updated row on a vector collection.
+        // Each row's `sparse.put` above reconciled storage + the btree/FTS/graph
+        // overlays but minted no WAL redo carrying the new body, so a WAL-only
+        // restart would rebuild the HNSW from the pre-update `Put` records and
+        // resurrect the stale embeddings. Carrying the surrogate + post-image back
+        // lets the Control Plane mint a durable `Put` redo per row. Only populated
+        // when the collection has a vector index.
+        let mut write_set: Vec<WriteSetEntry> = Vec::new();
         let mut returned_docs: Vec<serde_json::Value> = if returning.is_some() {
             Vec::with_capacity(apply_ids.len())
         } else {
@@ -286,10 +294,12 @@ impl CoreLoop {
                             &updated_bytes,
                         );
                         // Record the committed row's write version against its
-                        // surrogate + collection.
-                        if let Some(surrogate) =
-                            crate::engine::document::store::doc_id_to_surrogate(doc_id)
-                        {
+                        // surrogate + collection. Parsed once and reused below
+                        // for the write-set entry (the row's doc_id is the
+                        // hex-encoded surrogate storage key either way).
+                        let row_surrogate =
+                            crate::engine::document::store::doc_id_to_surrogate(doc_id);
+                        if let Some(surrogate) = row_surrogate {
                             self.note_surrogate_write_lsn(
                                 task,
                                 tid,
@@ -324,6 +334,18 @@ impl CoreLoop {
                             }
                             returned_docs.push(doc);
                         }
+                        // Carry the surrogate + post-image back for a post-apply
+                        // `Put` redo. `updated_bytes` is moved as its last use;
+                        // gated on `has_vectors` so a non-vector collection pays
+                        // nothing. Keyed by the row's surrogate parsed from its
+                        // doc_id (the hex-encoded surrogate storage key).
+                        if has_vectors && let Some(surrogate) = row_surrogate {
+                            write_set.push(WriteSetEntry {
+                                surrogate: surrogate.as_u32(),
+                                is_delete: false,
+                                value: updated_bytes,
+                            });
+                        }
                     }
                 }
                 _ => continue,
@@ -332,27 +354,35 @@ impl CoreLoop {
 
         debug!(core = self.core_id, %collection, affected, "bulk update complete");
 
-        if let Some(spec) = returning {
+        let mut response = if let Some(spec) = returning {
             match returning_rows::build_rows_payload(spec, &returned_docs) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("RETURNING encode: {e}"),
-                    },
-                ),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("RETURNING encode: {e}"),
+                        },
+                    );
+                }
             }
         } else {
             let result = serde_json::json!({ "affected": affected });
             match response_codec::encode_json(&result) {
                 Ok(payload) => self.response_with_payload(task, payload),
-                Err(e) => self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                ),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: e.to_string(),
+                        },
+                    );
+                }
             }
+        };
+        if !write_set.is_empty() {
+            response.write_set = write_set;
         }
+        response
     }
 }

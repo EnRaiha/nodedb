@@ -366,7 +366,32 @@ fn parse_delete_record(
         });
     }
 
-    // Try document delete with provenance (new arity): (collection, document_id, provenance)
+    // Try document delete with surrogate (redo 4-tuple): (collection, document_id, provenance, surrogate).
+    // PointDelete and the post-apply write-set redo helper both emit this shape;
+    // try it before the 3-tuple so a surrogate-carrying record isn't misdecoded.
+    if let Ok((collection, document_id, _prov, _surrogate)) =
+        zerompk::from_msgpack::<(String, String, Option<SyncProvenance>, u32)>(payload)
+    {
+        *sequence += 1;
+        return Some(WriteEvent {
+            sequence: *sequence,
+            collection: Arc::from(collection.as_str()),
+            op: WriteOp::Delete,
+            row_id: RowId::new(document_id.as_str()),
+            lsn,
+            tenant_id,
+            vshard_id,
+            source: EventSource::User,
+            new_value: None,
+            old_value: None,
+            system_time_ms: None,
+            valid_time_ms: None,
+            user_id: None,
+            statement_digest: None,
+        });
+    }
+
+    // Try document delete with provenance (older arity): (collection, document_id, provenance)
     if let Ok((collection, document_id, _prov)) =
         zerompk::from_msgpack::<(String, String, Option<SyncProvenance>)>(payload)
     {

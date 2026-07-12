@@ -55,7 +55,10 @@ impl CoreLoop {
         let mut rebuilt = 0usize;
 
         for record in records {
-            if RecordType::from_raw(record.logical_record_type()) != Some(RecordType::Put) {
+            let rt = RecordType::from_raw(record.logical_record_type());
+            let is_put = rt == Some(RecordType::Put);
+            let is_delete = rt == Some(RecordType::Delete);
+            if !is_put && !is_delete {
                 continue;
             }
 
@@ -70,6 +73,32 @@ impl CoreLoop {
             }
 
             let payload = &record.payload;
+
+            // Delete: a document delete journals a surrogate-carrying
+            // `RecordType::Delete` (4-tuple `(collection, document_id, prov,
+            // surrogate)`). Because this pass rebuilds a node from every `Put`,
+            // the deleted row's original insert `Put` would otherwise resurrect
+            // its vector; re-derive the row key from the surrogate and
+            // soft-delete the node so the delete survives a WAL-only restart.
+            // `Delete` records are journalled after the `Put` they cancel (a
+            // higher LSN), so processing in WAL order removes exactly what an
+            // earlier `Put` rebuilt. KV / other-engine deletes decode to a
+            // different shape and are skipped by the strict tuple decode.
+            if is_delete {
+                let Ok((collection, _document_id, _prov, surrogate_u32)) =
+                    zerompk::from_msgpack::<(String, String, Option<SyncProvenance>, u32)>(payload)
+                else {
+                    continue;
+                };
+                let tenant_id = record.header.tenant_id;
+                if tombstones.is_tombstoned(tenant_id, &collection, record.header.lsn) {
+                    continue;
+                }
+                let database_id = record.header.database_id;
+                let row_key = surrogate_to_doc_id(Surrogate::new(surrogate_u32));
+                self.remove_document_vector_indexes(database_id, tenant_id, &collection, &row_key);
+                continue;
+            }
 
             // KV puts share `RecordType::Put` but carry a leading discriminator
             // string; skip them so their value bytes are never misread as a

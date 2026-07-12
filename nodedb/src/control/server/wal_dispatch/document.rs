@@ -95,15 +95,13 @@ pub(super) fn wal_append_document_op(
         DocumentOp::PointDelete {
             collection,
             document_id,
+            surrogate,
             ..
         } => {
-            let prov: Option<nodedb_types::sync::wire::SyncProvenance> = None;
-            let entry = zerompk::to_msgpack_vec(&(collection, document_id, prov)).map_err(|e| {
-                crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal point delete: {e}"),
-                }
-            })?;
+            // Surrogate-carrying 4-tuple so the redo-document replay can key the
+            // secondary vector-index removal by surrogate on restart (a 3-tuple
+            // omits it, leaving the deleted embedding to resurrect).
+            let entry = encode_document_delete_record(collection, document_id, surrogate.as_u32())?;
             Some(wal.append_delete(tenant_id, vshard_id, database_id, &entry)?)
         }
         // NotAWrite — reads / query ops / DDL that produces no engine mutation here
