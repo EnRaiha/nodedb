@@ -503,12 +503,16 @@ mod tests {
     }
 
     /// The raw engine op `VectorCollection::insert` is still append-only (it
-    /// never dedups), but the per-collection checkpoint watermark now makes WAL
-    /// replay itself idempotent: `replay_vector_wal` records the applied LSN on
-    /// the collection and skips any record at or below it. Replaying the exact
-    /// same redo record (LSN 1) twice therefore leaves ONE copy, not two —
-    /// closing the straddling-segment duplication where a checkpoint that
-    /// already absorbed a write is replayed on top of on the next boot.
+    /// never dedups), but cross-boot (checkpoint) idempotency holds: the replay
+    /// gate (`checkpoint_wal_lsn`) is frozen during a replay pass —
+    /// `note_checkpoint_lsn` only advances the running `applied_wal_lsn` max,
+    /// so sibling sub-records sharing one `TransactionRedo` LSN all apply
+    /// instead of the first one gating the rest. The gate only moves at a
+    /// checkpoint save (folding `applied_wal_lsn` in) and load (exposing it),
+    /// which is what a real reboot does. This test reproduces that: replay
+    /// once, round-trip the collection through a checkpoint to install the
+    /// persisted watermark as the gate, then replay again and assert the
+    /// record is skipped, leaving ONE copy, not two.
     #[test]
     fn redo_vector_insert_idempotent_on_double_replay() {
         let mut h = make_core();
@@ -517,10 +521,26 @@ mod tests {
 
         h.core
             .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb);
+
+        // Simulate a checkpoint capture + reboot: saving folds the applied
+        // watermark into the persisted gate, and restoring exposes it — so the
+        // straddling record is now gated on the second replay.
+        let key = CoreLoop::vector_index_key(0, 7, "emb", "");
+        let bytes = h
+            .core
+            .vector_collections
+            .get(&key)
+            .expect("collection present after first replay")
+            .checkpoint_to_bytes(None);
+        let restored =
+            crate::engine::vector::collection::VectorCollection::from_checkpoint(&bytes, None)
+                .expect("decode checkpoint")
+                .expect("non-empty checkpoint");
+        h.core.vector_collections.insert(key.clone(), restored);
+
         h.core
             .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb);
 
-        let key = CoreLoop::vector_index_key(0, 7, "emb", "");
         let len = h.core.vector_collections.get(&key).map(|c| c.len());
         assert_eq!(
             len,

@@ -24,13 +24,16 @@
 //!   payload, provenance)`. The msgpack array never matches the map form, so it
 //!   falls through to the timeseries replay path.
 //!
-//! ## Ops that raise a typed error
+//! ## Predicate DML
 //!
-//! `ColumnarOp::Update` / `ColumnarOp::Delete` are predicate DML. The
-//! transaction overlay resolves them per-surrogate, but native columnar replay
-//! is **batch-only** — there is no per-row columnar redo shape. Serializing
-//! them would require inventing one; silently dropping them would lose the
-//! mutation on install. Both therefore raise a typed error.
+//! `ColumnarOp::Update` / `ColumnarOp::Delete` are predicate DML with no
+//! per-row post-image (the matching set is only known once the Data Plane
+//! re-scans current state). They serialize to the SAME predicate-carrying
+//! [`nodedb_types::columnar::ColumnarDmlWalRecord`] (`kind = "columnar_dml"`,
+//! under `RecordType::TimeseriesBatch`) the autocommit path appends via
+//! `encode_columnar_dml_payload`; replay re-executes the predicate through the
+//! live handler (`try_replay_columnar_predicate_dml`), so an in-tx columnar
+//! UPDATE/DELETE is restart-durable exactly like its autocommit twin.
 //!
 //! ## Determinism
 //!
@@ -41,15 +44,15 @@ use nodedb_physical::physical_plan::{ColumnarOp, TimeseriesOp};
 use nodedb_wal::record::RecordType;
 
 use crate::control::server::wal_dispatch::{
-    encode_columnar_batch_payload, encode_timeseries_batch_payload,
+    encode_columnar_batch_payload, encode_columnar_dml_payload, encode_timeseries_batch_payload,
 };
 use crate::wal::RedoSubRecord;
 
 /// Append the redo sub-record for a single columnar plan op to `ops`.
 ///
 /// `Insert` serializes to a `TimeseriesBatch` sub-record tagged `"columnar"`;
-/// read ops emit nothing; predicate DML (`Update` / `Delete`) raises a typed
-/// error (see module docs).
+/// read ops emit nothing; predicate DML (`Update` / `Delete`) serializes to a
+/// `TimeseriesBatch` sub-record tagged `"columnar_dml"` (see module docs).
 pub(super) fn serialize_columnar_op(
     op: &ColumnarOp,
     ops: &mut Vec<RedoSubRecord>,
@@ -82,14 +85,37 @@ pub(super) fn serialize_columnar_op(
         // Read families: no persisted post-image.
         ColumnarOp::Scan { .. } | ColumnarOp::MaterializeScan { .. } => Ok(()),
 
-        // Predicate DML resolved per-surrogate in the overlay, but native
-        // columnar replay is batch-only — no per-row columnar redo shape
-        // exists. Reject rather than invent one or silently drop the mutation.
-        ColumnarOp::Update { .. } | ColumnarOp::Delete { .. } => Err(crate::Error::PlanError {
-            detail: "columnar UPDATE/DELETE is predicate DML with no per-row redo shape and is \
-                     not supported in transaction resolve"
-                .to_string(),
-        }),
+        // Predicate DML: emit the SAME `ColumnarDmlWalRecord` (kind
+        // `"columnar_dml"`, carried under `RecordType::TimeseriesBatch`) the
+        // autocommit path appends via `encode_columnar_dml_payload`. Replay
+        // routes it back through `try_replay_columnar_predicate_dml`, which
+        // re-executes the predicate through the live handler — so an in-tx
+        // columnar UPDATE/DELETE is restart-durable exactly like its autocommit
+        // twin, rather than the redo record dropping it (and the commit
+        // failing) for lack of a per-row post-image.
+        ColumnarOp::Update {
+            collection,
+            filters,
+            updates,
+        } => {
+            let sub_payload = encode_columnar_dml_payload(collection, true, filters, updates)?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::TimeseriesBatch as u32,
+                payload: sub_payload,
+            });
+            Ok(())
+        }
+        ColumnarOp::Delete {
+            collection,
+            filters,
+        } => {
+            let sub_payload = encode_columnar_dml_payload(collection, false, filters, &[])?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::TimeseriesBatch as u32,
+                payload: sub_payload,
+            });
+            Ok(())
+        }
     }
 }
 

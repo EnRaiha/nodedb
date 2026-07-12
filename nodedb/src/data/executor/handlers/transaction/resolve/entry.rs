@@ -2150,38 +2150,48 @@ mod tests {
         );
     }
 
-    /// `Columnar::Update` / `Columnar::Delete` are predicate DML with no per-row
-    /// columnar redo shape: resolve must raise a typed error, never silently
-    /// drop the mutation.
+    /// `Columnar::Update` / `Columnar::Delete` are predicate DML: resolve emits
+    /// the SAME `columnar_dml` (`TimeseriesBatch`) sub-record the autocommit path
+    /// appends, carrying the predicate (and, for update, the assignments), so an
+    /// in-tx columnar UPDATE/DELETE is restart-durable exactly like its
+    /// autocommit twin.
     #[test]
-    fn columnar_update_and_delete_yield_typed_error() {
+    fn columnar_update_and_delete_emit_columnar_dml_sub_record() {
+        use nodedb_types::columnar::ColumnarDmlWalRecord;
+
         let (core, _dir) = make_core();
         let task = make_task();
 
         let update = PhysicalPlan::Columnar(ColumnarOp::Update {
             collection: "cevents".to_string(),
             filters: Vec::new(),
-            updates: vec![("a".to_string(), Vec::new())],
+            updates: vec![("a".to_string(), vec![1, 2, 3])],
         });
         let resp = core.execute_resolve_txn(&task, TID, TxnId::new(44), &[update]);
-        assert_eq!(
-            resp.status,
-            Status::Error,
-            "columnar UPDATE has no per-row redo shape and must raise a typed error"
-        );
-        assert!(resp.error_code.is_some());
+        assert_eq!(resp.status, Status::Ok);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1);
+        assert_eq!(redo.ops[0].record_type, RecordType::TimeseriesBatch as u32);
+        let rec: ColumnarDmlWalRecord =
+            zerompk::from_msgpack(&redo.ops[0].payload).expect("decode columnar_dml");
+        assert_eq!(rec.kind, "columnar_dml");
+        assert_eq!(rec.collection, "cevents");
+        assert!(rec.is_update, "UPDATE must carry is_update = true");
+        assert_eq!(rec.updates, vec![("a".to_string(), vec![1, 2, 3])]);
 
         let delete = PhysicalPlan::Columnar(ColumnarOp::Delete {
             collection: "cevents".to_string(),
             filters: Vec::new(),
         });
         let resp = core.execute_resolve_txn(&task, TID, TxnId::new(45), &[delete]);
-        assert_eq!(
-            resp.status,
-            Status::Error,
-            "columnar DELETE has no per-row redo shape and must raise a typed error"
-        );
-        assert!(resp.error_code.is_some());
+        assert_eq!(resp.status, Status::Ok);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1);
+        let rec: ColumnarDmlWalRecord =
+            zerompk::from_msgpack(&redo.ops[0].payload).expect("decode columnar_dml");
+        assert_eq!(rec.kind, "columnar_dml");
+        assert!(!rec.is_update, "DELETE must carry is_update = false");
+        assert!(rec.updates.is_empty(), "DELETE carries no assignments");
     }
 
     /// An array `Put` plan resolves to a version-tagged `ArrayPut` sub-record

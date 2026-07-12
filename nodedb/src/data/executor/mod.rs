@@ -21,6 +21,7 @@ pub(in crate::data) mod sync_gate;
 pub mod task;
 pub(crate) mod vector_checkpoint;
 mod wal_replay;
+mod wal_replay_all;
 mod wal_replay_columnar_dml;
 mod wal_replay_document_vector;
 mod wal_replay_fts;

@@ -175,9 +175,12 @@ pub async fn run_commit(
     CommitOutcome::Committed
 }
 
-/// Single-shard commit: write the transaction as one WAL record, then dispatch
-/// the buffered plans as one atomic `TransactionBatch`. Returns `Some(reason)`
-/// on failure.
+/// Single-shard commit: resolve the transaction's staged post-images into one
+/// replayable `TransactionRedo` WAL record, then dispatch the buffered plans as
+/// one atomic `TransactionBatch` stamped with that record's LSN. The redo
+/// record restores restart durability for in-transaction writes into in-memory
+/// secondary indexes (vector HNSW, FTS) that the base storage engine cannot
+/// rebuild on its own. Returns `Some(reason)` on failure.
 async fn dispatch_single_shard(
     state: &SharedState,
     dp: &impl TxnDataPlane,
@@ -185,49 +188,69 @@ async fn dispatch_single_shard(
     tenant_id: crate::types::TenantId,
     vshard_id: crate::types::VShardId,
 ) -> Option<AbortReason> {
-    let mut sub_records: Vec<(u16, Vec<u8>)> = Vec::with_capacity(buffered.len());
-    for task in buffered {
-        if let Some(entry) = crate::control::wal_replication::to_replicated_entry(
-            task.tenant_id,
-            task.database_id,
-            task.vshard_id,
-            &task.plan,
-        ) {
-            let bytes = entry.to_bytes();
-            sub_records.push((nodedb_wal::record::RecordType::Put as u16, bytes));
-        }
-    }
+    let plans: Vec<PhysicalPlan> = buffered.iter().map(|t| t.plan.clone()).collect();
 
-    // The single transaction WAL record's LSN is stamped onto the batch
-    // dispatch below so the Data Plane records the committed write version for
-    // every key in the batch. `None` when the batch has no durable writes.
-    let wal_lsn = if !sub_records.is_empty() {
-        let tx_payload = match zerompk::to_msgpack_vec(&sub_records) {
-            Ok(p) => p,
-            Err(e) => {
-                return Some(AbortReason::Dispatch(crate::Error::Internal {
-                    detail: format!("transaction WAL serialization failed: {e}"),
-                }));
-            }
-        };
-        match state.wal.append_transaction(
+    // txn_id is present for any staged commit (buffer_write stamps it).
+    let Some(txn_id) = buffered.first().and_then(|t| t.txn_id) else {
+        return Some(AbortReason::Dispatch(crate::Error::Internal {
+            detail: "single-shard commit: buffered task carries no txn_id".into(),
+        }));
+    };
+
+    // 1. Resolve the transaction's staged post-images into ONE replayable
+    //    RedoRecord. Read-only: reads `txn_overlays[txn_id]` on the owning
+    //    core, writes nothing.
+    let resolve_task = PhysicalTask {
+        tenant_id,
+        vshard_id,
+        database_id: crate::types::DatabaseId::DEFAULT,
+        plan: PhysicalPlan::Meta(MetaOp::ResolveTxn {
+            txn_id,
+            plans: plans.clone(),
+        }),
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    };
+    let resolve_resp = match dp.dispatch_no_wal(resolve_task, None).await {
+        Ok(r) if r.status == Status::Ok => r,
+        Ok(r) => {
+            return Some(AbortReason::BatchRejected {
+                code: r.error_code.clone(),
+            });
+        }
+        Err(e) => return Some(AbortReason::Dispatch(e)),
+    };
+    let redo = match crate::wal::RedoRecord::from_bytes(resolve_resp.payload.as_bytes()) {
+        Ok(r) => r,
+        Err(e) => {
+            return Some(AbortReason::Dispatch(crate::Error::Internal {
+                detail: format!("single-shard commit: resolve redo decode failed: {e}"),
+            }));
+        }
+    };
+
+    // 2. Write-ahead the transaction as ONE replayable `TransactionRedo` record
+    //    (each sub-op keeps its real engine `record_type`). `None` when the txn
+    //    has no durable writes (all reads / CRDT / text). Its LSN stamps the
+    //    batch install so the Data Plane records the committed write version for
+    //    every key in the batch.
+    let wal_lsn = if redo.ops.is_empty() {
+        None
+    } else {
+        match state.wal.append_transaction_redo(
             tenant_id,
             vshard_id,
             crate::types::DatabaseId::DEFAULT,
-            &tx_payload,
+            &redo,
         ) {
             Ok(lsn) => Some(lsn),
             Err(e) => {
                 return Some(AbortReason::Dispatch(crate::Error::Internal {
-                    detail: format!("transaction WAL append failed: {e}"),
+                    detail: format!("single-shard commit: transaction redo WAL append failed: {e}"),
                 }));
             }
         }
-    } else {
-        None
     };
-
-    let plans: Vec<PhysicalPlan> = buffered.iter().map(|t| t.plan.clone()).collect();
     let batch_task = PhysicalTask {
         tenant_id,
         vshard_id,

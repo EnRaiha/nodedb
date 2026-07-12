@@ -88,14 +88,28 @@ pub struct VectorCollection {
     /// the actual arena pinning is handled externally.
     pub arena_index: Option<u32>,
     /// Highest WAL LSN whose write is already reflected in this collection's
-    /// in-memory state. Persisted in the checkpoint so that startup WAL replay
-    /// can skip records the restored checkpoint already absorbed — the same
-    /// watermark discipline the timeseries engine applies via
-    /// `last_flushed_wal_lsn`. Advanced at each apply chokepoint (live and
-    /// replay) via [`Self::note_checkpoint_lsn`]. `0` means "no write recorded"
-    /// (a fresh collection or a legacy checkpoint predating this field), which
-    /// never gates replay.
+    /// in-memory state, as of the last checkpoint load or save. Persisted in
+    /// the checkpoint so that startup WAL replay can skip records the
+    /// restored checkpoint already absorbed — the same watermark discipline
+    /// the timeseries engine applies via `last_flushed_wal_lsn`. Set ONLY by
+    /// checkpoint load (restore) and checkpoint save; it is FROZEN during a
+    /// replay pass so all sub-records of a `TransactionRedo` record — which
+    /// share the enclosing record's single LSN — apply instead of the first
+    /// one gating its siblings. Per-apply advancement lands in
+    /// [`Self::applied_wal_lsn`] instead, and is folded into this field at
+    /// checkpoint save time. `0` means "no write recorded" (a fresh
+    /// collection or a legacy checkpoint predating this field), which never
+    /// gates replay.
     pub(crate) checkpoint_wal_lsn: u64,
+    /// Running max of WAL LSNs applied to this collection's in-memory state
+    /// since the last checkpoint load. Advanced by [`Self::note_checkpoint_lsn`]
+    /// at every live/replay apply chokepoint. NEVER read by the replay skip
+    /// gate (that reads `checkpoint_wal_lsn`, which stays frozen during a replay
+    /// pass so all sub-records of one transaction — which share the enclosing
+    /// `TransactionRedo` record's single LSN — apply instead of the first one
+    /// gating its siblings). Folded into the persisted watermark at checkpoint
+    /// save time via `max(checkpoint_wal_lsn, applied_wal_lsn)`.
+    pub(crate) applied_wal_lsn: u64,
 }
 
 impl VectorCollection {
@@ -148,27 +162,39 @@ impl VectorCollection {
             payload: PayloadIndexSet::default(),
             arena_index: None,
             checkpoint_wal_lsn: 0,
+            applied_wal_lsn: 0,
         }
     }
 
-    /// Advance the checkpoint watermark to `lsn` if it is higher than the
+    /// Advance the applied-watermark to `lsn` if it is higher than the
     /// current value. Called at every apply chokepoint (live write and WAL
     /// replay) with the WAL LSN of the applied write. `0` is ignored — an
-    /// unassigned LSN must never move the watermark, since a checkpoint stamped
-    /// with a stale-low value would fail to gate a straddling-segment replay.
+    /// unassigned LSN must never move the watermark. This does NOT move the
+    /// replay skip gate (`checkpoint_wal_lsn`); it is folded into that gate
+    /// only at checkpoint save time via `max(checkpoint_wal_lsn,
+    /// applied_wal_lsn)`, so the gate stays frozen across an entire replay
+    /// pass and doesn't gate a `TransactionRedo` record's own siblings.
     pub fn note_checkpoint_lsn(&mut self, lsn: u64) {
-        if lsn > self.checkpoint_wal_lsn {
-            self.checkpoint_wal_lsn = lsn;
+        if lsn > self.applied_wal_lsn {
+            self.applied_wal_lsn = lsn;
         }
     }
 
-    /// Highest WAL LSN already reflected in this collection's in-memory state.
+    /// Highest WAL LSN already reflected in this collection's in-memory state,
+    /// as of the last checkpoint load or save.
     ///
     /// Startup replay skips any record whose `lsn <= checkpoint_wal_lsn()` for
     /// this collection: the restored checkpoint already contains that write, so
     /// re-applying it would append a duplicate HNSW node.
     pub fn checkpoint_wal_lsn(&self) -> u64 {
         self.checkpoint_wal_lsn
+    }
+
+    /// Highest WAL LSN applied since the last checkpoint load (the running max
+    /// `note_checkpoint_lsn` builds). Folded into the persisted watermark at
+    /// checkpoint save time; not consulted by the replay gate.
+    pub fn applied_wal_lsn(&self) -> u64 {
+        self.applied_wal_lsn
     }
 
     /// Create with a specific seed (for deterministic testing).
