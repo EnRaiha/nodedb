@@ -28,17 +28,13 @@ impl KvHashTable {
         let mut dist = 0;
 
         loop {
-            match &slots[idx] {
-                None => return None,
-                Some(entry) => {
-                    if entry.hash == hash && entry.key == key {
-                        return Some(entry);
-                    }
-                    let entry_dist = Self::probe_distance(cap, entry.hash, idx);
-                    if dist > entry_dist {
-                        return None; // Robin Hood invariant: key can't be further.
-                    }
-                }
+            let entry = slots[idx].as_ref()?;
+            if entry.hash == hash && entry.key == key {
+                return Some(entry);
+            }
+            let entry_dist = Self::probe_distance(cap, entry.hash, idx);
+            if dist > entry_dist {
+                return None; // Robin Hood invariant: key can't be further.
             }
             idx = (idx + 1) & (cap - 1);
             dist += 1;
@@ -55,17 +51,13 @@ impl KvHashTable {
         let mut dist = 0;
 
         loop {
-            match &slots[idx] {
-                None => return None,
-                Some(entry) => {
-                    if entry.hash == hash && entry.key == key {
-                        return Some(idx);
-                    }
-                    let entry_dist = Self::probe_distance(cap, entry.hash, idx);
-                    if dist > entry_dist {
-                        return None;
-                    }
-                }
+            let entry = slots[idx].as_ref()?;
+            if entry.hash == hash && entry.key == key {
+                return Some(idx);
+            }
+            let entry_dist = Self::probe_distance(cap, entry.hash, idx);
+            if dist > entry_dist {
+                return None;
             }
             idx = (idx + 1) & (cap - 1);
             dist += 1;

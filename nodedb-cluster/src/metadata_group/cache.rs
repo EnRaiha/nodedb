@@ -67,8 +67,7 @@ impl MetadataCache {
         self.applied_index = index;
 
         match entry {
-            MetadataEntry::CatalogDdl { payload: _ }
-            | MetadataEntry::CatalogDdlAudited { payload: _, .. } => {
+            MetadataEntry::CatalogDdl { payload: _ } | MetadataEntry::CatalogDdlAudited { .. } => {
                 // Opaque to the cluster crate. The host-side applier
                 // decodes the payload and writes through to
                 // `SystemCatalog`. We just count it — both DDL

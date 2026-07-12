@@ -120,10 +120,10 @@ pub(super) fn try_columnar_aggregate(p: &ColumnarAggParams<'_>) -> Option<Column
     } else {
         match columnar_filter::eval_filters_bitmask(mt, filters, row_count) {
             Some(bm) => FilterResult::Bitmask(bm),
-            None => match columnar_filter::eval_filters_dense(mt, filters, row_count) {
-                Some(mask) => FilterResult::BoolMask(mask),
-                None => return None, // Complex filters — fall back to generic path
-            },
+            None => {
+                let mask = columnar_filter::eval_filters_dense(mt, filters, row_count)?;
+                FilterResult::BoolMask(mask)
+            }
         }
     };
 

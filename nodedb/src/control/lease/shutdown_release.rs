@@ -95,7 +95,7 @@ fn collect_local_descriptor_ids(shared: &SharedState) -> Vec<DescriptorId> {
         .unwrap_or_else(|p| p.into_inner());
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for ((id, node_id), _) in cache.leases.iter() {
+    for (id, node_id) in cache.leases.keys() {
         if *node_id != shared.node_id {
             continue;
         }
@@ -138,7 +138,7 @@ mod tests {
         let self_node_id = 1u64;
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for ((id, node_id), _) in map.iter() {
+        for (id, node_id) in map.keys() {
             if *node_id != self_node_id {
                 continue;
             }

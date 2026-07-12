@@ -79,10 +79,9 @@ pub fn try_parse_when_to_filter(condition: &str) -> Option<(WhenTarget, ScanFilt
     // Determine prefix: NEW. or OLD.
     let (target, rest) = if let Some(r) = strip_prefix_ci(s, "NEW.") {
         (WhenTarget::New, r)
-    } else if let Some(r) = strip_prefix_ci(s, "OLD.") {
-        (WhenTarget::Old, r)
     } else {
-        return None;
+        let r = strip_prefix_ci(s, "OLD.")?;
+        (WhenTarget::Old, r)
     };
 
     // IS NULL / IS NOT NULL (checked before general operator split)

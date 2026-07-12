@@ -200,7 +200,7 @@ pub fn compensations_for_phase(
         }
         MigrationPhaseTag::CatchUp => {
             // Catch-up started; AddLearner committed.  Remove the learner.
-            if let MigrationCheckpointPayload::CatchUp { vshard_id: _, .. } = payload {
+            if let MigrationCheckpointPayload::CatchUp { .. } = payload {
                 // We don't have group_id/peer_id at CatchUp payload level —
                 // the AddLearner checkpoint must have been the prior row.
                 // Emit empty (caller should chain with AddLearner payload).

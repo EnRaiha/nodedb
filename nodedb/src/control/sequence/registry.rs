@@ -255,7 +255,7 @@ impl SequenceRegistry {
     pub fn persist_all(&self, catalog: &SystemCatalog) {
         let map = self.sequences.read().unwrap_or_else(|p| p.into_inner());
 
-        for (_, handle) in map.iter() {
+        for handle in map.values() {
             let state = SequenceState {
                 tenant_id: handle.def.tenant_id,
                 name: handle.def.name.clone(),

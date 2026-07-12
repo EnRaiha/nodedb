@@ -62,13 +62,10 @@ pub fn parse_set_command(sql: &str) -> Option<(String, String)> {
     } else {
         // Try TO separator.
         let upper_rest = rest.to_uppercase();
-        if let Some(to_pos) = upper_rest.find(" TO ") {
-            let k = rest[..to_pos].trim();
-            let v = rest[to_pos + 4..].trim();
-            (k, v)
-        } else {
-            return None;
-        }
+        let to_pos = upper_rest.find(" TO ")?;
+        let k = rest[..to_pos].trim();
+        let v = rest[to_pos + 4..].trim();
+        (k, v)
     };
 
     if key.is_empty() {

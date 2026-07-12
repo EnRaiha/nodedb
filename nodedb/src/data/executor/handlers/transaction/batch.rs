@@ -351,7 +351,6 @@ impl CoreLoop {
                     collection,
                     document_id,
                     old_value,
-                    surrogate: _,
                     ..
                 } => Some(DeferredWrite {
                     collection,
