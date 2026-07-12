@@ -7,10 +7,12 @@ use nodedb_sql::types::{MergeClauseKind, MergePlanAction, MergePlanClause, SqlEx
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::DocumentOp;
+use nodedb_physical::physical_plan::UpdateValue;
 use nodedb_physical::physical_plan::document::merge_types::{
     MergeActionOp, MergeClauseKind as MergeClauseKindOp, MergeClauseOp,
 };
 
+use super::super::expr::sql_expr_to_bridge_expr_qualified;
 use super::super::filter::serialize_filters;
 use super::super::value::{assignments_to_update_values_qualified, sql_value_to_msgpack};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -62,7 +64,7 @@ pub(in super::super) fn convert_merge(
 
     let clause_ops = clauses
         .iter()
-        .map(|c| convert_clause(c, source_alias))
+        .map(convert_clause)
         .collect::<crate::Result<Vec<_>>>()?;
 
     let vshard = VShardId::from_collection_in_database(ctx.database_id, target);
@@ -95,7 +97,7 @@ pub(in super::super) fn convert_merge(
     }])
 }
 
-fn convert_clause(clause: &MergePlanClause, source_alias: &str) -> crate::Result<MergeClauseOp> {
+fn convert_clause(clause: &MergePlanClause) -> crate::Result<MergeClauseOp> {
     let kind = match clause.kind {
         MergeClauseKind::Matched => MergeClauseKindOp::Matched,
         MergeClauseKind::NotMatched => MergeClauseKindOp::NotMatched,
@@ -104,7 +106,7 @@ fn convert_clause(clause: &MergePlanClause, source_alias: &str) -> crate::Result
 
     let extra_predicate = serialize_filters(&clause.extra_predicate)?;
 
-    let action = convert_action(&clause.action, source_alias)?;
+    let action = convert_action(&clause.action)?;
 
     Ok(MergeClauseOp {
         kind,
@@ -113,7 +115,7 @@ fn convert_clause(clause: &MergePlanClause, source_alias: &str) -> crate::Result
     })
 }
 
-fn convert_action(action: &MergePlanAction, source_alias: &str) -> crate::Result<MergeActionOp> {
+fn convert_action(action: &MergePlanAction) -> crate::Result<MergeActionOp> {
     match action {
         MergePlanAction::Update { assignments } => {
             let updates = assignments_to_update_values_qualified(assignments)?;
@@ -121,25 +123,16 @@ fn convert_action(action: &MergePlanAction, source_alias: &str) -> crate::Result
         }
         MergePlanAction::Delete => Ok(MergeActionOp::Delete),
         MergePlanAction::Insert { columns, values } => {
-            let encoded: Vec<Vec<u8>> = values
+            // Value expressions reference the source row (`s.col`, `s.qty * 2`),
+            // so they qualify column names exactly like the UPDATE SET arm and
+            // are evaluated against the qualified source document at apply time.
+            let encoded: Vec<UpdateValue> = values
                 .iter()
                 .map(|expr| match expr {
-                    SqlExpr::Literal(v) => Ok(sql_value_to_msgpack(v)),
-                    other => {
-                        // For INSERT values that reference source columns, we
-                        // evaluate them at planning time as a bridge expression.
-                        // Most MERGE INSERT clauses use source column references
-                        // which are SqlExpr::Column — encode as msgpack NULL
-                        // placeholder and store the expression separately. Since
-                        // the Data Plane handler will rehydrate source column
-                        // expressions via the source document at execute time,
-                        // we encode non-literal expressions as tagged bytes.
-                        // Use the value converter to produce msgpack.
-                        let _ = source_alias;
-                        Ok(sql_expr_to_insert_value(other))
-                    }
+                    SqlExpr::Literal(v) => UpdateValue::Literal(sql_value_to_msgpack(v)),
+                    other => UpdateValue::Expr(sql_expr_to_bridge_expr_qualified(other)),
                 })
-                .collect::<crate::Result<Vec<_>>>()?;
+                .collect();
             Ok(MergeActionOp::Insert {
                 columns: columns.clone(),
                 values: encoded,
@@ -147,20 +140,4 @@ fn convert_action(action: &MergePlanAction, source_alias: &str) -> crate::Result
         }
         MergePlanAction::DoNothing => Ok(MergeActionOp::DoNothing),
     }
-}
-
-/// Convert a non-literal SqlExpr from an INSERT VALUES clause into msgpack bytes.
-///
-/// For column references (source.col), the value will be resolved at Data Plane
-/// execute time by looking up the column in the source document. We encode these
-/// as a tagged marker so the handler knows to do a runtime lookup.
-fn sql_expr_to_insert_value(expr: &SqlExpr) -> Vec<u8> {
-    // Use the bridge expression evaluator path: wrap as a 2-byte tag + expr bytes.
-    // Tag 0xFE is our "needs_runtime_eval" marker (not a valid msgpack type prefix
-    // for values we use). The handler checks this tag and evaluates the expression.
-    // NOTE: for simplicity, emit a nil msgpack value for unknown expressions.
-    // The Data Plane handler will resolve column references from source document.
-    // A future enhancement can serialize the full SqlExpr here for full expression support.
-    let _ = expr;
-    vec![0xc0] // msgpack nil
 }

@@ -165,7 +165,12 @@ impl CoreLoop {
             if let Some(arm) = find_arm(params.clauses, MergeClauseKindOp::NotMatched, src_doc)
                 && let MergeActionOp::Insert { columns, values } = &arm.action
             {
-                let body = encode_doc_body(&build_insert_doc(columns, values, src_doc));
+                let body = encode_doc_body(&build_insert_doc(
+                    columns,
+                    values,
+                    src_doc,
+                    params.source_alias,
+                ));
                 inserts.push(MergeInsert {
                     join_key: src_key.clone(),
                     body,

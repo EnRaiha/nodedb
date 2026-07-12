@@ -40,12 +40,14 @@ pub enum MergeActionOp {
     Update { updates: Vec<(String, UpdateValue)> },
     /// `THEN DELETE`
     Delete,
-    /// `THEN INSERT (cols) VALUES (vals)` — columns and pre-encoded msgpack bytes.
+    /// `THEN INSERT (cols) VALUES (vals)` — columns and their value expressions.
     Insert {
         /// Column names in declaration order.
         columns: Vec<String>,
-        /// Pre-encoded msgpack bytes for each value (parallel to `columns`).
-        values: Vec<Vec<u8>>,
+        /// Value for each column (parallel to `columns`): either a pre-encoded
+        /// msgpack literal or a `SqlExpr` evaluated against the source row at
+        /// apply time (e.g. `s.new_embedding`, `s.qty * 2`).
+        values: Vec<UpdateValue>,
     },
     /// `THEN DO NOTHING`
     DoNothing,

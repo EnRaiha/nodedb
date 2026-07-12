@@ -243,6 +243,7 @@ impl CoreLoop {
                         tid,
                         collection: target_collection,
                         source_doc: src_doc,
+                        source_alias,
                         clause: arm,
                         strict_schema: &strict_schema,
                     },

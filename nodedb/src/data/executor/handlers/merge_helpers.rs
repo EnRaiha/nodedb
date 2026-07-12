@@ -142,6 +142,7 @@ pub(super) struct ApplyInsertActionParams<'a> {
     pub tid: u64,
     pub collection: &'a str,
     pub source_doc: &'a serde_json::Value,
+    pub source_alias: &'a str,
     pub clause: &'a MergeClauseOp,
     pub strict_schema: &'a Option<nodedb_types::columnar::StrictSchema>,
 }
@@ -156,6 +157,7 @@ pub(super) fn apply_insert_action(
         tid,
         collection,
         source_doc,
+        source_alias,
         clause,
         strict_schema,
     } = params;
@@ -166,7 +168,7 @@ pub(super) fn apply_insert_action(
             Ok(false)
         }
         MergeActionOp::Insert { columns, values } => {
-            let json_doc = build_insert_doc(columns, values, source_doc);
+            let json_doc = build_insert_doc(columns, values, source_doc, source_alias);
             let doc_id = json_doc
                 .get("id")
                 .map(json_to_str)
@@ -197,13 +199,17 @@ pub(super) fn apply_insert_action(
 
 /// Build the JSON document a NOT-MATCHED `INSERT` arm produces from a source
 /// row. Empty `columns` copies all source fields; an explicit column list
-/// resolves each value via [`resolve_insert_value`]. Shared by the legacy
-/// per-row insert path and the orchestrated resolve/apply passes so both derive
-/// byte-identical bodies.
+/// evaluates each `UpdateValue` against the qualified source document (source
+/// fields keyed as `"<alias>.<field>"`) — literals decode directly, expressions
+/// (`s.new_embedding`, `s.qty * 2`) evaluate against the merged doc — and stores
+/// the result under the *target* column name. Mirrors [`build_update_doc`].
+/// Shared by the legacy per-row insert path and the orchestrated resolve/apply
+/// passes so both derive byte-identical bodies.
 pub(in crate::data::executor) fn build_insert_doc(
     columns: &[String],
-    values: &[Vec<u8>],
+    values: &[UpdateValue],
     source_doc: &serde_json::Value,
+    source_alias: &str,
 ) -> serde_json::Value {
     let mut new_doc = serde_json::Map::new();
     if columns.is_empty() {
@@ -213,9 +219,16 @@ pub(in crate::data::executor) fn build_insert_doc(
             }
         }
     } else {
-        for (col, val_bytes) in columns.iter().zip(values.iter()) {
-            let val = resolve_insert_value(val_bytes, source_doc, col);
-            new_doc.insert(col.clone(), val);
+        // There is no target row for an insert, so the merged document is the
+        // qualified source alone (target side is an empty object).
+        let merged = build_merged(
+            &serde_json::Value::Object(Default::default()),
+            source_doc,
+            source_alias,
+        );
+        let merged_ndb: nodedb_types::Value = merged.into();
+        for (col, val) in columns.iter().zip(values.iter()) {
+            new_doc.insert(col.clone(), resolve_update_value(val, &merged_ndb));
         }
     }
     serde_json::Value::Object(new_doc)
@@ -237,35 +250,22 @@ pub(in crate::data::executor) fn build_update_doc(
     let mut updated = target_doc.clone();
     if let Some(obj) = updated.as_object_mut() {
         for (field, update_val) in updates {
-            let val: serde_json::Value = match update_val {
-                UpdateValue::Literal(bytes) => {
-                    nodedb_types::json_from_msgpack(bytes).unwrap_or(serde_json::Value::Null)
-                }
-                UpdateValue::Expr(expr) => expr.eval(&merged_ndb).into(),
-            };
-            obj.insert(field.clone(), val);
+            obj.insert(field.clone(), resolve_update_value(update_val, &merged_ndb));
         }
     }
     updated
 }
 
-/// Resolve an INSERT value: either a pre-encoded literal or a source column lookup.
-///
-/// If the bytes are a msgpack nil (0xC0) and the column name exists in the source
-/// document, uses the source document's value. Implements the common MERGE INSERT
-/// pattern: `INSERT (col) VALUES (source.col)`.
-pub(super) fn resolve_insert_value(
-    bytes: &[u8],
-    source_doc: &serde_json::Value,
-    col: &str,
-) -> serde_json::Value {
-    if bytes == [0xc0] {
-        if let Some(v) = source_doc.get(col) {
-            return v.clone();
+/// Resolve one `UpdateValue` to JSON: a literal decodes directly from its
+/// msgpack encoding, an expression evaluates against the merged document.
+/// Shared by [`build_insert_doc`] and [`build_update_doc`].
+fn resolve_update_value(val: &UpdateValue, merged_ndb: &nodedb_types::Value) -> serde_json::Value {
+    match val {
+        UpdateValue::Literal(bytes) => {
+            nodedb_types::json_from_msgpack(bytes).unwrap_or(serde_json::Value::Null)
         }
-        return serde_json::Value::Null;
+        UpdateValue::Expr(expr) => expr.eval(merged_ndb).into(),
     }
-    nodedb_types::json_from_msgpack(bytes).unwrap_or(serde_json::Value::Null)
 }
 
 /// Build merged document: target fields at top level, source fields as
