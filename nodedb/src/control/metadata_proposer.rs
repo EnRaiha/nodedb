@@ -22,7 +22,7 @@
 //!    `Error::Config { detail: "metadata propose: not leader ..." }`.
 //!    Gateway-side redirection will make this transparent.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, WaitOutcome, encode_entry};
@@ -63,8 +63,15 @@ pub trait MetadataRaftHandle: Send + Sync {
 }
 
 /// Concrete impl wrapping `nodedb_cluster::RaftLoop`.
+///
+/// Holds the loop weakly: this handle lives on `SharedState`, which is
+/// itself kept alive transitively by the `RaftLoop`, so a strong
+/// reference here would close a cycle that pins both forever and blocks
+/// clean shutdown. The loop is kept alive by its own spawned tasks;
+/// `upgrade` therefore succeeds throughout normal operation and only
+/// fails once the loop has been dropped on shutdown.
 pub struct RaftLoopProposerHandle {
-    raft_loop: Arc<
+    raft_loop: Weak<
         nodedb_cluster::RaftLoop<
             crate::control::cluster::SpscCommitApplier,
             crate::control::LocalPlanExecutor,
@@ -81,7 +88,9 @@ impl RaftLoopProposerHandle {
             >,
         >,
     ) -> Self {
-        Self { raft_loop }
+        Self {
+            raft_loop: Arc::downgrade(&raft_loop),
+        }
     }
 }
 
@@ -95,7 +104,12 @@ impl MetadataRaftHandle for RaftLoopProposerHandle {
         // `block_in_place` + the current runtime's `block_on` so the
         // forwarding QUIC round-trip drives without starving the
         // raft tick that produces the leader_hint.
-        let raft_loop = self.raft_loop.clone();
+        // `upgrade` fails only once the raft loop has been dropped on
+        // shutdown; a request racing shutdown then fails cleanly with a
+        // typed error instead of panicking.
+        let raft_loop = self.raft_loop.upgrade().ok_or_else(|| Error::Config {
+            detail: "metadata propose: cluster not running".into(),
+        })?;
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(raft_loop.propose_to_metadata_group_via_leader(bytes))

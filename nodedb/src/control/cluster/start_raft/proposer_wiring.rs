@@ -28,11 +28,21 @@ pub(super) fn wire_proposers(
 ) {
     // Wire the Raft proposer into SharedState so CP dispatch paths
     // (pgwire, HTTP, array inbound) can route writes through Raft.
-    let raft_loop_for_propose = raft_loop.clone();
+    // Hold `raft_loop` weakly: `SharedState` owns this closure, and the
+    // closure must NOT keep `raft_loop` alive or the two form a strong
+    // reference cycle that pins `SharedState` forever. During normal
+    // operation the loop's spawned tasks keep it alive so `upgrade`
+    // always succeeds; `None` only occurs once those tasks have stopped
+    // on shutdown, where a clean "cluster not running" error is correct.
+    let raft_loop_for_propose = Arc::downgrade(raft_loop);
     let proposer: Arc<crate::control::wal_replication::RaftProposer> =
         Arc::new(move |vshard_id, data| {
-            raft_loop_for_propose
-                .propose(vshard_id, data)
+            let rl = raft_loop_for_propose
+                .upgrade()
+                .ok_or_else(|| crate::Error::Internal {
+                    detail: "raft propose: cluster not running".into(),
+                })?;
+            rl.propose(vshard_id, data)
                 .map_err(|e| crate::Error::Internal {
                     detail: format!("raft propose: {e}"),
                 })
@@ -46,11 +56,16 @@ pub(super) fn wire_proposers(
     // so compaction is gated on the data-plane applied watermark — never
     // raft's commit index. A no-op for groups whose
     // `log_compaction_threshold` is `None`.
-    let raft_loop_for_compact = raft_loop.clone();
+    // Weak for the same cycle-breaking reason as `raft_proposer` above.
+    let raft_loop_for_compact = Arc::downgrade(raft_loop);
     let compactor: Arc<crate::control::wal_replication::RaftCompactor> =
         Arc::new(move |group_id, applied_index| {
-            raft_loop_for_compact
-                .maybe_compact_group(group_id, applied_index)
+            let rl = raft_loop_for_compact
+                .upgrade()
+                .ok_or_else(|| crate::Error::Internal {
+                    detail: "raft log compaction: cluster not running".into(),
+                })?;
+            rl.maybe_compact_group(group_id, applied_index)
                 .map_err(|e| crate::Error::Internal {
                     detail: format!("raft log compaction: {e}"),
                 })
@@ -68,14 +83,18 @@ pub(super) fn wire_proposers(
     // before register() is called (possible on fast clusters where the entry
     // commits and applies on this node before the proposer returns), the
     // result is stored and register() picks it up immediately with no timeout.
-    let raft_loop_async = raft_loop.clone();
+    // Weak for the same cycle-breaking reason as `raft_proposer` above.
+    let raft_loop_async = Arc::downgrade(raft_loop);
     let tracker_for_proposer = tracker.clone();
     let deadline_secs = shared.tuning.network.default_deadline_secs;
     let async_proposer: Arc<crate::control::wal_replication::AsyncRaftProposer> =
         Arc::new(move |vshard_id, idempotency_key, data| {
-            let rl = raft_loop_async.clone();
+            let rl_weak = raft_loop_async.clone();
             let tk = tracker_for_proposer.clone();
             Box::pin(async move {
+                let rl = rl_weak.upgrade().ok_or_else(|| crate::Error::Internal {
+                    detail: "raft propose (async): cluster not running".into(),
+                })?;
                 let (group_id, log_index) = rl
                     .propose_via_data_leader(vshard_id, data)
                     .await

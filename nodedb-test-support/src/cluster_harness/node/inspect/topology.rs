@@ -47,7 +47,9 @@ impl TestClusterNode {
         };
         observer
             .group_status
-            .group_statuses()
+            .upgrade()
+            .map(|gs| gs.group_statuses())
+            .unwrap_or_default()
             .into_iter()
             .find(|g| g.group_id == nodedb_cluster::METADATA_GROUP_ID)
             .map(|g| g.leader_id)
@@ -70,7 +72,9 @@ impl TestClusterNode {
         };
         observer
             .group_status
-            .group_statuses()
+            .upgrade()
+            .map(|gs| gs.group_statuses())
+            .unwrap_or_default()
             .into_iter()
             .map(|g| (g.group_id, g.leader_id))
             .collect()
@@ -89,7 +93,9 @@ impl TestClusterNode {
         };
         observer
             .group_status
-            .group_statuses()
+            .upgrade()
+            .map(|gs| gs.group_statuses())
+            .unwrap_or_default()
             .into_iter()
             .find(|g| g.group_id == group_id)
             .map(|g| g.snapshot_index)
@@ -107,7 +113,9 @@ impl TestClusterNode {
         };
         observer
             .group_status
-            .group_statuses()
+            .upgrade()
+            .map(|gs| gs.group_statuses())
+            .unwrap_or_default()
             .into_iter()
             .filter(|g| g.group_id != nodedb_cluster::METADATA_GROUP_ID)
             .map(|g| g.snapshot_index)
@@ -130,7 +138,9 @@ impl TestClusterNode {
         };
         observer
             .group_status
-            .group_statuses()
+            .upgrade()
+            .map(|gs| gs.group_statuses())
+            .unwrap_or_default()
             .into_iter()
             .any(|g| g.group_id == group_id)
     }
@@ -160,7 +170,9 @@ impl TestClusterNode {
         };
         match observer
             .group_status
-            .group_statuses()
+            .upgrade()
+            .map(|gs| gs.group_statuses())
+            .unwrap_or_default()
             .into_iter()
             .find(|g| g.group_id == group_id)
         {
@@ -207,7 +219,9 @@ impl TestClusterNode {
         };
         observer
             .group_status
-            .group_statuses()
+            .upgrade()
+            .map(|gs| gs.group_statuses())
+            .unwrap_or_default()
             .into_iter()
             .find(|g| g.group_id == 1)
             .map(|g| g.leader_id)

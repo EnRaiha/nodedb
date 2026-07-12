@@ -11,7 +11,7 @@
 //! single `Arc<ClusterObserver>` and gets a complete, serialisable
 //! snapshot of everything the cluster surface exposes.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 use serde::{Deserialize, Serialize};
 
@@ -63,7 +63,15 @@ pub struct ClusterObserver {
     /// Shared routing table.
     pub routing: Arc<RwLock<RoutingTable>>,
     /// Type-erased per-group status provider backed by `RaftLoop`.
-    pub group_status: Arc<dyn GroupStatusProvider + Send + Sync>,
+    ///
+    /// Held as a `Weak` on purpose: the owner of this observer
+    /// (`SharedState`) is itself kept alive transitively by the
+    /// `RaftLoop`, so a strong reference here would close a cycle that
+    /// pins both forever and blocks clean shutdown. The loop is kept
+    /// alive by its own spawned tasks; `upgrade` therefore succeeds
+    /// throughout normal operation and only fails once the loop has been
+    /// dropped on shutdown, where an empty status snapshot is correct.
+    pub group_status: Weak<dyn GroupStatusProvider + Send + Sync>,
 }
 
 impl ClusterObserver {
@@ -72,7 +80,7 @@ impl ClusterObserver {
         lifecycle: ClusterLifecycleTracker,
         topology: Arc<RwLock<ClusterTopology>>,
         routing: Arc<RwLock<RoutingTable>>,
-        group_status: Arc<dyn GroupStatusProvider + Send + Sync>,
+        group_status: Weak<dyn GroupStatusProvider + Send + Sync>,
     ) -> Self {
         Self {
             node_id,
@@ -111,7 +119,14 @@ impl ClusterObserver {
                 .collect()
         };
 
-        let raft_groups = self.group_status.group_statuses();
+        // `upgrade` fails only after the backing `RaftLoop` has been
+        // dropped on shutdown; an empty snapshot ("no groups hosted")
+        // is the correct observability answer there, never a panic.
+        let raft_groups = self
+            .group_status
+            .upgrade()
+            .map(|gs| gs.group_statuses())
+            .unwrap_or_default();
         let groups: Vec<GroupSnapshot> = raft_groups
             .into_iter()
             .map(|gs| {
@@ -216,23 +231,30 @@ mod tests {
         }
     }
 
+    /// Returns the observer plus the strong provider it holds weakly. Tests
+    /// must keep the returned `Arc` alive for the duration they call
+    /// `snapshot()`, or the observer's `Weak` upgrade would fail and every
+    /// group would render as empty.
     fn make_observer(
         lifecycle: ClusterLifecycleTracker,
         peers: Vec<NodeInfo>,
         routing: RoutingTable,
         raft_groups: Vec<GroupStatus>,
-    ) -> ClusterObserver {
+    ) -> (ClusterObserver, Arc<dyn GroupStatusProvider + Send + Sync>) {
         let mut topology = ClusterTopology::new();
         for p in peers {
             topology.add_node(p);
         }
-        ClusterObserver::new(
+        let provider: Arc<dyn GroupStatusProvider + Send + Sync> =
+            Arc::new(FakeProvider(raft_groups));
+        let observer = ClusterObserver::new(
             1,
             lifecycle,
             Arc::new(RwLock::new(topology)),
             Arc::new(RwLock::new(routing)),
-            Arc::new(FakeProvider(raft_groups)),
-        )
+            Arc::downgrade(&provider),
+        );
+        (observer, provider)
     }
 
     fn gs(group_id: u64, role: &str, leader: u64) -> GroupStatus {
@@ -268,7 +290,7 @@ mod tests {
 
         let raft_groups = vec![gs(0, "Leader", 1), gs(1, "Follower", 2)];
 
-        let observer = make_observer(lifecycle, peers, routing, raft_groups);
+        let (observer, _provider) = make_observer(lifecycle, peers, routing, raft_groups);
         let snap = observer.snapshot();
 
         assert_eq!(snap.node_id, 1);
@@ -306,7 +328,7 @@ mod tests {
             NodeState::Active,
         )];
         let routing = RoutingTable::uniform(1, &[1], 1);
-        let observer = make_observer(lifecycle, peers, routing, vec![]);
+        let (observer, _provider) = make_observer(lifecycle, peers, routing, vec![]);
 
         let snap = observer.snapshot();
         assert_eq!(snap.lifecycle_label(), "bootstrapping");
@@ -327,7 +349,8 @@ mod tests {
             NodeState::Active,
         )];
         let routing = RoutingTable::uniform(1, &[1], 1);
-        let observer = make_observer(lifecycle, peers, routing, vec![gs(0, "Leader", 1)]);
+        let (observer, _provider) =
+            make_observer(lifecycle, peers, routing, vec![gs(0, "Leader", 1)]);
         let snap = observer.snapshot();
 
         let json = serde_json::to_string(&snap).expect("serialize");

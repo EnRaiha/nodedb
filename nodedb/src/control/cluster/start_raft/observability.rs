@@ -61,7 +61,13 @@ pub(super) fn finish_observability(
         handle.lifecycle.clone(),
         handle.topology.clone(),
         handle.routing.clone(),
-        raft_loop.clone() as Arc<dyn nodedb_cluster::GroupStatusProvider + Send + Sync>,
+        // Weak: `SharedState` owns the observer, and the observer must not
+        // keep `raft_loop` alive or the two form a strong reference cycle
+        // that pins `SharedState` forever. The loop's spawned tasks keep it
+        // alive during normal operation.
+        Arc::downgrade(
+            &(raft_loop.clone() as Arc<dyn nodedb_cluster::GroupStatusProvider + Send + Sync>),
+        ),
     ));
     if shared.cluster_observer.set(observer).is_err() {
         tracing::warn!("cluster_observer already set — start_raft appears to have run twice");
@@ -71,10 +77,19 @@ pub(super) fn finish_observability(
     // graph scatter) resolves group leadership from CURRENT Raft state
     // rather than the (lagging) routing-table hint. Wraps the raft loop's
     // `group_statuses()` snapshot.
-    let raft_loop_for_status = raft_loop.clone();
+    // Weak for the same cycle-breaking reason as `cluster_observer` above.
+    // A dropped loop (only reachable post-shutdown) yields an empty status
+    // snapshot, which every consumer already treats as "no cluster groups"
+    // — identical to the single-node case where this fn is never installed.
+    let raft_loop_for_status = Arc::downgrade(&raft_loop);
     if shared
         .raft_status_fn
-        .set(Arc::new(move || raft_loop_for_status.group_statuses()))
+        .set(Arc::new(move || {
+            raft_loop_for_status
+                .upgrade()
+                .map(|rl| rl.group_statuses())
+                .unwrap_or_default()
+        }))
         .is_err()
     {
         tracing::warn!("raft_status_fn already set — start_raft appears to have run twice");

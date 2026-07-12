@@ -331,7 +331,9 @@ async fn placement_converges_when_excluded_voter_leads_group() {
             .find_map(|node| {
                 node.shared.cluster_observer.get().and_then(|obs| {
                     obs.group_status
-                        .group_statuses()
+                        .upgrade()
+                        .map(|gs| gs.group_statuses())
+                        .unwrap_or_default()
                         .into_iter()
                         .find(|s| s.group_id == target_gid && s.leader_id != 0)
                         .map(|s| s.term)
