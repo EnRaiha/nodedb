@@ -7,7 +7,7 @@
 
 use tracing::debug;
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::point::apply_put::PointPutParams;
 use crate::data::executor::task::ExecutionTask;
@@ -74,6 +74,11 @@ impl CoreLoop {
         // lookup.
         let bitemporal = self.is_bitemporal(tid, collection);
         let database_id = task.request.database_id.as_u64();
+        // Computed once for the whole statement: the schemaless half of this
+        // check is an unindexed `vector_params` scan, so it must not be paid
+        // per branch. Gates the live HNSW re-index + the post-apply redo
+        // write-set below; a non-vector collection pays neither.
+        let has_vectors = self.collection_has_vectors(database_id, tid, collection);
         let existing = if bitemporal {
             self.sparse
                 .versioned_get_current(database_id, tid, collection, row_key)
@@ -225,7 +230,41 @@ impl CoreLoop {
                             &stored_bytes,
                             Some(&current_bytes),
                         );
-                        self.response_ok(task)
+
+                        // Maintain the secondary HNSW vector index. The body
+                        // rewrite above (sparse.put / versioned_put) reconciled
+                        // storage + the btree/FTS/graph overlays, but never the
+                        // vector index — re-index the surrogate's vectors from
+                        // the merged body so KNN search reflects the overwrite in
+                        // the same process. No-op when `has_vectors` is false.
+                        self.update_reindex_vector_indexes(
+                            super::point::update_reindex_vector::UpdateVectorReindex {
+                                database_id,
+                                tid,
+                                collection,
+                                row_key,
+                                surrogate,
+                                new_body: &stored_bytes,
+                                is_strict: strict_schema.is_some(),
+                                has_vectors,
+                            },
+                        );
+
+                        // Carry the surrogate + post-image back so the Control
+                        // Plane can mint a post-apply `Put` redo. The autocommit
+                        // WAL path mints none for an Upsert overwrite, so without
+                        // this a WAL-only restart rebuilds the HNSW from the
+                        // pre-upsert body and resurrects the old embedding.
+                        // `stored_bytes` is moved in as its last use.
+                        let mut response = self.response_ok(task);
+                        if has_vectors {
+                            response.write_set = vec![WriteSetEntry {
+                                surrogate: surrogate.as_u32(),
+                                is_delete: false,
+                                value: stored_bytes,
+                            }];
+                        }
+                        response
                     }
                     Err(e) => self.response_error(
                         task,
@@ -297,7 +336,20 @@ impl CoreLoop {
                     prior.prior_value.as_deref(),
                 );
 
-                self.response_ok(task)
+                // `apply_point_put` already inserted this row's vectors into the
+                // live HNSW, so the insert branch needs no live re-index — only a
+                // durable post-apply `Put` redo so a WAL-only restart rebuilds the
+                // index with the new embedding. `value` is a borrowed param here,
+                // so the post-image is copied. No-op when `has_vectors` is false.
+                let mut response = self.response_ok(task);
+                if has_vectors {
+                    response.write_set = vec![WriteSetEntry {
+                        surrogate: surrogate.as_u32(),
+                        is_delete: false,
+                        value: value.to_vec(),
+                    }];
+                }
+                response
             }
             Err(e) => self.response_error(
                 task,

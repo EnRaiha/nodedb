@@ -171,3 +171,132 @@ async fn document_secondary_vector_index_update_restart_projects_pk() {
          with the OLD vector wrongly returned the updated row first: {old_aligned:?}"
     );
 }
+
+/// UPSERT variant: an autocommit `DocumentOp::Upsert` that overwrites an existing
+/// row's embedding on a collection with a secondary vector index takes the
+/// handler's UPDATE branch. That branch rewrites the stored body but — before
+/// the fix — never re-indexed the surrogate's vectors, so the live HNSW kept
+/// serving the STALE embedding even in the same process (an L1 live-read bug),
+/// and, like `PointUpdate`, minted no WAL redo of its own so a WAL-only restart
+/// resurrected the pre-upsert vector.
+///
+/// This test pins both: (a) immediately after the UPSERT (no restart) a query
+/// aligned with the NEW embedding returns the row and the OLD axis does not; and
+/// (b) the same holds after a WAL-only restart, proving the post-apply `Put`
+/// redo preserved the new vector.
+#[tokio::test]
+async fn document_secondary_vector_index_upsert_restart_projects_pk() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION docs_vec_upsert_restart TYPE document")
+        .await
+        .unwrap();
+    srv.exec(
+        "CREATE VECTOR INDEX idx_docs_vec_upsert_restart ON docs_vec_upsert_restart (embedding) \
+         METRIC cosine DIM 4",
+    )
+    .await
+    .unwrap();
+
+    // Same anchor trick as the UPDATE test: `anchor` sits just off the x-axis so
+    // that once `persisted` moves away it is the UNIQUE nearest neighbour of the
+    // old-axis query, but a resurrected pre-upsert `persisted` (distance 0) would
+    // beat it.
+    let rows: &[(&str, [f32; 4])] = &[
+        ("persisted", [1.0, 0.0, 0.0, 0.0]),
+        ("anchor", [0.9, 0.1, 0.0, 0.0]),
+        ("second", [0.0, 1.0, 0.0, 0.0]),
+        ("third", [0.0, 0.0, 1.0, 0.0]),
+    ];
+    for (id, emb) in rows {
+        srv.exec(&format!(
+            "INSERT INTO docs_vec_upsert_restart (id, embedding) VALUES \
+             ('{id}', ARRAY[{},{},{},{}])",
+            emb[0], emb[1], emb[2], emb[3]
+        ))
+        .await
+        .unwrap();
+    }
+
+    // Overwrite `persisted`'s embedding via UPSERT onto the existing PK — this
+    // drives the handler's UPDATE branch (`DocumentOp::Upsert`, existing row).
+    srv.exec(
+        "UPSERT INTO docs_vec_upsert_restart (id, embedding) VALUES \
+         ('persisted', ARRAY[0.0, 0.0, 0.0, 1.0])",
+    )
+    .await
+    .unwrap();
+
+    // (L1, same process) The live index must already reflect the new embedding:
+    // a NEW-axis query returns the row, and the OLD axis must NOT — proving the
+    // UPDATE branch re-indexed the surrogate's vectors rather than leaving the
+    // stale pre-upsert embedding searchable.
+    let live_new = srv
+        .query_rows(
+            "SELECT id FROM docs_vec_upsert_restart \
+             ORDER BY vector_distance(embedding, ARRAY[0.0, 0.0, 0.0, 1.0]) LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        live_new.first().map(|r| r[0].as_str()),
+        Some("persisted"),
+        "same-process: an UPSERT overwrite must be reflected in the live vector index \
+         (new-axis query must return the upserted row): {live_new:?}"
+    );
+    let live_old = srv
+        .query_rows(
+            "SELECT id FROM docs_vec_upsert_restart \
+             ORDER BY vector_distance(embedding, ARRAY[1.0, 0.0, 0.0, 0.0]) LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        live_old.first().map(|r| r[0].as_str()),
+        Some("persisted"),
+        "same-process: the stale pre-upsert embedding must not remain live-searchable \
+         (old-axis query wrongly returned the upserted row): {live_old:?}"
+    );
+
+    // WAL-only restart (no vector checkpoint) — the exact path the redo targets.
+    let (srv, dir) = srv.take_dir();
+    srv.graceful_shutdown().await;
+    let (srv2, _dir) = TestServer::open_on_path(dir).await;
+
+    // (a) NEW-axis query must still return the upserted row after restart.
+    let new_aligned = srv2
+        .query_rows(
+            "SELECT id FROM docs_vec_upsert_restart \
+             ORDER BY vector_distance(embedding, ARRAY[0.0, 0.0, 0.0, 1.0]) LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        new_aligned.len(),
+        1,
+        "vector index must survive restart and return the nearest row; got {new_aligned:?}"
+    );
+    assert_eq!(
+        new_aligned[0][0], "persisted",
+        "post-restart search aligned with the UPSERTED embedding must return the row \
+         (the post-apply redo preserved the new vector): {new_aligned:?}"
+    );
+
+    // (b) OLD-axis query must NOT return the upserted row — no resurrection.
+    let old_aligned = srv2
+        .query_rows(
+            "SELECT id FROM docs_vec_upsert_restart \
+             ORDER BY vector_distance(embedding, ARRAY[1.0, 0.0, 0.0, 0.0]) LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        old_aligned.len(),
+        1,
+        "old-axis query must return a nearest row; got {old_aligned:?}"
+    );
+    assert_ne!(
+        old_aligned[0][0], "persisted",
+        "the pre-upsert embedding must not resurrect after WAL-only restart: a query aligned \
+         with the OLD vector wrongly returned the upserted row first: {old_aligned:?}"
+    );
+}

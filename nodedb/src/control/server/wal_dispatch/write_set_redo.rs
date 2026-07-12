@@ -34,13 +34,15 @@ use super::document::{encode_document_delete_record, encode_document_put_record}
 /// rather than on the pre-dispatch autocommit WAL path. Returns `None` for every
 /// other plan (its durability is owned on the WAL-append path or elsewhere).
 ///
-/// Today only `DocumentOp::PointUpdate` qualifies. Additional post-apply-redo
-/// write variants (`Upsert` / `Merge` / bulk document ops) will extend this as
-/// their post-apply redo is built — do not add them until that handler support
+/// Today `DocumentOp::PointUpdate` and `DocumentOp::Upsert` qualify. Additional
+/// post-apply-redo write variants (`Merge` / bulk document ops) will extend this
+/// as their post-apply redo is built — do not add them until that handler support
 /// exists, or a write would be admitted with its guard held for a redo that is
 /// never appended.
 pub fn plan_post_apply_redo(plan: &PhysicalPlan) -> Option<String> {
     if let PhysicalPlan::Document(DocumentOp::PointUpdate { collection, .. }) = plan {
+        Some(collection.clone())
+    } else if let PhysicalPlan::Document(DocumentOp::Upsert { collection, .. }) = plan {
         Some(collection.clone())
     } else {
         None
