@@ -607,6 +607,15 @@ mod tests {
         let mut coll = VectorCollection::new(dim, HnswParams::default());
         coll.insert(vector);
         coll.note_checkpoint_lsn(lsn);
+        // Round-trip through a checkpoint so the persisted watermark becomes the
+        // replay gate (`checkpoint_wal_lsn`): save folds the applied watermark
+        // into it, and load exposes it — faithfully simulating a restored
+        // checkpoint (the gate is set only by load/save, never by a live
+        // `note_checkpoint_lsn`, which feeds the separate applied watermark).
+        let bytes = coll.checkpoint_to_bytes(None);
+        let coll = VectorCollection::from_checkpoint(&bytes, None)
+            .expect("decode checkpoint")
+            .expect("non-empty checkpoint");
         let key = CoreLoop::vector_index_key(0, tenant_id, collection, "");
         core.vector_collections.insert(key, coll);
     }
