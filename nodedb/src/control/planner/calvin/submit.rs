@@ -169,7 +169,7 @@ pub async fn submit_and_await_calvin_with_timeout(
         .unwrap_or_else(|p| p.into_inner())
         .remove(&TxnId::new(epoch, position));
     match drained {
-        Some(CalvinApplyResult::Single(response)) => Ok(Some(response)),
+        Some(CalvinApplyResult::Single { response, .. }) => Ok(Some(response)),
         Some(CalvinApplyResult::Conflict) => Err(Error::Internal {
             detail: "multi-participant cross-shard RETURNING not supported".to_owned(),
         }),

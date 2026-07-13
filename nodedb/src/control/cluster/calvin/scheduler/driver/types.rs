@@ -31,6 +31,13 @@ pub(super) struct PendingTxn {
     /// cleanup participants that dual-home alongside it carry no primary write and
     /// so never clobber the entry the coordinator drains.
     pub has_primary_write: bool,
+    /// Whether this vShard's slice carries a RETURNING-bearing write (a plan
+    /// whose applied response is DATA-ROWs, not a bare affected-count). Used at
+    /// the commit tail to detect a genuine cross-shard RETURNING union: two
+    /// returning-bearing participants for one txn are unsupported, whereas
+    /// multiple plain-write participants (a multi-collection cross-shard COMMIT)
+    /// coalesce without conflict.
+    pub has_returning: bool,
     /// Commit-resolution state for a static-set Calvin txn.
     ///
     /// `Some(CommitState::Staged)` for a static txn dispatched via the

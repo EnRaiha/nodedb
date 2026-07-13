@@ -7,7 +7,8 @@ use nodedb_types::protocol::NativeResponse;
 use nodedb_types::value::Value;
 
 use crate::control::planner::calvin::{
-    CrossShardTxnMode, DispatchClass, classify_dispatch, dispatch_tasks_to_calvin,
+    CrossShardTxnMode, DispatchClass, TxnDispatchPosition, classify_dispatch,
+    dispatch_tasks_to_calvin,
 };
 use crate::control::server::shared::session::TransactionState;
 
@@ -289,7 +290,8 @@ async fn execute_planned(
                     &tasks,
                     ctx.tenant_id(),
                     cross_shard_mode,
-                    false,
+                    TxnDispatchPosition::Autocommit,
+                    &[],
                 )
                 .await
                 {

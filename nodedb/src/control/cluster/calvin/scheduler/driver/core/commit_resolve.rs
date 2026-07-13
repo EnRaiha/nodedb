@@ -316,19 +316,22 @@ impl Scheduler {
         // present by the time the coordinator drains it — no lost result, no
         // race.
         //
-        // Gated on the PRIMARY-WRITE participant: the sole participant whose
-        // slice carries the user's non-edge DML (Document/KV/Vector/etc.), as
-        // opposed to the implicit graph-edge cleanup that dual-homes alongside
-        // it. Exactly one participant carries the primary write for a
-        // single-collection user DML (+ its edges), so the edge participants
-        // never clobber the entry; the `CalvinApplyResult::{Single,Conflict}`
-        // guard stays as belt-and-suspenders. Results travel via this in-process
-        // sidecar only — never the sequencer Raft log.
-        let has_primary_write = self
+        // Gated on the PRIMARY-WRITE participant: any participant whose slice
+        // carries the user's non-edge DML (Document/KV/Vector/etc.), as opposed
+        // to the implicit graph-edge cleanup that dual-homes alongside it. A
+        // multi-collection cross-shard COMMIT has MANY primary-write
+        // participants — each a plain affected-count write — and they coalesce:
+        // the first applied response stands for the coordinator (which discards
+        // it for a COMMIT tag anyway), and the plain-write siblings do not
+        // conflict. Only a genuine cross-shard RETURNING union — two
+        // participants each carrying RETURNING rows — records `Conflict`.
+        // Results travel via this in-process sidecar only — never the sequencer
+        // Raft log.
+        let (has_primary_write, has_returning) = self
             .pending
             .get(&txn_id)
-            .map(|p| p.has_primary_write)
-            .unwrap_or(false);
+            .map(|p| (p.has_primary_write, p.has_returning))
+            .unwrap_or((false, false));
         if has_primary_write {
             use std::collections::hash_map::Entry;
 
@@ -342,22 +345,51 @@ impl Scheduler {
                 .unwrap_or_else(|p| p.into_inner());
             match results.entry(key) {
                 Entry::Vacant(slot) => {
-                    slot.insert(CalvinApplyResult::Single(response));
+                    slot.insert(CalvinApplyResult::Single {
+                        response,
+                        has_returning,
+                    });
                 }
                 Entry::Occupied(mut slot) => {
-                    // A second RETURNING-bearing participant for one Calvin txn
-                    // means a cross-shard RETURNING union, which is unsupported.
-                    // Record Conflict so the coordinator fails the statement
-                    // loudly rather than returning one shard's rows. Unreachable
-                    // under collection-level sharding today.
-                    tracing::error!(
-                        epoch = txn_id.epoch,
-                        position = txn_id.position,
-                        vshard = self.vshard_id,
-                        "multiple RETURNING participants for one Calvin txn — cross-shard \
-                         RETURNING union unsupported"
+                    // Derive both facts from the existing entry BEFORE any
+                    // insert, so the immutable borrow does not outlive the
+                    // mutable one.
+                    let existing_returning = matches!(
+                        slot.get(),
+                        CalvinApplyResult::Single {
+                            has_returning: true,
+                            ..
+                        }
                     );
-                    slot.insert(CalvinApplyResult::Conflict);
+                    let already_conflict = matches!(slot.get(), CalvinApplyResult::Conflict);
+
+                    if already_conflict {
+                        // A RETURNING union was already recorded; stays Conflict.
+                    } else if has_returning && existing_returning {
+                        // Two RETURNING-bearing participants for one Calvin txn:
+                        // a cross-shard RETURNING union, which is unsupported.
+                        // Record Conflict so the coordinator fails the statement
+                        // loudly rather than returning one shard's partial rows.
+                        tracing::error!(
+                            epoch = txn_id.epoch,
+                            position = txn_id.position,
+                            vshard = self.vshard_id,
+                            "two RETURNING-bearing participants for one Calvin txn — cross-shard \
+                             RETURNING union unsupported"
+                        );
+                        slot.insert(CalvinApplyResult::Conflict);
+                    } else if has_returning {
+                        // The incoming participant carries the rows; the existing
+                        // entry was a plain affected-count sibling. Rows win.
+                        slot.insert(CalvinApplyResult::Single {
+                            response,
+                            has_returning: true,
+                        });
+                    } else {
+                        // Incoming is a plain write; keep the existing entry — a
+                        // multi-collection cross-shard COMMIT coalesces (the
+                        // coordinator discards it for a COMMIT tag anyway).
+                    }
                 }
             }
         }
