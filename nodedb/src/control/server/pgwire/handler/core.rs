@@ -33,6 +33,7 @@ use crate::control::state::SharedState;
 use crate::types::RequestId;
 
 use super::super::types::notice_warning;
+use super::in_flight::InFlightGuard;
 use super::plan::extract_collection;
 use super::prepared::{NodeDbQueryParser, ParsedStatement};
 use crate::control::server::shared::session::{SessionStore, TransactionState};
@@ -314,6 +315,12 @@ impl SimpleQueryHandler for NodeDbPgHandler {
         let addr = client.socket_addr();
         self.sessions.ensure_session(addr);
 
+        // Mark this statement in flight for its whole duration so the idle
+        // watchdog never closes a connection mid-statement; the guard also
+        // stamps last-activity on drop, restarting the idle window at
+        // statement completion.
+        let _in_flight = InFlightGuard::new(&self.sessions, addr);
+
         let identity = self.resolve_identity(client, &addr)?;
         self.enforce_database_access(&identity, &addr)?;
 
@@ -443,10 +450,15 @@ impl ExtendedQueryHandler for NodeDbPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let addr = client.socket_addr();
+        // Mark this statement in flight for the duration of execution so a
+        // long-running prepared statement is never idle-killed; the guard
+        // stamps last-activity on drop.
+        let _in_flight = InFlightGuard::new(&self.sessions, addr);
+
         let result = self.execute_prepared(client, portal, max_rows).await;
         // Mirror the simple-query path: surface any queued NOTICE messages
         // (e.g. `truncated_before_horizon`) before returning.
-        let addr = client.socket_addr();
         for message in self.sessions.drain_notices(&addr) {
             let notice = notice_warning(&message);
             let _ = client
