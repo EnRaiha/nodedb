@@ -150,6 +150,36 @@ impl SessionStore {
         }
     }
 
+    /// Read the identity resolved for queries on this connection, if any.
+    /// Returns `None` when no query has resolved an identity yet (the session
+    /// never issued a statement past auth) or the session does not exist.
+    pub fn identity(
+        &self,
+        addr: &SocketAddr,
+    ) -> Option<crate::control::security::identity::AuthenticatedIdentity> {
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
+        sessions.get(addr).and_then(|s| s.identity.clone())
+    }
+
+    /// Stash the identity resolved for queries on this connection. Called from
+    /// the per-query auth chokepoint (`resolve_identity`) so a connection torn
+    /// down mid-transaction can reclaim its Data-Plane overlays without a live
+    /// query. Overwrites any prior value — the identity in force for the most
+    /// recent query is the one teardown must use. Creates the session entry if
+    /// absent so the extended-query path (which resolves identity before
+    /// `ensure_session`) still records it.
+    pub fn set_identity(
+        &self,
+        addr: &SocketAddr,
+        identity: crate::control::security::identity::AuthenticatedIdentity,
+    ) {
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
+        sessions
+            .entry(*addr)
+            .or_insert_with(ConnSession::new)
+            .identity = Some(identity);
+    }
+
     /// Reset per-session state for a `USE DATABASE` switch:
     ///   1. Aborts any open transaction (discards tx_buffer, resets state to Idle).
     ///   2. Clears all SQL-level prepared statements.

@@ -146,6 +146,11 @@ impl NodeDbPgHandler {
             }
         }
 
+        // Stash the identity in force for this query so a connection torn down
+        // mid-transaction can reclaim its Data-Plane staging overlays without a
+        // live query — `on_connection_end` reads it back to drive `run_rollback`.
+        self.sessions.set_identity(addr, identity.clone());
+
         Ok(identity)
     }
 

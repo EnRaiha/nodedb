@@ -166,7 +166,9 @@ impl TestServer {
                     core_dir: dir.path().to_path_buf(),
                     core_array_catalog: shared.array_catalog.clone(),
                     event_producer,
-                    core_metrics: None,
+                    // Share the Control-Plane `SystemMetrics` so the Data-Plane
+                    // core updates the same `active_txn_overlays` gauge tests read.
+                    core_metrics: shared.system_metrics.clone(),
                     governor: shared.governor.clone(),
                     replay: None,
                     graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),

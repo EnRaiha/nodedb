@@ -224,6 +224,14 @@ impl NodeDbPgHandlerFactory {
             state,
         }
     }
+
+    /// Reclaim an abandoned transaction's overlays and drop the shared session
+    /// entry when a pgwire connection ends. Idempotent — a no-op when the
+    /// connection had no open transaction.
+    pub async fn on_connection_end(&self, addr: &std::net::SocketAddr) {
+        self.handler.reclaim_open_txn(addr).await;
+        self.handler.sessions.remove(addr);
+    }
 }
 
 impl PgWireServerHandlers for NodeDbPgHandlerFactory {

@@ -123,9 +123,15 @@ impl PgListener {
                             let factory = Arc::clone(&factory);
                             let tls = tls_acceptor.clone();
                             connections.spawn(async move {
-                                if let Err(e) = process_socket(stream, tls, factory).await {
+                                if let Err(e) =
+                                    process_socket(stream, tls, Arc::clone(&factory)).await
+                                {
                                     warn!(%peer_addr, error = %e, "pgwire session error");
                                 }
+                                // Reclaim any abandoned-transaction Data-Plane
+                                // overlays and drop the shared session entry now
+                                // that the connection has ended.
+                                factory.on_connection_end(&peer_addr).await;
                                 drop(permit);
                                 peer_addr
                             });

@@ -72,6 +72,15 @@ pub struct ConnSession {
     /// with `42501` before this field is written), so the identity-bound
     /// invariant continues to hold for tenant-scoped users.
     pub effective_tenant_id: Option<TenantId>,
+    /// Authenticated identity resolved for queries on this connection.
+    ///
+    /// Stashed by `resolve_identity` (the per-query auth chokepoint) so that a
+    /// connection torn down mid-transaction can reclaim its Data-Plane staging
+    /// overlays without a live query in flight — `run_rollback` requires the
+    /// identity (tenant + username) to dispatch `MetaOp::DropTxnOverlay` and to
+    /// audit any GAP_FREE reservation rollback. `None` until the first query
+    /// resolves an identity on this connection.
+    pub identity: Option<crate::control::security::identity::AuthenticatedIdentity>,
     /// Session parameters set via SET commands.
     pub parameters: HashMap<String, String>,
     /// Buffered write tasks accumulated between BEGIN and COMMIT.
@@ -171,6 +180,7 @@ impl ConnSession {
             tx_state: TransactionState::Idle,
             current_database: None,
             effective_tenant_id: None,
+            identity: None,
             parameters,
             tx_buffer: Vec::new(),
             tx_snapshot_lsn: None,
