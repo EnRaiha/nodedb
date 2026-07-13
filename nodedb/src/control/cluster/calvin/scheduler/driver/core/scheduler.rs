@@ -256,6 +256,14 @@ impl Scheduler {
             "calvin scheduler starting"
         );
 
+        // Low-frequency liveness timer so the top-of-loop stall/barrier sweeps
+        // run even on an otherwise-idle vShard. Without it, a dropped verdict
+        // push plus zero further events for this vShard would leave a parked txn
+        // never re-probing the durable verdict. A fraction of the stall-warn
+        // window re-probes well within it.
+        let mut stall_tick = tokio::time::interval(self.config.verdict_stall_warn() / 4);
+        stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             self.check_dependent_barrier_timeouts();
             self.check_awaiting_verdict_stalls();
@@ -310,6 +318,13 @@ impl Scheduler {
                             break;
                         }
                     }
+                }
+
+                _ = stall_tick.tick() => {
+                    // Empty body on purpose: the top-of-loop
+                    // check_awaiting_verdict_stalls / check_dependent_barrier_timeouts
+                    // do the work on every wake. This arm only guarantees the loop
+                    // wakes to run them when no other event arrives.
                 }
             }
         }
