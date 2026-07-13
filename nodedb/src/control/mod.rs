@@ -44,6 +44,7 @@ pub mod state;
 pub mod surrogate;
 pub mod sync_producer;
 pub mod synonym;
+pub(crate) mod target_identity;
 pub mod trace_context;
 pub mod trace_export;
 pub mod trigger;

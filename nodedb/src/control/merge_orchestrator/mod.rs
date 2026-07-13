@@ -2,7 +2,7 @@
 
 pub mod expand_staged_merge;
 pub mod orchestrator;
-pub mod target_surrogate;
+pub mod resolve_arms;
 
 pub(crate) use expand_staged_merge::resolve_and_emit_merge_ops;
 pub use orchestrator::{MergeArgs, run_merge};

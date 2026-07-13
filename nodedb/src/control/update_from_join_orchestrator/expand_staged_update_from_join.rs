@@ -33,10 +33,10 @@ use nodedb_types::TenantId;
 
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::maintenance::clone_materializer::{dispatch_local, read_all_source_rows};
-use crate::control::merge_orchestrator::target_surrogate::{
+use crate::control::state::SharedState;
+use crate::control::target_identity::{
     bare_collection_name, derive_document_id, require_surrogate, resolve_target_pk,
 };
-use crate::control::state::SharedState;
 use crate::types::VShardId;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -82,7 +82,7 @@ pub(crate) async fn resolve_and_emit_update_from_join_ops(
             tenant_id,
             collection: target_collection.clone(),
         })?;
-    let target_pk = resolve_target_pk(&target)?;
+    let target_pk = resolve_target_pk(&target, "UPDATE ... FROM")?;
 
     // Concrete writes land on the TARGET collection's vShard — that is where the
     // updated rows live. Recomputing it (rather than reusing the staged task's

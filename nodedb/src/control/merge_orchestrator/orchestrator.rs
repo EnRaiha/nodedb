@@ -48,8 +48,9 @@ use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_plan::document::merge_types::MergeClauseOp;
 
-use super::target_surrogate::{
-    assign_target_surrogate, bare_collection_name, decode_resolve, resolve_target_pk,
+use super::resolve_arms::decode_resolve;
+use crate::control::target_identity::{
+    assign_target_surrogate, bare_collection_name, resolve_target_pk,
 };
 
 /// Upper bound on resolve→apply retries under concurrent source/target drift.
@@ -84,7 +85,7 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
             tenant_id: args.tenant_id,
             collection: args.target_collection.to_string(),
         })?;
-    let target_pk = resolve_target_pk(&target)?;
+    let target_pk = resolve_target_pk(&target, "MERGE")?;
 
     let mut attempt: u32 = 0;
     loop {

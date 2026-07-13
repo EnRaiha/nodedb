@@ -27,10 +27,10 @@ use nodedb_types::columnar::StrictSchema;
 use nodedb_types::{CollectionType, DatabaseId, Surrogate, TenantId};
 
 use crate::bridge::scan_filter::ScanFilter;
-use crate::control::insert_select::target_identity::{
-    TargetPk, assign_target_surrogate, resolve_target_pk,
-};
 use crate::control::state::SharedState;
+use crate::control::target_identity::{
+    TargetPk, assign_target_surrogate, bare_collection_name, resolve_target_pk,
+};
 use crate::data::executor::strict_format::binary_tuple_to_msgpack;
 use crate::engine::document::store::surrogate_to_doc_id;
 
@@ -72,7 +72,7 @@ pub(crate) fn resolve_copy_spec(
             tenant_id,
             collection: target_collection.to_string(),
         })?;
-    let target_pk = resolve_target_pk(&target)?;
+    let target_pk = resolve_target_pk(&target, "INSERT ... SELECT")?;
 
     let source_strict_schema = catalog
         .get_collection(
@@ -144,18 +144,4 @@ pub(crate) fn assign_page_rows(
         *remaining -= 1;
     }
     Ok(out)
-}
-
-/// Strip the `{database_id}/` qualifier from a db-qualified collection name to
-/// recover the bare name the catalog keys collections by (the DEFAULT database
-/// uses the bare name unqualified).
-fn bare_collection_name(database_id: DatabaseId, qualified: &str) -> String {
-    if database_id == DatabaseId::DEFAULT {
-        return qualified.to_string();
-    }
-    let prefix = format!("{}/", database_id.as_u64());
-    qualified
-        .strip_prefix(&prefix)
-        .unwrap_or(qualified)
-        .to_string()
 }

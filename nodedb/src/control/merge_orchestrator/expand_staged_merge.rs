@@ -25,7 +25,7 @@
 //! surrogate of — a row a prior statement in the same transaction staged.
 //!
 //! Mirrors [`super::orchestrator::run_merge`]'s identity derivation for
-//! autocommit; the two drivers share [`super::target_surrogate`].
+//! autocommit; the two drivers share [`crate::control::target_identity`].
 
 use nodedb_types::TenantId;
 
@@ -36,9 +36,10 @@ use crate::types::VShardId;
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use super::target_surrogate::{
-    ResolvedMergeArms, TargetPk, assign_target_surrogate, bare_collection_name, decode_resolve,
-    derive_document_id, require_surrogate, resolve_target_pk,
+use super::resolve_arms::{ResolvedMergeArms, decode_resolve};
+use crate::control::target_identity::{
+    TargetPk, assign_target_surrogate, bare_collection_name, derive_document_id, require_surrogate,
+    resolve_target_pk,
 };
 
 /// Resolve one in-transaction `DocumentOp::Merge` task into the concrete,
@@ -77,7 +78,7 @@ pub(crate) async fn resolve_and_emit_merge_ops(
             tenant_id,
             collection: target_collection.clone(),
         })?;
-    let target_pk = resolve_target_pk(&target)?;
+    let target_pk = resolve_target_pk(&target, "MERGE")?;
 
     let vshard_id = VShardId::from_collection_in_database(task.database_id, &target_collection);
     let mut out: Vec<PhysicalTask> = Vec::new();
