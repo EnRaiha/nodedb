@@ -114,13 +114,10 @@ impl CoreLoop {
             // Leader-only verification: compare the local actual matching set to
             // the prediction; on drift return OllpRetryRequired WITHOUT writing.
             // The set comparison is deterministic: both sides are sorted.
-            if self.ollp_is_group_leader {
-                let actual = super::scan::ollp_actual_surrogates(&matching_ids);
-                let mut predicted_sorted: Vec<u32> = predicted.to_vec();
-                predicted_sorted.sort_unstable();
-                if actual != predicted_sorted {
-                    return self.response_error(task, ErrorCode::OllpRetryRequired);
-                }
+            if self.ollp_is_group_leader
+                && !super::scan::ollp_surrogates_match(&matching_ids, predicted)
+            {
+                return self.response_error(task, ErrorCode::OllpRetryRequired);
             }
             // Apply set = the carried predicted surrogates (identical on every
             // replica). On the leader this equals `matching_ids` post-verify; on
@@ -151,9 +148,7 @@ impl CoreLoop {
                 collection,
                 &apply_ids,
             );
-            let mut predicted_sorted: Vec<OllpPredictedEdge> = predicted.to_vec();
-            predicted_sorted.sort_unstable();
-            if actual != predicted_sorted {
+            if !super::scan::ollp_edges_match(actual, predicted) {
                 return self.response_error(task, ErrorCode::OllpRetryRequired);
             }
         }

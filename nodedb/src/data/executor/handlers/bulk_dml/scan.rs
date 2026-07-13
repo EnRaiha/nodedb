@@ -84,7 +84,7 @@ pub(in crate::data::executor) fn ollp_predicted_doc_ids(predicted: &[u32]) -> Ve
         .collect()
 }
 
-pub(super) fn ollp_actual_surrogates(doc_ids: &[String]) -> Vec<u32> {
+pub(in crate::data::executor) fn ollp_actual_surrogates(doc_ids: &[String]) -> Vec<u32> {
     let mut surrogates: Vec<u32> = doc_ids
         .iter()
         .filter_map(|id| {
@@ -97,4 +97,32 @@ pub(super) fn ollp_actual_surrogates(doc_ids: &[String]) -> Vec<u32> {
         .collect();
     surrogates.sort_unstable();
     surrogates
+}
+
+/// True when the live `matching_ids` surrogate set equals the carried
+/// `predicted` set. Both sides are sorted before comparison, so the result is
+/// deterministic on every replica. Shared by the bulk-DML apply handlers and
+/// the Calvin active-stage OLLP verifier so the `actual == predicted` guard
+/// lives in exactly one place.
+pub(in crate::data::executor) fn ollp_surrogates_match(
+    matching_ids: &[String],
+    predicted: &[u32],
+) -> bool {
+    let actual = ollp_actual_surrogates(matching_ids);
+    let mut predicted_sorted: Vec<u32> = predicted.to_vec();
+    predicted_sorted.sort_unstable();
+    actual == predicted_sorted
+}
+
+/// True when the recomputed `actual` implicit-edge set equals the carried
+/// `predicted` edge set. Both sides are sorted via `OllpPredictedEdge`'s
+/// derived `Ord`, matching the surrogate-set comparison's determinism contract.
+pub(in crate::data::executor) fn ollp_edges_match(
+    mut actual: Vec<nodedb_physical::physical_plan::OllpPredictedEdge>,
+    predicted: &[nodedb_physical::physical_plan::OllpPredictedEdge],
+) -> bool {
+    actual.sort_unstable();
+    let mut predicted_sorted = predicted.to_vec();
+    predicted_sorted.sort_unstable();
+    actual == predicted_sorted
 }

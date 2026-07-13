@@ -413,9 +413,12 @@ impl Scheduler {
                 dispatch_time: dispatch_instant,
                 lock_acquired_time,
                 has_primary_write,
-                // The dependent-read active path applies directly (it resolves
-                // its reads via injected values, not a staged buffer).
-                commit_state: None,
+                // The dependent-read active path now STAGES (leader-verify OLLP
+                // + buffer, no base apply); its response drives the same
+                // resolve → redo → flush as the static path, restoring
+                // WAL-only-restart durability. `resolve_staged_commit` reads the
+                // `read_set_valid: None` the active handler returns as "commit".
+                commit_state: Some(super::super::types::CommitState::Staged),
             },
         );
     }
