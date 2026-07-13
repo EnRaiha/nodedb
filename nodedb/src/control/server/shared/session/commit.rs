@@ -84,7 +84,7 @@ pub async fn run_commit(
                 // and returns a serialization abort (SQLSTATE 40001) on an ABORT
                 // verdict.
                 if let Some(reason) = super::commit_calvin::run_commit_calvin(
-                    sessions, addr, state, dp, &buffered, tenant_id, &read_set,
+                    sessions, addr, state, &buffered, tenant_id, &read_set,
                 )
                 .await
                 {

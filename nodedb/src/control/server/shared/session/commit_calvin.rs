@@ -4,40 +4,37 @@
 //!
 //! Routes a transaction whose buffered writes span two or more vShards through
 //! the Calvin sequencer. Strict mode routes the whole buffered batch to the
-//! sequencer-group leader via `dispatch_tasks_to_calvin` — the same routed
-//! submit-and-await the autocommit cross-shard path uses — so a non-leader
-//! coordinator's interactive COMMIT still completes. Best-effort mode fans the
-//! batch out per-vShard independently. Split out of `commit.rs` to keep the
-//! orchestrator's top-level flow short.
+//! sequencer-group leader via `dispatch_tasks_to_calvin` — one atomic
+//! cross-shard transaction bound by the durable Vote/Verdict barrier.
+//! Best-effort mode groups the buffered writes by vShard and submits each group
+//! as an INDEPENDENT single-vShard Calvin transaction (via
+//! `build_single_vshard_tx_class` then `submit_calvin_routed`) — the SAME
+//! deterministic sequencer funnel, so each vShard gets an epoch-anchored
+//! bitemporal stamp and a `TransactionRedo` WAL record, while remaining
+//! non-atomic ACROSS vShards (no global vote binds them; a failure on one vShard
+//! does not roll back another).
 
 use std::net::SocketAddr;
 
-use crate::bridge::envelope::PhysicalPlan;
 use crate::control::planner::calvin::{
-    CrossShardTxnMode, TxnDispatchPosition, dispatch_tasks_to_calvin,
+    CrossShardTxnMode, TxnDispatchPosition, build_single_vshard_tx_class, dispatch_tasks_to_calvin,
+    submit_calvin_routed,
 };
 use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::state::SharedState;
-use nodedb_physical::physical_plan::MetaOp;
-use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+use nodedb_physical::physical_task::PhysicalTask;
 
-use super::commit::classify_batch_dispatch;
-use super::outcome::{AbortReason, TxnDataPlane};
+use super::outcome::AbortReason;
 use super::store::SessionStore;
 
-/// Dispatch a multi-shard transaction batch through Calvin (or best-effort
-/// per-vShard). Returns `Some(reason)` on failure, `None` on success.
-///
-/// This is the COMMIT flush of a buffered explicit block: the interactive
-/// `BEGIN; <cross-shard writes/reads>; COMMIT` sequence lands here with its
-/// whole batch, which commits atomically through the durable Vote/Verdict
-/// barrier. Strict mode routes to the sequencer-group leader so the commit
-/// completes even when this coordinator is not the leader.
+/// Dispatch a multi-shard transaction batch through Calvin. Strict commits the
+/// whole batch atomically through the leader-routed Vote/Verdict barrier;
+/// best-effort submits one independent single-vShard Calvin transaction per
+/// vShard. Returns `Some(reason)` on failure, `None` on success.
 pub(super) async fn run_commit_calvin(
     sessions: &SessionStore,
     addr: &SocketAddr,
     state: &SharedState,
-    dp: &impl TxnDataPlane,
     buffered: &[PhysicalTask],
     tenant_id: crate::types::TenantId,
     reads: &[ReadSetEntry],
@@ -52,11 +49,10 @@ pub(super) async fn run_commit_calvin(
                 return Some(AbortReason::Dispatch(crate::Error::SequencerUnavailable));
             }
             // Route the buffered cross-shard batch through the sequencer-group
-            // leader via the SAME routed submit-and-await the autocommit path
-            // uses. This is the COMMIT flush of a buffered explicit block — the
-            // whole batch commits atomically — NOT a mid-block single statement,
-            // so the mid-block cross-shard guard must not fire (hence
-            // `CommitFlush`, not `MidBlockStatement`).
+            // leader via the routed submit-and-await — the whole batch commits
+            // atomically. This is the COMMIT flush of a buffered explicit block,
+            // NOT a mid-block single statement, so the mid-block cross-shard guard
+            // must not fire (hence `CommitFlush`).
             match dispatch_tasks_to_calvin(
                 state,
                 buffered,
@@ -67,56 +63,54 @@ pub(super) async fn run_commit_calvin(
             )
             .await
             {
-                // Success: the durable, replicated commit was acknowledged by
-                // the routed submit-and-await. COMMIT returns no rows, so the
-                // applied Response (with any RETURNING payload) is unused here.
                 Ok(_) => None,
-                // The global cross-shard OCC verdict was ABORT (read-set
-                // validation failed); the routed await surfaces this as
-                // `CalvinSerializationConflict`. Map it to the serialization
-                // abort both transports render as SQLSTATE `40001` so the client
-                // retries the whole transaction.
                 Err(crate::Error::CalvinSerializationConflict) => Some(AbortReason::Serialization),
-                // Every other hard error (sequencer unavailable, a scheduler
-                // routing failure, an assignment/completion timeout mapped to
-                // `Internal`, or a TxClass encode failure) is a dispatch abort;
-                // adapters map the carried error per their existing rules.
                 Err(e) => Some(AbortReason::Dispatch(e)),
             }
         }
         CrossShardTxnMode::BestEffortNonAtomic => {
-            // Dispatch each vShard's sub-batch independently. Group buffered
-            // tasks by vShard and dispatch per-vShard TransactionBatches.
-            let mut by_vshard: std::collections::BTreeMap<u32, Vec<PhysicalPlan>> =
+            // The sequencer funnel each per-vShard submit uses requires the inbox
+            // (or, in cluster mode, a routable sequencer leader); fail fast and
+            // deployment-neutral if it is not wired, mirroring the strict arm.
+            if state.sequencer_inbox.get().is_none() {
+                return Some(AbortReason::Dispatch(crate::Error::SequencerUnavailable));
+            }
+            // Group the buffered writes by vShard. Each group becomes ONE
+            // independent single-vShard Calvin transaction, sequenced through the
+            // SAME deterministic funnel the contended point-write path uses
+            // (`build_single_vshard_tx_class` + `submit_calvin_routed`): the
+            // scheduler resolves it into a `TransactionRedo`, WAL-appends it, and
+            // the Calvin flush sets `epoch_system_ms` so every engine's bitemporal
+            // stamp is epoch-anchored and byte-identical on replay.
+            //
+            // Non-atomic ACROSS vShards is preserved by construction: each group
+            // is a separate submit-and-await with its own single-participant
+            // verdict (no cross-shard vote barrier). On the FIRST failure we
+            // surface the reason and stop — we do NOT roll back vShards that have
+            // already committed, exactly as the mode's contract requires.
+            let mut by_vshard: std::collections::BTreeMap<u32, Vec<PhysicalTask>> =
                 std::collections::BTreeMap::new();
             for task in buffered {
                 by_vshard
                     .entry(task.vshard_id.as_u32())
                     .or_default()
-                    .push(task.plan.clone());
+                    .push(task.clone());
             }
-            for (vshard_u32, plans) in by_vshard {
-                let vshard_id = nodedb_types::id::VShardId::new(vshard_u32);
-                let batch_task = PhysicalTask {
-                    tenant_id,
-                    vshard_id,
-                    database_id: crate::types::DatabaseId::DEFAULT,
-                    // Calvin threads its bitemporal stamps in on the Data Plane
-                    // (`execute_calvin_flush`), not via a session overlay.
-                    plan: PhysicalPlan::Meta(MetaOp::TransactionBatch {
-                        plans,
-                        txn_id: None,
-                    }),
-                    post_set_op: PostSetOp::None,
-                    txn_id: None,
+            for (_vshard_u32, tasks) in by_vshard {
+                // Empty read-set: best-effort performs no cross-shard OCC (the
+                // multi-shard COMMIT path never ran `si_conflict_abort`), so each
+                // group carries no versioned reads — matching the single-vShard
+                // submit `route_write_to_calvin` uses.
+                let tx_class = match build_single_vshard_tx_class(&tasks, tenant_id, &[]) {
+                    Ok(tc) => tc,
+                    Err(e) => return Some(AbortReason::Dispatch(e)),
                 };
-                // Calvin owns durability + write-version recording on its apply
-                // path (the scheduler's `append_calvin_applied` LSN is stamped
-                // there); no session-level WAL record exists here to stamp.
-                if let Some(reason) =
-                    classify_batch_dispatch(dp.dispatch_no_wal(batch_task, None).await)
-                {
-                    return Some(reason);
+                match submit_calvin_routed(state, tx_class).await {
+                    Ok(_) => {}
+                    Err(crate::Error::CalvinSerializationConflict) => {
+                        return Some(AbortReason::Serialization);
+                    }
+                    Err(e) => return Some(AbortReason::Dispatch(e)),
                 }
             }
             None
