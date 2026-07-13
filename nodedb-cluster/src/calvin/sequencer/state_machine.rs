@@ -262,9 +262,18 @@ impl SequencerStateMachine {
                 // epoch targeting a given vShard is stamped with the same count.
                 let mut vshard_txn_counts: HashMap<u32, u32> = HashMap::new();
                 for txn in &batch.txns {
-                    for vshard_id in txn.tx_class.participating_vshards() {
+                    let participating = txn.tx_class.participating_vshards();
+                    for vshard_id in participating {
                         *vshard_txn_counts.entry(vshard_id.as_u32()).or_insert(0) += 1;
                     }
+                    // Seed the expected vote-participant count deterministically on
+                    // EVERY replica (not just the epoch's originating leader), so a
+                    // post-failover sequencer leader can still detect vote
+                    // completeness and aggregate the verdict.
+                    self.completion_registry.seed_expected(
+                        crate::calvin::TxnId::new(batch.epoch, txn.position),
+                        participating.len(),
+                    );
                 }
 
                 for txn in &batch.txns {

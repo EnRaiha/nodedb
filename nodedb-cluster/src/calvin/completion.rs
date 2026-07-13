@@ -294,6 +294,25 @@ impl CalvinCompletionRegistry {
         }
     }
 
+    /// Seed the expected participant count for `txn` deterministically from the
+    /// replicated `SequencerEntry::EpochBatch` — this runs on every replica (not
+    /// just the epoch's originating leader), so vote-completeness becomes
+    /// detectable even on a replica that later becomes leader via failover and
+    /// never observed the original `note_assigned` seeding.
+    ///
+    /// Idempotent: takes the max with any existing seed, so ordering against
+    /// `note_assigned` / `register_completion` (which also seed this field) is
+    /// safe regardless of which one runs first. `expected == 0` is a harmless
+    /// no-op (max with the existing value).
+    pub fn seed_expected(&self, txn: TxnId, expected: usize) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = inner
+            .completions
+            .entry(txn)
+            .or_insert_with(|| PendingCompletion::new(0));
+        entry.expected_participants = entry.expected_participants.max(expected);
+    }
+
     /// Record one participant vshard's durable commit vote for `txn`, tallied
     /// from a replicated `SequencerEntry::Vote`.
     ///
@@ -311,13 +330,16 @@ impl CalvinCompletionRegistry {
         entry.votes.insert(vshard, commit);
 
         // On the transition to a complete tally, emit the aggregated verdict
-        // exactly once. `expected_participants` is seeded on the sequencer
-        // leader (the participant count arrives with the assignment); a replica
-        // whose registry never received that seed keeps `expected == 0` and
-        // never emits here — correct, because only the leader proposes the
-        // verdict. Deterministic all-replica seeding for failover is a
-        // follow-up. The `verdict_proposed` guard dedups a re-tally caused by a
-        // re-proposed vote on retry.
+        // exactly once. `expected_participants` is seeded deterministically on
+        // every replica from the `EpochBatch` apply arm (see `seed_expected`),
+        // as well as opportunistically by `note_assigned` / `register_completion`
+        // on the leader/coordinator — so completeness is detectable here on any
+        // replica, including one that becomes leader via failover after the
+        // epoch was originally applied elsewhere. Only the leader's
+        // `SequencerService` actually proposes the verdict from this signal
+        // (leader-gated at the propose site); a follower computing and sending
+        // the signal here is harmless. The `verdict_proposed` guard dedups a
+        // re-tally caused by a re-proposed vote on retry.
         if entry.expected_participants > 0
             && entry.votes.len() == entry.expected_participants
             && !entry.verdict_proposed
@@ -644,6 +666,73 @@ mod tests {
         // Any abort vote makes the aggregated verdict false.
         assert_eq!(rx.try_recv().expect("verdict emitted"), (txn, false));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn seed_expected_is_idempotent_max_and_enables_verdict_without_note_assigned() {
+        // Mirrors complete_all_true_tally_emits_commit_verdict_once, but seeds
+        // expected_participants via seed_expected (the EpochBatch apply-arm path
+        // that runs on every replica) instead of the leader-only note_assigned.
+        let (tx, mut rx) = mpsc::channel(8);
+        let reg = CalvinCompletionRegistry::new(tx);
+        let txn = TxnId::new(40, 0);
+
+        // Seeding a smaller value after a larger one must not shrink the count.
+        reg.seed_expected(txn, 2);
+        reg.seed_expected(txn, 1);
+
+        reg.note_vote(txn, 1, true);
+        assert!(
+            rx.try_recv().is_err(),
+            "only 1 of 2 expected votes in; must not emit yet"
+        );
+
+        reg.note_vote(txn, 2, true);
+        assert_eq!(
+            rx.try_recv().expect("verdict emitted"),
+            (txn, true),
+            "seed_expected alone (no note_assigned) must make completeness detectable"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_expected_and_note_assigned_take_the_max_regardless_of_order() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let reg = CalvinCompletionRegistry::new(tx);
+
+        // seed_expected first (larger), then note_assigned with a smaller count:
+        // the max (3) must win, so 2 votes must NOT be enough to emit a verdict.
+        let txn_a = TxnId::new(41, 0);
+        reg.seed_expected(txn_a, 3);
+        reg.note_assigned(1, txn_a, 1);
+        reg.note_vote(txn_a, 1, true);
+        reg.note_vote(txn_a, 2, true);
+        assert!(
+            rx.try_recv().is_err(),
+            "expected_participants must be max(3, 1) = 3; 2 votes is not complete"
+        );
+        reg.note_vote(txn_a, 3, true);
+        assert_eq!(
+            rx.try_recv().expect("verdict emitted at the 3rd vote"),
+            (txn_a, true)
+        );
+
+        // note_assigned first (smaller), then seed_expected with a larger count:
+        // same invariant, opposite call order.
+        let txn_b = TxnId::new(41, 1);
+        reg.note_assigned(2, txn_b, 1);
+        reg.seed_expected(txn_b, 3);
+        reg.note_vote(txn_b, 1, true);
+        reg.note_vote(txn_b, 2, true);
+        assert!(
+            rx.try_recv().is_err(),
+            "expected_participants must be max(1, 3) = 3, not the smaller seed"
+        );
+        reg.note_vote(txn_b, 3, true);
+        assert_eq!(
+            rx.try_recv().expect("verdict emitted at the 3rd vote"),
+            (txn_b, true)
+        );
     }
 
     #[tokio::test]
