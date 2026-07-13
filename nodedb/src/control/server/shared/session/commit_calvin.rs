@@ -25,15 +25,18 @@ use super::store::SessionStore;
 /// (`Completed`) nor a fresh-attempt retry decision into a terminal abort, or
 /// `None` if the caller should proceed with `Completed`.
 ///
-/// `Failed` (a scheduler-side routing rejection, never retried) and
-/// `Mismatch` (an OLLP predicate-drift signal, unreachable on this
-/// non-dependent path today but kept as a typed abort rather than a panic)
-/// both surface here as `AbortReason::Dispatch`. Split out from
-/// `run_commit_calvin` so the mapping is unit-testable without a live
+/// `Aborted` (the global cross-shard OCC verdict was ABORT — a read-set
+/// validation failure) surfaces as `AbortReason::Serialization`, which both
+/// transports map to SQLSTATE `40001`. `Failed` (a scheduler-side routing
+/// rejection, never retried) and `Mismatch` (an OLLP predicate-drift signal,
+/// unreachable on this non-dependent path today but kept as a typed abort
+/// rather than a panic) both surface here as `AbortReason::Dispatch`. Split out
+/// from `run_commit_calvin` so the mapping is unit-testable without a live
 /// `SharedState` / sequencer / registry.
 fn calvin_outcome_to_abort(outcome: &AttemptOutcome) -> Option<AbortReason> {
     match outcome {
         AttemptOutcome::Completed => None,
+        AttemptOutcome::Aborted => Some(AbortReason::Serialization),
         AttemptOutcome::Failed { detail } => Some(AbortReason::Dispatch(crate::Error::Internal {
             detail: format!("calvin transaction routing failed: {detail}"),
         })),
@@ -193,6 +196,16 @@ mod tests {
             }
             _ => panic!("Failed outcome must map to AbortReason::Dispatch"),
         }
+    }
+
+    #[test]
+    fn aborted_outcome_maps_to_serialization_abort() {
+        let reason = calvin_outcome_to_abort(&AttemptOutcome::Aborted)
+            .expect("Aborted must map to a terminal abort");
+        assert!(
+            matches!(reason, AbortReason::Serialization),
+            "a global ABORT verdict must map to AbortReason::Serialization (SQLSTATE 40001)"
+        );
     }
 
     #[test]

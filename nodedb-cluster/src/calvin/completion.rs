@@ -25,15 +25,22 @@ impl TxnId {
 /// Terminal outcome of a single Calvin transaction attempt.
 ///
 /// Exactly one of these fires per attempt on the unified completion channel:
-/// all expected vshards acked (`Completed`), the executor reported an OLLP
-/// prediction mismatch that forces a retry (`Mismatch`), or the scheduler
-/// rejected the transaction's routing as terminally broken (`Failed`) — this
-/// last case is NEVER retried, unlike `Mismatch`.
+/// all expected vshards acked AND the global verdict was commit (`Completed`),
+/// all expected vshards acked but the global cross-shard verdict was ABORT
+/// (`Aborted`), the executor reported an OLLP prediction mismatch that forces a
+/// retry (`Mismatch`), or the scheduler rejected the transaction's routing as
+/// terminally broken (`Failed`). `Aborted` and `Failed` are NEVER retried,
+/// unlike `Mismatch`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttemptOutcome {
     Completed,
+    /// The global cross-shard verdict was ABORT (read-set/OCC validation failed).
+    /// A serialization failure — surfaced to the client as SQLSTATE 40001, never retried.
+    Aborted,
     Mismatch,
-    Failed { detail: String },
+    Failed {
+        detail: String,
+    },
 }
 
 pub(crate) struct PendingCompletion {
@@ -69,6 +76,23 @@ pub(crate) struct PendingCompletion {
     /// NOT consulted by `drain_unproposed_verdicts` (which trusts only the
     /// durable `verdict`, letting a promoted leader re-propose a still-unstored one).
     pub(crate) verdict_proposed: bool,
+}
+
+/// Choose the terminal outcome for a COMPLETED entry (all expected vshards
+/// acked) by consulting the durable global verdict.
+///
+/// The verdict is applied from a replicated `SequencerEntry::Verdict` that is
+/// strictly ordered BEFORE the abort's `CompletionAck` in the sequencer Raft
+/// log, so an ABORT verdict is always stored (`verdict == Some(false)`) by the
+/// time this entry's completion fires. `Some(false)` is a serialization abort
+/// (`Aborted`); `None` (single-shard / no-verdict paths) and `Some(true)` are
+/// `Completed`. We deliberately do NOT gate on `verdict.is_some()` — that would
+/// stall the no-verdict completion paths.
+fn outcome_for(entry: &PendingCompletion) -> AttemptOutcome {
+    match entry.verdict {
+        Some(false) => AttemptOutcome::Aborted,
+        _ => AttemptOutcome::Completed,
+    }
 }
 
 impl PendingCompletion {
@@ -217,8 +241,12 @@ impl CalvinCompletionRegistry {
                 );
             }
         } else if entry.is_complete() {
+            // Acks raced ahead of waiter registration: consult the stored
+            // verdict so an already-complete ABORT surfaces as `Aborted`, not a
+            // false `Completed`.
+            let outcome = outcome_for(entry);
             inner.completions.remove(&txn);
-            if tx.send(AttemptOutcome::Completed).is_err() {
+            if tx.send(outcome).is_err() {
                 tracing::warn!(
                     epoch = txn.epoch,
                     position = txn.position,
@@ -240,18 +268,31 @@ impl CalvinCompletionRegistry {
             .or_insert_with(|| PendingCompletion::new(0));
         entry.acked_vshards.insert(vshard_id);
         if entry.is_complete() {
-            let tx = entry.completion_tx.take();
-            inner.completions.remove(&txn);
-            if let Some(tx) = tx
-                && tx.send(AttemptOutcome::Completed).is_err()
-            {
-                tracing::warn!(
-                    epoch = txn.epoch,
-                    position = txn.position,
-                    vshard_id,
-                    "calvin completion receiver dropped before final ack; \
-                     client likely timed out on completion wait"
-                );
+            // Consult the stored global verdict: `Verdict` is applied strictly
+            // before this abort's `CompletionAck` in the sequencer Raft log, so
+            // an ABORT is `Some(false)` here and must surface as `Aborted`
+            // rather than a silent `Completed` (which would drop the writes and
+            // report COMMIT SUCCESS to the client).
+            //
+            // Only fire + evict when the coordinator's waiter is registered. If
+            // the final ack races AHEAD of registration, LEAVE the entry — its
+            // `acked_vshards` (and the stored verdict) persist, so
+            // `register_completion`'s `is_complete()` branch fires the outcome.
+            // Evicting here would strand that branch (a fresh entry created by
+            // the later `register_completion` never re-completes). Mirrors how
+            // `mismatched`/`routing_failed` persist across the same race.
+            if let Some(tx) = entry.completion_tx.take() {
+                let outcome = outcome_for(entry);
+                inner.completions.remove(&txn);
+                if tx.send(outcome).is_err() {
+                    tracing::warn!(
+                        epoch = txn.epoch,
+                        position = txn.position,
+                        vshard_id,
+                        "calvin completion receiver dropped before final ack; \
+                         client likely timed out on completion wait"
+                    );
+                }
             }
         }
     }
@@ -521,6 +562,74 @@ mod tests {
             0,
             "entry must be evicted once routing failure is signalled"
         );
+    }
+
+    #[tokio::test]
+    async fn abort_verdict_makes_completion_report_aborted() {
+        // An ABORT verdict is stored (Raft-ordered) before the acks that complete
+        // the tally. Completion must consult it and report `Aborted`, never a
+        // silent `Completed` that would drop the writes and report COMMIT success.
+        let reg = CalvinCompletionRegistry::new_detached();
+        let txn = TxnId::new(31, 0);
+        reg.note_assigned(1, txn, 2);
+        reg.note_verdict(txn, false);
+        let rx = reg.register_completion(txn, 2);
+        reg.note_completion_ack(txn, 10);
+        reg.note_completion_ack(txn, 20);
+        let outcome = rx.await.expect("completion fires");
+        assert_eq!(
+            outcome,
+            AttemptOutcome::Aborted,
+            "a stored ABORT verdict must surface as Aborted, not Completed"
+        );
+        assert_eq!(reg.pending_completions_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn abort_verdict_reports_aborted_when_register_arrives_after_acks() {
+        // Acks (and the verdict) race ahead of waiter registration: the
+        // already-complete branch in `register_completion` must also consult the
+        // stored verdict and report `Aborted`.
+        let reg = CalvinCompletionRegistry::new_detached();
+        let txn = TxnId::new(32, 1);
+        reg.note_assigned(1, txn, 2);
+        reg.note_verdict(txn, false);
+        reg.note_completion_ack(txn, 10);
+        reg.note_completion_ack(txn, 20);
+        let rx = reg.register_completion(txn, 2);
+        let outcome = rx.await.expect("completion fires");
+        assert_eq!(outcome, AttemptOutcome::Aborted);
+        assert_eq!(reg.pending_completions_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn commit_verdict_reports_completed() {
+        // A COMMIT verdict (Some(true)) must still report `Completed`.
+        let reg = CalvinCompletionRegistry::new_detached();
+        let txn = TxnId::new(33, 2);
+        reg.note_assigned(1, txn, 2);
+        reg.note_verdict(txn, true);
+        let rx = reg.register_completion(txn, 2);
+        reg.note_completion_ack(txn, 10);
+        reg.note_completion_ack(txn, 20);
+        let outcome = rx.await.expect("completion fires");
+        assert_eq!(outcome, AttemptOutcome::Completed);
+        assert_eq!(reg.pending_completions_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_verdict_reports_completed_unchanged() {
+        // Single-shard / no-verdict paths (`verdict == None`) must report
+        // `Completed` unchanged — the fix must not stall them.
+        let reg = CalvinCompletionRegistry::new_detached();
+        let txn = TxnId::new(34, 3);
+        reg.note_assigned(1, txn, 2);
+        let rx = reg.register_completion(txn, 2);
+        reg.note_completion_ack(txn, 10);
+        reg.note_completion_ack(txn, 20);
+        let outcome = rx.await.expect("completion fires");
+        assert_eq!(outcome, AttemptOutcome::Completed);
+        assert_eq!(reg.pending_completions_len(), 0);
     }
 
     #[tokio::test]
