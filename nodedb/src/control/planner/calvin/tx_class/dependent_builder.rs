@@ -39,8 +39,9 @@ use super::shared::{
 ///
 /// `reads` is the neutral session read-set, projected onto the `TxClass`'s
 /// routing/identity `read_set` (collection-homed) so read shards are enumerated
-/// as participants; the LSN-versioned `versioned_reads` field stays empty (OCC
-/// enforcement is not yet active). Autocommit paths pass an empty slice.
+/// as participants, and onto `versioned_reads` (LSN-versioned OCC validation
+/// set) for commit-time optimistic-concurrency validation. Autocommit paths
+/// pass an empty slice.
 ///
 /// Returns `Err` if encoding fails or the resulting TxClass is invalid.
 pub fn build_dependent_tx_class(
@@ -201,11 +202,10 @@ fn build_dependent_tx_class_impl(
         detail: format!("failed to encode PhysicalPlan vec for Calvin dependent TxClass: {e}"),
     })?;
 
-    // versioned_reads (the LSN-versioned OCC validation set) stays EMPTY: only
-    // the routing `read_set` above is populated from the session reads. OCC
-    // enforcement is not yet active, so this is built from an empty slice —
-    // feeding real reads here would prematurely activate OCC validation.
-    let versioned_reads = versioned_reads_from(&[]);
+    // versioned_reads carries the LSN-versioned OCC validation set, populated
+    // from the same session read-set the routing `read_set` above was built
+    // from.
+    let versioned_reads = versioned_reads_from(reads);
 
     let result = if allow_single_vshard {
         TxClass::new_single_vshard(

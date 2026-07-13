@@ -9,7 +9,11 @@
 //! pgwire, native direct-ops, and single-node multi-core fan reads all funnel
 //! through [`record_read_set`], so no transport silently drops the read-set.
 //!
-//! A point read records [`ReadKey::Point`] carrying the row's [`KeyRepr`]; a
+//! A point read that HIT records [`ReadKey::Point`] carrying the row's
+//! [`KeyRepr`]; an absent DOCUMENT point read records [`ReadKey::Predicate`]
+//! (its placeholder surrogate would never collide with the phantom insert's
+//! fresh surrogate), while an absent KV point read keeps its precise `Point`
+//! key (the byte key any future write reuses). A
 //! scan / search / aggregate records [`ReadKey::Predicate`] (collection scope
 //! — the day-one phantom-safe floor). A multi-shard read records one entry per
 //! participating shard, each stamped with that shard's own watermark LSN.
@@ -77,19 +81,24 @@ pub struct ReadSetEntry {
 /// write path drops the entries otherwise), so autocommit reads never touch
 /// the read-set. Absent-key / empty-result reads MUST reach this with a
 /// non-empty `watermarks` slice — a "not found" is a validatable observation.
+///
+/// `found` reports whether a point read observed a present row (`true` on a hit,
+/// `false` on a miss). It only affects document point reads — an absent document
+/// read degrades to a collection-scoped predicate; see [`read_key_of`].
 pub fn record_read_set(
     sessions: &SessionStore,
     addr: &SocketAddr,
     tenant_id: TenantId,
     plan: &PhysicalPlan,
     watermarks: &[(VShardId, Lsn)],
+    found: bool,
 ) {
     if watermarks.is_empty() {
         return;
     }
 
     let engine = plan_engine(plan);
-    let key = read_key_of(plan);
+    let key = read_key_of(plan, found);
     let collection = extract_collection(plan)
         .map(String::from)
         .unwrap_or_default();
@@ -157,6 +166,7 @@ mod tests {
             TenantId::new(1),
             &kv_get("c", b"k1"),
             &[(VShardId::new(0), Lsn::new(7))],
+            true,
         );
         let rs = sessions.take_read_set(&a);
         assert_eq!(rs.len(), 1);
@@ -182,6 +192,7 @@ mod tests {
             TenantId::new(1),
             &kv_batch_get("c"),
             &[(VShardId::new(0), Lsn::new(9))],
+            true,
         );
         let rs = sessions.take_read_set(&a);
         assert_eq!(rs.len(), 1);
@@ -203,6 +214,7 @@ mod tests {
                 (VShardId::new(1), Lsn::new(11)),
                 (VShardId::new(2), Lsn::new(7)),
             ],
+            true,
         );
         let rs = sessions.take_read_set(&a);
         assert_eq!(rs.len(), 3);
@@ -214,14 +226,16 @@ mod tests {
     #[test]
     fn absent_key_point_read_is_recorded() {
         let (sessions, a) = begun_session();
-        // A "not found" is a validatable phantom observation: the point entry is
-        // recorded at the current watermark just like a hit.
+        // A "not found" is a validatable phantom observation: the KV point entry
+        // is recorded (as `found = false`) at the current watermark. KV keeps the
+        // precise byte key — the identity any future insert of that key reuses.
         record_read_set(
             &sessions,
             &a,
             TenantId::new(1),
             &kv_get("c", b"missing"),
             &[(VShardId::new(0), Lsn::new(5))],
+            false,
         );
         let rs = sessions.take_read_set(&a);
         assert_eq!(rs.len(), 1);
@@ -231,6 +245,60 @@ mod tests {
                 repr: KeyRepr::KvKey(Box::from(b"missing".as_slice())),
             }
         );
+    }
+
+    fn doc_point_get(collection: &str, surrogate: u32) -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::PointGet {
+            collection: collection.to_string(),
+            document_id: "d".to_string(),
+            surrogate: nodedb_types::Surrogate::new(surrogate),
+            pk_bytes: Vec::new(),
+            rls_filters: Vec::new(),
+            system_time: Default::default(),
+            valid_at_ms: None,
+        })
+    }
+
+    #[test]
+    fn document_point_read_hit_records_precise_surrogate() {
+        let (sessions, a) = begun_session();
+        // A hit keeps the precise cross-engine surrogate so the common case is
+        // validated per-key (no over-abort).
+        record_read_set(
+            &sessions,
+            &a,
+            TenantId::new(1),
+            &doc_point_get("docs", 42),
+            &[(VShardId::new(0), Lsn::new(7))],
+            true,
+        );
+        let rs = sessions.take_read_set(&a);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(
+            rs[0].key,
+            ReadKey::Point {
+                repr: KeyRepr::Surrogate(42),
+            }
+        );
+    }
+
+    #[test]
+    fn absent_document_point_read_records_predicate() {
+        let (sessions, a) = begun_session();
+        // A miss degrades to the collection-scoped predicate: the placeholder
+        // surrogate would never collide with a phantom insert's fresh surrogate,
+        // so the collection floor is the only safe read identity.
+        record_read_set(
+            &sessions,
+            &a,
+            TenantId::new(1),
+            &doc_point_get("docs", 999),
+            &[(VShardId::new(0), Lsn::new(5))],
+            false,
+        );
+        let rs = sessions.take_read_set(&a);
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].key, ReadKey::Predicate);
     }
 
     #[test]
@@ -245,6 +313,7 @@ mod tests {
             TenantId::new(1),
             &kv_get("c", b"k1"),
             &[(VShardId::new(0), Lsn::new(7))],
+            true,
         );
         assert!(sessions.take_read_set(&a).is_empty());
     }
@@ -252,7 +321,14 @@ mod tests {
     #[test]
     fn empty_watermarks_records_nothing() {
         let (sessions, a) = begun_session();
-        record_read_set(&sessions, &a, TenantId::new(1), &kv_get("c", b"k1"), &[]);
+        record_read_set(
+            &sessions,
+            &a,
+            TenantId::new(1),
+            &kv_get("c", b"k1"),
+            &[],
+            true,
+        );
         assert!(sessions.take_read_set(&a).is_empty());
     }
 
@@ -268,7 +344,7 @@ mod tests {
             valid_at_ms: None,
         });
         assert_eq!(
-            read_key_of(&plan),
+            read_key_of(&plan, true),
             ReadKey::Point {
                 repr: KeyRepr::Surrogate(42),
             }

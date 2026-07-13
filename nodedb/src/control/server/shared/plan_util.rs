@@ -139,10 +139,25 @@ pub(crate) fn plan_engine(plan: &PhysicalPlan) -> EngineTag {
 
 /// Classify a read plan's observed identity for the transaction read-set.
 ///
+/// `found` reports whether the point read actually observed a present row
+/// (`true` on a hit, `false` on a miss / absent row). It is meaningful only for
+/// single-row keyed lookups; scans and predicate reads ignore it.
+///
 /// Single-row keyed lookups whose identity maps to exactly one [`KeyRepr`]
 /// record [`ReadKey::Point`]:
-/// - `DocumentOp::PointGet` — the row's cross-engine surrogate.
-/// - `KvOp::Get` / `KvOp::FieldGet` — the raw KV key bytes.
+/// - `DocumentOp::PointGet` that HIT — the row's cross-engine surrogate.
+/// - `KvOp::Get` / `KvOp::FieldGet` — the raw KV key bytes (on hit AND miss).
+///
+/// A `DocumentOp::PointGet` that MISSED records [`ReadKey::Predicate`] instead.
+/// A document surrogate is allocated from a monotonic counter unrelated to the
+/// `document_id`, so the placeholder surrogate an absent read carries never
+/// coincides with the fresh surrogate a concurrent INSERT of that `document_id`
+/// will receive — a `Point` key would never collide with the phantom insert and
+/// the stale read would be wrongly judged current. Degrading the miss to the
+/// collection-scoped predicate makes any insert into the read collection advance
+/// the floor and abort the reader (collection-granular phantom safety). KV is
+/// unaffected: a KV read key IS the literal byte key any future write reuses, so
+/// an absent-key read collides correctly — it keeps its precise `Point` key.
 ///
 /// Everything else records [`ReadKey::Predicate`] (collection-scoped, phantom-
 /// safe). This deliberately includes keyed ops whose observation cannot be
@@ -152,11 +167,17 @@ pub(crate) fn plan_engine(plan: &PhysicalPlan) -> EngineTag {
 /// / rows they observed, which is the one thing phantom safety forbids; the
 /// coarse collection floor over-aborts instead, which is always safe. The match
 /// is total over [`PhysicalPlan`] so a new variant forces a classification.
-pub(crate) fn read_key_of(plan: &PhysicalPlan) -> ReadKey {
+pub(crate) fn read_key_of(plan: &PhysicalPlan, found: bool) -> ReadKey {
     match plan {
-        PhysicalPlan::Document(DocumentOp::PointGet { surrogate, .. }) => ReadKey::Point {
-            repr: KeyRepr::Surrogate(surrogate.as_u32()),
-        },
+        PhysicalPlan::Document(DocumentOp::PointGet { surrogate, .. }) => {
+            if found {
+                ReadKey::Point {
+                    repr: KeyRepr::Surrogate(surrogate.as_u32()),
+                }
+            } else {
+                ReadKey::Predicate
+            }
+        }
         PhysicalPlan::Kv(KvOp::Get { key, .. }) | PhysicalPlan::Kv(KvOp::FieldGet { key, .. }) => {
             ReadKey::Point {
                 repr: KeyRepr::KvKey(key.clone().into_boxed_slice()),

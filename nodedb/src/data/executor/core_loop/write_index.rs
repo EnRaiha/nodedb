@@ -9,10 +9,10 @@
 //! apply chokepoints on this core feed it here.
 //!
 //! This is the shard-local write-version substrate the optimistic-concurrency
-//! commit path later validates a transaction's read-set against. Nothing reads
-//! the index yet — it is populated here so those versions exist and are
-//! comparable. Because the index lives on the `!Send` core it is a plain
-//! `HashMap`: no atomics, no locks, no cross-core sharing.
+//! commit path validates a transaction's read-set against (see
+//! [`CoreLoop::read_set_still_current`]). Because the index lives on the
+//! `!Send` core it is a plain `HashMap`: no atomics, no locks, no cross-core
+//! sharing.
 //!
 //! The per-key map is bounded: horizon GC (run from the periodic maintenance
 //! hook) evicts entries far below the core watermark and enforces a hard

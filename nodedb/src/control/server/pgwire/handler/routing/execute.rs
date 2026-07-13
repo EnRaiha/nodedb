@@ -409,6 +409,7 @@ impl NodeDbPgHandler {
                     identity.tenant_id,
                     &plan_for_response,
                     &watermarks,
+                    resp.status == crate::bridge::envelope::Status::Ok,
                 );
             }
 

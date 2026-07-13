@@ -267,8 +267,9 @@ pub struct VersionedReadEntry {
 ///
 /// Empty for pure-write transactions and for autocommit statements (which
 /// accumulate no session read-set). Populated at commit time from the neutral
-/// session read-set. Nothing validates it yet — this is the carriage
-/// mechanism onto the replicated `TxClass`.
+/// session read-set, and validated per-participant against the local
+/// write-version index at Calvin stage time (the commit vote on
+/// `read_set_valid`).
 #[derive(
     Debug,
     Clone,

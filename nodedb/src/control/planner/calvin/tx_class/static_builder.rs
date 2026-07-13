@@ -30,9 +30,10 @@ use super::shared::{
 /// `reads` is the neutral session read-set captured during the transaction; it
 /// is projected onto the `TxClass`'s routing/identity `read_set` (collection-
 /// homed) so a txn that writes shard A but reads shard B enumerates B as a
-/// participant. The LSN-versioned `versioned_reads` field stays empty (OCC
-/// enforcement is not yet active). Autocommit and pure-write paths pass an empty
-/// slice, yielding an empty read_set.
+/// participant, and onto `versioned_reads` (LSN-versioned OCC validation set)
+/// for commit-time optimistic-concurrency validation. Autocommit and
+/// pure-write paths pass an empty slice, yielding an empty read_set and
+/// versioned_reads.
 ///
 /// Returns `Err(SequencerUnavailable)` if msgpack encoding of plans fails.
 pub fn build_static_tx_class(
@@ -204,11 +205,10 @@ fn build_static_tx_class_impl(
         detail: format!("failed to encode PhysicalPlan vec for Calvin TxClass: {e}"),
     })?;
 
-    // versioned_reads (the LSN-versioned OCC validation set) stays EMPTY: this
-    // path populates only the routing `read_set` above from the session reads.
-    // OCC enforcement is not yet active, so the versioned set is built from an
-    // empty slice — feeding real reads here would prematurely activate OCC.
-    let versioned_reads = versioned_reads_from(&[]);
+    // versioned_reads carries the LSN-versioned OCC validation set, populated
+    // from the same session read-set the routing `read_set` above was built
+    // from.
+    let versioned_reads = versioned_reads_from(reads);
 
     let result = if allow_single_vshard {
         TxClass::new_single_vshard(
@@ -308,12 +308,24 @@ mod tests {
         let tx = build_static_tx_class(&tasks, TenantId::new(1), &reads)
             .expect("valid multi-vShard TxClass");
 
-        // versioned_reads (the LSN-versioned OCC validation set) stays EMPTY:
-        // only the routing read_set is populated this unit.
-        assert!(
-            tx.versioned_reads.is_empty(),
-            "versioned_reads must stay empty until OCC is wired"
+        // versioned_reads (the LSN-versioned OCC validation set) carries the
+        // same session reads, 1:1, for commit-time validation.
+        assert_eq!(
+            tx.versioned_reads.len(),
+            reads.len(),
+            "versioned_reads must carry one entry per session read"
         );
+        for (entry, read) in tx.versioned_reads.iter().zip(reads.iter()) {
+            assert_eq!(entry.collection, read.collection);
+            assert_eq!(entry.read_lsn, read.read_lsn);
+            let expected_key = match &read.key {
+                ReadKey::Point { repr } => {
+                    nodedb_cluster::calvin::types::ReadKeyIdent::Point(repr.clone())
+                }
+                ReadKey::Predicate => nodedb_cluster::calvin::types::ReadKeyIdent::Predicate,
+            };
+            assert_eq!(entry.key, expected_key);
+        }
 
         // read_set is collection-homed from the session reads: both read
         // collections appear (Document engine → Document keyset).

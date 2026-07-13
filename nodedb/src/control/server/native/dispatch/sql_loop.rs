@@ -186,6 +186,7 @@ pub(super) async fn run_dispatch_loop(
                 ctx.tenant_id(),
                 &plan_for_response,
                 &watermarks,
+                task_resp.status == Status::Ok,
             );
         }
 
