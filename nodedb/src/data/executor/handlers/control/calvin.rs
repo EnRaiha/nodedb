@@ -38,6 +38,7 @@ use nodedb_types::calvin::VersionedReadEntry;
 use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::commit_pending::PendingCommit;
+use crate::data::executor::handlers::transaction::overlay::BitemporalStamp;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
@@ -173,6 +174,20 @@ impl CoreLoop {
         position: u32,
     ) -> Response {
         let vshard_id = task.request.vshard_id.as_u32();
+        // Capture the resolve-time bitemporal stamps (if `CalvinResolve` staged
+        // them into the synthetic overlay) BEFORE the overlay is dropped, so the
+        // base install below reuses the exact stamp the redo carries rather than
+        // minting a fresh one. Empty when this transaction wrote no bitemporal
+        // document rows or resolve never ran.
+        let bitemporal_stamps: Vec<(u32, BitemporalStamp)> =
+            match calvin_synthetic_txn_id(epoch, position, vshard_id) {
+                Ok(synthetic) => self
+                    .txn_overlays
+                    .get(&synthetic)
+                    .map(|overlay| overlay.all_bitemporal_stamps().collect())
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
         // Drop the synthetic overlay entry staged by
         // `execute_calvin_execute_static` unconditionally, before the apply
         // below: idempotent no-op on a duplicate dispatch.
@@ -201,10 +216,22 @@ impl CoreLoop {
         // batch, then restore the resting (authoritative) state.
         let prev_group_leader = self.ollp_is_group_leader;
         self.ollp_is_group_leader = pending.is_group_leader;
+        // Install the captured resolve-time stamps into apply scratch; the
+        // batch consumes them for its bitemporal document puts and clears the
+        // scratch when it returns. `txn_id = None`: the synthetic overlay was
+        // already dropped above, so the stamps are threaded in directly here.
+        for (surrogate, stamp) in bitemporal_stamps {
+            self.active_bitemporal_stamps.insert(surrogate, stamp);
+        }
         // The read-set was already validated at stage time and drives the
         // flush/drop decision; the replay itself carries no read-set to re-check.
-        let result =
-            self.execute_transaction_batch(task, pending.tenant_id.as_u64(), &pending.plans, &[]);
+        let result = self.execute_transaction_batch(
+            task,
+            pending.tenant_id.as_u64(),
+            &pending.plans,
+            &[],
+            None,
+        );
         self.ollp_is_group_leader = prev_group_leader;
         self.epoch_system_ms = None;
         result

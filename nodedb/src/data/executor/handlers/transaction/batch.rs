@@ -39,6 +39,7 @@ impl CoreLoop {
         tid: u64,
         plans: &[PhysicalPlan],
         versioned_reads: &[VersionedReadEntry],
+        txn_id: Option<crate::types::TxnId>,
     ) -> Response {
         debug!(
             core = self.core_id,
@@ -56,11 +57,22 @@ impl CoreLoop {
         let undo_log: Vec<UndoEntry> = Vec::with_capacity(plans.len());
         let crdt_deltas: Vec<CrdtDelta> = Vec::new();
 
-        let (last_response, undo_log, crdt_deltas) =
-            match self.run_sub_plans(task, tid, plans, undo_log, crdt_deltas) {
-                Ok(v) => v,
-                Err(resp) => return resp,
-            };
+        // Carry the resolve-time bitemporal stamps this transaction's overlay
+        // recorded into per-core apply scratch, so `apply_point_put` installs
+        // each bitemporal document put on the versioned store at the SAME stamp
+        // the redo carries. Calvin threads its stamps in before the call
+        // (`txn_id = None` here); the session single-shard commit passes its
+        // `txn_id`. The scratch is consulted ONLY by the forward apply below, so
+        // it is cleared the moment `run_sub_plans` returns (any path).
+        if let Some(txn_id) = txn_id {
+            self.load_bitemporal_stamps_for_txn(txn_id);
+        }
+        let sub = self.run_sub_plans(task, tid, plans, undo_log, crdt_deltas);
+        self.active_bitemporal_stamps.clear();
+        let (last_response, undo_log, crdt_deltas) = match sub {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
 
         let undo_log = match self.apply_balanced_constraint_check(task, tid, undo_log) {
             Ok(u) => u,
@@ -95,6 +107,20 @@ impl CoreLoop {
             error_code: None,
             read_set_valid: Some(read_set_current),
             write_set: Vec::new(),
+        }
+    }
+
+    /// Copy every resolve-time bitemporal stamp recorded in `txn_id`'s staging
+    /// overlay into the per-core `active_bitemporal_stamps` scratch. Surrogates
+    /// are globally unique, so all collections' stamps flatten into one map.
+    /// A no-op when no overlay exists (pure-read / non-bitemporal transaction).
+    fn load_bitemporal_stamps_for_txn(&mut self, txn_id: crate::types::TxnId) {
+        let stamps: Vec<_> = match self.txn_overlays.get(&txn_id) {
+            Some(overlay) => overlay.all_bitemporal_stamps().collect(),
+            None => return,
+        };
+        for (surrogate, stamp) in stamps {
+            self.active_bitemporal_stamps.insert(surrogate, stamp);
         }
     }
 

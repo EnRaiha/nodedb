@@ -463,6 +463,17 @@ pub struct CoreLoop {
     /// advanced by every committed write-apply. Type + GC in `write_index.rs`.
     pub(in crate::data::executor) write_index: super::write_index::WriteVersionIndex,
 
+    /// Scratch map (surrogate → resolve-time bitemporal stamp) consulted ONLY
+    /// by `apply_point_put`. Populated right before a bitemporal document apply
+    /// scope — from a committing transaction's overlay sidecar (commit-time
+    /// install) or a decoded 8-tuple redo sub-record (WAL replay) — and cleared
+    /// right after. When a surrogate has an entry, the put is forced onto the
+    /// versioned store at the carried stamp rather than deriving a fresh one,
+    /// so the base install and the redo agree on the version key even when
+    /// `doc_configs` is empty (the real replay-time boot state).
+    pub(in crate::data::executor) active_bitemporal_stamps:
+        HashMap<u32, crate::data::executor::handlers::transaction::overlay::BitemporalStamp>,
+
     /// Staged Calvin write plans awaiting the local commit verdict, keyed by
     /// `(epoch, position, vshard)`. `CalvinExecuteStatic` validates a
     /// transaction and inserts its plans here WITHOUT mutating base; the

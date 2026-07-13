@@ -361,6 +361,7 @@ fn transaction_batch_does_not_abort_on_zero_row_update() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::BulkUpdate {
                     collection: "products".into(),

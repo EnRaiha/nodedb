@@ -34,7 +34,10 @@ fn send_batch_expecting_panic_rollback(
     plans: Vec<PhysicalPlan>,
 ) -> nodedb::bridge::envelope::Response {
     tx.try_push(BridgeRequest {
-        inner: make_request(PhysicalPlan::Meta(MetaOp::TransactionBatch { plans })),
+        inner: make_request(PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            plans,
+            txn_id: None,
+        })),
     })
     .unwrap();
     core.tick();

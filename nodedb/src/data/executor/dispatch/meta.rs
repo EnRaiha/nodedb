@@ -22,8 +22,8 @@ impl CoreLoop {
 
             MetaOp::Cancel { target_request_id } => self.execute_cancel(task, *target_request_id),
 
-            MetaOp::TransactionBatch { plans } => {
-                self.execute_transaction_batch(task, tid, plans, &[])
+            MetaOp::TransactionBatch { plans, txn_id } => {
+                self.execute_transaction_batch(task, tid, plans, &[], *txn_id)
             }
 
             MetaOp::CreateSnapshot => self.execute_create_snapshot(task),

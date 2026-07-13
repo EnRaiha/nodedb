@@ -54,6 +54,16 @@ impl CoreLoop {
         self.last_stamp_ms.store(next, Ordering::Relaxed);
         next
     }
+
+    /// Advance the per-core HLC watermark to at least `sys_from_ms` without
+    /// producing a new stamp. Used by WAL replay of a carried bitemporal stamp:
+    /// the stamp was assigned on the original core at commit, so post-restart
+    /// writes must not hand out a value at or below it. `fetch_max` keeps the
+    /// update monotonic and lock-free (single-threaded per core, `Relaxed`).
+    #[inline]
+    pub(in crate::data::executor) fn observe_bitemporal_stamp(&self, sys_from_ms: i64) {
+        self.last_stamp_ms.fetch_max(sys_from_ms, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

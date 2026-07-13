@@ -122,6 +122,7 @@ fn calvin_static_apply_success() {
     let (mut core, mut tx, mut rx, _dir) = make_core();
 
     let batch_plan = PhysicalPlan::Meta(MetaOp::TransactionBatch {
+        txn_id: None,
         plans: vec![kv_put("orders", b"k1", b"v1")],
     });
 
@@ -204,7 +205,10 @@ fn calvin_static_apply_failure_rolls_back_cleanly() {
         &mut core,
         &mut tx,
         &mut rx,
-        PhysicalPlan::Meta(MetaOp::TransactionBatch { plans }),
+        PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
+            plans,
+        }),
     );
 
     assert_eq!(

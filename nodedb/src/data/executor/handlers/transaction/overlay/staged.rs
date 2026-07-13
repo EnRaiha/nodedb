@@ -44,6 +44,26 @@ pub enum StagedTtl {
     Persist,
 }
 
+/// The bitemporal system/valid-time stamp assigned to one staged document
+/// `Put` at COMMIT resolve time, kept OUTSIDE `Staged` because it is only
+/// meaningful for a `bitemporal=true` document collection (like [`StagedTtl`]
+/// is only meaningful for KV).
+///
+/// Assigning it ONCE at resolve — rather than re-deriving it at both the
+/// commit-time base install and WAL replay — is what keeps a normal restart
+/// from writing a SECOND version of the same row: the redo sub-record carries
+/// this stamp verbatim, and the base install reads the identical stamp back
+/// out of the overlay sidecar so both agree on the version key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitemporalStamp {
+    /// System-time key (`_ts_system`) the version row is appended at.
+    pub sys_from_ms: i64,
+    /// Valid-time lower bound (`i64::MIN` = unbounded).
+    pub valid_from_ms: i64,
+    /// Valid-time upper bound (`i64::MAX` = unbounded).
+    pub valid_until_ms: i64,
+}
+
 /// Staged mutations for a single collection within one transaction.
 #[derive(Debug, Default)]
 pub struct CollectionOverlay {
@@ -56,6 +76,11 @@ pub struct CollectionOverlay {
     /// Staged KV TTL delta per surrogate — sibling to `by_surrogate`, never
     /// consulted by non-KV engines. See [`StagedTtl`].
     ttl_by_surrogate: HashMap<u32, StagedTtl>,
+    /// Bitemporal stamp per surrogate — sibling to `by_surrogate`, written at
+    /// COMMIT resolve time for `bitemporal=true` document `Put`s and read back
+    /// by the commit-time base install so redo and install share one stamp.
+    /// See [`BitemporalStamp`]. Never consulted by non-bitemporal collections.
+    bitemporal_by_surrogate: HashMap<u32, BitemporalStamp>,
 }
 
 /// One overlay slot's state captured immediately before a staged value/TTL
@@ -290,6 +315,50 @@ impl TxnOverlay {
         let overlay = self.collections.get(coll_key)?;
         let surrogate = overlay.doc_id_to_surrogate.get(doc_id)?;
         overlay.ttl_by_surrogate.get(surrogate).copied()
+    }
+
+    /// Record the resolve-time bitemporal stamp for `surrogate` in the given
+    /// collection. Assigned exactly once, at COMMIT resolve, after all
+    /// savepoint activity for the transaction has completed — so no undo
+    /// journalling is needed (it is never rolled back mid-statement).
+    pub fn set_bitemporal(
+        &mut self,
+        coll_key: &(DatabaseId, TenantId, String),
+        surrogate: u32,
+        stamp: BitemporalStamp,
+    ) {
+        self.collections
+            .entry(coll_key.clone())
+            .or_default()
+            .bitemporal_by_surrogate
+            .insert(surrogate, stamp);
+    }
+
+    /// Look up the resolve-time bitemporal stamp for `surrogate` in the given
+    /// collection. `Some` only for a `bitemporal=true` collection's staged
+    /// `Put` whose stamp was assigned at resolve.
+    pub fn get_bitemporal(
+        &self,
+        coll_key: &(DatabaseId, TenantId, String),
+        surrogate: u32,
+    ) -> Option<BitemporalStamp> {
+        self.collections
+            .get(coll_key)?
+            .bitemporal_by_surrogate
+            .get(&surrogate)
+            .copied()
+    }
+
+    /// Iterate every `(surrogate, BitemporalStamp)` staged across all
+    /// collections in this overlay. Surrogates are globally unique, so the
+    /// commit-time install flattens these into one per-core scratch map.
+    pub fn all_bitemporal_stamps(&self) -> impl Iterator<Item = (u32, BitemporalStamp)> + '_ {
+        self.collections.values().flat_map(|overlay| {
+            overlay
+                .bitemporal_by_surrogate
+                .iter()
+                .map(|(surrogate, stamp)| (*surrogate, *stamp))
+        })
     }
 
     /// Iterate all staged `(surrogate, Staged)` pairs for a collection.

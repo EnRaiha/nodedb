@@ -16,6 +16,7 @@ fn transaction_batch_commits_atomically() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
                     collection: "docs".into(),
@@ -78,6 +79,7 @@ fn transaction_batch_response_uses_outer_request_id() {
         inner: make_request_with_id(
             42,
             PhysicalPlan::Meta(MetaOp::TransactionBatch {
+                txn_id: None,
                 plans: vec![PhysicalPlan::Document(DocumentOp::PointPut {
                     collection: "docs".into(),
                     document_id: "d1".into(),
@@ -153,6 +155,7 @@ fn transaction_batch_rollback_on_failure() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
                     collection: "docs".into(),
@@ -231,6 +234,7 @@ fn transaction_edge_put_committed() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
                     collection: "nodes".into(),
@@ -337,6 +341,7 @@ fn transaction_edge_put_rolled_back_on_failure() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Graph(GraphOp::EdgePut {
                     collection: "col".into(),
@@ -454,6 +459,7 @@ fn transaction_mixed_doc_edge_vector_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
                     collection: "nodes".into(),

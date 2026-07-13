@@ -219,7 +219,10 @@ impl<'a> StatementExecutor<'a> {
             let vshard_id = tasks[0].vshard_id;
             let plans: Vec<_> = tasks.into_iter().map(|t| t.plan).collect();
             let batch_plan = crate::bridge::envelope::PhysicalPlan::Meta(
-                nodedb_physical::physical_plan::MetaOp::TransactionBatch { plans },
+                nodedb_physical::physical_plan::MetaOp::TransactionBatch {
+                    plans,
+                    txn_id: None,
+                },
             );
             crate::control::server::dispatch_utils::dispatch_write_to_data_plane(
                 self.state,

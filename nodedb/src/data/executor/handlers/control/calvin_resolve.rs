@@ -37,7 +37,7 @@ impl CoreLoop {
     /// missing its required `ollp_predicted_surrogates` already failed loudly
     /// at staging time, before it could ever reach `commit_pending`.
     pub(in crate::data::executor) fn execute_calvin_resolve(
-        &self,
+        &mut self,
         task: &ExecutionTask,
         epoch: u64,
         position: u32,
@@ -48,22 +48,40 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, e),
         };
 
-        let Some(pending) = self.commit_pending.get(&(epoch, position, vshard_id)) else {
-            return self.response_error(
-                task,
-                crate::Error::Internal {
-                    detail: format!(
-                        "calvin resolve: no staged commit for epoch={epoch} \
-                         position={position} vshard={vshard_id} (must be staged via \
-                         CalvinExecuteStatic before CalvinResolve)"
-                    ),
-                },
-            );
-        };
+        // Clone the staged plans (and the deterministic epoch anchor) out of
+        // `commit_pending` so the `&mut self` resolve call — which assigns
+        // bitemporal stamps into the overlay — does not overlap the immutable
+        // borrow of the pending buffer.
+        let (tid, plans, epoch_system_ms) =
+            match self.commit_pending.get(&(epoch, position, vshard_id)) {
+                Some(pending) => (
+                    pending.tenant_id.as_u64(),
+                    pending.plans.clone(),
+                    pending.epoch_system_ms,
+                ),
+                None => {
+                    return self.response_error(
+                        task,
+                        crate::Error::Internal {
+                            detail: format!(
+                                "calvin resolve: no staged commit for epoch={epoch} \
+                                 position={position} vshard={vshard_id} (must be staged via \
+                                 CalvinExecuteStatic before CalvinResolve)"
+                            ),
+                        },
+                    );
+                }
+            };
 
-        let tid = pending.tenant_id.as_u64();
-        let plans = &pending.plans;
-        self.execute_resolve_txn(task, tid, synthetic_txn_id, plans)
+        // Restore the epoch's deterministic time anchor around resolve so the
+        // bitemporal stamps `execute_resolve_txn` assigns are identical across
+        // replicas (mirrors `execute_calvin_flush`). `CalvinFlush` reads these
+        // stamps back from the overlay, so redo and base install agree.
+        let prev_epoch_ms = self.epoch_system_ms;
+        self.epoch_system_ms = Some(epoch_system_ms);
+        let resp = self.execute_resolve_txn(task, tid, synthetic_txn_id, &plans);
+        self.epoch_system_ms = prev_epoch_ms;
+        resp
     }
 }
 
@@ -399,7 +417,7 @@ mod tests {
     #[test]
     fn calvin_resolve_missing_pending_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let (core, _tx, _rx) = make_core_with_dir(dir.path());
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
         let task = make_task();
 
         let resp = core.execute_calvin_resolve(&task, 99, 0);

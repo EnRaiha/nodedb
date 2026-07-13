@@ -204,6 +204,7 @@ fn drop_discards_invalid_staged_calvin_write() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![kv_put("dropcoll", b"seed", b"v")],
         }),
         0,

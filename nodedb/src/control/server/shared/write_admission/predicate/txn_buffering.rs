@@ -1638,7 +1638,10 @@ mod tests {
             PhysicalPlan::Meta(MetaOp::Cancel {
                 target_request_id: RequestId::new(1),
             }),
-            PhysicalPlan::Meta(MetaOp::TransactionBatch { plans: Vec::new() }),
+            PhysicalPlan::Meta(MetaOp::TransactionBatch {
+                plans: Vec::new(),
+                txn_id: None,
+            }),
             PhysicalPlan::Meta(MetaOp::CreateSnapshot),
             PhysicalPlan::Meta(MetaOp::Compact),
             PhysicalPlan::Meta(MetaOp::Checkpoint),

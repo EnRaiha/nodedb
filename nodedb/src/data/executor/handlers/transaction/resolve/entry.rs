@@ -30,6 +30,7 @@ use nodedb_physical::physical_plan::{DocumentOp, GraphOp, KvOp, PhysicalPlan};
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::transaction::overlay::{BitemporalStamp, Staged};
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{TenantId, TxnId};
 use crate::wal::{RedoRecord, RedoSubRecord};
@@ -42,7 +43,7 @@ impl CoreLoop {
     /// and return its encoded bytes in the response payload. Reads the overlay
     /// by `&` and never mutates any base engine.
     pub(in crate::data::executor) fn execute_resolve_txn(
-        &self,
+        &mut self,
         task: &ExecutionTask,
         tid: u64,
         txn_id: TxnId,
@@ -72,7 +73,7 @@ impl CoreLoop {
     /// post-image (value, tombstone, absolute expiry) lives in the overlay, not
     /// the plan.
     fn resolve_txn_ops(
-        &self,
+        &mut self,
         task: &ExecutionTask,
         tid: u64,
         txn_id: TxnId,
@@ -153,6 +154,58 @@ impl CoreLoop {
                         detail: "cluster-array op reached Data Plane transaction resolve"
                             .to_string(),
                     });
+                }
+            }
+        }
+
+        // Assign the resolve-time bitemporal stamp for every staged `Put` in a
+        // `bitemporal=true` document collection, ONCE, and store it in the
+        // overlay sidecar. `serialize_document_collection` emits it in the redo
+        // 8-tuple and the commit-time base install reads it back out of the same
+        // sidecar, so redo and install agree on the version key (a divergent
+        // stamp would write a second version on a normal restart). Stamps are
+        // assigned in deterministic (collection, doc-id) order so replicas
+        // resolving the same transaction produce identical version keys. The
+        // monotonic `bitemporal_now_ms` lives on the core, so this is the one
+        // place the stamp can be pinned before both the redo and the install.
+        for collection in &doc_collections {
+            if !self.is_bitemporal(tid, collection) {
+                continue;
+            }
+            let coll_key = (
+                task.request.database_id,
+                TenantId::new(tid),
+                collection.clone(),
+            );
+            let mut puts: Vec<(String, u32)> = match self.txn_overlays.get(&txn_id) {
+                Some(overlay) => overlay
+                    .iter_doc_entries_for_collection(&coll_key)
+                    .filter_map(|(doc_id, staged)| match staged {
+                        Staged::Put(_) => overlay
+                            .surrogate_for_doc_id(&coll_key, doc_id)
+                            .map(|surrogate| (doc_id.to_string(), surrogate)),
+                        Staged::Tombstone => None,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            puts.sort();
+            let stamps: Vec<(u32, BitemporalStamp)> = puts
+                .into_iter()
+                .map(|(_doc_id, surrogate)| {
+                    (
+                        surrogate,
+                        BitemporalStamp {
+                            sys_from_ms: self.bitemporal_now_ms(),
+                            valid_from_ms: i64::MIN,
+                            valid_until_ms: i64::MAX,
+                        },
+                    )
+                })
+                .collect();
+            if let Some(overlay) = self.txn_overlays.get_mut(&txn_id) {
+                for (surrogate, stamp) in stamps {
+                    overlay.set_bitemporal(&coll_key, surrogate, stamp);
                 }
             }
         }
@@ -1026,7 +1079,7 @@ mod tests {
 
     #[test]
     fn join_merge_batch_dml_still_yield_typed_error() {
-        let (core, _dir) = make_core();
+        let (mut core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(45);
 
@@ -1520,7 +1573,7 @@ mod tests {
 
     #[test]
     fn read_only_and_crdt_and_text_plans_emit_nothing() {
-        let (core, _dir) = make_core();
+        let (mut core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(8);
 
@@ -1542,7 +1595,7 @@ mod tests {
 
     #[test]
     fn empty_overlay_resolves_to_empty_record() {
-        let (core, _dir) = make_core();
+        let (mut core, _dir) = make_core();
         let task = make_task();
         let resp = core.execute_resolve_txn(&task, TID, TxnId::new(99), &[]);
         let redo = decode_redo(&resp);
@@ -1867,7 +1920,7 @@ mod tests {
 
     #[test]
     fn graph_set_node_labels_has_no_redo_shape_and_yields_typed_error() {
-        let (core, _dir) = make_core();
+        let (mut core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(36);
 
@@ -1889,7 +1942,7 @@ mod tests {
 
     #[test]
     fn graph_remove_node_labels_has_no_redo_shape_and_yields_typed_error() {
-        let (core, _dir) = make_core();
+        let (mut core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(37);
 
@@ -1941,7 +1994,7 @@ mod tests {
     /// replay rebuilds).
     #[test]
     fn vector_insert_resolves_and_replays_queryable() {
-        let (src, _src_dir) = make_core();
+        let (mut src, _src_dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(40);
 
@@ -2032,7 +2085,7 @@ mod tests {
     /// replays into the columnar engine's memtable.
     #[test]
     fn columnar_insert_resolves_to_columnar_batch_and_replays() {
-        let (src, _src_dir) = make_core();
+        let (mut src, _src_dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(42);
 
@@ -2094,7 +2147,7 @@ mod tests {
     /// tagged `"timeseries"` and replays its samples into the memtable.
     #[test]
     fn timeseries_ingest_resolves_and_replays() {
-        let (src, _src_dir) = make_core();
+        let (mut src, _src_dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(43);
 
@@ -2159,7 +2212,7 @@ mod tests {
     fn columnar_update_and_delete_emit_columnar_dml_sub_record() {
         use nodedb_types::columnar::ColumnarDmlWalRecord;
 
-        let (core, _dir) = make_core();
+        let (mut core, _dir) = make_core();
         let task = make_task();
 
         let update = PhysicalPlan::Columnar(ColumnarOp::Update {
@@ -2234,7 +2287,7 @@ mod tests {
         }];
         let cells_bytes = zerompk::to_msgpack_vec(&cells).expect("encode cells");
 
-        let (src, _src_dir) = make_core();
+        let (mut src, _src_dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(46);
         let plan = PhysicalPlan::Array(ArrayOp::Put {
@@ -2438,7 +2491,7 @@ mod tests {
 
     #[test]
     fn spatial_insert_resolves_and_replay_is_queryable() {
-        let (src, _src_dir) = make_core();
+        let (mut src, _src_dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(40);
         let surrogate = 7u32;
@@ -2501,7 +2554,7 @@ mod tests {
 
     #[test]
     fn spatial_delete_resolves_and_replay_removes_entry() {
-        let (seed_core, _seed_dir) = make_core();
+        let (mut seed_core, _seed_dir) = make_core();
         let task = make_task();
         let surrogate = 9u32;
 
@@ -2571,7 +2624,7 @@ mod tests {
 
     #[test]
     fn spatial_resolve_is_deterministic_across_two_resolves() {
-        let (src, _src_dir) = make_core();
+        let (mut src, _src_dir) = make_core();
         let task = make_task();
 
         let plans = [
@@ -2602,7 +2655,7 @@ mod tests {
 
     #[test]
     fn spatial_resolve_does_not_mutate_base() {
-        let (core, _dir) = make_core();
+        let (mut core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(43);
         let surrogate = 5u32;
@@ -2694,7 +2747,7 @@ mod tests {
 
     #[test]
     fn spatial_scan_op_emits_nothing() {
-        let (core, _dir) = make_core();
+        let (mut core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(45);
 
@@ -2720,7 +2773,7 @@ mod tests {
 
     #[test]
     fn spatial_insert_without_provenance_yields_typed_error() {
-        let (core, _dir) = make_core();
+        let (mut core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(46);
 

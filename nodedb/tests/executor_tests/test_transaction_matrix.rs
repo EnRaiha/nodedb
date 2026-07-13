@@ -146,6 +146,7 @@ fn rollback_matrix_doc_then_vector_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![doc_put("docs", b"modified"), vector_fail("vec")],
         }),
     );
@@ -199,6 +200,7 @@ fn rollback_matrix_vector_then_doc_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 v_plan,
                 doc_insert_conflict("docs"), // doc1 already exists → constraint fail
@@ -242,6 +244,7 @@ fn rollback_matrix_doc_then_graph_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 doc_put("docs", b"modified"),
                 doc_insert_conflict("docs"), // same key → constraint fail
@@ -274,6 +277,7 @@ fn rollback_matrix_graph_then_vector_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![edge_put("col", "alice", "bob"), vector_fail("vec")],
         }),
     );
@@ -315,6 +319,7 @@ fn rollback_matrix_graph_then_graph_and_vector_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 edge_put("col", "a", "b"),
                 edge_put("col", "c", "d"),
@@ -359,6 +364,7 @@ fn rollback_matrix_crdt_buffered_then_vector_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Crdt(CrdtOp::Apply {
                     collection: "crdt_coll".into(),
@@ -413,6 +419,7 @@ fn rollback_matrix_doc_doc_second_fails() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 other_put,
                 doc_insert_conflict("docs"), // "doc1" already exists
@@ -476,6 +483,7 @@ fn rollback_matrix_fts_side_effect_rolled_back() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
                     collection: "articles".into(),
@@ -556,6 +564,7 @@ fn rollback_matrix_spatial_not_written_in_tx_path() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Document(DocumentOp::PointPut {
                     collection: "places".into(),

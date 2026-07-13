@@ -127,7 +127,12 @@ pub(super) async fn run_commit_calvin(
                     tenant_id,
                     vshard_id,
                     database_id: crate::types::DatabaseId::DEFAULT,
-                    plan: PhysicalPlan::Meta(MetaOp::TransactionBatch { plans }),
+                    // Calvin threads its bitemporal stamps in on the Data Plane
+                    // (`execute_calvin_flush`), not via a session overlay.
+                    plan: PhysicalPlan::Meta(MetaOp::TransactionBatch {
+                        plans,
+                        txn_id: None,
+                    }),
                     post_set_op: PostSetOp::None,
                     txn_id: None,
                 };

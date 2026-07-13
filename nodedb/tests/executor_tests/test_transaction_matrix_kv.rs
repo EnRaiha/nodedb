@@ -89,6 +89,7 @@ fn rollback_matrix_kv_then_doc_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![kv_put(b"k1", b"modified"), doc_insert_conflict("docs")],
         }),
     );
@@ -127,6 +128,7 @@ fn rollback_matrix_doc_then_kv_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 kv_put(b"new_key", b"should_not_persist"),
                 doc_insert_conflict("docs"),
@@ -164,6 +166,7 @@ fn rollback_matrix_kv_delete_then_doc_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Kv(KvOp::Delete {
                     collection: "kv_coll".into(),
@@ -198,6 +201,7 @@ fn rollback_matrix_kv_batch_put_then_doc_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Kv(KvOp::BatchPut {
                     collection: "kv_coll".into(),
@@ -248,6 +252,7 @@ fn rollback_matrix_doc_then_doc_conflict_kv_intact() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 kv_put(b"anchor", b"anchor_modified"),
                 doc_insert_conflict("docs"),
@@ -300,6 +305,7 @@ fn rollback_matrix_columnar_then_doc_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Columnar(ColumnarOp::Insert {
                     collection: "metrics".into(),
@@ -386,6 +392,7 @@ fn rollback_matrix_columnar_count_after_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Columnar(ColumnarOp::Insert {
                     collection: "metrics2".into(),
@@ -471,6 +478,7 @@ fn rollback_matrix_timeseries_then_doc_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                     collection: "cpu".into(),
@@ -577,6 +585,7 @@ fn rollback_matrix_timeseries_count_after_rollback() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                     collection: "temp".into(),

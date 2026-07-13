@@ -8,7 +8,11 @@
 //! document WAL path produces, so producer and replay share one encoding:
 //!
 //! * A staged value ([`Staged::Put`]) → `RecordType::Put`,
-//!   `(collection, document_id, value, Option<SyncProvenance>, surrogate)`.
+//!   `(collection, document_id, value, Option<SyncProvenance>, surrogate)`. For
+//!   a `bitemporal=true` collection this becomes an 8-tuple that appends the
+//!   resolve-time stamp `(sys_from_ms, valid_from_ms, valid_until_ms)` so replay
+//!   restores the row on the versioned store at the same stamp the commit-time
+//!   install uses. The replay decoder distinguishes the two forms by arity.
 //! * A staged tombstone ([`Staged::Tombstone`]) → `RecordType::Delete`,
 //!   `(collection, document_id, Option<SyncProvenance>, surrogate)`. The redo
 //!   delete shape carries the surrogate (unlike the autocommit delete shape)
@@ -94,12 +98,37 @@ pub(super) fn serialize_document_collection(
                     None => body.clone(),
                 };
                 let prov: Option<SyncProvenance> = None;
-                let payload =
-                    zerompk::to_msgpack_vec(&(collection, doc_id.as_str(), value, prov, surrogate))
-                        .map_err(|e| crate::Error::Serialization {
-                            format: "msgpack".into(),
-                            detail: format!("document resolve put: {e}"),
-                        })?;
+                // A `bitemporal=true` collection's staged put carries the
+                // resolve-time system/valid-time stamp assigned by
+                // `resolve_txn_ops` into the overlay sidecar. Emit it as the
+                // trailing three elements of an 8-tuple so WAL replay installs
+                // the row on the VERSIONED store at the SAME stamp the
+                // commit-time base install uses (both read one stamp). A
+                // non-bitemporal collection has no sidecar entry and keeps the
+                // 5-tuple; the replay decoder distinguishes the two by arity.
+                let payload = match overlay.get_bitemporal(coll_key, surrogate) {
+                    Some(stamp) => zerompk::to_msgpack_vec(&(
+                        collection,
+                        doc_id.as_str(),
+                        value,
+                        prov,
+                        surrogate,
+                        stamp.sys_from_ms,
+                        stamp.valid_from_ms,
+                        stamp.valid_until_ms,
+                    )),
+                    None => zerompk::to_msgpack_vec(&(
+                        collection,
+                        doc_id.as_str(),
+                        value,
+                        prov,
+                        surrogate,
+                    )),
+                }
+                .map_err(|e| crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: format!("document resolve put: {e}"),
+                })?;
                 ops.push(RedoSubRecord {
                     record_type: RecordType::Put as u32,
                     payload,

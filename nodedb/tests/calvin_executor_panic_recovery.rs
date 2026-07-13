@@ -69,7 +69,10 @@ fn calvin_static(epoch: u64, plans: Vec<PhysicalPlan>) -> PhysicalPlan {
 /// Build a `MetaOp::TransactionBatch` with the given sub-plans.
 #[cfg(feature = "failpoints")]
 fn tx_batch(plans: Vec<PhysicalPlan>) -> PhysicalPlan {
-    PhysicalPlan::Meta(MetaOp::TransactionBatch { plans })
+    PhysicalPlan::Meta(MetaOp::TransactionBatch {
+        plans,
+        txn_id: None,
+    })
 }
 
 /// Build the `MetaOp::CalvinFlush` that resolves a staged transaction to

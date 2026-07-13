@@ -46,6 +46,7 @@ fn commit_kv_vector() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![kv_put(b"k1", b"v1"), vector_insert_ok("vec")],
         }),
     );
@@ -65,6 +66,7 @@ fn rollback_kv_then_vector_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![kv_put(b"k1", b"modified"), vector_fail("vec")],
         }),
     );
@@ -85,6 +87,7 @@ fn commit_kv_graph() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![kv_put(b"kg1", b"val"), edge_put("g", "a", "b")],
         }),
     );
@@ -104,6 +107,7 @@ fn rollback_kv_then_graph_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 kv_put(b"k2", b"modified"),
                 edge_put("g", "x", "y"),
@@ -129,6 +133,7 @@ fn commit_kv_columnar() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![kv_put(b"kc1", b"val"), columnar_insert("metrics", "r1", 10)],
         }),
     );
@@ -148,6 +153,7 @@ fn rollback_kv_then_columnar_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 kv_put(b"k3", b"modified"),
                 columnar_insert("metrics", "r1", 10),
@@ -174,6 +180,7 @@ fn commit_kv_timeseries() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![kv_put(b"kt1", b"val"), timeseries_ingest("temp", ilp)],
         }),
     );
@@ -195,6 +202,7 @@ fn rollback_kv_then_timeseries_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 kv_put(b"k4", b"modified"),
                 timeseries_ingest("temp", ilp),
@@ -222,6 +230,7 @@ fn rollback_kv_then_crdt_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 kv_put(b"k5", b"modified"),
                 crdt_apply("crdt_coll", "doc1"),

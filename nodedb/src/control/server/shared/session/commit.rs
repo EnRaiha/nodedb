@@ -255,7 +255,15 @@ async fn dispatch_single_shard(
         tenant_id,
         vshard_id,
         database_id: crate::types::DatabaseId::DEFAULT,
-        plan: PhysicalPlan::Meta(MetaOp::TransactionBatch { plans }),
+        plan: PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            plans,
+            // Reuse the resolve-time bitemporal stamps recorded in this
+            // transaction's staging overlay so a `bitemporal=true` document put
+            // installs on the same version key the redo (WAL-appended just
+            // above) carries — otherwise a normal restart writes a second
+            // version of the row.
+            txn_id: Some(txn_id),
+        }),
         post_set_op: PostSetOp::None,
         txn_id: None,
     };

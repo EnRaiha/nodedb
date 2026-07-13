@@ -275,7 +275,7 @@ fn transaction_batch_records_sub_plan_versions() {
         surrogate: Surrogate::new(11),
         pk_bytes: Vec::new(),
     })];
-    let resp = core.execute_transaction_batch(&task, 1, &plans, &[]);
+    let resp = core.execute_transaction_batch(&task, 1, &plans, &[], None);
     assert_eq!(resp.status, Status::Ok);
 
     assert_eq!(
@@ -745,7 +745,7 @@ fn conflicting_read_set_is_flagged_invalid_but_batch_still_applies() {
         surrogate: Surrogate::new(7),
         pk_bytes: Vec::new(),
     })];
-    let write_resp = core.execute_transaction_batch(&write_task, 1, &write_plans, &[]);
+    let write_resp = core.execute_transaction_batch(&write_task, 1, &write_plans, &[], None);
     assert_eq!(write_resp.status, Status::Ok);
     assert_eq!(
         write_resp.read_set_valid,
@@ -768,7 +768,8 @@ fn conflicting_read_set_is_flagged_invalid_but_batch_still_applies() {
         pk_bytes: Vec::new(),
     })];
     let stale_reads = vec![point_entry("orders", 7, 5)];
-    let second_resp = core.execute_transaction_batch(&second_task, 1, &second_plans, &stale_reads);
+    let second_resp =
+        core.execute_transaction_batch(&second_task, 1, &second_plans, &stale_reads, None);
 
     assert_eq!(
         second_resp.status,

@@ -15,7 +15,12 @@
 //!
 //! * PUT — `(collection, document_id, value, Option<SyncProvenance>, surrogate)`.
 //!   Byte-identical to the autocommit `PointPut` / `PointInsert` shape; the
-//!   trailing `surrogate` is the stable identity `apply_point_put` keys on.
+//!   trailing `surrogate` is the stable identity `apply_point_put` keys on. A
+//!   `bitemporal=true` collection's put instead carries an 8-tuple that appends
+//!   `(sys_from_ms, valid_from_ms, valid_until_ms)`; the decoder tries the
+//!   8-tuple first and falls back to the 5-tuple, and a decoded stamp forces the
+//!   put onto the versioned store at that exact version key (needed because
+//!   `doc_configs` is empty during replay, so `is_bitemporal` would say false).
 //! * DELETE — `(collection, document_id, Option<SyncProvenance>, surrogate)`.
 //!   The autocommit delete shape `(collection, document_id, prov)` omits the
 //!   surrogate; replay needs it (the redb storage key is
@@ -37,6 +42,7 @@ use nodedb_wal::record::RecordType;
 use super::core_loop::CoreLoop;
 use super::handlers::point::apply_delete::PointDeleteParams;
 use super::handlers::point::apply_put::PointPutParams;
+use super::handlers::transaction::overlay::BitemporalStamp;
 use crate::engine::document::store::surrogate_to_doc_id;
 
 impl CoreLoop {
@@ -78,24 +84,69 @@ impl CoreLoop {
             let record_lsn = record.header.lsn;
 
             if is_put {
-                let Ok((collection, _document_id, value, _prov, surrogate_u32)) =
-                    zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>, u32)>(
-                        &record.payload,
+                // Try the bitemporal 8-tuple first, then fall back to the plain
+                // 5-tuple (mirrors the KV base-vs-extended tuple discrimination).
+                // A `bitemporal=true` collection's put carries its resolve-time
+                // stamp; `doc_configs` is empty during replay, so the stamp is
+                // the ONLY signal that this row belongs on the versioned store.
+                type BitemporalPut = (
+                    String,
+                    String,
+                    Vec<u8>,
+                    Option<SyncProvenance>,
+                    u32,
+                    i64,
+                    i64,
+                    i64,
+                );
+                type PlainPut = (String, String, Vec<u8>, Option<SyncProvenance>, u32);
+                let decoded = zerompk::from_msgpack::<BitemporalPut>(&record.payload)
+                    .map(
+                        |(collection, _doc_id, value, _prov, surrogate, sys, vf, vu)| {
+                            (
+                                collection,
+                                value,
+                                surrogate,
+                                Some(BitemporalStamp {
+                                    sys_from_ms: sys,
+                                    valid_from_ms: vf,
+                                    valid_until_ms: vu,
+                                }),
+                            )
+                        },
                     )
-                else {
+                    .or_else(|_| {
+                        zerompk::from_msgpack::<PlainPut>(&record.payload).map(
+                            |(collection, _doc_id, value, _prov, surrogate)| {
+                                (collection, value, surrogate, None)
+                            },
+                        )
+                    });
+                let Ok((collection, value, surrogate_u32, stamp)) = decoded else {
                     continue;
                 };
                 if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
                     continue;
                 }
-                if self.apply_document_put(
+                // Carry the stamp into apply scratch (forcing the versioned
+                // branch at the exact stamp the commit-time install used) and
+                // advance the per-core HLC so post-restart writes stay monotonic.
+                if let Some(s) = stamp {
+                    self.observe_bitemporal_stamp(s.sys_from_ms);
+                    self.active_bitemporal_stamps.insert(surrogate_u32, s);
+                }
+                let applied = self.apply_document_put(
                     database_id,
                     tenant_id,
                     &collection,
                     surrogate_u32,
                     &value,
                     record_lsn,
-                ) {
+                );
+                if stamp.is_some() {
+                    self.active_bitemporal_stamps.remove(&surrogate_u32);
+                }
+                if applied {
                     puts += 1;
                 }
             } else {

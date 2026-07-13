@@ -50,6 +50,7 @@ fn commit_columnar_vector() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 columnar_insert("metrics", "r1", 10),
                 vector_insert_ok("vec"),
@@ -70,6 +71,7 @@ fn rollback_columnar_then_vector_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![columnar_insert("metrics", "r1", 10), vector_fail("vec")],
         }),
     );
@@ -90,6 +92,7 @@ fn rollback_columnar_then_graph_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 columnar_insert("metrics", "r1", 10),
                 edge_put("g", "p", "q"),
@@ -116,6 +119,7 @@ fn rollback_columnar_then_timeseries_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 columnar_insert("metrics", "r1", 10),
                 timeseries_ingest("temp", ilp),
@@ -141,6 +145,7 @@ fn rollback_columnar_then_crdt_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 columnar_insert("metrics", "r1", 10),
                 crdt_apply("crdt_coll", "doc1"),
@@ -166,6 +171,7 @@ fn commit_timeseries_vector() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![timeseries_ingest("cpu", ilp), vector_insert_ok("vec")],
         }),
     );
@@ -184,6 +190,7 @@ fn rollback_timeseries_then_vector_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![timeseries_ingest("cpu", ilp), vector_fail("vec")],
         }),
     );
@@ -205,6 +212,7 @@ fn rollback_timeseries_then_graph_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 timeseries_ingest("cpu", ilp),
                 edge_put("g", "m", "n"),
@@ -231,6 +239,7 @@ fn rollback_timeseries_then_crdt_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 timeseries_ingest("cpu", ilp),
                 crdt_apply("crdt_coll", "doc1"),
@@ -261,6 +270,7 @@ fn rollback_crdt_then_doc_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 crdt_apply("crdt_coll", "doc1"),
                 doc_put("docs", "sentinel", b"modified"),
@@ -288,6 +298,7 @@ fn rollback_crdt_then_graph_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 crdt_apply("crdt_coll", "doc1"),
                 edge_put("g", "c1", "c2"),
@@ -312,6 +323,7 @@ fn rollback_crdt_then_kv_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 crdt_apply("crdt_coll", "doc1"),
                 kv_put(b"ck1", b"should_not_persist"),
@@ -336,6 +348,7 @@ fn rollback_crdt_then_columnar_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 crdt_apply("crdt_coll", "doc1"),
                 columnar_insert("metrics", "r1", 10),
@@ -361,6 +374,7 @@ fn rollback_crdt_then_timeseries_fail() {
         &mut tx,
         &mut rx,
         PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            txn_id: None,
             plans: vec![
                 crdt_apply("crdt_coll", "doc1"),
                 timeseries_ingest("cpu", ilp),

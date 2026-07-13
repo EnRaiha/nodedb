@@ -182,6 +182,7 @@ impl CoreLoop {
             txn_created_columnar_engines: HashMap::new(),
             write_index: super::write_index::WriteVersionIndex::new(),
             commit_pending: HashMap::new(),
+            active_bitemporal_stamps: HashMap::new(),
         })
     }
 }

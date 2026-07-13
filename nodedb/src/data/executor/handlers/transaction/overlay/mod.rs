@@ -15,6 +15,8 @@ pub(in crate::data::executor) use fts_merge::FtsMergeParams;
 pub use graph_staged::{GraphCollKey, GraphTxnOverlay, NodeLabelDelta};
 pub(in crate::data::executor) use merge::IndexOverlayMergeParams;
 pub(in crate::data::executor) use spatial_merge::SpatialOverlayMergeParams;
-pub use staged::{CollectionOverlay, MAX_TXN_OVERLAY_BYTES, Staged, StagedTtl, TxnOverlay};
+pub use staged::{
+    BitemporalStamp, CollectionOverlay, MAX_TXN_OVERLAY_BYTES, Staged, StagedTtl, TxnOverlay,
+};
 pub(in crate::data::executor) use timeseries_merge::TimeseriesOverlayMergeParams;
 pub(in crate::data::executor) use vector_merge::VectorMergeParams;

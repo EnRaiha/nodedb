@@ -30,7 +30,19 @@ pub enum MetaOp {
     },
 
     /// Atomic transaction batch: execute all sub-plans atomically.
-    TransactionBatch { plans: Vec<super::PhysicalPlan> },
+    ///
+    /// `txn_id` identifies the committing session transaction whose staging
+    /// overlay holds the resolve-time bitemporal stamps this install must reuse
+    /// (so a `bitemporal=true` document put lands on the same version key the
+    /// redo carries, not a fresh one). `None` for install paths with no session
+    /// overlay to consult — Calvin (which threads its stamps in directly) and
+    /// procedural/test callers. Wire-additive: defaults to `None` on decode of
+    /// older entries.
+    TransactionBatch {
+        plans: Vec<super::PhysicalPlan>,
+        #[serde(default)]
+        txn_id: Option<nodedb_types::id::TxnId>,
+    },
 
     /// Create a snapshot: export all engine state for this core.
     CreateSnapshot,

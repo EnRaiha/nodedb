@@ -75,10 +75,29 @@ impl CoreLoop {
         };
         let value = &value;
 
-        let bitemporal = self.is_bitemporal(tid, collection);
-        let sys_from_ms = self.bitemporal_now_ms();
-        let valid_from_ms = i64::MIN;
-        let valid_until_ms = i64::MAX;
+        // A resolve-time stamp carried in `active_bitemporal_stamps` (present on
+        // the commit-time base install and on WAL replay of an 8-tuple document
+        // redo) forces the versioned branch at the EXACT stamp the redo carries,
+        // independent of `doc_configs` — which is empty during WAL replay. This
+        // is what keeps a normal restart from writing a SECOND version of the
+        // row and a crash-window restart from landing it on the plain table.
+        // Absent an override, keep the autocommit behavior: derive bitemporality
+        // from config and mint a fresh monotonic stamp.
+        let (bitemporal, sys_from_ms, valid_from_ms, valid_until_ms) =
+            match self.active_bitemporal_stamps.get(&surrogate.as_u32()) {
+                Some(stamp) => (
+                    true,
+                    stamp.sys_from_ms,
+                    stamp.valid_from_ms,
+                    stamp.valid_until_ms,
+                ),
+                None => (
+                    self.is_bitemporal(tid, collection),
+                    self.bitemporal_now_ms(),
+                    i64::MIN,
+                    i64::MAX,
+                ),
+            };
 
         // Strict (Binary Tuple) encoding pipeline. Runs in two steps under
         // a single doc-config lookup:
