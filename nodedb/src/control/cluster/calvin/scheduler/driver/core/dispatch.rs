@@ -238,6 +238,8 @@ impl Scheduler {
                 // its response carries the local commit vote that drives the
                 // subsequent flush-or-drop.
                 commit_state: Some(super::super::types::CommitState::Staged),
+                // Set only once the txn parks in `AwaitingVerdict`.
+                verdict_deadline: None,
             },
         );
     }
@@ -341,6 +343,8 @@ impl Scheduler {
                 // WAL-only-restart durability. `resolve_staged_commit` reads the
                 // `read_set_valid: None` the active handler returns as "commit".
                 commit_state: Some(super::super::types::CommitState::Staged),
+                // Set only once the txn parks in `AwaitingVerdict`.
+                verdict_deadline: None,
             },
         );
     }

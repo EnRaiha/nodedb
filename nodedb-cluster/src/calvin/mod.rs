@@ -4,7 +4,7 @@ pub mod completion;
 pub mod sequencer;
 pub mod types;
 
-pub use completion::{AttemptOutcome, CalvinCompletionRegistry, TxnId};
+pub use completion::{AttemptOutcome, CalvinCompletionRegistry, TxnId, VerdictSignal};
 pub use sequencer::{
     AdmittedTx, ConflictKey, Inbox, InboxReceiver, RejectedTx, SEQUENCER_GROUP_ID, SequencerConfig,
     SequencerEntry, SequencerError, SequencerMetrics, SequencerService, SequencerStateMachine,

@@ -22,6 +22,23 @@ impl TxnId {
     }
 }
 
+/// Push notification that a staged cross-shard txn's authoritative global
+/// verdict is now durable on this node.
+///
+/// Emitted by [`CalvinCompletionRegistry::note_verdict`] to every locally
+/// registered per-vShard Calvin scheduler (broadcast). A scheduler parked in
+/// `AwaitingVerdict` matches by its parked `(epoch, position)` and resumes its
+/// flush (commit) or drop (abort). This is a latency optimization only: a
+/// dropped signal (full/closed channel) is backstopped by the scheduler's
+/// probe-on-park and its stall re-probe sweep — the durable verdict stored on
+/// the same registry mutex is the source of truth, never this signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerdictSignal {
+    pub epoch: u64,
+    pub position: u32,
+    pub commit: bool,
+}
+
 /// Terminal outcome of a single Calvin transaction attempt.
 ///
 /// Exactly one of these fires per attempt on the unified completion channel:
@@ -94,6 +111,11 @@ impl PendingCompletion {
 struct Inner {
     assignments: BTreeMap<u64, oneshot::Sender<(u64, u32, usize)>>,
     completions: BTreeMap<TxnId, PendingCompletion>,
+    /// Per-vShard senders for the verdict push, keyed by vShard id. Each local
+    /// Calvin scheduler registers its receiver's sender here at construction;
+    /// `note_verdict` broadcasts a [`VerdictSignal`] to all of them under this
+    /// same mutex, so a stored verdict and its push notification never disagree.
+    verdict_signal_senders: BTreeMap<u32, mpsc::Sender<VerdictSignal>>,
 }
 
 pub struct CalvinCompletionRegistry {
@@ -123,6 +145,22 @@ impl CalvinCompletionRegistry {
     pub fn new_detached() -> Arc<Self> {
         let (verdict_tx, _verdict_rx) = mpsc::channel(1);
         Self::new(verdict_tx)
+    }
+
+    /// Register a per-vShard scheduler's verdict-push sender.
+    ///
+    /// Called once per hosted vShard when its Calvin scheduler is constructed.
+    /// `note_verdict` broadcasts to every registered sender; a scheduler filters
+    /// by its own parked `(epoch, position)`, so registering all local vShards
+    /// on one broadcast list is correct (and matches the read-result sender
+    /// registry's per-vShard registration shape). A re-registration for the same
+    /// vShard replaces the prior sender.
+    pub fn register_verdict_signal_sender(&self, vshard: u32, tx: mpsc::Sender<VerdictSignal>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .verdict_signal_senders
+            .insert(vshard, tx);
     }
 
     pub fn register_submission(&self, inbox_seq: u64) -> oneshot::Receiver<(u64, u32, usize)> {
@@ -356,33 +394,54 @@ impl CalvinCompletionRegistry {
     }
 
     /// Store the authoritative commit/abort verdict for `txn`, applied from a
-    /// replicated `SequencerEntry::Verdict` on every replica.
+    /// replicated `SequencerEntry::Verdict` on every replica, then PUSH the
+    /// verdict to every locally parked Calvin scheduler.
     ///
     /// Idempotent: re-applying the same verdict is a no-op. A verdict that
     /// differs from a previously stored one is a determinism bug (the tally is
     /// computed deterministically from replicated votes) — it is logged at
-    /// `warn` and the latest value is stored. Currently observed-only: nothing
-    /// reads the stored verdict to change flush/drop behavior yet.
+    /// `warn` and the latest value is stored.
+    ///
+    /// Store-and-notify run under the ONE `inner` mutex so a scheduler that
+    /// probes `verdict(txn)` after the store is guaranteed to see it, and the
+    /// push (buffered in each scheduler's bounded channel) covers a scheduler
+    /// that probed just before the store. A `try_send` that fails (full/closed
+    /// channel) is a non-fatal drop — the scheduler's stall re-probe backstops
+    /// it — never a block or panic, mirroring the apply fan-out drop discipline.
     pub fn note_verdict(&self, txn: TxnId, commit: bool) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let entry = inner
-            .completions
-            .entry(txn)
-            .or_insert_with(|| PendingCompletion::new(0));
-        match entry.verdict {
-            Some(existing) if existing != commit => {
-                tracing::warn!(
-                    epoch = txn.epoch,
-                    position = txn.position,
-                    existing,
-                    proposed = commit,
-                    "calvin verdict differs from a previously applied one; \
-                     determinism bug — overwriting with the latest"
-                );
-                entry.verdict = Some(commit);
+        {
+            let entry = inner
+                .completions
+                .entry(txn)
+                .or_insert_with(|| PendingCompletion::new(0));
+            match entry.verdict {
+                Some(existing) if existing != commit => {
+                    tracing::warn!(
+                        epoch = txn.epoch,
+                        position = txn.position,
+                        existing,
+                        proposed = commit,
+                        "calvin verdict differs from a previously applied one; \
+                         determinism bug — overwriting with the latest"
+                    );
+                    entry.verdict = Some(commit);
+                }
+                Some(_) => {}
+                None => entry.verdict = Some(commit),
             }
-            Some(_) => {}
-            None => entry.verdict = Some(commit),
+        }
+
+        // Broadcast the push to every locally registered scheduler. Each filters
+        // by its own parked `(epoch, position)`; a drop on a full/closed channel
+        // is backstopped by the scheduler's probe/stall re-probe.
+        let signal = VerdictSignal {
+            epoch: txn.epoch,
+            position: txn.position,
+            commit,
+        };
+        for tx in inner.verdict_signal_senders.values() {
+            let _ = tx.try_send(signal);
         }
     }
 
@@ -733,6 +792,77 @@ mod tests {
             rx.try_recv().expect("verdict emitted at the 3rd vote"),
             (txn_b, true)
         );
+    }
+
+    #[tokio::test]
+    async fn note_verdict_pushes_signal_to_registered_scheduler() {
+        let reg = CalvinCompletionRegistry::new_detached();
+        let (tx, mut sig_rx) = mpsc::channel(8);
+        reg.register_verdict_signal_sender(7, tx);
+
+        let txn = TxnId::new(50, 2);
+        reg.note_verdict(txn, true);
+
+        // The stored verdict and the pushed signal must agree.
+        assert_eq!(reg.verdict(txn), Some(true));
+        assert_eq!(
+            sig_rx.try_recv().expect("verdict signal pushed"),
+            VerdictSignal {
+                epoch: 50,
+                position: 2,
+                commit: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn note_verdict_broadcasts_to_all_registered_schedulers() {
+        let reg = CalvinCompletionRegistry::new_detached();
+        let (tx1, mut rx1) = mpsc::channel(8);
+        let (tx2, mut rx2) = mpsc::channel(8);
+        reg.register_verdict_signal_sender(1, tx1);
+        reg.register_verdict_signal_sender(2, tx2);
+
+        let txn = TxnId::new(51, 0);
+        reg.note_verdict(txn, false);
+
+        // Both locally registered vShard schedulers receive the broadcast; each
+        // filters by its own parked (epoch, position).
+        assert!(!rx1.try_recv().expect("push to vshard 1").commit);
+        assert!(!rx2.try_recv().expect("push to vshard 2").commit);
+    }
+
+    #[tokio::test]
+    async fn note_verdict_with_full_channel_drops_signal_but_stores_verdict() {
+        let reg = CalvinCompletionRegistry::new_detached();
+        // Capacity-1 channel, pre-filled so the next try_send fails.
+        let (tx, mut rx) = mpsc::channel(1);
+        reg.register_verdict_signal_sender(9, tx);
+        let filler = TxnId::new(60, 0);
+        reg.note_verdict(filler, true);
+        // Buffer now holds one signal; do NOT drain it.
+
+        let txn = TxnId::new(60, 1);
+        reg.note_verdict(txn, true);
+        // The push was dropped (channel full) but the durable verdict is stored —
+        // the scheduler's stall re-probe reads it back. No panic, no block.
+        assert_eq!(reg.verdict(txn), Some(true));
+        // Only the first (filler) signal is buffered; the second was dropped.
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn note_verdict_with_closed_channel_is_non_fatal() {
+        let reg = CalvinCompletionRegistry::new_detached();
+        let (tx, rx) = mpsc::channel::<VerdictSignal>(8);
+        reg.register_verdict_signal_sender(3, tx);
+        drop(rx); // scheduler exited: receiver gone.
+
+        let txn = TxnId::new(61, 0);
+        // Must not panic despite the closed channel; the verdict still stores.
+        reg.note_verdict(txn, false);
+        assert_eq!(reg.verdict(txn), Some(false));
     }
 
     #[tokio::test]
