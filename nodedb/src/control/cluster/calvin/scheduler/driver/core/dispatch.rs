@@ -10,9 +10,7 @@ use nodedb_cluster::calvin::types::SequencedTxn;
 
 use super::routing::{PlanRouting, plan_vshard};
 use super::scheduler::Scheduler;
-use crate::bridge::envelope::{Priority, Request};
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
-use crate::types::{DatabaseId, ReadConsistency, VShardId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::MetaOp;
 
@@ -152,7 +150,6 @@ impl Scheduler {
     ) {
         let request_id = self.next_request_id();
         let tenant_id = txn.tx_class.tenant_id;
-        let vshard_id = VShardId::new(self.vshard_id);
         let epoch = txn.epoch;
         let position = txn.position;
 
@@ -199,42 +196,10 @@ impl Scheduler {
             versioned_reads: txn.tx_class.versioned_reads.as_slice().to_vec(),
         });
 
-        // no-determinism: request deadline is ephemeral, not written to WAL
-        let deadline = Instant::now()
-            + std::time::Duration::from_millis(
-                self.config.epoch_duration_ms * u64::from(self.config.txn_deadline_multiplier),
-            );
-
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id: DatabaseId::DEFAULT,
-            vshard_id,
-            plan,
-            deadline,
-            priority: Priority::Normal,
-            trace_id: nodedb_types::TraceId([0u8; 16]),
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-            txn_id: None,
-            // Calvin allocates the CalvinApplied WAL LSN post-apply (in the
-            // scheduler's response handler), so no committed LSN is known at
-            // dispatch time to stamp here.
-            wal_lsn: None,
-            // Calvin resolves TTL instants via `epoch_system_ms`, not this
-            // field — see `resolved_now_ms` precedence in the KV write handlers.
-            resolved_now_ms: None,
-            // Calvin-scheduled apply: the deterministic scheduler already holds
-            // this transaction's locks, so it does not re-acquire at the
-            // write-admission gate — Exempt.
-            admission: crate::bridge::envelope::Admission::Exempt(
-                crate::bridge::envelope::ExemptReason::AlreadyOrdered,
-            ),
-        };
+        // Calvin allocates the CalvinApplied WAL LSN post-apply (in the
+        // scheduler's response handler), so no committed LSN is known at
+        // dispatch time to stamp here.
+        let request = self.build_exempt_request(request_id, tenant_id, plan, None);
 
         let resp_rx = self.shared.tracker.register(request_id);
 
@@ -289,7 +254,6 @@ impl Scheduler {
     ) {
         let request_id = self.next_request_id();
         let tenant_id = txn.tx_class.tenant_id;
-        let vshard_id = VShardId::new(self.vshard_id);
         let epoch = txn.epoch;
         let position = txn.position;
 
@@ -333,42 +297,10 @@ impl Scheduler {
             is_group_leader: self.is_group_leader(),
         });
 
-        // no-determinism: request deadline is ephemeral, not written to WAL
-        let deadline = Instant::now()
-            + std::time::Duration::from_millis(
-                self.config.epoch_duration_ms * u64::from(self.config.txn_deadline_multiplier),
-            );
-
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id: DatabaseId::DEFAULT,
-            vshard_id,
-            plan,
-            deadline,
-            priority: Priority::Normal,
-            trace_id: nodedb_types::TraceId([0u8; 16]),
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-            txn_id: None,
-            // Calvin allocates the CalvinApplied WAL LSN post-apply (in the
-            // scheduler's response handler), so no committed LSN is known at
-            // dispatch time to stamp here.
-            wal_lsn: None,
-            // Calvin resolves TTL instants via `epoch_system_ms`, not this
-            // field — see `resolved_now_ms` precedence in the KV write handlers.
-            resolved_now_ms: None,
-            // Calvin-scheduled apply: the deterministic scheduler already holds
-            // this transaction's locks, so it does not re-acquire at the
-            // write-admission gate — Exempt.
-            admission: crate::bridge::envelope::Admission::Exempt(
-                crate::bridge::envelope::ExemptReason::AlreadyOrdered,
-            ),
-        };
+        // Calvin allocates the CalvinApplied WAL LSN post-apply (in the
+        // scheduler's response handler), so no committed LSN is known at
+        // dispatch time to stamp here.
+        let request = self.build_exempt_request(request_id, tenant_id, plan, None);
 
         let resp_rx = self.shared.tracker.register(request_id);
 

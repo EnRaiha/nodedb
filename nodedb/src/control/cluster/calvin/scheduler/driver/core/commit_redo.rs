@@ -11,14 +11,12 @@
 //! commit), then hand off to `dispatch_commit_resolution` for the flush that
 //! `finish_resolved_commit` / `commit_apply_tail` complete.
 
-use std::time::Instant;
-
 use super::super::types::CommitState;
 use super::scheduler::Scheduler;
-use crate::bridge::envelope::{Admission, ExemptReason, Priority, Request, Response, Status};
+use crate::bridge::envelope::{Response, Status};
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason;
-use crate::types::{DatabaseId, ReadConsistency, VShardId};
+use crate::types::{DatabaseId, VShardId};
 use crate::wal::{CalvinStamp, RedoRecord};
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::MetaOp;
@@ -145,37 +143,10 @@ impl Scheduler {
         let position = txn_id.position;
 
         let request_id = self.next_request_id();
-        // no-determinism: request deadline is ephemeral, not written to WAL
-        let deadline = Instant::now()
-            + std::time::Duration::from_millis(
-                self.config.epoch_duration_ms * u64::from(self.config.txn_deadline_multiplier),
-            );
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::new(self.vshard_id),
-            plan: PhysicalPlan::Meta(MetaOp::CalvinResolve { epoch, position }),
-            deadline,
-            priority: Priority::Normal,
-            trace_id: nodedb_types::TraceId([0u8; 16]),
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-            txn_id: None,
-            // A resolve reads the staged overlay only; it writes no WAL record
-            // itself, so no committed LSN rides on this envelope.
-            wal_lsn: None,
-            // Calvin resolves TTL instants via `epoch_system_ms`, not this
-            // field — see `resolved_now_ms` precedence in the KV write handlers.
-            resolved_now_ms: None,
-            // The scheduler already holds this transaction's locks, so the
-            // write-admission gate must not re-acquire — Exempt.
-            admission: Admission::Exempt(ExemptReason::AlreadyOrdered),
-        };
+        let plan = PhysicalPlan::Meta(MetaOp::CalvinResolve { epoch, position });
+        // A resolve reads the staged overlay only; it writes no WAL record
+        // itself, so no committed LSN rides on this envelope.
+        let request = self.build_exempt_request(request_id, tenant_id, plan, None);
 
         let resp_rx = self.shared.tracker.register(request_id);
         let dispatch_result = match self.shared.dispatcher.lock() {

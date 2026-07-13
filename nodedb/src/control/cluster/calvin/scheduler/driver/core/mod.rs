@@ -21,6 +21,8 @@
 //!   into a replayable `TransactionRedo` WAL record ahead of the flush.
 //! - [`read_result`] — `CalvinReadResult` handling and barrier timeouts.
 //! - [`propose`] — propose `CalvinReadResult` Raft entries.
+//! - [`request`] — shared `Request` construction for already-sequenced Calvin
+//!   sub-operations.
 //! - [`write_version_record`] — post-apply write-version recording for
 //!   committed Calvin transactions (at the CalvinApplied WAL LSN).
 //!
@@ -43,6 +45,7 @@ pub mod dispatch;
 pub mod process;
 pub mod propose;
 pub mod read_result;
+pub mod request;
 pub mod routing;
 pub mod scheduler;
 pub mod write_version_record;

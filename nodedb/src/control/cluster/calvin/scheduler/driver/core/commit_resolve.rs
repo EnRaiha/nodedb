@@ -13,16 +13,14 @@
 //! drop.
 
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use nodedb_cluster::calvin::SequencerEntry;
 
 use super::super::types::CommitState;
 use super::scheduler::Scheduler;
-use crate::bridge::envelope::{Admission, ExemptReason, Priority, Request, Response, Status};
+use crate::bridge::envelope::{Response, Status};
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason;
-use crate::types::{DatabaseId, ReadConsistency, VShardId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::MetaOp;
 
@@ -287,38 +285,10 @@ impl Scheduler {
         };
 
         let request_id = self.next_request_id();
-        // no-determinism: request deadline is ephemeral, not written to WAL
-        let deadline = Instant::now()
-            + std::time::Duration::from_millis(
-                self.config.epoch_duration_ms * u64::from(self.config.txn_deadline_multiplier),
-            );
-        let request = Request {
-            request_id,
-            tenant_id,
-            database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::new(self.vshard_id),
-            plan,
-            deadline,
-            priority: Priority::Normal,
-            trace_id: nodedb_types::TraceId([0u8; 16]),
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-            txn_id: None,
-            // The redo record (if any) was already WAL-appended by the caller
-            // before this dispatch — see `finish_redo_resolve` — so its LSN
-            // rides on the envelope here rather than being allocated post-apply.
-            wal_lsn,
-            // Calvin resolves TTL instants via `epoch_system_ms`, not this
-            // field — see `resolved_now_ms` precedence in the KV write handlers.
-            resolved_now_ms: None,
-            // The scheduler already holds this transaction's locks, so the
-            // write-admission gate must not re-acquire — Exempt.
-            admission: Admission::Exempt(ExemptReason::AlreadyOrdered),
-        };
+        // The redo record (if any) was already WAL-appended by the caller
+        // before this dispatch — see `finish_redo_resolve` — so its LSN
+        // rides on the envelope here rather than being allocated post-apply.
+        let request = self.build_exempt_request(request_id, tenant_id, plan, wal_lsn);
 
         let resp_rx = self.shared.tracker.register(request_id);
         let dispatch_result = match self.shared.dispatcher.lock() {

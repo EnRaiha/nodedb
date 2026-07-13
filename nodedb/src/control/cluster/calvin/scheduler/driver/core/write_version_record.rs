@@ -13,12 +13,10 @@
 //! single-shard fast path and read watermarks use.
 
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use super::scheduler::Scheduler;
-use crate::bridge::envelope::{Admission, ExemptReason, Priority, Request};
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
-use crate::types::{DatabaseId, Lsn, ReadConsistency, VShardId};
+use crate::types::Lsn;
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::MetaOp;
 
@@ -86,38 +84,13 @@ impl Scheduler {
         };
 
         let request_id = self.next_request_id();
-        let deadline = Instant::now()
-            + std::time::Duration::from_millis(
-                self.config.epoch_duration_ms * u64::from(self.config.txn_deadline_multiplier),
-            );
-        let request = Request {
-            request_id,
+        let plan = PhysicalPlan::Meta(MetaOp::RecordCalvinWriteVersions {
             tenant_id,
-            database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::new(self.vshard_id),
-            plan: PhysicalPlan::Meta(MetaOp::RecordCalvinWriteVersions {
-                tenant_id,
-                plans: local,
-            }),
-            deadline,
-            priority: Priority::Normal,
-            trace_id: nodedb_types::TraceId([0u8; 16]),
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
-            txn_id: None,
-            // The committed write-LSN for this Calvin apply — recorded against
-            // every key the plans wrote, in the same WAL-LSN space as fast-path.
-            wal_lsn: Some(applied_lsn),
-            // Record-only pass: no TTL resolution happens here.
-            resolved_now_ms: None,
-            // Recording only — the scheduler already held (and is releasing) this
-            // transaction's locks; the write-admission gate must not re-acquire.
-            admission: Admission::Exempt(ExemptReason::AlreadyOrdered),
-        };
+            plans: local,
+        });
+        // The committed write-LSN for this Calvin apply — recorded against
+        // every key the plans wrote, in the same WAL-LSN space as fast-path.
+        let request = self.build_exempt_request(request_id, tenant_id, plan, Some(applied_lsn));
 
         // Register so the response routes to a real receiver (not the
         // unknown-request warning path), then discard it — the recording is
