@@ -18,6 +18,7 @@ use crate::types::{Lsn, TenantId};
 use nodedb_physical::physical_plan::{
     ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, SpatialOp, TextOp, TimeseriesOp, VectorOp,
 };
+use nodedb_types::Surrogate;
 
 impl CoreLoop {
     /// Record the version of every key written by a committed transaction batch.
@@ -138,6 +139,19 @@ impl CoreLoop {
         );
     }
 
+    /// Records the version of a vector-engine write within a committed
+    /// transaction batch.
+    ///
+    /// Mirrors the fork resolution the live write handlers apply (see
+    /// `handlers/vector*.rs`): surrogate-carrying ops record `KeyRepr::Surrogate`
+    /// per surrogate (a superset of the collection floor, since vector SEARCH
+    /// reads always record `ReadKey::Predicate`, the collection floor); sparse
+    /// ops (keyed by `doc_id: String`, no cross-engine surrogate) and
+    /// `Delete` (whose `vector_id` is the internal HNSW node id, NOT the
+    /// surrogate — recording it as `KeyRepr::Surrogate` would be a wrong
+    /// identity) record the collection floor only. Read/config/query ops
+    /// write nothing and are named explicitly below so the match stays
+    /// exhaustive.
     fn record_vector_version(
         &mut self,
         db: crate::types::DatabaseId,
@@ -145,19 +159,88 @@ impl CoreLoop {
         op: &VectorOp,
         lsn: Lsn,
     ) {
-        if let VectorOp::Insert {
-            collection,
-            surrogate,
-            ..
-        } = op
-        {
-            self.note_write_lsn(
-                db,
-                tenant,
+        match op {
+            VectorOp::Insert {
                 collection,
-                Some(KeyRepr::Surrogate(surrogate.as_u32())),
-                lsn,
-            );
+                surrogate,
+                ..
+            }
+            | VectorOp::DirectUpsert {
+                collection,
+                surrogate,
+                ..
+            }
+            | VectorOp::DeleteBySurrogate {
+                collection,
+                surrogate,
+                ..
+            } => {
+                self.note_write_lsn(
+                    db,
+                    tenant,
+                    collection,
+                    Some(KeyRepr::Surrogate(surrogate.as_u32())),
+                    lsn,
+                );
+            }
+            VectorOp::MultiVectorInsert {
+                collection,
+                document_surrogate,
+                ..
+            }
+            | VectorOp::MultiVectorDelete {
+                collection,
+                document_surrogate,
+                ..
+            } => {
+                self.note_write_lsn(
+                    db,
+                    tenant,
+                    collection,
+                    Some(KeyRepr::Surrogate(document_surrogate.as_u32())),
+                    lsn,
+                );
+            }
+            VectorOp::BatchInsert {
+                collection,
+                surrogates,
+                ..
+            } => {
+                let mut any_surrogate_recorded = false;
+                for s in surrogates {
+                    if *s != Surrogate::ZERO {
+                        self.note_write_lsn(
+                            db,
+                            tenant,
+                            collection,
+                            Some(KeyRepr::Surrogate(s.as_u32())),
+                            lsn,
+                        );
+                        any_surrogate_recorded = true;
+                    }
+                }
+                if !any_surrogate_recorded {
+                    self.note_write_lsn(db, tenant, collection, None, lsn);
+                }
+            }
+            // Sparse (doc_id-keyed, no surrogate) and `Delete` (vector_id is
+            // the internal HNSW node id, not the surrogate): collection floor
+            // only.
+            VectorOp::SparseInsert { collection, .. }
+            | VectorOp::SparseDelete { collection, .. }
+            | VectorOp::Delete { collection, .. } => {
+                self.note_write_lsn(db, tenant, collection, None, lsn);
+            }
+            // Read / config / query ops: nothing written, no version to record.
+            VectorOp::Search { .. }
+            | VectorOp::MultiSearch { .. }
+            | VectorOp::SetParams { .. }
+            | VectorOp::QueryStats { .. }
+            | VectorOp::Seal { .. }
+            | VectorOp::CompactIndex { .. }
+            | VectorOp::Rebuild { .. }
+            | VectorOp::SparseSearch { .. }
+            | VectorOp::MultiVectorScoreSearch { .. } => {}
         }
     }
 

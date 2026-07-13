@@ -85,6 +85,9 @@ impl CoreLoop {
         let index = self.get_or_create_sparse_index(database_id, tid, collection, field_name);
         index.insert(doc_id, &sv);
         self.checkpoint_coordinator.mark_dirty("vector", 1);
+        // Sparse vectors are keyed by `doc_id: String` — no cross-engine
+        // surrogate — so only the collection floor is recorded.
+        self.note_collection_write_lsn(task, collection);
         self.response_ok(task)
     }
 
@@ -184,9 +187,135 @@ impl CoreLoop {
 
         if index.delete(doc_id) {
             self.checkpoint_coordinator.mark_dirty("vector", 1);
+            // Sparse vectors are keyed by `doc_id: String` — no cross-engine
+            // surrogate — so only the collection floor is recorded.
+            self.note_collection_write_lsn(task, collection);
             self.response_ok(task)
         } else {
             self.response_error(task, ErrorCode::NotFound)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::{
+        Admission, ExemptReason, PhysicalPlan, Priority, Request, Status,
+    };
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::core_loop::write_index::{CollKey, KeyRepr, WriteKey};
+    use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+    use nodedb_bridge::buffer::RingBuffer;
+    use nodedb_physical::physical_plan::VectorOp;
+    use std::time::{Duration, Instant};
+
+    struct CoreHarness {
+        core: CoreLoop,
+        _req_tx: nodedb_bridge::buffer::Producer<crate::bridge::dispatch::BridgeRequest>,
+        _resp_rx: nodedb_bridge::buffer::Consumer<crate::bridge::dispatch::BridgeResponse>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn make_core() -> CoreHarness {
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("open core");
+        CoreHarness {
+            core,
+            _req_tx: req_tx,
+            _resp_rx: resp_rx,
+            _dir: dir,
+        }
+    }
+
+    /// A task carrying `wal_lsn` so `note_collection_write_lsn` (gated on
+    /// `task.wal_lsn().is_some()`) actually fires, mirroring a live write
+    /// dispatched with an allocated WAL LSN.
+    fn make_task_with_lsn(lsn: u64) -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Vector(VectorOp::Search {
+                collection: "docs".to_string(),
+                query_vector: Vec::new(),
+                top_k: 0,
+                ef_search: 0,
+                metric: nodedb_types::vector_distance::DistanceMetric::L2,
+                filter_bitmap: None,
+                field_name: String::new(),
+                rls_filters: Vec::new(),
+                inline_prefilter_plan: None,
+                ann_options: Default::default(),
+                skip_payload_fetch: false,
+                payload_filters: Vec::new(),
+            }),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: Some(Lsn::new(lsn)),
+            resolved_now_ms: None,
+            admission: Admission::Exempt(ExemptReason::Read),
+        })
+    }
+
+    #[test]
+    fn sparse_insert_populates_collection_floor_only_no_surrogate_entry() {
+        let mut h = make_core();
+        let task = make_task_with_lsn(41);
+
+        let response = h.core.execute_sparse_insert(
+            &task,
+            1,
+            "sparse_docs",
+            "vec",
+            "doc-1",
+            &[(3, 0.5), (7, 1.5)],
+        );
+        assert_eq!(response.status, Status::Ok);
+
+        let coll_key = CollKey {
+            db: DatabaseId::DEFAULT,
+            tenant: TenantId::new(1),
+            collection: Box::from("sparse_docs"),
+        };
+        assert_eq!(
+            h.core.write_index.collection_write_lsn(&coll_key),
+            Some(Lsn::new(41)),
+            "sparse insert must advance the collection write-version floor"
+        );
+
+        // Sparse vectors carry no cross-engine surrogate: no would-be
+        // per-key `Surrogate` entry must exist for this write.
+        let would_be_key = WriteKey {
+            db: DatabaseId::DEFAULT,
+            tenant: TenantId::new(1),
+            collection: Box::from("sparse_docs"),
+            key: KeyRepr::Surrogate(0),
+        };
+        assert_eq!(
+            h.core.write_index.key_write_lsn(&would_be_key),
+            None,
+            "sparse insert must not record a per-key surrogate entry"
+        );
     }
 }

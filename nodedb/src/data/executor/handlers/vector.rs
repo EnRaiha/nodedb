@@ -198,7 +198,7 @@ impl CoreLoop {
             && cfg.index_type == crate::engine::vector::index_config::IndexType::IvfPq
         {
             let key = index_key.clone();
-            return self.ivf_insert(task, &key, vector, dim, surrogate);
+            return self.ivf_insert(task, tid, &key, vector, dim, surrogate);
         }
 
         // Default: HNSW (with or without PQ).
@@ -222,6 +222,15 @@ impl CoreLoop {
                     warn!(core = self.core_id, error = %e, "failed to send HNSW build request");
                 }
                 self.checkpoint_coordinator.mark_dirty("vector", 1);
+                // Record this write's version so cross-shard OCC read-set
+                // validation (predicate reads always record the collection
+                // floor) sees this insert. `ZERO` means no surrogate binding
+                // was made (headless insert) — floor-only.
+                if surrogate == Surrogate::ZERO {
+                    self.note_collection_write_lsn(task, collection);
+                } else {
+                    self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+                }
                 self.response_ok(task)
             }
             Err(err) => self.response_error(task, err),
@@ -232,6 +241,7 @@ impl CoreLoop {
     fn ivf_insert(
         &mut self,
         task: &ExecutionTask,
+        tid: u64,
         index_key: &(DatabaseId, TenantId, String),
         vector: &[f32],
         dim: usize,
@@ -274,6 +284,14 @@ impl CoreLoop {
         }
 
         self.checkpoint_coordinator.mark_dirty("vector", 1);
+        // Record this write's version so cross-shard OCC read-set validation
+        // sees this insert, same as the HNSW insert path above. `ZERO` means
+        // no surrogate binding was made (headless insert) — floor-only.
+        if surrogate == Surrogate::ZERO {
+            self.note_collection_write_lsn(task, &index_key.2);
+        } else {
+            self.note_surrogate_write_lsn(task, tid, &index_key.2, surrogate.as_u32());
+        }
         self.response_ok(task)
     }
 
@@ -375,11 +393,147 @@ impl CoreLoop {
             .and_then(|c| c.surrogate_to_local.get(&surrogate).copied());
 
         match node_id {
-            Some(vid) => self.execute_vector_delete(task, tid, collection, vid),
+            Some(vid) => {
+                let response = self.execute_vector_delete(task, tid, collection, vid);
+                if response.status == crate::bridge::envelope::Status::Ok {
+                    // Record this write's version keyed by the cross-engine
+                    // surrogate (a superset of `execute_vector_delete`'s
+                    // node-id-scoped floor-only record below — correct and
+                    // more precise since the surrogate identity is known here).
+                    self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+                }
+                response
+            }
             None => {
                 // Surrogate not present — idempotent.
                 self.response_ok(task)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::{PhysicalPlan, Priority, Request};
+    use crate::data::executor::core_loop::write_index::WriteKey;
+    use crate::types::{Lsn, RequestId, TraceId, VShardId};
+    use nodedb_bridge::buffer::RingBuffer;
+    use nodedb_physical::physical_plan::VectorOp;
+    use std::time::{Duration, Instant};
+
+    struct CoreHarness {
+        core: CoreLoop,
+        _req_tx: nodedb_bridge::buffer::Producer<crate::bridge::dispatch::BridgeRequest>,
+        _resp_rx: nodedb_bridge::buffer::Consumer<crate::bridge::dispatch::BridgeResponse>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn make_core() -> CoreHarness {
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("open core");
+        CoreHarness {
+            core,
+            _req_tx: req_tx,
+            _resp_rx: resp_rx,
+            _dir: dir,
+        }
+    }
+
+    /// A task carrying `wal_lsn` so the handler's `note_*_write_lsn` calls
+    /// (gated on `task.wal_lsn().is_some()`) actually fire, mirroring a live
+    /// write dispatched with an allocated WAL LSN.
+    fn make_task_with_lsn(lsn: u64) -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Vector(VectorOp::Search {
+                collection: "docs".to_string(),
+                query_vector: Vec::new(),
+                top_k: 0,
+                ef_search: 0,
+                metric: nodedb_types::vector_distance::DistanceMetric::L2,
+                filter_bitmap: None,
+                field_name: String::new(),
+                rls_filters: Vec::new(),
+                inline_prefilter_plan: None,
+                ann_options: Default::default(),
+                skip_payload_fetch: false,
+                payload_filters: Vec::new(),
+            }),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: crate::types::ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: Some(Lsn::new(lsn)),
+            resolved_now_ms: None,
+            admission: crate::bridge::envelope::Admission::Exempt(
+                crate::bridge::envelope::ExemptReason::Read,
+            ),
+        })
+    }
+
+    #[test]
+    fn vector_insert_populates_write_version_index_surrogate_and_floor() {
+        let mut h = make_core();
+        let task = make_task_with_lsn(11);
+        let surrogate = Surrogate::new(42);
+
+        let response = h.core.execute_vector_insert(VectorInsertParams {
+            task: &task,
+            tid: 1,
+            collection: "docs",
+            vector: &[1.0, 2.0, 3.0],
+            dim: 3,
+            field_name: "",
+            surrogate,
+            provenance: None,
+        });
+        assert_eq!(response.status, crate::bridge::envelope::Status::Ok);
+
+        let key = WriteKey {
+            db: DatabaseId::DEFAULT,
+            tenant: TenantId::new(1),
+            collection: Box::from("docs"),
+            key: crate::data::executor::core_loop::write_index::KeyRepr::Surrogate(
+                surrogate.as_u32(),
+            ),
+        };
+        assert_eq!(
+            h.core.write_index.key_write_lsn(&key),
+            Some(Lsn::new(11)),
+            "vector insert must populate the per-key (surrogate) write-version index"
+        );
+
+        let coll_key = crate::data::executor::core_loop::write_index::CollKey {
+            db: DatabaseId::DEFAULT,
+            tenant: TenantId::new(1),
+            collection: Box::from("docs"),
+        };
+        assert_eq!(
+            h.core.write_index.collection_write_lsn(&coll_key),
+            Some(Lsn::new(11)),
+            "vector insert must advance the collection write-version floor \
+             (predicate reads validate against the floor)"
+        );
     }
 }
