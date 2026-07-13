@@ -17,7 +17,7 @@ use crate::control::array_sync::raft_apply::{
 use crate::control::cluster::calvin::ReadResultEvent;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{ReplicatedEntry, ReplicatedWrite, from_replicated_entry};
-use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, ReadConsistency, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::ArrayOp;
 
 use super::applier::ApplyBatch;
@@ -49,6 +49,7 @@ fn build_request(
     plan: PhysicalPlan,
     resolved_now_ms: Option<u64>,
     event_source: crate::event::EventSource,
+    record_lsn: Option<Lsn>,
 ) -> Request {
     Request {
         request_id: state.next_request_id(),
@@ -66,12 +67,25 @@ fn build_request(
         user_id: None,
         statement_digest: None,
         txn_id: None,
-        wal_lsn: None,
+        wal_lsn: record_lsn,
         resolved_now_ms,
         admission: crate::bridge::envelope::Admission::Exempt(
             crate::bridge::envelope::ExemptReason::AlreadyOrdered,
         ),
     }
+}
+
+/// The write-version LSN a follower stamps for a committed entry: the Raft log
+/// index (1-based, monotonic per core, identical across replicas). The leader's
+/// WAL LSN is intentionally not carried on the wire (`ReplicatedWrite` omits
+/// it — followers allocate their own WAL LSN at apply time); OCC validation is
+/// shard-local (both `read_lsn` and the recorded write-version LSN come from
+/// the same `note_write_lsn` feed on a given replica), so a consistent local
+/// monotonic LSN is the correct source, and `entry.index` is monotonic per
+/// core (one vShard homes to one Raft group). `Lsn::ZERO` stays the
+/// "never-written" sentinel.
+fn record_lsn_for(entry: &nodedb_raft::message::LogEntry) -> Option<Lsn> {
+    (entry.index != 0).then(|| Lsn::new(entry.index))
 }
 
 /// Dispatch a request through the SPSC bridge and await its response.
@@ -323,6 +337,7 @@ pub async fn run_apply_loop(
                 plan,
                 resolved_now_ms,
                 crate::event::EventSource::User,
+                record_lsn_for(entry),
             );
 
             let result = match dispatch_and_await(&state, request).await {
@@ -384,5 +399,30 @@ fn maybe_compact_log(state: &Arc<SharedState>, group_id: u64, applied_index: u64
                 "raft log compaction failed"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log_entry(index: u64) -> nodedb_raft::message::LogEntry {
+        nodedb_raft::message::LogEntry {
+            term: 1,
+            index,
+            data: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn record_lsn_for_uses_entry_index() {
+        let entry = log_entry(7);
+        assert_eq!(record_lsn_for(&entry), Some(Lsn::new(7)));
+    }
+
+    #[test]
+    fn record_lsn_for_none_when_index_zero() {
+        let entry = log_entry(0);
+        assert_eq!(record_lsn_for(&entry), None);
     }
 }
