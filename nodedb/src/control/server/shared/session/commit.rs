@@ -13,7 +13,7 @@
 use std::net::SocketAddr;
 
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
-use crate::control::planner::calvin::{DispatchClass, classify_dispatch};
+use crate::control::planner::calvin::{DispatchClass, classify_dispatch, read_vshards_of};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::plan_util::extract_collection;
 use crate::control::state::SharedState;
@@ -23,6 +23,7 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::ddl_buffer;
 use super::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
+use super::read_set::ReadSetEntry;
 use super::store::SessionStore;
 
 /// Run the neutral COMMIT sequence for the connection at `addr`.
@@ -37,7 +38,6 @@ pub async fn run_commit(
     state: &SharedState,
     dp: &impl TxnDataPlane,
 ) -> CommitOutcome {
-    // Snapshot isolation: check for write conflicts before committing.
     let read_set = sessions.take_read_set(addr);
     // Collections this transaction wrote itself. A read of a collection the
     // same transaction has written is a read-your-own-write, not a
@@ -46,44 +46,17 @@ pub async fn run_commit(
     // The read-set is collection-granular, so exclusion is too.
     let written_collections =
         sessions.buffered_collections(addr, |plan| extract_collection(plan).map(String::from));
-    if let Some(snapshot_lsn) = sessions.snapshot_lsn(addr) {
-        let current_lsn = state.wal.next_lsn();
-        let current = crate::types::Lsn::new(current_lsn.as_u64().saturating_sub(1));
-        for entry in &read_set {
-            let collection = &entry.collection;
-            let read_lsn = entry.read_lsn;
-            if written_collections.contains(collection) {
-                continue;
-            }
-            if current > read_lsn && current > snapshot_lsn {
-                // WAL advanced past what we read — concurrent write detected.
-                if let Ok(reservations) = sessions.rollback(addr) {
-                    for handle in &reservations {
-                        let key = handle.sequence_key.clone();
-                        let registry = &state.sequence_registry;
-                        registry.gap_free_manager().rollback(handle, || {
-                            let map = registry.sequences_read();
-                            if let Some(h) = map.get(&key) {
-                                h.rollback_one();
-                            }
-                        });
-                    }
-                }
-                return CommitOutcome::Aborted {
-                    reason: AbortReason::Serialization,
-                };
-            }
-        }
-    }
-
-    let buffered = match sessions.commit(addr) {
-        Ok(b) => b,
-        Err(_msg) => {
-            return CommitOutcome::Aborted {
-                reason: AbortReason::NoTransaction,
-            };
-        }
-    };
+    // Peek the buffered write tasks WITHOUT draining them or leaving the block.
+    // The session stays `InBlock` through classification and dispatch so a
+    // cross-shard write's `MultiShard` classification still sees `InBlock` and
+    // fires the `CrossShardInExplicitTransaction` reject inside `run_commit_calvin`.
+    let buffered = sessions.buffered_tasks(addr);
+    let tenant_id = identity.tenant_id;
+    // The interactive-COMMIT read-set widens dispatch classification: a txn that
+    // writes shard X but read shard Y participates in {X, Y} and must route
+    // through Calvin (which then rejects it as a cross-shard write inside an
+    // explicit block). Autocommit has no session read-set.
+    let read_vshards = read_vshards_of(&read_set);
 
     // In-transaction `MERGE`, `UPDATE ... FROM <source>`, and `INSERT ... SELECT`
     // are resolved + staged into concrete, surrogate-carrying point writes
@@ -92,37 +65,68 @@ pub async fn run_commit(
     // concrete point ops — no raw `Merge` / `UpdateFromJoin` / `InsertSelect`
     // plan remains to expand here, and COMMIT invokes no expander at all.
 
-    if !buffered.is_empty() {
-        let tenant_id = identity.tenant_id;
-
-        match classify_dispatch(&buffered) {
-            DispatchClass::SingleShard { vshard: vshard_id } => {
-                if let Some(reason) =
-                    dispatch_single_shard(state, dp, &buffered, tenant_id, vshard_id).await
-                {
-                    return CommitOutcome::Aborted { reason };
-                }
-            }
+    if buffered.is_empty() {
+        // Read-only interactive transaction: no writes to classify, but it can
+        // still serialization-conflict against concurrent writers. Run the
+        // single-shard SI validation only — classifying an empty buffer would
+        // misread a lone cross-shard READ as `MultiShard` and wrongly reject it.
+        if let Some(outcome) =
+            si_conflict_abort(sessions, addr, state, &read_set, &written_collections)
+        {
+            return outcome;
+        }
+    } else {
+        match classify_dispatch(&buffered, &read_vshards) {
             DispatchClass::MultiShard { .. } => {
+                // The session is STILL `InBlock` here, so `run_commit_calvin`'s
+                // `InBlock` gate fires `CrossShardInExplicitTransaction`. SI is a
+                // single-shard validation and is intentionally NOT run here.
                 if let Some(reason) = super::commit_calvin::run_commit_calvin(
-                    sessions, addr, state, dp, &buffered, tenant_id,
+                    sessions, addr, state, dp, &buffered, tenant_id, &read_set,
                 )
                 .await
                 {
+                    rollback_with_gap_free(sessions, addr, state);
+                    return CommitOutcome::Aborted { reason };
+                }
+            }
+            DispatchClass::SingleShard { vshard: vshard_id } => {
+                if let Some(outcome) =
+                    si_conflict_abort(sessions, addr, state, &read_set, &written_collections)
+                {
+                    return outcome;
+                }
+                if let Some(reason) =
+                    dispatch_single_shard(state, dp, &buffered, tenant_id, vshard_id).await
+                {
+                    rollback_with_gap_free(sessions, addr, state);
                     return CommitOutcome::Aborted { reason };
                 }
             }
         }
+    }
 
-        // Release the per-transaction staging overlay on every vShard that
-        // hosted a staged write, now that the durable batch(es) have flushed.
-        // Guarded on a staged (txn_id-carrying) buffer.
-        if let Some(txn_id) = buffered[0].txn_id {
-            let mut dropped = std::collections::HashSet::new();
-            for task in &buffered {
-                if dropped.insert(task.vshard_id) {
-                    drop_txn_overlay(dp, tenant_id, task.vshard_id, txn_id).await;
-                }
+    // Every abort branch above has already returned; the transaction is durable.
+    // Transition the session out of the block NOW — this drains the write buffer
+    // and clears snapshot/txn state, moving the session to `Idle`.
+    match sessions.commit(addr) {
+        Ok(_) => {}
+        Err(_msg) => {
+            return CommitOutcome::Aborted {
+                reason: AbortReason::NoTransaction,
+            };
+        }
+    }
+
+    // Release the per-transaction staging overlay on every vShard that hosted a
+    // staged write, now that the durable batch(es) have flushed. Uses the peeked
+    // buffer (identical contents to the drained one). Guarded on a staged
+    // (txn_id-carrying) buffer.
+    if let Some(txn_id) = buffered.first().and_then(|t| t.txn_id) {
+        let mut dropped = std::collections::HashSet::new();
+        for task in &buffered {
+            if dropped.insert(task.vshard_id) {
+                drop_txn_overlay(dp, tenant_id, task.vshard_id, txn_id).await;
             }
         }
     }
@@ -173,6 +177,63 @@ pub async fn run_commit(
     // Flush NOTIFY messages buffered during this transaction.
     sessions.flush_pending_notifies(addr, identity.tenant_id, &state.notify_bus);
     CommitOutcome::Committed
+}
+
+/// Snapshot-isolation write-conflict check for a single-shard interactive
+/// COMMIT. If any read key's collection advanced past both the read LSN and the
+/// transaction snapshot LSN — and the transaction did not write that collection
+/// itself (read-your-own-write is excluded) — the WAL moved under the reader:
+/// roll the session back (releasing GAP_FREE reservations) and return a
+/// serialization abort. Returns `None` when there is no conflict (or no
+/// snapshot, i.e. not in a transaction).
+///
+/// This is a single-shard validation: it compares against the global WAL
+/// `next_lsn`, so it is only sound for a transaction whose participants are one
+/// shard, and is run exclusively on the `SingleShard` / read-only paths.
+fn si_conflict_abort(
+    sessions: &SessionStore,
+    addr: &SocketAddr,
+    state: &SharedState,
+    read_set: &[ReadSetEntry],
+    written_collections: &std::collections::HashSet<String>,
+) -> Option<CommitOutcome> {
+    let snapshot_lsn = sessions.snapshot_lsn(addr)?;
+    let current_lsn = state.wal.next_lsn();
+    let current = crate::types::Lsn::new(current_lsn.as_u64().saturating_sub(1));
+    for entry in read_set {
+        let collection = &entry.collection;
+        let read_lsn = entry.read_lsn;
+        if written_collections.contains(collection) {
+            continue;
+        }
+        if current > read_lsn && current > snapshot_lsn {
+            // WAL advanced past what we read — concurrent write detected.
+            rollback_with_gap_free(sessions, addr, state);
+            return Some(CommitOutcome::Aborted {
+                reason: AbortReason::Serialization,
+            });
+        }
+    }
+    None
+}
+
+/// Roll the session back to `Idle` and release any pending GAP_FREE sequence
+/// reservations. Used by every COMMIT abort branch that must leave the session
+/// idle without persisting — the transport adapters map `Aborted` to a wire
+/// error and never roll back afterward, so each abort branch owns its rollback.
+fn rollback_with_gap_free(sessions: &SessionStore, addr: &SocketAddr, state: &SharedState) {
+    if let Ok(reservations) = sessions.rollback(addr) {
+        for handle in &reservations {
+            let key = handle.sequence_key.clone();
+            let registry = &state.sequence_registry;
+            registry.gap_free_manager().rollback(handle, || {
+                let map = registry.sequences_read();
+                if let Some(h) = map.get(&key) {
+                    h.rollback_one();
+                }
+            });
+        }
+    }
 }
 
 /// Single-shard commit: resolve the transaction's staged post-images into one

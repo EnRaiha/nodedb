@@ -35,7 +35,8 @@ use crate::control::planner::calvin::cross_shard_mode::CrossShardTxnMode;
 use crate::control::planner::calvin::tx_class::build_static_tx_class;
 use crate::control::planner::calvin::types::{DispatchClass, DispatchOutcome};
 use crate::control::server::shared::session::TransactionState;
-use crate::types::VShardId;
+use crate::control::server::shared::session::read_set::ReadSetEntry;
+use crate::types::{DatabaseId, VShardId};
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -62,12 +63,34 @@ pub fn is_dependent_predicate(plan: &PhysicalPlan) -> bool {
 
 // ── classify_dispatch ─────────────────────────────────────────────────────────
 
-/// Classify the dispatch class of a task slice by collecting the unique set of
-/// write vShards.
+/// Derive the set of vShards a transaction's session read-set touches.
 ///
-/// 0 or 1 unique write vShards → `SingleShard`.
-/// 2+ unique write vShards → `MultiShard` with the full `BTreeSet<u32>`.
-pub fn classify_dispatch(tasks: &[PhysicalTask]) -> DispatchClass {
+/// Each [`ReadSetEntry`] homes to its collection's vShard using the SAME
+/// collection→vShard map `ReadWriteSet::participating_vshards` uses to derive the
+/// `TxClass` read_set's participants (`DatabaseId::DEFAULT`-scoped, matching the
+/// write path's collection homing) — so the classifier's read∪write decision and
+/// the actual Calvin participant set agree. A read with no extractable collection
+/// contributes nothing.
+pub fn read_vshards_of(reads: &[ReadSetEntry]) -> BTreeSet<u32> {
+    reads
+        .iter()
+        .filter(|e| !e.collection.is_empty())
+        .map(|e| VShardId::from_collection_in_database(DatabaseId::DEFAULT, &e.collection).as_u32())
+        .collect()
+}
+
+/// Classify the dispatch class of a task slice from the union of its write
+/// vShards and the session read-set's vShards (`read_vshards`).
+///
+/// 0 or 1 unique vShards → `SingleShard`.
+/// 2+ unique vShards → `MultiShard` with the full `BTreeSet<u32>`.
+///
+/// A txn that writes shard X but READS shard Y participates in `{X, Y}` and must
+/// route through Calvin with Y as a participant, so the read vShards widen the
+/// class exactly as the write vShards do. Autocommit callers pass an empty
+/// `read_vshards` (no session read-set is captured outside an explicit
+/// transaction block), preserving write-only classification for them.
+pub fn classify_dispatch(tasks: &[PhysicalTask], read_vshards: &BTreeSet<u32>) -> DispatchClass {
     let mut vshards: BTreeSet<u32> = BTreeSet::new();
     let mut last_vshard = None;
 
@@ -79,6 +102,9 @@ pub fn classify_dispatch(tasks: &[PhysicalTask]) -> DispatchClass {
         }
     }
 
+    // Union the session read-set's vShards into the participant candidate set.
+    vshards.extend(read_vshards.iter().copied());
+
     match vshards.len() {
         0 => DispatchClass::SingleShard {
             vshard: tasks
@@ -87,9 +113,11 @@ pub fn classify_dispatch(tasks: &[PhysicalTask]) -> DispatchClass {
                 .unwrap_or(VShardId::new(0)),
         },
         1 => DispatchClass::SingleShard {
-            // Invariant: vshards.len() == 1 guarantees the loop ran at least
-            // once and set last_vshard. The unwrap_or_else is a defensive
-            // fallback that upholds the no-panic contract for library code.
+            // The single vShard is a write shard whenever any write ran (the
+            // common case: `last_vshard` is set). It could instead be a lone
+            // read shard with no writes — unreachable via the COMMIT path, which
+            // only classifies a non-empty write buffer — so the `unwrap_or_else`
+            // is a defensive fallback upholding the no-panic contract.
             vshard: last_vshard.unwrap_or_else(|| VShardId::new(0)),
         },
         _ => DispatchClass::MultiShard { vshards },
@@ -117,8 +145,13 @@ pub async fn dispatch_calvin_or_fast(
     inbox: Option<&Inbox>,
     _orchestrator: Option<&Arc<OllpOrchestrator>>,
     tenant_id: TenantId,
+    reads: &[ReadSetEntry],
 ) -> crate::Result<DispatchOutcome> {
-    let class = classify_dispatch(tasks);
+    // Interactive COMMIT threads its session read-set here; autocommit passes an
+    // empty slice. The read vShards widen both the classification (below) and the
+    // TxClass read_set participants (in `build_static_tx_class`) in lockstep.
+    let read_vshards = read_vshards_of(reads);
+    let class = classify_dispatch(tasks, &read_vshards);
 
     match &class {
         DispatchClass::MultiShard { .. } => {
@@ -130,9 +163,9 @@ pub async fn dispatch_calvin_or_fast(
             match mode {
                 CrossShardTxnMode::Strict => {
                     let inbox = inbox.ok_or(Error::SequencerUnavailable)?;
-                    // Autocommit cross-shard write: no session read-set is
-                    // accumulated (interactive COMMIT carries one later).
-                    let tx_class = build_static_tx_class(tasks, tenant_id, &[])?;
+                    // Populate the TxClass read_set from the session reads so the
+                    // read shards are enumerated as Calvin participants.
+                    let tx_class = build_static_tx_class(tasks, tenant_id, reads)?;
                     let inbox_seq = inbox.submit(tx_class).map_err(|e| Error::BadRequest {
                         detail: format!("Calvin sequencer rejected transaction: {e}"),
                     })?;

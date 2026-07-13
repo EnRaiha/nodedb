@@ -19,7 +19,7 @@ pub use dependent_recon::{
 };
 pub use dispatch::{
     classify_dispatch, dispatch_calvin_or_fast, is_dependent_predicate, is_write_plan,
-    predicate_class,
+    predicate_class, read_vshards_of,
 };
 pub use dispatch_multi::dispatch_tasks_to_calvin;
 pub use explain::calvin_explain_preamble;

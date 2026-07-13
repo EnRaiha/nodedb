@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::planner::calvin::{DispatchOutcome, dispatch_calvin_or_fast};
+use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::state::SharedState;
 use nodedb_cluster::calvin::{AttemptOutcome, TxnId as CalvinTxnId};
 use nodedb_physical::physical_plan::MetaOp;
@@ -51,9 +52,24 @@ pub(super) async fn run_commit_calvin(
     dp: &impl TxnDataPlane,
     buffered: &[PhysicalTask],
     tenant_id: crate::types::TenantId,
+    reads: &[ReadSetEntry],
 ) -> Option<AbortReason> {
     let cross_shard_mode = sessions.cross_shard_txn_mode(addr);
     let tx_state = sessions.transaction_state(addr);
+
+    // Cross-shard writes inside an explicit transaction block are a capability
+    // gap that is independent of deployment. Reject here — BEFORE the Calvin
+    // infrastructure availability check below — so an embedded/local node
+    // returns the same `CrossShardInExplicitTransaction` a cluster does for the
+    // identical query, instead of a deployment-specific "sequencer unavailable"
+    // error. `run_commit_calvin` is only ever the multi-shard arm, so being
+    // `InBlock` here is already the rejected shape (mirrors the classification
+    // reject in `dispatch_calvin_or_fast`).
+    if tx_state == super::TransactionState::InBlock {
+        return Some(AbortReason::Dispatch(
+            crate::Error::CrossShardInExplicitTransaction,
+        ));
+    }
 
     let inbox = state.sequencer_inbox.get();
     let orchestrator = state.ollp_orchestrator.get();
@@ -69,6 +85,7 @@ pub(super) async fn run_commit_calvin(
         inbox,
         orchestrator,
         tenant_id,
+        reads,
     )
     .await
     {

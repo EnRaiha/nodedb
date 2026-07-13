@@ -244,12 +244,30 @@ impl TxClass {
         }
         let mut participating_vshards = write_set.participating_vshards();
         let min_participants = if allow_single_vshard { 1 } else { 2 };
+        // The participant FLOOR is computed from the WRITE set ONLY, and BEFORE
+        // the read-set union below: a txn that writes a single shard but reads N
+        // additional shards is a legitimate single-write-shard txn and must not
+        // trip the `>= 2` floor.
         if participating_vshards.len() < min_participants {
             let vshard = participating_vshards
                 .first()
                 .map(|v| v.as_u32())
                 .unwrap_or(0);
             return Err(CalvinError::SingleVshardTxn { vshard });
+        }
+        // Union the read set's participating vShards: a shard that is only READ
+        // (never written) still participates so it can validate the read at the
+        // commit serialization point. This union MUST be applied identically in
+        // `new_checked` and `restore_derived` — `participating_vshards` is
+        // `#[serde(skip)]` and re-derived on decode, so an encoded and a decoded
+        // `TxClass` would disagree on their participant set if the two diverged.
+        for v in read_set.participating_vshards() {
+            if !participating_vshards
+                .iter()
+                .any(|e| e.as_u32() == v.as_u32())
+            {
+                participating_vshards.push(v);
+            }
         }
         // Extend participating_vshards with passive vshards from dependent_reads.
         if let Some(ref spec) = dependent_reads {
@@ -262,8 +280,11 @@ impl TxClass {
                     participating_vshards.push(v);
                 }
             }
-            participating_vshards.sort_by_key(|v| v.as_u32());
         }
+        // Stable ordering across encode/decode (participants ride the Raft log):
+        // one final sort after ALL unions (write floor + read + passive), kept in
+        // lockstep with `restore_derived`.
+        participating_vshards.sort_by_key(|v| v.as_u32());
         Ok(Self {
             read_set,
             write_set,
@@ -311,14 +332,23 @@ impl TxClass {
     /// the wire or out of the Raft log.
     pub fn restore_derived(&mut self) {
         let mut vshards = self.write_set.participating_vshards();
+        // Union the read set's participating vShards — MUST match `new_checked`'s
+        // union exactly so a decoded `TxClass` derives the identical participant
+        // set the encoder computed (participants are not serialized).
+        for v in self.read_set.participating_vshards() {
+            if !vshards.iter().any(|e| e.as_u32() == v.as_u32()) {
+                vshards.push(v);
+            }
+        }
         if let Some(ref spec) = self.dependent_reads {
             for &passive_vshard in spec.passive_reads.keys() {
                 if !vshards.iter().any(|e| e.as_u32() == passive_vshard) {
                     vshards.push(VShardId::new(passive_vshard));
                 }
             }
-            vshards.sort_by_key(|v| v.as_u32());
         }
+        // Final stable sort after all unions — lockstep with `new_checked`.
+        vshards.sort_by_key(|v| v.as_u32());
         self.participating_vshards = vshards;
     }
 }
@@ -529,6 +559,105 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, CalvinError::EmptyWriteSet));
+    }
+
+    /// Find two collection names whose default-database vShards differ.
+    fn two_distinct_vshard_collections() -> (String, String) {
+        let mut first: Option<(String, u32)> = None;
+        for i in 0u32..2048 {
+            let name = format!("coll_{i}");
+            let v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &name).as_u32();
+            if let Some((ref fname, fv)) = first {
+                if fv != v {
+                    return (fname.clone(), name);
+                }
+            } else {
+                first = Some((name, v));
+            }
+        }
+        panic!("could not find two distinct-vshard collections in 2048 tries");
+    }
+
+    #[test]
+    fn read_set_vshards_union_into_participants_and_survive_roundtrip() {
+        // A single-write-shard txn that READS a second collection homed on a
+        // different vShard: the read shard joins the participant set (the
+        // write-only floor still passes via the single-vshard opt-in), and the
+        // union is reproduced identically on decode.
+        let (wcoll, rcoll) = two_distinct_vshard_collections();
+        let wv = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &wcoll).as_u32();
+        let rv = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &rcoll).as_u32();
+        assert_ne!(wv, rv);
+
+        let write_set = ReadWriteSet::new(vec![EngineKeySet::Document {
+            collection: wcoll,
+            surrogates: SortedVec::new(vec![1]),
+        }]);
+        // Read-set keyset carries no identity (empty surrogates) — homed by
+        // collection, exactly as the builders' `read_set_from` constructs it.
+        let read_set = ReadWriteSet::new(vec![EngineKeySet::Document {
+            collection: rcoll,
+            surrogates: SortedVec::new(vec![]),
+        }]);
+
+        let tx = TxClass::new_single_vshard(
+            read_set,
+            write_set,
+            vec![0x01],
+            TenantId::new(1),
+            None,
+            VersionedReadSet::default(),
+        )
+        .expect("single-write-shard txn with a cross-shard read is valid");
+
+        let mut participants: Vec<u32> = tx
+            .participating_vshards()
+            .iter()
+            .map(|v| v.as_u32())
+            .collect();
+        participants.sort_unstable();
+        let mut want = vec![wv, rv];
+        want.sort_unstable();
+        assert_eq!(
+            participants, want,
+            "read shard must union into participants"
+        );
+
+        // Encode → decode → restore_derived reproduces the identical participant
+        // set (participants are `#[serde(skip)]`, re-derived in lockstep).
+        let bytes = zerompk::to_msgpack_vec(&tx).expect("encode");
+        let mut decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode");
+        decoded.restore_derived();
+        assert_eq!(
+            tx.participating_vshards(),
+            decoded.participating_vshards(),
+            "restore_derived must reproduce new_checked's read∪write participants"
+        );
+    }
+
+    #[test]
+    fn read_only_extra_shard_does_not_trip_write_floor() {
+        // `new` (>=2 floor) still rejects a single-WRITE-shard txn even when the
+        // read-set adds shards: the floor is computed from the write set only.
+        let (wcoll, rcoll) = two_distinct_vshard_collections();
+        let write_set = ReadWriteSet::new(vec![EngineKeySet::Document {
+            collection: wcoll,
+            surrogates: SortedVec::new(vec![1]),
+        }]);
+        let read_set = ReadWriteSet::new(vec![EngineKeySet::Document {
+            collection: rcoll,
+            surrogates: SortedVec::new(vec![]),
+        }]);
+        let err = TxClass::new(
+            read_set,
+            write_set,
+            vec![0x01],
+            TenantId::new(1),
+            None,
+            VersionedReadSet::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CalvinError::SingleVshardTxn { .. }));
     }
 
     #[test]

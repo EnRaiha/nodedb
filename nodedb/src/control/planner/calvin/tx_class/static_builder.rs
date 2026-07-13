@@ -13,8 +13,8 @@ use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::TenantId;
 
 use super::shared::{
-    collection_name_from_plan, kv_write_keys, surrogate_from_plan, vector_write_surrogates,
-    versioned_reads_from,
+    collection_name_from_plan, kv_write_keys, read_set_from, surrogate_from_plan,
+    vector_write_surrogates, versioned_reads_from,
 };
 
 /// Build a **multi-vshard** `TxClass` from a static write task slice.
@@ -27,9 +27,12 @@ use super::shared::{
 /// dispatch. For the legitimate contended-single-vshard point-write path, use
 /// [`build_single_vshard_tx_class`].
 ///
-/// `reads` is the neutral session read-set captured during the transaction;
-/// it is projected onto the `TxClass`'s LSN-versioned `versioned_reads` field.
-/// Autocommit and pure-write paths pass an empty slice.
+/// `reads` is the neutral session read-set captured during the transaction; it
+/// is projected onto the `TxClass`'s routing/identity `read_set` (collection-
+/// homed) so a txn that writes shard A but reads shard B enumerates B as a
+/// participant. The LSN-versioned `versioned_reads` field stays empty (OCC
+/// enforcement is not yet active). Autocommit and pure-write paths pass an empty
+/// slice, yielding an empty read_set.
 ///
 /// Returns `Err(SequencerUnavailable)` if msgpack encoding of plans fails.
 pub fn build_static_tx_class(
@@ -189,7 +192,10 @@ fn build_static_tx_class_impl(
     write_sets.sort_by(|a, b| a.collection().cmp(b.collection()));
 
     let write_set = ReadWriteSet::new(write_sets);
-    let read_set = ReadWriteSet::new(vec![]);
+    // Populate the routing/identity read_set from the session read-set so a txn
+    // that writes shard A but reads shard B enumerates B as a participant. An
+    // empty `reads` slice (autocommit / pure-write) yields an empty read_set.
+    let read_set = read_set_from(reads);
 
     // Encode all plans as msgpack bytes.
     let plans: Vec<&PhysicalPlan> = tasks.iter().map(|t| &t.plan).collect();
@@ -198,7 +204,11 @@ fn build_static_tx_class_impl(
         detail: format!("failed to encode PhysicalPlan vec for Calvin TxClass: {e}"),
     })?;
 
-    let versioned_reads = versioned_reads_from(reads);
+    // versioned_reads (the LSN-versioned OCC validation set) stays EMPTY: this
+    // path populates only the routing `read_set` above from the session reads.
+    // OCC enforcement is not yet active, so the versioned set is built from an
+    // empty slice — feeding real reads here would prematurely activate OCC.
+    let versioned_reads = versioned_reads_from(&[]);
 
     let result = if allow_single_vshard {
         TxClass::new_single_vshard(
@@ -229,7 +239,6 @@ mod tests {
     use super::*;
     use crate::control::server::shared::session::read_set::{EngineTag, ReadKey};
     use crate::types::{DatabaseId, KeyRepr, Lsn};
-    use nodedb_cluster::calvin::types::ReadKeyIdent;
     use nodedb_physical::physical_plan::DocumentOp;
     use nodedb_types::Surrogate;
 
@@ -278,12 +287,13 @@ mod tests {
     }
 
     #[test]
-    fn build_static_carries_versioned_reads_and_keeps_write_derived_vshards() {
+    fn build_static_populates_read_set_and_unions_read_participants() {
         let (col_a, col_b) = two_distinct_collections();
         let tasks = vec![point_insert_task(&col_a, 1), point_insert_task(&col_b, 2)];
 
         // Synthetic read-set: one point read (surrogate identity) at LSN 7 and
-        // one collection-scoped predicate read at LSN 11.
+        // one collection-scoped predicate read at LSN 11, on two collections
+        // distinct from the write collections.
         let reads = vec![
             read_entry(
                 "read_col",
@@ -298,38 +308,62 @@ mod tests {
         let tx = build_static_tx_class(&tasks, TenantId::new(1), &reads)
             .expect("valid multi-vShard TxClass");
 
-        // Versioned reads are carried on the new field, faithfully mapped.
-        assert_eq!(tx.versioned_reads.len(), 2);
-        let point = tx
-            .versioned_reads
-            .iter()
-            .find(|e| matches!(e.key, ReadKeyIdent::Point(_)))
-            .expect("point entry present");
-        assert_eq!(point.read_lsn, Lsn::new(7));
-        assert_eq!(point.engine, EngineTag::Document);
-        assert_eq!(point.key, ReadKeyIdent::Point(KeyRepr::Surrogate(42)));
+        // versioned_reads (the LSN-versioned OCC validation set) stays EMPTY:
+        // only the routing read_set is populated this unit.
+        assert!(
+            tx.versioned_reads.is_empty(),
+            "versioned_reads must stay empty until OCC is wired"
+        );
 
-        let predicate = tx
-            .versioned_reads
-            .iter()
-            .find(|e| matches!(e.key, ReadKeyIdent::Predicate))
-            .expect("predicate entry present");
-        assert_eq!(predicate.read_lsn, Lsn::new(11));
+        // read_set is collection-homed from the session reads: both read
+        // collections appear (Document engine → Document keyset).
+        let read_colls: std::collections::BTreeSet<&str> =
+            tx.read_set.0.iter().map(|ks| ks.collection()).collect();
+        assert!(
+            read_colls.contains("read_col"),
+            "read_col must be in read_set"
+        );
+        assert!(
+            read_colls.contains("scan_col"),
+            "scan_col must be in read_set"
+        );
 
-        // participating_vshards stays WRITE-derived: exactly the two write
-        // collections' vShards, unaffected by the read-set.
-        let expected = tx.write_set.participating_vshards();
-        assert_eq!(tx.participating_vshards(), expected.as_slice());
-        assert_eq!(tx.participating_vshards().len(), 2);
+        // participating_vshards is now write ∪ read: it contains the two write
+        // collections' vShards AND both read collections' vShards.
+        let participants: std::collections::BTreeSet<u32> = tx
+            .participating_vshards()
+            .iter()
+            .map(|v| v.as_u32())
+            .collect();
+        for coll in [col_a.as_str(), col_b.as_str(), "read_col", "scan_col"] {
+            let v = VShardId::from_collection_in_database(DatabaseId::DEFAULT, coll).as_u32();
+            assert!(
+                participants.contains(&v),
+                "participant set must include the vShard of {coll}"
+            );
+        }
+        // Every write shard is still present (the read union never drops one).
+        for v in tx.write_set.participating_vshards() {
+            assert!(
+                participants.contains(&v.as_u32()),
+                "read union must not drop a write shard"
+            );
+        }
     }
 
     #[test]
-    fn empty_read_set_yields_empty_versioned_reads() {
+    fn empty_read_set_yields_empty_read_and_versioned_reads() {
         let (col_a, col_b) = two_distinct_collections();
         let tasks = vec![point_insert_task(&col_a, 1), point_insert_task(&col_b, 2)];
         let tx = build_static_tx_class(&tasks, TenantId::new(1), &[])
             .expect("valid multi-vShard TxClass");
         assert!(tx.versioned_reads.is_empty());
+        assert!(tx.read_set.is_empty(), "no session reads → empty read_set");
+        // Participants collapse to the write-derived set when there are no reads.
+        assert_eq!(
+            tx.participating_vshards(),
+            tx.write_set.participating_vshards().as_slice()
+        );
     }
 
     #[test]

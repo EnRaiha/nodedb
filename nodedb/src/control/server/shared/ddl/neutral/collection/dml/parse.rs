@@ -369,7 +369,10 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     // local there, so a single-home edge is still reachable by forward traversal.
     if state.sequencer_inbox.get().is_some()
         && matches!(
-            crate::control::planner::calvin::classify_dispatch(&tasks),
+            crate::control::planner::calvin::classify_dispatch(
+                &tasks,
+                &std::collections::BTreeSet::new(),
+            ),
             crate::control::planner::calvin::DispatchClass::MultiShard { .. }
         )
     {

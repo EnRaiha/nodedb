@@ -211,7 +211,8 @@ impl NodeDbPgHandler {
         }
 
         let tx_state = self.sessions.transaction_state(addr);
-        match classify_dispatch(&tasks) {
+        // Autocommit statement routing: no session read-set to widen with.
+        match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
             DispatchClass::SingleShard { .. } => {
                 // A single-shard dependent-predicate write (e.g. `DELETE ...
                 // WHERE <non-pk>`) doesn't need OLLP/Calvin: one shard is one

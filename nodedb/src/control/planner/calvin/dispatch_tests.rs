@@ -3,6 +3,8 @@
 //! Unit tests for Calvin dispatch classification and routing.
 
 use super::*;
+use std::collections::BTreeSet;
+
 use crate::Error;
 use crate::control::planner::calvin::cross_shard_mode::CrossShardTxnMode;
 use crate::control::planner::calvin::types::{DispatchClass, DispatchOutcome};
@@ -167,7 +169,7 @@ fn classify_dispatch_multi_shard_counts_newly_widened_crdt_apply_write() {
     // for this pair and returned `SingleShard`, silently dropping Calvin's
     // cross-shard atomicity for a real two-vshard CRDT write.
     let tasks = vec![crdt_apply_task(3), crdt_apply_task(7)];
-    let class = classify_dispatch(&tasks);
+    let class = classify_dispatch(&tasks, &BTreeSet::new());
     match class {
         DispatchClass::MultiShard { vshards } => {
             let v: Vec<u32> = vshards.into_iter().collect();
@@ -196,7 +198,7 @@ fn is_dependent_predicate_point_insert_is_false() {
 #[test]
 fn classify_dispatch_single_shard() {
     let tasks = vec![doc_insert_task(5), doc_insert_task(5)];
-    let class = classify_dispatch(&tasks);
+    let class = classify_dispatch(&tasks, &BTreeSet::new());
     assert!(matches!(
         class,
         DispatchClass::SingleShard { vshard } if vshard.as_u32() == 5
@@ -206,7 +208,7 @@ fn classify_dispatch_single_shard() {
 #[test]
 fn classify_dispatch_multi_shard_returns_btreeset() {
     let tasks = vec![doc_insert_task(3), doc_insert_task(7)];
-    let class = classify_dispatch(&tasks);
+    let class = classify_dispatch(&tasks, &BTreeSet::new());
     match class {
         DispatchClass::MultiShard { vshards } => {
             let v: Vec<u32> = vshards.into_iter().collect();
@@ -219,8 +221,37 @@ fn classify_dispatch_multi_shard_returns_btreeset() {
 #[test]
 fn classify_dispatch_zero_writes_is_single_shard() {
     let tasks = vec![scan_task(3), scan_task(7)];
-    let class = classify_dispatch(&tasks);
+    let class = classify_dispatch(&tasks, &BTreeSet::new());
     assert!(matches!(class, DispatchClass::SingleShard { .. }));
+}
+
+#[test]
+fn classify_dispatch_read_widened_multi_shard() {
+    // A single-WRITE-shard batch (shard 5) that READS shard 8 classifies as
+    // MultiShard{5,8}: the read vShard widens the participant set exactly as a
+    // write vShard would.
+    let tasks = vec![doc_insert_task(5)];
+    let read_vshards: BTreeSet<u32> = [8u32].into_iter().collect();
+    let class = classify_dispatch(&tasks, &read_vshards);
+    match class {
+        DispatchClass::MultiShard { vshards } => {
+            let v: Vec<u32> = vshards.into_iter().collect();
+            assert_eq!(v, vec![5, 8], "read shard 8 must union with write shard 5");
+        }
+        other => panic!("expected MultiShard{{5,8}} for write-5 + read-8, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_dispatch_read_on_write_shard_stays_single() {
+    // Reading the same shard the writes target does not widen the class.
+    let tasks = vec![doc_insert_task(5)];
+    let read_vshards: BTreeSet<u32> = [5u32].into_iter().collect();
+    let class = classify_dispatch(&tasks, &read_vshards);
+    assert!(matches!(
+        class,
+        DispatchClass::SingleShard { vshard } if vshard.as_u32() == 5
+    ));
 }
 
 #[test]
@@ -252,6 +283,7 @@ fn dispatch_inblock_multi_shard_rejects() {
             None,
             None,
             TenantId::new(1),
+            &[],
         )
         .await;
         assert!(
@@ -273,6 +305,7 @@ fn dispatch_no_inbox_returns_sequencer_unavailable() {
             None,
             None,
             TenantId::new(1),
+            &[],
         )
         .await;
         assert!(
@@ -298,6 +331,7 @@ fn dispatch_best_effort_skips_inbox() {
             Some(&inbox),
             None,
             TenantId::new(1),
+            &[],
         )
         .await;
         assert!(

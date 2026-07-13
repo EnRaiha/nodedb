@@ -27,7 +27,8 @@ pub fn calvin_explain_preamble(
     mode: CrossShardTxnMode,
     predicted_read_set_size: Option<usize>,
 ) -> Option<String> {
-    let class = classify_dispatch(tasks);
+    // EXPLAIN classifies by writes alone (no session read-set at plan time).
+    let class = classify_dispatch(tasks, &std::collections::BTreeSet::new());
     match class {
         DispatchClass::SingleShard { .. } => None,
         DispatchClass::MultiShard { vshards } => {

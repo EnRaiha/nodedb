@@ -224,7 +224,8 @@ pub(crate) async fn handle_direct_op(
     // returning the document task's response. Local WAL durability for the
     // single-shard path is handled inside `dispatch_single_task`.
     ctx.state.tenant_request_start(tenant_id);
-    let result = match classify_dispatch(&tasks) {
+    // Autocommit direct-ops dispatch: no session read-set to widen with.
+    let result = match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
         DispatchClass::MultiShard { .. } => {
             match dispatch_tasks_to_calvin(
                 ctx.state,

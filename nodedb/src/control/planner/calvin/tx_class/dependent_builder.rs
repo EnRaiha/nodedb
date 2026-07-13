@@ -21,7 +21,9 @@ use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::TenantId;
 
-use super::shared::{collection_name_from_plan, surrogate_from_plan, versioned_reads_from};
+use super::shared::{
+    collection_name_from_plan, read_set_from, surrogate_from_plan, versioned_reads_from,
+};
 
 /// Build a **multi-vshard** `TxClass` for a dependent-read (OLLP) transaction.
 ///
@@ -36,7 +38,9 @@ use super::shared::{collection_name_from_plan, surrogate_from_plan, versioned_re
 /// [`build_single_vshard_dependent_tx_class`].
 ///
 /// `reads` is the neutral session read-set, projected onto the `TxClass`'s
-/// LSN-versioned `versioned_reads` field; autocommit paths pass an empty slice.
+/// routing/identity `read_set` (collection-homed) so read shards are enumerated
+/// as participants; the LSN-versioned `versioned_reads` field stays empty (OCC
+/// enforcement is not yet active). Autocommit paths pass an empty slice.
 ///
 /// Returns `Err` if encoding fails or the resulting TxClass is invalid.
 pub fn build_dependent_tx_class(
@@ -186,7 +190,10 @@ fn build_dependent_tx_class_impl(
     write_sets.sort_by(|a, b| a.collection().cmp(b.collection()));
 
     let write_set = ReadWriteSet::new(write_sets);
-    let read_set = ReadWriteSet::new(vec![]);
+    // Populate the routing/identity read_set from the session read-set (a txn
+    // that writes shard A but reads shard B enumerates B as a participant). An
+    // empty `reads` slice yields an empty read_set.
+    let read_set = read_set_from(reads);
 
     let plans: Vec<&PhysicalPlan> = tasks.iter().map(|t| &t.plan).collect();
     let plans_bytes = zerompk::to_msgpack_vec(&plans).map_err(|e| Error::Serialization {
@@ -194,7 +201,11 @@ fn build_dependent_tx_class_impl(
         detail: format!("failed to encode PhysicalPlan vec for Calvin dependent TxClass: {e}"),
     })?;
 
-    let versioned_reads = versioned_reads_from(reads);
+    // versioned_reads (the LSN-versioned OCC validation set) stays EMPTY: only
+    // the routing `read_set` above is populated from the session reads. OCC
+    // enforcement is not yet active, so this is built from an empty slice —
+    // feeding real reads here would prematurely activate OCC validation.
+    let versioned_reads = versioned_reads_from(&[]);
 
     let result = if allow_single_vshard {
         TxClass::new_single_vshard(

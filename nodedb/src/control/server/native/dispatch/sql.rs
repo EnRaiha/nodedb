@@ -263,7 +263,8 @@ async fn execute_planned(
     // for a strict multi-shard write, route the whole batch through the Calvin
     // sequencer so it commits atomically. Single-shard (and best-effort) keep
     // the existing per-task gateway/SPSC dispatch loop below unchanged.
-    match classify_dispatch(&tasks) {
+    // Autocommit single-statement dispatch: no session read-set to widen with.
+    match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
         DispatchClass::SingleShard { .. } => {}
         DispatchClass::MultiShard { .. } => {
             // Reject a cross-shard write inside an explicit transaction block,

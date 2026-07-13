@@ -4,7 +4,10 @@
 //! builders.
 
 use crate::control::server::shared::session::read_set::{ReadKey, ReadSetEntry};
-use nodedb_cluster::calvin::types::{ReadKeyIdent, VersionedReadEntry, VersionedReadSet};
+use nodedb_cluster::calvin::types::{
+    EngineKeySet, EngineTag, ReadKeyIdent, ReadWriteSet, SortedVec, VersionedReadEntry,
+    VersionedReadSet,
+};
 use nodedb_physical::physical_plan::{
     DocumentOp, GraphOp, KvOp, PhysicalPlan, TimeseriesOp, VectorOp,
 };
@@ -37,6 +40,82 @@ pub(super) fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
             })
             .collect(),
     )
+}
+
+/// Build the routing/identity `read_set` for a Calvin `TxClass` from the
+/// neutral session read-set.
+///
+/// This populates the key-IDENTITY set used for participant derivation and
+/// routing — NOT the LSN-versioned OCC validation set (`versioned_reads`, built
+/// separately by [`versioned_reads_from`]).
+///
+/// Each [`ReadSetEntry`] carries only `(engine, collection)` plus a
+/// point/predicate marker — no surrogate or byte-key identity — so it maps to a
+/// COLLECTION-homed [`EngineKeySet`] with an empty key vector, and its
+/// participating vShard is derived from the collection name. This intentionally
+/// over-approximates participants at collection granularity. For a graph/edge
+/// read it is REQUIRED and SAFE: a `ReadSetEntry` has no endpoint homes, so an
+/// `EngineKeySet::Edge` (which routes by key-hashed endpoint homes) cannot be
+/// built — collection-homing adds participant shards (more validation) and never
+/// drops one. A read with no extractable collection contributes no participant.
+pub(super) fn read_set_from(reads: &[ReadSetEntry]) -> ReadWriteSet {
+    use std::collections::BTreeSet;
+
+    // Dedup by (engine-variant, collection): identity is empty, so many reads on
+    // one collection collapse to a single keyset, keeping the read_set that
+    // rides the Raft log compact. Vector and KV reads keep their engine variant;
+    // every other engine (Document plus the graph / FTS / columnar / ... overlays
+    // and column-family engines) routes by collection name and is collection-homed
+    // via a Document keyset.
+    let mut vector_colls: BTreeSet<String> = BTreeSet::new();
+    let mut kv_colls: BTreeSet<String> = BTreeSet::new();
+    let mut doc_colls: BTreeSet<String> = BTreeSet::new();
+    for entry in reads {
+        if entry.collection.is_empty() {
+            continue;
+        }
+        match entry.engine {
+            EngineTag::Vector => {
+                vector_colls.insert(entry.collection.clone());
+            }
+            EngineTag::Kv => {
+                kv_colls.insert(entry.collection.clone());
+            }
+            EngineTag::Document
+            | EngineTag::Graph
+            | EngineTag::Text
+            | EngineTag::Columnar
+            | EngineTag::Timeseries
+            | EngineTag::Spatial
+            | EngineTag::Crdt
+            | EngineTag::Query
+            | EngineTag::Meta
+            | EngineTag::Array
+            | EngineTag::ClusterArray => {
+                doc_colls.insert(entry.collection.clone());
+            }
+        }
+    }
+    let mut sets: Vec<EngineKeySet> = Vec::new();
+    for collection in vector_colls {
+        sets.push(EngineKeySet::Vector {
+            collection,
+            surrogates: SortedVec::new(vec![]),
+        });
+    }
+    for collection in kv_colls {
+        sets.push(EngineKeySet::Kv {
+            collection,
+            keys: SortedVec::new(vec![]),
+        });
+    }
+    for collection in doc_colls {
+        sets.push(EngineKeySet::Document {
+            collection,
+            surrogates: SortedVec::new(vec![]),
+        });
+    }
+    ReadWriteSet::new(sets)
 }
 
 /// Extract `(collection, raw byte keys)` from a KV write plan, or `None` for a

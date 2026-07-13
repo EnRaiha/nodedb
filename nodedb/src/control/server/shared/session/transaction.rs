@@ -125,6 +125,15 @@ impl SessionStore {
         .unwrap_or_default()
     }
 
+    /// Clone the current transaction's buffered write tasks WITHOUT consuming
+    /// them or transitioning session state, so COMMIT can classify dispatch off
+    /// the buffered writes while still holding the option to `rollback` on a
+    /// conflict. `commit()` remains the consuming drain.
+    pub fn buffered_tasks(&self, addr: &SocketAddr) -> Vec<PhysicalTask> {
+        self.read_session(addr, |s| s.tx_buffer.clone())
+            .unwrap_or_default()
+    }
+
     /// Drain the read-set for conflict checking at COMMIT time.
     pub fn take_read_set(&self, addr: &SocketAddr) -> Vec<ReadSetEntry> {
         self.write_session(addr, |session| std::mem::take(&mut session.tx_read_set))

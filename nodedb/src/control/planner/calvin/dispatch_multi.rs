@@ -52,7 +52,9 @@ pub async fn dispatch_tasks_to_calvin(
     cross_shard_mode: CrossShardTxnMode,
     in_txn_block: bool,
 ) -> crate::Result<Option<Response>> {
-    match classify_dispatch(tasks) {
+    // Autocommit cross-shard dispatch: no session read-set (that is captured
+    // only inside an explicit transaction block), so classify by writes alone.
+    match classify_dispatch(tasks, &std::collections::BTreeSet::new()) {
         DispatchClass::MultiShard { .. } => {
             if in_txn_block {
                 return Err(crate::Error::CrossShardInExplicitTransaction);
