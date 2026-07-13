@@ -69,6 +69,16 @@ pub enum SequencerEntry {
         vshard: u32,
         commit: bool,
     },
+    /// The global commit/abort verdict for a staged cross-shard txn, proposed by
+    /// the sequencer leader once every participant has voted (see `Vote`).
+    /// `commit = all participant votes are true`. Every replica applies this to
+    /// store the authoritative decision; participants later flush (commit) or drop
+    /// (abort) their staged buffer on it.
+    Verdict {
+        epoch: u64,
+        position: u32,
+        commit: bool,
+    },
 }
 
 #[cfg(test)]
@@ -190,6 +200,18 @@ mod tests {
             position: 2,
             vshard: 9,
             commit: true,
+        };
+        let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
+        let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn verdict_msgpack_roundtrip() {
+        let entry = SequencerEntry::Verdict {
+            epoch: 5,
+            position: 2,
+            commit: false,
         };
         let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
         let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");

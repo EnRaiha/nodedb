@@ -201,6 +201,9 @@ impl SequencerStateMachine {
                 // `OllpMismatch`/`TxnRoutingFailed`; they carry no txn data to
                 // replay. Replay re-derives tallies via live `apply` instead.
                 SequencerEntry::Vote { .. } => {}
+                // Verdict signals carry no txn data to replay, like `Vote`; the
+                // stored verdict is re-derived via live `apply`.
+                SequencerEntry::Verdict { .. } => {}
             }
         }
 
@@ -361,6 +364,20 @@ impl SequencerStateMachine {
                     commit,
                 );
             }
+            // Authoritative commit/abort verdict for a staged cross-shard txn,
+            // proposed by the leader once every participant voted. Applied on
+            // ALL replicas to store the decision. Currently observed-only:
+            // nothing yet reads the stored verdict to change flush/drop
+            // behavior (that is a follow-up); the leader's local decision still
+            // drives.
+            SequencerEntry::Verdict {
+                epoch,
+                position,
+                commit,
+            } => {
+                self.completion_registry
+                    .note_verdict(crate::calvin::TxnId::new(epoch, position), commit);
+            }
         }
     }
 }
@@ -451,7 +468,7 @@ mod tests {
         let mut senders = HashMap::new();
         senders.insert(va, tx_a);
         senders.insert(vb, tx_b);
-        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new());
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
         assert_eq!(sm.last_applied_epoch(), None);
 
         let data = encode_entry(&SequencerEntry::EpochBatch { batch });
@@ -469,7 +486,7 @@ mod tests {
         let mut senders = HashMap::new();
         senders.insert(va, tx_a);
         senders.insert(vb, tx_b);
-        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new());
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
 
         // Apply epoch 0.
         let data0 = encode_entry(&SequencerEntry::EpochBatch {
@@ -502,7 +519,7 @@ mod tests {
         senders.insert(va, tx_a);
         senders.insert(vb, tx_b);
         senders.insert(999, tx_c);
-        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new());
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
 
         let data = encode_entry(&SequencerEntry::EpochBatch { batch });
         sm.apply(&data);
@@ -529,7 +546,7 @@ mod tests {
         let mut senders = HashMap::new();
         senders.insert(va, tx_a);
         senders.insert(vb, tx_b);
-        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new());
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
 
         let data = encode_entry(&SequencerEntry::EpochBatch { batch });
         // Must not panic or block.
@@ -541,7 +558,8 @@ mod tests {
 
     #[test]
     fn next_epoch_is_zero_on_fresh_state_machine() {
-        let sm = SequencerStateMachine::new(HashMap::new(), CalvinCompletionRegistry::new());
+        let sm =
+            SequencerStateMachine::new(HashMap::new(), CalvinCompletionRegistry::new_detached());
         assert_eq!(sm.next_epoch(), 0);
     }
 
@@ -553,7 +571,7 @@ mod tests {
         let mut senders = HashMap::new();
         senders.insert(va, tx_a);
         senders.insert(vb, tx_b);
-        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new());
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
 
         let data = encode_entry(&SequencerEntry::EpochBatch { batch });
         sm.apply(&data);
@@ -563,7 +581,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_txn_routing_failed_dispatches_to_completion_registry() {
-        let registry = CalvinCompletionRegistry::new();
+        let registry = CalvinCompletionRegistry::new_detached();
         let mut sm = SequencerStateMachine::new(HashMap::new(), Arc::clone(&registry));
 
         let data = encode_entry(&SequencerEntry::TxnRoutingFailed {
@@ -585,6 +603,26 @@ mod tests {
         );
         // TxnRoutingFailed is not an EpochBatch, so it must not perturb the
         // epoch counter (mirrors OllpMismatch's non-effect on last_applied_epoch).
+        assert_eq!(sm.last_applied_epoch(), None);
+    }
+
+    #[tokio::test]
+    async fn apply_verdict_stores_decision_without_perturbing_epoch() {
+        let registry = CalvinCompletionRegistry::new_detached();
+        let mut sm = SequencerStateMachine::new(HashMap::new(), Arc::clone(&registry));
+        let txn = crate::calvin::TxnId::new(9, 4);
+
+        let data = encode_entry(&SequencerEntry::Verdict {
+            epoch: 9,
+            position: 4,
+            commit: true,
+        });
+        sm.apply(&data);
+
+        // The verdict is stored authoritatively on every replica.
+        assert_eq!(registry.verdict(txn), Some(true));
+        // Verdict is not an EpochBatch, so it must not perturb the epoch counter
+        // (mirrors OllpMismatch/TxnRoutingFailed's non-effect).
         assert_eq!(sm.last_applied_epoch(), None);
     }
 }

@@ -64,6 +64,7 @@ pub(super) fn build_raft_loop(
         data_applier,
         apply_rx,
         calvin_completion_registry,
+        calvin_verdict_rx,
         sequencer_state_machine,
         calvin_read_result_senders,
         metadata_applier,
@@ -131,6 +132,7 @@ pub(super) fn build_raft_loop(
             .unwrap_or_else(|p| p.into_inner())
             .next_epoch(),
         Arc::clone(&calvin_completion_registry),
+        calvin_verdict_rx,
     );
     let sequencer_metrics = Arc::clone(&sequencer_service.metrics);
 

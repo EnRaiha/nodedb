@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::{self, Sender};
 
-use nodedb_cluster::calvin::{CalvinCompletionRegistry, SEQUENCER_GROUP_ID, SequencerStateMachine};
+use nodedb_cluster::calvin::{
+    CalvinCompletionRegistry, SEQUENCER_GROUP_ID, SequencerStateMachine, TxnId,
+};
 
 use crate::control::cluster::array_executor::DataPlaneArrayExecutor;
 use crate::control::cluster::calvin::ReadResultEvent;
@@ -30,6 +32,11 @@ pub(super) struct GroupSetup {
     pub(super) data_applier: SpscCommitApplier,
     pub(super) apply_rx: mpsc::Receiver<ApplyBatch>,
     pub(super) calvin_completion_registry: Arc<CalvinCompletionRegistry>,
+    /// Receiver for verdict signals emitted by `calvin_completion_registry`.
+    /// Handed to the `SequencerService` (built in the loop-build phase) so the
+    /// leader can propose `SequencerEntry::Verdict` once a cross-shard txn's
+    /// vote tally completes.
+    pub(super) calvin_verdict_rx: mpsc::Receiver<(TxnId, bool)>,
     pub(super) sequencer_state_machine: Arc<Mutex<SequencerStateMachine>>,
     pub(super) calvin_read_result_senders: Arc<Mutex<BTreeMap<u32, Sender<ReadResultEvent>>>>,
     pub(super) metadata_applier: Arc<dyn nodedb_cluster::MetadataApplier>,
@@ -92,7 +99,11 @@ pub(super) fn build_group_setup(
         Arc::new(ProposeTracker::new().with_group_watchers(handle.group_watchers.clone()));
     let (dist_applier, apply_rx) = create_distributed_applier(tracker.clone());
     let dist_applier = Arc::new(dist_applier);
-    let calvin_completion_registry = CalvinCompletionRegistry::new();
+    // Verdict signal channel: the registry emits `(txn, commit)` on a complete
+    // vote tally; the sequencer service's leader-guarded arm proposes the
+    // `Verdict`. Bounded to match the scheduler completion channel capacity.
+    let (calvin_verdict_tx, calvin_verdict_rx) = mpsc::channel(512);
+    let calvin_completion_registry = CalvinCompletionRegistry::new(calvin_verdict_tx);
     let sequencer_state_machine = Arc::new(Mutex::new(SequencerStateMachine::new(
         std::collections::HashMap::new(),
         Arc::clone(&calvin_completion_registry),
@@ -186,6 +197,7 @@ pub(super) fn build_group_setup(
         data_applier,
         apply_rx,
         calvin_completion_registry,
+        calvin_verdict_rx,
         sequencer_state_machine,
         calvin_read_result_senders,
         metadata_applier,

@@ -159,13 +159,18 @@ impl CalvinTestNode {
             .unwrap_or_else(|p| p.into_inner())
             .next_epoch();
 
+        // Pair the registry's verdict signal channel with the service's
+        // receiver so a completed vote tally would reach the leader's propose
+        // arm (inert for now — nothing reads the verdict).
+        let (verdict_tx, verdict_rx) = tokio::sync::mpsc::channel(512);
         let mut service = SequencerService::new(
             config,
             self.node_id,
             self.multi_raft.clone(),
             inbox_receiver,
             starting_epoch,
-            CalvinCompletionRegistry::new(),
+            CalvinCompletionRegistry::new(verdict_tx),
+            verdict_rx,
         );
 
         let metrics = service.metrics.clone();
@@ -286,7 +291,7 @@ async fn spawn_one_calvin_node(
     let sm_metrics = StateMachineMetrics::new();
     let state_machine = Arc::new(Mutex::new(SequencerStateMachine::new(
         HashMap::new(),
-        CalvinCompletionRegistry::new(),
+        CalvinCompletionRegistry::new_detached(),
     )));
     let applier = CalvinApplier::new(state_machine.clone());
 

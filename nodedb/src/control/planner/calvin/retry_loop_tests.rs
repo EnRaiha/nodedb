@@ -85,7 +85,7 @@ fn converges_after_two_mismatches() {
         .build()
         .expect("build current-thread runtime");
     rt.block_on(async {
-        let registry = CalvinCompletionRegistry::new();
+        let registry = CalvinCompletionRegistry::new_detached();
         let orchestrator = zero_backoff_orchestrator();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<TxnId>(16);
@@ -154,7 +154,7 @@ fn exhausts_on_persistent_mismatch() {
         .build()
         .expect("build current-thread runtime");
     rt.block_on(async {
-        let registry = CalvinCompletionRegistry::new();
+        let registry = CalvinCompletionRegistry::new_detached();
         let orchestrator = zero_backoff_orchestrator();
 
         // Mismatch on every attempt (large count → never acks).
@@ -214,7 +214,7 @@ fn pre_admission_retry_does_not_rescan() {
         .build()
         .expect("build current-thread runtime");
     rt.block_on(async {
-        let registry = CalvinCompletionRegistry::new();
+        let registry = CalvinCompletionRegistry::new_detached();
         let orchestrator = zero_backoff_orchestrator();
 
         // No mismatch path needed: the first two submits fail pre-admission, the

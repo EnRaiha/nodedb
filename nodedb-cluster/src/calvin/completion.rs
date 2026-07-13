@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// Calvin transaction identity in the sequencer-assigned coordinate space.
 ///
@@ -55,6 +55,14 @@ struct PendingCompletion {
     /// tally to change flush/drop behavior yet (that is a follow-up); the
     /// leader's local decision still drives.
     votes: BTreeMap<u32, bool>,
+    /// The authoritative commit/abort verdict once applied from a replicated
+    /// `SequencerEntry::Verdict`. `None` until the leader's verdict is applied.
+    /// Currently observed-only: nothing reads this to change flush/drop yet.
+    verdict: Option<bool>,
+    /// Dedup guard: set the first time the vote tally becomes complete so the
+    /// verdict signal is emitted exactly once, even if a retry re-proposes a
+    /// vote and re-tallies afterwards.
+    verdict_proposed: bool,
 }
 
 impl PendingCompletion {
@@ -66,6 +74,8 @@ impl PendingCompletion {
             mismatched: false,
             routing_failed: None,
             votes: BTreeMap::new(),
+            verdict: None,
+            verdict_proposed: false,
         }
     }
 
@@ -86,14 +96,33 @@ struct Inner {
     completions: BTreeMap<TxnId, PendingCompletion>,
 }
 
-#[derive(Default)]
 pub struct CalvinCompletionRegistry {
     inner: Mutex<Inner>,
+    /// Emits `(txn, commit)` exactly once when a staged cross-shard txn's vote
+    /// tally becomes complete (all expected participants voted). The paired
+    /// receiver lives in the `SequencerService`, whose leader-guarded arm turns
+    /// the signal into a `SequencerEntry::Verdict` proposal.
+    verdict_tx: mpsc::Sender<(TxnId, bool)>,
 }
 
 impl CalvinCompletionRegistry {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    /// Construct a registry wired to a verdict signal channel. The paired
+    /// receiver must be handed to the `SequencerService` on this node so the
+    /// leader can propose the aggregated verdict.
+    pub fn new(verdict_tx: mpsc::Sender<(TxnId, bool)>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Inner::default()),
+            verdict_tx,
+        })
+    }
+
+    /// Construct a registry with no verdict consumer: the signal channel is
+    /// created internally and its receiver dropped, so vote-complete transitions
+    /// are still computed and stored but never delivered to a sequencer service.
+    /// For callers (and tests) that do not drive verdict proposal.
+    pub fn new_detached() -> Arc<Self> {
+        let (verdict_tx, _verdict_rx) = mpsc::channel(1);
+        Self::new(verdict_tx)
     }
 
     pub fn register_submission(&self, inbox_seq: u64) -> oneshot::Receiver<(u64, u32, usize)> {
@@ -280,6 +309,70 @@ impl CalvinCompletionRegistry {
             .entry(txn_id)
             .or_insert_with(|| PendingCompletion::new(0));
         entry.votes.insert(vshard, commit);
+
+        // On the transition to a complete tally, emit the aggregated verdict
+        // exactly once. `expected_participants` is seeded on the sequencer
+        // leader (the participant count arrives with the assignment); a replica
+        // whose registry never received that seed keeps `expected == 0` and
+        // never emits here — correct, because only the leader proposes the
+        // verdict. Deterministic all-replica seeding for failover is a
+        // follow-up. The `verdict_proposed` guard dedups a re-tally caused by a
+        // re-proposed vote on retry.
+        if entry.expected_participants > 0
+            && entry.votes.len() == entry.expected_participants
+            && !entry.verdict_proposed
+        {
+            let commit_all = entry.votes.values().all(|&v| v);
+            entry.verdict_proposed = true;
+            // Non-blocking: a full channel drops the signal, mirroring how the
+            // apply fan-out drops on backpressure. A dropped signal is a missed
+            // proposal (the leader re-drives on the next tally that isn't
+            // deduped), never lost state — the verdict is stored separately via
+            // `note_verdict` when the leader's proposal is applied.
+            let _ = self.verdict_tx.try_send((txn_id, commit_all));
+        }
+    }
+
+    /// Store the authoritative commit/abort verdict for `txn`, applied from a
+    /// replicated `SequencerEntry::Verdict` on every replica.
+    ///
+    /// Idempotent: re-applying the same verdict is a no-op. A verdict that
+    /// differs from a previously stored one is a determinism bug (the tally is
+    /// computed deterministically from replicated votes) — it is logged at
+    /// `warn` and the latest value is stored. Currently observed-only: nothing
+    /// reads the stored verdict to change flush/drop behavior yet.
+    pub fn note_verdict(&self, txn: TxnId, commit: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = inner
+            .completions
+            .entry(txn)
+            .or_insert_with(|| PendingCompletion::new(0));
+        match entry.verdict {
+            Some(existing) if existing != commit => {
+                tracing::warn!(
+                    epoch = txn.epoch,
+                    position = txn.position,
+                    existing,
+                    proposed = commit,
+                    "calvin verdict differs from a previously applied one; \
+                     determinism bug — overwriting with the latest"
+                );
+                entry.verdict = Some(commit);
+            }
+            Some(_) => {}
+            None => entry.verdict = Some(commit),
+        }
+    }
+
+    /// Test/inspection accessor: returns the stored commit/abort verdict for
+    /// `txn_id`, or `None` if no verdict has been applied yet.
+    pub fn verdict(&self, txn_id: TxnId) -> Option<bool> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .completions
+            .get(&txn_id)
+            .and_then(|entry| entry.verdict)
     }
 
     /// Test/inspection accessor: returns the current per-vshard vote tally for
@@ -311,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_entry_removed_after_all_acks() {
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(7, 0);
         reg.note_assigned(1, txn, 2);
         let rx = reg.register_completion(txn, 2);
@@ -330,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn completion_entry_removed_when_register_arrives_after_acks() {
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(9, 3);
         reg.note_assigned(1, txn, 2);
         reg.note_completion_ack(txn, 10);
@@ -350,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn mismatch_arriving_before_register_fires_mismatch() {
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(11, 1);
         reg.note_assigned(1, txn, 2);
         // Mismatch observed before the coordinator registers its waiter: the
@@ -369,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_before_mismatch_fires_mismatch() {
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(12, 5);
         reg.note_assigned(1, txn, 2);
         let rx = reg.register_completion(txn, 2);
@@ -391,7 +484,7 @@ mod tests {
         // register_completion must seed expected_participants from the assignment.
         // Without the seed (or with the is_complete>0 guard absent) this would
         // spuriously fire Completed with zero acks.
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(21, 0);
         let rx = reg.register_completion(txn, 1);
         assert_eq!(
@@ -411,7 +504,7 @@ mod tests {
         // coordinator calls register_completion. With expected_participants still
         // unknown (0), the ack must persist without firing/evicting; the later
         // register_completion seeds the count and then completes.
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(22, 0);
         reg.note_completion_ack(txn, 7);
         assert_eq!(
@@ -427,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn routing_failed_arriving_before_register_fires_failed() {
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(14, 1);
         reg.note_assigned(1, txn, 2);
         // Routing failure observed before the coordinator registers its
@@ -452,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_before_routing_failed_fires_failed() {
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(15, 4);
         reg.note_assigned(1, txn, 2);
         let rx = reg.register_completion(txn, 2);
@@ -475,7 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn routing_failed_takes_precedence_over_pending_acks_and_mismatch() {
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(16, 0);
         reg.note_assigned(1, txn, 2);
         // No waiter registered yet: an ack and a mismatch both persist onto
@@ -505,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn note_vote_tallies_one_vote_per_vshard() {
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(30, 0);
         reg.note_vote(txn, 1, true);
         reg.note_vote(txn, 2, false);
@@ -516,8 +609,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_all_true_tally_emits_commit_verdict_once() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let reg = CalvinCompletionRegistry::new(tx);
+        let txn = TxnId::new(30, 1);
+        // Seed the expected participant count the way the leader does.
+        reg.note_assigned(1, txn, 2);
+
+        reg.note_vote(txn, 1, true);
+        // First vote: tally incomplete (1 of 2), nothing emitted yet.
+        assert!(rx.try_recv().is_err());
+
+        reg.note_vote(txn, 2, true);
+        // Second vote completes the tally → commit verdict emitted exactly once.
+        assert_eq!(rx.try_recv().expect("verdict emitted"), (txn, true));
+
+        // A re-proposed vote re-tallies but must NOT emit again (dedup).
+        reg.note_vote(txn, 2, true);
+        assert!(
+            rx.try_recv().is_err(),
+            "dedup: verdict must emit only on the first complete tally"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_tally_with_one_abort_emits_abort_verdict() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let reg = CalvinCompletionRegistry::new(tx);
+        let txn = TxnId::new(31, 0);
+        reg.note_assigned(1, txn, 2);
+
+        reg.note_vote(txn, 1, true);
+        reg.note_vote(txn, 2, false);
+        // Any abort vote makes the aggregated verdict false.
+        assert_eq!(rx.try_recv().expect("verdict emitted"), (txn, false));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn mismatch_takes_precedence_over_pending_acks() {
-        let reg = CalvinCompletionRegistry::new();
+        let reg = CalvinCompletionRegistry::new_detached();
         let txn = TxnId::new(13, 2);
         reg.note_assigned(1, txn, 2);
         let rx = reg.register_completion(txn, 2);

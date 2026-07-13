@@ -23,13 +23,15 @@ use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
-use crate::calvin::CalvinCompletionRegistry;
+use tokio::sync::mpsc;
+
 use crate::calvin::sequencer::config::SEQUENCER_GROUP_ID;
 use crate::calvin::sequencer::config::SequencerConfig;
 use crate::calvin::sequencer::entry::SequencerEntry;
 use crate::calvin::sequencer::inbox::{AdmittedTx, InboxReceiver};
 use crate::calvin::sequencer::validator::validate_batch_with_assignments;
 use crate::calvin::types::EpochBatch;
+use crate::calvin::{CalvinCompletionRegistry, TxnId};
 use crate::error::ClusterError;
 use crate::multi_raft::MultiRaft;
 
@@ -52,6 +54,13 @@ pub struct SequencerService {
     current_epoch: u64,
     pub metrics: Arc<SequencerMetrics>,
     completion_registry: Arc<CalvinCompletionRegistry>,
+    /// Receives `(txn, commit)` verdict signals emitted by this node's
+    /// completion registry when a staged cross-shard txn's vote tally becomes
+    /// complete. Only the leader turns a signal into a `Verdict` proposal.
+    /// Stored as `Option` so `run` can move it out of `&mut self` into an owned
+    /// local, avoiding a borrow conflict with `self.tick()` in a sibling
+    /// `select!` arm; it is always `Some` after construction.
+    verdict_rx: Option<mpsc::Receiver<(TxnId, bool)>>,
 }
 
 impl SequencerService {
@@ -66,6 +75,7 @@ impl SequencerService {
         inbox_receiver: InboxReceiver,
         starting_epoch: u64,
         completion_registry: Arc<CalvinCompletionRegistry>,
+        verdict_rx: mpsc::Receiver<(TxnId, bool)>,
     ) -> Self {
         Self {
             config,
@@ -75,6 +85,7 @@ impl SequencerService {
             current_epoch: starting_epoch,
             metrics: SequencerMetrics::new(),
             completion_registry,
+            verdict_rx: Some(verdict_rx),
         }
     }
 
@@ -90,10 +101,41 @@ impl SequencerService {
             "sequencer service starting"
         );
 
+        // Move the verdict receiver out of `self` so the `select!` loop can hold
+        // an owned `&mut` to it without conflicting with `self.tick()` in a
+        // sibling arm. Always `Some` after construction; a `None` (run called
+        // twice) simply disables the verdict arm forever via `pending()`.
+        let mut verdict_rx = self.verdict_rx.take();
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     self.tick();
+                }
+                verdict = async {
+                    match verdict_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Every replica's registry emits deterministically, but only
+                    // the leader proposes — same leader-gate as OllpMismatch/Vote.
+                    if let Some((txn, commit)) = verdict
+                        && self.is_leader()
+                        && let Err(e) = self.propose_entry(&SequencerEntry::Verdict {
+                            epoch: txn.epoch,
+                            position: txn.position,
+                            commit,
+                        })
+                    {
+                        warn!(
+                            epoch = txn.epoch,
+                            position = txn.position,
+                            error = %e,
+                            "sequencer verdict propose failed; a later re-tally will not \
+                             re-emit (deduped), but the local decision still drives"
+                        );
+                    }
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
@@ -256,6 +298,7 @@ fn entry_txn_count(entry: &SequencerEntry) -> usize {
         SequencerEntry::OllpMismatch { .. } => 0,
         SequencerEntry::TxnRoutingFailed { .. } => 0,
         SequencerEntry::Vote { .. } => 0,
+        SequencerEntry::Verdict { .. } => 0,
     }
 }
 
