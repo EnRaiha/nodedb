@@ -31,6 +31,7 @@
 use tracing::warn;
 
 use super::core_loop::CoreLoop;
+use crate::data::executor::core_loop::write_index::KeyRepr;
 use crate::engine::kv::{AtomicError, AtomicKeyCtx};
 
 impl CoreLoop {
@@ -106,7 +107,17 @@ impl CoreLoop {
             ttl_ms,
             expire_at_ms,
         );
-        Some(self.log_kv_incr_result(&collection, &key, delta, result))
+        let applied = self.log_kv_incr_result(&collection, &key, delta, result);
+        if applied > 0 {
+            self.note_replay_write_lsn(
+                database_id,
+                tenant_id,
+                &collection,
+                Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+                record_lsn,
+            );
+        }
+        Some(applied)
     }
 
     /// Six-element shape: `("kv_incr", collection, key, delta, ttl_ms,
@@ -145,7 +156,17 @@ impl CoreLoop {
             delta,
             ttl_ms,
         );
-        Some(self.log_kv_incr_result(&collection, &key, delta, result))
+        let applied = self.log_kv_incr_result(&collection, &key, delta, result);
+        if applied > 0 {
+            self.note_replay_write_lsn(
+                database_id,
+                tenant_id,
+                &collection,
+                Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+                record_lsn,
+            );
+        }
+        Some(applied)
     }
 
     /// Shared result handling for both `kv_incr` shapes: `Ok` counts as one

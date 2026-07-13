@@ -43,6 +43,7 @@ use super::core_loop::CoreLoop;
 use super::handlers::point::apply_delete::PointDeleteParams;
 use super::handlers::point::apply_put::PointPutParams;
 use super::handlers::transaction::overlay::BitemporalStamp;
+use crate::data::executor::core_loop::write_index::KeyRepr;
 use crate::engine::document::store::surrogate_to_doc_id;
 
 impl CoreLoop {
@@ -148,6 +149,13 @@ impl CoreLoop {
                 }
                 if applied {
                     puts += 1;
+                    self.note_replay_write_lsn(
+                        database_id,
+                        tenant_id,
+                        &collection,
+                        Some(KeyRepr::Surrogate(surrogate_u32)),
+                        record_lsn,
+                    );
                 }
             } else {
                 let Ok((collection, _document_id, _prov, surrogate_u32)) =
@@ -162,6 +170,13 @@ impl CoreLoop {
                 }
                 if self.apply_document_delete(database_id, tenant_id, &collection, surrogate_u32) {
                     deletes += 1;
+                    self.note_replay_write_lsn(
+                        database_id,
+                        tenant_id,
+                        &collection,
+                        Some(KeyRepr::Surrogate(surrogate_u32)),
+                        record_lsn,
+                    );
                 }
             }
         }
@@ -290,6 +305,7 @@ impl CoreLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{DatabaseId, Lsn, TenantId};
     use crate::wal::{RedoRecord, RedoSubRecord};
     use nodedb_wal::WalRecord;
     use nodedb_wal::record::WalRecordArgs;
@@ -598,6 +614,112 @@ mod tests {
             Some(1),
             "checkpoint-LSN gate makes replay idempotent: a record at or below the \
              collection's recorded watermark is skipped on re-replay"
+        );
+    }
+
+    #[test]
+    fn redo_replay_populates_write_version_index() {
+        use crate::data::executor::core_loop::write_index::{CollKey, WriteKey};
+
+        let mut h = make_core();
+        let surrogate = 99u32;
+        let expire_at_ms = crate::engine::kv::current_ms() + 3_600_000;
+        let put_record = redo_record(
+            7,
+            0,
+            vec![
+                doc_put_sub("notes", surrogate, "carol"),
+                kv_put_sub_with_expiry("sessions", b"s1", expire_at_ms),
+            ],
+        );
+
+        h.core.replay_transaction_redo_wal(
+            std::slice::from_ref(&put_record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let db = DatabaseId::new(0);
+        let tenant = TenantId::new(7);
+
+        let doc_key = WriteKey {
+            db,
+            tenant,
+            collection: Box::from("notes"),
+            key: KeyRepr::Surrogate(surrogate),
+        };
+        assert_eq!(
+            h.core.write_index.key_write_lsn(&doc_key),
+            Some(Lsn::new(1)),
+            "document redo put must populate the per-key write-version index"
+        );
+
+        let doc_coll_key = CollKey {
+            db,
+            tenant,
+            collection: Box::from("notes"),
+        };
+        assert_eq!(
+            h.core.write_index.collection_write_lsn(&doc_coll_key),
+            Some(Lsn::new(1)),
+            "document redo put must advance the collection write-version floor"
+        );
+
+        let kv_key = WriteKey {
+            db,
+            tenant,
+            collection: Box::from("sessions"),
+            key: KeyRepr::KvKey(Box::from(b"s1".as_slice())),
+        };
+        assert_eq!(
+            h.core.write_index.key_write_lsn(&kv_key),
+            Some(Lsn::new(1)),
+            "kv redo put must populate the per-key write-version index"
+        );
+
+        let kv_coll_key = CollKey {
+            db,
+            tenant,
+            collection: Box::from("sessions"),
+        };
+        assert_eq!(
+            h.core.write_index.collection_write_lsn(&kv_coll_key),
+            Some(Lsn::new(1)),
+            "kv redo put must advance the collection write-version floor"
+        );
+
+        // A later delete at a higher LSN must bump the document key's write
+        // version above the prior put, proving the OCC read-then-delete
+        // conflict window is visible after replay, not just after a live
+        // delete.
+        let delete_record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::TransactionRedo as u32,
+            lsn: 2,
+            tenant_id: 7,
+            vshard_id: 0,
+            database_id: 0,
+            payload: RedoRecord {
+                version: 1,
+                ops: vec![doc_delete_sub("notes", surrogate)],
+                calvin_stamp: None,
+            }
+            .to_bytes()
+            .expect("encode redo record"),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("wal record");
+
+        h.core.replay_transaction_redo_wal(
+            std::slice::from_ref(&delete_record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        assert_eq!(
+            h.core.write_index.key_write_lsn(&doc_key),
+            Some(Lsn::new(2)),
+            "redo delete must bump the key's write-version above the prior put"
         );
     }
 

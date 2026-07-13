@@ -13,12 +13,14 @@ use tracing::warn;
 
 use super::core_loop::CoreLoop;
 use super::handlers::kv::transfer_compute::{TransferError, compute_transfer};
+use crate::data::executor::core_loop::write_index::KeyRepr;
 
 /// Fields needed to replay one `kv_transfer` delta record.
 pub(super) struct ReplayKvTransferParams<'a> {
     pub database_id: u64,
     pub tenant_id: u64,
     pub now_ms: u64,
+    pub record_lsn: u64,
     pub collection: &'a str,
     pub source_key: &'a [u8],
     pub dest_key: &'a [u8],
@@ -33,6 +35,7 @@ pub(super) struct ReplayKvTransferItemParams<'a> {
     pub database_id: u64,
     pub tenant_id: u64,
     pub now_ms: u64,
+    pub record_lsn: u64,
     pub source_collection: &'a str,
     pub dest_collection: &'a str,
     pub item_key: &'a [u8],
@@ -135,6 +138,20 @@ impl CoreLoop {
             now_ms: p.now_ms,
             surrogate: nodedb_types::Surrogate::new(p.credit_surrogate),
         });
+        self.note_replay_write_lsn(
+            p.database_id,
+            p.tenant_id,
+            p.collection,
+            Some(KeyRepr::KvKey(Box::from(p.source_key))),
+            p.record_lsn,
+        );
+        self.note_replay_write_lsn(
+            p.database_id,
+            p.tenant_id,
+            p.collection,
+            Some(KeyRepr::KvKey(Box::from(p.dest_key))),
+            p.record_lsn,
+        );
         2
     }
 
@@ -184,6 +201,21 @@ impl CoreLoop {
             surrogate: nodedb_types::Surrogate::new(p.surrogate),
         });
 
+        self.note_replay_write_lsn(
+            p.database_id,
+            p.tenant_id,
+            p.source_collection,
+            Some(KeyRepr::KvKey(Box::from(p.item_key))),
+            p.record_lsn,
+        );
+        self.note_replay_write_lsn(
+            p.database_id,
+            p.tenant_id,
+            p.dest_collection,
+            Some(KeyRepr::KvKey(Box::from(p.dest_key))),
+            p.record_lsn,
+        );
+
         (1, 1)
     }
 
@@ -224,6 +256,7 @@ impl CoreLoop {
             database_id,
             tenant_id,
             now_ms,
+            record_lsn,
             collection: &collection,
             source_key: &source_key,
             dest_key: &dest_key,
@@ -266,6 +299,7 @@ impl CoreLoop {
             database_id,
             tenant_id,
             now_ms,
+            record_lsn,
             source_collection: &source_collection,
             dest_collection: &dest_collection,
             item_key: &item_key,

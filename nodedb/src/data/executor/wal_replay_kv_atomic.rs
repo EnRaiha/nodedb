@@ -20,6 +20,7 @@
 use tracing::warn;
 
 use super::core_loop::CoreLoop;
+use crate::data::executor::core_loop::write_index::KeyRepr;
 use crate::engine::kv::{AtomicError, AtomicKeyCtx};
 
 impl CoreLoop {
@@ -103,6 +104,15 @@ impl CoreLoop {
             &expected,
             &new_value,
         );
+        if result.success {
+            self.note_replay_write_lsn(
+                database_id,
+                tenant_id,
+                &collection,
+                Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+                record_lsn,
+            );
+        }
         Some(usize::from(result.success))
     }
 
@@ -140,7 +150,16 @@ impl CoreLoop {
             },
             delta,
         ) {
-            Ok(_) => Some(1),
+            Ok(_) => {
+                self.note_replay_write_lsn(
+                    database_id,
+                    tenant_id,
+                    &collection,
+                    Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+                    record_lsn,
+                );
+                Some(1)
+            }
             Err(AtomicError::TypeMismatch { detail }) => {
                 warn!(
                     core = self.core_id,
@@ -205,6 +224,13 @@ impl CoreLoop {
                 surrogate: nodedb_types::Surrogate::new(surrogate),
             },
             &new_value,
+        );
+        self.note_replay_write_lsn(
+            database_id,
+            tenant_id,
+            &collection,
+            Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+            record_lsn,
         );
         Some(1)
     }

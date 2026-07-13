@@ -27,6 +27,7 @@
 use tracing::warn;
 
 use super::core_loop::CoreLoop;
+use crate::data::executor::core_loop::write_index::KeyRepr;
 
 impl CoreLoop {
     /// Decode + tombstone-gate + replay one `kv_expire` WAL record.
@@ -75,6 +76,13 @@ impl CoreLoop {
             );
             return Some(0);
         }
+        self.note_replay_write_lsn(
+            database_id,
+            tenant_id,
+            &collection,
+            Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+            record_lsn,
+        );
         Some(1)
     }
 
@@ -115,6 +123,13 @@ impl CoreLoop {
             );
             return Some(0);
         }
+        self.note_replay_write_lsn(
+            database_id,
+            tenant_id,
+            &collection,
+            Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+            record_lsn,
+        );
         Some(1)
     }
 }

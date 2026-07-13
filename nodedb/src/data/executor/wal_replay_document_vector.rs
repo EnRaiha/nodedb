@@ -35,6 +35,7 @@ use nodedb_types::sync::wire::SyncProvenance;
 use nodedb_wal::record::RecordType;
 
 use super::core_loop::CoreLoop;
+use crate::data::executor::core_loop::write_index::KeyRepr;
 use crate::engine::document::store::surrogate_to_doc_id;
 
 impl CoreLoop {
@@ -97,6 +98,14 @@ impl CoreLoop {
                 let database_id = record.header.database_id;
                 let row_key = surrogate_to_doc_id(Surrogate::new(surrogate_u32));
                 self.remove_document_vector_indexes(database_id, tenant_id, &collection, &row_key);
+                let record_lsn = record.header.lsn;
+                self.note_replay_write_lsn(
+                    database_id,
+                    tenant_id,
+                    &collection,
+                    Some(KeyRepr::Surrogate(surrogate_u32)),
+                    record_lsn,
+                );
                 continue;
             }
 
@@ -143,6 +152,13 @@ impl CoreLoop {
             if !deltas.is_empty() {
                 rebuilt += deltas.len();
             }
+            self.note_replay_write_lsn(
+                database_id,
+                tenant_id,
+                &collection,
+                Some(KeyRepr::Surrogate(surrogate.as_u32())),
+                record_lsn,
+            );
         }
 
         if rebuilt > 0 {

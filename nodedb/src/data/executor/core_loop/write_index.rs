@@ -302,6 +302,36 @@ impl CoreLoop {
             );
         }
     }
+
+    /// Record a committed WAL-replay write's version. A no-op when
+    /// `record_lsn == 0` (no durable LSN was recorded for this write); `key`
+    /// is `None` for collection-only entries (e.g. truncate) and `Some` for
+    /// per-key/per-surrogate entries, exactly like [`Self::note_write_lsn`].
+    ///
+    /// Shared by every WAL replay chokepoint (KV, document, document-vector):
+    /// unlike the live write path, replay only has the raw `(database_id,
+    /// tenant_id, record_lsn)` off the WAL record header, not an
+    /// `ExecutionTask` — hence the separate `u64`-typed entry point rather
+    /// than reusing [`Self::note_surrogate_write_lsn`] /
+    /// [`Self::note_collection_write_lsn`].
+    pub(in crate::data::executor) fn note_replay_write_lsn(
+        &mut self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        key: Option<KeyRepr>,
+        record_lsn: u64,
+    ) {
+        if record_lsn != 0 {
+            self.note_write_lsn(
+                DatabaseId::new(database_id),
+                TenantId::new(tenant_id),
+                collection,
+                key,
+                Lsn::new(record_lsn),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

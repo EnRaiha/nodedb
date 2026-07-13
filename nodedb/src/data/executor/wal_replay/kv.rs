@@ -3,6 +3,7 @@
 //! KV WAL replay: rebuilds in-memory hash tables after crash.
 
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::core_loop::write_index::KeyRepr;
 
 impl CoreLoop {
     /// Replay WAL KV records to rebuild in-memory hash tables after crash.
@@ -83,6 +84,13 @@ impl CoreLoop {
                         },
                         expire_at_ms,
                     );
+                    self.note_replay_write_lsn(
+                        database_id,
+                        tenant_id,
+                        &collection,
+                        Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+                        record_lsn,
+                    );
                     puts += 1;
                     continue;
                 }
@@ -105,6 +113,13 @@ impl CoreLoop {
                         now_ms,
                         surrogate: nodedb_types::Surrogate::ZERO,
                     });
+                    self.note_replay_write_lsn(
+                        database_id,
+                        tenant_id,
+                        &collection,
+                        Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+                        record_lsn,
+                    );
                     puts += 1;
                     continue;
                 }
@@ -141,6 +156,15 @@ impl CoreLoop {
                         },
                         expire_at_ms,
                     );
+                    for (entry_key, _entry_value) in &entries {
+                        self.note_replay_write_lsn(
+                            database_id,
+                            tenant_id,
+                            &collection,
+                            Some(KeyRepr::KvKey(Box::from(entry_key.as_slice()))),
+                            record_lsn,
+                        );
+                    }
                     puts += entries.len();
                     continue;
                 }
@@ -171,6 +195,15 @@ impl CoreLoop {
                             now_ms,
                             surrogates: &surrogates,
                         });
+                    for (entry_key, _entry_value) in &entries {
+                        self.note_replay_write_lsn(
+                            database_id,
+                            tenant_id,
+                            &collection,
+                            Some(KeyRepr::KvKey(Box::from(entry_key.as_slice()))),
+                            record_lsn,
+                        );
+                    }
                     puts += entries.len();
                     continue;
                 }
@@ -317,6 +350,15 @@ impl CoreLoop {
                     }
                     self.kv_engine
                         .delete(database_id, tenant_id, &collection, &keys, now_ms);
+                    for deleted_key in &keys {
+                        self.note_replay_write_lsn(
+                            database_id,
+                            tenant_id,
+                            &collection,
+                            Some(KeyRepr::KvKey(Box::from(deleted_key.as_slice()))),
+                            record_lsn,
+                        );
+                    }
                     deletes += keys.len();
                     continue;
                 }
@@ -330,6 +372,13 @@ impl CoreLoop {
                         continue;
                     }
                     self.kv_engine.truncate(database_id, tenant_id, &collection);
+                    self.note_replay_write_lsn(
+                        database_id,
+                        tenant_id,
+                        &collection,
+                        None,
+                        record_lsn,
+                    );
                     deletes += 1;
                     continue;
                 }

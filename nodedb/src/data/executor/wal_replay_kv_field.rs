@@ -17,6 +17,7 @@ use tracing::warn;
 
 use super::core_loop::CoreLoop;
 use super::handlers::kv::field_compute::merge_field_updates;
+use crate::data::executor::core_loop::write_index::KeyRepr;
 
 impl CoreLoop {
     /// Decode + tombstone-gate + replay one `kv_field_set` WAL record.
@@ -72,6 +73,13 @@ impl CoreLoop {
             now_ms,
             surrogate: nodedb_types::Surrogate::new(surrogate),
         });
+        self.note_replay_write_lsn(
+            database_id,
+            tenant_id,
+            &collection,
+            Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
+            record_lsn,
+        );
         Some(1)
     }
 }
