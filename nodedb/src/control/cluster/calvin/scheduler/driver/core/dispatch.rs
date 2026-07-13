@@ -11,7 +11,7 @@ use nodedb_cluster::calvin::types::SequencedTxn;
 use super::routing::{PlanRouting, plan_vshard};
 use super::scheduler::Scheduler;
 use crate::bridge::envelope::{Priority, Request};
-use crate::control::cluster::calvin::scheduler::lock_manager::{LockKey, TxnId};
+use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::types::{DatabaseId, ReadConsistency, VShardId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::MetaOp;
@@ -149,8 +149,6 @@ impl Scheduler {
         &mut self,
         txn: SequencedTxn,
         txn_id: TxnId,
-        keys: std::collections::BTreeSet<LockKey>,
-        lock_acquired_time: Instant,
     ) {
         let request_id = self.next_request_id();
         let tenant_id = txn.tx_class.tenant_id;
@@ -268,11 +266,8 @@ impl Scheduler {
             txn_id,
             super::super::types::PendingTxn {
                 txn,
-                keys,
-                request_id,
                 // no-determinism: dispatch_time is scheduler observability, not Calvin WAL data
                 dispatch_time: dispatch_instant,
-                lock_acquired_time,
                 has_primary_write,
                 // This dispatch STAGED the txn (validate + buffer, no apply);
                 // its response carries the local commit vote that drives the
@@ -287,8 +282,6 @@ impl Scheduler {
         &mut self,
         txn: SequencedTxn,
         txn_id: TxnId,
-        keys: std::collections::BTreeSet<LockKey>,
-        lock_acquired_time: Instant,
         injected_reads: std::collections::BTreeMap<
             nodedb_physical::physical_plan::meta::PassiveReadKeyId,
             nodedb_types::Value,
@@ -407,11 +400,8 @@ impl Scheduler {
             txn_id,
             super::super::types::PendingTxn {
                 txn,
-                keys,
-                request_id,
                 // no-determinism: dispatch_time is scheduler observability, not Calvin WAL data
                 dispatch_time: dispatch_instant,
-                lock_acquired_time,
                 has_primary_write,
                 // The dependent-read active path now STAGES (leader-verify OLLP
                 // + buffer, no base apply); its response drives the same

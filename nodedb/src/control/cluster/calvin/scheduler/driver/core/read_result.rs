@@ -47,10 +47,8 @@ impl Scheduler {
 
         let injected_reads = barrier.assemble_injected_reads();
         let txn = barrier.txn;
-        let keys = barrier.keys;
-        let lock_acquired_time = barrier.lock_acquired_time;
 
-        self.dispatch_active_txn(txn, txn_id, keys, lock_acquired_time, injected_reads);
+        self.dispatch_active_txn(txn, txn_id, injected_reads);
     }
 
     /// Check all pending dependent barriers for timeout.

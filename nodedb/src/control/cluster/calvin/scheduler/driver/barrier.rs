@@ -24,7 +24,6 @@ use std::time::Instant;
 
 use nodedb_cluster::calvin::types::SequencedTxn;
 
-use crate::control::cluster::calvin::scheduler::lock_manager::LockKey;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::meta::PassiveReadKeyId;
 use nodedb_types::Value;
@@ -57,12 +56,6 @@ pub struct ReadResultEvent {
 pub struct PendingDependentBarrier {
     /// Original sequenced transaction.
     pub txn: SequencedTxn,
-    /// Pre-computed lock key set held by this barrier.
-    pub keys: BTreeSet<LockKey>,
-    /// Wall-clock time at lock acquisition (for latency metrics).
-    ///
-    /// `Instant::now()` used for observability only; never WAL-influencing.
-    pub lock_acquired_time: Instant,
     /// Passive vshards still waiting to deliver their read results.
     /// Entries are removed as `ReadResultEvent`s arrive.
     /// `BTreeSet` for determinism.

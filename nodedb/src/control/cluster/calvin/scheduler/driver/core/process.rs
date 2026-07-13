@@ -11,7 +11,7 @@ use nodedb_cluster::calvin::types::SequencedTxn;
 
 use super::super::barrier::PendingDependentBarrier;
 use super::scheduler::Scheduler;
-use crate::control::cluster::calvin::scheduler::lock_manager::{AcquireOutcome, LockKey, TxnId};
+use crate::control::cluster::calvin::scheduler::lock_manager::{AcquireOutcome, TxnId};
 
 impl Scheduler {
     /// Process a newly arrived sequenced transaction.
@@ -63,8 +63,7 @@ impl Scheduler {
 
         match outcome {
             AcquireOutcome::Ready => {
-                // no-determinism: lock_acquired_time is scheduler observability, not Calvin WAL data
-                self.dispatch_or_barrier(txn, txn_id, keys, Instant::now());
+                self.dispatch_or_barrier(txn, txn_id);
             }
             AcquireOutcome::Blocked => {
                 self.metrics.record_blocked();
@@ -86,30 +85,22 @@ impl Scheduler {
         &mut self,
         txn: SequencedTxn,
         txn_id: TxnId,
-        keys: std::collections::BTreeSet<LockKey>,
-        lock_acquired_time: Instant,
     ) {
         let is_dependent = txn.tx_class.dependent_reads.is_some();
         if is_dependent {
-            self.insert_dependent_barrier(txn, txn_id, keys, lock_acquired_time);
+            self.insert_dependent_barrier(txn, txn_id);
         } else {
-            self.dispatch_txn(txn, txn_id, keys, lock_acquired_time);
+            self.dispatch_txn(txn, txn_id);
         }
     }
 
     /// Insert a dependent-read barrier for an active vshard.
-    fn insert_dependent_barrier(
-        &mut self,
-        txn: SequencedTxn,
-        txn_id: TxnId,
-        keys: std::collections::BTreeSet<LockKey>,
-        lock_acquired_time: Instant,
-    ) {
+    fn insert_dependent_barrier(&mut self, txn: SequencedTxn, txn_id: TxnId) {
         let spec = match &txn.tx_class.dependent_reads {
             Some(s) => s,
             None => {
                 // Shouldn't happen; fall through to static dispatch.
-                self.dispatch_txn(txn, txn_id, keys, lock_acquired_time);
+                self.dispatch_txn(txn, txn_id);
                 return;
             }
         };
@@ -121,8 +112,6 @@ impl Scheduler {
 
         let barrier = PendingDependentBarrier {
             txn,
-            keys,
-            lock_acquired_time,
             waiting_for,
             received: BTreeMap::new(),
             timeout_at,
@@ -189,8 +178,7 @@ impl Scheduler {
         }
 
         let lm = Arc::clone(&self.lock_manager);
-        let mut to_dispatch: Vec<(SequencedTxn, TxnId, std::collections::BTreeSet<LockKey>)> =
-            Vec::new();
+        let mut to_dispatch: Vec<(SequencedTxn, TxnId)> = Vec::new();
         {
             let mut guard = lm.lock().unwrap_or_else(|p| p.into_inner());
             for waiter_id in promoted {
@@ -211,7 +199,7 @@ impl Scheduler {
                     continue;
                 }
                 let keys = blocked.keys.clone();
-                let outcome = guard.acquire(waiter_id, keys.clone());
+                let outcome = guard.acquire(waiter_id, keys);
                 debug_assert_eq!(
                     outcome,
                     AcquireOutcome::Ready,
@@ -221,14 +209,13 @@ impl Scheduler {
                 if let Some(blocked_txn) = self.blocked.remove(&waiter_id) {
                     let wait_ms = blocked_txn.blocked_at.elapsed().as_millis() as u64;
                     self.metrics.record_lock_wait_ms(wait_ms);
-                    to_dispatch.push((blocked_txn.txn, waiter_id, keys));
+                    to_dispatch.push((blocked_txn.txn, waiter_id));
                 }
             }
         }
 
-        for (txn, waiter_id, keys) in to_dispatch {
-            // no-determinism: lock_acquired_time for unblocked txn is scheduler observability, not Calvin WAL data
-            self.dispatch_or_barrier(txn, waiter_id, keys, Instant::now());
+        for (txn, waiter_id) in to_dispatch {
+            self.dispatch_or_barrier(txn, waiter_id);
         }
     }
 }

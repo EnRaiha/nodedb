@@ -14,8 +14,6 @@ use nodedb::control::cluster::calvin::scheduler::driver::barrier::{
 use nodedb_physical::physical_plan::meta::PassiveReadKeyId;
 use nodedb_types::{TenantId, Value};
 
-use nodedb::control::cluster::calvin::scheduler::lock_manager::LockKey;
-
 use std::collections::BTreeSet;
 use std::time::Instant;
 
@@ -96,13 +94,10 @@ fn dependent_barrier_completes_after_passive_delivers() {
     let mut waiting_for = BTreeSet::new();
     waiting_for.insert(passive_vshard);
 
-    let keys: BTreeSet<LockKey> = BTreeSet::new();
     let timeout_at = Instant::now() + Duration::from_secs(30);
 
     let mut barrier = PendingDependentBarrier {
         txn: txn.clone(),
-        keys,
-        lock_acquired_time: Instant::now(),
         waiting_for,
         received: BTreeMap::new(),
         timeout_at,
@@ -188,8 +183,6 @@ fn dependent_barrier_not_complete_with_multiple_passives() {
             epoch_system_ms: 0,
             epoch_vshard_txn_count: 0,
         },
-        keys: BTreeSet::new(),
-        lock_acquired_time: Instant::now(),
         waiting_for,
         received: BTreeMap::new(),
         timeout_at: Instant::now() + Duration::from_secs(30),
@@ -233,8 +226,6 @@ fn dependent_barrier_timeout_detected() {
     let txn = make_dependent_txn(7);
     let barrier = PendingDependentBarrier {
         txn,
-        keys: BTreeSet::new(),
-        lock_acquired_time: Instant::now(),
         waiting_for: {
             let mut s = BTreeSet::new();
             s.insert(7u32);
