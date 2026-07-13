@@ -17,6 +17,10 @@ use nodedb::wal::WalManager;
 /// A running native-protocol test server.
 pub struct NativeTestServer {
     pub addr: std::net::SocketAddr,
+    /// Shared Control-Plane state, exposed so tests can read metrics (e.g.
+    /// `shared.system_metrics.active_txn_overlays`) that the Data-Plane
+    /// core also updates via the same `Arc<SystemMetrics>`.
+    pub shared: Arc<SharedState>,
     pub(super) shutdown_bus: nodedb::control::shutdown::ShutdownBus,
     pub(super) poller_shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub(super) core_stop_tx: std::sync::mpsc::Sender<()>,
@@ -65,6 +69,7 @@ impl NativeTestServer {
         let core_dir = dir.path().to_path_buf();
         let event_producer = event_producers.into_iter().next().expect("event producer");
         let core_array_catalog = shared.array_catalog.clone();
+        let core_metrics = shared.system_metrics.clone();
         let (core_stop_tx, core_stop_rx) = std::sync::mpsc::channel::<()>();
         let _core_handle = tokio::task::spawn_blocking(move || {
             let mut core = CoreLoop::open_with_array_catalog(
@@ -77,6 +82,9 @@ impl NativeTestServer {
             )
             .expect("open core");
             core.set_event_producer(event_producer);
+            if let Some(m) = core_metrics {
+                core.set_metrics(m);
+            }
             while matches!(
                 core_stop_rx.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
@@ -145,6 +153,7 @@ impl NativeTestServer {
 
         Self {
             addr,
+            shared: Arc::clone(&shared),
             shutdown_bus,
             poller_shutdown_tx,
             core_stop_tx,
