@@ -57,6 +57,18 @@ pub enum SequencerEntry {
         position: u32,
         detail: String,
     },
+    /// One participant vShard's durable commit vote for a staged cross-shard txn.
+    /// Generalizes `OllpMismatch` (an implicit vote=abort). Unlike
+    /// `OllpMismatch`/`CompletionAck` which key only on `(epoch, position)`, `Vote`
+    /// carries `vshard` because the verdict aggregator must attribute exactly one
+    /// vote per participant to know when the tally is complete. `commit` is the
+    /// participant's `read_set_valid` outcome (true = valid/commit, false = abort).
+    Vote {
+        epoch: u64,
+        position: u32,
+        vshard: u32,
+        commit: bool,
+    },
 }
 
 #[cfg(test)]
@@ -169,5 +181,18 @@ mod tests {
         assert_eq!(epoch, 42);
         assert_eq!(position, 3);
         assert_eq!(detail, "unroutable plan: Vector");
+    }
+
+    #[test]
+    fn vote_msgpack_roundtrip() {
+        let entry = SequencerEntry::Vote {
+            epoch: 5,
+            position: 2,
+            vshard: 9,
+            commit: true,
+        };
+        let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
+        let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
+        assert_eq!(entry, decoded);
     }
 }

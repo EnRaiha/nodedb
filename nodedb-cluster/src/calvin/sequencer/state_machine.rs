@@ -197,6 +197,10 @@ impl SequencerStateMachine {
                 // Routing-failure signals are coordinator-side notifications
                 // only, like `OllpMismatch`; they carry no txn data to replay.
                 SequencerEntry::TxnRoutingFailed { .. } => {}
+                // Vote signals are coordinator-side notifications only, like
+                // `OllpMismatch`/`TxnRoutingFailed`; they carry no txn data to
+                // replay. Replay re-derives tallies via live `apply` instead.
+                SequencerEntry::Vote { .. } => {}
             }
         }
 
@@ -340,6 +344,22 @@ impl SequencerStateMachine {
             } => {
                 self.completion_registry
                     .note_routing_failed(crate::calvin::TxnId::new(epoch, position), detail);
+            }
+            // Durable per-participant commit vote for a staged cross-shard txn.
+            // Currently observed-only: the registry tallies votes but nothing
+            // yet reads the tally to change flush/drop behavior (that is a
+            // follow-up); the leader's local decision still drives.
+            SequencerEntry::Vote {
+                epoch,
+                position,
+                vshard,
+                commit,
+            } => {
+                self.completion_registry.note_vote(
+                    crate::calvin::TxnId::new(epoch, position),
+                    vshard,
+                    commit,
+                );
             }
         }
     }

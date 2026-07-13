@@ -44,6 +44,27 @@ impl Scheduler {
         staged_response: &Response,
     ) {
         let committed = staged_response.read_set_valid != Some(false);
+
+        // Durably propose this participant's commit vote via the sequencer
+        // Raft group, leader-guarded like `OllpMismatch`: only the data-group
+        // leader ran read-set validation, so only a leader's vote is
+        // authoritative. Currently observed-only — the registry tallies the
+        // vote (`CalvinCompletionRegistry::note_vote`) but nothing yet reads
+        // the tally to change flush/drop behavior; the local `committed`
+        // decision below still drives the resolve path unchanged.
+        if self.is_group_leader() {
+            self.propose_sequencer_entry(
+                SequencerEntry::Vote {
+                    epoch: txn_id.epoch,
+                    position: txn_id.position,
+                    vshard: self.vshard_id,
+                    commit: committed,
+                },
+                txn_id,
+                "commit vote",
+            );
+        }
+
         if !committed {
             // The staged slice's read-set was no longer current: observe it, the
             // same node-global signal the direct-apply path records.

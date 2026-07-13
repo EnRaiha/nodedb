@@ -255,6 +255,7 @@ fn entry_txn_count(entry: &SequencerEntry) -> usize {
         SequencerEntry::CompletionAck { .. } => 0,
         SequencerEntry::OllpMismatch { .. } => 0,
         SequencerEntry::TxnRoutingFailed { .. } => 0,
+        SequencerEntry::Vote { .. } => 0,
     }
 }
 

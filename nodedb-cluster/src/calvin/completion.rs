@@ -49,6 +49,12 @@ struct PendingCompletion {
     /// `mismatched` and completion: a routing failure is never retried and never
     /// falsely reported as success.
     routing_failed: Option<String>,
+    /// Durable per-participant commit votes tallied from `SequencerEntry::Vote`.
+    /// Keyed by vshard so a re-proposed vote (retry) overwrites deterministically
+    /// rather than double-counting. Currently observed-only: nothing reads this
+    /// tally to change flush/drop behavior yet (that is a follow-up); the
+    /// leader's local decision still drives.
+    votes: BTreeMap<u32, bool>,
 }
 
 impl PendingCompletion {
@@ -59,6 +65,7 @@ impl PendingCompletion {
             completion_tx: None,
             mismatched: false,
             routing_failed: None,
+            votes: BTreeMap::new(),
         }
     }
 
@@ -256,6 +263,34 @@ impl CalvinCompletionRegistry {
                 );
             }
         }
+    }
+
+    /// Record one participant vshard's durable commit vote for `txn`, tallied
+    /// from a replicated `SequencerEntry::Vote`.
+    ///
+    /// This is observed-only: it accumulates the vote per `vshard` (last write
+    /// wins, deterministic across re-proposals from retries) but does NOT
+    /// compute a verdict or wake any waiter — the local flush/drop decision
+    /// still drives. A follow-up aggregates the tally into the commit
+    /// verdict.
+    pub fn note_vote(&self, txn_id: TxnId, vshard: u32, commit: bool) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = inner
+            .completions
+            .entry(txn_id)
+            .or_insert_with(|| PendingCompletion::new(0));
+        entry.votes.insert(vshard, commit);
+    }
+
+    /// Test/inspection accessor: returns the current per-vshard vote tally for
+    /// `txn_id`, or `None` if no entry (and therefore no votes) exist yet.
+    pub fn vote_tally(&self, txn_id: TxnId) -> Option<BTreeMap<u32, bool>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .completions
+            .get(&txn_id)
+            .map(|entry| entry.votes.clone())
     }
 
     /// Test-only: returns the number of pending completion entries.
@@ -466,6 +501,18 @@ mod tests {
             0,
             "entry must be evicted once routing failure is signalled"
         );
+    }
+
+    #[tokio::test]
+    async fn note_vote_tallies_one_vote_per_vshard() {
+        let reg = CalvinCompletionRegistry::new();
+        let txn = TxnId::new(30, 0);
+        reg.note_vote(txn, 1, true);
+        reg.note_vote(txn, 2, false);
+        let tally = reg.vote_tally(txn).expect("entry created by note_vote");
+        assert_eq!(tally.len(), 2);
+        assert_eq!(tally.get(&1), Some(&true));
+        assert_eq!(tally.get(&2), Some(&false));
     }
 
     #[tokio::test]
