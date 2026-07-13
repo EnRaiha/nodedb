@@ -16,7 +16,7 @@ use tracing::warn;
 
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::CrdtListOpWalRecord;
 use nodedb_physical::physical_plan::CrdtOp;
 use nodedb_types::Surrogate;
@@ -133,7 +133,8 @@ impl CoreLoop {
                     fields_json: fields_json.clone(),
                     surrogate: Surrogate::ZERO,
                 });
-                let task = Self::replay_task(tid, database_id, vshard, plan);
+                let task =
+                    Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
                 let response = self.execute_crdt_list_insert(
                     &task,
                     collection,
@@ -160,7 +161,8 @@ impl CoreLoop {
                     index,
                     surrogate: Surrogate::ZERO,
                 });
-                let task = Self::replay_task(tid, database_id, vshard, plan);
+                let task =
+                    Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
                 let response =
                     self.execute_crdt_list_delete(&task, collection, document_id, list_path, index);
                 (collection, document_id, list_path, response)
@@ -189,7 +191,8 @@ impl CoreLoop {
                     to_index,
                     surrogate: Surrogate::ZERO,
                 });
-                let task = Self::replay_task(tid, database_id, vshard, plan);
+                let task =
+                    Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
                 let response = self.execute_crdt_list_move(
                     &task,
                     collection,

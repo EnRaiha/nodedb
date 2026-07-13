@@ -44,7 +44,7 @@ use tracing::warn;
 
 use super::core_loop::CoreLoop;
 use crate::bridge::envelope::{PhysicalPlan, Status};
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::ColumnarOp;
 use nodedb_types::columnar::ColumnarDmlWalRecord;
 
@@ -92,7 +92,13 @@ impl CoreLoop {
                 filters: record.filters.clone(),
             })
         };
-        let task = Self::replay_task(tid, database_id, vshard_id, plan);
+        let task = Self::replay_task(
+            tid,
+            database_id,
+            vshard_id,
+            plan,
+            Some(Lsn::new(record_lsn)),
+        );
 
         // Re-execute via the same live handlers the autocommit dispatch used —
         // `undo_log: None` mirrors the autocommit path (no transaction batch
@@ -303,7 +309,11 @@ mod tests {
             filters: eq_filter_bytes("id", Value::Integer(1)),
             updates: vec![(
                 "v".to_string(),
-                zerompk::to_msgpack_vec(&Value::Integer(999)).expect("encode"),
+                // `execute_columnar_update` decodes each update value with the
+                // plain reader (`value_from_msgpack`), matching the planner's
+                // `sql_value_to_msgpack` output — not the tagged `Value` enum
+                // encoding `zerompk::to_msgpack_vec(&Value)` would emit.
+                nodedb_types::value_to_msgpack(&Value::Integer(999)).expect("encode"),
             )],
         });
         let outcome = wal_append_if_write(

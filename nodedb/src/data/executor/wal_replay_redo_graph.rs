@@ -310,6 +310,36 @@ mod tests {
     }
 
     #[test]
+    fn redo_graph_edge_put_records_write_version_floor() {
+        use crate::data::executor::core_loop::write_index::{KeyRepr, WriteKey};
+
+        let mut h = make_core();
+        let record = redo_record(7, vec![edge_put_sub("knows", "a", "KNOWS", "b")]);
+
+        h.core.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let write_key = WriteKey {
+            db: DatabaseId::new(0),
+            tenant: crate::types::TenantId::new(7),
+            collection: Box::from("knows"),
+            key: KeyRepr::Edge {
+                src: Box::from("a"),
+                label: Box::from("KNOWS"),
+                dst: Box::from("b"),
+            },
+        };
+        assert_eq!(
+            h.core.write_index.key_write_lsn(&write_key),
+            Some(Lsn::new(1)),
+            "graph edge redo replay must record the write-version floor at the record's LSN"
+        );
+    }
+
+    #[test]
     fn redo_graph_edge_put_idempotent_double_replay() {
         let mut h = make_core();
         let record = redo_record(7, vec![edge_put_sub("knows", "a", "KNOWS", "b")]);

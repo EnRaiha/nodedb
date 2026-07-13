@@ -108,6 +108,7 @@ impl CoreLoop {
         database_id: DatabaseId,
         vshard_id: crate::types::VShardId,
         plan: PhysicalPlan,
+        wal_lsn: Option<crate::types::Lsn>,
     ) -> ExecutionTask {
         ExecutionTask {
             request: Request {
@@ -126,14 +127,14 @@ impl CoreLoop {
                 user_id: None,
                 statement_digest: None,
                 txn_id: None,
-                wal_lsn: None,
+                wal_lsn,
                 resolved_now_ms: None,
                 admission: crate::bridge::envelope::Admission::Exempt(
                     crate::bridge::envelope::ExemptReason::AlreadyOrdered,
                 ),
             },
             state: TaskState::Running,
-            wal_lsn: None,
+            wal_lsn,
             resolved_now_ms: None,
         }
     }
@@ -202,6 +203,7 @@ impl CoreLoop {
                 surrogates: Vec::new(),
                 provenance: provenance.clone(),
             }),
+            Some(crate::types::Lsn::new(record_lsn)),
         );
         let response = self.execute_timeseries_ingest(TimeseriesIngestExec {
             task: &task,
@@ -258,6 +260,7 @@ impl CoreLoop {
                 provenance: None,
                 wal_lsn: Some(record_lsn),
             }),
+            Some(crate::types::Lsn::new(record_lsn)),
         );
         // Restore the persisted per-row surrogates so `execute_columnar_insert`
         // rebinds the exact same cross-engine identity via
@@ -449,9 +452,118 @@ impl CoreLoop {
 #[cfg(test)]
 mod tests {
     use super::decode_batch_record;
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::core_loop::write_index::CollKey;
+    use crate::types::{DatabaseId, Lsn, TenantId};
     use nodedb_types::Surrogate;
     use nodedb_types::columnar::ColumnarWalRecord;
     use nodedb_types::sync::wire::SyncProvenance;
+    use nodedb_wal::WalRecord;
+    use nodedb_wal::record::{RecordType, WalRecordArgs};
+    use std::sync::Arc;
+
+    /// Holds the bridge endpoints + tempdir alive for the core's lifetime.
+    /// The test drives replay directly and never ticks the event loop, so
+    /// the far ends of the bridge are unused — they just must not be
+    /// dropped mid-test.
+    struct CoreHarness {
+        core: CoreLoop,
+        _req_tx: nodedb_bridge::buffer::Producer<crate::bridge::dispatch::BridgeRequest>,
+        _resp_rx: nodedb_bridge::buffer::Consumer<crate::bridge::dispatch::BridgeResponse>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn make_core() -> CoreHarness {
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+        use nodedb_bridge::buffer::RingBuffer;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("open core");
+        CoreHarness {
+            core,
+            _req_tx: req_tx,
+            _resp_rx: resp_rx,
+            _dir: dir,
+        }
+    }
+
+    /// A one-row msgpack `Value::Object` columnar payload: `{col: "v"}`.
+    fn row_payload(col: &str, value: &str) -> Vec<u8> {
+        let mut obj = std::collections::HashMap::new();
+        obj.insert(
+            col.to_string(),
+            nodedb_types::Value::String(value.to_string()),
+        );
+        // Mirror the production columnar-insert write path, which encodes rows
+        // with the PLAIN msgpack writer (`value_to_msgpack`) and reads them back
+        // with `value_from_msgpack`. `zerompk::to_msgpack_vec(&Value)` would emit
+        // a tagged `[variant, payload]` array that the plain reader mis-parses.
+        nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(obj)).expect("encode row")
+    }
+
+    /// A `TimeseriesBatch`-typed WAL record carrying a map-shaped
+    /// `ColumnarWalRecord` with `kind = "columnar"`, at `lsn`.
+    fn columnar_wal_record(collection: &str, lsn: u64, tenant_id: u64) -> WalRecord {
+        let rec = ColumnarWalRecord {
+            kind: "columnar".to_string(),
+            collection: collection.to_string(),
+            payload: row_payload("name", "alice"),
+            provenance: None,
+            surrogates: Vec::new(),
+        };
+        let payload = zerompk::to_msgpack_vec(&rec).expect("encode columnar wal record");
+        WalRecord::new(WalRecordArgs {
+            record_type: RecordType::TimeseriesBatch as u32,
+            lsn,
+            tenant_id,
+            vshard_id: 0,
+            database_id: 0,
+            payload,
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("wal record")
+    }
+
+    /// WAL replay threads the record LSN into `replay_task` so
+    /// `execute_columnar_insert`'s `note_collection_write_lsn(task, ..)` call
+    /// (gated on `task.wal_lsn().is_some()`) fires during WAL replay too, not
+    /// just on live writes. This proves the collection floor in
+    /// `WriteVersionIndex` is populated end-to-end through
+    /// `replay_timeseries_wal` -> `replay_columnar_payload` ->
+    /// `execute_columnar_insert`.
+    #[test]
+    fn columnar_insert_replay_populates_collection_write_lsn_floor() {
+        let mut h = make_core();
+        let record = columnar_wal_record("events_wv", 123, 7);
+
+        h.core.replay_timeseries_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let coll_key = CollKey {
+            db: DatabaseId::new(0),
+            tenant: TenantId::new(7),
+            collection: Box::from("events_wv"),
+        };
+        assert_eq!(
+            h.core.write_index.collection_write_lsn(&coll_key),
+            Some(Lsn::new(123)),
+            "columnar insert replay must record the record LSN as the \
+             collection write-version floor"
+        );
+    }
 
     #[test]
     fn decodes_map_columnar_record_with_surrogates() {
