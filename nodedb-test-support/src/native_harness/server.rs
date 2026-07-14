@@ -77,6 +77,9 @@ impl NativeTestServer {
         let core_dir = dir.path().to_path_buf();
         let event_producer = event_producers.into_iter().next().expect("event producer");
         let core_array_catalog = shared.array_catalog.clone();
+        // Share the Control-Plane `SystemMetrics` so the Data-Plane core updates
+        // the same `active_txn_overlays` gauge tests read via `shared`.
+        let core_metrics = shared.system_metrics.clone();
         let (core_stop_tx, core_stop_rx) = std::sync::mpsc::channel::<()>();
         let _core_handle = tokio::task::spawn_blocking(move || {
             let mut core = CoreLoop::open_with_array_catalog(
@@ -89,6 +92,9 @@ impl NativeTestServer {
             )
             .expect("open core");
             core.set_event_producer(event_producer);
+            if let Some(m) = core_metrics {
+                core.set_metrics(m);
+            }
             while matches!(
                 core_stop_rx.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
