@@ -4,6 +4,8 @@
 //!
 //! Discriminants 18 and 19 are permanently assigned to these variants.
 
+use nodedb_types::id::TxnId;
+
 use super::discriminants::*;
 use super::header::write_frame;
 use super::raft_rpc::RaftRpc;
@@ -38,6 +40,11 @@ pub struct ExecuteRequest {
     pub trace_id: [u8; 16],
     /// Caller's view of descriptor versions for every collection touched by the plan.
     pub descriptor_versions: Vec<DescriptorVersionEntry>,
+    /// Transaction context for the plan, when this leg executes inside a session
+    /// transaction (e.g. a multi-node graph-MATCH leg). `None` for the common
+    /// non-transactional dispatch. Lets the receiver resolve the per-transaction
+    /// staging overlay for the id on the remote node.
+    pub txn_id: Option<TxnId>,
 }
 
 /// Response to an `ExecuteRequest`.
@@ -252,6 +259,7 @@ mod tests {
                     version: 1,
                 },
             ],
+            txn_id: None,
         };
         let decoded = roundtrip_req(req.clone());
         assert_eq!(decoded.plan_bytes, req.plan_bytes);
@@ -275,6 +283,7 @@ mod tests {
             deadline_remaining_ms: 1000,
             trace_id: [0u8; 16],
             descriptor_versions: vec![],
+            txn_id: None,
         };
         let decoded = roundtrip_req(req);
         assert!(decoded.descriptor_versions.is_empty());
@@ -416,6 +425,7 @@ mod tests {
                 collection: "wide".into(),
                 version: 3,
             }],
+            txn_id: None,
         };
         let rpc = RaftRpc::ExecuteStreamRequest(req.clone());
         let encoded = super::super::encode(&rpc).unwrap();

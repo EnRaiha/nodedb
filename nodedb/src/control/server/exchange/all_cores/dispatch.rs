@@ -5,7 +5,7 @@
 //! bespoke single-blob merge (see `snapshot.rs`, `bsp.rs`, `wcc.rs`).
 
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
+use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId};
 use nodedb_physical::physical_plan::{GraphOp, MetaOp, PhysicalPlan};
 
 use super::bsp::fan_bsp_all_cores;
@@ -43,12 +43,21 @@ pub struct NodeLevelResult {
 ///
 /// At 1 core/node every branch is behaviour-identical to the prior single-core
 /// paths.
+///
+/// `txn_id` is the caller's active session transaction, if any. On the cluster
+/// receive path it comes from the incoming `ExecuteRequest.txn_id` so a MATCH
+/// leg (and the generic array gather) can stamp each core's request and resolve
+/// the transaction's staged overlay for read-your-own-writes. `None` is the
+/// autocommit / non-transactional path and is byte-identical to before. The
+/// graph-analytics fan-out (BSP / WCC / snapshot / single-blob) is not
+/// session-transaction-scoped, so it does not carry the id.
 pub async fn execute_plan_all_local_cores(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<NodeLevelResult> {
     match &plan {
         PhysicalPlan::Graph(g) => match g {
@@ -60,17 +69,19 @@ pub async fn execute_plan_all_local_cores(
                 use crate::data::executor::handlers::graph_match::encode_match_envelope_raw;
 
                 // Cross-node MATCH execution: this node received the plan from a
-                // remote coordinator, so the transaction's staged overlay (which
-                // lives on the origin node) is not reachable here — run
-                // committed-CSR-only. Cross-node read-your-own-writes for MATCH
-                // is a separate unit.
+                // remote coordinator and the forwarded `txn_id` is stamped on
+                // each core's request so the Data-Plane MATCH handler can resolve
+                // the transaction's staged overlay once it is present on this
+                // node. It is inert while `None` (autocommit) and while no
+                // overlay is staged for the id — staging/forwarding the overlay
+                // to the leader is a separate unit.
                 let outcome = broadcast_match_to_all_cores(
                     state,
                     tenant_id,
                     database_id,
                     plan,
                     trace_id,
-                    None,
+                    txn_id,
                 )
                 .await?;
 
@@ -117,7 +128,7 @@ pub async fn execute_plan_all_local_cores(
             | GraphOp::TemporalNeighbors { .. }
             | GraphOp::TemporalAlgorithm { .. }
             | GraphOp::Stats { .. } => {
-                generic_gather(state, tenant_id, database_id, plan, trace_id).await
+                generic_gather(state, tenant_id, database_id, plan, trace_id, txn_id).await
             }
         },
 
@@ -204,7 +215,7 @@ pub async fn execute_plan_all_local_cores(
             | MetaOp::RecordCalvinWriteVersions { .. }
             | MetaOp::CalvinFlush { .. }
             | MetaOp::CalvinDrop { .. } => {
-                generic_gather(state, tenant_id, database_id, plan, trace_id).await
+                generic_gather(state, tenant_id, database_id, plan, trace_id, txn_id).await
             }
         },
 
@@ -220,7 +231,7 @@ pub async fn execute_plan_all_local_cores(
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Array(_)
         | PhysicalPlan::ClusterArray(_) => {
-            generic_gather(state, tenant_id, database_id, plan, trace_id).await
+            generic_gather(state, tenant_id, database_id, plan, trace_id, txn_id).await
         }
     }
 }
@@ -232,13 +243,14 @@ async fn generic_gather(
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<NodeLevelResult> {
     use crate::control::server::exchange::gather::gather_all_cores;
 
-    // Cluster RPC receiver path (remote-node local execution): no session
-    // transaction context crosses the node boundary yet, so `txn_id` is
-    // `None` here. TRACKED: cross-node in-transaction reads are a known gap.
-    let outcome = gather_all_cores(state, tenant_id, database_id, plan, trace_id, None).await?;
+    // Cluster RPC receiver path (remote-node local execution): the forwarded
+    // `txn_id` (if any) is stamped on each core's request so a transactional
+    // read honours its staged overlay. Inert when `None`.
+    let outcome = gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await?;
     Ok(NodeLevelResult {
         payload: outcome.merged_array,
         watermark_lsn: outcome.watermark_lsn,

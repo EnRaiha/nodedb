@@ -322,6 +322,8 @@ async fn snapshot_remote(
         deadline_remaining_ms: NODE_SNAPSHOT_TIMEOUT.as_millis() as u64,
         trace_id: TraceId::generate().0,
         descriptor_versions: Vec::new(),
+        // Backup snapshot dispatch is not session-transaction-scoped.
+        txn_id: None,
     });
 
     let resp = transport

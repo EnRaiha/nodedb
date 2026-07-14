@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use futures::future::join_all;
 
 use crate::bridge::envelope::{Payload, PhysicalPlan};
-use crate::control::gateway::dispatcher::dispatch_route;
+use crate::control::gateway::dispatcher::{DispatchRouteParams, dispatch_route};
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
@@ -42,8 +42,10 @@ pub(super) async fn scatter_round_zero(
     // active `txn_id` is threaded onto this LOCAL leg so each core merges the
     // transaction's staged edge overlay for read-your-own-writes; with the
     // fixed-hop overlay merge un-gated in cluster mode, a bound zero-degree
-    // source still emits its cross-shard frontier. Remote owners below read
-    // committed CSR (`None`) — multi-node overlay forwarding is a separate unit.
+    // source still emits its cross-shard frontier. The same `txn_id` is now
+    // forwarded to remote owners below so their leg can resolve the transaction's
+    // staged overlay; the staging/forwarding of that overlay to the leader is a
+    // separate unit, so the forwarded id is inert until that lands.
     let local_plan = PhysicalPlan::Graph(GraphOp::Match {
         query: query_bytes.to_vec(),
         frontier_bitmap: None,
@@ -80,15 +82,16 @@ pub(super) async fn scatter_round_zero(
         let node_id = owner.node_id;
         let shared_arc = shared_arc.clone();
         Box::pin(async move {
-            let payloads = dispatch_route(
+            let payloads = dispatch_route(DispatchRouteParams {
                 route,
-                &shared_arc,
+                shared: &shared_arc,
                 tenant_id,
                 database_id,
-                TraceId::ZERO,
+                trace_id: TraceId::ZERO,
                 deadline_ms,
-                &version_set,
-            )
+                version_set: &version_set,
+                txn_id,
+            })
             .await?
             .payloads;
             collect_remote_envelopes(node_id, payloads)

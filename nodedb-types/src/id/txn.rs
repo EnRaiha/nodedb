@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
     Deserialize,
     zerompk::ToMessagePack,
     zerompk::FromMessagePack,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub struct TxnId(u64);
 

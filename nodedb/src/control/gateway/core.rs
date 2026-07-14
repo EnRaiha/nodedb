@@ -30,7 +30,7 @@ use crate::control::trace_export::EmitSpanParams;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 
-use super::dispatcher::{default_deadline_ms, dispatch_route};
+use super::dispatcher::{DispatchRouteParams, default_deadline_ms, dispatch_route};
 use super::fuser::fuse_payloads;
 use super::key_extractor::UnwiredKeyExtractor;
 use super::plan_cache::{PlanCache, PlanCacheKey, SqlKey, hash_placeholder_types, hash_sql};
@@ -210,8 +210,16 @@ impl Gateway {
         if let Some(stored_vs) = self.plan_cache.lookup_version_set(&sql_key) {
             // Verify the stored version set is still current by cross-checking
             // each collection's current descriptor version.
-            let current_vs =
-                self.verify_version_set(&stored_vs, ctx.tenant_id.as_u64(), ctx.database_id)?;
+            let shared = self.shared()?;
+            let catalog = shared.credentials.catalog();
+            let current_vs = stored_vs.reverify(|name| {
+                catalog
+                    .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), name)
+                    .ok()
+                    .flatten()
+                    .map(|col| col.descriptor_version.max(1))
+                    .unwrap_or(0)
+            });
             if current_vs == stored_vs {
                 // Version set is still current — try the full plan cache.
                 let full_key = PlanCacheKey {
@@ -335,15 +343,19 @@ impl Gateway {
                         decision,
                         vshard_id: vshard_id_u32,
                     };
-                    dispatch_route(
+                    dispatch_route(DispatchRouteParams {
                         route,
-                        &shared,
+                        shared: &shared,
                         tenant_id,
                         database_id,
                         trace_id,
                         deadline_ms,
-                        &version_set,
-                    )
+                        version_set: &version_set,
+                        // The gateway does not yet carry session-transaction
+                        // context across this boundary (known cross-node
+                        // in-transaction read gap), so `None`.
+                        txn_id: None,
+                    })
                     .await
                 }
             })
@@ -466,35 +478,6 @@ impl Gateway {
         }))
     }
 
-    /// Re-read the current descriptor versions for the collections listed in
-    /// `stored_vs` and return a new `GatewayVersionSet` with the current values.
-    ///
-    /// Used by `execute_sql` to verify that a cached version set is still
-    /// current before trusting a plan-cache hit. If the returned set equals
-    /// `stored_vs`, the cached plan is still valid.
-    fn verify_version_set(
-        &self,
-        stored_vs: &GatewayVersionSet,
-        tenant_id: u64,
-        database_id: DatabaseId,
-    ) -> Result<GatewayVersionSet, Error> {
-        let shared = self.shared()?;
-        let catalog = Some(shared.credentials.catalog());
-
-        let pairs: Vec<(String, u64)> = stored_vs
-            .iter()
-            .map(|(name, _)| {
-                let current_version = catalog
-                    .and_then(|c| c.get_collection(database_id, tenant_id, name).ok())
-                    .flatten()
-                    .map(|col| col.descriptor_version.max(1))
-                    .unwrap_or(0);
-                (name.clone(), current_version)
-            })
-            .collect();
-
-        Ok(GatewayVersionSet::from_pairs(pairs))
-    }
 }
 
 #[cfg(test)]

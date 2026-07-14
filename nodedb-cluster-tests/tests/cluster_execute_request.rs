@@ -53,6 +53,7 @@ fn make_kv_put_request(
             collection: collection.into(),
             version: descriptor_version,
         }],
+        txn_id: None,
     }
 }
 
@@ -159,6 +160,7 @@ async fn execute_request_read_carries_watermark_lsn() {
         deadline_remaining_ms: 5000,
         trace_id: [0u8; 16],
         descriptor_versions: vec![],
+        txn_id: None,
     };
 
     let resp = send_execute_request(transport, node1.listen_addr, req).await;
@@ -284,6 +286,7 @@ async fn execute_request_cross_node_dispatch() {
             collection: "cross_node_kv".into(),
             version: 0, // Accept any version (pre-B.1 sentinel bypass)
         }],
+        txn_id: None,
     };
 
     let resp = send_execute_request(sender_transport, target_addr, req).await;

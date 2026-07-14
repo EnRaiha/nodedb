@@ -24,7 +24,7 @@ use crate::Error;
 use crate::control::server::dispatch_utils::dispatch_to_data_plane;
 use crate::control::server::result_stream::ResultStream;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 
 use super::dispatch_remote::{RemoteDispatchArgs, dispatch_remote, dispatch_remote_stream};
 use super::route::{RouteDecision, TaskRoute};
@@ -51,21 +51,37 @@ pub struct DispatchOutcome {
     pub read_version_lsn: Lsn,
 }
 
-/// Dispatch a single route and return the raw payload bytes.
+/// Parameters for [`dispatch_route`].
 ///
 /// `tenant_id` — the authenticated tenant for this query.
 /// `trace_id` — distributed trace ID propagated from the client request.
 /// `deadline_ms` — remaining deadline in milliseconds.
 /// `version_set` — descriptor versions for the collections touched by the plan.
-pub async fn dispatch_route(
-    route: TaskRoute,
-    shared: &Arc<SharedState>,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    trace_id: TraceId,
-    deadline_ms: u64,
-    version_set: &GatewayVersionSet,
-) -> Result<DispatchOutcome, Error> {
+/// `txn_id` — session-transaction context to forward to the remote executor, or
+///   `None` for non-transactional dispatch (the common case).
+pub struct DispatchRouteParams<'a> {
+    pub route: TaskRoute,
+    pub shared: &'a Arc<SharedState>,
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub trace_id: TraceId,
+    pub deadline_ms: u64,
+    pub version_set: &'a GatewayVersionSet,
+    pub txn_id: Option<TxnId>,
+}
+
+/// Dispatch a single route and return the raw payload bytes.
+pub async fn dispatch_route(params: DispatchRouteParams<'_>) -> Result<DispatchOutcome, Error> {
+    let DispatchRouteParams {
+        route,
+        shared,
+        tenant_id,
+        database_id,
+        trace_id,
+        deadline_ms,
+        version_set,
+        txn_id,
+    } = params;
     match route.decision {
         RouteDecision::Local => {
             dispatch_local(route, shared, tenant_id, database_id, trace_id).await
@@ -81,6 +97,7 @@ pub async fn dispatch_route(
                 trace_id,
                 deadline_ms,
                 version_set,
+                txn_id,
             })
             .await
         }
@@ -161,6 +178,9 @@ pub async fn dispatch_route_stream(
                 trace_id,
                 deadline_ms,
                 version_set,
+                // No session-transaction context crosses the streaming gateway
+                // boundary yet (see `resolve/exchange.rs`), so `None`.
+                txn_id: None,
             })
             .await
         }

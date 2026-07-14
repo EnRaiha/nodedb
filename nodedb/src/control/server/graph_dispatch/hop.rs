@@ -35,7 +35,9 @@ use std::collections::HashMap;
 use futures::future::join_all;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::gateway::dispatcher::{default_deadline_ms, dispatch_route};
+use crate::control::gateway::dispatcher::{
+    DispatchRouteParams, default_deadline_ms, dispatch_route,
+};
 use crate::control::gateway::router::resolve_decision;
 use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
@@ -324,15 +326,17 @@ async fn expand_remote(
         // Box::pin keeps the heterogeneous async dispatch futures uniform for
         // `join_all` and guards against any future async-recursion concerns.
         Box::pin(async move {
-            dispatch_route(
+            dispatch_route(DispatchRouteParams {
                 route,
-                &shared_arc,
+                shared: &shared_arc,
                 tenant_id,
                 database_id,
-                TraceId::ZERO,
+                trace_id: TraceId::ZERO,
                 deadline_ms,
-                &version_set,
-            )
+                version_set: &version_set,
+                // Graph hop traversal carries no session-transaction context.
+                txn_id: None,
+            })
             .await
         })
     });

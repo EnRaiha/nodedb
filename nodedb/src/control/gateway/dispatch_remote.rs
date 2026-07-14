@@ -17,13 +17,13 @@ use tracing::debug;
 use crate::Error;
 use crate::control::server::result_stream::{ResultStream, RowBatch};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_plan::wire as plan_wire;
 
 use super::dispatcher::{DispatchOutcome, map_typed_cluster_error};
 use super::version_set::GatewayVersionSet;
 
-/// Arguments for a remote dispatch call (bundles the 8 parameters to stay
+/// Arguments for a remote dispatch call (bundles the parameters to stay
 /// within clippy's `too_many_arguments` limit).
 pub(super) struct RemoteDispatchArgs<'a> {
     pub plan: nodedb_physical::physical_plan::PhysicalPlan,
@@ -35,6 +35,9 @@ pub(super) struct RemoteDispatchArgs<'a> {
     pub trace_id: TraceId,
     pub deadline_ms: u64,
     pub version_set: &'a GatewayVersionSet,
+    /// Session-transaction context forwarded to the remote executor, or `None`
+    /// for non-transactional dispatch.
+    pub txn_id: Option<TxnId>,
 }
 
 /// Remote dispatch via `ExecuteRequest` RPC.
@@ -51,6 +54,7 @@ pub(super) async fn dispatch_remote(
         trace_id,
         deadline_ms,
         version_set,
+        txn_id,
     } = args;
     let transport = shared.cluster_transport.as_ref().ok_or(Error::Internal {
         detail: "gateway: cluster transport not available for remote dispatch".into(),
@@ -130,6 +134,7 @@ pub(super) async fn dispatch_remote(
         deadline_remaining_ms: deadline_ms,
         trace_id: trace_id.0,
         descriptor_versions,
+        txn_id,
     });
 
     debug!(
@@ -210,6 +215,7 @@ pub(super) async fn dispatch_remote_stream(
         trace_id,
         deadline_ms,
         version_set,
+        txn_id,
     } = args;
     let transport = shared.cluster_transport.as_ref().ok_or(Error::Internal {
         detail: "gateway: cluster transport not available for remote stream dispatch".into(),
@@ -263,6 +269,7 @@ pub(super) async fn dispatch_remote_stream(
         deadline_remaining_ms: deadline_ms,
         trace_id: trace_id.0,
         descriptor_versions,
+        txn_id,
     });
 
     debug!(

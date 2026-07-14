@@ -106,6 +106,9 @@ impl RegistryShuffleProducer {
                     version: d.version,
                 })
                 .collect(),
+            // Shuffle produce is a non-transactional exchange-scan path; it does
+            // not carry a transaction context.
+            txn_id: None,
         };
 
         let executor = LocalPlanExecutor::new(Arc::clone(&self.state));

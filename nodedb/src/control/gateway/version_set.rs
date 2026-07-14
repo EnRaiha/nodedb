@@ -27,6 +27,25 @@ impl GatewayVersionSet {
         Self(pairs)
     }
 
+    /// Re-look-up the current descriptor version for every collection already
+    /// in this set, returning a new set with refreshed versions.
+    ///
+    /// Used to check a cached version set is still current before trusting a
+    /// plan-cache hit: if the result equals the original, the cached plan is
+    /// still valid. `version_fn` receives a collection name and returns the
+    /// current descriptor version (or 0 if unknown).
+    pub fn reverify(&self, version_fn: impl Fn(&str) -> u64) -> Self {
+        let pairs: Vec<(String, u64)> = self
+            .0
+            .iter()
+            .map(|(name, _)| {
+                let v = version_fn(name);
+                (name.clone(), v)
+            })
+            .collect();
+        Self::from_pairs(pairs)
+    }
+
     /// Collect all collection names touched by a plan with the provided
     /// version lookup function.
     ///
