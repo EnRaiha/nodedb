@@ -82,10 +82,13 @@ pub struct ServerSection {
     /// peer, and a cross-core (cross-vShard) transaction traverses the
     /// deterministic Calvin path exactly as in cluster mode.
     ///
-    /// When `false` (the default) the standalone boot path is unchanged:
-    /// no Calvin stack is started and every write stays on the existing
-    /// single-node path.
-    #[serde(default)]
+    /// On by default: a standalone node stands up the single-node Calvin
+    /// stack so cross-core (cross-vShard) transactions commit atomically
+    /// through the deterministic sequencer path instead of being rejected.
+    /// Set to `false` to force the legacy single-node path (no Calvin stack;
+    /// cross-shard interactive transactions are rejected) — e.g. for a
+    /// minimal deployment that never issues cross-core transactions.
+    #[serde(default = "default_single_node_calvin")]
     pub single_node_calvin: bool,
 }
 
@@ -100,9 +103,16 @@ impl Default for ServerSection {
             max_connections: default_max_connections(),
             log_format: LogFormat::Text,
             tls: None,
-            single_node_calvin: false,
+            single_node_calvin: default_single_node_calvin(),
         }
     }
+}
+
+/// Default for [`ServerSection::single_node_calvin`]: on, so a standalone
+/// node supports cross-core transactions through the single-node Calvin path
+/// out of the box.
+fn default_single_node_calvin() -> bool {
+    true
 }
 
 fn default_host() -> IpAddr {

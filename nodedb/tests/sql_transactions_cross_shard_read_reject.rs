@@ -2,9 +2,13 @@
 
 //! An interactive transaction that writes one vShard and reads a DIFFERENT
 //! vShard is a cross-shard transaction at COMMIT time — even though the
-//! buffered write batch itself is single-shard — and on a non-cluster
-//! (embedded/local) node it is rejected because cross-shard commit needs the
-//! Calvin sequencer, which embedded mode does not stand up.
+//! buffered write batch itself is single-shard — and on a node with NO Calvin
+//! sequencer wired it is rejected. This covers the sequencer-absent path:
+//! embedded/local mode (which never stands up Calvin) and an Origin node with
+//! `single_node_calvin = false`. A default Origin node stands up the
+//! single-node Calvin sequencer and commits this transaction atomically
+//! instead; this harness builds a server without a sequencer, so it exercises
+//! the rejection path directly.
 //!
 //! The interactive-COMMIT orchestrator (`run_commit`, in
 //! `control/server/shared/session/commit.rs`) widens `classify_dispatch`'s

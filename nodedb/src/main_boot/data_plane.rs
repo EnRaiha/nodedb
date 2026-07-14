@@ -116,10 +116,11 @@ pub(crate) async fn bootstrap_data_plane(
         .await?;
         Some(Arc::new(handle))
     } else if config.server.single_node_calvin {
-        // Flag-gated single-node Calvin: synthesize a one-node cluster so the
-        // sequencer + per-vShard schedulers run and cross-core transactions
-        // take the deterministic Calvin path. Off by default → this branch is
-        // skipped and the standalone path (the `else` below) is unchanged.
+        // Single-node Calvin (on by default): synthesize a one-node cluster so
+        // the sequencer + per-vShard schedulers run and cross-core transactions
+        // take the deterministic Calvin path. Set `single_node_calvin = false`
+        // to skip this branch and take the legacy standalone path (the `else`
+        // below), where cross-shard interactive transactions are rejected.
         let handle = nodedb::control::cluster::init_single_node_calvin(
             &config.server.data_dir,
             &config.tuning.cluster_transport,
