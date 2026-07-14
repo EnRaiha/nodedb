@@ -29,7 +29,6 @@
 //! `Error::NotLeader` (via the gateway dispatcher) so the transaction retries,
 //! never a silent fall back to local staging on a non-leader.
 
-
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response};
 use crate::control::gateway::dispatcher::{
     DispatchRouteParams, default_deadline_ms, dispatch_route,

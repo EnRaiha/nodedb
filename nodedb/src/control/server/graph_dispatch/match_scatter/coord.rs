@@ -15,7 +15,7 @@ use nodedb_cluster::distributed_graph::{
     DistributedMatchCoordinator, PatternContinuation, ResolvedContinuationArgs, ShardMatchResult,
 };
 
-use super::resume_queue::{PendingResume, resume_to_pending};
+use super::resume_queue::{PendingResume, resume_seed_key, resume_to_pending};
 use super::round_loop::{dispatch_continuations, dispatch_resumes};
 use super::round_zero::scatter_round_zero;
 
@@ -99,6 +99,12 @@ pub async fn scatter_match(
     // emit a fresh frontier (→ coordinator) and a fresh resume (→ this queue),
     // and they round-trip naturally.
     let mut pending_resumes: Vec<PendingResume> = Vec::new();
+    // Seeds (anchor + frontier + depth) already dispatched as resumes. Boundary
+    // continuation cursors are visited-less by contract, so without this the
+    // coordinator re-dispatches the same boundary every round and the pending
+    // queue fans out until it exhausts a core's dispatch admission queue. See
+    // `resume_seed_key`.
+    let mut dispatched_seeds: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut resume_rounds: u32 = 0;
     // Latches once the coordinator's hop budget (`max_rounds`) is exhausted with
     // continuations still pending, so the loop stops re-attempting `advance()`
@@ -116,7 +122,13 @@ pub async fn scatter_match(
     )
     .await?;
     for tagged in round0 {
-        feed_result(state, &mut coordinator, &mut pending_resumes, tagged)?;
+        feed_result(
+            state,
+            &mut coordinator,
+            &mut pending_resumes,
+            &mut dispatched_seeds,
+            tagged,
+        )?;
     }
 
     // ---- Round loop: drain both frontier continuations AND varlen resumes. ----
@@ -145,7 +157,13 @@ pub async fn scatter_match(
                 )
                 .await?;
                 for t in tagged {
-                    feed_result(state, &mut coordinator, &mut pending_resumes, t)?;
+                    feed_result(
+                        state,
+                        &mut coordinator,
+                        &mut pending_resumes,
+                        &mut dispatched_seeds,
+                        t,
+                    )?;
                 }
             }
         }
@@ -161,9 +179,10 @@ pub async fn scatter_match(
             }
             resume_rounds += 1;
             // Take the current batch so this round cannot spin on the same
-            // cursors: progress is guaranteed because each dispatched resume
-            // either grows its owning core's BFS visited set or is capped again
-            // (re-enqueued as a fresh, advanced cursor).
+            // cursors. Progress is guaranteed two ways: a cap-truncation resume
+            // re-enqueues as a fresh, advanced cursor, and every resume seed is
+            // deduped in `feed_result` (see `dispatched_seeds`) so a visited-less
+            // boundary continuation is dispatched at most once per anchor/depth.
             let batch = std::mem::take(&mut pending_resumes);
             let tagged = dispatch_resumes(
                 state,
@@ -176,7 +195,13 @@ pub async fn scatter_match(
             )
             .await?;
             for t in tagged {
-                feed_result(state, &mut coordinator, &mut pending_resumes, t)?;
+                feed_result(
+                    state,
+                    &mut coordinator,
+                    &mut pending_resumes,
+                    &mut dispatched_seeds,
+                    t,
+                )?;
             }
         }
     }
@@ -203,6 +228,7 @@ pub(super) fn feed_result(
     state: &SharedState,
     coordinator: &mut DistributedMatchCoordinator,
     pending_resumes: &mut Vec<PendingResume>,
+    dispatched_seeds: &mut std::collections::HashSet<u64>,
     tagged: TaggedShardResult,
 ) -> crate::Result<()> {
     let TaggedShardResult {
@@ -213,8 +239,13 @@ pub(super) fn feed_result(
     } = tagged;
 
     // Enqueue each resume cursor, routed back to the node owning its surviving
-    // frontier. Degenerate (empty-frontier) cursors are skipped.
+    // frontier. Degenerate (empty-frontier) cursors are skipped, and a seed
+    // (anchor + frontier + depth) already dispatched this scatter is skipped so
+    // visited-less boundary continuations converge instead of fanning out.
     for cursor in resume {
+        if !dispatched_seeds.insert(resume_seed_key(&cursor)) {
+            continue;
+        }
         if let Some(pending) = resume_to_pending(state, cursor)? {
             pending_resumes.push(pending);
         }
