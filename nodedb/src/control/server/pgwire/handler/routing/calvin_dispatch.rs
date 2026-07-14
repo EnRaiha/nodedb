@@ -127,7 +127,7 @@ impl NodeDbPgHandler {
                     tenant_id,
                     database_id,
                     result_formats,
-                ));
+                )?);
             }
             return Ok(calvin_responses);
         }
@@ -188,7 +188,7 @@ impl NodeDbPgHandler {
                 tenant_id,
                 database_id,
                 result_formats,
-            ));
+            )?);
         }
         Ok(calvin_responses)
     }
