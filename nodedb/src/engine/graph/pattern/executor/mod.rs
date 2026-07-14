@@ -11,6 +11,7 @@ pub(super) mod expansion;
 pub(super) mod overlay_expand;
 pub(super) mod predicates;
 pub(super) mod types;
+pub(super) mod varlen_named;
 
 pub use self::continuation::{execute_continuation, execute_varlen_resume};
 pub use self::core::{MatchExecCtx, execute, rows_to_msgpack};

@@ -12,6 +12,7 @@ use crate::engine::graph::pattern::executor::overlay_expand;
 use crate::engine::graph::pattern::executor::types::{
     BindingRow, ExecutionState, UnresolvedExpansion, VarLenResume,
 };
+use crate::engine::graph::pattern::executor::varlen_named::{self, NameOrId};
 
 use super::binding::{bind_node, binding_compatible, resolve_binding};
 
@@ -82,8 +83,13 @@ pub(in crate::engine::graph::pattern::executor) fn execute_triple(
             collection_filter: state.collection_filter,
         };
         for &src_id in &src_nodes {
-            let expansion =
-                expansion::expand_variable_length(csr, src_id, &pattern, state.varlen_caps);
+            let expansion = expansion::expand_variable_length(
+                csr,
+                src_id,
+                &pattern,
+                state.varlen_caps,
+                overlay,
+            );
             if let Some(cursor) = expansion.cursor {
                 // Capture the LIVE resume cursor instead of silently dropping
                 // the un-expanded frontier. The cursor's `source_row` MUST carry
@@ -101,6 +107,24 @@ pub(in crate::engine::graph::pattern::executor) fn execute_triple(
                     depth: cursor.depth,
                 });
             }
+
+            // Cross-boundary continuations: frontier nodes with zero local
+            // out-degree whose remaining edges may be homed on another shard.
+            // Shipping them (gated on the remote-node predicate) is what makes a
+            // staged/durable cross-boundary edge reachable without depending on
+            // the result cap firing. The anchor's binding is carried on the
+            // resumed rows via `source_row`, identical to the cap-cursor case.
+            if !expansion.boundary.is_empty() && state.is_remote_node.is_some() {
+                let mut source_row = input_row.clone();
+                bind_node(&mut source_row, &triple.src, csr, src_id);
+                varlen_named::record_boundary_resumes(
+                    state,
+                    triple_idx,
+                    &source_row,
+                    &expansion.boundary,
+                );
+            }
+
             for (dst_id, path) in expansion.results {
                 if !binding_compatible(&triple.dst, csr, input_row, dst_id) {
                     continue;
@@ -112,6 +136,37 @@ pub(in crate::engine::graph::pattern::executor) fn execute_triple(
                     row.insert(edge_name.clone(), path);
                 }
                 results.push(row);
+            }
+
+            // Overlay path destinations: a durable dst binds by id (as above); a
+            // staged-only dst has no CSR id and binds by name.
+            for (bound, path) in expansion.named_results {
+                match bound {
+                    NameOrId::Id(dst_id) => {
+                        if !binding_compatible(&triple.dst, csr, input_row, dst_id) {
+                            continue;
+                        }
+                        let mut row = input_row.clone();
+                        bind_node(&mut row, &triple.src, csr, src_id);
+                        bind_node(&mut row, &triple.dst, csr, dst_id);
+                        if let Some(ref edge_name) = triple.edge.name {
+                            row.insert(edge_name.clone(), path);
+                        }
+                        results.push(row);
+                    }
+                    NameOrId::Name(dst_name) => {
+                        if !overlay_expand::dst_compatible(&triple.dst, csr, input_row, &dst_name) {
+                            continue;
+                        }
+                        let mut row = input_row.clone();
+                        bind_node(&mut row, &triple.src, csr, src_id);
+                        overlay_expand::bind_name(&mut row, &triple.dst, &dst_name);
+                        if let Some(ref edge_name) = triple.edge.name {
+                            row.insert(edge_name.clone(), path);
+                        }
+                        results.push(row);
+                    }
+                }
             }
         }
     } else {

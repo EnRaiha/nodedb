@@ -11,9 +11,11 @@
 use super::super::ast::{MatchQuery, PatternChain};
 use super::core::{MatchExecCtx, bind_node, binding_compatible, execute_triple};
 use super::expansion::{VarLenCaps, VarLenCursor, VarLenPattern, resume_variable_length};
+use super::overlay_expand;
 use super::predicates;
 use super::predicates::PropertyLookup;
 use super::types::{BindingRow, ContinuationSeed, ExecutionState, MatchOutcome, VarLenResume};
+use super::varlen_named::{self, NameOrId};
 use crate::engine::graph::csr::{CsrIndex, GraphOverlayDelta};
 use crate::engine::graph::edge_store::EdgeStore;
 
@@ -339,7 +341,7 @@ pub fn execute_varlen_resume<'a>(
         frontier: resume.frontier,
         depth: resume.depth,
     };
-    let expansion = resume_variable_length(csr, &cursor, &pattern, varlen_caps);
+    let expansion = resume_variable_length(csr, &cursor, &pattern, varlen_caps, overlay);
     if let Some(next_cursor) = expansion.cursor {
         state.record_truncation(VarLenResume {
             triple_idx: resume.triple_idx,
@@ -349,31 +351,78 @@ pub fn execute_varlen_resume<'a>(
         });
     }
 
+    // Cross-boundary continuations from the RESUMED segment: a frontier node
+    // reached here with zero local out-degree is shipped onward exactly as on
+    // the from-scratch path. `source_row` already carries the anchor bindings.
+    varlen_named::record_boundary_resumes(
+        &mut state,
+        resume.triple_idx,
+        &resume.source_row,
+        &expansion.boundary,
+    );
+
     // Bind the resumed destinations onto the source row exactly as the
     // from-scratch varlen branch does, then carry them into the remaining
     // triples.
     let src_binding = &triple.src;
     let dst_binding = &triple.dst;
     let mut resumed_rows: Vec<BindingRow> = Vec::new();
+
+    // The source id is already carried in `source_row`; bind_node is a no-op
+    // when the variable is present, but keep the call for parity with
+    // `execute_triple` (handles anonymous/unbound source shapes).
+    let bind_source = |row: &mut BindingRow| {
+        if let Some(src_name) = src_binding.name.as_deref()
+            && let Some(src_value) = resume.source_row.get(src_name)
+            && let Some(src_id) = csr.node_id_raw(src_value)
+        {
+            bind_node(row, src_binding, csr, src_id);
+        }
+    };
+
     for (dst_id, path) in expansion.results {
         if !binding_compatible(dst_binding, csr, &resume.source_row, dst_id) {
             continue;
         }
         let mut row = resume.source_row.clone();
-        // The source id is already carried in `source_row`; bind_node is a
-        // no-op when the variable is present, but keep the call for parity
-        // with `execute_triple` (handles anonymous/unbound source shapes).
-        if let Some(src_name) = src_binding.name.as_deref()
-            && let Some(src_value) = resume.source_row.get(src_name)
-            && let Some(src_id) = csr.node_id_raw(src_value)
-        {
-            bind_node(&mut row, src_binding, csr, src_id);
-        }
+        bind_source(&mut row);
         bind_node(&mut row, dst_binding, csr, dst_id);
         if let Some(ref edge_name) = triple.edge.name {
             row.insert(edge_name.clone(), path);
         }
         resumed_rows.push(row);
+    }
+
+    // Overlay destinations from a resumed name-keyed segment: a durable dst
+    // binds by id, a staged-only dst binds by name.
+    for (bound, path) in expansion.named_results {
+        match bound {
+            NameOrId::Id(dst_id) => {
+                if !binding_compatible(dst_binding, csr, &resume.source_row, dst_id) {
+                    continue;
+                }
+                let mut row = resume.source_row.clone();
+                bind_source(&mut row);
+                bind_node(&mut row, dst_binding, csr, dst_id);
+                if let Some(ref edge_name) = triple.edge.name {
+                    row.insert(edge_name.clone(), path);
+                }
+                resumed_rows.push(row);
+            }
+            NameOrId::Name(dst_name) => {
+                if !overlay_expand::dst_compatible(dst_binding, csr, &resume.source_row, &dst_name)
+                {
+                    continue;
+                }
+                let mut row = resume.source_row.clone();
+                bind_source(&mut row);
+                overlay_expand::bind_name(&mut row, dst_binding, &dst_name);
+                if let Some(ref edge_name) = triple.edge.name {
+                    row.insert(edge_name.clone(), path);
+                }
+                resumed_rows.push(row);
+            }
+        }
     }
 
     // Run the REMAINING triples (after the truncated one) over the resumed rows,
@@ -502,7 +551,7 @@ mod tests {
             max_results: 2,
             max_frontier: usize::MAX,
         };
-        let first = expand_variable_length(&csr, src, &pat, caps);
+        let first = expand_variable_length(&csr, src, &pat, caps, None);
         let cursor = first.cursor.clone().expect("low cap must truncate");
 
         let mut source_row = BindingRow::new();
@@ -542,7 +591,7 @@ mod tests {
                 assert_eq!(row["a"], "n0", "source binding carried through resume");
                 union_b.insert(row["b"].clone());
             }
-            next = outcome.truncation.map(|t| VarLenResume {
+            next = outcome.truncation.into_iter().next().map(|t| VarLenResume {
                 triple_idx: 0,
                 source_row: source_row.clone(),
                 frontier: t.frontier,

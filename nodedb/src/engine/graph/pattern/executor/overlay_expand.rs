@@ -24,9 +24,9 @@
 //! unresolved frontier: a staged edge is always locally resolvable.
 
 use super::super::ast::{NodeBinding, PatternTriple};
-use super::expansion::{self, CollectionFilter};
 use super::types::{BindingRow, ExecutionState};
-use crate::engine::graph::csr::{CsrIndex, Direction, GraphOverlayDelta};
+use super::varlen_named::merge_neighbors_named;
+use crate::engine::graph::csr::{CsrIndex, GraphOverlayDelta};
 
 /// Expand one fixed-hop (non variable-length) triple against a name-keyed merge
 /// of durable CSR adjacency and the transaction's staged overlay.
@@ -49,7 +49,7 @@ pub(super) fn expand_triple_overlay(
 
     let mut results = Vec::new();
     for (src_name, src_id) in &sources {
-        let neighbors = collect_neighbors_named(
+        let neighbors = merge_neighbors_named(
             csr,
             src_name,
             *src_id,
@@ -130,115 +130,15 @@ fn resolve_sources(
     out
 }
 
-/// Merge a source node's durable CSR neighbours with the transaction's staged
-/// edges for one hop, as `(label_name, neighbour_name)` pairs.
-///
-/// Durable neighbours whose backing edge is staged-tombstoned are dropped;
-/// staged edges matching the direction and label are added (deduplicated
-/// against the durable set). `src_id` is `Some` for a durable source (its CSR
-/// adjacency is walked) and `None` for a staged-only source (only its staged
-/// edges exist). Out- and in-edges are collected under a single direction each
-/// so the tombstone lookup always knows the edge's orientation, even for a
-/// `Both` triple.
-fn collect_neighbors_named(
-    csr: &CsrIndex,
-    src_name: &str,
-    src_id: Option<u32>,
-    label_filter: Option<&str>,
-    direction: Direction,
-    collection_filter: CollectionFilter,
-    overlay: &GraphOverlayDelta,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let want_out = matches!(direction, Direction::Out | Direction::Both);
-    let want_in = matches!(direction, Direction::In | Direction::Both);
-
-    if let Some(id) = src_id {
-        // Durable adjacency, collected per-direction so tombstone orientation
-        // is unambiguous even for a `Both` triple.
-        if want_out {
-            out.extend(durable_named(
-                csr,
-                id,
-                label_filter,
-                Direction::Out,
-                collection_filter,
-                src_name,
-                overlay,
-            ));
-        }
-        if want_in {
-            out.extend(durable_named(
-                csr,
-                id,
-                label_filter,
-                Direction::In,
-                collection_filter,
-                src_name,
-                overlay,
-            ));
-        }
-    }
-
-    if want_out {
-        for (label, dst) in overlay.out_neighbors(src_name, label_filter) {
-            if !out
-                .iter()
-                .any(|(l, n)| l.as_str() == label && n.as_str() == dst)
-            {
-                out.push((label.to_string(), dst.to_string()));
-            }
-        }
-    }
-    if want_in {
-        for (label, src) in overlay.in_neighbors(src_name, label_filter) {
-            if !out
-                .iter()
-                .any(|(l, n)| l.as_str() == label && n.as_str() == src)
-            {
-                out.push((label.to_string(), src.to_string()));
-            }
-        }
-    }
-    out
-}
-
-/// Durable CSR neighbours of `id` in one direction, as `(label, neighbour)`
-/// names, with any staged-tombstoned edge removed. Split out from
-/// [`collect_neighbors_named`] so out- and in-edges are each collected under a
-/// single known direction, keeping the tombstone lookup's `(src, label, dst)`
-/// orientation unambiguous.
-fn durable_named(
-    csr: &CsrIndex,
-    id: u32,
-    label_filter: Option<&str>,
-    dir: Direction,
-    collection_filter: CollectionFilter,
-    src_name: &str,
-    overlay: &GraphOverlayDelta,
-) -> Vec<(String, String)> {
-    let mut v = Vec::new();
-    for (lid, other_id) in
-        expansion::collect_neighbors(csr, id, label_filter, dir, collection_filter)
-    {
-        let label = csr.label_name(lid).to_string();
-        let other = csr.node_name_raw(other_id).to_string();
-        let tombstoned = if matches!(dir, Direction::In) {
-            overlay.is_tombstoned(&other, &label, src_name)
-        } else {
-            overlay.is_tombstoned(src_name, &label, &other)
-        };
-        if !tombstoned {
-            v.push((label, other));
-        }
-    }
-    v
-}
-
 /// Name-based analogue of [`super::core::binding_compatible`]. A staged-only
 /// destination has no CSR id, so a label constraint on it cannot be verified
 /// and fails closed; an already-bound destination variable must match by name.
-fn dst_compatible(binding: &NodeBinding, csr: &CsrIndex, row: &BindingRow, name: &str) -> bool {
+pub(super) fn dst_compatible(
+    binding: &NodeBinding,
+    csr: &CsrIndex,
+    row: &BindingRow,
+    name: &str,
+) -> bool {
     if let Some(ref label) = binding.label {
         match csr.node_id_raw(name) {
             Some(id) if csr.node_has_label(id, label) => {}
@@ -255,7 +155,7 @@ fn dst_compatible(binding: &NodeBinding, csr: &CsrIndex, row: &BindingRow, name:
 
 /// Name-based analogue of [`super::core::bind_node`]: record `name` under the
 /// binding's variable if it has one and is not already bound.
-fn bind_name(row: &mut BindingRow, binding: &NodeBinding, name: &str) {
+pub(super) fn bind_name(row: &mut BindingRow, binding: &NodeBinding, name: &str) {
     if let Some(ref var) = binding.name {
         row.entry(var.clone()).or_insert_with(|| name.to_string());
     }
@@ -287,7 +187,7 @@ mod tests {
     }
 
     fn state() -> ExecutionState<'static> {
-        ExecutionState::new(None, expansion::VarLenCaps::default())
+        ExecutionState::new(None, super::super::expansion::VarLenCaps::default())
     }
 
     /// A staged PUT is unioned with durable neighbours: a bound source `a` with

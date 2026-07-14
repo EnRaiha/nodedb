@@ -114,26 +114,31 @@ pub struct VarLenResume {
 
 /// Result of running a MATCH query.
 ///
-/// `truncation` is `Some` iff a hard cap inside variable-length expansion
-/// fired — the binding rows are incomplete and the [`VarLenResume`] cursor
-/// records where to continue. Data Plane handlers MUST set the `partial`
-/// flag on the response envelope when this is set so clients can observe
-/// the incomplete result. Use [`MatchOutcome::truncated`] for the bare bool.
+/// `truncation` is non-empty iff a hard cap inside variable-length expansion
+/// fired OR a cross-boundary continuation was produced — the binding rows are
+/// incomplete and each [`VarLenResume`] cursor records where to continue. Data
+/// Plane handlers MUST set the `partial` flag on the response envelope when
+/// this is non-empty so clients can observe the incomplete result. Use
+/// [`MatchOutcome::truncated`] for the bare bool.
+///
+/// It is a `Vec` (not an `Option`) because a single free-ranging expansion can
+/// produce MANY boundary frontiers — one per anchor whose edges are homed
+/// remotely — each needing its own `source_row` anchor to resume from.
 ///
 /// `unresolved_frontier` lists expansion sources whose edges are not
 /// present in the local CSR partition. On a fully-local CSR this vec
 /// is always empty and existing behaviour is byte-identical to before.
 pub struct MatchOutcome {
     pub rows: Vec<BindingRow>,
-    pub truncation: Option<VarLenResume>,
+    pub truncation: Vec<VarLenResume>,
     pub unresolved_frontier: Vec<UnresolvedExpansion>,
 }
 
 impl MatchOutcome {
-    /// `true` iff a variable-length expansion hit a hard cap and the result
-    /// set is incomplete. Convenience for callers that only need the flag.
+    /// `true` iff a variable-length expansion hit a hard cap or produced a
+    /// cross-boundary continuation, so the result set is incomplete.
     pub fn truncated(&self) -> bool {
-        self.truncation.is_some()
+        !self.truncation.is_empty()
     }
 }
 
@@ -162,12 +167,13 @@ pub struct ContinuationSeed {
 /// and no frontier entries are ever emitted. The predicate is borrowed
 /// for the lifetime `'a` of the execution call to avoid allocation.
 pub(super) struct ExecutionState<'a> {
-    /// Structured resume cursor for the first variable-length expansion that
-    /// hit a cap during this execution; `None` until one truncates. Only the
-    /// first capped expansion is retained — resume is single-cursor by design
-    /// (a query with multiple capping varlen triples would need multi-cursor
-    /// fan-out, which is not yet supported).
-    pub varlen_resume: Option<VarLenResume>,
+    /// Structured resume cursors accumulated during this execution: one per
+    /// variable-length expansion that hit a cap, plus one per cross-boundary
+    /// frontier node (zero local out-degree, homed remotely). A free-ranging
+    /// expansion produces MANY boundary frontiers — each carries its own
+    /// `source_row` anchor — so this is a `Vec`, not a single cursor. Empty
+    /// until the first cursor is recorded.
+    pub varlen_resume: Vec<VarLenResume>,
     pub frontier: Vec<UnresolvedExpansion>,
     pub is_remote_node: Option<&'a dyn Fn(&str) -> bool>,
     /// Hard caps applied to every variable-length expansion in this execution.
@@ -188,7 +194,7 @@ impl<'a> ExecutionState<'a> {
         varlen_caps: super::expansion::VarLenCaps,
     ) -> Self {
         Self {
-            varlen_resume: None,
+            varlen_resume: Vec::new(),
             frontier: Vec::new(),
             is_remote_node,
             varlen_caps,
@@ -196,16 +202,16 @@ impl<'a> ExecutionState<'a> {
         }
     }
 
-    /// `true` iff a variable-length expansion hit a cap during this execution.
+    /// `true` iff any resume cursor was recorded during this execution (a cap
+    /// hit or a cross-boundary continuation).
     pub(super) fn truncated(&self) -> bool {
-        self.varlen_resume.is_some()
+        !self.varlen_resume.is_empty()
     }
 
-    /// Record the resume cursor from the first capped expansion. Subsequent
-    /// truncations are ignored (single-cursor design).
+    /// Append a resume cursor. Every capped expansion and every cross-boundary
+    /// frontier node contributes its own cursor, so all are retained (the wire
+    /// envelope carries the full list; the coordinator dispatches each round).
     pub(super) fn record_truncation(&mut self, resume: VarLenResume) {
-        if self.varlen_resume.is_none() {
-            self.varlen_resume = Some(resume);
-        }
+        self.varlen_resume.push(resume);
     }
 }

@@ -4,7 +4,8 @@
 
 use std::collections::HashSet;
 
-use crate::engine::graph::csr::CsrIndex;
+use super::varlen_named::{self, NameOrId};
+use crate::engine::graph::csr::{CsrIndex, GraphOverlayDelta};
 use crate::engine::graph::edge_store::Direction;
 
 /// Hard cap on results returned from a single variable-length expansion.
@@ -86,9 +87,26 @@ pub(super) struct VarLenCursor {
 /// `max_frontier`) fired: the result set for this round is incomplete and the
 /// cursor records the live frontier/depth needed to resume next round. `None`
 /// means the expansion ran to its natural completion.
+///
+/// A single call populates EITHER `results` (the durable u32-keyed path) OR
+/// `named_results` (the overlay name-keyed path), never both — the other stays
+/// empty. `boundary` lists frontier nodes with zero local merged out-degree
+/// (`(node_name, path_so_far, resume_depth)`) whose remaining edges may be
+/// homed on another shard; the caller emits a cross-shard continuation for each
+/// (gated on the remote-node predicate) so a boundary edge is reached without
+/// depending on a result cap firing.
 pub(super) struct VarLenExpansion {
+    /// Durable destinations `(dst_node_id, path)` — the u32-keyed path.
     pub results: Vec<(u32, String)>,
+    /// Overlay destinations `(NameOrId, path)` — the name-keyed path. A durable
+    /// destination keeps its id; a staged-only destination is carried by name.
+    pub named_results: Vec<(NameOrId, String)>,
     pub cursor: Option<VarLenCursor>,
+    /// Frontier nodes dropped for zero local merged out-degree, as
+    /// `(node_name, path_so_far, resume_depth)`. `resume_depth` is the hop depth
+    /// at which the node would have been expanded, i.e. the depth to resume its
+    /// continuation from on the owning shard.
+    pub boundary: Vec<(String, String, usize)>,
 }
 
 /// Pattern-shape parameters for a variable-length BFS expansion.
@@ -181,6 +199,7 @@ pub(super) fn expand_variable_length(
     source: u32,
     pattern: &VarLenPattern<'_>,
     caps: VarLenCaps,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> VarLenExpansion {
     let mut results: Vec<(u32, String)> = Vec::new();
     if pattern.max_hops == 0 {
@@ -189,8 +208,20 @@ pub(super) fn expand_variable_length(
         }
         return VarLenExpansion {
             results,
+            named_results: Vec::new(),
             cursor: None,
+            boundary: Vec::new(),
         };
+    }
+
+    // Inside a transaction with staged edges, run the name-keyed merge BFS so
+    // staged edges/tombstones and staged-only nodes are observed. An absent or
+    // empty overlay takes the durable u32-keyed path below, byte-identical to
+    // committed-CSR-only execution.
+    if let Some(ov) = overlay
+        && !ov.is_empty()
+    {
+        return varlen_named::expand_named(csr, source, pattern, caps, ov);
     }
 
     let src_name = node_name_or_empty(csr, source, pattern.want_path);
@@ -234,7 +265,17 @@ pub(super) fn resume_variable_length(
     cursor: &VarLenCursor,
     pattern: &VarLenPattern<'_>,
     caps: VarLenCaps,
+    overlay: Option<&GraphOverlayDelta>,
 ) -> VarLenExpansion {
+    // Inside a transaction with staged edges, resume via the name-keyed merge
+    // BFS so a staged-only frontier node (or staged tail) is walked. An absent
+    // or empty overlay takes the durable resume path below.
+    if let Some(ov) = overlay
+        && !ov.is_empty()
+    {
+        return varlen_named::resume_named(csr, cursor, pattern, caps, ov);
+    }
+
     // Resolve each frontier NAME against this core's CSR. A name the CSR owns
     // becomes a local id and seeds the BFS; a name it does NOT own is skipped —
     // this is what lets the resume plan be fanned to all cores and self-scope to
@@ -285,6 +326,7 @@ fn run_bfs(
     caps: VarLenCaps,
 ) -> VarLenExpansion {
     let mut cursor: Option<VarLenCursor> = None;
+    let mut boundary: Vec<(String, String, usize)> = Vec::new();
 
     for depth in start_depth..=pattern.max_hops {
         if frontier.is_empty() {
@@ -301,6 +343,15 @@ fn run_bfs(
                 pattern.direction,
                 pattern.collection_filter,
             );
+            // Zero local out-degree: this node's remaining edges (if any) may be
+            // homed on another shard. Capture it (keyed by GLOBAL name) so the
+            // caller can ship a cross-shard continuation instead of dropping the
+            // partial match — a boundary edge is then reached without waiting for
+            // a result cap to fire.
+            if neighbors.is_empty() {
+                boundary.push((csr.node_name_raw(*node).to_string(), path.clone(), depth));
+                continue;
+            }
             for (_, dst) in neighbors {
                 if !visited.insert(dst) {
                     continue;
@@ -352,7 +403,12 @@ fn run_bfs(
         frontier = next_frontier;
     }
 
-    VarLenExpansion { results, cursor }
+    VarLenExpansion {
+        results,
+        named_results: Vec::new(),
+        cursor,
+        boundary,
+    }
 }
 
 /// Collect neighbor (label_id, node_id) pairs from CSR.
@@ -460,6 +516,7 @@ mod tests {
                 collection_filter: CollectionFilter::Unscoped,
             },
             VarLenCaps::default(),
+            None,
         );
         let results = expansion.results;
 
@@ -508,6 +565,7 @@ mod tests {
                 collection_filter: CollectionFilter::Unscoped,
             },
             VarLenCaps::default(),
+            None,
         );
         let results = expansion.results;
 
@@ -543,6 +601,7 @@ mod tests {
                 collection_filter: CollectionFilter::Unscoped,
             },
             VarLenCaps::default(),
+            None,
         );
         let results = expansion.results;
 
@@ -586,6 +645,7 @@ mod tests {
                 collection_filter: CollectionFilter::Unscoped,
             },
             VarLenCaps::default(),
+            None,
         );
         let results = expansion.results;
 
@@ -632,7 +692,7 @@ mod tests {
             want_path: false,
             collection_filter: CollectionFilter::Unscoped,
         };
-        let uncapped = expand_variable_length(&csr, src, &pat, VarLenCaps::default());
+        let uncapped = expand_variable_length(&csr, src, &pat, VarLenCaps::default(), None);
         assert!(uncapped.cursor.is_none(), "uncapped pass must not truncate");
         let full = dst_set(&uncapped.results);
 
@@ -641,7 +701,7 @@ mod tests {
             max_results: 2,
             max_frontier: usize::MAX,
         };
-        let first = expand_variable_length(&csr, src, &pat, caps);
+        let first = expand_variable_length(&csr, src, &pat, caps, None);
         let cursor = first
             .cursor
             .clone()
@@ -652,7 +712,7 @@ mod tests {
         let mut union: std::collections::HashSet<u32> = dst_set(&first.results);
         let mut next = Some(cursor);
         while let Some(c) = next {
-            let resumed = resume_variable_length(&csr, &c, &pat, caps);
+            let resumed = resume_variable_length(&csr, &c, &pat, caps, None);
             union.extend(dst_set(&resumed.results));
             next = resumed.cursor;
         }
@@ -681,6 +741,7 @@ mod tests {
                 collection_filter: CollectionFilter::Unscoped,
             },
             VarLenCaps::default(),
+            None,
         );
         assert!(
             expansion.cursor.is_none(),
@@ -716,10 +777,10 @@ mod tests {
             want_path: false,
             collection_filter: CollectionFilter::Unscoped,
         };
-        let first = expand_variable_length(&csr, src, &pat, caps);
+        let first = expand_variable_length(&csr, src, &pat, caps, None);
         let cursor = first.cursor.clone().expect("cap=1 must truncate");
 
-        let resumed = resume_variable_length(&csr, &cursor, &pat, caps);
+        let resumed = resume_variable_length(&csr, &cursor, &pat, caps, None);
 
         let mut union = dst_set(&first.results);
         union.extend(dst_set(&resumed.results));
@@ -767,7 +828,7 @@ mod tests {
         };
 
         // Ground truth: a single uncapped want_path pass.
-        let uncapped = expand_variable_length(&csr, src, &pat, VarLenCaps::default());
+        let uncapped = expand_variable_length(&csr, src, &pat, VarLenCaps::default(), None);
         assert!(uncapped.cursor.is_none(), "uncapped pass must not truncate");
         let full_paths = path_set(&uncapped.results);
         assert!(
@@ -780,7 +841,7 @@ mod tests {
             max_results: 2,
             max_frontier: usize::MAX,
         };
-        let first = expand_variable_length(&csr, src, &pat, caps);
+        let first = expand_variable_length(&csr, src, &pat, caps, None);
         let cursor = first
             .cursor
             .clone()
@@ -790,7 +851,7 @@ mod tests {
         let mut union: std::collections::HashSet<String> = path_set(&first.results);
         let mut next = Some(cursor);
         while let Some(c) = next {
-            let resumed = resume_variable_length(&csr, &c, &pat, caps);
+            let resumed = resume_variable_length(&csr, &c, &pat, caps, None);
             union.extend(path_set(&resumed.results));
             next = resumed.cursor;
         }
@@ -829,7 +890,7 @@ mod tests {
             depth: 2,
         };
 
-        let resumed = resume_variable_length(&csr, &cursor, &pat, VarLenCaps::default());
+        let resumed = resume_variable_length(&csr, &cursor, &pat, VarLenCaps::default(), None);
 
         assert!(
             resumed.results.is_empty(),
@@ -867,7 +928,7 @@ mod tests {
             depth: 2,
         };
 
-        let resumed = resume_variable_length(&csr, &cursor, &pat, VarLenCaps::default());
+        let resumed = resume_variable_length(&csr, &cursor, &pat, VarLenCaps::default(), None);
 
         let dsts = dst_set(&resumed.results);
         let expected: std::collections::HashSet<u32> = ["n2", "n3", "n4", "n5", "n6"]
