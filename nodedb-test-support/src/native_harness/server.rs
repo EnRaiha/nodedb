@@ -17,9 +17,8 @@ use nodedb::wal::WalManager;
 /// A running native-protocol test server.
 pub struct NativeTestServer {
     pub addr: std::net::SocketAddr,
-    /// Shared Control-Plane state, exposed so tests can read metrics (e.g.
-    /// `shared.system_metrics.active_txn_overlays`) that the Data-Plane
-    /// core also updates via the same `Arc<SystemMetrics>`.
+    /// Shared Control-Plane state, exposed so tests can inspect the same
+    /// metrics and authorization stores used by the running server.
     pub shared: Arc<SharedState>,
     pub(super) shutdown_bus: nodedb::control::shutdown::ShutdownBus,
     pub(super) poller_shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -35,6 +34,15 @@ impl NativeTestServer {
     /// Spawn a single-core NodeDB server with the native listener bound to
     /// an ephemeral `127.0.0.1` port (trust-mode auth).
     pub async fn start() -> Self {
+        Self::start_with_auth_mode(AuthMode::Trust).await
+    }
+
+    /// Spawn a single-core server that requires an explicit native Auth frame.
+    pub async fn start_authenticated() -> Self {
+        Self::start_with_auth_mode(AuthMode::Password).await
+    }
+
+    async fn start_with_auth_mode(auth_mode: AuthMode) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal_path = dir.path().join("test.wal");
         let wal = Arc::new(WalManager::open_for_testing(&wal_path).expect("open wal"));
@@ -69,7 +77,6 @@ impl NativeTestServer {
         let core_dir = dir.path().to_path_buf();
         let event_producer = event_producers.into_iter().next().expect("event producer");
         let core_array_catalog = shared.array_catalog.clone();
-        let core_metrics = shared.system_metrics.clone();
         let (core_stop_tx, core_stop_rx) = std::sync::mpsc::channel::<()>();
         let _core_handle = tokio::task::spawn_blocking(move || {
             let mut core = CoreLoop::open_with_array_catalog(
@@ -82,9 +89,6 @@ impl NativeTestServer {
             )
             .expect("open core");
             core.set_event_producer(event_producer);
-            if let Some(m) = core_metrics {
-                core.set_metrics(m);
-            }
             while matches!(
                 core_stop_rx.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
@@ -136,7 +140,7 @@ impl NativeTestServer {
             listener
                 .run(nodedb::control::server::listener::ListenerRunParams {
                     state: shared_listener,
-                    auth_mode: AuthMode::Trust,
+                    auth_mode,
                     tls_acceptor: None,
                     conn_semaphore: Arc::new(tokio::sync::Semaphore::new(128)),
                     startup_gate: test_startup_gate,
