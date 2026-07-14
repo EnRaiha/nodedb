@@ -219,7 +219,10 @@ fn calvin_static_apply_failure_rolls_back_cleanly() {
     );
     // Rollback must succeed — the engine must not be in an unknown state.
     assert!(
-        !matches!(resp.error_code, Some(ErrorCode::RollbackFailed { .. })),
+        !matches!(
+            resp.error_code.as_deref(),
+            Some(ErrorCode::RollbackFailed { .. })
+        ),
         "rollback must succeed on failure path; got {:?}",
         resp.error_code
     );

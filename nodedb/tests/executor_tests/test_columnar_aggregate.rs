@@ -386,8 +386,8 @@ fn columnar_unbounded_scan_over_budget_surfaces_error() {
         "over-budget scan must surface an error"
     );
     assert_eq!(
-        resp.error_code,
-        Some(ErrorCode::ResourcesExhausted),
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::ResourcesExhausted),
         "must surface the deterministic resource-exhausted error"
     );
 }

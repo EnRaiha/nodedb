@@ -53,6 +53,7 @@ pub(super) async fn fan_bsp_all_cores(
     Ok(NodeLevelResult {
         payload,
         watermark_lsn: Lsn::ZERO,
+        read_version_lsn: Lsn::ZERO,
     })
 }
 

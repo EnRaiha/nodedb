@@ -79,7 +79,7 @@ impl CoreLoop {
             // Mirrors the live handler: EXPIRE on an absent key returns
             // `ErrorCode::NotFound` (see `handlers/kv/ttl.rs`), not a
             // synthesized default.
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "kv expire failed".into(),
             }));
         }
@@ -108,7 +108,7 @@ impl CoreLoop {
         let prior_meta = self.kv_engine.get_ttl_meta(did, tid, collection, key);
         let resp = self.execute_kv_persist(task, did, tid, collection, key);
         if resp.status == Status::Error {
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "kv persist failed".into(),
             }));
         }
@@ -167,7 +167,7 @@ impl CoreLoop {
             },
         );
         if resp.status == Status::Error {
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "kv register sorted index failed".into(),
             }));
         }
@@ -202,7 +202,7 @@ impl CoreLoop {
             .cloned();
         let resp = self.execute_kv_drop_sorted_index(task, did, tid, index_name);
         if resp.status == Status::Error {
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "kv drop sorted index failed".into(),
             }));
         }

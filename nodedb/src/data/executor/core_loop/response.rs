@@ -19,6 +19,7 @@ impl CoreLoop {
             partial: false,
             payload: Payload::empty(),
             watermark_lsn: self.watermark,
+            read_version_lsn: self.read_version_lsn(task),
             error_code: None,
             read_set_valid: None,
             write_set: Vec::new(),
@@ -37,6 +38,7 @@ impl CoreLoop {
             partial: false,
             payload: Payload::from_vec(payload),
             watermark_lsn: self.watermark,
+            read_version_lsn: self.read_version_lsn(task),
             error_code: None,
             read_set_valid: None,
             write_set: Vec::new(),
@@ -55,10 +57,34 @@ impl CoreLoop {
             partial: true,
             payload: Payload::from_vec(payload),
             watermark_lsn: self.watermark,
+            read_version_lsn: self.read_version_lsn(task),
             error_code: None,
             read_set_valid: None,
             write_set: Vec::new(),
         }
+    }
+
+    /// Per-collection read-version LSN for `task`'s plan: the scanned
+    /// collection's `coll_write_lsn` (in its Raft-group index space) at read
+    /// time, the sound comparand for cross-shard OCC read validation. `Lsn::ZERO`
+    /// when the plan maps to no single collection or the collection has no
+    /// recorded write on this core. Distinct from the core-global `watermark`.
+    pub(in crate::data::executor) fn read_version_lsn(
+        &self,
+        task: &ExecutionTask,
+    ) -> crate::types::Lsn {
+        task.plan()
+            .collection()
+            .map(|c| {
+                self.write_index
+                    .collection_write_lsn(&super::write_index::CollKey {
+                        db: task.request.database_id,
+                        tenant: task.request.tenant_id,
+                        collection: Box::from(c),
+                    })
+                    .unwrap_or(crate::types::Lsn::ZERO)
+            })
+            .unwrap_or(crate::types::Lsn::ZERO)
     }
 
     pub(in crate::data::executor) fn response_error(
@@ -73,7 +99,8 @@ impl CoreLoop {
             partial: false,
             payload: Payload::empty(),
             watermark_lsn: self.watermark,
-            error_code: Some(error_code.into()),
+            read_version_lsn: crate::types::Lsn::ZERO,
+            error_code: Some(Box::new(error_code.into())),
             read_set_valid: None,
             write_set: Vec::new(),
         }

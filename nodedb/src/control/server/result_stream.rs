@@ -54,7 +54,7 @@ pub(crate) fn stream_response_channel(
             if resp.status == Status::Error {
                 if tolerate_not_found
                     && matches!(
-                        resp.error_code,
+                        resp.error_code.as_deref(),
                         Some(crate::bridge::envelope::ErrorCode::NotFound)
                     )
                 {
@@ -137,6 +137,7 @@ mod tests {
             watermark_lsn: Lsn::ZERO,
             error_code: None,
             read_set_valid: None,
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         }
     }
@@ -151,6 +152,7 @@ mod tests {
             watermark_lsn: Lsn::ZERO,
             error_code: None,
             read_set_valid: None,
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         }
     }
@@ -165,6 +167,7 @@ mod tests {
             watermark_lsn: Lsn::ZERO,
             error_code: None,
             read_set_valid: None,
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         }
     }
@@ -177,8 +180,9 @@ mod tests {
             partial: false,
             payload: Payload::empty(),
             watermark_lsn: Lsn::ZERO,
-            error_code: Some(code),
+            error_code: Some(Box::new(code)),
             read_set_valid: None,
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         }
     }

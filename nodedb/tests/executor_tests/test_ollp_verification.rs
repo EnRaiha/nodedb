@@ -271,8 +271,8 @@ fn bulk_update_stale_prediction_returns_ollp_retry_required() {
         "stale prediction should produce Status::Error"
     );
     assert_eq!(
-        resp.error_code,
-        Some(ErrorCode::OllpRetryRequired),
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::OllpRetryRequired),
         "error code must be OllpRetryRequired, got {:?}",
         resp.error_code
     );
@@ -320,7 +320,10 @@ fn bulk_delete_stale_prediction_returns_ollp_retry_required() {
     );
 
     assert_eq!(resp.status, Status::Error);
-    assert_eq!(resp.error_code, Some(ErrorCode::OllpRetryRequired));
+    assert_eq!(
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::OllpRetryRequired)
+    );
 }
 
 // ── edge-content drift (TOCTOU on _from/_to/_type) ───────────────────────────
@@ -385,8 +388,8 @@ fn bulk_delete_changed_edge_endpoint_returns_ollp_retry_required() {
 
     assert_eq!(resp.status, Status::Error);
     assert_eq!(
-        resp.error_code,
-        Some(ErrorCode::OllpRetryRequired),
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::OllpRetryRequired),
         "changed edge endpoint must trigger OllpRetryRequired, got {:?}",
         resp.error_code
     );
@@ -433,7 +436,10 @@ fn bulk_delete_changed_edge_label_returns_ollp_retry_required() {
         bulk_delete_plan_with_edges(Some(predicted), Some(edges)),
     );
     assert_eq!(resp.status, Status::Error);
-    assert_eq!(resp.error_code, Some(ErrorCode::OllpRetryRequired));
+    assert_eq!(
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::OllpRetryRequired)
+    );
 }
 
 /// A NEW edge appeared among the matched docs (a matched doc gained `_from`/`_to`
@@ -458,7 +464,10 @@ fn bulk_delete_appeared_edge_returns_ollp_retry_required() {
         bulk_delete_plan_with_edges(Some(predicted), Some(edges)),
     );
     assert_eq!(resp.status, Status::Error);
-    assert_eq!(resp.error_code, Some(ErrorCode::OllpRetryRequired));
+    assert_eq!(
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::OllpRetryRequired)
+    );
 }
 
 /// `ollp_predicted_edges: None` → edge-content check is skipped entirely; the
@@ -501,7 +510,10 @@ fn bulk_update_retry_with_corrected_prediction_succeeds() {
         &mut ctx.rx,
         bulk_update_plan(Some(stale_predicted)),
     );
-    assert_eq!(first_resp.error_code, Some(ErrorCode::OllpRetryRequired));
+    assert_eq!(
+        first_resp.error_code.as_deref(),
+        Some(&ErrorCode::OllpRetryRequired)
+    );
 
     // Retry: re-scan sees {r1, r2, r3} → corrected prediction.
     let corrected_predicted = vec![
@@ -580,5 +592,8 @@ fn bulk_update_superset_prediction_returns_ollp_retry_required() {
     );
 
     assert_eq!(resp.status, Status::Error);
-    assert_eq!(resp.error_code, Some(ErrorCode::OllpRetryRequired));
+    assert_eq!(
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::OllpRetryRequired)
+    );
 }

@@ -109,8 +109,8 @@ fn sparse_cross_tenant_delete_does_not_affect_owner() {
             returning: None,
         }),
     );
-    let ok_or_not_found =
-        resp_del.status == Status::Ok || resp_del.error_code == Some(ErrorCode::NotFound);
+    let ok_or_not_found = resp_del.status == Status::Ok
+        || resp_del.error_code.as_deref() == Some(&ErrorCode::NotFound);
     assert!(
         ok_or_not_found,
         "Cross-tenant document delete must be Ok or NotFound, got {:?}",

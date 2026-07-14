@@ -250,8 +250,8 @@ fn emergency_pressure_suspends_reads_and_increments_metric() {
         "Emergency pressure must reject the write (returns Some)"
     );
     assert_eq!(
-        result.unwrap().error_code,
-        Some(ErrorCode::ResourcesExhausted),
+        result.unwrap().error_code.as_deref(),
+        Some(&ErrorCode::ResourcesExhausted),
         "Emergency rejection must carry ResourcesExhausted"
     );
 

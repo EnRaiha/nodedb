@@ -115,6 +115,12 @@ pub struct GatherOutcome {
     /// Maximum watermark LSN seen across all responding cores. Retained as the
     /// scalar fence value for Strong-consistency callers that need one LSN.
     pub watermark_lsn: Lsn,
+    /// Max per-collection read-version LSN across all responding cores. A read
+    /// homes to exactly ONE core, so the non-owning cores report `Lsn::ZERO` and
+    /// the owning core's value dominates the fold — yielding the scanned
+    /// collection's `coll_write_lsn` at read time (the sound comparand for
+    /// cross-shard OCC read validation, distinct from `watermark_lsn`).
+    pub read_version_lsn: Lsn,
     /// Per-shard watermark LSNs — one `(vshard, watermark_lsn)` per responding
     /// core, NOT collapsed to the max. The transaction read-set records one
     /// entry per participating shard from this, so a predicate read fanned over
@@ -195,6 +201,11 @@ pub async fn gather_all_cores(
     let mut raw = Vec::new();
     let mut all_elements: Vec<Vec<u8>> = Vec::new();
     let mut max_lsn = Lsn::ZERO;
+    // Max-fold of the per-collection read-version across cores: a collection
+    // homes to ONE core, so non-owning cores contribute `Lsn::ZERO` and the
+    // owning core's value dominates. Kept as a single scalar (not per-core) —
+    // the read plan targets one collection, so one non-zero value survives.
+    let mut max_read_version = Lsn::ZERO;
     let mut shard_watermarks: Vec<(VShardId, Lsn)> = Vec::new();
     let mut had_error = false;
     let mut error_msg = String::new();
@@ -210,7 +221,7 @@ pub async fn gather_all_cores(
         };
 
         if resp.status == Status::Error {
-            if let Some(ref ec) = resp.error_code {
+            if let Some(ec) = resp.error_code.as_deref() {
                 match ec {
                     crate::bridge::envelope::ErrorCode::NotFound => continue,
                     _ => {
@@ -229,6 +240,9 @@ pub async fn gather_all_cores(
 
         if resp.watermark_lsn > max_lsn {
             max_lsn = resp.watermark_lsn;
+        }
+        if resp.read_version_lsn > max_read_version {
+            max_read_version = resp.read_version_lsn;
         }
 
         if resp.payload.is_empty() {
@@ -250,6 +264,7 @@ pub async fn gather_all_cores(
         raw,
         merged_array,
         watermark_lsn: max_lsn,
+        read_version_lsn: max_read_version,
         shard_watermarks,
     })
 }
@@ -378,7 +393,7 @@ pub async fn gather_all_vshards(
     // terminates at runtime (the plan is Exchange-free, so the re-entrant
     // resolve is a no-op), but the future must be heap-indirected so its size
     // is finite.
-    let (payloads, shard_watermarks): (Vec<Vec<u8>>, Vec<(VShardId, Lsn)>) =
+    let (payloads, shard_watermarks, read_version_lsn): (Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn) =
         Box::pin(gateway.execute_with_watermarks(&ctx, plan))
             .await
             .map_err(|e| crate::Error::Dispatch {
@@ -407,6 +422,7 @@ pub async fn gather_all_vshards(
         raw,
         merged_array,
         watermark_lsn,
+        read_version_lsn,
         shard_watermarks,
     })
 }
@@ -451,6 +467,7 @@ pub(super) fn outcome_to_response(merged_array: Vec<u8>, watermark_lsn: Lsn) -> 
         watermark_lsn,
         error_code: None,
         read_set_valid: None,
+        read_version_lsn: crate::types::Lsn::ZERO,
         write_set: Vec::new(),
     }
 }

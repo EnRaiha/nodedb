@@ -76,8 +76,9 @@ impl CoreLoop {
                 partial: false,
                 payload: Payload::empty(),
                 watermark_lsn: self.watermark,
-                error_code: Some(ErrorCode::DeadlineExceeded),
+                error_code: Some(Box::new(ErrorCode::DeadlineExceeded)),
                 read_set_valid: None,
+                read_version_lsn: crate::types::Lsn::ZERO,
                 write_set: Vec::new(),
             }
         } else {

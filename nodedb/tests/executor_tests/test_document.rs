@@ -64,7 +64,7 @@ fn run_scan_and_count(
         }
         if r.status != Status::Partial {
             terminal_status = r.status;
-            terminal_error = r.error_code;
+            terminal_error = r.error_code.map(|b| *b);
         }
     }
     (total, terminal_status, terminal_error)
@@ -190,7 +190,7 @@ fn crdt_read_not_found() {
         }),
     );
     assert_eq!(resp.status, Status::Error);
-    assert_eq!(resp.error_code, Some(ErrorCode::NotFound));
+    assert_eq!(resp.error_code.as_deref(), Some(&ErrorCode::NotFound));
 }
 
 #[test]

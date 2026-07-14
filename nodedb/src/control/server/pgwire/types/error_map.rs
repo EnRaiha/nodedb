@@ -120,7 +120,7 @@ pub fn notice_warning(message: &str) -> pgwire::messages::response::NoticeRespon
 /// Map a Data Plane response status + error code to a SQLSTATE triple.
 pub fn response_status_to_sqlstate(
     status: Status,
-    error_code: &Option<ErrorCode>,
+    error_code: Option<&ErrorCode>,
 ) -> Option<(&'static str, &'static str, String)> {
     match status {
         Status::Ok | Status::Partial => None,

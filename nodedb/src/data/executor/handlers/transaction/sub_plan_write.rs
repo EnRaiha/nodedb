@@ -182,7 +182,7 @@ impl CoreLoop {
             },
         );
         if resp.status == Status::Error {
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "edge put failed".into(),
             }));
         }
@@ -226,7 +226,7 @@ impl CoreLoop {
 
         let resp = self.execute_edge_delete(dummy_task, tid, collection, src_id, label, dst_id);
         if resp.status == Status::Error {
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "edge delete failed".into(),
             }));
         }
@@ -255,7 +255,7 @@ impl CoreLoop {
         let resp =
             self.execute_columnar_update(dummy_task, collection, filters, updates, Some(undo_log));
         if resp.status == Status::Error {
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "columnar update failed".into(),
             }));
         }
@@ -272,7 +272,7 @@ impl CoreLoop {
     ) -> Result<Response, ErrorCode> {
         let resp = self.execute_columnar_delete(dummy_task, collection, filters, Some(undo_log));
         if resp.status == Status::Error {
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "columnar delete failed".into(),
             }));
         }
@@ -311,7 +311,7 @@ impl CoreLoop {
             ),
         }));
         if resp.status == Status::Error {
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "sub-plan execution failed".into(),
             }));
         }

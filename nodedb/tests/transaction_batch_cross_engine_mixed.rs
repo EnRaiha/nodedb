@@ -32,7 +32,10 @@ fn seed_conflict_doc(
 
 fn assert_no_rb_fail(resp: &nodedb::bridge::envelope::Response) {
     assert!(
-        !matches!(resp.error_code, Some(ErrorCode::RollbackFailed { .. })),
+        !matches!(
+            resp.error_code.as_deref(),
+            Some(ErrorCode::RollbackFailed { .. })
+        ),
         "rollback itself must succeed; got {:?}",
         resp.error_code
     );

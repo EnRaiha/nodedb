@@ -170,7 +170,8 @@ pub(super) async fn run_dispatch_loop(
         // fan read records one entry per participating shard from the gather's
         // per-shard watermarks; a single read falls back to its one watermark.
         let records_read = task_resp.status == Status::Ok
-            || task_resp.error_code == Some(crate::bridge::envelope::ErrorCode::NotFound);
+            || task_resp.error_code.as_deref()
+                == Some(&crate::bridge::envelope::ErrorCode::NotFound);
         if records_read
             && ctx.sessions.transaction_state(ctx.peer_addr)
                 == crate::control::server::shared::session::TransactionState::InBlock

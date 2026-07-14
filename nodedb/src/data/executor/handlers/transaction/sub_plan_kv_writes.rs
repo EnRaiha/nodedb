@@ -53,7 +53,7 @@ impl CoreLoop {
                     },
                 );
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv put failed".into(),
                     }));
                 }
@@ -85,7 +85,7 @@ impl CoreLoop {
                     },
                 );
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv insert failed".into(),
                     }));
                 }
@@ -123,7 +123,7 @@ impl CoreLoop {
                     },
                 );
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv insert-if-absent failed".into(),
                     }));
                 }
@@ -145,7 +145,7 @@ impl CoreLoop {
                 let prior = self.kv_engine.get(did, tid, collection, key, now_ms);
                 let resp = self.execute_kv(task, did, tid, op);
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv insert-on-conflict-update failed".into(),
                     }));
                 }
@@ -169,7 +169,7 @@ impl CoreLoop {
                     .collect();
                 let resp = self.execute_kv_delete(task, did, tid, collection, keys);
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv delete failed".into(),
                     }));
                 }
@@ -209,7 +209,7 @@ impl CoreLoop {
                     },
                 );
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv batch put failed".into(),
                     }));
                 }
@@ -240,7 +240,7 @@ impl CoreLoop {
                     updates,
                 );
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv field set failed".into(),
                     }));
                 }
@@ -274,7 +274,7 @@ impl CoreLoop {
                     *ttl_ms,
                 );
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv incr failed".into(),
                     }));
                 }
@@ -306,7 +306,7 @@ impl CoreLoop {
                     *delta,
                 );
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv incr float failed".into(),
                     }));
                 }
@@ -340,7 +340,7 @@ impl CoreLoop {
                     new_value,
                 );
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv cas failed".into(),
                     }));
                 }
@@ -373,7 +373,7 @@ impl CoreLoop {
                     new_value,
                 );
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv get-set failed".into(),
                     }));
                 }
@@ -396,7 +396,7 @@ impl CoreLoop {
                 let dest_prior = self.kv_engine.get(did, tid, collection, dest_key, now_ms);
                 let resp = self.execute_kv(task, did, tid, op);
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv transfer failed".into(),
                     }));
                 }
@@ -443,7 +443,7 @@ impl CoreLoop {
                     },
                 );
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv transfer-item failed".into(),
                     }));
                 }

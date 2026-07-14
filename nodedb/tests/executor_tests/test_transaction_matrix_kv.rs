@@ -329,7 +329,7 @@ fn rollback_matrix_columnar_then_doc_fail() {
     );
     assert!(
         !matches!(
-            resp.error_code,
+            resp.error_code.as_deref(),
             Some(nodedb::bridge::envelope::ErrorCode::RollbackFailed { .. })
         ),
         "rollback itself must succeed; got {:?}",
@@ -499,7 +499,7 @@ fn rollback_matrix_timeseries_then_doc_fail() {
     );
     assert!(
         !matches!(
-            resp.error_code,
+            resp.error_code.as_deref(),
             Some(nodedb::bridge::envelope::ErrorCode::RollbackFailed { .. })
         ),
         "rollback itself must succeed; got {:?}",

@@ -62,7 +62,7 @@ fn kv_get_isolated() {
     );
     // KV engine returns Ok with empty payload or NotFound for missing keys.
     let is_empty = resp_b.payload.is_empty()
-        || resp_b.error_code == Some(ErrorCode::NotFound)
+        || resp_b.error_code.as_deref() == Some(&ErrorCode::NotFound)
         || payload_json(&resp_b.payload).contains("null");
     assert!(
         is_empty,

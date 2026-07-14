@@ -275,8 +275,15 @@ pub struct Response {
     /// Watermark LSN at the time of read (for snapshot consistency tracking).
     pub watermark_lsn: Lsn,
 
+    /// Per-collection read-version LSN (the scanned collection's `coll_write_lsn`
+    /// at read time, in its Raft-group index space) — the sound comparand for
+    /// cross-shard OCC read validation. Distinct from `watermark_lsn`
+    /// (core-global max, used for snapshot/SI reporting). `Lsn::ZERO` for
+    /// non-read responses.
+    pub read_version_lsn: Lsn,
+
     /// Error code if status is not Ok.
-    pub error_code: Option<ErrorCode>,
+    pub error_code: Option<Box<ErrorCode>>,
 
     /// Whether this response's originating transaction found its slice of the
     /// versioned read-set still current against the local write versions.
@@ -533,6 +540,7 @@ mod tests {
             watermark_lsn: Lsn::new(42),
             error_code: None,
             read_set_valid: None,
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         };
         assert_eq!(resp.status, Status::Ok);
@@ -549,11 +557,15 @@ mod tests {
             partial: false,
             payload: Payload::empty(),
             watermark_lsn: Lsn::ZERO,
-            error_code: Some(ErrorCode::DeadlineExceeded),
+            error_code: Some(Box::new(ErrorCode::DeadlineExceeded)),
             read_set_valid: None,
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         };
-        assert_eq!(resp.error_code, Some(ErrorCode::DeadlineExceeded));
+        assert_eq!(
+            resp.error_code.as_deref(),
+            Some(&ErrorCode::DeadlineExceeded)
+        );
     }
 
     #[test]

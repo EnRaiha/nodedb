@@ -323,10 +323,11 @@ fn drain_and_reject(core: &mut CoreLoop, core_id: usize) {
             partial: false,
             payload: Payload::empty(),
             watermark_lsn: core.watermark,
-            error_code: Some(ErrorCode::Internal {
+            error_code: Some(Box::new(ErrorCode::Internal {
                 detail: format!("core-{core_id} is degraded after repeated panics"),
-            }),
+            })),
             read_set_valid: None,
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         };
         if let Err(e) = core

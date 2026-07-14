@@ -210,7 +210,10 @@ fn rollback_matrix_vector_then_doc_fail() {
     assert_eq!(resp.status, Status::Error, "batch should fail");
     // The error must be a constraint violation, not a rollback failure.
     assert!(
-        !matches!(resp.error_code, Some(ErrorCode::RollbackFailed { .. })),
+        !matches!(
+            resp.error_code.as_deref(),
+            Some(ErrorCode::RollbackFailed { .. })
+        ),
         "rollback itself must succeed; got {:?}",
         resp.error_code
     );
@@ -283,7 +286,10 @@ fn rollback_matrix_graph_then_vector_fail() {
     );
     assert_eq!(resp.status, Status::Error);
     assert!(
-        !matches!(resp.error_code, Some(ErrorCode::RollbackFailed { .. })),
+        !matches!(
+            resp.error_code.as_deref(),
+            Some(ErrorCode::RollbackFailed { .. })
+        ),
         "rollback itself must succeed; got {:?}",
         resp.error_code
     );
@@ -384,7 +390,10 @@ fn rollback_matrix_crdt_buffered_then_vector_fail() {
     assert_eq!(resp.status, Status::Error);
     // Rollback must succeed (not RollbackFailed).
     assert!(
-        !matches!(resp.error_code, Some(ErrorCode::RollbackFailed { .. })),
+        !matches!(
+            resp.error_code.as_deref(),
+            Some(ErrorCode::RollbackFailed { .. })
+        ),
         "rollback itself must succeed; got {:?}",
         resp.error_code
     );
@@ -502,7 +511,10 @@ fn rollback_matrix_fts_side_effect_rolled_back() {
         "batch must fail on dim-mismatch"
     );
     assert!(
-        !matches!(resp.error_code, Some(ErrorCode::RollbackFailed { .. })),
+        !matches!(
+            resp.error_code.as_deref(),
+            Some(ErrorCode::RollbackFailed { .. })
+        ),
         "rollback itself must succeed; got {:?}",
         resp.error_code
     );
@@ -583,7 +595,10 @@ fn rollback_matrix_spatial_not_written_in_tx_path() {
         "batch must fail on dim-mismatch"
     );
     assert!(
-        !matches!(resp.error_code, Some(ErrorCode::RollbackFailed { .. })),
+        !matches!(
+            resp.error_code.as_deref(),
+            Some(ErrorCode::RollbackFailed { .. })
+        ),
         "rollback itself must succeed; got {:?}",
         resp.error_code
     );

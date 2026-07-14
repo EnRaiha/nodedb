@@ -371,7 +371,10 @@ fn expired_task_returns_deadline_exceeded() {
     core.tick();
     let resp = resp_rx.try_pop().unwrap();
     assert_eq!(resp.inner.status, Status::Error);
-    assert_eq!(resp.inner.error_code, Some(ErrorCode::DeadlineExceeded));
+    assert_eq!(
+        resp.inner.error_code.as_deref(),
+        Some(&ErrorCode::DeadlineExceeded)
+    );
 }
 
 #[test]

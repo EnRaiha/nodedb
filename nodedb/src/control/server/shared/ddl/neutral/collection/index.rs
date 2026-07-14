@@ -211,7 +211,7 @@ pub async fn create_index(
     .map_err(|e| err("XX000", e.to_string()))?;
 
     if backfill_resp.status == crate::bridge::envelope::Status::Error {
-        let detail = match &backfill_resp.error_code {
+        let detail = match backfill_resp.error_code.as_deref() {
             Some(crate::bridge::envelope::ErrorCode::Internal { detail, .. }) => detail.clone(),
             Some(other) => format!("{other:?}"),
             None => String::from_utf8_lossy(&backfill_resp.payload).into_owned(),

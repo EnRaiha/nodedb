@@ -278,7 +278,7 @@ async fn dispatch_single_shard(
         Ok(r) if r.status == Status::Ok => r,
         Ok(r) => {
             return Some(AbortReason::BatchRejected {
-                code: r.error_code.clone(),
+                code: r.error_code.as_deref().cloned(),
             });
         }
         Err(e) => return Some(AbortReason::Dispatch(e)),
@@ -344,7 +344,7 @@ pub(super) fn classify_batch_dispatch(result: crate::Result<Response>) -> Option
             Some(AbortReason::Dispatch(e))
         }
         Ok(resp) if resp.status != Status::Ok => Some(AbortReason::BatchRejected {
-            code: resp.error_code.clone(),
+            code: resp.error_code.as_deref().cloned(),
         }),
         Ok(_) => None,
     }

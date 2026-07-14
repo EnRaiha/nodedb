@@ -63,7 +63,8 @@ impl Scheduler {
         // (2) signals the coordinator's completion waiter via the registry so it
         // can run a FRESH reconnaissance and resubmit.
         if response.status == crate::bridge::envelope::Status::Error
-            && response.error_code == Some(crate::bridge::envelope::ErrorCode::OllpRetryRequired)
+            && response.error_code.as_deref()
+                == Some(&crate::bridge::envelope::ErrorCode::OllpRetryRequired)
         {
             // A mismatch is a normal OLLP retry signal, not a failure: the executor
             // correctly detected predicate drift and declined to write. Count it as

@@ -98,5 +98,6 @@ pub(super) async fn fan_tenant_snapshot_all_cores(
     Ok(NodeLevelResult {
         payload,
         watermark_lsn,
+        read_version_lsn: Lsn::ZERO,
     })
 }

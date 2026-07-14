@@ -18,6 +18,11 @@ use super::wcc::fan_wcc_all_cores;
 pub struct NodeLevelResult {
     pub payload: Vec<u8>,
     pub watermark_lsn: Lsn,
+    /// Max per-collection read-version LSN of the fanned read (the scanned
+    /// collection's `coll_write_lsn` at read time). `Lsn::ZERO` for non-read
+    /// node-level results. Distinct from the core-global `watermark_lsn`; the
+    /// sound comparand for cross-shard OCC read validation.
+    pub read_version_lsn: Lsn,
 }
 
 /// Fan `plan` across all local Data-Plane cores, merge per-core payloads, and
@@ -81,6 +86,7 @@ pub async fn execute_plan_all_local_cores(
                 Ok(NodeLevelResult {
                     payload: envelope,
                     watermark_lsn: Lsn::ZERO,
+                    read_version_lsn: Lsn::ZERO,
                 })
             }
 
@@ -236,6 +242,7 @@ async fn generic_gather(
     Ok(NodeLevelResult {
         payload: outcome.merged_array,
         watermark_lsn: outcome.watermark_lsn,
+        read_version_lsn: outcome.read_version_lsn,
     })
 }
 
@@ -262,10 +269,14 @@ async fn single_blob_gather(
             .await?;
 
     let mut watermark_lsn = Lsn::ZERO;
+    let mut read_version_lsn = Lsn::ZERO;
     let mut payload: Option<Vec<u8>> = None;
     for resp in responses {
         if resp.watermark_lsn > watermark_lsn {
             watermark_lsn = resp.watermark_lsn;
+        }
+        if resp.read_version_lsn > read_version_lsn {
+            read_version_lsn = resp.read_version_lsn;
         }
         if payload.is_none() && !resp.payload.is_empty() {
             payload = Some(resp.payload.as_ref().to_vec());
@@ -275,5 +286,6 @@ async fn single_blob_gather(
     Ok(NodeLevelResult {
         payload: payload.unwrap_or_default(),
         watermark_lsn,
+        read_version_lsn,
     })
 }

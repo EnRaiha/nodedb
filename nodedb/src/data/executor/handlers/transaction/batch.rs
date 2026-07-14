@@ -106,6 +106,7 @@ impl CoreLoop {
             watermark_lsn: self.watermark,
             error_code: None,
             read_set_valid: Some(read_set_current),
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         }
     }
@@ -223,8 +224,9 @@ impl CoreLoop {
                         partial: false,
                         payload: crate::bridge::envelope::Payload::empty(),
                         watermark_lsn: self.watermark,
-                        error_code: Some(rollback_error_code),
+                        error_code: Some(Box::new(rollback_error_code)),
                         read_set_valid: None,
+                        read_version_lsn: crate::types::Lsn::ZERO,
                         write_set: Vec::new(),
                     });
                 }
@@ -279,8 +281,9 @@ impl CoreLoop {
                 partial: false,
                 payload: crate::bridge::envelope::Payload::empty(),
                 watermark_lsn: self.watermark,
-                error_code: Some(rollback_error_code),
+                error_code: Some(Box::new(rollback_error_code)),
                 read_set_valid: None,
+                read_version_lsn: crate::types::Lsn::ZERO,
                 write_set: Vec::new(),
             });
         }
@@ -329,11 +332,14 @@ impl CoreLoop {
                             partial: false,
                             payload: crate::bridge::envelope::Payload::empty(),
                             watermark_lsn: self.watermark,
-                            error_code: Some(crate::bridge::envelope::ErrorCode::RollbackFailed {
-                                entry_index: crdt_idx,
-                                detail: format!("CRDT delta apply failed: {e}"),
-                            }),
+                            error_code: Some(Box::new(
+                                crate::bridge::envelope::ErrorCode::RollbackFailed {
+                                    entry_index: crdt_idx,
+                                    detail: format!("CRDT delta apply failed: {e}"),
+                                },
+                            )),
                             read_set_valid: None,
+                            read_version_lsn: crate::types::Lsn::ZERO,
                             write_set: Vec::new(),
                         });
                     }
@@ -353,11 +359,14 @@ impl CoreLoop {
                         partial: false,
                         payload: crate::bridge::envelope::Payload::empty(),
                         watermark_lsn: self.watermark,
-                        error_code: Some(crate::bridge::envelope::ErrorCode::RollbackFailed {
-                            entry_index: crdt_idx,
-                            detail: format!("CRDT engine not available: {e}"),
-                        }),
+                        error_code: Some(Box::new(
+                            crate::bridge::envelope::ErrorCode::RollbackFailed {
+                                entry_index: crdt_idx,
+                                detail: format!("CRDT engine not available: {e}"),
+                            },
+                        )),
                         read_set_valid: None,
+                        read_version_lsn: crate::types::Lsn::ZERO,
                         write_set: Vec::new(),
                     });
                 }

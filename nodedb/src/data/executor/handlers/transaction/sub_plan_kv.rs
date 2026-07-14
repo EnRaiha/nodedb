@@ -94,7 +94,7 @@ impl CoreLoop {
             },
         );
         if resp.status == Status::Error {
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "columnar insert failed".into(),
             }));
         }
@@ -209,7 +209,7 @@ impl CoreLoop {
             provenance: None,
         });
         if resp.status == Status::Error {
-            return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "timeseries ingest failed".into(),
             }));
         }

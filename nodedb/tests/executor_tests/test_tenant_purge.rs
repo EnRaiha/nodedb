@@ -181,7 +181,7 @@ fn purge_removes_all_tenant_data() {
         }),
     );
     let kv_empty = kv_resp.payload.is_empty()
-        || kv_resp.error_code == Some(ErrorCode::NotFound)
+        || kv_resp.error_code.as_deref() == Some(&ErrorCode::NotFound)
         || payload_json(&kv_resp.payload).contains("null");
     assert!(kv_empty, "Tenant A KV data should be purged");
 

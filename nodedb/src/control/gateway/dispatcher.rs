@@ -42,6 +42,13 @@ use super::version_set::GatewayVersionSet;
 pub struct DispatchOutcome {
     pub payloads: Vec<Vec<u8>>,
     pub shard_watermarks: Vec<(VShardId, Lsn)>,
+    /// Per-collection read-version LSN for this route's scanned collection (its
+    /// `coll_write_lsn` at read time, in its Raft-group index space); `Lsn::ZERO`
+    /// for writes / non-read routes. The gateway max-folds these across routes —
+    /// a read targets one collection, so one non-zero value survives — giving the
+    /// sound comparand for cross-shard OCC read validation (distinct from the
+    /// per-shard `shard_watermarks`, which report the core-global watermark).
+    pub read_version_lsn: Lsn,
 }
 
 /// Dispatch a single route and return the raw payload bytes.
@@ -190,6 +197,7 @@ async fn dispatch_local(
     Ok(DispatchOutcome {
         payloads: vec![resp.payload.to_vec()],
         shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],
+        read_version_lsn: resp.read_version_lsn,
     })
 }
 

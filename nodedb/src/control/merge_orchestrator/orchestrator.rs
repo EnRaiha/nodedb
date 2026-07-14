@@ -150,7 +150,7 @@ pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Resul
         )
         .await?;
 
-        if apply_resp.error_code == Some(ErrorCode::OllpRetryRequired) {
+        if apply_resp.error_code.as_deref() == Some(&ErrorCode::OllpRetryRequired) {
             attempt += 1;
             if attempt > MAX_MERGE_RETRIES {
                 return Err(crate::Error::OllpExhausted {

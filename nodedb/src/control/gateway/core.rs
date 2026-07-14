@@ -117,7 +117,7 @@ impl Gateway {
     ) -> Result<Vec<Vec<u8>>, Error> {
         self.execute_with_watermarks(ctx, plan)
             .await
-            .map(|(payloads, _watermarks)| payloads)
+            .map(|(payloads, _watermarks, _read_version)| payloads)
     }
 
     /// Execute a pre-planned `PhysicalPlan`, returning both the raw payloads and
@@ -132,7 +132,7 @@ impl Gateway {
         &self,
         ctx: &QueryContext,
         plan: PhysicalPlan,
-    ) -> Result<(Vec<Vec<u8>>, Vec<(VShardId, Lsn)>), Error> {
+    ) -> Result<(Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn), Error> {
         let shared = self.shared()?;
         let span = info_span!(
             "gateway.execute",
@@ -224,7 +224,7 @@ impl Gateway {
                     return self
                         .execute_with_version_set(ctx, (*cached_plan).clone(), stored_vs)
                         .await
-                        .map(|(payloads, _watermarks)| payloads);
+                        .map(|(payloads, _watermarks, _read_version)| payloads);
                 }
             }
             // Stored version set is stale or plan was evicted — fall through
@@ -250,7 +250,7 @@ impl Gateway {
 
         self.execute_with_version_set(ctx, plan, actual_vs)
             .await
-            .map(|(payloads, _watermarks)| payloads)
+            .map(|(payloads, _watermarks, _read_version)| payloads)
     }
 
     /// Core execution path: route → dispatch with retry → fuse.
@@ -263,7 +263,7 @@ impl Gateway {
         ctx: &QueryContext,
         plan: PhysicalPlan,
         version_set: GatewayVersionSet,
-    ) -> Result<(Vec<Vec<u8>>, Vec<(VShardId, Lsn)>), Error> {
+    ) -> Result<(Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn), Error> {
         let shared = self.shared()?;
         let routes = self.compute_routes(plan, ctx)?;
 
@@ -275,6 +275,10 @@ impl Gateway {
         let max_total_bytes = shared.tuning.network.max_query_result_bytes as usize;
         let mut all_payloads: Vec<Vec<u8>> = Vec::new();
         let mut all_shard_watermarks: Vec<(VShardId, Lsn)> = Vec::new();
+        // Max-fold of the per-collection read-version across routes: a read
+        // targets one collection homed to one shard, so non-owning routes
+        // contribute `Lsn::ZERO` and the owning route's value survives.
+        let mut max_read_version = Lsn::ZERO;
         let mut accumulated_bytes: usize = 0;
 
         for route in routes {
@@ -358,6 +362,9 @@ impl Gateway {
             // participating shard, never collapsed to a scalar, so a multi-route
             // read produces one read-set entry per shard.
             all_shard_watermarks.extend(outcome.shard_watermarks);
+            if outcome.read_version_lsn > max_read_version {
+                max_read_version = outcome.read_version_lsn;
+            }
 
             for p in outcome.payloads {
                 accumulated_bytes = accumulated_bytes.saturating_add(p.len());
@@ -378,9 +385,9 @@ impl Gateway {
         // read-set entry.
         if all_payloads.len() > 1 {
             let fused = fuse_payloads(all_payloads)?;
-            Ok((vec![fused.payload], all_shard_watermarks))
+            Ok((vec![fused.payload], all_shard_watermarks, max_read_version))
         } else {
-            Ok((all_payloads, all_shard_watermarks))
+            Ok((all_payloads, all_shard_watermarks, max_read_version))
         }
     }
 

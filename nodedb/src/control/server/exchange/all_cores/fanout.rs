@@ -161,7 +161,7 @@ pub(super) async fn gather_graph_op_all_cores(
         };
 
         if resp.status == Status::Error {
-            if let Some(ref ec) = resp.error_code {
+            if let Some(ec) = resp.error_code.as_deref() {
                 match ec {
                     crate::bridge::envelope::ErrorCode::NotFound => continue,
                     _ => {

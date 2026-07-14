@@ -340,7 +340,7 @@ pub(crate) async fn handle_graph_match(
     // predicate read at the shard's watermark, identical to every other read
     // seam. Single-shard direct op → one watermark, one entry.
     if (resp.status == Status::Ok
-        || resp.error_code == Some(crate::bridge::envelope::ErrorCode::NotFound))
+        || resp.error_code.as_deref() == Some(&crate::bridge::envelope::ErrorCode::NotFound))
         && ctx.sessions.transaction_state(ctx.peer_addr)
             == crate::control::server::shared::session::TransactionState::InBlock
     {
@@ -441,6 +441,7 @@ async fn dispatch_single_task(
                 watermark_lsn: Lsn::new(0),
                 error_code: None,
                 read_set_valid: None,
+                read_version_lsn: crate::types::Lsn::ZERO,
                 write_set: Vec::new(),
             };
             return data_plane_response_to_native(ctx, seq, &plan_for_staged_response, &synthetic);
@@ -468,7 +469,8 @@ async fn dispatch_single_task(
             // observation). Direct ops are single-shard, so one watermark → one
             // entry.
             let records_read = resp.status == Status::Ok
-                || resp.error_code == Some(crate::bridge::envelope::ErrorCode::NotFound);
+                || resp.error_code.as_deref()
+                    == Some(&crate::bridge::envelope::ErrorCode::NotFound);
             if records_read
                 && ctx.sessions.transaction_state(ctx.peer_addr)
                     == crate::control::server::shared::session::TransactionState::InBlock
@@ -565,6 +567,7 @@ fn gateway_payloads_to_response(payloads: Vec<Vec<u8>>) -> Response {
         watermark_lsn: Lsn::new(0),
         error_code: None,
         read_set_valid: None,
+        read_version_lsn: crate::types::Lsn::ZERO,
         write_set: Vec::new(),
     }
 }

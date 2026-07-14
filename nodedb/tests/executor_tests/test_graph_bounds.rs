@@ -135,8 +135,8 @@ fn graph_traversal_bounded_under_adversarial_queries() {
     );
     // c0→c50 is 50 hops, depth limit 3 should fail.
     assert_eq!(
-        path_short.error_code,
-        Some(ErrorCode::NotFound),
+        path_short.error_code.as_deref(),
+        Some(&ErrorCode::NotFound),
         "50-hop path should not be found with max_depth=3"
     );
 

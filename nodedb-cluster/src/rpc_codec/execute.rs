@@ -51,6 +51,12 @@ pub struct ExecuteResponse {
     /// writes/errors. Mirrors [`ExecuteStreamChunk::watermark_lsn`]: raw `u64`
     /// on the wire, converted to `Lsn` at the coordinator via `Lsn::new`.
     pub watermark_lsn: u64,
+    /// Per-collection read-version LSN for the scanned collection (its
+    /// `coll_write_lsn` at read time, in its Raft-group index space); 0 for
+    /// writes/errors. The sound comparand for cross-shard OCC read validation,
+    /// distinct from the core-global `watermark_lsn`. Raw `u64` on the wire,
+    /// converted to `Lsn` at the coordinator via `Lsn::new`.
+    pub read_version_lsn: u64,
 }
 
 /// Typed error returned by the remote executor.
@@ -101,12 +107,13 @@ pub struct ExecuteStreamEnd {
 }
 
 impl ExecuteResponse {
-    pub fn ok(payloads: Vec<Vec<u8>>, watermark_lsn: u64) -> Self {
+    pub fn ok(payloads: Vec<Vec<u8>>, watermark_lsn: u64, read_version_lsn: u64) -> Self {
         Self {
             success: true,
             payloads,
             error: None,
             watermark_lsn,
+            read_version_lsn,
         }
     }
     pub fn err(error: TypedClusterError) -> Self {
@@ -115,6 +122,7 @@ impl ExecuteResponse {
             payloads: vec![],
             error: Some(error),
             watermark_lsn: 0,
+            read_version_lsn: 0,
         }
     }
 }
@@ -274,7 +282,11 @@ mod tests {
 
     #[test]
     fn roundtrip_execute_response_success() {
-        let resp = ExecuteResponse::ok(vec![b"row1".to_vec(), b"row2".to_vec()], 0xCAFE_1234);
+        let resp = ExecuteResponse::ok(
+            vec![b"row1".to_vec(), b"row2".to_vec()],
+            0xCAFE_1234,
+            0xBEEF_5678,
+        );
         let decoded = roundtrip_resp(resp);
         assert!(decoded.success);
         assert_eq!(decoded.payloads.len(), 2);
@@ -283,6 +295,10 @@ mod tests {
         assert_eq!(
             decoded.watermark_lsn, 0xCAFE_1234,
             "read watermark roundtrips on the response body"
+        );
+        assert_eq!(
+            decoded.read_version_lsn, 0xBEEF_5678,
+            "per-collection read-version LSN roundtrips distinct from the watermark"
         );
     }
 
@@ -299,6 +315,10 @@ mod tests {
         assert_eq!(
             decoded.watermark_lsn, 0,
             "error responses carry no watermark"
+        );
+        assert_eq!(
+            decoded.read_version_lsn, 0,
+            "error responses carry no read-version LSN"
         );
         match decoded.error {
             Some(TypedClusterError::NotLeader {

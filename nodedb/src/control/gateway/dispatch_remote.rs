@@ -84,6 +84,9 @@ pub(super) async fn dispatch_remote(
             return Ok(DispatchOutcome {
                 payloads: vec![resp.payload.to_vec()],
                 shard_watermarks,
+                // Coordinator-gathered at the exchange root; the per-collection
+                // read-version is folded on the gather path, not this route.
+                read_version_lsn: Lsn::ZERO,
             });
         }
         crate::control::server::exchange::Resolved::Plan(p) => p,
@@ -97,6 +100,9 @@ pub(super) async fn dispatch_remote(
             return Ok(DispatchOutcome {
                 payloads: vec![merged],
                 shard_watermarks: vec![(VShardId::new(vshard_id as u32), lsn)],
+                // Materialized stream carries no separate per-collection
+                // read-version; the watermark keys the shard entry.
+                read_version_lsn: Lsn::ZERO,
             });
         }
     };
@@ -162,6 +168,7 @@ pub(super) async fn dispatch_remote(
                         Lsn::new(resp.watermark_lsn),
                     )],
                     payloads: resp.payloads,
+                    read_version_lsn: Lsn::new(resp.read_version_lsn),
                 })
             }
         }

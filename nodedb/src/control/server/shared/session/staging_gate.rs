@@ -203,7 +203,7 @@ where
 
     if resp.status == Status::Error {
         return Err(StagingGateError::Rejected {
-            code: resp.error_code.clone(),
+            code: resp.error_code.as_deref().cloned(),
         });
     }
 

@@ -40,7 +40,7 @@ impl CoreLoop {
             | KvOp::SortedIndexScore { .. } => {
                 let resp = self.execute_kv(task, did, tid, op);
                 if resp.status == Status::Error {
-                    return Err(resp.error_code.unwrap_or(ErrorCode::Internal {
+                    return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                         detail: "kv read failed".into(),
                     }));
                 }

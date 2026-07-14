@@ -393,7 +393,8 @@ impl NodeDbPgHandler {
             // phantom observation, not a no-op. Only successful reads and
             // not-found reads record; a genuine dispatch failure does not.
             let records_read = resp.status == crate::bridge::envelope::Status::Ok
-                || resp.error_code == Some(crate::bridge::envelope::ErrorCode::NotFound);
+                || resp.error_code.as_deref()
+                    == Some(&crate::bridge::envelope::ErrorCode::NotFound);
             if records_read
                 && self.sessions.transaction_state(addr)
                     == crate::control::server::shared::session::TransactionState::InBlock
@@ -414,7 +415,7 @@ impl NodeDbPgHandler {
             }
 
             if let Some((severity, code, message)) =
-                response_status_to_sqlstate(resp.status, &resp.error_code)
+                response_status_to_sqlstate(resp.status, resp.error_code.as_deref())
             {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     severity.to_owned(),

@@ -152,6 +152,7 @@ impl CoreLoop {
             watermark_lsn: self.watermark,
             error_code: None,
             read_set_valid: Some(vote),
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         }
     }
@@ -426,6 +427,7 @@ impl CoreLoop {
             // The dependent-read path carries no versioned read-set; `None` maps
             // to "commit" in `resolve_staged_commit` (`read_set_valid != Some(false)`).
             read_set_valid: None,
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         }
     }
@@ -707,7 +709,10 @@ mod tests {
 
         let resp = core.execute_calvin_execute_active(&task, ctx, &tenant_id, &plans, &injected);
         assert_eq!(resp.status, Status::Error);
-        assert_eq!(resp.error_code, Some(ErrorCode::OllpRetryRequired));
+        assert_eq!(
+            resp.error_code.as_deref(),
+            Some(&ErrorCode::OllpRetryRequired)
+        );
 
         // Drift stages NOTHING — neither the raw buffer nor the overlay.
         let vshard_id = task.request.vshard_id.as_u32();

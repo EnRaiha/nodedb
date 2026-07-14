@@ -127,6 +127,7 @@ pub async fn dispatch_sync_response(
             watermark_lsn: Lsn::new(0),
             error_code: None,
             read_set_valid: None,
+            read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         });
     }
@@ -266,7 +267,7 @@ pub async fn dispatch_write_replicated(
         // build a precise compensation hint by type instead of substring-matching
         // a human message.
         return Err(match resp.error_code {
-            Some(code) => crate::Error::DataPlane(code),
+            Some(code) => crate::Error::DataPlane(*code),
             None => crate::Error::Internal {
                 detail: String::from_utf8_lossy(&resp.payload).into_owned(),
             },

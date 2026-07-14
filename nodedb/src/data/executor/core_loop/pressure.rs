@@ -296,8 +296,8 @@ mod tests {
         let result = core.check_engine_pressure(&task, EngineId::Vector);
         assert!(result.is_some(), "Emergency must reject (Some)");
         assert_eq!(
-            result.unwrap().error_code,
-            Some(ErrorCode::ResourcesExhausted)
+            result.unwrap().error_code.as_deref(),
+            Some(&ErrorCode::ResourcesExhausted)
         );
         let m = metrics.backpressure_emergency_by_engine.read().unwrap();
         assert_eq!(m.get("vector").copied().unwrap_or(0), 1);

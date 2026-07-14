@@ -505,8 +505,8 @@ fn sort_merge_join_left_over_budget_surfaces_error() {
 
     assert_eq!(resp.status, Status::Error);
     assert_eq!(
-        resp.error_code,
-        Some(ErrorCode::ResourcesExhausted),
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::ResourcesExhausted),
         "sort-merge left over-budget must surface ResourcesExhausted"
     );
 }
@@ -541,8 +541,8 @@ fn sort_merge_join_right_over_budget_surfaces_error() {
 
     assert_eq!(resp.status, Status::Error);
     assert_eq!(
-        resp.error_code,
-        Some(ErrorCode::ResourcesExhausted),
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::ResourcesExhausted),
         "sort-merge right over-budget must surface ResourcesExhausted"
     );
 }
@@ -576,8 +576,8 @@ fn nested_loop_join_left_over_budget_surfaces_error() {
 
     assert_eq!(resp.status, Status::Error);
     assert_eq!(
-        resp.error_code,
-        Some(ErrorCode::ResourcesExhausted),
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::ResourcesExhausted),
         "nested-loop left over-budget must surface ResourcesExhausted"
     );
 }
@@ -611,8 +611,8 @@ fn nested_loop_join_right_over_budget_surfaces_error() {
 
     assert_eq!(resp.status, Status::Error);
     assert_eq!(
-        resp.error_code,
-        Some(ErrorCode::ResourcesExhausted),
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::ResourcesExhausted),
         "nested-loop right over-budget must surface ResourcesExhausted"
     );
 }
@@ -662,8 +662,8 @@ fn no_limit_join_output_over_budget_surfaces_error() {
         "no-LIMIT join over output budget must error, not silently truncate"
     );
     assert_eq!(
-        resp.error_code,
-        Some(ErrorCode::ResourcesExhausted),
+        resp.error_code.as_deref(),
+        Some(&ErrorCode::ResourcesExhausted),
         "expected ResourcesExhausted, got {:?}",
         resp.error_code
     );

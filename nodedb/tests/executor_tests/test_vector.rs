@@ -86,5 +86,5 @@ fn vector_search_no_index_returns_not_found() {
         }),
     );
     assert_eq!(resp.status, Status::Error);
-    assert_eq!(resp.error_code, Some(ErrorCode::NotFound));
+    assert_eq!(resp.error_code.as_deref(), Some(&ErrorCode::NotFound));
 }

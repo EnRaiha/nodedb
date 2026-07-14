@@ -451,7 +451,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         // rejection would be silently swallowed and the write appears
         // to succeed at the SQL layer.
         if response.status == crate::bridge::envelope::Status::Error {
-            let detail = match &response.error_code {
+            let detail = match response.error_code.as_deref() {
                 Some(crate::bridge::envelope::ErrorCode::Internal { detail, .. }) => detail.clone(),
                 Some(other) => format!("{other:?}"),
                 None => String::from_utf8_lossy(&response.payload).into_owned(),

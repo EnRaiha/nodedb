@@ -63,7 +63,7 @@ fn kv_cross_tenant_put_does_not_overwrite() {
     );
     assert_eq!(resp_a.status, Status::Ok);
     let is_present = !resp_a.payload.is_empty()
-        && resp_a.error_code != Some(ErrorCode::NotFound)
+        && resp_a.error_code.as_deref() != Some(&ErrorCode::NotFound)
         && !payload_json(&resp_a.payload).contains("null");
     assert!(
         is_present,
@@ -106,8 +106,8 @@ fn kv_cross_tenant_delete_does_not_affect_owner() {
         }),
     );
     // Either Ok (deleted 0 rows from B's namespace) or NotFound — both correct.
-    let ok_or_not_found =
-        resp_del.status == Status::Ok || resp_del.error_code == Some(ErrorCode::NotFound);
+    let ok_or_not_found = resp_del.status == Status::Ok
+        || resp_del.error_code.as_deref() == Some(&ErrorCode::NotFound);
     assert!(
         ok_or_not_found,
         "Cross-tenant delete must be Ok or NotFound, got {:?}",
@@ -129,7 +129,7 @@ fn kv_cross_tenant_delete_does_not_affect_owner() {
     );
     assert_eq!(resp_a.status, Status::Ok);
     let is_present = !resp_a.payload.is_empty()
-        && resp_a.error_code != Some(ErrorCode::NotFound)
+        && resp_a.error_code.as_deref() != Some(&ErrorCode::NotFound)
         && !payload_json(&resp_a.payload).contains("null");
     assert!(
         is_present,
