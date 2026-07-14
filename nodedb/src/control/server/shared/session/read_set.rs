@@ -54,6 +54,17 @@ pub enum ReadKey {
     Point { repr: KeyRepr },
     /// A collection-scoped predicate observation.
     Predicate,
+    /// A secondary-index equality observation on one indexed field, carrying
+    /// the canonical stringified index value.
+    IndexEq { field: String, value: String },
+    /// A secondary-index range observation on one indexed field. `lo`/`hi` are
+    /// optional so a one-sided native range is representable; both `None` is
+    /// never emitted.
+    IndexRange {
+        field: String,
+        lo: Option<String>,
+        hi: Option<String>,
+    },
 }
 
 /// One LSN-versioned, predicate-aware read-set entry. Scoped by
@@ -94,9 +105,9 @@ pub struct ReadSetEntry {
 /// comparand cross-shard OCC validation consumes; the per-shard `watermarks`
 /// still source the core-global `read_lsn` used by single-shard SI.
 ///
-/// `found` reports whether a point read observed a present row (`true` on a hit,
-/// `false` on a miss). It only affects document point reads — an absent document
-/// read degrades to a collection-scoped predicate; see [`read_key_of`].
+/// `found` reports whether a point read observed a present row (`true` on a
+/// hit, `false` on a miss). It only affects document point reads — an absent
+/// document read degrades to a collection-scoped predicate; see [`read_key_of`].
 pub fn record_read_set(
     sessions: &SessionStore,
     addr: &SocketAddr,
@@ -386,5 +397,59 @@ mod tests {
             }
         );
         assert_eq!(plan_engine(&plan), EngineTag::Document);
+    }
+
+    fn indexed_fetch(collection: &str, path: &str, value: &str) -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::IndexedFetch {
+            collection: collection.to_string(),
+            path: path.to_string(),
+            value: value.to_string(),
+            filters: Vec::new(),
+            projection: Vec::new(),
+            limit: 0,
+            offset: 0,
+        })
+    }
+
+    fn range_scan(
+        collection: &str,
+        field: &str,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> PhysicalPlan {
+        PhysicalPlan::Document(DocumentOp::RangeScan {
+            collection: collection.to_string(),
+            field: field.to_string(),
+            lower: lower.map(|b| b.to_vec()),
+            upper: upper.map(|b| b.to_vec()),
+            limit: 0,
+        })
+    }
+
+    #[test]
+    fn indexed_fetch_always_records_index_eq() {
+        // A secondary-index equality read always captures the indexed field +
+        // canonical value.
+        let plan = indexed_fetch("users", "$.email", "a@b.c");
+        assert_eq!(
+            read_key_of(&plan, true),
+            ReadKey::IndexEq {
+                field: "$.email".to_string(),
+                value: "a@b.c".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn range_scan_always_records_index_range() {
+        let plan = range_scan("users", "$.age", Some(b"18"), Some(b"65"));
+        assert_eq!(
+            read_key_of(&plan, true),
+            ReadKey::IndexRange {
+                field: "$.age".to_string(),
+                lo: Some("18".to_string()),
+                hi: Some("65".to_string()),
+            }
+        );
     }
 }

@@ -217,7 +217,13 @@ pub enum EngineTag {
 /// `Point` carries the exact row identity ([`KeyRepr`]) for a keyed lookup
 /// (per-key optimistic-concurrency validation). `Predicate` is the coarse,
 /// collection-scoped observation for scans / searches / aggregates — safe
-/// against phantoms, never under-approximating.
+/// against phantoms, never under-approximating. `IndexEq` / `IndexRange` carry
+/// the indexed dimension of a secondary-index equality / range read (canonical
+/// stringified index value, identical to the index-key segment) for narrower
+/// per-value validation.
+///
+/// New variants are APPENDED only — the on-wire encoding is positional, so
+/// reordering would break cross-version decode. Do NOT reorder variants.
 #[derive(
     Debug,
     Clone,
@@ -233,6 +239,16 @@ pub enum ReadKeyIdent {
     Point(KeyRepr),
     /// A collection-scoped predicate observation.
     Predicate,
+    /// A secondary-index equality observation on one indexed field.
+    IndexEq { field: String, value: String },
+    /// A secondary-index range observation on one indexed field. `lo`/`hi` are
+    /// optional so a one-sided native range is representable; both `None` is
+    /// never emitted.
+    IndexRange {
+        field: String,
+        lo: Option<String>,
+        hi: Option<String>,
+    },
 }
 
 /// One LSN-versioned, predicate-aware read observed by a transaction, carried

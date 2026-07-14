@@ -74,7 +74,7 @@ fn navigate_rmpv<'a>(value: &'a rmpv::Value, path: &str) -> Option<&'a rmpv::Val
     Some(current)
 }
 
-fn json_scalar_to_string(val: &serde_json::Value) -> Option<String> {
+pub(crate) fn json_scalar_to_string(val: &serde_json::Value) -> Option<String> {
     match val {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Number(n) => Some(n.to_string()),

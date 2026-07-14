@@ -64,3 +64,38 @@ pub(crate) fn sql_value_to_msgpack(v: &SqlValue) -> Vec<u8> {
     write_msgpack_value(&mut buf, v);
     buf
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::document::store::extract::json_scalar_to_string;
+
+    /// The read-side stringifier (`sql_value_to_string`, which the index-range
+    /// read-set capture uses) and the write-side index-key stringifier
+    /// (`json_scalar_to_string`) MUST agree on the canonical string for every
+    /// scalar type — otherwise a captured `IndexEq` value would never match the
+    /// index key a write records. This parity is the load-bearing guarantee the
+    /// per-value comparison (a later change) will rest on.
+    #[test]
+    fn read_and_write_scalar_stringifiers_agree() {
+        let cases = [
+            (
+                SqlValue::String("a@b.c".to_string()),
+                serde_json::json!("a@b.c"),
+            ),
+            (SqlValue::Int(42), serde_json::json!(42)),
+            (SqlValue::Float(1.5), serde_json::json!(1.5)),
+            (SqlValue::Bool(true), serde_json::json!(true)),
+            (SqlValue::Bool(false), serde_json::json!(false)),
+        ];
+        for (sql, json) in cases {
+            let read_side = sql_value_to_string(&sql);
+            let write_side =
+                json_scalar_to_string(&json).expect("scalar json must stringify to Some");
+            assert_eq!(
+                read_side, write_side,
+                "read/write stringifiers diverge for {sql:?}"
+            );
+        }
+    }
+}

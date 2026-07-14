@@ -143,6 +143,12 @@ pub(crate) fn plan_engine(plan: &PhysicalPlan) -> EngineTag {
 /// (`true` on a hit, `false` on a miss / absent row). It is meaningful only for
 /// single-row keyed lookups; scans and predicate reads ignore it.
 ///
+/// Secondary-index reads whose observation is confined to one indexed
+/// dimension always record the narrower `IndexEq` / `IndexRange` variants:
+/// `DocumentOp::IndexedFetch` / `IndexLookup` (equality) and
+/// `DocumentOp::RangeScan` (range). These validate identically to the
+/// collection floor today; per-value comparison lands later.
+///
 /// Single-row keyed lookups whose identity maps to exactly one [`KeyRepr`]
 /// record [`ReadKey::Point`]:
 /// - `DocumentOp::PointGet` that HIT — the row's cross-engine surrogate.
@@ -162,11 +168,13 @@ pub(crate) fn plan_engine(plan: &PhysicalPlan) -> EngineTag {
 /// Everything else records [`ReadKey::Predicate`] (collection-scoped, phantom-
 /// safe). This deliberately includes keyed ops whose observation cannot be
 /// captured by a single `KeyRepr` without under-approximating — `KvOp::BatchGet`
-/// (many keys) and `DocumentOp::IndexedFetch` (a secondary-index equality that
-/// can match many rows). A single-key repr for those would MISS the other keys
-/// / rows they observed, which is the one thing phantom safety forbids; the
-/// coarse collection floor over-aborts instead, which is always safe. The match
-/// is total over [`PhysicalPlan`] so a new variant forces a classification.
+/// (many keys). A single-key repr for those would MISS the other keys / rows
+/// they observed, which is the one thing phantom safety forbids; the coarse
+/// collection floor over-aborts instead, which is always safe. Secondary-index
+/// reads are the one exception carved out above: their observation IS confined
+/// to the indexed dimension, so `IndexEq` / `IndexRange` capture it precisely
+/// without under-approximating. The match is total over [`PhysicalPlan`] so a
+/// new variant forces a classification.
 pub(crate) fn read_key_of(plan: &PhysicalPlan, found: bool) -> ReadKey {
     match plan {
         PhysicalPlan::Document(DocumentOp::PointGet { surrogate, .. }) => {
@@ -183,6 +191,35 @@ pub(crate) fn read_key_of(plan: &PhysicalPlan, found: bool) -> ReadKey {
                 repr: KeyRepr::KvKey(key.clone().into_boxed_slice()),
             }
         }
+        // Secondary-index equality: the observation is confined to the indexed
+        // dimension, so record the indexed field + canonical stringified value.
+        // `filters` (the residual compound predicate) is ignored: validating
+        // the indexed dimension is sound (it never under-approximates the rows
+        // a concurrent write must conflict against).
+        PhysicalPlan::Document(
+            DocumentOp::IndexedFetch { path, value, .. }
+            | DocumentOp::IndexLookup { path, value, .. },
+        ) => ReadKey::IndexEq {
+            field: path.clone(),
+            value: value.clone(),
+        },
+        // Secondary-index range: the bound bytes are interpreted as UTF-8
+        // exactly as the scan itself interprets them. One-sided ranges keep the
+        // present bound and leave the other `None`.
+        PhysicalPlan::Document(DocumentOp::RangeScan {
+            field,
+            lower,
+            upper,
+            ..
+        }) => ReadKey::IndexRange {
+            field: field.clone(),
+            lo: lower
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).into_owned()),
+            hi: upper
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).into_owned()),
+        },
         PhysicalPlan::Document(_)
         | PhysicalPlan::Kv(_)
         | PhysicalPlan::Vector(_)

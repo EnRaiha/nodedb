@@ -145,6 +145,20 @@ impl WriteVersionIndex {
         key: &ReadKeyIdent,
         read_lsn: Lsn,
     ) -> bool {
+        // Collection-floor check shared by `Predicate` and — for now — the
+        // secondary-index variants: a read is current iff no write to the
+        // collection has been recorded since it. `IndexEq` / `IndexRange`
+        // validate identically to `Predicate` in this form; the per-value
+        // comparison against the indexed dimension lands in a later change.
+        let collection_floor_current = || {
+            let coll_key = CollKey {
+                db,
+                tenant,
+                collection: Box::from(collection),
+            };
+            self.collection_write_lsn(&coll_key).unwrap_or(Lsn::ZERO) <= read_lsn
+        };
+
         match key {
             ReadKeyIdent::Point(repr) => {
                 let write_key = WriteKey {
@@ -155,14 +169,9 @@ impl WriteVersionIndex {
                 };
                 self.key_write_lsn(&write_key).unwrap_or(Lsn::ZERO) <= read_lsn
             }
-            ReadKeyIdent::Predicate => {
-                let coll_key = CollKey {
-                    db,
-                    tenant,
-                    collection: Box::from(collection),
-                };
-                self.collection_write_lsn(&coll_key).unwrap_or(Lsn::ZERO) <= read_lsn
-            }
+            ReadKeyIdent::Predicate
+            | ReadKeyIdent::IndexEq { .. }
+            | ReadKeyIdent::IndexRange { .. } => collection_floor_current(),
         }
     }
 
@@ -408,5 +417,41 @@ mod tests {
 
         let key = ReadKeyIdent::Predicate;
         assert!(!index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+    }
+
+    #[test]
+    fn index_variants_validate_identically_to_predicate() {
+        // The index-range variants must, in this form, produce the SAME verdict
+        // as the collection-scoped `Predicate` for every floor position — the
+        // behavior-preserving guarantee this change rests on.
+        let index_eq = ReadKeyIdent::IndexEq {
+            field: "email".to_string(),
+            value: "a@b.c".to_string(),
+        };
+        let index_range = ReadKeyIdent::IndexRange {
+            field: "age".to_string(),
+            lo: Some("18".to_string()),
+            hi: None,
+        };
+        let predicate = ReadKeyIdent::Predicate;
+
+        // Floor below the read LSN (current), at it (current), and above it
+        // (stale) — the index variants track `Predicate` in every case.
+        for (floor, read_lsn) in [(5u64, 10u64), (10, 10), (20, 10)] {
+            let mut index = WriteVersionIndex::new();
+            index.note_write_lsn(db(), tenant(), "orders", None, Lsn::new(floor));
+            let want =
+                index.read_is_valid(db(), tenant(), "orders", &predicate, Lsn::new(read_lsn));
+            assert_eq!(
+                index.read_is_valid(db(), tenant(), "orders", &index_eq, Lsn::new(read_lsn)),
+                want,
+                "IndexEq must match Predicate (floor {floor}, read {read_lsn})"
+            );
+            assert_eq!(
+                index.read_is_valid(db(), tenant(), "orders", &index_range, Lsn::new(read_lsn)),
+                want,
+                "IndexRange must match Predicate (floor {floor}, read {read_lsn})"
+            );
+        }
     }
 }

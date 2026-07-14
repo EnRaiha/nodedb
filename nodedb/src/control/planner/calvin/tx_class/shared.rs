@@ -37,6 +37,15 @@ pub(super) fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
                 key: match &entry.key {
                     ReadKey::Point { repr } => ReadKeyIdent::Point(repr.clone()),
                     ReadKey::Predicate => ReadKeyIdent::Predicate,
+                    ReadKey::IndexEq { field, value } => ReadKeyIdent::IndexEq {
+                        field: field.clone(),
+                        value: value.clone(),
+                    },
+                    ReadKey::IndexRange { field, lo, hi } => ReadKeyIdent::IndexRange {
+                        field: field.clone(),
+                        lo: lo.clone(),
+                        hi: hi.clone(),
+                    },
                 },
                 read_lsn: entry.read_version_lsn,
             })

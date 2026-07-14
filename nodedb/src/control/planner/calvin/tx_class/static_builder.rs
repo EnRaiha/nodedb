@@ -343,6 +343,19 @@ mod tests {
                     nodedb_cluster::calvin::types::ReadKeyIdent::Point(repr.clone())
                 }
                 ReadKey::Predicate => nodedb_cluster::calvin::types::ReadKeyIdent::Predicate,
+                ReadKey::IndexEq { field, value } => {
+                    nodedb_cluster::calvin::types::ReadKeyIdent::IndexEq {
+                        field: field.clone(),
+                        value: value.clone(),
+                    }
+                }
+                ReadKey::IndexRange { field, lo, hi } => {
+                    nodedb_cluster::calvin::types::ReadKeyIdent::IndexRange {
+                        field: field.clone(),
+                        lo: lo.clone(),
+                        hi: hi.clone(),
+                    }
+                }
             };
             assert_eq!(entry.key, expected_key);
         }
