@@ -12,7 +12,7 @@ use futures::future::join_all;
 use crate::bridge::envelope::{Response, Status};
 use crate::control::server::exchange::gather::eager_dispatch_to_all_cores;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId};
+use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
 
 /// Shared per-core fan for a graph BSP/WCC superstep plan: eagerly dispatch the
@@ -31,12 +31,18 @@ use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
 /// Per-core scoping makes the owned sets genuinely disjoint (each graph node is
 /// owned by exactly its home core), so the field-concat merge is correct with no
 /// dedup, and cross-core edges become ordinary ghosts / boundary edges.
+/// `txn_id` is stamped on every core's request so a session-transaction-scoped
+/// single-blob op (a forwarded `MetaOp::StageWrite` / `MetaOp::DropTxnOverlay`,
+/// which the leader's Data-Plane handler keys purely by `txn_id`) reaches its
+/// per-transaction overlay. `None` for the graph BSP/WCC/snapshot fans, which
+/// carry no transaction context.
 pub(super) async fn gather_graph_op_all_cores(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
     label: &'static str,
 ) -> crate::Result<Vec<Response>> {
     // Shared broadcast call counter (parity with gather_all_cores).
@@ -57,9 +63,8 @@ pub(super) async fn gather_graph_op_all_cores(
     // CRITICAL: scope each core's `owned_vshards` to the vShards round-robin homed
     // on THAT core (`vshard % num_cores == core_id`) so owned sets are genuinely
     // disjoint across cores. See function-level doc for details.
-    // Graph BSP superstep fan-out: not session-transaction-scoped, so `None`.
     let receivers =
-        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, None, |core_id| {
+        eager_dispatch_to_all_cores(state, tenant_id, database_id, trace_id, txn_id, |core_id| {
             let mut core_plan = plan.clone();
             match &mut core_plan {
                 PhysicalPlan::Graph(g) => match g {

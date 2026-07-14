@@ -156,7 +156,7 @@ pub async fn execute_plan_all_local_cores(
             // `success`-only check (and any future result inspection) sees the
             // unwrapped object.
             MetaOp::RestoreTenantSnapshot { .. } => {
-                single_blob_gather(state, tenant_id, database_id, plan, trace_id).await
+                single_blob_gather(state, tenant_id, database_id, plan, trace_id, None).await
             }
             // A `ResolveTxn` response is a single `RedoRecord` blob (msgpack
             // map), not an array of rows — same single-blob corruption class as
@@ -164,13 +164,25 @@ pub async fn execute_plan_all_local_cores(
             // op that never actually fans across cores, but is routed through
             // `single_blob_gather` here so its payload is returned verbatim.
             MetaOp::ResolveTxn { .. } => {
-                single_blob_gather(state, tenant_id, database_id, plan, trace_id).await
+                single_blob_gather(state, tenant_id, database_id, plan, trace_id, None).await
             }
             // `CalvinResolve` returns the same single `RedoRecord` blob shape as
             // `ResolveTxn` (it reuses `execute_resolve_txn` internally) — same
             // single-blob corruption class if array-wrapped.
             MetaOp::CalvinResolve { .. } => {
-                single_blob_gather(state, tenant_id, database_id, plan, trace_id).await
+                single_blob_gather(state, tenant_id, database_id, plan, trace_id, None).await
+            }
+
+            // A forwarded `StageWrite` / `DropTxnOverlay` (this node is the target
+            // vShard's leader) is a single-core, single-blob control op the
+            // Data-Plane handler keys purely by `txn_id`: route it through
+            // `single_blob_gather` so the handler's affected-count blob (or drop
+            // ack) is returned VERBATIM — the row gather would msgpack-array-wrap
+            // it, corrupting the coordinator's affected-count / tag extraction —
+            // and stamp the request `txn_id` so the leader stages into / reaps the
+            // correct per-transaction overlay.
+            MetaOp::StageWrite { .. } | MetaOp::DropTxnOverlay { .. } => {
+                single_blob_gather(state, tenant_id, database_id, plan, trace_id, txn_id).await
             }
             // Every other MetaOp either returns an array of rows / count payload
             // (→ generic gather is correct) or is a single-core control op whose
@@ -208,8 +220,6 @@ pub async fn execute_plan_all_local_cores(
             | MetaOp::PutSynonymGroup { .. }
             | MetaOp::DeleteSynonymGroup { .. }
             | MetaOp::RenameCollection { .. }
-            | MetaOp::StageWrite { .. }
-            | MetaOp::DropTxnOverlay { .. }
             | MetaOp::MarkSavepoint { .. }
             | MetaOp::RollbackToSavepoint { .. }
             | MetaOp::RecordCalvinWriteVersions { .. }
@@ -275,10 +285,18 @@ async fn single_blob_gather(
     database_id: DatabaseId,
     plan: PhysicalPlan,
     trace_id: TraceId,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<NodeLevelResult> {
-    let responses =
-        gather_graph_op_all_cores(state, tenant_id, database_id, plan, trace_id, "single-blob")
-            .await?;
+    let responses = gather_graph_op_all_cores(
+        state,
+        tenant_id,
+        database_id,
+        plan,
+        trace_id,
+        txn_id,
+        "single-blob",
+    )
+    .await?;
 
     let mut watermark_lsn = Lsn::ZERO;
     let mut read_version_lsn = Lsn::ZERO;

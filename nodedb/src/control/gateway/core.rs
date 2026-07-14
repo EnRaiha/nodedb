@@ -477,7 +477,6 @@ impl Gateway {
                 .unwrap_or(0)
         }))
     }
-
 }
 
 #[cfg(test)]

@@ -25,7 +25,8 @@ pub(super) async fn fan_wcc_all_cores(
     trace_id: TraceId,
 ) -> crate::Result<NodeLevelResult> {
     let responses =
-        gather_graph_op_all_cores(state, tenant_id, database_id, plan, trace_id, "wcc").await?;
+        gather_graph_op_all_cores(state, tenant_id, database_id, plan, trace_id, None, "wcc")
+            .await?;
 
     let mut parts: Vec<WccSuperstepResult> = Vec::with_capacity(responses.len());
     for resp in responses {

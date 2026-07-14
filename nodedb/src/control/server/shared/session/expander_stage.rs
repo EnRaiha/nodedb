@@ -148,7 +148,7 @@ where
         _ => return Ok(ExpanderOutcome::Passthrough(Box::new(task))),
     };
     Ok(ExpanderOutcome::Handled(
-        stage_and_aggregate(sessions, addr, ops, kind, dispatch).await?,
+        stage_and_aggregate(state, sessions, addr, ops, kind, dispatch).await?,
     ))
 }
 
@@ -159,6 +159,7 @@ where
 /// `resolve_and_emit_*` fn produced `ops` and which [`StagedTagKind`] the result
 /// carries.
 async fn stage_and_aggregate<F, Fut>(
+    state: &SharedState,
     sessions: &SessionStore,
     addr: &SocketAddr,
     ops: Vec<PhysicalTask>,
@@ -181,7 +182,8 @@ where
         // OTHER return paths in `route_in_tx_write`, never `stage_write`'s
         // own. Panic loudly rather than silently guess an affected count if
         // that invariant is ever broken.
-        let InTxnRoute::Staged(outcome) = stage_write(sessions, addr, op, &dispatch).await? else {
+        let InTxnRoute::Staged(outcome) = stage_write(state, sessions, addr, op, &dispatch).await?
+        else {
             unreachable!("stage_write returned a non-Staged InTxnRoute");
         };
         affected += outcome.affected;

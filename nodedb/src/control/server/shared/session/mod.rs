@@ -8,6 +8,7 @@ mod cursor;
 pub mod cursor_spill;
 pub mod ddl_buffer;
 pub mod expander_stage;
+mod leader_forward;
 pub mod lifecycle;
 mod listen;
 mod live;

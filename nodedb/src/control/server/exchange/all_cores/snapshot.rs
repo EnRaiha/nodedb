@@ -36,6 +36,7 @@ pub(super) async fn fan_tenant_snapshot_all_cores(
         database_id,
         plan,
         trace_id,
+        None,
         "tenant-snapshot",
     )
     .await?;

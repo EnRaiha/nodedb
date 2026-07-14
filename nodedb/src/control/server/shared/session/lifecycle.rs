@@ -92,7 +92,18 @@ pub async fn run_rollback(
     // every vShard the transaction staged to, so no core's overlay leaks.
     if let Some(txn_id) = overlay_txn_id {
         for vshard_id in overlay_vshards {
-            drop_txn_overlay(dp, identity.tenant_id, vshard_id, txn_id).await;
+            // Teardown of an aborted transaction's overlay: surface a failure at
+            // ERROR (the overlay, keyed by `txn_id`, is reclaimable by its holder)
+            // and continue reaping the remaining vShards. ROLLBACK is infallible
+            // for the client, so there is no outcome to change here.
+            if let Err(e) = drop_txn_overlay(state, dp, identity.tenant_id, vshard_id, txn_id).await
+            {
+                tracing::error!(
+                    vshard = vshard_id.as_u32(),
+                    error = %e,
+                    "failed to release per-transaction staging overlay on rollback"
+                );
+            }
         }
     }
 }

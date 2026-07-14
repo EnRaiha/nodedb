@@ -122,7 +122,7 @@ pub(super) async fn stage_edge_write_in_txn(
         txn_id: None,
     };
 
-    let routed = route_in_tx_write(txn_ctx.sessions, txn_ctx.addr, task, |staged| {
+    let routed = route_in_tx_write(state, txn_ctx.sessions, txn_ctx.addr, task, |staged| {
         crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn(
             state,
             staged.tenant_id,

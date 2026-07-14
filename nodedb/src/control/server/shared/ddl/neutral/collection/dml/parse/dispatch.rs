@@ -131,7 +131,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         let task_vshard_id = task.vshard_id;
         let task_database_id = task.database_id;
 
-        let routed = route_in_tx_write(txn_ctx.sessions, txn_ctx.addr, task, |staged| {
+        let routed = route_in_tx_write(state, txn_ctx.sessions, txn_ctx.addr, task, |staged| {
             crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn(
                 state,
                 staged.tenant_id,

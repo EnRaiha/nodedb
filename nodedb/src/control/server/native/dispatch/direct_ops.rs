@@ -415,7 +415,7 @@ async fn dispatch_single_task(
     // response the same way the non-staged branch below shapes it.
     let plan_for_staged_response = task.plan.clone();
 
-    let task = match route_in_tx_write(ctx.sessions, ctx.peer_addr, task, |stage_task| {
+    let task = match route_in_tx_write(ctx.state, ctx.sessions, ctx.peer_addr, task, |stage_task| {
         dispatch_single_task_raw(
             ctx,
             stage_task.tenant_id,

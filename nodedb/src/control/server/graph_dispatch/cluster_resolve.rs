@@ -22,7 +22,12 @@ use crate::types::{DatabaseId, TenantId, TraceId};
 
 /// Resolve a vShard to a `RouteDecision` against live Raft leadership, falling
 /// back to the routing-table hint when no live snapshot is available.
-pub(super) fn resolve_for_vshard(state: &SharedState, vshard_id: u32) -> RouteDecision {
+///
+/// `pub(crate)` so the in-transaction staging choke points
+/// (`session::leader_forward`) can resolve a staged write's / overlay drop's
+/// target leader with the same live-leader semantics the graph scatter uses,
+/// instead of duplicating the routing-lock + live-leader plumbing.
+pub(crate) fn resolve_for_vshard(state: &SharedState, vshard_id: u32) -> RouteDecision {
     let routing_guard = state
         .cluster_routing
         .as_ref()
@@ -134,7 +139,12 @@ pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_no
 /// The gateway's `Arc<SharedState>` for the remote dispatch path. In cluster
 /// mode the gateway is always wired; failing loudly here beats silently
 /// degrading to a local-only (partial) scatter.
-pub(super) fn gateway_shared(state: &SharedState) -> crate::Result<Arc<SharedState>> {
+///
+/// `pub(crate)` so the in-transaction staging choke points
+/// (`session::leader_forward`) can obtain the `Arc<SharedState>` the remote
+/// dispatch primitive requires when forwarding a staged write / overlay drop to
+/// a remote leader.
+pub(crate) fn gateway_shared(state: &SharedState) -> crate::Result<Arc<SharedState>> {
     let gateway = state
         .gateway
         .as_ref()

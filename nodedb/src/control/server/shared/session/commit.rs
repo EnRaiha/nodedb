@@ -13,6 +13,7 @@
 use std::net::SocketAddr;
 
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
+use crate::control::gateway::RouteDecision;
 use crate::control::planner::calvin::{DispatchClass, classify_dispatch, read_vshards_of};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::plan_util::extract_collection;
@@ -22,6 +23,7 @@ use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::ddl_buffer;
+use super::leader_forward::{forward_to_leader, resolve_leader};
 use super::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
 use super::read_set::ReadSetEntry;
 use super::store::SessionStore;
@@ -128,7 +130,22 @@ pub async fn run_commit(
         let mut dropped = std::collections::HashSet::new();
         for task in &buffered {
             if dropped.insert(task.vshard_id) {
-                drop_txn_overlay(dp, tenant_id, task.vshard_id, txn_id).await;
+                // The transaction is already durable at this point; a teardown
+                // failure (e.g. the vShard's leader moved and the drop can no
+                // longer reach the overlay) cannot un-commit it, so it is
+                // surfaced at ERROR and the remaining vShards are still reaped
+                // rather than aborting a committed transaction. A drop that fails
+                // strands a bounded, invisible (the `txn_id` is never reused)
+                // overlay on the unreachable former leader, cleared on that
+                // node's restart and visible meanwhile via `active_txn_overlays`.
+                if let Err(e) = drop_txn_overlay(state, dp, tenant_id, task.vshard_id, txn_id).await
+                {
+                    tracing::error!(
+                        vshard = task.vshard_id.as_u32(),
+                        error = %e,
+                        "failed to release per-transaction staging overlay after commit"
+                    );
+                }
             }
         }
     }
@@ -393,27 +410,45 @@ fn flush_buffered_ddl(state: &SharedState) -> Option<AbortReason> {
     None
 }
 
-/// Best-effort release of a transaction's staging overlay on a vShard that
-/// hosted staged writes. Dispatched AFTER the durable resolution (COMMIT batch
-/// flush / ROLLBACK); a failure here leaks in-memory overlay state on that
-/// core but does not affect the already-resolved transaction, so it is logged
-/// rather than surfaced.
+/// Release a transaction's staging overlay on a vShard that hosted staged
+/// writes. Dispatched AFTER the durable resolution (COMMIT batch flush /
+/// ROLLBACK) on the vShard's CURRENT leader: when this node leads the vShard (or
+/// single-node) the existing WAL-free local dispatch runs unchanged; otherwise
+/// the `DropTxnOverlay` is forwarded to the remote leader keyed by `txn_id` — the
+/// same node the matching `StageWrite` reached, since stage / read / drop all
+/// resolve to the vShard's leader (see [`super::leader_forward`]).
+///
+/// Returns the dispatch/forward error rather than swallowing it, so the caller
+/// (COMMIT / ROLLBACK) sees a teardown failure and decides how to surface it —
+/// a `LeaderUnknown` resolution fails closed as `Error::NotLeader` inside
+/// [`forward_to_leader`].
 pub(super) async fn drop_txn_overlay(
+    state: &SharedState,
     dp: &impl TxnDataPlane,
     tenant_id: crate::types::TenantId,
     vshard_id: crate::types::VShardId,
     txn_id: crate::types::TxnId,
-) {
+) -> crate::Result<()> {
+    // The overlay id travels inside the plan (the Data-Plane handler reads it
+    // from `MetaOp::DropTxnOverlay`); the request `txn_id` stamp additionally
+    // keys the leader's per-transaction overlay when forwarded (inert locally).
+    let drop_plan = PhysicalPlan::Meta(MetaOp::DropTxnOverlay { txn_id });
     let task = PhysicalTask {
         tenant_id,
         vshard_id,
         database_id: crate::types::DatabaseId::DEFAULT,
-        plan: PhysicalPlan::Meta(MetaOp::DropTxnOverlay { txn_id }),
+        plan: drop_plan.clone(),
         post_set_op: PostSetOp::None,
-        txn_id: None,
+        txn_id: Some(txn_id),
     };
     // Overlay teardown is not a write — no WAL record, no write version.
-    if let Err(e) = dp.dispatch_no_wal(task, None).await {
-        tracing::warn!(error = %e, "failed to drop per-transaction staging overlay");
+    match resolve_leader(&task, state) {
+        RouteDecision::Local => {
+            dp.dispatch_no_wal(task, None).await?;
+            Ok(())
+        }
+        remote => forward_to_leader(state, remote, task, &drop_plan)
+            .await
+            .map(|_| ()),
     }
 }

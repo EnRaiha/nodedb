@@ -95,6 +95,7 @@ pub(super) async fn run_dispatch_loop(
             Ok(ExpanderOutcome::Handled(route)) => Ok(route),
             Ok(ExpanderOutcome::Passthrough(task)) => {
                 route_in_tx_write(
+                    ctx.state,
                     ctx.sessions,
                     ctx.peer_addr,
                     *task,

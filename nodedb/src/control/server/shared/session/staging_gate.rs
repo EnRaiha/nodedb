@@ -20,13 +20,16 @@ use std::future::Future;
 use std::net::SocketAddr;
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
+use crate::control::gateway::RouteDecision;
 use crate::control::server::shared::sql::staging_predicates::{
     extract_affected_count, is_stageable_write, staged_tag_kind,
 };
 use crate::control::server::shared::write_admission::plan_requires_txn_buffering;
+use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+use super::leader_forward::{forward_to_leader, resolve_leader};
 use super::state::TransactionState;
 use super::store::SessionStore;
 pub use crate::control::server::shared::sql::staging_predicates::StagedTagKind;
@@ -135,6 +138,7 @@ pub enum StagingGateError {
 /// result a protocol's own single-task dispatch method produces, before any
 /// protocol-specific error-to-wire mapping is applied).
 pub async fn route_in_tx_write<F, Fut>(
+    state: &SharedState,
     sessions: &SessionStore,
     addr: &SocketAddr,
     mut task: PhysicalTask,
@@ -166,7 +170,7 @@ where
         return Ok(InTxnRoute::Buffered);
     }
 
-    stage_write(sessions, addr, task, dispatch).await
+    stage_write(state, sessions, addr, task, dispatch).await
 }
 
 /// Stage a stageable write into the per-transaction overlay and classify its
@@ -177,6 +181,7 @@ where
 /// derives through the exact same overlay-dispatch + buffer path a plain
 /// in-transaction point write uses — no separate staging code to drift.
 pub(super) async fn stage_write<F, Fut>(
+    state: &SharedState,
     sessions: &SessionStore,
     addr: &SocketAddr,
     task: PhysicalTask,
@@ -197,9 +202,23 @@ where
         txn_id: sessions.tx_id(addr),
     };
 
-    let resp = dispatch(stage_task)
-        .await
-        .map_err(StagingGateError::Dispatch)?;
+    // Stage on the vShard's CURRENT leader. When this node leads the vShard (or
+    // single-node), the existing local dispatch runs byte-identically; otherwise
+    // the wrapped `StageWrite` is forwarded to the remote leader keyed by
+    // `txn_id`, so the overlay is populated on the same node a later
+    // read-your-own-writes read resolves to. `LeaderUnknown` fails closed inside
+    // `forward_to_leader` (→ `Error::NotLeader`), never a local fallback.
+    // The descriptor version set is computed from the INNER write (`task.plan`),
+    // not the `Meta(StageWrite)` wrapper, so the leader's OCC check sees the
+    // touched collection's version.
+    let resp = match resolve_leader(&stage_task, state) {
+        RouteDecision::Local => dispatch(stage_task)
+            .await
+            .map_err(StagingGateError::Dispatch)?,
+        remote => forward_to_leader(state, remote, stage_task, &task.plan)
+            .await
+            .map_err(StagingGateError::Dispatch)?,
+    };
 
     if resp.status == Status::Error {
         return Err(StagingGateError::Rejected {

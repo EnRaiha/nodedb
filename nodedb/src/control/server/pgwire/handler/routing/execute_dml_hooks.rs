@@ -66,7 +66,7 @@ impl NodeDbPgHandler {
             {
                 Ok(ExpanderOutcome::Handled(route)) => Ok(route),
                 Ok(ExpanderOutcome::Passthrough(task)) => {
-                    route_in_tx_write(&self.sessions, addr, *task, |stage_task| {
+                    route_in_tx_write(&self.state, &self.sessions, addr, *task, |stage_task| {
                         self.dispatch_task(stage_task, user_id.clone(), Some(identity))
                     })
                     .await
