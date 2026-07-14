@@ -26,8 +26,12 @@
 //! resolve the leader themselves and keep their existing LOCAL dispatch
 //! byte-identical; only the REMOTE arm routes through [`forward_to_leader`],
 //! which fails CLOSED — a `LeaderUnknown` resolution surfaces as
-//! `Error::NotLeader` (via the gateway dispatcher) so the transaction retries,
-//! never a silent fall back to local staging on a non-leader.
+//! `Error::NotLeader` via the gateway dispatcher. `commit::drop_txn_overlay`'s
+//! remote arm wraps this in a bounded retry (`retry_not_leader`) so a
+//! transient leader election does not strand the overlay after a single
+//! attempt; `staging_gate::stage_write`'s remote arm surfaces the error
+//! directly to the statement layer. Neither ever falls back to local staging
+//! on a non-leader.
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response};
 use crate::control::gateway::dispatcher::{

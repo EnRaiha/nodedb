@@ -14,8 +14,10 @@ use std::net::SocketAddr;
 
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
 use crate::control::gateway::RouteDecision;
+use crate::control::gateway::retry::retry_not_leader;
 use crate::control::planner::calvin::{DispatchClass, classify_dispatch, read_vshards_of};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
 use crate::control::server::shared::plan_util::extract_collection;
 use crate::control::state::SharedState;
 use nodedb_cluster::{MetadataEntry, encode_entry};
@@ -134,10 +136,13 @@ pub async fn run_commit(
                 // failure (e.g. the vShard's leader moved and the drop can no
                 // longer reach the overlay) cannot un-commit it, so it is
                 // surfaced at ERROR and the remaining vShards are still reaped
-                // rather than aborting a committed transaction. A drop that fails
-                // strands a bounded, invisible (the `txn_id` is never reused)
-                // overlay on the unreachable former leader, cleared on that
-                // node's restart and visible meanwhile via `active_txn_overlays`.
+                // rather than aborting a committed transaction. `drop_txn_overlay`
+                // already retries a transient remote failure a bounded number of
+                // times internally (see `retry_not_leader`); a drop that still
+                // fails after that budget strands a bounded, invisible (the
+                // `txn_id` is never reused) overlay on the unreachable former
+                // leader, cleared on that node's restart and visible meanwhile
+                // via `active_txn_overlays`.
                 if let Err(e) = drop_txn_overlay(state, dp, tenant_id, task.vshard_id, txn_id).await
                 {
                     tracing::error!(
@@ -421,7 +426,10 @@ fn flush_buffered_ddl(state: &SharedState) -> Option<AbortReason> {
 /// Returns the dispatch/forward error rather than swallowing it, so the caller
 /// (COMMIT / ROLLBACK) sees a teardown failure and decides how to surface it —
 /// a `LeaderUnknown` resolution fails closed as `Error::NotLeader` inside
-/// [`forward_to_leader`].
+/// [`forward_to_leader`]. The remote arm retries a transient `NotLeader` /
+/// `RetryableLeaderChange` a bounded number of times (see [`retry_not_leader`])
+/// before that error is returned, so a momentary leader election does not
+/// strand the overlay after a single forward attempt.
 pub(super) async fn drop_txn_overlay(
     state: &SharedState,
     dp: &impl TxnDataPlane,
@@ -447,8 +455,30 @@ pub(super) async fn drop_txn_overlay(
             dp.dispatch_no_wal(task, None).await?;
             Ok(())
         }
-        remote => forward_to_leader(state, remote, task, &drop_plan)
+        _ => {
+            // A transient leader-election failure at COMMIT/ROLLBACK must not
+            // strand the overlay after a single forward attempt: retry the
+            // remote drop up to `retry_not_leader`'s bounded budget (3
+            // attempts, ~50ms then ~100ms backoff between them), re-resolving
+            // the leader on every
+            // attempt so a routing-table hint refreshed by a prior
+            // `NotLeader` (or a mid-retry leadership handback to this node)
+            // is picked up rather than repeatedly re-forwarding to a now-dead
+            // target.
+            let shared = gateway_shared(state)?;
+            let routing_ref = shared.cluster_routing.as_deref();
+            retry_not_leader(routing_ref, |_attempt| {
+                let task = task.clone();
+                let drop_plan = drop_plan.clone();
+                async move {
+                    match resolve_leader(&task, state) {
+                        RouteDecision::Local => dp.dispatch_no_wal(task, None).await,
+                        remote => forward_to_leader(state, remote, task, &drop_plan).await,
+                    }
+                }
+            })
             .await
-            .map(|_| ()),
+            .map(|_| ())
+        }
     }
 }
