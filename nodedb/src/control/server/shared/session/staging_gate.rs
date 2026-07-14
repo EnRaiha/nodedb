@@ -170,7 +170,9 @@ where
         return Ok(InTxnRoute::Buffered);
     }
 
-    stage_write(state, sessions, addr, task, dispatch).await
+    Ok(InTxnRoute::Staged(
+        stage_write(state, sessions, addr, task, dispatch).await?,
+    ))
 }
 
 /// Stage a stageable write into the per-transaction overlay and classify its
@@ -186,7 +188,7 @@ pub(super) async fn stage_write<F, Fut>(
     addr: &SocketAddr,
     task: PhysicalTask,
     dispatch: F,
-) -> Result<InTxnRoute, StagingGateError>
+) -> Result<StagedWriteOutcome, StagingGateError>
 where
     F: FnOnce(PhysicalTask) -> Fut,
     Fut: Future<Output = crate::Result<Response>>,
@@ -233,9 +235,9 @@ where
     // Durable path unchanged: still buffered, replayed at COMMIT.
     sessions.buffer_write(addr, task);
 
-    Ok(InTxnRoute::Staged(StagedWriteOutcome {
+    Ok(StagedWriteOutcome {
         kind,
         affected,
         payload,
-    }))
+    })
 }

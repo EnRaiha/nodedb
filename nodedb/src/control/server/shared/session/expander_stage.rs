@@ -177,15 +177,7 @@ where
     // never buffered.
     let mut affected = 0usize;
     for op in ops {
-        // `stage_write` only ever returns `Staged` (or propagates an `Err`
-        // before returning at all) -- `Read` / `Buffered` are its callers'
-        // OTHER return paths in `route_in_tx_write`, never `stage_write`'s
-        // own. Panic loudly rather than silently guess an affected count if
-        // that invariant is ever broken.
-        let InTxnRoute::Staged(outcome) = stage_write(state, sessions, addr, op, &dispatch).await?
-        else {
-            unreachable!("stage_write returned a non-Staged InTxnRoute");
-        };
+        let outcome = stage_write(state, sessions, addr, op, &dispatch).await?;
         affected += outcome.affected;
     }
 
