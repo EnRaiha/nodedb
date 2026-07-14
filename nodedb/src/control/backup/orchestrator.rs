@@ -220,7 +220,7 @@ fn source_assignment(state: &SharedState) -> Vec<(u64, HashSet<u32>)> {
     let Some(routing) = state.cluster_routing.as_ref() else {
         return vec![(state.node_id, (0..VSHARD_COUNT).collect())];
     };
-    let table = routing.read().expect("routing table poisoned");
+    let table = routing.read().unwrap_or_else(|p| p.into_inner());
 
     let mut by_node: BTreeMap<u64, HashSet<u32>> = BTreeMap::new();
     for vshard in 0..VSHARD_COUNT {
