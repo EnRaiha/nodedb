@@ -53,6 +53,22 @@ impl MetadataCache {
         Self::default()
     }
 
+    /// Advance the applied-index watermark past a committed Raft no-op (a
+    /// leader-transition entry with no `MetadataEntry` payload).
+    ///
+    /// A no-op mutates no cache state, but it IS applied, so the cache watermark
+    /// must move in lockstep with the Raft applied index the tick loop reports.
+    /// Otherwise the startup applied-index sanity check reads `cache_applied` <
+    /// `watcher_current` and fails the boot with a spurious gap — which is
+    /// exactly what happens on a fresh single-node start, where every group's
+    /// first committed entry is an election no-op at index 1. Monotonic: never
+    /// regresses the watermark.
+    pub fn advance_applied_index(&mut self, index: u64) {
+        if index > self.applied_index {
+            self.applied_index = index;
+        }
+    }
+
     /// Apply a committed entry. Idempotent by `applied_index`:
     /// entries at or below the current watermark are ignored.
     pub fn apply(&mut self, index: u64, entry: &MetadataEntry) {

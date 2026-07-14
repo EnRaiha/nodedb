@@ -123,7 +123,16 @@ impl MetadataApplier for MetadataCommitApplier {
         let mut last = 0u64;
         for (index, data) in entries {
             if data.is_empty() {
-                // Raft no-op: nothing to apply, safe to advance.
+                // Raft no-op: nothing to apply, but advance the cache watermark
+                // in lockstep with the Raft applied index the tick loop reports
+                // from our return value. Skipping this leaves `cache.applied_index`
+                // behind the watcher and the startup applied-index sanity check
+                // fails the boot with a spurious gap (every group's first
+                // committed entry on a fresh start is an election no-op).
+                self.cache
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .advance_applied_index(*index);
                 last = *index;
                 continue;
             }

@@ -86,3 +86,20 @@ fn apply_empty_batch_is_noop() {
     let (applier, _cache, _credentials, _tmp) = make_applier();
     assert_eq!(applier.apply(&[]), 0);
 }
+
+#[test]
+fn apply_noop_entry_advances_cache_watermark() {
+    let (applier, cache, _credentials, _tmp) = make_applier();
+    // A committed Raft no-op (empty payload) at index 1 — the shape of every
+    // group's first entry on a fresh single-node start. It mutates nothing, but
+    // the cache watermark must advance in lockstep with the Raft applied index
+    // the tick loop takes from the return value; otherwise the startup
+    // applied-index sanity check reads a spurious gap and fails the boot.
+    assert_eq!(applier.apply(&[(1, Vec::new())]), 1);
+    assert_eq!(cache.read().unwrap().applied_index, 1);
+    assert_eq!(
+        cache.read().unwrap().catalog_entries_applied,
+        0,
+        "a no-op applies no catalog entry"
+    );
+}
