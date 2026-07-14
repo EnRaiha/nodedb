@@ -350,6 +350,7 @@ pub(crate) async fn handle_graph_match(
             ctx.tenant_id(),
             &plan_for_response,
             &[(vshard_id, resp.watermark_lsn)],
+            resp.read_version_lsn,
             resp.status == Status::Ok,
         );
     }
@@ -481,6 +482,7 @@ async fn dispatch_single_task(
                     ctx.tenant_id(),
                     &plan_for_response,
                     &[(task_vshard, resp.watermark_lsn)],
+                    resp.read_version_lsn,
                     resp.status == Status::Ok,
                 );
             }

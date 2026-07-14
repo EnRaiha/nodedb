@@ -16,7 +16,9 @@ use nodedb_physical::physical_plan::{
 /// [`VersionedReadSet`] carried on the `TxClass`.
 ///
 /// Each [`ReadSetEntry`] becomes one [`VersionedReadEntry`], preserving the
-/// engine, collection, per-shard `read_lsn`, and the point/predicate
+/// engine, collection, per-collection `read_version_lsn` (the read collection's
+/// write floor in its own Raft-group index space — the sound cross-shard OCC
+/// comparand, not the core-global `read_lsn`), and the point/predicate
 /// distinction. The entry's `(database_id, tenant_id)` scope is not re-carried
 /// per entry: the enclosing `TxClass` already scopes the tenant.
 ///
@@ -36,7 +38,7 @@ pub(super) fn versioned_reads_from(reads: &[ReadSetEntry]) -> VersionedReadSet {
                     ReadKey::Point { repr } => ReadKeyIdent::Point(repr.clone()),
                     ReadKey::Predicate => ReadKeyIdent::Predicate,
                 },
-                read_lsn: entry.read_lsn,
+                read_lsn: entry.read_version_lsn,
             })
             .collect(),
     )

@@ -283,6 +283,9 @@ mod tests {
             collection: collection.to_owned(),
             key,
             read_lsn: Lsn::new(read_lsn),
+            // The per-collection read-version is the OCC comparand
+            // `versioned_reads_from` propagates; give it the same synthetic LSN.
+            read_version_lsn: Lsn::new(read_lsn),
         }
     }
 
@@ -317,7 +320,7 @@ mod tests {
         );
         for (entry, read) in tx.versioned_reads.iter().zip(reads.iter()) {
             assert_eq!(entry.collection, read.collection);
-            assert_eq!(entry.read_lsn, read.read_lsn);
+            assert_eq!(entry.read_lsn, read.read_version_lsn);
             let expected_key = match &read.key {
                 ReadKey::Point { repr } => {
                     nodedb_cluster::calvin::types::ReadKeyIdent::Point(repr.clone())

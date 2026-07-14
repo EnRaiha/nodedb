@@ -67,6 +67,11 @@ pub struct ReadSetEntry {
     pub collection: String,
     pub key: ReadKey,
     pub read_lsn: Lsn,
+    /// Per-collection read-version LSN (the read collection's `coll_write_lsn`
+    /// at read time, in its Raft-group index space) — the SOUND comparand for
+    /// cross-shard OCC validation. `read_lsn` above stays the core-global
+    /// watermark used by single-shard SI (`si_conflict_abort`).
+    pub read_version_lsn: Lsn,
 }
 
 /// Record a completed read into the session's transaction read-set.
@@ -82,6 +87,13 @@ pub struct ReadSetEntry {
 /// the read-set. Absent-key / empty-result reads MUST reach this with a
 /// non-empty `watermarks` slice — a "not found" is a validatable observation.
 ///
+/// `read_version_lsn` is the read collection's per-collection write floor at
+/// read time (in its own Raft-group index space) — one scalar, since a read op
+/// resolves to a single collection (joins collapse to one via
+/// `extract_collection`). It stamps every entry produced here and is the SOUND
+/// comparand cross-shard OCC validation consumes; the per-shard `watermarks`
+/// still source the core-global `read_lsn` used by single-shard SI.
+///
 /// `found` reports whether a point read observed a present row (`true` on a hit,
 /// `false` on a miss). It only affects document point reads — an absent document
 /// read degrades to a collection-scoped predicate; see [`read_key_of`].
@@ -91,6 +103,7 @@ pub fn record_read_set(
     tenant_id: TenantId,
     plan: &PhysicalPlan,
     watermarks: &[(VShardId, Lsn)],
+    read_version_lsn: Lsn,
     found: bool,
 ) {
     if watermarks.is_empty() {
@@ -118,6 +131,7 @@ pub fn record_read_set(
             collection: collection.clone(),
             key: key.clone(),
             read_lsn: *read_lsn,
+            read_version_lsn,
         })
         .collect();
 
@@ -166,6 +180,7 @@ mod tests {
             TenantId::new(1),
             &kv_get("c", b"k1"),
             &[(VShardId::new(0), Lsn::new(7))],
+            Lsn::ZERO,
             true,
         );
         let rs = sessions.take_read_set(&a);
@@ -192,6 +207,7 @@ mod tests {
             TenantId::new(1),
             &kv_batch_get("c"),
             &[(VShardId::new(0), Lsn::new(9))],
+            Lsn::ZERO,
             true,
         );
         let rs = sessions.take_read_set(&a);
@@ -214,6 +230,7 @@ mod tests {
                 (VShardId::new(1), Lsn::new(11)),
                 (VShardId::new(2), Lsn::new(7)),
             ],
+            Lsn::ZERO,
             true,
         );
         let rs = sessions.take_read_set(&a);
@@ -235,6 +252,7 @@ mod tests {
             TenantId::new(1),
             &kv_get("c", b"missing"),
             &[(VShardId::new(0), Lsn::new(5))],
+            Lsn::ZERO,
             false,
         );
         let rs = sessions.take_read_set(&a);
@@ -270,6 +288,7 @@ mod tests {
             TenantId::new(1),
             &doc_point_get("docs", 42),
             &[(VShardId::new(0), Lsn::new(7))],
+            Lsn::ZERO,
             true,
         );
         let rs = sessions.take_read_set(&a);
@@ -294,6 +313,7 @@ mod tests {
             TenantId::new(1),
             &doc_point_get("docs", 999),
             &[(VShardId::new(0), Lsn::new(5))],
+            Lsn::ZERO,
             false,
         );
         let rs = sessions.take_read_set(&a);
@@ -313,6 +333,7 @@ mod tests {
             TenantId::new(1),
             &kv_get("c", b"k1"),
             &[(VShardId::new(0), Lsn::new(7))],
+            Lsn::ZERO,
             true,
         );
         assert!(sessions.take_read_set(&a).is_empty());
@@ -327,6 +348,7 @@ mod tests {
             TenantId::new(1),
             &kv_get("c", b"k1"),
             &[],
+            Lsn::ZERO,
             true,
         );
         assert!(sessions.take_read_set(&a).is_empty());

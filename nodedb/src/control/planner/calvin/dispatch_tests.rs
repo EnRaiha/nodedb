@@ -294,6 +294,7 @@ fn read_entry_on_foreign_collection_widens_class_to_multishard() {
         collection: read_coll.clone(),
         key: ReadKey::Predicate,
         read_lsn: Lsn::new(1),
+        read_version_lsn: Lsn::ZERO,
     };
 
     // The homing step under test: a foreign-collection read must home to a
