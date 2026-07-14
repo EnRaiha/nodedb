@@ -63,12 +63,12 @@ impl Scheduler {
                 return;
             }
         };
-        // The locally-applied slice this vShard committed. `local_calvin_plans`
-        // guarantees a non-empty set (this completion path only fires for a
-        // write participant); the recorder no-ops any plan without a per-key or
-        // collection version, so no gate on plan kind is applied here — gating
-        // on a narrower write predicate would silently skip recordable writes
-        // (e.g. a CRDT apply) and reopen the version gap.
+        // The locally-applied slice this vShard committed. Empty for a
+        // validate-only READ participant (no local writes) — the recorder then
+        // has nothing to record, which is correct. The recorder no-ops any plan
+        // without a per-key or collection version, so no gate on plan kind is
+        // applied here — gating on a narrower write predicate would silently
+        // skip recordable writes (e.g. a CRDT apply) and reopen the version gap.
         let local = match self.local_calvin_plans(plans, epoch, position) {
             Ok(p) => p,
             Err(e) => {

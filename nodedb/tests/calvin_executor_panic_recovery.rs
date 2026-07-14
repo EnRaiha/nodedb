@@ -160,7 +160,7 @@ fn calvin_static_panic_returns_internal_error() {
         "expected Status::Error after Calvin executor panic; got {:?}",
         resp.status
     );
-    match &resp.error_code {
+    match resp.error_code.as_deref() {
         Some(ErrorCode::Internal { detail }) => {
             assert!(
                 detail.contains("panic in sub-apply"),

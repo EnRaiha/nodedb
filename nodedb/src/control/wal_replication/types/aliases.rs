@@ -12,17 +12,26 @@ pub type RaftProposer =
 
 /// Type alias for the asynchronous Raft propose callback with leader forwarding.
 ///
-/// Takes `(vshard_id, idempotency_key, serialized_entry)` and returns the Data
-/// Plane apply payload bytes on success. The `idempotency_key` matches the one
-/// embedded in the serialized `ReplicatedEntry`; the proposer registers the
-/// tracker waiter with this key so apply-side mismatch detection can surface
-/// `RetryableLeaderChange` when a new leader's entry overwrites this one.
+/// Takes `(vshard_id, idempotency_key, serialized_entry)` and returns, on
+/// success, the Data Plane apply payload bytes together with the committed Raft
+/// log index (as an [`crate::types::Lsn`]) the entry applied at. That index is
+/// the write's committed per-collection version — the apply loop stamps it as
+/// the collection's `coll_write_lsn` — so callers that need the write's version
+/// (e.g. a read-your-writes floor for cross-shard OCC) read it here without a
+/// second lookup. The `idempotency_key` matches the one embedded in the
+/// serialized `ReplicatedEntry`; the proposer registers the tracker waiter with
+/// this key so apply-side mismatch detection can surface `RetryableLeaderChange`
+/// when a new leader's entry overwrites this one.
 pub type AsyncRaftProposer = dyn Fn(
         u32,
         u64,
         Vec<u8>,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Vec<u8>, crate::Error>> + Send>,
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<(Vec<u8>, crate::types::Lsn), crate::Error>,
+                > + Send,
+        >,
     > + Send
     + Sync;
 

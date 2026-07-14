@@ -15,7 +15,10 @@ use crate::control::state::SharedState;
 /// Backoff schedule for `RetryableLeaderChange` re-proposals (5 attempts).
 const BACKOFF_MS: [u64; 5] = [10, 25, 50, 100, 200];
 
-/// Propose `entry` via `proposer` and return the Data Plane apply payload bytes.
+/// Propose `entry` via `proposer` and return the Data Plane apply payload bytes
+/// together with the committed Raft log index (as an [`crate::types::Lsn`]) the
+/// entry applied at — the write's committed per-collection version, which the
+/// apply loop stamps as the collection's `coll_write_lsn`.
 ///
 /// Retries transparently on [`crate::Error::RetryableLeaderChange`]: the
 /// previous leader's entry was overwritten by a new leader's election no-op, so
@@ -26,7 +29,7 @@ pub async fn propose_replicated_entry(
     state: &SharedState,
     proposer: &Arc<AsyncRaftProposer>,
     entry: ReplicatedEntry,
-) -> crate::Result<Vec<u8>> {
+) -> crate::Result<(Vec<u8>, crate::types::Lsn)> {
     let idempotency_key = entry.idempotency_key;
     let data = entry.to_bytes();
     let vshard_id = entry.vshard_id;

@@ -50,7 +50,9 @@ pub async fn propose_sync_write(
 
     for (attempt, backoff_ms) in BACKOFF_MS.iter().enumerate() {
         match proposer(vshard_id, idempotency_key, data.clone()).await {
-            Ok(p) => {
+            // The committed log index rides alongside the payload; the sync-ack
+            // path only needs the payload bytes.
+            Ok((p, _committed_version)) => {
                 payload = Some(p);
                 break;
             }

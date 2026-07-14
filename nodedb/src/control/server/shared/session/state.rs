@@ -170,6 +170,17 @@ pub struct ConnSession {
     /// is idle-eligible only when this is zero — a legitimately long-running
     /// statement (in flight) must never be idle-killed.
     pub in_flight: AtomicU32,
+    /// Highest committed write-version this session has observed for each
+    /// `(database, tenant, collection)` it has written, keyed identically to
+    /// the read/write namespace. Used to floor a later transaction's captured
+    /// `read_version_lsn` at the session's OWN prior committed writes — a
+    /// read-your-writes floor that removes cross-shard OCC self-aborts on a
+    /// collection the session itself last wrote, without ever masking a
+    /// concurrent OTHER-session write (whose higher `coll_write_lsn` still
+    /// exceeds the floor). Persists for the life of the session — a prior
+    /// autocommit write must still floor a later transaction's read — and is
+    /// therefore NOT cleared at transaction boundaries.
+    pub own_write_versions: HashMap<(DatabaseId, TenantId, String), Lsn>,
 }
 
 impl ConnSession {
@@ -221,6 +232,7 @@ impl ConnSession {
             pending_sequence_reservations: Vec::new(),
             last_activity_ms: AtomicU64::new(now_unix_ms()),
             in_flight: AtomicU32::new(0),
+            own_write_versions: HashMap::new(),
         }
     }
 }

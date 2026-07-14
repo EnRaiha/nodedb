@@ -40,7 +40,7 @@ impl OriginArrayInbound {
         // wait) when available. It returns the apply payload directly.
         if let Some(async_proposer) = self.shared().async_raft_proposer.get().map(|a| a.as_ref()) {
             return match async_proposer(vshard_id, idempotency_key, data).await {
-                Ok(_payload) => Ok(()),
+                Ok((_payload, _committed_version)) => Ok(()),
                 Err(e) => {
                     warn!(array = %array, error = %e, "array_inbound: raft propose+apply failed");
                     Err(Some(build_reject(

@@ -122,6 +122,20 @@ pub fn record_read_set(
         .get_current_database(addr)
         .unwrap_or(DatabaseId::DEFAULT);
 
+    // Read-your-writes floor: raise the captured read-version to the session's
+    // OWN highest committed write-version for this collection. Without it, a
+    // read that observed a stale collection floor (0) before the session's own
+    // prior committed write was reflected on the serving core would, at
+    // cross-shard OCC validation, see that write's `coll_write_lsn` exceed the
+    // read-version and false-abort with a serialization failure on the session's
+    // OWN write. The floor is only ever raised by this session's own committed
+    // writes to this exact `(database, tenant, collection)`, so a concurrent
+    // OTHER-session write (higher `coll_write_lsn`) still exceeds the floor and
+    // still aborts — this removes only the self-abort. `read_lsn` (the per-shard
+    // watermark used by single-shard SI) is deliberately left untouched.
+    let own_write_version = sessions.own_write_version(addr, database_id, tenant_id, &collection);
+    let effective_read_version = read_version_lsn.max(own_write_version);
+
     let entries: Vec<ReadSetEntry> = watermarks
         .iter()
         .map(|(_vshard, read_lsn)| ReadSetEntry {
@@ -131,7 +145,7 @@ pub fn record_read_set(
             collection: collection.clone(),
             key: key.clone(),
             read_lsn: *read_lsn,
-            read_version_lsn,
+            read_version_lsn: effective_read_version,
         })
         .collect();
 

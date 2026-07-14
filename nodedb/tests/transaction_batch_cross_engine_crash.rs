@@ -52,7 +52,7 @@ fn assert_panic_rollback_response(resp: &nodedb::bridge::envelope::Response) {
         "expected Status::Error after panic-rollback, got {:?}",
         resp.status
     );
-    match &resp.error_code {
+    match resp.error_code.as_deref() {
         Some(ErrorCode::Internal { detail }) => {
             assert!(
                 detail.contains("panic in sub-apply"),

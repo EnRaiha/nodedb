@@ -13,6 +13,7 @@ mod listen;
 mod live;
 mod notice;
 pub mod outcome;
+mod own_writes;
 mod params;
 pub mod read_consistency;
 pub mod read_set;

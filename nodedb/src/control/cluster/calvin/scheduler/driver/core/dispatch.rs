@@ -11,6 +11,7 @@ use nodedb_cluster::calvin::types::SequencedTxn;
 use super::routing::{PlanRouting, plan_vshard};
 use super::scheduler::Scheduler;
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
+use crate::types::{DatabaseId, VShardId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::MetaOp;
 
@@ -95,6 +96,15 @@ impl Scheduler {
         );
     }
 
+    /// Filter a transaction's write plans down to the slice that homes to this
+    /// scheduler's vShard.
+    ///
+    /// Returns an EMPTY vector when no write plan homes here — that is NOT an
+    /// error: a read-only participant (writes elsewhere, only READS this vShard)
+    /// legitimately has no local write slice yet must still validate its reads.
+    /// Each caller decides what an empty slice means for its path. A genuinely
+    /// malformed plan (control-plane-only, unroutable, or a non-write inside a
+    /// write txn) is still a hard `Err`.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn local_calvin_plans(
         &self,
         plans: Vec<PhysicalPlan>,
@@ -141,16 +151,24 @@ impl Scheduler {
             }
         }
 
-        if local.is_empty() {
-            return Err(crate::Error::Internal {
-                detail: format!(
-                    "calvin txn {epoch}/{position} contains no local plans for vshard {}",
-                    self.vshard_id
-                ),
-            });
-        }
-
         Ok(local)
+    }
+
+    /// Whether any of this transaction's LSN-versioned reads homes to THIS
+    /// scheduler's vShard — i.e. this node is a READ participant that must
+    /// validate its slice of the read-set even if it holds no local write.
+    ///
+    /// Homing uses the SAME `(DatabaseId::DEFAULT, collection)` function the
+    /// Data Plane's `read_set_still_current` filters with, so the scheduler and
+    /// the apply core agree on exactly which reads this vShard owns.
+    fn homes_any_local_read(
+        &self,
+        versioned_reads: &nodedb_types::calvin::VersionedReadSet,
+    ) -> bool {
+        versioned_reads.iter().any(|entry| {
+            VShardId::from_collection_in_database(DatabaseId::DEFAULT, &entry.collection).as_u32()
+                == self.vshard_id
+        })
     }
 
     /// Dispatch a static-set ready transaction to the Data Plane executor.
@@ -159,7 +177,6 @@ impl Scheduler {
         txn: SequencedTxn,
         txn_id: TxnId,
     ) {
-        let request_id = self.next_request_id();
         let tenant_id = txn.tx_class.tenant_id;
         let epoch = txn.epoch;
         let position = txn.position;
@@ -178,7 +195,7 @@ impl Scheduler {
                 return;
             }
         };
-        let plans = match self.local_calvin_plans(plans, epoch, position) {
+        let local = match self.local_calvin_plans(plans, epoch, position) {
             Ok(p) => p,
             Err(e) => {
                 error!(
@@ -193,6 +210,59 @@ impl Scheduler {
                 return;
             }
         };
+
+        // A participant with no local WRITE slice is either a READ-ONLY
+        // participant — writes home elsewhere, but a read homes HERE, so it must
+        // still validate its slice of the read-set and cast a real commit/abort
+        // vote — or a routing bug (neither writes nor reads home here). Only the
+        // latter is an error; the former stages a validate-only task below.
+        if local.is_empty() && !self.homes_any_local_read(&txn.tx_class.versioned_reads) {
+            let e = crate::Error::Internal {
+                detail: format!(
+                    "calvin txn {epoch}/{position} homes no local write plans or reads \
+                     for vshard {}",
+                    self.vshard_id
+                ),
+            };
+            error!(
+                vshard_id = self.vshard_id,
+                epoch,
+                position,
+                error = %e,
+                "calvin scheduler: static txn homes no local work; releasing locks"
+            );
+            self.propose_routing_failure(epoch, position, txn_id, &e);
+            self.on_txn_complete(txn_id);
+            return;
+        }
+
+        // Write participant (`local` non-empty) or validate-only read
+        // participant (`local` empty, a read homes here): both STAGE through the
+        // identical static path so each casts a real commit/abort Vote through
+        // stage -> resolve -> verdict. The validate-only task stages no plans;
+        // its response carries only the read-set vote.
+        self.dispatch_calvin_static(txn, txn_id, epoch, position, tenant_id, local);
+    }
+
+    /// Build and dispatch a `CalvinExecuteStatic` task, then park the txn in
+    /// `pending` as `Staged`.
+    ///
+    /// Shared by the write path (`plans` = this vShard's local write slice) and
+    /// the validate-only read path (`plans` empty). Both carry the txn's FULL
+    /// `versioned_reads` to the apply core, which validates the LOCAL slice of
+    /// the read-set — whether or not `plans` is empty — and returns the commit
+    /// vote on `read_set_valid`. A validate-only task has `has_primary_write ==
+    /// false`, so it deposits no result sidecar entry, exactly as intended.
+    fn dispatch_calvin_static(
+        &mut self,
+        txn: SequencedTxn,
+        txn_id: TxnId,
+        epoch: u64,
+        position: u32,
+        tenant_id: crate::types::TenantId,
+        plans: Vec<PhysicalPlan>,
+    ) {
+        let request_id = self.next_request_id();
         let has_primary_write = plans_have_primary_write(&plans);
         let has_returning = plans_have_returning(&plans);
         let plan = PhysicalPlan::Meta(MetaOp::CalvinExecuteStatic {
@@ -287,7 +357,32 @@ impl Scheduler {
             }
         };
         let plans = match self.local_calvin_plans(plans, epoch, position) {
-            Ok(p) => p,
+            Ok(p) if !p.is_empty() => p,
+            Ok(_) => {
+                // A dependent-read active txn dispatched here always carries a
+                // local write slice (the OLLP orchestrator only routes the write
+                // participant through this path). An empty local slice is a
+                // routing bug, not a read-only participant — surface it as a
+                // terminal routing failure rather than dispatching an
+                // active task with nothing to apply.
+                let e = crate::Error::Internal {
+                    detail: format!(
+                        "calvin active txn {epoch}/{position} homes no local write plans \
+                         for vshard {}",
+                        self.vshard_id
+                    ),
+                };
+                error!(
+                    vshard_id = self.vshard_id,
+                    epoch,
+                    position,
+                    error = %e,
+                    "calvin scheduler: active txn homes no local writes; releasing locks"
+                );
+                self.propose_routing_failure(epoch, position, txn_id, &e);
+                self.on_txn_complete(txn_id);
+                return;
+            }
             Err(e) => {
                 error!(
                     vshard_id = self.vshard_id,

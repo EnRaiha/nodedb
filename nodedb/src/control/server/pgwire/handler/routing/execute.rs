@@ -415,6 +415,34 @@ impl NodeDbPgHandler {
                 );
             }
 
+            // Record the session's OWN committed write-version so a later
+            // transaction's read-set capture can be floored at it
+            // (read-your-writes floor for cross-shard OCC). A prior autocommit
+            // write must still floor a later transaction's read, so this records
+            // regardless of transaction state — the version is the write's
+            // committed per-collection `coll_write_lsn`, carried on
+            // `read_version_lsn` by the replicated-write dispatch path. Only
+            // successful writes with a non-zero version are recorded.
+            if resp.status == crate::bridge::envelope::Status::Ok
+                && resp.read_version_lsn > crate::types::Lsn::ZERO
+                && matches!(
+                    crate::control::security::identity::required_permission(&plan_for_response),
+                    crate::control::security::identity::Permission::Write
+                )
+                && let Some(collection) =
+                    crate::control::server::shared::plan_util::extract_collection(
+                        &plan_for_response,
+                    )
+            {
+                self.sessions.note_own_write(
+                    addr,
+                    task_database_id,
+                    identity.tenant_id,
+                    collection,
+                    resp.read_version_lsn,
+                );
+            }
+
             if let Some((severity, code, message)) =
                 response_status_to_sqlstate(resp.status, resp.error_code.as_deref())
             {

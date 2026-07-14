@@ -324,7 +324,12 @@ impl NodeDbPgHandler {
 
         // Propose through Raft with transparent leader-change retry. Shared with
         // the durable RESTORE re-issue path so both replicate identically.
-        let payload =
+        // `committed_version` is the committed Raft log index the entry applied
+        // at — the write's per-collection version (`coll_write_lsn`). Surfacing
+        // it on the response lets the session record its own committed writes so
+        // a later transaction's read-set can be floored at them (read-your-writes
+        // floor for cross-shard OCC), instead of losing the version to `ZERO`.
+        let (payload, committed_version) =
             crate::control::wal_replication::propose_replicated_entry(&self.state, proposer, entry)
                 .await?;
 
@@ -337,7 +342,7 @@ impl NodeDbPgHandler {
             watermark_lsn: Lsn::new(0),
             error_code: None,
             read_set_valid: None,
-            read_version_lsn: crate::types::Lsn::ZERO,
+            read_version_lsn: committed_version,
             write_set: Vec::new(),
         })
     }

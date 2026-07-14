@@ -131,6 +131,10 @@ pub(super) fn wire_proposers(
                             detail: format!("apply error: {other}"),
                         },
                     })
+                    // Carry the committed log index out as the write's
+                    // per-collection version (`coll_write_lsn`), stamped by the
+                    // apply loop from this same `entry.index`.
+                    .map(|payload| (payload, crate::types::Lsn::new(log_index)))
             })
         });
     if shared.async_raft_proposer.set(async_proposer).is_err() {

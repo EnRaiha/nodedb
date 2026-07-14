@@ -271,8 +271,9 @@ impl LocalPlanExecutor {
             )
             .await
             {
-                // Replicated writes carry no read watermark or read-version → 0.
-                Ok(payload) => ExecuteResponse::ok(vec![payload], 0, 0),
+                // Replicated writes carry no read watermark → 0; the committed
+                // log index rides alongside the payload but is not needed here.
+                Ok((payload, _committed_version)) => ExecuteResponse::ok(vec![payload], 0, 0),
                 Err(e) => ExecuteResponse::err(TypedClusterError::Internal {
                     code: PLAN_DECODE_FAILED,
                     message: e.to_string(),

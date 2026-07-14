@@ -192,11 +192,28 @@ fn build_static_tx_class_impl(
     // Sort by collection name for determinism.
     write_sets.sort_by(|a, b| a.collection().cmp(b.collection()));
 
+    // Read-your-own-write: a read of a collection this txn also WRITES must NOT
+    // enter the OCC read set. The txn's own staged write advances that
+    // collection's write floor, so validating the earlier read against it would
+    // flag it stale and abort the commit — a false serialization conflict. This
+    // mirrors the written-collection exclusion the single-shard
+    // `si_conflict_abort` path already applies.
+    let written_collections: std::collections::HashSet<String> = write_sets
+        .iter()
+        .map(|ks| ks.collection().to_string())
+        .collect();
+    let owned_reads: Vec<ReadSetEntry> = reads
+        .iter()
+        .filter(|e| !written_collections.contains(e.collection.as_str()))
+        .cloned()
+        .collect();
+
     let write_set = ReadWriteSet::new(write_sets);
-    // Populate the routing/identity read_set from the session read-set so a txn
-    // that writes shard A but reads shard B enumerates B as a participant. An
-    // empty `reads` slice (autocommit / pure-write) yields an empty read_set.
-    let read_set = read_set_from(reads);
+    // Populate the routing/identity read_set from the (own-write-filtered)
+    // session read-set so a txn that writes shard A but reads shard B enumerates
+    // B as a participant. An empty read set (autocommit / pure-write, or all
+    // reads self-written) yields an empty read_set.
+    let read_set = read_set_from(&owned_reads);
 
     // Encode all plans as msgpack bytes.
     let plans: Vec<&PhysicalPlan> = tasks.iter().map(|t| &t.plan).collect();
@@ -208,7 +225,7 @@ fn build_static_tx_class_impl(
     // versioned_reads carries the LSN-versioned OCC validation set, populated
     // from the same session read-set the routing `read_set` above was built
     // from.
-    let versioned_reads = versioned_reads_from(reads);
+    let versioned_reads = versioned_reads_from(&owned_reads);
 
     let result = if allow_single_vshard {
         TxClass::new_single_vshard(
