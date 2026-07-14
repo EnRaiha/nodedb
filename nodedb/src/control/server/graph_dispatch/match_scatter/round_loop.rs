@@ -14,7 +14,7 @@ use crate::control::gateway::version_set::GatewayVersionSet;
 use crate::control::gateway::{RouteDecision, TaskRoute};
 use crate::control::server::graph_dispatch::match_broadcast::broadcast_match_to_all_cores;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId, TxnId, VShardId};
 use nodedb_cluster::distributed_graph::PatternContinuation;
 use nodedb_physical::physical_plan::GraphOp;
 
@@ -38,6 +38,7 @@ struct DispatchCtx<'f> {
     tenant_id: TenantId,
     database_id: DatabaseId,
     deadline_ms: u64,
+    txn_id: Option<TxnId>,
     shared_arc: Arc<SharedState>,
     version_set: GatewayVersionSet,
 }
@@ -54,23 +55,28 @@ fn push_dispatch_fut<'f>(
     plan: PhysicalPlan,
     remote_coords: Option<(u64, u64)>,
 ) {
-    let (state, tenant_id, database_id, deadline_ms) =
-        (ctx.state, ctx.tenant_id, ctx.database_id, ctx.deadline_ms);
+    let (state, tenant_id, database_id, deadline_ms, txn_id) = (
+        ctx.state,
+        ctx.tenant_id,
+        ctx.database_id,
+        ctx.deadline_ms,
+        ctx.txn_id,
+    );
     match remote_coords {
         None => {
             futs.push(Box::pin(async move {
-                // Cross-shard MATCH continuation: the resumed pattern runs on
-                // whichever owner shard emitted the frontier, not necessarily
-                // the node holding the transaction's staged overlay, so no
-                // txn_id is threaded here (committed-CSR-only). Cross-shard
-                // read-your-own-writes for MATCH remains a separate unit.
+                // Local continuation/resume leg: thread the active `txn_id` so
+                // each core merges the transaction's staged edge overlay for
+                // read-your-own-writes. A remote leg (the `Some` arm below)
+                // reads committed CSR — multi-node overlay forwarding is a
+                // separate unit.
                 let outcome = broadcast_match_to_all_cores(
                     state,
                     tenant_id,
                     database_id,
                     plan,
                     TraceId::ZERO,
-                    None,
+                    txn_id,
                 )
                 .await?;
                 Ok::<_, crate::Error>(vec![TaggedShardResult {
@@ -114,6 +120,7 @@ pub(super) async fn dispatch_continuations(
     database_id: DatabaseId,
     query_bytes: &[u8],
     deadline_ms: u64,
+    txn_id: Option<TxnId>,
     pending: HashMap<u32, Vec<PatternContinuation>>,
 ) -> crate::Result<Vec<TaggedShardResult>> {
     let shared_arc = gateway_shared(state)?;
@@ -122,6 +129,7 @@ pub(super) async fn dispatch_continuations(
         tenant_id,
         database_id,
         deadline_ms,
+        txn_id,
         shared_arc,
         version_set: GatewayVersionSet::from_pairs(Vec::new()),
     };
@@ -196,6 +204,7 @@ pub(super) async fn dispatch_resumes(
     database_id: DatabaseId,
     query_bytes: &[u8],
     deadline_ms: u64,
+    txn_id: Option<TxnId>,
     pending_resumes: Vec<PendingResume>,
 ) -> crate::Result<Vec<TaggedShardResult>> {
     let shared_arc = gateway_shared(state)?;
@@ -204,6 +213,7 @@ pub(super) async fn dispatch_resumes(
         tenant_id,
         database_id,
         deadline_ms,
+        txn_id,
         shared_arc,
         version_set: GatewayVersionSet::from_pairs(Vec::new()),
     };

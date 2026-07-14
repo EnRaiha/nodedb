@@ -32,8 +32,8 @@
 //!    fingerprint before re-encoding into the bare msgpack array shape
 //!    `match_payload_to_response` expects.
 //!
-//! Single-node deployments NEVER reach this module — `match_ops` keeps the B1
-//! `broadcast_match_to_all_cores` path byte-identical when
+//! Single-node deployments NEVER reach this module — `match_ops` keeps the
+//! direct `broadcast_match_to_all_cores` path byte-identical when
 //! `cluster_routing.is_none()`.
 
 mod coord;

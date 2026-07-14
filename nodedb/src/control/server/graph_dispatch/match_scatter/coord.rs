@@ -10,7 +10,7 @@ use crate::control::gateway::RouteDecision;
 use crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard;
 use crate::control::state::SharedState;
 use crate::engine::graph::pattern::executor::{UnresolvedExpansion, VarLenResume, rows_to_msgpack};
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::{DatabaseId, TenantId, TxnId, VShardId};
 use nodedb_cluster::distributed_graph::{
     DistributedMatchCoordinator, PatternContinuation, ResolvedContinuationArgs, ShardMatchResult,
 };
@@ -71,12 +71,17 @@ pub(super) struct TaggedShardResult {
 
 /// Orchestrate a cross-shard MATCH. Caller guarantees cluster mode
 /// (`cluster_routing.is_some()`); single-node never enters here.
+///
+/// `txn_id` is threaded onto every LOCAL scatter/resume leg so this node's cores
+/// merge the transaction's staged edge overlay for read-your-own-writes; remote
+/// legs read committed CSR (multi-node overlay forwarding is a separate unit).
 pub async fn scatter_match(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     query_bytes: Vec<u8>,
     deadline_ms: u64,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<MatchScatterOutcome> {
     // Round budget = the maximum number of hops the pattern can take (summed
     // per-triple `max_hops`), since each round advances every frontier by one
@@ -101,8 +106,15 @@ pub async fn scatter_match(
     let mut continuations_exhausted = false;
 
     // ---- Round 0: scatter the Match plan to local + every remote owner. ----
-    let round0 =
-        scatter_round_zero(state, tenant_id, database_id, &query_bytes, deadline_ms).await?;
+    let round0 = scatter_round_zero(
+        state,
+        tenant_id,
+        database_id,
+        &query_bytes,
+        deadline_ms,
+        txn_id,
+    )
+    .await?;
     for tagged in round0 {
         feed_result(state, &mut coordinator, &mut pending_resumes, tagged)?;
     }
@@ -128,6 +140,7 @@ pub async fn scatter_match(
                     database_id,
                     &query_bytes,
                     deadline_ms,
+                    txn_id,
                     pending,
                 )
                 .await?;
@@ -158,6 +171,7 @@ pub async fn scatter_match(
                 database_id,
                 &query_bytes,
                 deadline_ms,
+                txn_id,
                 batch,
             )
             .await?;

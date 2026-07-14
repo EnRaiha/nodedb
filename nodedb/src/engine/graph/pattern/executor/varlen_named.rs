@@ -578,12 +578,18 @@ mod tests {
 
         assert_eq!(
             from_a,
-            ["b", "c"].into_iter().map(String::from).collect::<HashSet<String>>(),
+            ["b", "c"]
+                .into_iter()
+                .map(String::from)
+                .collect::<HashSet<String>>(),
             "anchor a reaches only its own tail"
         );
         assert_eq!(
             from_p,
-            ["q", "r"].into_iter().map(String::from).collect::<HashSet<String>>(),
+            ["q", "r"]
+                .into_iter()
+                .map(String::from)
+                .collect::<HashSet<String>>(),
             "anchor p reaches only its own tail"
         );
     }

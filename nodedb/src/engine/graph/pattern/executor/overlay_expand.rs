@@ -19,12 +19,16 @@
 //! rewrite to walk staged-only nodes; the caller keeps the durable varlen path
 //! for those.
 //!
-//! Transaction overlays are single-node by construction (a txn's staged writes
-//! live on the shard that owns the txn), so this path never emits a cross-shard
-//! unresolved frontier: a staged edge is always locally resolvable.
+//! In cluster mode this path also emits a cross-shard unresolved frontier: a
+//! bound source whose merged out-degree is zero and which the caller's locality
+//! predicate marks remote is recorded as an [`UnresolvedExpansion`], mirroring
+//! the durable fixed-hop path, so a resumed pattern's fixed-hop tail can
+//! continue onto a staged edge's owning core. In a true single-node deployment
+//! (no locality predicate) nothing is emitted and a staged edge is always
+//! locally resolvable.
 
 use super::super::ast::{NodeBinding, PatternTriple};
-use super::types::{BindingRow, ExecutionState};
+use super::types::{BindingRow, ExecutionState, UnresolvedExpansion};
 use super::varlen_named::merge_neighbors_named;
 use crate::engine::graph::csr::{CsrIndex, GraphOverlayDelta};
 
@@ -35,16 +39,33 @@ use crate::engine::graph::csr::{CsrIndex, GraphOverlayDelta};
 /// durable branch in [`super::core::execute_triple`] (source resolution →
 /// per-neighbour destination-binding compatibility → row emission) but keys on
 /// node NAMES so a staged-only intermediate node (no CSR id) participates.
+///
+/// `triple_idx` is the within-chain position of this triple, recorded on any
+/// [`UnresolvedExpansion`] this path emits: a bound source with zero merged
+/// out-degree that the locality predicate marks remote is shipped as a
+/// cross-shard continuation, exactly as the durable fixed-hop path does.
 pub(super) fn expand_triple_overlay(
     triple: &PatternTriple,
+    triple_idx: usize,
     csr: &CsrIndex,
     input_row: &BindingRow,
-    state: &ExecutionState<'_>,
+    state: &mut ExecutionState,
     frontier_bitmap: Option<&nodedb_types::SurrogateBitmap>,
     overlay: &GraphOverlayDelta,
 ) -> Vec<BindingRow> {
     let direction = triple.edge.direction.to_csr_direction();
     let label_filter = triple.edge.edge_type.as_deref();
+    let collection_filter = state.collection_filter;
+    let is_remote = state.is_remote_node;
+    // Only a BOUND source (its variable already resolved in `input_row`) can
+    // emit a cross-shard continuation, exactly as the durable fixed-hop path
+    // gates its frontier emission — a free-ranging source is enumerated
+    // identically on every shard and must not.
+    let source_is_bound = triple
+        .src
+        .name
+        .as_deref()
+        .is_some_and(|n| input_row.contains_key(n));
     let sources = resolve_sources(&triple.src, csr, input_row, frontier_bitmap, overlay);
 
     let mut results = Vec::new();
@@ -55,9 +76,45 @@ pub(super) fn expand_triple_overlay(
             *src_id,
             label_filter,
             direction,
-            state.collection_filter,
+            collection_filter,
             overlay,
         );
+        if neighbors.is_empty() {
+            // A bound source with zero merged out-degree may have its remaining
+            // edges homed on another shard: record a cross-shard continuation
+            // rather than dropping the partial match. Gated exactly as the
+            // durable path — only a bound source the locality predicate marks
+            // remote emits; the single-node path (no predicate) never does. The
+            // degree is measured label-unfiltered so a source that has local
+            // edges of a non-matching label stays a legitimate local empty,
+            // mirroring the durable `raw_degree` check.
+            if source_is_bound
+                && let Some(pred) = is_remote
+                && pred(src_name)
+            {
+                let unfiltered_empty = label_filter.is_none()
+                    || merge_neighbors_named(
+                        csr,
+                        src_name,
+                        *src_id,
+                        None,
+                        direction,
+                        collection_filter,
+                        overlay,
+                    )
+                    .is_empty();
+                if unfiltered_empty {
+                    let binding_var = triple.src.name.clone().unwrap_or_else(|| src_name.clone());
+                    state.frontier.push(UnresolvedExpansion {
+                        binding_var,
+                        node_name: src_name.clone(),
+                        triple_idx,
+                        partial_row: input_row.clone(),
+                    });
+                }
+            }
+            continue;
+        }
         for (label, dst_name) in neighbors {
             if !dst_compatible(&triple.dst, csr, input_row, &dst_name) {
                 continue;
@@ -203,11 +260,13 @@ mod tests {
         row.insert("a".to_string(), "a".to_string());
         // `(a)-[:KNOWS]->(y)` with `y` a free variable: both the durable `b` and
         // the staged `c` bind to `y`.
+        let mut st = state();
         let rows = expand_triple_overlay(
             &triple(Some("a"), "KNOWS", Some("y")),
+            0,
             &csr,
             &row,
-            &state(),
+            &mut st,
             None,
             &ov,
         );
@@ -230,11 +289,13 @@ mod tests {
 
         let mut row = BindingRow::new();
         row.insert("a".to_string(), "a".to_string());
+        let mut st = state();
         let rows = expand_triple_overlay(
             &triple(Some("a"), "KNOWS", Some("x")),
+            0,
             &csr,
             &row,
-            &state(),
+            &mut st,
             None,
             &ov,
         );
@@ -251,11 +312,13 @@ mod tests {
 
         let mut row = BindingRow::new();
         row.insert("m".to_string(), "x".to_string());
+        let mut st = state();
         let rows = expand_triple_overlay(
             &triple(Some("m"), "KNOWS", Some("n")),
+            0,
             &csr,
             &row,
-            &state(),
+            &mut st,
             None,
             &ov,
         );

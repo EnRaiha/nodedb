@@ -139,7 +139,7 @@ impl CoreLoop {
     /// The Control Plane's `broadcast_match_to_all_cores` unwraps this map:
     /// it merges the `rows` subfields across cores back into the SAME bare
     /// array shape `match_payload_to_response` already expects, and unions the
-    /// `frontier` entries for cross-shard continuation dispatch (B2). On a
+    /// `frontier` entries for cross-shard continuation dispatch. On a
     /// fully-local CSR the frontier array is empty, so single-node client
     /// behaviour after the unwrap is byte-identical to the prior bare-array
     /// response.
@@ -370,11 +370,12 @@ impl CoreLoop {
             tenant_id: tid,
             collection: query.collection.as_deref(),
         };
-        // A continuation only ever runs cross-shard (`is_remote_node` is always
-        // `Some` here), where the pattern engine's overlay merge is disabled and
-        // the transaction's staged overlay is not reachable anyway — so no
-        // overlay is built. Cross-shard MATCH read-your-own-writes is a separate
-        // unit.
+        // Resolve the transaction's staged edge overlay (when the task carries a
+        // live `txn_id`) so the resumed pattern observes read-your-own-writes on
+        // this core, mirroring the round-0 `execute_graph_match` path. With the
+        // fixed-hop overlay merge un-gated in cluster mode, a bound zero-degree
+        // source still emits its cross-shard frontier for onward continuation.
+        let overlay = self.match_graph_overlay(task, tid);
         match crate::engine::graph::pattern::executor::execute_continuation(
             &query,
             crate::engine::graph::pattern::executor::MatchExecCtx {
@@ -384,7 +385,7 @@ impl CoreLoop {
                 is_remote_node,
                 varlen_caps,
                 props: &props,
-                overlay: None,
+                overlay: overlay.as_ref(),
             },
             ContinuationSeed {
                 triple_idx: resume_triple_idx,
@@ -469,10 +470,11 @@ impl CoreLoop {
             tenant_id: tid,
             collection: query.collection.as_deref(),
         };
-        // A variable-length resume only ever runs cross-shard (`is_remote_node`
-        // is always `Some` here); the pattern engine's overlay merge is disabled
-        // in that mode and the staged overlay is not reachable, so no overlay is
-        // built. Cross-shard MATCH read-your-own-writes is a separate unit.
+        // Resolve the transaction's staged edge overlay (when the task carries a
+        // live `txn_id`) so the resumed variable-length expansion observes
+        // read-your-own-writes on this core — the name-keyed BFS walks staged
+        // edges and continues onto their owning core via boundary resumes.
+        let overlay = self.match_graph_overlay(task, tid);
         match crate::engine::graph::pattern::executor::execute_varlen_resume(
             &query,
             crate::engine::graph::pattern::executor::MatchExecCtx {
@@ -482,7 +484,7 @@ impl CoreLoop {
                 is_remote_node,
                 varlen_caps,
                 props: &props,
-                overlay: None,
+                overlay: overlay.as_ref(),
             },
             resume,
         ) {

@@ -16,7 +16,7 @@ use crate::control::server::graph_dispatch::match_broadcast::{
     broadcast_match_to_all_cores, unwrap_match_envelope,
 };
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_plan::GraphOp;
 
 use super::coord::{TaggedShardResult, decode_rows};
@@ -36,12 +36,14 @@ pub(super) async fn scatter_round_zero(
     database_id: DatabaseId,
     query_bytes: &[u8],
     deadline_ms: u64,
+    txn_id: Option<TxnId>,
 ) -> crate::Result<Vec<TaggedShardResult>> {
     // Local cores: fan to all and unwrap each `{rows, frontier}` envelope. The
-    // cluster MATCH path runs `cluster_mode = true`, under which the pattern
-    // engine's transaction-overlay merge is disabled (the durable path must emit
-    // the cross-shard frontier instead), so no `txn_id` is threaded here —
-    // cross-shard MATCH read-your-own-writes is a separate unit.
+    // active `txn_id` is threaded onto this LOCAL leg so each core merges the
+    // transaction's staged edge overlay for read-your-own-writes; with the
+    // fixed-hop overlay merge un-gated in cluster mode, a bound zero-degree
+    // source still emits its cross-shard frontier. Remote owners below read
+    // committed CSR (`None`) — multi-node overlay forwarding is a separate unit.
     let local_plan = PhysicalPlan::Graph(GraphOp::Match {
         query: query_bytes.to_vec(),
         frontier_bitmap: None,
@@ -53,7 +55,7 @@ pub(super) async fn scatter_round_zero(
         database_id,
         local_plan,
         TraceId::ZERO,
-        None,
+        txn_id,
     );
 
     // Remote owners: one batched dispatch per distinct non-local group leader.

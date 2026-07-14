@@ -37,20 +37,19 @@ pub(in crate::engine::graph::pattern::executor) fn execute_triple(
     // path (its visited set keys on dense CSR ids); autocommit / empty-overlay
     // runs are unaffected and fall through to the durable path below.
     //
-    // The overlay merge runs single-node only (`is_remote_node.is_none()`): in
-    // cluster mode the durable path emits the cross-shard unresolved frontier
-    // for a bound zero-local-degree source, which this name-keyed path does not
-    // produce. Taking it in cluster mode would drop committed cross-shard
-    // continuations, so a transaction's staged overlay is only merged on the
-    // single-node path. Cross-shard MATCH read-your-own-writes is a separate
-    // unit.
+    // The merge runs in cluster mode too: a bound source whose merged (durable
+    // ∪ staged, minus tombstone) out-degree is zero and which the locality
+    // predicate marks remote is emitted as a cross-shard `UnresolvedExpansion`
+    // by `expand_triple_overlay`, exactly as the durable fixed-hop path does for
+    // a zero-raw-degree bound source, so a resumed pattern's fixed-hop tail
+    // continues onto the staged edge's owning core instead of being dropped.
     if let Some(ov) = overlay
         && !ov.is_empty()
         && !triple.edge.is_variable_length()
-        && state.is_remote_node.is_none()
     {
         return Ok(overlay_expand::expand_triple_overlay(
             triple,
+            triple_idx,
             csr,
             input_row,
             state,

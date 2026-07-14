@@ -113,7 +113,7 @@ pub async fn match_query(
 
     let tenant_id = identity.tenant_id;
 
-    // Single-node mode: keep the B1 path byte-identical — broadcast the `Match`
+    // Single-node mode: keep the direct path byte-identical — broadcast the `Match`
     // plan with `cluster_mode = false` to all local cores. The Data Plane emits
     // no frontier, so the unwrapped rows payload is exactly the prior bare-array
     // gather. No cross-shard orchestration is needed (and there is no routing
@@ -159,16 +159,20 @@ pub async fn match_query(
     // Cluster mode: scatter-all to local + every remote owner, then drive the
     // continuation round loop across shard boundaries. `scatter_match` returns
     // the deduped rows in the same bare-array shape and a `partial` flag set on
-    // truncation / round exhaustion.
-    // Cluster mode runs `cluster_mode = true`, under which the pattern engine's
-    // transaction-overlay merge is disabled (see `match_scatter::round_zero`), so
-    // `txn_id` is not threaded into the cluster scatter — a MATCH inside a
-    // transaction reads committed CSR across shards. Cross-shard MATCH
-    // read-your-own-writes is a separate unit; the single-node path above carries
-    // `txn_id` for the overlay merge.
+    // truncation / round exhaustion. The active `txn_id` is threaded onto every
+    // LOCAL scatter/resume leg so this node's cores merge the transaction's
+    // staged edge overlay (read-your-own-writes); remote legs read committed CSR
+    // (multi-node overlay forwarding is a separate unit).
     let deadline_ms = crate::control::gateway::dispatcher::default_deadline_ms(state);
-    match graph_dispatch::scatter_match(state, tenant_id, database_id, query_bytes, deadline_ms)
-        .await
+    match graph_dispatch::scatter_match(
+        state,
+        tenant_id,
+        database_id,
+        query_bytes,
+        deadline_ms,
+        txn_id,
+    )
+    .await
     {
         Ok(outcome) => {
             // A `partial` result means the cross-shard hop rounds or the
