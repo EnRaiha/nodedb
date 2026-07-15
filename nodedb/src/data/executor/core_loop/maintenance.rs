@@ -264,6 +264,25 @@ impl CoreLoop {
         self.paused_vshards.contains(&vshard)
     }
 
+    /// Expand a document into the `(field, value)` tuples it contributes across
+    /// a set of index paths, via the same [`index_values_for`] extraction the
+    /// forward write path uses. Used to recompute the secondary-index tuples a
+    /// pre-delete document would have contributed, when the delete cascade
+    /// itself (a prefix scan) does not return them.
+    pub(in crate::data::executor) fn index_tuples_for_doc(
+        &self,
+        doc: &serde_json::Value,
+        index_paths: &[crate::engine::document::store::IndexPath],
+    ) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for index_path in index_paths {
+            for v in index_values_for(doc, index_path) {
+                out.push((index_path.path.clone(), v));
+            }
+        }
+        out
+    }
+
     /// Sweep dangling edges: detect edges whose source or destination
     /// node has been deleted (tracked per-tenant in `deleted_nodes`).
     ///

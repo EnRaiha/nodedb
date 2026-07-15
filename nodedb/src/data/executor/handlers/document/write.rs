@@ -182,10 +182,15 @@ impl CoreLoop {
         // (dropping `txn`, which rolls back every row applied so far).
         let mut applied: Vec<String> = Vec::with_capacity(documents.len());
         let mut write_set: Vec<WriteSetEntry> = Vec::new();
+        // Per-row secondary-index tuples (added ∪ removed ∪ bitemporal),
+        // parallel to `applied`. Recorded into the per-index write-value
+        // substrate only after `txn.commit()` succeeds below — a row that
+        // never commits touched no durable index state.
+        let mut row_index_tuples: Vec<Vec<(String, String)>> = Vec::with_capacity(documents.len());
         for (i, (_document_id, value)) in documents.iter().enumerate() {
             let surrogate = surrogates[i];
             let row_key = surrogate_to_doc_id(surrogate);
-            if let Err(e) = self.apply_point_put(
+            let outcome = match self.apply_point_put(
                 &txn,
                 PointPutParams {
                     database_id,
@@ -200,14 +205,21 @@ impl CoreLoop {
                     wal_lsn: task.wal_lsn(),
                 },
             ) {
-                return self.response_error(task, e);
-            }
+                Ok(o) => o,
+                Err(e) => return self.response_error(task, e),
+            };
             if has_vectors {
                 write_set.push(WriteSetEntry {
                     surrogate: surrogate.as_u32(),
                     is_delete: false,
                     value: value.clone(),
                 });
+            }
+            if task.wal_lsn().is_some() {
+                let mut tuples = outcome.secondary_index_added;
+                tuples.extend(outcome.secondary_index_removed);
+                tuples.extend(outcome.bitemporal_index_tuples);
+                row_index_tuples.push(tuples);
             }
             applied.push(row_key);
         }
@@ -219,6 +231,21 @@ impl CoreLoop {
                     detail: format!("batch insert commit: {e}"),
                 },
             );
+        }
+
+        // Record each committed row's touched secondary-index values into the
+        // per-index write-value substrate, now that the batch has durably
+        // committed.
+        if let Some(lsn) = task.wal_lsn() {
+            for tuples in &row_index_tuples {
+                self.note_index_write_values(
+                    task.request.database_id,
+                    crate::types::TenantId::new(tid),
+                    collection,
+                    tuples,
+                    lsn,
+                );
+            }
         }
 
         self.checkpoint_coordinator

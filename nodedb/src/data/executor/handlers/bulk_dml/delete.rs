@@ -135,6 +135,19 @@ impl CoreLoop {
         // would otherwise leak vector nodes that keep scoring in KNN search.
         let has_vectors = self.collection_has_vectors(database_id, tid, collection);
 
+        // Secondary-index paths for this collection, hoisted once. The delete
+        // cascade below (`delete_indexes_for_document`) is a prefix scan that
+        // does NOT return the removed `(field, value)` tuples, and the index
+        // keys are `:`-delimited with values that may themselves contain `:` —
+        // so parsing them back out is unsafe. The removed tuples are instead
+        // recomputed from the pre-delete document via `index_tuples_for_doc`.
+        let config_key = (crate::types::TenantId::new(tid), collection.to_string());
+        let index_paths: Vec<crate::engine::document::store::IndexPath> = self
+            .doc_configs
+            .get(&config_key)
+            .map(|c| c.index_paths.clone())
+            .unwrap_or_default();
+
         // Delete each matching document with full cascade.
         let mut affected = 0u64;
         // One post-apply `Delete` redo entry per removed row on a vector
@@ -151,20 +164,24 @@ impl CoreLoop {
             Vec::new()
         };
         for doc_id in &apply_ids {
-            // Capture pre-deletion snapshot if RETURNING was requested.
-            let pre_delete_doc: Option<serde_json::Value> = if returning.is_some() {
-                self.sparse
-                    .get(task.request.database_id.as_u64(), tid, collection, doc_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|bytes| {
-                        let with_id =
-                            nodedb_query::msgpack_scan::inject_str_field(&bytes, "id", doc_id);
-                        doc_format::decode_document(&with_id)
-                    })
-            } else {
-                None
-            };
+            // Capture pre-deletion snapshot if RETURNING was requested, or if
+            // the collection is indexed (needed to recompute the removed
+            // secondary-index tuples below — the delete cascade's prefix scan
+            // cannot safely return them).
+            let pre_delete_doc: Option<serde_json::Value> =
+                if returning.is_some() || !index_paths.is_empty() {
+                    self.sparse
+                        .get(task.request.database_id.as_u64(), tid, collection, doc_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|bytes| {
+                            let with_id =
+                                nodedb_query::msgpack_scan::inject_str_field(&bytes, "id", doc_id);
+                            doc_format::decode_document(&with_id)
+                        })
+                } else {
+                    None
+                };
 
             if self
                 .sparse
@@ -234,6 +251,19 @@ impl CoreLoop {
                 // surrogate + collection.
                 if let Some(surrogate) = row_surrogate {
                     self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+                    // Record the removed secondary-index tuples into the
+                    // per-index write-value substrate, recomputed from the
+                    // pre-delete document (see `index_paths` comment above).
+                    if let (Some(lsn), Some(doc)) = (task.wal_lsn(), pre_delete_doc.as_ref()) {
+                        let tuples = self.index_tuples_for_doc(doc, &index_paths);
+                        self.note_index_write_values(
+                            task.request.database_id,
+                            crate::types::TenantId::new(tid),
+                            collection,
+                            &tuples,
+                            lsn,
+                        );
+                    }
                     // Carry the surrogate back for a post-apply `Delete` redo so
                     // the removed vector node does not resurrect on a WAL-only
                     // restart. Gated on `has_vectors` — a non-vector collection
@@ -247,7 +277,9 @@ impl CoreLoop {
                     }
                 }
                 affected += 1;
-                if let Some(doc) = pre_delete_doc {
+                if returning.is_some()
+                    && let Some(doc) = pre_delete_doc
+                {
                     returned_docs.push(doc);
                 }
             }
