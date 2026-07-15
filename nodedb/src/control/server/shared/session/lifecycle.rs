@@ -61,6 +61,15 @@ pub async fn run_rollback(
     // so the staging overlay can be released on EVERY vShard the transaction
     // staged writes to (a transaction may span multiple cores).
     let (overlay_txn_id, overlay_vshards) = sessions.txn_identity(addr);
+    // Release this transaction's read reservations while the reservation owner is
+    // still set — `rollback` below clears it. Best-effort; lease GC backstops.
+    super::reservation_release::release_session_reservations(
+        state,
+        sessions,
+        addr,
+        nodedb_cluster::calvin::types::ReleaseReason::Abort,
+    )
+    .await;
     let reservations = sessions.rollback(addr).unwrap_or_default();
     for handle in &reservations {
         let key = &handle.sequence_key;

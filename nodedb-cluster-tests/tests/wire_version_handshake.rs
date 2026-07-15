@@ -135,6 +135,23 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_reserve_read(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ReserveReadRequest,
+    ) -> nodedb_cluster::rpc_codec::ReserveReadResponse {
+        nodedb_cluster::rpc_codec::ReserveReadResponse {
+            owner_bytes: None,
+            error: None,
+        }
+    }
+
+    async fn on_release_reservation(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ReleaseReservationRequest,
+    ) -> nodedb_cluster::rpc_codec::ReleaseReservationResponse {
+        nodedb_cluster::rpc_codec::ReleaseReservationResponse { error: None }
+    }
 }
 
 /// Handler that records whether it was ever invoked.
@@ -271,6 +288,33 @@ impl RaftRpcHandler for SentinelHandler {
             error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
                 code: 0,
                 message: "sentinel: unexpected submit-calvin-inbox dispatch".into(),
+            }),
+        }
+    }
+
+    async fn on_reserve_read(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ReserveReadRequest,
+    ) -> nodedb_cluster::rpc_codec::ReserveReadResponse {
+        self.invoked.store(true, Ordering::SeqCst);
+        nodedb_cluster::rpc_codec::ReserveReadResponse {
+            owner_bytes: None,
+            error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
+                code: 0,
+                message: "sentinel: unexpected reserve-read dispatch".into(),
+            }),
+        }
+    }
+
+    async fn on_release_reservation(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ReleaseReservationRequest,
+    ) -> nodedb_cluster::rpc_codec::ReleaseReservationResponse {
+        self.invoked.store(true, Ordering::SeqCst);
+        nodedb_cluster::rpc_codec::ReleaseReservationResponse {
+            error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
+                code: 0,
+                message: "sentinel: unexpected release-reservation dispatch".into(),
             }),
         }
     }

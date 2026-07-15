@@ -7,6 +7,7 @@ pub mod dispatch_multi;
 pub mod explain;
 pub mod predicate;
 pub mod preexec;
+pub mod reservation;
 pub mod retry_loop;
 pub mod submit;
 pub mod tx_class;

@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use nodedb_cluster::calvin::types::TxnIdWire;
+
 use crate::types::{Lsn, TxnId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -44,6 +46,8 @@ impl SessionStore {
                 session.tx_snapshot_lsn = Some(current_lsn);
                 session.tx_snapshot_epoch = Some(snapshot_epoch);
                 session.tx_read_set.clear();
+                session.tx_reservation_vshards.clear();
+                session.tx_reservation_owner = None;
                 session.tx_id = Some(TxnId::new(NEXT_TXN_ID.fetch_add(1, Ordering::Relaxed)));
                 session.tx_vshards.clear();
                 Ok(())
@@ -75,6 +79,54 @@ impl SessionStore {
                 session.tx_read_set.extend(entries);
             }
         });
+    }
+
+    /// Whether the connection at `addr` is inside a transaction block. Mirrors
+    /// the `tx_state == InBlock` gate the read-set recording uses internally, so
+    /// the hot-key reservation seam can skip autocommit reads without duplicating
+    /// the predicate.
+    pub fn is_in_transaction_block(&self, addr: &SocketAddr) -> bool {
+        self.read_session(addr, |s| s.tx_state == TransactionState::InBlock)
+            .unwrap_or(false)
+    }
+
+    /// The reservation owner id minted for the current transaction, if a hot-key
+    /// read has already reserved one. `None` before the first hot-key read (or
+    /// outside a transaction block). Short lock scope — reads and drops.
+    pub fn current_reservation_owner(&self, addr: &SocketAddr) -> Option<TxnIdWire> {
+        self.read_session(addr, |s| s.tx_reservation_owner)
+            .flatten()
+    }
+
+    /// Record a sequenced SHARED reservation taken on a hot point key. Inserts
+    /// the reservation's owning `vshard` into the transaction's touched-vShard set
+    /// and, on the FIRST reservation, adopts `owner` as the transaction's single
+    /// reservation owner so every later hot-key read reuses the same `lock_owner`.
+    /// Short lock scope — mutates and drops.
+    pub fn record_reservation(&self, addr: &SocketAddr, vshard: u32, owner: TxnIdWire) {
+        self.write_session(addr, |session| {
+            session.tx_reservation_vshards.insert(vshard);
+            if session.tx_reservation_owner.is_none() {
+                session.tx_reservation_owner = Some(owner);
+            }
+        });
+    }
+
+    /// Drain the current transaction's read reservations for release. Takes the
+    /// single reservation `owner` (leaving `None`) and drains the set of distinct
+    /// vShards it reserved on (leaving empty), returning `(owner, vshards)`. Short
+    /// lock scope, no await held — the async release routes one
+    /// `ReleaseReservation` per vShard AFTER this returns. Draining makes a repeat
+    /// call a no-op, so two graceful-exit paths releasing is idempotent.
+    pub fn take_reservations(&self, addr: &SocketAddr) -> (Option<TxnIdWire>, Vec<u32>) {
+        self.write_session(addr, |session| {
+            let owner = session.tx_reservation_owner.take();
+            let vshards = std::mem::take(&mut session.tx_reservation_vshards)
+                .into_iter()
+                .collect();
+            (owner, vshards)
+        })
+        .unwrap_or((None, Vec::new()))
     }
 
     /// Get the snapshot LSN for the current transaction.
@@ -151,6 +203,8 @@ impl SessionStore {
             session.tx_snapshot_epoch = None;
             session.tx_id = None;
             session.tx_vshards.clear();
+            session.tx_reservation_vshards.clear();
+            session.tx_reservation_owner = None;
             session.savepoints.clear();
             // Note: pending_sequence_reservations are taken separately via
             // take_pending_reservations() so the caller can finalize them
@@ -241,6 +295,8 @@ impl SessionStore {
                 session.tx_id = None;
                 session.tx_vshards.clear();
                 session.tx_read_set.clear();
+                session.tx_reservation_vshards.clear();
+                session.tx_reservation_owner = None;
                 session.savepoints.clear();
                 session.pending_offset_commits.clear();
                 std::mem::take(&mut session.pending_sequence_reservations)

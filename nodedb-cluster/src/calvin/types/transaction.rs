@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::CalvinError;
 
+use super::lock_wire::TxnIdWire;
 use super::primitives::{DependentReadSpec, EngineKeySet, VersionedReadSet};
 
 // ── ReadWriteSet ──────────────────────────────────────────────────────────────
@@ -148,6 +149,15 @@ pub struct TxClass {
     #[serde(default)]
     #[msgpack(default)]
     pub versioned_reads: VersionedReadSet,
+    /// Optional lock-table owner id for this transaction, propagated to
+    /// `SequencedTxn.lock_owner`. `Some(R)` when the committing session holds
+    /// read reservations under `R` — the commit batch then acquires its keys as
+    /// `R` and self-upgrades those shared reservations. `None` (default) for
+    /// transactions with no reservation. Wire-additive: decodes to `None` on
+    /// older log entries.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub lock_owner: Option<TxnIdWire>,
     /// Cached participating-vshard set. Re-derived on decode; not serialized.
     #[serde(skip)]
     #[msgpack(ignore)]
@@ -291,6 +301,7 @@ impl TxClass {
             tenant_id,
             dependent_reads,
             versioned_reads,
+            lock_owner: None,
             participating_vshards,
         })
     }
@@ -349,6 +360,11 @@ impl TxClass {
         // Final stable sort after all unions — lockstep with `new_checked`.
         vshards.sort_by_key(|v| v.as_u32());
         self.participating_vshards = vshards;
+    }
+
+    /// Set the lock-table owner id propagated to `SequencedTxn.lock_owner`.
+    pub fn set_lock_owner(&mut self, owner: Option<TxnIdWire>) {
+        self.lock_owner = owner;
     }
 }
 

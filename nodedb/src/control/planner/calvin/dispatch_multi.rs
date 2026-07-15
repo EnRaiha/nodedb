@@ -61,6 +61,7 @@ pub async fn dispatch_tasks_to_calvin(
     cross_shard_mode: CrossShardTxnMode,
     position: TxnDispatchPosition,
     reads: &[ReadSetEntry],
+    lock_owner: Option<nodedb_cluster::calvin::types::TxnIdWire>,
 ) -> crate::Result<Option<Response>> {
     // The read-set widens classification exactly as it widens the TxClass
     // participants below: an empty slice (autocommit) preserves write-only
@@ -85,7 +86,11 @@ pub async fn dispatch_tasks_to_calvin(
                     }
                     // Thread the session read-set into the TxClass so read shards
                     // are enumerated as Calvin participants and validated by OCC.
-                    let tx_class = build_static_tx_class(tasks, tenant_id, reads)?;
+                    let mut tx_class = build_static_tx_class(tasks, tenant_id, reads)?;
+                    // Carry the session's read-reservation owner `R` onto the
+                    // commit batch so it acquires its keys as `R` and self-upgrades
+                    // the shared reservations taken at read time.
+                    tx_class.set_lock_owner(lock_owner);
                     submit_calvin_routed(state, tx_class).await
                 }
                 CrossShardTxnMode::BestEffortNonAtomic => {

@@ -14,9 +14,9 @@
 
 use crate::error::{ClusterError, Result};
 use crate::rpc_codec::{
-    self, AssignSurrogateResponse, RaftRpc, ShuffleAggregateConsumeResponse,
-    ShuffleConsumeResponse, ShuffleProduceResponse, SubmitCalvinInboxResponse,
-    SubmitCalvinTxnResponse, auth_envelope,
+    self, AssignSurrogateResponse, RaftRpc, ReleaseReservationResponse, ReserveReadResponse,
+    ShuffleAggregateConsumeResponse, ShuffleConsumeResponse, ShuffleProduceResponse,
+    SubmitCalvinInboxResponse, SubmitCalvinTxnResponse, auth_envelope,
 };
 use crate::transport::auth_context::AuthContext;
 use crate::transport::rpc_handler::RaftRpcHandler;
@@ -230,6 +230,71 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
             })?;
         send.finish().map_err(|e| ClusterError::Transport {
             detail: format!("finish submit calvin inbox response: {e}"),
+        })?;
+        return Ok(None);
+    }
+
+    // 4i2. Routed reserve-read (Calvin OLLP): a `ReserveReadRequest` is a
+    //     ONE-SHOT request/response. This node is the SEQUENCER-GROUP leader; it
+    //     decodes the carried `LockKey` and assign-only reserves the read lock,
+    //     replying with exactly one `ReserveReadResponse` carrying the minted
+    //     owner or a typed error. The reply is written on this same bidi
+    //     stream's send half (mirroring the submit-calvin-inbox arm above), then
+    //     `finish()`ed.
+    if let RaftRpc::ReserveReadRequest(req) = request {
+        let resp: ReserveReadResponse = handler.on_reserve_read(req).await;
+        let resp_rpc = RaftRpc::ReserveReadResponse(resp);
+        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_seq = auth.peer_seq_out.next();
+        let mut resp_envelope =
+            Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
+        auth_envelope::write_envelope(
+            auth.local_node_id,
+            resp_seq,
+            &resp_inner,
+            &auth.mac_key,
+            &mut resp_envelope,
+        )?;
+        send.write_all(&resp_envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write reserve read response: {e}"),
+            })?;
+        send.finish().map_err(|e| ClusterError::Transport {
+            detail: format!("finish reserve read response: {e}"),
+        })?;
+        return Ok(None);
+    }
+
+    // 4i3. Routed release-reservation (Calvin OLLP): a
+    //     `ReleaseReservationRequest` is a ONE-SHOT request/response and the
+    //     ack-only sibling of the reserve-read arm above. This node is the
+    //     SEQUENCER-GROUP leader; it decodes the carried owner and release
+    //     reason and releases the reservation, replying with exactly one
+    //     `ReleaseReservationResponse` carrying success or a typed error. The
+    //     reply is written on this same bidi stream's send half (mirroring the
+    //     reserve-read arm above), then `finish()`ed.
+    if let RaftRpc::ReleaseReservationRequest(req) = request {
+        let resp: ReleaseReservationResponse = handler.on_release_reservation(req).await;
+        let resp_rpc = RaftRpc::ReleaseReservationResponse(resp);
+        let resp_inner = rpc_codec::encode(&resp_rpc)?;
+        let resp_seq = auth.peer_seq_out.next();
+        let mut resp_envelope =
+            Vec::with_capacity(auth_envelope::ENVELOPE_OVERHEAD + resp_inner.len());
+        auth_envelope::write_envelope(
+            auth.local_node_id,
+            resp_seq,
+            &resp_inner,
+            &auth.mac_key,
+            &mut resp_envelope,
+        )?;
+        send.write_all(&resp_envelope)
+            .await
+            .map_err(|e| ClusterError::Transport {
+                detail: format!("write release reservation response: {e}"),
+            })?;
+        send.finish().map_err(|e| ClusterError::Transport {
+            detail: format!("finish release reservation response: {e}"),
         })?;
         return Ok(None);
     }

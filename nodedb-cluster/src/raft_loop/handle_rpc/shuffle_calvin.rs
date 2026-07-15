@@ -6,10 +6,11 @@
 use crate::error::Result;
 use crate::forward::PlanExecutor;
 use crate::rpc_codec::{
-    AssignSurrogateRequest, AssignSurrogateResponse, ShuffleAggregateConsumeRequest,
-    ShuffleAggregateConsumeResponse, ShuffleConsumeRequest, ShuffleConsumeResponse,
-    ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinInboxRequest, SubmitCalvinInboxResponse,
-    SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
+    AssignSurrogateRequest, AssignSurrogateResponse, ReleaseReservationRequest,
+    ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
+    ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinInboxRequest,
+    SubmitCalvinInboxResponse, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
 };
 
 use super::super::loop_core::{CommitApplier, RaftLoop};
@@ -184,6 +185,52 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
                 error: Some(TypedClusterError::Internal {
                     code: 0,
                     message: "calvin-inbox not configured (no CalvinSubmitInbox installed)".into(),
+                }),
+            },
+        }
+    }
+
+    // Routed reserve-read (Calvin OLLP) — delegate to the host-crate
+    // `ReserveRead`. This node is the sequencer-group leader; reserving
+    // through it is correct because the leader's scheduler holds the
+    // authoritative lock table for its local sequencer inbox. When no
+    // reserve-read hook is installed (cluster-only tests / single-node),
+    // return a typed "not configured" error so the coordinator learns the
+    // request could not run rather than silently believing the read was
+    // reserved.
+    pub(super) async fn on_reserve_read_impl(
+        &self,
+        req: ReserveReadRequest,
+    ) -> ReserveReadResponse {
+        match &self.reserve_read {
+            Some(hook) => hook.on_reserve_read(req).await,
+            None => ReserveReadResponse {
+                owner_bytes: None,
+                error: Some(TypedClusterError::Internal {
+                    code: 0,
+                    message: "reserve-read not configured (no ReserveRead installed)".into(),
+                }),
+            },
+        }
+    }
+
+    // Routed release-reservation (Calvin OLLP) — delegate to the host-crate
+    // `ReleaseReservation`. The ack-only sibling of `on_reserve_read`. When no
+    // release-reservation hook is installed (cluster-only tests /
+    // single-node), return a typed "not configured" error so the coordinator
+    // learns the request could not run rather than silently believing the
+    // reservation was released.
+    pub(super) async fn on_release_reservation_impl(
+        &self,
+        req: ReleaseReservationRequest,
+    ) -> ReleaseReservationResponse {
+        match &self.release_reservation {
+            Some(hook) => hook.on_release_reservation(req).await,
+            None => ReleaseReservationResponse {
+                error: Some(TypedClusterError::Internal {
+                    code: 0,
+                    message: "release-reservation not configured (no ReleaseReservation installed)"
+                        .into(),
                 }),
             },
         }

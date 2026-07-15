@@ -107,6 +107,7 @@ impl NodeDbPgHandler {
                 cross_shard_mode,
                 position,
                 &[],
+                None,
             )
             .await
             .map_err(|e| {

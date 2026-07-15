@@ -291,9 +291,14 @@ impl Scheduler {
         }
 
         for (txn, waiter_id) in to_dispatch {
-            // lock_owner == apply-slot today; the reservation path will recover
-            // the promoted txn's own apply-slot here.
-            self.dispatch_or_barrier(txn, waiter_id, waiter_id);
+            // `waiter_id` is the lock-table owner — a reservation id when the txn
+            // holds a read reservation, otherwise the apply-slot itself. The
+            // watermark / completion apply-slot is ALWAYS the txn's own
+            // `(epoch, position)`; recover it here so a reservation-owned commit
+            // dispatches under the correct apply-slot while releasing the lock
+            // under `waiter_id`.
+            let apply_slot = TxnId::new(txn.epoch, txn.position);
+            self.dispatch_or_barrier(txn, apply_slot, waiter_id);
         }
     }
 }

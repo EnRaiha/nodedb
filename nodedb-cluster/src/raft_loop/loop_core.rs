@@ -25,8 +25,9 @@ use crate::topology::ClusterTopology;
 use crate::transport::NexarTransport;
 
 use super::hooks::{
-    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ShuffleAggregator, ShuffleConsumer,
-    ShuffleProducer, ShuffleReceiver, SnapshotApplier, SnapshotBuilder, SnapshotQuarantineHook,
+    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ReleaseReservation, ReserveRead,
+    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotApplier,
+    SnapshotBuilder, SnapshotQuarantineHook,
 };
 
 /// Default tick interval (10ms — fast enough for sub-second elections).
@@ -205,6 +206,26 @@ pub struct RaftLoop<A: CommitApplier, P: PlanExecutor = NoopPlanExecutor> {
     /// `SubmitCalvinInbox` request return a typed "not configured" error.
     pub(super) calvin_submit_inbox: Option<Arc<dyn CalvinSubmitInbox>>,
 
+    /// Optional routed reserve-read hook (Calvin OLLP).
+    ///
+    /// When set (by the `nodedb` binary via `with_reserve_read`), an incoming
+    /// `ReserveReadRequest` assign-only reserves the read lock for the carried
+    /// `LockKey` through it (this node IS the sequencer-group leader, so the
+    /// reserve is enforced against the authoritative lock table). Cluster-only
+    /// tests leave this `None`, which makes any incoming `ReserveRead` request
+    /// return a typed "not configured" error.
+    pub(super) reserve_read: Option<Arc<dyn ReserveRead>>,
+
+    /// Optional routed release-reservation hook (Calvin OLLP).
+    ///
+    /// Ack-only sibling of [`reserve_read`](Self::reserve_read). When set (by
+    /// the `nodedb` binary via `with_release_reservation`), an incoming
+    /// `ReleaseReservationRequest` releases the reservation held by the
+    /// carried owner through it. Cluster-only tests leave this `None`, which
+    /// makes any incoming `ReleaseReservation` request return a typed "not
+    /// configured" error.
+    pub(super) release_reservation: Option<Arc<dyn ReleaseReservation>>,
+
     /// Optional per-group snapshot builder for the SEND path.
     ///
     /// When set (by the `nodedb` binary via `with_snapshot_builder`), the
@@ -295,6 +316,8 @@ impl<A: CommitApplier> RaftLoop<A> {
             assign_remote_surrogate: None,
             calvin_submit: None,
             calvin_submit_inbox: None,
+            reserve_read: None,
+            release_reservation: None,
             snapshot_builder: None,
             snapshot_applier: None,
             partial_snapshots: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),

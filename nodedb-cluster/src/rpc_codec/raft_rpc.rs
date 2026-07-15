@@ -19,6 +19,9 @@ use super::discriminants::*;
 use super::execute::{ExecuteRequest, ExecuteResponse, ExecuteStreamChunk, ExecuteStreamEnd};
 use super::header::HEADER_SIZE;
 use super::metadata::{MetadataProposeRequest, MetadataProposeResponse};
+use super::reservation::{
+    ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
+};
 use super::shuffle::{
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
     ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk,
@@ -26,8 +29,8 @@ use super::shuffle::{
 };
 use super::surrogate::{AssignSurrogateRequest, AssignSurrogateResponse};
 use super::{
-    calvin_submit, cluster_mgmt, data_propose, execute, metadata, raft_msgs, shuffle, surrogate,
-    vshard,
+    calvin_submit, cluster_mgmt, data_propose, execute, metadata, raft_msgs, reservation, shuffle,
+    surrogate, vshard,
 };
 use crate::error::{ClusterError, Result};
 use crate::wire_version::{unwrap_bytes_versioned, wrap_bytes_versioned};
@@ -116,6 +119,21 @@ pub enum RaftRpc {
     // error.
     SubmitCalvinInboxRequest(SubmitCalvinInboxRequest),
     SubmitCalvinInboxResponse(SubmitCalvinInboxResponse),
+    // Routed reserve-read (Calvin OLLP). A coordinator sends a
+    // `ReserveReadRequest` carrying a msgpack-encoded `LockKeyWire` to the
+    // sequencer-group leader; the leader assign-only reserves the read lock
+    // and replies with one `ReserveReadResponse` carrying the minted owner
+    // (msgpack-encoded `TxnIdWire`) or a typed error.
+    ReserveReadRequest(ReserveReadRequest),
+    ReserveReadResponse(ReserveReadResponse),
+    // Routed release-reservation (Calvin OLLP). The ack-only sibling of
+    // `ReserveRead*`: a coordinator sends a `ReleaseReservationRequest`
+    // carrying the msgpack-encoded owner and release reason to the
+    // sequencer-group leader; the leader releases the reservation and
+    // replies with one `ReleaseReservationResponse` carrying success or a
+    // typed error.
+    ReleaseReservationRequest(ReleaseReservationRequest),
+    ReleaseReservationResponse(ReleaseReservationResponse),
     // Data-group proposal forwarding (groups 1+)
     DataProposeRequest(DataProposeRequest),
     DataProposeResponse(DataProposeResponse),
@@ -172,6 +190,14 @@ pub fn encode(rpc: &RaftRpc) -> Result<Vec<u8>> {
         }
         RaftRpc::SubmitCalvinInboxResponse(m) => {
             calvin_submit::encode_submit_calvin_inbox_resp(m, &mut out)
+        }
+        RaftRpc::ReserveReadRequest(m) => reservation::encode_reserve_read_req(m, &mut out),
+        RaftRpc::ReserveReadResponse(m) => reservation::encode_reserve_read_resp(m, &mut out),
+        RaftRpc::ReleaseReservationRequest(m) => {
+            reservation::encode_release_reservation_req(m, &mut out)
+        }
+        RaftRpc::ReleaseReservationResponse(m) => {
+            reservation::encode_release_reservation_resp(m, &mut out)
         }
         RaftRpc::DataProposeRequest(m) => data_propose::encode_data_propose_req(m, &mut out),
         RaftRpc::DataProposeResponse(m) => data_propose::encode_data_propose_resp(m, &mut out),
@@ -254,6 +280,10 @@ pub fn decode(data: &[u8]) -> Result<RaftRpc> {
         RPC_SUBMIT_CALVIN_TXN_RESP => calvin_submit::decode_submit_calvin_txn_resp(payload),
         RPC_SUBMIT_CALVIN_INBOX_REQ => calvin_submit::decode_submit_calvin_inbox_req(payload),
         RPC_SUBMIT_CALVIN_INBOX_RESP => calvin_submit::decode_submit_calvin_inbox_resp(payload),
+        RPC_RESERVE_READ_REQ => reservation::decode_reserve_read_req(payload),
+        RPC_RESERVE_READ_RESP => reservation::decode_reserve_read_resp(payload),
+        RPC_RELEASE_RESERVATION_REQ => reservation::decode_release_reservation_req(payload),
+        RPC_RELEASE_RESERVATION_RESP => reservation::decode_release_reservation_resp(payload),
         RPC_DATA_PROPOSE_REQ => data_propose::decode_data_propose_req(payload),
         RPC_DATA_PROPOSE_RESP => data_propose::decode_data_propose_resp(payload),
         _ => Err(ClusterError::Codec {

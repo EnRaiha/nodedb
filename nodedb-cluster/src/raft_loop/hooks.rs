@@ -363,3 +363,69 @@ pub trait CalvinSubmitInbox: Send + Sync + 'static {
         req: crate::rpc_codec::SubmitCalvinInboxRequest,
     ) -> crate::rpc_codec::SubmitCalvinInboxResponse;
 }
+
+/// Hook for routed reserve-read (Calvin OLLP).
+///
+/// `nodedb-cluster` cannot depend on `nodedb` (circular), so the reserve
+/// logic — decode the `LockKey` and assign-only reserve the read lock through
+/// THIS node's Calvin sequencer scheduler — lives in `nodedb` behind this
+/// `Send + Sync` hook. The transport read-loop calls
+/// [`on_reserve_read`](Self::on_reserve_read) when a `ReserveReadRequest`
+/// arrives at the SEQUENCER-GROUP leader and writes the returned
+/// [`ReserveReadResponse`](crate::rpc_codec::ReserveReadResponse) back to the
+/// coordinator.
+///
+/// Because the handler runs on the sequencer-group leader, the reserve is
+/// correct: only the leader's scheduler holds the authoritative lock table for
+/// its local sequencer inbox. The coordinator routes here precisely so the
+/// reservation lands where it will actually be enforced.
+///
+/// Cluster-only tests leave the `RaftLoop` field `None`; a `ReserveRead`
+/// request against a node with no reserve-read hook installed returns a typed
+/// "not configured" error.
+///
+/// The hook is **async** for signature symmetry with the other one-shot
+/// hooks; the reserve itself is bounded by the request deadline on the Tokio
+/// transport reactor. It never touches io_uring or storage directly.
+#[async_trait::async_trait]
+pub trait ReserveRead: Send + Sync + 'static {
+    /// Assign-only reserve the read lock for the `LockKey` carried by `req`.
+    /// Returns a [`ReserveReadResponse`](crate::rpc_codec::ReserveReadResponse)
+    /// with the minted (or confirmed) owner on success or a typed error on
+    /// failure (never a silent drop).
+    async fn on_reserve_read(
+        &self,
+        req: crate::rpc_codec::ReserveReadRequest,
+    ) -> crate::rpc_codec::ReserveReadResponse;
+}
+
+/// Hook for routed release-reservation (Calvin OLLP).
+///
+/// Ack-only sibling of [`ReserveRead`]: `nodedb-cluster` cannot depend on
+/// `nodedb` (circular), so the release logic — decode the owner and release
+/// reason, and release the reservation through THIS node's Calvin sequencer
+/// scheduler — lives in `nodedb` behind this `Send + Sync` hook. The transport
+/// read-loop calls [`on_release_reservation`](Self::on_release_reservation)
+/// when a `ReleaseReservationRequest` arrives at the SEQUENCER-GROUP leader
+/// and writes the returned
+/// [`ReleaseReservationResponse`](crate::rpc_codec::ReleaseReservationResponse)
+/// back to the coordinator.
+///
+/// Cluster-only tests leave the `RaftLoop` field `None`; a
+/// `ReleaseReservation` request against a node with no release-reservation
+/// hook installed returns a typed "not configured" error.
+///
+/// The hook is **async** for signature symmetry with the other one-shot
+/// hooks; the release itself is bounded by the request deadline on the Tokio
+/// transport reactor. It never touches io_uring or storage directly.
+#[async_trait::async_trait]
+pub trait ReleaseReservation: Send + Sync + 'static {
+    /// Release the reservation held by the owner carried by `req`. Returns a
+    /// [`ReleaseReservationResponse`](crate::rpc_codec::ReleaseReservationResponse)
+    /// with `error: None` on success (ack) or a typed error on failure (never
+    /// a silent drop).
+    async fn on_release_reservation(
+        &self,
+        req: crate::rpc_codec::ReleaseReservationRequest,
+    ) -> crate::rpc_codec::ReleaseReservationResponse;
+}

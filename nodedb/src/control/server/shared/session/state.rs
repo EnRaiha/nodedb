@@ -123,6 +123,19 @@ pub struct ConnSession {
     /// write-LSN past `read_lsn`, a concurrent write occurred and the
     /// transaction is rejected with SERIALIZATION_FAILURE.
     pub tx_read_set: Vec<super::read_set::ReadSetEntry>,
+    /// Distinct vShards this transaction took a SHARED read reservation on. A
+    /// hot-key read reserves under the transaction's single `tx_reservation_owner`
+    /// and routes to the key's owning vShard; release at every graceful txn exit
+    /// only needs the OWNER plus the SET of vShards touched (one sequenced
+    /// `ReleaseReservation` per distinct vShard), so the per-key lock identity is
+    /// not retained. Ordered (BTree) for deterministic release. Cleared alongside
+    /// `tx_read_set` at transaction boundaries.
+    pub tx_reservation_vshards: BTreeSet<u32>,
+    /// The single reservation owner id minted for this transaction, set on the
+    /// FIRST hot-key read and reused for every subsequent reservation so one
+    /// `lock_owner` covers the whole transaction. `None` until the first hot-key
+    /// read reserves, and reset at transaction boundaries.
+    pub tx_reservation_owner: Option<nodedb_cluster::calvin::types::TxnIdWire>,
     /// Savepoint stack. On ROLLBACK TO, truncate tx_buffer to the saved length
     /// AND rewind each staged vShard's two Data-Plane staging overlays (value/TTL
     /// and GRAPH) to their saved journal markers. See [`SavepointEntry`].
@@ -219,6 +232,8 @@ impl ConnSession {
             tx_id: None,
             tx_vshards: BTreeSet::new(),
             tx_read_set: Vec::new(),
+            tx_reservation_vshards: BTreeSet::new(),
+            tx_reservation_owner: None,
             savepoints: Vec::new(),
             pending_offset_commits: Vec::new(),
             cursors: HashMap::new(),

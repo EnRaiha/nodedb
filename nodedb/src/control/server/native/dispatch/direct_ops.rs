@@ -235,6 +235,7 @@ pub(crate) async fn handle_direct_op(
                 CrossShardTxnMode::Strict,
                 TxnDispatchPosition::Autocommit,
                 &[],
+                None,
             )
             .await
             {
@@ -345,14 +346,18 @@ pub(crate) async fn handle_graph_match(
             == crate::control::server::shared::session::TransactionState::InBlock
     {
         crate::control::server::shared::session::record_read_set(
+            ctx.state,
             ctx.sessions,
             ctx.peer_addr,
             ctx.tenant_id(),
-            &plan_for_response,
-            &[(vshard_id, resp.watermark_lsn)],
-            resp.read_version_lsn,
-            resp.status == Status::Ok,
-        );
+            crate::control::server::shared::session::ReadCapture {
+                plan: &plan_for_response,
+                watermarks: &[(vshard_id, resp.watermark_lsn)],
+                read_version_lsn: resp.read_version_lsn,
+                found: resp.status == Status::Ok,
+            },
+        )
+        .await;
     }
 
     if resp.status == Status::Error {
@@ -477,14 +482,18 @@ async fn dispatch_single_task(
                     == crate::control::server::shared::session::TransactionState::InBlock
             {
                 crate::control::server::shared::session::record_read_set(
+                    ctx.state,
                     ctx.sessions,
                     ctx.peer_addr,
                     ctx.tenant_id(),
-                    &plan_for_response,
-                    &[(task_vshard, resp.watermark_lsn)],
-                    resp.read_version_lsn,
-                    resp.status == Status::Ok,
-                );
+                    crate::control::server::shared::session::ReadCapture {
+                        plan: &plan_for_response,
+                        watermarks: &[(task_vshard, resp.watermark_lsn)],
+                        read_version_lsn: resp.read_version_lsn,
+                        found: resp.status == Status::Ok,
+                    },
+                )
+                .await;
             }
             data_plane_response_to_native(ctx, seq, &plan_for_response, &resp)
         }

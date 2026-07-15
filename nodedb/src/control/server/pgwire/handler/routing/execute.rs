@@ -397,14 +397,18 @@ impl NodeDbPgHandler {
                     shard_watermarks
                 };
                 crate::control::server::shared::session::record_read_set(
+                    &self.state,
                     &self.sessions,
                     addr,
                     identity.tenant_id,
-                    &plan_for_response,
-                    &watermarks,
-                    resp.read_version_lsn,
-                    resp.status == crate::bridge::envelope::Status::Ok,
-                );
+                    crate::control::server::shared::session::ReadCapture {
+                        plan: &plan_for_response,
+                        watermarks: &watermarks,
+                        read_version_lsn: resp.read_version_lsn,
+                        found: resp.status == crate::bridge::envelope::Status::Ok,
+                    },
+                )
+                .await;
             }
 
             // Record the session's OWN committed write-version so a later

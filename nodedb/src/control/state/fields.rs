@@ -331,6 +331,9 @@ pub struct SharedState {
     pub startup: Arc<crate::control::startup::StartupGate>,
     /// Calvin sequencer inbox for cross-shard transactions (empty in single-node mode).
     pub sequencer_inbox: std::sync::OnceLock<nodedb_cluster::calvin::sequencer::inbox::Inbox>,
+    /// Calvin reservation inbox for hot-key read reservations (empty in single-node mode).
+    pub reservation_inbox:
+        std::sync::OnceLock<nodedb_cluster::calvin::sequencer::reservation_inbox::ReservationInbox>,
     /// Sequencer metrics for Prometheus `/metrics` route.
     pub sequencer_metrics: std::sync::OnceLock<
         std::sync::Arc<nodedb_cluster::calvin::sequencer::metrics::SequencerMetrics>,
@@ -400,11 +403,9 @@ pub struct SharedState {
     >,
     /// Per-vShard deterministic lock managers, lifted out of each Calvin
     /// `Scheduler` so the Control-Plane write-admission gate shares the SAME
-    /// `Arc<Mutex<LockManager>>` the scheduler holds. A fast-path uncontended
-    /// point write and a Calvin transaction's lock validation then contend on
-    /// one OS mutex — whoever takes it first wins, no time-of-check /
-    /// time-of-use gap. Keyed by vShard id; empty in single-node / no-Calvin
-    /// deployments (the gate then admits point writes without a fence).
+    /// `Arc<Mutex<LockManager>>` the scheduler holds — a fast-path point write and
+    /// a Calvin txn's lock validation contend on one OS mutex, no TOCTOU gap.
+    /// Keyed by vShard id; empty in single-node / no-Calvin deployments.
     pub calvin_lock_managers: Arc<
         Mutex<
             std::collections::BTreeMap<
@@ -413,21 +414,16 @@ pub struct SharedState {
             >,
         >,
     >,
-    /// Per-vShard promotion channels, parallel to [`calvin_lock_managers`]. When a
-    /// fast-path [`WriteAdmissionGuard`] releases an uncontended key on drop, the
-    /// deterministic [`LockManager::release`] may promote a multi-vShard scheduler
-    /// transaction queued behind that key to holder. The guard runs on the
-    /// Control Plane, not inside the owning vShard's scheduler task, so it cannot
-    /// dispatch the promoted txn itself — it sends the promoted `TxnId`s over
-    /// this channel to the scheduler, which runs its normal promotion -> dispatch
-    /// path. Unbounded: promotions are low-volume (bounded by in-flight txns) and
-    /// the send happens from a synchronous `Drop` that must never block or await.
-    /// Keyed by vShard id; empty in single-node / no-Calvin deployments (the gate
-    /// then has no sender and the drop is a no-op).
-    ///
-    /// [`calvin_lock_managers`]: Self::calvin_lock_managers
-    /// [`WriteAdmissionGuard`]: crate::control::server::shared::write_admission::WriteAdmissionGuard
-    /// [`LockManager::release`]: crate::control::cluster::calvin::scheduler::lock_manager::LockManager::release
+    /// Global hot-key detector for Calvin read reservations (CP-local heuristic).
+    pub hot_key_table: std::sync::Arc<
+        std::sync::Mutex<crate::control::cluster::calvin::scheduler::lock::HotKeyTable>,
+    >,
+    /// Per-vShard promotion channels, parallel to `calvin_lock_managers`. When a
+    /// fast-path write guard releases an uncontended key on drop, `LockManager`
+    /// may promote a scheduler txn queued behind it; the guard (Control-Plane,
+    /// not in the scheduler task) forwards the promoted `TxnId`s here for the
+    /// scheduler to dispatch. Unbounded (low-volume, sent from a non-blocking
+    /// `Drop`). Keyed by vShard id; empty in single-node / no-Calvin deployments.
     pub calvin_promotion_senders: Arc<
         Mutex<
             std::collections::BTreeMap<

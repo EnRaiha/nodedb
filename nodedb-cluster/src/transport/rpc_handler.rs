@@ -9,6 +9,7 @@ use nodedb_raft::message::TimeoutNowRequest;
 
 use crate::rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
+    ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
     ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinInboxRequest,
     SubmitCalvinInboxResponse, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
@@ -139,4 +140,26 @@ pub trait RaftRpcHandler: Send + Sync + 'static {
         &self,
         req: SubmitCalvinInboxRequest,
     ) -> impl std::future::Future<Output = SubmitCalvinInboxResponse> + Send;
+
+    /// Routed reserve-read (Calvin OLLP). This node is the SEQUENCER-GROUP
+    /// leader: decode the `LockKey` carried by `req` and assign-only reserve
+    /// the read lock. The transport writes exactly one [`ReserveReadResponse`]
+    /// carrying the minted owner (or a typed error) back to the coordinator.
+    /// The reserve is bounded by `req.deadline_remaining_ms`.
+    fn on_reserve_read(
+        &self,
+        req: ReserveReadRequest,
+    ) -> impl std::future::Future<Output = ReserveReadResponse> + Send;
+
+    /// Routed release-reservation (Calvin OLLP). The ack-only sibling of
+    /// [`on_reserve_read`](Self::on_reserve_read). This node is the
+    /// SEQUENCER-GROUP leader: decode the owner and release reason carried by
+    /// `req` and release the reservation. The transport writes exactly one
+    /// [`ReleaseReservationResponse`] carrying success (or a typed error)
+    /// back to the coordinator. The release is bounded by
+    /// `req.deadline_remaining_ms`.
+    fn on_release_reservation(
+        &self,
+        req: ReleaseReservationRequest,
+    ) -> impl std::future::Future<Output = ReleaseReservationResponse> + Send;
 }

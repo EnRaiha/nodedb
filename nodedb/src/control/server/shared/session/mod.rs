@@ -8,6 +8,7 @@ mod cursor;
 pub mod cursor_spill;
 pub mod ddl_buffer;
 pub mod expander_stage;
+mod hot_key;
 mod leader_forward;
 pub mod lifecycle;
 mod listen;
@@ -18,6 +19,7 @@ mod own_writes;
 mod params;
 pub mod read_consistency;
 pub mod read_set;
+mod reservation_release;
 pub mod savepoint_ops;
 pub mod staging_gate;
 mod state;
@@ -36,7 +38,7 @@ pub use self::params::{
     is_known_pg_runtime_parameter, is_known_settable_runtime_parameter, parse_set_command,
     parse_show_command,
 };
-pub use self::read_set::{EngineTag, ReadKey, ReadSetEntry, record_read_set};
+pub use self::read_set::{EngineTag, ReadCapture, ReadKey, ReadSetEntry, record_read_set};
 pub use self::savepoint_ops::SavepointError;
 pub use self::staging_gate::{
     DetachedTxnScope, DmlTxnCtx, InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError,

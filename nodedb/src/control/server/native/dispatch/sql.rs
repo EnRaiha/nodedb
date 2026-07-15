@@ -315,6 +315,7 @@ async fn execute_planned(
                     cross_shard_mode,
                     TxnDispatchPosition::Autocommit,
                     &[],
+                    None,
                 )
                 .await
                 {

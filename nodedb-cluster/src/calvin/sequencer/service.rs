@@ -29,14 +29,33 @@ use crate::calvin::sequencer::config::SEQUENCER_GROUP_ID;
 use crate::calvin::sequencer::config::SequencerConfig;
 use crate::calvin::sequencer::entry::SequencerEntry;
 use crate::calvin::sequencer::inbox::{AdmittedTx, InboxReceiver};
+use crate::calvin::sequencer::reservation_inbox::{ReservationInboxReceiver, ReservationRequest};
 use crate::calvin::sequencer::validator::validate_batch_with_assignments;
-use crate::calvin::types::EpochBatch;
+use crate::calvin::types::{EpochBatch, TxnIdWire};
 use crate::calvin::{CalvinCompletionRegistry, TxnId};
 use crate::error::ClusterError;
 use crate::multi_raft::MultiRaft;
 
 // Re-export so existing call sites (`service::SequencerMetrics`) don't break.
 pub use crate::calvin::sequencer::metrics::{ConflictKey, SequencerMetrics};
+
+/// The low edge of the reservation position band.
+///
+/// Real batch positions run `0..N` where `N <= max_txns_per_epoch`, far below
+/// `2^31`. A reservation minted at a position `>= 2^31` therefore can never
+/// share a `(epoch, position)` lock-table identity with a real batch txn in the
+/// same epoch, so reservations and batch txns never collide.
+///
+/// Reservations create NO watermark obligation — `install_reservation` never
+/// calls `note_expected` — so this band is purely anti-collision, not a
+/// scheduling reservation of positions.
+pub const RESERVATION_POSITION_BAND: u32 = 1 << 31;
+
+/// The two inbound channels a `SequencerService` drains each leader tick.
+pub struct SequencerReceivers {
+    pub inbox: InboxReceiver,
+    pub reservations: ReservationInboxReceiver,
+}
 
 /// The Calvin sequencer service.
 ///
@@ -47,6 +66,17 @@ pub struct SequencerService {
     node_id: u64,
     multi_raft: Arc<Mutex<MultiRaft>>,
     inbox_receiver: InboxReceiver,
+    /// Carries hot-key read-reservation requests from the Control Plane. Only
+    /// the leader services it (see `process_reservations`); a follower drains
+    /// and discards it so awaiting callers fall back to plain OCC.
+    reservation_receiver: ReservationInboxReceiver,
+    /// The next position to mint in the reservation band for `reservation_epoch`.
+    /// Reset to [`RESERVATION_POSITION_BAND`] whenever the current epoch advances
+    /// so minted positions stay small and unique within each epoch.
+    next_reservation_position: u32,
+    /// The epoch `next_reservation_position` is counting within. When it lags
+    /// `current_epoch`, the band counter is reset before the next mint.
+    reservation_epoch: u64,
     /// Current epoch number. The leader starts at the last committed epoch + 1
     /// (loaded from state machine on construction) and increments after each
     /// successful proposal. On leader failover, `inbox_receiver` is simply
@@ -72,16 +102,23 @@ impl SequencerService {
         config: SequencerConfig,
         node_id: u64,
         multi_raft: Arc<Mutex<MultiRaft>>,
-        inbox_receiver: InboxReceiver,
+        receivers: SequencerReceivers,
         starting_epoch: u64,
         completion_registry: Arc<CalvinCompletionRegistry>,
         verdict_rx: mpsc::Receiver<(TxnId, bool)>,
     ) -> Self {
+        let SequencerReceivers {
+            inbox,
+            reservations,
+        } = receivers;
         Self {
             config,
             node_id,
             multi_raft,
-            inbox_receiver,
+            inbox_receiver: inbox,
+            reservation_receiver: reservations,
+            next_reservation_position: RESERVATION_POSITION_BAND,
+            reservation_epoch: 0,
             current_epoch: starting_epoch,
             metrics: SequencerMetrics::new(),
             completion_registry,
@@ -171,9 +208,14 @@ impl SequencerService {
         if !self.is_leader() {
             // Drain and discard: clients will retry against the real leader.
             let discarded = self.inbox_receiver.drain_all_discard();
+            // Discard reservation requests too: dropping each `Reserve`'s `reply`
+            // sender makes the CP awaiter observe a closed channel and fall back
+            // to plain OCC — correct degradation when this node is not leader.
+            let reservations_discarded = self.reservation_receiver.drain_all_discard();
             debug!(
                 node_id = self.node_id,
-                "not sequencer leader; discarding {discarded} inbox items",
+                "not sequencer leader; discarding {discarded} inbox items \
+                 and {reservations_discarded} reservation requests",
             );
             return;
         }
@@ -186,6 +228,11 @@ impl SequencerService {
         // re-driven to durability. It is safe to skip only when not leader, which
         // the gate above already guarantees.
         self.redrive_unproposed_verdicts();
+
+        // Service hot-key read reservations on EVERY leader tick, before the txn
+        // drain — so reservations are minted and proposed even on ticks that
+        // early-return below (empty inbox, all candidates rejected).
+        self.process_reservations();
 
         // Snapshot inbox depth before drain so the gauge reflects the queue
         // depth at the start of this epoch.
@@ -317,6 +364,98 @@ impl SequencerService {
                     "sequencer failover verdict re-propose failed; the next tick will \
                      retry while this node stays leader"
                 );
+            }
+        }
+    }
+
+    /// Service every pending hot-key read-reservation request.
+    ///
+    /// Leader-only: the caller gates on `is_leader`. For a `Reserve` with no
+    /// owner this mints a stable `R = (current_epoch, position)` in the
+    /// reservation band and proposes a `ReserveRead` entry; for a `Reserve` with
+    /// an existing owner it echoes that id (no mint) and proposes an additional
+    /// `ReserveRead` under it. `Release` fires a `ReleaseReservation` entry.
+    ///
+    /// Minting reads only `self.current_epoch` plus the local band counter and
+    /// ships the resulting id on the wire entry — replicas never recompute it,
+    /// exactly like the batch position path in `validate_batch_with_assignments`.
+    /// No wall-clock, no per-replica divergence.
+    fn process_reservations(&mut self) {
+        let mut requests: Vec<ReservationRequest> = Vec::new();
+        self.reservation_receiver.drain_into(&mut requests);
+
+        for request in requests {
+            match request {
+                ReservationRequest::Reserve {
+                    key,
+                    vshard,
+                    owner,
+                    reply,
+                } => {
+                    let owner_id = match owner {
+                        // Reserve an additional key under an existing R: echo it,
+                        // no mint.
+                        Some(existing) => existing,
+                        // Mint a fresh R for a new interactive txn.
+                        None => {
+                            // Reset the band counter when the epoch advances so
+                            // positions stay small and unique within each epoch.
+                            if self.reservation_epoch != self.current_epoch {
+                                self.reservation_epoch = self.current_epoch;
+                                self.next_reservation_position = RESERVATION_POSITION_BAND;
+                            }
+                            let position = self.next_reservation_position;
+                            match self.next_reservation_position.checked_add(1) {
+                                Some(n) => self.next_reservation_position = n,
+                                None => {
+                                    // Band exhausted within one epoch (pathological:
+                                    // 2^31 reservations with no committed txn to
+                                    // advance the epoch). Refuse rather than wrap
+                                    // into the batch band; dropping `reply` degrades
+                                    // the caller to OCC.
+                                    warn!(
+                                        epoch = self.current_epoch,
+                                        "reservation band exhausted within epoch; \
+                                         refusing reservation, caller falls back to OCC"
+                                    );
+                                    drop(reply);
+                                    continue;
+                                }
+                            }
+                            TxnIdWire {
+                                epoch: self.current_epoch,
+                                position,
+                            }
+                        }
+                    };
+
+                    match self.propose_entry(&SequencerEntry::ReserveRead {
+                        owner: owner_id,
+                        vshard,
+                        key,
+                    }) {
+                        Ok(_) => {
+                            let _ = reply.send(owner_id);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "reservation propose failed; caller falls back to OCC");
+                            // Drop `reply` implicitly at scope end → caller degrades.
+                        }
+                    }
+                }
+                ReservationRequest::Release {
+                    owner,
+                    vshard,
+                    reason,
+                } => {
+                    if let Err(e) = self.propose_entry(&SequencerEntry::ReleaseReservation {
+                        owner,
+                        vshard,
+                        reason,
+                    }) {
+                        warn!(error = %e, "reservation release propose failed");
+                    }
+                }
             }
         }
     }

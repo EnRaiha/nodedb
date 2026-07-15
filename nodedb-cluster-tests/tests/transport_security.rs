@@ -169,6 +169,23 @@ impl RaftRpcHandler for EchoHandler {
             error: None,
         }
     }
+
+    async fn on_reserve_read(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ReserveReadRequest,
+    ) -> nodedb_cluster::rpc_codec::ReserveReadResponse {
+        nodedb_cluster::rpc_codec::ReserveReadResponse {
+            owner_bytes: None,
+            error: None,
+        }
+    }
+
+    async fn on_release_reservation(
+        &self,
+        _req: nodedb_cluster::rpc_codec::ReleaseReservationRequest,
+    ) -> nodedb_cluster::rpc_codec::ReleaseReservationResponse {
+        nodedb_cluster::rpc_codec::ReleaseReservationResponse { error: None }
+    }
 }
 
 fn sample_append(term: u64) -> AppendEntriesRequest {

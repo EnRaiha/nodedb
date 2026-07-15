@@ -639,6 +639,23 @@ mod tests {
                     error: None,
                 }
             }
+
+            async fn on_reserve_read(
+                &self,
+                _req: crate::rpc_codec::ReserveReadRequest,
+            ) -> crate::rpc_codec::ReserveReadResponse {
+                crate::rpc_codec::ReserveReadResponse {
+                    owner_bytes: None,
+                    error: None,
+                }
+            }
+
+            async fn on_release_reservation(
+                &self,
+                _req: crate::rpc_codec::ReleaseReservationRequest,
+            ) -> crate::rpc_codec::ReleaseReservationResponse {
+                crate::rpc_codec::ReleaseReservationResponse { error: None }
+            }
         }
 
         let handler = Arc::new(JoinHandler {

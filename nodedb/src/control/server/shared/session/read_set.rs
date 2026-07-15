@@ -24,9 +24,15 @@
 //! optimistic-concurrency check to consume.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+
+use nodedb_cluster::calvin::types::LockKeyWire;
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::cluster::calvin::scheduler::lock::LockKey;
+use crate::control::planner::calvin::reservation::submit_reserve_read;
 use crate::control::server::shared::plan_util::{extract_collection, plan_engine, read_key_of};
+use crate::control::state::SharedState;
 use crate::types::{DatabaseId, KeyRepr, Lsn, TenantId, VShardId};
 
 use super::store::SessionStore;
@@ -85,6 +91,16 @@ pub struct ReadSetEntry {
     pub read_version_lsn: Lsn,
 }
 
+/// The observed read passed to [`record_read_set`]: the executed plan, the
+/// responding shards' write-LSN watermarks, the read-version floor, and whether
+/// a point read hit.
+pub struct ReadCapture<'a> {
+    pub plan: &'a PhysicalPlan,
+    pub watermarks: &'a [(VShardId, Lsn)],
+    pub read_version_lsn: Lsn,
+    pub found: bool,
+}
+
 /// Record a completed read into the session's transaction read-set.
 ///
 /// Transport-agnostic: every read post-dispatch seam calls this with the plan
@@ -108,15 +124,19 @@ pub struct ReadSetEntry {
 /// `found` reports whether a point read observed a present row (`true` on a
 /// hit, `false` on a miss). It only affects document point reads — an absent
 /// document read degrades to a collection-scoped predicate; see [`read_key_of`].
-pub fn record_read_set(
+pub async fn record_read_set(
+    state: &SharedState,
     sessions: &SessionStore,
     addr: &SocketAddr,
     tenant_id: TenantId,
-    plan: &PhysicalPlan,
-    watermarks: &[(VShardId, Lsn)],
-    read_version_lsn: Lsn,
-    found: bool,
+    capture: ReadCapture<'_>,
 ) {
+    let ReadCapture {
+        plan,
+        watermarks,
+        read_version_lsn,
+        found,
+    } = capture;
     if watermarks.is_empty() {
         return;
     }
@@ -161,6 +181,106 @@ pub fn record_read_set(
         .collect();
 
     sessions.record_read_entries(addr, entries);
+
+    // RESERVE-AT-READ: when an interactive transaction reads a HOT point key,
+    // take a sequenced SHARED reservation on it and remember the granted owner on
+    // the session so the eventual commit can carry it as `lock_owner`. The
+    // reservation is a hint — `is_hot` varies per node, and a failed/absent
+    // reservation simply means the read proceeds under plain OCC. It never
+    // changes the read result and never fails the read.
+
+    // Autocommit reads never reserve: there is no transaction to carry the owner.
+    if !sessions.is_in_transaction_block(addr) {
+        return;
+    }
+
+    // Only single-row point reads are lockable; scans / index / absent-document
+    // observations have no single lock key to reserve.
+    let Some(lock_key) = lock_key_of_read(&key, &collection) else {
+        return;
+    };
+
+    // Hotness check — scope the table guard so it drops BEFORE any await.
+    let now = std::time::Instant::now();
+    let hot = {
+        let table = state
+            .hot_key_table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        table.is_hot(&lock_key, now)
+    };
+    if !hot {
+        return;
+    }
+
+    // Route the shared reservation to the SAME vshard the commit batch will use
+    // for this key (write/commit routing derives the shard identically), so the
+    // self-upgrade at commit finds the shared lock on the right scheduler.
+    let vshard = VShardId::from_collection_in_database(database_id, &collection).as_u32();
+    // Reuse the transaction's single reservation owner (None on the first hot-key
+    // read; the assignment mints it, and `record_reservation` adopts it). Guard
+    // dropped inside the accessor — nothing is held across the await below.
+    let owner = sessions.current_reservation_owner(addr);
+    let wire_key = lock_key_to_wire(&lock_key);
+    match submit_reserve_read(state, wire_key, vshard, owner).await {
+        Ok(r) => sessions.record_reservation(addr, vshard, r),
+        Err(e) => {
+            tracing::debug!(error = %e, "hot-key read reservation failed; proceeding under OCC");
+        }
+    }
+}
+
+/// Map a completed point read (`ReadKey` + collection) to the deterministic CP
+/// [`LockKey`] it observed, when the read was a single-row point read
+/// (`Surrogate` or `KvKey`). Every other shape (predicate / index-eq /
+/// index-range scans, absent document) has no single lock key to reserve.
+///
+/// `pub(super)` so [`super::hot_key::record_read_set_aborts`] can reuse the
+/// same construction instead of duplicating the `KeyRepr` match against a
+/// [`ReadSetEntry`]'s `(key, collection)` pair.
+pub(super) fn lock_key_of_read(key: &ReadKey, collection: &str) -> Option<LockKey> {
+    match key {
+        ReadKey::Point {
+            repr: KeyRepr::Surrogate(s),
+        } => Some(LockKey::Surrogate {
+            collection: Arc::from(collection),
+            surrogate: *s,
+        }),
+        ReadKey::Point {
+            repr: KeyRepr::KvKey(k),
+        } => Some(LockKey::Kv {
+            collection: Arc::from(collection),
+            key: Arc::from(&**k),
+        }),
+        _ => None,
+    }
+}
+
+/// Convert a CP [`LockKey`] into its [`LockKeyWire`] transport twin — the
+/// inverse of the scheduler driver's `decode_lock_key`.
+fn lock_key_to_wire(key: &LockKey) -> LockKeyWire {
+    match key {
+        LockKey::Surrogate {
+            collection,
+            surrogate,
+        } => LockKeyWire::Surrogate {
+            collection: collection.to_string(),
+            surrogate: *surrogate,
+        },
+        LockKey::Kv { collection, key } => LockKeyWire::Kv {
+            collection: collection.to_string(),
+            key: key.to_vec(),
+        },
+        LockKey::Edge {
+            collection,
+            src,
+            dst,
+        } => LockKeyWire::Edge {
+            collection: collection.to_string(),
+            src: *src,
+            dst: *dst,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -196,18 +316,41 @@ mod tests {
         (sessions, a)
     }
 
-    #[test]
-    fn point_read_records_point_key() {
+    /// Build a minimal `SharedState` for the read-capture seam. The hot-key
+    /// table starts empty, so `is_hot` is always false here and the
+    /// reserve-at-read path is a no-op — these tests exercise read-set capture,
+    /// not reservation. The returned `TempDir` must outlive the state (it backs
+    /// the test WAL).
+    fn test_state() -> (std::sync::Arc<SharedState>, tempfile::TempDir) {
+        use crate::bridge::dispatch::Dispatcher;
+        use crate::wal::WalManager;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = std::sync::Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("wal"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("shared state");
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn point_read_records_point_key() {
+        let (state, _dir) = test_state();
         let (sessions, a) = begun_session();
         record_read_set(
+            &state,
             &sessions,
             &a,
             TenantId::new(1),
-            &kv_get("c", b"k1"),
-            &[(VShardId::new(0), Lsn::new(7))],
-            Lsn::ZERO,
-            true,
-        );
+            ReadCapture {
+                plan: &kv_get("c", b"k1"),
+                watermarks: &[(VShardId::new(0), Lsn::new(7))],
+                read_version_lsn: Lsn::ZERO,
+                found: true,
+            },
+        )
+        .await;
         let rs = sessions.take_read_set(&a);
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].engine, EngineTag::Kv);
@@ -221,43 +364,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn predicate_read_records_predicate_key() {
+    #[tokio::test]
+    async fn predicate_read_records_predicate_key() {
+        let (state, _dir) = test_state();
         let (sessions, a) = begun_session();
         // A batch get spans multiple keys — recorded as a collection-scoped
         // predicate (never under-approximated to a single key).
         record_read_set(
+            &state,
             &sessions,
             &a,
             TenantId::new(1),
-            &kv_batch_get("c"),
-            &[(VShardId::new(0), Lsn::new(9))],
-            Lsn::ZERO,
-            true,
-        );
+            ReadCapture {
+                plan: &kv_batch_get("c"),
+                watermarks: &[(VShardId::new(0), Lsn::new(9))],
+                read_version_lsn: Lsn::ZERO,
+                found: true,
+            },
+        )
+        .await;
         let rs = sessions.take_read_set(&a);
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].key, ReadKey::Predicate);
     }
 
-    #[test]
-    fn multi_shard_read_records_one_entry_per_watermark() {
+    #[tokio::test]
+    async fn multi_shard_read_records_one_entry_per_watermark() {
+        let (state, _dir) = test_state();
         let (sessions, a) = begun_session();
         // A predicate fanned over three cores records one entry per shard, each
         // stamped with that shard's own watermark — NOT a single collapsed max.
         record_read_set(
+            &state,
             &sessions,
             &a,
             TenantId::new(1),
-            &kv_batch_get("c"),
-            &[
-                (VShardId::new(0), Lsn::new(3)),
-                (VShardId::new(1), Lsn::new(11)),
-                (VShardId::new(2), Lsn::new(7)),
-            ],
-            Lsn::ZERO,
-            true,
-        );
+            ReadCapture {
+                plan: &kv_batch_get("c"),
+                watermarks: &[
+                    (VShardId::new(0), Lsn::new(3)),
+                    (VShardId::new(1), Lsn::new(11)),
+                    (VShardId::new(2), Lsn::new(7)),
+                ],
+                read_version_lsn: Lsn::ZERO,
+                found: true,
+            },
+        )
+        .await;
         let rs = sessions.take_read_set(&a);
         assert_eq!(rs.len(), 3);
         let mut lsns: Vec<u64> = rs.iter().map(|e| e.read_lsn.as_u64()).collect();
@@ -265,21 +418,26 @@ mod tests {
         assert_eq!(lsns, vec![3, 7, 11]);
     }
 
-    #[test]
-    fn absent_key_point_read_is_recorded() {
+    #[tokio::test]
+    async fn absent_key_point_read_is_recorded() {
+        let (state, _dir) = test_state();
         let (sessions, a) = begun_session();
         // A "not found" is a validatable phantom observation: the KV point entry
         // is recorded (as `found = false`) at the current watermark. KV keeps the
         // precise byte key — the identity any future insert of that key reuses.
         record_read_set(
+            &state,
             &sessions,
             &a,
             TenantId::new(1),
-            &kv_get("c", b"missing"),
-            &[(VShardId::new(0), Lsn::new(5))],
-            Lsn::ZERO,
-            false,
-        );
+            ReadCapture {
+                plan: &kv_get("c", b"missing"),
+                watermarks: &[(VShardId::new(0), Lsn::new(5))],
+                read_version_lsn: Lsn::ZERO,
+                found: false,
+            },
+        )
+        .await;
         let rs = sessions.take_read_set(&a);
         assert_eq!(rs.len(), 1);
         assert_eq!(
@@ -302,20 +460,25 @@ mod tests {
         })
     }
 
-    #[test]
-    fn document_point_read_hit_records_precise_surrogate() {
+    #[tokio::test]
+    async fn document_point_read_hit_records_precise_surrogate() {
+        let (state, _dir) = test_state();
         let (sessions, a) = begun_session();
         // A hit keeps the precise cross-engine surrogate so the common case is
         // validated per-key (no over-abort).
         record_read_set(
+            &state,
             &sessions,
             &a,
             TenantId::new(1),
-            &doc_point_get("docs", 42),
-            &[(VShardId::new(0), Lsn::new(7))],
-            Lsn::ZERO,
-            true,
-        );
+            ReadCapture {
+                plan: &doc_point_get("docs", 42),
+                watermarks: &[(VShardId::new(0), Lsn::new(7))],
+                read_version_lsn: Lsn::ZERO,
+                found: true,
+            },
+        )
+        .await;
         let rs = sessions.take_read_set(&a);
         assert_eq!(rs.len(), 1);
         assert_eq!(
@@ -326,56 +489,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn absent_document_point_read_records_predicate() {
+    #[tokio::test]
+    async fn absent_document_point_read_records_predicate() {
+        let (state, _dir) = test_state();
         let (sessions, a) = begun_session();
         // A miss degrades to the collection-scoped predicate: the placeholder
         // surrogate would never collide with a phantom insert's fresh surrogate,
         // so the collection floor is the only safe read identity.
         record_read_set(
+            &state,
             &sessions,
             &a,
             TenantId::new(1),
-            &doc_point_get("docs", 999),
-            &[(VShardId::new(0), Lsn::new(5))],
-            Lsn::ZERO,
-            false,
-        );
+            ReadCapture {
+                plan: &doc_point_get("docs", 999),
+                watermarks: &[(VShardId::new(0), Lsn::new(5))],
+                read_version_lsn: Lsn::ZERO,
+                found: false,
+            },
+        )
+        .await;
         let rs = sessions.take_read_set(&a);
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].key, ReadKey::Predicate);
     }
 
-    #[test]
-    fn autocommit_reads_are_not_recorded() {
+    #[tokio::test]
+    async fn autocommit_reads_are_not_recorded() {
+        let (state, _dir) = test_state();
         let sessions = SessionStore::new();
         let a = addr();
         sessions.ensure_session(a);
         // No BEGIN: outside a transaction block the read-set stays empty.
         record_read_set(
+            &state,
             &sessions,
             &a,
             TenantId::new(1),
-            &kv_get("c", b"k1"),
-            &[(VShardId::new(0), Lsn::new(7))],
-            Lsn::ZERO,
-            true,
-        );
+            ReadCapture {
+                plan: &kv_get("c", b"k1"),
+                watermarks: &[(VShardId::new(0), Lsn::new(7))],
+                read_version_lsn: Lsn::ZERO,
+                found: true,
+            },
+        )
+        .await;
         assert!(sessions.take_read_set(&a).is_empty());
     }
 
-    #[test]
-    fn empty_watermarks_records_nothing() {
+    #[tokio::test]
+    async fn empty_watermarks_records_nothing() {
+        let (state, _dir) = test_state();
         let (sessions, a) = begun_session();
         record_read_set(
+            &state,
             &sessions,
             &a,
             TenantId::new(1),
-            &kv_get("c", b"k1"),
-            &[],
-            Lsn::ZERO,
-            true,
-        );
+            ReadCapture {
+                plan: &kv_get("c", b"k1"),
+                watermarks: &[],
+                read_version_lsn: Lsn::ZERO,
+                found: true,
+            },
+        )
+        .await;
         assert!(sessions.take_read_set(&a).is_empty());
     }
 

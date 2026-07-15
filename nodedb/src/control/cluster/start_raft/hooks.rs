@@ -26,6 +26,8 @@ pub(super) struct Hooks {
     pub(super) assign_remote_surrogate: Arc<dyn nodedb_cluster::AssignRemoteSurrogate>,
     pub(super) calvin_submit: Arc<dyn nodedb_cluster::CalvinSubmit>,
     pub(super) calvin_submit_inbox: Arc<dyn nodedb_cluster::CalvinSubmitInbox>,
+    pub(super) reserve_read: Arc<dyn nodedb_cluster::ReserveRead>,
+    pub(super) release_reservation: Arc<dyn nodedb_cluster::ReleaseReservation>,
 }
 
 /// Build every cross-plane hook `RaftLoop` needs, including the follower
@@ -133,6 +135,18 @@ pub(super) fn build_hooks(
         crate::control::server::calvin_submit::RegistryCalvinSubmitInbox::new(shared.clone()),
     );
 
+    // Routed reserve-read (reservation admission): when this node is the
+    // sequencer-group leader, submit a forwarded reserve-read to the local
+    // reservation inbox and reply with the assigned owner.
+    let reserve_read: Arc<dyn nodedb_cluster::ReserveRead> =
+        Arc::new(crate::control::server::reservation::RegistryReserveRead::new(shared.clone()));
+
+    // Routed release-reservation: when this node is the sequencer-group
+    // leader, submit a forwarded release to the local reservation inbox.
+    let release_reservation: Arc<dyn nodedb_cluster::ReleaseReservation> = Arc::new(
+        crate::control::server::reservation::RegistryReleaseReservation::new(shared.clone()),
+    );
+
     Ok(Hooks {
         quarantine_hook,
         snapshot_builder,
@@ -144,5 +158,7 @@ pub(super) fn build_hooks(
         assign_remote_surrogate,
         calvin_submit,
         calvin_submit_inbox,
+        reserve_read,
+        release_reservation,
     })
 }

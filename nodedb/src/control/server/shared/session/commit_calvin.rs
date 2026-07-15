@@ -40,6 +40,11 @@ pub(super) async fn run_commit_calvin(
     reads: &[ReadSetEntry],
 ) -> Option<AbortReason> {
     let cross_shard_mode = sessions.cross_shard_txn_mode(addr);
+    // The session's read-reservation owner `R`, taken at read time. Fetched once
+    // and stamped onto every Calvin submit below so each commit batch acquires
+    // its keys as `R` and self-upgrades the shared reservations — never
+    // recomputed at commit.
+    let reservation_owner = sessions.current_reservation_owner(addr);
 
     match cross_shard_mode {
         CrossShardTxnMode::Strict => {
@@ -60,11 +65,15 @@ pub(super) async fn run_commit_calvin(
                 cross_shard_mode,
                 TxnDispatchPosition::CommitFlush,
                 reads,
+                reservation_owner,
             )
             .await
             {
                 Ok(_) => None,
-                Err(crate::Error::CalvinSerializationConflict) => Some(AbortReason::Serialization),
+                Err(crate::Error::CalvinSerializationConflict) => {
+                    super::hot_key::record_read_set_aborts(state, reads);
+                    Some(AbortReason::Serialization)
+                }
                 Err(e) => Some(AbortReason::Dispatch(e)),
             }
         }
@@ -101,13 +110,17 @@ pub(super) async fn run_commit_calvin(
                 // multi-shard COMMIT path never ran `si_conflict_abort`), so each
                 // group carries no versioned reads — matching the single-vShard
                 // submit `route_write_to_calvin` uses.
-                let tx_class = match build_single_vshard_tx_class(&tasks, tenant_id, &[]) {
+                let mut tx_class = match build_single_vshard_tx_class(&tasks, tenant_id, &[]) {
                     Ok(tc) => tc,
                     Err(e) => return Some(AbortReason::Dispatch(e)),
                 };
+                // Each per-vShard group acquires under `R` too, so it self-upgrades
+                // its slice of the session's shared reservations.
+                tx_class.set_lock_owner(reservation_owner);
                 match submit_calvin_routed(state, tx_class).await {
                     Ok(_) => {}
                     Err(crate::Error::CalvinSerializationConflict) => {
+                        super::hot_key::record_read_set_aborts(state, reads);
                         return Some(AbortReason::Serialization);
                     }
                     Err(e) => return Some(AbortReason::Dispatch(e)),

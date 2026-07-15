@@ -21,6 +21,8 @@ use super::loop_build::RaftLoopType;
 /// Everything the final phase needs beyond `handle`/`shared`.
 pub(super) struct ObservabilityInputs {
     pub(super) sequencer_inbox: nodedb_cluster::calvin::Inbox,
+    pub(super) reservation_inbox:
+        nodedb_cluster::calvin::sequencer::reservation_inbox::ReservationInbox,
     pub(super) sequencer_metrics: Arc<nodedb_cluster::calvin::SequencerMetrics>,
     pub(super) calvin_completion_registry: Arc<CalvinCompletionRegistry>,
     pub(super) ollp_orchestrator: Arc<OllpOrchestrator>,
@@ -40,6 +42,7 @@ pub(super) fn finish_observability(
 ) -> tokio::sync::watch::Receiver<bool> {
     let ObservabilityInputs {
         sequencer_inbox,
+        reservation_inbox,
         sequencer_metrics,
         calvin_completion_registry,
         ollp_orchestrator,
@@ -47,6 +50,7 @@ pub(super) fn finish_observability(
     } = inputs;
 
     let _ = shared.sequencer_inbox.set(sequencer_inbox);
+    let _ = shared.reservation_inbox.set(reservation_inbox);
     let _ = shared.sequencer_metrics.set(sequencer_metrics);
     let _ = shared
         .calvin_completion_registry

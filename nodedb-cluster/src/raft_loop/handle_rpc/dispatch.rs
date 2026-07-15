@@ -9,6 +9,7 @@ use crate::error::{ClusterError, Result};
 use crate::forward::{ChunkSink, PlanExecutor};
 use crate::rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
+    ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
     ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinInboxRequest,
     SubmitCalvinInboxResponse, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
@@ -111,6 +112,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
         req: SubmitCalvinInboxRequest,
     ) -> SubmitCalvinInboxResponse {
         self.on_submit_calvin_inbox_impl(req).await
+    }
+
+    async fn on_reserve_read(&self, req: ReserveReadRequest) -> ReserveReadResponse {
+        self.on_reserve_read_impl(req).await
+    }
+
+    async fn on_release_reservation(
+        &self,
+        req: ReleaseReservationRequest,
+    ) -> ReleaseReservationResponse {
+        self.on_release_reservation_impl(req).await
     }
 
     async fn on_timeout_now(&self, req: TimeoutNowRequest) {

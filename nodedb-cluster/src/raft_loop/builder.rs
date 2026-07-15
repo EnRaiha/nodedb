@@ -17,8 +17,9 @@ use crate::forward::PlanExecutor;
 use crate::metadata_group::applier::MetadataApplier;
 
 use super::hooks::{
-    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ShuffleAggregator, ShuffleConsumer,
-    ShuffleProducer, ShuffleReceiver, SnapshotApplier, SnapshotBuilder, SnapshotQuarantineHook,
+    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ReleaseReservation, ReserveRead,
+    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotApplier,
+    SnapshotBuilder, SnapshotQuarantineHook,
 };
 use super::loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};
 
@@ -49,6 +50,8 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
             assign_remote_surrogate: self.assign_remote_surrogate,
             calvin_submit: self.calvin_submit,
             calvin_submit_inbox: self.calvin_submit_inbox,
+            reserve_read: self.reserve_read,
+            release_reservation: self.release_reservation,
             snapshot_builder: self.snapshot_builder,
             snapshot_applier: self.snapshot_applier,
             partial_snapshots: self.partial_snapshots,
@@ -171,6 +174,30 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     /// drives it to completion itself).
     pub fn with_calvin_submit_inbox(mut self, submit: Arc<dyn CalvinSubmitInbox>) -> Self {
         self.calvin_submit_inbox = Some(submit);
+        self
+    }
+
+    /// Attach the routed reserve-read hook (Calvin OLLP, builder chain).
+    ///
+    /// The supplied implementation (backed by `nodedb`'s Calvin sequencer
+    /// scheduler) is called by the `ReserveRead` transport handler when this
+    /// node is the sequencer-group leader: it decodes the carried `LockKey`
+    /// and assign-only reserves the read lock against the local lock table.
+    pub fn with_reserve_read(mut self, hook: Arc<dyn ReserveRead>) -> Self {
+        self.reserve_read = Some(hook);
+        self
+    }
+
+    /// Attach the routed release-reservation hook (Calvin OLLP, builder
+    /// chain).
+    ///
+    /// Ack-only sibling of [`with_reserve_read`](Self::with_reserve_read). The
+    /// supplied implementation (backed by `nodedb`'s Calvin sequencer
+    /// scheduler) is called by the `ReleaseReservation` transport handler when
+    /// this node is the sequencer-group leader: it decodes the carried owner
+    /// and release reason and releases the reservation.
+    pub fn with_release_reservation(mut self, hook: Arc<dyn ReleaseReservation>) -> Self {
+        self.release_reservation = Some(hook);
         self
     }
 

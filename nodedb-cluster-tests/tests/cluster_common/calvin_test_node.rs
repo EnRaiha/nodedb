@@ -42,8 +42,9 @@ use nodedb_cluster::{
     calvin::{
         CalvinCompletionRegistry, SEQUENCER_GROUP_ID,
         sequencer::{
-            InboxReceiver, SequencerConfig, SequencerService, SequencerStateMachine,
-            service::SequencerMetrics, state_machine::StateMachineMetrics,
+            InboxReceiver, SequencerConfig, SequencerReceivers, SequencerService,
+            SequencerStateMachine, new_reservation_inbox, service::SequencerMetrics,
+            state_machine::StateMachineMetrics,
         },
         types::{SchedulerInput, SequencedTxn},
     },
@@ -176,11 +177,17 @@ impl CalvinTestNode {
         // receiver so a completed vote tally would reach the leader's propose
         // arm (inert for now — nothing reads the verdict).
         let (verdict_tx, verdict_rx) = tokio::sync::mpsc::channel(512);
+        // No test in this file exercises hot-key reservations; the receiver is
+        // wired for arity only and its paired `ReservationInbox` is dropped.
+        let (_reservation_inbox, reservation_receiver) = new_reservation_inbox(64);
         let mut service = SequencerService::new(
             config,
             self.node_id,
             self.multi_raft.clone(),
-            inbox_receiver,
+            SequencerReceivers {
+                inbox: inbox_receiver,
+                reservations: reservation_receiver,
+            },
             starting_epoch,
             CalvinCompletionRegistry::new(verdict_tx),
             verdict_rx,

@@ -52,6 +52,7 @@ pub fn start_raft(
         loop_build.raft_loop,
         ObservabilityInputs {
             sequencer_inbox: loop_build.sequencer_inbox,
+            reservation_inbox: loop_build.reservation_inbox,
             sequencer_metrics: loop_build.sequencer_metrics,
             calvin_completion_registry: loop_build.calvin_completion_registry,
             ollp_orchestrator: loop_build.ollp_orchestrator,

@@ -20,6 +20,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
 use crate::control::server::shared::plan_util::extract_collection;
 use crate::control::state::SharedState;
+use nodedb_cluster::calvin::types::ReleaseReason;
 use nodedb_cluster::{MetadataEntry, encode_entry};
 use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -76,6 +77,8 @@ pub async fn run_commit(
         if let Some(outcome) =
             si_conflict_abort(sessions, addr, state, &read_set, &written_collections)
         {
+            // Release read reservations (owner still set), then roll back.
+            super::reservation_release::release_and_rollback(state, sessions, addr).await;
             return outcome;
         }
     } else {
@@ -92,7 +95,7 @@ pub async fn run_commit(
                 )
                 .await
                 {
-                    rollback_with_gap_free(sessions, addr, state);
+                    super::reservation_release::release_and_rollback(state, sessions, addr).await;
                     return CommitOutcome::Aborted { reason };
                 }
             }
@@ -100,12 +103,13 @@ pub async fn run_commit(
                 if let Some(outcome) =
                     si_conflict_abort(sessions, addr, state, &read_set, &written_collections)
                 {
+                    super::reservation_release::release_and_rollback(state, sessions, addr).await;
                     return outcome;
                 }
                 if let Some(reason) =
                     dispatch_single_shard(state, dp, &buffered, tenant_id, vshard_id).await
                 {
-                    rollback_with_gap_free(sessions, addr, state);
+                    super::reservation_release::release_and_rollback(state, sessions, addr).await;
                     return CommitOutcome::Aborted { reason };
                 }
             }
@@ -113,6 +117,17 @@ pub async fn run_commit(
     }
 
     // Every abort branch above has already returned; the transaction is durable.
+    // Release this transaction's read reservations (belt-and-suspenders: the
+    // Calvin batch's `on_txn_complete` already releases the owner for keys in the
+    // batch — this covers reserved keys not in it) while the owner is still set,
+    // before `sessions.commit` drains the session below.
+    super::reservation_release::release_session_reservations(
+        state,
+        sessions,
+        addr,
+        ReleaseReason::Commit,
+    )
+    .await;
     // Transition the session out of the block NOW — this drains the write buffer
     // and clears snapshot/txn state, moving the session to `Idle`.
     match sessions.commit(addr) {
@@ -207,9 +222,11 @@ pub async fn run_commit(
 /// COMMIT. If any read key's collection advanced past both the read LSN and the
 /// transaction snapshot LSN — and the transaction did not write that collection
 /// itself (read-your-own-write is excluded) — the WAL moved under the reader:
-/// roll the session back (releasing GAP_FREE reservations) and return a
-/// serialization abort. Returns `None` when there is no conflict (or no
-/// snapshot, i.e. not in a transaction).
+/// records the read-set hot-key aborts and returns a serialization abort. The
+/// caller owns the session rollback (via `release_and_rollback`) so it can
+/// first release the transaction's read reservations while the reservation owner
+/// is still set — the rollback clears it. Returns `None` when there is no
+/// conflict (or no snapshot, i.e. not in a transaction).
 ///
 /// This is a single-shard validation: it compares against the global WAL
 /// `next_lsn`, so it is only sound for a transaction whose participants are one
@@ -231,33 +248,15 @@ fn si_conflict_abort(
             continue;
         }
         if current > read_lsn && current > snapshot_lsn {
-            // WAL advanced past what we read — concurrent write detected.
-            rollback_with_gap_free(sessions, addr, state);
+            // WAL advanced past what we read — concurrent write detected. The
+            // caller releases reservations and rolls the session back.
+            super::hot_key::record_read_set_aborts(state, read_set);
             return Some(CommitOutcome::Aborted {
                 reason: AbortReason::Serialization,
             });
         }
     }
     None
-}
-
-/// Roll the session back to `Idle` and release any pending GAP_FREE sequence
-/// reservations. Used by every COMMIT abort branch that must leave the session
-/// idle without persisting — the transport adapters map `Aborted` to a wire
-/// error and never roll back afterward, so each abort branch owns its rollback.
-fn rollback_with_gap_free(sessions: &SessionStore, addr: &SocketAddr, state: &SharedState) {
-    if let Ok(reservations) = sessions.rollback(addr) {
-        for handle in &reservations {
-            let key = handle.sequence_key.clone();
-            let registry = &state.sequence_registry;
-            registry.gap_free_manager().rollback(handle, || {
-                let map = registry.sequences_read();
-                if let Some(h) = map.get(&key) {
-                    h.rollback_one();
-                }
-            });
-        }
-    }
 }
 
 /// Single-shard commit: resolve the transaction's staged post-images into one

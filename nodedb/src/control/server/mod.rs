@@ -14,6 +14,7 @@ pub mod native;
 pub mod payload_merge;
 pub mod pgwire;
 pub mod post_aggregate;
+pub mod reservation;
 pub mod resp;
 pub mod response_shape;
 pub mod response_translate;

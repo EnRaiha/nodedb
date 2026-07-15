@@ -336,6 +336,7 @@ impl SharedState {
             lease_drain: Arc::new(crate::control::lease::DescriptorDrainTracker::new()),
             lease_refcount: Arc::new(crate::control::lease::LeaseRefCount::new()),
             sequencer_inbox: std::sync::OnceLock::new(),
+            reservation_inbox: std::sync::OnceLock::new(),
             sequencer_metrics: std::sync::OnceLock::new(),
             calvin_completion_registry: std::sync::OnceLock::new(),
             ollp_orchestrator: std::sync::OnceLock::new(),
@@ -358,6 +359,9 @@ impl SharedState {
             },
             calvin_apply_results: Arc::new(Mutex::new(std::collections::HashMap::new())),
             calvin_lock_managers: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            hot_key_table: Arc::new(Mutex::new(
+                crate::control::cluster::calvin::scheduler::lock::HotKeyTable::new(),
+            )),
             calvin_promotion_senders: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             write_order_locks: Arc::new(
                 crate::control::server::shared::write_admission::KeyedWriteOrderLock::new(),

@@ -215,6 +215,10 @@ pub fn validate_batch_with_assignments(
             });
         } else {
             let inbox_seq = tx.inbox_seq;
+            // Copy the submitted class's reservation owner before the class is
+            // moved into the SequencedTxn: `Some(R)` acquires the commit batch's
+            // keys as `R` so it self-upgrades the session's shared reservations.
+            let lock_owner = tx.tx_class.lock_owner;
             admitted_out.push((
                 inbox_seq,
                 SequencedTxn {
@@ -227,7 +231,7 @@ pub fn validate_batch_with_assignments(
                     // epoch_vshard_txn_count is stamped per-vShard by the state
                     // machine at fan-out time; 0 is a safe placeholder here.
                     epoch_vshard_txn_count: 0,
-                    lock_owner: None,
+                    lock_owner,
                 },
             ));
         }

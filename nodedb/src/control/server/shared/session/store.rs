@@ -242,6 +242,8 @@ impl SessionStore {
             session.tx_id = None;
             session.tx_vshards.clear();
             session.tx_read_set.clear();
+            session.tx_reservation_vshards.clear();
+            session.tx_reservation_owner = None;
             session.savepoints.clear();
             session.pending_offset_commits.clear();
             session.pending_notifies.clear();

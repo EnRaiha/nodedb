@@ -28,8 +28,9 @@ pub mod proposals;
 pub mod tick;
 
 pub use hooks::{
-    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ShuffleAggregator, ShuffleConsumer,
-    ShuffleProducer, ShuffleReceiver, SnapshotApplier, SnapshotBuilder, SnapshotQuarantineHook,
+    AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, ReleaseReservation, ReserveRead,
+    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotApplier,
+    SnapshotBuilder, SnapshotQuarantineHook,
 };
 pub use in_flight_snapshots::{InFlightSnapshotGuard, InFlightSnapshots};
 pub use loop_core::{CommitApplier, RaftLoop, VShardEnvelopeHandler};

@@ -183,14 +183,18 @@ pub(super) async fn run_dispatch_loop(
                 shard_watermarks
             };
             crate::control::server::shared::session::record_read_set(
+                ctx.state,
                 ctx.sessions,
                 ctx.peer_addr,
                 ctx.tenant_id(),
-                &plan_for_response,
-                &watermarks,
-                task_resp.read_version_lsn,
-                task_resp.status == Status::Ok,
-            );
+                crate::control::server::shared::session::ReadCapture {
+                    plan: &plan_for_response,
+                    watermarks: &watermarks,
+                    read_version_lsn: task_resp.read_version_lsn,
+                    found: task_resp.status == Status::Ok,
+                },
+            )
+            .await;
         }
 
         if task_resp.status == Status::Error {

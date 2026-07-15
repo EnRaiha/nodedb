@@ -114,8 +114,9 @@ pub use migration_executor::{
 pub use multi_raft::{GroupStatus, MultiRaft};
 pub use raft_loop::{
     AssignRemoteSurrogate, CalvinSubmit, CalvinSubmitInbox, CommitApplier, RaftLoop,
-    ShuffleAggregator, ShuffleConsumer, ShuffleProducer, ShuffleReceiver, SnapshotApplier,
-    SnapshotBuilder, SnapshotQuarantineHook, VShardEnvelopeHandler,
+    ReleaseReservation, ReserveRead, ShuffleAggregator, ShuffleConsumer, ShuffleProducer,
+    ShuffleReceiver, SnapshotApplier, SnapshotBuilder, SnapshotQuarantineHook,
+    VShardEnvelopeHandler,
 };
 pub use reachability::{
     NoopProber, ReachabilityDriver, ReachabilityDriverConfig, ReachabilityProber, TransportProber,
@@ -130,6 +131,7 @@ pub use routing::RoutingTable;
 pub use routing_liveness::{NodeIdResolver, RoutingLivenessHook};
 pub use rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, JoinKeyPair, MacKey, PartNodeEntry, RaftRpc,
+    ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
     ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushChunk,
     ShufflePushEnd, ShufflePushRequest, SortKey, SubmitCalvinInboxRequest,

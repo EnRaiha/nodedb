@@ -109,6 +109,25 @@ pub const RPC_SUBMIT_CALVIN_INBOX_RESP: u8 = 39;
 /// The receiver immediately starts an election for the addressed Raft group.
 pub const RPC_TIMEOUT_NOW_REQ: u8 = 40;
 
+/// Routed reserve-read (Calvin OLLP). A coordinator sends a
+/// `RPC_RESERVE_READ_REQ` carrying a msgpack-encoded `LockKeyWire` to the
+/// sequencer-group leader; the leader assign-only reserves the read lock and
+/// replies with exactly one `RPC_RESERVE_READ_RESP` carrying the minted owner
+/// (`TxnIdWire`, msgpack-encoded) or a typed error. One-shot request/response
+/// — no streaming.
+pub const RPC_RESERVE_READ_REQ: u8 = 41;
+pub const RPC_RESERVE_READ_RESP: u8 = 42;
+
+/// Routed release-reservation (Calvin OLLP). The ack-only sibling of
+/// `RPC_RESERVE_READ_*`: a coordinator sends a `RPC_RELEASE_RESERVATION_REQ`
+/// carrying the msgpack-encoded owner (`TxnIdWire`) and release reason
+/// (`ReleaseReason`) to the sequencer-group leader; the leader releases the
+/// reservation and replies with exactly one `RPC_RELEASE_RESERVATION_RESP`
+/// carrying success or a typed error. One-shot request/response — no
+/// streaming.
+pub const RPC_RELEASE_RESERVATION_REQ: u8 = 43;
+pub const RPC_RELEASE_RESERVATION_RESP: u8 = 44;
+
 // VShardMessageType discriminants for distributed array ops (u16, range 80-89).
 // These mirror `crate::wire::VShardMessageType` repr values and are declared
 // here so external code can reference them without importing the full enum.

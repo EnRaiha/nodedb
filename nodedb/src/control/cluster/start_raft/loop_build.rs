@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Sender};
 
 use nodedb_cluster::calvin::{
-    CalvinCompletionRegistry, SequencerConfig, SequencerService, new_inbox,
+    CalvinCompletionRegistry, SequencerConfig, SequencerReceivers, SequencerService, new_inbox,
+    new_reservation_inbox,
 };
 
 use crate::control::cluster::calvin::executor::ollp::OllpConfig;
@@ -41,6 +42,8 @@ pub(super) struct LoopBuild {
     pub(super) sequencer_service: SequencerService,
     pub(super) sequencer_metrics: Arc<nodedb_cluster::calvin::SequencerMetrics>,
     pub(super) sequencer_inbox: nodedb_cluster::calvin::Inbox,
+    pub(super) reservation_inbox:
+        nodedb_cluster::calvin::sequencer::reservation_inbox::ReservationInbox,
     pub(super) ollp_orchestrator: Arc<OllpOrchestrator>,
     pub(super) tracker: Arc<ProposeTracker>,
     pub(super) apply_rx: mpsc::Receiver<ApplyBatch>,
@@ -98,6 +101,8 @@ pub(super) fn build_raft_loop(
         .with_assign_remote_surrogate(hooks.assign_remote_surrogate)
         .with_calvin_submit(hooks.calvin_submit)
         .with_calvin_submit_inbox(hooks.calvin_submit_inbox)
+        .with_reserve_read(hooks.reserve_read)
+        .with_release_reservation(hooks.release_reservation)
         .with_data_dir(data_dir.to_path_buf())
         .with_snapshot_chunk_bytes(snapshot_chunk_bytes)
         .with_orphan_partial_max_age_secs(orphan_partial_max_age_secs)
@@ -121,12 +126,16 @@ pub(super) fn build_raft_loop(
 
     let sequencer_config = SequencerConfig::default();
     let (sequencer_inbox, sequencer_inbox_rx) = new_inbox(10_000, &sequencer_config);
+    let (reservation_inbox, reservation_inbox_rx) = new_reservation_inbox(10_000);
     let ollp_orchestrator = Arc::new(OllpOrchestrator::new(OllpConfig::default()));
     let sequencer_service = SequencerService::new(
         sequencer_config,
         handle.node_id,
         raft_loop_handle.clone(),
-        sequencer_inbox_rx,
+        SequencerReceivers {
+            inbox: sequencer_inbox_rx,
+            reservations: reservation_inbox_rx,
+        },
         sequencer_state_machine
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -169,6 +178,7 @@ pub(super) fn build_raft_loop(
         sequencer_service,
         sequencer_metrics,
         sequencer_inbox,
+        reservation_inbox,
         ollp_orchestrator,
         tracker,
         apply_rx,
