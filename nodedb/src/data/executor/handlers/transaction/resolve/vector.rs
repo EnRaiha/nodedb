@@ -21,16 +21,26 @@
 //! * `Delete` → `RecordType::VectorDelete`, `(collection, vector_id, None)`.
 //! * `DeleteBySurrogate` → `RecordType::VectorDelete`,
 //!   `(collection, surrogate, field_name, provenance)`.
+//! * `DirectUpsert` → `RecordType::VectorDirectUpsert`, the 8-element
+//!   vector-primary post-image (`replay_direct_upsert`).
+//! * `MultiVectorInsert` → `RecordType::MultiVectorPut`, the 6-element
+//!   flattened multi-vector shape (`replay_multi_vector_put`).
+//! * `MultiVectorDelete` → `RecordType::MultiVectorDelete`,
+//!   `(collection, field_name, document_surrogate)` (`replay_multi_vector_delete`).
+//! * `SparseInsert` → `RecordType::SparseVectorPut`,
+//!   `(collection, field_name, doc_id, entries)` (`replay_sparse_put`).
+//! * `SparseDelete` → `RecordType::SparseVectorDelete`,
+//!   `(collection, field_name, doc_id)` (`replay_sparse_delete`).
+//!
+//! These five share the autocommit WAL shapes emitted by `wal_append_vector_op`
+//! and decoded by `replay_vector_extended_wal`, which the redo replay path
+//! invokes after `replay_vector_wal`, so producer and replay never drift.
 //!
 //! ## Ops that raise a typed error
 //!
-//! `DirectUpsert`, `MultiVectorInsert`, `MultiVectorDelete`, `SparseInsert`,
-//! and `SparseDelete` are writes with NO autocommit WAL shape (they fall to the
-//! `_ => None` arm of `wal_append_if_write_with_creds`), so no redo sub-record
-//! decoder exists for them. Silently omitting a write from the redo record
-//! would lose it on install, so each raises a typed error rather than being
-//! dropped. `SetParams` (vector-index DDL) likewise raises a typed error,
-//! matching how the KV / document serializers reject index / DDL ops.
+//! `SetParams` (vector-index DDL) raises a typed error, matching how the KV /
+//! document serializers reject index / DDL ops: a `CREATE VECTOR INDEX` rides
+//! its own autocommit `VectorParams` record, not a transaction redo.
 //!
 //! ## Ops that emit nothing
 //!
@@ -50,16 +60,20 @@ use nodedb_physical::physical_plan::VectorOp;
 use nodedb_wal::record::RecordType;
 
 use crate::control::server::wal_dispatch::{
+    VectorDirectUpsertPayload, encode_multi_vector_delete_payload, encode_multi_vector_put_payload,
+    encode_sparse_vector_delete_payload, encode_sparse_vector_put_payload,
     encode_vector_batch_put_payload, encode_vector_delete_by_surrogate_payload,
-    encode_vector_delete_payload, encode_vector_put_payload,
+    encode_vector_delete_payload, encode_vector_direct_upsert_payload, encode_vector_put_payload,
 };
 use crate::wal::RedoSubRecord;
 
 /// Append the redo sub-record(s) for a single vector plan op to `ops`.
 ///
-/// Writes serialize to their engine-native `VectorPut` / `VectorDelete` shape;
-/// read and index-maintenance ops emit nothing; writes without a redo shape
-/// raise a typed error (see module docs).
+/// Writes serialize to their engine-native record shape (`VectorPut` /
+/// `VectorDelete` / `VectorDirectUpsert` / `MultiVectorPut` /
+/// `MultiVectorDelete` / `SparseVectorPut` / `SparseVectorDelete`); read and
+/// index-maintenance ops emit nothing; vector-index DDL (`SetParams`) raises a
+/// typed error (see module docs).
 pub(super) fn serialize_vector_op(
     op: &VectorOp,
     ops: &mut Vec<RedoSubRecord>,
@@ -151,17 +165,99 @@ pub(super) fn serialize_vector_op(
                 .to_string(),
         }),
 
-        // Writes with no autocommit WAL shape and therefore no redo sub-record
-        // decoder. Rejecting keeps their rows out of a silently lossy redo
-        // record rather than inventing an unreplayable shape.
-        VectorOp::DirectUpsert { .. }
-        | VectorOp::MultiVectorInsert { .. }
-        | VectorOp::MultiVectorDelete { .. }
-        | VectorOp::SparseInsert { .. }
-        | VectorOp::SparseDelete { .. } => Err(crate::Error::PlanError {
-            detail: "vector direct-upsert / multi-vector / sparse writes have no redo sub-record \
-                     shape and are not supported in transaction resolve"
-                .to_string(),
-        }),
+        // Vector-primary direct upsert: full post-image, replayed via
+        // `replay_direct_upsert`.
+        VectorOp::DirectUpsert {
+            collection,
+            field,
+            surrogate,
+            vector,
+            payload,
+            quantization,
+            storage_dtype,
+            payload_indexes,
+        } => {
+            let payload = encode_vector_direct_upsert_payload(VectorDirectUpsertPayload {
+                collection,
+                field,
+                surrogate: *surrogate,
+                vector,
+                payload,
+                quantization: *quantization,
+                storage_dtype: *storage_dtype,
+                payload_indexes,
+            })?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::VectorDirectUpsert as u32,
+                payload,
+            });
+            Ok(())
+        }
+        // Multi-vector (ColBERT-style) insert, replayed via
+        // `replay_multi_vector_put`.
+        VectorOp::MultiVectorInsert {
+            collection,
+            field_name,
+            document_surrogate,
+            vectors,
+            count,
+            dim,
+        } => {
+            let payload = encode_multi_vector_put_payload(
+                collection,
+                field_name,
+                *document_surrogate,
+                vectors,
+                *count,
+                *dim,
+            )?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::MultiVectorPut as u32,
+                payload,
+            });
+            Ok(())
+        }
+        // Multi-vector delete, replayed via `replay_multi_vector_delete`.
+        VectorOp::MultiVectorDelete {
+            collection,
+            field_name,
+            document_surrogate,
+        } => {
+            let payload =
+                encode_multi_vector_delete_payload(collection, field_name, *document_surrogate)?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::MultiVectorDelete as u32,
+                payload,
+            });
+            Ok(())
+        }
+        // Sparse-vector insert, replayed via `replay_sparse_put`.
+        VectorOp::SparseInsert {
+            collection,
+            field_name,
+            doc_id,
+            entries,
+        } => {
+            let payload =
+                encode_sparse_vector_put_payload(collection, field_name, doc_id, entries)?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::SparseVectorPut as u32,
+                payload,
+            });
+            Ok(())
+        }
+        // Sparse-vector delete, replayed via `replay_sparse_delete`.
+        VectorOp::SparseDelete {
+            collection,
+            field_name,
+            doc_id,
+        } => {
+            let payload = encode_sparse_vector_delete_payload(collection, field_name, doc_id)?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::SparseVectorDelete as u32,
+                payload,
+            });
+            Ok(())
+        }
     }
 }

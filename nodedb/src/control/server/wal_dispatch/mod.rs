@@ -33,8 +33,10 @@ pub(crate) use timeseries::{
     encode_columnar_batch_payload, encode_columnar_dml_payload, encode_timeseries_batch_payload,
 };
 pub(crate) use vector::{
+    VectorDirectUpsertPayload, encode_multi_vector_delete_payload, encode_multi_vector_put_payload,
+    encode_sparse_vector_delete_payload, encode_sparse_vector_put_payload,
     encode_vector_batch_put_payload, encode_vector_delete_by_surrogate_payload,
-    encode_vector_delete_payload, encode_vector_put_payload,
+    encode_vector_delete_payload, encode_vector_direct_upsert_payload, encode_vector_put_payload,
 };
 
 pub(crate) use super::wal_dispatch_fts_spatial::{

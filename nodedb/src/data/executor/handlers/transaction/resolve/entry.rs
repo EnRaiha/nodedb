@@ -1120,6 +1120,270 @@ mod tests {
         }
     }
 
+    /// The inverse of `join_merge_batch_dml_still_yield_typed_error`: the five
+    /// extended vector writes (`DirectUpsert`, `MultiVectorInsert`,
+    /// `MultiVectorDelete`, `SparseInsert`, `SparseDelete`) used to raise a
+    /// typed error in `serialize_vector_op`; they now resolve to redo
+    /// sub-records so an in-transaction vector write is not silently lost.
+    #[test]
+    fn extended_vector_writes_now_resolve_ok() {
+        let (mut core, _dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(50);
+
+        let plans = [
+            PhysicalPlan::Vector(VectorOp::DirectUpsert {
+                collection: "vp".to_string(),
+                field: "emb".to_string(),
+                surrogate: Surrogate::new(1),
+                vector: vec![1.0, 2.0, 3.0],
+                payload: Vec::new(),
+                quantization: nodedb_types::VectorQuantization::None,
+                storage_dtype: nodedb_types::VectorStorageDtype::F32,
+                payload_indexes: Vec::new(),
+            }),
+            PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
+                collection: "mc".to_string(),
+                field_name: "mv".to_string(),
+                document_surrogate: Surrogate::new(2),
+                vectors: vec![1.0, 2.0, 3.0, 4.0],
+                count: 2,
+                dim: 2,
+            }),
+            PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
+                collection: "mc".to_string(),
+                field_name: "mv".to_string(),
+                document_surrogate: Surrogate::new(2),
+            }),
+            PhysicalPlan::Vector(VectorOp::SparseInsert {
+                collection: "sc".to_string(),
+                field_name: "sv".to_string(),
+                doc_id: "d1".to_string(),
+                entries: vec![(10, 0.5)],
+            }),
+            PhysicalPlan::Vector(VectorOp::SparseDelete {
+                collection: "sc".to_string(),
+                field_name: "sv".to_string(),
+                doc_id: "d1".to_string(),
+            }),
+        ];
+
+        for plan in plans {
+            let resp = core.execute_resolve_txn(&task, TID, txn, std::slice::from_ref(&plan));
+            assert_eq!(
+                resp.status,
+                Status::Ok,
+                "{plan:?} must now resolve to a redo sub-record, not a typed error"
+            );
+            let redo = decode_redo(&resp);
+            assert_eq!(
+                redo.ops.len(),
+                1,
+                "{plan:?} resolves to exactly one sub-record"
+            );
+        }
+    }
+
+    fn vp_index_key() -> (DatabaseId, TenantId, String) {
+        CoreLoop::vector_index_key(DatabaseId::DEFAULT.as_u64(), TID, "vp", "emb")
+    }
+
+    fn mv_index_key() -> (DatabaseId, TenantId, String) {
+        CoreLoop::vector_index_key(DatabaseId::DEFAULT.as_u64(), TID, "mc", "mv")
+    }
+
+    fn sparse_index_key() -> (DatabaseId, TenantId, String, String) {
+        (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "sc".to_string(),
+            "sv".to_string(),
+        )
+    }
+
+    /// Resolve a `DirectUpsert`, wrap it into a `TransactionRedo` record, and
+    /// replay into a fresh core — the vector-primary row must survive. Before
+    /// the resolve/replay wiring this was rejected at resolve and, even if
+    /// resolved, would not be decoded (only `replay_vector_extended_wal`
+    /// decodes it, and the redo path never called it).
+    #[test]
+    fn resolved_direct_upsert_replays_into_fresh_engine() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let plan = PhysicalPlan::Vector(VectorOp::DirectUpsert {
+            collection: "vp".to_string(),
+            field: "emb".to_string(),
+            surrogate: Surrogate::new(42),
+            vector: vec![1.0, 2.0, 3.0],
+            payload: Vec::new(),
+            quantization: nodedb_types::VectorQuantization::None,
+            storage_dtype: nodedb_types::VectorStorageDtype::F32,
+            payload_indexes: Vec::new(),
+        });
+        let resp = src.execute_resolve_txn(&task, TID, TxnId::new(51), std::slice::from_ref(&plan));
+        let redo = decode_redo(&resp);
+        let record = wrap_redo(&redo);
+
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        let coll = dst
+            .vector_collections
+            .get(&vp_index_key())
+            .expect("vector-primary collection rebuilt from redo replay");
+        assert_eq!(coll.len(), 1, "the upserted vector must be recovered");
+        assert!(
+            coll.local_for_surrogate(Surrogate::new(42)).is_some(),
+            "the cross-engine surrogate must be rebound on redo replay"
+        );
+    }
+
+    /// Resolve a `MultiVectorInsert` and replay it through the redo path.
+    #[test]
+    fn resolved_multi_vector_insert_replays_into_fresh_engine() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let plan = PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
+            collection: "mc".to_string(),
+            field_name: "mv".to_string(),
+            document_surrogate: Surrogate::new(7),
+            vectors: vec![1.0, 2.0, 3.0, 4.0],
+            count: 2,
+            dim: 2,
+        });
+        let resp = src.execute_resolve_txn(&task, TID, TxnId::new(52), std::slice::from_ref(&plan));
+        let redo = decode_redo(&resp);
+        let record = wrap_redo(&redo);
+
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        let coll = dst
+            .vector_collections
+            .get(&mv_index_key())
+            .expect("multi-vector collection rebuilt from redo replay");
+        assert_eq!(coll.len(), 2, "both document vectors must be recovered");
+        assert!(
+            coll.multi_doc_map.contains_key(&Surrogate::new(7)),
+            "the multi-vector document grouping must be reconstructed"
+        );
+    }
+
+    /// Resolve a `MultiVectorInsert` then a `MultiVectorDelete` in the same
+    /// transaction and replay — the delete must leave the document removed.
+    #[test]
+    fn resolved_multi_vector_delete_replays_into_fresh_engine() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(53);
+        let insert = PhysicalPlan::Vector(VectorOp::MultiVectorInsert {
+            collection: "mc".to_string(),
+            field_name: "mv".to_string(),
+            document_surrogate: Surrogate::new(7),
+            vectors: vec![1.0, 2.0, 3.0, 4.0],
+            count: 2,
+            dim: 2,
+        });
+        let delete = PhysicalPlan::Vector(VectorOp::MultiVectorDelete {
+            collection: "mc".to_string(),
+            field_name: "mv".to_string(),
+            document_surrogate: Surrogate::new(7),
+        });
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[insert, delete]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 2, "insert + delete both resolve");
+        let record = wrap_redo(&redo);
+
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        let coll = dst
+            .vector_collections
+            .get(&mv_index_key())
+            .expect("collection present after redo replay");
+        assert!(
+            !coll.multi_doc_map.contains_key(&Surrogate::new(7)),
+            "the deleted multi-vector document must stay deleted"
+        );
+    }
+
+    /// Resolve a `SparseInsert` and replay it through the redo path.
+    #[test]
+    fn resolved_sparse_insert_replays_into_fresh_engine() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let plan = PhysicalPlan::Vector(VectorOp::SparseInsert {
+            collection: "sc".to_string(),
+            field_name: "sv".to_string(),
+            doc_id: "d1".to_string(),
+            entries: vec![(10, 0.5), (20, 0.8)],
+        });
+        let resp = src.execute_resolve_txn(&task, TID, TxnId::new(54), std::slice::from_ref(&plan));
+        let redo = decode_redo(&resp);
+        let record = wrap_redo(&redo);
+
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        let idx = dst
+            .sparse_vector_indexes
+            .get(&sparse_index_key())
+            .expect("sparse index rebuilt from redo replay");
+        assert_eq!(idx.doc_count(), 1, "the sparse document must be recovered");
+    }
+
+    /// Resolve a `SparseInsert` then a `SparseDelete` in the same transaction
+    /// and replay — the delete must leave the document removed.
+    #[test]
+    fn resolved_sparse_delete_replays_into_fresh_engine() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(55);
+        let insert = PhysicalPlan::Vector(VectorOp::SparseInsert {
+            collection: "sc".to_string(),
+            field_name: "sv".to_string(),
+            doc_id: "d1".to_string(),
+            entries: vec![(10, 0.5)],
+        });
+        let delete = PhysicalPlan::Vector(VectorOp::SparseDelete {
+            collection: "sc".to_string(),
+            field_name: "sv".to_string(),
+            doc_id: "d1".to_string(),
+        });
+        let resp = src.execute_resolve_txn(&task, TID, txn, &[insert, delete]);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 2, "insert + delete both resolve");
+        let record = wrap_redo(&redo);
+
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        let doc_count = dst
+            .sparse_vector_indexes
+            .get(&sparse_index_key())
+            .map(|i| i.doc_count())
+            .unwrap_or(0);
+        assert_eq!(
+            doc_count, 0,
+            "the deleted sparse document must stay deleted"
+        );
+    }
+
     /// Register a strict collection whose first column is a non-null `_rowid`
     /// (so `apply_point_put` reads it from the emitted MessagePack) plus a
     /// nullable `body` column.

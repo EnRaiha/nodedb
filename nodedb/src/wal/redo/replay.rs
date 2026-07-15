@@ -104,6 +104,15 @@ impl CoreLoop {
     /// safe. Must also run after checkpoint restores, for the same reason the
     /// per-op replays do.
     ///
+    /// `replay_vector_extended_wal` is dispatched immediately after
+    /// `replay_vector_wal` here — matching the startup ordering in
+    /// `replay_all_wal` — because it is the ONLY decoder for the
+    /// `VectorDirectUpsert` / `SparseVectorPut` / `SparseVectorDelete` /
+    /// `MultiVectorPut` / `MultiVectorDelete` sub-records the vector resolver
+    /// emits. It follows `replay_vector_wal` so any `VectorParams` are
+    /// registered first, and is watermark-gated so a restored checkpoint that
+    /// already absorbed a write is not double-applied.
+    ///
     /// CRDT is intentionally NOT dispatched here: CRDT deltas ride their own
     /// `CrdtDelta` records via `replay_crdt_wal`, never redo sub-records.
     pub(crate) fn replay_transaction_redo_wal(
@@ -120,6 +129,13 @@ impl CoreLoop {
         // Vector params (VectorParams sub-records) register before vector puts,
         // exactly as in the standalone replay ordering.
         self.replay_vector_wal(&reconstituted, num_cores, tombstones);
+        // Direct-upsert / sparse / multi-vector redo sub-records — the ONLY
+        // decoder for those five record types. Must follow `replay_vector_wal`
+        // (so any `VectorParams` are registered first) and is watermark-gated,
+        // mirroring the startup ordering in `replay_all_wal`. Without this call
+        // the resolver's five extended sub-records reconstitute but no arm above
+        // decodes them, silently losing the writes.
+        self.replay_vector_extended_wal(&reconstituted, num_cores, tombstones);
         self.replay_kv_wal(&reconstituted, num_cores, tombstones);
         self.replay_timeseries_wal(&reconstituted, num_cores, tombstones);
         self.replay_array_wal(&reconstituted, num_cores, tombstones);
