@@ -41,6 +41,9 @@ impl CoreLoop {
         surrogate: Surrogate,
     ) -> Option<Result<Vec<u8>, Response>> {
         let txn_id = task.request.txn_id?;
+        // Read-your-own-writes refreshes the lease so a long read-only txn
+        // never ages out of the overlay reaper.
+        self.touch_overlay(txn_id);
         let coll_key = (
             task.request.database_id,
             crate::types::TenantId::new(tid),
@@ -80,6 +83,8 @@ impl CoreLoop {
         key: &[u8],
     ) -> Option<Option<Vec<u8>>> {
         let txn_id = task.request.txn_id?;
+        // Read-your-own-writes refreshes the lease (see the reaper).
+        self.touch_overlay(txn_id);
         let coll_key = (
             task.request.database_id,
             crate::types::TenantId::new(tid),

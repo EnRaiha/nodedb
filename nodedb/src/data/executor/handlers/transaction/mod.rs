@@ -4,6 +4,7 @@ mod batch;
 pub(in crate::data::executor) mod index_write_values;
 pub mod overlay;
 mod overlay_gauge;
+pub(in crate::data::executor) mod overlay_reap;
 mod resolve;
 pub(in crate::data::executor) mod stage_write;
 mod sub_plan;

@@ -24,7 +24,12 @@ impl CoreLoop {
         {
             m.active_txn_overlays.fetch_add(1, Ordering::Relaxed);
         }
-        self.txn_overlays.entry(txn_id).or_default()
+        // Refresh the lease stamp on every staged write so the overlay reaper
+        // never reclaims a transaction that is still writing.
+        let ord = self.hlc.next_ordinal();
+        let overlay = self.txn_overlays.entry(txn_id).or_default();
+        overlay.touch(ord);
+        overlay
     }
 
     /// Get-or-create this transaction's GRAPH staging overlay, bumping the
@@ -40,6 +45,11 @@ impl CoreLoop {
         {
             m.active_txn_overlays.fetch_add(1, Ordering::Relaxed);
         }
-        self.graph_txn_overlays.entry(txn_id).or_default()
+        // Refresh the lease stamp on every staged graph write (see
+        // `txn_overlay_mut`).
+        let ord = self.hlc.next_ordinal();
+        let overlay = self.graph_txn_overlays.entry(txn_id).or_default();
+        overlay.touch(ord);
+        overlay
     }
 }

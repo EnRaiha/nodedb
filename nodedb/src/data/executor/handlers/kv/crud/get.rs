@@ -34,6 +34,8 @@ impl CoreLoop {
         // engine, keyed by the same hex-encoded identity the staging path
         // uses for KV rows.
         if let Some(txn_id) = task.request.txn_id {
+            // Read-your-own-writes refreshes the lease (see the reaper).
+            self.touch_overlay(txn_id);
             let coll_key = (
                 task.request.database_id,
                 TenantId::new(tid),

@@ -79,6 +79,8 @@ impl CoreLoop {
         // TTL-carrying `Incr` / `BatchPut`) -- before falling back to the
         // base KV engine.
         if let Some(txn_id) = task.request.txn_id {
+            // Read-your-own-writes refreshes the lease (see the reaper).
+            self.touch_overlay(txn_id);
             let coll_key = (
                 task.request.database_id,
                 TenantId::new(tid),

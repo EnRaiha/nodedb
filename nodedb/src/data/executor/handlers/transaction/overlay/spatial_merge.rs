@@ -106,6 +106,8 @@ impl CoreLoop {
             row_level_filters,
         } = params;
 
+        // Read-your-own-writes refreshes the lease (see the reaper).
+        self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
             return;
         };

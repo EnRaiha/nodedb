@@ -13,6 +13,7 @@
 //! staged surrogate for not-yet-persisted inserts (a doc_id that has no
 //! durable surrogate yet because the insert itself is only staged).
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use crate::types::{DatabaseId, TenantId};
@@ -114,12 +115,36 @@ pub struct TxnOverlay {
     /// appended to by the value/TTL mutators so nothing escapes it; dropped with
     /// the overlay when the transaction resolves.
     journal: Vec<OverlayUndo>,
+    /// Ordinal-clock stamp of the last time this transaction touched its
+    /// overlay — advanced by every staged write AND every in-transaction
+    /// read-your-own-write, so a live transaction's stamp always tracks the
+    /// clock. The overlay lease reaper reclaims overlays whose stamp has aged
+    /// past `OVERLAY_LEASE_NS` (an abandoned txn whose teardown never ran).
+    ///
+    /// `Cell` (interior mutability) so read-your-own-write paths — which hold
+    /// only `&self` while a scan borrows other core state — can refresh the
+    /// stamp without threading `&mut self` through the entire read pipeline.
+    /// Sound because a `CoreLoop` is `!Send` and single-threaded per core.
+    last_touch_ord: Cell<i64>,
 }
 
 impl TxnOverlay {
     /// Create an empty overlay.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Refresh the overlay's lease stamp to `ord` (a monotonic ordinal-clock
+    /// value). Called by the write choke point on staging and by every
+    /// read-your-own-write path so an active transaction never ages out.
+    pub fn touch(&self, ord: i64) {
+        self.last_touch_ord.set(ord);
+    }
+
+    /// The overlay's last lease stamp (0 for a freshly-created overlay that has
+    /// not yet been touched). Read by the lease reaper.
+    pub fn last_touch(&self) -> i64 {
+        self.last_touch_ord.get()
     }
 
     /// Record the current slot state for `(coll_key, surrogate, doc_id)` onto

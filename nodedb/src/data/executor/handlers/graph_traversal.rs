@@ -40,6 +40,10 @@ impl CoreLoop {
         // Read-your-own-writes: fold this transaction's staged edges/tombstones
         // into the bidirectional search, including a path that must pass
         // through a node reachable only via a staged edge.
+        // Read-your-own-writes refreshes the lease (see the overlay reaper).
+        if let Some(txn_id) = task.request.txn_id {
+            self.touch_overlay(txn_id);
+        }
         let delta = task
             .request
             .txn_id
@@ -112,6 +116,10 @@ impl CoreLoop {
         let direction = crate::engine::graph::edge_store::Direction::Out;
         // Read-your-own-writes: fold this transaction's staged edges/tombstones
         // into the materialized subgraph, including through staged-only nodes.
+        // Read-your-own-writes refreshes the lease (see the overlay reaper).
+        if let Some(txn_id) = task.request.txn_id {
+            self.touch_overlay(txn_id);
+        }
         let delta = task
             .request
             .txn_id

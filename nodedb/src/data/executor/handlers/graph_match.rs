@@ -186,6 +186,10 @@ impl CoreLoop {
         task: &ExecutionTask,
         tid: u64,
     ) -> Option<crate::engine::graph::csr::GraphOverlayDelta> {
+        // Read-your-own-writes refreshes the lease (see the overlay reaper).
+        if let Some(txn_id) = task.request.txn_id {
+            self.touch_overlay(txn_id);
+        }
         task.request
             .txn_id
             .and_then(|txn_id| self.graph_txn_overlays.get(&txn_id))

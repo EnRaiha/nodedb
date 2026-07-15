@@ -140,6 +140,10 @@ impl CoreLoop {
         // far below the watermark and enforce the entry-count backstop. Rides
         // the compaction interval — no dedicated timer.
         self.gc_write_index();
+        // Lease-GC abandoned per-transaction staging overlays (client vanished,
+        // teardown dispatch failed, or vShard leader moved mid-txn). Bounded by
+        // a per-tick budget internally. Rides the compaction interval.
+        self.reap_expired_overlays();
         self.run_compaction(false);
         true
     }

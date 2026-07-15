@@ -73,6 +73,10 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let depth = depth.min(crate::engine::graph::traversal_options::MAX_GRAPH_TRAVERSAL_DEPTH);
         let refs: Vec<&str> = start_nodes.iter().map(String::as_str).collect();
+        // Read-your-own-writes refreshes the lease (see the overlay reaper).
+        if let Some(txn_id) = task.request.txn_id {
+            self.touch_overlay(txn_id);
+        }
         let overlay = task
             .request
             .txn_id
@@ -156,6 +160,10 @@ impl CoreLoop {
         };
         // Read-your-own-writes: fold this transaction's staged edge writes
         // into the durable result (see `graph_txn_merge`).
+        // Read-your-own-writes refreshes the lease (see the overlay reaper).
+        if let Some(txn_id) = task.request.txn_id {
+            self.touch_overlay(txn_id);
+        }
         let overlay = task
             .request
             .txn_id

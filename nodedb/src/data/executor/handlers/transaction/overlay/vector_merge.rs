@@ -193,6 +193,8 @@ impl CoreLoop {
         let coll_key = (database_id, tid, collection.to_string());
         let config_key = (tid, collection.to_string());
 
+        // Read-your-own-writes refreshes the lease (see the reaper).
+        self.touch_overlay(txn_id);
         if let Some(overlay) = self.txn_overlays.get(&txn_id) {
             let mut seen: HashMap<u32, usize> = hits
                 .iter()

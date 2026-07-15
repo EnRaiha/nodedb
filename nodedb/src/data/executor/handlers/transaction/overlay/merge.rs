@@ -85,6 +85,8 @@ impl CoreLoop {
         rows: &mut Vec<(String, Vec<u8>)>,
         matches: &dyn Fn(&[u8]) -> bool,
     ) {
+        // Read-your-own-writes refreshes the lease (see the reaper).
+        self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
             return;
         };
@@ -151,6 +153,8 @@ impl CoreLoop {
         rows: &mut Vec<(Vec<u8>, Vec<u8>)>,
         matches: &dyn Fn(&[u8]) -> bool,
     ) {
+        // Read-your-own-writes refreshes the lease (see the reaper).
+        self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
             return;
         };
@@ -258,6 +262,8 @@ impl CoreLoop {
             residual,
             strict_schema,
         } = params;
+        // Read-your-own-writes refreshes the lease (see the reaper).
+        self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
             return;
         };
@@ -351,14 +357,17 @@ impl CoreLoop {
         doc_id: &str,
         base: impl FnOnce() -> crate::Result<Option<Vec<u8>>>,
     ) -> crate::Result<Option<Vec<u8>>> {
-        if let Some(txn_id) = txn_id
-            && let Some(overlay) = self.txn_overlays.get(&txn_id)
-            && let Ok(surrogate) = u32::from_str_radix(doc_id, 16)
-        {
-            match overlay.get(coll_key, surrogate) {
-                Some(Staged::Put(body)) => return Ok(Some(body.clone())),
-                Some(Staged::Tombstone) => return Ok(None),
-                None => {}
+        if let Some(txn_id) = txn_id {
+            // Read-your-own-writes refreshes the lease (see the reaper).
+            self.touch_overlay(txn_id);
+            if let Some(overlay) = self.txn_overlays.get(&txn_id)
+                && let Ok(surrogate) = u32::from_str_radix(doc_id, 16)
+            {
+                match overlay.get(coll_key, surrogate) {
+                    Some(Staged::Put(body)) => return Ok(Some(body.clone())),
+                    Some(Staged::Tombstone) => return Ok(None),
+                    None => {}
+                }
             }
         }
         base()

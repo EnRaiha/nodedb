@@ -22,6 +22,7 @@
 //! and node-label staging live in the sibling `edges` and `labels` modules;
 //! memory accounting lives in `memory`.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use super::types::{EdgeKey, GraphCollKey, GraphCollectionOverlay, NodeLabelDelta};
@@ -72,11 +73,28 @@ pub struct GraphTxnOverlay {
     /// escapes the journal — the guarantee `ROLLBACK TO SAVEPOINT` relies on.
     /// Dropped with the overlay when the transaction resolves.
     journal: Vec<GraphOverlayUndo>,
+    /// Ordinal-clock stamp of the last time this transaction touched its GRAPH
+    /// overlay — the parallel of `super::super::staged::TxnOverlay`'s stamp,
+    /// read alongside it by the lease reaper (a refresh on EITHER overlay keeps
+    /// the transaction alive). `Cell` for the same single-threaded `!Send`
+    /// interior-mutability reason.
+    last_touch_ord: Cell<i64>,
 }
 
 impl GraphTxnOverlay {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Refresh the graph overlay's lease stamp to `ord`. See
+    /// `super::super::staged::TxnOverlay::touch`.
+    pub fn touch(&self, ord: i64) {
+        self.last_touch_ord.set(ord);
+    }
+
+    /// The graph overlay's last lease stamp (0 if never touched).
+    pub fn last_touch(&self) -> i64 {
+        self.last_touch_ord.get()
     }
 
     /// Record an edge identity's prior state across BOTH edge sets before a

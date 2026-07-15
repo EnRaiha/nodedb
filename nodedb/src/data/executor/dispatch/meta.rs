@@ -299,25 +299,9 @@ impl CoreLoop {
             // memtable) before this dispatches, so the empty-check fails and
             // the engine correctly stays registered with its committed rows.
             MetaOp::DropTxnOverlay { txn_id } => {
-                let removed = u64::from(self.txn_overlays.remove(txn_id).is_some())
-                    + u64::from(self.graph_txn_overlays.remove(txn_id).is_some());
-                if removed > 0
-                    && let Some(m) = &self.metrics
-                {
-                    m.active_txn_overlays
-                        .fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
-                }
-                if let Some(created) = self.txn_created_columnar_engines.remove(txn_id) {
-                    for engine_key in created {
-                        let still_empty = self
-                            .columnar_engines
-                            .get(&engine_key)
-                            .is_some_and(|engine| engine.memtable().is_empty());
-                        if still_empty {
-                            self.columnar_engines.remove(&engine_key);
-                        }
-                    }
-                }
+                // Behaviour-preserving delegation to the shared teardown, which
+                // the lease reaper also calls (see `CoreLoop::drop_overlay_entry`).
+                self.drop_overlay_entry(*txn_id);
                 self.response_ok(task)
             }
 
@@ -326,6 +310,8 @@ impl CoreLoop {
             // GRAPH overlay's, each an 8-byte LE u64 (16 bytes total). An
             // absent overlay (no staged write of that kind yet) reports 0.
             MetaOp::MarkSavepoint { txn_id } => {
+                // A savepoint marks an active transaction — refresh its lease.
+                self.touch_overlay(*txn_id);
                 let value_marker = self
                     .txn_overlays
                     .get(txn_id)
@@ -350,6 +336,8 @@ impl CoreLoop {
                 value_marker,
                 graph_marker,
             } => {
+                // Rewinding a savepoint is transaction activity — refresh lease.
+                self.touch_overlay(*txn_id);
                 if let Some(overlay) = self.txn_overlays.get_mut(txn_id) {
                     overlay.rollback_to(*value_marker as usize);
                 }
@@ -656,6 +644,124 @@ mod txn_created_columnar_engine_tests {
             gauge(),
             0,
             "dropping both overlays must return the gauge to zero"
+        );
+    }
+
+    // ── Overlay lease GC (reap of abandoned per-txn staging overlays) ────
+    //
+    // Mirrors the reservation lease-GC pattern: a still-active transaction
+    // refreshes its stamp on every write AND every read, so only genuinely
+    // abandoned overlays (past `OVERLAY_LEASE_NS`) are reclaimed. Fully
+    // deterministic via the logical `OrdinalClock` — no sleeps.
+
+    use crate::data::executor::handlers::transaction::overlay_reap::OVERLAY_LEASE_NS;
+
+    #[test]
+    fn reap_reclaims_past_lease_overlay_and_spares_active_one() {
+        let (mut core, _dir) = make_core();
+        let metrics = std::sync::Arc::new(crate::control::metrics::SystemMetrics::new());
+        core.metrics = Some(metrics.clone());
+        let task = make_task();
+        let gauge = || {
+            metrics
+                .active_txn_overlays
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let txn_a = TxnId::new(1001);
+        let txn_b = TxnId::new(1002);
+
+        // txn_A: value overlay (+ an auto-created, still-empty columnar engine)
+        // plus a parallel graph overlay — all three leaking maps populated.
+        let key_a = stage_new_collection(&mut core, &task, txn_a, "reap_a");
+        core.graph_txn_overlay_mut(txn_a);
+        assert!(core.txn_overlays.contains_key(&txn_a));
+        assert!(core.graph_txn_overlays.contains_key(&txn_a));
+        assert!(core.txn_created_columnar_engines.contains_key(&txn_a));
+
+        // Freeze txn_A's newest stamp; everything staged after is strictly newer.
+        let a_stamp = core.hlc.peek();
+
+        // txn_B stages later, so its stamp is strictly greater than a_stamp.
+        let _key_b = stage_new_collection(&mut core, &task, txn_b, "reap_b");
+        core.graph_txn_overlay_mut(txn_b);
+        assert_eq!(gauge(), 4, "two overlays each for txn_A and txn_B");
+
+        // Advance the clock so the threshold (peek - LEASE) lands strictly above
+        // txn_A's stamp but at-or-below txn_B's: a_stamp < threshold <= b_stamp.
+        core.hlc.update_from_remote(a_stamp + OVERLAY_LEASE_NS + 1);
+
+        core.reap_expired_overlays();
+
+        // txn_A is past-lease: all three maps cleared, its empty auto-created
+        // engine dropped, gauge decremented by its two overlays.
+        assert!(
+            !core.txn_overlays.contains_key(&txn_a),
+            "past-lease txn_A value overlay must be reaped"
+        );
+        assert!(
+            !core.graph_txn_overlays.contains_key(&txn_a),
+            "past-lease txn_A graph overlay must be reaped"
+        );
+        assert!(
+            !core.txn_created_columnar_engines.contains_key(&txn_a),
+            "past-lease txn_A columnar tracking must be reaped"
+        );
+        assert!(
+            !core.columnar_engines.contains_key(&key_a),
+            "txn_A's still-empty auto-created engine must be dropped on reap"
+        );
+        assert_eq!(gauge(), 2, "gauge decremented by txn_A's two overlays");
+
+        // txn_B is still active (stamp above threshold): spared entirely — the
+        // active-txn-not-reaped safety half.
+        assert!(
+            core.txn_overlays.contains_key(&txn_b),
+            "active txn_B value overlay must survive"
+        );
+        assert!(
+            core.graph_txn_overlays.contains_key(&txn_b),
+            "active txn_B graph overlay must survive"
+        );
+    }
+
+    #[test]
+    fn read_your_own_write_refresh_spares_past_lease_overlay() {
+        let (mut core, _dir) = make_core();
+        let task = make_task();
+
+        let txn_a = TxnId::new(2001);
+        let key_a = stage_new_collection(&mut core, &task, txn_a, "refresh_a");
+        let a_stamp = core.hlc.peek();
+
+        // Advance so txn_A is nominally past-lease before the read.
+        core.hlc.update_from_remote(a_stamp + OVERLAY_LEASE_NS + 1);
+
+        // A real in-transaction READ (read-your-own-write scan merge) refreshes
+        // the lease via the instrumented `touch_overlay` on the read path.
+        let coll_key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "refresh_a".to_string(),
+        );
+        let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
+        core.merge_overlay_into_scan(txn_a, &coll_key, &mut rows, &|_| true);
+
+        core.reap_expired_overlays();
+
+        // The read refreshed txn_A's stamp to the current clock, so it survives
+        // — proving refresh-on-access keeps a live read-only txn alive.
+        assert!(
+            core.txn_overlays.contains_key(&txn_a),
+            "a txn refreshed by an in-txn read must NOT be reaped"
+        );
+        assert!(
+            core.txn_created_columnar_engines.contains_key(&txn_a),
+            "read-refreshed txn_A columnar tracking must be retained"
+        );
+        assert!(
+            core.columnar_engines.contains_key(&key_a),
+            "read-refreshed txn_A engine must be retained"
         );
     }
 }
