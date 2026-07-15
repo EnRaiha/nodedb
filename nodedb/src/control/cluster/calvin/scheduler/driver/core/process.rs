@@ -145,6 +145,28 @@ impl Scheduler {
             return;
         }
 
+        // In-flight guard (catch-up-replay idempotency). Skip a txn that is
+        // already in-flight on this scheduler — dispatched-and-awaiting-response
+        // (`pending`), blocked on locks (`blocked`), or parked on a dependent-read
+        // barrier (`dependent_barrier`). Re-running any of these would dispatch a
+        // SECOND copy and double-execute the transaction.
+        //
+        // This is a strict NO-OP for LIVE inputs: the sequencer delivers each
+        // `(epoch, position)` to a given vShard exactly once, so a live txn can
+        // never already be in-flight on its first arrival. The guard fires ONLY
+        // when the catch-up drain replays a committed log range that overlaps an
+        // input already delivered live and still in-flight — the exact overlap
+        // the drain cannot avoid (it replays from the earliest dropped index
+        // forward, which may re-cover inputs that were NOT dropped). Reserve /
+        // Release replay is already idempotent in the lock manager, so only Txn
+        // needs this guard.
+        if self.pending.contains_key(&txn_id)
+            || self.blocked.contains_key(&lock_owner)
+            || self.dependent_barrier.contains_key(&txn_id)
+        {
+            return;
+        }
+
         let keys = super::super::helpers::expand_rw_set(&txn);
         let keys_count = keys.len();
         let _acquire_span = tracing::info_span!(

@@ -14,6 +14,8 @@
 //!   mismatch, staged commit-resolution state, or direct apply) to its handler.
 //! - [`process`] — new-txn processing, dependent-read barrier setup,
 //!   txn-completion bookkeeping.
+//! - [`catch_up`] — sequencer-fan-out catch-up drain: replays inputs dropped on
+//!   this replica (channel Full/Closed) from the committed sequencer Raft log.
 //! - [`dispatch`] — static / active dispatch to the Data Plane executor.
 //! - [`routing`] — exhaustive `PhysicalPlan` → vshard routing oracle used by
 //!   `dispatch`'s local-plan filtering.
@@ -41,6 +43,7 @@
 //!
 //! Never used for WAL-influencing values.
 
+pub mod catch_up;
 pub mod commit_redo;
 pub mod commit_resolve;
 pub mod completion_route;

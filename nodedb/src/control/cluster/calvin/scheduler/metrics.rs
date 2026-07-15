@@ -45,6 +45,19 @@ pub struct SchedulerMetrics {
     /// non-zero, growing value flags a stuck sequencer / partitioned verdict
     /// path that needs operator attention, never a correctness action here.
     pub verdict_stall_count: AtomicU64,
+    /// Total `SchedulerInput`s replayed by the sequencer-fan-out catch-up drain
+    /// (`drain_catch_up`). A non-zero value means this replica dropped at least
+    /// one fan-out `try_send` (channel Full/Closed) and the drain reconstructed
+    /// the missed input from the committed sequencer Raft log — the mechanism
+    /// that keeps this replica's lock table convergent with its peers.
+    pub catch_up_replayed: AtomicU64,
+    /// Times the catch-up drain found the sequencer Raft log compacted below the
+    /// dropped index (`LogCompacted`). Reachable only via a sequencer-group
+    /// snapshot-install resync, where the installed snapshot already subsumes the
+    /// dropped index, so the state is already correct. A non-zero, growing value
+    /// flags that catch-up is relying on snapshot coverage rather than log replay
+    /// and warrants operator attention.
+    pub catch_up_log_compacted: AtomicU64,
 }
 
 /// Reason codes for `nodedb_calvin_infra_abort_total`.
@@ -110,6 +123,16 @@ impl SchedulerMetrics {
     /// waiting; it never aborts on a stall.
     pub fn record_verdict_stall(&self) {
         self.verdict_stall_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that the catch-up drain replayed `n` sequencer inputs.
+    pub fn record_catch_up_replayed(&self, n: u64) {
+        self.catch_up_replayed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Record that the catch-up drain hit a compacted sequencer log.
+    pub fn record_catch_up_log_compacted(&self) {
+        self.catch_up_log_compacted.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record the end-to-end executor txn duration (dispatch → response).
@@ -239,6 +262,34 @@ impl SchedulerMetrics {
             self.verdict_stall_count.load(Ordering::Relaxed)
         );
 
+        let _ = writeln!(
+            out,
+            "# HELP nodedb_calvin_catch_up_replayed_total \
+             Sequencer inputs replayed by the fan-out catch-up drain."
+        );
+        let _ = writeln!(out, "# TYPE nodedb_calvin_catch_up_replayed_total counter");
+        let _ = writeln!(
+            out,
+            "nodedb_calvin_catch_up_replayed_total{{{label}}} {}",
+            self.catch_up_replayed.load(Ordering::Relaxed)
+        );
+
+        let _ = writeln!(
+            out,
+            "# HELP nodedb_calvin_catch_up_log_compacted_total \
+             Times the catch-up drain found the sequencer log compacted below the \
+             dropped index (state is snapshot-covered)."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE nodedb_calvin_catch_up_log_compacted_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "nodedb_calvin_catch_up_log_compacted_total{{{label}}} {}",
+            self.catch_up_log_compacted.load(Ordering::Relaxed)
+        );
+
         out
     }
 }
@@ -256,6 +307,8 @@ impl Default for SchedulerMetrics {
             executor_txn_duration_sum_ms: AtomicU64::new(0),
             infra_abort_counts: std::array::from_fn(|_| AtomicU64::new(0)),
             verdict_stall_count: AtomicU64::new(0),
+            catch_up_replayed: AtomicU64::new(0),
+            catch_up_log_compacted: AtomicU64::new(0),
         }
     }
 }

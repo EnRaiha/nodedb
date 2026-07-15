@@ -11,7 +11,8 @@ use tracing::info;
 use nodedb_cluster::MultiRaft;
 use nodedb_cluster::calvin::types::SchedulerInput;
 use nodedb_cluster::calvin::{
-    CalvinCompletionRegistry, SEQUENCER_GROUP_ID, SequencerEntry, VerdictSignal,
+    CalvinCompletionRegistry, SEQUENCER_GROUP_ID, SequencerEntry, SequencerStateMachine,
+    VerdictSignal,
 };
 
 use super::super::barrier::{PendingDependentBarrier, ReadResultEvent};
@@ -52,6 +53,17 @@ pub struct Scheduler {
     /// the sequencer group.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) multi_raft:
         Arc<Mutex<MultiRaft>>,
+    /// Shared handle to the sequencer state machine. The state machine records,
+    /// per vShard, the earliest Raft index whose fan-out `try_send` was DROPPED
+    /// (channel Full/Closed) so a dropped `SchedulerInput` never permanently
+    /// diverges this replica's lock table from its peers. The catch-up drain
+    /// (`drain_catch_up`, run on the periodic stall tick) TAKEs that index,
+    /// replays the committed sequencer log range through the SAME
+    /// `process_scheduler_input` path, and thereby reconstructs the missed input.
+    /// Shared `Arc<Mutex<_>>` with the Raft apply loop; both are Control Plane,
+    /// so holding it crosses no plane boundary.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) sequencer_state_machine:
+        Arc<Mutex<SequencerStateMachine>>,
     /// Deterministic lock manager for this vshard. Shared (via `Arc<Mutex<_>>`)
     /// with the Control-Plane write-admission gate through
     /// `SharedState.calvin_lock_managers`, so a fast-path point write contends
@@ -139,6 +151,9 @@ pub struct SchedulerParams {
     pub receiver: mpsc::Receiver<SchedulerInput>,
     pub shared: Arc<SharedState>,
     pub multi_raft: Arc<Mutex<MultiRaft>>,
+    /// Shared sequencer state machine, source of the per-vShard catch-up index
+    /// the drain replays from. Same `Arc` the Raft apply loop drives.
+    pub sequencer_state_machine: Arc<Mutex<SequencerStateMachine>>,
     /// Fully-applied watermark seed from the recovery scan.
     pub fully_applied_epoch: u64,
     /// Applied `(epoch, position)` pairs seed from the recovery scan.
@@ -172,6 +187,7 @@ impl Scheduler {
             receiver,
             shared,
             multi_raft,
+            sequencer_state_machine,
             fully_applied_epoch,
             applied_tail,
             rebuild_target_epoch,
@@ -194,6 +210,7 @@ impl Scheduler {
             receiver,
             shared,
             multi_raft,
+            sequencer_state_machine,
             lock_manager,
             pending: BTreeMap::new(),
             blocked: BTreeMap::new(),
@@ -329,10 +346,15 @@ impl Scheduler {
                 }
 
                 _ = stall_tick.tick() => {
-                    // Empty body on purpose: the top-of-loop
-                    // check_awaiting_verdict_stalls / check_dependent_barrier_timeouts
-                    // do the work on every wake. This arm only guarantees the loop
-                    // wakes to run them when no other event arrives.
+                    // Replay any sequencer-fan-out inputs dropped on this replica
+                    // (channel Full/Closed) so a missed `SchedulerInput` never
+                    // permanently diverges this vShard's lock table from its peers.
+                    // O(1) common case (no pending catch-up). See `drain_catch_up`.
+                    self.drain_catch_up();
+                    // The top-of-loop check_awaiting_verdict_stalls /
+                    // check_dependent_barrier_timeouts do the stall work on every
+                    // wake; this arm guarantees the loop wakes to run them (and the
+                    // drain) when no other event arrives.
                 }
             }
         }

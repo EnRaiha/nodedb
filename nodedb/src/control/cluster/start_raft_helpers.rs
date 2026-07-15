@@ -197,6 +197,7 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
             receiver: sequenced_rx,
             shared: Arc::clone(shared),
             multi_raft: raft_loop_handle.clone(),
+            sequencer_state_machine: Arc::clone(sequencer_state_machine),
             fully_applied_epoch: recovery.fully_applied_epoch,
             applied_tail: recovery.applied_tail,
             rebuild_target_epoch: recovery.max_applied_epoch,
