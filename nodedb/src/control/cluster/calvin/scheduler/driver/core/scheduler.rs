@@ -83,6 +83,12 @@ pub struct Scheduler {
     /// Rebuild target epoch (highest applied epoch from the initial recovery
     /// scan).
     pub(in crate::control::cluster::calvin::scheduler::driver::core) rebuild_target_epoch: u64,
+    /// Highest replicated epoch observed across all scheduler inputs so far.
+    /// Advances monotonically as `process_scheduler_input` sees new inputs; the
+    /// lease-based reservation reap uses it (minus `LEASE_EPOCHS`) as the
+    /// deterministic threshold below which an orphaned shared reservation is
+    /// released. Purely a function of replicated input order — no wall clock.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) max_input_epoch: u64,
     /// Scheduler configuration.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) config: SchedulerConfig,
     /// Metrics.
@@ -195,6 +201,7 @@ impl Scheduler {
             read_result_rx,
             applied: AppliedGate::new(fully_applied_epoch, applied_tail),
             rebuild_target_epoch,
+            max_input_epoch: 0,
             config,
             metrics,
             completion_rx,

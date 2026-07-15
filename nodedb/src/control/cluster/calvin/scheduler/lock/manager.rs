@@ -41,10 +41,13 @@ use super::lock_key::{LockKey, TxnId};
 ///   one of its keys, the entry moves from `pending_keys` to `held_locks`.
 pub struct LockManager {
     /// Per-key lock entries.  Uses `BTreeMap` for deterministic iteration.
-    table: BTreeMap<LockKey, LockEntry>,
+    /// `pub(super)` so the sibling `reap` module can scan entries for
+    /// lease-expired reservations without a public accessor.
+    pub(super) table: BTreeMap<LockKey, LockEntry>,
     /// Per-transaction set of currently held keys for **dispatched** txns.
     /// Used by `release` to iterate the key set without a full table scan.
-    held_locks: BTreeMap<TxnId, BTreeSet<LockKey>>,
+    /// `pub(super)` — see `table`.
+    pub(super) held_locks: BTreeMap<TxnId, BTreeSet<LockKey>>,
     /// Key sets for **blocked** (not-yet-dispatched) txns.  Populated when
     /// `acquire` returns `Blocked`; cleared (moved to `held_locks`) when all
     /// keys have been acquired on the promotion path inside `release`.

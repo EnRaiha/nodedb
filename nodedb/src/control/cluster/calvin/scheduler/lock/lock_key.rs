@@ -70,4 +70,16 @@ impl TxnId {
     pub fn is_autocommit(&self) -> bool {
         self.epoch == Self::AUTOCOMMIT_EPOCH
     }
+
+    /// Start of the reservation position band. A read-reservation owner always
+    /// has `position >= this`; a real Calvin batch position never does (batch
+    /// positions run `0..max_txns_per_epoch`, far below this band). Mirrors the
+    /// sequencer's reservation-position band — the two MUST stay in sync.
+    pub const RESERVATION_POSITION_BAND: u32 = 1 << 31;
+
+    /// Whether this id owns a read reservation (its position is in the
+    /// reservation band) rather than a real Calvin batch transaction.
+    pub fn is_reservation(&self) -> bool {
+        self.position >= Self::RESERVATION_POSITION_BAND
+    }
 }

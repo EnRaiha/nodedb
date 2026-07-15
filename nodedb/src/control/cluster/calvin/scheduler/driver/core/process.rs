@@ -15,6 +15,13 @@ use super::super::barrier::PendingDependentBarrier;
 use super::scheduler::Scheduler;
 use crate::control::cluster::calvin::scheduler::lock_manager::{AcquireOutcome, TxnId};
 
+/// Epochs a read reservation may live before the scheduler reaps it as orphaned.
+/// At the default 20ms epoch tick this is ~5s of wall-clock — far longer than any
+/// real think-time between reservation install and commit, yet short enough that a
+/// crashed coordinator's reservation is reclaimed promptly. Expressed in epochs
+/// (logical, replicated), NOT seconds — deterministic across replicas.
+const LEASE_EPOCHS: u64 = 250;
+
 impl Scheduler {
     /// Route a fanned-out scheduler input to its handler.
     ///
@@ -22,14 +29,40 @@ impl Scheduler {
     /// the resulting `process`/`acquire_shared`/`release` calls are identical
     /// across replicas — the determinism contract. No wall clock or local state
     /// enters the routing decision.
+    ///
+    /// Before dispatching, advances `max_input_epoch` on epoch increase and reaps
+    /// any shared reservation whose owner epoch has fallen behind the lease
+    /// window (`max_input_epoch - LEASE_EPOCHS`) — a deterministic function of
+    /// replicated input order, so every replica reaps identically.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn process_scheduler_input(
         &mut self,
         input: SchedulerInput,
     ) {
+        let epoch = Self::input_epoch(&input);
+        if epoch > self.max_input_epoch {
+            self.max_input_epoch = epoch;
+            let threshold = self.max_input_epoch.saturating_sub(LEASE_EPOCHS);
+            let promoted = {
+                let mut lm = self.lock_manager.lock().unwrap_or_else(|p| p.into_inner());
+                lm.reap_expired_shared(threshold)
+            };
+            self.dispatch_promoted(promoted);
+        }
+
         match input {
             SchedulerInput::Txn(txn) => self.process_new_txn(txn),
             SchedulerInput::Reserve { owner, key } => self.install_reservation(owner, key),
             SchedulerInput::Release { owner, reason } => self.release_reservation(owner, reason),
+        }
+    }
+
+    /// The replicated epoch an input is stamped with — the monotonic logical
+    /// clock the lease reap advances on.
+    fn input_epoch(input: &SchedulerInput) -> u64 {
+        match input {
+            SchedulerInput::Txn(txn) => txn.epoch,
+            SchedulerInput::Reserve { owner, .. } => owner.epoch,
+            SchedulerInput::Release { owner, .. } => owner.epoch,
         }
     }
 
