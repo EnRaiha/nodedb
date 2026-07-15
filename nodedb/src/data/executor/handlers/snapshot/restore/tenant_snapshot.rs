@@ -196,6 +196,28 @@ impl CoreLoop {
                 vectors_written += count;
             }
 
+            // Vectors installed above land only in the in-memory
+            // `vector_collections` map with no WAL record — the Raft
+            // install-snapshot path (`replace_mode`) never re-issues them as
+            // live writes (they are already Raft-committed; re-proposing
+            // would be circular), so its only durability contract is Raft's
+            // own fsynced `.snap` file plus this local checkpoint. Without a
+            // synchronous checkpoint here, a crash before the next periodic
+            // `checkpoint_vector_indexes()` run (every 5 minutes) would lose
+            // the just-installed vectors. Checkpointing is cheap-idempotent
+            // (skips empty collections), so this is unconditional rather than
+            // gated on `replace_mode`: the user-RESTORE path drains vector
+            // data before it ever reaches here (see
+            // `control/backup/restore/orchestrate/mod.rs`), so `vectors_written`
+            // is 0 and the call is a no-op on that path.
+            if vectors_written > 0 {
+                let checkpointed = self.checkpoint_vector_indexes();
+                info!(
+                    core = self.core_id,
+                    tenant_id, checkpointed, "vector snapshot install checkpointed synchronously"
+                );
+            }
+
             // Restore KV tables.
             for (collection_name, bytes) in &snap.kv_tables {
                 let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = match zerompk::from_msgpack(bytes) {
@@ -320,5 +342,109 @@ impl CoreLoop {
                 },
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+    use crate::bridge::envelope::{PhysicalPlan, Status};
+    use crate::data::executor::vector_checkpoint::vector_ckpt_dir;
+    use nodedb_bridge::buffer::RingBuffer;
+    use nodedb_physical::physical_plan::MetaOp;
+
+    fn open_core(dir: &std::path::Path) -> CoreLoop {
+        let hlc = Arc::new(nodedb_types::OrdinalClock::new());
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        drop(req_tx);
+        drop(resp_rx);
+        CoreLoop::open(0, req_rx, resp_tx, dir, hlc).expect("CoreLoop::open")
+    }
+
+    /// A msgpack-encoded `TenantDataSnapshot` carrying one vector collection
+    /// entry under key `"0:0:emb"` (db=0, tenant=0, collection="emb").
+    fn vector_snapshot_bytes() -> Vec<u8> {
+        let vectors: Vec<(u32, Vec<f32>, Option<nodedb_types::Surrogate>)> = vec![(
+            0,
+            vec![1.0, 2.0, 3.0],
+            Some(nodedb_types::Surrogate::new(1)),
+        )];
+        let vectors_bytes = zerompk::to_msgpack_vec(&vectors).expect("encode vectors");
+        let snap = crate::types::TenantDataSnapshot {
+            vectors: vec![("0:0:emb".to_string(), vectors_bytes)],
+            ..Default::default()
+        };
+        zerompk::to_msgpack_vec(&snap).expect("encode snapshot")
+    }
+
+    /// The Raft install-snapshot path (`replace_mode = true`) installs
+    /// vectors straight into the in-memory-only `vector_collections` map with
+    /// no WAL record. Its only durability contract is Raft's own fsynced
+    /// `.snap` file plus an immediate local checkpoint — this proves the
+    /// checkpoint happens SYNCHRONOUSLY within the restore call, not on the
+    /// next periodic (5-minute) timer tick.
+    #[test]
+    fn raft_install_checkpoints_vectors_synchronously() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut core = open_core(dir.path());
+
+        let task = CoreLoop::replay_vector_task(
+            crate::types::TenantId::new(0),
+            nodedb_types::DatabaseId::DEFAULT,
+            crate::types::VShardId::from_collection_in_database(
+                nodedb_types::DatabaseId::DEFAULT,
+                "emb",
+            ),
+            PhysicalPlan::Meta(MetaOp::WalAppend {
+                payload: Vec::new(),
+            }),
+        );
+
+        let response = core.execute_restore_tenant_snapshot(
+            &task,
+            0,
+            &vector_snapshot_bytes(),
+            true, // replace_mode = true: the Raft-install signature.
+            &[],
+            &[],
+        );
+        assert_eq!(response.status, Status::Ok, "restore must succeed");
+
+        // The checkpoint file must exist on disk immediately — no periodic
+        // timer tick has run.
+        let ckpt_dir = vector_ckpt_dir(&core.data_dir, core.core_id);
+        let entries: Vec<_> = std::fs::read_dir(&ckpt_dir)
+            .expect("checkpoint dir must exist synchronously")
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("ckpt"))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the restored vector collection must be checkpointed to disk synchronously"
+        );
+
+        // Reopen a fresh CoreLoop against the same data_dir with zero WAL
+        // records: `load_vector_checkpoints()` alone must restore the vector,
+        // proving durability came from the synchronous checkpoint, not replay.
+        drop(core);
+        let mut reopened = open_core(dir.path());
+        reopened.load_vector_checkpoints();
+        let key = CoreLoop::vector_index_key(0, 0, "emb", "");
+        let restored = reopened
+            .vector_collections
+            .get(&key)
+            .expect("checkpoint must restore the vector collection on reopen");
+        assert_eq!(
+            restored.len(),
+            1,
+            "the restored collection must contain the one vector"
+        );
     }
 }
