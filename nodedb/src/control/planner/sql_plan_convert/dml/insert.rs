@@ -222,11 +222,16 @@ pub(in super::super) fn convert_insert(
             }
             EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
                 let value_bytes = row_to_msgpack(row)?;
-                // Auto-`_rowid` collections carry no user identity: mint a fresh
-                // surrogate per row and use it as the document id (the Data
-                // Plane sets `_rowid` to the same value). A content-addressed
-                // assign on the empty pk would give every row one surrogate.
-                let (doc_id, surrogate) = if is_auto_rowid_pk(primary_key) {
+                // Mint a fresh surrogate + document id when the row carries no
+                // primary-key value: either an auto-`_rowid` collection (no
+                // `PRIMARY KEY` declared) or an INSERT that simply omitted the
+                // pk column. A content-addressed `assign` on the empty pk would
+                // bind EVERY such row to one surrogate and one empty document
+                // id, collapsing distinct id-less rows onto a single document
+                // (each insert overwriting the last). The Data Plane sets the
+                // row identity to this surrogate — matching the columnar path
+                // (`columnar_row_surrogates`).
+                let (doc_id, surrogate) = if is_auto_rowid_pk(primary_key) || doc_id.is_empty() {
                     let s = assign_fresh(ctx, collection)?;
                     (s.as_u32().to_string(), s)
                 } else {
@@ -336,10 +341,13 @@ pub(in super::super) fn convert_upsert(
         match engine {
             EngineType::DocumentSchemaless | EngineType::DocumentStrict => {
                 let value_bytes = row_to_msgpack(row)?;
-                // Auto-`_rowid` collections have no user identity to match on,
-                // so an upsert degenerates to an insert with a fresh surrogate;
-                // the on-conflict clause can never match a prior row.
-                let (doc_id, surrogate) = if is_auto_rowid_pk(primary_key) {
+                // A row with no primary-key value (auto-`_rowid` collection or
+                // an upsert that omitted the pk column) has no identity to match
+                // on, so the upsert degenerates to an insert with a fresh
+                // surrogate; the on-conflict clause can never match a prior row.
+                // Content-addressing the empty pk would instead collapse every
+                // id-less row onto one document.
+                let (doc_id, surrogate) = if is_auto_rowid_pk(primary_key) || doc_id.is_empty() {
                     let s = assign_fresh(ctx, collection)?;
                     (s.as_u32().to_string(), s)
                 } else {
