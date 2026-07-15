@@ -295,6 +295,7 @@ impl CoreLoop {
                         index_paths: &index_paths,
                         old_doc: &old_doc_json,
                         new_doc: &doc,
+                        wal_lsn: task.wal_lsn(),
                     }) {
                         tracing::warn!(
                             %doc_id,

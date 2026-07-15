@@ -34,6 +34,9 @@ pub(in crate::data::executor) struct BitemporalUpdateReindex<'a> {
     pub old_doc: Option<&'a serde_json::Value>,
     /// Decoded post-update document, used to compute the current index values.
     pub new_doc: &'a serde_json::Value,
+    /// Committed WAL LSN for this write, if any. `None` skips recording into
+    /// the per-index write-value substrate (mirrors `note_surrogate_write_lsn`).
+    pub wal_lsn: Option<crate::types::Lsn>,
 }
 
 /// Inputs for [`CoreLoop::nonbitemporal_update_reindex`].
@@ -49,6 +52,9 @@ pub(in crate::data::executor) struct NonbitemporalUpdateReindex<'a> {
     pub old_doc: &'a serde_json::Value,
     /// Post-update document image, for the secondary-index SET diff.
     pub new_doc: &'a serde_json::Value,
+    /// Committed WAL LSN for this write, if any. `None` skips recording into
+    /// the per-index write-value substrate (mirrors `note_surrogate_write_lsn`).
+    pub wal_lsn: Option<crate::types::Lsn>,
 }
 
 impl CoreLoop {
@@ -77,7 +83,7 @@ impl CoreLoop {
     /// index atomically. Removed values are tombstoned; current values are
     /// asserted live at `sys_from_ms`.
     pub(in crate::data::executor) fn bitemporal_update_reindex(
-        &self,
+        &mut self,
         p: BitemporalUpdateReindex<'_>,
     ) -> crate::Result<()> {
         let txn = self.sparse.begin_write()?;
@@ -95,6 +101,10 @@ impl CoreLoop {
                 body: p.new_body,
             },
         )?;
+
+        // Collected up front (owned, no borrow of `self`) so it can be handed
+        // to `note_index_write_values` after commit without a borrow conflict.
+        let mut touched_values: Vec<(String, String)> = Vec::new();
 
         for path in p.index_paths {
             let new_values = Self::indexed_values_for_path(p.new_doc, path);
@@ -135,12 +145,26 @@ impl CoreLoop {
                     },
                 )?;
             }
+
+            for value in old_values.union(&new_values) {
+                touched_values.push((path.path.clone(), value.clone()));
+            }
         }
 
         txn.commit().map_err(|e| crate::Error::Storage {
             engine: "sparse".into(),
             detail: format!("bitemporal update reindex commit: {e}"),
         })?;
+
+        if let Some(lsn) = p.wal_lsn {
+            self.note_index_write_values(
+                nodedb_types::DatabaseId::new(p.database_id),
+                crate::types::TenantId::new(p.tid),
+                p.collection,
+                &touched_values,
+                lsn,
+            );
+        }
         Ok(())
     }
 
@@ -169,7 +193,7 @@ impl CoreLoop {
             p.new_body,
         )?;
 
-        if !p.index_paths.is_empty() {
+        let (added, removed) = if !p.index_paths.is_empty() {
             self.apply_secondary_indexes_in_txn(
                 &txn,
                 crate::data::executor::core_loop::maintenance::SecondaryIndexInputs {
@@ -181,13 +205,27 @@ impl CoreLoop {
                     doc_id: p.doc_id,
                     index_paths: p.index_paths,
                 },
-            );
-        }
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         txn.commit().map_err(|e| crate::Error::Storage {
             engine: "sparse".into(),
             detail: format!("nonbitemporal update reindex commit: {e}"),
         })?;
+
+        if let Some(lsn) = p.wal_lsn {
+            let mut tuples = added;
+            tuples.extend(removed);
+            self.note_index_write_values(
+                nodedb_types::DatabaseId::new(p.database_id),
+                crate::types::TenantId::new(p.tid),
+                p.collection,
+                &tuples,
+                lsn,
+            );
+        }
         Ok(())
     }
 }

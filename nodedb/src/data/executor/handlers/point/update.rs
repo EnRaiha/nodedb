@@ -292,6 +292,7 @@ impl CoreLoop {
                                     index_paths: &index_paths,
                                     old_doc: old_doc.as_ref(),
                                     new_doc: &new_doc,
+                                    wal_lsn: task.wal_lsn(),
                                 },
                             )
                             .map(|()| None::<Vec<u8>>),
@@ -341,6 +342,7 @@ impl CoreLoop {
                                     index_paths: &index_paths,
                                     old_doc: &old_doc,
                                     new_doc: &new_doc,
+                                    wal_lsn: task.wal_lsn(),
                                 },
                             )
                             .map(|()| None::<Vec<u8>>),
