@@ -2,6 +2,8 @@
 
 //! Pure payload encoders for KV WAL records.
 
+use nodedb_physical::physical_plan::UpdateValue;
+
 /// Serialize `value` to a MessagePack WAL payload, wrapping any encode error
 /// into a `crate::Error::Serialization` tagged with `context`.
 fn encode<T: zerompk::ToMessagePack>(context: &str, value: &T) -> crate::Result<Vec<u8>> {
@@ -32,6 +34,62 @@ pub(crate) fn encode_kv_put(
         Some(expire_at_ms) => encode(
             "put",
             &("kv_put", collection, key, value, ttl_ms, expire_at_ms),
+        ),
+    }
+}
+
+/// Encode a `kv_insert_on_conflict_update` WAL payload in the shape the KV
+/// replay path decodes.
+///
+/// This is a DELTA record, not a post-image: `value` is the pre-merge
+/// incoming (`EXCLUDED`) row and `updates` carries the `DO UPDATE SET`
+/// assignment inputs — the Control Plane cannot know the merged document
+/// before dispatch. Replay re-reads whatever value is present in the KV
+/// engine at that point in LSN order and re-runs the same
+/// `apply_on_conflict_updates` merge the live handler uses, rather than
+/// trusting a captured post-image. This is the same rationale as
+/// [`encode_kv_field_set`], applied to the `INSERT ... ON CONFLICT DO
+/// UPDATE` RMW instead of `HSET`-style field merge.
+///
+/// With `expire_at_ms = None` this produces the six-element tuple
+/// `("kv_insert_on_conflict_update", collection, key, value, ttl_ms,
+/// updates)`. With `Some(instant)` it appends the resolved absolute expiry
+/// as a seventh element — the same additive, trailing-field convention
+/// `encode_kv_put` uses — so replay installs the exact instant the Control
+/// Plane resolved instead of recomputing `now_ms + ttl_ms` (which would
+/// drift). zerompk's strict array-length check means the two shapes never
+/// alias.
+pub(crate) fn encode_kv_insert_on_conflict_update(
+    collection: &str,
+    key: &[u8],
+    value: &[u8],
+    ttl_ms: u64,
+    updates: &[(String, UpdateValue)],
+    expire_at_ms: Option<u64>,
+) -> crate::Result<Vec<u8>> {
+    match expire_at_ms {
+        None => encode(
+            "insert on conflict update",
+            &(
+                "kv_insert_on_conflict_update",
+                collection,
+                key,
+                value,
+                ttl_ms,
+                updates,
+            ),
+        ),
+        Some(expire_at_ms) => encode(
+            "insert on conflict update",
+            &(
+                "kv_insert_on_conflict_update",
+                collection,
+                key,
+                value,
+                ttl_ms,
+                updates,
+                expire_at_ms,
+            ),
         ),
     }
 }
@@ -352,10 +410,13 @@ pub(crate) fn encode_kv_truncate(collection: &str) -> crate::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use nodedb_physical::physical_plan::UpdateValue;
+
     use super::{
         KvTransferFields, encode_kv_batch_put, encode_kv_cas, encode_kv_expire,
-        encode_kv_field_set, encode_kv_getset, encode_kv_incr, encode_kv_incr_float, encode_kv_put,
-        encode_kv_register_index, encode_kv_transfer, encode_kv_transfer_item,
+        encode_kv_field_set, encode_kv_getset, encode_kv_incr, encode_kv_incr_float,
+        encode_kv_insert_on_conflict_update, encode_kv_put, encode_kv_register_index,
+        encode_kv_transfer, encode_kv_transfer_item,
     };
 
     #[test]
@@ -537,6 +598,78 @@ mod tests {
         assert_eq!(key, b"p1");
         assert_eq!(decoded_updates, updates);
         assert_eq!(surrogate, 11);
+    }
+
+    #[test]
+    fn kv_insert_on_conflict_update_without_expire_at_carries_updates() {
+        let updates = vec![("score".to_string(), UpdateValue::Literal(b"42".to_vec()))];
+        let entry =
+            encode_kv_insert_on_conflict_update("players", b"p1", b"excluded", 0, &updates, None)
+                .unwrap();
+
+        let (disc, collection, key, value, ttl_ms, decoded_updates) = zerompk::from_msgpack::<(
+            &str,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+            u64,
+            Vec<(String, UpdateValue)>,
+        )>(&entry)
+        .unwrap();
+        assert_eq!(disc, "kv_insert_on_conflict_update");
+        assert_eq!(collection, "players");
+        assert_eq!(key, b"p1");
+        assert_eq!(value, b"excluded");
+        assert_eq!(ttl_ms, 0);
+        assert_eq!(decoded_updates, updates);
+
+        // The extended (with-expiry) shape must not alias this one.
+        assert!(
+            zerompk::from_msgpack::<(
+                &str,
+                String,
+                Vec<u8>,
+                Vec<u8>,
+                u64,
+                Vec<(String, UpdateValue)>,
+                u64
+            )>(&entry)
+            .is_err(),
+            "six-element payload must not decode as the seven-element tuple"
+        );
+    }
+
+    #[test]
+    fn kv_insert_on_conflict_update_with_expire_at_carries_absolute_instant() {
+        let updates = vec![("score".to_string(), UpdateValue::Literal(b"42".to_vec()))];
+        let entry = encode_kv_insert_on_conflict_update(
+            "players",
+            b"p1",
+            b"excluded",
+            5_000,
+            &updates,
+            Some(1_700_000_000_000),
+        )
+        .unwrap();
+
+        let (disc, collection, key, value, ttl_ms, decoded_updates, expire_at_ms) =
+            zerompk::from_msgpack::<(
+                &str,
+                String,
+                Vec<u8>,
+                Vec<u8>,
+                u64,
+                Vec<(String, UpdateValue)>,
+                u64,
+            )>(&entry)
+            .unwrap();
+        assert_eq!(disc, "kv_insert_on_conflict_update");
+        assert_eq!(collection, "players");
+        assert_eq!(key, b"p1");
+        assert_eq!(value, b"excluded");
+        assert_eq!(ttl_ms, 5_000);
+        assert_eq!(decoded_updates, updates);
+        assert_eq!(expire_at_ms, 1_700_000_000_000);
     }
 
     #[test]

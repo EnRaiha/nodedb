@@ -273,6 +273,23 @@ impl CoreLoop {
                     continue;
                 }
 
+                // kv_insert_on_conflict_update (delta record, not a
+                // post-image): re-runs the same `apply_on_conflict_updates`
+                // RMW merge against whatever value is present in this core's
+                // KV engine at this point in LSN order — see
+                // `wal_replay_kv_insert_conflict.rs`.
+                if let Some(applied) = self.try_replay_kv_insert_on_conflict_update(
+                    &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                    tombstones,
+                ) {
+                    puts += applied;
+                    continue;
+                }
+
                 // kv_register_index / kv_drop_index — see `wal_replay_kv_index.rs`.
                 if let Some(applied) = self.try_replay_kv_index(
                     &record.payload,

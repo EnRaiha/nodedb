@@ -31,6 +31,7 @@ mod wal_replay_kv_expiry;
 mod wal_replay_kv_field;
 mod wal_replay_kv_incr;
 mod wal_replay_kv_index;
+mod wal_replay_kv_insert_conflict;
 mod wal_replay_kv_sorted_index;
 mod wal_replay_kv_transfer;
 mod wal_replay_kv_ttl;

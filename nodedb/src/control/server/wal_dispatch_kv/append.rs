@@ -9,8 +9,9 @@ use nodedb_physical::physical_plan::KvOp;
 use super::encode::{
     KvRegisterSortedIndexFields, KvTransferFields, encode_kv_batch_put, encode_kv_cas,
     encode_kv_delete, encode_kv_drop_index, encode_kv_drop_sorted_index, encode_kv_expire,
-    encode_kv_field_set, encode_kv_getset, encode_kv_incr, encode_kv_incr_float, encode_kv_persist,
-    encode_kv_put, encode_kv_register_index, encode_kv_register_sorted_index, encode_kv_transfer,
+    encode_kv_field_set, encode_kv_getset, encode_kv_incr, encode_kv_incr_float,
+    encode_kv_insert_on_conflict_update, encode_kv_persist, encode_kv_put,
+    encode_kv_register_index, encode_kv_register_sorted_index, encode_kv_transfer,
     encode_kv_transfer_item, encode_kv_truncate,
 };
 
@@ -89,18 +90,30 @@ pub fn wal_append_kv_op(
             value,
             ttl_ms,
             surrogate: _,
-        }
-        | KvOp::InsertOnConflictUpdate {
-            collection,
-            key,
-            value,
-            ttl_ms,
-            updates: _,
-            surrogate: _,
         } => {
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
             resolved_now_ms = now_ms;
             let entry = encode_kv_put(collection, key, value, *ttl_ms, expire_at_ms)?;
+            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
+        }
+        KvOp::InsertOnConflictUpdate {
+            collection,
+            key,
+            value,
+            ttl_ms,
+            updates,
+            surrogate: _,
+        } => {
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
+            resolved_now_ms = now_ms;
+            let entry = encode_kv_insert_on_conflict_update(
+                collection,
+                key,
+                value,
+                *ttl_ms,
+                updates,
+                expire_at_ms,
+            )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Delete { collection, keys } => {
