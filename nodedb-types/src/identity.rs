@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// - `KvKey` for the raw Key-Value engine key bytes.
 /// - `Edge` for a graph edge, whose identity is the `(src, label, dst)` tuple
 ///   rather than a surrogate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum KeyRepr {
     /// Cross-engine `u32` surrogate identity.
     Surrogate(u32),

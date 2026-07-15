@@ -8,6 +8,7 @@ pub(in crate::data::executor) mod deferred;
 mod event_emit;
 pub(in crate::data::executor) mod filter_match;
 mod graph_partition;
+pub(in crate::data::executor) mod index_value_versions;
 pub(in crate::data::executor) mod maintenance;
 mod open;
 pub(in crate::data::executor) mod pressure;

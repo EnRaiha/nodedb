@@ -72,6 +72,9 @@ pub struct WriteVersionIndex {
     /// Last committed-write LSN per written collection (the phantom-safe floor:
     /// a predicate reader validates against this when it owns no per-key entry).
     coll_write_lsn: HashMap<CollKey, Lsn>,
+    /// Per-secondary-index-dimension write-VALUE versions — the finer-grained
+    /// sibling of `coll_write_lsn` an index-range read validates against.
+    pub(in crate::data::executor) index_values: super::index_value_versions::IndexValueVersionIndex,
 }
 
 impl WriteVersionIndex {
@@ -193,11 +196,24 @@ impl WriteVersionIndex {
                 .iter()
                 .map(|(k, lsn)| (*lsn, k.clone()))
                 .collect();
-            by_lsn.sort_by_key(|(lsn, _)| *lsn);
+            // TOTAL order so tied-LSN eviction is replica-identical: a plain
+            // `sort_by_key(lsn)` over a `HashMap`-collected Vec would let the
+            // dropped set depend on hash-iteration layout, diverging across
+            // replicas. `DatabaseId`/`TenantId` lack `Ord` (compare via
+            // `as_u64()`); `KeyRepr` is `Ord`.
+            by_lsn.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1.db.as_u64().cmp(&b.1.db.as_u64()))
+                    .then_with(|| a.1.tenant.as_u64().cmp(&b.1.tenant.as_u64()))
+                    .then_with(|| a.1.collection.cmp(&b.1.collection))
+                    .then_with(|| a.1.key.cmp(&b.1.key))
+            });
             for (_, key) in by_lsn.into_iter().take(overflow) {
                 self.last_write_lsn.remove(&key);
             }
         }
+
+        self.index_values.gc(watermark);
     }
 }
 

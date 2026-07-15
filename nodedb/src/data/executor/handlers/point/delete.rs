@@ -31,7 +31,7 @@ impl CoreLoop {
         // Doc-store write + all index cascades, via `apply_point_delete`.
         // The doc-store transaction is committed internally before any
         // cascade runs (cascades open their own write transactions).
-        let prior = match self.apply_point_delete(PointDeleteParams {
+        let outcome = match self.apply_point_delete(PointDeleteParams {
             database_id,
             tid,
             collection,
@@ -40,7 +40,7 @@ impl CoreLoop {
             user_roles: &task.request.user_roles,
             enforce: true,
         }) {
-            Ok(outcome) => outcome.prior_value,
+            Ok(outcome) => outcome,
             Err(e) => {
                 return self.response_error(
                     task,
@@ -50,6 +50,7 @@ impl CoreLoop {
                 );
             }
         };
+        let prior = outcome.prior_value;
 
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
@@ -58,6 +59,20 @@ impl CoreLoop {
         // matched nothing changes no state and creates no OCC conflict.
         if prior.is_some() {
             self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+
+            // Record the removed secondary-index values into the per-index
+            // write-value substrate (plain cascade ∪ bitemporal tombstones).
+            if let Some(lsn) = task.wal_lsn() {
+                let mut tuples = outcome.secondary_index_tuples;
+                tuples.extend(outcome.bitemporal_index_tuples);
+                self.note_index_write_values(
+                    task.request.database_id,
+                    crate::types::TenantId::new(tid),
+                    collection,
+                    &tuples,
+                    lsn,
+                );
+            }
         }
 
         // Emit delete event to Event Plane if the row actually existed.

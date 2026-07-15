@@ -94,10 +94,11 @@ impl CoreLoop {
             Err(e) => return self.response_error(task, e),
         }
 
-        // `apply_point_put` returns prior bytes if any — for PointInsert this
-        // must be `None` because the probe above already rejected the
-        // conflict case. We intentionally drop it.
-        if let Err(e) = self.apply_point_put(
+        // `apply_point_put` returns prior bytes if any — for PointInsert that
+        // is `None` because the probe above already rejected the conflict case.
+        // The outcome's index tuples are consumed below to record touched
+        // secondary-index values.
+        let outcome = match self.apply_point_put(
             &txn,
             PointPutParams {
                 database_id: task.request.database_id.as_u64(),
@@ -112,8 +113,9 @@ impl CoreLoop {
                 wal_lsn: task.wal_lsn(),
             },
         ) {
-            return self.response_error(task, e);
-        }
+            Ok(o) => o,
+            Err(e) => return self.response_error(task, e),
+        };
 
         if let Err(e) = txn.commit() {
             return self.response_error(
@@ -128,6 +130,21 @@ impl CoreLoop {
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
         self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+
+        // Record the touched secondary-index values into the per-index
+        // write-value substrate (added ∪ removed ∪ bitemporal tuples).
+        if let Some(lsn) = task.wal_lsn() {
+            let mut tuples = outcome.secondary_index_added;
+            tuples.extend(outcome.secondary_index_removed);
+            tuples.extend(outcome.bitemporal_index_tuples);
+            self.note_index_write_values(
+                task.request.database_id,
+                crate::types::TenantId::new(tid),
+                collection,
+                &tuples,
+                lsn,
+            );
+        }
 
         // Implicit graph-edge extraction now lives on the Control Plane
         // (`control/planner/implicit_edges/`): a `_from`/`_to` document is

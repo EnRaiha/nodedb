@@ -39,7 +39,7 @@ impl CoreLoop {
             }
         };
 
-        let prior = match self.apply_point_put(
+        let mut prior = match self.apply_point_put(
             &txn,
             PointPutParams {
                 database_id: task.request.database_id.as_u64(),
@@ -76,6 +76,21 @@ impl CoreLoop {
 
         // Record the committed write's version against its surrogate + collection.
         self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+
+        // Record the touched secondary-index values into the per-index
+        // write-value substrate (added ∪ removed ∪ bitemporal tuples).
+        if let Some(lsn) = task.wal_lsn() {
+            let mut tuples = std::mem::take(&mut prior.secondary_index_added);
+            tuples.append(&mut prior.secondary_index_removed);
+            tuples.append(&mut prior.bitemporal_index_tuples);
+            self.note_index_write_values(
+                task.request.database_id,
+                crate::types::TenantId::new(tid),
+                collection,
+                &tuples,
+                lsn,
+            );
+        }
 
         self.checkpoint_coordinator.mark_dirty("sparse", 1);
 
