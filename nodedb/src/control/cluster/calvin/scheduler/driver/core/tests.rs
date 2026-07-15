@@ -133,7 +133,9 @@ use nodedb_types::TenantId;
 use super::scheduler::{Scheduler, SchedulerParams};
 use crate::bridge::dispatch::Dispatcher;
 use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
-use crate::control::cluster::calvin::scheduler::{NOT_YET_APPLIED_EPOCH, SchedulerConfig};
+use crate::control::cluster::calvin::scheduler::{
+    AppliedGate, NOT_YET_APPLIED_EPOCH, SchedulerConfig,
+};
 use crate::control::state::SharedState;
 use crate::wal::WalManager;
 
@@ -542,5 +544,71 @@ async fn drain_skips_in_flight_overlap_no_double_dispatch_end_to_end() {
         scheduler.metrics.dispatch_count.load(Ordering::Relaxed),
         dispatched_before,
         "the guarded overlap must not cause a second dispatch"
+    );
+}
+
+// ── `is_caught_up` sentinel handling ─────────────────────────────────────────
+
+/// A freshly-recovered scheduler (`fully_applied_epoch` still the
+/// `NOT_YET_APPLIED_EPOCH` sentinel) with a REAL, non-zero rebuild target must
+/// NOT report caught-up. Naively comparing `u64::MAX >= rebuild_target_epoch`
+/// (the bug) would say "caught up" before a single epoch was re-applied.
+#[tokio::test]
+async fn is_caught_up_false_when_fully_applied_is_sentinel_and_target_is_real() {
+    let (mut scheduler, _dir) = build_test_scheduler(0);
+    scheduler.rebuild_target_epoch = 5;
+    assert_eq!(
+        scheduler.applied.fully_applied_epoch(),
+        NOT_YET_APPLIED_EPOCH
+    );
+
+    assert!(
+        !scheduler.is_caught_up(),
+        "sentinel fully_applied_epoch with a real rebuild target must not be caught up"
+    );
+}
+
+/// Once the applied watermark advances to (or past) a real rebuild target,
+/// the scheduler correctly reports caught-up.
+#[tokio::test]
+async fn is_caught_up_true_once_fully_applied_reaches_target() {
+    let (mut scheduler, _dir) = build_test_scheduler(0);
+    scheduler.rebuild_target_epoch = 5;
+
+    scheduler.applied = AppliedGate::new(5, BTreeSet::new());
+    assert!(
+        scheduler.is_caught_up(),
+        "fully_applied_epoch == rebuild_target_epoch must be caught up"
+    );
+
+    scheduler.applied = AppliedGate::new(7, BTreeSet::new());
+    assert!(
+        scheduler.is_caught_up(),
+        "fully_applied_epoch > rebuild_target_epoch must be caught up"
+    );
+}
+
+/// A greenfield node with NO Calvin history at all: `read_applied_recovery`
+/// seeds `max_applied_epoch` (hence `rebuild_target_epoch`) to
+/// `NOT_YET_APPLIED_EPOCH` too (see `recovery.rs`'s
+/// `greenfield_returns_sentinel_and_empty_tail` test) — this is distinct from
+/// a real target of epoch 0 (which would report `max_applied_epoch == 0`).
+/// With nothing to rebuild, the scheduler is trivially caught up even though
+/// `fully_applied_epoch` is still the sentinel.
+#[tokio::test]
+async fn is_caught_up_true_when_no_rebuild_target_exists() {
+    let (mut scheduler, _dir) = build_test_scheduler(0);
+    // `build_test_scheduler` defaults `rebuild_target_epoch` to `0` (a REAL
+    // target) for its own catch-up-drain tests; set it to the sentinel here to
+    // model the actual greenfield-recovery value.
+    scheduler.rebuild_target_epoch = NOT_YET_APPLIED_EPOCH;
+    assert_eq!(
+        scheduler.applied.fully_applied_epoch(),
+        NOT_YET_APPLIED_EPOCH
+    );
+
+    assert!(
+        scheduler.is_caught_up(),
+        "no rebuild target (greenfield node) must report caught-up"
     );
 }

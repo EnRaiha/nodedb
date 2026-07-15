@@ -19,9 +19,9 @@ use super::super::barrier::{PendingDependentBarrier, ReadResultEvent};
 use super::super::config::SchedulerConfig;
 use super::super::types::{BlockedTxn, PendingTxn};
 use crate::bridge::envelope::Response;
-use crate::control::cluster::calvin::scheduler::AppliedGate;
 use crate::control::cluster::calvin::scheduler::lock_manager::{LockManager, TxnId};
 use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
+use crate::control::cluster::calvin::scheduler::{AppliedGate, NOT_YET_APPLIED_EPOCH};
 use crate::control::shutdown::ShutdownReceiver;
 use crate::control::state::SharedState;
 use crate::types::RequestId;
@@ -230,8 +230,33 @@ impl Scheduler {
     }
 
     /// Whether the scheduler has caught up to the rebuild target epoch.
+    ///
+    /// `rebuild_target_epoch` is seeded from `AppliedRecovery::max_applied_epoch`
+    /// (see `recovery.rs`): [`NOT_YET_APPLIED_EPOCH`] means the WAL scan found NO
+    /// `CalvinApplied` marker for this vShard at all — a greenfield node with no
+    /// Calvin history — never a real epoch (epoch 0 with markers reports
+    /// `max_applied_epoch == 0`, distinct from the sentinel). With nothing to
+    /// rebuild, such a node is trivially caught up.
+    ///
+    /// `fully_applied_epoch()` is conservatively seeded to the same sentinel by
+    /// recovery (the watermark only advances once the sequencer's re-fan-out
+    /// supplies per-epoch expected-position counts) — it does NOT mean "nothing
+    /// left to apply". Naively comparing `u64::MAX >= rebuild_target_epoch` would
+    /// therefore report caught-up before a single epoch was actually
+    /// re-applied. So: sentinel `fully_applied_epoch` is caught-up ONLY when
+    /// there is genuinely no rebuild target; otherwise it must NOT be treated as
+    /// "ahead of everything".
     pub fn is_caught_up(&self) -> bool {
-        self.applied.fully_applied_epoch() >= self.rebuild_target_epoch
+        if self.rebuild_target_epoch == NOT_YET_APPLIED_EPOCH {
+            // No Calvin history for this vShard — nothing to rebuild.
+            return true;
+        }
+        let fully_applied = self.applied.fully_applied_epoch();
+        if fully_applied == NOT_YET_APPLIED_EPOCH {
+            // Nothing proven fully-applied yet, but a real target exists.
+            return false;
+        }
+        fully_applied >= self.rebuild_target_epoch
     }
 
     /// Publish an advanced fully-applied watermark to the metrics gauge and the
