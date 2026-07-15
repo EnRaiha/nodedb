@@ -148,6 +148,14 @@ impl CoreLoop {
         // separate `replay_document_vector_wal` pass is needed here.
         self.replay_document_redo(&reconstituted, num_cores, tombstones);
         self.replay_graph_redo(&reconstituted, num_cores, tombstones);
+        // Node-label deltas staged inside a transaction resolve to the same
+        // `GraphNodeLabelSet` / `GraphNodeLabelRemove` sub-record shape the
+        // autocommit path produces (`resolve/graph.rs`'s
+        // `serialize_node_label_deltas`); this is the ONLY decoder that
+        // routes them from a reconstituted `TransactionRedo` record, mirroring
+        // `replay_vector_extended_wal`'s role for the vector engine's extended
+        // sub-records above.
+        self.replay_graph_node_labels_redo(&reconstituted, num_cores);
     }
 }
 

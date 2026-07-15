@@ -26,11 +26,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use nodedb_physical::physical_plan::{DocumentOp, GraphOp, KvOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::overlay::{BitemporalStamp, Staged};
+use crate::data::executor::handlers::transaction::stage_write::GRAPH_LABEL_COLL_KEY;
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{TenantId, TxnId};
 use crate::wal::{RedoRecord, RedoSubRecord};
@@ -110,7 +111,7 @@ impl CoreLoop {
                 // plan-construction time) into `edge_surrogates`. Node-label
                 // deltas have no redo shape and raise a typed error.
                 PhysicalPlan::Graph(op) => {
-                    classify_graph_op(op, &mut graph_collections, &mut edge_surrogates)?
+                    graph::classify_graph_op(op, &mut graph_collections, &mut edge_surrogates)?
                 }
 
                 // CRDT deltas ride their own `CrdtDelta` WAL record, never redo
@@ -252,6 +253,16 @@ impl CoreLoop {
                     &mut ops,
                 )?;
             }
+            // Node-label deltas live under the fixed sentinel collection key,
+            // not one of `graph_collections` (a transaction may stage ONLY
+            // label mutations with no edge writes at all), so this is called
+            // unconditionally whenever the transaction has a graph overlay.
+            let label_coll_key = (
+                task.request.database_id,
+                TenantId::new(tid),
+                GRAPH_LABEL_COLL_KEY.to_string(),
+            );
+            graph::serialize_node_label_deltas(graph_overlay, &label_coll_key, &mut ops)?;
         }
         Ok(ops)
     }
@@ -389,108 +400,6 @@ fn classify_document_op(op: &DocumentOp, collections: &mut BTreeSet<String>) -> 
             detail: "document index/DDL/truncate op is not supported in transaction resolve"
                 .to_string(),
         }),
-    }
-}
-
-/// Classify a Graph op for transaction resolve: collect the collection of a
-/// staged edge write into `collections` (so the serializer walks its
-/// overlay), collect the endpoint surrogates of every staged edge PUT into
-/// `edge_surrogates` (the overlay itself carries only identity + properties,
-/// not surrogates — see `resolve/graph.rs` module docs), skip read-only
-/// traversal/algorithm ops, and reject node-label ops that have no redo
-/// sub-record shape.
-fn classify_graph_op(
-    op: &GraphOp,
-    collections: &mut BTreeSet<String>,
-    edge_surrogates: &mut BTreeMap<EdgeIdentityKey, (u32, u32)>,
-) -> crate::Result<()> {
-    match op {
-        // Edge put: the overlay holds the resolved post-image (identity +
-        // properties); the endpoint surrogates are resolved once at
-        // construction time and only live here on the plan node.
-        GraphOp::EdgePut {
-            collection,
-            src_id,
-            label,
-            dst_id,
-            src_surrogate,
-            dst_surrogate,
-            ..
-        } => {
-            collections.insert(collection.clone());
-            edge_surrogates.insert(
-                (
-                    collection.clone(),
-                    src_id.clone(),
-                    label.clone(),
-                    dst_id.clone(),
-                ),
-                (src_surrogate.as_u32(), dst_surrogate.as_u32()),
-            );
-            Ok(())
-        }
-        GraphOp::EdgePutBatch { edges } => {
-            for edge in edges {
-                collections.insert(edge.collection.clone());
-                edge_surrogates.insert(
-                    (
-                        edge.collection.clone(),
-                        edge.src_id.clone(),
-                        edge.label.clone(),
-                        edge.dst_id.clone(),
-                    ),
-                    (edge.src_surrogate.as_u32(), edge.dst_surrogate.as_u32()),
-                );
-            }
-            Ok(())
-        }
-
-        // Edge delete: the redo delete tuple carries no surrogate, so only
-        // the collection is needed to walk the overlay's tombstone set.
-        GraphOp::EdgeDelete { collection, .. } => {
-            collections.insert(collection.clone());
-            Ok(())
-        }
-        GraphOp::EdgeDeleteBatch { edges } => {
-            for edge in edges {
-                collections.insert(edge.collection.clone());
-            }
-            Ok(())
-        }
-
-        // Read-only families: traversal, pattern matching, algorithms, and
-        // stats carry no persisted post-image.
-        GraphOp::Hop { .. }
-        | GraphOp::Neighbors { .. }
-        | GraphOp::NeighborsMulti { .. }
-        | GraphOp::Path { .. }
-        | GraphOp::Subgraph { .. }
-        | GraphOp::RagFusion { .. }
-        | GraphOp::Algo { .. }
-        | GraphOp::Match { .. }
-        | GraphOp::MatchContinuation { .. }
-        | GraphOp::MatchVarLenResume { .. }
-        | GraphOp::BspSuperstep(_)
-        | GraphOp::WccSuperstep(_)
-        | GraphOp::TemporalNeighbors { .. }
-        | GraphOp::TemporalAlgorithm { .. }
-        | GraphOp::Stats { .. } => Ok(()),
-
-        // Node-label mutations stage a delta (added/removed sets), not an
-        // absolute post-image. `RecordType::GraphNodeLabelSet` /
-        // `GraphNodeLabelRemove` exist for the autocommit path
-        // (`wal_replay_graph_labels.rs`), but no `RedoSubRecord` shape or
-        // decoder exists yet for a delta-shaped node-label mutation staged
-        // inside a transaction (see `resolve/graph.rs`'s module doc).
-        // Silently omitting the change from the redo record would lose it on
-        // install, so this is a typed error.
-        GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. } => {
-            Err(crate::Error::PlanError {
-                detail: "graph node-label ops have no redo sub-record shape and are not \
-                         supported in transaction resolve"
-                    .to_string(),
-            })
-        }
     }
 }
 
@@ -2165,45 +2074,218 @@ mod tests {
         );
     }
 
+    /// True if `node_id` carries `label` in the CSR partition for
+    /// `(DatabaseId::DEFAULT, TID)`. Mirrors `wal_replay_graph_labels.rs`'s
+    /// test helper of the same shape.
+    fn has_label(core: &CoreLoop, node_id: &str, label: &str) -> bool {
+        let Some(partition) = core.csr_partition(DatabaseId::DEFAULT.as_u64(), TID) else {
+            return false;
+        };
+        let Some(id) = partition.node_id(node_id) else {
+            return false;
+        };
+        partition.node_has_label(id.raw(partition.partition_tag()), label)
+    }
+
+    /// Stage a `SetNodeLabels` / `RemoveNodeLabels` op into the graph overlay
+    /// exactly as the live statement-time path does (`execute_stage_graph`),
+    /// then resolve the transaction.
+    fn stage_and_resolve_labels(
+        core: &mut CoreLoop,
+        task: &ExecutionTask,
+        txn: TxnId,
+        op: &GraphOp,
+    ) -> crate::bridge::envelope::Response {
+        let stage_resp = core.execute_stage_graph(task, TID, txn, op);
+        assert_eq!(stage_resp.status, Status::Ok, "stage: {stage_resp:?}");
+        core.execute_resolve_txn(task, TID, txn, &[PhysicalPlan::Graph(op.clone())])
+    }
+
+    /// Inverse of the old typed-error regression: `SetNodeLabels` staged
+    /// alone must now resolve to a `GraphNodeLabelSet` sub-record and the
+    /// label must survive a redo replay into a fresh engine (simulating a
+    /// crash between WAL append and install — the fresh core never sees the
+    /// original core's base state, only the wrapped redo bytes).
     #[test]
-    fn graph_set_node_labels_has_no_redo_shape_and_yields_typed_error() {
-        let (mut core, _dir) = make_core();
+    fn graph_set_node_labels_resolves_and_replays_into_fresh_engine() {
+        let (mut src, _src_dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(36);
 
-        // `SetNodeLabels` stages a delta, not an absolute post-image, and no
-        // redo sub-record shape exists for it: resolve must raise a typed
-        // error rather than silently drop the label change.
-        let plan = PhysicalPlan::Graph(GraphOp::SetNodeLabels {
+        let op = GraphOp::SetNodeLabels {
             node_id: "n1".to_string(),
             labels: vec!["Person".to_string()],
-        });
-        let resp = core.execute_resolve_txn(&task, TID, txn, &[plan]);
+        };
+        let resp = stage_and_resolve_labels(&mut src, &task, txn, &op);
+        let redo = decode_redo(&resp);
         assert_eq!(
-            resp.status,
-            Status::Error,
-            "node-label ops have no redo shape and must raise a typed error"
+            redo.ops.len(),
+            1,
+            "one staged label delta -> one sub-record"
         );
-        assert!(resp.error_code.is_some());
+        assert_eq!(
+            redo.ops[0].record_type,
+            RecordType::GraphNodeLabelSet as u32
+        );
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        assert!(
+            has_label(&dst, "n1", "Person"),
+            "SetNodeLabels must survive resolve -> redo replay"
+        );
     }
 
+    /// Inverse of the old typed-error regression for `RemoveNodeLabels`: the
+    /// label must be removed after redo replay into a fresh engine that
+    /// already carries the label (seeded independently of the source core).
     #[test]
-    fn graph_remove_node_labels_has_no_redo_shape_and_yields_typed_error() {
-        let (mut core, _dir) = make_core();
+    fn graph_remove_node_labels_resolves_and_replays_into_fresh_engine() {
+        let (mut src, _src_dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(37);
 
-        let plan = PhysicalPlan::Graph(GraphOp::RemoveNodeLabels {
+        let op = GraphOp::RemoveNodeLabels {
             node_id: "n1".to_string(),
             labels: vec!["Person".to_string()],
-        });
-        let resp = core.execute_resolve_txn(&task, TID, txn, &[plan]);
+        };
+        let resp = stage_and_resolve_labels(&mut src, &task, txn, &op);
+        let redo = decode_redo(&resp);
+        assert_eq!(redo.ops.len(), 1);
         assert_eq!(
-            resp.status,
-            Status::Error,
-            "node-label ops have no redo shape and must raise a typed error"
+            redo.ops[0].record_type,
+            RecordType::GraphNodeLabelRemove as u32
         );
-        assert!(resp.error_code.is_some());
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        // Seed the label independently (as an earlier install / redo would
+        // have) so the remove has something to remove.
+        dst.csr_partition_mut(DatabaseId::DEFAULT.as_u64(), TID)
+            .add_node_label("n1", "Person")
+            .expect("seed label");
+        assert!(
+            has_label(&dst, "n1", "Person"),
+            "label seeded before replay"
+        );
+
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        assert!(
+            !has_label(&dst, "n1", "Person"),
+            "RemoveNodeLabels must survive resolve -> redo replay"
+        );
+    }
+
+    /// Both a SET and a REMOVE on the SAME node in one transaction resolve to
+    /// two sub-records (one per direction) and both apply on replay.
+    #[test]
+    fn graph_set_and_remove_node_labels_same_node_same_txn_resolves_both() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(38);
+
+        let set_resp = src.execute_stage_graph(
+            &task,
+            TID,
+            txn,
+            &GraphOp::SetNodeLabels {
+                node_id: "n1".to_string(),
+                labels: vec!["Robot".to_string()],
+            },
+        );
+        assert_eq!(set_resp.status, Status::Ok);
+        let remove_resp = src.execute_stage_graph(
+            &task,
+            TID,
+            txn,
+            &GraphOp::RemoveNodeLabels {
+                node_id: "n1".to_string(),
+                labels: vec!["Person".to_string()],
+            },
+        );
+        assert_eq!(remove_resp.status, Status::Ok);
+
+        // Pass both ops through resolve exactly as the Control Plane would
+        // (the full staged transaction's op list), proving the label
+        // serialization fires from a realistic call, not a contrived one.
+        let plans = [
+            PhysicalPlan::Graph(GraphOp::SetNodeLabels {
+                node_id: "n1".to_string(),
+                labels: vec!["Robot".to_string()],
+            }),
+            PhysicalPlan::Graph(GraphOp::RemoveNodeLabels {
+                node_id: "n1".to_string(),
+                labels: vec!["Person".to_string()],
+            }),
+        ];
+        let resp = src.execute_resolve_txn(&task, TID, txn, &plans);
+        let redo = decode_redo(&resp);
+        assert_eq!(
+            redo.ops.len(),
+            2,
+            "one added label and one removed label on the same node -> two sub-records"
+        );
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.csr_partition_mut(DatabaseId::DEFAULT.as_u64(), TID)
+            .add_node_label("n1", "Person")
+            .expect("seed pre-existing label");
+
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+        assert!(
+            has_label(&dst, "n1", "Robot"),
+            "the added label must be present after replay"
+        );
+        assert!(
+            !has_label(&dst, "n1", "Person"),
+            "the removed label must be absent after replay"
+        );
+    }
+
+    /// Crash-before-install: the fresh destination core never installs
+    /// anything itself — the wrapped `TransactionRedo` bytes travel alone
+    /// (as they would from the WAL after a crash right after append), and
+    /// `replay_transaction_redo_wal` must reconstruct the label from those
+    /// bytes with no other state present.
+    #[test]
+    fn graph_node_label_crash_before_install_replays_from_wal_only() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(39);
+
+        let op = GraphOp::SetNodeLabels {
+            node_id: "ghost".to_string(),
+            labels: vec!["Person".to_string(), "Agent".to_string()],
+        };
+        let resp = stage_and_resolve_labels(&mut src, &task, txn, &op);
+        let redo = decode_redo(&resp);
+        let record = wrap_redo(&redo);
+
+        // `dst` is a brand-new engine that never observed `src`'s in-memory
+        // state (no install happened) — only the WAL-durable redo bytes do.
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        assert!(has_label(&dst, "ghost", "Person"));
+        assert!(has_label(&dst, "ghost", "Agent"));
     }
 
     #[test]

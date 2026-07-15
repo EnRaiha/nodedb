@@ -175,6 +175,56 @@ impl CoreLoop {
         }
     }
 
+    /// Replay reconstituted `GraphNodeLabelSet` / `GraphNodeLabelRemove` redo
+    /// sub-records — the transaction-resolve counterpart of
+    /// `replay_graph_node_label_wal` (autocommit, `wal_replay_graph_labels.rs`).
+    ///
+    /// A transaction's staged node-label deltas resolve to the SAME
+    /// `(node_id, labels)` payload shape the autocommit path produces (see
+    /// `resolve/graph.rs`'s `serialize_node_label_deltas`), so this routes
+    /// each reconstituted record through the SAME `try_replay_graph_node_label`
+    /// decoder rather than reimplementing it — producer and both replay paths
+    /// never drift on shape.
+    pub(crate) fn replay_graph_node_labels_redo(
+        &mut self,
+        records: &[WalRecord],
+        num_cores: usize,
+    ) {
+        let mut replayed = 0usize;
+
+        for record in records {
+            let record_type = RecordType::from_raw(record.logical_record_type());
+            let is_set = record_type == Some(RecordType::GraphNodeLabelSet);
+            let is_remove = record_type == Some(RecordType::GraphNodeLabelRemove);
+            if !is_set && !is_remove {
+                continue;
+            }
+
+            let vshard_id = record.header.vshard_id as usize;
+            let target_core = if num_cores > 0 {
+                vshard_id % num_cores
+            } else {
+                0
+            };
+            if target_core != self.core_id {
+                continue;
+            }
+
+            let database_id = DatabaseId::new(record.header.database_id);
+            if let Some(applied) = self.try_replay_graph_node_label(record, database_id) {
+                replayed += applied;
+            }
+        }
+
+        if replayed > 0 {
+            tracing::info!(
+                core = self.core_id,
+                replayed,
+                "WAL graph node-label redo replay complete"
+            );
+        }
+    }
+
     /// Build a synthetic `ExecutionTask` for graph edge redo replay. Carries the
     /// enclosing record's `database_id` (which the edge handlers read for
     /// keying) and its LSN as `wal_lsn` so the committed-edge write-version index

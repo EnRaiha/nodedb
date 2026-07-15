@@ -38,7 +38,7 @@ use crate::types::{TenantId, TxnId};
 /// CSR partition (no collection argument on the plan), so the overlay --
 /// which keys everything per-collection like every other GRAPH op -- stores
 /// label deltas under this fixed key instead of a real collection name.
-const GRAPH_LABEL_COLL_KEY: &str = "\0__graph_node_labels__";
+pub(in crate::data::executor) const GRAPH_LABEL_COLL_KEY: &str = "\0__graph_node_labels__";
 
 impl CoreLoop {
     /// Route a stageable `GraphOp` to its staging handler.

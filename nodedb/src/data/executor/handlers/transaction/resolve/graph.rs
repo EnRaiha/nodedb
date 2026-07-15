@@ -34,26 +34,39 @@
 //! ## Node-label ops
 //!
 //! `SetNodeLabels` / `RemoveNodeLabels` stage a delta (`NodeLabelDelta`:
-//! added/removed sets), not an absolute post-image. `RecordType::GraphNodeLabelSet`
-//! / `GraphNodeLabelRemove` now exist for the AUTOCOMMIT path
-//! (`wal_replay_graph_labels.rs`), but no `RedoSubRecord` shape or decoder
-//! exists yet for a node-label mutation staged inside a transaction — that
-//! would need a delta-shaped sub-record distinct from the autocommit
-//! set/remove payload, which carries a flat label list, not an added/removed
-//! delta. `entry.rs` therefore still raises a typed error for both rather
-//! than silently dropping the staged label change from the redo record.
+//! disjoint added/removed sets) under the fixed sentinel collection key
+//! `GRAPH_LABEL_COLL_KEY` (`stage_write::stage_graph`), not an absolute
+//! post-image. That delta maps directly onto the AUTOCOMMIT payload shape —
+//! `RecordType::GraphNodeLabelSet` / `GraphNodeLabelRemove`, `(node_id,
+//! labels)` where `labels` is applied additively / subtractively
+//! (`wal_replay_graph_labels.rs`) — because `added` and `removed` are each
+//! already exactly the touched-label list for their direction. So
+//! [`serialize_node_label_deltas`] reuses the SAME record types and the
+//! SAME `encode_graph_node_label_payload` encoder the autocommit path uses,
+//! emitting one `GraphNodeLabelSet` sub-record per node with a non-empty
+//! `added` set and one `GraphNodeLabelRemove` sub-record per node with a
+//! non-empty `removed` set. No new `RedoSubRecord` shape or decoder is
+//! needed: `try_replay_graph_node_label` already decodes this exact payload
+//! for the autocommit path and is reused verbatim for redo replay
+//! (`wal_replay_redo_graph.rs`'s `replay_graph_node_labels_redo`).
 //!
 //! ## Determinism
 //!
-//! The overlay keys edges in a `HashMap`, so entries are collected into
-//! `BTreeMap`/`BTreeSet`s keyed by edge identity before emitting. Two
-//! replicas resolving the same transaction produce byte-identical redo ops.
+//! The overlay keys edges (and node-label deltas) in `HashMap`/`HashSet`s, so
+//! entries are collected into `BTreeMap`/`BTreeSet`s keyed by edge identity —
+//! or, for labels, by node id with each label set sorted into a `Vec` — before
+//! emitting. Two replicas resolving the same transaction produce
+//! byte-identical redo ops.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use nodedb_physical::physical_plan::GraphOp;
 use nodedb_wal::record::RecordType;
 
-use crate::data::executor::handlers::transaction::overlay::{GraphCollKey, GraphTxnOverlay};
+use crate::control::server::wal_dispatch::encode_graph_node_label_payload;
+use crate::data::executor::handlers::transaction::overlay::{
+    GraphCollKey, GraphTxnOverlay, NodeLabelDelta,
+};
 use crate::wal::RedoSubRecord;
 
 /// Edge identity key: `(collection, src_id, label, dst_id)`. Scoped by
@@ -137,6 +150,152 @@ pub(super) fn serialize_graph_collection(
         });
     }
     Ok(())
+}
+
+/// Append the redo sub-records for every staged node-label delta in
+/// `overlay` for the label sentinel collection `label_coll_key` to `ops`, in
+/// deterministic node-id order.
+///
+/// `NodeLabelDelta.added` / `.removed` are disjoint by construction (see
+/// `GraphTxnOverlay::stage_node_labels_set` / `stage_node_labels_remove`), so
+/// each maps directly onto the autocommit `(node_id, labels)` payload shape:
+/// one `GraphNodeLabelSet` sub-record for a non-empty `added` set, one
+/// `GraphNodeLabelRemove` sub-record for a non-empty `removed` set. Reuses
+/// `encode_graph_node_label_payload` so this producer and the autocommit
+/// producer never drift on shape.
+///
+/// Each label set is a `HashSet<String>` (nondeterministic iteration order),
+/// so it is sorted into a `Vec` before encoding — two replicas resolving the
+/// same transaction must produce byte-identical redo payloads.
+pub(super) fn serialize_node_label_deltas(
+    overlay: &GraphTxnOverlay,
+    label_coll_key: &GraphCollKey,
+    ops: &mut Vec<RedoSubRecord>,
+) -> crate::Result<()> {
+    let mut deltas: BTreeMap<&str, &NodeLabelDelta> = BTreeMap::new();
+    for (node_id, delta) in overlay.staged_node_label_deltas_for_collection(label_coll_key) {
+        deltas.insert(node_id, delta);
+    }
+
+    for (node_id, delta) in deltas {
+        if !delta.added.is_empty() {
+            let payload = encode_graph_node_label_payload(node_id, &sorted_labels(&delta.added))?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::GraphNodeLabelSet as u32,
+                payload,
+            });
+        }
+        if !delta.removed.is_empty() {
+            let payload = encode_graph_node_label_payload(node_id, &sorted_labels(&delta.removed))?;
+            ops.push(RedoSubRecord {
+                record_type: RecordType::GraphNodeLabelRemove as u32,
+                payload,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Sort a staged label `HashSet` into a deterministic `Vec` before encoding.
+fn sorted_labels(labels: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut sorted: Vec<String> = labels.iter().cloned().collect();
+    sorted.sort();
+    sorted
+}
+
+/// Classify a Graph op for transaction resolve: collect the collection of a
+/// staged edge write into `collections` (so the serializer walks its
+/// overlay), collect the endpoint surrogates of every staged edge PUT into
+/// `edge_surrogates` (the overlay itself carries only identity + properties,
+/// not surrogates — see this module's doc comment), skip read-only
+/// traversal/algorithm ops, and skip node-label ops — their staged deltas
+/// live in the graph overlay under a fixed sentinel collection key
+/// (`GRAPH_LABEL_COLL_KEY`) and are serialized unconditionally by
+/// `resolve_txn_ops`, not collected here.
+pub(super) fn classify_graph_op(
+    op: &GraphOp,
+    collections: &mut BTreeSet<String>,
+    edge_surrogates: &mut BTreeMap<EdgeIdentityKey, (u32, u32)>,
+) -> crate::Result<()> {
+    match op {
+        // Edge put: the overlay holds the resolved post-image (identity +
+        // properties); the endpoint surrogates are resolved once at
+        // construction time and only live here on the plan node.
+        GraphOp::EdgePut {
+            collection,
+            src_id,
+            label,
+            dst_id,
+            src_surrogate,
+            dst_surrogate,
+            ..
+        } => {
+            collections.insert(collection.clone());
+            edge_surrogates.insert(
+                (
+                    collection.clone(),
+                    src_id.clone(),
+                    label.clone(),
+                    dst_id.clone(),
+                ),
+                (src_surrogate.as_u32(), dst_surrogate.as_u32()),
+            );
+            Ok(())
+        }
+        GraphOp::EdgePutBatch { edges } => {
+            for edge in edges {
+                collections.insert(edge.collection.clone());
+                edge_surrogates.insert(
+                    (
+                        edge.collection.clone(),
+                        edge.src_id.clone(),
+                        edge.label.clone(),
+                        edge.dst_id.clone(),
+                    ),
+                    (edge.src_surrogate.as_u32(), edge.dst_surrogate.as_u32()),
+                );
+            }
+            Ok(())
+        }
+
+        // Edge delete: the redo delete tuple carries no surrogate, so only
+        // the collection is needed to walk the overlay's tombstone set.
+        GraphOp::EdgeDelete { collection, .. } => {
+            collections.insert(collection.clone());
+            Ok(())
+        }
+        GraphOp::EdgeDeleteBatch { edges } => {
+            for edge in edges {
+                collections.insert(edge.collection.clone());
+            }
+            Ok(())
+        }
+
+        // Read-only families: traversal, pattern matching, algorithms, and
+        // stats carry no persisted post-image.
+        GraphOp::Hop { .. }
+        | GraphOp::Neighbors { .. }
+        | GraphOp::NeighborsMulti { .. }
+        | GraphOp::Path { .. }
+        | GraphOp::Subgraph { .. }
+        | GraphOp::RagFusion { .. }
+        | GraphOp::Algo { .. }
+        | GraphOp::Match { .. }
+        | GraphOp::MatchContinuation { .. }
+        | GraphOp::MatchVarLenResume { .. }
+        | GraphOp::BspSuperstep(_)
+        | GraphOp::WccSuperstep(_)
+        | GraphOp::TemporalNeighbors { .. }
+        | GraphOp::TemporalAlgorithm { .. }
+        | GraphOp::Stats { .. } => Ok(()),
+
+        // Node-label mutations stage a delta (added/removed sets) under the
+        // fixed sentinel collection key, not a per-collection post-image, so
+        // there is nothing to collect here — `resolve_txn_ops` serializes
+        // every staged node-label delta unconditionally via
+        // `serialize_node_label_deltas` (see this module's doc comment).
+        GraphOp::SetNodeLabels { .. } | GraphOp::RemoveNodeLabels { .. } => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -258,5 +417,95 @@ mod tests {
             })
             .collect();
         assert_eq!(srcs, vec!["a", "b", "c"], "src-id ascending order");
+    }
+
+    #[test]
+    fn node_label_set_emits_graph_node_label_set_subrecord() {
+        let mut overlay = GraphTxnOverlay::new();
+        overlay.stage_node_labels_set(coll_key("g"), "n1", &["Person".to_string()]);
+
+        let mut ops = Vec::new();
+        serialize_node_label_deltas(&overlay, &coll_key("g"), &mut ops).expect("serialize");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].record_type, RecordType::GraphNodeLabelSet as u32);
+
+        let (node_id, labels) =
+            zerompk::from_msgpack::<(String, Vec<String>)>(&ops[0].payload).expect("decode");
+        assert_eq!(node_id, "n1");
+        assert_eq!(labels, vec!["Person".to_string()]);
+    }
+
+    #[test]
+    fn node_label_remove_emits_graph_node_label_remove_subrecord() {
+        let mut overlay = GraphTxnOverlay::new();
+        overlay.stage_node_labels_remove(coll_key("g"), "n1", &["Person".to_string()]);
+
+        let mut ops = Vec::new();
+        serialize_node_label_deltas(&overlay, &coll_key("g"), &mut ops).expect("serialize");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].record_type, RecordType::GraphNodeLabelRemove as u32);
+
+        let (node_id, labels) =
+            zerompk::from_msgpack::<(String, Vec<String>)>(&ops[0].payload).expect("decode");
+        assert_eq!(node_id, "n1");
+        assert_eq!(labels, vec!["Person".to_string()]);
+    }
+
+    #[test]
+    fn node_label_added_and_removed_on_same_node_emit_both_subrecords() {
+        let mut overlay = GraphTxnOverlay::new();
+        overlay.stage_node_labels_set(coll_key("g"), "n1", &["Robot".to_string()]);
+        overlay.stage_node_labels_remove(coll_key("g"), "n1", &["Person".to_string()]);
+
+        let mut ops = Vec::new();
+        serialize_node_label_deltas(&overlay, &coll_key("g"), &mut ops).expect("serialize");
+        assert_eq!(
+            ops.len(),
+            2,
+            "a node with both an added and a removed label emits both sub-records"
+        );
+
+        let types: Vec<u32> = ops.iter().map(|op| op.record_type).collect();
+        assert!(types.contains(&(RecordType::GraphNodeLabelSet as u32)));
+        assert!(types.contains(&(RecordType::GraphNodeLabelRemove as u32)));
+    }
+
+    #[test]
+    fn node_label_deltas_emit_deterministic_bytes_regardless_of_insertion_order() {
+        // Two overlays, same final delta, different HashSet insertion order —
+        // the encoded redo sub-record bytes must be byte-identical.
+        let mut overlay_a = GraphTxnOverlay::new();
+        overlay_a.stage_node_labels_set(
+            coll_key("g"),
+            "n1",
+            &["Zeta".to_string(), "Alpha".to_string(), "Mu".to_string()],
+        );
+
+        let mut overlay_b = GraphTxnOverlay::new();
+        overlay_b.stage_node_labels_set(
+            coll_key("g"),
+            "n1",
+            &["Mu".to_string(), "Zeta".to_string(), "Alpha".to_string()],
+        );
+
+        let mut ops_a = Vec::new();
+        serialize_node_label_deltas(&overlay_a, &coll_key("g"), &mut ops_a).expect("serialize a");
+        let mut ops_b = Vec::new();
+        serialize_node_label_deltas(&overlay_b, &coll_key("g"), &mut ops_b).expect("serialize b");
+
+        assert_eq!(ops_a.len(), 1);
+        assert_eq!(
+            ops_a[0].payload, ops_b[0].payload,
+            "sorted labels must produce byte-identical payloads regardless of \
+             HashSet insertion order"
+        );
+    }
+
+    #[test]
+    fn no_staged_labels_emits_nothing() {
+        let overlay = GraphTxnOverlay::new();
+        let mut ops = Vec::new();
+        serialize_node_label_deltas(&overlay, &coll_key("g"), &mut ops).expect("serialize");
+        assert!(ops.is_empty());
     }
 }

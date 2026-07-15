@@ -37,6 +37,7 @@ pub(in crate::data::executor) use stage_columnar::StageColumnarInsertParams;
 pub(in crate::data::executor) use stage_columnar_dml::{
     StageColumnarDeleteParams, StageColumnarUpdateParams,
 };
+pub(in crate::data::executor) use stage_graph::GRAPH_LABEL_COLL_KEY;
 pub(in crate::data::executor) use stage_kv::{hex_key, unhex_key};
 pub(in crate::data::executor) use stage_spatial::StageSpatialInsertParams;
 pub(in crate::data::executor) use stage_timeseries::StageTimeseriesInsertParams;

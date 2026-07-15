@@ -73,6 +73,26 @@ impl GraphTxnOverlay {
             .filter(|((db, t, _), _)| *db == database_id && *t == tenant)
             .find_map(|(_, overlay)| overlay.pending_node_labels.get(node_id).cloned())
     }
+
+    /// Every staged node-label delta in `coll_key`: `(node_id, delta)`. The
+    /// per-collection counterpart of `labels_delta_any_collection`, feeding
+    /// transaction-resolve serialization (`resolve/graph.rs`), which needs
+    /// every touched node's delta for exactly the label sentinel collection
+    /// rather than a single node's lookup.
+    pub fn staged_node_label_deltas_for_collection<'a>(
+        &'a self,
+        coll_key: &GraphCollKey,
+    ) -> impl Iterator<Item = (&'a str, &'a NodeLabelDelta)> {
+        self.collections
+            .get(coll_key)
+            .into_iter()
+            .flat_map(|overlay| {
+                overlay
+                    .pending_node_labels
+                    .iter()
+                    .map(|(node_id, delta)| (node_id.as_str(), delta))
+            })
+    }
 }
 
 #[cfg(test)]
