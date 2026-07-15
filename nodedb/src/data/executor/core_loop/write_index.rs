@@ -148,11 +148,11 @@ impl WriteVersionIndex {
         key: &ReadKeyIdent,
         read_lsn: Lsn,
     ) -> bool {
-        // Collection-floor check shared by `Predicate` and — for now — the
-        // secondary-index variants: a read is current iff no write to the
-        // collection has been recorded since it. `IndexEq` / `IndexRange`
-        // validate identically to `Predicate` in this form; the per-value
-        // comparison against the indexed dimension lands in a later change.
+        // Collection-floor check shared by `Predicate` and the fallback for
+        // untracked secondary-index dimensions: a read is current iff no write
+        // to the collection has been recorded since it. `IndexEq` / `IndexRange`
+        // consult the per-value substrate first and only fall back here when the
+        // `(collection, field)` dimension is untracked.
         let collection_floor_current = || {
             let coll_key = CollKey {
                 db,
@@ -172,9 +172,29 @@ impl WriteVersionIndex {
                 };
                 self.key_write_lsn(&write_key).unwrap_or(Lsn::ZERO) <= read_lsn
             }
-            ReadKeyIdent::Predicate
-            | ReadKeyIdent::IndexEq { .. }
-            | ReadKeyIdent::IndexRange { .. } => collection_floor_current(),
+            ReadKeyIdent::Predicate => collection_floor_current(),
+            ReadKeyIdent::IndexEq { field, value } => {
+                match self
+                    .index_values
+                    .eq_max_lsn(db, tenant, collection, field, value)
+                {
+                    Some(max) => max <= read_lsn,
+                    None => collection_floor_current(),
+                }
+            }
+            ReadKeyIdent::IndexRange { field, lo, hi } => {
+                match self.index_values.range_max_lsn(
+                    db,
+                    tenant,
+                    collection,
+                    field,
+                    lo.as_deref(),
+                    hi.as_deref(),
+                ) {
+                    Some(max) => max <= read_lsn,
+                    None => collection_floor_current(),
+                }
+            }
         }
     }
 
@@ -436,10 +456,11 @@ mod tests {
     }
 
     #[test]
-    fn index_variants_validate_identically_to_predicate() {
-        // The index-range variants must, in this form, produce the SAME verdict
-        // as the collection-scoped `Predicate` for every floor position — the
-        // behavior-preserving guarantee this change rests on.
+    fn untracked_index_dimension_falls_back_to_collection_floor() {
+        // A `(collection, field)` never recorded in the per-value substrate is
+        // untracked → `eq_max_lsn`/`range_max_lsn` return `None` → the validator
+        // falls back to the collection floor, producing the SAME verdict as a
+        // `Predicate` read for every floor position.
         let index_eq = ReadKeyIdent::IndexEq {
             field: "email".to_string(),
             value: "a@b.c".to_string(),
@@ -452,7 +473,7 @@ mod tests {
         let predicate = ReadKeyIdent::Predicate;
 
         // Floor below the read LSN (current), at it (current), and above it
-        // (stale) — the index variants track `Predicate` in every case.
+        // (stale) — the untracked index variants track `Predicate` in every case.
         for (floor, read_lsn) in [(5u64, 10u64), (10, 10), (20, 10)] {
             let mut index = WriteVersionIndex::new();
             index.note_write_lsn(db(), tenant(), "orders", None, Lsn::new(floor));
@@ -461,13 +482,161 @@ mod tests {
             assert_eq!(
                 index.read_is_valid(db(), tenant(), "orders", &index_eq, Lsn::new(read_lsn)),
                 want,
-                "IndexEq must match Predicate (floor {floor}, read {read_lsn})"
+                "untracked IndexEq must match Predicate (floor {floor}, read {read_lsn})"
             );
             assert_eq!(
                 index.read_is_valid(db(), tenant(), "orders", &index_range, Lsn::new(read_lsn)),
                 want,
-                "IndexRange must match Predicate (floor {floor}, read {read_lsn})"
+                "untracked IndexRange must match Predicate (floor {floor}, read {read_lsn})"
             );
         }
+    }
+
+    #[test]
+    fn index_eq_disjoint_write_does_not_abort() {
+        // Read of email = "a@b.c" at read_lsn 10; a later write to a DIFFERENT
+        // value on the same dimension must NOT abort the read (the coarse
+        // collection floor would have).
+        let mut index = WriteVersionIndex::new();
+        // A real write to a disjoint value advances BOTH the collection floor
+        // (which the coarse `Predicate` path would abort on) AND records the
+        // per-value entry — so this proves the per-value check reduces the abort,
+        // not merely that nothing was written.
+        index.note_write_lsn(db(), tenant(), "orders", None, Lsn::new(20));
+        index
+            .index_values
+            .record(db(), tenant(), "orders", "email", "z@z.z", Lsn::new(20));
+        let key = ReadKeyIdent::IndexEq {
+            field: "email".to_string(),
+            value: "a@b.c".to_string(),
+        };
+        assert!(index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+    }
+
+    #[test]
+    fn index_range_disjoint_write_does_not_abort() {
+        // Range [10, 20] read at read_lsn 10; a write to out-of-range "50" must
+        // not abort.
+        let mut index = WriteVersionIndex::new();
+        // Advance the collection floor too (the coarse path aborts on it) so this
+        // proves range validation reduces the abort, not just an empty index.
+        index.note_write_lsn(db(), tenant(), "orders", None, Lsn::new(20));
+        index
+            .index_values
+            .record(db(), tenant(), "orders", "age", "50", Lsn::new(20));
+        let key = ReadKeyIdent::IndexRange {
+            field: "age".to_string(),
+            lo: Some("10".to_string()),
+            hi: Some("20".to_string()),
+        };
+        assert!(index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+    }
+
+    #[test]
+    fn index_eq_same_value_conflict_aborts() {
+        // A write to the SAME read value after the read LSN must abort.
+        let mut index = WriteVersionIndex::new();
+        index
+            .index_values
+            .record(db(), tenant(), "orders", "email", "a@b.c", Lsn::new(20));
+        let key = ReadKeyIdent::IndexEq {
+            field: "email".to_string(),
+            value: "a@b.c".to_string(),
+        };
+        assert!(!index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+    }
+
+    #[test]
+    fn index_range_in_range_added_value_conflict_aborts() {
+        // An added value INSIDE the read range after the read LSN must abort.
+        let mut index = WriteVersionIndex::new();
+        index
+            .index_values
+            .record(db(), tenant(), "orders", "age", "15", Lsn::new(20));
+        let key = ReadKeyIdent::IndexRange {
+            field: "age".to_string(),
+            lo: Some("10".to_string()),
+            hi: Some("20".to_string()),
+        };
+        assert!(!index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+    }
+
+    #[test]
+    fn index_range_in_range_removed_value_conflict_aborts() {
+        // A delete of an in-range value also records that value's LSN, so a
+        // removal inside the read range must abort the read just like an insert.
+        let mut index = WriteVersionIndex::new();
+        index
+            .index_values
+            .record(db(), tenant(), "orders", "age", "17", Lsn::new(20));
+        let key = ReadKeyIdent::IndexRange {
+            field: "age".to_string(),
+            lo: Some("10".to_string()),
+            hi: Some("20".to_string()),
+        };
+        assert!(!index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+    }
+
+    #[test]
+    fn index_range_phantom_insert_aborts() {
+        // Phantom protection: the range is current while it holds no in-range
+        // value (tracked → `Some(ZERO)`), then a NEW in-range value recorded
+        // after the read LSN invalidates it — proving the range captures the
+        // predicate, not just values extant at read time.
+        let mut index = WriteVersionIndex::new();
+        // Track the dimension with an OUT-of-range value so the read starts
+        // current (tracked, no in-range write).
+        index
+            .index_values
+            .record(db(), tenant(), "orders", "age", "99", Lsn::new(5));
+        let key = ReadKeyIdent::IndexRange {
+            field: "age".to_string(),
+            lo: Some("10".to_string()),
+            hi: Some("20".to_string()),
+        };
+        assert!(
+            index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)),
+            "range with no in-range write is current"
+        );
+
+        // Phantom insert inside the range after the read LSN.
+        index
+            .index_values
+            .record(db(), tenant(), "orders", "age", "15", Lsn::new(20));
+        assert!(
+            !index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)),
+            "phantom in-range insert must abort"
+        );
+    }
+
+    #[test]
+    fn tracked_index_eq_missing_value_is_current() {
+        // A tracked dimension (some other value recorded) queried for a value
+        // with no entry returns `Some(ZERO)` → current.
+        let mut index = WriteVersionIndex::new();
+        index
+            .index_values
+            .record(db(), tenant(), "orders", "email", "other@x.y", Lsn::new(20));
+        let key = ReadKeyIdent::IndexEq {
+            field: "email".to_string(),
+            value: "a@b.c".to_string(),
+        };
+        assert!(index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
+    }
+
+    #[test]
+    fn tracked_index_range_empty_range_is_current() {
+        // A tracked dimension queried for a range with no in-range entry returns
+        // `Some(ZERO)` → current.
+        let mut index = WriteVersionIndex::new();
+        index
+            .index_values
+            .record(db(), tenant(), "orders", "age", "99", Lsn::new(20));
+        let key = ReadKeyIdent::IndexRange {
+            field: "age".to_string(),
+            lo: Some("10".to_string()),
+            hi: Some("20".to_string()),
+        };
+        assert!(index.read_is_valid(db(), tenant(), "orders", &key, Lsn::new(10)));
     }
 }

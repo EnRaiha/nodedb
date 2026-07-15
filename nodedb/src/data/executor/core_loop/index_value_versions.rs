@@ -76,6 +76,65 @@ impl IndexValueVersionIndex {
         }
     }
 
+    /// Max committed-write LSN for an exact indexed value. `None` == the
+    /// `(collection, field)` dimension is UNtracked (validator falls back to the
+    /// collection floor). `Some(ZERO)` == tracked but this value has no recorded
+    /// write on this core (never invalidated → always current).
+    pub(in crate::data::executor) fn eq_max_lsn(
+        &self,
+        db: DatabaseId,
+        tenant: TenantId,
+        collection: &str,
+        field: &str,
+        value: &str,
+    ) -> Option<Lsn> {
+        let key = IndexKey {
+            db,
+            tenant,
+            collection: Box::from(collection),
+            field: Box::from(field),
+        };
+        let values = self.per_index.get(&key)?;
+        Some(values.get(value).copied().unwrap_or(Lsn::ZERO))
+    }
+
+    /// Max committed-write LSN over the inclusive value range `[lo, hi]` (a
+    /// `None` bound is open). `None` == untracked dimension; `Some(ZERO)` ==
+    /// tracked with no in-range recorded write.
+    pub(in crate::data::executor) fn range_max_lsn(
+        &self,
+        db: DatabaseId,
+        tenant: TenantId,
+        collection: &str,
+        field: &str,
+        lo: Option<&str>,
+        hi: Option<&str>,
+    ) -> Option<Lsn> {
+        use std::ops::Bound;
+        let key = IndexKey {
+            db,
+            tenant,
+            collection: Box::from(collection),
+            field: Box::from(field),
+        };
+        let values = self.per_index.get(&key)?;
+        let lo_b = match lo {
+            Some(s) => Bound::Included(s),
+            None => Bound::Unbounded,
+        };
+        let hi_b = match hi {
+            Some(s) => Bound::Included(s),
+            None => Bound::Unbounded,
+        };
+        let mut max = Lsn::ZERO;
+        for (_v, lsn) in values.range::<str, _>((lo_b, hi_b)) {
+            if *lsn > max {
+                max = *lsn;
+            }
+        }
+        Some(max)
+    }
+
     /// Test accessor: the recorded LSN for a `(db, tenant, collection, field)`
     /// dimension's `value`, or `None` if the dimension or value is untracked.
     #[cfg(test)]
