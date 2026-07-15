@@ -7,7 +7,7 @@
 //! sub-snapshots according to the *current* cluster topology and
 //! dispatches `MetaOp::RestoreTenantSnapshot` to each owning node.
 //!
-//! Durable re-issue of columnar/timeseries rows lives in [`reissue`];
+//! Durable re-issue of columnar/timeseries/vector rows lives in [`reissue`];
 //! post-install surrogate rebinding and tombstone warnings live in
 //! [`rebind`].
 
@@ -53,6 +53,8 @@ pub struct RestoreStats {
     /// Number of CRDT tenant-snapshot imports re-issued durably (Raft/WAL) on
     /// restore — one per distinct data group that owns any CRDT collection.
     pub crdt_reissued: usize,
+    /// Number of individual vectors re-issued durably (Raft/WAL) on restore.
+    pub vectors_reissued: usize,
     /// Number of PK→surrogate identity bindings rebound into the catalog.
     pub surrogate_pk: usize,
     pub nodes_dispatched: usize,
@@ -178,6 +180,17 @@ pub async fn restore_tenant(
     // coordinator would double-import.
     let crdt_state = std::mem::take(&mut merged.crdt_state);
 
+    // Vector engine state is likewise NOT installed via the snapshot path —
+    // `restore_vector_collection` installs straight into the in-memory-only
+    // `vector_collections` Data Plane map with no WAL record and no Raft
+    // entry, so it is lost on restart (single-node) and never replicated
+    // (cluster). Drain it here and re-issue durably below, one
+    // `VectorOp::Insert` per restored vector (Raft-replicated in cluster
+    // mode; WAL-appended then installed in single-node mode). The topology
+    // split must therefore never see vector data — otherwise it would be
+    // double-installed.
+    let vector_snapshots = std::mem::take(&mut merged.vectors);
+
     // Drain the PK→surrogate identity map before the topology split (the split
     // only routes per-key engine data). It is rebound into the destination
     // catalog after the data install dispatches succeed — without it restored
@@ -284,6 +297,14 @@ pub async fn restore_tenant(
     // and converges deterministically. Any failure is fatal — no
     // warn-and-continue.
     stats.crdt_reissued = super::crdt_reissue::reissue_crdt_snapshots(state, crdt_state).await?;
+
+    // Durable re-issue of vector rows. Each restored vector is replayed as an
+    // individual `VectorOp::Insert` (Raft-replicated in cluster mode;
+    // WAL-appended then installed in single-node mode). Collections that
+    // decode to zero vectors are skipped. Any failure is fatal — no
+    // warn-and-continue.
+    stats.vectors_reissued =
+        reissue::reissue_vector_snapshots(state, tenant_id, vector_snapshots).await?;
 
     Ok(stats)
 }

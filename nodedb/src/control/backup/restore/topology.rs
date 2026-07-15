@@ -121,10 +121,6 @@ pub(super) fn split_by_current_topology(
         let node = resolve(route_key(&entry.0), Some(&entry.0));
         all_owners.entry(node).or_default().indexes.push(entry);
     }
-    for entry in merged.vectors {
-        let node = resolve(route_key(&entry.0), Some(&entry.0));
-        all_owners.entry(node).or_default().vectors.push(entry);
-    }
     for entry in merged.kv_tables {
         let node = resolve(route_collection(&entry.0), Some(&entry.0));
         all_owners.entry(node).or_default().kv_tables.push(entry);
@@ -142,6 +138,14 @@ pub(super) fn split_by_current_topology(
     debug_assert!(
         merged.columnar_engines.is_empty(),
         "columnar engines must be drained before topology split"
+    );
+    // Vector engine state is likewise NOT installed via the snapshot path:
+    // RESTORE re-issues each restored vector as a durable `VectorOp::Insert`
+    // instead (see `vector_reissue`); `merged.vectors` is therefore drained
+    // by the caller before this split and never bucketed here.
+    debug_assert!(
+        merged.vectors.is_empty(),
+        "vectors must be drained before topology split"
     );
     for blob in merged.flushed_ts_segments {
         let node = resolve(

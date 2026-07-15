@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Durable re-issue of columnar and timeseries rows drained from the
+//! Durable re-issue of columnar, timeseries, and vector rows drained from the
 //! snapshot before the topology split (see [`super::restore_tenant`]'s
-//! doc comments on why these two engines bypass the per-node snapshot
+//! doc comments on why these engines bypass the per-node snapshot
 //! install path).
 
 use std::sync::Arc;
+
+use nodedb_types::surrogate::Surrogate;
 
 use crate::Error;
 use crate::control::state::SharedState;
@@ -144,6 +146,72 @@ pub(super) async fn reissue_columnar_snapshots(
         )
         .await?;
         reissued += 1;
+    }
+    Ok(reissued)
+}
+
+/// Decode and durably re-issue every restored vector as an individual
+/// `VectorOp::Insert`.
+///
+/// Returns the number of vectors re-issued. Unlike columnar/timeseries,
+/// `VectorOp::Insert` is a single-row op (there is no named-field-aware batch
+/// variant), so — unlike the collection-level counts above — this counts
+/// individual vectors, one re-issue per restored row.
+///
+/// `entries` are `("{db}:{tid}:{coll_key}", msgpack)` pairs where `coll_key`
+/// is `collection` or `collection:field_name` (see
+/// `CoreLoop::vector_index_key`) and the payload decodes to
+/// `Vec<(u32, Vec<f32>, Option<Surrogate>)>` — the raw HNSW export shape
+/// (`node_id`, vector data, surrogate) `VectorCollection::export_snapshot`
+/// produces.
+pub(super) async fn reissue_vector_snapshots(
+    state: &Arc<SharedState>,
+    tenant_id: u64,
+    entries: Vec<(String, Vec<u8>)>,
+) -> Result<usize, Error> {
+    let database_id = crate::types::DatabaseId::DEFAULT;
+
+    let mut reissued = 0usize;
+    for (key, bytes) in entries {
+        let Some(coll_key) = extract_db_scoped_collection(&key, tenant_id) else {
+            return Err(Error::Internal {
+                detail: format!("restore reissue: malformed vector snapshot key '{key}'"),
+            });
+        };
+        let (collection, field_name) =
+            super::super::vector_reissue::split_vector_coll_key(coll_key);
+        let collection = collection.to_owned();
+        let field_name = field_name.to_owned();
+
+        let vectors: Vec<(u32, Vec<f32>, Option<Surrogate>)> = zerompk::from_msgpack(&bytes)
+            .map_err(|e| Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!(
+                    "restore reissue: deserialize vector snapshot for '{collection}': {e}"
+                ),
+            })?;
+        if vectors.is_empty() {
+            continue;
+        }
+
+        for (_node_id, vector, surrogate) in vectors {
+            let surrogate = surrogate.unwrap_or(Surrogate::ZERO);
+            let plan = super::super::vector_reissue::build_vector_insert_plan(
+                &collection,
+                &field_name,
+                vector,
+                surrogate,
+            );
+            super::super::vector_reissue::reissue_vector_durably(
+                state,
+                TenantId::new(tenant_id),
+                database_id,
+                &collection,
+                plan,
+            )
+            .await?;
+            reissued += 1;
+        }
     }
     Ok(reissued)
 }
