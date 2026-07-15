@@ -93,6 +93,7 @@ impl CoreLoop {
         // in the committed batch. Covers the fast-path commit AND every Calvin
         // apply (both funnel through here); one batch WAL LSN for all keys.
         self.record_batch_write_versions(task, tid, plans);
+        self.record_batch_index_write_values(task, tid, &undo_log);
 
         self.emit_deferred_writes(task, undo_log);
 
