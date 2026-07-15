@@ -46,9 +46,10 @@ impl Scheduler {
             .expect("barrier just confirmed present");
 
         let injected_reads = barrier.assemble_injected_reads();
+        let lock_owner = barrier.lock_owner;
         let txn = barrier.txn;
 
-        self.dispatch_active_txn(txn, txn_id, injected_reads);
+        self.dispatch_active_txn(txn, txn_id, lock_owner, injected_reads);
     }
 
     /// Check all pending dependent barriers for timeout.

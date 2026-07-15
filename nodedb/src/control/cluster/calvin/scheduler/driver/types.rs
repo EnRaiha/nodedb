@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use nodedb_cluster::calvin::types::SequencedTxn;
 
-use super::super::lock_manager::LockKey;
+use super::super::lock_manager::{LockKey, TxnId};
 
 /// An in-flight transaction that has been dispatched and is awaiting a
 /// Data Plane response.
@@ -19,6 +19,10 @@ use super::super::lock_manager::LockKey;
 pub(super) struct PendingTxn {
     /// Original sequenced transaction (for WAL record on completion).
     pub txn: SequencedTxn,
+    /// The lock-table owner id for this txn (equals the apply-slot id unless a
+    /// reservation owns the lock). Used by `on_txn_complete` to `release` the
+    /// correct lock-manager identity.
+    pub lock_owner: TxnId,
     /// Wall-clock time at dispatch (for lock-wait latency metrics).
     ///
     /// `Instant::now()` is used here for observability only; never

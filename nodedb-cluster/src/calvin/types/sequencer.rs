@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::lock_wire::TxnIdWire;
 use super::transaction::TxClass;
 
 // ── SequencedTxn ──────────────────────────────────────────────────────────────
@@ -61,6 +62,15 @@ pub struct SequencedTxn {
     #[serde(default)]
     #[msgpack(default)]
     pub epoch_vshard_txn_count: u32,
+    /// Optional lock-table identity distinct from this txn's `(epoch, position)`
+    /// apply-slot. `None` (the default) means the lock owner is the apply slot —
+    /// the established behavior. `Some(id)` lets a different identity (e.g. a
+    /// read-reservation id from a separate position band) own the exclusive lock
+    /// while this txn keeps its own fresh apply-slot for the watermark and
+    /// completion path. Wire-additive: decodes to `None` on older log entries.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub lock_owner: Option<TxnIdWire>,
 }
 
 // ── EpochBatch ────────────────────────────────────────────────────────────────

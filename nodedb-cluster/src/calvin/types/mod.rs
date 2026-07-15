@@ -298,6 +298,7 @@ mod tests {
             tx_class,
             epoch_system_ms: 1_700_000_000_000,
             epoch_vshard_txn_count: 3,
+            lock_owner: None,
         };
         let bytes = zerompk::to_msgpack_vec(&st).unwrap();
         let mut decoded: SequencedTxn = zerompk::from_msgpack(&bytes).unwrap();
@@ -403,6 +404,7 @@ mod tests {
                     tx_class: tc.clone(),
                     epoch_system_ms: 1_700_000_000_000,
                     epoch_vshard_txn_count: 2,
+                    lock_owner: None,
                 },
                 SequencedTxn {
                     epoch: 1,
@@ -410,6 +412,7 @@ mod tests {
                     tx_class: tc,
                     epoch_system_ms: 1_700_000_000_000,
                     epoch_vshard_txn_count: 2,
+                    lock_owner: None,
                 },
             ],
             epoch_system_ms: 1_700_000_000_000,

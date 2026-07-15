@@ -11,6 +11,7 @@ use std::time::Duration;
 use nodedb::control::cluster::calvin::scheduler::driver::barrier::{
     PendingDependentBarrier, ReadResultEvent,
 };
+use nodedb::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use nodedb_physical::physical_plan::meta::PassiveReadKeyId;
 use nodedb_types::{TenantId, Value};
 
@@ -83,6 +84,7 @@ fn make_dependent_txn(passive_vshard: u32) -> SequencedTxn {
         tx_class,
         epoch_system_ms: 0,
         epoch_vshard_txn_count: 0,
+        lock_owner: None,
     }
 }
 
@@ -98,6 +100,7 @@ fn dependent_barrier_completes_after_passive_delivers() {
 
     let mut barrier = PendingDependentBarrier {
         txn: txn.clone(),
+        lock_owner: TxnId::new(txn.epoch, txn.position),
         waiting_for,
         received: BTreeMap::new(),
         timeout_at,
@@ -182,7 +185,9 @@ fn dependent_barrier_not_complete_with_multiple_passives() {
             tx_class,
             epoch_system_ms: 0,
             epoch_vshard_txn_count: 0,
+            lock_owner: None,
         },
+        lock_owner: TxnId::new(1, 0),
         waiting_for,
         received: BTreeMap::new(),
         timeout_at: Instant::now() + Duration::from_secs(30),
@@ -224,8 +229,10 @@ fn dependent_barrier_not_complete_with_multiple_passives() {
 #[test]
 fn dependent_barrier_timeout_detected() {
     let txn = make_dependent_txn(7);
+    let lock_owner = TxnId::new(txn.epoch, txn.position);
     let barrier = PendingDependentBarrier {
         txn,
+        lock_owner,
         waiting_for: {
             let mut s = BTreeSet::new();
             s.insert(7u32);

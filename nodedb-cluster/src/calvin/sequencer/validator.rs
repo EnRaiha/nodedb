@@ -227,6 +227,7 @@ pub fn validate_batch_with_assignments(
                     // epoch_vshard_txn_count is stamped per-vShard by the state
                     // machine at fan-out time; 0 is a safe placeholder here.
                     epoch_vshard_txn_count: 0,
+                    lock_owner: None,
                 },
             ));
         }

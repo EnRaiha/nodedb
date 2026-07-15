@@ -82,6 +82,10 @@ impl Scheduler {
         txn: SequencedTxn,
     ) {
         let txn_id = TxnId::new(txn.epoch, txn.position);
+        // Lock-table owner: distinct from the apply-slot only when a producer
+        // set `lock_owner` (e.g. a read reservation). Defaults to the apply-slot
+        // id, so today's behavior is unchanged.
+        let lock_owner = txn.lock_owner.map(TxnId::from).unwrap_or(txn_id);
 
         // Record this delivery with the sequencer's per-`(epoch, vShard)` count.
         // A count >= 1 is the authoritative expected total (every position of the
@@ -120,17 +124,17 @@ impl Scheduler {
         .entered();
         let outcome = {
             let mut lm = self.lock_manager.lock().unwrap_or_else(|p| p.into_inner());
-            lm.acquire(txn_id, keys.clone())
+            lm.acquire(lock_owner, keys.clone())
         };
 
         match outcome {
             AcquireOutcome::Ready => {
-                self.dispatch_or_barrier(txn, txn_id);
+                self.dispatch_or_barrier(txn, txn_id, lock_owner);
             }
             AcquireOutcome::Blocked => {
                 self.metrics.record_blocked();
                 self.blocked.insert(
-                    txn_id,
+                    lock_owner,
                     super::super::types::BlockedTxn {
                         txn,
                         keys,
@@ -147,22 +151,23 @@ impl Scheduler {
         &mut self,
         txn: SequencedTxn,
         txn_id: TxnId,
+        lock_owner: TxnId,
     ) {
         let is_dependent = txn.tx_class.dependent_reads.is_some();
         if is_dependent {
-            self.insert_dependent_barrier(txn, txn_id);
+            self.insert_dependent_barrier(txn, txn_id, lock_owner);
         } else {
-            self.dispatch_txn(txn, txn_id);
+            self.dispatch_txn(txn, txn_id, lock_owner);
         }
     }
 
     /// Insert a dependent-read barrier for an active vshard.
-    fn insert_dependent_barrier(&mut self, txn: SequencedTxn, txn_id: TxnId) {
+    fn insert_dependent_barrier(&mut self, txn: SequencedTxn, txn_id: TxnId, lock_owner: TxnId) {
         let spec = match &txn.tx_class.dependent_reads {
             Some(s) => s,
             None => {
                 // Shouldn't happen; fall through to static dispatch.
-                self.dispatch_txn(txn, txn_id);
+                self.dispatch_txn(txn, txn_id, lock_owner);
                 return;
             }
         };
@@ -174,6 +179,7 @@ impl Scheduler {
 
         let barrier = PendingDependentBarrier {
             txn,
+            lock_owner,
             waiting_for,
             received: BTreeMap::new(),
             timeout_at,
@@ -188,6 +194,14 @@ impl Scheduler {
         txn_id: TxnId,
     ) {
         let epoch = txn_id.epoch;
+        // Recover the lock-table owner (equals `txn_id` unless a reservation
+        // owned the lock). Blocked txns never reach here, so `pending` always
+        // holds the entry by the time a txn completes.
+        let lock_owner = self
+            .pending
+            .get(&txn_id)
+            .map(|p| p.lock_owner)
+            .unwrap_or(txn_id);
 
         // Release this txn's locks. `release` promotes any waiter queued behind
         // each freed key to holder (moving it pending -> held) and returns the
@@ -198,7 +212,7 @@ impl Scheduler {
         let newly_unblocked = {
             let lm = Arc::clone(&self.lock_manager);
             let mut guard = lm.lock().unwrap_or_else(|p| p.into_inner());
-            guard.release(txn_id)
+            guard.release(lock_owner)
         };
         self.dispatch_promoted(newly_unblocked);
 
@@ -277,7 +291,9 @@ impl Scheduler {
         }
 
         for (txn, waiter_id) in to_dispatch {
-            self.dispatch_or_barrier(txn, waiter_id);
+            // lock_owner == apply-slot today; the reservation path will recover
+            // the promoted txn's own apply-slot here.
+            self.dispatch_or_barrier(txn, waiter_id, waiter_id);
         }
     }
 }

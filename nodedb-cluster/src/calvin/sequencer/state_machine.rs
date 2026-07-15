@@ -519,6 +519,7 @@ mod tests {
                 tx_class,
                 epoch_system_ms: 1_700_000_000_000,
                 epoch_vshard_txn_count: 1,
+                lock_owner: None,
             }],
             epoch_system_ms: 1_700_000_000_000,
         };

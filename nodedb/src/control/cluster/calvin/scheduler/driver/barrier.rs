@@ -24,6 +24,7 @@ use std::time::Instant;
 
 use nodedb_cluster::calvin::types::SequencedTxn;
 
+use super::super::lock_manager::TxnId;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::meta::PassiveReadKeyId;
 use nodedb_types::Value;
@@ -56,6 +57,10 @@ pub struct ReadResultEvent {
 pub struct PendingDependentBarrier {
     /// Original sequenced transaction.
     pub txn: SequencedTxn,
+    /// The lock-table owner id for this txn (equals the apply-slot id unless a
+    /// reservation owns the lock). Carried through the barrier so the eventual
+    /// `dispatch_active_txn` call can park the correct id in `PendingTxn`.
+    pub lock_owner: TxnId,
     /// Passive vshards still waiting to deliver their read results.
     /// Entries are removed as `ReadResultEvent`s arrive.
     /// `BTreeSet` for determinism.

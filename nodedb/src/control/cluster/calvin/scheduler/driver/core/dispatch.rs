@@ -176,6 +176,7 @@ impl Scheduler {
         &mut self,
         txn: SequencedTxn,
         txn_id: TxnId,
+        lock_owner: TxnId,
     ) {
         let tenant_id = txn.tx_class.tenant_id;
         let epoch = txn.epoch;
@@ -241,7 +242,7 @@ impl Scheduler {
         // identical static path so each casts a real commit/abort Vote through
         // stage -> resolve -> verdict. The validate-only task stages no plans;
         // its response carries only the read-set vote.
-        self.dispatch_calvin_static(txn, txn_id, epoch, position, tenant_id, local);
+        self.dispatch_calvin_static(txn, txn_id, lock_owner, tenant_id, local);
     }
 
     /// Build and dispatch a `CalvinExecuteStatic` task, then park the txn in
@@ -257,11 +258,15 @@ impl Scheduler {
         &mut self,
         txn: SequencedTxn,
         txn_id: TxnId,
-        epoch: u64,
-        position: u32,
+        lock_owner: TxnId,
         tenant_id: crate::types::TenantId,
         plans: Vec<PhysicalPlan>,
     ) {
+        // The apply-slot identity (used in the CalvinExecuteStatic task and
+        // error logs) is exactly `txn_id`; deriving it here keeps the two in
+        // lockstep instead of passing the pair redundantly.
+        let epoch = txn_id.epoch;
+        let position = txn_id.position;
         let request_id = self.next_request_id();
         let has_primary_write = plans_have_primary_write(&plans);
         let has_returning = plans_have_returning(&plans);
@@ -313,6 +318,7 @@ impl Scheduler {
             txn_id,
             super::super::types::PendingTxn {
                 txn,
+                lock_owner,
                 // no-determinism: dispatch_time is scheduler observability, not Calvin WAL data
                 dispatch_time: dispatch_instant,
                 has_primary_write,
@@ -332,6 +338,7 @@ impl Scheduler {
         &mut self,
         txn: SequencedTxn,
         txn_id: TxnId,
+        lock_owner: TxnId,
         injected_reads: std::collections::BTreeMap<
             nodedb_physical::physical_plan::meta::PassiveReadKeyId,
             nodedb_types::Value,
@@ -443,6 +450,7 @@ impl Scheduler {
             txn_id,
             super::super::types::PendingTxn {
                 txn,
+                lock_owner,
                 // no-determinism: dispatch_time is scheduler observability, not Calvin WAL data
                 dispatch_time: dispatch_instant,
                 has_primary_write,
