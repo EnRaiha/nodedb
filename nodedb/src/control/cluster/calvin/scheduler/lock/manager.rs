@@ -90,9 +90,10 @@ impl LockManager {
 
     /// Attempt to acquire **exclusive** locks on all keys for `txn`.
     ///
-    /// If every key is free or already held exclusively by `txn` (promoted from
-    /// waiter), records `txn` as sole holder of each key and returns
-    /// [`AcquireOutcome::Ready`].
+    /// If every key is free, already held exclusively by `txn` (promoted from
+    /// waiter), or held **shared solely by `txn`** (a reservation this txn placed
+    /// earlier, now upgraded in place to exclusive), records `txn` as sole holder
+    /// of each key and returns [`AcquireOutcome::Ready`].
     ///
     /// Otherwise the whole key set is classified under the WOUND-WAIT discipline
     /// (see [`Self::wound_or_block`]).  `TxnId` order (`(epoch, position)`) is
@@ -113,12 +114,13 @@ impl LockManager {
     /// all-keys-or-none — the manager never partially wounds and then blocks.
     pub fn acquire(&mut self, txn: TxnId, keys: BTreeSet<LockKey>) -> AcquireOutcome {
         // First pass: determine whether any key is held by a *different* txn.
-        // A key already held exclusively by `txn` itself (promoted via release)
-        // counts as available — re-acquire on that key is a no-op.
+        // A key already held exclusively by `txn` (promoted via release) or held
+        // shared solely by `txn` (an earlier reservation) counts as available —
+        // the former is a no-op re-acquire, the latter a self-upgrade to exclusive.
         let all_available = keys.iter().all(|k| {
-            self.table
-                .get(k)
-                .is_none_or(|entry| entry.held_exclusively_by(txn))
+            self.table.get(k).is_none_or(|entry| {
+                entry.held_exclusively_by(txn) || entry.held_shared_solely_by(txn)
+            })
         });
 
         if all_available {
@@ -126,15 +128,26 @@ impl LockManager {
             // new exclusive entry.  For keys already held by this txn (promoted
             // waiter), leave the entry unchanged — the waiter queue is intact.
             for key in &keys {
-                if !self.table.contains_key(key) {
-                    self.table.insert(
-                        key.clone(),
-                        LockEntry {
-                            mode: LockMode::Exclusive,
-                            holders: smallvec![txn],
-                            waiters: VecDeque::new(),
-                        },
-                    );
+                match self.table.get_mut(key) {
+                    None => {
+                        self.table.insert(
+                            key.clone(),
+                            LockEntry {
+                                mode: LockMode::Exclusive,
+                                holders: smallvec![txn],
+                                waiters: VecDeque::new(),
+                            },
+                        );
+                    }
+                    Some(entry) => {
+                        // A key this txn already holds shared-solely is upgraded
+                        // to exclusive in place (holders is exactly `[txn]`, so no
+                        // holder change and any waiter queue stays intact). A key
+                        // already held exclusively by `txn` is left unchanged.
+                        if entry.held_shared_solely_by(txn) {
+                            entry.mode = LockMode::Exclusive;
+                        }
+                    }
                 }
             }
             // Move out of pending (if the txn was previously blocked on this
@@ -179,14 +192,29 @@ impl LockManager {
                 // Enqueue as an exclusive waiter on every key held by a
                 // different txn.
                 for key in &keys {
-                    if let Some(entry) = self.table.get_mut(key)
-                        && !entry.holders.contains(&txn)
-                        && !entry.has_waiter(txn)
-                    {
-                        entry.waiters.push_back((txn, LockMode::Exclusive));
+                    if let Some(entry) = self.table.get_mut(key) {
+                        // No conflict on this key means it is held solely by `txn`
+                        // (a shared reservation to be upgraded, or an exclusive
+                        // re-acquire) — leave it untouched; `txn` keeps the key and
+                        // upgrades it once its conflicting keys are free. Same
+                        // predicate as the `all_available` check above.
+                        if entry.held_exclusively_by(txn) || entry.held_shared_solely_by(txn) {
+                            continue;
+                        }
+                        // Real conflict on this key. If `txn` also holds it shared
+                        // (an upgrade that must wait behind an OLDER shared holder),
+                        // drop its own shared hold — degrading that read to plain
+                        // OCC, never worse than today — so the key can drain to
+                        // empty and normal promotion can grant `txn` the exclusive
+                        // lock later. Without this, `txn` would occupy the key
+                        // forever and its own exclusive request could never fire.
+                        entry.holders.retain(|h| *h != txn);
+                        if !entry.has_waiter(txn) {
+                            entry.waiters.push_back((txn, LockMode::Exclusive));
+                        }
                     }
-                    // Free keys: no entry exists; the txn will acquire them on
-                    // the re-acquire path after all held keys are released.
+                    // Free keys: no entry exists; the txn acquires them on the
+                    // re-acquire path after all conflicting keys are released.
                 }
                 // Store the full key set so that release can promote this txn
                 // atomically once all its keys become available.
@@ -229,9 +257,10 @@ impl LockManager {
             }
         }
         // Wound only when there is a shared conflict AND `txn` is older than
-        // every conflicting shared holder. Otherwise block (this also covers the
-        // no-conflict edge — e.g. a lone self-shared key — which stays blocked,
-        // preserving prior behavior).
+        // every conflicting shared holder; otherwise block. `shared_conflicts`
+        // only ever holds *other* txns' shared holders (a key held shared solely
+        // by `txn` never reaches here — it takes the self-upgrade path in
+        // `acquire`), so an empty set here means every conflict was exclusive.
         if !shared_conflicts.is_empty() && shared_conflicts.iter().all(|holder| txn < *holder) {
             ExclusiveWait::Wound
         } else {
@@ -463,6 +492,13 @@ impl LockEntry {
     /// re-acquire case on the exclusive path).
     fn held_exclusively_by(&self, txn: TxnId) -> bool {
         self.mode == LockMode::Exclusive && self.holders.len() == 1 && self.holders[0] == txn
+    }
+
+    /// Whether this entry is held **shared** by exactly `txn` and no one else —
+    /// the self-upgrade case: `txn` may take the key exclusively because it is
+    /// the sole current holder.
+    fn held_shared_solely_by(&self, txn: TxnId) -> bool {
+        self.mode == LockMode::Shared && self.holders.len() == 1 && self.holders[0] == txn
     }
 
     /// Whether `txn` is already enqueued as a waiter on this entry.
@@ -866,5 +902,112 @@ mod tests {
             !k2.holders.contains(&t2),
             "the younger's reservation is wounded away"
         );
+    }
+
+    #[test]
+    fn shared_reservation_self_upgrades_to_exclusive() {
+        let mut lm = LockManager::new();
+        let t = txn(1, 0);
+
+        assert_eq!(lm.acquire_shared(t, key("k")), AcquireOutcome::Ready);
+        // The txn re-acquires its own shared reservation exclusively — this must
+        // NOT self-deadlock by blocking on its own held key.
+        assert_eq!(
+            lm.acquire(t, keyset(&["k"])),
+            AcquireOutcome::Ready,
+            "self-upgrade from shared to exclusive must not block"
+        );
+
+        let entry = lm.table.get(&key("k")).unwrap();
+        assert_eq!(entry.mode, LockMode::Exclusive);
+        assert_eq!(entry.holders.len(), 1);
+        assert_eq!(entry.holders[0], t);
+    }
+
+    #[test]
+    fn self_upgrade_with_other_shared_holder_blocks_or_wounds() {
+        // T_old is older than T_young: T_old's self-upgrade must wound T_young.
+        let mut lm = LockManager::new();
+        let t_old = txn(1, 0);
+        let t_young = txn(1, 1);
+
+        assert_eq!(lm.acquire_shared(t_old, key("k")), AcquireOutcome::Ready);
+        assert_eq!(lm.acquire_shared(t_young, key("k")), AcquireOutcome::Ready);
+
+        assert_eq!(
+            lm.acquire(t_old, keyset(&["k"])),
+            AcquireOutcome::Ready,
+            "the older self-upgrader wounds the younger shared holder"
+        );
+        let entry = lm.table.get(&key("k")).unwrap();
+        assert_eq!(entry.mode, LockMode::Exclusive);
+        assert_eq!(entry.holders.len(), 1);
+        assert_eq!(entry.holders[0], t_old);
+
+        // Symmetric case: the YOUNGER of the two self-upgrades and must block.
+        let mut lm = LockManager::new();
+        let t_old = txn(1, 0);
+        let t_young = txn(1, 1);
+
+        assert_eq!(lm.acquire_shared(t_old, key("k")), AcquireOutcome::Ready);
+        assert_eq!(lm.acquire_shared(t_young, key("k")), AcquireOutcome::Ready);
+
+        assert_eq!(
+            lm.acquire(t_young, keyset(&["k"])),
+            AcquireOutcome::Blocked,
+            "the younger self-upgrader must wait behind the older shared holder"
+        );
+        // t_young drops its own shared hold (degrading to plain OCC) so the key
+        // can drain to empty and its exclusive request can later be promoted;
+        // t_old remains the sole shared holder, and t_young is enqueued as an
+        // exclusive waiter rather than left stuck as a non-waiting holder.
+        let entry = lm.table.get(&key("k")).unwrap();
+        assert_eq!(entry.mode, LockMode::Shared);
+        assert!(entry.holders.contains(&t_old));
+        assert!(!entry.holders.contains(&t_young));
+        assert!(entry.has_waiter(t_young));
+
+        // Once t_old releases, t_young is promoted to sole exclusive holder.
+        let unblocked = lm.release(t_old);
+        assert!(unblocked.contains(&t_young));
+        let entry = lm.table.get(&key("k")).unwrap();
+        assert_eq!(entry.mode, LockMode::Exclusive);
+        assert_eq!(entry.holders.len(), 1);
+        assert_eq!(entry.holders[0], t_young);
+    }
+
+    #[test]
+    fn self_upgrade_mixed_with_conflict_on_other_key() {
+        let mut lm = LockManager::new();
+        let t = txn(1, 0);
+        let u = txn(1, 1);
+
+        // T reserves K1 shared; U holds K2 exclusively.
+        assert_eq!(lm.acquire_shared(t, key("k1")), AcquireOutcome::Ready);
+        assert_eq!(lm.acquire(u, keyset(&["k2"])), AcquireOutcome::Ready);
+
+        // T tries to take both keys exclusively: K2 conflicts with U, so T must
+        // block on the whole set — and critically must NOT self-deadlock on K1.
+        assert_eq!(
+            lm.acquire(t, keyset(&["k1", "k2"])),
+            AcquireOutcome::Blocked,
+            "conflict on k2 blocks the whole set"
+        );
+
+        // After U releases K2, T's re-acquire succeeds and upgrades K1 in place.
+        lm.release(u);
+        assert_eq!(
+            lm.acquire(t, keyset(&["k1", "k2"])),
+            AcquireOutcome::Ready,
+            "once k2 frees up, t acquires both keys exclusively"
+        );
+        let k1 = lm.table.get(&key("k1")).unwrap();
+        assert_eq!(k1.mode, LockMode::Exclusive);
+        assert_eq!(k1.holders.len(), 1);
+        assert_eq!(k1.holders[0], t);
+        let k2 = lm.table.get(&key("k2")).unwrap();
+        assert_eq!(k2.mode, LockMode::Exclusive);
+        assert_eq!(k2.holders.len(), 1);
+        assert_eq!(k2.holders[0], t);
     }
 }
