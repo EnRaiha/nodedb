@@ -19,7 +19,9 @@
 //!
 //! Lives on the `!Send` core: plain `HashMap`/`BTreeMap`, no atomics/locks.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 
 use nodedb_types::{DatabaseId, TenantId};
 
@@ -36,12 +38,69 @@ const MAX_INDEX_VALUE_ENTRIES: usize = 65_536;
 
 /// Per-index dimension key: one secondary-index `field` of a
 /// `(database, tenant, collection)`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexKey {
     pub db: DatabaseId,
     pub tenant: TenantId,
     pub collection: Box<str>,
     pub field: Box<str>,
+}
+
+/// The identity of an index dimension expressed as borrowable parts, so a
+/// `HashMap` keyed by owned [`IndexKey`] can be probed with borrowed `&str`s
+/// without allocating an owned key per lookup.
+trait IndexDim {
+    fn parts(&self) -> (DatabaseId, TenantId, &str, &str);
+}
+
+impl IndexDim for IndexKey {
+    fn parts(&self) -> (DatabaseId, TenantId, &str, &str) {
+        (self.db, self.tenant, &self.collection, &self.field)
+    }
+}
+
+/// Borrowed probe into the per-index map — holds `&str`s, allocates nothing.
+struct IndexDimRef<'a> {
+    db: DatabaseId,
+    tenant: TenantId,
+    collection: &'a str,
+    field: &'a str,
+}
+
+impl IndexDim for IndexDimRef<'_> {
+    fn parts(&self) -> (DatabaseId, TenantId, &str, &str) {
+        (self.db, self.tenant, self.collection, self.field)
+    }
+}
+
+impl Hash for dyn IndexDim + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let (db, tenant, collection, field) = self.parts();
+        db.hash(state);
+        tenant.hash(state);
+        collection.hash(state);
+        field.hash(state);
+    }
+}
+
+impl PartialEq for dyn IndexDim + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn IndexDim + '_ {}
+
+impl<'a> Borrow<dyn IndexDim + 'a> for IndexKey {
+    fn borrow(&self) -> &(dyn IndexDim + 'a) {
+        self
+    }
+}
+
+impl Hash for IndexKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (self as &dyn IndexDim).hash(state);
+    }
 }
 
 /// Per-core, per-index write-VALUE version index.
@@ -88,13 +147,12 @@ impl IndexValueVersionIndex {
         field: &str,
         value: &str,
     ) -> Option<Lsn> {
-        let key = IndexKey {
+        let values = self.per_index.get(&IndexDimRef {
             db,
             tenant,
-            collection: Box::from(collection),
-            field: Box::from(field),
-        };
-        let values = self.per_index.get(&key)?;
+            collection,
+            field,
+        } as &dyn IndexDim)?;
         Some(values.get(value).copied().unwrap_or(Lsn::ZERO))
     }
 
@@ -111,13 +169,12 @@ impl IndexValueVersionIndex {
         hi: Option<&str>,
     ) -> Option<Lsn> {
         use std::ops::Bound;
-        let key = IndexKey {
+        let values = self.per_index.get(&IndexDimRef {
             db,
             tenant,
-            collection: Box::from(collection),
-            field: Box::from(field),
-        };
-        let values = self.per_index.get(&key)?;
+            collection,
+            field,
+        } as &dyn IndexDim)?;
         let lo_b = match lo {
             Some(s) => Bound::Included(s),
             None => Bound::Unbounded,
@@ -147,12 +204,12 @@ impl IndexValueVersionIndex {
         value: &str,
     ) -> Option<Lsn> {
         self.per_index
-            .get(&IndexKey {
+            .get(&IndexDimRef {
                 db,
                 tenant,
-                collection: Box::from(collection),
-                field: Box::from(field),
-            })
+                collection,
+                field,
+            } as &dyn IndexDim)
             .and_then(|values| values.get(value).copied())
     }
 
