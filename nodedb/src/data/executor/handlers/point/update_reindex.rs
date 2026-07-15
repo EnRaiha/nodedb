@@ -36,6 +36,21 @@ pub(in crate::data::executor) struct BitemporalUpdateReindex<'a> {
     pub new_doc: &'a serde_json::Value,
 }
 
+/// Inputs for [`CoreLoop::nonbitemporal_update_reindex`].
+pub(in crate::data::executor) struct NonbitemporalUpdateReindex<'a> {
+    pub database_id: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub doc_id: &'a str,
+    /// New stored bytes for the primary document row.
+    pub new_body: &'a [u8],
+    pub index_paths: &'a [IndexPath],
+    /// Pre-update document image, for the secondary-index SET diff.
+    pub old_doc: &'a serde_json::Value,
+    /// Post-update document image, for the secondary-index SET diff.
+    pub new_doc: &'a serde_json::Value,
+}
+
 impl CoreLoop {
     /// Extract the indexed values a document contributes for one path, honoring
     /// the path's partial predicate and case-folding — matching the put-time
@@ -125,6 +140,53 @@ impl CoreLoop {
         txn.commit().map_err(|e| crate::Error::Storage {
             engine: "sparse".into(),
             detail: format!("bitemporal update reindex commit: {e}"),
+        })?;
+        Ok(())
+    }
+
+    /// Write the new (non-bitemporal) document body and reconcile the plain
+    /// `INDEXES` secondary index atomically in a single write transaction.
+    ///
+    /// The autocommit bulk-UPDATE path uses this instead of the
+    /// self-committing [`SparseEngine::put`](crate::engine::sparse::SparseEngine::put):
+    /// the primary row and the secondary-index SET diff commit in ONE redb
+    /// transaction, closing the crash window in which the index would still
+    /// point at the pre-update value while the document already holds the new
+    /// one — a desync that makes a later lookup on the new value miss the row
+    /// and a lookup on the old value wrongly return it.
+    pub(in crate::data::executor) fn nonbitemporal_update_reindex(
+        &mut self,
+        p: NonbitemporalUpdateReindex<'_>,
+    ) -> crate::Result<()> {
+        let txn = self.sparse.begin_write()?;
+
+        self.sparse.put_in_txn(
+            &txn,
+            p.database_id,
+            p.tid,
+            p.collection,
+            p.doc_id,
+            p.new_body,
+        )?;
+
+        if !p.index_paths.is_empty() {
+            self.apply_secondary_indexes_in_txn(
+                &txn,
+                crate::data::executor::core_loop::maintenance::SecondaryIndexInputs {
+                    database_id: p.database_id,
+                    tid: p.tid,
+                    collection: p.collection,
+                    old_doc: Some(p.old_doc),
+                    new_doc: p.new_doc,
+                    doc_id: p.doc_id,
+                    index_paths: p.index_paths,
+                },
+            );
+        }
+
+        txn.commit().map_err(|e| crate::Error::Storage {
+            engine: "sparse".into(),
+            detail: format!("nonbitemporal update reindex commit: {e}"),
         })?;
         Ok(())
     }

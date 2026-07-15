@@ -6,6 +6,7 @@ use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use crate::data::executor::handlers::point::update_reindex::NonbitemporalUpdateReindex;
 use crate::data::executor::handlers::point::update_reindex_vector::UpdateVectorReindex;
 use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::response_codec;
@@ -173,6 +174,17 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let has_vectors = self.collection_has_vectors(database_id, tid, collection);
 
+        // The plain `INDEXES` secondary-index paths for this collection, cloned
+        // once for the whole statement. Each row's primary write reconciles
+        // these atomically via `nonbitemporal_update_reindex` so a value the
+        // UPDATE changed can't leave a stale index entry pointing at the old
+        // value (which would make a later lookup on the new value miss the row).
+        let index_paths = self
+            .doc_configs
+            .get(&config_key)
+            .map(|c| c.index_paths.clone())
+            .unwrap_or_default();
+
         // Apply updates to each matching document.
         let mut affected = 0u64;
         // One post-apply `Put` redo entry per updated row on a vector collection.
@@ -210,6 +222,10 @@ impl CoreLoop {
                             None => continue,
                         }
                     };
+                    // Pre-mutation image, captured before any field is changed.
+                    // Feeds the secondary-index SET diff so values the UPDATE
+                    // drops are removed from the index atomically with the write.
+                    let old_doc_json = doc.clone();
                     // Snapshot the current row for expression evaluation. All
                     // expression assignments see the pre-update state — multiple
                     // assignments in the same UPDATE do not observe each other,
@@ -270,77 +286,73 @@ impl CoreLoop {
                     } else {
                         doc_format::encode_to_msgpack(&doc)
                     };
-                    if self
-                        .sparse
-                        .put(
-                            task.request.database_id.as_u64(),
-                            tid,
-                            collection,
-                            doc_id,
-                            &updated_bytes,
-                        )
-                        .is_ok()
-                    {
-                        self.doc_cache.put(
-                            task.request.database_id.as_u64(),
-                            tid,
-                            collection,
-                            doc_id,
-                            &updated_bytes,
+                    if let Err(e) = self.nonbitemporal_update_reindex(NonbitemporalUpdateReindex {
+                        database_id,
+                        tid,
+                        collection,
+                        doc_id,
+                        new_body: &updated_bytes,
+                        index_paths: &index_paths,
+                        old_doc: &old_doc_json,
+                        new_doc: &doc,
+                    }) {
+                        tracing::warn!(
+                            %doc_id,
+                            error = %e,
+                            "update reindex commit failed, skipping document"
                         );
-                        // Record the committed row's write version against its
-                        // surrogate + collection. Parsed once and reused below
-                        // for the write-set entry (the row's doc_id is the
-                        // hex-encoded surrogate storage key either way).
-                        let row_surrogate =
-                            crate::engine::document::store::doc_id_to_surrogate(doc_id);
-                        if let Some(surrogate) = row_surrogate {
-                            self.note_surrogate_write_lsn(
-                                task,
+                        continue;
+                    }
+                    self.doc_cache.put(
+                        task.request.database_id.as_u64(),
+                        tid,
+                        collection,
+                        doc_id,
+                        &updated_bytes,
+                    );
+                    // Record the committed row's write version against its
+                    // surrogate + collection. Parsed once and reused below
+                    // for the write-set entry (the row's doc_id is the
+                    // hex-encoded surrogate storage key either way).
+                    let row_surrogate = crate::engine::document::store::doc_id_to_surrogate(doc_id);
+                    if let Some(surrogate) = row_surrogate {
+                        self.note_surrogate_write_lsn(task, tid, collection, surrogate.as_u32());
+                        // Re-index the row's vectors from the new body
+                        // (soft-delete the old HNSW node + insert the new
+                        // one, keyed by the stable surrogate). No-op unless
+                        // the collection has a vector field (gated above).
+                        if has_vectors {
+                            self.update_reindex_vector_indexes(UpdateVectorReindex {
+                                database_id,
                                 tid,
                                 collection,
-                                surrogate.as_u32(),
-                            );
-                            // Re-index the row's vectors from the new body
-                            // (soft-delete the old HNSW node + insert the new
-                            // one, keyed by the stable surrogate). No-op unless
-                            // the collection has a vector field (gated above).
-                            if has_vectors {
-                                self.update_reindex_vector_indexes(UpdateVectorReindex {
-                                    database_id,
-                                    tid,
-                                    collection,
-                                    row_key: doc_id,
-                                    surrogate,
-                                    new_body: &updated_bytes,
-                                    is_strict: strict_schema.is_some(),
-                                    has_vectors,
-                                });
-                            }
-                        }
-                        affected += 1;
-                        if returning.is_some() {
-                            // Include document ID in the returned document.
-                            if let Some(obj) = doc.as_object_mut() {
-                                obj.insert(
-                                    "id".to_string(),
-                                    serde_json::Value::String(doc_id.clone()),
-                                );
-                            }
-                            returned_docs.push(doc);
-                        }
-                        // Carry the surrogate + post-image back for a post-apply
-                        // `Put` redo. `updated_bytes` is moved as its last use;
-                        // gated on `has_vectors` so a non-vector collection pays
-                        // nothing. Keyed by the row's surrogate parsed from its
-                        // doc_id (the hex-encoded surrogate storage key).
-                        if has_vectors && let Some(surrogate) = row_surrogate {
-                            write_set.push(WriteSetEntry {
-                                surrogate: surrogate.as_u32(),
-                                is_delete: false,
-                                value: updated_bytes,
+                                row_key: doc_id,
+                                surrogate,
+                                new_body: &updated_bytes,
+                                is_strict: strict_schema.is_some(),
+                                has_vectors,
                             });
                         }
+                    }
+                    affected += 1;
+                    if returning.is_some() {
+                        // Include document ID in the returned document.
+                        if let Some(obj) = doc.as_object_mut() {
+                            obj.insert("id".to_string(), serde_json::Value::String(doc_id.clone()));
+                        }
+                        returned_docs.push(doc);
+                    }
+                    // Carry the surrogate + post-image back for a post-apply
+                    // `Put` redo. `updated_bytes` is moved as its last use;
+                    // gated on `has_vectors` so a non-vector collection pays
+                    // nothing. Keyed by the row's surrogate parsed from its
+                    // doc_id (the hex-encoded surrogate storage key).
+                    if has_vectors && let Some(surrogate) = row_surrogate {
+                        write_set.push(WriteSetEntry {
+                            surrogate: surrogate.as_u32(),
+                            is_delete: false,
+                            value: updated_bytes,
+                        });
                     }
                 }
                 _ => continue,

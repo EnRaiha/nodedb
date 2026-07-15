@@ -20,3 +20,6 @@ mod backfill;
 
 #[path = "sql_index/partial.rs"]
 mod partial;
+
+#[path = "sql_index/update_reindex.rs"]
+mod update_reindex;
