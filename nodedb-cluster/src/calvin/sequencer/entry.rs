@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::calvin::types::EpochBatch;
+use crate::calvin::types::{EpochBatch, LockKeyWire, ReleaseReason, TxnIdWire};
 
 /// An entry in the replicated sequencer log.
 ///
@@ -78,6 +78,20 @@ pub enum SequencerEntry {
         epoch: u64,
         position: u32,
         commit: bool,
+    },
+    /// Install a SHARED reservation on `key` for interactive txn `owner` (its
+    /// stable Calvin `(epoch, position)` lock id). Leader-proposed; applied on
+    /// every replica so each installs an identical shared lock.
+    ReserveRead {
+        owner: TxnIdWire,
+        vshard: u32,
+        key: LockKeyWire,
+    },
+    /// Release ALL of `owner`'s shared reservations on `vshard`.
+    ReleaseReservation {
+        owner: TxnIdWire,
+        vshard: u32,
+        reason: ReleaseReason,
     },
 }
 
@@ -212,6 +226,39 @@ mod tests {
             epoch: 5,
             position: 2,
             commit: false,
+        };
+        let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
+        let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn reserve_read_msgpack_roundtrip() {
+        let entry = SequencerEntry::ReserveRead {
+            owner: TxnIdWire {
+                epoch: 11,
+                position: 4,
+            },
+            vshard: 7,
+            key: LockKeyWire::Kv {
+                collection: "sessions".to_owned(),
+                key: b"hot".to_vec(),
+            },
+        };
+        let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
+        let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");
+        assert_eq!(entry, decoded);
+    }
+
+    #[test]
+    fn release_reservation_msgpack_roundtrip() {
+        let entry = SequencerEntry::ReleaseReservation {
+            owner: TxnIdWire {
+                epoch: 11,
+                position: 4,
+            },
+            vshard: 7,
+            reason: ReleaseReason::Commit,
         };
         let bytes = zerompk::to_msgpack_vec(&entry).expect("encode");
         let decoded: SequencerEntry = zerompk::from_msgpack(&bytes).expect("decode");

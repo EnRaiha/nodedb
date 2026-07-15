@@ -7,13 +7,75 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nodedb_cluster::calvin::types::SequencedTxn;
+use nodedb_cluster::calvin::types::{
+    LockKeyWire, ReleaseReason, SchedulerInput, SequencedTxn, TxnIdWire,
+};
 
 use super::super::barrier::PendingDependentBarrier;
 use super::scheduler::Scheduler;
 use crate::control::cluster::calvin::scheduler::lock_manager::{AcquireOutcome, TxnId};
 
 impl Scheduler {
+    /// Route a fanned-out scheduler input to its handler.
+    ///
+    /// Every replica applies the sequencer-ordered inputs in identical order, so
+    /// the resulting `process`/`acquire_shared`/`release` calls are identical
+    /// across replicas — the determinism contract. No wall clock or local state
+    /// enters the routing decision.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn process_scheduler_input(
+        &mut self,
+        input: SchedulerInput,
+    ) {
+        match input {
+            SchedulerInput::Txn(txn) => self.process_new_txn(txn),
+            SchedulerInput::Reserve { owner, key } => self.install_reservation(owner, key),
+            SchedulerInput::Release { owner, reason } => self.release_reservation(owner, reason),
+        }
+    }
+
+    /// Install a SHARED reservation on `key` for interactive txn `owner`.
+    ///
+    /// The `AcquireOutcome` is intentionally discarded: promotion of a
+    /// reservation that blocks behind an exclusive holder is handled by the
+    /// existing FIFO waiter mechanics, and lock-promotion wiring for reservations
+    /// lands in a later change.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn install_reservation(
+        &mut self,
+        owner: TxnIdWire,
+        key: LockKeyWire,
+    ) {
+        let txn_id: TxnId = owner.into();
+        let lock_key = super::super::helpers::decode_lock_key(&key);
+        let mut lm = self.lock_manager.lock().unwrap_or_else(|p| p.into_inner());
+        let _outcome = lm.acquire_shared(txn_id, lock_key);
+    }
+
+    /// Release ALL shared reservations held by `owner`, promoting any waiters that
+    /// become ready — the same promotion -> dispatch path `on_txn_complete` uses.
+    ///
+    /// `reason` is carried for observability only; the release is identical for
+    /// every reason.
+    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn release_reservation(
+        &mut self,
+        owner: TxnIdWire,
+        reason: ReleaseReason,
+    ) {
+        let txn_id: TxnId = owner.into();
+        tracing::debug!(
+            vshard = self.vshard_id,
+            epoch = txn_id.epoch,
+            position = txn_id.position,
+            ?reason,
+            "calvin: releasing shared reservation"
+        );
+        let newly_unblocked = {
+            let lm = Arc::clone(&self.lock_manager);
+            let mut guard = lm.lock().unwrap_or_else(|p| p.into_inner());
+            guard.release(txn_id)
+        };
+        self.dispatch_promoted(newly_unblocked);
+    }
+
     /// Process a newly arrived sequenced transaction.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn process_new_txn(
         &mut self,

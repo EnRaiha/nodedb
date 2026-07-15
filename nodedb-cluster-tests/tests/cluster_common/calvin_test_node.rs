@@ -45,7 +45,7 @@ use nodedb_cluster::{
             InboxReceiver, SequencerConfig, SequencerService, SequencerStateMachine,
             service::SequencerMetrics, state_machine::StateMachineMetrics,
         },
-        types::SequencedTxn,
+        types::{SchedulerInput, SequencedTxn},
     },
     start_cluster,
 };
@@ -130,10 +130,23 @@ impl CalvinTestNode {
     /// Register a per-vshard output sender so the state machine can
     /// fan out sequenced transactions to the receiving test code.
     pub fn add_vshard_sender(&self, vshard_id: u32, sender: mpsc::Sender<SequencedTxn>) {
+        // The state machine now fans out `SchedulerInput`; these tests assert on
+        // the sequenced-txn stream, so adapt: forward only `Txn` payloads to the
+        // caller's `SequencedTxn` channel (reservation inputs don't occur here).
+        let (adapt_tx, mut adapt_rx) = mpsc::channel::<SchedulerInput>(512);
+        tokio::spawn(async move {
+            while let Some(input) = adapt_rx.recv().await {
+                if let SchedulerInput::Txn(txn) = input
+                    && sender.send(txn).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
         self.state_machine
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .set_vshard_sender(vshard_id, sender);
+            .set_vshard_sender(vshard_id, adapt_tx);
     }
 
     /// Start the sequencer service epoch-ticker task on this node.

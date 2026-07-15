@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use nodedb_cluster::MultiRaft;
-use nodedb_cluster::calvin::types::SequencedTxn;
+use nodedb_cluster::calvin::types::SchedulerInput;
 use nodedb_cluster::calvin::{
     CalvinCompletionRegistry, SEQUENCER_GROUP_ID, SequencerEntry, VerdictSignal,
 };
@@ -41,9 +41,10 @@ pub(in crate::control::cluster::calvin::scheduler::driver::core) type Completion
 pub struct Scheduler {
     /// Vshard this scheduler is responsible for.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) vshard_id: u32,
-    /// Incoming sequenced transactions from the sequencer fan-out.
+    /// Incoming scheduler inputs from the sequencer fan-out (sequenced txns and
+    /// shared-reservation install/release directives).
     pub(in crate::control::cluster::calvin::scheduler::driver::core) receiver:
-        mpsc::Receiver<SequencedTxn>,
+        mpsc::Receiver<SchedulerInput>,
     /// Shared control-plane state used for dispatch, response tracking, WAL,
     /// and request-id allocation.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) shared: Arc<SharedState>,
@@ -129,7 +130,7 @@ pub struct Scheduler {
 /// Parameters for [`Scheduler::new`].
 pub struct SchedulerParams {
     pub vshard_id: u32,
-    pub receiver: mpsc::Receiver<SequencedTxn>,
+    pub receiver: mpsc::Receiver<SchedulerInput>,
     pub shared: Arc<SharedState>,
     pub multi_raft: Arc<Mutex<MultiRaft>>,
     /// Fully-applied watermark seed from the recovery scan.
@@ -309,7 +310,7 @@ impl Scheduler {
 
                 maybe_txn = self.receiver.recv() => {
                     match maybe_txn {
-                        Some(txn) => self.process_new_txn(txn),
+                        Some(input) => self.process_scheduler_input(input),
                         None => {
                             info!(
                                 vshard_id = self.vshard_id,

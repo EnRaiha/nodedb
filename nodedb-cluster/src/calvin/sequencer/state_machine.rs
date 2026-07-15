@@ -27,7 +27,7 @@ use tracing::{error, warn};
 
 use crate::calvin::CalvinCompletionRegistry;
 use crate::calvin::sequencer::entry::SequencerEntry;
-use crate::calvin::types::SequencedTxn;
+use crate::calvin::types::{SchedulerInput, SequencedTxn};
 
 /// Atomic counters for the sequencer state machine apply path.
 pub struct StateMachineMetrics {
@@ -74,7 +74,7 @@ pub struct SequencerStateMachine {
     /// makes the "nothing applied" state explicit).
     last_applied_epoch: u64,
     /// Per-vshard output channels. The scheduler subscribes on the other end.
-    vshard_senders: HashMap<u32, mpsc::Sender<SequencedTxn>>,
+    vshard_senders: HashMap<u32, mpsc::Sender<SchedulerInput>>,
     pub metrics: Arc<StateMachineMetrics>,
     completion_registry: Arc<CalvinCompletionRegistry>,
 }
@@ -84,7 +84,7 @@ const NOT_YET_APPLIED: u64 = u64::MAX;
 impl SequencerStateMachine {
     /// Construct a fresh state machine with no applied epochs.
     pub fn new(
-        vshard_senders: HashMap<u32, mpsc::Sender<SequencedTxn>>,
+        vshard_senders: HashMap<u32, mpsc::Sender<SchedulerInput>>,
         completion_registry: Arc<CalvinCompletionRegistry>,
     ) -> Self {
         Self {
@@ -117,7 +117,7 @@ impl SequencerStateMachine {
     /// Register (or replace) the output sender for a vshard.
     ///
     /// Call this when a scheduler subscribes for a vshard hosted on this node.
-    pub fn set_vshard_sender(&mut self, vshard: u32, sender: mpsc::Sender<SequencedTxn>) {
+    pub fn set_vshard_sender(&mut self, vshard: u32, sender: mpsc::Sender<SchedulerInput>) {
         self.vshard_senders.insert(vshard, sender);
     }
 
@@ -204,6 +204,10 @@ impl SequencerStateMachine {
                 // Verdict signals carry no txn data to replay, like `Vote`; the
                 // stored verdict is re-derived via live `apply`.
                 SequencerEntry::Verdict { .. } => {}
+                // Reservation entries carry no epoch-batch txn data to replay for
+                // a vShard; they are re-fanned via live `apply`.
+                SequencerEntry::ReserveRead { .. } => {}
+                SequencerEntry::ReleaseReservation { .. } => {}
             }
         }
 
@@ -293,7 +297,7 @@ impl SequencerStateMachine {
                             let mut per_vshard = txn_with_ts.clone();
                             per_vshard.epoch_vshard_txn_count =
                                 vshard_txn_counts.get(&vshard).copied().unwrap_or(0);
-                            match sender.try_send(per_vshard) {
+                            match sender.try_send(SchedulerInput::Txn(per_vshard)) {
                                 Ok(()) => {
                                     fanned_out += 1;
                                 }
@@ -385,6 +389,63 @@ impl SequencerStateMachine {
             } => {
                 self.completion_registry
                     .note_verdict(crate::calvin::TxnId::new(epoch, position), commit);
+            }
+            // Fan a hot-key read reservation out to its owning vShard's scheduler,
+            // which installs the SHARED lock. Same `try_send` backpressure
+            // discipline as the epoch-batch fan-out: a full/closed channel logs
+            // and drops (this node may not host the vShard, in which case there is
+            // simply no sender registered).
+            SequencerEntry::ReserveRead { owner, vshard, key } => {
+                if let Some(sender) = self.vshard_senders.get(&vshard) {
+                    match sender.try_send(SchedulerInput::Reserve { owner, key }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                vshard,
+                                owner_epoch = owner.epoch,
+                                owner_position = owner.position,
+                                "sequencer apply: vshard channel full (backpressure); \
+                                 dropping read reservation"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!(
+                                vshard,
+                                "sequencer apply: vshard sender gone; \
+                                 scheduler may have exited (reservation)"
+                            );
+                        }
+                    }
+                }
+            }
+            // Fan a reservation release out to its owning vShard's scheduler.
+            // Same `try_send` discipline as `ReserveRead`.
+            SequencerEntry::ReleaseReservation {
+                owner,
+                vshard,
+                reason,
+            } => {
+                if let Some(sender) = self.vshard_senders.get(&vshard) {
+                    match sender.try_send(SchedulerInput::Release { owner, reason }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                vshard,
+                                owner_epoch = owner.epoch,
+                                owner_position = owner.position,
+                                "sequencer apply: vshard channel full (backpressure); \
+                                 dropping reservation release"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!(
+                                vshard,
+                                "sequencer apply: vshard sender gone; \
+                                 scheduler may have exited (reservation release)"
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -550,7 +611,7 @@ mod tests {
         let (tx_b, _rx_b) = mpsc::channel(1);
         // Pre-fill channel A so it is full.
         let pre_fill: SequencedTxn = batch.txns[0].clone();
-        let _ = tx_a.try_send(pre_fill);
+        let _ = tx_a.try_send(SchedulerInput::Txn(pre_fill));
         let mut senders = HashMap::new();
         senders.insert(va, tx_a);
         senders.insert(vb, tx_b);

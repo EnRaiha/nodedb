@@ -5,11 +5,45 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use nodedb_cluster::calvin::types::{EngineKeySet, SequencedTxn};
+use nodedb_cluster::calvin::types::{EngineKeySet, LockKeyWire, SequencedTxn, TxnIdWire};
 
-use crate::control::cluster::calvin::scheduler::lock_manager::LockKey;
+use crate::control::cluster::calvin::scheduler::lock_manager::{LockKey, TxnId};
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::wire as plan_wire;
+
+impl From<TxnIdWire> for TxnId {
+    fn from(wire: TxnIdWire) -> Self {
+        TxnId::new(wire.epoch, wire.position)
+    }
+}
+
+/// Decode a [`LockKeyWire`] transport twin into the real scheduler-side
+/// [`LockKey`]. Mirrors the field shapes of [`expand_rw_set`]'s per-engine key
+/// construction (interned `Arc<str>` / `Arc<[u8]>` for cheap clones).
+pub(super) fn decode_lock_key(wire: &LockKeyWire) -> LockKey {
+    match wire {
+        LockKeyWire::Surrogate {
+            collection,
+            surrogate,
+        } => LockKey::Surrogate {
+            collection: Arc::from(collection.as_str()),
+            surrogate: *surrogate,
+        },
+        LockKeyWire::Kv { collection, key } => LockKey::Kv {
+            collection: Arc::from(collection.as_str()),
+            key: Arc::from(key.as_slice()),
+        },
+        LockKeyWire::Edge {
+            collection,
+            src,
+            dst,
+        } => LockKey::Edge {
+            collection: Arc::from(collection.as_str()),
+            src: *src,
+            dst: *dst,
+        },
+    }
+}
 
 /// Expand the read_set ∪ write_set of a sequenced transaction into a
 /// `BTreeSet<LockKey>`.
