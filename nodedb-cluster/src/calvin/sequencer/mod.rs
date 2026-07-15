@@ -5,6 +5,7 @@ pub mod entry;
 pub mod error;
 pub mod inbox;
 pub mod metrics;
+pub mod replay;
 pub mod reservation_inbox;
 pub mod service;
 pub mod state_machine;

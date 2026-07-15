@@ -46,7 +46,7 @@ impl nodedb_cluster::CommitApplier for SpscCommitApplier {
                 .unwrap_or_else(|p| p.into_inner());
             for entry in entries {
                 if !entry.data.is_empty() {
-                    sm.apply(&entry.data);
+                    sm.apply(entry.index, &entry.data);
                 }
             }
             return entries.last().map(|e| e.index).unwrap_or(0);

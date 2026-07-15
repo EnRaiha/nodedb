@@ -72,7 +72,7 @@ impl nodedb_cluster::CommitApplier for CalvinApplier {
             let mut sm = self.state_machine.lock().unwrap_or_else(|p| p.into_inner());
             for entry in entries {
                 if !entry.data.is_empty() {
-                    sm.apply(&entry.data);
+                    sm.apply(entry.index, &entry.data);
                 }
             }
         }
