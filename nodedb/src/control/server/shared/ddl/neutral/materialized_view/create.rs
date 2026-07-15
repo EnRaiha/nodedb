@@ -122,6 +122,7 @@ pub async fn create_materialized_view(
             event_defs: Vec::new(),
             collection_type: nodedb_types::CollectionType::document(),
             timeseries_config: None,
+            conflict_policy: None,
             is_active: true,
             append_only: false,
             hash_chain: false,

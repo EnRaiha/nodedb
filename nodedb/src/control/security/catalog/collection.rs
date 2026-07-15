@@ -146,6 +146,15 @@ pub struct StoredCollection {
     /// other engines ignore it.
     #[msgpack(default)]
     pub bitemporal: bool,
+    /// Durable CRDT conflict-resolution policy (JSON-serialized
+    /// `nodedb_crdt::policy::CollectionPolicy`), set via
+    /// `ALTER COLLECTION ... SET ON CONFLICT ... FOR ...`. `None` = no
+    /// explicit policy persisted; the per-core `PolicyRegistry` falls back
+    /// to `CollectionPolicy::ephemeral()`. Rehydrated into every Data Plane
+    /// core's registry via `DocumentOp::Register` on both live DDL apply and
+    /// boot rehydration, so the policy survives a restart.
+    #[msgpack(default)]
+    pub conflict_policy: Option<String>,
     /// Permission tree definition (JSON-serialized).
     #[msgpack(default)]
     pub permission_tree_def: Option<String>,
@@ -283,6 +292,7 @@ impl StoredCollection {
             materialized_sums: Vec::new(),
             lvc_enabled: false,
             bitemporal: false,
+            conflict_policy: None,
             permission_tree_def: None,
             indexes: Vec::new(),
             size_bytes_estimate: 0,

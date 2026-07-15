@@ -248,6 +248,7 @@ pub(crate) fn build_doc_config_from_stored(
     config.storage_mode = storage_mode;
     config.enforcement = enforcement;
     config.bitemporal = coll.bitemporal;
+    config.conflict_policy = coll.conflict_policy.clone();
     config.index_paths = indexes
         .iter()
         .map(crate::engine::document::store::IndexPath::from_registered)
@@ -272,6 +273,7 @@ async fn dispatch_register_from_stored_inner(
             storage_mode: config.storage_mode,
             enforcement: Box::new(config.enforcement),
             bitemporal: config.bitemporal,
+            conflict_policy: config.conflict_policy.clone(),
         },
     );
 

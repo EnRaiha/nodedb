@@ -14,6 +14,8 @@ mod test_array_ops;
 mod test_columnar_aggregate;
 #[path = "executor_tests/test_conditional_update.rs"]
 mod test_conditional_update;
+#[path = "executor_tests/test_conflict_policy_register.rs"]
+mod test_conflict_policy_register;
 #[path = "executor_tests/test_cross_engine_validation.rs"]
 mod test_cross_engine_validation;
 #[path = "executor_tests/test_cross_type_join/mod.rs"]

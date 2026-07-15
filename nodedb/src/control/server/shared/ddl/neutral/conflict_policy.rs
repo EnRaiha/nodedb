@@ -5,27 +5,30 @@
 //! - `ALTER COLLECTION <name> SET ON CONFLICT <policy> FOR <kind>`
 //! - `SHOW CONFLICT POLICY ON <name>`
 //!
-//! Ported from the pgwire `ddl::conflict_policy` handlers; the Data Plane
-//! read-modify-write cycle (`CrdtOp::GetPolicy` / `SetPolicy`), the policy
-//! serialization, and the fallback-to-empty behavior are preserved verbatim.
-//! Only the result construction changed from pgwire `Response` /
-//! `QueryResponse` to the protocol-neutral [`DdlResult`] over [`ShapedRows`];
-//! the SQLSTATE codes and messages are unchanged.
-
-use std::time::Duration;
+//! Conflict policies are persisted on the collection's catalog record
+//! (`StoredCollection::conflict_policy`, mirroring `bitemporal`) instead of
+//! living only in the in-memory per-core `PolicyRegistry`. The read-modify-
+//! write cycle now targets the catalog directly: read the durable policy (or
+//! `CollectionPolicy::ephemeral()` when none has ever been persisted),
+//! apply the partial update, and write back via `CatalogEntry::PutCollection`
+//! — the existing `PutCollection` post-apply hook re-broadcasts
+//! `DocumentOp::Register` to every Data Plane core (live) and boot
+//! rehydration replays the same path, so the policy survives a restart.
+//! The SQLSTATE codes and messages are unchanged from the previous
+//! Data-Plane-round-trip implementation.
 
 use serde_json::{Map, Value as JsonValue};
 
 use nodedb_crdt::policy::{CollectionPolicy, ConflictPolicy};
-use nodedb_physical::physical_plan::CrdtOp;
 use nodedb_sql::ddl_ast::alter_ops::{ConflictPolicyKind, ConstraintKindKeyword};
 
-use crate::bridge::envelope::PhysicalPlan;
+use crate::control::catalog_entry::CatalogEntry;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
+use super::super::catalog::propose_and_apply;
 use super::super::result::{DdlError, DdlResult};
 
 /// Construct a [`DdlError`], preserving the exact SQLSTATE codes and messages
@@ -39,10 +42,15 @@ fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
 
 /// Handle `ALTER COLLECTION <name> SET ON CONFLICT <policy> FOR <kind>`.
 ///
-/// Implements a read-modify-write cycle against the Data Plane:
-/// 1. Read the current policy via `CrdtOp::GetPolicy`.
+/// Implements a read-modify-write cycle against the collection's catalog
+/// record (mirroring `alter_collection_set_retention`):
+/// 1. Read `StoredCollection::conflict_policy` (or `CollectionPolicy::ephemeral()`
+///    when none has ever been persisted).
 /// 2. Replace the targeted constraint-kind field.
-/// 3. Write the updated policy back via `CrdtOp::SetPolicy`.
+/// 3. Write the updated policy back via `CatalogEntry::PutCollection` and bump
+///    `schema_version`. The `PutCollection` post-apply hook re-broadcasts
+///    `DocumentOp::Register` to every Data Plane core, rehydrating the
+///    per-core `PolicyRegistry` — durably, so the policy survives a restart.
 pub async fn alter_set_on_conflict(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -51,47 +59,31 @@ pub async fn alter_set_on_conflict(
     policy_kind: &ConflictPolicyKind,
     constraint_kind: &ConstraintKindKeyword,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let tenant_id = identity.tenant_id;
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
+    let tenant_id = identity.tenant_id.as_u64();
+    let catalog = state.credentials.catalog();
+    let mut coll = catalog
+        .get_collection(database_id, tenant_id, collection)
+        .map_err(|e| err("XX000", e.to_string()))?
+        .ok_or_else(|| err("42P01", format!("collection '{collection}' not found")))?;
 
-    // Step 1: read current policy.
-    let get_plan = PhysicalPlan::Crdt(CrdtOp::GetPolicy {
-        collection: collection.to_string(),
-    });
-    let policy_bytes = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
-        state,
-        tenant_id,
-        database_id,
-        collection,
-        get_plan,
-        timeout,
-    )
-    .await
-    .map_err(|e| err("XX000", e.to_string()))?;
-
-    let mut policy: CollectionPolicy =
-        sonic_rs::from_slice(&policy_bytes).map_err(|e| err("XX000", e.to_string()))?;
+    // Step 1: read the durable policy, falling back to the same ephemeral
+    // default the in-memory `PolicyRegistry` uses for an unregistered
+    // collection.
+    let mut policy: CollectionPolicy = match &coll.conflict_policy {
+        Some(json) => sonic_rs::from_str(json).map_err(|e| err("XX000", e.to_string()))?,
+        None => CollectionPolicy::ephemeral(),
+    };
 
     // Step 2: apply the partial update.
     let new_conflict_policy = resolve_policy_kind(policy_kind);
     apply_conflict_policy(&mut policy, constraint_kind, new_conflict_policy);
 
-    // Step 3: write back.
+    // Step 3: persist on the catalog record and re-broadcast.
     let policy_json = sonic_rs::to_string(&policy).map_err(|e| err("XX000", e.to_string()))?;
-    let set_plan = PhysicalPlan::Crdt(CrdtOp::SetPolicy {
-        collection: collection.to_string(),
-        policy_json,
-    });
-    crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
-        state,
-        tenant_id,
-        database_id,
-        collection,
-        set_plan,
-        timeout,
-    )
-    .await
-    .map_err(|e| err("XX000", e.to_string()))?;
+    coll.conflict_policy = Some(policy_json);
+    let entry = CatalogEntry::PutCollection(Box::new(coll));
+    propose_and_apply(state, &entry)?;
+    state.schema_version.bump();
 
     let mut row = Map::new();
     row.insert("result".to_string(), JsonValue::String("OK".to_string()));
@@ -106,48 +98,32 @@ pub async fn alter_set_on_conflict(
 /// Handle `SHOW CONFLICT POLICY ON <collection>`.
 ///
 /// Returns one row with a single `policy` column containing the JSON-serialized
-/// `CollectionPolicy`. Falls back to the ephemeral default when no policy is set.
+/// `CollectionPolicy`, read straight from the durable catalog record. Falls
+/// back to the ephemeral default when no policy has ever been persisted.
 pub async fn show_conflict_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     collection: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let tenant_id = identity.tenant_id;
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
+    let tenant_id = identity.tenant_id.as_u64();
+    let catalog = state.credentials.catalog();
+    let coll = catalog
+        .get_collection(database_id, tenant_id, collection)
+        .map_err(|e| err("XX000", e.to_string()))?
+        .ok_or_else(|| err("42P01", format!("collection '{collection}' not found")))?;
 
-    let plan = PhysicalPlan::Crdt(CrdtOp::GetPolicy {
-        collection: collection.to_string(),
-    });
-    let policy_bytes = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
-        state,
-        tenant_id,
-        database_id,
-        collection,
-        plan,
-        timeout,
-    )
-    .await
-    .map_err(|e| err("XX000", e.to_string()))?;
+    let policy: CollectionPolicy = match &coll.conflict_policy {
+        Some(json) => sonic_rs::from_str(json).map_err(|e| err("XX000", e.to_string()))?,
+        None => CollectionPolicy::ephemeral(),
+    };
+    let text = sonic_rs::to_string(&policy).map_err(|e| err("XX000", e.to_string()))?;
 
-    let columns = vec!["policy".to_string()];
-    let column_types = ShapedRows::text_types(1);
-
-    if policy_bytes.is_empty() {
-        return Ok(vec![DdlResult::Rows(ShapedRows {
-            columns,
-            column_types,
-            rows: Vec::new(),
-            notice: None,
-        })]);
-    }
-
-    let text = String::from_utf8_lossy(&policy_bytes).into_owned();
     let mut row = Map::new();
     row.insert("policy".to_string(), JsonValue::String(text));
     Ok(vec![DdlResult::Rows(ShapedRows {
-        columns,
-        column_types,
+        columns: vec!["policy".to_string()],
+        column_types: ShapedRows::text_types(1),
         rows: vec![row],
         notice: None,
     })])

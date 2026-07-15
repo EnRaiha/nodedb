@@ -98,6 +98,7 @@ fn document_scan_preserves_kv_rows_when_collection_has_strict_config() {
             },
             enforcement: Box::new(EnforcementOptions::default()),
             bitemporal: false,
+            conflict_policy: None,
         }),
     );
 

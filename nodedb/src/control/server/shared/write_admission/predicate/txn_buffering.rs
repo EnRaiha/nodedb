@@ -639,6 +639,7 @@ mod tests {
                 storage_mode: StorageMode::default(),
                 enforcement: Box::new(EnforcementOptions::default()),
                 bitemporal: false,
+                conflict_policy: None,
             }),
             PhysicalPlan::Document(DocumentOp::IndexLookup {
                 collection: "c".into(),

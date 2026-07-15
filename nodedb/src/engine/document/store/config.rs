@@ -20,6 +20,11 @@ pub struct CollectionConfig {
     /// table, keyed by `system_from_ms`. Enables `FOR SYSTEM_TIME AS OF`
     /// queries.
     pub bitemporal: bool,
+    /// Durable CRDT conflict-resolution policy (JSON-serialized
+    /// `CollectionPolicy`), carried through from the catalog so
+    /// `execute_register_document_collection` can rehydrate it into this
+    /// core's `PolicyRegistry`. `None` = no explicit policy persisted.
+    pub conflict_policy: Option<String>,
 }
 
 impl CollectionConfig {
@@ -31,6 +36,7 @@ impl CollectionConfig {
             storage_mode: nodedb_physical::physical_plan::StorageMode::Schemaless,
             enforcement: nodedb_physical::physical_plan::EnforcementOptions::default(),
             bitemporal: false,
+            conflict_policy: None,
         }
     }
 

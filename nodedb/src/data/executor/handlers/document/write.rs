@@ -286,6 +286,11 @@ pub(in crate::data::executor) struct RegisterDocumentCollectionParams<'a> {
     pub storage_mode: &'a nodedb_physical::physical_plan::StorageMode,
     pub enforcement: &'a nodedb_physical::physical_plan::EnforcementOptions,
     pub bitemporal: bool,
+    /// Durable CRDT conflict-resolution policy (JSON-serialized
+    /// `CollectionPolicy`), persisted on the collection's catalog record.
+    /// `Some` rehydrates this core's `PolicyRegistry` so the policy survives
+    /// register/reboot instead of falling back to `CollectionPolicy::ephemeral()`.
+    pub conflict_policy: Option<&'a str>,
 }
 
 impl CoreLoop {
@@ -307,6 +312,7 @@ impl CoreLoop {
             storage_mode,
             enforcement,
             bitemporal,
+            conflict_policy,
         } = params;
         let mode_label = match storage_mode {
             nodedb_physical::physical_plan::StorageMode::Schemaless => "document_schemaless",
@@ -329,6 +335,7 @@ impl CoreLoop {
         config.storage_mode = storage_mode.clone();
         config.enforcement = enforcement.clone();
         config.bitemporal = bitemporal;
+        config.conflict_policy = conflict_policy.map(str::to_string);
         config.index_paths = indexes
             .iter()
             .map(crate::engine::document::store::IndexPath::from_registered)
@@ -336,6 +343,34 @@ impl CoreLoop {
 
         let config_key = (crate::types::TenantId::new(tid), collection.to_string());
         self.doc_configs.insert(config_key, config);
+
+        // Rehydrate the durable CRDT conflict-resolution policy (if any) into
+        // this core's `PolicyRegistry`. Runs on every `Register` — live DDL
+        // apply AND boot rehydration replay — so `ALTER COLLECTION ... SET ON
+        // CONFLICT ...` survives a restart instead of silently reverting to
+        // `CollectionPolicy::ephemeral()`.
+        if let Some(policy_json) = conflict_policy {
+            match self.get_crdt_engine(crate::types::TenantId::new(tid)) {
+                Ok(engine) => {
+                    if let Err(e) = engine.set_collection_policy(collection, policy_json) {
+                        warn!(
+                            core = self.core_id,
+                            %collection,
+                            error = %e,
+                            "failed to rehydrate persisted conflict policy on register"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        core = self.core_id,
+                        %collection,
+                        error = %e,
+                        "failed to create CRDT engine for conflict policy rehydration"
+                    );
+                }
+            }
+        }
 
         self.response_ok(task)
     }

@@ -70,6 +70,7 @@ pub fn create_timeseries(
         event_defs: Vec::new(),
         collection_type: nodedb_types::CollectionType::timeseries("timestamp", "1h"),
         timeseries_config: config_json,
+        conflict_policy: None,
         is_active: true,
         append_only: false,
         hash_chain: false,

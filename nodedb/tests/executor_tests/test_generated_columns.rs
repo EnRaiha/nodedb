@@ -38,6 +38,7 @@ fn register_with_generated(
             storage_mode: Default::default(),
             enforcement: Box::new(enforcement),
             bitemporal: false,
+            conflict_policy: None,
         }),
     );
 }

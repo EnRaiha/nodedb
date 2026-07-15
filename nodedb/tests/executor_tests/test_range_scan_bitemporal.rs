@@ -39,6 +39,7 @@ fn register_schemaless_bitemporal(ctx: &mut TestCtx, collection: &str) {
             storage_mode: StorageMode::Schemaless,
             enforcement: Box::new(EnforcementOptions::default()),
             bitemporal: true,
+            conflict_policy: None,
         }),
     );
     assert_eq!(resp.status, Status::Ok, "register schemaless bitemporal");
@@ -66,6 +67,7 @@ fn register_strict_bitemporal(ctx: &mut TestCtx, collection: &str) {
             },
             enforcement: Box::new(EnforcementOptions::default()),
             bitemporal: true,
+            conflict_policy: None,
         }),
     );
     assert_eq!(resp.status, Status::Ok, "register strict bitemporal");

@@ -201,6 +201,7 @@ pub async fn build_and_persist(
         event_defs: Vec::new(),
         collection_type,
         timeseries_config: schema_json,
+        conflict_policy: None,
         is_active: true,
         append_only,
         hash_chain,

@@ -176,6 +176,14 @@ pub enum DocumentOp {
         /// `system_from_ms`; reads use the versioned table and Ceiling
         /// resolver.
         bitemporal: bool,
+        /// Durable CRDT conflict-resolution policy (JSON-serialized
+        /// `CollectionPolicy`), persisted on the collection's catalog record.
+        /// `Some` rehydrates the per-core `PolicyRegistry` on register/reboot
+        /// so `ALTER COLLECTION ... SET ON CONFLICT ...` survives a restart
+        /// instead of silently reverting to `CollectionPolicy::ephemeral()`.
+        /// `None` = no explicit policy persisted; the registry falls back to
+        /// the ephemeral default.
+        conflict_policy: Option<String>,
     },
 
     /// Lookup documents by secondary index value.

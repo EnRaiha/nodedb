@@ -419,6 +419,7 @@ pub(crate) fn build_register(fields: &TextFields, collection: &str) -> crate::Re
         storage_mode: nodedb_physical::physical_plan::StorageMode::Schemaless,
         enforcement: Box::new(nodedb_physical::physical_plan::EnforcementOptions::default()),
         bitemporal: false,
+        conflict_policy: None,
     }))
 }
 
