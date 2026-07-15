@@ -232,13 +232,30 @@ impl CoreLoop {
                 },
             ),
 
-            MetaOp::RecordCalvinWriteVersions { tenant_id, plans } => {
+            MetaOp::RecordCalvinWriteVersions {
+                tenant_id,
+                plans,
+                epoch,
+                position,
+            } => {
                 // The Calvin apply already committed; this records the write
                 // version of every key it wrote at the CalvinApplied WAL LSN the
                 // scheduler threaded onto the request envelope, reusing the same
                 // recorder the single-shard fast-path commit funnels through. A
                 // no-op when the envelope carries no LSN.
                 self.record_batch_write_versions(task, tenant_id.as_u64(), plans);
+                // Drain the per-index value tuples the distributed flush staged
+                // for this batch and record them at the same applied LSN.
+                if let Some(lsn) = task.wal_lsn() {
+                    self.record_staged_calvin_index_values(
+                        task.request.database_id,
+                        *tenant_id,
+                        *epoch,
+                        *position,
+                        task.request.vshard_id.as_u32(),
+                        lsn,
+                    );
+                }
                 self.response_ok(task)
             }
 

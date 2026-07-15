@@ -478,6 +478,12 @@ pub enum MetaOp {
         tenant_id: TenantId,
         /// The locally-applied write plans whose keys' versions are recorded.
         plans: Vec<super::PhysicalPlan>,
+        /// Calvin epoch of the applied transaction. With `position` and the
+        /// request's vShard, keys the index-value tuples the flush staged so the
+        /// core drains and records them at this op's applied LSN.
+        epoch: u64,
+        /// Calvin position within the epoch (see `epoch`).
+        position: u32,
     },
 
     /// Flush the staged writes of a Calvin transaction to base storage.

@@ -182,6 +182,8 @@ impl CoreLoop {
             txn_created_columnar_engines: HashMap::new(),
             write_index: super::write_index::WriteVersionIndex::new(),
             commit_pending: HashMap::new(),
+            calvin_flush_key: None,
+            calvin_flush_index_tuples: HashMap::new(),
             active_bitemporal_stamps: HashMap::new(),
         })
     }

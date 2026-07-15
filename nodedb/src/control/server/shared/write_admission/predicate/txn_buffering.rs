@@ -1804,6 +1804,8 @@ mod tests {
             PhysicalPlan::Meta(MetaOp::RecordCalvinWriteVersions {
                 tenant_id: tenant(),
                 plans: Vec::new(),
+                epoch: 0,
+                position: 0,
             }),
             PhysicalPlan::Meta(MetaOp::CalvinFlush {
                 epoch: 0,

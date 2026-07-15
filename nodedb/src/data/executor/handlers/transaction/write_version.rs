@@ -20,8 +20,6 @@ use nodedb_physical::physical_plan::{
 };
 use nodedb_types::Surrogate;
 
-use super::undo::UndoEntry;
-
 impl CoreLoop {
     /// Record the version of every key written by a committed transaction batch.
     ///
@@ -42,97 +40,6 @@ impl CoreLoop {
         let tenant = TenantId::new(tid);
         for plan in plans {
             self.record_plan_write_version(db, tenant, plan, lsn);
-        }
-    }
-
-    /// Record the touched secondary-index VALUES of every document write in a
-    /// committed fast-path transaction batch into the per-index write-value
-    /// substrate, at the batch's committed WAL LSN. No-op when the task carries
-    /// no WAL LSN. The undo log is the carrier: it already holds each write's
-    /// (field,value) tuples plus its collection, in deterministic plan order.
-    pub(in crate::data::executor) fn record_batch_index_write_values(
-        &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        undo_log: &[UndoEntry],
-    ) {
-        let Some(lsn) = task.wal_lsn() else {
-            return;
-        };
-        let db = task.request.database_id;
-        let tenant = TenantId::new(tid);
-        for entry in undo_log {
-            match entry {
-                UndoEntry::PutDocument {
-                    collection,
-                    secondary_index_added,
-                    secondary_index_removed,
-                    bitemporal_index_tuples,
-                    ..
-                } => {
-                    self.note_index_write_values(
-                        db,
-                        tenant,
-                        collection,
-                        secondary_index_added,
-                        lsn,
-                    );
-                    self.note_index_write_values(
-                        db,
-                        tenant,
-                        collection,
-                        secondary_index_removed,
-                        lsn,
-                    );
-                    self.note_index_write_values(
-                        db,
-                        tenant,
-                        collection,
-                        bitemporal_index_tuples,
-                        lsn,
-                    );
-                }
-                UndoEntry::DeleteDocument {
-                    collection,
-                    secondary_index_tuples,
-                    bitemporal_index_tuples,
-                    ..
-                } => {
-                    self.note_index_write_values(
-                        db,
-                        tenant,
-                        collection,
-                        secondary_index_tuples,
-                        lsn,
-                    );
-                    self.note_index_write_values(
-                        db,
-                        tenant,
-                        collection,
-                        bitemporal_index_tuples,
-                        lsn,
-                    );
-                }
-                UndoEntry::InsertVector { .. }
-                | UndoEntry::DeleteVector { .. }
-                | UndoEntry::SpatialInsert { .. }
-                | UndoEntry::SpatialDelete { .. }
-                | UndoEntry::PutEdge { .. }
-                | UndoEntry::DeleteEdge { .. }
-                | UndoEntry::KvPut { .. }
-                | UndoEntry::KvDelete { .. }
-                | UndoEntry::KvBatchPut { .. }
-                | UndoEntry::KvTransfer { .. }
-                | UndoEntry::KvTransferItem { .. }
-                | UndoEntry::KvTtl { .. }
-                | UndoEntry::SortedIndexDdl { .. }
-                | UndoEntry::MarkNodeDeleted { .. }
-                | UndoEntry::ColumnarInsert { .. }
-                | UndoEntry::ColumnarUpdate { .. }
-                | UndoEntry::ColumnarDelete { .. }
-                | UndoEntry::TimeseriesIngest { .. }
-                | UndoEntry::StatsRestore { .. } => {}
-            }
         }
     }
 

@@ -76,6 +76,27 @@ impl IndexValueVersionIndex {
         }
     }
 
+    /// Test accessor: the recorded LSN for a `(db, tenant, collection, field)`
+    /// dimension's `value`, or `None` if the dimension or value is untracked.
+    #[cfg(test)]
+    pub(in crate::data::executor) fn value_lsn(
+        &self,
+        db: DatabaseId,
+        tenant: TenantId,
+        collection: &str,
+        field: &str,
+        value: &str,
+    ) -> Option<Lsn> {
+        self.per_index
+            .get(&IndexKey {
+                db,
+                tenant,
+                collection: Box::from(collection),
+                field: Box::from(field),
+            })
+            .and_then(|values| values.get(value).copied())
+    }
+
     /// Horizon GC against `watermark`, mirroring the per-key index. Evicts value
     /// entries below `watermark - RETAIN_WINDOW`, keeping the (possibly empty)
     /// inner map so the dimension stays tracked. A count backstop drops the

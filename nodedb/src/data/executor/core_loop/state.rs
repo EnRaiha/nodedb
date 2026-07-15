@@ -488,4 +488,12 @@ pub struct CoreLoop {
     /// stage and flush its own slice independently rather than clobber a peer's.
     pub(in crate::data::executor) commit_pending:
         HashMap<(u64, u32, u32), super::commit_pending::PendingCommit>,
+
+    /// `Some((epoch, position, vshard))` only during a distributed Calvin flush apply (staging gate).
+    pub(in crate::data::executor) calvin_flush_key: Option<(u64, u32, u32)>,
+
+    /// Per-`(epoch, position, vshard)` index-value tuples drained from a Calvin
+    /// flush's undo log, awaiting the post-apply `RecordCalvinWriteVersions` op.
+    pub(in crate::data::executor) calvin_flush_index_tuples:
+        crate::data::executor::handlers::transaction::index_write_values::StagedCalvinIndexTuples,
 }

@@ -226,6 +226,10 @@ impl CoreLoop {
         }
         // The read-set was already validated at stage time and drives the
         // flush/drop decision; the replay itself carries no read-set to re-check.
+        // Scope the flush key so `record_batch_index_write_values` stages this
+        // batch's index tuples (the apply carries `wal_lsn: None`); the post-apply
+        // `RecordCalvinWriteVersions` op drains them at the replicated applied LSN.
+        self.calvin_flush_key = Some((epoch, position, vshard_id));
         let result = self.execute_transaction_batch(
             task,
             pending.tenant_id.as_u64(),
@@ -233,6 +237,7 @@ impl CoreLoop {
             &[],
             None,
         );
+        self.calvin_flush_key = None;
         self.ollp_is_group_leader = prev_group_leader;
         self.epoch_system_ms = None;
         result

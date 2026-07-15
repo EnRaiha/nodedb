@@ -87,6 +87,8 @@ impl Scheduler {
         let plan = PhysicalPlan::Meta(MetaOp::RecordCalvinWriteVersions {
             tenant_id,
             plans: local,
+            epoch,
+            position,
         });
         // The committed write-LSN for this Calvin apply — recorded against
         // every key the plans wrote, in the same WAL-LSN space as fast-path.
