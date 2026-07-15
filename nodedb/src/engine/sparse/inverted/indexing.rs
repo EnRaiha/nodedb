@@ -173,6 +173,21 @@ impl InvertedIndex {
         let mut lengths = txn
             .open_table(DOC_LENGTHS)
             .map_err(|e| inverted_err("open doc_lengths", e))?;
+
+        // Read the surrogate's prior length (if any) BEFORE overwriting it, in
+        // the same write transaction as the overwrite and the STATS update
+        // below, so the check-and-increment is atomic (no TOCTOU). Presence of
+        // a DOC_LENGTHS entry is the idempotency key: it means this surrogate
+        // was already counted into STATS by a prior index (live write or an
+        // earlier WAL replay pass), so a repeat index of the SAME surrogate
+        // (e.g. WAL replay re-invoking this exact path) must NOT increment
+        // `count` again.
+        let prior_len: Option<u32> = lengths
+            .get((database_id, t, collection, surrogate.as_u32()))
+            .ok()
+            .flatten()
+            .and_then(|v| zerompk::from_msgpack::<u32>(v.value()).ok());
+
         let len_bytes =
             zerompk::to_msgpack_vec(&doc_len).map_err(|e| inverted_err("serialize doc_len", e))?;
         lengths
@@ -183,40 +198,56 @@ impl InvertedIndex {
             .map_err(|e| inverted_err("insert doc_len", e))?;
         drop(lengths);
 
-        Self::update_stats_in_txn(txn, database_id, tid, collection, doc_len as i64)?;
+        let (count_delta, total_delta) = match prior_len {
+            // New document: bump the doc count and add its full length.
+            None => (1i64, doc_len as i64),
+            // Re-index of an already-counted surrogate (replay of an
+            // unchanged doc, or a genuine re-index of changed content): the
+            // doc was already counted once, so `count` does not change;
+            // `total` only moves by the delta between the new and prior
+            // length (zero for an identical replay).
+            Some(prior) => (0i64, doc_len as i64 - prior as i64),
+        };
+
+        Self::update_stats_in_txn(txn, database_id, tid, collection, count_delta, total_delta)?;
 
         debug!(database_id, tid = t, %collection, surrogate = surrogate.as_u32(), tokens = tokens.len(), terms = term_postings.len(), "indexed document");
         Ok(())
     }
 
-    /// Atomically update `(doc_count, total_token_sum)` in STATS.
+    /// Atomically update `(doc_count, total_token_sum)` in STATS by the given
+    /// explicit deltas.
+    ///
+    /// Callers compute `count_delta` / `total_delta` themselves rather than
+    /// this function inferring "new doc vs. removal" from the sign of a
+    /// single combined delta: a re-index of an already-counted surrogate
+    /// (e.g. WAL replay) needs `count_delta == 0` with a `total_delta` that
+    /// may be positive, negative, or zero — a case the old sign-based
+    /// inference could not express, which is what caused STATS to be
+    /// double-counted on replay.
     pub(super) fn update_stats_in_txn(
         txn: &WriteTransaction,
         database_id: u64,
         tid: TenantId,
         collection: &str,
-        delta: i64,
+        count_delta: i64,
+        total_delta: i64,
     ) -> crate::Result<()> {
         let t = tid.as_u64();
         let mut stats = txn
             .open_table(STATS)
             .map_err(|e| inverted_err("open stats", e))?;
-        let (mut count, mut total) = stats
+        let (count, total) = stats
             .get((database_id, t, collection))
             .ok()
             .flatten()
             .and_then(|v| zerompk::from_msgpack::<(u32, u64)>(v.value()).ok())
             .unwrap_or((0, 0));
 
-        if delta > 0 {
-            count += 1;
-            total += delta as u64;
-        } else {
-            count = count.saturating_sub(1);
-            total = total.saturating_sub((-delta) as u64);
-        }
+        let new_count = (i64::from(count) + count_delta).max(0) as u32;
+        let new_total = (total as i64 + total_delta).max(0) as u64;
 
-        let bytes = zerompk::to_msgpack_vec(&(count, total))
+        let bytes = zerompk::to_msgpack_vec(&(new_count, new_total))
             .map_err(|e| inverted_err("serialize stats", e))?;
         stats
             .insert((database_id, t, collection), bytes.as_slice())
@@ -309,6 +340,7 @@ impl InvertedIndex {
                     database_id,
                     tid,
                     collection,
+                    -1,
                     -(old_len as i64),
                 )?;
             }
