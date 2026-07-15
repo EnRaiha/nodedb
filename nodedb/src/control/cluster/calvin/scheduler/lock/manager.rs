@@ -477,6 +477,17 @@ impl LockManager {
         })
     }
 
+    /// Number of holders of `key` that hold it as a Calvin read reservation
+    /// (a `TxnId` in the reservation position band), or 0 when the key is
+    /// unlocked or held only by non-reservation transactions. Used to observe
+    /// reservation install/release from outside the scheduler.
+    pub fn reservation_holder_count(&self, key: &LockKey) -> usize {
+        self.table
+            .get(key)
+            .map(|e| e.holders.iter().filter(|h| h.is_reservation()).count())
+            .unwrap_or(0)
+    }
+
     /// Number of currently-held locks (entries in the lock table).
     #[cfg(test)]
     pub fn lock_count(&self) -> usize {
