@@ -47,7 +47,12 @@ use super::document::{encode_document_delete_record, encode_document_put_record}
 /// carries one `Put` entry per inserted row on a vector-indexed collection —
 /// `wal_append_document_op` returns `None` for `BatchInsert` (row durability is
 /// redb-synchronous), so without this the HNSW rebuild on restart would
-/// silently drop every batch-inserted row's vector.
+/// silently drop every batch-inserted row's vector. `Truncate` carries one
+/// `Delete` entry per removed row on a vector-indexed collection, same
+/// rationale as `BulkDelete` — `wal_append_document_op` mints no per-row redo
+/// for `Truncate` either, so without this every truncated row's HNSW vector
+/// would resurrect on a WAL-only restart (the original insert `Put` record
+/// replays with no matching `Delete` to cancel it).
 /// Additional post-apply redo variants (`Merge`) will extend this as their
 /// post-apply redo is built — do not add them until that handler support exists,
 /// or a write would be admitted with its guard held for a redo that is never
@@ -62,6 +67,8 @@ pub fn plan_post_apply_redo(plan: &PhysicalPlan) -> Option<String> {
     } else if let PhysicalPlan::Document(DocumentOp::BulkDelete { collection, .. }) = plan {
         Some(collection.clone())
     } else if let PhysicalPlan::Document(DocumentOp::BatchInsert { collection, .. }) = plan {
+        Some(collection.clone())
+    } else if let PhysicalPlan::Document(DocumentOp::Truncate { collection, .. }) = plan {
         Some(collection.clone())
     } else if let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
         target_collection, ..

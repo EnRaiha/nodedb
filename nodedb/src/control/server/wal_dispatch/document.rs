@@ -123,8 +123,11 @@ pub(super) fn wal_append_document_op(
         | DocumentOp::BulkDelete { .. }
         | DocumentOp::Merge { .. }
         | DocumentOp::UpdateFromJoin { .. } => None,
-        // DurableElsewhere — row deletion is redb-durable; vector-rebuild tombstone
-        // barrier tracked
+        // DurableElsewhere — row deletion is redb-durable; a vector-indexed
+        // collection's per-row HNSW cleanup is carried back in
+        // `Response::write_set` and minted as a post-apply `Delete` redo by
+        // `plan_post_apply_redo` / `append_write_set_redo` (mirrors
+        // `BulkDelete`), so restart does not resurrect truncated vectors.
         DocumentOp::Truncate { .. } => None,
         // DurableElsewhere — index state is catalog + redb durable
         DocumentOp::Register { .. }

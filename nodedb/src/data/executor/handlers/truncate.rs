@@ -4,7 +4,7 @@
 
 use tracing::{debug, warn};
 
-use crate::bridge::envelope::{ErrorCode, Response};
+use crate::bridge::envelope::{ErrorCode, Response, WriteSetEntry};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
@@ -41,9 +41,21 @@ impl CoreLoop {
             }
         };
 
-        // Delete each document with full cascade.
+        // Gate secondary-vector maintenance once for the whole statement so a
+        // collection with no vector field pays nothing — mirrors
+        // `execute_bulk_delete`'s `has_vectors` gate.
         let database_id = task.request.database_id.as_u64();
+        let has_vectors = self.collection_has_vectors(database_id, tid, collection);
+
+        // Delete each document with full cascade.
         let mut truncated = 0u64;
+        // One post-apply `Delete` redo entry per removed row on a vector
+        // collection. `wal_append_document_op` mints no per-row redo for
+        // `DocumentOp::Truncate` (row durability is redb-synchronous), so
+        // without this a WAL-only restart would replay each row's original
+        // `Put` record and resurrect its HNSW vector — mirrors
+        // `execute_bulk_delete`'s `write_set` cascade.
+        let mut write_set: Vec<WriteSetEntry> = Vec::new();
         for doc_id in &all_ids {
             let deleted_bytes = self
                 .sparse
@@ -69,6 +81,23 @@ impl CoreLoop {
                         .delete_indexes_for_document(database_id, tid, collection, doc_id)
                 {
                     warn!(core = self.core_id, %collection, %doc_id, error = %e, "truncate: index cascade failed");
+                }
+                // Cascade: secondary HNSW vector index. The put path indexed
+                // this row's vectors under its surrogate; truncate must
+                // soft-delete those nodes and drop the reverse-map entry, or
+                // the leaked vector keeps scoring in KNN search in the same
+                // process (mirrors `execute_bulk_delete`'s vector cascade).
+                if has_vectors {
+                    self.remove_document_vector_indexes(database_id, tid, collection, doc_id);
+                    if let Some(surrogate) =
+                        crate::engine::document::store::doc_id_to_surrogate(doc_id)
+                    {
+                        write_set.push(WriteSetEntry {
+                            surrogate: surrogate.as_u32(),
+                            is_delete: true,
+                            value: Vec::new(),
+                        });
+                    }
                 }
                 let edges = self
                     .csr_partition_mut(database_id, tid)
@@ -119,15 +148,21 @@ impl CoreLoop {
 
         debug!(core = self.core_id, %collection, truncated, "truncate complete");
         let result = serde_json::json!({ "truncated": truncated });
-        match response_codec::encode_json(&result) {
+        let mut response = match response_codec::encode_json(&result) {
             Ok(payload) => self.response_with_payload(task, payload),
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        };
+        if !write_set.is_empty() {
+            response.write_set = write_set;
         }
+        response
     }
 
     /// ESTIMATE_COUNT: return approximate row count from HLL cardinality stats.
