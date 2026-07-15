@@ -183,13 +183,12 @@ impl CoreLoop {
                     None
                 };
 
-            if self
+            let deleted_bytes = self
                 .sparse
                 .delete(task.request.database_id.as_u64(), tid, collection, doc_id)
                 .ok()
-                .flatten()
-                .is_some()
-            {
+                .flatten();
+            if let Some(deleted_bytes) = deleted_bytes.as_deref() {
                 // Cascade: inverted index. doc_id is the hex-encoded surrogate
                 // (the redb storage key). Parse back once for FTS removal and
                 // reused below for the write version + write-set entry.
@@ -276,6 +275,25 @@ impl CoreLoop {
                         });
                     }
                 }
+                // Emit a delete event per affected row to the Event Plane, so
+                // AFTER-DELETE triggers and CDC/change-stream consumers see
+                // each row a bulk DELETE removed — mirroring
+                // `execute_point_delete`'s single-row emit. `deleted_bytes` is
+                // the prior stored bytes `sparse.delete` returned above (no
+                // second read needed); `resolve_event_payload` handles the
+                // strict->msgpack conversion for triggers. Emitted per row
+                // (not a `WriteOp::BulkDelete` summary) — the Event Plane's
+                // WAL-replay bulk variant is aggregate metadata reconstructed
+                // only when the live per-row events were lost.
+                let old_converted = self.resolve_event_payload(tid, collection, deleted_bytes);
+                self.emit_write_event(
+                    task,
+                    collection,
+                    crate::event::WriteOp::Delete,
+                    doc_id,
+                    None,
+                    Some(old_converted.as_deref().unwrap_or(deleted_bytes)),
+                );
                 affected += 1;
                 if returning.is_some()
                     && let Some(doc) = pre_delete_doc

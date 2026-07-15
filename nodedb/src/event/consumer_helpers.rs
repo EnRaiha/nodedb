@@ -151,16 +151,19 @@ pub async fn dispatch_event(
     cdc_router.route_event(event, &shared_state.watermark_tracker);
 }
 
-/// Dispatch a data write event (op.is_data_event() == true): advances wall-time watermark,
-/// batches triggers, routes CDC, updates permission cache, feeds streaming MVs and CRDT sync.
+/// Apply the non-trigger side effects of a data write event
+/// (`op.is_data_event() == true`): advances the wall-time watermark, routes
+/// CDC, updates the permission cache, feeds streaming MVs and CRDT sync.
 ///
-/// Returns a completed trigger batch if the collector filled on this event.
+/// Row/statement trigger dispatch is NOT done here — it is owned exclusively
+/// by [`dispatch_triggers`] (called once per event by both the Normal-mode
+/// and WAL-catchup paths) so a per-row event fires its AFTER-ROW trigger
+/// exactly once regardless of which path consumed it.
 pub fn accumulate_data_event(
     event: &WriteEvent,
     shared_state: &Arc<SharedState>,
-    trigger_collector: &mut crate::control::trigger::batch::collector::TriggerBatchCollector,
     cdc_router: &Arc<super::cdc::CdcRouter>,
-) -> Option<crate::control::trigger::batch::collector::TriggerBatch> {
+) {
     let event_time_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -170,9 +173,6 @@ pub fn accumulate_data_event(
         event.lsn.as_u64(),
         event_time_ms,
     );
-
-    let batch =
-        crate::control::trigger::batch::collector::push_write_event(trigger_collector, event);
 
     cdc_router.route_event(event, &shared_state.watermark_tracker);
     crate::control::security::permission_tree::event_handler::handle_permission_event(
@@ -192,6 +192,4 @@ pub fn accumulate_data_event(
     shared_state
         .delta_packager
         .package_and_enqueue(event, &shared_state.crdt_sync_delivery);
-
-    batch
 }

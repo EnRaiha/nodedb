@@ -180,14 +180,8 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
                     empty_polls = 0;
                     dirty_watermark = true;
 
-                    process_normal_batch(
-                        &events,
-                        &shared_state,
-                        &mut retry_queue,
-                        &cdc_router,
-                        &slab_account,
-                    )
-                    .await;
+                    process_normal_batch(&events, &shared_state, &mut retry_queue, &cdc_router)
+                        .await;
 
                     let batch_payload_bytes: u64 = events
                         .iter()
@@ -353,20 +347,20 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
     );
 }
 
-/// Process a batch of Normal-mode events: trigger batching, CDC, permission cache,
-/// streaming MVs, CRDT sync. Statement-level trigger dispatch is per-event (no batching).
+/// Process a batch of Normal-mode events: CDC, permission cache, streaming MVs,
+/// CRDT sync, and AFTER trigger dispatch.
+///
+/// Row and statement trigger dispatch is per-event via [`dispatch_triggers`] —
+/// the SINGLE per-event path is the sole owner of AFTER-ROW trigger firing, so
+/// a per-row `WriteEvent` fires its trigger exactly once. This mirrors the
+/// WAL-catchup path (`dispatch_event` → `dispatch_triggers`) so both consumer
+/// modes fire the same number of triggers for the same events.
 async fn process_normal_batch(
     events: &[super::types::WriteEvent],
     shared_state: &Arc<SharedState>,
     retry_queue: &mut TriggerRetryQueue,
     cdc_router: &Arc<super::cdc::CdcRouter>,
-    _slab_account: &Arc<super::slab_budget::ConsumerSlabAccount>,
 ) {
-    let mut trigger_collector =
-        crate::control::trigger::batch::collector::TriggerBatchCollector::new(
-            crate::control::trigger::batch::BatchConfig::default().batch_size,
-        );
-
     for event in events {
         if !event.op.is_data_event() {
             shared_state
@@ -378,18 +372,11 @@ async fn process_normal_batch(
         // DML audit: record to audit log before dispatching triggers.
         super::audit_dml::audit_dml_event(event, shared_state);
 
-        if let Some(batch) =
-            accumulate_data_event(event, shared_state, &mut trigger_collector, cdc_router)
-        {
-            super::trigger::dispatcher::dispatch_trigger_batch(&batch, shared_state, retry_queue)
-                .await;
-        }
+        // Non-trigger side effects (watermark, CDC, permission cache, MVs, CRDT).
+        accumulate_data_event(event, shared_state, cdc_router);
 
+        // AFTER trigger dispatch — the single per-event path, fired exactly once.
         super::trigger::dispatcher::dispatch_triggers(event, shared_state, retry_queue).await;
-    }
-
-    if let Some(batch) = trigger_collector.flush() {
-        super::trigger::dispatcher::dispatch_trigger_batch(&batch, shared_state, retry_queue).await;
     }
 }
 

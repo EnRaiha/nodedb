@@ -45,13 +45,12 @@ impl CoreLoop {
         let database_id = task.request.database_id.as_u64();
         let mut truncated = 0u64;
         for doc_id in &all_ids {
-            if self
+            let deleted_bytes = self
                 .sparse
                 .delete(database_id, tid, collection, doc_id)
                 .ok()
-                .flatten()
-                .is_some()
-            {
+                .flatten();
+            if let Some(deleted_bytes) = deleted_bytes.as_deref() {
                 // doc_id is the hex-encoded surrogate (the redb storage key).
                 // Parse back to Surrogate for FTS removal. Non-hex keys
                 // (legacy non-surrogate docs) produce None and skip FTS.
@@ -90,6 +89,26 @@ impl CoreLoop {
                     tid,
                     collection,
                     doc_id,
+                );
+                // Emit a delete event per removed row to the Event Plane, so
+                // AFTER-DELETE triggers and CDC/change-stream consumers see
+                // each row TRUNCATE removed — mirroring `execute_point_delete`
+                // and `execute_bulk_delete`'s single-row emit. `deleted_bytes`
+                // is the prior stored bytes `sparse.delete` returned above.
+                // Emitted per row rather than a single `WriteOp::BulkDelete`
+                // summary: that variant is aggregate metadata the Event
+                // Plane's WAL replay reconstructs only when the live per-row
+                // events were lost, and per-row events are what ROW-level
+                // AFTER-DELETE triggers match on (see
+                // `event::trigger::dispatcher::single`).
+                let old_converted = self.resolve_event_payload(tid, collection, deleted_bytes);
+                self.emit_write_event(
+                    task,
+                    collection,
+                    crate::event::WriteOp::Delete,
+                    doc_id,
+                    None,
+                    Some(old_converted.as_deref().unwrap_or(deleted_bytes)),
                 );
                 truncated += 1;
             }

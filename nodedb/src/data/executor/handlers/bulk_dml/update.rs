@@ -335,6 +335,25 @@ impl CoreLoop {
                             });
                         }
                     }
+                    // Emit an update event per affected row to the Event Plane,
+                    // so AFTER-UPDATE triggers and CDC/change-stream consumers
+                    // see each row a bulk UPDATE touched — mirroring
+                    // `execute_point_update`'s single-row emit. `current_bytes`
+                    // is the pre-update row read above; `emit_put_event` derives
+                    // `WriteOp::Update` from the Some prior + Some new pair and
+                    // handles strict->msgpack conversion on both sides. Emitted
+                    // per row (not a `WriteOp::BulkUpdate` summary) because the
+                    // Event Plane's WAL-replay bulk variants are aggregate
+                    // metadata reconstructed only when the live per-row events
+                    // were lost — the live path always emits per row.
+                    self.emit_put_event(
+                        task,
+                        tid,
+                        collection,
+                        doc_id,
+                        &updated_bytes,
+                        Some(&current_bytes),
+                    );
                     affected += 1;
                     if returning.is_some() {
                         // Include document ID in the returned document.

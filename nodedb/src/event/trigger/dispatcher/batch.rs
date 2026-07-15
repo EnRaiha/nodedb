@@ -3,10 +3,14 @@
 //! Batch trigger dispatch: a `TriggerBatch` (multiple rows) → matching
 //! AFTER triggers, with WHEN-clause pre-filtering across the whole batch.
 //!
-//! Called by the consumer loop after the batch collector yields a full
-//! batch. For `BatchSafe` triggers we can in the future dispatch a single
-//! bulk DML; for now they still fire per-row but with WHEN evaluated once
-//! per row and short-circuited at the parse-and-eval boundary.
+//! Not currently wired into the Normal-mode consumer loop — per-event
+//! dispatch (`dispatch_triggers` in `single.rs`) is the sole production path
+//! for AFTER-ROW trigger firing (see `event::consumer::process_normal_batch`).
+//! This batch path (and its `TriggerBatchCollector`) remains available for a
+//! future WHEN-clause-batched throughput optimization; for `BatchSafe`
+//! triggers it could dispatch a single bulk DML, but for now it still fires
+//! per-row with WHEN evaluated once per row and short-circuited at the
+//! parse-and-eval boundary.
 
 use std::sync::Arc;
 

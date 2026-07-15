@@ -41,6 +41,12 @@ pub(in crate::data::executor) struct ResolvedUpdateRow {
     /// Post-image body: strict Binary Tuple for a strict target, MessagePack
     /// for a schemaless target.
     pub body: Vec<u8>,
+    /// Pre-update stored bytes (same storage-mode encoding as `body`), read
+    /// before any field was mutated. Threaded through to the write pass so it
+    /// can emit an `Update` `WriteEvent` carrying the row's real `old_value` —
+    /// mirrors `execute_point_update` and `execute_bulk_update`, which both
+    /// capture the pre-image before re-encoding.
+    pub old_body: Vec<u8>,
     /// Post-image decoded to JSON (generated columns applied), reused by the
     /// write pass to build `RETURNING` rows without re-decoding `body`.
     pub doc: serde_json::Value,
@@ -233,6 +239,7 @@ impl CoreLoop {
                 doc_id,
                 surrogate: row_surrogate,
                 body: updated_bytes,
+                old_body,
                 mut doc,
             } = row;
 
@@ -253,6 +260,22 @@ impl CoreLoop {
                     target_collection,
                     &doc_id,
                     &updated_bytes,
+                );
+                // Emit an update event per affected row to the Event Plane, so
+                // AFTER-UPDATE triggers and CDC/change-stream consumers see
+                // each row `UPDATE ... FROM` touched — mirroring
+                // `execute_point_update`/`execute_bulk_update`'s single-row
+                // emit. `old_body` is the pre-update stored bytes captured by
+                // `collect_update_from_join_rows`; `emit_put_event` derives
+                // `WriteOp::Update` from the Some prior + Some new pair and
+                // handles strict->msgpack conversion on both sides.
+                self.emit_put_event(
+                    task,
+                    tid,
+                    target_collection,
+                    &doc_id,
+                    &updated_bytes,
+                    Some(&old_body),
                 );
                 // Re-index the row's vectors from the new body (soft-delete the
                 // old HNSW node + insert the new one, keyed by the stable

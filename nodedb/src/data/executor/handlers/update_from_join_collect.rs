@@ -196,6 +196,7 @@ impl CoreLoop {
                 doc_id,
                 surrogate,
                 body: updated_bytes,
+                old_body: current_bytes,
                 doc: target_doc,
             });
         }
