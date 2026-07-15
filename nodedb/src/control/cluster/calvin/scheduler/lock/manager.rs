@@ -1,0 +1,634 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Deterministic lock manager for the Calvin scheduler.
+//!
+//! # Design
+//!
+//! The lock manager provides a deterministic, totally-ordered lock table over
+//! per-key entries keyed by [`LockKey`]. Locks come in two modes: `Exclusive`
+//! (one holder, excludes all others) and `Shared` (many compatible holders).
+//! The Calvin batch acquire path takes every key in a transaction's
+//! `read_set ∪ write_set` as an `Exclusive` lock; single-key `Shared` locks are
+//! available via [`LockManager::acquire_shared`].
+//!
+//! # Determinism
+//!
+//! `BTreeMap` is used throughout (not `HashMap`) so that iteration order is
+//! deterministic and reproducible across replicas.  This is a correctness
+//! requirement, not a style preference.
+
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use smallvec::smallvec;
+
+use super::lock_entry::{AcquireOutcome, LockEntry, LockMode};
+use super::lock_key::{LockKey, TxnId};
+
+// ── LockManager ───────────────────────────────────────────────────────────────
+
+/// Deterministic Calvin lock manager for one vshard.
+///
+/// Manages an in-memory lock table keyed by [`LockKey`].  The table is held in
+/// a `BTreeMap` so iteration is always deterministic.
+///
+/// # Key sets tracked per transaction
+///
+/// - `held_locks`: key sets for transactions that are a current holder on ALL
+///   their keys and are actively executing (i.e. dispatched to the Data Plane).
+/// - `pending_keys`: key sets for transactions that are blocked waiting for at
+///   least one key.  When `release` promotes a blocked txn to holder on every
+///   one of its keys, the entry moves from `pending_keys` to `held_locks`.
+pub struct LockManager {
+    /// Per-key lock entries.  Uses `BTreeMap` for deterministic iteration.
+    table: BTreeMap<LockKey, LockEntry>,
+    /// Per-transaction set of currently held keys for **dispatched** txns.
+    /// Used by `release` to iterate the key set without a full table scan.
+    held_locks: BTreeMap<TxnId, BTreeSet<LockKey>>,
+    /// Key sets for **blocked** (not-yet-dispatched) txns.  Populated when
+    /// `acquire` returns `Blocked`; cleared (moved to `held_locks`) when all
+    /// keys have been acquired on the promotion path inside `release`.
+    pending_keys: BTreeMap<TxnId, BTreeSet<LockKey>>,
+}
+
+/// Outcome of inspecting a single key during [`LockManager::acquire_shared`].
+enum SharedGrant {
+    /// The shared lock was granted (key was free or already held shared).
+    Granted,
+    /// The key is held exclusively by another txn; the request was enqueued.
+    Blocked,
+}
+
+/// The waiters promoted off one key when its holders drained, together with the
+/// action to take on the now-empty entry.
+enum Promotion {
+    /// No waiters remained; the entry should be removed entirely.
+    Freed,
+    /// These waiters were installed as the new holders.
+    Promoted(Vec<TxnId>),
+}
+
+impl LockManager {
+    /// Create an empty lock manager.
+    pub fn new() -> Self {
+        Self {
+            table: BTreeMap::new(),
+            held_locks: BTreeMap::new(),
+            pending_keys: BTreeMap::new(),
+        }
+    }
+
+    /// Attempt to acquire **exclusive** locks on all keys for `txn`.
+    ///
+    /// If every key is free or already held exclusively by `txn` (promoted from
+    /// waiter), records `txn` as sole holder of each key and returns
+    /// [`AcquireOutcome::Ready`].
+    ///
+    /// If any key is held by a different transaction, enqueues `txn` as an
+    /// exclusive waiter on every unavailable key and returns
+    /// [`AcquireOutcome::Blocked`].  The txn's key set is stored in
+    /// `pending_keys` so that `release` can promote it atomically when all keys
+    /// become available.
+    pub fn acquire(&mut self, txn: TxnId, keys: BTreeSet<LockKey>) -> AcquireOutcome {
+        // First pass: determine whether any key is held by a *different* txn.
+        // A key already held exclusively by `txn` itself (promoted via release)
+        // counts as available — re-acquire on that key is a no-op.
+        let all_available = keys.iter().all(|k| {
+            self.table
+                .get(k)
+                .is_none_or(|entry| entry.held_exclusively_by(txn))
+        });
+
+        if all_available {
+            // Acquire all keys.  For keys not yet in the table (free), insert a
+            // new exclusive entry.  For keys already held by this txn (promoted
+            // waiter), leave the entry unchanged — the waiter queue is intact.
+            for key in &keys {
+                if !self.table.contains_key(key) {
+                    self.table.insert(
+                        key.clone(),
+                        LockEntry {
+                            mode: LockMode::Exclusive,
+                            holders: smallvec![txn],
+                            waiters: VecDeque::new(),
+                        },
+                    );
+                }
+            }
+            // Move out of pending (if the txn was previously blocked on this
+            // same key set) and into held_locks.
+            self.pending_keys.remove(&txn);
+            self.held_locks.insert(txn, keys);
+            AcquireOutcome::Ready
+        } else {
+            // Enqueue as an exclusive waiter on every key held by a different
+            // txn.
+            for key in &keys {
+                if let Some(entry) = self.table.get_mut(key)
+                    && !entry.holders.contains(&txn)
+                    && !entry.has_waiter(txn)
+                {
+                    entry.waiters.push_back((txn, LockMode::Exclusive));
+                }
+                // Free keys: no entry exists; the txn will acquire them on the
+                // re-acquire path after all held keys are released.
+            }
+            // Store the full key set so that release can promote this txn
+            // atomically once all its keys become available.
+            self.pending_keys.insert(txn, keys);
+            AcquireOutcome::Blocked
+        }
+    }
+
+    /// Attempt to acquire a **shared** lock on a single `key` for `txn`.
+    ///
+    /// - Key free → create a shared entry holding `txn`, return
+    ///   [`AcquireOutcome::Ready`].
+    /// - Key held shared → add `txn` to the holders, return
+    ///   [`AcquireOutcome::Ready`].
+    /// - Key held exclusively by another txn → enqueue `txn` as a shared waiter
+    ///   (FIFO) and return [`AcquireOutcome::Blocked`].
+    ///
+    /// A shared request that meets an exclusive holder blocks FIFO for now;
+    /// wound-wait priority resolution lands in a following change.
+    pub fn acquire_shared(&mut self, txn: TxnId, key: LockKey) -> AcquireOutcome {
+        // Inspect / mutate the entry via the `Entry` API (which takes the key by
+        // value, sidestepping a get-then-insert borrow conflict) inside a scoped
+        // borrow so the map-level bookkeeping below can re-borrow `self`.
+        let grant = match self.table.entry(key.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(LockEntry {
+                    mode: LockMode::Shared,
+                    holders: smallvec![txn],
+                    waiters: VecDeque::new(),
+                });
+                SharedGrant::Granted
+            }
+            Entry::Occupied(mut slot) => {
+                let entry = slot.get_mut();
+                if entry.mode == LockMode::Shared {
+                    if !entry.holders.contains(&txn) {
+                        entry.holders.push(txn);
+                    }
+                    SharedGrant::Granted
+                } else {
+                    // Held exclusively by another txn: block FIFO.
+                    if !entry.has_waiter(txn) {
+                        entry.waiters.push_back((txn, LockMode::Shared));
+                    }
+                    SharedGrant::Blocked
+                }
+            }
+        };
+
+        match grant {
+            SharedGrant::Granted => {
+                self.pending_keys.remove(&txn);
+                self.held_locks.entry(txn).or_default().insert(key);
+                AcquireOutcome::Ready
+            }
+            SharedGrant::Blocked => {
+                let mut pending = BTreeSet::new();
+                pending.insert(key);
+                self.pending_keys.insert(txn, pending);
+                AcquireOutcome::Blocked
+            }
+        }
+    }
+
+    /// Non-blocking exclusive acquire: take all `keys` for `txn` iff every one is
+    /// free (or already held by `txn`), returning `true`; otherwise return
+    /// `false` WITHOUT enqueuing a waiter or recording any pending state.
+    ///
+    /// This is the fast path's probe. Unlike [`acquire`](Self::acquire), the
+    /// contended (`false`) path touches NOTHING — no holder, no `pending_keys`,
+    /// no waiter `VecDeque` — so a caller that does not intend to block (an
+    /// autocommit point write that will instead route to the scheduler) never
+    /// leaves an orphaned waiter that a later `release` would promote to an
+    /// unowned holder. It also never perturbs the FIFO ordering that Calvin
+    /// transactions depend on.
+    pub fn try_acquire(&mut self, txn: TxnId, keys: BTreeSet<LockKey>) -> bool {
+        if !self.is_ready(txn, &keys) {
+            // Contended: leave the table, waiter queues, and pending_keys
+            // completely untouched.
+            return false;
+        }
+        // Every key is free or already held by `txn`, so `acquire` takes its
+        // all-available path — it inserts the holder and never enqueues.
+        let outcome = self.acquire(txn, keys);
+        debug_assert_eq!(
+            outcome,
+            AcquireOutcome::Ready,
+            "try_acquire: is_ready was true but acquire returned Blocked"
+        );
+        true
+    }
+
+    /// Release all locks held by `txn`.
+    ///
+    /// `txn` is removed from every entry's holder set.  When an entry's holders
+    /// drain to empty, its FIFO waiters are promoted mode-aware: a leading run
+    /// of shared waiters is promoted together, or a single leading exclusive
+    /// waiter is promoted alone.  A waiter that becomes holder on ALL its
+    /// pending keys is moved from `pending_keys` to `held_locks` immediately.
+    ///
+    /// Returns the set of `TxnId`s that have been fully promoted (i.e. moved
+    /// into `held_locks`).  The caller may use this list to dispatch those
+    /// transactions.
+    pub fn release(&mut self, txn: TxnId) -> Vec<TxnId> {
+        let held = match self.held_locks.remove(&txn) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+
+        let mut newly_promoted: BTreeSet<TxnId> = BTreeSet::new();
+
+        for key in &held {
+            // Drop `txn` from this key's holders. If other (shared) holders
+            // remain, the key stays held and there is nothing to promote.
+            let now_empty = match self.table.get_mut(key) {
+                Some(entry) => {
+                    entry.holders.retain(|h| *h != txn);
+                    entry.holders.is_empty()
+                }
+                None => continue,
+            };
+            if now_empty {
+                self.promote_waiters(key, &mut newly_promoted);
+            }
+        }
+
+        newly_promoted.into_iter().collect()
+    }
+
+    /// Promote the front of `key`'s waiter queue after its holders drained.
+    ///
+    /// A leading run of shared waiters is granted together; a single leading
+    /// exclusive waiter is granted alone; an empty queue frees the entry. Any
+    /// promoted txn that is now holder on all of its pending keys is moved into
+    /// `held_locks` and recorded in `newly_promoted`.
+    fn promote_waiters(&mut self, key: &LockKey, newly_promoted: &mut BTreeSet<TxnId>) {
+        // Decide the promotion inside a scoped borrow so the readiness sweep
+        // below can re-borrow the table.
+        let decision = match self.table.get_mut(key) {
+            Some(entry) => match entry.waiters.front().map(|(_, mode)| *mode) {
+                None => Promotion::Freed,
+                Some(LockMode::Exclusive) => match entry.waiters.pop_front() {
+                    Some((next, _)) => {
+                        entry.mode = LockMode::Exclusive;
+                        entry.holders.clear();
+                        entry.holders.push(next);
+                        Promotion::Promoted(vec![next])
+                    }
+                    None => Promotion::Freed,
+                },
+                Some(LockMode::Shared) => {
+                    entry.mode = LockMode::Shared;
+                    entry.holders.clear();
+                    let mut promoted = Vec::new();
+                    while matches!(entry.waiters.front(), Some((_, LockMode::Shared))) {
+                        if let Some((next, _)) = entry.waiters.pop_front() {
+                            entry.holders.push(next);
+                            promoted.push(next);
+                        }
+                    }
+                    Promotion::Promoted(promoted)
+                }
+            },
+            None => return,
+        };
+
+        let promoted = match decision {
+            Promotion::Freed => {
+                self.table.remove(key);
+                return;
+            }
+            Promotion::Promoted(promoted) => promoted,
+        };
+
+        // For each promoted txn, check whether it is now holder on ALL of its
+        // pending keys.  If so, it is fully ready — move to held_locks.  Remove
+        // first (rather than `get` + a follow-up `remove`) so there is no
+        // unwrap/expect on a "just confirmed Some" invariant: the owned
+        // `pending` set is reinserted on the not-yet-ready path.
+        for next in promoted {
+            if let Some(pending) = self.pending_keys.remove(&next) {
+                let all_held = pending
+                    .iter()
+                    .all(|k| self.table.get(k).is_none_or(|e| e.holders.contains(&next)));
+                if all_held {
+                    self.held_locks.insert(next, pending);
+                    newly_promoted.insert(next);
+                } else {
+                    self.pending_keys.insert(next, pending);
+                }
+            }
+        }
+    }
+
+    /// Check whether a previously-blocked transaction is now ready.
+    ///
+    /// A transaction is ready when for every key in its key set, the key is
+    /// either:
+    /// - Not present in the lock table (free), or
+    /// - Present in the lock table with `txn` among the current holders
+    ///   (shared or exclusive).
+    ///
+    /// This is called after `release` returns `txn_id` in the unblocked set.
+    /// If `is_ready` returns `true`, the caller calls `acquire` again which
+    /// will succeed on the all-available path (because the waiter was promoted).
+    pub fn is_ready(&self, txn: TxnId, keys: &BTreeSet<LockKey>) -> bool {
+        keys.iter().all(|key| {
+            match self.table.get(key) {
+                None => true,                                // key is free
+                Some(entry) => entry.holders.contains(&txn), // txn is a current holder
+            }
+        })
+    }
+
+    /// Number of currently-held locks (entries in the lock table).
+    #[cfg(test)]
+    pub fn lock_count(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Number of transactions currently holding at least one lock.
+    #[cfg(test)]
+    pub fn holder_count(&self) -> usize {
+        self.held_locks.len()
+    }
+}
+
+impl LockEntry {
+    /// Whether this entry is held exclusively by exactly `txn` (the self
+    /// re-acquire case on the exclusive path).
+    fn held_exclusively_by(&self, txn: TxnId) -> bool {
+        self.mode == LockMode::Exclusive && self.holders.len() == 1 && self.holders[0] == txn
+    }
+
+    /// Whether `txn` is already enqueued as a waiter on this entry.
+    fn has_waiter(&self, txn: TxnId) -> bool {
+        self.waiters.iter().any(|(w, _)| *w == txn)
+    }
+}
+
+impl Default for LockManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn key(name: &str) -> LockKey {
+        LockKey::Surrogate {
+            collection: Arc::from(name),
+            surrogate: 1,
+        }
+    }
+
+    fn keyset(names: &[&str]) -> BTreeSet<LockKey> {
+        names.iter().map(|n| key(n)).collect()
+    }
+
+    fn txn(epoch: u64, pos: u32) -> TxnId {
+        TxnId::new(epoch, pos)
+    }
+
+    #[test]
+    fn acquire_free_keys_returns_ready() {
+        let mut lm = LockManager::new();
+        let t = txn(1, 0);
+        let outcome = lm.acquire(t, keyset(&["a", "b"]));
+        assert_eq!(outcome, AcquireOutcome::Ready);
+        assert_eq!(lm.lock_count(), 2);
+    }
+
+    #[test]
+    fn acquire_held_key_returns_blocked_and_enqueues_waiter() {
+        let mut lm = LockManager::new();
+        let t1 = txn(1, 0);
+        let t2 = txn(1, 1);
+        lm.acquire(t1, keyset(&["x"]));
+
+        let outcome = lm.acquire(t2, keyset(&["x"]));
+        assert_eq!(outcome, AcquireOutcome::Blocked);
+
+        // t2 should be in the waiter queue for "x".
+        assert!(lm.table.get(&key("x")).unwrap().has_waiter(t2));
+    }
+
+    #[test]
+    fn release_returns_unblocked_waiter_ids() {
+        let mut lm = LockManager::new();
+        let t1 = txn(1, 0);
+        let t2 = txn(1, 1);
+        lm.acquire(t1, keyset(&["x"]));
+        lm.acquire(t2, keyset(&["x"]));
+
+        let unblocked = lm.release(t1);
+        assert!(unblocked.contains(&t2));
+    }
+
+    #[test]
+    fn autocommit_holder_release_promotes_and_returns_scheduler_waiter() {
+        // Mirrors the write-admission fast path: an autocommit-band holder takes
+        // an uncontended key, a normal-band scheduler txn then blocks behind it,
+        // and the holder's release promotes that scheduler txn AND returns its id
+        // — the value the fast-path guard forwards to the scheduler on drop
+        // (previously discarded, stranding the promoted txn as a zombie holder).
+        let mut lm = LockManager::new();
+        let autocommit = txn(TxnId::AUTOCOMMIT_EPOCH, 0);
+        let scheduler_txn = txn(9, 0);
+
+        assert!(
+            lm.try_acquire(autocommit, keyset(&["k"])),
+            "the fast-path holder takes the uncontended key"
+        );
+        assert_eq!(
+            lm.acquire(scheduler_txn, keyset(&["k"])),
+            AcquireOutcome::Blocked,
+            "the scheduler txn queues behind the fast-path holder"
+        );
+
+        let promoted = lm.release(autocommit);
+        assert_eq!(
+            promoted,
+            vec![scheduler_txn],
+            "release must return the promoted scheduler waiter"
+        );
+        assert!(
+            lm.is_ready(scheduler_txn, &keyset(&["k"])),
+            "the promoted scheduler txn is now holder of the freed key"
+        );
+    }
+
+    #[test]
+    fn release_preserves_fifo_waiter_order() {
+        let mut lm = LockManager::new();
+        let t1 = txn(1, 0);
+        let t2 = txn(1, 1);
+        let t3 = txn(1, 2);
+        lm.acquire(t1, keyset(&["x"]));
+        lm.acquire(t2, keyset(&["x"]));
+        lm.acquire(t3, keyset(&["x"]));
+
+        // Release t1 — t2 should become holder (FIFO).
+        lm.release(t1);
+        let holder = lm.table.get(&key("x")).unwrap().holders[0];
+        assert_eq!(holder, t2);
+
+        // Release t2 — t3 should become holder.
+        lm.release(t2);
+        let holder = lm.table.get(&key("x")).unwrap().holders[0];
+        assert_eq!(holder, t3);
+    }
+
+    #[test]
+    fn multi_key_txn_releases_all_atomically() {
+        let mut lm = LockManager::new();
+        let t1 = txn(1, 0);
+        lm.acquire(t1, keyset(&["a", "b", "c"]));
+        assert_eq!(lm.lock_count(), 3);
+
+        lm.release(t1);
+        assert_eq!(lm.lock_count(), 0);
+        assert_eq!(lm.holder_count(), 0);
+    }
+
+    #[test]
+    fn is_ready_returns_true_when_all_keys_free_or_self_at_front() {
+        let mut lm = LockManager::new();
+        let t1 = txn(1, 0);
+        let t2 = txn(1, 1);
+        lm.acquire(t1, keyset(&["x", "y"]));
+        lm.acquire(t2, keyset(&["x", "y"]));
+
+        // t2 is not ready while t1 holds.
+        assert!(!lm.is_ready(t2, &keyset(&["x", "y"])));
+
+        // Release t1 — t2 becomes holder on both keys.
+        lm.release(t1);
+        // After release, t2 is promoted to holder on both keys.
+        assert!(lm.is_ready(t2, &keyset(&["x", "y"])));
+    }
+
+    #[test]
+    fn shared_shared_compatible() {
+        let mut lm = LockManager::new();
+        let t1 = txn(1, 0);
+        let t2 = txn(1, 1);
+
+        assert_eq!(lm.acquire_shared(t1, key("s")), AcquireOutcome::Ready);
+        assert_eq!(lm.acquire_shared(t2, key("s")), AcquireOutcome::Ready);
+
+        let entry = lm.table.get(&key("s")).unwrap();
+        assert_eq!(entry.mode, LockMode::Shared);
+        assert!(entry.holders.contains(&t1));
+        assert!(entry.holders.contains(&t2));
+    }
+
+    #[test]
+    fn shared_blocks_exclusive() {
+        let mut lm = LockManager::new();
+        let t1 = txn(1, 0);
+        let t2 = txn(1, 1);
+
+        assert_eq!(lm.acquire_shared(t1, key("k")), AcquireOutcome::Ready);
+        assert_eq!(
+            lm.acquire(t2, keyset(&["k"])),
+            AcquireOutcome::Blocked,
+            "an exclusive request must block behind a shared holder"
+        );
+        assert!(lm.table.get(&key("k")).unwrap().has_waiter(t2));
+    }
+
+    #[test]
+    fn exclusive_blocks_shared() {
+        let mut lm = LockManager::new();
+        let t1 = txn(1, 0);
+        let t2 = txn(1, 1);
+
+        assert_eq!(lm.acquire(t1, keyset(&["k"])), AcquireOutcome::Ready);
+        assert_eq!(
+            lm.acquire_shared(t2, key("k")),
+            AcquireOutcome::Blocked,
+            "a shared request must block behind an exclusive holder"
+        );
+        assert!(lm.table.get(&key("k")).unwrap().has_waiter(t2));
+    }
+
+    #[test]
+    fn release_promotes_shared_run_together() {
+        let mut lm = LockManager::new();
+        let holder = txn(1, 0);
+        let s1 = txn(2, 0);
+        let s2 = txn(2, 1);
+
+        // Exclusive holder, two shared waiters queued behind it.
+        assert_eq!(lm.acquire(holder, keyset(&["k"])), AcquireOutcome::Ready);
+        assert_eq!(lm.acquire_shared(s1, key("k")), AcquireOutcome::Blocked);
+        assert_eq!(lm.acquire_shared(s2, key("k")), AcquireOutcome::Blocked);
+
+        // Releasing the exclusive holder promotes the whole run of shared
+        // waiters together.
+        let promoted = lm.release(holder);
+        assert!(promoted.contains(&s1));
+        assert!(promoted.contains(&s2));
+
+        let entry = lm.table.get(&key("k")).unwrap();
+        assert_eq!(entry.mode, LockMode::Shared);
+        assert!(entry.holders.contains(&s1));
+        assert!(entry.holders.contains(&s2));
+    }
+
+    #[test]
+    fn release_promotes_single_exclusive_waiter() {
+        let mut lm = LockManager::new();
+        let holder = txn(1, 0);
+        let x1 = txn(2, 0);
+        let x2 = txn(2, 1);
+
+        assert_eq!(lm.acquire(holder, keyset(&["k"])), AcquireOutcome::Ready);
+        assert_eq!(lm.acquire(x1, keyset(&["k"])), AcquireOutcome::Blocked);
+        assert_eq!(lm.acquire(x2, keyset(&["k"])), AcquireOutcome::Blocked);
+
+        // Only the single leading exclusive waiter is promoted.
+        let promoted = lm.release(holder);
+        assert_eq!(promoted, vec![x1]);
+
+        let entry = lm.table.get(&key("k")).unwrap();
+        assert_eq!(entry.mode, LockMode::Exclusive);
+        assert_eq!(entry.holders.len(), 1);
+        assert_eq!(entry.holders[0], x1);
+        // x2 is still waiting behind x1.
+        assert!(entry.has_waiter(x2));
+    }
+
+    #[test]
+    fn multi_holder_release() {
+        let mut lm = LockManager::new();
+        let t1 = txn(1, 0);
+        let t2 = txn(1, 1);
+
+        assert_eq!(lm.acquire_shared(t1, key("k")), AcquireOutcome::Ready);
+        assert_eq!(lm.acquire_shared(t2, key("k")), AcquireOutcome::Ready);
+        assert_eq!(lm.lock_count(), 1);
+
+        // Releasing one shared holder leaves the other holding the key.
+        lm.release(t1);
+        let entry = lm.table.get(&key("k")).unwrap();
+        assert!(!entry.holders.contains(&t1));
+        assert!(entry.holders.contains(&t2));
+        assert_eq!(lm.lock_count(), 1);
+
+        // Releasing the last shared holder frees the key.
+        lm.release(t2);
+        assert_eq!(lm.lock_count(), 0);
+    }
+}

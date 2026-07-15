@@ -2,7 +2,7 @@
 
 pub mod applied_gate;
 pub mod driver;
-pub mod lock_manager;
+pub mod lock;
 pub mod metrics;
 pub mod recovery;
 
@@ -11,6 +11,9 @@ pub use driver::{
     CalvinReadResultProposal, ReadResultEvent, Scheduler, SchedulerConfig, SchedulerParams,
     propose_calvin_read_result,
 };
-pub use lock_manager::{AcquireOutcome, LockKey, LockManager, TxnId};
+pub use lock::{AcquireOutcome, LockKey, LockManager, LockMode, TxnId};
+// Existing call sites reference this module as `scheduler::lock_manager::…`;
+// keep that path stable via an alias while the module lives under `lock/`.
+pub use lock as lock_manager;
 pub use metrics::SchedulerMetrics;
 pub use recovery::{AppliedRecovery, NOT_YET_APPLIED_EPOCH, read_applied_recovery};
