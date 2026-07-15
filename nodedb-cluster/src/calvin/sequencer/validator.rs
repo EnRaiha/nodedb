@@ -2,76 +2,103 @@
 
 //! Pre-validation pass for a candidate epoch batch.
 //!
-//! The validator detects intra-batch write-set conflicts and produces a
-//! deterministically-ordered list of admitted and rejected transactions. No
-//! cross-epoch read-set checks are performed here; cross-epoch read-after-write
-//! conflict detection is the scheduler's responsibility.
+//! The validator is a pure deterministic function: it takes the candidate
+//! transactions admitted this epoch and produces a deterministically-ordered
+//! list of admitted (positioned) and rejected transactions. It performs no
+//! I/O, reads no wall clock, and touches no global state, so it re-runs
+//! byte-identically on a failover leader.
 //!
 //! # Ordering
 //!
-//! Transactions are ordered by `(inbox_seq, tenant_id, hash(plans))`.
+//! Transactions are first sorted by `(inbox_seq, tenant_id, hash(plans))`.
 //! `inbox_seq` is assigned by the sequencer leader at admit time and is the
 //! primary tiebreaker. `xxh3_64` (from `xxhash-rust`) is used for `hash(plans)`
-//! because it is byte-stable across processes and architectures.
+//! because it is byte-stable across processes and architectures. This sort
+//! makes the sorted index order identical to the sort-key order, so "smallest
+//! sort key" is "smallest index" and "largest sort key" is "largest index".
 //!
-//! # Conflict detection
+//! # Conflict handling (read-aware)
 //!
-//! A flat list of `(engine_discriminant, collection, key_bytes)` is built from
-//! each transaction's write set. The list is sorted lexicographically. Adjacent
-//! entries with identical `(discriminant, collection, key_bytes)` from different
-//! txn indices indicate a conflict; the later txn (higher sort key, i.e. higher
-//! `inbox_seq`) is rejected.
+//! The commit lockset is all-exclusive over each txn's read ∪ write keys, so
+//! same-key transactions serialize by `position`. Per-key last-write-LSN
+//! validation means a reader `R` of key `K` aborts at commit only if a
+//! *lower-position* writer `W` of `K` committed first (its write LSN exceeds
+//! `R`'s read version). Giving `R` a lower position than `W` converts that
+//! read-after-write abort into a write-after-read that commits.
+//!
+//! So the validator:
+//!
+//! - Builds, per key `K`, the set of transactions that read `K` and the set
+//!   that write `K`.
+//! - For every `(reader r, writer w)` pair on the same key with `r != w`, adds
+//!   a directed edge `r -> w` ("`r` must get a lower position than `w`").
+//! - Emits positions in a deterministic topological order of those edges,
+//!   which places every reader ahead of the conflicting writers it can — the
+//!   read-after-write → write-after-read reorder that avoids the abort.
+//!
+//! Write-write pairs add no edge: two writers of `K` both commit (they apply in
+//! position order, last write wins) and are simply ordered by the sort-key
+//! tiebreak. Read-read pairs add no edge either.
+//!
+//! Only a cyclic read/write dependency (which cannot be satisfied by any single
+//! serial order) forces a rejection: the cycle is broken deterministically by
+//! rejecting the member with the largest sort key (highest `inbox_seq`),
+//! mirroring "the later transaction loses". Positions on the admitted set are
+//! dense `0..(n - num_rejected)` in emission order.
 
-use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::calvin::sequencer::error::SequencerError;
 use crate::calvin::sequencer::inbox::{AdmittedTx, RejectedTx};
 use crate::calvin::sequencer::metrics::ConflictKey;
-use crate::calvin::types::{EngineKeySet, SequencedTxn};
+use crate::calvin::types::{EngineKeySet, ReadWriteSet, SequencedTxn};
 
-/// A flat write-set entry used during conflict detection.
+/// Canonical, order-comparable identity of a single key across engines:
+/// `(engine_discriminant, collection, key_bytes)`. Used as the `BTreeMap` key
+/// for the reader/writer maps so all iteration feeding output is deterministic.
+type KeyId = (u8, String, Vec<u8>);
+
+/// A single flattened key drawn from one transaction's read or write set.
 #[derive(Debug)]
-struct WriteEntry {
+struct FlatKey {
     /// Discriminant tag for the engine variant (Document=0, Vector=1, Kv=2, Edge=3).
     discriminant: u8,
-    /// Static engine name used when building conflict context keys.
+    /// Static engine name used when building conflict-context keys.
     engine_name: &'static str,
     /// Collection name.
     collection: String,
     /// Serialized key bytes.
     key_bytes: Vec<u8>,
-    /// Index into the sorted-batch `Vec<AdmittedTx>`.
-    txn_index: usize,
 }
 
-impl WriteEntry {
-    fn sort_key(&self) -> (&u8, &str, &[u8]) {
+impl FlatKey {
+    /// The order-comparable identity of this key.
+    fn key_id(&self) -> KeyId {
         (
-            &self.discriminant,
-            self.collection.as_str(),
-            &self.key_bytes,
+            self.discriminant,
+            self.collection.clone(),
+            self.key_bytes.clone(),
         )
     }
 }
 
-/// Build the flat write-entry list for one transaction.
-fn flatten_write_set(tx: &AdmittedTx, txn_index: usize) -> Vec<WriteEntry> {
+/// Flatten one read-or-write set into its constituent per-key entries.
+fn flatten_set(set: &ReadWriteSet) -> Vec<FlatKey> {
     let mut out = Vec::new();
-    for key_set in &tx.tx_class.write_set.0 {
+    for key_set in &set.0 {
         match key_set {
             EngineKeySet::Document {
                 collection,
                 surrogates,
             } => {
                 for &s in surrogates.as_slice() {
-                    out.push(WriteEntry {
+                    out.push(FlatKey {
                         discriminant: 0,
                         engine_name: "document",
                         collection: collection.clone(),
                         key_bytes: s.to_le_bytes().to_vec(),
-                        txn_index,
                     });
                 }
             }
@@ -80,23 +107,21 @@ fn flatten_write_set(tx: &AdmittedTx, txn_index: usize) -> Vec<WriteEntry> {
                 surrogates,
             } => {
                 for &s in surrogates.as_slice() {
-                    out.push(WriteEntry {
+                    out.push(FlatKey {
                         discriminant: 1,
                         engine_name: "vector",
                         collection: collection.clone(),
                         key_bytes: s.to_le_bytes().to_vec(),
-                        txn_index,
                     });
                 }
             }
             EngineKeySet::Kv { collection, keys } => {
                 for k in keys.as_slice() {
-                    out.push(WriteEntry {
+                    out.push(FlatKey {
                         discriminant: 2,
                         engine_name: "kv",
                         collection: collection.clone(),
                         key_bytes: k.clone(),
-                        txn_index,
                     });
                 }
             }
@@ -106,12 +131,11 @@ fn flatten_write_set(tx: &AdmittedTx, txn_index: usize) -> Vec<WriteEntry> {
                 for &(src, dst) in edges.as_slice() {
                     let mut key_bytes = src.to_le_bytes().to_vec();
                     key_bytes.extend_from_slice(&dst.to_le_bytes());
-                    out.push(WriteEntry {
+                    out.push(FlatKey {
                         discriminant: 3,
                         engine_name: "edge",
                         collection: collection.clone(),
                         key_bytes,
-                        txn_index,
                     });
                 }
             }
@@ -128,11 +152,15 @@ fn admitted_sort_key(tx: &AdmittedTx) -> (u64, u64, u64) {
 
 /// Validate a candidate batch of admitted transactions.
 ///
-/// Returns `(Vec<SequencedTxn>, Vec<RejectedTx>)`:
-/// - `SequencedTxn.position` is 0-based among the admitted transactions only.
-/// - `RejectedTx.reason` is `SequencerError::Conflict { position_admitted }`.
+/// Returns `(Vec<(u64, SequencedTxn)>, Vec<RejectedTx>)`:
+/// - `SequencedTxn.position` is 0-based and dense among the admitted
+///   transactions only.
+/// - Each admitted entry is paired with its `inbox_seq`.
+/// - `RejectedTx.reason` is `SequencerError::Conflict { position_admitted }`;
+///   rejections occur only when a read/write dependency cycle cannot be
+///   serialized.
 ///
-/// The function is pure — no I/O, no global state, deterministic.
+/// The function is pure — no I/O, no wall clock, no global state, deterministic.
 pub fn validate_batch_with_assignments(
     epoch: u64,
     mut candidates: Vec<AdmittedTx>,
@@ -141,99 +169,143 @@ pub fn validate_batch_with_assignments(
         return (vec![], vec![]);
     }
 
-    // Step 1: sort by (inbox_seq, tenant_id, hash(plans)).
+    // Sort by (inbox_seq, tenant_id, hash(plans)). After this, the sorted index
+    // order equals the sort-key order: index `i < j` implies `sort_key(i) <=
+    // sort_key(j)`. The topological pick and cycle-break rely on this.
     candidates.sort_by_key(admitted_sort_key);
-
-    // Step 2: build flat write-entry list.
-    let mut flat: Vec<WriteEntry> = Vec::new();
-    for (i, tx) in candidates.iter().enumerate() {
-        flat.extend(flatten_write_set(tx, i));
-    }
-
-    // Step 3: sort flat list lexicographically.
-    flat.sort_by(|a, b| match a.discriminant.cmp(&b.discriminant) {
-        Ordering::Equal => match a.collection.cmp(&b.collection) {
-            Ordering::Equal => a.key_bytes.cmp(&b.key_bytes),
-            other => other,
-        },
-        other => other,
-    });
-
-    // Step 4: detect conflicts — adjacent duplicate keys from different txns.
     let n = candidates.len();
-    let mut rejected = vec![false; n];
-    // determinism: scratch map, not iterated for output
-    let mut admitted_position_for: std::collections::HashMap<usize, u32> =
-        std::collections::HashMap::new();
 
-    let mut i = 0;
-    while i < flat.len() {
-        // Collect run of entries with same (discriminant, collection, key_bytes).
-        let mut j = i + 1;
-        while j < flat.len() && flat[j].sort_key() == flat[i].sort_key() {
-            j += 1;
-        }
-        // flat[i..j] all have the same key. If more than one distinct txn_index
-        // appears, all but the lowest-indexed are rejected.
-        let min_txn = flat[i..j].iter().map(|e| e.txn_index).min().unwrap_or(i);
-        for entry in &flat[i..j] {
-            if entry.txn_index != min_txn {
-                rejected[entry.txn_index] = true;
-                // Record the admitted position of the winner if not yet set.
-                admitted_position_for.entry(entry.txn_index).or_insert(0);
+    // Flatten both sets of every transaction and build the reader/writer maps
+    // keyed by canonical key identity. BTreeMap + ascending index vectors keep
+    // every iteration that feeds output deterministic.
+    let mut readers_of: BTreeMap<KeyId, Vec<usize>> = BTreeMap::new();
+    let mut writers_of: BTreeMap<KeyId, Vec<usize>> = BTreeMap::new();
+    let mut tx_reads: Vec<Vec<FlatKey>> = Vec::with_capacity(n);
+    let mut tx_writes: Vec<Vec<FlatKey>> = Vec::with_capacity(n);
+
+    for (i, tx) in candidates.iter().enumerate() {
+        let reads = flatten_set(&tx.tx_class.read_set);
+        let writes = flatten_set(&tx.tx_class.write_set);
+        for fk in &reads {
+            let entry = readers_of.entry(fk.key_id()).or_default();
+            if entry.last() != Some(&i) {
+                entry.push(i);
             }
         }
-        i = j;
+        for fk in &writes {
+            let entry = writers_of.entry(fk.key_id()).or_default();
+            if entry.last() != Some(&i) {
+                entry.push(i);
+            }
+        }
+        tx_reads.push(reads);
+        tx_writes.push(writes);
     }
 
-    // Step 5: build output. First pass: assign positions to admitted txns.
-    let mut position_map = vec![0u32; n];
-    let mut next_position: u32 = 0;
-    for (idx, is_rejected) in rejected.iter().enumerate() {
-        if !*is_rejected {
-            position_map[idx] = next_position;
-            next_position += 1;
+    // Build RAW edges `reader -> writer` (reader gets the lower position). A
+    // BTreeSet of successors deduplicates edges arising from multiple shared
+    // keys and keeps successor iteration deterministic.
+    let mut out: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    let mut in_degree: Vec<usize> = vec![0; n];
+    for (key, readers) in &readers_of {
+        if let Some(writers) = writers_of.get(key) {
+            for &r in readers {
+                for &w in writers {
+                    if r != w && out[r].insert(w) {
+                        in_degree[w] += 1;
+                    }
+                }
+            }
         }
     }
 
-    // Now build admitted/rejected output.
+    // Deterministic topological emission with cycle-breaking. `ready` is a
+    // BTreeSet so `pop_first` always yields the smallest index — i.e. the
+    // smallest admitted sort key among currently-schedulable nodes.
+    let mut rejected = vec![false; n];
+    let mut emitted_position: Vec<Option<u32>> = vec![None; n];
+    let mut ready: BTreeSet<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+    let mut next_position: u32 = 0;
+
+    loop {
+        while let Some(node) = ready.pop_first() {
+            emitted_position[node] = Some(next_position);
+            next_position += 1;
+            for &succ in &out[node] {
+                in_degree[succ] -= 1;
+                if in_degree[succ] == 0 && !rejected[succ] && emitted_position[succ].is_none() {
+                    ready.insert(succ);
+                }
+            }
+        }
+        // A cycle remains iff some node is neither emitted nor rejected. Break
+        // it by rejecting the largest sort key (largest index = highest
+        // inbox_seq): the later transaction loses. A rejected node imposes no
+        // ordering, so drop its outgoing edges.
+        match (0..n)
+            .rev()
+            .find(|&i| !rejected[i] && emitted_position[i].is_none())
+        {
+            Some(victim) => {
+                rejected[victim] = true;
+                for &succ in &out[victim] {
+                    in_degree[succ] -= 1;
+                    if in_degree[succ] == 0 && !rejected[succ] && emitted_position[succ].is_none() {
+                        ready.insert(succ);
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+
+    // Build output in sorted-index order.
     let mut admitted_out: Vec<(u64, SequencedTxn)> = Vec::new();
     let mut rejected_out: Vec<RejectedTx> = Vec::new();
 
     for (idx, tx) in candidates.into_iter().enumerate() {
-        if rejected[idx] {
-            // Find the winning position: the admitted txn that holds the conflicting key.
-            // We scan flat to find the min txn_index for any key this txn writes.
-            let (winner_position, conflict_context) =
-                find_winner_position_and_context(&flat, idx, &position_map, &tx);
-            rejected_out.push(RejectedTx {
-                admitted: tx,
-                reason: SequencerError::Conflict {
-                    position_admitted: winner_position,
-                },
-                conflict_context,
-            });
-        } else {
-            let inbox_seq = tx.inbox_seq;
-            // Copy the submitted class's reservation owner before the class is
-            // moved into the SequencedTxn: `Some(R)` acquires the commit batch's
-            // keys as `R` so it self-upgrades the session's shared reservations.
-            let lock_owner = tx.tx_class.lock_owner;
-            admitted_out.push((
-                inbox_seq,
-                SequencedTxn {
-                    epoch,
-                    position: position_map[idx],
-                    tx_class: tx.tx_class,
-                    // epoch_system_ms is filled in by the service tick() when the
-                    // EpochBatch is constructed; 0 is a safe placeholder here.
-                    epoch_system_ms: 0,
-                    // epoch_vshard_txn_count is stamped per-vShard by the state
-                    // machine at fan-out time; 0 is a safe placeholder here.
-                    epoch_vshard_txn_count: 0,
-                    lock_owner,
-                },
-            ));
+        match emitted_position[idx] {
+            Some(position) => {
+                let inbox_seq = tx.inbox_seq;
+                // Copy the submitted class's reservation owner before the class
+                // is moved into the SequencedTxn: `Some(R)` acquires the commit
+                // batch's keys as `R` so it self-upgrades the session's shared
+                // reservations.
+                let lock_owner = tx.tx_class.lock_owner;
+                admitted_out.push((
+                    inbox_seq,
+                    SequencedTxn {
+                        epoch,
+                        position,
+                        tx_class: tx.tx_class,
+                        // epoch_system_ms is filled in by the service tick()
+                        // when the EpochBatch is constructed; 0 is a safe
+                        // placeholder here.
+                        epoch_system_ms: 0,
+                        // epoch_vshard_txn_count is stamped per-vShard by the
+                        // state machine at fan-out time; 0 is a safe placeholder.
+                        epoch_vshard_txn_count: 0,
+                        lock_owner,
+                    },
+                ));
+            }
+            None => {
+                let tenant = tx.tx_class.tenant_id.as_u64();
+                let (position_admitted, conflict_context) = reject_context(
+                    idx,
+                    tenant,
+                    &tx_reads,
+                    &tx_writes,
+                    &readers_of,
+                    &writers_of,
+                    &emitted_position,
+                );
+                rejected_out.push(RejectedTx {
+                    admitted: tx,
+                    reason: SequencerError::Conflict { position_admitted },
+                    conflict_context,
+                });
+            }
         }
     }
 
@@ -248,36 +320,65 @@ pub fn validate_batch(
     (admitted.into_iter().map(|(_, txn)| txn).collect(), rejected)
 }
 
-/// Find the position of the admitted (winning) txn that conflicts with
-/// `loser_idx`, and build the [`ConflictKey`] for the first conflicting write
-/// entry found.
+/// Build the `(position_admitted, conflict_context)` for a cycle-rejected txn.
 ///
-/// Returns `(winner_position, Some(ConflictKey))`. The `ConflictKey` uses the
-/// tenant from `loser_tx`, the engine from the `WriteEntry`, and the collection
-/// from that same entry — matching what the metrics layer needs for per-context
-/// hotness tracking.
-fn find_winner_position_and_context(
-    flat: &[WriteEntry],
-    loser_idx: usize,
-    position_map: &[u32],
-    loser_tx: &AdmittedTx,
+/// A rejected txn conflicts with any admitted txn that writes a key it reads or
+/// reads a key it writes. We select the conflict with the smallest admitted
+/// position (ties broken by key identity) so both the reported position and the
+/// [`ConflictKey`] are deterministic. If no conflicting txn was admitted, the
+/// position defaults to `0` and the context to `None`.
+fn reject_context(
+    idx: usize,
+    tenant: u64,
+    tx_reads: &[Vec<FlatKey>],
+    tx_writes: &[Vec<FlatKey>],
+    readers_of: &BTreeMap<KeyId, Vec<usize>>,
+    writers_of: &BTreeMap<KeyId, Vec<usize>>,
+    emitted_position: &[Option<u32>],
 ) -> (u32, Option<ConflictKey>) {
-    for entry in flat.iter().filter(|e| e.txn_index == loser_idx) {
-        let min_idx = flat
-            .iter()
-            .filter(|e| e.sort_key() == entry.sort_key() && e.txn_index != loser_idx)
-            .map(|e| e.txn_index)
-            .min();
-        if let Some(winner) = min_idx {
-            let ctx = ConflictKey {
-                tenant: loser_tx.tx_class.tenant_id.as_u64(),
-                engine: entry.engine_name,
-                collection: entry.collection.clone(),
+    // Best conflict so far, ordered by (admitted position, key identity).
+    let mut best: Option<(u32, KeyId, &'static str)> = None;
+    let mut consider = |fk: &FlatKey, others: Option<&Vec<usize>>| {
+        let Some(others) = others else { return };
+        for &other in others {
+            if other == idx {
+                continue;
+            }
+            let Some(pos) = emitted_position[other] else {
+                continue;
             };
-            return (position_map[winner], Some(ctx));
+            let key = fk.key_id();
+            let candidate = (pos, key, fk.engine_name);
+            let better = match &best {
+                None => true,
+                Some((bpos, bkey, _)) => (pos, &candidate.1) < (*bpos, bkey),
+            };
+            if better {
+                best = Some(candidate);
+            }
         }
+    };
+
+    // A writer of a key this txn reads.
+    for fk in &tx_reads[idx] {
+        consider(fk, writers_of.get(&fk.key_id()));
     }
-    (0, None)
+    // A reader of a key this txn writes.
+    for fk in &tx_writes[idx] {
+        consider(fk, readers_of.get(&fk.key_id()));
+    }
+
+    match best {
+        Some((pos, key, engine)) => (
+            pos,
+            Some(ConflictKey {
+                tenant,
+                engine,
+                collection: key.1,
+            }),
+        ),
+        None => (0, None),
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +407,7 @@ mod tests {
         panic!("could not find two distinct-vshard collections in 512 tries");
     }
 
+    /// Build a two-collection write-only transaction (multi-vshard).
     fn make_tx(
         inbox_seq: u64,
         col_a: &str,
@@ -325,6 +427,40 @@ mod tests {
         ]);
         let tx_class = TxClass::new(
             ReadWriteSet::new(vec![]),
+            write_set,
+            vec![inbox_seq as u8],
+            TenantId::new(1),
+            None,
+            crate::calvin::types::VersionedReadSet::default(),
+        )
+        .expect("valid TxClass");
+        AdmittedTx {
+            inbox_seq,
+            tx_class,
+        }
+    }
+
+    /// Build a transaction with a distinct read set and write set. The write set
+    /// is a single collection, so this uses the single-vshard opt-in
+    /// constructor (the validator operates purely on set contents). An empty
+    /// `read_surrogates` yields a read set with no keys.
+    fn make_rw_tx(
+        inbox_seq: u64,
+        read_col: &str,
+        read_surrogates: Vec<u32>,
+        write_col: &str,
+        write_surrogates: Vec<u32>,
+    ) -> AdmittedTx {
+        let read_set = ReadWriteSet::new(vec![EngineKeySet::Document {
+            collection: read_col.to_owned(),
+            surrogates: SortedVec::new(read_surrogates),
+        }]);
+        let write_set = ReadWriteSet::new(vec![EngineKeySet::Document {
+            collection: write_col.to_owned(),
+            surrogates: SortedVec::new(write_surrogates),
+        }]);
+        let tx_class = TxClass::new_single_vshard(
+            read_set,
             write_set,
             vec![inbox_seq as u8],
             TenantId::new(1),
@@ -364,30 +500,143 @@ mod tests {
         let (admitted, rejected) = validate_batch(2, vec![tx0, tx1]);
         assert_eq!(admitted.len(), 2);
         assert!(rejected.is_empty());
-        // Position 0 should have the lower inbox_seq.
+        // No RAW edges → inbox_seq order preserved.
         assert_eq!(admitted[0].position, 0);
         assert_eq!(admitted[1].position, 1);
     }
 
     #[test]
-    fn two_conflicting_txns_first_admitted_second_rejected() {
+    fn two_same_key_writers_both_admitted() {
         let (col_a, col_b) = find_two_distinct_collections();
-        // Both txns write to surrogate 42 in col_a.
+        // Both txns WRITE surrogate 42 in col_a. Write-write is not a conflict:
+        // they serialize by position (last write wins) and both commit.
         let tx0 = make_tx(0, &col_a, vec![42], &col_b, vec![1]);
         let tx1 = make_tx(1, &col_a, vec![42], &col_b, vec![2]);
         let (admitted, rejected) = validate_batch(3, vec![tx0, tx1]);
+        assert_eq!(admitted.len(), 2);
+        assert!(rejected.is_empty());
+        // Ordered by inbox_seq (no RAW edge between two writers).
+        assert_eq!(admitted[0].position, 0);
+        assert_eq!(admitted[1].position, 1);
+    }
+
+    #[test]
+    fn raw_reader_ordered_before_writer() {
+        let (col_k, col_other) = find_two_distinct_collections();
+        // tx0 (inbox_seq 0) WRITES key K.
+        let tx0 = make_rw_tx(0, &col_k, vec![], &col_k, vec![7]);
+        // tx1 (inbox_seq 1) READS key K and writes something else.
+        let tx1 = make_rw_tx(1, &col_k, vec![7], &col_other, vec![99]);
+        let (admitted, _rejected) = validate_batch_with_assignments(4, vec![tx0, tx1]);
+        assert_eq!(admitted.len(), 2);
+
+        // Reader (inbox_seq 1) must get a LOWER position than writer (inbox_seq 0)
+        // — the reorder that protects the read from a read-after-write abort,
+        // overriding inbox_seq order.
+        let writer_pos = admitted
+            .iter()
+            .find(|(seq, _)| *seq == 0)
+            .map(|(_, t)| t.position)
+            .expect("writer admitted");
+        let reader_pos = admitted
+            .iter()
+            .find(|(seq, _)| *seq == 1)
+            .map(|(_, t)| t.position)
+            .expect("reader admitted");
+        assert!(
+            reader_pos < writer_pos,
+            "reader (seq 1) at {reader_pos} must precede writer (seq 0) at {writer_pos}"
+        );
+    }
+
+    #[test]
+    fn raw_cycle_rejects_later_txn_with_winner_position() {
+        let (col_a, col_b) = find_two_distinct_collections();
+        // tx0 READS A, WRITES B; tx1 READS B, WRITES A → a RAW cycle that no
+        // serial order can satisfy.
+        let tx0 = make_rw_tx(0, &col_a, vec![1], &col_b, vec![1]);
+        let tx1 = make_rw_tx(1, &col_b, vec![1], &col_a, vec![1]);
+        let (admitted, rejected) = validate_batch_with_assignments(5, vec![tx0, tx1]);
         assert_eq!(admitted.len(), 1);
         assert_eq!(rejected.len(), 1);
-        assert_eq!(admitted[0].position, 0);
-        assert!(matches!(
+        // Later txn (inbox_seq 1) loses the cycle break.
+        assert_eq!(rejected[0].admitted.inbox_seq, 1);
+        // Winner admitted at position 0.
+        assert_eq!(
             rejected[0].reason,
-            SequencerError::Conflict { .. }
-        ));
+            SequencerError::Conflict {
+                position_admitted: 0
+            }
+        );
+        assert_eq!(admitted[0].1.position, 0);
+        assert_eq!(admitted[0].1.tx_class.tenant_id.as_u64(), 1);
+    }
+
+    #[test]
+    fn raw_cycle_reject_carries_conflict_context() {
+        let (col_a, col_b) = find_two_distinct_collections();
+        let tx0 = make_rw_tx(0, &col_a, vec![1], &col_b, vec![1]);
+        let tx1 = make_rw_tx(1, &col_b, vec![1], &col_a, vec![1]);
+        let (_admitted, rejected) = validate_batch(10, vec![tx0, tx1]);
+        assert_eq!(rejected.len(), 1);
+
+        let ctx = rejected[0]
+            .conflict_context
+            .as_ref()
+            .expect("conflict_context must be Some for a Conflict rejection");
+        assert_eq!(ctx.tenant, 1, "tenant should match tx tenant_id");
+        assert_eq!(
+            ctx.engine, "document",
+            "engine should be 'document' for Document key set"
+        );
+        assert!(
+            ctx.collection == col_a || ctx.collection == col_b,
+            "collection {} should be one of the cycle's conflicting keys",
+            ctx.collection
+        );
+    }
+
+    #[test]
+    fn positions_are_dense_and_reorder_is_deterministic() {
+        let (col_k, col_other) = find_two_distinct_collections();
+        let build = || {
+            vec![
+                // tx0 WRITES K.
+                make_rw_tx(0, &col_k, vec![], &col_k, vec![5]),
+                // tx1 READS K, writes elsewhere → RAW edge tx1 -> tx0.
+                make_rw_tx(1, &col_k, vec![5], &col_other, vec![6]),
+                // tx2 independent write.
+                make_rw_tx(2, &col_other, vec![], &col_other, vec![7]),
+            ]
+        };
+
+        let (admitted1, rejected1) = validate_batch_with_assignments(7, build());
+        assert!(rejected1.is_empty());
+        assert_eq!(admitted1.len(), 3);
+        // Positions are exactly 0..len with no gaps.
+        let mut positions: Vec<u32> = admitted1.iter().map(|(_, t)| t.position).collect();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![0, 1, 2]);
+
+        // Second run yields identical position-per-inbox_seq assignment.
+        let (admitted2, _rejected2) = validate_batch_with_assignments(7, build());
+        for (seq, txn) in &admitted1 {
+            let other = admitted2
+                .iter()
+                .find(|(s, _)| s == seq)
+                .map(|(_, t)| t.position)
+                .expect("same txn present in second run");
+            assert_eq!(
+                txn.position, other,
+                "position for inbox_seq {seq} must be stable"
+            );
+        }
     }
 
     #[test]
     fn deterministic_ordering_across_repeated_runs() {
         let (col_a, col_b) = find_two_distinct_collections();
+        // Two same-key writers (write-write both admitted).
         let tx0 = make_tx(0, &col_a, vec![1], &col_b, vec![10]);
         let tx1 = make_tx(1, &col_a, vec![1], &col_b, vec![20]);
 
@@ -399,50 +648,5 @@ mod tests {
         for (a, b) in admitted1.iter().zip(admitted2.iter()) {
             assert_eq!(a.position, b.position);
         }
-    }
-
-    #[test]
-    fn rejected_txn_carries_conflict_error_with_winner_position() {
-        let (col_a, col_b) = find_two_distinct_collections();
-        let tx0 = make_tx(0, &col_a, vec![99], &col_b, vec![1]);
-        let tx1 = make_tx(1, &col_a, vec![99], &col_b, vec![2]);
-        let (_admitted, rejected) = validate_batch(5, vec![tx0, tx1]);
-        assert_eq!(rejected.len(), 1);
-        // Winner is at position 0.
-        assert_eq!(
-            rejected[0].reason,
-            SequencerError::Conflict {
-                position_admitted: 0
-            }
-        );
-    }
-
-    #[test]
-    fn conflict_fairness_metric_keyed() {
-        // Verify that RejectedTx.conflict_context is populated with the
-        // correct tenant, engine name, and collection when a conflict occurs.
-        let (col_a, col_b) = find_two_distinct_collections();
-        // Both transactions write to surrogate 7 in col_a (Document engine).
-        let tx0 = make_tx(0, &col_a, vec![7], &col_b, vec![1]);
-        let tx1 = make_tx(1, &col_a, vec![7], &col_b, vec![2]);
-
-        // tx1 uses tenant_id 1 (from make_tx helper).
-        let (_admitted, rejected) = validate_batch(10, vec![tx0, tx1]);
-        assert_eq!(rejected.len(), 1);
-
-        let ctx = rejected[0]
-            .conflict_context
-            .as_ref()
-            .expect("conflict_context must be Some for a Conflict rejection");
-
-        assert_eq!(ctx.tenant, 1, "tenant should match tx tenant_id");
-        assert_eq!(
-            ctx.engine, "document",
-            "engine should be 'document' for Document key set"
-        );
-        assert_eq!(
-            ctx.collection, col_a,
-            "collection should be the conflicting collection"
-        );
     }
 }
