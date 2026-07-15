@@ -248,6 +248,16 @@ impl CoreLoop {
                     }
                 };
 
+                // The plain `INDEXES` secondary-index paths for this collection.
+                // The non-bitemporal write must reconcile these atomically with
+                // the primary body so a changed value can't leave a stale index
+                // entry pointing at the old value.
+                let index_paths = self
+                    .doc_configs
+                    .get(&config_key)
+                    .map(|c| c.index_paths.clone())
+                    .unwrap_or_default();
+
                 let write_result = if bitemporal {
                     // Bitemporal collections keep secondary-index entries in the
                     // versioned index only; the update must tombstone values it
@@ -299,9 +309,57 @@ impl CoreLoop {
                             })
                             .map(|()| None::<Vec<u8>>),
                     }
-                } else {
+                } else if index_paths.is_empty() {
+                    // No secondary index to maintain — nothing to diff, so the
+                    // self-committing put is sufficient and avoids a redundant
+                    // decode of both document images.
                     self.sparse
                         .put(database_id, tid, collection, row_key, &updated_bytes)
+                } else {
+                    // Reconcile the plain secondary index atomically with the
+                    // primary body. Decode old/new (storage-mode-aware) so the
+                    // SET diff drops values the update removed and asserts the
+                    // new ones in the same redb transaction — otherwise a later
+                    // lookup on the new value misses the row and a lookup on the
+                    // old value wrongly returns it. Mirrors the bitemporal branch.
+                    let (old_doc, new_doc) = match self.doc_configs.get(&config_key) {
+                        Some(cfg) => (
+                            self.decode_stored_document(cfg, &current_bytes),
+                            self.decode_stored_document(cfg, &updated_bytes),
+                        ),
+                        None => (None, None),
+                    };
+                    match (old_doc, new_doc) {
+                        (Some(old_doc), Some(new_doc)) => self
+                            .nonbitemporal_update_reindex(
+                                super::update_reindex::NonbitemporalUpdateReindex {
+                                    database_id,
+                                    tid,
+                                    collection,
+                                    doc_id: row_key,
+                                    new_body: &updated_bytes,
+                                    index_paths: &index_paths,
+                                    old_doc: &old_doc,
+                                    new_doc: &new_doc,
+                                },
+                            )
+                            .map(|()| None::<Vec<u8>>),
+                        _ => {
+                            // Unreachable for well-formed data: both images are
+                            // documents we just read / re-encoded. If one ever
+                            // fails to decode we cannot compute the secondary-index
+                            // diff, so we must NOT write the primary alone — that
+                            // would silently desync the index (the very bug this
+                            // path fixes). Fail loud instead.
+                            Err(crate::Error::Storage {
+                                engine: "sparse".into(),
+                                detail: format!(
+                                    "non-bitemporal update: document failed to decode for \
+                                     secondary-index diff (collection {collection}, id {row_key})"
+                                ),
+                            })
+                        }
+                    }
                 };
                 match write_result {
                     Ok(_prior) => {
