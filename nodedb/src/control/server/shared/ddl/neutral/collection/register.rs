@@ -110,7 +110,11 @@ pub async fn dispatch_register_from_stored(
 /// Per-field auto-derived indexes (schemaless default: each declared field
 /// becomes a non-unique `$.field` index). Always `Ready` — these exist
 /// from the moment the collection is created.
-fn derive_auto_indexes<'a>(
+///
+/// `pub(crate)` so the boot-time `doc_configs` seed loader
+/// ([`crate::bootstrap::data_plane::load_doc_config_registry`]) can derive
+/// the same index set as the live-DDL path without drift.
+pub(crate) fn derive_auto_indexes<'a>(
     field_names: impl IntoIterator<Item = &'a str>,
 ) -> Vec<nodedb_physical::physical_plan::RegisteredIndex> {
     field_names
@@ -130,7 +134,7 @@ fn derive_auto_indexes<'a>(
 /// explicit catalog index shares a path with an auto-derived one, the
 /// catalog entry supersedes the auto-derived one: UNIQUE/COLLATE
 /// modifiers have to take effect.
-fn extend_with_catalog_indexes(
+pub(crate) fn extend_with_catalog_indexes(
     out: &mut Vec<nodedb_physical::physical_plan::RegisteredIndex>,
     coll: &StoredCollection,
 ) {
@@ -159,17 +163,28 @@ fn extend_with_catalog_indexes(
     }
 }
 
-async fn dispatch_register_from_stored_inner(
-    state: &SharedState,
+/// Build the `CollectionConfig` a `DocumentOp::Register` would install in
+/// `doc_configs`, straight from the durable catalog — storage mode,
+/// enforcement options, generated columns, and secondary indexes.
+///
+/// Shared by two callers that must never drift apart:
+/// - [`dispatch_register_from_stored_inner`] (live DDL / applier path):
+///   derives the same fields to build the `DocumentOp::Register` plan
+///   broadcast to Data Plane cores.
+/// - [`crate::bootstrap::data_plane::load_doc_config_registry`] (boot
+///   path): seeds every core's `doc_configs` synchronously, before WAL
+///   redo replay runs, so strict collections re-encode Binary Tuple
+///   instead of falling through to the raw-MessagePack fallback.
+pub(crate) fn build_doc_config_from_stored(
+    catalog: &crate::control::security::catalog::SystemCatalog,
     tenant_id: crate::types::TenantId,
     coll: &StoredCollection,
-    indexes: Vec<nodedb_physical::physical_plan::RegisteredIndex>,
-) -> crate::Result<()> {
+    indexes: &[nodedb_physical::physical_plan::RegisteredIndex],
+) -> crate::engine::document::store::CollectionConfig {
     let name = crate::control::planner::sql_plan_convert::convert::db_qualified(
         coll.database_id,
         &coll.name,
     );
-    let catalog = state.credentials.catalog();
 
     // Determine storage mode from collection type — exhaustive
     // match ensures new CollectionType variants get a compile
@@ -190,8 +205,6 @@ async fn dispatch_register_from_stored_inner(
             nodedb_physical::physical_plan::StorageMode::Schemaless
         }
     };
-
-    let crdt_enabled = false;
 
     let enforcement = nodedb_physical::physical_plan::EnforcementOptions {
         append_only: coll.append_only,
@@ -230,14 +243,35 @@ async fn dispatch_register_from_stored_inner(
         generated_columns: build_generated_column_specs(coll),
     };
 
+    let mut config = crate::engine::document::store::CollectionConfig::new(&name);
+    config.crdt_enabled = false;
+    config.storage_mode = storage_mode;
+    config.enforcement = enforcement;
+    config.bitemporal = coll.bitemporal;
+    config.index_paths = indexes
+        .iter()
+        .map(crate::engine::document::store::IndexPath::from_registered)
+        .collect();
+    config
+}
+
+async fn dispatch_register_from_stored_inner(
+    state: &SharedState,
+    tenant_id: crate::types::TenantId,
+    coll: &StoredCollection,
+    indexes: Vec<nodedb_physical::physical_plan::RegisteredIndex>,
+) -> crate::Result<()> {
+    let catalog = state.credentials.catalog();
+    let config = build_doc_config_from_stored(catalog, tenant_id, coll, &indexes);
+
     let plan = crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::Register {
-            collection: name.clone(),
+            collection: config.name.clone(),
             indexes,
-            crdt_enabled,
-            storage_mode,
-            enforcement: Box::new(enforcement),
-            bitemporal: coll.bitemporal,
+            crdt_enabled: config.crdt_enabled,
+            storage_mode: config.storage_mode,
+            enforcement: Box::new(config.enforcement),
+            bitemporal: config.bitemporal,
         },
     );
 

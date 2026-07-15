@@ -66,6 +66,11 @@ pub(crate) async fn bootstrap_data_plane(
     // Load the persisted ND-array catalog once, before spawning cores.
     let array_catalog = bootstrap::data_plane::load_array_catalog(config);
 
+    // Load every active collection's schema from the durable catalog once,
+    // before spawning cores, so each core can seed `doc_configs` ahead of
+    // its own WAL redo replay (see `load_doc_config_registry` docs).
+    let doc_config_seed = Arc::new(bootstrap::data_plane::load_doc_config_registry(config));
+
     // Create the quarantine registry before spawning cores.
     let quarantine_registry =
         std::sync::Arc::new(nodedb::storage::quarantine::QuarantineRegistry::new());
@@ -90,6 +95,7 @@ pub(crate) async fn bootstrap_data_plane(
             quarantine_registry: Arc::clone(&quarantine_registry),
             system_metrics: Arc::clone(&system_metrics),
             maintenance_budget: Arc::clone(&maintenance_budget),
+            doc_config_seed: Arc::clone(&doc_config_seed),
         },
     )?;
 

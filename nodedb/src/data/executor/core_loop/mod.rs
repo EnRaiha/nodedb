@@ -5,6 +5,7 @@ mod bitemporal_time;
 pub(in crate::data::executor) mod commit_pending;
 mod decode_stored;
 pub(in crate::data::executor) mod deferred;
+mod doc_config_seed;
 mod event_emit;
 pub(in crate::data::executor) mod filter_match;
 mod graph_partition;

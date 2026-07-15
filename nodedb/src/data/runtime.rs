@@ -83,6 +83,15 @@ pub struct SpawnCoreParams<'a> {
     pub array_catalog: crate::control::array_catalog::ArrayCatalogHandle,
     pub quarantine_registry: Arc<crate::storage::quarantine::QuarantineRegistry>,
     pub maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
+    /// Catalog-sourced `doc_configs` seed, applied before `replay_all_wal`
+    /// so strict (Binary Tuple) collections redo-replay through their real
+    /// schema instead of falling through to the raw-MessagePack fallback.
+    pub doc_config_seed: Arc<
+        Vec<(
+            (crate::types::TenantId, String),
+            crate::engine::document::store::CollectionConfig,
+        )>,
+    >,
 }
 
 /// Spawn a Data Plane core on a dedicated OS thread with TPC isolation.
@@ -112,6 +121,7 @@ pub fn spawn_core(
         array_catalog,
         quarantine_registry,
         maintenance_budget,
+        doc_config_seed,
     } = params;
 
     let data_dir = data_dir.to_path_buf();
@@ -182,6 +192,17 @@ pub fn spawn_core(
             core.load_spatial_checkpoints();
             core.load_sparse_vector_checkpoints();
             core.load_crdt_checkpoints();
+
+            // 3b. Seed `doc_configs` from the durable catalog BEFORE WAL
+            // replay. `doc_configs` is otherwise only populated by
+            // `DocumentOp::Register` broadcasts processed in the event
+            // loop below — too late for redo replay, which runs
+            // synchronously on this thread before the core ever drains
+            // an SPSC request. Without this seed, strict (Binary Tuple)
+            // collections replay through the schemaless fallback and get
+            // re-persisted as raw MessagePack, corrupting the strict
+            // store's O(1) field layout.
+            core.seed_doc_configs(&doc_config_seed);
 
             // 4. Replay WAL records for crash recovery.
             //

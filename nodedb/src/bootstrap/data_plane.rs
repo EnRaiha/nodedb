@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Data Plane core spawning and array catalog initialization.
+//! Data Plane core spawning, array catalog initialization, and document
+//! schema registry seeding.
 
 use std::sync::Arc;
 
@@ -11,10 +12,15 @@ use crate::bridge::dispatch::{CoreChannelDataSide, Dispatcher};
 use crate::bridge::quiesce::CollectionQuiesce;
 use crate::control::array_catalog::ArrayCatalog;
 use crate::control::metrics::SystemMetrics;
+use crate::control::server::shared::ddl::neutral::collection::register::{
+    build_doc_config_from_stored, derive_auto_indexes, extend_with_catalog_indexes,
+};
 use crate::data::eventfd::EventFdNotifier;
 use crate::data::runtime::{CoreCompactionConfig, SpawnCoreParams, spawn_core};
+use crate::engine::document::store::CollectionConfig;
 use crate::event::EventProducer;
 use crate::storage::quarantine::QuarantineRegistry;
+use crate::types::TenantId;
 
 /// Load the persisted ND-array catalog from redb into the shared in-memory handle.
 pub fn load_array_catalog(
@@ -45,6 +51,53 @@ pub fn load_array_catalog(
     array_catalog
 }
 
+/// Load every active collection's `CollectionConfig` from the durable
+/// catalog, keyed the same way `doc_configs` is keyed, so each Data Plane
+/// core can seed its schema registry synchronously before WAL redo replay
+/// runs.
+///
+/// WAL replay happens on the core's own thread before that core ever
+/// drains an SPSC request — including the `DocumentOp::Register`
+/// broadcasts that normally populate `doc_configs` post-boot via
+/// [`crate::bootstrap::schema_rehydrate::rehydrate_schema_registry`].
+/// Without this, strict (Binary Tuple) document collections replay
+/// through the schemaless fallback and get re-persisted as raw
+/// MessagePack. Mirrors [`load_array_catalog`]'s fail-open pattern: a
+/// catalog open/load failure at this boot phase logs a warning and
+/// yields an empty seed rather than aborting startup.
+pub fn load_doc_config_registry(
+    config: &ServerConfig,
+) -> Vec<((TenantId, String), CollectionConfig)> {
+    let catalog_path = config.catalog_path();
+    let catalog = match crate::control::security::catalog::SystemCatalog::open(&catalog_path) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not open system catalog to seed doc_configs");
+            return Vec::new();
+        }
+    };
+
+    let all = match crate::bootstrap::constraint_reconcile::load_collections(&catalog) {
+        Ok(all) => all,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load collections to seed doc_configs");
+            return Vec::new();
+        }
+    };
+
+    all.into_iter()
+        .filter(|(_, coll)| coll.is_active)
+        .map(|(_, coll)| {
+            let tenant_id = TenantId::new(coll.tenant_id);
+            let mut indexes = derive_auto_indexes(coll.fields.iter().map(|(n, _)| n.as_str()));
+            extend_with_catalog_indexes(&mut indexes, &coll);
+            let config = build_doc_config_from_stored(&catalog, tenant_id, &coll, &indexes);
+            let key = (tenant_id, config.name.clone());
+            (key, config)
+        })
+        .collect()
+}
+
 /// Shared Arc resources passed to each Data Plane core at spawn time.
 pub struct CoreSharedResources {
     pub governor: Arc<nodedb_mem::MemoryGovernor>,
@@ -54,6 +107,7 @@ pub struct CoreSharedResources {
     pub quarantine_registry: Arc<QuarantineRegistry>,
     pub system_metrics: Arc<SystemMetrics>,
     pub maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
+    pub doc_config_seed: Arc<Vec<((TenantId, String), CollectionConfig)>>,
 }
 
 /// Spawn all Data Plane cores, wire dispatcher notifiers, and return core handles.
@@ -76,6 +130,7 @@ pub fn spawn_data_plane_cores(
         quarantine_registry,
         system_metrics,
         maintenance_budget,
+        doc_config_seed,
     } = resources;
     let num_cores = config.server.data_plane_cores;
     let compaction_cfg = CoreCompactionConfig {
@@ -108,6 +163,7 @@ pub fn spawn_data_plane_cores(
             array_catalog: Arc::clone(&array_catalog),
             quarantine_registry: Arc::clone(&quarantine_registry),
             maintenance_budget: Arc::clone(&maintenance_budget),
+            doc_config_seed: Arc::clone(&doc_config_seed),
         })?;
         core_handles.push(handle);
         notifiers.push((core_id, notifier));
