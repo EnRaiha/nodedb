@@ -11,6 +11,7 @@ use nodedb_types::surrogate::Surrogate;
 
 use crate::Error;
 use crate::control::state::SharedState;
+use crate::engine::vector::index_config::IndexConfig;
 use crate::types::TenantId;
 
 use crate::control::backup::snapshot_keys::extract_db_scoped_collection;
@@ -212,6 +213,110 @@ pub(super) async fn reissue_vector_snapshots(
             .await?;
             reissued += 1;
         }
+    }
+    Ok(reissued)
+}
+
+/// Decode and durably re-issue every restored vector-index (collection,
+/// field) HNSW/PQ/IVF configuration as a `VectorOp::SetParams`.
+///
+/// MUST run before [`reissue_vector_snapshots`]: `get_or_create_vector_index`
+/// (`handlers/vector.rs`) lazily creates the Data Plane HNSW index from
+/// `self.vector_params` on the FIRST `VectorOp::Insert` it sees for a
+/// (collection, field) — falling back to `HnswParams::default()` when no
+/// `SetParams` has landed yet. Re-issuing params after inserts would be a
+/// no-op for the already-created index.
+///
+/// `params` are `("{db}:{tid}:{coll_key}", msgpack)` pairs decoding to
+/// `HnswParams` (the `TenantDataSnapshot::vector_params` wire shape);
+/// `index_configs` are the same key shape decoding to `IndexConfig` (the
+/// superset — HNSW params + index type + PQ/IVF params). A (collection,
+/// field) present in both is re-issued once using the `IndexConfig` entry
+/// (the superset); a (collection, field) present only in `params` is
+/// re-issued with the rest of `IndexConfig` left at its default (matching
+/// what `execute_set_vector_params` does for unspecified fields). Returns the
+/// number of (collection, field) configs re-issued. Any failure is fatal — no
+/// warn-and-continue.
+pub(super) async fn reissue_vector_params(
+    state: &Arc<SharedState>,
+    tenant_id: u64,
+    params: Vec<(String, Vec<u8>)>,
+    index_configs: Vec<(String, Vec<u8>)>,
+) -> Result<usize, Error> {
+    let database_id = crate::types::DatabaseId::DEFAULT;
+
+    let mut resolved: std::collections::HashMap<String, IndexConfig> =
+        std::collections::HashMap::new();
+    let mut keys_in_order: Vec<String> = Vec::new();
+
+    for (key, bytes) in index_configs {
+        let Some(coll_key) = extract_db_scoped_collection(&key, tenant_id) else {
+            return Err(Error::Internal {
+                detail: format!("restore reissue: malformed index_configs snapshot key '{key}'"),
+            });
+        };
+        let coll_key = coll_key.to_owned();
+        let cfg: IndexConfig = zerompk::from_msgpack(&bytes).map_err(|e| Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("restore reissue: deserialize IndexConfig for '{coll_key}': {e}"),
+        })?;
+        keys_in_order.push(coll_key.clone());
+        resolved.insert(coll_key, cfg);
+    }
+
+    for (key, bytes) in params {
+        let Some(coll_key) = extract_db_scoped_collection(&key, tenant_id) else {
+            return Err(Error::Internal {
+                detail: format!("restore reissue: malformed vector_params snapshot key '{key}'"),
+            });
+        };
+        let coll_key = coll_key.to_owned();
+        if resolved.contains_key(&coll_key) {
+            // Superseded by a full IndexConfig entry for the same (collection,
+            // field) — the two sections always describe the same DDL state,
+            // so skip the narrower one.
+            continue;
+        }
+        let hnsw: nodedb_types::hnsw::HnswParams =
+            zerompk::from_msgpack(&bytes).map_err(|e| Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("restore reissue: deserialize HnswParams for '{coll_key}': {e}"),
+            })?;
+        keys_in_order.push(coll_key.clone());
+        resolved.insert(
+            coll_key,
+            IndexConfig {
+                hnsw,
+                ..IndexConfig::default()
+            },
+        );
+    }
+
+    let mut reissued = 0usize;
+    for coll_key in keys_in_order {
+        let Some(config) = resolved.remove(&coll_key) else {
+            // Already re-issued (duplicate key across sections).
+            continue;
+        };
+        let (collection, field_name) =
+            super::super::vector_reissue::split_vector_coll_key(&coll_key);
+        let collection = collection.to_owned();
+        let field_name = field_name.to_owned();
+
+        let plan = super::super::vector_reissue::build_vector_set_params_plan(
+            &collection,
+            &field_name,
+            &config,
+        );
+        super::super::vector_reissue::reissue_vector_durably(
+            state,
+            TenantId::new(tenant_id),
+            database_id,
+            &collection,
+            plan,
+        )
+        .await?;
+        reissued += 1;
     }
     Ok(reissued)
 }

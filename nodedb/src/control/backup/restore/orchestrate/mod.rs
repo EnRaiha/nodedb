@@ -55,6 +55,9 @@ pub struct RestoreStats {
     pub crdt_reissued: usize,
     /// Number of individual vectors re-issued durably (Raft/WAL) on restore.
     pub vectors_reissued: usize,
+    /// Number of (collection, field) vector-index HNSW/PQ/IVF configs
+    /// re-issued durably (Raft/WAL) on restore.
+    pub vector_params_reissued: usize,
     /// Number of PK→surrogate identity bindings rebound into the catalog.
     pub surrogate_pk: usize,
     pub nodes_dispatched: usize,
@@ -191,6 +194,19 @@ pub async fn restore_tenant(
     // double-installed.
     let vector_snapshots = std::mem::take(&mut merged.vectors);
 
+    // Vector-index HNSW/PQ/IVF configuration (metric, M, ef_construction,
+    // quantization/index_type) is captured at backup alongside the raw
+    // vectors above (see `TenantDataSnapshot::vector_params` /
+    // `::index_configs` doc comments) but is likewise NOT installed via the
+    // snapshot path. Drain both here and re-issue durably below as
+    // `VectorOp::SetParams` — BEFORE the vector `Insert` re-issue, since
+    // `get_or_create_vector_index` lazily creates the Data Plane HNSW index
+    // from `self.vector_params` on the first `Insert` it sees for a
+    // (collection, field), defaulting silently if no `SetParams` landed
+    // first. The topology split must therefore never see these sections.
+    let vector_params_snapshots = std::mem::take(&mut merged.vector_params);
+    let index_config_snapshots = std::mem::take(&mut merged.index_configs);
+
     // Drain the PK→surrogate identity map before the topology split (the split
     // only routes per-key engine data). It is rebound into the destination
     // catalog after the data install dispatches succeed — without it restored
@@ -297,6 +313,20 @@ pub async fn restore_tenant(
     // and converges deterministically. Any failure is fatal — no
     // warn-and-continue.
     stats.crdt_reissued = super::crdt_reissue::reissue_crdt_snapshots(state, crdt_state).await?;
+
+    // Durable re-issue of vector-index configuration. Each restored
+    // (collection, field) HNSW/PQ/IVF config is replayed as a
+    // `VectorOp::SetParams` (Raft-replicated in cluster mode; WAL-appended
+    // then installed in single-node mode). MUST run before the vector-insert
+    // re-issue below — see the `vector_params_snapshots` drain comment
+    // above. Any failure is fatal — no warn-and-continue.
+    stats.vector_params_reissued = reissue::reissue_vector_params(
+        state,
+        tenant_id,
+        vector_params_snapshots,
+        index_config_snapshots,
+    )
+    .await?;
 
     // Durable re-issue of vector rows. Each restored vector is replayed as an
     // individual `VectorOp::Insert` (Raft-replicated in cluster mode;

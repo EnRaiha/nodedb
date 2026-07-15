@@ -46,6 +46,8 @@ pub(super) fn merge_sections(
         merged.indexes.extend(snap.indexes);
         merged.edges.extend(snap.edges);
         merged.vectors.extend(snap.vectors);
+        merged.vector_params.extend(snap.vector_params);
+        merged.index_configs.extend(snap.index_configs);
         merged.kv_tables.extend(snap.kv_tables);
         // CRDT state is per-collection and tenant-explicit:
         // `(tenant_id, collection, loro_bytes)`. Loro import is a monotonic
