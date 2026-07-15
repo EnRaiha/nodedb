@@ -460,18 +460,20 @@ async fn dispatch_to_data_plane_inner(
     }
     drop(deferred_guards);
 
-    // Publish change events for successful writes.
-    if response.status == crate::bridge::envelope::Status::Ok
-        && let Some(meta) = change_meta
-    {
-        publish_change_event(
-            shared,
-            tenant_id,
-            database_id,
-            is_columnar_collection,
-            meta,
-            &response,
-        );
+    // Publish change events for successful writes. Almost every write plan
+    // yields exactly one tuple; a handful of multi-row / multi-collection
+    // ops (see `extract_write_metadata`) yield more than one or zero.
+    if response.status == crate::bridge::envelope::Status::Ok {
+        for meta in change_meta {
+            publish_change_event(
+                shared,
+                tenant_id,
+                database_id,
+                is_columnar_collection,
+                meta,
+                &response,
+            );
+        }
     }
 
     // Advance the tenant's observed write-HLC high-water on any
