@@ -249,6 +249,33 @@ pub(super) fn drop_sorted_index(index_name: &str) -> PhysicalPlan {
     })
 }
 
+/// Reconstruct a `RegisterIndex` plan. No surrogate binding — a secondary
+/// index carries no per-row identity; apply re-runs registration (and, if
+/// `backfill`, the scan of pre-existing rows) live on the follower, and the
+/// local WAL append makes it durable there.
+pub(super) fn register_index(
+    collection: &str,
+    field: &str,
+    field_position: usize,
+    backfill: bool,
+) -> PhysicalPlan {
+    PhysicalPlan::Kv(KvOp::RegisterIndex {
+        collection: collection.to_owned(),
+        field: field.to_owned(),
+        field_position,
+        backfill,
+    })
+}
+
+/// Reconstruct a `DropIndex` plan. Same surrogate-free contract as
+/// [`register_index`].
+pub(super) fn drop_index(collection: &str, field: &str) -> PhysicalPlan {
+    PhysicalPlan::Kv(KvOp::DropIndex {
+        collection: collection.to_owned(),
+        field: field.to_owned(),
+    })
+}
+
 pub(super) fn field_set(
     ctx: &DecodeCtx,
     collection: &str,

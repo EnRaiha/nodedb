@@ -548,6 +548,98 @@ fn kv_truncate_roundtrip() {
     }
 }
 
+/// `KvOp::RegisterIndex` (KV secondary-index DDL) must produce a
+/// `ReplicatedEntry` and round-trip verbatim. Regression guard: this op was
+/// previously classified as a non-replicated write (`kv_write` returned
+/// `None`), so `CREATE INDEX` on a KV collection committed only on the leader
+/// and never reached followers — replica divergence. Every field, especially
+/// `backfill` and `field_position` (neither inferable at apply time), must
+/// survive the wire.
+#[test]
+fn kv_register_index_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    use nodedb_physical::physical_plan::KvOp;
+    let plan = PhysicalPlan::Kv(KvOp::RegisterIndex {
+        collection: "players".into(),
+        field: "name".into(),
+        field_position: 2,
+        backfill: true,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("KvOp::RegisterIndex must now produce a ReplicatedEntry (cluster-replicated)");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, resolved_now_ms) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    assert_eq!(resolved_now_ms, None, "index DDL carries no TTL instant");
+    match decoded_plan {
+        PhysicalPlan::Kv(KvOp::RegisterIndex {
+            collection,
+            field,
+            field_position,
+            backfill,
+        }) => {
+            assert_eq!(collection, "players");
+            assert_eq!(field, "name");
+            assert_eq!(field_position, 2, "field_position must round-trip");
+            assert!(
+                backfill,
+                "backfill must round-trip (not inferable at apply)"
+            );
+        }
+        other => panic!("expected Kv(RegisterIndex), got {other:?}"),
+    }
+
+    // The `backfill = false` shape must survive distinctly, not default to true.
+    let plan = PhysicalPlan::Kv(KvOp::RegisterIndex {
+        collection: "players".into(),
+        field: "name".into(),
+        field_position: 0,
+        backfill: false,
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("KvOp::RegisterIndex must produce a ReplicatedEntry");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Kv(KvOp::RegisterIndex { backfill, .. }) => {
+            assert!(!backfill, "backfill = false must round-trip distinctly");
+        }
+        other => panic!("expected Kv(RegisterIndex), got {other:?}"),
+    }
+}
+
+/// `KvOp::DropIndex` (KV secondary-index DDL) — same cluster-replication
+/// regression guard as [`kv_register_index_roundtrip`].
+#[test]
+fn kv_drop_index_roundtrip() {
+    let tenant = TenantId::new(1);
+    let vshard = VShardId::new(0);
+
+    use nodedb_physical::physical_plan::KvOp;
+    let plan = PhysicalPlan::Kv(KvOp::DropIndex {
+        collection: "players".into(),
+        field: "name".into(),
+    });
+    let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
+        .expect("KvOp::DropIndex must now produce a ReplicatedEntry (cluster-replicated)");
+    let bytes = entry.to_bytes();
+    let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
+        .expect("from_replicated_entry error")
+        .expect("from_replicated_entry returned None");
+    match decoded_plan {
+        PhysicalPlan::Kv(KvOp::DropIndex { collection, field }) => {
+            assert_eq!(collection, "players");
+            assert_eq!(field, "name");
+        }
+        other => panic!("expected Kv(DropIndex), got {other:?}"),
+    }
+}
+
 #[test]
 fn crdt_list_delete_roundtrip() {
     let tenant = TenantId::new(1);

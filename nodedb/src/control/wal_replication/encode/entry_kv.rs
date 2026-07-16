@@ -110,6 +110,13 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
             window_end_ms: *window_end_ms,
         }),
         KvOp::DropSortedIndex { index_name } => kv::drop_sorted_index(index_name),
+        KvOp::RegisterIndex {
+            collection,
+            field,
+            field_position,
+            backfill,
+        } => kv::register_index(collection, field, *field_position, *backfill),
+        KvOp::DropIndex { collection, field } => kv::drop_index(collection, field),
         KvOp::FieldSet {
             collection,
             key,
@@ -149,16 +156,13 @@ pub(super) fn kv_write(op: &KvOp) -> Option<ReplicatedWrite> {
 
         KvOp::Truncate { collection } => kv::truncate(collection),
 
-        // Not a write — reads / scans / sorted-index queries / index
-        // DDL-metadata registration (not key-value state).
+        // Not a write — reads / scans / sorted-index queries.
         KvOp::Get { .. }
         | KvOp::Scan { .. }
         | KvOp::GetTtl { .. }
         | KvOp::BatchGet { .. }
         | KvOp::FieldGet { .. }
         | KvOp::MaterializeScan { .. }
-        | KvOp::RegisterIndex { .. }
-        | KvOp::DropIndex { .. }
         | KvOp::SortedIndexRank { .. }
         | KvOp::SortedIndexTopK { .. }
         | KvOp::SortedIndexRange { .. }

@@ -147,6 +147,8 @@ fn to_physical_plan(
         | ReplicatedWrite::KvGetSet { .. }
         | ReplicatedWrite::KvRegisterSortedIndex { .. }
         | ReplicatedWrite::KvDropSortedIndex { .. }
+        | ReplicatedWrite::KvRegisterIndex { .. }
+        | ReplicatedWrite::KvDropIndex { .. }
         | ReplicatedWrite::KvFieldSet { .. }
         | ReplicatedWrite::KvTransfer { .. }
         | ReplicatedWrite::KvTransferItem { .. } => entry_kv::decode_arm(ctx, write),

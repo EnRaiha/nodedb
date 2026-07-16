@@ -227,6 +227,27 @@ pub(super) fn drop_sorted_index(index_name: &str) -> ReplicatedWrite {
     }
 }
 
+pub(super) fn register_index(
+    collection: &str,
+    field: &str,
+    field_position: usize,
+    backfill: bool,
+) -> ReplicatedWrite {
+    ReplicatedWrite::KvRegisterIndex {
+        collection: collection.to_owned(),
+        field: field.to_owned(),
+        field_position,
+        backfill,
+    }
+}
+
+pub(super) fn drop_index(collection: &str, field: &str) -> ReplicatedWrite {
+    ReplicatedWrite::KvDropIndex {
+        collection: collection.to_owned(),
+        field: field.to_owned(),
+    }
+}
+
 pub(super) fn field_set(
     collection: &str,
     key: &[u8],

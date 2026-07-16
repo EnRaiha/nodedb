@@ -141,6 +141,13 @@ pub(super) fn decode_arm(
             window_end_ms: *window_end_ms,
         }),
         ReplicatedWrite::KvDropSortedIndex { index_name } => kv::drop_sorted_index(index_name),
+        ReplicatedWrite::KvRegisterIndex {
+            collection,
+            field,
+            field_position,
+            backfill,
+        } => kv::register_index(collection, field, *field_position, *backfill),
+        ReplicatedWrite::KvDropIndex { collection, field } => kv::drop_index(collection, field),
         ReplicatedWrite::KvFieldSet {
             collection,
             key,

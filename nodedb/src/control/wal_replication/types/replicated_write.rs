@@ -480,6 +480,29 @@ pub enum ReplicatedWrite {
     KvDropSortedIndex {
         index_name: String,
     },
+    /// Register a KV secondary index on a value field (`CREATE INDEX ON
+    /// kv_collection (field)`). Carries the same fields `KvOp::RegisterIndex`
+    /// does so replay reconstructs the op verbatim. `backfill` is carried
+    /// (not inferred) because it cannot be recomputed at apply time: it
+    /// toggles whether the live registration scanned + populated the index
+    /// from pre-existing rows, and a replica guessing either way would
+    /// diverge. Index DDL is autocommit-by-design (executed immediately, never
+    /// txn-staged), so a single shard being one Raft group makes apply
+    /// deterministic — every replica, applying in log order, sees the same
+    /// pre-existing rows the leader saw at registration.
+    KvRegisterIndex {
+        collection: String,
+        field: String,
+        field_position: usize,
+        backfill: bool,
+    },
+    /// Drop a KV secondary index from a value field. Same reconstruct-the-op
+    /// contract as `KvRegisterIndex`; removing an already-absent index on a
+    /// replica is a harmless no-op under idempotent, log-ordered apply.
+    KvDropIndex {
+        collection: String,
+        field: String,
+    },
     /// HSET-style read-modify-write field merge. Replay re-runs the merge
     /// deterministically on the follower against its own current value,
     /// same as `KvInsertOnConflictUpdate` / `PointUpdate`.
