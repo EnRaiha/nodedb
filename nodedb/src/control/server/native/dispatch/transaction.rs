@@ -47,7 +47,7 @@ impl TxnDataPlane for NativeTxnDp<'_> {
     ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
         let state = self.state;
         Box::pin(async move {
-            match state.gateway.as_ref() {
+            match state.gateway.get() {
                 Some(gw) => {
                     let gw_ctx = GatewayQueryContext {
                         tenant_id: task.tenant_id,

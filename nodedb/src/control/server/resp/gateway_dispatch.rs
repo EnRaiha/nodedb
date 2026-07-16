@@ -31,7 +31,7 @@ pub(super) async fn dispatch_kv(
     plan: PhysicalPlan,
 ) -> crate::Result<Response> {
     // RESP protocol carries no database selector; all ops target DatabaseId::DEFAULT.
-    match state.gateway.as_ref() {
+    match state.gateway.get() {
         Some(gw) => {
             let gw_ctx = QueryContext {
                 tenant_id: session.tenant_id,
@@ -75,7 +75,7 @@ pub(super) async fn dispatch_kv_write(
     plan: PhysicalPlan,
 ) -> crate::Result<Response> {
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &session.collection);
-    match state.gateway.as_ref() {
+    match state.gateway.get() {
         Some(gw) => {
             let gw_ctx = QueryContext {
                 tenant_id: session.tenant_id,

@@ -42,7 +42,7 @@ use crate::control::state::SharedState;
 /// | PutPermission / DeletePermission        | ❌ no       | permission checked at exec time |
 /// | PutOwner / DeleteOwner                  | ❌ no       | ownership does not affect plan shape |
 pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &Arc<SharedState>) {
-    let Some(ref inv) = shared.gateway_invalidator else {
+    let Some(inv) = shared.gateway_invalidator.get() else {
         return;
     };
     match entry {

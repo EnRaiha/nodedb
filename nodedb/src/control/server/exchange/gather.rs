@@ -358,7 +358,7 @@ pub async fn gather_all_vshards(
     trace_id: TraceId,
     txn_id: Option<TxnId>,
 ) -> crate::Result<GatherOutcome> {
-    let Some(gateway) = state.gateway.as_ref() else {
+    let Some(gateway) = state.gateway.get() else {
         // Single-node: delegate to the local fan-out path unchanged.
         return gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await;
     };

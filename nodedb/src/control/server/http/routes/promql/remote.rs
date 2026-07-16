@@ -84,7 +84,7 @@ pub async fn remote_write(
 
         // Route through gateway when available (cluster-aware dispatch);
         // fall back to direct local SPSC dispatch on single-node boot.
-        let dispatch_result = match state.shared.gateway.as_ref() {
+        let dispatch_result = match state.shared.gateway.get() {
             Some(gw) => {
                 let gw_ctx = QueryContext {
                     tenant_id,

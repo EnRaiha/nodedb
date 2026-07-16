@@ -149,7 +149,7 @@ pub async fn publish_remote(
 ) -> Result<u64, PublishError> {
     let gateway = state
         .gateway
-        .as_ref()
+        .get()
         .ok_or_else(|| PublishError::RemoteError("gateway not available".into()))?;
 
     let sql = format!(

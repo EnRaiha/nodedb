@@ -287,7 +287,7 @@ pub async fn query(
             // the WAL append is performed inside the dispatch core, under the
             // write-admission guard and just before the enqueue, so LSN order
             // matches apply order.
-            let payloads = match state.shared.gateway.as_ref() {
+            let payloads = match state.shared.gateway.get() {
                 Some(gw) => {
                     let gw_ctx = QueryContext {
                         tenant_id: task.tenant_id,

@@ -321,7 +321,7 @@ fn render_loop_specific_gauges(state: &AppState, out: &mut String) {
     // gateway_plan_cache_hit_ratio — derived from the plan cache's
     // hit+miss counters. Returns 0.0 when the cache has never been
     // consulted so the series never reports NaN.
-    if let Some(ref gateway) = state.shared.gateway {
+    if let Some(gateway) = state.shared.gateway.get() {
         let hits = gateway.plan_cache.cache_hit_count();
         let misses = gateway.plan_cache.cache_miss_count();
         let ratio = gateway.plan_cache.hit_ratio();

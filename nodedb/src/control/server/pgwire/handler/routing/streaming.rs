@@ -77,7 +77,7 @@ impl NodeDbPgHandler {
         // Single-node fans to local cores directly; cluster routes the scan to
         // its owning vShard (local or remote over the L4 QUIC streaming
         // transport) via the gateway and merges per-route streams.
-        let stream = if let Some(gw) = state.gateway.as_ref() {
+        let stream = if let Some(gw) = state.gateway.get() {
             let ctx = crate::control::gateway::core::QueryContext {
                 tenant_id: task.tenant_id,
                 trace_id: crate::types::TraceId::ZERO,

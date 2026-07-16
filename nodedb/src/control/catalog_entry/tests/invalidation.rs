@@ -61,8 +61,8 @@ fn make_test_state() -> (Arc<SharedState>, Arc<PlanCache>) {
     // as `None` and are written exactly once here.
     unsafe {
         let state = Arc::as_ptr(&shared) as *mut SharedState;
-        (*state).gateway = Some(gateway);
-        (*state).gateway_invalidator = Some(invalidator);
+        let _ = (*state).gateway.set(gateway);
+        let _ = (*state).gateway_invalidator.set(invalidator);
     }
 
     (shared, plan_cache)

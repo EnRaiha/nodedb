@@ -33,7 +33,7 @@ pub(super) async fn dispatch_task_via_gateway(
     let txn_id = task.txn_id;
     let plan = task.plan;
 
-    match ctx.state.gateway.as_ref() {
+    match ctx.state.gateway.get() {
         Some(gw) => {
             let gw_ctx = GatewayQueryContext {
                 tenant_id,

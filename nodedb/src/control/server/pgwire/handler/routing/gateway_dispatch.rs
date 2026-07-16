@@ -33,7 +33,7 @@ impl NodeDbPgHandler {
         tasks: &[PhysicalTask],
         consistency: ReadConsistency,
     ) -> bool {
-        if self.state.gateway.is_none() {
+        if self.state.gateway.get().is_none() {
             return false;
         }
         let routing = match self.state.cluster_routing.as_ref() {
@@ -91,7 +91,7 @@ impl NodeDbPgHandler {
         projection: Option<&OutputSchema>,
         result_formats: &[FieldFormat],
     ) -> PgWireResult<Vec<Response>> {
-        let gateway = self.state.gateway.as_ref().ok_or_else(|| {
+        let gateway = self.state.gateway.get().ok_or_else(|| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "55000".to_owned(),

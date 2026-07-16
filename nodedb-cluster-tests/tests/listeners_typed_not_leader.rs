@@ -106,14 +106,14 @@ async fn pgwire_not_leader_retry_uses_shared_gateway() {
 
     // Verify shared.gateway is installed (harness wires it before listeners bind).
     assert!(
-        node.shared.gateway.is_some(),
+        node.shared.gateway.get().is_some(),
         "shared.gateway must be installed by harness"
     );
 
     let gateway = node
         .shared
         .gateway
-        .as_ref()
+        .get()
         .expect("gateway installed by harness");
 
     // Baseline counter.
@@ -147,7 +147,7 @@ async fn pgwire_not_leader_retry_uses_shared_gateway() {
     assert!(
         node.shared
             .gateway
-            .as_ref()
+            .get()
             .expect("gateway")
             .plan_cache
             .get(&sentinel_key)
@@ -209,14 +209,17 @@ async fn http_not_leader_gateway_error_mapping() {
         .expect("CREATE COLLECTION");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    assert!(node.shared.gateway.is_some(), "gateway must be installed");
+    assert!(
+        node.shared.gateway.get().is_some(),
+        "gateway must be installed"
+    );
     assert_eq!(node.not_leader_retry_count(), 0);
 
     // Direct dispatch via shared.gateway.
     let gateway = node
         .shared
         .gateway
-        .as_ref()
+        .get()
         .expect("gateway installed by harness");
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
         collection: "nl_http_shared_gw".into(),
@@ -271,13 +274,16 @@ async fn resp_not_leader_gateway_error_mapping() {
         .expect("CREATE COLLECTION");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    assert!(node.shared.gateway.is_some(), "gateway must be installed");
+    assert!(
+        node.shared.gateway.get().is_some(),
+        "gateway must be installed"
+    );
     assert_eq!(node.not_leader_retry_count(), 0);
 
     let gateway = node
         .shared
         .gateway
-        .as_ref()
+        .get()
         .expect("gateway installed by harness");
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
         collection: "nl_resp_shared_gw".into(),
@@ -338,7 +344,10 @@ async fn ilp_not_leader_gateway_error_mapping() {
         .expect("spawn single-node node");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    assert!(node.shared.gateway.is_some(), "gateway must be installed");
+    assert!(
+        node.shared.gateway.get().is_some(),
+        "gateway must be installed"
+    );
     assert_eq!(node.not_leader_retry_count(), 0);
 
     // No collection needed for ILP validation — the test proves shared.gateway
@@ -346,7 +355,7 @@ async fn ilp_not_leader_gateway_error_mapping() {
     let gateway = node
         .shared
         .gateway
-        .as_ref()
+        .get()
         .expect("gateway installed by harness");
     let _ = gateway.not_leader_retry_count(); // observable via shared.gateway
 
@@ -392,13 +401,16 @@ async fn native_not_leader_gateway_error_mapping() {
         .expect("CREATE COLLECTION");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    assert!(node.shared.gateway.is_some(), "gateway must be installed");
+    assert!(
+        node.shared.gateway.get().is_some(),
+        "gateway must be installed"
+    );
     assert_eq!(node.not_leader_retry_count(), 0);
 
     let gateway = node
         .shared
         .gateway
-        .as_ref()
+        .get()
         .expect("gateway installed by harness");
     let put_plan = PhysicalPlan::Kv(KvOp::Put {
         collection: "nl_native_shared_gw".into(),

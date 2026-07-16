@@ -121,7 +121,7 @@ pub async fn run_preexec_scan(
     // a normal `SELECT` and returns the same msgpack payload shape, so
     // `decode_scan` applies unchanged. In single-node deployments without a
     // gateway, fall back to the local data-plane dispatch.
-    if let Some(gateway) = &shared.gateway {
+    if let Some(gateway) = shared.gateway.get() {
         let gw_ctx = crate::control::gateway::core::QueryContext {
             tenant_id,
             trace_id: TraceId::ZERO,

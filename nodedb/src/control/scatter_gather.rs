@@ -279,7 +279,7 @@ pub async fn coordinate_cross_shard_hop(
             return Ok((local_nodes, meta));
         }
     };
-    let gateway = match &shared.gateway {
+    let gateway = match shared.gateway.get() {
         Some(g) => g.clone(),
         None => {
             warn!("coordinate_cross_shard_hop called without gateway");

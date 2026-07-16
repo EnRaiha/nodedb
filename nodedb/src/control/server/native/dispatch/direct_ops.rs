@@ -519,7 +519,7 @@ async fn dispatch_single_task_raw(
     plan: PhysicalPlan,
     txn_id: Option<TxnId>,
 ) -> crate::Result<Response> {
-    match ctx.state.gateway.as_ref() {
+    match ctx.state.gateway.get() {
         Some(gw) => {
             let gw_ctx = GatewayQueryContext {
                 tenant_id,

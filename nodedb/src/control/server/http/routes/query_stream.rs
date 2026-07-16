@@ -56,7 +56,7 @@ pub(super) async fn try_open_stream(
         return Ok(None);
     };
 
-    let stream = if let Some(gw) = state.shared.gateway.as_ref() {
+    let stream = if let Some(gw) = state.shared.gateway.get() {
         let ctx = QueryContext {
             tenant_id: task.tenant_id,
             trace_id,

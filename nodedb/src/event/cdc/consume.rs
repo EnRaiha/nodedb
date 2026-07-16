@@ -240,7 +240,7 @@ pub async fn consume_remote(
 ) -> Result<ConsumeResult, ConsumeError> {
     let gateway = state
         .gateway
-        .as_ref()
+        .get()
         .ok_or(ConsumeError::NoClusterTransport)?;
 
     let sql = build_consume_sql(params);

@@ -222,7 +222,7 @@ pub async fn execute_sql(
             continue;
         }
 
-        let payloads: crate::Result<Vec<Vec<u8>>> = match shared.gateway.as_ref() {
+        let payloads: crate::Result<Vec<Vec<u8>>> = match shared.gateway.get() {
             Some(gw) => {
                 let gw_ctx = QueryContext {
                     tenant_id: task.tenant_id,

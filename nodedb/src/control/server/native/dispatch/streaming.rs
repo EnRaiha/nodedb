@@ -101,7 +101,7 @@ pub(crate) async fn try_open_sql_stream(
         return Ok(None);
     };
 
-    let stream = if let Some(gw) = ctx.state.gateway.as_ref() {
+    let stream = if let Some(gw) = ctx.state.gateway.get() {
         let gw_ctx = QueryContext {
             tenant_id: task.tenant_id,
             trace_id: crate::types::TraceId::ZERO,

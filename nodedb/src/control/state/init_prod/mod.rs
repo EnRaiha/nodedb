@@ -321,8 +321,8 @@ impl SharedState {
                 ),
             )),
             permission_cache: Arc::new(tokio::sync::RwLock::new(permission_cache)),
-            gateway_invalidator: None,
-            gateway: None,
+            gateway_invalidator: std::sync::OnceLock::new(),
+            gateway: std::sync::OnceLock::new(),
             backup_kek: None,
             quarantine_registry: Arc::new(crate::storage::quarantine::QuarantineRegistry::new()),
             admission_registry: Arc::new(

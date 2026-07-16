@@ -227,16 +227,19 @@ pub fn wire_state(
     }
 
     // Construct and install the gateway + DDL plan-cache invalidator.
+    //
+    // `Gateway` holds a `Weak<SharedState>` back-reference to its own
+    // `SharedState`, so it cannot be installed via `Arc::get_mut` (which
+    // requires strong count 1 AND weak count 0 — the gateway's own `Weak`
+    // violates the latter). `gateway`/`gateway_invalidator` are therefore
+    // `OnceLock`s, set through `&self` exactly once here at boot.
     {
-        let shared_for_gateway = Arc::clone(shared);
-        if let Some(state) = Arc::get_mut(shared) {
-            let gateway = Arc::new(crate::control::gateway::Gateway::new(shared_for_gateway));
-            let invalidator = Arc::new(crate::control::gateway::PlanCacheInvalidator::new(
-                &gateway.plan_cache,
-            ));
-            state.gateway = Some(Arc::clone(&gateway));
-            state.gateway_invalidator = Some(invalidator);
-        }
+        let gateway = Arc::new(crate::control::gateway::Gateway::new(Arc::clone(shared)));
+        let invalidator = Arc::new(crate::control::gateway::PlanCacheInvalidator::new(
+            &gateway.plan_cache,
+        ));
+        let _ = shared.gateway.set(gateway);
+        let _ = shared.gateway_invalidator.set(invalidator);
     }
 
     // Hydrate bitemporal retention registry from array catalog.

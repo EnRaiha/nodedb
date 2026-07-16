@@ -145,7 +145,7 @@ async fn flush_ilp_batch_inner(
             provenance: None,
         });
 
-        let response = match state.gateway.as_ref() {
+        let response = match state.gateway.get() {
             Some(gw) => {
                 let gw_ctx = QueryContext {
                     tenant_id,

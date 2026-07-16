@@ -455,9 +455,10 @@ pub struct SharedState {
     pub permission_cache:
         Arc<tokio::sync::RwLock<crate::control::security::permission_tree::PermissionCache>>,
     /// Gateway plan-cache invalidator; called after every DDL commit. None until `Gateway::new`.
-    pub gateway_invalidator: Option<Arc<crate::control::gateway::PlanCacheInvalidator>>,
+    pub gateway_invalidator:
+        std::sync::OnceLock<Arc<crate::control::gateway::PlanCacheInvalidator>>,
     /// The gateway: entry point for routing physical plans to the correct cluster node.
-    pub gateway: Option<Arc<crate::control::gateway::Gateway>>,
+    pub gateway: std::sync::OnceLock<Arc<crate::control::gateway::Gateway>>,
     /// Per-backup KEK for wrapping DEKs. None = unencrypted backups.
     pub backup_kek: Option<Arc<[u8; 32]>>,
     /// In-process quarantine registry for corrupt segments.

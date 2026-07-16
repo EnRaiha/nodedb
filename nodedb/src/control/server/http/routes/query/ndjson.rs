@@ -155,7 +155,7 @@ pub async fn query_ndjson(
         let plan_kind = describe_plan(&task.plan);
         let plan_for_shape = task.plan.clone();
 
-        let dispatch_result: crate::Result<Vec<Vec<u8>>> = match state.shared.gateway.as_ref() {
+        let dispatch_result: crate::Result<Vec<Vec<u8>>> = match state.shared.gateway.get() {
             Some(gw) => {
                 let gw_ctx = QueryContext {
                     tenant_id: task.tenant_id,

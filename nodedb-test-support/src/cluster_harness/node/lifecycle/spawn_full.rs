@@ -296,31 +296,17 @@ impl TestClusterNode {
         });
 
         // Construct the gateway and install it (plus its DDL invalidator) on
-        // SharedState, mirroring what main.rs does before listeners bind.
-        //
-        // We use a raw-pointer write because `shared` has already been cloned
-        // by the response poller task, making `Arc::get_mut` return None.
-        // This is sound at this point in setup because:
-        //   1. The response poller only calls `poll_and_route_responses()`,
-        //      which never touches the `gateway` or `gateway_invalidator` fields.
-        //   2. No other concurrent task reads those fields before the pgwire
-        //      listener binds (a few lines below).
-        //   3. The write completes before the pgwire listener spawns, so the
-        //      happens-before relationship is guaranteed.
+        // SharedState, mirroring what main.rs does before listeners bind. The
+        // fields are `OnceLock`s, set through `&self`, so no `Arc::get_mut`
+        // (which `shared` being already cloned would defeat) or raw-pointer
+        // write is needed.
         {
-            let shared_for_gw = Arc::clone(&shared);
-            let gateway = Arc::new(nodedb::control::gateway::Gateway::new(shared_for_gw));
+            let gateway = Arc::new(nodedb::control::gateway::Gateway::new(Arc::clone(&shared)));
             let invalidator = Arc::new(nodedb::control::gateway::PlanCacheInvalidator::new(
                 &gateway.plan_cache,
             ));
-            // SAFETY: no concurrent reads of `gateway` / `gateway_invalidator`
-            // at this point (see comment above). Fields start as `None` and
-            // are written once here before any listener starts.
-            unsafe {
-                let state = Arc::as_ptr(&shared) as *mut nodedb::control::state::SharedState;
-                (*state).gateway = Some(Arc::clone(&gateway));
-                (*state).gateway_invalidator = Some(invalidator);
-            }
+            let _ = shared.gateway.set(gateway);
+            let _ = shared.gateway_invalidator.set(invalidator);
         }
 
         // pgwire listener.

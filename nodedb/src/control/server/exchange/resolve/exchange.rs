@@ -164,7 +164,7 @@ async fn resolve_exchange(
             // `gather_all_vshards` branch below whose `GatherOutcome` preserves
             // `shard_watermarks`.
             if !as_aggregate && txn_id.is_none() && child.is_streamable_unordered_scan() {
-                let stream = if let Some(gw) = state.gateway.as_ref() {
+                let stream = if let Some(gw) = state.gateway.get() {
                     let ctx = crate::control::gateway::core::QueryContext {
                         tenant_id,
                         trace_id,
@@ -290,7 +290,10 @@ async fn resolve_exchange(
             // `ProviderScan`. The HashJoin shipped to the probe node is then
             // self-contained. Only the RIGHT/build side is gathered; the
             // LEFT/probe side stays local to the routed vShard.
-            if state.gateway.is_some() && right_input.is_none() && !right_collection.is_empty() {
+            if state.gateway.get().is_some()
+                && right_input.is_none()
+                && !right_collection.is_empty()
+            {
                 right_input = gather_join_build_side(
                     state,
                     database_id,

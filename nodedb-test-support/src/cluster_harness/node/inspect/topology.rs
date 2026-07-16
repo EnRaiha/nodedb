@@ -281,7 +281,7 @@ impl TestClusterNode {
     pub fn not_leader_retry_count(&self) -> u64 {
         self.shared
             .gateway
-            .as_ref()
+            .get()
             .map(|gw| gw.not_leader_retry_count())
             .unwrap_or(0)
     }

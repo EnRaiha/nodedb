@@ -145,14 +145,11 @@ pub(in crate::control::server::graph_dispatch) async fn dispatch_superstep_to_no
 /// dispatch primitive requires when forwarding a staged write / overlay drop to
 /// a remote leader.
 pub(crate) fn gateway_shared(state: &SharedState) -> crate::Result<Arc<SharedState>> {
-    let gateway = state
-        .gateway
-        .as_ref()
-        .ok_or_else(|| crate::Error::Internal {
-            detail: "graph scatter: cluster routing present but gateway unavailable for \
+    let gateway = state.gateway.get().ok_or_else(|| crate::Error::Internal {
+        detail: "graph scatter: cluster routing present but gateway unavailable for \
                  remote dispatch"
-                .into(),
-        })?;
+            .into(),
+    })?;
     // Upgrade the gateway's `Weak<SharedState>` back-reference. Always
     // succeeds while the node runs; a `None` (racing full teardown) surfaces
     // as the accessor's own typed shutdown error.
