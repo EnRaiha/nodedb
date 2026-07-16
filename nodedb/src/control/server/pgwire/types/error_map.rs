@@ -104,7 +104,49 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
         crate::Error::OllpExhausted { .. } => {
             ("ERROR", sqlstate::SERIALIZATION_FAILURE, err.to_string())
         }
+        crate::Error::RemoteTyped { code, message } => {
+            ("ERROR", numeric_code_to_sqlstate(*code), message.clone())
+        }
         _ => ("ERROR", sqlstate::INTERNAL_ERROR, err.to_string()),
+    }
+}
+
+/// Map a numeric `ErrorCode` received from a remote node back to a SQLSTATE.
+/// Local errors map by variant identity above; a remote error arrives as a bare
+/// numeric code, so this recovers the classification. Each bucket mirrors the
+/// sqlstate the corresponding local variant arm chooses above for the same
+/// numeric code, so a constraint violation (say) maps to the same SQLSTATE
+/// whether it happened locally or on a remote node. Unmapped/unknown codes
+/// fall back to INTERNAL_ERROR — the behaviour before codes were preserved.
+pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> &'static str {
+    use nodedb_types::error::ErrorCode as Ec;
+    match code {
+        // Mirrors the `RejectedConstraint` arm.
+        Ec::CONSTRAINT_VIOLATION => sqlstate::UNIQUE_VIOLATION,
+        // Mirrors the `ConflictRetry` / `CalvinSerializationConflict` /
+        // `SourceFrozen` / `OllpExhausted` arms.
+        Ec::WRITE_CONFLICT => sqlstate::SERIALIZATION_FAILURE,
+        // Mirrors the `DeadlineExceeded` arm.
+        Ec::DEADLINE_EXCEEDED => sqlstate::QUERY_CANCELED,
+        // Mirrors the `CollectionNotFound` / `CollectionDeactivated` arms.
+        Ec::COLLECTION_NOT_FOUND | Ec::COLLECTION_DEACTIVATED => sqlstate::UNDEFINED_TABLE,
+        // Mirrors the `DocumentNotFound` arm.
+        Ec::DOCUMENT_NOT_FOUND => sqlstate::NO_DATA,
+        // Mirrors the `BadRequest` / `PlanError` arms.
+        Ec::BAD_REQUEST | Ec::PLAN_ERROR => sqlstate::SYNTAX_ERROR,
+        // Mirrors the `FanOutExceeded` arm.
+        Ec::FAN_OUT_EXCEEDED => sqlstate::STATEMENT_TOO_COMPLEX,
+        // Mirrors the `RejectedAuthz` arm.
+        Ec::AUTHORIZATION_DENIED => sqlstate::INSUFFICIENT_PRIVILEGE,
+        // Mirrors the `RateExceeded` arm.
+        Ec::RATE_EXCEEDED => sqlstate::TOO_MANY_CONNECTIONS,
+        // Mirrors the `MemoryExhausted` / `Backpressure` arms.
+        Ec::MEMORY_EXHAUSTED => sqlstate::OUT_OF_MEMORY,
+        // Mirrors the `NoLeader` arm.
+        Ec::NO_LEADER => sqlstate::LOCK_NOT_AVAILABLE,
+        // Mirrors the `NotLeader` arm.
+        Ec::NOT_LEADER => sqlstate::DATABASE_DROPPED,
+        _ => sqlstate::INTERNAL_ERROR,
     }
 }
 

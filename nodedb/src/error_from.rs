@@ -217,6 +217,7 @@ impl From<Error> for NodeDbError {
             Error::Bridge { detail } => NodeDbError::bridge(detail),
             Error::VersionCompat { detail } => NodeDbError::cluster(detail),
             Error::Internal { detail } => NodeDbError::internal(detail),
+            Error::RemoteTyped { code, message } => NodeDbError::remote_typed(code, message),
             err @ Error::DescriptorVersionAnomaly { .. } => NodeDbError::internal(err.to_string()),
             Error::Promql(e) => NodeDbError::bad_request(e.to_string()),
             Error::DependentObjectsExist {
@@ -356,7 +357,19 @@ impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
             TypedClusterError::DeadlineExceeded { .. } => Error::DeadlineExceeded {
                 request_id: crate::types::RequestId::new(0),
             },
-            TypedClusterError::Internal { message, .. } => Error::Internal { detail: message },
+            TypedClusterError::Internal { code, message } => {
+                // `code == 0` covers legacy peers that never populated the field, and
+                // an out-of-range value covers a future wire code this build doesn't
+                // know about yet — both degrade to the pre-existing generic behaviour
+                // rather than losing the message or panicking on a bad cast.
+                match u16::try_from(code) {
+                    Ok(code_u16) if code_u16 != 0 => Error::RemoteTyped {
+                        code: nodedb_types::error::ErrorCode(code_u16),
+                        message,
+                    },
+                    _ => Error::Internal { detail: message },
+                }
+            }
         }
     }
 }
@@ -385,10 +398,100 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
                 term: 0,
             },
             Error::DeadlineExceeded { .. } => TypedClusterError::DeadlineExceeded { elapsed_ms: 0 },
-            other => TypedClusterError::Internal {
-                code: 0,
-                message: other.to_string(),
+            Error::RemoteTyped { code, message } => TypedClusterError::Internal {
+                code: u32::from(code.0),
+                message,
             },
+            other => {
+                // Derive a real numeric code instead of hardcoding 0, so a
+                // multi-hop forward (this node re-encoding a local error for a
+                // further remote call) still lets the eventual client recover
+                // the classification instead of seeing a bare internal error.
+                let message = other.to_string();
+                let code = u32::from(NodeDbError::from(other).code().0);
+                TypedClusterError::Internal { code, message }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_cluster::rpc_codec::TypedClusterError;
+    use nodedb_types::error::ErrorCode;
+
+    use super::Error;
+    use crate::types::TenantId;
+
+    /// A legacy peer (or one that never classified the failure) sends `code ==
+    /// 0`. Decoding must degrade to the pre-existing generic `Error::Internal`
+    /// rather than fabricating a bogus `ErrorCode(0)` classification.
+    #[test]
+    fn decode_zero_code_degrades_to_internal() {
+        let wire = TypedClusterError::Internal {
+            code: 0,
+            message: "boom".to_owned(),
+        };
+        let err: Error = wire.into();
+        match err {
+            Error::Internal { detail } => assert_eq!(detail, "boom"),
+            other => panic!("expected Error::Internal, got {other:?}"),
+        }
+    }
+
+    /// A remote peer that populated a real `ErrorCode` must decode to
+    /// `Error::RemoteTyped`, carrying that code forward instead of losing it.
+    #[test]
+    fn decode_real_code_becomes_remote_typed() {
+        let wire = TypedClusterError::Internal {
+            code: u32::from(ErrorCode::CONSTRAINT_VIOLATION.0),
+            message: "duplicate key".to_owned(),
+        };
+        let err: Error = wire.into();
+        match err {
+            Error::RemoteTyped { code, message } => {
+                assert_eq!(code, ErrorCode::CONSTRAINT_VIOLATION);
+                assert_eq!(message, "duplicate key");
+            }
+            other => panic!("expected Error::RemoteTyped, got {other:?}"),
+        }
+    }
+
+    /// Encoding a `RejectedConstraint` must derive its real code
+    /// (`CONSTRAINT_VIOLATION`), never the old hardcoded 0 catch-all.
+    #[test]
+    fn encode_rejected_constraint_derives_nonzero_code() {
+        let err = Error::RejectedConstraint {
+            collection: "users".to_owned(),
+            constraint: "unique_email".to_owned(),
+            detail: "duplicate email".to_owned(),
+        };
+        let wire: TypedClusterError = err.into();
+        match wire {
+            TypedClusterError::Internal { code, .. } => {
+                assert_ne!(code, 0);
+                assert_eq!(code, u32::from(ErrorCode::CONSTRAINT_VIOLATION.0));
+            }
+            other => panic!("expected TypedClusterError::Internal, got {other:?}"),
+        }
+    }
+
+    /// Encoding then decoding a typed error must preserve the numeric code
+    /// end to end, which is the whole point of this fix.
+    #[test]
+    fn round_trip_preserves_code() {
+        let original = Error::RejectedAuthz {
+            tenant_id: TenantId::new(0),
+            resource: "secret_vault".to_owned(),
+        };
+        let wire: TypedClusterError = original.into();
+        let decoded: Error = wire.into();
+        match decoded {
+            Error::RemoteTyped { code, message } => {
+                assert_eq!(code, ErrorCode::AUTHORIZATION_DENIED);
+                assert!(message.contains("secret_vault"));
+            }
+            other => panic!("expected Error::RemoteTyped, got {other:?}"),
         }
     }
 }

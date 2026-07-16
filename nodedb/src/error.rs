@@ -275,6 +275,16 @@ pub enum Error {
     #[error("internal error: {detail}")]
     Internal { detail: String },
 
+    /// A typed error surfaced from a remote node during cluster RPC. Preserves the
+    /// transmitted numeric `ErrorCode` alongside the message so the client-facing
+    /// mapping can recover the precise classification instead of collapsing every
+    /// remote failure to a generic internal error.
+    #[error("remote error [{code}]: {message}")]
+    RemoteTyped {
+        code: nodedb_types::error::ErrorCode,
+        message: String,
+    },
+
     #[error(
         "descriptor version anomaly for '{descriptor}': replicated version {carried} \
          is inconsistent with local prior {prior} (expected {prior} or prior+1)"

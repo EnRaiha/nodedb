@@ -45,6 +45,10 @@ impl GatewayErrorMap {
             Error::CrossCollectionNotColocated { .. } => {
                 (sqlstate::FEATURE_NOT_SUPPORTED, err.to_string())
             }
+            Error::RemoteTyped { code, message } => (
+                crate::control::server::pgwire::types::error_map::numeric_code_to_sqlstate(*code),
+                message.clone(),
+            ),
             _ => (sqlstate::INTERNAL_ERROR, err.to_string()),
         }
     }
@@ -82,6 +86,9 @@ impl GatewayErrorMap {
             // 501 Not Implemented: a valid op refused because cross-core
             // source-shipping is not yet supported (fail-closed safety floor).
             Error::CrossCollectionNotColocated { .. } => (501, err.to_string()),
+            Error::RemoteTyped { code, message } => {
+                (remote_code_to_http_status(*code), message.clone())
+            }
             _ => (500, err.to_string()),
         }
     }
@@ -106,6 +113,9 @@ impl GatewayErrorMap {
             Error::RejectedConstraint { detail, .. } => format!("CONSTRAINT {detail}"),
             Error::RetryableSchemaChanged { descriptor } => {
                 format!("ERR schema changed ({descriptor}); please retry")
+            }
+            Error::RemoteTyped { code, message } => {
+                format!("{} {message}", remote_code_to_resp_prefix(*code))
             }
             _ => format!("ERR {err}"),
         }
@@ -145,8 +155,49 @@ impl GatewayErrorMap {
             }
             Error::RejectedConstraint { detail, .. } => (CODE_CONSTRAINT, detail.clone()),
             Error::CrossCollectionNotColocated { .. } => (CODE_BAD_REQUEST, err.to_string()),
+            Error::RemoteTyped { code, message } => {
+                use nodedb_types::error::ErrorCode as Ec;
+                let native_code = match *code {
+                    Ec::DEADLINE_EXCEEDED => CODE_DEADLINE,
+                    Ec::COLLECTION_NOT_FOUND => CODE_NOT_FOUND,
+                    Ec::AUTHORIZATION_DENIED => CODE_AUTHZ,
+                    Ec::BAD_REQUEST | Ec::PLAN_ERROR => CODE_BAD_REQUEST,
+                    Ec::CONSTRAINT_VIOLATION => CODE_CONSTRAINT,
+                    _ => CODE_INTERNAL,
+                };
+                (native_code, message.clone())
+            }
             _ => (CODE_INTERNAL, err.to_string()),
         }
+    }
+}
+
+/// Map a numeric `ErrorCode` from a `RemoteTyped` error to an HTTP status,
+/// mirroring the local variant arms in `to_http` above for the same
+/// condition (e.g. `CONSTRAINT_VIOLATION` mirrors `RejectedConstraint`'s 409).
+fn remote_code_to_http_status(code: nodedb_types::error::ErrorCode) -> u16 {
+    use nodedb_types::error::ErrorCode as Ec;
+    match code {
+        Ec::NOT_LEADER | Ec::NO_LEADER => 503,
+        Ec::DEADLINE_EXCEEDED => 504,
+        Ec::COLLECTION_NOT_FOUND => 404,
+        Ec::AUTHORIZATION_DENIED => 403,
+        Ec::BAD_REQUEST | Ec::PLAN_ERROR => 400,
+        Ec::CONSTRAINT_VIOLATION | Ec::WRITE_CONFLICT => 409,
+        _ => 500,
+    }
+}
+
+/// Map a numeric `ErrorCode` from a `RemoteTyped` error to a RESP error
+/// prefix, mirroring the local variant arms in `to_resp` above.
+fn remote_code_to_resp_prefix(code: nodedb_types::error::ErrorCode) -> &'static str {
+    use nodedb_types::error::ErrorCode as Ec;
+    match code {
+        Ec::DEADLINE_EXCEEDED => "TIMEOUT",
+        Ec::COLLECTION_NOT_FOUND => "NOTFOUND",
+        Ec::AUTHORIZATION_DENIED => "NOPERM",
+        Ec::CONSTRAINT_VIOLATION => "CONSTRAINT",
+        _ => "ERR",
     }
 }
 
@@ -349,5 +400,82 @@ mod tests {
     fn native_internal() {
         let (code, _) = GatewayErrorMap::to_native(&internal());
         assert_eq!(code, 99);
+    }
+
+    // --- RemoteTyped helpers ---
+    //
+    // `RemoteTyped` carries a numeric `ErrorCode` from a remote node across
+    // cluster RPC. `remote_code_to_http_status` / `remote_code_to_resp_prefix`
+    // translate that numeric code back into listener-specific shapes. The
+    // unmapped-code case matters because remote peers may run newer code with
+    // error codes this build doesn't recognize yet (rolling upgrades); the
+    // fallback must degrade to a generic status/prefix rather than panicking
+    // or misclassifying the failure.
+
+    #[test]
+    fn remote_http_status_maps_known_code() {
+        use nodedb_types::error::ErrorCode;
+        // Mirrors `RejectedConstraint`'s 409 in `to_http` above.
+        assert_eq!(
+            remote_code_to_http_status(ErrorCode::CONSTRAINT_VIOLATION),
+            409
+        );
+        assert_eq!(
+            remote_code_to_http_status(ErrorCode::AUTHORIZATION_DENIED),
+            403
+        );
+    }
+
+    #[test]
+    fn remote_http_status_unmapped_code_falls_back_to_500() {
+        use nodedb_types::error::ErrorCode;
+        // A code with no explicit arm (e.g. one a newer remote node minted
+        // that this build doesn't recognize) must degrade to the generic
+        // 500 fallback, not silently misreport a specific status.
+        assert_eq!(remote_code_to_http_status(ErrorCode(65000)), 500);
+    }
+
+    #[test]
+    fn remote_resp_prefix_maps_known_code() {
+        use nodedb_types::error::ErrorCode;
+        assert_eq!(
+            remote_code_to_resp_prefix(ErrorCode::AUTHORIZATION_DENIED),
+            "NOPERM"
+        );
+        assert_eq!(
+            remote_code_to_resp_prefix(ErrorCode::CONSTRAINT_VIOLATION),
+            "CONSTRAINT"
+        );
+    }
+
+    #[test]
+    fn remote_resp_prefix_unmapped_code_falls_back_to_err() {
+        use nodedb_types::error::ErrorCode;
+        // Same degrade path as the HTTP fallback above: an unrecognized
+        // remote code must still surface as the generic `ERR` prefix.
+        assert_eq!(remote_code_to_resp_prefix(ErrorCode(65000)), "ERR");
+    }
+
+    #[test]
+    fn to_http_remote_typed_is_wired_to_helper() {
+        use nodedb_types::error::ErrorCode;
+        let err = Error::RemoteTyped {
+            code: ErrorCode::AUTHORIZATION_DENIED,
+            message: "remote denied write".into(),
+        };
+        let (status, msg) = GatewayErrorMap::to_http(&err);
+        assert_eq!(status, 403);
+        assert_eq!(msg, "remote denied write");
+    }
+
+    #[test]
+    fn to_resp_remote_typed_is_wired_to_helper() {
+        use nodedb_types::error::ErrorCode;
+        let err = Error::RemoteTyped {
+            code: ErrorCode::CONSTRAINT_VIOLATION,
+            message: "unique key clash".into(),
+        };
+        let msg = GatewayErrorMap::to_resp(&err);
+        assert_eq!(msg, "CONSTRAINT unique key clash");
     }
 }
