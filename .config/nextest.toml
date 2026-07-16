@@ -51,8 +51,22 @@ retries = { backoff = "fixed", count = 2, delay = "1s" }
 # default 30s × 4 = 120s ceiling stays in force for unit tests.
 slow-timeout = { period = "30s", terminate-after = 6 }
 
+# Tests that spawn REAL `nodedb` server OS processes (crash-recovery,
+# startup-failure, shutdown lifecycle). Each brings up a full Data Plane
+# (per-core threads, jemalloc arenas, listeners); running several at once
+# exhausts ports / connections and causes spurious `ConnectionRefused`.
+# Serialize them like the cluster group so at most one runs at a time.
+[[profile.default.overrides]]
+filter = 'binary(crash_recovery) | binary(startup_failure) | binary(shutdown_in_flight) | binary(shutdown_budget) | binary(shutdown_abort_offender) | binary(shutdown_idempotent)'
+test-group = 'server-process'
+# Claim every slot so each real-server test runs strictly ALONE — no other
+# server-spawning test (in-process or OS-process) runs alongside to steal
+# ports/CPU and cause spurious connection failures.
+threads-required = 'num-test-threads'
+
 [test-groups]
 cluster = { max-threads = 1 }
+server-process = { max-threads = 1 }
 
 [profile.ci]
 # CI inherits the default profile (cluster group, threads-required,

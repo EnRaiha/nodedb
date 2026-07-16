@@ -6,7 +6,8 @@
 //! survive a `kill -9`, because the write path acks the client only after
 //! the WAL append is persisted. Reopening the same data directory on a
 //! fresh process replays the WAL and must restore the row. Covers
-//! document_strict, KV, and vector-index (HNSW rebuild from WAL) recovery.
+//! document_strict, KV, vector-index (HNSW rebuild from WAL), and spatial
+//! R-tree recovery.
 
 mod crash_harness;
 
@@ -130,5 +131,52 @@ async fn vector_index_survives_kill_9() {
         nn_r2,
         vec!["r2".to_string()],
         "vector index not rebuilt after kill -9: nearest neighbour of r2's embedding was not r2 (got {nn_r2:?})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spatial_index_survives_kill_9() {
+    let mut h = CrashHarness::new();
+    h.spawn();
+    h.wait_ready(Duration::from_secs(20));
+
+    h.exec(
+        "CREATE COLLECTION geo_places (id TEXT, location GEOMETRY SPATIAL_INDEX, name TEXT) \
+         WITH (engine='spatial')",
+    )
+    .await;
+    h.exec(
+        "INSERT INTO geo_places (id, location, name) \
+         VALUES ('p1', ST_Point(-73.9857, 40.7580), 'Times Square')",
+    )
+    .await;
+    h.exec(
+        "INSERT INTO geo_places (id, location, name) \
+         VALUES ('p2', ST_Point(2.3522, 48.8566), 'Paris')",
+    )
+    .await;
+
+    // Live sanity BEFORE the crash: the R-tree query works, so any post-restart
+    // failure is attributable to recovery, not test setup.
+    let q = "SELECT name FROM geo_places WHERE \
+             ST_DWithin(location, '{\"type\":\"Point\",\"coordinates\":[-73.9857,40.7580]}', 5000)";
+    let live = h.query_col(q, "name").await;
+    assert_eq!(
+        live,
+        vec!["Times Square".to_string()],
+        "spatial query must work BEFORE the crash (test-setup sanity): {live:?}"
+    );
+
+    h.kill_9();
+    h.reopen();
+
+    // The in-memory R-tree must be rebuilt from the durable document store on
+    // boot: the geometry documents survive in redb, so a kill -9 that emptied
+    // the WAL must not leave the spatial index empty.
+    let recovered = h.query_col(q, "name").await;
+    assert_eq!(
+        recovered,
+        vec!["Times Square".to_string()],
+        "spatial R-tree not rebuilt after kill -9 (got {recovered:?})"
     );
 }
