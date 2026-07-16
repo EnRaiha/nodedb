@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Phase 4 of `start_raft`: install the sync/async Raft proposer and
-//! compactor closures onto `SharedState`, and spawn the background apply
-//! loop that drains `DistributedApplier::apply_committed` into the Data
-//! Plane and notifies propose waiters.
+//! Phase 4 of `start_raft`: install the sync/async Raft proposer, compactor,
+//! and durable applied-index closures onto `SharedState`, and spawn the
+//! background apply loop that drains `DistributedApplier::apply_committed`
+//! into the Data Plane and notifies propose waiters.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -16,8 +16,9 @@ use crate::control::state::SharedState;
 
 use super::loop_build::RaftLoopType;
 
-/// Install the sync `raft_proposer` / `raft_compactor`, the async
-/// `async_raft_proposer`, and spawn the apply loop.
+/// Install the sync `raft_proposer` / `raft_compactor` /
+/// `raft_applied_index_sink`, the async `async_raft_proposer`, and spawn the
+/// apply loop.
 pub(super) fn wire_proposers(
     shared: &Arc<SharedState>,
     raft_loop: &Arc<RaftLoopType>,
@@ -71,6 +72,35 @@ pub(super) fn wire_proposers(
         });
     if shared.raft_compactor.set(compactor).is_err() {
         tracing::warn!("raft_compactor already set — start_raft appears to have run twice");
+    }
+
+    // Wire the durable applied-index sink. `run_apply_loop` invokes this for
+    // each committed entry once the write funnel's durable-at-ack barrier has
+    // fsynced that entry's redo record, so the next boot resumes Raft delivery
+    // above it — without this floor the whole retained log is re-delivered on
+    // every boot and WAL replay applies the same entries a second time.
+    // Weak for the same cycle-breaking reason as `raft_proposer` above.
+    let raft_loop_for_applied = Arc::downgrade(raft_loop);
+    let applied_index_sink: Arc<crate::control::wal_replication::RaftAppliedIndexSink> =
+        Arc::new(move |group_id, applied_index| {
+            let rl = raft_loop_for_applied
+                .upgrade()
+                .ok_or_else(|| crate::Error::Internal {
+                    detail: "raft applied index: cluster not running".into(),
+                })?;
+            rl.save_applied_index(group_id, applied_index)
+                .map_err(|e| crate::Error::Internal {
+                    detail: format!("raft applied index: {e}"),
+                })
+        });
+    if shared
+        .raft_applied_index_sink
+        .set(applied_index_sink)
+        .is_err()
+    {
+        tracing::warn!(
+            "raft_applied_index_sink already set — start_raft appears to have run twice"
+        );
     }
 
     // Install the async proposer with transparent leader forwarding.
@@ -131,10 +161,16 @@ pub(super) fn wire_proposers(
                             detail: format!("apply error: {other}"),
                         },
                     })
-                    // Carry the committed log index out as the write's
-                    // per-collection version (`coll_write_lsn`), stamped by the
-                    // apply loop from this same `entry.index`.
-                    .map(|payload| (payload, crate::types::Lsn::new(log_index)))
+                    // Carry out the write-version the APPLY side stamped, not
+                    // `log_index`. The tracker resolves on the node that applied
+                    // the entry locally, so `write_version` is this replica's own
+                    // post-write `coll_write_lsn` — a WAL LSN, the same domain
+                    // every other feed of that map records in, and the only
+                    // domain the shard-local OCC read validator compares in. The
+                    // raft log index is a per-group counter on a different scale
+                    // entirely; publishing it here made reads validate a WAL LSN
+                    // against a log index.
+                    .map(|applied| (applied.payload, applied.write_version))
             })
         });
     if shared.async_raft_proposer.set(async_proposer).is_err() {

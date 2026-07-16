@@ -29,6 +29,21 @@ pub trait LogStorage: Send {
 
     /// Load hard state on startup.
     fn load_hard_state(&self) -> Result<HardState>;
+
+    /// Persist the durable applied index (must be durable before returning).
+    ///
+    /// `index` names an entry whose state-machine effects are ALREADY durable.
+    /// The next boot resumes delivery at `index + 1`, so saving ahead of
+    /// durability drops the entries in between; saving behind it re-delivers
+    /// them.
+    fn save_applied_index(&mut self, index: u64) -> Result<()>;
+
+    /// Load the durable applied index on startup.
+    ///
+    /// Returns 0 when no index has ever been saved, which replays the whole
+    /// retained log — the safe direction for storage written before this index
+    /// existed.
+    fn load_applied_index(&self) -> Result<u64>;
 }
 
 /// In-memory storage for testing.
@@ -38,6 +53,7 @@ pub struct MemStorage {
     hard_state: HardState,
     snapshot_index: u64,
     snapshot_term: u64,
+    applied_index: u64,
 }
 
 impl MemStorage {
@@ -91,6 +107,15 @@ impl LogStorage for MemStorage {
 
     fn load_hard_state(&self) -> Result<HardState> {
         Ok(self.hard_state.clone())
+    }
+
+    fn save_applied_index(&mut self, index: u64) -> Result<()> {
+        self.applied_index = index;
+        Ok(())
+    }
+
+    fn load_applied_index(&self) -> Result<u64> {
+        Ok(self.applied_index)
     }
 }
 
@@ -164,5 +189,15 @@ mod tests {
         s.save_hard_state(&hs).unwrap();
         let loaded = s.load_hard_state().unwrap();
         assert_eq!(loaded, hs);
+    }
+
+    #[test]
+    fn mem_storage_applied_index() {
+        let mut s = MemStorage::new();
+        // Never saved: replay the whole retained log.
+        assert_eq!(s.load_applied_index().unwrap(), 0);
+
+        s.save_applied_index(42).unwrap();
+        assert_eq!(s.load_applied_index().unwrap(), 42);
     }
 }

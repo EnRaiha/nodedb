@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! The dispatch core: sends a physical plan to the Data Plane over the SPSC
-//! bridge and awaits its response, funneling every write through the
-//! write-admission gate and (for autocommit writes) the WAL append.
+//! The dispatch core: resolves Exchange data-movement nodes, then hands the
+//! plan to the shared Control-Plane write funnel (`submit_write`), which owns
+//! write admission, the WAL append, the enqueue, and the response collect.
 
-use std::time::{Duration, Instant};
-
-use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response};
+use crate::bridge::envelope::{PhysicalPlan, Response};
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
-use nodedb_physical::physical_plan::TimeseriesOp;
+use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 
-use super::change_events::{extract_write_metadata, publish_change_event};
-use super::collect::{DispatchCollectError, collect_bounded_response};
+use super::submit_write::{
+    ChangeFeedOwner, SubmitWrite, WalDurability, WriteOrdering, submit_write,
+};
 use super::types::{AutocommitWrite, DataPlaneDispatch, WriteDispatch};
 
 /// Dispatch a physical plan to the Data Plane and await the response.
@@ -63,11 +61,12 @@ pub async fn dispatch_to_data_plane_with_source(
             trace_id,
             event_source,
             txn_id: None,
-            wal_lsn: None,
-            resolved_now_ms: None,
             // The caller (trigger / sync / internal funnel) owns durability on its
-            // own path; the core does not append here.
-            append_wal: false,
+            // own path; the funnel does not append here.
+            durability: WalDurability::CallerSupplied {
+                wal_lsn: None,
+                resolved_now_ms: None,
+            },
         },
     )
     .await
@@ -108,29 +107,30 @@ pub(crate) async fn dispatch_write_to_data_plane(
             trace_id,
             event_source,
             txn_id,
-            wal_lsn,
-            resolved_now_ms,
             // Caller pre-appended and supplied `wal_lsn` (e.g. the procedural
             // batch-flush path whose dispatched plan is a `TransactionBatch`
-            // whose per-task records were appended upstream): the core must not
+            // whose per-task records were appended upstream): the funnel must not
             // append again.
-            append_wal: false,
+            durability: WalDurability::CallerSupplied {
+                wal_lsn,
+                resolved_now_ms,
+            },
         },
     )
     .await
 }
 
-/// Dispatch an autocommit write whose WAL append the core performs *under the
+/// Dispatch an autocommit write whose WAL append the funnel performs *under the
 /// write-admission guard*, immediately before the enqueue.
 ///
-/// This is the funnel for single-node local writes that own their own
+/// This is the entry point for single-node local writes that own their own
 /// autocommit durability (the native SQL / direct-op boot path, HTTP query,
 /// RESP KV write, protocol-neutral INSERT/UPSERT). The WAL LSN must be minted
 /// after admission and just before the dispatcher enqueue so that WAL-LSN order
-/// equals Data-Plane apply order per key; performing the append inside the core
-/// (rather than at the caller, before admission) is what closes that ordering
-/// gap. `wal_lsn` / `resolved_now_ms` are therefore *not* caller inputs — the
-/// core resolves them.
+/// equals Data-Plane apply order per key; performing the append inside the
+/// funnel (rather than at the caller, before admission) is what closes that
+/// ordering gap. `wal_lsn` / `resolved_now_ms` are therefore *not* caller
+/// inputs — the funnel resolves them.
 pub(crate) async fn dispatch_autocommit_write(
     shared: &SharedState,
     write: AutocommitWrite,
@@ -154,11 +154,9 @@ pub(crate) async fn dispatch_autocommit_write(
             trace_id,
             event_source,
             txn_id,
-            wal_lsn: None,
-            resolved_now_ms: None,
-            // The core appends the WAL record under the admission guard just
+            // The funnel appends the WAL record under the admission guard just
             // before enqueue and stamps the minted LSN onto the `Request`.
-            append_wal: true,
+            durability: WalDurability::AppendHere { now_override: None },
         },
     )
     .await
@@ -188,12 +186,12 @@ pub async fn dispatch_to_data_plane_with_txn(
             event_source: crate::event::EventSource::User,
             txn_id,
             // Staged in-transaction writes are not yet durably committed; the
-            // committed write version is recorded at COMMIT via the batch funnel.
-            wal_lsn: None,
-            resolved_now_ms: None,
-            // Durability for a staged write is deferred to COMMIT — the core
-            // must not append here.
-            append_wal: false,
+            // committed write version is recorded at COMMIT via the batch funnel,
+            // so durability is not the funnel's to append here.
+            durability: WalDurability::CallerSupplied {
+                wal_lsn: None,
+                resolved_now_ms: None,
+            },
         },
     )
     .await
@@ -211,9 +209,7 @@ async fn dispatch_to_data_plane_inner(
         trace_id,
         event_source,
         txn_id,
-        wal_lsn,
-        resolved_now_ms,
-        append_wal,
+        durability,
     } = params;
     // Resolve any Exchange data-movement nodes before dispatch: a root-level
     // Gather fans the child to all cores and returns the merged response here;
@@ -245,270 +241,26 @@ async fn dispatch_to_data_plane_inner(
         }
     };
 
-    // Extract write metadata before the plan is moved into the request.
-    let is_columnar_collection = matches!(
-        &plan,
-        PhysicalPlan::Columnar(_)
-            | PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. })
-            | PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. })
-    );
-    let change_meta = extract_write_metadata(&plan, tenant_id);
-
-    // Post-apply redo classification, computed before `plan` is moved into the
-    // `Request`. For a write whose autocommit WAL path mints no redo of its own
-    // but whose effect must survive a WAL-only restart (a document PointUpdate
-    // on a collection carrying a secondary vector index), the durable redo is
-    // minted AFTER apply from the surrogate + post-image the Data Plane returns
-    // in `Response::write_set`. `Some(collection)` for such a write, else `None`.
-    let post_apply = crate::control::server::wal_dispatch::plan_post_apply_redo(&plan);
-
-    // Write-admission gate: every write-class plan on this near-universal
-    // autocommit / internal funnel passes here. An uncontended point write takes
-    // the fast path holding its per-vShard deterministic locks; a contended or
-    // bulk write is submitted through the deterministic scheduler and its applied
-    // response is surfaced here; reads / control ops are `Exempt`.
-    //
-    // Ordering (fast path): the guard is acquired FIRST, then — for an autocommit
-    // write that owns its durability (`append_wal`) — the WAL append happens HERE,
-    // under the guard, minting the LSN just before the enqueue below. This makes
-    // WAL-LSN order equal to dispatcher-enqueue order per key; the strict-FIFO
-    // per-database WFQ then makes apply order follow enqueue order, so restart
-    // replay (in LSN order) cannot diverge from live state. The guard is released
-    // immediately after the enqueue (not across the response await).
-    use crate::control::server::shared::write_admission::{
-        WriteAdmission, WriteTarget, admit, bare_ok_response, route_write_to_calvin,
-    };
-    let (admission, admission_guard, order_guard) = match admit(
+    submit_write(
         shared,
-        &WriteTarget {
+        SubmitWrite {
             tenant_id,
             database_id,
             vshard_id,
-            plan: &plan,
+            plan,
+            trace_id,
+            event_source,
+            txn_id,
+            // Internal / autocommit funnel: no session user to attribute.
+            user_id: None,
+            durability,
+            ordering: WriteOrdering::Gate,
+            // The autocommit / internal funnel is the path that feeds `/cdc`
+            // and WS-RPC subscribers; every other caller of `submit_write` is
+            // `Unowned`.
+            change_feed: ChangeFeedOwner::Funnel,
         },
-    ) {
-        WriteAdmission::ExemptRead => (
-            crate::bridge::envelope::Admission::Exempt(crate::bridge::envelope::ExemptReason::Read),
-            None,
-            None,
-        ),
-        WriteAdmission::FastPath { guard } => {
-            (crate::bridge::envelope::Admission::Admitted, guard, None)
-        }
-        WriteAdmission::FastPathBlocking { key, keyed_lock } => {
-            // Single-node serialization point: acquire the per-key FIFO order-lock
-            // FIRST, before the WAL append and enqueue below. `tokio::sync::Mutex`
-            // is fair, so concurrent same-key writers are admitted in arrival
-            // order — the WAL append + enqueue then happen in that order, giving
-            // WAL-LSN order == enqueue order == apply order per key. Distinct keys
-            // use distinct per-key mutexes and never contend.
-            let order_guard = keyed_lock.lock_owned(key).await;
-            (
-                crate::bridge::envelope::Admission::Admitted,
-                None,
-                Some(order_guard),
-            )
-        }
-        WriteAdmission::RouteToCalvin => {
-            // The deterministic scheduler applies the write (emitting its own
-            // WriteEvents) and returns the applied response; a plain write with
-            // no RETURNING rows yields `None`, synthesized into a bare `Ok`. Calvin
-            // owns durability on this route (the sequenced TxClass plus its own
-            // `CalvinApplied` WAL record), so no local append happens here.
-            let routed =
-                route_write_to_calvin(shared, tenant_id, database_id, vshard_id, plan).await?;
-            return Ok(routed.unwrap_or_else(|| bare_ok_response(crate::types::RequestId::new(0))));
-        }
-    };
-
-    // Fast-path autocommit durability: append the write to the WAL now, while the
-    // admission guard is held, so the LSN is minted in the same order the request
-    // is about to be enqueued. `wal_append_if_write` is a no-op (returns `None`)
-    // for the exempt-read case, but gating on `append_wal` keeps caller-supplied
-    // LSNs (procedural batch flush, staged-txn, trigger/sync paths) untouched.
-    let (wal_lsn, resolved_now_ms) = if append_wal {
-        let outcome = crate::control::server::wal_dispatch::wal_append_if_write(
-            &shared.wal,
-            tenant_id,
-            vshard_id,
-            database_id,
-            &plan,
-        )?;
-        (outcome.lsn, outcome.resolved_now_ms)
-    } else {
-        (wal_lsn, resolved_now_ms)
-    };
-
-    // Per-vShard QPS + latency timer. `dispatch_started` marks the
-    // wall-clock moment the request enters the Control Plane dispatch
-    // site; observation happens on every exit path (success, budget
-    // over-run, timeout) so the histogram captures the true end-to-end
-    // shape of the work routed to this vshard.
-    let dispatch_started = Instant::now();
-    let vshard_u32 = vshard_id.as_u32();
-
-    let request_id = shared.next_request_id();
-    let request = Request {
-        request_id,
-        tenant_id,
-        database_id,
-        vshard_id,
-        plan,
-        deadline: Instant::now() + Duration::from_secs(shared.tuning.network.default_deadline_secs),
-        priority: Priority::Normal,
-        trace_id,
-        consistency: ReadConsistency::Strong,
-        idempotency_key: None,
-        event_source,
-        user_roles: Vec::new(),
-        user_id: None,
-        statement_digest: None,
-        txn_id,
-        wal_lsn,
-        resolved_now_ms,
-        admission,
-    };
-
-    let mut rx = shared.tracker.register(request_id);
-
-    match shared.dispatcher.lock() {
-        Ok(mut d) => d.dispatch(request)?,
-        Err(poisoned) => poisoned.into_inner().dispatch(request)?,
-    };
-
-    // Release the write-admission guards immediately after the enqueue, before
-    // the Data-Plane round-trip. The per-database WFQ is strict FIFO, so once LSN
-    // order equals enqueue order the apply order follows from the queue alone;
-    // holding the guards across the response await would only serialize same-key
-    // throughput needlessly.
-    //
-    // EXCEPTION — a post-apply-redo write (`post_apply.is_some()`) mints its
-    // durable redo AFTER apply, from the write-set on the response; the guards
-    // MUST stay held across the response collect + that append so two concurrent
-    // same-surrogate writes cannot reorder their redo appends. Both guard types
-    // are `Send`, so holding them across the `.await` is sound. Moved into an
-    // `Option` so the release is a single, unconditional `drop` below regardless
-    // of which path took it. (`None` guard slots when no lock manager was
-    // registered / for the exempt-read / Calvin / unordered cases.)
-    let deferred_guards = if post_apply.is_some() {
-        Some((admission_guard, order_guard))
-    } else {
-        drop(admission_guard);
-        drop(order_guard);
-        None
-    };
-
-    // Collect response(s). For non-streaming queries, exactly one arrives.
-    // For streaming queries, multiple partial chunks arrive before the final.
-    // The mpsc channel is bounded (see `RequestTracker::register`); here we
-    // additionally cap the *total* accumulated payload so a runaway scan
-    // can't pin Control-Plane RAM — any query whose combined result
-    // exceeds `tuning.network.max_query_result_bytes` is cancelled with
-    // a typed `ExecutionLimitExceeded` error.
-    let max_result_bytes = shared.tuning.network.max_query_result_bytes as usize;
-    let observe = |shared: &SharedState| {
-        let latency_us = dispatch_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
-        shared.per_vshard_metrics.observe(vshard_u32, latency_us);
-    };
-    let response = tokio::time::timeout(
-        Duration::from_secs(shared.tuning.network.default_deadline_secs),
-        collect_bounded_response(&mut rx, max_result_bytes),
     )
     .await
-    .map_err(|_| {
-        observe(shared);
-        crate::Error::DeadlineExceeded { request_id }
-    })?;
-
-    let response = match response {
-        Ok(r) => r,
-        Err(DispatchCollectError::OverBudget { bytes }) => {
-            shared.tracker.cancel(&request_id);
-            observe(shared);
-            return Err(crate::Error::ExecutionLimitExceeded {
-                detail: format!(
-                    "query result exceeded max_query_result_bytes \
-                     ({bytes} > {max_result_bytes} bytes)"
-                ),
-            });
-        }
-        Err(DispatchCollectError::ChannelClosed) => {
-            observe(shared);
-            return Err(crate::Error::Dispatch {
-                detail: "response channel closed".into(),
-            });
-        }
-    };
-
-    // Mint the post-apply redo record while the guards are still held, then
-    // release them. A PointUpdate whose collection carries a secondary vector
-    // index returns its surrogate + post-image in `write_set`; without this
-    // durable `Put` a WAL-only restart rebuilds the HNSW from the pre-update body
-    // and resurrects the old embedding.
-    let post_apply_lsn = if let Some(collection) = &post_apply
-        && append_wal
-        && response.status == crate::bridge::envelope::Status::Ok
-    {
-        crate::control::server::wal_dispatch::append_write_set_redo(
-            &shared.wal,
-            tenant_id,
-            vshard_id,
-            database_id,
-            collection,
-            &response.write_set,
-        )?
-    } else {
-        None
-    };
-    drop(deferred_guards);
-
-    // Durable-at-ack barrier: an acknowledged write must be WAL-fsync-durable
-    // before this response (the client ack) returns. `wal_lsn` is the forward
-    // write's LSN — minted here under the admission guard for an autocommit
-    // write, or supplied by a caller that appended upstream (procedural batch
-    // flush, interactive-COMMIT transaction redo). `post_apply_lsn` covers the
-    // post-apply document redo appended just above. Both records are already
-    // buffered in the shared WAL; one group-commit fsync coalesces concurrent
-    // writers (see `WalManager::wait_durable`), and it runs here — after the
-    // admission guards are released — so it never serializes same-key
-    // throughput. Reads / control ops / trigger / staged-write dispatch carry no
-    // LSN and skip the barrier; the cluster/Raft commit path owns its own
-    // durability and never reaches this funnel with a local WAL LSN.
-    if response.status == crate::bridge::envelope::Status::Ok {
-        let durable_target = match (wal_lsn, post_apply_lsn) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
-        if let Some(lsn) = durable_target {
-            shared.wal.wait_durable(lsn).await?;
-        }
-    }
-
-    // Publish change events for successful writes. Almost every write plan
-    // yields exactly one tuple; a handful of multi-row / multi-collection
-    // ops (see `extract_write_metadata`) yield more than one or zero.
-    if response.status == crate::bridge::envelope::Status::Ok {
-        for meta in change_meta {
-            publish_change_event(
-                shared,
-                tenant_id,
-                database_id,
-                is_columnar_collection,
-                meta,
-                &response,
-            );
-        }
-    }
-
-    // Advance the tenant's observed write-HLC high-water on any
-    // successful dispatch. Used by RESTORE staleness gate. Advance
-    // on every success (not just writes) is intentionally
-    // conservative — envelope.watermark is captured AFTER fan-out so
-    // it always dominates the tenant_wm of a fresh backup.
-    if response.status == crate::bridge::envelope::Status::Ok {
-        shared.advance_tenant_write_hlc(tenant_id.as_u64());
-    }
-
-    observe(shared);
-    Ok(response)
+    .map(|outcome| outcome.response)
 }

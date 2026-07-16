@@ -312,9 +312,12 @@ pub async fn resolve_shuffle_aggregate(
     let merged = encode_msgpack_array(&elements);
 
     // Cross-node shuffle aggregate: per-shard watermarks are not threaded
-    // through the shuffle transport, so no per-shard read versions here.
+    // through the shuffle transport, so no per-shard read versions here. Both
+    // LSNs stay `ZERO` — no participant reports its collection's `coll_write_lsn`
+    // back to the coordinator, so there is no observed read-version to pass, and
+    // substituting one would assert a version this path never saw.
     Ok(Resolved::Gathered(
-        outcome_to_response(merged, Lsn::ZERO),
+        outcome_to_response(merged, Lsn::ZERO, Lsn::ZERO),
         Vec::new(),
     ))
 }

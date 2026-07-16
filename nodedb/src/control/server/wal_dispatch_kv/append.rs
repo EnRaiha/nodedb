@@ -42,11 +42,15 @@ pub struct KvAppendOutcome {
 /// once. Returns `(resolved_now_ms, expire_at_ms)`, both `None` when
 /// `ttl_ms == 0` so the caller's encode call preserves the historical
 /// no-TTL payload shape byte-for-byte.
-fn resolve_expiry(ttl_ms: u64) -> (Option<u64>, Option<u64>) {
+///
+/// `now_override` supplies the instant instead of this node's clock when it was
+/// decided elsewhere and the durable record must carry that exact value — see
+/// [`wal_append_kv_op`].
+fn resolve_expiry(ttl_ms: u64, now_override: Option<u64>) -> (Option<u64>, Option<u64>) {
     if ttl_ms == 0 {
         (None, None)
     } else {
-        let now_ms = crate::engine::kv::current_ms();
+        let now_ms = now_override.unwrap_or_else(crate::engine::kv::current_ms);
         (Some(now_ms), Some(now_ms + ttl_ms))
     }
 }
@@ -56,12 +60,20 @@ fn resolve_expiry(ttl_ms: u64) -> (Option<u64>, Option<u64>) {
 /// Returns the appended write's WAL LSN (`Some`) for KV writes, or `None` for
 /// read-only / non-WAL KV ops, alongside the resolved TTL instant (if any) —
 /// see [`KvAppendOutcome`].
+///
+/// `now_override` pins a TTL-bearing write's `expire_at_ms` to an instant
+/// decided elsewhere instead of this node's clock. `Some` only when the durable
+/// record must carry that exact value: a Raft-committed entry carries the
+/// instant the proposing node resolved, and every replica's redo record — like
+/// every replica's live apply — must install it verbatim, or a replica's WAL
+/// replay resurrects a different `expire_at_ms` than its peers.
 pub fn wal_append_kv_op(
     wal: &WalManager,
     tenant_id: TenantId,
     vshard_id: VShardId,
     database_id: DatabaseId,
     op: &KvOp,
+    now_override: Option<u64>,
 ) -> crate::Result<KvAppendOutcome> {
     let mut resolved_now_ms: Option<u64> = None;
     let lsn: Option<crate::types::Lsn> = match op {
@@ -72,7 +84,7 @@ pub fn wal_append_kv_op(
             ttl_ms,
             surrogate: _,
         } => {
-            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
             let entry = encode_kv_put(collection, key, value, *ttl_ms, expire_at_ms)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
@@ -91,7 +103,7 @@ pub fn wal_append_kv_op(
             ttl_ms,
             surrogate: _,
         } => {
-            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
             let entry = encode_kv_put(collection, key, value, *ttl_ms, expire_at_ms)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
@@ -104,7 +116,7 @@ pub fn wal_append_kv_op(
             updates,
             surrogate: _,
         } => {
-            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
             let entry = encode_kv_insert_on_conflict_update(
                 collection,
@@ -126,7 +138,7 @@ pub fn wal_append_kv_op(
             ttl_ms,
             surrogates: _,
         } => {
-            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
             let entry = encode_kv_batch_put(collection, entries, *ttl_ms, expire_at_ms)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
@@ -141,7 +153,7 @@ pub fn wal_append_kv_op(
             // absolute instant is always resolved, so this deliberately does
             // not route through `resolve_expiry`, which returns `None` on
             // `ttl_ms == 0` for the Put family's different semantics.
-            let now_ms = crate::engine::kv::current_ms();
+            let now_ms = now_override.unwrap_or_else(crate::engine::kv::current_ms);
             let expire_at_ms = now_ms + *ttl_ms;
             resolved_now_ms = Some(now_ms);
             let entry = encode_kv_expire(collection, key, *ttl_ms, expire_at_ms)?;
@@ -180,7 +192,7 @@ pub fn wal_append_kv_op(
             ttl_ms,
             surrogate,
         } => {
-            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms);
+            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
             let entry = encode_kv_incr(
                 collection,

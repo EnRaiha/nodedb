@@ -11,6 +11,7 @@
 //!   - "hard_state" → HardState { current_term, voted_for }
 //!   - "snapshot_index" → u64
 //!   - "snapshot_term" → u64
+//!   - "applied_index" → u64
 
 use std::path::Path;
 
@@ -32,6 +33,7 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft.meta");
 const KEY_HARD_STATE: &str = "hard_state";
 const KEY_SNAPSHOT_INDEX: &str = "snapshot_index";
 const KEY_SNAPSHOT_TERM: &str = "snapshot_term";
+const KEY_APPLIED_INDEX: &str = "applied_index";
 
 /// Persistent Raft log storage backed by redb.
 pub struct RedbLogStorage {
@@ -387,6 +389,76 @@ impl LogStorage for RedbLogStorage {
             }),
         }
     }
+
+    fn save_applied_index(&mut self, index: u64) -> nodedb_raft::error::Result<()> {
+        let write_txn =
+            self.db
+                .begin_write()
+                .map_err(|e| nodedb_raft::error::RaftError::Storage {
+                    detail: format!("write txn: {e}"),
+                })?;
+        {
+            let mut table =
+                write_txn
+                    .open_table(META)
+                    .map_err(|e| nodedb_raft::error::RaftError::Storage {
+                        detail: format!("open meta: {e}"),
+                    })?;
+
+            let bytes = zerompk::to_msgpack_vec(&index).map_err(|e| {
+                nodedb_raft::error::RaftError::Storage {
+                    detail: format!("serialize: {e}"),
+                }
+            })?;
+            table
+                .insert(KEY_APPLIED_INDEX, bytes.as_slice())
+                .map_err(|e| nodedb_raft::error::RaftError::Storage {
+                    detail: format!("insert: {e}"),
+                })?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| nodedb_raft::error::RaftError::Storage {
+                detail: format!("commit: {e}"),
+            })?;
+
+        debug!(index, "raft applied index saved");
+        Ok(())
+    }
+
+    fn load_applied_index(&self) -> nodedb_raft::error::Result<u64> {
+        let read_txn =
+            self.db
+                .begin_read()
+                .map_err(|e| nodedb_raft::error::RaftError::Storage {
+                    detail: format!("read txn: {e}"),
+                })?;
+        let table =
+            read_txn
+                .open_table(META)
+                .map_err(|e| nodedb_raft::error::RaftError::Storage {
+                    detail: format!("open meta: {e}"),
+                })?;
+
+        match table.get(KEY_APPLIED_INDEX) {
+            Ok(Some(value)) => {
+                let index: u64 = zerompk::from_msgpack(value.value()).map_err(|e| {
+                    nodedb_raft::error::RaftError::Storage {
+                        detail: format!("deserialize: {e}"),
+                    }
+                })?;
+                Ok(index)
+            }
+            // Absent on any group file written before the applied index
+            // existed. Reporting 0 degrades to a full replay of the retained
+            // log on the first boot after upgrade, and the key is written on
+            // the first apply after that — self-correcting, never an error.
+            Ok(None) => Ok(0),
+            Err(e) => Err(nodedb_raft::error::RaftError::Storage {
+                detail: format!("get applied index: {e}"),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +545,28 @@ mod tests {
         s.save_hard_state(&hs).unwrap();
         let loaded = s.load_hard_state().unwrap();
         assert_eq!(loaded, hs);
+    }
+
+    /// A group file written before the applied index existed has no key.
+    /// Reporting 0 degrades to today's full replay rather than erroring.
+    #[test]
+    fn applied_index_absent_reads_zero() {
+        let (s, _dir) = open_temp();
+        assert_eq!(s.load_applied_index().unwrap(), 0);
+    }
+
+    #[test]
+    fn applied_index_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("applied-index-raft.redb");
+
+        {
+            let mut s = RedbLogStorage::open(&path).unwrap();
+            s.save_applied_index(9).unwrap();
+        }
+
+        let s = RedbLogStorage::open(&path).unwrap();
+        assert_eq!(s.load_applied_index().unwrap(), 9);
     }
 
     /// LogEntry written and read back via the versioned envelope.

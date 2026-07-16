@@ -43,7 +43,7 @@ pub struct DispatchOutcome {
     pub payloads: Vec<Vec<u8>>,
     pub shard_watermarks: Vec<(VShardId, Lsn)>,
     /// Per-collection read-version LSN for this route's scanned collection (its
-    /// `coll_write_lsn` at read time, in its Raft-group index space); `Lsn::ZERO`
+    /// `coll_write_lsn` at read time, a WAL LSN); `Lsn::ZERO`
     /// for writes / non-read routes. The gateway max-folds these across routes —
     /// a read targets one collection, so one non-zero value survives — giving the
     /// sound comparand for cross-shard OCC read validation (distinct from the

@@ -131,6 +131,14 @@ pub struct SharedState {
     /// durably applied to the Data Plane (gated on the applied watermark, not
     /// raft's commit index). No-op when `log_compaction_threshold` is `None`.
     pub raft_compactor: OnceLock<Arc<crate::control::wal_replication::RaftCompactor>>,
+    /// Durable Raft applied-index sink. Set by `start_raft`; absent in
+    /// single-node mode. Invoked by `run_apply_loop` after a committed entry's
+    /// redo record has been WAL-fsynced, so the next boot resumes Raft delivery
+    /// above it and no entry is applied by both WAL replay and Raft replay.
+    /// Deliberately NOT raft's in-memory `last_applied`, which advances at
+    /// enqueue time and is therefore ahead of durability.
+    pub raft_applied_index_sink:
+        OnceLock<Arc<crate::control::wal_replication::RaftAppliedIndexSink>>,
     /// Query Raft group statuses for observability (unset in single-node mode).
     pub raft_status_fn:
         std::sync::OnceLock<Arc<dyn Fn() -> Vec<nodedb_cluster::GroupStatus> + Send + Sync>>,

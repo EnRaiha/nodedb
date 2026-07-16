@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::bridge::envelope::Response;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::dispatch_utils::WalDurability;
 use crate::control::server::exchange::resolve::{Resolved, resolve_and_materialize};
 use crate::types::{Lsn, ReadConsistency, TraceId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
@@ -324,12 +325,13 @@ impl NodeDbPgHandler {
 
         // Propose through Raft with transparent leader-change retry. Shared with
         // the durable RESTORE re-issue path so both replicate identically.
-        // `committed_version` is the committed Raft log index the entry applied
-        // at — the write's per-collection version (`coll_write_lsn`). Surfacing
-        // it on the response lets the session record its own committed writes so
-        // a later transaction's read-set can be floored at them (read-your-writes
-        // floor for cross-shard OCC), instead of losing the version to `ZERO`.
-        let (payload, committed_version) =
+        // `write_version` is the written collection's post-write
+        // `coll_write_lsn` as the applying replica recorded it — a WAL LSN, the
+        // single domain the read validator compares in. Surfacing it on the
+        // response lets the session record its own committed writes so a later
+        // transaction's read-set can be floored at them (read-your-writes floor
+        // for cross-shard OCC), instead of losing the version to `ZERO`.
+        let (payload, write_version) =
             crate::control::wal_replication::propose_replicated_entry(&self.state, proposer, entry)
                 .await?;
 
@@ -342,18 +344,18 @@ impl NodeDbPgHandler {
             watermark_lsn: Lsn::new(0),
             error_code: None,
             read_set_valid: None,
-            read_version_lsn: committed_version,
+            read_version_lsn: write_version,
             write_set: Vec::new(),
         })
     }
 
     /// Dispatch a task directly to the local Data Plane (single-node or reads).
     ///
-    /// For write operations the WAL append is performed inside
-    /// `submit_to_data_plane` (`append_wal: true`), under the write-admission
-    /// guard and immediately before the enqueue, so the minted LSN order equals
-    /// the Data-Plane apply order per key. Reads bypass the WAL entirely (the
-    /// append helper is a no-op for non-write plans).
+    /// For write operations the WAL append is performed inside the shared write
+    /// funnel (`WalDurability::AppendHere`), under the write-admission guard and
+    /// immediately before the enqueue, so the minted LSN order equals the
+    /// Data-Plane apply order per key. Reads bypass the WAL entirely (the append
+    /// helper is a no-op for non-write plans).
     async fn dispatch_local(
         &self,
         task: PhysicalTask,
@@ -367,10 +369,9 @@ impl NodeDbPgHandler {
             plan: task.plan,
             user_id,
             txn_id,
-            // The core mints these under the admission guard just before enqueue.
-            wal_lsn: None,
-            resolved_now_ms: None,
-            append_wal: true,
+            // The funnel mints the LSN under the admission guard just before
+            // enqueue.
+            durability: WalDurability::AppendHere { now_override: None },
         })
         .await
     }
@@ -416,15 +417,16 @@ impl NodeDbPgHandler {
             plan: task.plan,
             user_id,
             txn_id,
-            wal_lsn,
-            // The batch WAL record above does not carry a per-task resolved TTL
-            // instant (see `flush_transaction_buffer`'s equivalent limitation);
-            // a TTL-bearing KV write inside a multi-task COMMIT batch falls back
-            // to `epoch_system_ms` / the wall clock at apply time.
-            resolved_now_ms: None,
             // Durability was recorded at COMMIT under a single `Transaction`
-            // record whose LSN is `wal_lsn`; the core must not append again.
-            append_wal: false,
+            // record whose LSN is `wal_lsn`, so the funnel must not append again.
+            // That batch record carries no per-task resolved TTL instant (see
+            // `flush_transaction_buffer`'s equivalent limitation), so a
+            // TTL-bearing KV write inside a multi-task COMMIT batch falls back to
+            // `epoch_system_ms` / the wall clock at apply time.
+            durability: WalDurability::CallerSupplied {
+                wal_lsn,
+                resolved_now_ms: None,
+            },
         })
         .await
     }

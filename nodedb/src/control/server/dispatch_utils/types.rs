@@ -51,19 +51,8 @@ pub(super) struct DataPlaneDispatch {
     pub(super) trace_id: TraceId,
     pub(super) event_source: crate::event::EventSource,
     pub(super) txn_id: Option<crate::types::TxnId>,
-    /// WAL LSN allocated for this write (from `wal_append_if_write`), stamped
-    /// onto the `Request` so the Data Plane records the committed write
-    /// version. `None` for reads and control ops.
-    pub(super) wal_lsn: Option<crate::types::Lsn>,
-    /// Resolved TTL instant, stamped onto the `Request` alongside `wal_lsn` —
-    /// see [`WriteDispatch::resolved_now_ms`].
-    pub(super) resolved_now_ms: Option<u64>,
-    /// When `true`, the core appends this write to the WAL itself — under the
-    /// write-admission guard, immediately before the dispatcher enqueue — and
-    /// stamps the minted LSN (and any resolved TTL instant) onto the `Request`,
-    /// ignoring `wal_lsn` / `resolved_now_ms`. This is what keeps WAL-LSN order
-    /// equal to Data-Plane apply order per key. When `false`, the caller already
-    /// appended (or the write's durability lives elsewhere) and the core stamps
-    /// the caller-supplied `wal_lsn` / `resolved_now_ms` unchanged.
-    pub(super) append_wal: bool,
+    /// Who owns this write's durable redo record — the funnel appends it under
+    /// the write-admission guard, or the caller already recorded durability
+    /// elsewhere and supplies the LSN it minted.
+    pub(super) durability: super::submit_write::WalDurability,
 }

@@ -34,6 +34,27 @@ pub struct WalAppendOutcome {
     pub resolved_now_ms: Option<u64>,
 }
 
+/// Inputs for [`wal_append`]: the write's target coordinates, the plan whose
+/// redo record is to be encoded, and the two optional knobs only some callers
+/// need.
+pub struct WalAppendRequest<'a> {
+    pub wal: &'a WalManager,
+    pub tenant_id: TenantId,
+    pub vshard_id: VShardId,
+    pub database_id: DatabaseId,
+    pub plan: &'a PhysicalPlan,
+    /// Credential store for the timeseries `wal=false` bypass check.
+    pub credentials: Option<&'a CredentialStore>,
+    /// Wall-clock instant (ms since epoch) to resolve a TTL-bearing KV write's
+    /// `expire_at_ms` against, instead of reading this node's clock. `Some`
+    /// only when the instant was decided elsewhere and the durable record must
+    /// carry that exact value: a Raft-committed entry carries the instant the
+    /// proposing node resolved, and every replica's redo record — like every
+    /// replica's live apply — must install it verbatim, or a replica's WAL
+    /// replay resurrects a different `expire_at_ms` than its peers.
+    pub now_override: Option<u64>,
+}
+
 /// Append a write operation to the WAL for single-node durability.
 ///
 /// Serializes the write as MessagePack and appends to the appropriate
@@ -65,6 +86,32 @@ pub fn wal_append_if_write_with_creds(
     plan: &PhysicalPlan,
     credentials: Option<&CredentialStore>,
 ) -> crate::Result<WalAppendOutcome> {
+    wal_append(WalAppendRequest {
+        wal,
+        tenant_id,
+        vshard_id,
+        database_id,
+        plan,
+        credentials,
+        now_override: None,
+    })
+}
+
+/// Encode and append the redo record for `plan`, if it is a write.
+///
+/// The full-control entry point behind [`wal_append_if_write`] /
+/// [`wal_append_if_write_with_creds`]; callers that must pin a TTL-bearing KV
+/// write's resolved instant reach for this one.
+pub fn wal_append(req: WalAppendRequest<'_>) -> crate::Result<WalAppendOutcome> {
+    let WalAppendRequest {
+        wal,
+        tenant_id,
+        vshard_id,
+        database_id,
+        plan,
+        credentials,
+        now_override,
+    } = req;
     let mut resolved_now_ms: Option<u64> = None;
     // Every engine routes through one exhaustive per-engine match (no `_`
     // catch-all anywhere, enforced by `deny(wildcard_enum_match_arm)`), so a
@@ -98,8 +145,14 @@ pub fn wal_append_if_write_with_creds(
         // that resolves a wall-clock instant (TTL `expire_at_ms`), threaded back
         // out via `resolved_now_ms`.
         PhysicalPlan::Kv(kv_op) => {
-            let outcome =
-                wal_dispatch_kv::wal_append_kv_op(wal, tenant_id, vshard_id, database_id, kv_op)?;
+            let outcome = wal_dispatch_kv::wal_append_kv_op(
+                wal,
+                tenant_id,
+                vshard_id,
+                database_id,
+                kv_op,
+                now_override,
+            )?;
             resolved_now_ms = outcome.resolved_now_ms;
             outcome.lsn
         }
@@ -115,9 +168,10 @@ pub fn wal_append_if_write_with_creds(
         // NotAWrite — reads / query ops / control commands. `Meta` durable
         // writes (WAL append, transaction batch, Calvin apply) are logged on
         // their own dedicated paths, never through this autocommit oracle;
-        // `Query` is joins/aggregates/scans; `ClusterArray` is resolved by the
-        // coordinator before the SPSC bridge and carries a Control-Plane-allocated
-        // `wal_lsn` of its own. All produce no durable record here.
+        // `Query` is joins/aggregates/scans; `ClusterArray` is a routing wrapper
+        // resolved by the coordinator before the SPSC bridge — it fans its cells
+        // out to the owning shards, and each owner's apply mints the redo for
+        // the cells it actually holds. All produce no durable record here.
         PhysicalPlan::Meta(_) | PhysicalPlan::Query(_) | PhysicalPlan::ClusterArray(_) => None,
     };
     Ok(WalAppendOutcome {

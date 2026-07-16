@@ -190,7 +190,7 @@ async fn resolve_exchange(
                 outcome.merged_array
             };
             Ok(Resolved::Gathered(
-                outcome_to_response(payload, outcome.watermark_lsn),
+                outcome_to_response(payload, outcome.watermark_lsn, outcome.read_version_lsn),
                 outcome.shard_watermarks,
             ))
         }
@@ -203,7 +203,11 @@ async fn resolve_exchange(
             let outcome =
                 gather_all_vshards(state, tenant_id, database_id, *child, trace_id, txn_id).await?;
             Ok(Resolved::Gathered(
-                outcome_to_response(outcome.merged_array, outcome.watermark_lsn),
+                outcome_to_response(
+                    outcome.merged_array,
+                    outcome.watermark_lsn,
+                    outcome.read_version_lsn,
+                ),
                 outcome.shard_watermarks,
             ))
         }

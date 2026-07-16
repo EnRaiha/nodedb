@@ -18,6 +18,18 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 /// Data Plane to respond before returning an error to the coordinator.
 const LOCAL_DISPATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The vShard every shard-local array op on this node dispatches under.
+///
+/// The RPC layer has already routed this request to the owning NODE by tile;
+/// what remains is picking the local Data Plane core, and `vshard % num_cores`
+/// is that choice. Every op here — the reads AND the single-node write fallback
+/// — must name the same vShard, because the array engine is per-core state: a
+/// write dispatched under a different vShard would land in another core's
+/// engine and be invisible to these reads. WAL replay routes each array record
+/// by `record.vshard_id % num_cores` too, so the redo record minted for a write
+/// under this vShard also replays back onto this same core.
+pub(super) const LOCAL_DISPATCH_VSHARD: VShardId = VShardId::new(0);
+
 /// Concrete implementation of `ArrayLocalExecutor` backed by the local Data Plane.
 ///
 /// Holds a reference to `SharedState` so it can dispatch `PhysicalPlan::Array`
@@ -45,7 +57,7 @@ impl DataPlaneArrayExecutor {
             request_id,
             tenant_id: TenantId::new(0),
             database_id: DatabaseId::DEFAULT,
-            vshard_id: VShardId::new(0),
+            vshard_id: LOCAL_DISPATCH_VSHARD,
             plan,
             deadline: Instant::now() + LOCAL_DISPATCH_TIMEOUT,
             priority: Priority::Normal,

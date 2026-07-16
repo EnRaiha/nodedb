@@ -65,10 +65,16 @@ impl CoreLoop {
     }
 
     /// Per-collection read-version LSN for `task`'s plan: the scanned
-    /// collection's `coll_write_lsn` (in its Raft-group index space) at read
-    /// time, the sound comparand for cross-shard OCC read validation. `Lsn::ZERO`
-    /// when the plan maps to no single collection or the collection has no
-    /// recorded write on this core. Distinct from the core-global `watermark`.
+    /// collection's `coll_write_lsn` at read time — a WAL LSN, the single domain
+    /// the version index is fed in — and the sound comparand for cross-shard OCC
+    /// read validation. `Lsn::ZERO` when the plan maps to no single collection or
+    /// the collection has no recorded write on this core. Distinct from the
+    /// core-global `watermark`.
+    ///
+    /// On a WRITE response this is the POST-write version: every write handler
+    /// records its LSN into the index before building its response, so the value
+    /// read back here already includes the write. That is what lets the apply
+    /// path hand a committed write's own version back to its proposer.
     pub(in crate::data::executor) fn read_version_lsn(
         &self,
         task: &ExecutionTask,

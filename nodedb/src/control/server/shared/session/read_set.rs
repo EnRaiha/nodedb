@@ -85,8 +85,9 @@ pub struct ReadSetEntry {
     pub key: ReadKey,
     pub read_lsn: Lsn,
     /// Per-collection read-version LSN (the read collection's `coll_write_lsn`
-    /// at read time, in its Raft-group index space) — the SOUND comparand for
-    /// cross-shard OCC validation. `read_lsn` above stays the core-global
+    /// at read time, a WAL LSN) — the SOUND comparand for cross-shard OCC
+    /// validation, which compares it against the same collection's recorded
+    /// write versions in that one domain. `read_lsn` above stays the core-global
     /// watermark used by single-shard SI (`si_conflict_abort`).
     pub read_version_lsn: Lsn,
 }
@@ -115,7 +116,7 @@ pub struct ReadCapture<'a> {
 /// non-empty `watermarks` slice — a "not found" is a validatable observation.
 ///
 /// `read_version_lsn` is the read collection's per-collection write floor at
-/// read time (in its own Raft-group index space) — one scalar, since a read op
+/// read time (a WAL LSN) — one scalar, since a read op
 /// resolves to a single collection (joins collapse to one via
 /// `extract_collection`). It stamps every entry produced here and is the SOUND
 /// comparand cross-shard OCC validation consumes; the per-shard `watermarks`

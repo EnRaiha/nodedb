@@ -76,6 +76,15 @@ pub struct RaftNode<S: LogStorage> {
     pub(super) leader_id: u64,
     /// In-progress leadership transfer, if any (leader-side, volatile).
     pub(super) leadership_transfer: Option<LeadershipTransfer>,
+    /// Highest log index whose apply is durable on this node, mirroring
+    /// `LogStorage::save_applied_index`.
+    ///
+    /// Deliberately distinct from `volatile.last_applied`, which advances the
+    /// moment an entry is DELIVERED to the state machine. This index only
+    /// advances once that entry's effects are durable, which makes it two
+    /// things `last_applied` cannot be: the floor a restart resumes delivery
+    /// from, and the ceiling compaction may discard up to.
+    pub(super) durable_applied: u64,
 }
 
 impl<S: LogStorage> RaftNode<S> {
@@ -105,13 +114,21 @@ impl<S: LogStorage> RaftNode<S> {
             ready: Ready::default(),
             leader_id: 0,
             leadership_transfer: None,
+            durable_applied: 0,
             config,
         }
     }
 
     /// Restore state from persistent storage. Must be called before ticking.
+    ///
+    /// Seeds `volatile.last_applied` from the durable applied index so
+    /// delivery resumes at the first entry whose effects are NOT already
+    /// durable. Storage written before the durable index existed reports 0 and
+    /// degrades to a full replay of the retained log.
     pub fn restore(&mut self) -> Result<()> {
         self.hard_state = self.log.storage().load_hard_state()?;
+        self.durable_applied = self.log.storage().load_applied_index()?;
+        self.volatile = VolatileState::restored(self.durable_applied);
         self.log.restore()?;
         self.reset_election_timeout();
         Ok(())
@@ -185,8 +202,36 @@ impl<S: LogStorage> RaftNode<S> {
     }
 
     /// Advance `last_applied` after the caller has applied entries.
+    ///
+    /// This is the DELIVERY watermark: it advances as entries are handed to
+    /// the state machine, before their effects are necessarily durable. Use
+    /// [`Self::save_durable_applied_index`] for the durability floor.
     pub fn advance_applied(&mut self, applied_to: u64) {
         self.volatile.last_applied = applied_to;
+    }
+
+    /// Highest log index whose apply is durable on this node.
+    pub fn durable_applied_index(&self) -> u64 {
+        self.durable_applied
+    }
+
+    /// Persist `index` as the durable applied floor.
+    ///
+    /// The caller MUST only pass an index whose state-machine effects are
+    /// already durable — for data groups, an index whose redo record the WAL
+    /// has fsynced. The next boot resumes delivery at `index + 1`, so an index
+    /// saved ahead of durability silently drops the entries in between.
+    ///
+    /// Monotonic: an `index` at or below the current floor is a no-op, so an
+    /// out-of-order or retrying caller can never move the floor backwards and
+    /// re-expose an entry to a second apply.
+    pub fn save_durable_applied_index(&mut self, index: u64) -> Result<()> {
+        if index <= self.durable_applied {
+            return Ok(());
+        }
+        self.log.storage_mut().save_applied_index(index)?;
+        self.durable_applied = index;
+        Ok(())
     }
 
     /// Auto-compaction threshold: entries retained past `snapshot_index`
@@ -214,12 +259,12 @@ impl<S: LogStorage> RaftNode<S> {
     /// guarantees this: it only compacts an index after the SPSC round-trip
     /// that applies that entry to the Data Plane has returned.
     ///
-    /// This method additionally clamps to raft's `volatile.last_applied`
-    /// (returning [`RaftError::CompactionAheadOfApplied`] otherwise) as a
-    /// coarse sanity bound — but note that for data groups raft's
-    /// `last_applied` advances at commit/enqueue time and is therefore
-    /// `>=` the data-plane applied index. So this guard is an upper bound,
-    /// NOT a substitute for the caller's data-plane gating.
+    /// This method additionally clamps to the DURABLE applied index
+    /// (returning [`RaftError::CompactionAheadOfApplied`] otherwise).
+    /// Deliberately not `volatile.last_applied`: that advances at
+    /// commit/enqueue time, so clamping to it would let compaction discard
+    /// entries whose redo record is not yet fsynced — losing the only recovery
+    /// source for the memory-only engines.
     ///
     /// Returns `Ok(false)` when there is nothing to compact
     /// (`up_to_index <= snapshot_index`). Returns
@@ -229,10 +274,10 @@ impl<S: LogStorage> RaftNode<S> {
         if up_to_index <= self.log.snapshot_index() {
             return Ok(false);
         }
-        if up_to_index > self.volatile.last_applied {
+        if up_to_index > self.durable_applied {
             return Err(RaftError::CompactionAheadOfApplied {
                 requested: up_to_index,
-                last_applied: self.volatile.last_applied,
+                last_applied: self.durable_applied,
             });
         }
         let term = self
@@ -268,8 +313,8 @@ impl<S: LogStorage> RaftNode<S> {
         if applied_index - snapshot_index < threshold {
             return Ok(false);
         }
-        // Never compact past the data-plane applied watermark.
-        let up_to = applied_index.min(self.volatile.last_applied);
+        // Never compact past an entry whose apply is not yet durable.
+        let up_to = applied_index.min(self.durable_applied);
         self.compact_log_up_to(up_to)
     }
 
@@ -442,6 +487,14 @@ mod tests {
         node
     }
 
+    /// Stand in for a data-plane apply that reached durability: advance the
+    /// delivery watermark AND the durable floor, as the apply loop does once
+    /// the write funnel's fsync barrier has returned.
+    fn apply_durably(node: &mut RaftNode<MemStorage>, index: u64) {
+        node.advance_applied(index);
+        node.save_durable_applied_index(index).unwrap();
+    }
+
     #[test]
     fn single_node_election() {
         let config = test_config(1, vec![]);
@@ -534,7 +587,7 @@ mod tests {
         for _ in 0..8 {
             let idx = node.propose(b"write".to_vec()).unwrap();
             let _ = node.take_ready();
-            node.advance_applied(idx);
+            apply_durably(&mut node, idx);
 
             // Trigger gated on the data-plane applied watermark (= idx here).
             node.maybe_compact_log(idx).unwrap();
@@ -572,7 +625,7 @@ mod tests {
         for _ in 0..12 {
             let idx = node.propose(b"write".to_vec()).unwrap();
             let _ = node.take_ready();
-            node.advance_applied(idx);
+            apply_durably(&mut node, idx);
             // No-op: threshold is None.
             assert!(!node.maybe_compact_log(idx).unwrap());
         }
@@ -595,10 +648,86 @@ mod tests {
 
         let idx = node.propose(b"write".to_vec()).unwrap();
         let _ = node.take_ready();
-        // Deliberately do NOT advance_applied past the noop — the data
-        // plane has not applied `idx` yet.
+        // Deliberately do NOT apply past the noop — the data plane has not
+        // applied `idx` yet.
         let err = node.compact_log_up_to(idx).unwrap_err();
         assert!(matches!(err, RaftError::CompactionAheadOfApplied { .. }));
+    }
+
+    /// Compaction gates on the DURABLE applied floor, not the delivery
+    /// watermark. An entry that has been handed to the state machine but whose
+    /// redo is not yet fsynced must NOT be compacted away: the log is the only
+    /// thing that can rebuild the memory-only engines for it.
+    #[test]
+    fn compact_log_up_to_rejects_delivered_but_not_durable() {
+        let mut cfg = test_config(1, vec![]);
+        cfg.log_compaction_threshold = Some(2);
+        let mut node = leader_with_applied_noop(cfg);
+
+        let idx = node.propose(b"write".to_vec()).unwrap();
+        let _ = node.take_ready();
+        // Delivery watermark advances; the durable floor does not.
+        node.advance_applied(idx);
+
+        let err = node.compact_log_up_to(idx).unwrap_err();
+        assert!(matches!(err, RaftError::CompactionAheadOfApplied { .. }));
+
+        // Once the apply is durable the same index compacts.
+        node.save_durable_applied_index(idx).unwrap();
+        assert!(node.compact_log_up_to(idx).unwrap());
+    }
+
+    /// The durable floor never moves backwards, however a caller retries.
+    #[test]
+    fn durable_applied_index_is_monotonic() {
+        let mut node = RaftNode::new(test_config(1, vec![]), MemStorage::new());
+        assert_eq!(node.durable_applied_index(), 0);
+
+        node.save_durable_applied_index(5).unwrap();
+        assert_eq!(node.durable_applied_index(), 5);
+
+        node.save_durable_applied_index(3).unwrap();
+        assert_eq!(node.durable_applied_index(), 5);
+    }
+
+    /// A restart resumes delivery ABOVE the durable floor: entries whose
+    /// effects are already durable must never be handed to the state machine a
+    /// second time.
+    #[test]
+    fn restore_seeds_last_applied_from_durable_index() {
+        let mut storage = MemStorage::new();
+        storage
+            .append(&[
+                LogEntry {
+                    term: 1,
+                    index: 1,
+                    data: b"a".to_vec(),
+                },
+                LogEntry {
+                    term: 1,
+                    index: 2,
+                    data: b"b".to_vec(),
+                },
+                LogEntry {
+                    term: 1,
+                    index: 3,
+                    data: b"c".to_vec(),
+                },
+            ])
+            .unwrap();
+        storage.save_applied_index(2).unwrap();
+
+        let mut node = RaftNode::new(test_config(1, vec![]), storage);
+        node.restore().unwrap();
+        assert_eq!(node.last_applied(), 2);
+        assert_eq!(node.durable_applied_index(), 2);
+
+        // Learning the commit index re-delivers ONLY the tail above the floor.
+        node.volatile.commit_index = 3;
+        node.collect_committed_entries();
+        let ready = node.take_ready();
+        assert_eq!(ready.committed_entries.len(), 1);
+        assert_eq!(ready.committed_entries[0].index, 3);
     }
 
     #[test]

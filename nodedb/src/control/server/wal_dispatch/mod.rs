@@ -13,12 +13,17 @@ mod document;
 mod graph;
 mod graph_labels;
 mod spatial;
+mod stamp;
 mod text;
 mod timeseries;
 mod vector;
 mod write_set_redo;
 
-pub use core::{WalAppendOutcome, wal_append_if_write, wal_append_if_write_with_creds};
+pub use core::{
+    WalAppendOutcome, WalAppendRequest, wal_append, wal_append_if_write,
+    wal_append_if_write_with_creds,
+};
+pub use stamp::stamp_minted_lsn;
 pub use timeseries::{ColumnarWalAppendArgs, wal_append_columnar, wal_append_timeseries};
 pub use vector::{
     VectorDeleteWalArgs, VectorPutWalArgs, wal_append_vector_delete_by_surrogate,

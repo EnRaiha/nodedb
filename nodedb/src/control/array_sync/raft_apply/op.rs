@@ -7,10 +7,10 @@ use std::sync::Arc;
 use tracing::warn;
 
 use super::common::{
-    AppliedPosition, await_data_plane, build_array_request, ensure_array_open, vshard_for_array_op,
+    AppliedPosition, ArrayWriteSubmit, ensure_array_open, submit_array_write, vshard_for_array_op,
 };
 use crate::control::array_sync::OriginApplyEngine;
-use crate::control::distributed_applier::ProposeTracker;
+use crate::control::distributed_applier::{AppliedWrite, ProposeTracker};
 use crate::control::state::SharedState;
 
 /// Apply a committed `ArrayOp` entry on the local node.
@@ -85,7 +85,14 @@ pub(crate) async fn apply_array_op(
         Arc::clone(&state.array_sync_op_log),
     );
     if engine.already_seen(&op.header.array, op.header.hlc) {
-        tracker.complete(group_id, log_index, applied_key, Ok(vec![]));
+        // Deduplicated before the funnel: no write happened on this apply, so
+        // there is no version to publish.
+        tracker.complete(
+            group_id,
+            log_index,
+            applied_key,
+            Ok(AppliedWrite::unversioned(Vec::new())),
+        );
         return true;
     }
 
@@ -139,6 +146,9 @@ pub(crate) async fn apply_array_op(
             DataArrayOp::Put {
                 array_id,
                 cells_msgpack,
+                // The funnel mints this replica's redo LSN and stamps it into
+                // the plan before the enqueue, so the live tile version matches
+                // the one replay reconstructs from the record header.
                 wal_lsn: 0,
                 provenance: provenance.clone(),
             }
@@ -163,6 +173,7 @@ pub(crate) async fn apply_array_op(
             DataArrayOp::Delete {
                 array_id,
                 coords_msgpack,
+                // Minted and stamped by the funnel — see the `Put` arm above.
                 wal_lsn: 0,
                 provenance,
             }
@@ -170,31 +181,28 @@ pub(crate) async fn apply_array_op(
     };
 
     let plan = crate::bridge::envelope::PhysicalPlan::Array(data_op);
-    let request = build_array_request(state, tenant_id, vshard, plan);
-    let request_id = request.request_id;
-    let mut rx = state.tracker.register(request_id);
+    let result = submit_array_write(
+        state,
+        ArrayWriteSubmit {
+            tenant_id,
+            // Array ops route by name and carry no database on the sync wire;
+            // the apply path scopes them to the default database, and the redo
+            // record must be appended under that same scope or replay lands it
+            // in the wrong catalog namespace.
+            database_id: crate::types::DatabaseId::DEFAULT,
+            vshard,
+            plan,
+            event_source: crate::event::EventSource::CrdtSync,
+            // A sync op carries no proposer-resolved instant; only TTL-bearing
+            // KV writes resolve one, and no array op is such a write.
+            resolved_now_ms: None,
+            op_label: "array op",
+        },
+    )
+    .await;
 
-    let dispatch_result = match state.dispatcher.lock() {
-        Ok(mut d) => d.dispatch(request),
-        Err(poisoned) => poisoned.into_inner().dispatch(request),
-    };
-
-    if let Err(e) = dispatch_result {
-        warn!(group_id, index = log_index, error = %e, "apply_array_op: dispatch failed");
-        tracker.complete(
-            group_id,
-            log_index,
-            applied_key,
-            Err(crate::Error::Internal {
-                detail: format!("dispatch: {e}"),
-            }),
-        );
-        return false;
-    }
-
-    let result = await_data_plane(async move { rx.recv().await.ok_or(()) }, "array op").await;
     match result {
-        Ok(payload) => {
+        Ok(applied) => {
             // Record applied — authoritative idempotency entry.
             if let Err(e) = engine.record_applied(&op) {
                 tracing::error!(
@@ -203,10 +211,14 @@ pub(crate) async fn apply_array_op(
                     "apply_array_op: op applied but op-log append failed"
                 );
             }
-            tracker.complete(group_id, log_index, applied_key, Ok(payload));
+            tracker.complete(group_id, log_index, applied_key, Ok(applied));
             true
         }
         Err(e) => {
+            warn!(
+                group_id, index = log_index, array = %op.header.array, error = %e,
+                "apply_array_op: apply failed"
+            );
             tracker.complete(group_id, log_index, applied_key, Err(e));
             false
         }

@@ -17,7 +17,7 @@ use crate::control::state::SharedState;
 
 /// Register (or no-op if already present) an [`ArrayCatalogEntry`] for
 /// `array` by reading back its just-imported schema from
-/// `state.array_sync_schemas`.
+/// `state.array_sync_schemas`, and persist it to the system catalog.
 ///
 /// Without this call, a synced array's schema lands in `array_sync_schemas`
 /// but the array never becomes openable by the Data Plane
@@ -25,15 +25,17 @@ use crate::control::state::SharedState;
 /// visible to system-catalog introspection (`SHOW COLLECTIONS` merges in
 /// `array_catalog::all_entries()`).
 ///
-/// Returns `Ok(())` when an entry already exists (benign no-op) or was
-/// freshly registered. Returns `Err` on a genuine registration failure
-/// (schema not readable back, encode failure, or catalog write error) —
-/// the caller decides whether to propagate (single-node direct-import path,
-/// which can still fail the request back to the sync sender) or to
-/// warn-and-continue (Raft-apply path, which has already committed the
-/// schema import durably and runs in a fire-and-forget apply loop that
-/// cannot fail back; a missing entry there is caught by the next
-/// `ensure_array_open` lookup failure or by drift detection instead).
+/// The persist is not optional. `ArrayCatalog::register` mutates an in-memory
+/// registry that is rebuilt at boot from the system catalog alone
+/// (`array_catalog::persist::load_all`), so an entry that is only registered
+/// vanishes on restart — taking with it the Data Plane's ability to open the
+/// array, and therefore WAL replay's ability to restore its cells. Both the
+/// Raft-apply and the single-node direct-import path report success to a caller
+/// that treats it as durable, so both must make it durable here.
+///
+/// Returns `Ok(())` when an entry already exists (benign no-op) or was freshly
+/// registered and persisted. Returns `Err` on a genuine registration failure
+/// (schema not readable back, encode failure, or catalog write error).
 pub(crate) fn register_array_catalog_entry(
     state: &Arc<SharedState>,
     array: &str,
@@ -62,14 +64,29 @@ pub(crate) fn register_array_catalog_entry(
         audit_retain_ms: None,
         minimum_audit_retain_ms: None,
     };
-    let mut cat = state
-        .array_catalog
-        .write()
-        .unwrap_or_else(|p| p.into_inner());
-    if cat.lookup_by_name(array).is_none() {
-        cat.register(entry).map_err(|e| crate::Error::Internal {
-            detail: format!("register_array_catalog_entry: catalog register failed: {e}"),
-        })?;
+    {
+        let mut cat = state
+            .array_catalog
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if cat.lookup_by_name(array).is_some() {
+            return Ok(());
+        }
+        cat.register(entry.clone())
+            .map_err(|e| crate::Error::Internal {
+                detail: format!("register_array_catalog_entry: catalog register failed: {e}"),
+            })?;
     }
+
+    // Persist under the same ordering `CREATE ARRAY` uses (register, then
+    // persist), so a synced array survives a restart exactly as a locally
+    // created one does. The lock is released first: the redb commit fsyncs, and
+    // holding the catalog write lock across it would block every concurrent
+    // array lookup for the duration.
+    crate::control::array_catalog::persist::persist(state.credentials.catalog(), &entry).map_err(
+        |e| crate::Error::Internal {
+            detail: format!("register_array_catalog_entry: catalog persist failed: {e}"),
+        },
+    )?;
     Ok(())
 }

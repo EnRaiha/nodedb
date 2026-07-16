@@ -28,9 +28,6 @@ pub(in super::super) fn convert_insert_array(
         .ok_or_else(|| crate::Error::PlanError {
             detail: "INSERT INTO ARRAY: no array catalog wired into convert context".into(),
         })?;
-    let wal = ctx.wal.as_ref().ok_or_else(|| crate::Error::PlanError {
-        detail: "INSERT INTO ARRAY: no WAL wired into convert context".into(),
-    })?;
     let surrogate_assigner =
         ctx.surrogate_assigner
             .as_ref()
@@ -55,7 +52,6 @@ pub(in super::super) fn convert_insert_array(
         })?;
 
     let aid = ArrayId::new(tenant_id, name);
-    let wal_lsn = wal.next_lsn().as_u64();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
     let system_now_ms = chrono::Utc::now().timestamp_millis();
 
@@ -103,7 +99,10 @@ pub(in super::super) fn convert_insert_array(
                 array_id: aid,
                 array_id_msgpack,
                 cells: partitioned,
-                wal_lsn,
+                // A routing wrapper carries no LSN of its own: the coordinator
+                // fans these cells out to the owning shards and each owner's
+                // apply mints the redo — and the LSN — for the cells it holds.
+                wal_lsn: 0,
                 prefix_bits: entry.prefix_bits,
             }),
             post_set_op: PostSetOp::None,
@@ -144,7 +143,12 @@ pub(in super::super) fn convert_insert_array(
         plan: PhysicalPlan::Array(ArrayOp::Put {
             array_id: aid,
             cells_msgpack,
-            wal_lsn,
+            // Stamped by the write funnel with the LSN of the redo record it
+            // appends for this write, so the live tile version equals the one
+            // replay rebuilds from that record's header. The planner must not
+            // allocate one: it appends nothing, so any LSN it picked would name
+            // a record that does not exist.
+            wal_lsn: 0,
             provenance: None,
         }),
         post_set_op: PostSetOp::None,
@@ -164,9 +168,6 @@ pub(in super::super) fn convert_delete_array(
         .ok_or_else(|| crate::Error::PlanError {
             detail: "DELETE FROM ARRAY: no array catalog wired into convert context".into(),
         })?;
-    let wal = ctx.wal.as_ref().ok_or_else(|| crate::Error::PlanError {
-        detail: "DELETE FROM ARRAY: no WAL wired into convert context".into(),
-    })?;
     let entry = {
         let cat = array_catalog.read().map_err(|_| crate::Error::PlanError {
             detail: "array catalog lock poisoned".into(),
@@ -183,7 +184,6 @@ pub(in super::super) fn convert_delete_array(
         })?;
 
     let aid = ArrayId::new(tenant_id, name);
-    let wal_lsn = wal.next_lsn().as_u64();
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
     let system_now_ms = chrono::Utc::now().timestamp_millis();
 
@@ -220,7 +220,9 @@ pub(in super::super) fn convert_delete_array(
                 array_id: aid,
                 array_id_msgpack,
                 coords: partitioned,
-                wal_lsn,
+                // See `convert_insert_array`: the owning shard's apply mints the
+                // redo, so the routing wrapper carries no LSN.
+                wal_lsn: 0,
                 prefix_bits: entry.prefix_bits,
             }),
             post_set_op: PostSetOp::None,
@@ -249,7 +251,8 @@ pub(in super::super) fn convert_delete_array(
         plan: PhysicalPlan::Array(ArrayOp::Delete {
             array_id: aid,
             coords_msgpack,
-            wal_lsn,
+            // Stamped by the write funnel — see `convert_insert_array`.
+            wal_lsn: 0,
             provenance: None,
         }),
         post_set_op: PostSetOp::None,

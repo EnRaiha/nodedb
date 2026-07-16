@@ -22,6 +22,10 @@ pub(crate) fn convert_flush(
     })?;
     let aid = ArrayId::new(tenant_id, name);
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
+    // A frontier read, not an allocation: `Flush` appends no WAL record, and
+    // this LSN becomes the flushed segment's watermark — every cell it contains
+    // was written by a record below the current frontier. The write funnel mints
+    // nothing for `Flush` and so has no LSN to stamp here.
     let wal_lsn = wal.next_lsn().as_u64();
     Ok(vec![PhysicalTask {
         tenant_id,

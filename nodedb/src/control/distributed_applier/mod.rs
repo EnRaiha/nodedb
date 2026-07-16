@@ -5,10 +5,12 @@
 //!
 //! See [`crate::control::wal_replication`] for the full write flow description.
 
+pub mod applied_index;
 pub mod applier;
 pub mod apply_loop;
 pub mod propose_tracker;
 
+pub use applied_index::{AppliedPrefix, save_applied_index};
 pub use applier::{ApplyBatch, DistributedApplier, create_distributed_applier};
 pub use apply_loop::run_apply_loop;
-pub use propose_tracker::{ProposeResult, ProposeTracker};
+pub use propose_tracker::{AppliedWrite, ProposeResult, ProposeTracker};

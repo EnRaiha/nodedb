@@ -59,7 +59,7 @@ pub struct ExecuteResponse {
     /// on the wire, converted to `Lsn` at the coordinator via `Lsn::new`.
     pub watermark_lsn: u64,
     /// Per-collection read-version LSN for the scanned collection (its
-    /// `coll_write_lsn` at read time, in its Raft-group index space); 0 for
+    /// `coll_write_lsn` at read time, a WAL LSN); 0 for
     /// writes/errors. The sound comparand for cross-shard OCC read validation,
     /// distinct from the core-global `watermark_lsn`. Raw `u64` on the wire,
     /// converted to `Lsn` at the coordinator via `Lsn::new`.

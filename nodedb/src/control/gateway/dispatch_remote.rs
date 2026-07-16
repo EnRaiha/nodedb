@@ -88,9 +88,11 @@ pub(super) async fn dispatch_remote(
             return Ok(DispatchOutcome {
                 payloads: vec![resp.payload.to_vec()],
                 shard_watermarks,
-                // Coordinator-gathered at the exchange root; the per-collection
-                // read-version is folded on the gather path, not this route.
-                read_version_lsn: Lsn::ZERO,
+                // Coordinator-gathered at the exchange root: the gather folded
+                // the per-collection read-version across the responding shards
+                // and stamped it on this response, so carry it through. This
+                // route did not observe a version of its own to report.
+                read_version_lsn: resp.read_version_lsn,
             });
         }
         crate::control::server::exchange::Resolved::Plan(p) => p,
@@ -104,8 +106,12 @@ pub(super) async fn dispatch_remote(
             return Ok(DispatchOutcome {
                 payloads: vec![merged],
                 shard_watermarks: vec![(VShardId::new(vshard_id as u32), lsn)],
-                // Materialized stream carries no separate per-collection
-                // read-version; the watermark keys the shard entry.
+                // A materialized stream reports no per-collection read-version:
+                // its frames carry per-batch watermarks only. `ZERO` is honest
+                // here rather than lossy — the streaming branch is gated on
+                // `txn_id.is_none()` (`resolve/exchange.rs`), so a stream never
+                // serves an in-transaction read and no read-set entry consumes
+                // this value.
                 read_version_lsn: Lsn::ZERO,
             });
         }

@@ -18,6 +18,21 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         mr.propose(vshard_id, data)
     }
 
+    /// Durably record `applied_index` as the group's applied floor.
+    ///
+    /// `applied_index` MUST name an entry whose state-machine effects are
+    /// already durable — callers invoke this from the data-plane
+    /// apply-completion path, after the write funnel's fsync barrier has
+    /// returned for that entry. The next boot resumes Raft delivery at
+    /// `applied_index + 1`, which is what stops WAL replay and Raft replay
+    /// both applying it.
+    ///
+    /// Monotonic per group: an index at or below the current floor is a no-op.
+    pub fn save_applied_index(&self, group_id: u64, applied_index: u64) -> Result<()> {
+        let mut mr = self.multi_raft.lock().unwrap_or_else(|p| p.into_inner());
+        mr.save_applied_index(group_id, applied_index)
+    }
+
     /// Auto-compact a group's Raft log if its configured threshold has
     /// been reached, given the DATA-PLANE applied watermark
     /// `applied_index`.

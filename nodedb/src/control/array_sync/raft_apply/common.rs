@@ -3,16 +3,19 @@
 //! Shared scaffolding for the array Raft apply paths.
 //!
 //! Holds the pieces reused across every per-concern apply module (op, schema,
-//! and the upcoming cell path): the committed-entry position identifier, the
-//! Data-Plane `Request` builder, the response-await helper, the array-open
-//! bootstrap, and the vShard derivation from an array op's coordinate (its
-//! Hilbert-prefix tile placement).
+//! cell): the committed-entry position identifier, the funnel submit shared by
+//! both write paths, the Data-Plane `Request` builder and response-await helper
+//! used by the array-open bootstrap, and the vShard derivation from an array
+//! op's coordinate (its Hilbert-prefix tile placement).
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bridge::envelope::{Priority, Request, Response, Status};
-use crate::control::distributed_applier::ProposeResult;
+use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status};
+use crate::control::distributed_applier::{AppliedWrite, ProposeResult};
+use crate::control::server::dispatch_utils::{
+    ChangeFeedOwner, SubmitWrite, WalDurability, WriteOrdering, submit_write,
+};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
 
@@ -27,6 +30,97 @@ pub(crate) struct AppliedPosition {
     pub group_id: u64,
     pub log_index: u64,
     pub applied_key: u64,
+}
+
+/// One committed array write, ready for the Control-Plane write funnel.
+pub(super) struct ArrayWriteSubmit {
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    pub vshard: VShardId,
+    pub plan: PhysicalPlan,
+    pub event_source: crate::event::EventSource,
+    /// The instant the proposing node resolved for this entry, or `None` when
+    /// the entry carries none. Passed through as the redo record's
+    /// `now_override` so this replica records the value its peers recorded.
+    pub resolved_now_ms: Option<u64>,
+    /// Contextual label for the error surfaced to the propose waiter.
+    pub op_label: &'static str,
+}
+
+/// Submit a committed array write through the shared Control-Plane write funnel
+/// and return the Data Plane's payload.
+///
+/// The funnel — not this module — appends the redo record, stamps the minted LSN
+/// onto both the request and the plan, and fsyncs it before returning. That is
+/// the whole reason both array write-apply paths route through here: the durable
+/// applied floor the caller advances on success asserts exactly that this
+/// entry's redo is fsync-durable, which is only true if a redo was minted at all.
+///
+/// An error-status response is surfaced as a typed error: a committed entry that
+/// failed to apply must reach the propose waiter as a failure, not an empty
+/// success, and must NOT advance the floor.
+pub(super) async fn submit_array_write(
+    state: &Arc<SharedState>,
+    params: ArrayWriteSubmit,
+) -> ProposeResult {
+    let ArrayWriteSubmit {
+        tenant_id,
+        database_id,
+        vshard,
+        plan,
+        event_source,
+        resolved_now_ms,
+        op_label,
+    } = params;
+
+    let outcome = submit_write(
+        state,
+        SubmitWrite {
+            tenant_id,
+            database_id,
+            vshard_id: vshard,
+            plan,
+            trace_id: TraceId::generate(),
+            event_source,
+            txn_id: None,
+            // Auth ran on the node that proposed the entry; the committed entry
+            // carries no session user.
+            user_id: None,
+            // The redo record is appended HERE, on this replica, from the
+            // committed plan: the proposer's LSN is deliberately not carried on
+            // the wire, and the array engine's tile state has no other
+            // durability path than this record's replay.
+            durability: WalDurability::AppendHere {
+                now_override: resolved_now_ms,
+            },
+            // Raft committed this entry at a fixed log index and every replica
+            // applies it in that order; re-entering the write-admission gate
+            // would re-decide an ordering that is already final.
+            ordering: WriteOrdering::AlreadyOrdered,
+            // An `ArrayOp::Put` / `Delete` does yield change metadata, but a
+            // Raft-committed array write raises no Control-Plane change event;
+            // see [`ChangeFeedOwner::Unowned`].
+            change_feed: ChangeFeedOwner::Unowned,
+        },
+    )
+    .await
+    .map_err(|e| crate::Error::Internal {
+        detail: format!("{op_label}: {e}"),
+    })?;
+    let response = outcome.response;
+
+    if response.status != Status::Ok {
+        let detail = response
+            .error_code
+            .as_ref()
+            .map(|c| format!("{op_label} error: {c:?}"))
+            .unwrap_or_else(|| format!("{op_label} returned error status"));
+        return Err(crate::Error::Internal { detail });
+    }
+    // The response carries the write-version this replica stamped alongside the
+    // payload; an array plan names no user collection, so it is `Lsn::ZERO` here
+    // — reported honestly rather than substituted for.
+    Ok(AppliedWrite::from_response(&response))
 }
 
 /// Derive the dispatch vShard for an array op from its coordinate.
@@ -168,7 +262,7 @@ pub(super) async fn await_data_plane(
     op_label: &str,
 ) -> ProposeResult {
     match tokio::time::timeout(Duration::from_secs(30), rx).await {
-        Ok(Ok(resp)) if resp.status == Status::Ok => Ok(resp.payload.to_vec()),
+        Ok(Ok(resp)) if resp.status == Status::Ok => Ok(AppliedWrite::from_response(&resp)),
         Ok(Ok(resp)) => {
             let detail = resp
                 .error_code

@@ -276,10 +276,14 @@ pub struct Response {
     pub watermark_lsn: Lsn,
 
     /// Per-collection read-version LSN (the scanned collection's `coll_write_lsn`
-    /// at read time, in its Raft-group index space) — the sound comparand for
-    /// cross-shard OCC read validation. Distinct from `watermark_lsn`
-    /// (core-global max, used for snapshot/SI reporting). `Lsn::ZERO` for
-    /// non-read responses.
+    /// at read time, a WAL LSN) — the sound comparand for cross-shard OCC read
+    /// validation. Distinct from `watermark_lsn` (core-global max, used for
+    /// snapshot/SI reporting).
+    ///
+    /// On a WRITE response it is the POST-write version of the written
+    /// collection (the handlers record before responding), which is how the Raft
+    /// apply path returns a committed write's own version to its proposer.
+    /// `Lsn::ZERO` when the plan names no single user collection.
     pub read_version_lsn: Lsn,
 
     /// Error code if status is not Ok.

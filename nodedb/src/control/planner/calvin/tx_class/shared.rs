@@ -17,8 +17,8 @@ use nodedb_physical::physical_plan::{
 ///
 /// Each [`ReadSetEntry`] becomes one [`VersionedReadEntry`], preserving the
 /// engine, collection, per-collection `read_version_lsn` (the read collection's
-/// write floor in its own Raft-group index space — the sound cross-shard OCC
-/// comparand, not the core-global `read_lsn`), and the point/predicate
+/// write floor, a WAL LSN — the sound cross-shard OCC comparand, not the
+/// core-global `read_lsn`), and the point/predicate
 /// distinction. The entry's `(database_id, tenant_id)` scope is not re-carried
 /// per entry: the enclosing `TxClass` already scopes the tenant.
 ///

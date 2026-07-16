@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::bridge::envelope::PhysicalPlan;
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb_physical::physical_plan::{
     ColumnarInsertIntent, ColumnarOp, CrdtOp, DocumentOp, GraphOp, SpatialOp, TextOp, TimeseriesOp,
     VectorOp,
@@ -183,16 +183,28 @@ fn propose_tracker_register_and_complete() {
     let tracker = ProposeTracker::new();
     let mut rx = tracker.register(1, 5, 0xdead_beef);
 
-    assert!(tracker.complete(1, 5, 0xdead_beef, Ok(b"result".to_vec())));
+    // The apply side stamps the written collection's post-write `coll_write_lsn`
+    // alongside the payload; the waiter must receive BOTH — it is the proposer's
+    // only channel for a version minted on the apply path.
+    assert!(tracker.complete(
+        1,
+        5,
+        0xdead_beef,
+        Ok(AppliedWrite {
+            payload: b"result".to_vec(),
+            write_version: Lsn::new(137),
+        }),
+    ));
 
-    let result = rx.try_recv().unwrap();
-    assert_eq!(result.unwrap(), b"result");
+    let result = rx.try_recv().unwrap().unwrap();
+    assert_eq!(result.payload, b"result");
+    assert_eq!(result.write_version, Lsn::new(137));
 }
 
 #[test]
 fn propose_tracker_no_waiter_returns_false() {
     let tracker = ProposeTracker::new();
-    assert!(!tracker.complete(1, 99, 0, Ok(vec![])));
+    assert!(!tracker.complete(1, 99, 0, Ok(AppliedWrite::unversioned(Vec::new()))));
 }
 
 #[test]
@@ -204,7 +216,14 @@ fn propose_tracker_key_mismatch_surfaces_retryable_leader_change() {
     // committed at the same (group_id, log_index). The waiter must
     // see RetryableLeaderChange, not the success result that belongs
     // to a different proposal.
-    assert!(tracker.complete(1, 5, 0xbbbb, Ok(b"other-proposers-payload".to_vec())));
+    assert!(tracker.complete(
+        1,
+        5,
+        0xbbbb,
+        Ok(AppliedWrite::unversioned(
+            b"other-proposers-payload".to_vec()
+        )),
+    ));
 
     let result = rx.try_recv().unwrap();
     match result {

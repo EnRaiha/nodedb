@@ -16,9 +16,12 @@ use crate::control::state::SharedState;
 const BACKOFF_MS: [u64; 5] = [10, 25, 50, 100, 200];
 
 /// Propose `entry` via `proposer` and return the Data Plane apply payload bytes
-/// together with the committed Raft log index (as an [`crate::types::Lsn`]) the
-/// entry applied at — the write's committed per-collection version, which the
-/// apply loop stamps as the collection's `coll_write_lsn`.
+/// together with the write's per-collection version (as an
+/// [`crate::types::Lsn`]): the written collection's `coll_write_lsn` after the
+/// write, stamped by the applying replica from the WAL LSN it minted for the
+/// entry's redo record. `Lsn::ZERO` when the write's plan names no single user
+/// collection. See [`AsyncRaftProposer`] for why this is a WAL LSN and never the
+/// Raft log index.
 ///
 /// Retries transparently on [`crate::Error::RetryableLeaderChange`]: the
 /// previous leader's entry was overwritten by a new leader's election no-op, so

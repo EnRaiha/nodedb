@@ -52,7 +52,7 @@ impl MultiRaft {
             .ok_or(ClusterError::GroupNotFound {
                 group_id: req.group_id,
             })?;
-        Ok(node.handle_install_snapshot(req))
+        Ok(node.handle_install_snapshot(req)?)
     }
 
     /// Route a TimeoutNow RPC to the correct group.
@@ -125,12 +125,32 @@ impl MultiRaft {
     }
 
     /// Advance applied index for a group after processing committed entries.
+    ///
+    /// This is the DELIVERY watermark. See [`Self::save_applied_index`] for the
+    /// durable floor a restart resumes from.
     pub fn advance_applied(&mut self, group_id: u64, applied_to: u64) -> Result<()> {
         let node = self
             .groups
             .get_mut(&group_id)
             .ok_or(ClusterError::GroupNotFound { group_id })?;
         node.advance_applied(applied_to);
+        Ok(())
+    }
+
+    /// Durably record `applied_to` as the group's applied floor.
+    ///
+    /// `applied_to` MUST name an entry whose state-machine effects are already
+    /// durable — for data groups, one whose redo record the WAL has fsynced.
+    /// The next boot resumes delivery at `applied_to + 1`, so this is what
+    /// keeps WAL replay and Raft replay from applying the same entry twice.
+    ///
+    /// Monotonic per group: an index at or below the current floor is a no-op.
+    pub fn save_applied_index(&mut self, group_id: u64, applied_to: u64) -> Result<()> {
+        let node = self
+            .groups
+            .get_mut(&group_id)
+            .ok_or(ClusterError::GroupNotFound { group_id })?;
+        node.save_durable_applied_index(applied_to)?;
         Ok(())
     }
 

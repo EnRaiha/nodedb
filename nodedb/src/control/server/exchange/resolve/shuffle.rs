@@ -300,8 +300,12 @@ pub async fn resolve_shuffle_join(
     // the part-owner after its consume completes.
     // Cross-node shuffle join: per-shard watermarks are not threaded through
     // the shuffle transport, so no per-shard read versions are surfaced here.
+    // Both LSNs are therefore `ZERO` — the watermark for the same reason, and the
+    // read-version because no shuffle participant reports its collection's
+    // `coll_write_lsn` back to the coordinator. Nothing may be substituted for it:
+    // any non-zero stand-in would assert a version this path never observed.
     Ok(Resolved::Gathered(
-        outcome_to_response(merged, Lsn::ZERO),
+        outcome_to_response(merged, Lsn::ZERO, Lsn::ZERO),
         Vec::new(),
     ))
 }
