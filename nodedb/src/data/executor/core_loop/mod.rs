@@ -2,6 +2,7 @@
 
 mod accessors;
 mod bitemporal_time;
+mod columnar_schema_seed;
 pub(in crate::data::executor) mod commit_pending;
 mod decode_stored;
 pub(in crate::data::executor) mod deferred;
@@ -16,6 +17,7 @@ pub(in crate::data::executor) mod pressure;
 pub(in crate::data::executor) mod priority_queues;
 mod response;
 mod segment_keks;
+mod spatial_index_rebuild;
 mod state;
 #[cfg(test)]
 pub(crate) mod tests;

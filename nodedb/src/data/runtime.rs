@@ -97,6 +97,23 @@ pub struct SpawnCoreParams<'a> {
     /// after it (rebuild the HNSW from the durable store), so vector search
     /// survives a hard crash that emptied the WAL.
     pub vector_index_param_seed: Arc<Vec<nodedb_types::StoredVectorIndexParams>>,
+    /// Catalog-sourced spatial collections `(tenant_id, name)`, used after
+    /// `replay_all_wal` to rebuild the in-memory R-tree from the durable
+    /// document store, so spatial search survives a hard crash that emptied the
+    /// WAL and left no spatial checkpoint.
+    pub spatial_collection_seed: Arc<Vec<(u64, String)>>,
+    /// Catalog-sourced schema for every columnar-family (`columnar` /
+    /// `timeseries` / `spatial`) collection, applied before `replay_all_wal`
+    /// so a fresh `MutationEngine` is pre-registered with its real schema
+    /// instead of the WAL redo path inferring one from the first replayed
+    /// row (which loses declared types like Geometry, Timestamp, Decimal).
+    pub columnar_schema_seed: Arc<
+        Vec<(
+            crate::types::TenantId,
+            String,
+            nodedb_types::columnar::ColumnarSchema,
+        )>,
+    >,
     /// One-shot signal fired once this core finishes `replay_all_wal` (before
     /// it enters its event loop). Boot awaits every core's signal before
     /// opening the client gateway, so `/healthz` never reports ready while a
@@ -136,6 +153,8 @@ pub fn spawn_core(
         maintenance_budget,
         doc_config_seed,
         vector_index_param_seed,
+        spatial_collection_seed,
+        columnar_schema_seed,
         replay_done,
     } = params;
 
@@ -228,6 +247,18 @@ pub fn spawn_core(
             // survive a hard crash.
             core.seed_vector_index_params(&vector_index_param_seed);
 
+            // 3d. Seed columnar-family (`columnar` / `timeseries` /
+            // `spatial`) MutationEngine schemas from the durable catalog
+            // BEFORE WAL replay. `replay_columnar_payload` replays redo
+            // records with an empty `schema_bytes`; on a fresh engine map
+            // that falls back to inferring the schema from the first
+            // replayed row, which loses declared types like Geometry,
+            // Timestamp, and Decimal. Pre-registering here means the
+            // replay path finds an existing engine and reuses its real
+            // schema instead of ever inferring. Must run after
+            // `seed_doc_configs` so `is_bitemporal` sees the right flag.
+            core.seed_columnar_schemas(&columnar_schema_seed);
+
             // 4. Replay WAL records for crash recovery.
             //
             // Tombstones are pre-built by the caller from
@@ -247,6 +278,15 @@ pub fn spawn_core(
             // remove-then-insert), so it safely overlays whatever the vector
             // checkpoint + WAL replay above already restored.
             core.rebuild_vector_indexes_from_store(&vector_index_param_seed);
+
+            // 4c. Same crash-recovery backstop for the in-memory R-tree spatial
+            // index: spatial checkpoints run only on a manual snapshot and the
+            // WAL is not crash-durable, so on a hard crash the R-tree may come
+            // back empty while the geometry documents survived in redb. Re-index
+            // every geometry document from the durable store. Idempotent (per-
+            // document remove-then-insert), so it safely overlays whatever the
+            // spatial checkpoint + WAL replay above already restored.
+            core.rebuild_spatial_indexes_from_store(&spatial_collection_seed);
 
             // Replay is complete: every in-memory index (HNSW, etc.) has been
             // rebuilt from the WAL. Signal boot so the client gateway is not

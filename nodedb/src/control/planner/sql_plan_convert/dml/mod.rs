@@ -5,6 +5,7 @@ mod kv_and_vector;
 mod merge;
 mod update_delete;
 
+pub(crate) use insert::build_columnar_schema;
 pub(super) use insert::{ConvertInsertArgs, ConvertUpsertArgs, convert_insert, convert_upsert};
 pub(super) use kv_and_vector::{
     VectorPrimaryInsertCfg, convert_kv_insert, convert_vector_primary_insert,

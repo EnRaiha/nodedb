@@ -15,8 +15,7 @@ use super::super::value::{
 };
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-/// Build a `ColumnarSchema` from raw catalog column-type strings, then
-/// serialize it as MessagePack for the `ColumnarOp::Insert::schema_bytes` field.
+/// Build a `ColumnarSchema` from raw catalog column-type strings.
 ///
 /// `column_schema` is the list of `(column_name, type_str)` pairs from the
 /// DDL catalog (`stored.fields`). Unknown type strings are treated as
@@ -25,11 +24,19 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 /// The `id` column is treated as the primary key when present; all other
 /// columns are treated as nullable.
 ///
-/// Returns an empty `Vec` when `column_schema` is empty (no catalog schema
-/// available — test fixtures and legacy paths).
-fn build_schema_bytes(column_schema: &[(String, String)]) -> Vec<u8> {
+/// Returns `None` when `column_schema` is empty (no catalog schema available
+/// — test fixtures and legacy paths) or the resulting schema fails
+/// validation.
+///
+/// This is the single source of truth for turning a catalog's raw
+/// `(name, type_str)` field list into a typed `ColumnarSchema` — shared by
+/// the live SQL insert path (via [`build_schema_bytes`]) and
+/// `bootstrap::data_plane::load_columnar_schema_seed`, which pre-registers
+/// each columnar-family collection's real schema before WAL replay so a
+/// fresh `MutationEngine` never falls back to type-lossy inference.
+pub(crate) fn build_columnar_schema(column_schema: &[(String, String)]) -> Option<ColumnarSchema> {
     if column_schema.is_empty() {
-        return Vec::new();
+        return None;
     }
     let mut cols = Vec::with_capacity(column_schema.len());
     let mut has_id = false;
@@ -59,11 +66,18 @@ fn build_schema_bytes(column_schema: &[(String, String)]) -> Vec<u8> {
             ColumnDef::required("id", ColumnType::String).with_primary_key(),
         );
     }
-    let schema = match ColumnarSchema::new(cols) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    zerompk::to_msgpack_vec(&schema).unwrap_or_default()
+    ColumnarSchema::new(cols).ok()
+}
+
+/// Build a `ColumnarSchema` from raw catalog column-type strings, then
+/// serialize it as MessagePack for the `ColumnarOp::Insert::schema_bytes` field.
+///
+/// Returns an empty `Vec` when `column_schema` is empty or fails validation
+/// — see [`build_columnar_schema`] for the typed builder this wraps.
+fn build_schema_bytes(column_schema: &[(String, String)]) -> Vec<u8> {
+    build_columnar_schema(column_schema)
+        .map(|schema| zerompk::to_msgpack_vec(&schema).unwrap_or_default())
+        .unwrap_or_default()
 }
 
 /// Extract the document-id value from a row, keyed off the declared

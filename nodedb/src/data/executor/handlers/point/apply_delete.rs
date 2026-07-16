@@ -327,41 +327,14 @@ impl CoreLoop {
         // `(spatial_index_key, entry_id, bbox, document_id)` tuples removed by
         // the spatial cascade below are captured so a transactional caller can
         // reverse them.
-        let mut spatial_deletes = Vec::new();
         let mut mark_node_deleted_capture: Option<String> = None;
-        let entry_id = crate::util::fnv1a_hash(row_key.as_bytes());
-        let db_id = nodedb_types::DatabaseId::new(database_id);
-        let tid_id = crate::types::TenantId::new(tid);
-        let spatial_fields: Vec<String> = self
-            .spatial_indexes
-            .keys()
-            .filter(|(d, t, c, _)| *d == db_id && *t == tid_id && c == collection)
-            .map(|(_, _, _, f)| f.clone())
-            .collect();
-        for field in spatial_fields {
-            let skey = (db_id, tid_id, collection.to_string(), field.clone());
-            // Read the bbox BEFORE deleting — the R-tree `delete` does not
-            // return the removed geometry, so a reversible undo must capture
-            // it here (the reverse `spatial_doc_map` stores only the doc id).
-            let bbox = self
-                .spatial_indexes
-                .get(&skey)
-                .and_then(|rtree| rtree.entries().into_iter().find(|e| e.id == entry_id))
-                .map(|e| e.bbox);
-            if let Some(rtree) = self.spatial_indexes.get_mut(&skey) {
-                rtree.delete(entry_id);
-            }
-            let removed_doc = self.spatial_doc_map.remove(&(
-                db_id,
-                tid_id,
-                collection.to_string(),
-                field,
-                entry_id,
-            ));
-            if let (Some(bbox), Some(doc)) = (bbox, removed_doc) {
-                spatial_deletes.push((skey, entry_id, bbox, doc));
-            }
-        }
+        // The put path hashes the hex-surrogate storage key (== `row_key`) as
+        // the R-tree entry id, so the shared removal hashes the same key to
+        // find and drop every per-field entry + reverse-map pair for this
+        // document. Captures each removed `(skey, entry_id, bbox, doc)` for
+        // reversible undo.
+        let spatial_deletes =
+            self.remove_document_spatial_indexes(database_id, tid, collection, row_key);
 
         // Record deletion for edge referential integrity. Capture the id
         // for undo ONLY when this call newly marked it — un-marking a node
