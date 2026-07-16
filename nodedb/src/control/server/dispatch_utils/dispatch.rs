@@ -445,7 +445,7 @@ async fn dispatch_to_data_plane_inner(
     // index returns its surrogate + post-image in `write_set`; without this
     // durable `Put` a WAL-only restart rebuilds the HNSW from the pre-update body
     // and resurrects the old embedding.
-    if let Some(collection) = &post_apply
+    let post_apply_lsn = if let Some(collection) = &post_apply
         && append_wal
         && response.status == crate::bridge::envelope::Status::Ok
     {
@@ -456,9 +456,33 @@ async fn dispatch_to_data_plane_inner(
             database_id,
             collection,
             &response.write_set,
-        )?;
-    }
+        )?
+    } else {
+        None
+    };
     drop(deferred_guards);
+
+    // Durable-at-ack barrier: an acknowledged write must be WAL-fsync-durable
+    // before this response (the client ack) returns. `wal_lsn` is the forward
+    // write's LSN — minted here under the admission guard for an autocommit
+    // write, or supplied by a caller that appended upstream (procedural batch
+    // flush, interactive-COMMIT transaction redo). `post_apply_lsn` covers the
+    // post-apply document redo appended just above. Both records are already
+    // buffered in the shared WAL; one group-commit fsync coalesces concurrent
+    // writers (see `WalManager::wait_durable`), and it runs here — after the
+    // admission guards are released — so it never serializes same-key
+    // throughput. Reads / control ops / trigger / staged-write dispatch carry no
+    // LSN and skip the barrier; the cluster/Raft commit path owns its own
+    // durability and never reaches this funnel with a local WAL LSN.
+    if response.status == crate::bridge::envelope::Status::Ok {
+        let durable_target = match (wal_lsn, post_apply_lsn) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if let Some(lsn) = durable_target {
+            shared.wal.wait_durable(lsn).await?;
+        }
+    }
 
     // Publish change events for successful writes. Almost every write plan
     // yields exactly one tuple; a handful of multi-row / multi-collection

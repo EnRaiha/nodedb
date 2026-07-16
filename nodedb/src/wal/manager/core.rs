@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
 
 use tracing::info;
 
@@ -19,7 +20,10 @@ use nodedb_wal::writer::WalWriterConfig;
 /// serializes writes, which is correct — WAL appends must be ordered anyway.
 /// The `sync()` call (fsync) is the expensive part and is batched via group commit.
 pub struct WalManager {
-    pub(super) wal: Mutex<SegmentedWal>,
+    /// The segmented WAL. `Arc` so the group-commit fsync
+    /// ([`WalManager::wait_durable`]) can move a handle into a `spawn_blocking`
+    /// thread — the O_DIRECT `sync()` must never run inline on a Tokio worker.
+    pub(super) wal: Arc<Mutex<SegmentedWal>>,
     /// The WAL directory path (for replay without holding the lock).
     pub(super) wal_dir: PathBuf,
     /// Encryption key ring (if configured). Supports dual-key reads during rotation.
@@ -27,6 +31,18 @@ pub struct WalManager {
     /// Dedicated audit WAL segment. When present, audit entries are written
     /// atomically alongside data writes. Append-only, never compacted.
     pub(super) audit_wal: Option<crate::wal::AuditWalSegment>,
+    /// Highest LSN known to be fsync-durable. Advanced only by the
+    /// group-commit leader in [`WalManager::wait_durable`] after a successful
+    /// `sync()`, never past what that fsync actually made durable.
+    pub(super) durable_lsn: AtomicU64,
+    /// Async group-commit leader election: the first `wait_durable` caller to
+    /// acquire this becomes the leader and performs the single coalesced fsync
+    /// covering every concurrently-buffered write. Async so waiting for
+    /// leadership never blocks a Tokio worker.
+    pub(super) commit_lock: tokio::sync::Mutex<()>,
+    /// Wakes `wait_durable` followers when `durable_lsn` advances (or a leader's
+    /// fsync fails, so they re-attempt and observe the same error).
+    pub(super) durable_notify: tokio::sync::Notify,
 }
 
 impl WalManager {
@@ -118,10 +134,13 @@ impl WalManager {
         };
 
         Ok(Self {
-            wal: Mutex::new(wal),
+            wal: Arc::new(Mutex::new(wal)),
             wal_dir,
             encryption_ring: None,
             audit_wal,
+            durable_lsn: AtomicU64::new(0),
+            commit_lock: tokio::sync::Mutex::new(()),
+            durable_notify: tokio::sync::Notify::new(),
         })
     }
 
