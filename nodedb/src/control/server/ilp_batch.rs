@@ -196,6 +196,20 @@ async fn flush_ilp_batch_inner(
             }
         };
 
+        // Durable-at-ack barrier: the batch was appended to the WAL above, but
+        // `wal_append_timeseries` only buffers the record and mints its `Lsn` —
+        // the fsync is deferred. Without this barrier a `kill -9` loses the
+        // buffered bytes after the caller was already told the rows were
+        // accepted. Timeseries rows live only in the `MutationEngine` memtable
+        // until a restart replays the WAL, so the WAL is their sole durability
+        // path. Mirrors the barrier in `submit_to_data_plane` and
+        // `dispatch_utils::dispatch::dispatch_to_data_plane_inner`.
+        if response.status == Status::Ok
+            && let Some(lsn) = wal_lsn
+        {
+            state.wal.wait_durable(Lsn::new(lsn)).await?;
+        }
+
         if !response.payload.is_empty()
             && let Ok(v) = sonic_rs::from_slice::<serde_json::Value>(&response.payload)
         {

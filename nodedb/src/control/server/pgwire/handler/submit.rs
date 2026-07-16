@@ -203,7 +203,7 @@ impl NodeDbPgHandler {
                 // `write_set`; without this durable `Put` a WAL-only restart
                 // rebuilds the HNSW from the pre-update body and resurrects the
                 // old embedding.
-                if let Some(collection) = &post_apply
+                let post_apply_lsn = if let Some(collection) = &post_apply
                     && append_wal
                     && resp.status == crate::bridge::envelope::Status::Ok
                 {
@@ -214,9 +214,37 @@ impl NodeDbPgHandler {
                         database_id,
                         collection,
                         &resp.write_set,
-                    )?;
-                }
+                    )?
+                } else {
+                    None
+                };
                 drop(deferred_guards);
+
+                // Durable-at-ack barrier: an acknowledged write must be
+                // WAL-fsync-durable before this response (the client ack)
+                // returns. `WalManager::append_*` only buffers the record and
+                // mints its `Lsn`; without this barrier a `kill -9` loses the
+                // buffered bytes, which is invisible for engines whose rows are
+                // committed durably by redb but silently destroys the
+                // columnar/timeseries memtable engines, whose only durability
+                // path is WAL replay. `wal_lsn` is the forward write's LSN
+                // (minted above for an autocommit write, or supplied by the
+                // COMMIT batch-flush caller); `post_apply_lsn` covers the
+                // post-apply redo appended just above. One group-commit fsync
+                // coalesces concurrent writers (see `WalManager::wait_durable`),
+                // and it runs after the admission guards are released so it never
+                // serializes same-key throughput. Reads / control ops carry no
+                // LSN and skip the barrier. Mirrors the same barrier in
+                // `dispatch_utils::dispatch::dispatch_to_data_plane_inner`.
+                if resp.status == crate::bridge::envelope::Status::Ok {
+                    let durable_target = match (wal_lsn, post_apply_lsn) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    };
+                    if let Some(lsn) = durable_target {
+                        self.state.wal.wait_durable(lsn).await?;
+                    }
+                }
                 Ok(resp)
             }
             Err(DispatchCollectError::OverBudget { bytes }) => {
