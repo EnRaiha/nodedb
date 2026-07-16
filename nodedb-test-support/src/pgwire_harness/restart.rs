@@ -265,6 +265,14 @@ impl TestServer {
         )
         .await;
 
+        // Rehydrate the AFTER-trigger registry from the catalog before the
+        // Event Plane starts — it is per-process in-memory state and is
+        // otherwise empty after a restart, so replayed/live events would match
+        // no trigger. Mirrors the production boot sequence.
+        shared
+            .trigger_registry
+            .load_all(shared.credentials.catalog());
+
         let watermark_store =
             Arc::new(nodedb::event::watermark::WatermarkStore::open(dir_path).unwrap());
         let trigger_dlq = Arc::new(std::sync::Mutex::new(

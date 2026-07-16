@@ -112,19 +112,27 @@ pub fn drain_ring_buffer(
     events
 }
 
-/// Drain the ring buffer, skipping events with sequence <= last_sequence.
-/// Used after WAL catchup to discard stale events that overlap with replay.
-pub fn drain_and_skip_stale(rx: &mut EventConsumerRx, last_sequence: u64) {
+/// Drain ring-buffer events already covered by WAL replay (`lsn <= last_lsn`),
+/// returning the first event whose LSN is beyond the replay point so the
+/// caller can dispatch it.
+///
+/// Reconciliation is by **LSN** — the durable, monotonic key — not by
+/// `sequence`: the per-core `sequence` counter resets to 0 on process
+/// restart, so at boot it collides between WAL-replayed events and freshly
+/// produced live events and cannot distinguish them. The ring is SPSC (a
+/// `try_recv`'d event cannot be pushed back), so the first non-stale event is
+/// handed back to the caller rather than dropped; every event after it in the
+/// ring is also fresh (the producer emits in LSN order) and is left for the
+/// Normal-mode drain.
+pub fn drain_and_skip_stale(rx: &mut EventConsumerRx, last_lsn: Lsn) -> Option<WriteEvent> {
     let mut skipped = 0u32;
+    let mut fresh = None;
     while let Some(event) = rx.try_recv() {
-        if event.sequence <= last_sequence {
-            skipped += 1;
-        } else {
-            // Shouldn't happen — we just caught up. But if it does,
-            // the event is newer than what we replayed. Log and drop
-            // (next normal poll will process new events).
+        if event.lsn.is_ahead_of(last_lsn) {
+            fresh = Some(event);
             break;
         }
+        skipped += 1;
     }
     if skipped > 0 {
         trace!(
@@ -132,6 +140,7 @@ pub fn drain_and_skip_stale(rx: &mut EventConsumerRx, last_sequence: u64) {
             "drained stale events from ring buffer after WAL catchup"
         );
     }
+    fresh
 }
 
 /// Dispatch a single write event: triggers, CDC, permission cache, streaming MVs, CRDT sync.

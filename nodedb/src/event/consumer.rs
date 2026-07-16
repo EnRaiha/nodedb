@@ -5,15 +5,21 @@
 //! Each consumer operates in one of two modes:
 //!
 //! ```text
-//! Normal ──[sequence gap detected]──► WalCatchup
-//!   ▲                                    │
-//!   └──[caught up to WAL head]───────────┘
+//! (boot: resume from persisted watermark)
+//!         │
+//!         ▼
+//! WalCatchup ──[caught up to WAL head]──► Normal
+//!   ▲                                       │
+//!   └────────[sequence gap detected]────────┘
 //! ```
 //!
 //! - **Normal**: polls ring buffer, processes events, persists watermark.
 //! - **WalCatchup**: pauses ring buffer entirely, reads events exclusively
 //!   from WAL on disk until caught up, then switches back. Ring buffer and
 //!   WAL are NEVER read simultaneously (prevents "thundering WAL" spiral).
+//!   The consumer also boots directly into this mode (see `consumer_loop`)
+//!   to replay any WAL suffix past the persisted watermark before serving
+//!   the ring buffer, closing the restart delivery gap.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,7 +139,6 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
     } = config;
 
     let core_id = rx.core_id();
-    let mut mode = ConsumerMode::Normal;
     let mut last_sequence: u64 = 0;
     let mut last_lsn = Lsn::ZERO;
     let mut dirty_watermark = false;
@@ -151,6 +156,14 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
             warn!(core_id, error = %e, "failed to load watermark, starting from ZERO");
         }
     }
+
+    // Boot directly into WalCatchup: the ring buffer is always empty on a
+    // fresh process, so any events committed to the WAL but not yet
+    // dispatched+watermarked before a crash/restart would otherwise be
+    // silently dropped. Replaying [watermark+1, WAL head] here closes that
+    // gap; the WalCatchup arm below self-transitions to Normal once caught
+    // up (or immediately, on a fresh DB with an empty WAL).
+    let mut mode = ConsumerMode::WalCatchup;
 
     debug!(core_id, "event plane consumer started");
     let mut wal_retry_count: u32 = 0;
@@ -324,7 +337,19 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
                     }
                 }
 
-                drain_and_skip_stale(&mut rx, last_sequence);
+                // Discard ring-buffer events already re-dispatched by replay
+                // (`lsn <= last_lsn`); the first event past the replay point is
+                // returned and dispatched here rather than dropped (the ring is
+                // SPSC and cannot un-receive it). Everything after it is fresh
+                // and is served by the Normal-mode drain on the next iteration.
+                if let Some(event) = drain_and_skip_stale(&mut rx, last_lsn) {
+                    record_event(core_id, &event, &metrics);
+                    dispatch_event(&event, &shared_state, &mut retry_queue, &cdc_router).await;
+                    last_sequence = event.sequence;
+                    if event.lsn.is_ahead_of(last_lsn) {
+                        last_lsn = event.lsn;
+                    }
+                }
 
                 flush_watermark(&watermark_store, core_id, last_lsn);
                 dirty_watermark = false;
