@@ -124,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         trigger_dlq,
         cluster_handle,
         _core_handles,
+        replay_done,
     } = data_plane::bootstrap_data_plane(&config, &wal_gate).await?;
 
     let shared = shared_state::open_and_wire_state(
@@ -192,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
     nodedb::bootstrap::cluster_ready::await_cluster_ready(
         &shared,
         raft_ready_rx,
+        replay_done,
         nodedb::bootstrap::cluster_ready::ClusterReadyGates {
             raft_gate,
             schema_gate,

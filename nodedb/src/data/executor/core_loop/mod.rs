@@ -20,6 +20,8 @@ mod state;
 #[cfg(test)]
 pub(crate) mod tests;
 mod tick;
+mod vector_index_rebuild;
+mod vector_index_seed;
 pub(in crate::data::executor) mod write_index;
 
 pub(in crate::data::executor) use segment_keks::SegmentKeks;

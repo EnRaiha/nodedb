@@ -78,6 +78,7 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "pending_reclaim" => PENDING_RECLAIM,
     "column_stats" => COLUMN_STATS,
     "vector_model_metadata" => VECTOR_MODEL_METADATA,
+    "vector_index_params" => VECTOR_INDEX_PARAMS,
     "checkpoints" => CHECKPOINTS,
     // ── Surrogate identity map ──
     "surrogate_pk_v3" => SURROGATE_PK_V3,

@@ -31,6 +31,7 @@ pub struct ClusterReadyGates {
 pub async fn await_cluster_ready(
     shared: &Arc<SharedState>,
     raft_ready_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    data_plane_replay_done: Vec<tokio::sync::oneshot::Receiver<()>>,
     gates: ClusterReadyGates,
 ) -> anyhow::Result<()> {
     let ClusterReadyGates {
@@ -103,6 +104,38 @@ pub async fn await_cluster_ready(
         ));
     }
     sanity_gate.fire();
+
+    // Wait for every Data Plane core to finish `replay_all_wal` before opening
+    // the client gateway. Each core rebuilds its in-memory indexes (HNSW, etc.)
+    // from the WAL on its own thread; `/healthz` must not report ready until
+    // that is done, or a just-restarted node would serve queries against
+    // half-rebuilt indexes (e.g. an empty vector search). A dropped sender
+    // means a core panicked during open/replay — fail closed, exactly as the
+    // raft-readiness gate does, rather than open the gateway on a broken core.
+    const REPLAY_READY_TIMEOUT: Duration = Duration::from_secs(300);
+    let replay_wait = async {
+        for rx in data_plane_replay_done {
+            rx.await.map_err(|_| {
+                anyhow::anyhow!("data plane core exited before signalling WAL replay completion")
+            })?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    match tokio::time::timeout(REPLAY_READY_TIMEOUT, replay_wait).await {
+        Ok(Ok(())) => info!("all data plane cores completed WAL replay"),
+        Ok(Err(e)) => {
+            data_groups_gate.fail(format!("data plane WAL replay failed: {e}"));
+            return Err(e);
+        }
+        Err(_) => {
+            data_groups_gate.fail(format!(
+                "data plane WAL replay did not complete within {REPLAY_READY_TIMEOUT:?}"
+            ));
+            return Err(anyhow::anyhow!(
+                "data plane WAL replay timeout after {REPLAY_READY_TIMEOUT:?}"
+            ));
+        }
+    }
     data_groups_gate.fire();
     transport_gate.fire();
 

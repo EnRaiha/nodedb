@@ -82,6 +82,34 @@ pub async fn create_vector_index(
         &identity.username,
     )?;
 
+    // Persist the index parameters durably to the catalog so they survive a
+    // hard crash (the WAL `VectorParams` record below is not crash-durable —
+    // it is lost if the process is killed before the WAL group-commit flush).
+    // Boot re-seeds these to the Data Plane and rebuilds the HNSW from the
+    // durable document store.
+    state
+        .credentials
+        .catalog()
+        .put_vector_index_params(&nodedb_types::StoredVectorIndexParams {
+            tenant_id: tenant_id.as_u64(),
+            collection: collection.to_string(),
+            field_name: field_name.clone(),
+            dim,
+            metric: metric.to_lowercase(),
+            m,
+            ef_construction,
+            index_type: index_type.clone(),
+            pq_m,
+            ivf_cells,
+            ivf_nprobe,
+        })
+        .map_err(|e| {
+            ddl_err(
+                "XX000",
+                format!("persist vector index params to catalog: {e}"),
+            )
+        })?;
+
     let vshard =
         crate::types::VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection);
     let set_params_plan = PhysicalPlan::Vector(VectorOp::SetParams {

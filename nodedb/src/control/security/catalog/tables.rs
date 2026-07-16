@@ -365,6 +365,10 @@ pub(super) const MIRROR_LAG: TableDefinition<u64, &[u8]> =
 pub(super) const VECTOR_MODEL_METADATA: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.vector_model_metadata");
 
+/// Table: "{tenant_id}:{collection}:{field_name}" -> MessagePack-serialized StoredVectorIndexParams.
+pub(super) const VECTOR_INDEX_PARAMS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("_system.vector_index_params");
+
 /// Table: "{tenant_id}:{collection}:{doc_id}:{checkpoint_name}" -> MessagePack CheckpointRecord.
 pub(super) const CHECKPOINTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.checkpoints");

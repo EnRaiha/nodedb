@@ -29,6 +29,10 @@ pub(crate) struct DataPlaneBootstrap {
     pub(crate) cluster_handle: Option<Arc<nodedb::control::cluster::ClusterHandle>>,
     // Held only to keep the Data Plane core threads alive; never read.
     pub(crate) _core_handles: Vec<std::thread::JoinHandle<()>>,
+    /// Per-core WAL-replay-completion signals. Boot awaits every one before
+    /// firing the gateway readiness gate so `/healthz` reports ready only once
+    /// every core has rebuilt its in-memory indexes from the WAL.
+    pub(crate) replay_done: Vec<tokio::sync::oneshot::Receiver<()>>,
 }
 
 /// Run the full Data Plane bootstrap phase. Pure relocation of what
@@ -71,6 +75,13 @@ pub(crate) async fn bootstrap_data_plane(
     // its own WAL redo replay (see `load_doc_config_registry` docs).
     let doc_config_seed = Arc::new(bootstrap::data_plane::load_doc_config_registry(config));
 
+    // Load every persisted `CREATE VECTOR INDEX`'s build parameters once,
+    // before spawning cores, so each core can seed its vector-index config and
+    // rebuild the HNSW from the durable document store on boot (the WAL
+    // `VectorParams` record is not crash-durable).
+    let vector_index_param_seed =
+        Arc::new(bootstrap::data_plane::load_vector_index_param_seed(config));
+
     // Create the quarantine registry before spawning cores.
     let quarantine_registry =
         std::sync::Arc::new(nodedb::storage::quarantine::QuarantineRegistry::new());
@@ -80,7 +91,10 @@ pub(crate) async fn bootstrap_data_plane(
     let maintenance_budget =
         Arc::new(nodedb::control::maintenance::MaintenanceBudgetTracker::new());
 
-    let _core_handles = bootstrap::data_plane::spawn_data_plane_cores(
+    let bootstrap::data_plane::SpawnedDataPlaneCores {
+        handles: _core_handles,
+        replay_done,
+    } = bootstrap::data_plane::spawn_data_plane_cores(
         config,
         data_sides,
         event_producers,
@@ -96,6 +110,7 @@ pub(crate) async fn bootstrap_data_plane(
             system_metrics: Arc::clone(&system_metrics),
             maintenance_budget: Arc::clone(&maintenance_budget),
             doc_config_seed: Arc::clone(&doc_config_seed),
+            vector_index_param_seed: Arc::clone(&vector_index_param_seed),
         },
     )?;
 
@@ -153,5 +168,6 @@ pub(crate) async fn bootstrap_data_plane(
         trigger_dlq,
         cluster_handle,
         _core_handles,
+        replay_done,
     })
 }

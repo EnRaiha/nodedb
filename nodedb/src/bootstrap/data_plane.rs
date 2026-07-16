@@ -98,6 +98,48 @@ pub fn load_doc_config_registry(
         .collect()
 }
 
+/// Load every persisted `CREATE VECTOR INDEX`'s build parameters from the
+/// durable catalog so each Data Plane core can seed its in-memory
+/// vector-index config (`vector_params` + `index_configs`) and rebuild the
+/// HNSW from the durable document store on boot.
+///
+/// The WAL `VectorParams` record is not crash-durable — a `kill -9` before
+/// the WAL group-commit flush loses it, so on reopen the core would not know
+/// the collection carries a vector index and post-restart search would return
+/// empty. Mirrors [`load_doc_config_registry`]'s fail-open pattern: a catalog
+/// open/load failure at this boot phase logs a warning and yields an empty
+/// seed rather than aborting startup.
+pub fn load_vector_index_param_seed(
+    config: &ServerConfig,
+) -> Vec<nodedb_types::StoredVectorIndexParams> {
+    let catalog_path = config.catalog_path();
+    let catalog = match crate::control::security::catalog::SystemCatalog::open(&catalog_path) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not open system catalog to seed vector index params");
+            return Vec::new();
+        }
+    };
+    match catalog.list_all_vector_index_params() {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load vector index params to seed cores");
+            Vec::new()
+        }
+    }
+}
+
+/// Result of [`spawn_data_plane_cores`]: the core thread handles plus each
+/// core's WAL-replay-completion signal.
+pub struct SpawnedDataPlaneCores {
+    /// Held only to keep the Data Plane core threads alive; never read.
+    pub handles: Vec<std::thread::JoinHandle<()>>,
+    /// Per-core one-shot that resolves when the core finishes `replay_all_wal`
+    /// (before entering its event loop). Boot awaits every one before opening
+    /// the client gateway.
+    pub replay_done: Vec<tokio::sync::oneshot::Receiver<()>>,
+}
+
 /// Shared Arc resources passed to each Data Plane core at spawn time.
 pub struct CoreSharedResources {
     pub governor: Arc<nodedb_mem::MemoryGovernor>,
@@ -108,11 +150,16 @@ pub struct CoreSharedResources {
     pub system_metrics: Arc<SystemMetrics>,
     pub maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
     pub doc_config_seed: Arc<Vec<((TenantId, String), CollectionConfig)>>,
+    pub vector_index_param_seed: Arc<Vec<nodedb_types::StoredVectorIndexParams>>,
 }
 
-/// Spawn all Data Plane cores, wire dispatcher notifiers, and return core handles.
+/// Spawn all Data Plane cores, wire dispatcher notifiers, and return core
+/// handles plus a per-core WAL-replay-completion signal.
 ///
-/// Returns `(core_handles, event_consumers)`.
+/// Each returned `oneshot::Receiver<()>` resolves when its core finishes
+/// `replay_all_wal` (before it enters its event loop). Boot must await every
+/// one before opening the client gateway so `/healthz` cannot report ready
+/// while a core is still rebuilding in-memory indexes from the WAL.
 pub fn spawn_data_plane_cores(
     config: &ServerConfig,
     data_sides: Vec<CoreChannelDataSide>,
@@ -121,7 +168,7 @@ pub fn spawn_data_plane_cores(
     replay_tombstones: nodedb_wal::TombstoneSet,
     dispatcher: &mut Dispatcher,
     resources: CoreSharedResources,
-) -> anyhow::Result<Vec<std::thread::JoinHandle<()>>> {
+) -> anyhow::Result<SpawnedDataPlaneCores> {
     let CoreSharedResources {
         governor,
         quiesce,
@@ -131,6 +178,7 @@ pub fn spawn_data_plane_cores(
         system_metrics,
         maintenance_budget,
         doc_config_seed,
+        vector_index_param_seed,
     } = resources;
     let num_cores = config.server.data_plane_cores;
     let compaction_cfg = CoreCompactionConfig {
@@ -141,11 +189,13 @@ pub fn spawn_data_plane_cores(
     };
 
     let mut core_handles = Vec::with_capacity(num_cores);
+    let mut replay_done_rxs = Vec::with_capacity(num_cores);
     let mut notifiers: Vec<(usize, EventFdNotifier)> = Vec::with_capacity(num_cores);
 
     for (core_id, (data_side, event_producer)) in
         data_sides.into_iter().zip(event_producers).enumerate()
     {
+        let (replay_done_tx, replay_done_rx) = tokio::sync::oneshot::channel();
         let (handle, notifier) = spawn_core(SpawnCoreParams {
             core_id,
             request_rx: data_side.request_rx,
@@ -164,8 +214,11 @@ pub fn spawn_data_plane_cores(
             quarantine_registry: Arc::clone(&quarantine_registry),
             maintenance_budget: Arc::clone(&maintenance_budget),
             doc_config_seed: Arc::clone(&doc_config_seed),
+            vector_index_param_seed: Arc::clone(&vector_index_param_seed),
+            replay_done: replay_done_tx,
         })?;
         core_handles.push(handle);
+        replay_done_rxs.push(replay_done_rx);
         notifiers.push((core_id, notifier));
     }
 
@@ -174,5 +227,8 @@ pub fn spawn_data_plane_cores(
     }
 
     info!(num_cores, "data plane cores running (eventfd-driven)");
-    Ok(core_handles)
+    Ok(SpawnedDataPlaneCores {
+        handles: core_handles,
+        replay_done: replay_done_rxs,
+    })
 }

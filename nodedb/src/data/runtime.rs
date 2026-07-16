@@ -92,6 +92,19 @@ pub struct SpawnCoreParams<'a> {
             crate::engine::document::store::CollectionConfig,
         )>,
     >,
+    /// Catalog-sourced vector-index build parameters, applied before
+    /// `replay_all_wal` (seed `vector_params` + `index_configs`) and again
+    /// after it (rebuild the HNSW from the durable store), so vector search
+    /// survives a hard crash that emptied the WAL.
+    pub vector_index_param_seed: Arc<Vec<nodedb_types::StoredVectorIndexParams>>,
+    /// One-shot signal fired once this core finishes `replay_all_wal` (before
+    /// it enters its event loop). Boot awaits every core's signal before
+    /// opening the client gateway, so `/healthz` never reports ready while a
+    /// core is still rebuilding its in-memory indexes (HNSW, etc.) from the
+    /// WAL — which would otherwise let a just-restarted node serve half-rebuilt
+    /// results. Dropped without firing if the core panics during open/replay,
+    /// which surfaces to boot as a failed readiness gate.
+    pub replay_done: tokio::sync::oneshot::Sender<()>,
 }
 
 /// Spawn a Data Plane core on a dedicated OS thread with TPC isolation.
@@ -122,6 +135,8 @@ pub fn spawn_core(
         quarantine_registry,
         maintenance_budget,
         doc_config_seed,
+        vector_index_param_seed,
+        replay_done,
     } = params;
 
     let data_dir = data_dir.to_path_buf();
@@ -204,6 +219,15 @@ pub fn spawn_core(
             // store's O(1) field layout.
             core.seed_doc_configs(&doc_config_seed);
 
+            // 3c. Seed vector-index config from the durable catalog BEFORE
+            // WAL replay. The `CREATE VECTOR INDEX` parameters otherwise
+            // arrive only as a WAL `VectorParams` record, which is not
+            // crash-durable: a `kill -9` before the group-commit flush loses
+            // it, so the core would not know the collection carries a vector
+            // index. Seeding here (and rebuilding below) makes vector search
+            // survive a hard crash.
+            core.seed_vector_index_params(&vector_index_param_seed);
+
             // 4. Replay WAL records for crash recovery.
             //
             // Tombstones are pre-built by the caller from
@@ -215,6 +239,20 @@ pub fn spawn_core(
             // must still be skipped. Every per-engine replay method
             // consults the merged set.
             core.replay_all_wal(&wal_records, num_cores, &tombstones);
+
+            // 4b. Crash-recovery backstop: rebuild the HNSW by re-indexing
+            // every document from the durable redb `sparse` store. The WAL is
+            // not crash-durable, so on a hard crash it may be empty on reopen
+            // while the documents survived in redb. Idempotent (per-surrogate
+            // remove-then-insert), so it safely overlays whatever the vector
+            // checkpoint + WAL replay above already restored.
+            core.rebuild_vector_indexes_from_store(&vector_index_param_seed);
+
+            // Replay is complete: every in-memory index (HNSW, etc.) has been
+            // rebuilt from the WAL. Signal boot so the client gateway is not
+            // opened until this core is ready to serve fully-recovered results.
+            // A closed receiver (boot already gave up) is not actionable here.
+            let _ = replay_done.send(());
 
             info!(core_id, "data plane core started (eventfd-driven)");
 
