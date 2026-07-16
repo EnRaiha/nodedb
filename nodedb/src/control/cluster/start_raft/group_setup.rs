@@ -55,6 +55,7 @@ pub(super) struct GroupSetup {
 pub(super) fn build_group_setup(
     handle: &ClusterHandle,
     shared: &Arc<SharedState>,
+    data_dir: &std::path::Path,
     transport_tuning: &nodedb_types::config::tuning::ClusterTransportTuning,
 ) -> crate::Result<(nodedb_cluster::multi_raft::MultiRaft, GroupSetup)> {
     // Move the MultiRaft constructed by `start_cluster` into this
@@ -146,7 +147,27 @@ pub(super) fn build_group_setup(
     // that wraps it.
     let array_executor: Arc<dyn nodedb_cluster::distributed_array::ArrayLocalExecutor> =
         Arc::new(DataPlaneArrayExecutor::new(shared.clone()));
-    let vshard_handler = build_vshard_handler(array_executor);
+
+    // Receive side for Event-Plane envelopes. Its dependencies are constructed
+    // here rather than read from `SharedState`: this is the one site that runs
+    // only in cluster mode, where both are unconditionally available, so the
+    // handler holds concrete values and has no absent-dependency case to
+    // resolve at message time — an inbound NOTIFY can never be silently
+    // dropped for want of a store it does not use.
+    //
+    // The HWM store roots under this node's `data_dir` ARGUMENT, not
+    // `shared.data_dir`: the same path `build_hooks` and `build_raft_loop`
+    // root under. `SharedState`'s field is not that path everywhere a node is
+    // constructed, and rooting a redb file at the wrong one makes two nodes in
+    // a single process open the same file — the second fails to acquire its
+    // lock and the whole node fails to start.
+    let cross_shard_receiver = Arc::new(crate::event::cross_shard::CrossShardReceiver::new(
+        Arc::new(crate::event::cross_shard::HwmStore::open(data_dir)?),
+        Arc::clone(shared),
+        Arc::new(crate::event::cross_shard::CrossShardMetrics::new()),
+        handle.node_id,
+    ));
+    let vshard_handler = build_vshard_handler(array_executor, cross_shard_receiver);
 
     let tick_interval = Duration::from_millis(transport_tuning.raft_tick_interval_ms);
 

@@ -33,7 +33,7 @@ pub fn start_raft(
     data_dir: &std::path::Path,
     transport_tuning: &ClusterTransportTuning,
 ) -> crate::Result<tokio::sync::watch::Receiver<bool>> {
-    let (multi_raft, setup) = build_group_setup(handle, &shared, transport_tuning)?;
+    let (multi_raft, setup) = build_group_setup(handle, &shared, data_dir, transport_tuning)?;
     let hooks = build_hooks(handle, &shared, data_dir)?;
     let loop_build = build_raft_loop(handle, &shared, data_dir, multi_raft, setup, hooks)?;
 

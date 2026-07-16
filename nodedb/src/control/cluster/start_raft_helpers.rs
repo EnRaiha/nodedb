@@ -15,6 +15,7 @@ use crate::control::cluster::calvin::{
 };
 use crate::control::cluster::handle::ClusterHandle;
 use crate::control::state::SharedState;
+use crate::event::cross_shard::CrossShardReceiver;
 
 /// Build the `VShardEnvelopeHandler` closure used by `RaftLoop`.
 ///
@@ -22,9 +23,11 @@ use crate::control::state::SharedState;
 /// dispatches based on `msg_type`, and returns a serialized response.
 pub(super) fn build_vshard_handler(
     array_executor: Arc<dyn ArrayLocalExecutor>,
+    cross_shard_receiver: Arc<CrossShardReceiver>,
 ) -> nodedb_cluster::VShardEnvelopeHandler {
     Arc::new(move |bytes: Vec<u8>| {
         let executor = array_executor.clone();
+        let receiver = Arc::clone(&cross_shard_receiver);
         let fut: Pin<
             Box<dyn std::future::Future<Output = nodedb_cluster::error::Result<Vec<u8>>> + Send>,
         > = Box::pin(async move {
@@ -61,6 +64,18 @@ pub(super) fn build_vshard_handler(
                     );
                     Ok(resp_envelope.to_bytes())
                 }
+
+                // `CrossShardEvent` (remote trigger DML) and `NotifyBroadcast`
+                // (cluster-wide CDC fan-out) both land here. `handle_envelope`
+                // re-parses the raw bytes and returns a fully-formed response
+                // envelope — including the error-shaped one for a message type
+                // that may not arrive as a REQUEST. The `*Ack` variants are such
+                // a case: every sender reads its Ack as the RESPONSE on the same
+                // QUIC stream, so an inbound Ack request is a protocol violation,
+                // not a case to handle. Unlike the ArrayShard arm there is no
+                // opcode+1 convention to apply: the receiver picks the response
+                // msg_type per request type itself.
+                DispatchTarget::EventPlane => Ok(receiver.handle_envelope(bytes).await),
 
                 other => Err(nodedb_cluster::error::ClusterError::Transport {
                     detail: format!(

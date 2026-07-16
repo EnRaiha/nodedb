@@ -373,7 +373,14 @@ pub fn broadcast_notify_to_cluster(
         let transport = Arc::clone(&transport);
         tokio::spawn(async move {
             let rpc = RaftRpc::VShardEnvelope(envelope.to_bytes());
-            if let Err(e) = transport.send_rpc(peer_id, rpc).await {
+            // One-way: this broadcast is best-effort by contract, so it must not
+            // reach the retry + circuit-breaker path. That breaker is per-PEER
+            // and shared by every RPC type, so a dropped NOTIFY would open it
+            // and take that peer's raft and metadata RPCs down with it — a CDC
+            // event is not permitted to cost a node its routing. The receiver
+            // still writes its Ack frame; each RPC owns its own QUIC stream, so
+            // discarding the recv side here is sound.
+            if let Err(e) = transport.send_rpc_oneway(peer_id, rpc).await {
                 trace!(
                     peer = peer_id,
                     error = %e,
