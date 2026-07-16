@@ -67,18 +67,20 @@
 //!    ride this exact path.
 //!
 //! A second, inverse divergence exists in the opposite direction:
-//! `DocumentOp::Truncate` and `KvOp::Truncate` classify `false` here
-//! (not buffered) even though `to_replicated_entry` now has an encoder arm
-//! for both and returns `Some`. This is not a bug in either function: both
-//! ops are autocommit-only — `resolve/entry.rs` (`data/executor/handlers/
-//! transaction/resolve/entry.rs:335` for Document, `:269` for Kv) rejects
-//! them with `PlanError` when they appear inside an explicit transaction, so
-//! they are never routed through `plan_requires_txn_buffering` for staging
-//! in practice. They only ever reach `to_replicated_entry` via the
-//! autocommit path, where they replicate normally. Pinned by
-//! `truncate_variants_are_encoded_but_not_buffered` below via
+//! `DocumentOp::Truncate` and `KvOp::{Truncate, RegisterIndex, DropIndex}`
+//! classify `false` here (not buffered) even though `to_replicated_entry` has
+//! an encoder arm for each and returns `Some`. This is not a bug in either
+//! function: every one of them is autocommit-only — `resolve/entry.rs`
+//! (`data/executor/handlers/transaction/resolve/entry.rs:329-334` for the Kv
+//! index/DDL/truncate arm, `:394-400` for the Document arm) rejects them with
+//! `PlanError` when they appear inside an explicit transaction, so they are
+//! never routed through `plan_requires_txn_buffering` for staging in practice.
+//! They only ever reach `to_replicated_entry` via the autocommit path, where
+//! they replicate normally. Pinned by
+//! `truncate_and_index_variants_are_encoded_but_not_buffered` below via
 //! `assert_encoded_but_not_buffered` — the inverse of
-//! `assert_buffered_but_unencoded`.
+//! `assert_buffered_but_unencoded` — and correspondingly excluded from
+//! `kv_variants_match_oracle`.
 
 #![deny(clippy::wildcard_enum_match_arm)]
 
@@ -316,7 +318,14 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | KvOp::MaterializeScan { .. },
         ) => false,
 
-        // Write-but-unbuffered: Write permission, no encoder arm today.
+        // ---- Kv: index / DDL / truncate — encoded, but autocommit-only ----
+        // A deliberate inverse divergence from the oracle: `to_replicated_entry`
+        // encodes all three (they replicate normally when executed autocommit),
+        // but transaction resolve rejects them outright
+        // (`data/executor/handlers/transaction/resolve/entry.rs:329-334`: "kv
+        // index/DDL/truncate op is not supported in transaction resolve"), so
+        // they are never stageable into the overlay and never need buffering.
+        // Pinned by `truncate_and_index_variants_are_encoded_but_not_buffered`.
         PhysicalPlan::Kv(
             KvOp::Truncate { .. } | KvOp::RegisterIndex { .. } | KvOp::DropIndex { .. },
         ) => false,
@@ -1212,16 +1221,6 @@ mod tests {
                 ttl_ms: 0,
                 surrogates: Vec::new(),
             }),
-            PhysicalPlan::Kv(KvOp::RegisterIndex {
-                collection: "c".into(),
-                field: "f".into(),
-                field_position: 0,
-                backfill: false,
-            }),
-            PhysicalPlan::Kv(KvOp::DropIndex {
-                collection: "c".into(),
-                field: "f".into(),
-            }),
             PhysicalPlan::Kv(KvOp::FieldGet {
                 collection: "c".into(),
                 key: Vec::new(),
@@ -1992,15 +1991,21 @@ mod tests {
         }
     }
 
-    /// Pin the inverse divergence (module doc): `DocumentOp::Truncate` and
-    /// `KvOp::Truncate` are autocommit-only — rejected in a transaction
-    /// (`data/executor/handlers/transaction/resolve/entry.rs:335` and
-    /// `:269` respectively), so `plan_requires_txn_buffering` never needs to
-    /// buffer them — and `to_replicated_entry` now encodes both, since they
-    /// replicate normally when executed autocommit. The inverse of
+    /// Pin the inverse divergence (module doc): truncate and KV index/DDL ops
+    /// are autocommit-only — transaction resolve rejects them outright
+    /// (`data/executor/handlers/transaction/resolve/entry.rs:329-334` for the
+    /// KV arm, `:394-400` for the document arm), so
+    /// `plan_requires_txn_buffering` never needs to buffer them — while
+    /// `to_replicated_entry` encodes them all, since they replicate normally
+    /// when executed autocommit. The inverse of
     /// `flipped_variants_are_buffered_and_unencoded`.
+    ///
+    /// These are deliberately excluded from `kv_variants_match_oracle`: they
+    /// are the KV variants that legitimately disagree with the oracle, and
+    /// pinning them here keeps that disagreement explicit rather than letting
+    /// the equivalence test fail on an intentional divergence.
     #[test]
-    fn truncate_variants_are_encoded_but_not_buffered() {
+    fn truncate_and_index_variants_are_encoded_but_not_buffered() {
         let plans = vec![
             PhysicalPlan::Document(DocumentOp::Truncate {
                 collection: "c".into(),
@@ -2008,6 +2013,16 @@ mod tests {
             }),
             PhysicalPlan::Kv(KvOp::Truncate {
                 collection: "c".into(),
+            }),
+            PhysicalPlan::Kv(KvOp::RegisterIndex {
+                collection: "c".into(),
+                field: "f".into(),
+                field_position: 0,
+                backfill: false,
+            }),
+            PhysicalPlan::Kv(KvOp::DropIndex {
+                collection: "c".into(),
+                field: "f".into(),
             }),
         ];
         for p in &plans {
