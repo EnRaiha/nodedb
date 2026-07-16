@@ -4,6 +4,7 @@ pub mod background_loops;
 pub mod cluster_ready;
 pub mod constraint_reconcile;
 pub mod credentials;
+pub mod data_group_recovery;
 pub mod data_plane;
 pub mod listeners;
 pub mod schema_rehydrate;

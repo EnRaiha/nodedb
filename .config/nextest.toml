@@ -57,7 +57,7 @@ slow-timeout = { period = "30s", terminate-after = 6 }
 # exhausts ports / connections and causes spurious `ConnectionRefused`.
 # Serialize them like the cluster group so at most one runs at a time.
 [[profile.default.overrides]]
-filter = 'binary(crash_recovery) | binary(startup_failure) | binary(shutdown_in_flight) | binary(shutdown_budget) | binary(shutdown_abort_offender) | binary(shutdown_idempotent)'
+filter = 'binary(crash_recovery) | binary(crash_recovery_overlays) | binary(crash_recovery_analytics) | binary(startup_failure) | binary(shutdown_in_flight) | binary(shutdown_budget) | binary(shutdown_abort_offender) | binary(shutdown_idempotent)'
 test-group = 'server-process'
 # Claim every slot so each real-server test runs strictly ALONE — no other
 # server-spawning test (in-process or OS-process) runs alongside to steal

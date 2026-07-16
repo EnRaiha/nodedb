@@ -136,6 +136,20 @@ pub async fn await_cluster_ready(
             ));
         }
     }
+
+    // WAL replay only rebuilds what the NodeDB WAL holds. Writes to
+    // replicable collections are durable as entries in their data group's
+    // Raft log instead, and their engine state comes back only when each
+    // group — after winning its own post-restart election — re-delivers that
+    // log to the applier. Metadata readiness says nothing about those
+    // elections, so without this wait the gateway can open while a data
+    // group's engines are still empty and an acknowledged write reads back as
+    // if it never happened. Fail closed, like the replay wait above.
+    if let Err(e) = crate::bootstrap::data_group_recovery::await_data_group_recovery(shared).await {
+        data_groups_gate.fail(format!("data raft group recovery failed: {e}"));
+        return Err(e);
+    }
+
     data_groups_gate.fire();
     transport_gate.fire();
 
