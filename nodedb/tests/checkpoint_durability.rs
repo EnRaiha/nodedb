@@ -40,10 +40,11 @@ fn read(rel: &str) -> String {
 fn assert_durable_checkpoint_writer(rel: &str) {
     let src = read(rel);
     assert!(
-        src.contains("atomic_write_fsync"),
+        src.contains("atomic_write_fsync") || src.contains("write_checkpoint_framed"),
         "{rel} must route checkpoint writes through \
-         nodedb_wal::segment::atomic_write_fsync so tmp-file data and the \
-         parent directory are fsynced before rename. Raw fs::write + \
+         nodedb_wal::segment::atomic_write_fsync — directly, or via the \
+         write_checkpoint_framed CRC wrapper that delegates to it — so tmp-file \
+         data and the parent directory are fsynced before rename. Raw fs::write + \
          fs::rename is not crash-safe on ext4/XFS."
     );
     // The raw anti-pattern must not coexist. Allow `fs::rename` only when the
@@ -161,6 +162,19 @@ fn crdt_checkpoint_writes_are_durable() {
     );
 }
 
+/// The CRC-framing wrapper must not bypass the durable write path: it has to
+/// delegate to `atomic_write_fsync` (tmp write + data fsync + rename + parent
+/// directory fsync), not hand-roll its own `fs::write` + `fs::rename`.
+#[test]
+fn framed_checkpoint_writer_wraps_durable_helper() {
+    let src = read("nodedb-wal/src/segment/checkpoint_frame.rs");
+    assert!(
+        src.contains("atomic_write_fsync"),
+        "write_checkpoint_framed must delegate to atomic_write_fsync so the CRC \
+         frame is written through the same durable tmp+fsync+rename+dir-fsync path."
+    );
+}
+
 /// Regression guard against the specific silent-failure mode: on ext4 / XFS
 /// the parent directory entry can reach disk before the tmp file's data
 /// pages. The helper must fsync the parent directory after rename.
@@ -264,11 +278,27 @@ fn checkpoint_reads_drop_page_cache() {
     ] {
         let src = read(rel);
         assert!(
-            src.contains("read_checkpoint_dontneed") || src.contains("POSIX_FADV_DONTNEED"),
+            src.contains("read_checkpoint_dontneed")
+                || src.contains("read_checkpoint_framed")
+                || src.contains("POSIX_FADV_DONTNEED"),
             "{rel} reads checkpoint bytes with `std::fs::read`, leaving them \
              pinned in the page cache for the process lifetime. Use the \
-             shared `read_checkpoint_dontneed` helper (or equivalent \
-             POSIX_FADV_DONTNEED advise) so the bytes are evicted after load."
+             shared `read_checkpoint_dontneed` helper — directly or via the \
+             `read_checkpoint_framed` CRC wrapper that delegates to it (or an \
+             equivalent POSIX_FADV_DONTNEED advise) — so the bytes are evicted \
+             after load."
         );
     }
+}
+
+/// The CRC-framing read wrapper must not bypass the page-cache-drop path: it
+/// has to delegate to `read_checkpoint_dontneed`, not hand-roll `std::fs::read`.
+#[test]
+fn framed_checkpoint_reader_wraps_dontneed_helper() {
+    let src = read("nodedb-wal/src/segment/checkpoint_frame.rs");
+    assert!(
+        src.contains("read_checkpoint_dontneed"),
+        "read_checkpoint_framed must delegate to read_checkpoint_dontneed so \
+         framed checkpoint bytes are still evicted from the page cache after load."
+    );
 }

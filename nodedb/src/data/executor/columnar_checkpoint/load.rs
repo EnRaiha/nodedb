@@ -155,7 +155,7 @@ impl CoreLoop {
                     }
                 })?;
 
-            let bytes = nodedb_wal::segment::read_checkpoint_dontneed(&path).map_err(|source| {
+            let bytes = nodedb_wal::segment::read_checkpoint_framed(&path).map_err(|source| {
                 CheckpointDecodeError::ReadFile {
                     path: path.clone(),
                     source,

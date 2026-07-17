@@ -103,7 +103,7 @@ impl CoreLoop {
             // Write R-tree checkpoint.
             let ckpt_path = ckpt_dir.join(format!("{stem}.ckpt"));
             let tmp_path = ckpt_dir.join(format!("{stem}.ckpt.tmp"));
-            nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &bytes)
+            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes)
                 .map_err(|e| storage_err(&ckpt_path, "publish checkpoint", &e))?;
             files_written += 1;
 
@@ -126,7 +126,7 @@ impl CoreLoop {
                 })?;
                 let map_path = ckpt_dir.join(format!("{stem}.docmap"));
                 let map_tmp = ckpt_dir.join(format!("{stem}.docmap.tmp"));
-                nodedb_wal::segment::atomic_write_fsync(&map_tmp, &map_path, &map_bytes)
+                nodedb_wal::segment::write_checkpoint_framed(&map_tmp, &map_path, &map_bytes)
                     .map_err(|e| storage_err(&map_path, "publish doc_map", &e))?;
                 files_written += 1;
             }
@@ -197,7 +197,7 @@ impl CoreLoop {
                 }
             };
 
-            let Ok(bytes) = nodedb_wal::segment::read_checkpoint_dontneed(&path) else {
+            let Ok(bytes) = nodedb_wal::segment::read_checkpoint_framed(&path) else {
                 continue;
             };
 
@@ -227,7 +227,7 @@ impl CoreLoop {
 
             // Load doc_map (keyed off the same logical key).
             let map_path = ckpt_dir.join(format!("{stem}.docmap"));
-            if let Ok(map_bytes) = nodedb_wal::segment::read_checkpoint_dontneed(&map_path)
+            if let Ok(map_bytes) = nodedb_wal::segment::read_checkpoint_framed(&map_path)
                 && let Ok(doc_entries) = zerompk::from_msgpack::<Vec<(u64, String)>>(&map_bytes)
             {
                 for (entry_id, doc_id) in doc_entries {

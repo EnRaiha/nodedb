@@ -138,7 +138,7 @@ impl CoreLoop {
                 })?;
             let ckpt_path = ckpt_dir.join(format!("{filename}.ckpt"));
             let tmp_path = ckpt_dir.join(format!("{filename}.ckpt.tmp"));
-            nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &bytes)
+            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes)
                 .map_err(|e| storage_err(&ckpt_path, "publish checkpoint", &e))?;
             files_written += 1;
         }
@@ -202,7 +202,7 @@ impl CoreLoop {
                 continue;
             };
 
-            let Ok(bytes) = nodedb_wal::segment::read_checkpoint_dontneed(&path) else {
+            let Ok(bytes) = nodedb_wal::segment::read_checkpoint_framed(&path) else {
                 continue;
             };
             let kek = self.segment_keks.vector_checkpoint_kek.as_ref();

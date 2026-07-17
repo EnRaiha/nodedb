@@ -7,7 +7,6 @@
 //! use the standard write-tmp-then-rename atomic swap so a torn write
 //! never replaces the live manifest.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -76,7 +75,7 @@ impl Manifest {
     /// exist (caller is opening a brand-new array).
     pub fn load_or_new(root: &Path, schema_hash: u64) -> Result<Self, ManifestError> {
         let path = root.join(MANIFEST_FILENAME);
-        match fs::read(&path) {
+        match nodedb_wal::segment::read_checkpoint_framed(&path) {
             Ok(bytes) => {
                 let m: Manifest =
                     zerompk::from_msgpack(&bytes).map_err(|e| ManifestError::Decode {
@@ -84,7 +83,9 @@ impl Manifest {
                     })?;
                 Ok(m)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new(schema_hash)),
+            Err(nodedb_wal::WalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Self::new(schema_hash))
+            }
             Err(e) => Err(ManifestError::Io {
                 detail: format!("{path:?}: {e}"),
             }),
@@ -93,7 +94,7 @@ impl Manifest {
 
     /// Atomically write the manifest to disk: serialise → write tmp → fsync tmp
     /// → rename → fsync directory, via the shared
-    /// `nodedb_wal::segment::atomic_write_fsync`.
+    /// `nodedb_wal::segment::write_checkpoint_framed`.
     ///
     /// This write is the commit point of a flush — a segment file is only
     /// reachable once the manifest names it — so the whole ordering is
@@ -108,7 +109,7 @@ impl Manifest {
         })?;
         let tmp = root.join(MANIFEST_TMP_FILENAME);
         let final_path = root.join(MANIFEST_FILENAME);
-        nodedb_wal::segment::atomic_write_fsync(&tmp, &final_path, &bytes).map_err(|e| {
+        nodedb_wal::segment::write_checkpoint_framed(&tmp, &final_path, &bytes).map_err(|e| {
             ManifestError::Io {
                 detail: format!("publish {final_path:?}: {e}"),
             }

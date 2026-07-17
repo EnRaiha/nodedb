@@ -28,7 +28,7 @@ impl CoreLoop {
             return;
         }
 
-        let bytes = match nodedb_wal::segment::read_checkpoint_dontneed(&path) {
+        let bytes = match nodedb_wal::segment::read_checkpoint_framed(&path) {
             Ok(b) => b,
             Err(e) => {
                 error!(
@@ -266,7 +266,7 @@ mod tests {
         let bytes = zerompk::to_msgpack_vec(&file).expect("encode");
         let path = sync_hwm_ckpt_state_path(&ckpt_dir);
         let tmp = ckpt_dir.join("STATE.tmp");
-        nodedb_wal::segment::atomic_write_fsync(&tmp, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes).expect("write");
 
         let mut core = open_core_at(dir.path());
         core.load_sync_hwm_checkpoint();

@@ -117,7 +117,7 @@ impl CoreLoop {
                 }
             })?;
 
-            let bytes = nodedb_wal::segment::read_checkpoint_dontneed(&path).map_err(|source| {
+            let bytes = nodedb_wal::segment::read_checkpoint_framed(&path).map_err(|source| {
                 CheckpointDecodeError::ReadFile {
                     path: path.clone(),
                     source,
@@ -314,9 +314,9 @@ mod tests {
         let path = tmp.path().join(kv_ckpt_filename(7, "users"));
         let tmp_path = tmp.path().join("f.tmp");
         let bytes = zerompk::to_msgpack_vec(&written).expect("encode");
-        nodedb_wal::segment::atomic_write_fsync(&tmp_path, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
 
-        let read_back = nodedb_wal::segment::read_checkpoint_dontneed(&path).expect("read");
+        let read_back = nodedb_wal::segment::read_checkpoint_framed(&path).expect("read");
         let decoded: KvCheckpointFile = zerompk::from_msgpack(&read_back).expect("decode");
         assert_eq!(decoded, written, "the file must decode to what was written");
 
@@ -396,9 +396,9 @@ mod tests {
         let path = tmp.path().join(KV_CKPT_MANIFEST);
         let tmp_path = tmp.path().join("m.tmp");
         let bytes = zerompk::to_msgpack_vec(&written).expect("encode");
-        nodedb_wal::segment::atomic_write_fsync(&tmp_path, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
 
-        let read_back = nodedb_wal::segment::read_checkpoint_dontneed(&path).expect("read");
+        let read_back = nodedb_wal::segment::read_checkpoint_framed(&path).expect("read");
         let decoded: KvCheckpointManifest = zerompk::from_msgpack(&read_back).expect("decode");
         assert_eq!(
             decoded.durable_through_lsn, 4_242,

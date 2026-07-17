@@ -138,7 +138,7 @@ impl CoreLoop {
             let fname = kv_ckpt_filename(coll.tenant_id, coll.collection);
             let ckpt_path = gen_dir.join(&fname);
             let tmp_path = gen_dir.join(format!("{fname}.tmp"));
-            nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &bytes).map_err(
+            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes).map_err(
                 |e| crate::Error::Storage {
                     engine: "kv".to_string(),
                     detail: format!(
@@ -177,7 +177,7 @@ impl CoreLoop {
             })?;
         let path = ckpt_dir.join(KV_CKPT_MANIFEST);
         let tmp = ckpt_dir.join(format!("{KV_CKPT_MANIFEST}.tmp"));
-        nodedb_wal::segment::atomic_write_fsync(&tmp, &path, &bytes)
+        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes)
             .map_err(|e| storage_err(&path, "publish manifest", &e))?;
         Ok(())
     }

@@ -160,7 +160,7 @@ impl CoreLoop {
             let fname = columnar_ckpt_filename(db_id.as_u64(), tenant_id.as_u64(), collection);
             let ckpt_path = gen_dir.join(&fname);
             let tmp_path = gen_dir.join(format!("{fname}.tmp"));
-            nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &bytes).map_err(
+            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes).map_err(
                 |e| crate::Error::Storage {
                     engine: "columnar".to_string(),
                     detail: format!(
@@ -201,7 +201,7 @@ impl CoreLoop {
             })?;
         let path = ckpt_dir.join(COLUMNAR_CKPT_MANIFEST);
         let tmp = ckpt_dir.join(format!("{COLUMNAR_CKPT_MANIFEST}.tmp"));
-        nodedb_wal::segment::atomic_write_fsync(&tmp, &path, &bytes)
+        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes)
             .map_err(|e| storage_err(&path, "publish manifest", &e))?;
         Ok(())
     }

@@ -24,7 +24,7 @@ impl CoreLoop {
         if !path.exists() {
             return None;
         }
-        let bytes = match nodedb_wal::segment::read_checkpoint_dontneed(&path) {
+        let bytes = match nodedb_wal::segment::read_checkpoint_framed(&path) {
             Ok(b) => b,
             Err(e) => {
                 warn!(

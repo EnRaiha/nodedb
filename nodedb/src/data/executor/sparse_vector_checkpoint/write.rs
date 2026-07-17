@@ -101,7 +101,7 @@ impl CoreLoop {
             let stem = sparse_vector_checkpoint_stem(db.as_u64(), tid.as_u64(), coll, field);
             let ckpt_path = gen_dir.join(format!("{stem}.ckpt"));
             let tmp_path = gen_dir.join(format!("{stem}.ckpt.tmp"));
-            nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &bytes).map_err(
+            nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes).map_err(
                 |e| crate::Error::Storage {
                     engine: "sparse_vector".to_string(),
                     detail: format!(
@@ -142,7 +142,7 @@ impl CoreLoop {
             })?;
         let path = ckpt_dir.join(SPARSE_VECTOR_CKPT_MANIFEST);
         let tmp = ckpt_dir.join(format!("{SPARSE_VECTOR_CKPT_MANIFEST}.tmp"));
-        nodedb_wal::segment::atomic_write_fsync(&tmp, &path, &bytes)
+        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes)
             .map_err(|e| storage_err(&path, "publish manifest", &e))?;
         Ok(())
     }

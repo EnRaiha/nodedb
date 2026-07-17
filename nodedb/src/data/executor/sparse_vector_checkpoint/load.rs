@@ -115,7 +115,7 @@ impl CoreLoop {
                 }
             })?;
 
-            let bytes = nodedb_wal::segment::read_checkpoint_dontneed(&path).map_err(|source| {
+            let bytes = nodedb_wal::segment::read_checkpoint_framed(&path).map_err(|source| {
                 CheckpointDecodeError::ReadFile {
                     path: path.clone(),
                     source,
@@ -162,9 +162,9 @@ mod tests {
         let path = tmp.path().join(format!("{stem}.ckpt"));
         let tmp_path = tmp.path().join(format!("{stem}.ckpt.tmp"));
         let bytes = index.checkpoint_to_bytes().expect("encode");
-        nodedb_wal::segment::atomic_write_fsync(&tmp_path, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
 
-        let read_back = nodedb_wal::segment::read_checkpoint_dontneed(&path).expect("read");
+        let read_back = nodedb_wal::segment::read_checkpoint_framed(&path).expect("read");
         let restored = SparseInvertedIndex::from_checkpoint(&read_back).expect("decode");
 
         assert_eq!(
@@ -216,7 +216,7 @@ mod tests {
         let path = tmp.path().join(SPARSE_VECTOR_CKPT_MANIFEST);
         let tmp_path = tmp.path().join("m.tmp");
         let bytes = zerompk::to_msgpack_vec(&written).expect("encode");
-        nodedb_wal::segment::atomic_write_fsync(&tmp_path, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
 
         let decoded = read_sparse_vector_manifest_at(tmp.path(), 0).expect("manifest must read");
         assert_eq!(
@@ -240,7 +240,7 @@ mod tests {
         let path = tmp.path().join(SPARSE_VECTOR_CKPT_MANIFEST);
         let tmp_path = tmp.path().join("m.tmp");
         let bytes = zerompk::to_msgpack_vec(&written).expect("encode");
-        nodedb_wal::segment::atomic_write_fsync(&tmp_path, &path, &bytes).expect("write");
+        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
 
         assert!(
             read_sparse_vector_manifest_at(tmp.path(), 0).is_none(),

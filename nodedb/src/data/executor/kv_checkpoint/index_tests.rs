@@ -142,8 +142,8 @@ fn through_disk(file: &KvCheckpointFile) -> KvCheckpointFile {
     let path = tmp.path().join(kv_ckpt_filename(TID, COLL));
     let tmp_path = tmp.path().join("f.tmp");
     let bytes = zerompk::to_msgpack_vec(file).expect("encode");
-    nodedb_wal::segment::atomic_write_fsync(&tmp_path, &path, &bytes).expect("write");
-    let read_back = nodedb_wal::segment::read_checkpoint_dontneed(&path).expect("read");
+    nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
+    let read_back = nodedb_wal::segment::read_checkpoint_framed(&path).expect("read");
     zerompk::from_msgpack(&read_back).expect("decode")
 }
 

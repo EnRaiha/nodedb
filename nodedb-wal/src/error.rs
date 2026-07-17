@@ -15,6 +15,10 @@ pub enum WalError {
         actual: u32,
     },
 
+    /// Checkpoint frame is corrupt: bad version, truncated payload, or CRC mismatch.
+    #[error("checkpoint frame corrupt at {path}: {detail}")]
+    CheckpointCorrupt { path: String, detail: String },
+
     /// Record header has an invalid magic number — file is corrupted or not a WAL.
     #[error("invalid WAL magic at offset {offset}: expected {expected:#010x}, got {actual:#010x}")]
     InvalidMagic {
