@@ -82,13 +82,6 @@ pub(crate) async fn bootstrap_data_plane(
     let vector_index_param_seed =
         Arc::new(bootstrap::data_plane::load_vector_index_param_seed(config));
 
-    // Seed each core with the durable spatial collections so it can rebuild the
-    // in-memory R-tree from the durable document store on boot (spatial
-    // checkpoints run only on a manual snapshot and the WAL is not
-    // crash-durable).
-    let spatial_collection_seed =
-        Arc::new(bootstrap::data_plane::load_spatial_collection_seed(config));
-
     // Seed each core with every columnar-family collection's real catalog
     // schema so a fresh `MutationEngine` created during WAL redo replay is
     // pre-registered with its declared types (Geometry, Timestamp, Decimal,
@@ -125,7 +118,6 @@ pub(crate) async fn bootstrap_data_plane(
             maintenance_budget: Arc::clone(&maintenance_budget),
             doc_config_seed: Arc::clone(&doc_config_seed),
             vector_index_param_seed: Arc::clone(&vector_index_param_seed),
-            spatial_collection_seed: Arc::clone(&spatial_collection_seed),
             columnar_schema_seed: Arc::clone(&columnar_schema_seed),
         },
     )?;

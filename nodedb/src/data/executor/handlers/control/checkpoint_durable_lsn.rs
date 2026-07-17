@@ -331,22 +331,21 @@ impl CoreLoop {
 
     /// Flush the spatial R-trees and return the LSN they are durable through.
     ///
-    /// Scoped, like the graph labels, to the half with no rebuild.
-    /// `spatial_indexes` is fed by two paths: `index_columnar_geometry_columns`
-    /// for a columnar-family (`engine='spatial'`) collection, whose entries
-    /// `restore_columnar_geometry_indexes` re-derives from the rows the columnar
-    /// checkpoint restored; and `apply_point_put_spatial` for a DOCUMENT
-    /// collection's geometry field, whose entries nothing rebuilds.
+    /// Scoped, like the graph labels, to the half with no rebuild independent of
+    /// this file. `spatial_indexes` is fed by two paths:
+    /// `index_columnar_geometry_columns` for a columnar-family (`engine='spatial'`)
+    /// collection, whose entries `restore_columnar_geometry_indexes` re-derives
+    /// from the rows the columnar checkpoint restored; and `apply_point_put_spatial`
+    /// for a DOCUMENT collection's geometry field.
     ///
-    /// `rebuild_spatial_indexes_from_store` is not that rebuild despite its
-    /// name. Its seed, `load_spatial_collection_seed`, filters on
-    /// `collection_type.is_spatial()`, which selects `Columnar(Spatial)`
-    /// collections — the ones whose rows go to the columnar engines and never
-    /// into the redb `sparse` store the rebuild scans. It therefore finds zero
-    /// documents for every collection it is given, and the document collections
-    /// whose geometry it could genuinely rebuild from `sparse` are never in its
-    /// seed. So for the document half this checkpoint and the `Put` records are
-    /// the only two copies, and the reported LSN must respect that.
+    /// A document collection's entries ARE rebuilt at boot — the same
+    /// `apply_point_put_spatial` side-effect runs on the WAL redo path, so every
+    /// document `Put` still in the WAL re-indexes into the R-tree. But nothing
+    /// re-derives them from the redb `sparse` store, so once the WAL is truncated
+    /// below a row's `Put` this checkpoint is that row's only surviving R-tree
+    /// copy. The reported LSN gates that truncation, so for the document half this
+    /// checkpoint and the un-truncated `Put` records are the only two copies and
+    /// the reported LSN must respect that.
     ///
     /// No dirty-page accounting here, unlike the vector and CRDT arms: no write
     /// handler marks a "spatial" engine dirty, so the coordinator does not track

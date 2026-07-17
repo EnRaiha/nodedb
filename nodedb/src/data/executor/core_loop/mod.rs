@@ -18,7 +18,6 @@ pub(in crate::data::executor) mod pressure;
 pub(in crate::data::executor) mod priority_queues;
 mod response;
 mod segment_keks;
-mod spatial_index_rebuild;
 mod state;
 #[cfg(test)]
 pub(crate) mod tests;

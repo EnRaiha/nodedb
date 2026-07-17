@@ -11,9 +11,9 @@
 //! the first replayed row (`infer_schema_from_value`), which recognizes
 //! only Float/Int/Bool/String. Declared types such as Geometry, Timestamp,
 //! Decimal, Bytes, and Uuid are lost — for a spatial collection the
-//! geometry column silently degrades to `String`, and the R-tree
-//! crash-recovery rebuild (`rebuild_spatial_indexes_from_store`, which
-//! filters on `column_type == Geometry`) never runs.
+//! geometry column silently degrades to `String`, and the R-tree restore
+//! (`restore_columnar_geometry_indexes`, which filters on
+//! `column_type == Geometry`) never runs.
 //!
 //! [`CoreLoop::seed_columnar_schemas`] closes that gap: called with the
 //! catalog-sourced schema for every columnar-family collection (built by

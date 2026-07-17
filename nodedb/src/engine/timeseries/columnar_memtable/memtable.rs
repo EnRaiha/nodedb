@@ -721,7 +721,11 @@ mod tests {
                 "sample {i} must not be rejected — that would drop a durable record on replay"
             );
         }
-        assert_eq!(mt.row_count(), 1000, "every sample past the limit is retained");
+        assert_eq!(
+            mt.row_count(),
+            1000,
+            "every sample past the limit is retained"
+        );
         assert!(
             mt.memory_bytes() >= 200,
             "the footprint is allowed to overshoot the hard limit"

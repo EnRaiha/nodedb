@@ -43,11 +43,6 @@ pub struct SpawnCoreParams<'a> {
     /// after it (rebuild the HNSW from the durable store), so vector search
     /// survives a hard crash that emptied the WAL.
     pub vector_index_param_seed: Arc<Vec<nodedb_types::StoredVectorIndexParams>>,
-    /// Catalog-sourced spatial collections `(tenant_id, name)`, used after
-    /// `replay_all_wal` to rebuild the in-memory R-tree from the durable
-    /// document store, so spatial search survives a hard crash that emptied the
-    /// WAL and left no spatial checkpoint.
-    pub spatial_collection_seed: Arc<Vec<(u64, String)>>,
     /// Catalog-sourced schema for every columnar-family (`columnar` /
     /// `timeseries` / `spatial`) collection, applied before `replay_all_wal`
     /// so a fresh `MutationEngine` is pre-registered with its real schema

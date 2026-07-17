@@ -129,39 +129,6 @@ pub fn load_vector_index_param_seed(
     }
 }
 
-/// Load every persisted spatial collection's `(tenant_id, name)` from the
-/// durable catalog so each Data Plane core can rebuild its in-memory R-tree
-/// spatial index from the durable document store on boot.
-///
-/// The in-memory R-tree is otherwise restored only from spatial checkpoints
-/// (manual-snapshot only) plus WAL replay, and the WAL is not crash-durable —
-/// a `kill -9` before the WAL group-commit flush loses the `Put` records, so on
-/// reopen the R-tree would be empty or incomplete even though the geometry
-/// documents survived in redb. Mirrors [`load_vector_index_param_seed`]'s
-/// fail-open pattern: a catalog open/load failure at this boot phase logs a
-/// warning and yields an empty seed rather than aborting startup.
-pub fn load_spatial_collection_seed(config: &ServerConfig) -> Vec<(u64, String)> {
-    let catalog_path = config.catalog_path();
-    let catalog = match crate::control::security::catalog::SystemCatalog::open(&catalog_path) {
-        Ok(catalog) => catalog,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not open system catalog to seed spatial collections");
-            return Vec::new();
-        }
-    };
-    let all = match crate::bootstrap::constraint_reconcile::load_collections(&catalog) {
-        Ok(all) => all,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load collections to seed spatial rebuild");
-            return Vec::new();
-        }
-    };
-    all.into_iter()
-        .filter(|(_, coll)| coll.collection_type.is_spatial() && coll.is_active)
-        .map(|(_, coll)| (coll.tenant_id, coll.name))
-        .collect()
-}
-
 /// Load every active columnar-family collection's (tenant, name, schema)
 /// from the durable catalog so each Data Plane core can pre-register the
 /// real `MutationEngine` schema BEFORE `replay_all_wal`.
@@ -234,7 +201,6 @@ pub struct CoreSharedResources {
     pub maintenance_budget: Arc<crate::control::maintenance::MaintenanceBudgetTracker>,
     pub doc_config_seed: Arc<Vec<((TenantId, String), CollectionConfig)>>,
     pub vector_index_param_seed: Arc<Vec<nodedb_types::StoredVectorIndexParams>>,
-    pub spatial_collection_seed: Arc<Vec<(u64, String)>>,
     pub columnar_schema_seed: Arc<Vec<(TenantId, String, nodedb_types::columnar::ColumnarSchema)>>,
 }
 
@@ -264,7 +230,6 @@ pub fn spawn_data_plane_cores(
         maintenance_budget,
         doc_config_seed,
         vector_index_param_seed,
-        spatial_collection_seed,
         columnar_schema_seed,
     } = resources;
     let num_cores = config.server.data_plane_cores;
@@ -304,7 +269,6 @@ pub fn spawn_data_plane_cores(
             maintenance_budget: Arc::clone(&maintenance_budget),
             doc_config_seed: Arc::clone(&doc_config_seed),
             vector_index_param_seed: Arc::clone(&vector_index_param_seed),
-            spatial_collection_seed: Arc::clone(&spatial_collection_seed),
             columnar_schema_seed: Arc::clone(&columnar_schema_seed),
             replay_done: replay_done_tx,
         })?;

@@ -412,10 +412,11 @@ impl CoreLoop {
         //    (`engine='spatial'`) collection does not depend on this file
         //    surviving: `columnar_checkpoint/geometry_restore.rs` rebuilds it
         //    from the restored columnar rows at boot. A DOCUMENT collection's
-        //    geometry does. `rebuild_spatial_indexes_from_store` is not its
-        //    backstop despite the name — its seed selects `is_spatial()`
-        //    collections, i.e. precisely the columnar ones whose rows are not in
-        //    the `sparse` store it scans, so it rebuilds nothing for either half.
+        //    geometry is rebuilt at boot by WAL redo of its document `Put`s (the
+        //    same `apply_point_put_spatial` side-effect as the live write), but
+        //    only for `Put`s still in the WAL — nothing re-derives it from the
+        //    redb `sparse` store, so this checkpoint is the R-tree's only copy of
+        //    any row whose `Put` the WAL has already truncated past.
         durable_lsns.push(self.checkpoint_spatial_durable_lsn());
 
         // 7. Compact CSR write buffers into dense arrays for clean state. This

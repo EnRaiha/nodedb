@@ -25,10 +25,11 @@
 //! Rebuilding here removes the cross-engine dependency instead of ranking the
 //! two checkpoints against each other. The R-tree is a derived index over rows
 //! this generation already restored, so it is reconstructible from them and does
-//! not belong in the checkpoint file. This mirrors
-//! `rebuild_spatial_indexes_from_store`, the equivalent backstop for document
-//! geometry, and is idempotent for the same reason: the shared indexing helper
-//! removes a document's existing entries before inserting.
+//! not belong in the checkpoint file. It is idempotent: the shared indexing
+//! helper removes a document's existing entries before inserting — the same
+//! property that lets WAL redo of a document collection's `Put`s (via
+//! `apply_point_put_spatial`) safely re-index document geometry over whatever a
+//! restored spatial checkpoint already holds.
 //!
 //! ## What this rebuild can and cannot see
 //!

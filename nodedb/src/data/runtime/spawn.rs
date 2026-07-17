@@ -46,7 +46,6 @@ pub fn spawn_core(
         maintenance_budget,
         doc_config_seed,
         vector_index_param_seed,
-        spatial_collection_seed,
         columnar_schema_seed,
         replay_done,
     } = params;
@@ -132,7 +131,6 @@ pub fn spawn_core(
                 num_cores,
                 &tombstones,
                 &vector_index_param_seed,
-                &spatial_collection_seed,
             );
 
             // Replay is complete: every in-memory index (HNSW, etc.) has been

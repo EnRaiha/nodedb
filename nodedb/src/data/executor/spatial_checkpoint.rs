@@ -48,20 +48,21 @@ impl CoreLoop {
     ///
     /// ## Why this returns a `Result` and an LSN
     ///
-    /// `spatial_indexes` holds entries from two different write paths, and only
-    /// one of them has a rebuild behind it:
+    /// `spatial_indexes` holds entries from two different write paths, and once
+    /// the WAL is truncated only one of them still has a rebuild independent of
+    /// this file:
     ///
     /// - Geometry on a COLUMNAR-family collection (`engine='spatial'`) is
     ///   re-derived at boot by `restore_columnar_geometry_indexes` from the rows
     ///   the columnar checkpoint restored, so it survives the loss of this file.
-    /// - Geometry on a DOCUMENT collection is indexed by `apply_point_put_spatial`
-    ///   and has NO live rebuild. `rebuild_spatial_indexes_from_store` looks like
-    ///   one, but its seed (`load_spatial_collection_seed`) selects on
-    ///   `collection_type.is_spatial()` — i.e. the columnar-family collections
-    ///   whose rows never enter the redb `sparse` store it scans. Document
-    ///   collections, whose geometry it COULD rebuild from `sparse`, are never in
-    ///   the seed. So for those entries this checkpoint and the `Put` records are
-    ///   the only two copies.
+    /// - Geometry on a DOCUMENT collection is indexed by `apply_point_put_spatial`,
+    ///   the same side-effect on both the live write and the WAL redo path, so it
+    ///   is rebuilt at boot from every document `Put` still in the WAL. But
+    ///   nothing re-derives it from the redb `sparse` store where the document
+    ///   itself lives on. So once the WAL is truncated below a row's `Put`, this
+    ///   checkpoint is the R-tree's only surviving copy of that row's geometry
+    ///   entry — for the document half this checkpoint and the un-truncated `Put`
+    ///   records are the only two copies.
     ///
     /// Rather than rank those two halves against each other at truncation time,
     /// the flush reports honestly for both: any index or doc_map that cannot be

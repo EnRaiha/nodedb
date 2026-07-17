@@ -146,16 +146,16 @@ pub(in crate::data::executor) struct CheckpointFloors {
     /// checkpoint files carry no core LSN — so it starts at zero and is first
     /// advanced by this process's own successful flush.
     ///
-    /// Scoped to what no rebuild reaches. Geometry on a columnar-family
-    /// (`engine='spatial'`) collection is re-derived from restored columnar rows
-    /// by `restore_columnar_geometry_indexes` and survives without this.
-    /// Geometry on a DOCUMENT collection has no live rebuild —
-    /// `rebuild_spatial_indexes_from_store` is seeded only with
-    /// `is_spatial()` collections, which are exactly the ones whose rows are not
-    /// in the `sparse` store it scans — so for those entries the checkpoint file
-    /// and the `Put` records are the only two copies. Same rule as
-    /// `kv_durable_lsn`: when a flush fails, this — not the watermark — is what
-    /// the core may report.
+    /// Scoped to what no WAL-independent rebuild reaches. Geometry on a
+    /// columnar-family (`engine='spatial'`) collection is re-derived from restored
+    /// columnar rows by `restore_columnar_geometry_indexes` and survives without
+    /// this. Geometry on a DOCUMENT collection is rebuilt at boot by WAL redo of
+    /// its document `Put`s (the same `apply_point_put_spatial` side-effect as the
+    /// live write), but nothing re-derives it from the redb `sparse` store — so
+    /// once the WAL is truncated below a row's `Put`, this checkpoint file and the
+    /// remaining `Put` records are the only two copies of that row's geometry
+    /// entry. Same rule as `kv_durable_lsn`: when a flush fails, this — not the
+    /// watermark — is what the core may report.
     pub(in crate::data::executor) spatial_durable_lsn: Lsn,
 
     /// Per-engine "already durable through LSN X" floors recovered from on-disk
