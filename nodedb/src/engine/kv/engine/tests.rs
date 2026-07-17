@@ -2,6 +2,9 @@
 
 use super::super::engine_index::RegisterIndexParams;
 use super::super::scan::KvScanParams;
+use super::super::sorted_index::key::{SortColumn, SortDirection, SortKeyEncoder};
+use super::super::sorted_index::manager::SortedIndexDef;
+use super::super::sorted_index::window::WindowConfig;
 use super::*;
 
 fn now() -> u64 {
@@ -404,6 +407,312 @@ fn index_cleaned_on_delete() {
 
     e.delete(0, 1, "c", &[b"k1".to_vec()], n);
     assert_eq!(e.index_lookup_eq(0, 1, "c", "region", b"us").len(), 1);
+}
+
+// ── TTL × index interaction ──────────────────────────────────────────────
+//
+// The expiry reaper is a delete path, so every index a DELETE maintains it
+// must maintain too. These cases put a TTL and an index on the SAME
+// collection: `ttl_expiry_via_tick` covers TTL on an index-less collection
+// and `index_cleaned_on_delete` covers an index on a TTL-less collection, so
+// neither observes the reaper touching an index.
+
+/// An unwindowed leaderboard on `score` DESC, keyed on `player_id`.
+///
+/// Built inline rather than through the Data Plane's
+/// `build_sorted_index_def`: this is an engine unit test, and the engine does
+/// not depend on the executor that owns that builder.
+fn leaderboard_def(collection: &str, name: &str) -> SortedIndexDef {
+    SortedIndexDef {
+        name: name.into(),
+        collection: collection.into(),
+        key_column: "player_id".into(),
+        encoder: SortKeyEncoder::new(vec![SortColumn {
+            name: "score".into(),
+            direction: SortDirection::Desc,
+        }]),
+        window: WindowConfig::none(),
+    }
+}
+
+/// The reaper must remove a single-field index entry along with the row.
+/// Pre-fix `tick_expiry` reaped the hash slot only, so the index kept
+/// pointing at a key that no longer existed — an unbounded leak that the
+/// checkpoint then persisted verbatim.
+#[test]
+fn index_cleaned_on_ttl_reap() {
+    let mut e = make_engine();
+    let n = now();
+
+    e.register_index(RegisterIndexParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection: "sess",
+        field: "region",
+        field_position: 0,
+        backfill: false,
+        now_ms: n,
+    });
+    e.put(KvPutParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection: "sess",
+        key: b"s1",
+        value: &mp_obj(&[("region", "us")]),
+        ttl_ms: 5000,
+        now_ms: n,
+        surrogate: Surrogate::ZERO,
+    });
+    assert_eq!(e.index_lookup_eq(0, 1, "sess", "region", b"us").len(), 1);
+
+    let reaped = e.tick_expiry(n + 5000);
+    assert_eq!(reaped.len(), 1);
+
+    assert_eq!(e.total_entries(), 0);
+    assert!(
+        e.index_lookup_eq(0, 1, "sess", "region", b"us").is_empty(),
+        "reaping the row must remove its index entry"
+    );
+    assert_eq!(
+        e.stats().total_index_entries,
+        0,
+        "no index entry may outlive the row it points at"
+    );
+}
+
+/// The hard-wrong-answer case. `sorted_index_rank` / `top_k` return tree
+/// entries verbatim with no re-check against the hash table, so a sorted
+/// index entry stranded by the reaper is not merely a leak: the expired
+/// player keeps rank 1 and pushes every live player one rank down.
+#[test]
+fn sorted_index_cleaned_on_ttl_reap() {
+    let mut e = make_engine();
+    let n = now();
+
+    // Register before the PUTs: `register_sorted_index` backfills against
+    // wall-clock now, which is far past this test's synthetic `now()`.
+    e.register_sorted_index(0, 1, "players", leaderboard_def("players", "lb"));
+
+    e.put(KvPutParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection: "players",
+        key: b"p1",
+        value: &mp_obj(&[("player_id", "p1"), ("score", "200")]),
+        ttl_ms: 5000,
+        now_ms: n,
+        surrogate: Surrogate::ZERO,
+    });
+    e.put(KvPutParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection: "players",
+        key: b"p2",
+        value: &mp_obj(&[("player_id", "p2"), ("score", "100")]),
+        ttl_ms: 0,
+        now_ms: n,
+        surrogate: Surrogate::ZERO,
+    });
+
+    assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p1", n), Some(1));
+    assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p2", n), Some(2));
+
+    let reaped = e.tick_expiry(n + 5000);
+    assert_eq!(reaped.len(), 1);
+
+    assert_eq!(
+        e.sorted_index_rank(0, 1, "lb", b"p1", n + 5000),
+        None,
+        "the expired leader must not still hold a rank"
+    );
+    assert_eq!(
+        e.sorted_index_rank(0, 1, "lb", b"p2", n + 5000),
+        Some(1),
+        "the live player must move up, not stay shifted down by a ghost"
+    );
+    assert_eq!(
+        e.sorted_index_top_k(0, 1, "lb", 10, n + 5000),
+        Some(vec![(1, b"p2".to_vec())]),
+        "top_k must not return the expired key"
+    );
+}
+
+/// TRUNCATE must take the sorted indexes with the rows.
+///
+/// They live in their own manager rather than in the `KvIndexSet` that
+/// `truncate` drops, so forgetting them strands the tree. That is the same
+/// hard-wrong-answer as an unreaped expiry, by another route: `rank` / `top_k`
+/// never re-check the table, so a truncated collection would keep serving
+/// ranked keys for rows that no longer exist.
+#[test]
+fn sorted_index_cleaned_on_truncate() {
+    let mut e = make_engine();
+    let n = now();
+
+    e.register_sorted_index(0, 1, "players", leaderboard_def("players", "lb"));
+    e.put(KvPutParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection: "players",
+        key: b"p1",
+        value: &mp_obj(&[("player_id", "p1"), ("score", "200")]),
+        ttl_ms: 0,
+        now_ms: n,
+        surrogate: Surrogate::ZERO,
+    });
+    assert_eq!(e.sorted_index_rank(0, 1, "lb", b"p1", n), Some(1));
+
+    assert_eq!(e.truncate(0, 1, "players"), 1);
+
+    assert_eq!(e.total_entries(), 0);
+    assert_eq!(
+        e.sorted_index_rank(0, 1, "lb", b"p1", n),
+        None,
+        "a truncated collection must not leave its leaderboard ranking ghosts"
+    );
+    assert_eq!(
+        e.sorted_index_top_k(0, 1, "lb", 10, n),
+        None,
+        "the sorted index itself must be gone, as the secondary indexes are"
+    );
+}
+
+/// Composite indexes are cleaned by a separate loop in `KvIndexSet::on_delete`
+/// than single-field ones, so the reaper needs its own case for them.
+///
+/// Seeded through `KvIndexSet::add_composite_index` directly: that is the only
+/// registration path a composite index has — the engine exposes no
+/// `register_composite_index` counterpart to `register_index`.
+#[test]
+fn composite_index_cleaned_on_ttl_reap() {
+    let mut e = make_engine();
+    let n = now();
+    let tkey = table_key(0, 1, "sess");
+
+    e.indexes
+        .entry(tkey)
+        .or_default()
+        .add_composite_index(vec!["region".into(), "status".into()], vec![0, 1]);
+
+    e.put(KvPutParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection: "sess",
+        key: b"s1",
+        value: &mp_obj(&[("region", "us"), ("status", "active")]),
+        ttl_ms: 5000,
+        now_ms: n,
+        surrogate: Surrogate::ZERO,
+    });
+
+    let ci_fields = vec!["region".to_string(), "status".to_string()];
+    let hits = |e: &KvEngine| -> usize {
+        e.indexes
+            .get(&tkey)
+            .and_then(|s| s.get_composite_index(&ci_fields))
+            .map(|ci| ci.lookup_eq(&[b"us", b"active"]).len())
+            .unwrap_or(0)
+    };
+    assert_eq!(hits(&e), 1);
+
+    let reaped = e.tick_expiry(n + 5000);
+    assert_eq!(reaped.len(), 1);
+    assert_eq!(
+        hits(&e),
+        0,
+        "reaping the row must remove its composite entry"
+    );
+}
+
+/// DELETE of a key whose TTL has elapsed but which the wheel has not reaped
+/// yet. `KvHashTable::delete` succeeds regardless of expiry, so reading the
+/// old field values through the expiry-checking `get` used to return `None`
+/// and strand the index entries behind a DELETE that reported success.
+#[test]
+fn index_cleaned_on_delete_of_expired_key() {
+    let mut e = make_engine();
+    let n = now();
+
+    e.register_index(RegisterIndexParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection: "sess",
+        field: "region",
+        field_position: 0,
+        backfill: false,
+        now_ms: n,
+    });
+    e.put(KvPutParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection: "sess",
+        key: b"s1",
+        value: &mp_obj(&[("region", "us")]),
+        ttl_ms: 5000,
+        now_ms: n,
+        surrogate: Surrogate::ZERO,
+    });
+    assert_eq!(e.index_lookup_eq(0, 1, "sess", "region", b"us").len(), 1);
+
+    // No tick — the row is expired but still present.
+    assert_eq!(e.delete(0, 1, "sess", &[b"s1".to_vec()], n + 5000), 1);
+    assert!(
+        e.index_lookup_eq(0, 1, "sess", "region", b"us").is_empty(),
+        "DELETE of an expired-pending-reap key must still clean the index"
+    );
+}
+
+/// A rehash moves every existing entry into `rehash_source`; a row reaped
+/// while it sits there is exactly the row whose index cleanup a probe of the
+/// primary slots alone would skip. Guards `get_ignoring_expiry`'s
+/// `rehash_source` fallback.
+#[test]
+fn index_cleaned_on_ttl_reap_during_rehash() {
+    let mut e = make_engine();
+    let n = now();
+
+    e.register_index(RegisterIndexParams {
+        database_id: 0,
+        tenant_id: 1,
+        collection: "sess",
+        field: "region",
+        field_position: 0,
+        backfill: false,
+        now_ms: n,
+    });
+
+    // make_engine's table starts at capacity 16 with a 0.75 rehash threshold,
+    // so the 13th insert starts a rehash and parks all 13 rows in the source.
+    // No PUT follows, so none of them get migrated back out.
+    let rows = 13u32;
+    for i in 0..rows {
+        e.put(KvPutParams {
+            database_id: 0,
+            tenant_id: 1,
+            collection: "sess",
+            key: &i.to_be_bytes(),
+            value: &mp_obj(&[("region", "us")]),
+            ttl_ms: 5000,
+            now_ms: n,
+            surrogate: Surrogate::ZERO,
+        });
+    }
+    assert!(
+        e.stats().is_rehashing,
+        "test premise: the reaped rows must sit in the rehash source"
+    );
+    assert_eq!(
+        e.index_lookup_eq(0, 1, "sess", "region", b"us").len(),
+        rows as usize
+    );
+
+    let reaped = e.tick_expiry(n + 5000);
+    assert_eq!(reaped.len(), rows as usize);
+    assert_eq!(e.total_entries(), 0);
+    assert!(
+        e.index_lookup_eq(0, 1, "sess", "region", b"us").is_empty(),
+        "rows reaped out of the rehash source must clean their index entries too"
+    );
 }
 
 #[test]

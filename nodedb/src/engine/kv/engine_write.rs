@@ -187,9 +187,13 @@ impl KvEngine {
             }
 
             // Extract field values before deletion (for index cleanup).
+            // Expiry-blind: `table.delete` below removes the row regardless of
+            // expiry, so for a key whose TTL has elapsed but which the wheel has
+            // not reaped yet, a `get(key, now_ms)` would return `None` and leave
+            // its index entries stranded behind a successful DELETE.
             let old_fields = if has_indexes {
                 table
-                    .get(key, now_ms)
+                    .get_ignoring_expiry(key)
                     .map(extract_all_field_values_from_msgpack)
             } else {
                 None

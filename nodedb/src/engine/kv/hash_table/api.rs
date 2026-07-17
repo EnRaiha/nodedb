@@ -75,6 +75,35 @@ impl KvHashTable {
         None
     }
 
+    /// Read a key's value ignoring expiry.
+    ///
+    /// Unlike [`get`], returns the bytes of an entry whose TTL has elapsed but
+    /// which the expiry wheel has not reaped yet. The reaper needs them to
+    /// remove the row's secondary/sorted index entries, which are keyed on the
+    /// field values held in the value itself — by the time the reaper runs the
+    /// TTL has elapsed by definition, so a `get` would report the row as
+    /// already gone and the index entries would be stranded.
+    ///
+    /// [`get`]: KvHashTable::get
+    pub fn get_ignoring_expiry(&self, key: &[u8]) -> Option<&[u8]> {
+        let h = hash_key(key);
+
+        if let Some(entry) = self.probe_find(&self.slots, h, key) {
+            return Some(read_value_from(entry, &self.overflow));
+        }
+
+        // A live entry that a rehash has not migrated yet exists ONLY here —
+        // probing the primary alone would silently skip index cleanup for
+        // exactly the rows a rehash is in the middle of moving.
+        if let Some(old) = &self.rehash_source
+            && let Some(entry) = self.probe_find(old, h, key)
+        {
+            return Some(read_value_from(entry, &self.overflow));
+        }
+
+        None
+    }
+
     /// Insert or update a key-value pair. Returns the old value bytes if overwritten.
     ///
     /// `surrogate` is the row's stable global identity:
