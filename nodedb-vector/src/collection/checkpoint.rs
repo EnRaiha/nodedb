@@ -136,12 +136,12 @@ impl VectorCollection {
     /// AES-256-GCM encrypted envelope with a `SEGV` preamble. When `None`,
     /// raw MessagePack bytes are returned (existing plaintext format).
     ///
-    /// Returns an empty `Vec` on serialization failure (callers treat this as a
-    /// skip signal, consistent with the pre-existing error handling).
+    /// Returns `Err` on serialization or encryption failure — callers must
+    /// propagate rather than treat a failed encode as an empty checkpoint.
     pub fn checkpoint_to_bytes(
         &self,
         kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, VectorError> {
         let snapshot = CollectionSnapshot {
             dim: self.dim,
             params_m: self.params.m,
@@ -161,7 +161,14 @@ impl VectorCollection {
                 .iter()
                 .map(|s| {
                     let (pq_bytes, pq_codes) = match &s.pq {
-                        Some((codec, codes)) => (codec.to_bytes().ok(), Some(codes.clone())),
+                        Some((codec, codes)) => (
+                            Some(codec.to_bytes().map_err(|e| {
+                                VectorError::CheckpointSerializationError {
+                                    detail: format!("PQ codec encode: {e}"),
+                                }
+                            })?),
+                            Some(codes.clone()),
+                        ),
                         None => (None, None),
                     };
                     // Only serialize SQ8 when PQ is absent — a segment never carries both.
@@ -173,16 +180,16 @@ impl VectorCollection {
                     } else {
                         (None, None)
                     };
-                    SealedSnapshot {
+                    Ok(SealedSnapshot {
                         base_id: s.base_id,
-                        hnsw_bytes: s.index.checkpoint_to_bytes(),
+                        hnsw_bytes: s.index.checkpoint_to_bytes()?,
                         pq_bytes,
                         pq_codes,
                         sq8_bytes,
                         sq8_codes,
-                    }
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, VectorError>>()?,
             building_segments: self
                 .building
                 .iter()
@@ -212,11 +219,9 @@ impl VectorCollection {
                 match zerompk::to_msgpack_vec(&snap) {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "vector payload index snapshot serialization failed"
-                        );
-                        return Vec::new();
+                        return Err(VectorError::CheckpointSerializationError {
+                            detail: e.to_string(),
+                        });
                     }
                 }
             },
@@ -225,21 +230,16 @@ impl VectorCollection {
         let msgpack = match zerompk::to_msgpack_vec(&snapshot) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::warn!(error = %e, "vector collection checkpoint serialization failed");
-                return Vec::new();
+                return Err(VectorError::CheckpointSerializationError {
+                    detail: e.to_string(),
+                });
             }
         };
 
         if let Some(key) = kek {
-            match encrypt_checkpoint(key, &msgpack) {
-                Ok(encrypted) => encrypted,
-                Err(e) => {
-                    tracing::warn!(error = %e, "vector collection checkpoint encryption failed");
-                    Vec::new()
-                }
-            }
+            encrypt_checkpoint(key, &msgpack)
         } else {
-            msgpack
+            Ok(msgpack)
         }
     }
 
@@ -493,7 +493,7 @@ mod tests {
         // Capture serialized form as ground truth.
         let orig_bytes = orig_sq8.0.to_bytes();
 
-        let checkpoint = coll.checkpoint_to_bytes(None);
+        let checkpoint = coll.checkpoint_to_bytes(None).unwrap();
         let restored = VectorCollection::from_checkpoint(&checkpoint, None)
             .unwrap()
             .unwrap();
@@ -526,7 +526,7 @@ mod tests {
         for i in 0..50u32 {
             coll.insert(vec![i as f32, 0.0, 0.0]);
         }
-        let bytes = coll.checkpoint_to_bytes(None);
+        let bytes = coll.checkpoint_to_bytes(None).unwrap();
         let restored = VectorCollection::from_checkpoint(&bytes, None)
             .unwrap()
             .unwrap();
@@ -563,7 +563,7 @@ mod tests {
             "gate is not advanced by note; only by load/save"
         );
 
-        let bytes = coll.checkpoint_to_bytes(None);
+        let bytes = coll.checkpoint_to_bytes(None).unwrap();
         let restored = VectorCollection::from_checkpoint(&bytes, None)
             .unwrap()
             .unwrap();
@@ -618,7 +618,7 @@ mod tests {
             coll.payload.insert_row(node_id, &fields);
         }
 
-        let bytes = coll.checkpoint_to_bytes(None);
+        let bytes = coll.checkpoint_to_bytes(None).unwrap();
         let restored = VectorCollection::from_checkpoint(&bytes, None)
             .unwrap()
             .unwrap();

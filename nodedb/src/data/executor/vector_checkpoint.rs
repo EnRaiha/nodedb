@@ -127,22 +127,15 @@ impl CoreLoop {
             }
             // Checkpoint filename is `"{db}:{tid}:{coll}"`.
             let filename = CoreLoop::vector_checkpoint_filename(key);
-            let bytes =
-                collection.checkpoint_to_bytes(self.segment_keks.vector_checkpoint_kek.as_ref());
-            // `checkpoint_to_bytes` signals a serialization or encryption
-            // failure by returning empty. The `is_empty` guard above already
-            // excluded the only innocent reason for empty bytes, so reaching
-            // here means the encode failed and this index was NOT written.
-            if bytes.is_empty() {
-                return Err(crate::Error::Serialization {
+            let bytes = collection
+                .checkpoint_to_bytes(self.segment_keks.vector_checkpoint_kek.as_ref())
+                .map_err(|e| crate::Error::Serialization {
                     format: "msgpack".to_string(),
                     detail: format!(
-                        "vector checkpoint encode produced no bytes for non-empty index \
-                         {filename} ({} vectors)",
+                        "vector checkpoint encode failed for {filename} ({} vectors): {e}",
                         collection.len()
                     ),
-                });
-            }
+                })?;
             let ckpt_path = ckpt_dir.join(format!("{filename}.ckpt"));
             let tmp_path = ckpt_dir.join(format!("{filename}.ckpt.tmp"));
             nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &bytes)

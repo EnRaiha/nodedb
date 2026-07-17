@@ -566,7 +566,7 @@ mod tests {
         // replay gate (`checkpoint_wal_lsn`): a live `note_checkpoint_lsn` only
         // feeds the applied watermark, which save folds into the gate and load
         // restores — the faithful shape of a restored checkpoint.
-        let bytes = coll.checkpoint_to_bytes(None);
+        let bytes = coll.checkpoint_to_bytes(None).unwrap();
         let coll = VectorCollection::from_checkpoint(&bytes, None)
             .expect("decode checkpoint")
             .expect("non-empty checkpoint");

@@ -39,7 +39,7 @@ fn growing_segment_tombstones_survive_checkpoint_roundtrip() {
     let live_before = coll.live_count();
     assert_eq!(live_before, 8);
 
-    let bytes = coll.checkpoint_to_bytes(None);
+    let bytes = coll.checkpoint_to_bytes(None).unwrap();
     let restored = VectorCollection::from_checkpoint(&bytes, None)
         .expect("checkpoint deserializes")
         .unwrap();
@@ -78,7 +78,7 @@ fn building_segment_tombstones_survive_checkpoint_roundtrip() {
     let live_before = coll.live_count();
     assert_eq!(live_before, 18);
 
-    let bytes = coll.checkpoint_to_bytes(None);
+    let bytes = coll.checkpoint_to_bytes(None).unwrap();
     let restored = VectorCollection::from_checkpoint(&bytes, None)
         .expect("checkpoint deserializes")
         .unwrap();

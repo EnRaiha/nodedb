@@ -48,7 +48,12 @@ pub(super) fn rebuild_hnsw_thread(
         })?;
     }
     Ok(RebuildOutput::Hnsw {
-        bytes: index.checkpoint_to_bytes(),
+        bytes: index
+            .checkpoint_to_bytes()
+            .map_err(|e| crate::Error::Storage {
+                engine: "vector".to_string(),
+                detail: format!("HNSW checkpoint encode: {e}"),
+            })?,
     })
 }
 

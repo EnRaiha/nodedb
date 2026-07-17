@@ -39,7 +39,7 @@ fn hnsw_checkpoint_encrypted_at_rest() {
     let coll = make_collection();
     let key = make_key();
 
-    let blob = coll.checkpoint_to_bytes(Some(&key));
+    let blob = coll.checkpoint_to_bytes(Some(&key)).unwrap();
     assert!(!blob.is_empty(), "encrypted checkpoint must not be empty");
 
     // File must start with SEGV magic.
@@ -85,7 +85,7 @@ fn hnsw_refuses_plaintext_when_kek_required() {
     let coll = make_collection();
 
     // Write a plaintext checkpoint (no KEK).
-    let plaintext_blob = coll.checkpoint_to_bytes(None);
+    let plaintext_blob = coll.checkpoint_to_bytes(None).unwrap();
     assert!(
         plaintext_blob.len() >= 4,
         "plaintext checkpoint must have content"

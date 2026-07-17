@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 
 use crate::distance::DistanceMetric;
+use crate::error::VectorError;
 use crate::hnsw::arena::BeamSearchArena;
 use crate::hnsw::flat_neighbors::FlatNeighborStore;
 use crate::hnsw::graph::{ARENA_INITIAL_CAPACITY, HnswIndex, Node, NodeStorage, Xorshift64};
@@ -47,7 +48,7 @@ impl HnswIndex {
     ///
     /// This is the Lite pagedb-segment write path: vectors live in the segment,
     /// graph topology lives in the B+ tree.  Origin never calls this method.
-    pub fn graph_checkpoint_to_bytes(&self) -> Vec<u8> {
+    pub fn graph_checkpoint_to_bytes(&self) -> Result<Vec<u8>, VectorError> {
         let snapshot = HnswSnapshotRkyv {
             dim: self.dim,
             m: self.params.m,
@@ -66,19 +67,22 @@ impl HnswIndex {
             },
             node_deleted: self.nodes.iter().map(|n| n.deleted).collect(),
         };
-        let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot)
-            .expect("HNSW graph-only rkyv serialization should not fail");
+        let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot).map_err(|e| {
+            VectorError::CheckpointSerializationError {
+                detail: e.to_string(),
+            }
+        })?;
         let mut buf = Vec::with_capacity(HNSW_RKYV_MAGIC.len() + 1 + rkyv_bytes.len());
         buf.extend_from_slice(HNSW_RKYV_MAGIC);
         buf.push(HNSW_FORMAT_VERSION);
         buf.extend_from_slice(&rkyv_bytes);
-        buf
+        Ok(buf)
     }
 
     /// Serialize the index to rkyv bytes (with magic header) for storage.
     ///
     /// Magic header `RKHNS\0` allows `from_checkpoint` to detect format.
-    pub fn checkpoint_to_bytes(&self) -> Vec<u8> {
+    pub fn checkpoint_to_bytes(&self) -> Result<Vec<u8>, VectorError> {
         let snapshot = HnswSnapshotRkyv {
             dim: self.dim,
             m: self.params.m,
@@ -96,13 +100,16 @@ impl HnswIndex {
             },
             node_deleted: self.nodes.iter().map(|n| n.deleted).collect(),
         };
-        let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot)
-            .expect("HNSW rkyv serialization should not fail");
+        let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&snapshot).map_err(|e| {
+            VectorError::CheckpointSerializationError {
+                detail: e.to_string(),
+            }
+        })?;
         let mut buf = Vec::with_capacity(HNSW_RKYV_MAGIC.len() + 1 + rkyv_bytes.len());
         buf.extend_from_slice(HNSW_RKYV_MAGIC);
         buf.push(HNSW_FORMAT_VERSION);
         buf.extend_from_slice(&rkyv_bytes);
-        buf
+        Ok(buf)
     }
 
     /// Restore an index from a checkpoint snapshot.
@@ -211,7 +218,7 @@ mod tests {
                 .unwrap();
         }
 
-        let bytes = idx.checkpoint_to_bytes();
+        let bytes = idx.checkpoint_to_bytes().unwrap();
         assert!(!bytes.is_empty());
 
         let restored = HnswIndex::from_checkpoint(&bytes).unwrap().unwrap();
@@ -234,7 +241,7 @@ mod tests {
     fn golden_header_layout() {
         let mut idx = make_index();
         idx.insert(vec![1.0, 2.0, 3.0]).unwrap();
-        let bytes = idx.checkpoint_to_bytes();
+        let bytes = idx.checkpoint_to_bytes().unwrap();
         // Magic at bytes[0..6].
         assert_eq!(&bytes[0..6], b"RKHNS\0");
         // Version byte at bytes[6].
@@ -247,7 +254,7 @@ mod tests {
     fn version_mismatch_returns_error() {
         let mut idx = make_index();
         idx.insert(vec![1.0, 2.0, 3.0]).unwrap();
-        let mut bytes = idx.checkpoint_to_bytes();
+        let mut bytes = idx.checkpoint_to_bytes().unwrap();
         // Corrupt the version byte to an unsupported value.
         bytes[6] = 0;
         match HnswIndex::from_checkpoint(&bytes) {

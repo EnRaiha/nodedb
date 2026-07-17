@@ -38,23 +38,24 @@ impl CoreLoop {
             })
             .collect();
 
-        let hnsw_indexes: Vec<HnswSnapshot> = self
-            .vector_collections
-            .iter()
-            .filter_map(|(key, coll)| {
-                let checkpoint_bytes =
-                    coll.checkpoint_to_bytes(self.segment_keks.vector_checkpoint_kek.as_ref());
-                if checkpoint_bytes.is_empty() {
-                    return None;
-                }
-                Some(HnswSnapshot {
-                    database_id: key.0.as_u64(),
-                    tenant_id: key.1.as_u64(),
-                    collection: key.2.clone(),
-                    checkpoint_bytes,
-                })
-            })
-            .collect();
+        let mut hnsw_indexes: Vec<HnswSnapshot> = Vec::new();
+        for (key, coll) in self.vector_collections.iter() {
+            if coll.is_empty() {
+                continue; // empty collection: no state to snapshot
+            }
+            let checkpoint_bytes = coll
+                .checkpoint_to_bytes(self.segment_keks.vector_checkpoint_kek.as_ref())
+                .map_err(|e| crate::Error::Serialization {
+                    format: "msgpack".to_string(),
+                    detail: format!("vector snapshot encode failed: {e}"),
+                })?;
+            hnsw_indexes.push(HnswSnapshot {
+                database_id: key.0.as_u64(),
+                tenant_id: key.1.as_u64(),
+                collection: key.2.clone(),
+                checkpoint_bytes,
+            });
+        }
 
         let mut crdt_snapshots: Vec<CrdtSnapshot> = Vec::new();
         for (tid, engine) in &self.crdt_engines {

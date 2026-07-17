@@ -598,7 +598,8 @@ mod tests {
             .vector_collections
             .get(&key)
             .expect("collection present after first replay")
-            .checkpoint_to_bytes(None);
+            .checkpoint_to_bytes(None)
+            .unwrap();
         let restored =
             crate::engine::vector::collection::VectorCollection::from_checkpoint(&bytes, None)
                 .expect("decode checkpoint")

@@ -612,7 +612,7 @@ mod tests {
         // into it, and load exposes it — faithfully simulating a restored
         // checkpoint (the gate is set only by load/save, never by a live
         // `note_checkpoint_lsn`, which feeds the separate applied watermark).
-        let bytes = coll.checkpoint_to_bytes(None);
+        let bytes = coll.checkpoint_to_bytes(None).unwrap();
         let coll = VectorCollection::from_checkpoint(&bytes, None)
             .expect("decode checkpoint")
             .expect("non-empty checkpoint");
