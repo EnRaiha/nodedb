@@ -6,13 +6,26 @@ use std::sync::Arc;
 
 use crate::bridge::envelope::Response;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::dispatch_utils::WalDurability;
+use crate::control::server::dispatch_utils::{WalDurability, publish_origin_change_events};
 use crate::control::server::exchange::resolve::{Resolved, resolve_and_materialize};
 use crate::types::{Lsn, ReadConsistency, TraceId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::core::NodeDbPgHandler;
 use super::submit::SubmitArgs;
+
+/// Inputs for [`NodeDbPgHandler::dispatch_replicated_write`]: the entry to
+/// propose, the proposer, and the identity + plan its origin CDC publish needs.
+struct ReplicatedWrite<'a> {
+    entry: crate::control::wal_replication::ReplicatedEntry,
+    proposer: &'a Arc<crate::control::wal_replication::AsyncRaftProposer>,
+    tenant_id: crate::types::TenantId,
+    database_id: crate::types::DatabaseId,
+    /// The plan `entry` encodes. The entry does not hand the plan back, and the
+    /// change events must be derived from it after the entry is proposed, so
+    /// the borrow is carried through rather than re-decoded.
+    plan: &'a crate::bridge::envelope::PhysicalPlan,
+}
 
 impl NodeDbPgHandler {
     /// Dispatch a single physical task and wait for the response.
@@ -304,7 +317,17 @@ impl NodeDbPgHandler {
                 &task.plan,
             )
         {
-            return self.dispatch_replicated_write(entry, async_proposer).await;
+            return self
+                .dispatch_replicated_write(ReplicatedWrite {
+                    entry,
+                    proposer: async_proposer,
+                    tenant_id: task.tenant_id,
+                    database_id: task.database_id,
+                    // The CDC publish inside needs the plan, which the entry
+                    // encoded but does not hand back; `task` still owns it here.
+                    plan: &task.plan,
+                })
+                .await;
         }
 
         self.dispatch_local(task, user_id).await
@@ -316,11 +339,24 @@ impl NodeDbPgHandler {
     /// step. The `ProposeTracker` is race-safe: if the entry commits and
     /// applies on this node before `register()` is called, the result is
     /// stored and `register()` picks it up immediately.
+    ///
+    /// This is also the origin CDC publish site for a replicated write. It runs
+    /// on exactly one node — the one the client wrote to — and returns only
+    /// after the entry is committed and applied, which is precisely the
+    /// "acknowledged, committed, applied" point a change event names. The
+    /// replicas' apply loops deliberately publish nothing (see
+    /// `ChangeFeedOwner::Unowned`).
     async fn dispatch_replicated_write(
         &self,
-        entry: crate::control::wal_replication::ReplicatedEntry,
-        proposer: &Arc<crate::control::wal_replication::AsyncRaftProposer>,
+        args: ReplicatedWrite<'_>,
     ) -> crate::Result<Response> {
+        let ReplicatedWrite {
+            entry,
+            proposer,
+            tenant_id,
+            database_id,
+            plan,
+        } = args;
         let request_id = self.next_request_id();
 
         // Propose through Raft with transparent leader-change retry. Shared with
@@ -335,7 +371,7 @@ impl NodeDbPgHandler {
             crate::control::wal_replication::propose_replicated_entry(&self.state, proposer, entry)
                 .await?;
 
-        Ok(Response {
+        let response = Response {
             request_id,
             status: crate::bridge::envelope::Status::Ok,
             attempt: 1,
@@ -346,7 +382,13 @@ impl NodeDbPgHandler {
             read_set_valid: None,
             read_version_lsn: write_version,
             write_set: Vec::new(),
-        })
+        };
+
+        // The propose returned, so the entry is committed and this node has
+        // applied it. Publish once, here, from the plan the entry encodes.
+        publish_origin_change_events(&self.state, tenant_id, database_id, plan, &response);
+
+        Ok(response)
     }
 
     /// Dispatch a task directly to the local Data Plane (single-node or reads).

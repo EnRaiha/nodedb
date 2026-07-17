@@ -23,9 +23,8 @@ use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Response, Status}
 use crate::control::server::wal_dispatch::{self, WalAppendRequest};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, ReadConsistency, TenantId, TraceId, TxnId, VShardId};
-use nodedb_physical::physical_plan::TimeseriesOp;
 
-use super::change_events::{extract_write_metadata, publish_change_event};
+use super::change_events::{extract_write_change_set, publish_change_set};
 use super::collect::{DispatchCollectError, collect_bounded_response};
 
 /// Who owns this write's durable redo record.
@@ -63,28 +62,23 @@ pub(crate) enum WriteOrdering {
 /// Who owns emitting this write's Control-Plane change event.
 pub(crate) enum ChangeFeedOwner {
     /// The funnel extracts the write's change metadata from the plan and
-    /// publishes it once the apply succeeds. The autocommit / internal funnel
-    /// takes this route, and it is the only route on which a write reaches
-    /// `/cdc` and WS-RPC subscribers.
+    /// publishes it once the apply succeeds. This is the route for every write
+    /// this node both handles and applies itself — the autocommit / internal
+    /// funnel, the pgwire SQL path's local dispatch, and the array executor's
+    /// single-node write — and it is what carries those writes to `/cdc` and
+    /// WS-RPC subscribers.
     Funnel,
-    /// No component emits a Control-Plane change event for this write. The
-    /// pgwire SQL path and the Raft data-group apply loop (including the array
-    /// apply + array-executor single-node write) take this route, so a write
-    /// submitted through them is never observed by `/cdc` or WS-RPC
-    /// subscribers — SQL DML raises no change event.
+    /// The funnel emits no change event for this write, because the node that
+    /// handled the write already emitted it.
     ///
-    /// That is a known gap, preserved by this enum rather than fixed here.
-    /// Emitting from those paths activates `publish_change_event`'s
-    /// cluster-wide NOTIFY broadcast, and no peer registers a handler for
-    /// `DispatchTarget::EventPlane`: the receive side (`CrossShardReceiver`)
-    /// exists but is never constructed. Every broadcast therefore fails, and
-    /// the failure is recorded against the per-peer circuit breaker that all
-    /// RPC types share, so it opens and takes that peer's raft and metadata
-    /// RPCs down with it.
-    ///
-    /// Closing the gap requires both wiring `CrossShardReceiver` into the
-    /// vshard_handler and deciding whether the event must be emitted once per
-    /// write by the originating / leader node rather than once per replica.
+    /// This is the route for a submit that applies a Raft-committed entry (the
+    /// data-group apply loop and the array apply path). Those run on EVERY
+    /// replica: publishing here would emit one event per replica, each with its
+    /// own cluster-wide NOTIFY fan-out to every peer, and no dedup exists on
+    /// either side — a subscriber would silently see the write once per
+    /// replica, multiplied again by the fan-out. The proposing node handled the
+    /// write exactly once and publishes there instead, after commit + apply
+    /// (see `publish_origin_change_events`).
     Unowned,
 }
 
@@ -142,20 +136,14 @@ pub(crate) async fn submit_write(
         change_feed,
     } = params;
 
-    // Change metadata is derived from the plan here, before it is moved into
-    // the request. `extract_write_metadata` is a pure match over the plan that
-    // clones out collection / document identity, so a caller whose change feed
-    // is `Unowned` skips it rather than allocating tuples nothing will read.
-    let change_meta = match change_feed {
-        ChangeFeedOwner::Funnel => Some((
-            matches!(
-                &plan,
-                PhysicalPlan::Columnar(_)
-                    | PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. })
-                    | PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. })
-            ),
-            extract_write_metadata(&plan, tenant_id),
-        )),
+    // Change metadata is derived from the plan HERE, before it is moved into
+    // the request — the publish itself happens after apply, once the response
+    // (which carries the event's LSN) exists, by which point the plan is gone.
+    // Extraction is a pure match that clones out collection / document
+    // identity, so a caller whose change feed is `Unowned` skips it rather than
+    // allocating tuples nothing will read.
+    let change_set = match change_feed {
+        ChangeFeedOwner::Funnel => Some(extract_write_change_set(&plan, tenant_id)),
         ChangeFeedOwner::Unowned => None,
     };
 
@@ -423,22 +411,12 @@ pub(crate) async fn submit_write(
     }
 
     // Publish change events for successful writes whose change feed this funnel
-    // owns. Almost every write plan yields exactly one tuple; a handful of
-    // multi-row / multi-collection ops (see `extract_write_metadata`) yield more
-    // than one or zero. `None` is a caller whose change feed is `Unowned` — see
-    // [`ChangeFeedOwner`] for why those writes raise no event at all.
+    // owns. `None` is a caller whose change feed is `Unowned` — see
+    // [`ChangeFeedOwner`] for why the node that applies those writes is not the
+    // node that publishes them.
     if response.status == Status::Ok {
-        if let Some((is_columnar_collection, metas)) = change_meta {
-            for meta in metas {
-                publish_change_event(
-                    shared,
-                    tenant_id,
-                    database_id,
-                    is_columnar_collection,
-                    meta,
-                    &response,
-                );
-            }
+        if let Some(change_set) = change_set {
+            publish_change_set(shared, tenant_id, database_id, change_set, &response);
         }
 
         // Advance the tenant's observed write-HLC high-water on any successful

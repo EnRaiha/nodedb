@@ -178,10 +178,13 @@ impl DataPlaneArrayExecutor {
                 user_id: None,
                 durability: WalDurability::AppendHere { now_override: None },
                 ordering: WriteOrdering::Gate,
-                // This path hand-built its own `Request` before it moved onto
-                // the funnel and never published a change event for the array
-                // write it dispatched; see [`ChangeFeedOwner::Unowned`].
-                change_feed: ChangeFeedOwner::Unowned,
+                // Single-node: this node is the only one that handles and
+                // applies the array write, so the funnel publishes its change
+                // event once, here. The propose branch above returned before
+                // reaching this point — its event is published by the node that
+                // proposed the entry, not by each replica that applies it (see
+                // [`ChangeFeedOwner`]).
+                change_feed: ChangeFeedOwner::Funnel,
             },
         )
         .await

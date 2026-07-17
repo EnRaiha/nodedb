@@ -350,10 +350,11 @@ pub async fn run_apply_loop(
                     // write-admission gate would re-decide an ordering that is
                     // already final.
                     ordering: WriteOrdering::AlreadyOrdered,
-                    // A Raft-committed write raises no Control-Plane change
-                    // event; see [`ChangeFeedOwner::Unowned`] for the gap this
-                    // preserves, and for why emitting once per replica is not
-                    // the answer.
+                    // This loop runs on EVERY replica, so it must not publish:
+                    // the node that proposed this entry already published the
+                    // write's change event once, after commit + apply. Emitting
+                    // here would give each subscriber one copy per replica plus
+                    // a NOTIFY fan-out from each. See [`ChangeFeedOwner`].
                     change_feed: ChangeFeedOwner::Unowned,
                 },
             )

@@ -54,9 +54,13 @@ impl NodeDbPgHandler {
                 user_id,
                 durability,
                 ordering: WriteOrdering::Gate,
-                // SQL DML raises no Control-Plane change event; see
-                // [`ChangeFeedOwner::Unowned`] for the gap this preserves.
-                change_feed: ChangeFeedOwner::Unowned,
+                // This node both handles and applies the write: `dispatch_local`
+                // is reached only when no Raft proposer exists (single node) or
+                // when the plan is not encodable as a replicated entry, so
+                // exactly one node applies it and exactly one event is emitted.
+                // The replicated path publishes at its own origin site instead
+                // — see [`ChangeFeedOwner`].
+                change_feed: ChangeFeedOwner::Funnel,
             },
         )
         .await

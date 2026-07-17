@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! CDC change-event publishing for dispatched writes: turning the metadata
+//! [`super::extract`] derived from a plan into `ChangeEvent`s on the local
+//! change stream plus the cluster-wide NOTIFY fan-out.
+
+use crate::bridge::envelope::{PhysicalPlan, Response};
+use crate::control::change_stream::ChangeOperation;
+use crate::control::state::SharedState;
+use crate::types::{DatabaseId, TenantId};
+use nodedb_physical::physical_plan::TimeseriesOp;
+
+use super::extract::extract_write_metadata;
+
+/// Current wall-clock time as milliseconds since Unix epoch.
+///
+/// Returns 0 if the system clock is before the epoch (should never happen
+/// on correctly configured systems).
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Check if a timeseries collection has CDC enabled.
+///
+/// Returns `false` (CDC off) by default for timeseries to prevent
+/// high-cardinality metric streams from flooding the ChangeStream bus.
+/// Users opt in via `CREATE TIMESERIES name WITH (cdc = 'true')`.
+fn is_timeseries_cdc_enabled(
+    shared: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    collection: &str,
+) -> bool {
+    let catalog = shared.credentials.catalog();
+    if let Ok(Some(coll)) = catalog.get_collection(database_id, tenant_id.as_u64(), collection)
+        && coll.collection_type.is_timeseries()
+    {
+        if let Some(config) = coll.get_timeseries_config()
+            && let Some(cdc_val) = config.get("cdc")
+        {
+            return cdc_val.as_str() == Some("true") || cdc_val.as_bool() == Some(true);
+        }
+        // Default: CDC off for timeseries.
+        return false;
+    }
+    // Not timeseries or catalog unavailable — allow publishing.
+    true
+}
+
+/// Publish a change event (and cluster-wide NOTIFY) for a successful write.
+///
+/// CDC opt-in check for timeseries: skip publishing unless `cdc_enabled`.
+/// Document collections always publish (backward compatible).
+fn publish_change_event(
+    shared: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    is_columnar_collection: bool,
+    change_meta: (String, String, ChangeOperation),
+    response: &Response,
+) {
+    let (collection, doc_id, op) = change_meta;
+    let should_publish = if is_columnar_collection {
+        is_timeseries_cdc_enabled(shared, database_id, tenant_id, &collection)
+    } else {
+        true
+    };
+    if !should_publish {
+        return;
+    }
+
+    use crate::control::change_stream::ChangeEvent;
+    let event = ChangeEvent {
+        lsn: response.watermark_lsn,
+        tenant_id,
+        collection,
+        document_id: doc_id,
+        operation: op,
+        timestamp_ms: current_timestamp_ms(),
+        after: None,
+    };
+
+    // Cluster-wide NOTIFY: broadcast to all peers via QUIC.
+    if let (Some(transport), Some(topology)) = (&shared.cluster_transport, &shared.cluster_topology)
+    {
+        use std::sync::atomic::Ordering;
+        static NOTIFY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let seq = NOTIFY_SEQ.fetch_add(1, Ordering::Relaxed);
+        crate::control::change_stream::broadcast_notify_to_cluster(
+            &event,
+            shared.node_id,
+            seq,
+            transport,
+            topology,
+        );
+    }
+
+    shared.change_stream.publish(event);
+}
+
+/// The Control-Plane change events one write plan yields.
+///
+/// Extraction is split from publishing because the write funnel consumes the
+/// plan — it moves into the `Request` — long before the `Response` the event's
+/// LSN comes from exists. A caller that still owns its plan at publish time
+/// uses [`publish_origin_change_events`] and never names this type.
+pub(crate) struct WriteChangeSet {
+    /// Whether this plan writes through the columnar storage core. Only those
+    /// collections can be timeseries, so this gates the per-collection
+    /// timeseries CDC opt-in check to the writes that could opt out of it.
+    is_columnar_collection: bool,
+    /// One tuple per logical row change — see `extract_write_metadata`.
+    metas: Vec<(String, String, ChangeOperation)>,
+}
+
+/// Derive a plan's change events. Pure: it matches over the plan and clones out
+/// collection / document identity, touching no shared state, so it is safe to
+/// call at the one point where the plan is still owned.
+pub(crate) fn extract_write_change_set(plan: &PhysicalPlan, tenant_id: TenantId) -> WriteChangeSet {
+    WriteChangeSet {
+        is_columnar_collection: matches!(
+            plan,
+            PhysicalPlan::Columnar(_)
+                | PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. })
+                | PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. })
+        ),
+        metas: extract_write_metadata(plan, tenant_id),
+    }
+}
+
+/// Publish an already-extracted change set. Almost every write plan yields
+/// exactly one event; a handful of multi-row / multi-collection ops yield more
+/// than one, and reads / DDL / index maintenance yield none.
+pub(crate) fn publish_change_set(
+    shared: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    change_set: WriteChangeSet,
+    response: &Response,
+) {
+    let WriteChangeSet {
+        is_columnar_collection,
+        metas,
+    } = change_set;
+    for meta in metas {
+        publish_change_event(
+            shared,
+            tenant_id,
+            database_id,
+            is_columnar_collection,
+            meta,
+            response,
+        );
+    }
+}
+
+/// Publish the Control-Plane change event(s) for a write this node originated
+/// and has already had committed and applied.
+///
+/// The cluster Raft path cannot let the write funnel own its change feed: the
+/// proposing node never reaches `submit_write` — it proposes, and every
+/// replica's apply loop submits the committed entry independently. Publishing
+/// from the apply loop would emit one event per replica plus a full NOTIFY
+/// fan-out from each, so a subscriber would see the write once per replica. The
+/// proposing node is the one node that handled the write exactly once, so it is
+/// the one that publishes.
+pub(crate) fn publish_origin_change_events(
+    shared: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    plan: &PhysicalPlan,
+    response: &Response,
+) {
+    publish_change_set(
+        shared,
+        tenant_id,
+        database_id,
+        extract_write_change_set(plan, tenant_id),
+        response,
+    );
+}

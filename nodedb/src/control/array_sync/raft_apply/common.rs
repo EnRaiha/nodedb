@@ -97,9 +97,11 @@ pub(super) async fn submit_array_write(
             // applies it in that order; re-entering the write-admission gate
             // would re-decide an ordering that is already final.
             ordering: WriteOrdering::AlreadyOrdered,
-            // An `ArrayOp::Put` / `Delete` does yield change metadata, but a
-            // Raft-committed array write raises no Control-Plane change event;
-            // see [`ChangeFeedOwner::Unowned`].
+            // An `ArrayOp::Put` / `Delete` does yield change metadata, but this
+            // apply path runs on EVERY replica of the committed entry — the
+            // node that proposed it owns the single publish. Emitting here
+            // would give each subscriber one copy per replica plus a NOTIFY
+            // fan-out from each. See [`ChangeFeedOwner`].
             change_feed: ChangeFeedOwner::Unowned,
         },
     )
