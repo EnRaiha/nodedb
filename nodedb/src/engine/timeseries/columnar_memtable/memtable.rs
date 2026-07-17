@@ -73,11 +73,20 @@ impl ColumnarMemtable {
     ///
     /// For the simple 2-column schema. For multi-column schemas with tags,
     /// use `ingest_row()` instead.
+    ///
+    /// Does NOT enforce `hard_memory_limit`, for the same reason `ingest_row`
+    /// does not (see its doc): the sole production caller is WAL replay
+    /// (`replay_timeseries_payload`), and a sample reaching here belongs to a
+    /// record that has ALREADY COMMITTED, so refusing it is not backpressure —
+    /// it is silent loss of a durable write. Replay must take the record whole;
+    /// the ceiling lives at the record boundary in the live ingest handler's
+    /// admission gate, never here. NOTE: if a structured-`TimeseriesWalBatch`
+    /// ingest producer is ever added, its replay must gain that same
+    /// record-boundary flush AND move the `ts_max_ingested_lsn` advance in
+    /// `replay_timeseries_wal` to AFTER a successful dispatch (it is currently
+    /// pre-advanced to the in-flight record), or a mid-record replay flush
+    /// would stamp the partition with the wrong LSN.
     pub fn ingest_metric(&mut self, series_id: SeriesId, sample: MetricSample) -> IngestResult {
-        if self.memory_bytes >= self.config.hard_memory_limit {
-            return IngestResult::Rejected;
-        }
-
         // Push to timestamp column.
         if let ColumnData::Timestamp(ref mut v) = self.columns[self.schema.timestamp_idx] {
             v.push(sample.timestamp_ms);
@@ -685,7 +694,12 @@ mod tests {
     }
 
     #[test]
-    fn hard_limit_rejection() {
+    fn ingest_metric_accepts_past_hard_limit() {
+        // A sample reaching the memtable belongs to an already-committed WAL
+        // record; refusing it would silently drop a durable write on replay.
+        // So `ingest_metric` accepts every sample regardless of the ceiling —
+        // it never returns `Rejected`, and the resident footprint overshoots
+        // the hard limit rather than losing data.
         let config = ColumnarMemtableConfig {
             max_memory_bytes: 100,
             hard_memory_limit: 200,
@@ -693,8 +707,6 @@ mod tests {
         };
         let mut mt = ColumnarMemtable::new_metric(config);
 
-        // Fill past hard limit.
-        let mut rejected = false;
         for i in 0..1000 {
             let r = mt.ingest_metric(
                 1,
@@ -703,12 +715,17 @@ mod tests {
                     value: 1.0,
                 },
             );
-            if r == IngestResult::Rejected {
-                rejected = true;
-                break;
-            }
+            assert_ne!(
+                r,
+                IngestResult::Rejected,
+                "sample {i} must not be rejected — that would drop a durable record on replay"
+            );
         }
-        assert!(rejected);
+        assert_eq!(mt.row_count(), 1000, "every sample past the limit is retained");
+        assert!(
+            mt.memory_bytes() >= 200,
+            "the footprint is allowed to overshoot the hard limit"
+        );
     }
 
     #[test]

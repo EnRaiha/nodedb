@@ -681,6 +681,71 @@ mod tests {
         );
     }
 
+    /// Replaying a `TimeseriesWalBatch` larger than the memtable's hard limit
+    /// must retain EVERY sample. The batch is one already-committed WAL record;
+    /// dropping samples that push past the ceiling is silent loss of durable
+    /// data on restart. `ingest_metric` therefore never rejects, and the
+    /// resident footprint overshoots the limit rather than truncating.
+    #[test]
+    fn oversized_timeseries_batch_replays_every_sample() {
+        let mut h = make_core();
+        // Size the replay memtable's hard limit far below the batch: 100
+        // samples charge 16 B each (1600 B) against a 64 B ceiling, so the old
+        // reject would have kept only the handful that fit.
+        h.core.ts_tuning.memtable_hard_limit_bytes = 64;
+        h.core.ts_tuning.memtable_budget_bytes = 32;
+
+        const N: usize = 100;
+        let samples: Vec<(u64, i64, f64)> =
+            (0..N).map(|i| (1u64, 1_000 + i as i64, i as f64)).collect();
+        let batch = nodedb_types::timeseries::TimeseriesWalBatch {
+            collection: "metrics_big".to_string(),
+            samples,
+            provenance: None,
+        };
+        let payload = zerompk::to_msgpack_vec(&batch).expect("encode ts batch");
+        let rec_bytes = zerompk::to_msgpack_vec(&(
+            "timeseries".to_string(),
+            "metrics_big".to_string(),
+            payload,
+            Option::<SyncProvenance>::None,
+        ))
+        .expect("encode timeseries tuple");
+        let record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::TimeseriesBatch as u32,
+            lsn: 200,
+            tenant_id: 7,
+            vshard_id: 0,
+            database_id: 0,
+            payload: rec_bytes,
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("wal record");
+
+        h.core.replay_timeseries_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let key = (
+            DatabaseId::new(0),
+            TenantId::new(7),
+            "metrics_big".to_string(),
+        );
+        let mt = h
+            .core
+            .columnar_memtables
+            .get(&key)
+            .expect("memtable created by replay");
+        assert_eq!(
+            mt.row_count(),
+            N as u64,
+            "every sample of an over-limit replayed batch must be retained"
+        );
+    }
+
     #[test]
     fn decodes_map_columnar_record_with_surrogates() {
         let prov = SyncProvenance {
