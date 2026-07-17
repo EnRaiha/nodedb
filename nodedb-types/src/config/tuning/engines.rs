@@ -166,8 +166,24 @@ fn default_varlen_max_frontier() -> usize {
 /// Timeseries engine tuning (memtable budgets, block sizes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeseriesToning {
+    /// Soft memtable budget: reaching it schedules a flush at the next record
+    /// boundary. Rows already in the memtable are never refused because of it.
     #[serde(default = "default_memtable_budget_bytes")]
     pub memtable_budget_bytes: usize,
+    /// Hard memtable ceiling. Reaching it forces a flush BEFORE the next WAL
+    /// record is ingested, never partway through one: by the time the Data
+    /// Plane sees a record its WAL append has already committed, so the
+    /// memtable must take the record whole or the write is silently lost.
+    /// Consequently a single record can carry the memtable up to its own
+    /// decoded size past this ceiling; see the admission gate in the
+    /// timeseries ingest handler for the bound that costs.
+    #[serde(default = "default_memtable_hard_limit_bytes")]
+    pub memtable_hard_limit_bytes: usize,
+    /// Maximum distinct values per symbol (tag / string) column in one
+    /// memtable generation. Flushing resets the dictionaries, so this bounds
+    /// dictionary size between flushes rather than over the collection's life.
+    #[serde(default = "default_max_tag_cardinality")]
+    pub max_tag_cardinality: u32,
     #[serde(default = "default_total_budget_bytes")]
     pub total_budget_bytes: usize,
     #[serde(default = "default_ts_block_size")]
@@ -178,6 +194,8 @@ impl Default for TimeseriesToning {
     fn default() -> Self {
         Self {
             memtable_budget_bytes: default_memtable_budget_bytes(),
+            memtable_hard_limit_bytes: default_memtable_hard_limit_bytes(),
+            max_tag_cardinality: default_max_tag_cardinality(),
             total_budget_bytes: default_total_budget_bytes(),
             block_size: default_ts_block_size(),
         }
@@ -186,6 +204,12 @@ impl Default for TimeseriesToning {
 
 fn default_memtable_budget_bytes() -> usize {
     64 * 1024 * 1024
+}
+fn default_memtable_hard_limit_bytes() -> usize {
+    80 * 1024 * 1024
+}
+fn default_max_tag_cardinality() -> u32 {
+    100_000
 }
 fn default_total_budget_bytes() -> usize {
     100 * 1024 * 1024

@@ -217,21 +217,38 @@ impl ColumnData {
 /// Configuration for the columnar memtable.
 #[derive(Debug, Clone)]
 pub struct ColumnarMemtableConfig {
-    /// Maximum memory usage before flush is triggered (bytes).
+    /// Soft budget: reaching it makes `ingest_row` report `FlushNeeded` so the
+    /// caller can flush at a record boundary. Rows are still accepted.
     pub max_memory_bytes: usize,
-    /// Hard memory ceiling — ingest is rejected above this.
+    /// Hard memory ceiling. The memtable itself does NOT enforce this — it is
+    /// the ingest path's record-boundary admission gate that reads it and
+    /// flushes BEFORE a record rather than partway through one. Enforcing it
+    /// per-row here is what produced a partial-record flush, and a partition
+    /// holding part of a WAL record cannot be stamped with any LSN truthfully.
     pub hard_memory_limit: usize,
-    /// Maximum tag cardinality per symbol column.
+    /// Maximum tag cardinality per symbol column, per memtable generation.
     pub max_tag_cardinality: u32,
 }
 
-impl Default for ColumnarMemtableConfig {
-    fn default() -> Self {
+impl ColumnarMemtableConfig {
+    /// Build the memtable's limits from the operator's `[tuning.timeseries]`
+    /// section. The single translation point from config to memtable, so the
+    /// two cannot describe different budgets.
+    pub fn from_tuning(tuning: &nodedb_types::config::tuning::TimeseriesToning) -> Self {
         Self {
-            max_memory_bytes: crate::engine::timeseries::memtable::DEFAULT_MEMTABLE_BUDGET_BYTES,
-            hard_memory_limit: 80 * 1024 * 1024,
-            max_tag_cardinality: 100_000,
+            max_memory_bytes: tuning.memtable_budget_bytes,
+            hard_memory_limit: tuning.memtable_hard_limit_bytes,
+            max_tag_cardinality: tuning.max_tag_cardinality,
         }
+    }
+}
+
+impl Default for ColumnarMemtableConfig {
+    /// Delegates to the tuning defaults (64 MiB / 80 MiB / 100k) rather than
+    /// restating them, so an operator-facing default and a code default can
+    /// never disagree.
+    fn default() -> Self {
+        Self::from_tuning(&nodedb_types::config::tuning::TimeseriesToning::default())
     }
 }
 

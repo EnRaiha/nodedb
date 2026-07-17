@@ -2,6 +2,7 @@
 
 //! Data Plane handlers for timeseries scan and ingest.
 
+mod admission;
 pub mod aggregate;
 pub mod encode;
 pub mod flush;

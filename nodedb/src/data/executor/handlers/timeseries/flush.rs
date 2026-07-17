@@ -64,8 +64,23 @@ impl CoreLoop {
 
         // Use the max ingested WAL LSN for this collection so the partition
         // records which WAL records have been flushed. Read before the write and
-        // never advanced by it: the ingest path stamps this only AFTER its own
-        // flush calls return, so every row in the view is at or below it.
+        // never advanced by it.
+        //
+        // This is a collection-wide SCALAR, so the only state it can express is
+        // "every record at or below N is WHOLLY on disk" — and boot replay reads
+        // it exactly that way, skipping every record at or below the highest
+        // stamp it finds. "All of <= L-1 plus part of L" has no representation
+        // here, which is why the ingest path resolves everything that could stop
+        // it mid-record BEFORE the first row of a record goes in (its
+        // record-boundary admission gate) and stamps a record's LSN only once
+        // the record is fully ingested. Those two together are what make the
+        // claim this stamp rests on true by construction: every row in the view
+        // belongs to a record at or below it.
+        //
+        // A flush fired from between two rows of a record would break it in
+        // whichever direction it stamped — the predecessor's LSN duplicates the
+        // record on replay, the record's own LSN loses the rows not yet
+        // flushed — so no caller may introduce one.
         let flush_wal_lsn = self.ts_max_ingested_lsn.get(&key).copied().unwrap_or(0);
         let ts_kek = self.segment_keks.ts_segment_kek.as_ref();
         let meta = writer

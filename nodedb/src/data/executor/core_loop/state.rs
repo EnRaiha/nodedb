@@ -313,6 +313,12 @@ pub struct CoreLoop {
     /// Set at core spawn time from config; never changed at runtime.
     pub(in crate::data::executor) graph_tuning: nodedb_types::config::tuning::GraphTuning,
 
+    /// Timeseries engine tuning (memtable soft/hard budgets, tag cardinality
+    /// ceiling). Set at core spawn time from config; never changed at runtime.
+    /// Read when a collection's `ColumnarMemtable` is created and by the ingest
+    /// path's record-boundary admission gate.
+    pub(in crate::data::executor) ts_tuning: nodedb_types::config::tuning::TimeseriesToning,
+
     /// Per-core KV engine: hash tables + expiry wheel. `!Send`.
     pub(in crate::data::executor) kv_engine: crate::engine::kv::KvEngine,
 

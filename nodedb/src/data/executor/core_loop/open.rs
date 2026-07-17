@@ -136,6 +136,7 @@ impl CoreLoop {
             chain_hashes: HashMap::new(),
             query_tuning: nodedb_types::config::tuning::QueryTuning::default(),
             graph_tuning: nodedb_types::config::tuning::GraphTuning::default(),
+            ts_tuning: nodedb_types::config::tuning::TimeseriesToning::default(),
             kv_engine: crate::engine::kv::KvEngine::from_tuning(
                 crate::engine::kv::current_ms(),
                 &nodedb_types::config::tuning::KvTuning::default(),

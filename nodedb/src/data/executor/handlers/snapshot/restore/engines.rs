@@ -167,7 +167,14 @@ impl CoreLoop {
         // handled by `parse_timeseries_snapshot_key`.
         let (database_id, tenant_id, collection) = super::keys::parse_timeseries_snapshot_key(key);
 
-        let mt = ColumnarMemtable::from_snapshot(snap, ColumnarMemtableConfig::default())?;
+        // Restore under this core's operator tuning, not the compiled defaults:
+        // a memtable keeps the limits it was built with for its whole life, so
+        // a restored collection would otherwise run budgets the operator never
+        // configured until it happened to flush.
+        let mt = ColumnarMemtable::from_snapshot(
+            snap,
+            ColumnarMemtableConfig::from_tuning(&self.ts_tuning),
+        )?;
 
         let tid = crate::types::TenantId::new(tenant_id);
         let db_id = nodedb_types::DatabaseId::new(database_id);

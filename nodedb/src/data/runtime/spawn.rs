@@ -89,7 +89,8 @@ pub fn spawn_core(
                 },
             );
 
-            // Capture before `.query`/`.graph` are moved out below (Duration is Copy).
+            // Capture before `.query`/`.graph`/`.timeseries` are moved out below
+            // (Duration is Copy).
             let checkpoint_interval = compaction_config.checkpoint_interval;
 
             // 2c. Apply compaction config.
@@ -103,6 +104,12 @@ pub fn spawn_core(
 
             // 2d. Apply graph engine tuning (traversal limits + varlen caps).
             core.set_graph_tuning(compaction_config.graph);
+
+            // 2e. Apply timeseries tuning. This must land before any ingest or
+            // WAL replay: it is read when a collection's memtable is CREATED,
+            // and a memtable built with the default budgets keeps them for its
+            // whole life regardless of what the operator configured.
+            core.set_timeseries_tuning(compaction_config.timeseries);
 
             // 3 → 3b → 4. Boot recovery runs in exactly this order and no other:
             // restore the checkpoints, THEN seed the catalog state, THEN replay

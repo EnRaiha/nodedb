@@ -77,6 +77,46 @@ fn apply_port_env(var: &str, target: &mut u16) {
     }
 }
 
+/// Parse a strictly-positive integer from an env var into a required field.
+///
+/// Zero is rejected rather than applied: every knob routed through here is a
+/// budget or a ceiling, and zero would mean "admit nothing", which is a
+/// misconfiguration to warn about rather than a value to honour. One helper
+/// keeps the info/warn wording identical across the knobs that share these
+/// semantics instead of letting copy-pasted blocks drift.
+fn apply_positive_env<T>(var: &str, target: &mut T)
+where
+    T: std::str::FromStr + PartialEq + From<u8> + std::fmt::Display + Copy,
+{
+    let Ok(val) = std::env::var(var) else {
+        return;
+    };
+    match val.trim().parse::<T>() {
+        Ok(parsed) if parsed != T::from(0) => {
+            tracing::info!(
+                env_var = var,
+                value = %parsed,
+                "environment variable override applied"
+            );
+            *target = parsed;
+        }
+        Ok(zero) => {
+            tracing::warn!(
+                env_var = var,
+                value = %zero,
+                "ignoring value of 0 (must be positive), using config value"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                env_var = var,
+                value = %val,
+                "ignoring malformed environment variable (expected a positive integer), using config value"
+            );
+        }
+    }
+}
+
 /// Parse a u16 port from an env var into an optional field (enables the listener).
 fn apply_optional_port_env(var: &str, target: &mut Option<u16>) {
     if let Ok(val) = std::env::var(var) {
@@ -159,6 +199,12 @@ fn apply_bool_env(var: &str, target: &mut bool) {
 ///   (parse as u64 seconds; 0 is rejected)
 /// - `NODEDB_WAL_SEGMENT_TARGET_MB`    — overrides `config.checkpoint.wal_segment_target_mb`
 ///   (parse as u64 MiB; 0 is rejected)
+/// - `NODEDB_TS_MEMTABLE_BUDGET_BYTES` — overrides
+///   `config.tuning.timeseries.memtable_budget_bytes` (parse as usize; 0 is rejected)
+/// - `NODEDB_TS_MEMTABLE_HARD_LIMIT_BYTES` — overrides
+///   `config.tuning.timeseries.memtable_hard_limit_bytes` (parse as usize; 0 is rejected)
+/// - `NODEDB_TS_MAX_TAG_CARDINALITY`   — overrides
+///   `config.tuning.timeseries.max_tag_cardinality` (parse as u32; 0 is rejected)
 ///
 /// `NODEDB_CONFIG` (config file path) is handled upstream in `main.rs`
 /// before this function is called, so it is not processed here.
@@ -452,6 +498,27 @@ pub fn apply_env_overrides(config: &mut ServerConfig) {
             }
         }
     }
+
+    // ── Timeseries memtable admission knobs ─────────────────────────
+    // The three limits that decide whether a timeseries WAL record can be
+    // taken into the memtable whole. They are env-reachable because the
+    // record-boundary admission gate they drive is otherwise only observable
+    // at 64/80 MiB and 100k distinct tags — a cost no test can pay, which is
+    // how a mid-record flush stamping a partition with the WRONG WAL LSN went
+    // unnoticed. Defaults are unchanged; this only makes them reachable.
+
+    apply_positive_env(
+        "NODEDB_TS_MEMTABLE_BUDGET_BYTES",
+        &mut config.tuning.timeseries.memtable_budget_bytes,
+    );
+    apply_positive_env(
+        "NODEDB_TS_MEMTABLE_HARD_LIMIT_BYTES",
+        &mut config.tuning.timeseries.memtable_hard_limit_bytes,
+    );
+    apply_positive_env(
+        "NODEDB_TS_MAX_TAG_CARDINALITY",
+        &mut config.tuning.timeseries.max_tag_cardinality,
+    );
 
     // ── Observability overrides (PromQL, OTLP) ─────────────────────
 

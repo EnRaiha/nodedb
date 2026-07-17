@@ -98,15 +98,29 @@ impl ColumnarMemtable {
     ///
     /// `values` must match the schema length. Tag string values are resolved
     /// to symbol IDs via the per-column dictionary.
+    ///
+    /// ## Why this does NOT enforce `hard_memory_limit`
+    ///
+    /// It used to: a row arriving above the ceiling came back
+    /// `Ok(IngestResult::Rejected)`. But every row reaching here belongs to a
+    /// WAL record that has ALREADY COMMITTED, so refusing it is not
+    /// backpressure — it is silent loss of a durable write. The caller then
+    /// tried to rescue the refusal by flushing and re-ingesting mid-record,
+    /// which stamped the flushed partition with the PREVIOUS record's LSN
+    /// while it held part of the current one; replay, gated on that stamp,
+    /// re-appended the whole record on top.
+    ///
+    /// The ceiling now lives at the record boundary instead (the ingest
+    /// handler's admission gate flushes BEFORE a record when the memtable is
+    /// at or over it), so a flush always lands on a whole-record prefix and
+    /// the partition's stamp is true of every row in it. Errors returned here
+    /// are therefore genuine per-row data faults — bad arity, type mismatch,
+    /// exhausted tag dictionary — never "come back later".
     pub fn ingest_row(
         &mut self,
         series_id: SeriesId,
         values: &[ColumnValue],
     ) -> crate::Result<IngestResult> {
-        if self.memory_bytes >= self.config.hard_memory_limit {
-            return Ok(IngestResult::Rejected);
-        }
-
         let col_types: Vec<(String, ColumnType)> = self.schema.columns.clone();
 
         if values.len() != col_types.len() {
@@ -412,8 +426,12 @@ impl ColumnarMemtable {
     }
 
     /// Reconstruct a memtable from a snapshot. Returns a typed error on any
-    /// schema/row-count mismatch. Pass `ColumnarMemtableConfig::default()` for
-    /// operator-DDL restore; real per-collection config is a follow-up.
+    /// schema/row-count mismatch.
+    ///
+    /// `config` is not carried in the snapshot — it is operator tuning, not
+    /// data — so callers pass the live `ColumnarMemtableConfig::from_tuning`
+    /// value. A memtable keeps its limits for its whole life, so restoring with
+    /// compiled defaults would silently ignore the operator's configuration.
     pub fn from_snapshot(
         snap: MemtableSnapshot,
         config: ColumnarMemtableConfig,

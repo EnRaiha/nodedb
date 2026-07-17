@@ -273,6 +273,7 @@ pub fn spawn_data_plane_cores(
         tombstone_threshold: config.checkpoint.compaction_tombstone_threshold,
         query: config.tuning.query.clone(),
         graph: config.tuning.graph.clone(),
+        timeseries: config.tuning.timeseries.clone(),
         checkpoint_interval: std::time::Duration::from_secs(config.checkpoint.interval_secs),
     };
 

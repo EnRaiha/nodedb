@@ -717,3 +717,118 @@ fn large_group_by_returns_single_valid_json() {
         .expect("Data Plane response should be a single valid JSON array");
     assert_eq!(results.len(), 2_000);
 }
+
+// ---------------------------------------------------------------------------
+// Tag-cardinality exhaustion must not duplicate or drop lines
+// ---------------------------------------------------------------------------
+
+/// Distinct tag values one memtable generation may hold in this test.
+///
+/// Small enough to exhaust with four lines. The production ceiling is 100k,
+/// which is why this path went untested: filling it costs 100k distinct tag
+/// values per run. `set_timeseries_tuning` is the same knob the server exposes
+/// as `NODEDB_TS_MAX_TAG_CARDINALITY`.
+const TEST_TAG_CARDINALITY: u32 = 4;
+
+fn tag_line(collection: &str, host: &str, ts_ns: i64) -> String {
+    format!("{collection},host={host} value=1.0 {ts_ns}\n")
+}
+
+/// Count the rows the scan returns per `host`, across memtable AND partitions.
+fn counts_by_host(ctx: &mut crate::helpers::TestCtx, collection: &str) -> Vec<(String, u64)> {
+    let mut rows: Vec<(String, u64)> = ts_scan(
+        ctx,
+        collection,
+        vec!["host".into()],
+        vec![("count".into(), "*".into())],
+        0,
+    )
+    .iter()
+    .map(|r| {
+        (
+            r["host"].as_str().unwrap_or_default().to_string(),
+            r["count(*)"].as_u64().unwrap_or(0),
+        )
+    })
+    .collect();
+    rows.sort();
+    rows
+}
+
+/// A batch that exhausts the tag dictionary partway through must be ingested
+/// exactly once — every line present, no line twice.
+///
+/// This is the interleaving case, and it needs no crash to observe.
+/// `SymbolDictionary::resolve` fails only for values that are NOT already in
+/// the dictionary, so once the dictionary is full a batch alternating new and
+/// existing tag values fails and succeeds ALTERNATELY — the failures are not a
+/// suffix of the batch.
+///
+/// The ingest path used to react to any rejection by flushing and re-ingesting
+/// `lines[accepted..]`, a slice that is only the untouched remainder if the
+/// rejections WERE a suffix. Here `accepted` is 2 while 4 lines have been
+/// consumed, so the retry re-ingested lines already in the memtable — and
+/// because the flush it had just done resets the dictionaries, the retry
+/// succeeded and duplicated them on the spot.
+///
+/// COUNT(*) alone cannot see this: the duplicated lines and the dropped ones
+/// cancel out. The per-host counts are what make it visible.
+#[test]
+fn interleaved_tag_cardinality_batch_ingests_each_line_exactly_once() {
+    let mut ctx = make_ctx();
+    ctx.core
+        .set_timeseries_tuning(nodedb_types::config::tuning::TimeseriesToning {
+            max_tag_cardinality: TEST_TAG_CARDINALITY,
+            ..Default::default()
+        });
+
+    // Fill the dictionary exactly: 4 lines, 4 distinct hosts.
+    let mut first = String::new();
+    for i in 0..TEST_TAG_CARDINALITY {
+        first.push_str(&tag_line(
+            "card",
+            &format!("h{i}"),
+            1_000_000 * (i as i64 + 1),
+        ));
+    }
+    let resp = ingest_ilp(&mut ctx, "card", &first);
+    assert_eq!(resp["accepted"].as_u64(), Some(4), "setup batch: {resp}");
+    assert_eq!(resp["rejected"].as_u64(), Some(0), "setup batch: {resp}");
+
+    // The interleaving batch: new host, existing host, new host, existing host.
+    // Against a full dictionary, lines 0 and 2 fail and lines 1 and 3 succeed.
+    // Its four lines carry only four distinct hosts, so once the gate flushes
+    // (resetting the dictionaries) it fits whole.
+    let second = [
+        tag_line("card", "h4", 5_000_000),
+        tag_line("card", "h0", 6_000_000),
+        tag_line("card", "h5", 7_000_000),
+        tag_line("card", "h1", 8_000_000),
+    ]
+    .concat();
+    let resp = ingest_ilp(&mut ctx, "card", &second);
+    assert_eq!(
+        resp["rejected"].as_u64(),
+        Some(0),
+        "the gate must flush BEFORE this batch so the fresh dictionaries take \
+         all four of its hosts: {resp}"
+    );
+    assert_eq!(resp["accepted"].as_u64(), Some(4), "{resp}");
+
+    // Eight lines were sent: h0,h1,h2,h3 then h4,h0,h5,h1. Each must appear
+    // exactly the number of times it was sent.
+    assert_eq!(
+        counts_by_host(&mut ctx, "card"),
+        vec![
+            ("h0".to_string(), 2),
+            ("h1".to_string(), 2),
+            ("h2".to_string(), 1),
+            ("h3".to_string(), 1),
+            ("h4".to_string(), 1),
+            ("h5".to_string(), 1),
+        ],
+        "every sent line must appear exactly once. h1 appearing 3 times means \
+         the mid-batch flush-and-retry re-ingested an already-accepted line; \
+         h4 missing means its line was dropped outright."
+    );
+}

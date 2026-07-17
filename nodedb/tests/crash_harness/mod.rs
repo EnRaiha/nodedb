@@ -232,6 +232,33 @@ impl CrashHarness {
             })
             .collect()
     }
+
+    /// Run a query and return column `idx` (0-based) from every returned row.
+    ///
+    /// Positional rather than by-name: a bare `COUNT(*)` — and even
+    /// `COUNT(*) AS n` — does not surface a usable column name through the
+    /// pgwire row description, so aggregates must be read by index.
+    pub async fn query_col_idx(&self, sql: &str, idx: usize) -> Vec<String> {
+        let (client, connection) =
+            tokio_postgres::connect(&self.pgwire_conn_str(), tokio_postgres::NoTls)
+                .await
+                .expect("connect for query");
+        let conn_handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let messages = client.simple_query(sql).await.expect("query");
+        drop(client);
+        let _ = conn_handle.await;
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(row) => {
+                    Some(row.get(idx).unwrap_or_default().to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 impl Default for CrashHarness {

@@ -145,11 +145,24 @@ pub fn ingest_batch_with_lvc(
 }
 
 fn find_field_str(fields: &[(&str, FieldValue)], name: &str) -> Option<String> {
+    find_field_str_ref(fields, name).map(str::to_string)
+}
+
+/// Borrow a string field's value instead of copying it.
+///
+/// The ingest path needs an owned `String` because `ColumnValue::Symbol` owns
+/// its value, but the admission gate only needs to PROBE the symbol
+/// dictionaries with it. Both go through this one lookup so the gate can never
+/// answer about a different value than the ingest would insert.
+pub(crate) fn find_field_str_ref<'f>(
+    fields: &'f [(&str, FieldValue)],
+    name: &str,
+) -> Option<&'f str> {
     for (k, v) in fields {
         if *k == name
             && let FieldValue::Str(s) = v
         {
-            return Some(s.clone());
+            return Some(s.as_str());
         }
     }
     None

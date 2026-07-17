@@ -269,6 +269,21 @@ ilp = false                       # Example: disable TLS for ILP ingest
 | `checkpoint.interval_secs`       | `NODEDB_CHECKPOINT_INTERVAL_SECS`  | `300`   |
 | `checkpoint.wal_segment_target_mb` | `NODEDB_WAL_SEGMENT_TARGET_MB`   | `64`    |
 
+**Timeseries memtable settings:**
+
+| Config field                              | Environment variable                   | Default |
+| ----------------------------------------- | -------------------------------------- | ------- |
+| `tuning.timeseries.memtable_budget_bytes` | `NODEDB_TS_MEMTABLE_BUDGET_BYTES`      | `67108864` (64 MiB) |
+| `tuning.timeseries.memtable_hard_limit_bytes` | `NODEDB_TS_MEMTABLE_HARD_LIMIT_BYTES` | `83886080` (80 MiB) |
+| `tuning.timeseries.max_tag_cardinality`   | `NODEDB_TS_MAX_TAG_CARDINALITY`        | `100000` |
+
+`memtable_budget_bytes` is the soft budget that schedules a flush;
+`memtable_hard_limit_bytes` is the ceiling that forces one before the next
+write is applied. A single write is always applied whole, so it can carry the
+memtable past the hard limit by its own size before the next flush drains it.
+`max_tag_cardinality` bounds the distinct values a text/tag column may hold
+between flushes.
+
 ## Connect
 
 ### With the `ndb` CLI

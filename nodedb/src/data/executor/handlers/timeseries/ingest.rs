@@ -2,8 +2,10 @@
 
 //! Timeseries ILP ingest handler.
 //!
-//! msgpack / JSON row ingests that normalize into ILP text live in the
-//! sibling `ingest_formats` module.
+//! Every ingest format funnels through here: msgpack / JSON row ingests
+//! normalize into ILP text in the sibling `ingest_formats` module and then call
+//! `execute_ilp_ingest`, so the record-boundary admission gate below covers
+//! them all. The checks the gate runs live in the sibling `admission` module.
 
 use std::collections::HashMap;
 
@@ -19,6 +21,8 @@ use crate::engine::timeseries::columnar_memtable::{
 };
 use crate::engine::timeseries::ilp;
 use crate::engine::timeseries::ilp_ingest;
+
+use super::admission;
 
 /// Parameters for a timeseries ingest operation on the Data Plane.
 ///
@@ -232,11 +236,7 @@ impl CoreLoop {
             if bitemporal {
                 ilp_ingest::ensure_bitemporal_columns(&mut schema);
             }
-            let config = ColumnarMemtableConfig {
-                max_memory_bytes: 64 * 1024 * 1024,
-                hard_memory_limit: 80 * 1024 * 1024,
-                max_tag_cardinality: 100_000,
-            };
+            let config = ColumnarMemtableConfig::from_tuning(&self.ts_tuning);
             let mt = ColumnarMemtable::new(schema, config);
             self.columnar_memtables.insert(key.clone(), mt);
         }
@@ -259,8 +259,46 @@ impl CoreLoop {
                 .get(&key)
                 .is_some_and(|mt| mt.schema().columns.len() != cols_before);
 
-        // Pre-flush: flush BEFORE ingesting if memtable is at the soft limit
-        // OR if the timeseries engine budget is exhausted (governor pressure).
+        // ── Record-boundary admission gate ───────────────────────────────────
+        //
+        // By the time the Data Plane sees this record, the WAL has ALREADY
+        // COMMITTED it. Refusing its rows for memory is therefore not
+        // backpressure — it is silent loss of a durable write. The memtable
+        // MUST take the record whole, so everything that could otherwise stop
+        // it partway through is resolved HERE, before the first row lands:
+        //
+        //   * soft budget reached — flush now rather than mid-record;
+        //   * governor pressure — the timeseries engine budget is exhausted;
+        //   * hard ceiling reached — the memtable would previously have started
+        //     refusing rows somewhere inside this record;
+        //   * tag-dictionary headroom — the dictionaries cannot absorb this
+        //     batch's distinct symbols and would start failing rows INTERLEAVED
+        //     with rows that still resolve.
+        //
+        // Both limits are tested because nothing orders them: a config with a
+        // hard ceiling below the soft budget makes the hard term the binding
+        // one, and vice versa.
+        //
+        // Gating here is what makes `flush_ts_collection`'s stamp true. That
+        // flush labels its partition with `ts_max_ingested_lsn`, which is this
+        // record's PREDECESSOR (this record's LSN is recorded only once it is
+        // fully ingested, below), and boot replay skips every record at or
+        // below the highest stamp it finds. Flushing between two rows of this
+        // record writes a partition holding part of it but stamped with its
+        // predecessor — replay then does not skip the record and re-appends all
+        // of it on top of the rows already in that partition. Stamping this
+        // record's LSN instead would be worse: replay would skip it and lose
+        // the rows that had not been flushed.
+        //
+        // The accepted cost is a bounded overshoot. After a pre-flush the
+        // memtable is empty and takes the whole record regardless of its size,
+        // so this call can end above `hard_memory_limit` by up to one record's
+        // decoded payload — bounded by the WAL's own
+        // `MAX_WAL_PAYLOAD_SIZE` (64 MiB) cap on a record, times this
+        // collection's decoded-bytes-per-payload-byte ratio. The post-ingest
+        // flush below then drains it immediately, so the overshoot is transient
+        // rather than a new resident ceiling. Overshooting for one record beats
+        // duplicating or losing rows the WAL has already promised the client.
         let governor_pressure = self.governor.as_ref().is_some_and(|g| {
             g.try_reserve(
                 task.request.database_id,
@@ -270,10 +308,16 @@ impl CoreLoop {
             )
             .is_err()
         });
-        let needs_flush = self
-            .columnar_memtables
-            .get(&key)
-            .is_some_and(|mt| mt.memory_bytes() >= 64 * 1024 * 1024 || governor_pressure);
+        let soft_limit = self.ts_tuning.memtable_budget_bytes;
+        let hard_limit = self.ts_tuning.memtable_hard_limit_bytes;
+        let max_tag_cardinality = self.ts_tuning.max_tag_cardinality;
+        let needs_flush = self.columnar_memtables.get(&key).is_some_and(|mt| {
+            let resident = mt.memory_bytes();
+            resident >= soft_limit
+                || resident >= hard_limit
+                || governor_pressure
+                || !admission::has_tag_headroom(mt, &lines, max_tag_cardinality)
+        });
         if needs_flush
             && let Err(e) =
                 self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
@@ -302,46 +346,36 @@ impl CoreLoop {
         };
         let lvc = self.ts_last_value_caches.get_mut(&key);
         let mut series_keys = HashMap::new();
-        let (mut accepted, rejected) =
+        let (accepted, rejected) =
             ilp_ingest::ingest_batch_with_lvc(mt, &lines, &mut series_keys, now_ms, lvc, stamps);
 
-        // If rows were rejected (memtable hit hard limit), flush and re-ingest.
+        // A rejection here is a genuine per-row data fault (bad arity, type
+        // mismatch, or a batch whose own distinct-symbol count exceeds
+        // `max_tag_cardinality` and so fits in no generation). It is reported
+        // as `rejected` in the response and NOTHING else: there is deliberately
+        // no flush-and-retry.
+        //
+        // The retry that used to live here re-ingested `lines[accepted..]` on
+        // the assumption that rejections were a strict suffix. Cardinality
+        // rejections are not — once a dictionary is full, lines carrying new
+        // tag values fail while lines reusing existing ones still succeed — so
+        // `accepted` under-counted the consumed prefix and the retry re-ingested
+        // lines already in the memtable. The flush that preceded it reset the
+        // dictionaries, so the retry SUCCEEDED, duplicating them on the spot.
+        // The admission gate above removes the reason to retry at all: the
+        // memtable was made able to take the record whole before the first row
+        // went in.
         if rejected > 0 {
             tracing::warn!(
                 collection,
                 accepted,
                 rejected,
-                "ILP batch rows rejected by hard limit, flushing and retrying"
+                "ILP batch rows rejected as invalid rows"
             );
-            if let Err(e) =
-                self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)
-            {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: format!("hard-limit ts flush failed: {e}"),
-                    },
-                );
-            }
-            if let Some(mt) = self.columnar_memtables.get_mut(&key) {
-                let mut retry_keys = HashMap::new();
-                let retry_lines = &lines[accepted..];
-                let retry_lvc = self.ts_last_value_caches.get_mut(&key);
-                let (retry_accepted, _) = ilp_ingest::ingest_batch_with_lvc(
-                    mt,
-                    retry_lines,
-                    &mut retry_keys,
-                    now_ms,
-                    retry_lvc,
-                    stamps,
-                );
-                accepted += retry_accepted;
-            }
         }
 
         // Track this record's WAL LSN BEFORE the post-ingest flush below, and
-        // only now that the record is FULLY ingested (the retry above having
-        // placed any hard-limit leftovers).
+        // only now that the record is FULLY ingested.
         //
         // The order is load-bearing. `flush_ts_collection` stamps the partition
         // it writes with `ts_max_ingested_lsn`, and replay skips every record at
@@ -357,7 +391,12 @@ impl CoreLoop {
             *entry = (*entry).max(lsn);
         }
 
-        // Post-flush: standard 64MB threshold check.
+        // Post-flush: soft-budget check. Correct to run here because the record
+        // is now fully ingested and its LSN recorded, so the partition this
+        // writes is stamped with an LSN that covers every row in it — including
+        // this record's. It is also what makes the admission gate's one-record
+        // overshoot transient: a record that carried the memtable past the
+        // budget is drained again before the next one arrives.
         let Some(mt) = self.columnar_memtables.get(&key) else {
             return self.response_error(
                 task,
@@ -366,7 +405,7 @@ impl CoreLoop {
                 },
             );
         };
-        let needs_flush = mt.memory_bytes() >= 64 * 1024 * 1024;
+        let needs_flush = mt.memory_bytes() >= soft_limit;
         if needs_flush
             && let Err(e) =
                 self.flush_ts_collection(tid, task.request.database_id, collection, now_ms)

@@ -88,6 +88,20 @@ impl CoreLoop {
         self.graph_tuning = tuning;
     }
 
+    /// Set timeseries engine tuning (memtable soft/hard budgets + tag
+    /// cardinality ceiling), called after open, before the event loop starts.
+    ///
+    /// Call this before any ingest or WAL replay. Each collection's memtable
+    /// captures these limits when it is CREATED and keeps them for its whole
+    /// life, so a memtable built ahead of this call would silently keep the
+    /// defaults.
+    pub fn set_timeseries_tuning(
+        &mut self,
+        tuning: nodedb_types::config::tuning::TimeseriesToning,
+    ) {
+        self.ts_tuning = tuning;
+    }
+
     /// Apply the secondary-index SET diff for a document (opens its own txn).
     ///
     /// Used by `execute_document_batch_insert` after `batch_put` has already

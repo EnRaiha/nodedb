@@ -18,15 +18,6 @@ use crate::types::ReadConsistency;
 use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp, TimeseriesOp};
 use nodedb_types::timeseries::MetricSample;
 
-/// Default timeseries memtable configuration for replay and auto-creation.
-fn default_ts_config() -> ColumnarMemtableConfig {
-    ColumnarMemtableConfig {
-        max_memory_bytes: 64 * 1024 * 1024,
-        hard_memory_limit: 80 * 1024 * 1024,
-        max_tag_cardinality: 100_000,
-    }
-}
-
 /// Decoded fields of a `TimeseriesBatch` WAL record.
 ///
 /// `kind` is `Some("columnar")` / `Some("timeseries")` for tagged records and
@@ -140,14 +131,20 @@ impl CoreLoop {
     }
 
     /// Ensure a timeseries memtable exists for the given collection, creating if needed.
+    ///
+    /// Uses the same operator tuning the live ingest path does. A memtable keeps
+    /// the limits it was built with for its whole life, so seeding replay with
+    /// hardcoded defaults would leave a restarted node running budgets the
+    /// operator did not configure until every collection happened to flush.
     fn ensure_columnar_memtable(
         &mut self,
         key: (DatabaseId, crate::types::TenantId, String),
         schema: ColumnarSchema,
     ) {
+        let config = ColumnarMemtableConfig::from_tuning(&self.ts_tuning);
         self.columnar_memtables
             .entry(key)
-            .or_insert_with(|| ColumnarMemtable::new(schema, default_ts_config()));
+            .or_insert_with(|| ColumnarMemtable::new(schema, config));
     }
 
     fn replay_timeseries_payload(
