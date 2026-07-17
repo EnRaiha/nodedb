@@ -9,6 +9,8 @@ mod calvin_overlay_stage_bulk;
 mod calvin_passive_read;
 mod calvin_resolve;
 mod calvin_txn_id;
+mod checkpoint_crdt;
+mod checkpoint_durable_lsn;
 pub mod convert;
 pub mod crdt;
 pub mod crdt_constraints;

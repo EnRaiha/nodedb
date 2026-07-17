@@ -15,6 +15,8 @@
 //! separate child process exercises the boot-time WAL replay path the way a
 //! real deployment would encounter it after a hard crash.
 
+#![allow(dead_code)] // Not every crash-test binary uses every helper.
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
@@ -71,6 +73,12 @@ pub struct CrashHarness {
     pub pgwire_port: u16,
     pub native_port: u16,
     child: Option<std::process::Child>,
+    /// Extra server env applied on EVERY spawn, including `reopen`. A test that
+    /// tunes the server (short checkpoint interval, small WAL segments) needs
+    /// the restarted process to boot under the same tuning as the one it
+    /// killed, or the recovery half runs against a differently configured
+    /// server than the crash half did.
+    extra_env: Vec<(String, String)>,
 }
 
 impl CrashHarness {
@@ -83,13 +91,51 @@ impl CrashHarness {
             pgwire_port: free_port(),
             native_port: free_port(),
             child: None,
+            extra_env: Vec::new(),
         }
+    }
+
+    /// Add a server env override applied on every spawn. Call before `spawn`.
+    pub fn with_env(mut self, key: &str, value: &str) -> CrashHarness {
+        self.extra_env.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// The data directory this server was started against.
+    pub fn data_dir(&self) -> &std::path::Path {
+        self.tempdir.path()
+    }
+
+    /// File names of the WAL segments currently on disk, sorted.
+    ///
+    /// Reading the directory rather than asking the server keeps this honest:
+    /// the question a truncation test must answer is whether the file was
+    /// actually unlinked, which only the filesystem can answer.
+    pub fn wal_segments(&self) -> Vec<String> {
+        let dir = self.data_dir().join("wal");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // The WAL directory not existing yet is a legitimate "no segments"
+            // answer during startup, not a test failure.
+            Err(_) => return Vec::new(),
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".seg"))
+            .collect();
+        names.sort();
+        names
     }
 
     /// Spawn (or respawn) the `nodedb` binary against this harness's data
     /// directory and ports.
     pub fn spawn(&mut self) {
-        let child = std::process::Command::new(self.bin)
+        let mut cmd = std::process::Command::new(self.bin);
+        for (k, v) in &self.extra_env {
+            cmd.env(k, v);
+        }
+        let child = cmd
             .env("NODEDB_DATA_DIR", self.tempdir.path())
             .env("NODEDB_DATA_PLANE_CORES", "1")
             .env("NODEDB_PORT_HTTP", self.http_port.to_string())

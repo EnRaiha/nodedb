@@ -66,7 +66,12 @@ pub(super) fn parse_vector_snapshot_key(key: &str, tenant_id: u64) -> (u64, &str
 /// Non-default databases qualify their collections as `"{database_id}/{name}"`;
 /// the default database uses the bare name. A bare name (no leading numeric
 /// segment before a `/`) maps to `DatabaseId::DEFAULT` (0).
-pub(super) fn database_id_from_qualified(collection: &str) -> u64 {
+///
+/// Shared with the KV checkpoint path (`data::executor::kv_checkpoint`), which
+/// faces the same problem: `KvEngine` stores the db-qualified name in
+/// `hash_to_collection`, and the database id must be recovered from it to
+/// rebuild the table key a live read computes.
+pub(in crate::data::executor) fn database_id_from_qualified(collection: &str) -> u64 {
     match collection.split_once('/') {
         Some((prefix, _)) => prefix.parse::<u64>().unwrap_or(0),
         None => 0,

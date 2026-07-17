@@ -37,6 +37,16 @@ impl KvEngine {
         let tkey = table_key(database_id, tenant_id, collection);
         let now_ms = super::current_ms();
 
+        // Name the collection even when it holds no rows yet: the checkpoint
+        // writer recovers a collection's identity from these reverse maps, and
+        // an unnamed collection gets no checkpoint file — which would drop this
+        // registration from the checkpoint while WAL truncation deleted the
+        // record that carries it.
+        self.hash_to_tenant.entry(tkey).or_insert(tenant_id);
+        self.hash_to_collection
+            .entry(tkey)
+            .or_insert_with(|| collection.to_string());
+
         // Collect existing entries from the hash table for backfill.
         let entries: Vec<(Vec<u8>, Vec<u8>)> = self
             .tables

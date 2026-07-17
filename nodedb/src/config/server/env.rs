@@ -155,6 +155,10 @@ fn apply_bool_env(var: &str, target: &mut bool) {
 /// - `NODEDB_NODE_ID`          — overrides `config.cluster.node_id` (parse as u64)
 /// - `NODEDB_SEED_NODES`       — overrides `config.cluster.seed_nodes`
 ///   (comma-separated `SocketAddr` list)
+/// - `NODEDB_CHECKPOINT_INTERVAL_SECS` — overrides `config.checkpoint.interval_secs`
+///   (parse as u64 seconds; 0 is rejected)
+/// - `NODEDB_WAL_SEGMENT_TARGET_MB`    — overrides `config.checkpoint.wal_segment_target_mb`
+///   (parse as u64 MiB; 0 is rejected)
 ///
 /// `NODEDB_CONFIG` (config file path) is handled upstream in `main.rs`
 /// before this function is called, so it is not processed here.
@@ -385,6 +389,65 @@ pub fn apply_env_overrides(config: &mut ServerConfig) {
                     env_var = "NODEDB_WAL_WRITE_BUFFER_SIZE",
                     value = %val,
                     "ignoring malformed environment variable, using config value"
+                );
+            }
+        }
+    }
+
+    // ── Checkpoint / WAL segment tuning ─────────────────────────────
+    // Both drive the crash-recovery test harness: a short interval forces a
+    // checkpoint cycle quickly, and a small segment target forces WAL
+    // rotation so sealed segments exist for truncation to act on.
+
+    if let Ok(val) = std::env::var("NODEDB_CHECKPOINT_INTERVAL_SECS") {
+        match val.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => {
+                tracing::info!(
+                    env_var = "NODEDB_CHECKPOINT_INTERVAL_SECS",
+                    value = secs,
+                    "environment variable override applied"
+                );
+                config.checkpoint.interval_secs = secs;
+            }
+            Ok(secs) => {
+                tracing::warn!(
+                    env_var = "NODEDB_CHECKPOINT_INTERVAL_SECS",
+                    value = secs,
+                    "ignoring value of 0 (checkpoint interval must be positive), using config value"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    env_var = "NODEDB_CHECKPOINT_INTERVAL_SECS",
+                    value = %val,
+                    "ignoring malformed environment variable (expected u64 seconds), using config value"
+                );
+            }
+        }
+    }
+
+    if let Ok(val) = std::env::var("NODEDB_WAL_SEGMENT_TARGET_MB") {
+        match val.trim().parse::<u64>() {
+            Ok(mb) if mb > 0 => {
+                tracing::info!(
+                    env_var = "NODEDB_WAL_SEGMENT_TARGET_MB",
+                    value = mb,
+                    "environment variable override applied"
+                );
+                config.checkpoint.wal_segment_target_mb = mb;
+            }
+            Ok(mb) => {
+                tracing::warn!(
+                    env_var = "NODEDB_WAL_SEGMENT_TARGET_MB",
+                    value = mb,
+                    "ignoring value of 0 (WAL segment target must be positive), using config value"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    env_var = "NODEDB_WAL_SEGMENT_TARGET_MB",
+                    value = %val,
+                    "ignoring malformed environment variable (expected u64 MiB), using config value"
                 );
             }
         }

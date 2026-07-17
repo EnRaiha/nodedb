@@ -23,16 +23,67 @@ impl CoreLoop {
         let flush_plan = self.checkpoint_coordinator.tick();
         for (engine, pages) in &flush_plan {
             match engine.as_str() {
-                "vector" => {
-                    let flushed = self.checkpoint_vector_indexes();
-                    self.checkpoint_coordinator
-                        .record_flush("vector", flushed.min(*pages));
-                }
-                "crdt" => {
-                    let flushed = self.checkpoint_crdt_engines();
-                    self.checkpoint_coordinator
-                        .record_flush("crdt", flushed.min(*pages));
-                }
+                // A maintenance flush deliberately does NOT advance
+                // `vector_durable_lsn` / `crdt_durable_lsn`, even on success.
+                // Those fields are the floor the coordinated checkpoint clamps
+                // to, and they may only record what a flush ordered against the
+                // truncation it authorises has made durable. Raising them from
+                // an unordered timer would let a later failed checkpoint clamp
+                // to a point this path claimed — the exact "a flush that is not
+                // ordered against the truncation it authorises is not a
+                // checkpoint" mistake that moved the sparse-vector flush out of
+                // `data/runtime.rs`. Leaving them alone costs nothing: the next
+                // `execute_checkpoint` re-flushes and reports for itself.
+                "vector" => match self.checkpoint_vector_indexes() {
+                    Ok(outcome) => {
+                        self.checkpoint_coordinator
+                            .record_flush("vector", outcome.files_written.min(*pages));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            core = self.core_id,
+                            error = %e,
+                            "maintenance vector checkpoint failed; pages stay dirty for the \
+                             next tick and the coordinated checkpoint will clamp its \
+                             reported LSN if it fails there too"
+                        );
+                    }
+                },
+                "crdt" => match self.checkpoint_crdt_engines() {
+                    Ok(outcome) => {
+                        self.checkpoint_coordinator
+                            .record_flush("crdt", outcome.files_written.min(*pages));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            core = self.core_id,
+                            error = %e,
+                            "maintenance CRDT checkpoint failed; pages stay dirty for the \
+                             next tick and the coordinated checkpoint will clamp its \
+                             reported LSN if it fails there too"
+                        );
+                    }
+                },
+                // Same rule as vector/crdt: the flushed point is deliberately
+                // NOT recorded into `columnar_durable_lsn`. This flush is
+                // ordered against a timer, not against the truncation the
+                // coordinated checkpoint authorises, so it may not raise the
+                // floor that checkpoint clamps to. It exists only to keep the
+                // backlog from arriving at that checkpoint whole.
+                "columnar" => match self.checkpoint_columnar_engines() {
+                    Ok(_) => {
+                        self.checkpoint_coordinator.record_flush("columnar", *pages);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            core = self.core_id,
+                            error = %e,
+                            "maintenance columnar checkpoint failed; pages stay dirty for the \
+                             next tick and the coordinated checkpoint will clamp its \
+                             reported LSN if it fails there too"
+                        );
+                    }
+                },
                 "sparse" => {
                     // redb is ACID — writes are already durable.
                     self.checkpoint_coordinator.record_flush("sparse", *pages);
@@ -90,15 +141,21 @@ impl CoreLoop {
                             .record_flush("timeseries", *pages);
                     }
                 }
-                _ => {}
+                // `tick()` only ever plans engines from `TRACKED_ENGINES`, so
+                // reaching this arm means that list gained an entry without an
+                // arm here. Silently ignoring it would leave the engine planned
+                // every tick and flushed never, its dirty count only growing,
+                // so it is reported rather than dropped.
+                other => {
+                    tracing::warn!(
+                        core = self.core_id,
+                        engine = other,
+                        pages = *pages,
+                        "checkpoint tick planned a flush for an engine with no maintenance \
+                         flush path; its backlog cannot be worked off"
+                    );
+                }
             }
-        }
-        if self.checkpoint_coordinator.is_clean()
-            && !flush_plan.is_empty()
-            && self.checkpoint_coordinator.total_dirty_pages() == 0
-        {
-            self.checkpoint_coordinator
-                .complete_checkpoint(self.watermark.as_u64());
         }
 
         // KV expiry wheel tick: process expired keys on every maintenance call.

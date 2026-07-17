@@ -115,7 +115,7 @@ pub fn merge_o3_into_partition(
     let writer = ColumnarSegmentWriter::new(base_dir);
     let new_meta = writer.write_partition(
         &tmp_name,
-        &drain,
+        &drain.view(),
         existing_meta.interval_ms,
         existing_meta.last_flushed_wal_lsn,
         None,

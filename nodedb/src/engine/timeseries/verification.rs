@@ -118,7 +118,7 @@ mod tests {
         }
         let d1 = mt1.drain();
         writer
-            .write_partition("ts-1d-part", &d1, 86_400_000, 0, None)
+            .write_partition("ts-1d-part", &d1.view(), 86_400_000, 0, None)
             .unwrap();
 
         // Partition 2: 3-day width (rows 100-199, ts 2000-2099)
@@ -134,7 +134,7 @@ mod tests {
         }
         let d2 = mt2.drain();
         writer
-            .write_partition("ts-3d-part", &d2, 3 * 86_400_000, 0, None)
+            .write_partition("ts-3d-part", &d2.view(), 3 * 86_400_000, 0, None)
             .unwrap();
 
         // Partition 3: 1-week width (rows 200-299, ts 3000-3099)
@@ -150,7 +150,7 @@ mod tests {
         }
         let d3 = mt3.drain();
         writer
-            .write_partition("ts-1w-part", &d3, 7 * 86_400_000, 0, None)
+            .write_partition("ts-1w-part", &d3.view(), 7 * 86_400_000, 0, None)
             .unwrap();
 
         // Register all three in a registry.
@@ -256,7 +256,7 @@ mod tests {
         }
         let d1 = mt1.drain();
         writer
-            .write_partition("ts-v1", &d1, 86_400_000, 0, None)
+            .write_partition("ts-v1", &d1.view(), 86_400_000, 0, None)
             .unwrap();
 
         // V2 schema: timestamp + cpu + mem (added)
@@ -283,7 +283,7 @@ mod tests {
         }
         let d2 = mt2.drain();
         writer
-            .write_partition("ts-v2", &d2, 86_400_000, 0, None)
+            .write_partition("ts-v2", &d2.view(), 86_400_000, 0, None)
             .unwrap();
 
         // Query with V2 schema against V1 partition → "mem" should be NaN.
@@ -483,7 +483,7 @@ mod tests {
             }
             let drain = mt.drain();
             writer
-                .write_partition(&dir_name, &drain, 86_400_000, 0, None)
+                .write_partition(&dir_name, &drain.view(), 86_400_000, 0, None)
                 .unwrap();
 
             if let Some(e) = registry.get_mut(start) {

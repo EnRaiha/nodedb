@@ -24,15 +24,31 @@ impl CoreLoop {
         self.watermark = lsn;
     }
 
-    /// Install reconstructed sync HWM state from WAL replay.
+    /// Merge reconstructed sync HWM state from WAL replay into this core's gate.
     ///
-    /// Called once by `spawn_core` (in `data/runtime.rs`) immediately after
-    /// WAL replay and before the core enters its event loop. Overwrites both
-    /// `sync_hwm` and `producer_epoch_floor` with the maps built by
-    /// [`crate::wal::replay::replay_sync_hwm_records`].
+    /// Called by `replay_all_wal` with the maps built by
+    /// [`crate::wal::replay::replay_sync_hwm_records`], after
+    /// `load_sync_hwm_checkpoint` has restored the gate from disk.
+    ///
+    /// Folds max-wins over the CURRENT maps rather than assigning them. The
+    /// distinction is the whole reason the restore survives: the WAL below the
+    /// checkpoint's LSN is deleted, so replay only ever sees the records ABOVE
+    /// it, and assigning would discard every high-watermark that only the
+    /// checkpoint still knows — resetting the gate to zero and re-admitting
+    /// frames the producer had already had applied. Max-wins is also exactly the
+    /// rule that built these maps
+    /// ([`crate::wal::replay::sync_hwm::apply_sync_seq_advance`]), so a record already
+    /// folded into the restored state re-folds to the same value and needs no
+    /// replay floor.
     pub fn install_sync_hwm_maps(&mut self, maps: SyncHwmReplayMaps) {
-        self.sync_hwm = maps.sync_hwm;
-        self.producer_epoch_floor = maps.producer_epoch_floor;
+        for (key, seq) in maps.sync_hwm {
+            let entry = self.sync_hwm.entry(key).or_insert(0);
+            *entry = (*entry).max(seq);
+        }
+        for (producer_id, epoch) in maps.producer_epoch_floor {
+            let entry = self.producer_epoch_floor.entry(producer_id).or_insert(0);
+            *entry = (*entry).max(epoch);
+        }
     }
 
     /// Install the shared scan-quiesce registry. Called once by the

@@ -8,7 +8,6 @@
 //! never replaces the live manifest.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -92,34 +91,28 @@ impl Manifest {
         }
     }
 
-    /// Atomically write the manifest to disk. Steps: serialise → write
-    /// tmp file → fsync tmp → rename → fsync directory.
+    /// Atomically write the manifest to disk: serialise → write tmp → fsync tmp
+    /// → rename → fsync directory, via the shared
+    /// `nodedb_wal::segment::atomic_write_fsync`.
+    ///
+    /// This write is the commit point of a flush — a segment file is only
+    /// reachable once the manifest names it — so the whole ordering is
+    /// load-bearing, and the directory fsync is a requirement rather than a
+    /// best effort: without it the rename can be visible while the manifest's
+    /// own directory entry is not, and the array comes back at the PREVIOUS
+    /// manifest, silently dropping every cell the flush had just made durable
+    /// and whose WAL records the checkpoint then authorised deleting.
     pub fn persist(&self, root: &Path) -> Result<(), ManifestError> {
         let bytes = zerompk::to_msgpack_vec(self).map_err(|e| ManifestError::Encode {
             detail: e.to_string(),
         })?;
         let tmp = root.join(MANIFEST_TMP_FILENAME);
         let final_path = root.join(MANIFEST_FILENAME);
-        {
-            let mut f = fs::File::create(&tmp).map_err(|e| ManifestError::Io {
-                detail: format!("create {tmp:?}: {e}"),
-            })?;
-            f.write_all(&bytes).map_err(|e| ManifestError::Io {
-                detail: format!("write {tmp:?}: {e}"),
-            })?;
-            f.sync_all().map_err(|e| ManifestError::Io {
-                detail: format!("fsync {tmp:?}: {e}"),
-            })?;
-        }
-        fs::rename(&tmp, &final_path).map_err(|e| ManifestError::Io {
-            detail: format!("rename to {final_path:?}: {e}"),
-        })?;
-        // Best-effort directory fsync. POSIX guarantees rename durability
-        // only after a directory fsync.
-        if let Ok(dir) = fs::File::open(root) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+        nodedb_wal::segment::atomic_write_fsync(&tmp, &final_path, &bytes).map_err(|e| {
+            ManifestError::Io {
+                detail: format!("publish {final_path:?}: {e}"),
+            }
+        })
     }
 
     pub fn append(&mut self, seg: SegmentRef) {

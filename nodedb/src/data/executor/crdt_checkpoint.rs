@@ -2,7 +2,7 @@
 
 //! CRDT tenant checkpoint load operations for [`CoreLoop`].
 //!
-//! The matching write path lives in `handlers/control/snapshot.rs`
+//! The matching write path lives in `handlers/control/checkpoint_crdt.rs`
 //! (`checkpoint_crdt_engines`). Checkpoints are written per-core to
 //! `{data_dir}/crdt-ckpt/core-{core_id}/tenant-{tid}-coll-{hex(collection)}.ckpt` because
 //! `data_dir` is shared across cores and each core only owns the CRDT

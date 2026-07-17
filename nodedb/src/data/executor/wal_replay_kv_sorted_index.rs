@@ -3,9 +3,16 @@
 //! WAL replay for the KV `RegisterSortedIndex` / `DropSortedIndex` records.
 //!
 //! `SortedIndexManager` (`engine/kv/sorted_index/manager.rs`) lives only
-//! in-process — there is no durable catalog counterpart and KV has no
-//! checkpoint, so the WAL record is the only durability mechanism for a
-//! registered sorted index (leaderboard). Replay is LSN-ordered, so every
+//! in-process — there is no durable catalog counterpart. This record is one of a
+//! registered sorted index's (leaderboard's) two durable records; the other is
+//! the KV checkpoint, which carries each collection's registrations and their
+//! tree content in the same atomically published generation as its rows. That is
+//! what makes gating this arm on the replay floor safe: a floor is only ever
+//! installed by a generation that already holds every registration at or below
+//! it, so a gated-out record is one the checkpoint has already accounted for.
+//! See `kv_checkpoint`.
+//!
+//! Replay is LSN-ordered, so every
 //! `kv_put` that preceded a `kv_register_sorted_index` record has already
 //! been applied to `self.tables` by the time it replays, exactly mirroring
 //! what the live registration saw when it ran (same backfill semantics as
@@ -68,7 +75,7 @@ impl CoreLoop {
         if disc != "kv_register_sorted_index" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
 

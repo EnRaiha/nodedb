@@ -2,16 +2,47 @@
 
 //! Checkpoint spread / dirty page throttling.
 //!
-//! Prevents checkpoint storms by tracking dirty page counts per engine
-//! and flushing incrementally (configurable % per tick). Rate-limited
-//! by the memory governor's I/O budget.
+//! Prevents checkpoint storms by tracking dirty page counts per engine and
+//! flushing incrementally (configurable % per tick), rate-limited by an I/O
+//! budget. This decides WHEN an engine's accumulated writes get flushed between
+//! coordinated checkpoints, so a checkpoint cycle does not arrive to a fully
+//! dirty engine and stall the core flushing all of it at once.
 //!
-//! Also wires `RecordType::Checkpoint` into the WAL to mark consistent
-//! snapshot points for crash recovery.
+//! This is scheduling pressure and NOTHING ELSE. In particular it is **not
+//! durability evidence, and nothing may treat it as such**:
+//!
+//!   - A dirty-page count is an estimate of pending work. It is incremented by
+//!     write handlers that count rows, not pages, and an engine only appears
+//!     here if some handler happens to call `mark_dirty` for it. `is_clean()`
+//!     therefore means "no engine reports outstanding work to schedule", never
+//!     "every engine is on stable storage".
+//!   - Whether an engine's state actually survives a restart is answered ONLY
+//!     by `handlers/control/checkpoint_durable_lsn.rs`, whose per-engine
+//!     contributors flush and then report the LSN they truly made durable.
+//!     `execute_checkpoint` folds `min` over those, and that fold is what
+//!     authorises `WalManager::truncate_before` to unlink segments.
+//!
+//! This type deliberately holds no LSN. It used to carry a `checkpoint_lsn`
+//! that `complete_checkpoint` set from the raw watermark and that nothing ever
+//! read — a second, parallel "the watermark is durable" claim of exactly the
+//! kind that let WAL truncation delete the only copy of memory-only engine
+//! state. A scheduler that cannot name an LSN cannot be misread as authorising
+//! a deletion, so the LSN half is gone rather than merely unused.
 
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info};
+use tracing::debug;
+
+/// Every engine the coordinator schedules flushes for.
+///
+/// Registration is driven off this one list so the registry cannot drift from
+/// the handlers that call `mark_dirty` / `record_flush`. An engine missing here
+/// makes those calls silent no-ops — the counter has nowhere to land, the
+/// engine never appears in a flush plan, and its writes are never scheduled.
+/// An entry here with no arm in `CoreLoop::maybe_run_maintenance` is the
+/// mirror-image bug: it is planned every tick and never flushed, so its dirty
+/// count only grows. Add to both sides or neither.
+pub const TRACKED_ENGINES: &[&str] = &["sparse", "vector", "crdt", "timeseries", "columnar"];
 
 /// Checkpoint configuration.
 #[derive(Debug, Clone)]
@@ -82,30 +113,35 @@ impl EngineCheckpointState {
     }
 }
 
-/// Checkpoint coordinator: manages incremental flushing across engines.
+/// Schedules incremental flushing across engines. Holds no durability state —
+/// see the module docs for why it must never be read as if it did.
 pub struct CheckpointCoordinator {
     config: CheckpointConfig,
     engines: Vec<EngineCheckpointState>,
     last_tick: Option<Instant>,
-    /// LSN at the last completed checkpoint.
-    checkpoint_lsn: u64,
-    /// Total checkpoint cycles completed.
-    checkpoint_count: u64,
 }
 
 impl CheckpointCoordinator {
+    /// Build a coordinator with every engine in `TRACKED_ENGINES` registered.
+    ///
+    /// Registration is not a caller's choice: a coordinator missing an engine
+    /// silently drops that engine's `mark_dirty` calls, so there is no useful
+    /// partially-registered state to expose.
     pub fn new(config: CheckpointConfig) -> Self {
-        Self {
+        let mut coord = Self {
             config,
             engines: Vec::new(),
             last_tick: None,
-            checkpoint_lsn: 0,
-            checkpoint_count: 0,
+        };
+        for name in TRACKED_ENGINES {
+            coord.register_engine(name);
         }
+        coord
     }
 
-    /// Register an engine for checkpoint tracking.
-    pub fn register_engine(&mut self, name: &str) {
+    /// Register one engine for flush scheduling. Private so `TRACKED_ENGINES`
+    /// stays the only source of truth for which engines are tracked.
+    fn register_engine(&mut self, name: &str) {
         if !self.engines.iter().any(|e| e.engine_name == name) {
             self.engines.push(EngineCheckpointState::new(name));
         }
@@ -173,35 +209,19 @@ impl CheckpointCoordinator {
         }
     }
 
-    /// Mark a checkpoint as complete at the given LSN.
+    /// Whether no engine reports outstanding work to schedule.
     ///
-    /// The WAL can be safely truncated up to this LSN after
-    /// all engines have flushed their dirty pages.
-    pub fn complete_checkpoint(&mut self, lsn: u64) {
-        self.checkpoint_lsn = lsn;
-        self.checkpoint_count += 1;
-        info!(lsn, count = self.checkpoint_count, "checkpoint completed");
-    }
-
-    /// LSN of the last completed checkpoint.
-    /// WAL entries before this LSN are safe to truncate.
-    pub fn checkpoint_lsn(&self) -> u64 {
-        self.checkpoint_lsn
-    }
-
-    /// Whether all engines have zero dirty pages (clean checkpoint).
+    /// This is a scheduling question, NOT a durability one: it says every
+    /// tracked engine's pending-write estimate has been worked off, not that
+    /// any engine is on stable storage. Only the per-engine durable LSNs
+    /// folded by `execute_checkpoint` answer that.
     pub fn is_clean(&self) -> bool {
         self.engines.iter().all(|e| e.dirty_pages == 0)
     }
 
-    /// Total dirty pages across all engines.
+    /// Total dirty pages across all engines. Backlog depth for observability.
     pub fn total_dirty_pages(&self) -> usize {
         self.engines.iter().map(|e| e.dirty_pages).sum()
-    }
-
-    /// Total checkpoint cycles completed.
-    pub fn checkpoint_count(&self) -> u64 {
-        self.checkpoint_count
     }
 }
 
@@ -217,8 +237,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = CheckpointCoordinator::new(config);
-        coord.register_engine("sparse");
-        coord.register_engine("vector");
 
         coord.mark_dirty("sparse", 100);
         coord.mark_dirty("vector", 50);
@@ -250,7 +268,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = CheckpointCoordinator::new(config);
-        coord.register_engine("sparse");
         coord.mark_dirty("sparse", 100); // Over threshold.
 
         let plan = coord.tick();
@@ -266,7 +283,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = CheckpointCoordinator::new(config);
-        coord.register_engine("sparse");
         coord.mark_dirty("sparse", 50);
 
         let plan = coord.tick();
@@ -276,13 +292,28 @@ mod tests {
         assert!(coord.is_clean());
     }
 
+    /// Every engine a handler can name must be registered, or its `mark_dirty`
+    /// lands nowhere and its writes are never scheduled for flushing — the
+    /// silent-no-op failure `TRACKED_ENGINES` exists to prevent.
     #[test]
-    fn checkpoint_lsn_tracking() {
-        let mut coord = CheckpointCoordinator::new(CheckpointConfig::default());
-        assert_eq!(coord.checkpoint_lsn(), 0);
-
-        coord.complete_checkpoint(42);
-        assert_eq!(coord.checkpoint_lsn(), 42);
-        assert_eq!(coord.checkpoint_count(), 1);
+    fn every_tracked_engine_accepts_dirty_pages() {
+        let config = CheckpointConfig {
+            tick_interval: Duration::from_millis(0),
+            ..Default::default()
+        };
+        for engine in TRACKED_ENGINES {
+            let mut coord = CheckpointCoordinator::new(config.clone());
+            coord.mark_dirty(engine, 100);
+            assert_eq!(
+                coord.total_dirty_pages(),
+                100,
+                "mark_dirty({engine}) was silently dropped — engine not registered"
+            );
+            let plan = coord.tick();
+            assert!(
+                plan.iter().any(|(e, _)| e == engine),
+                "{engine} marked dirty but absent from the flush plan"
+            );
+        }
     }
 }

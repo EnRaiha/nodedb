@@ -6,6 +6,7 @@
 
 use nodedb_types::DatabaseId;
 
+use super::checkpoint_outcome::CheckpointOutcome;
 use super::core_loop::CoreLoop;
 
 /// Canonical path for a core's vector checkpoint directory.
@@ -76,56 +77,92 @@ impl CoreLoop {
         }
     }
 
-    /// Write HNSW checkpoints for all vector indexes to disk.
+    /// Flush every vector index to disk and report the LSN they are now durable
+    /// through, plus the number of checkpoint files published.
     ///
-    /// Called periodically from the TPC event loop (e.g., every 5 minutes
-    /// or when idle). Each index is serialized to a file at
-    /// `{data_dir}/vector-ckpt/{index_key}.ckpt`.
+    /// Each index is serialized to `{data_dir}/vector-ckpt/core-{id}/{key}.ckpt`.
+    /// After checkpointing, WAL replay only needs to process entries since the
+    /// checkpoint — not the entire history.
     ///
-    /// After checkpointing, WAL replay only needs to process entries
-    /// since the checkpoint — not the entire history.
-    pub fn checkpoint_vector_indexes(&self) -> usize {
+    /// ## Why this returns a `Result` and an LSN
+    ///
+    /// The HNSW is not fully reconstructible without the WAL.
+    /// `rebuild_vector_indexes_from_store` re-indexes the redb `sparse`
+    /// documents of every collection carrying a `CREATE VECTOR INDEX`, but a
+    /// vector does not have to arrive as a document: `VectorOp::Insert` writes a
+    /// bare `(vector, surrogate, pk_bytes)` straight into `vector_collections`,
+    /// and nothing on that path puts a row in `sparse` for the rebuild to find.
+    /// Those vectors exist in exactly two places — this checkpoint and the
+    /// `VectorOp::Insert` WAL records — so a flush that fails while still
+    /// letting the core report its watermark deletes the only surviving copy.
+    ///
+    /// The failure is therefore all-or-nothing by construction: any index that
+    /// cannot be published returns `Err`, and the caller clamps the reported
+    /// checkpoint LSN to the last LSN vectors were known durable through. A
+    /// partial success cannot be expressed, because the LSN it would justify
+    /// does not exist.
+    ///
+    /// Stamping with the core watermark mirrors `checkpoint_kv_engines`: this
+    /// runs on the core's own thread between tasks, and a vector write raises
+    /// the watermark only after the collection has already been mutated, so
+    /// every write with `lsn <= watermark` is in the bytes written below.
+    pub(crate) fn checkpoint_vector_indexes(&self) -> crate::Result<CheckpointOutcome> {
+        let durable_lsn = self.watermark;
         if self.vector_collections.is_empty() {
-            return 0;
+            return Ok(CheckpointOutcome {
+                durable_lsn,
+                files_written: 0,
+            });
         }
 
         let ckpt_dir = vector_ckpt_dir(&self.data_dir, self.core_id);
-        if std::fs::create_dir_all(&ckpt_dir).is_err() {
-            tracing::warn!(
-                core = self.core_id,
-                "failed to create vector checkpoint dir"
-            );
-            return 0;
-        }
+        std::fs::create_dir_all(&ckpt_dir).map_err(|e| storage_err(&ckpt_dir, "create dir", &e))?;
 
-        let mut checkpointed = 0;
+        let mut files_written = 0;
         for (key, collection) in &self.vector_collections {
+            // An empty collection has no state to make durable, so it writes no
+            // file and cannot be the reason an LSN is overstated.
             if collection.is_empty() {
-                continue;
-            }
-            let bytes =
-                collection.checkpoint_to_bytes(self.segment_keks.vector_checkpoint_kek.as_ref());
-            if bytes.is_empty() {
                 continue;
             }
             // Checkpoint filename is `"{db}:{tid}:{coll}"`.
             let filename = CoreLoop::vector_checkpoint_filename(key);
+            let bytes =
+                collection.checkpoint_to_bytes(self.segment_keks.vector_checkpoint_kek.as_ref());
+            // `checkpoint_to_bytes` signals a serialization or encryption
+            // failure by returning empty. The `is_empty` guard above already
+            // excluded the only innocent reason for empty bytes, so reaching
+            // here means the encode failed and this index was NOT written.
+            if bytes.is_empty() {
+                return Err(crate::Error::Serialization {
+                    format: "msgpack".to_string(),
+                    detail: format!(
+                        "vector checkpoint encode produced no bytes for non-empty index \
+                         {filename} ({} vectors)",
+                        collection.len()
+                    ),
+                });
+            }
             let ckpt_path = ckpt_dir.join(format!("{filename}.ckpt"));
             let tmp_path = ckpt_dir.join(format!("{filename}.ckpt.tmp"));
-            if nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &bytes).is_ok() {
-                checkpointed += 1;
-            }
+            nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &bytes)
+                .map_err(|e| storage_err(&ckpt_path, "publish checkpoint", &e))?;
+            files_written += 1;
         }
 
-        if checkpointed > 0 {
+        if files_written > 0 {
             tracing::info!(
                 core = self.core_id,
-                checkpointed,
+                files_written,
                 total = self.vector_collections.len(),
+                durable_through_lsn = durable_lsn.as_u64(),
                 "vector collections checkpointed"
             );
         }
-        checkpointed
+        Ok(CheckpointOutcome {
+            durable_lsn,
+            files_written,
+        })
     }
 
     /// Load HNSW checkpoints from disk on startup, before WAL replay.
@@ -204,6 +241,17 @@ impl CoreLoop {
         if loaded > 0 {
             tracing::info!(core = self.core_id, loaded, "vector checkpoints loaded");
         }
+    }
+}
+
+/// Wrap a filesystem failure as the vector engine's typed storage error.
+fn storage_err(path: &std::path::Path, action: &str, e: &dyn std::fmt::Display) -> crate::Error {
+    crate::Error::Storage {
+        engine: "vector".to_string(),
+        detail: format!(
+            "vector checkpoint: failed to {action} at {}: {e}",
+            path.display()
+        ),
     }
 }
 

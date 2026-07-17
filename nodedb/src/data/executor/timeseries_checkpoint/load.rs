@@ -1,0 +1,310 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Rebuilding `ts_registries` from the partition directories on disk.
+//!
+//! The partitions ARE the timeseries checkpoint, so this is its loader: it makes
+//! the flushed rows reachable again, and it installs the per-collection
+//! `last_flushed_wal_lsn` gate that stops `replay_timeseries_wal` re-appending
+//! records those partitions already contain.
+//!
+//! A partition directory is committed by its `partition.meta`, which
+//! `ColumnarSegmentWriter::write_partition` writes last and atomically. A
+//! directory without one is an incomplete write — the crash-time remains of a
+//! flush that never reached its commit point — and is ignored here, exactly as
+//! `PartitionRegistry::cleanup_orphans` would remove it. A meta that is present
+//! but cannot be read or decoded is NOT ignored: that is corruption of a
+//! committed partition, and silently dropping it would under-restore the
+//! collection while the LSN gate it carries says its records need no replay.
+
+use tracing::info;
+
+use crate::data::executor::core_loop::CoreLoop;
+use crate::engine::timeseries::partition_registry::{PartitionEntry, PartitionRegistry};
+use crate::types::{DatabaseId, TenantId};
+
+impl CoreLoop {
+    /// Rebuild every timeseries collection's partition registry from disk.
+    ///
+    /// Called once at boot, BEFORE `replay_all_wal`. Until it existed
+    /// `ts_registries` was populated only lazily — by the first SCAN of a
+    /// collection, via [`Self::ensure_ts_registry`] — which happens long after
+    /// replay. Replay's dedup gate reads those registries, so at replay time it
+    /// found no partitions, gated nothing, and re-appended every retained
+    /// `TimeseriesBatch` on top of the partition that already held it. A
+    /// timeseries ingest is an append and the scan reads partitions and memtable
+    /// together, so nothing masked the duplicate rows.
+    ///
+    /// A collection whose registry cannot be rebuilt is logged and skipped
+    /// rather than aborting the boot of every other collection on the core. The
+    /// consequence is bounded and self-announcing: its records replay un-gated,
+    /// which duplicates rows rather than losing them.
+    pub fn load_ts_registries(&mut self) {
+        let ts_root = self.data_dir.join("ts");
+        if !ts_root.exists() {
+            return;
+        }
+
+        let mut loaded = 0usize;
+        let mut partitions = 0usize;
+        for (database_id, tenant_id, collection) in enumerate_ts_collections(&ts_root) {
+            match self.ensure_ts_registry(tenant_id, database_id, &collection) {
+                Ok(()) => {
+                    let key = (database_id, tenant_id, collection);
+                    if let Some(reg) = self.ts_registries.get(&key) {
+                        loaded += 1;
+                        partitions += reg.partition_count();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        core = self.core_id,
+                        collection = %collection,
+                        error = %e,
+                        "timeseries partition registry rebuild failed at boot; this \
+                         collection's records will replay UN-GATED, duplicating rows its \
+                         partitions already contain"
+                    );
+                }
+            }
+        }
+
+        if loaded > 0 {
+            info!(
+                core = self.core_id,
+                collections = loaded,
+                partitions,
+                "timeseries partition registries restored"
+            );
+        }
+    }
+
+    /// Ensure the partition registry is loaded for one timeseries collection.
+    ///
+    /// A no-op once the collection's registry is present, so the boot load above
+    /// and the lazy first-scan path can both call it.
+    pub(in crate::data::executor) fn ensure_ts_registry(
+        &mut self,
+        tid: TenantId,
+        database_id: DatabaseId,
+        collection: &str,
+    ) -> crate::Result<()> {
+        let key = (database_id, tid, collection.to_string());
+        if self.ts_registries.contains_key(&key) {
+            return Ok(());
+        }
+        let ts_dir = crate::data::executor::handlers::timeseries::paths::ts_collection_dir(
+            &self.data_dir,
+            database_id.as_u64(),
+            tid.as_u64(),
+            collection,
+        );
+        if !ts_dir.exists() {
+            return Ok(());
+        }
+
+        let registry = read_registry(&ts_dir, self.segment_keks.ts_segment_kek.as_ref())?;
+        if registry.partition_count() > 0 {
+            info!(
+                collection,
+                partitions = registry.partition_count(),
+                "loaded partition registry from disk"
+            );
+        }
+        self.ts_registries.insert(key, registry);
+        Ok(())
+    }
+}
+
+/// Walk `{data_dir}/ts/{database_id}/{tenant_id}/{collection}` and yield every
+/// collection that has a directory.
+///
+/// Unparseable directory names are skipped: the layout is written only by
+/// `ts_collection_dir`, so a name that is not a `u64` at the database or tenant
+/// level was not put there by this engine.
+fn enumerate_ts_collections(ts_root: &std::path::Path) -> Vec<(DatabaseId, TenantId, String)> {
+    let mut out = Vec::new();
+    let Ok(db_dirs) = std::fs::read_dir(ts_root) else {
+        return out;
+    };
+    for db_dir in db_dirs.flatten() {
+        let Some(database_id) = db_dir
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Ok(tenant_dirs) = std::fs::read_dir(db_dir.path()) else {
+            continue;
+        };
+        for tenant_dir in tenant_dirs.flatten() {
+            let Some(tenant_id) = tenant_dir
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let Ok(coll_dirs) = std::fs::read_dir(tenant_dir.path()) else {
+                continue;
+            };
+            for coll_dir in coll_dirs.flatten() {
+                if !coll_dir.path().is_dir() {
+                    continue;
+                }
+                let Some(collection) = coll_dir.file_name().to_str().map(|s| s.to_string()) else {
+                    continue;
+                };
+                out.push((
+                    DatabaseId::new(database_id),
+                    TenantId::new(tenant_id),
+                    collection,
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Build a registry from every committed partition directory under `ts_dir`.
+fn read_registry(
+    ts_dir: &std::path::Path,
+    kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
+) -> crate::Result<PartitionRegistry> {
+    let mut registry =
+        PartitionRegistry::new(nodedb_types::timeseries::TieredPartitionConfig::origin_defaults());
+
+    let entries = std::fs::read_dir(ts_dir).map_err(|e| crate::Error::Storage {
+        engine: "timeseries".to_string(),
+        detail: format!("read partition dir {}: {e}", ts_dir.display()),
+    })?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(dir_name) = name.to_str() else {
+            continue;
+        };
+        if !dir_name.starts_with("ts-") || !entry.path().is_dir() {
+            continue;
+        }
+        let meta_path = entry.path().join("partition.meta");
+        if !meta_path.exists() {
+            // Not committed: the meta write is the commit point, so this
+            // directory is the remains of an interrupted flush.
+            continue;
+        }
+        let meta = read_partition_meta(&meta_path, kek)?;
+        registry.import(vec![(
+            meta.min_ts,
+            PartitionEntry {
+                meta,
+                dir_name: dir_name.to_string(),
+            },
+        )]);
+    }
+    Ok(registry)
+}
+
+/// Read and decode one committed `partition.meta`.
+///
+/// Reads via `read_checkpoint_dontneed`: the metas are consumed once at boot and
+/// then superseded by the in-memory registry, so leaving them pinned in the page
+/// cache costs memory the hot workload needs.
+///
+/// Decrypts when the file carries the `SEGT` envelope. `write_partition` wraps
+/// EVERY file it writes — the meta included — when a segment KEK is installed,
+/// so a raw parse would find nothing but ciphertext and hand back an empty
+/// registry: partitions unreachable, records un-gated. Nothing installs the
+/// timeseries segment KEK today (`set_ts_segment_kek` has no caller outside
+/// tests), so that is a hole the first caller would fall into rather than a live
+/// one — which is why it is closed here, in the reader, alongside the writer
+/// that already encrypts.
+fn read_partition_meta(
+    path: &std::path::Path,
+    kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
+) -> crate::Result<nodedb_types::timeseries::PartitionMeta> {
+    let raw =
+        nodedb_wal::segment::read_checkpoint_dontneed(path).map_err(|e| crate::Error::Storage {
+            engine: "timeseries".to_string(),
+            detail: format!("read {}: {e}", path.display()),
+        })?;
+
+    let encrypted = crate::engine::timeseries::columnar_segment::encrypt::is_encrypted(&raw)
+        .map_err(|e| crate::Error::Storage {
+            engine: "timeseries".to_string(),
+            detail: format!("sniff {}: {e}", path.display()),
+        })?;
+    let bytes = if encrypted {
+        let key = kek.ok_or_else(|| crate::Error::Storage {
+            engine: "timeseries".to_string(),
+            detail: format!(
+                "{} is SEGT-encrypted but no timeseries segment key is installed",
+                path.display()
+            ),
+        })?;
+        crate::engine::timeseries::columnar_segment::encrypt::decrypt_file(key, &raw).map_err(
+            |e| crate::Error::Storage {
+                engine: "timeseries".to_string(),
+                detail: format!("decrypt {}: {e}", path.display()),
+            },
+        )?
+    } else {
+        raw
+    };
+
+    sonic_rs::from_slice(&bytes).map_err(|e| crate::Error::Serialization {
+        format: "json".to_string(),
+        detail: format!("parse {}: {e}", path.display()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enumerate_walks_database_tenant_collection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ts_root = dir.path().join("ts");
+        std::fs::create_dir_all(ts_root.join("0").join("1").join("metrics")).expect("mkdir");
+        std::fs::create_dir_all(ts_root.join("0").join("2").join("events")).expect("mkdir");
+        // A non-numeric level is not this engine's layout and must be skipped
+        // rather than mis-attributed to some tenant.
+        std::fs::create_dir_all(ts_root.join("not-a-db").join("1").join("x")).expect("mkdir");
+
+        let mut found = enumerate_ts_collections(&ts_root);
+        found.sort_by_key(|entry| (entry.1.as_u64(), entry.2.clone()));
+        assert_eq!(
+            found,
+            vec![
+                (DatabaseId::new(0), TenantId::new(1), "metrics".to_string()),
+                (DatabaseId::new(0), TenantId::new(2), "events".to_string()),
+            ]
+        );
+    }
+
+    /// A partition directory with no `partition.meta` never reached its commit
+    /// point. Restoring it would register a partition whose columns may be
+    /// missing or half-written.
+    #[test]
+    fn uncommitted_partition_directory_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("ts-1_2")).expect("mkdir");
+        let registry = read_registry(dir.path(), None).expect("read registry");
+        assert_eq!(registry.partition_count(), 0);
+    }
+
+    /// A committed partition whose meta cannot be decoded is corruption of state
+    /// this core is about to claim is durable. Skipping it quietly would leave
+    /// the collection short of rows AND leave its records un-gated.
+    #[test]
+    fn corrupt_partition_meta_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let part = dir.path().join("ts-1_2");
+        std::fs::create_dir_all(&part).expect("mkdir");
+        std::fs::write(part.join("partition.meta"), b"{ not json").expect("write meta");
+        assert!(
+            read_registry(dir.path(), None).is_err(),
+            "an undecodable committed meta must surface, not be skipped"
+        );
+    }
+}

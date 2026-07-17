@@ -12,4 +12,5 @@ mod engines;
 mod keys;
 mod tenant_snapshot;
 
+pub(in crate::data::executor) use keys::database_id_from_qualified;
 pub(in crate::data::executor::handlers::snapshot) use keys::parse_timeseries_snapshot_key;

@@ -211,11 +211,33 @@ impl CoreLoop {
             // `control/backup/restore/orchestrate/mod.rs`), so `vectors_written`
             // is 0 and the call is a no-op on that path.
             if vectors_written > 0 {
-                let checkpointed = self.checkpoint_vector_indexes();
-                info!(
-                    core = self.core_id,
-                    tenant_id, checkpointed, "vector snapshot install checkpointed synchronously"
-                );
+                match self.checkpoint_vector_indexes() {
+                    Ok(outcome) => {
+                        info!(
+                            core = self.core_id,
+                            tenant_id,
+                            files_written = outcome.files_written,
+                            "vector snapshot install checkpointed synchronously"
+                        );
+                    }
+                    // The install path has no LSN to clamp — it applies
+                    // Raft-committed vectors with no WAL record behind them, so
+                    // there is no truncation authority to narrow here. What a
+                    // failure does mean is that this core's only local copy of
+                    // the just-installed vectors is still in memory, which the
+                    // operator needs to see rather than have it disappear into
+                    // a discarded count.
+                    Err(e) => {
+                        warn!(
+                            core = self.core_id,
+                            tenant_id,
+                            error = %e,
+                            "vector snapshot install checkpoint failed; the installed \
+                             vectors are memory-only on this core until the next \
+                             successful checkpoint"
+                        );
+                    }
+                }
             }
 
             // Restore KV tables.

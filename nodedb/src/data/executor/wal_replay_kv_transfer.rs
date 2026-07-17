@@ -249,7 +249,7 @@ impl CoreLoop {
         if disc != "kv_transfer" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
         Some(self.replay_kv_transfer(ReplayKvTransferParams {
@@ -267,15 +267,24 @@ impl CoreLoop {
         }))
     }
 
-    /// Decode + tombstone-gate + replay one `kv_transfer_item` WAL record.
+    /// Decode + skip-gate + replay one `kv_transfer_item` WAL record.
     ///
     /// Returns `None` when `payload` does not match the `kv_transfer_item`
     /// discriminator shape, otherwise `Some((puts, deletes))` applied (both
-    /// 0 if tombstoned or skipped). The move touches two collections, so it
-    /// is skipped whole if either side was truncated after this LSN —
-    /// matching the single-collection tombstone gate used for every other
-    /// KV WAL arm, applied to both collections `execute_kv_transfer_item`
-    /// authoritatively mutates (delete from source, insert into dest).
+    /// 0 if skipped). The move touches two collections, so it is skipped whole
+    /// if either side is gated out — matching the single-collection gate used
+    /// for every other KV WAL arm, applied to both collections
+    /// `execute_kv_transfer_item` authoritatively mutates (delete from source,
+    /// insert into dest).
+    ///
+    /// Gating on either side is only sound because the two sides can never
+    /// disagree. The tombstone half is per-collection, but the checkpoint half
+    /// is engine-wide: a KV checkpoint publishes every collection at ONE LSN
+    /// atomically, so this record is either below that LSN for both sides or
+    /// above it for both. Were the checkpoint floor per-collection, a
+    /// source-covered / dest-uncovered split would be unrepresentable here —
+    /// skipping would drop the dest insert, applying would double-debit the
+    /// source. See `kv_checkpoint.rs`.
     pub(super) fn try_replay_kv_transfer_item(
         &mut self,
         payload: &[u8],
@@ -290,8 +299,8 @@ impl CoreLoop {
         if disc != "kv_transfer_item" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &source_collection, record_lsn)
-            || tombstones.is_tombstoned(tenant_id, &dest_collection, record_lsn)
+        if self.skip_kv_replay_record(tombstones, tenant_id, &source_collection, record_lsn)
+            || self.skip_kv_replay_record(tombstones, tenant_id, &dest_collection, record_lsn)
         {
             return Some((0, 0));
         }

@@ -142,7 +142,7 @@ pub fn merge_partitions(
         "merge partition written"
     );
 
-    let meta = writer.write_partition(output_name, &drain, interval_ms, 0, None)?;
+    let meta = writer.write_partition(output_name, &drain.view(), interval_ms, 0, None)?;
 
     Ok(MergeResult {
         meta,

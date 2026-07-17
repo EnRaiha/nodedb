@@ -91,7 +91,7 @@ impl CoreLoop {
         if disc != "kv_incr" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
         let result = self.kv_engine.incr_with_absolute_expiry(
@@ -141,7 +141,7 @@ impl CoreLoop {
         if disc != "kv_incr" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
         let result = self.kv_engine.incr(

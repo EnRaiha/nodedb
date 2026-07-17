@@ -32,9 +32,9 @@ pub struct SortedIndexDef {
 }
 
 /// A live sorted index: definition + data.
-struct SortedIndex {
-    def: SortedIndexDef,
-    tree: OrderStatTree,
+pub(super) struct SortedIndex {
+    pub(super) def: SortedIndexDef,
+    pub(super) tree: OrderStatTree,
 }
 
 /// Manages all sorted indexes on a single TPC core.
@@ -44,10 +44,10 @@ struct SortedIndex {
 #[derive(Debug)]
 pub struct SortedIndexManager {
     /// All sorted indexes. Key: `"{tenant_id}:{index_name}"`.
-    indexes: HashMap<String, SortedIndex>,
+    pub(super) indexes: HashMap<String, SortedIndex>,
     /// Reverse map: `"{tenant_id}:{collection}"` → list of index names.
     /// Used to find which sorted indexes to update on PUT/DELETE.
-    collection_indexes: HashMap<u64, Vec<String>>,
+    pub(super) collection_indexes: HashMap<u64, Vec<String>>,
 }
 
 impl std::fmt::Debug for SortedIndex {
@@ -378,7 +378,7 @@ impl Default for SortedIndexManager {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-fn index_key(database_id: u64, tenant_id: u64, index_name: &str) -> String {
+pub(super) fn index_key(database_id: u64, tenant_id: u64, index_name: &str) -> String {
     format!("{database_id}:{tenant_id}:{index_name}")
 }
 

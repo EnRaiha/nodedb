@@ -402,6 +402,22 @@ impl CoreLoop {
             }
 
             let accepted = match kind.as_deref() {
+                // The columnar floor is consulted HERE and not above the `kind`
+                // match, because it is the columnar engines' floor and this
+                // record type is shared: a `timeseries` record routes to
+                // `columnar_memtables` / `ts_registries`, which this checkpoint
+                // does not cover and whose replay it must therefore not gate.
+                // Gating one engine's records on another engine's durability
+                // would drop the writes outright.
+                Some("columnar") if self.floors.replay_floors.columnar.covers(record_lsn) => {
+                    // Already folded into the restored generation. Replaying it
+                    // would re-insert every row: an upsert masks the duplicate
+                    // on a plain collection, but a `bitemporal=true` collection
+                    // deliberately retains every version, so the duplicate
+                    // becomes a second version visible to `AS OF` queries.
+                    skipped += 1;
+                    continue;
+                }
                 Some("columnar") => self.replay_columnar_payload(
                     tid_id,
                     db_id,
@@ -562,6 +578,109 @@ mod tests {
             Some(Lsn::new(123)),
             "columnar insert replay must record the record LSN as the \
              collection write-version floor"
+        );
+    }
+
+    /// A columnar record already folded into a restored checkpoint must NOT be
+    /// replayed. Columnar replay is not idempotent, so re-applying an insert
+    /// re-runs the whole upsert; on a `bitemporal=true` collection it appends a
+    /// second version outright. The floor is what restores the "from state that
+    /// does not contain this record" precondition the replay depends on.
+    #[test]
+    fn columnar_records_at_or_below_the_floor_are_not_replayed() {
+        let mut h = make_core();
+        h.core.floors.replay_floors.columnar.set(Lsn::new(200));
+        let record = columnar_wal_record("events_gated", 150, 7);
+
+        h.core.replay_timeseries_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        assert!(
+            h.core.columnar_engines.is_empty(),
+            "a record at or below the floor is already in the restored \
+             checkpoint and must not be applied a second time"
+        );
+    }
+
+    /// The floor gates only what the checkpoint covers. A record ABOVE it is
+    /// absent from the restored state, so gating it would not prevent a
+    /// duplicate — it would drop the write.
+    #[test]
+    fn columnar_records_above_the_floor_still_replay() {
+        let mut h = make_core();
+        h.core.floors.replay_floors.columnar.set(Lsn::new(100));
+        let record = columnar_wal_record("events_ungated", 150, 7);
+
+        h.core.replay_timeseries_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let coll_key = CollKey {
+            db: DatabaseId::new(0),
+            tenant: TenantId::new(7),
+            collection: Box::from("events_ungated"),
+        };
+        assert_eq!(
+            h.core.write_index.collection_write_lsn(&coll_key),
+            Some(Lsn::new(150)),
+            "a record above the floor must be applied"
+        );
+    }
+
+    /// `TimeseriesBatch` is a shared record type: a `timeseries`-kind record
+    /// routes to `columnar_memtables` / `ts_registries`, which the columnar
+    /// checkpoint does not cover. Gating it on the COLUMNAR engines' durability
+    /// would not deduplicate anything — it would silently drop timeseries
+    /// writes whose only durable copy is the record being skipped.
+    #[test]
+    fn the_columnar_floor_does_not_gate_timeseries_records() {
+        let mut h = make_core();
+        // A floor far above the record's LSN: if the gate were applied by
+        // record type instead of by kind, this would suppress it.
+        h.core.floors.replay_floors.columnar.set(Lsn::new(10_000));
+
+        let batch = nodedb_types::timeseries::TimeseriesWalBatch {
+            collection: "metrics_ungated".to_string(),
+            samples: vec![(1u64, 1_000i64, 42.0f64)],
+            provenance: None,
+        };
+        let payload = zerompk::to_msgpack_vec(&batch).expect("encode ts batch");
+        let rec_bytes = zerompk::to_msgpack_vec(&(
+            "timeseries".to_string(),
+            "metrics_ungated".to_string(),
+            payload,
+            Option::<SyncProvenance>::None,
+        ))
+        .expect("encode timeseries tuple");
+        let record = WalRecord::new(WalRecordArgs {
+            record_type: RecordType::TimeseriesBatch as u32,
+            lsn: 150,
+            tenant_id: 7,
+            vshard_id: 0,
+            database_id: 0,
+            payload: rec_bytes,
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("wal record");
+
+        h.core.replay_timeseries_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        assert!(
+            h.core
+                .columnar_memtables
+                .keys()
+                .any(|(_, t, c)| { *t == TenantId::new(7) && c == "metrics_ungated" }),
+            "a timeseries record must replay regardless of the columnar floor"
         );
     }
 

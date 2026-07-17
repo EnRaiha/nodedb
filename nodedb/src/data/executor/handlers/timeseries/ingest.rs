@@ -339,6 +339,24 @@ impl CoreLoop {
             }
         }
 
+        // Track this record's WAL LSN BEFORE the post-ingest flush below, and
+        // only now that the record is FULLY ingested (the retry above having
+        // placed any hard-limit leftovers).
+        //
+        // The order is load-bearing. `flush_ts_collection` stamps the partition
+        // it writes with `ts_max_ingested_lsn`, and replay skips every record at
+        // or below the highest stamp it finds. Stamping after the flush — as
+        // this did — labelled a partition holding record L's rows with L-1, so a
+        // restart replayed L back on top of the partition that already contained
+        // it and every one of its rows appeared twice. Timeseries ingest is an
+        // APPEND: nothing masks the duplicate.
+        if accepted > 0
+            && let Some(lsn) = wal_lsn
+        {
+            let entry = self.ts_max_ingested_lsn.entry(key.clone()).or_insert(0);
+            *entry = (*entry).max(lsn);
+        }
+
         // Post-flush: standard 64MB threshold check.
         let Some(mt) = self.columnar_memtables.get(&key) else {
             return self.response_error(
@@ -361,12 +379,7 @@ impl CoreLoop {
             );
         }
 
-        // Track WAL LSN and last ingest time for dedup + idle flush.
         if accepted > 0 {
-            if let Some(lsn) = wal_lsn {
-                let entry = self.ts_max_ingested_lsn.entry(key.clone()).or_insert(0);
-                *entry = (*entry).max(lsn);
-            }
             // no-determinism: last_ts_ingest is a flush-trigger timer, not Calvin row data
             self.last_ts_ingest = Some(std::time::Instant::now());
         }

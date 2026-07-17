@@ -10,8 +10,8 @@ use nodedb_types::timeseries::{IngestResult, MetricSample, SeriesId, SymbolDicti
 
 use super::snapshot::{MemtableSnapshot, column_to_snapshot, rebuild_columns};
 use super::types::{
-    ColumnData, ColumnType, ColumnValue, ColumnarDrainResult, ColumnarMemtableConfig,
-    ColumnarSchema,
+    ColumnData, ColumnType, ColumnValue, ColumnarDrainResult, ColumnarFlushView,
+    ColumnarMemtableConfig, ColumnarSchema, max_system_ts_of,
 };
 
 /// Columnar memtable: per-column vectors instead of per-series hash maps.
@@ -223,9 +223,32 @@ impl ColumnarMemtable {
         }
     }
 
+    /// Borrow this memtable's live rows as the payload a flush would write.
+    ///
+    /// The read-only half of a flush: a segment can be encoded and landed from
+    /// this view, and only then does [`Self::drain`] take the rows out. Nothing
+    /// leaves memory before it is durable, so a failed segment write leaves the
+    /// memtable exactly as it was.
+    pub fn flush_view(&self) -> ColumnarFlushView<'_> {
+        ColumnarFlushView {
+            columns: &self.columns,
+            schema: &self.schema,
+            symbol_dicts: &self.symbol_dicts,
+            row_count: self.row_count,
+            min_ts: self.min_ts,
+            max_ts: self.max_ts,
+            max_system_ts: max_system_ts_of(&self.schema, &self.columns),
+        }
+    }
+
     /// Drain all data from the memtable, resetting it for reuse.
     ///
     /// Returns the column data, schema, symbol dicts, and stats.
+    ///
+    /// Callers that flush must write the segment from [`Self::flush_view`] FIRST
+    /// and drain only once that write has committed — the rows here have no
+    /// other copy but the WAL, and the checkpoint that calls the flush is what
+    /// authorises deleting it.
     pub fn drain(&mut self) -> ColumnarDrainResult {
         let mut drained_columns = Vec::with_capacity(self.columns.len());
         for col in &mut self.columns {
@@ -253,17 +276,7 @@ impl ColumnarMemtable {
         }
 
         // Scan `_ts_system` column (if present) for retention's system-time axis.
-        let max_system_ts = self
-            .schema
-            .ts_system_idx()
-            .and_then(|idx| drained_columns.get(idx))
-            .map(|col| match col {
-                ColumnData::Timestamp(v) | ColumnData::Int64(v) => {
-                    v.iter().copied().max().unwrap_or(0)
-                }
-                _ => 0,
-            })
-            .unwrap_or(0);
+        let max_system_ts = max_system_ts_of(&self.schema, &drained_columns);
 
         let result = ColumnarDrainResult {
             columns: drained_columns,

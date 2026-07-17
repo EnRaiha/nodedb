@@ -38,6 +38,18 @@ impl KvEngine {
             now_ms,
         } = params;
         let tkey = table_key(database_id, tenant_id, collection);
+
+        // Name the collection even though no row has been written to it yet.
+        // `CREATE INDEX` before the first `INSERT` is ordinary usage, and the
+        // reverse maps are how the checkpoint writer recovers a collection's
+        // identity from its hashed table key — an unnamed collection cannot be
+        // given a checkpoint file, so its registration would be dropped from the
+        // checkpoint while the WAL record carrying it was truncated away.
+        self.hash_to_tenant.entry(tkey).or_insert(tenant_id);
+        self.hash_to_collection
+            .entry(tkey)
+            .or_insert_with(|| collection.to_string());
+
         let idx_set = self.indexes.entry(tkey).or_default();
 
         if !idx_set.add_index(field, field_position) {

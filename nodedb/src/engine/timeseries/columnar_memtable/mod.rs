@@ -7,6 +7,6 @@ mod types;
 pub use memtable::ColumnarMemtable;
 pub use snapshot::{ColumnSnapshot, MemtableSnapshot};
 pub use types::{
-    ColumnData, ColumnType, ColumnValue, ColumnarDrainResult, ColumnarMemtableConfig,
-    ColumnarSchema,
+    ColumnData, ColumnType, ColumnValue, ColumnarDrainResult, ColumnarFlushView,
+    ColumnarMemtableConfig, ColumnarSchema,
 };

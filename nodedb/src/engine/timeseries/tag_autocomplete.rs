@@ -178,7 +178,7 @@ mod tests {
 
         let writer = ColumnarSegmentWriter::new(tmp.path());
         writer
-            .write_partition("ts-tags", &drain, 86_400_000, 0, None)
+            .write_partition("ts-tags", &drain.view(), 86_400_000, 0, None)
             .unwrap();
 
         let part_dir = tmp.path().join("ts-tags");

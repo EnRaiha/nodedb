@@ -42,7 +42,7 @@ fn write_and_read_simple_partition() {
     let drain = mt.drain();
 
     let meta = writer
-        .write_partition("ts-test", &drain, 86_400_000, 42, None)
+        .write_partition("ts-test", &drain.view(), 86_400_000, 42, None)
         .unwrap();
     assert_eq!(meta.row_count, 100);
     assert_eq!(meta.min_ts, 1000);
@@ -127,7 +127,7 @@ fn write_and_read_with_tags() {
     let drain = mt.drain();
 
     let meta = writer
-        .write_partition("ts-tags", &drain, 86_400_000, 99, None)
+        .write_partition("ts-tags", &drain.view(), 86_400_000, 99, None)
         .unwrap();
     assert_eq!(meta.row_count, 50);
     assert_eq!(
@@ -179,7 +179,7 @@ fn column_projection() {
     }
     let drain = mt.drain();
     let meta = writer
-        .write_partition("ts-proj", &drain, 86_400_000, 0, None)
+        .write_partition("ts-proj", &drain.view(), 86_400_000, 0, None)
         .unwrap();
 
     assert!(matches!(
@@ -227,7 +227,7 @@ fn explicit_codec_override() {
     }
     let drain = mt.drain();
     let meta = writer
-        .write_partition("ts-gorilla", &drain, 86_400_000, 0, None)
+        .write_partition("ts-gorilla", &drain.view(), 86_400_000, 0, None)
         .unwrap();
 
     assert_eq!(
@@ -270,7 +270,7 @@ fn compression_stats_in_metadata() {
     }
     let drain = mt.drain();
     let meta = writer
-        .write_partition("ts-stats", &drain, 86_400_000, 0, None)
+        .write_partition("ts-stats", &drain.view(), 86_400_000, 0, None)
         .unwrap();
 
     let ts_stats = &meta.column_stats["timestamp"];
@@ -326,7 +326,7 @@ fn sparse_index_written_during_flush() {
     }
     let drain = mt.drain();
     writer
-        .write_partition("ts-sparse", &drain, 86_400_000, 0, None)
+        .write_partition("ts-sparse", &drain.view(), 86_400_000, 0, None)
         .unwrap();
 
     let part_dir = tmp.path().join("ts-sparse");
@@ -360,7 +360,7 @@ fn sparse_index_time_range_query() {
     }
     let drain = mt.drain();
     writer
-        .write_partition("ts-range", &drain, 86_400_000, 0, None)
+        .write_partition("ts-range", &drain.view(), 86_400_000, 0, None)
         .unwrap();
 
     let part_dir = tmp.path().join("ts-range");
@@ -407,7 +407,7 @@ fn sparse_index_predicate_pushdown() {
     }
     let drain = mt.drain();
     writer
-        .write_partition("ts-pred", &drain, 86_400_000, 0, None)
+        .write_partition("ts-pred", &drain.view(), 86_400_000, 0, None)
         .unwrap();
 
     let part_dir = tmp.path().join("ts-pred");
@@ -441,7 +441,7 @@ fn metadata_only_queries() {
     }
     let drain = mt.drain();
     writer
-        .write_partition("ts-meta", &drain, 86_400_000, 0, None)
+        .write_partition("ts-meta", &drain.view(), 86_400_000, 0, None)
         .unwrap();
 
     let part_dir = tmp.path().join("ts-meta");
@@ -531,7 +531,7 @@ fn columnar_segment_encrypted_at_rest() {
     let (tmp, drain) = build_simple_drain();
     let writer = ColumnarSegmentWriter::new(tmp.path());
     writer
-        .write_partition("enc-part", &drain, 86_400_000, 1, Some(&kek))
+        .write_partition("enc-part", &drain.view(), 86_400_000, 1, Some(&kek))
         .unwrap();
 
     let part_dir = tmp.path().join("enc-part");
@@ -576,7 +576,7 @@ fn columnar_segment_refuses_plaintext_with_kek() {
     let writer = ColumnarSegmentWriter::new(tmp.path());
     // Write WITHOUT encryption.
     writer
-        .write_partition("plain-part", &drain, 86_400_000, 1, None)
+        .write_partition("plain-part", &drain.view(), 86_400_000, 1, None)
         .unwrap();
 
     let part_dir = tmp.path().join("plain-part");
@@ -596,7 +596,7 @@ fn columnar_segment_refuses_encrypted_without_kek() {
     let (tmp, drain) = build_simple_drain();
     let writer = ColumnarSegmentWriter::new(tmp.path());
     writer
-        .write_partition("enc-part2", &drain, 86_400_000, 1, Some(&kek))
+        .write_partition("enc-part2", &drain.view(), 86_400_000, 1, Some(&kek))
         .unwrap();
 
     let part_dir = tmp.path().join("enc-part2");
@@ -615,7 +615,7 @@ fn columnar_segment_tampered_ciphertext_rejected() {
     let (tmp, drain) = build_simple_drain();
     let writer = ColumnarSegmentWriter::new(tmp.path());
     writer
-        .write_partition("tamper-part", &drain, 86_400_000, 1, Some(&kek))
+        .write_partition("tamper-part", &drain.view(), 86_400_000, 1, Some(&kek))
         .unwrap();
 
     let part_dir = tmp.path().join("tamper-part");
@@ -644,7 +644,7 @@ fn columnar_segment_mmap_plaintext_owned_buffer_encrypted() {
     let (tmp, drain) = build_simple_drain();
     let writer = ColumnarSegmentWriter::new(tmp.path());
     writer
-        .write_partition("mmap-part", &drain, 86_400_000, 1, Some(&kek))
+        .write_partition("mmap-part", &drain.view(), 86_400_000, 1, Some(&kek))
         .unwrap();
 
     let part_dir = tmp.path().join("mmap-part");
@@ -661,7 +661,7 @@ fn columnar_segment_mmap_plaintext_owned_buffer_encrypted() {
     let (tmp2, drain2) = build_simple_drain();
     let writer2 = ColumnarSegmentWriter::new(tmp2.path());
     writer2
-        .write_partition("plain-mmap", &drain2, 86_400_000, 1, None)
+        .write_partition("plain-mmap", &drain2.view(), 86_400_000, 1, None)
         .unwrap();
     let part_dir2 = tmp2.path().join("plain-mmap");
     let plain_mmap = ColumnarSegmentReader::mmap_column(&part_dir2, "timestamp", None).unwrap();

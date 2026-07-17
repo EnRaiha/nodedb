@@ -22,6 +22,24 @@ pub struct EntryMeta {
     pub expire_at_ms: u64,
 }
 
+/// One exported KV row, returned by [`KvHashTable::export_entries_with_surrogates`].
+///
+/// Carries everything needed to reconstruct the row through `KvEngine::put` —
+/// including the `surrogate`, without which the restored row would lose its
+/// stable cross-engine identity and no longer be reachable from a vector / FTS /
+/// spatial bitmap intersection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvExportEntry {
+    /// Primary key bytes.
+    pub key: Vec<u8>,
+    /// Value bytes, already resolved out of the overflow pool.
+    pub value: Vec<u8>,
+    /// Absolute expiry instant in ms since epoch, or `NO_EXPIRY` (`0`).
+    pub expire_at_ms: u64,
+    /// Stable global row identity, or `Surrogate::ZERO` when unbound.
+    pub surrogate: Surrogate,
+}
+
 /// Robin Hood hash table with incremental rehash.
 ///
 /// Uses two internal tables during rehash: `primary` (new, larger) and
@@ -110,13 +128,51 @@ impl KvHashTable {
     /// Export all entries for snapshot/backup.
     ///
     /// Returns `(key_bytes, value_bytes, expire_at_ms)` for every live entry.
+    /// Drops the surrogate — prefer [`KvHashTable::export_entries_with_surrogates`]
+    /// for any path that restores into a live engine, since a dropped surrogate
+    /// severs the row's cross-engine identity.
     pub fn export_entries(&self) -> Vec<(Vec<u8>, Vec<u8>, u64)> {
-        let mut result = Vec::with_capacity(self.len);
-        for entry in self.slots.iter().flatten() {
-            let value_bytes = extract_value_from(&entry.value, &self.overflow);
-            result.push((entry.key.clone(), value_bytes, entry.expire_at_ms));
-        }
-        result
+        self.live_entries()
+            .map(|entry| {
+                (
+                    entry.key.clone(),
+                    extract_value_from(&entry.value, &self.overflow),
+                    entry.expire_at_ms,
+                )
+            })
+            .collect()
+    }
+
+    /// Export all entries INCLUDING each row's stable cross-engine surrogate.
+    ///
+    /// The surrogate is read straight off the entry rather than reversed out of
+    /// `surrogate_to_key`: the entry is the authority (the reverse map is a
+    /// derived index of it), and entries created by internal read-modify-write
+    /// paths carry `Surrogate::ZERO` and have no reverse-map row at all — so
+    /// reversing the map would silently drop them.
+    pub fn export_entries_with_surrogates(&self) -> Vec<KvExportEntry> {
+        self.live_entries()
+            .map(|entry| KvExportEntry {
+                key: entry.key.clone(),
+                value: extract_value_from(&entry.value, &self.overflow),
+                expire_at_ms: entry.expire_at_ms,
+                surrogate: entry.surrogate,
+            })
+            .collect()
+    }
+
+    /// Every live entry, across BOTH the primary slots and the rehash source.
+    ///
+    /// While an incremental rehash is in progress, entries that have not yet
+    /// been migrated live only in `rehash_source`; an export that walked
+    /// `slots` alone would silently omit them. Migration `take()`s the entry
+    /// out of the source before inserting it into the primary, so an entry is
+    /// never present in both and this yields each live entry exactly once.
+    fn live_entries(&self) -> impl Iterator<Item = &KvEntry> {
+        self.slots
+            .iter()
+            .flatten()
+            .chain(self.rehash_source.iter().flatten().flatten())
     }
 
     /// Current load factor of the primary table.

@@ -258,3 +258,61 @@ pub struct ColumnarDrainResult {
     pub max_system_ts: i64,
     pub series_row_counts: HashMap<SeriesId, u64>,
 }
+
+impl ColumnarDrainResult {
+    /// Borrow this drained payload as a [`ColumnarFlushView`].
+    ///
+    /// Lets a caller that already owns a drain result share the one segment
+    /// writer with callers that only hold a live memtable.
+    pub fn view(&self) -> ColumnarFlushView<'_> {
+        ColumnarFlushView {
+            columns: &self.columns,
+            schema: &self.schema,
+            symbol_dicts: &self.symbol_dicts,
+            row_count: self.row_count,
+            min_ts: self.min_ts,
+            max_ts: self.max_ts,
+            max_system_ts: self.max_system_ts,
+        }
+    }
+}
+
+/// A BORROWED view of the rows a flush is about to encode.
+///
+/// This type exists so a segment can be written without the rows first leaving
+/// the memtable. `ColumnarSegmentWriter::write_partition` needs only to READ the
+/// columns, so taking a view rather than an owned `ColumnarDrainResult` lets the
+/// flush write the segment first and drain only once the write has committed —
+/// a failed write then costs a retry instead of the rows. Draining up front
+/// took them out of memory without putting them anywhere, and the coordinated
+/// checkpoint calls that flush on a timer.
+///
+/// It borrows rather than clones because the alternative — copying the payload
+/// so the memtable can keep its own — would duplicate up to the memtable's whole
+/// hard limit on the ingest path's flush, on a Data Plane core, for every flush.
+pub struct ColumnarFlushView<'a> {
+    pub columns: &'a [ColumnData],
+    pub schema: &'a ColumnarSchema,
+    pub symbol_dicts: &'a HashMap<usize, SymbolDictionary>,
+    pub row_count: u64,
+    pub min_ts: i64,
+    pub max_ts: i64,
+    /// Maximum `_ts_system` value across rows (bitemporal only; 0 otherwise).
+    pub max_system_ts: i64,
+}
+
+/// Scan the `_ts_system` column for its maximum, or `0` when the schema has no
+/// such column (non-bitemporal).
+///
+/// Shared by the drain and the borrowed view so the two can never disagree about
+/// the system-time bound a partition records for retention.
+pub(super) fn max_system_ts_of(schema: &ColumnarSchema, columns: &[ColumnData]) -> i64 {
+    schema
+        .ts_system_idx()
+        .and_then(|idx| columns.get(idx))
+        .map(|col| match col {
+            ColumnData::Timestamp(v) | ColumnData::Int64(v) => v.iter().copied().max().unwrap_or(0),
+            _ => 0,
+        })
+        .unwrap_or(0)
+}

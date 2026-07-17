@@ -2,6 +2,7 @@
 
 mod accessors;
 mod bitemporal_time;
+pub(in crate::data::executor) mod checkpoint_floors;
 mod columnar_schema_seed;
 pub(in crate::data::executor) mod commit_pending;
 mod decode_stored;

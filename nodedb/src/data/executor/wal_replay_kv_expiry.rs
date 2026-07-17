@@ -3,10 +3,12 @@
 //! WAL replay for the KV `Expire` / `Persist` TTL-mutation records.
 //!
 //! Both records were durably WAL-appended (`wal_append_kv_op`'s `KvOp::Expire`
-//! / `KvOp::Persist` arms) but had no decode arm in `replay_kv_wal` before
-//! this module existed — KV has no checkpoint, so WAL replay is the only
-//! durability mechanism for these writes, and both were silently lost on
-//! every crash-restart.
+//! / `KvOp::Persist` arms) but had no decode arm in `replay_kv_wal` before this
+//! module existed, so both were silently lost on every crash-restart. WAL replay
+//! is the recovery path for these writes above the KV checkpoint's replay floor;
+//! at or below that floor the checkpoint already carries each row's resolved
+//! absolute `expire_at_ms`, so the gate in `skip_kv_replay_record` is what stops
+//! a TTL mutation from being applied twice.
 //!
 //! `kv_expire` always carries the Control-Plane-resolved absolute
 //! `expire_at_ms` (see `encode_kv_expire`'s doc comment for why `EXPIRE` has
@@ -56,7 +58,7 @@ impl CoreLoop {
         if disc != "kv_expire" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
 
@@ -107,7 +109,7 @@ impl CoreLoop {
         if disc != "kv_persist" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
 

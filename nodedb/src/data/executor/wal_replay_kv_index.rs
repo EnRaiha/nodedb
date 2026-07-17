@@ -3,9 +3,16 @@
 //! WAL replay for the KV `RegisterIndex` / `DropIndex` secondary-index
 //! records.
 //!
-//! Secondary index state (`KvEngine::indexes`) lives only in-process — there
-//! is no durable catalog counterpart and KV has no checkpoint, so the WAL
-//! record is the only durability mechanism for a registered index. Replay is
+//! Secondary index state (`KvEngine::indexes`) lives only in-process — there is
+//! no durable catalog counterpart. This record is one of its two durable
+//! records; the other is the KV checkpoint, which carries each collection's
+//! registrations and their content in the same atomically published generation
+//! as its rows. That is what makes gating this arm on the replay floor safe: a
+//! floor is only ever installed by a generation that already holds every
+//! registration at or below it, so a gated-out record is one the checkpoint has
+//! already accounted for. See `kv_checkpoint`.
+//!
+//! Replay is
 //! LSN-ordered, so every `kv_put` that preceded a `RegisterIndex` record has
 //! already been applied to `self.tables` by the time it replays, exactly
 //! mirroring what the live registration saw when it ran.
@@ -66,7 +73,7 @@ impl CoreLoop {
         if disc != "kv_register_index" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
 
@@ -101,7 +108,7 @@ impl CoreLoop {
         if disc != "kv_drop_index" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
 

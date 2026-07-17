@@ -214,6 +214,44 @@ fn node_labels_bitset() {
     assert!(!csr.node_has_label(bob_id, "NonExistent"));
 }
 
+/// `labeled_nodes` is the export a checkpoint persists, so it must yield every
+/// labeled node under its NAME — including a node that has no edges at all,
+/// whose labels no edge-store rebuild could ever bring back.
+#[test]
+fn labeled_nodes_exports_every_labeled_node_by_name() {
+    let mut csr = CsrIndex::new();
+    csr.add_edge("alice", "KNOWS", "bob").unwrap();
+    csr.add_node_label("alice", "Person").unwrap();
+    csr.add_node_label("alice", "Employee").unwrap();
+    // Never edged: `add_node_label` vivifies it, exactly as the live handler
+    // does, and it exists ONLY in memory.
+    csr.add_node_label("ghost", "Person").unwrap();
+
+    let mut exported = csr.labeled_nodes();
+    exported.sort_by(|a, b| a.0.cmp(b.0));
+
+    assert_eq!(
+        exported,
+        vec![
+            ("alice", vec!["Person", "Employee"]),
+            ("ghost", vec!["Person"]),
+        ],
+        "every labeled node must export with all of its labels; `bob` has none \
+         and must not appear"
+    );
+}
+
+/// A label cleared with `remove_node_label` must leave the node out of the
+/// export entirely once its bitset empties — otherwise a restore would
+/// resurrect a label the user deleted.
+#[test]
+fn labeled_nodes_omits_a_node_whose_labels_were_all_removed() {
+    let mut csr = CsrIndex::new();
+    csr.add_node_label("alice", "Person").unwrap();
+    csr.remove_node_label("alice", "Person");
+    assert!(csr.labeled_nodes().is_empty());
+}
+
 /// Spec: edge-label interning MUST assign a distinct id to each distinct
 /// label, or fail loudly with an overflow error — never silently alias
 /// two unrelated labels to the same id.

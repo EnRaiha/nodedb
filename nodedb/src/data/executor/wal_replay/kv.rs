@@ -6,6 +6,40 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::write_index::KeyRepr;
 
 impl CoreLoop {
+    /// Whether a KV WAL record must NOT be re-applied during boot replay.
+    ///
+    /// Two independent reasons to skip, each a correctness bug if missed:
+    ///
+    /// * **Tombstoned** — the collection was dropped at or after this LSN, so
+    ///   the record is shadowed by a delete that may itself have fallen out of
+    ///   the live WAL.
+    /// * **Below the checkpoint floor** — the record's effect is already inside
+    ///   the KV checkpoint restored before replay. Skipping is mandatory rather
+    ///   than merely wasteful: most KV records are DELTAS (`kv_incr`, `kv_cas`,
+    ///   `kv_field_set`, `kv_transfer`, `kv_insert_on_conflict_update`) whose
+    ///   replay re-executes against current state instead of overwriting it, so
+    ///   re-applying one already folded into the checkpoint double-counts it.
+    ///
+    /// Records ABOVE the floor are safe to replay on top of the restored table:
+    /// the checkpoint reproduces exactly the state that existed at its stamped
+    /// LSN, so applying the remaining records in LSN order reaches the same
+    /// state a full from-zero replay would.
+    ///
+    /// The floor is engine-wide rather than per-collection because a KV
+    /// checkpoint publishes every collection at ONE LSN atomically — see
+    /// `kv_checkpoint.rs` for why a per-collection floor is unsound for the
+    /// records that span two collections.
+    pub(in crate::data::executor) fn skip_kv_replay_record(
+        &self,
+        tombstones: &nodedb_wal::TombstoneSet,
+        tenant_id: u64,
+        collection: &str,
+        record_lsn: u64,
+    ) -> bool {
+        tombstones.is_tombstoned(tenant_id, collection, record_lsn)
+            || self.floors.replay_floors.kv.covers(record_lsn)
+    }
+
     /// Replay WAL KV records to rebuild in-memory hash tables after crash.
     ///
     /// KV records use generic `RecordType::Put` and `RecordType::Delete` with
@@ -68,7 +102,7 @@ impl CoreLoop {
                     )
                     && disc == "kv_put"
                 {
-                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+                    if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
                         continue;
                     }
                     self.kv_engine.put_with_absolute_expiry(
@@ -100,7 +134,7 @@ impl CoreLoop {
                     zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&record.payload)
                     && disc == "kv_put"
                 {
-                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+                    if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
                         continue;
                     }
                     self.kv_engine.put(crate::engine::kv::KvPutParams {
@@ -140,7 +174,7 @@ impl CoreLoop {
                     )
                     && disc == "kv_batch_put"
                 {
-                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+                    if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
                         continue;
                     }
                     let surrogates = vec![nodedb_types::Surrogate::ZERO; entries.len()];
@@ -176,7 +210,7 @@ impl CoreLoop {
                     )
                     && disc == "kv_batch_put"
                 {
-                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+                    if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
                         continue;
                     }
                     // Same as the `kv_put` replay arm above: this local WAL
@@ -362,7 +396,7 @@ impl CoreLoop {
                     zerompk::from_msgpack::<(&str, String, Vec<Vec<u8>>)>(&record.payload)
                     && disc == "kv_delete"
                 {
-                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+                    if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
                         continue;
                     }
                     self.kv_engine
@@ -385,7 +419,7 @@ impl CoreLoop {
                     zerompk::from_msgpack::<(&str, String)>(&record.payload)
                     && disc == "kv_truncate"
                 {
-                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+                    if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
                         continue;
                     }
                     self.kv_engine.truncate(database_id, tenant_id, &collection);

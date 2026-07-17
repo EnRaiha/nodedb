@@ -6,9 +6,14 @@
 //! hash table; the expiry wheel is shared across all collections on
 //! this core (one wheel tick processes all collections).
 
+mod checkpoint_export;
+mod checkpoint_restore;
 mod scan_ops;
 #[cfg(test)]
 mod tests;
+
+pub use checkpoint_export::KvCollectionRef;
+pub use checkpoint_restore::{RestoreCompositeIndexParams, RestoreFieldIndexParams};
 
 use std::collections::HashMap;
 

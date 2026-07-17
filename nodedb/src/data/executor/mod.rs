@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+pub(crate) mod array_checkpoint;
+pub(crate) mod checkpoint_decode_error;
 pub(crate) mod checkpoint_encoding;
+pub(crate) mod checkpoint_outcome;
+pub(crate) mod columnar_checkpoint;
 pub mod core_loop;
 pub(crate) mod crdt_checkpoint;
 mod dispatch;
 pub(crate) mod doc_format;
 pub mod enforcement;
 pub(crate) mod fts_text;
+mod graph_label_checkpoint;
 pub mod handlers;
+pub(crate) mod kv_checkpoint;
 pub(super) mod msgpack_utils;
+pub(crate) mod replay_floors;
 pub mod response_codec;
 mod scan_normalize;
 mod scan_versioned;
@@ -18,7 +25,9 @@ mod spatial_checkpoint;
 mod spatial_key;
 pub(crate) mod strict_format;
 pub(in crate::data) mod sync_gate;
+mod sync_hwm_checkpoint;
 pub mod task;
+pub(crate) mod timeseries_checkpoint;
 pub(crate) mod vector_checkpoint;
 mod wal_replay;
 mod wal_replay_all;

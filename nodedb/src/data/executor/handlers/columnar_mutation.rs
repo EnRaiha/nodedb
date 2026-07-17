@@ -188,6 +188,25 @@ impl CoreLoop {
             });
         }
 
+        // Advance the collection floor for this committed columnar write, exactly
+        // as `execute_columnar_insert` does.
+        //
+        // The columnar checkpoint stamps its generation with the core watermark
+        // and that stamp becomes the replay floor, so the watermark must mean
+        // "every columnar record at or below this is folded into the engines".
+        // An UPDATE that mutated rows without raising it would sit ABOVE the
+        // stamp of a checkpoint that already contains it, and replay would
+        // re-execute it — appending a duplicate row, since the update is
+        // delete-old-PK + insert-new-row rather than an overwrite.
+        //
+        // Gated on `affected` for the same reason as the insert path: a
+        // predicate that matched nothing wrote nothing, so it owes no floor, and
+        // re-executing it against the identical restored state matches nothing
+        // again.
+        if affected > 0 {
+            self.note_collection_write_lsn(task, collection);
+        }
+
         debug!(core = self.core_id, %collection, affected, "columnar update complete");
         let result = serde_json::json!({ "affected": affected });
         match super::super::response_codec::encode_json(&result) {
@@ -310,6 +329,16 @@ impl CoreLoop {
                 collection_key: key,
                 restored,
             });
+        }
+
+        // Advance the collection floor for this committed columnar write. DELETE
+        // replays idempotently, so unlike UPDATE it is not the record whose
+        // double-application corrupts — but the watermark is a single claim
+        // across all columnar records, and a delete left unstamped understates
+        // it, needlessly holding WAL segments and denying a concurrent
+        // transaction the conflict it should see against the rows this removed.
+        if affected > 0 {
+            self.note_collection_write_lsn(task, collection);
         }
 
         debug!(core = self.core_id, %collection, affected, "columnar delete complete");

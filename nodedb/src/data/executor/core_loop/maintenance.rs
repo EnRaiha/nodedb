@@ -58,10 +58,6 @@ impl CoreLoop {
     pub fn set_checkpoint_config(&mut self, config: crate::storage::checkpoint::CheckpointConfig) {
         self.checkpoint_coordinator =
             crate::storage::checkpoint::CheckpointCoordinator::new(config);
-        self.checkpoint_coordinator.register_engine("sparse");
-        self.checkpoint_coordinator.register_engine("vector");
-        self.checkpoint_coordinator.register_engine("crdt");
-        self.checkpoint_coordinator.register_engine("timeseries");
     }
 
     /// Set L1 segment compaction config.

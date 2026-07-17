@@ -262,6 +262,13 @@ ilp = false                       # Example: disable TLS for ILP ingest
 | `tls.resp`   | `NODEDB_TLS_RESP`    | `true`  |
 | `tls.ilp`    | `NODEDB_TLS_ILP`     | `true`  |
 
+**Checkpoint & WAL settings:**
+
+| Config field                    | Environment variable              | Default |
+| -------------------------------- | ---------------------------------- | ------- |
+| `checkpoint.interval_secs`       | `NODEDB_CHECKPOINT_INTERVAL_SECS`  | `300`   |
+| `checkpoint.wal_segment_target_mb` | `NODEDB_WAL_SEGMENT_TARGET_MB`   | `64`    |
+
 ## Connect
 
 ### With the `ndb` CLI

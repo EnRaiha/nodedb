@@ -65,7 +65,54 @@ fn vector_checkpoint_writes_are_durable() {
 
 #[test]
 fn sparse_vector_checkpoint_writes_are_durable() {
-    assert_durable_checkpoint_writer("nodedb/src/data/executor/sparse_vector_checkpoint.rs");
+    assert_durable_checkpoint_writer("nodedb/src/data/executor/sparse_vector_checkpoint/write.rs");
+}
+
+#[test]
+fn kv_checkpoint_writes_are_durable() {
+    assert_durable_checkpoint_writer("nodedb/src/data/executor/kv_checkpoint/write.rs");
+}
+
+#[test]
+fn sync_hwm_checkpoint_writes_are_durable() {
+    assert_durable_checkpoint_writer("nodedb/src/data/executor/sync_hwm_checkpoint/write.rs");
+}
+
+#[test]
+fn columnar_checkpoint_writes_are_durable() {
+    // Columnar is memory-only on both halves: the live memtables AND the
+    // encoded flushed-segment bytes. Its checkpoint files are the only non-WAL
+    // copy of either, so a zero-filled file after power loss is data loss.
+    assert_durable_checkpoint_writer("nodedb/src/data/executor/columnar_checkpoint/write.rs");
+}
+
+#[test]
+fn graph_label_checkpoint_writes_are_durable() {
+    // The CSR node-label bitset has no redb store behind it — unlike the edges,
+    // which are rebuilt from the `EdgeStore` at boot. This file is the labels'
+    // only non-WAL copy, so a zero-filled file after power loss silently
+    // unlabels every node while its edges come back intact.
+    assert_durable_checkpoint_writer("nodedb/src/data/executor/graph_label_checkpoint/write.rs");
+}
+
+#[test]
+fn array_segment_and_manifest_writes_are_durable() {
+    // The array engine writes no checkpoint blob: the coordinated checkpoint
+    // reports its on-disk tile SEGMENTS as its durability, so those writes are
+    // checkpoint-class and carry the same power-loss exposure. The manifest
+    // write is the commit point that makes a segment reachable at all.
+    assert_durable_checkpoint_writer("nodedb/src/engine/array/flush.rs");
+    assert_durable_checkpoint_writer("nodedb/src/engine/array/store/manifest.rs");
+}
+
+#[test]
+fn timeseries_partition_writes_are_durable() {
+    // Timeseries writes no checkpoint blob: the coordinated checkpoint reports
+    // its on-disk L1 PARTITIONS as its durability, so every file the segment
+    // writer emits is checkpoint-class and carries the same power-loss
+    // exposure. `partition.meta` is written last and is the commit point that
+    // makes the partition reachable at all.
+    assert_durable_checkpoint_writer("nodedb/src/engine/timeseries/columnar_segment/writer.rs");
 }
 
 #[test]
@@ -109,7 +156,9 @@ fn snapshot_writer_core_and_manifest_writes_are_durable() {
 fn crdt_checkpoint_writes_are_durable() {
     // Shares the same design flaw as the five files named in the bug report —
     // CRDT checkpoints also use the raw fs::write + fs::rename pair.
-    assert_durable_checkpoint_writer("nodedb/src/data/executor/handlers/control/snapshot.rs");
+    assert_durable_checkpoint_writer(
+        "nodedb/src/data/executor/handlers/control/checkpoint_crdt.rs",
+    );
 }
 
 /// Regression guard against the specific silent-failure mode: on ext4 / XFS
@@ -202,8 +251,16 @@ fn timeseries_ddl_partition_swap_is_durable() {
 fn checkpoint_reads_drop_page_cache() {
     for rel in [
         "nodedb/src/data/executor/vector_checkpoint.rs",
-        "nodedb/src/data/executor/sparse_vector_checkpoint.rs",
+        "nodedb/src/data/executor/sparse_vector_checkpoint/load.rs",
         "nodedb/src/data/executor/spatial_checkpoint.rs",
+        "nodedb/src/data/executor/kv_checkpoint/load.rs",
+        "nodedb/src/data/executor/sync_hwm_checkpoint/load.rs",
+        "nodedb/src/data/executor/columnar_checkpoint/load.rs",
+        "nodedb/src/data/executor/graph_label_checkpoint/load.rs",
+        // The timeseries loader reads one `partition.meta` per partition to
+        // rebuild the registry at boot. They are consumed once and superseded
+        // by the in-memory registry, exactly like every checkpoint blob above.
+        "nodedb/src/data/executor/timeseries_checkpoint/load.rs",
     ] {
         let src = read(rel);
         assert!(

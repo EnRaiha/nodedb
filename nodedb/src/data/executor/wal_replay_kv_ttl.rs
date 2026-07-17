@@ -9,10 +9,10 @@
 //! AND threaded onto the dispatched `Request` (`resolved_now_ms`) so the live
 //! Data-Plane apply installs the SAME instant. Replay installs the encoded
 //! instant verbatim rather than recomputing `now_ms + ttl_ms` at replay time,
-//! which would drift the expiry forward by the crash-to-restart delay. KV has
-//! no checkpoint, so WAL replay is the only durability mechanism for these
-//! writes — an untested drift here silently outlives its intended TTL after
-//! every crash-restart.
+//! which would drift the expiry forward by the crash-to-restart delay. The KV
+//! checkpoint stores the same resolved absolute instant for the rows below its
+//! replay floor, and WAL replay recovers everything above it — an untested drift
+//! on either path silently outlives its intended TTL after a crash-restart.
 
 #[cfg(test)]
 mod tests {

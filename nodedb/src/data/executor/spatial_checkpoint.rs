@@ -19,6 +19,7 @@
 use nodedb_types::DatabaseId;
 
 use super::checkpoint_encoding::{dec_component, enc_component};
+use super::checkpoint_outcome::CheckpointOutcome;
 use super::core_loop::CoreLoop;
 use crate::types::TenantId;
 
@@ -35,7 +36,8 @@ pub(crate) fn spatial_ckpt_dir(data_dir: &std::path::Path, core_id: usize) -> st
 }
 
 impl CoreLoop {
-    /// Write R-tree checkpoints for all spatial indexes to disk.
+    /// Flush every in-memory R-tree to disk and report the LSN they are now
+    /// durable through, plus the number of checkpoint files published.
     ///
     /// Each index is serialized via `nodedb_spatial::persist` to a file at
     /// `{data_dir}/spatial-ckpt/core-{core_id}/{db}_{tid}_{enc(coll)}_{enc(field)}.ckpt`.
@@ -43,42 +45,71 @@ impl CoreLoop {
     ///
     /// When `spatial_checkpoint_kek` is set, checkpoint files are written
     /// encrypted (AES-256-GCM SEGV framing) and plaintext loads are refused.
-    pub fn checkpoint_spatial_indexes(&self) -> usize {
+    ///
+    /// ## Why this returns a `Result` and an LSN
+    ///
+    /// `spatial_indexes` holds entries from two different write paths, and only
+    /// one of them has a rebuild behind it:
+    ///
+    /// - Geometry on a COLUMNAR-family collection (`engine='spatial'`) is
+    ///   re-derived at boot by `restore_columnar_geometry_indexes` from the rows
+    ///   the columnar checkpoint restored, so it survives the loss of this file.
+    /// - Geometry on a DOCUMENT collection is indexed by `apply_point_put_spatial`
+    ///   and has NO live rebuild. `rebuild_spatial_indexes_from_store` looks like
+    ///   one, but its seed (`load_spatial_collection_seed`) selects on
+    ///   `collection_type.is_spatial()` — i.e. the columnar-family collections
+    ///   whose rows never enter the redb `sparse` store it scans. Document
+    ///   collections, whose geometry it COULD rebuild from `sparse`, are never in
+    ///   the seed. So for those entries this checkpoint and the `Put` records are
+    ///   the only two copies.
+    ///
+    /// Rather than rank those two halves against each other at truncation time,
+    /// the flush reports honestly for both: any index or doc_map that cannot be
+    /// published returns `Err`, and the caller clamps the reported checkpoint LSN
+    /// to the last LSN the R-trees were known durable through. Over-reporting
+    /// would drop geometry entries while the rows they point at survive — a
+    /// spatial predicate silently stops matching rows a full scan still returns.
+    ///
+    /// Stamping with the core watermark mirrors `checkpoint_kv_engines`: this
+    /// runs on the core's own thread between tasks, and a geometry write raises
+    /// the watermark only after the R-tree has already been mutated.
+    pub(crate) fn checkpoint_spatial_indexes(&self) -> crate::Result<CheckpointOutcome> {
+        let durable_lsn = self.watermark;
         if self.spatial_indexes.is_empty() {
-            return 0;
+            return Ok(CheckpointOutcome {
+                durable_lsn,
+                files_written: 0,
+            });
         }
 
         let ckpt_dir = spatial_ckpt_dir(&self.data_dir, self.core_id);
-        if std::fs::create_dir_all(&ckpt_dir).is_err() {
-            tracing::warn!(
-                core = self.core_id,
-                "failed to create spatial checkpoint dir"
-            );
-            return 0;
-        }
+        std::fs::create_dir_all(&ckpt_dir).map_err(|e| storage_err(&ckpt_dir, "create dir", &e))?;
 
         let kek = self.segment_keks.spatial_checkpoint_kek.as_ref();
 
-        let mut checkpointed = 0;
+        let mut files_written = 0;
         for ((db, tid, coll, field), rtree) in &self.spatial_indexes {
             let stem = checkpoint_stem(*db, *tid, coll, field);
-            let bytes = match rtree.checkpoint_to_bytes(kek) {
-                Ok(b) if !b.is_empty() => b,
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!(%stem, error = %e, "R-tree checkpoint failed");
-                    continue;
-                }
-            };
+            let bytes = rtree
+                .checkpoint_to_bytes(kek)
+                .map_err(|e| storage_err(&ckpt_dir.join(&stem), "encode R-tree", &e))?;
+            // An empty R-tree holds nothing to make durable, so it writes
+            // neither checkpoint nor doc_map and cannot overstate the LSN.
+            if bytes.is_empty() {
+                continue;
+            }
 
             // Write R-tree checkpoint.
             let ckpt_path = ckpt_dir.join(format!("{stem}.ckpt"));
             let tmp_path = ckpt_dir.join(format!("{stem}.ckpt.tmp"));
-            if nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &bytes).is_ok() {
-                checkpointed += 1;
-            }
+            nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &bytes)
+                .map_err(|e| storage_err(&ckpt_path, "publish checkpoint", &e))?;
+            files_written += 1;
 
-            // Write doc_map entries for this index.
+            // Write doc_map entries for this index. It is not optional company
+            // for the R-tree: `load_spatial_checkpoints` needs it to map an
+            // entry id back to a document id, so an R-tree published without
+            // its doc_map restores as entries that resolve to nothing.
             let doc_entries: Vec<(u64, String)> = self
                 .spatial_doc_map
                 .iter()
@@ -86,28 +117,33 @@ impl CoreLoop {
                 .map(|((_, _, _, _, entry_id), doc_id)| (*entry_id, doc_id.clone()))
                 .collect();
             if !doc_entries.is_empty() {
-                let map_bytes = match zerompk::to_msgpack_vec(&doc_entries) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(%stem, error = %e, "spatial doc_map serialization failed");
-                        continue;
+                let map_bytes = zerompk::to_msgpack_vec(&doc_entries).map_err(|e| {
+                    crate::Error::Serialization {
+                        format: "msgpack".to_string(),
+                        detail: format!("spatial doc_map encode failed for {stem}: {e}"),
                     }
-                };
+                })?;
                 let map_path = ckpt_dir.join(format!("{stem}.docmap"));
                 let map_tmp = ckpt_dir.join(format!("{stem}.docmap.tmp"));
-                let _ = nodedb_wal::segment::atomic_write_fsync(&map_tmp, &map_path, &map_bytes);
+                nodedb_wal::segment::atomic_write_fsync(&map_tmp, &map_path, &map_bytes)
+                    .map_err(|e| storage_err(&map_path, "publish doc_map", &e))?;
+                files_written += 1;
             }
         }
 
-        if checkpointed > 0 {
+        if files_written > 0 {
             tracing::info!(
                 core = self.core_id,
-                checkpointed,
+                files_written,
                 total = self.spatial_indexes.len(),
+                durable_through_lsn = durable_lsn.as_u64(),
                 "spatial indexes checkpointed"
             );
         }
-        checkpointed
+        Ok(CheckpointOutcome {
+            durable_lsn,
+            files_written,
+        })
     }
 
     /// Load R-tree checkpoints from disk on startup.
@@ -203,6 +239,18 @@ impl CoreLoop {
         if loaded > 0 {
             tracing::info!(core = self.core_id, loaded, "spatial checkpoints loaded");
         }
+    }
+}
+
+/// Wrap a filesystem or encode failure as the spatial engine's typed storage
+/// error.
+fn storage_err(path: &std::path::Path, action: &str, e: &dyn std::fmt::Display) -> crate::Error {
+    crate::Error::Storage {
+        engine: "spatial".to_string(),
+        detail: format!(
+            "spatial checkpoint: failed to {action} at {}: {e}",
+            path.display()
+        ),
     }
 }
 

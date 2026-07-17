@@ -16,12 +16,22 @@ impl ArrayEngine {
     /// Flush the array's memtable to a new on-disk segment using a
     /// caller-supplied LSN as the segment's flush watermark. A no-op if
     /// the memtable is empty.
+    ///
+    /// The memtable is cleared LAST, once the segment and the manifest naming
+    /// it are both on disk. Draining it up front — as this did while the only
+    /// caller was an explicit `NDARRAY_FLUSH` — means an encode or write failure
+    /// takes the cells out of memory without putting them anywhere: reads stop
+    /// returning them for the rest of the process's life, and only a restart's
+    /// WAL replay brings them back. Now every failure path leaves the memtable
+    /// exactly as it was, so a failed flush costs nothing but the retry, and the
+    /// caller's clamped checkpoint LSN keeps the WAL records that back it.
     pub fn flush(&mut self, id: &ArrayId, wal_lsn: u64) -> ArrayEngineResult<Option<SegmentRef>> {
         let Some(prepared) = self.prepare_flush(id)? else {
             return Ok(None);
         };
-        self.install_flushed_segment(id, prepared, wal_lsn)
-            .map(Some)
+        let seg_ref = self.install_flushed_segment(id, prepared, wal_lsn)?;
+        self.store_mut(id)?.memtable = Memtable::new();
+        Ok(Some(seg_ref))
     }
 
     fn prepare_flush(&mut self, id: &ArrayId) -> ArrayEngineResult<Option<PreparedFlush>> {
@@ -32,8 +42,11 @@ impl ArrayEngine {
         let schema = store.schema().clone();
         let schema_hash = store.schema_hash();
         let kek = store.kek().cloned();
-        let drained = std::mem::replace(&mut store.memtable, Memtable::new()).drain_sorted();
-        let built = build_segment_from_memtable(&schema, schema_hash, kek.as_ref(), &drained)?;
+        // Built from a BORROW of the memtable, never a drain: nothing may leave
+        // memory before it is durable. `Memtable::iter` walks a `BTreeMap`, so
+        // tiles arrive in `TileId`-ascending order exactly as before.
+        let built =
+            build_segment_from_memtable(&schema, schema_hash, kek.as_ref(), store.memtable.iter())?;
         let segment_id = store.allocate_segment_id();
         Ok(Some(PreparedFlush {
             segment_id,
@@ -55,6 +68,10 @@ impl ArrayEngine {
         write_atomic(&path, &prepared.bytes).map_err(|e| ArrayEngineError::Io {
             detail: format!("write segment {path:?}: {e}"),
         })?;
+        // Any failure past this point leaves the segment file on disk but
+        // unreferenced by the manifest — inert bytes, not a half-published
+        // state, and the caller clamps the checkpoint LSN so the WAL records it
+        // holds are kept.
         let seg_ref = SegmentRef {
             id: prepared.segment_id,
             level: 0,
@@ -84,17 +101,17 @@ struct BuiltSegment {
     tile_count: u32,
 }
 
-fn build_segment_from_memtable(
+fn build_segment_from_memtable<'a>(
     schema: &ArraySchema,
     schema_hash: u64,
     kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
-    drained: &[(TileId, TileBuffer)],
+    tiles: impl Iterator<Item = (&'a TileId, &'a TileBuffer)>,
 ) -> ArrayResult<BuiltSegment> {
     let mut writer = SegmentWriter::new(schema_hash);
     let mut min_tile: Option<TileId> = None;
     let mut max_tile: Option<TileId> = None;
     let mut tile_count: u32 = 0;
-    for (tile_id, buf) in drained {
+    for (tile_id, buf) in tiles {
         if buf.entry_count() == 0 {
             continue;
         }
@@ -112,26 +129,24 @@ fn build_segment_from_memtable(
     })
 }
 
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+/// Write a segment file durably: data fsynced before the rename, and the parent
+/// directory fsynced after it.
+///
+/// Routed through `nodedb_wal::segment::atomic_write_fsync` rather than
+/// re-implemented, because this is a checkpoint-class write: the coordinated
+/// checkpoint reports these segments as the array engine's durability and the
+/// WAL segments below that LSN are then deleted. A correctly-named file full of
+/// zeros after power loss — what a rename that reaches disk ahead of the data
+/// pages produces — is not a degraded segment, it is the only copy of those
+/// cells, gone. The one helper keeps the ordering from drifting per call site.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), nodedb_wal::WalError> {
     let mut tmp = path.to_path_buf();
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().into_owned())
         .unwrap_or_default();
     tmp.set_extension(format!("{ext}.tmp"));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    if let Some(dir) = path.parent()
-        && let Ok(d) = std::fs::File::open(dir)
-    {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    nodedb_wal::segment::atomic_write_fsync(&tmp, path, bytes)
 }
 
 #[cfg(test)]
@@ -159,5 +174,42 @@ mod tests {
         let mut e = ArrayEngine::new(ArrayEngineConfig::new(dir.path().to_path_buf())).unwrap();
         e.open_array(aid(), schema(), 0x1).unwrap();
         assert!(e.flush(&aid(), 1).unwrap().is_none());
+    }
+
+    /// A flush that cannot write its segment must leave the memtable untouched.
+    /// Draining first would take the cells out of memory without putting them
+    /// anywhere — reads would stop returning them until a restart replayed the
+    /// WAL, which the coordinated checkpoint now calls this on a timer.
+    #[test]
+    fn failed_flush_leaves_the_memtable_intact() {
+        let dir = TempDir::new().unwrap();
+        let mut e = ArrayEngine::new(ArrayEngineConfig::new(dir.path().to_path_buf())).unwrap();
+        e.open_array(aid(), schema(), 0xCAFE).unwrap();
+        put_one(&mut e, 1, 2, 10, 1);
+
+        // Take the array's directory away so the segment write has nowhere to
+        // land.
+        let root = e.store(&aid()).unwrap().root().to_path_buf();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            e.flush(&aid(), 7).is_err(),
+            "a flush that cannot write its segment must report the failure, not \
+             swallow it — the caller clamps its checkpoint LSN on this Err"
+        );
+        assert_eq!(
+            e.store(&aid()).unwrap().memtable.stats().cell_count,
+            1,
+            "the cell must still be live in the memtable after the failed flush"
+        );
+
+        // And the retry, once the directory is back, still publishes it.
+        std::fs::create_dir_all(&root).unwrap();
+        let seg = e.flush(&aid(), 7).unwrap().expect("retry must flush");
+        assert_eq!(seg.tile_count, 1);
+        assert!(
+            e.store(&aid()).unwrap().memtable.is_empty(),
+            "a SUCCESSFUL flush must clear the memtable — the cells are durable now"
+        );
     }
 }

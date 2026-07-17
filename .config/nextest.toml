@@ -51,13 +51,26 @@ retries = { backoff = "fixed", count = 2, delay = "1s" }
 # default 30s × 4 = 120s ceiling stays in force for unit tests.
 slow-timeout = { period = "30s", terminate-after = 6 }
 
+# WAL-truncation crash tests wait on real wall-clock server behaviour that the
+# other real-server tests do not: a checkpoint cycle must fire AND actually
+# unlink a sealed segment before the test can crash the server, on top of two
+# full server bring-ups. That is legitimately slower than a test which writes a
+# row and immediately kills the process, so the default 30s × 4 = 120s ceiling
+# is too tight to distinguish "slow" from "hung". Only the ceiling moves — the
+# in-test truncation wait is bounded separately and fails on its own.
+# Settings are resolved per-key by first match, so the group/threads settings
+# from the override below still apply to this binary.
+[[profile.default.overrides]]
+filter = 'binary(crash_wal_truncation)'
+slow-timeout = { period = "30s", terminate-after = 8 }
+
 # Tests that spawn REAL `nodedb` server OS processes (crash-recovery,
 # startup-failure, shutdown lifecycle). Each brings up a full Data Plane
 # (per-core threads, jemalloc arenas, listeners); running several at once
 # exhausts ports / connections and causes spurious `ConnectionRefused`.
 # Serialize them like the cluster group so at most one runs at a time.
 [[profile.default.overrides]]
-filter = 'binary(crash_recovery) | binary(crash_recovery_overlays) | binary(crash_recovery_analytics) | binary(startup_failure) | binary(shutdown_in_flight) | binary(shutdown_budget) | binary(shutdown_abort_offender) | binary(shutdown_idempotent)'
+filter = 'binary(crash_recovery) | binary(crash_recovery_overlays) | binary(crash_recovery_analytics) | binary(crash_wal_truncation) | binary(startup_failure) | binary(shutdown_in_flight) | binary(shutdown_budget) | binary(shutdown_abort_offender) | binary(shutdown_idempotent)'
 test-group = 'server-process'
 # Claim every slot so each real-server test runs strictly ALONE — no other
 # server-spawning test (in-process or OS-process) runs alongside to steal

@@ -277,48 +277,185 @@ impl CoreLoop {
     /// Execute a coordinated checkpoint: flush all engine state to disk
     /// and return this core's checkpoint LSN.
     ///
-    /// 1. Checkpoint vector indexes (HNSW segments → disk files).
-    /// 2. Export CRDT snapshots (Loro docs → disk files).
-    /// 3. redb sparse engine is already ACID — no action needed.
-    /// 4. CSR is rebuilt from redb edge store on startup — no action needed.
-    /// 5. Return the core's watermark LSN as the checkpoint point.
+    /// 1. Checkpoint KV collections (hash tables → disk files).
+    /// 2. Checkpoint sparse vector indexes (inverted indexes → disk files).
+    /// 3. Checkpoint the sync idempotency gate (HWM + epoch maps → disk file).
+    /// 4. Checkpoint columnar collections (memtables + PK indexes + delete
+    ///    bitmaps + in-memory flushed segment bytes → disk files).
+    /// 5. Checkpoint the CSR graph node labels (label bitsets → disk file).
+    /// 6. Checkpoint the array engines (memtables → on-disk tile segments).
+    /// 7. Checkpoint the timeseries engines (columnar memtables → on-disk L1
+    ///    partitions).
+    /// 8. Checkpoint vector indexes (HNSW segments → disk files).
+    /// 9. Export CRDT snapshots (Loro docs → disk files).
+    /// 10. Flush spatial R-tree indexes to disk.
+    /// 11. redb sparse engine is already ACID — no action needed. Neither is the
+    ///     full-text `inverted` index, for the same reason and in the same
+    ///     store: both its write paths commit POSTINGS / DOC_LENGTHS / STATS
+    ///     into that redb `Database`, so it has nothing memory-only to flush.
+    /// 12. Graph EDGES are committed to the redb edge store at apply time and
+    ///     rebuilt into the CSR on startup — no action needed. Their node
+    ///     LABELS are not (step 5).
+    /// 13. Return the LSN below which ALL of this core's state is durable.
+    ///
+    /// ## The LSN this returns is a deletion authority, not a progress report
+    ///
+    /// The checkpoint manager takes the minimum of every core's reply and hands
+    /// it to `WalManager::truncate_before`, which unlinks the sealed segments
+    /// below it. So the returned LSN must satisfy one rule:
+    ///
+    /// > every byte of this core's state at or below the returned LSN is
+    /// > recoverable WITHOUT the WAL — either flushed by this checkpoint, or
+    /// > held in a durable store that is not the WAL.
+    ///
+    /// Reporting the watermark unconditionally violated that rule for any engine
+    /// whose flush was partial or absent, and deleted the only copy of its
+    /// state. The LSN is therefore computed as `min(watermark, every engine's
+    /// reported durable LSN)`: a flush that fails clamps the LSN instead of
+    /// silently widening the deletion.
     pub(in crate::data::executor) fn execute_checkpoint(
         &mut self,
         task: &ExecutionTask,
     ) -> Response {
-        let checkpoint_lsn = self.watermark.as_u64();
+        // Every engine on this core whose flush can fail contributes the LSN it
+        // is durable through. The watermark is the ceiling — no engine can be
+        // durable past writes this core has not seen — and every contribution
+        // can only pull it DOWN.
+        //
+        // No engine is left contributing nothing on the grounds that its flush
+        // reports no LSN; that gap is closed. The only state on this core with
+        // no contributor is state that needs none because the WAL is not its
+        // only other copy, and there are exactly three such cases:
+        //
+        //   - the redb `sparse` document store, which is ACID at apply time;
+        //   - the full-text `inverted` index, which is the SAME redb database —
+        //     both its write paths bypass the LSM memtable and commit postings
+        //     with the document write, so it has nothing memory-only to flush
+        //     and no flush to fail;
+        //   - graph EDGES, committed to the redb `EdgeStore` at apply time and
+        //     rebuilt into the CSR in `CoreLoop::open` (their node LABELS have
+        //     no such store, hence step 3c).
+        //
+        // A partial rebuild does NOT earn an engine a place on that list. Both
+        // vector and spatial have one — the HNSW re-indexes documents from
+        // `sparse`, the R-tree re-derives columnar geometry from restored rows —
+        // and both still contribute below, because each also holds state its
+        // rebuild cannot see (vectors inserted without a document; a document
+        // collection's geometry). An engine is only safe if the rebuild covers
+        // ALL of it.
+        // 1. Flush KV collections to disk, seeding the fold.
+        let mut durable_lsns: Vec<crate::types::Lsn> = vec![self.checkpoint_kv_durable_lsn()];
 
-        // 1. Flush vector indexes to disk.
-        let vectors_checkpointed = self.checkpoint_vector_indexes();
+        // 2. Flush the sparse-vector indexes. Same shape as KV — in-memory
+        //    state whose only durable copy was the WAL. Its flush used to hang
+        //    off an INDEPENDENT timer in `data/runtime.rs`, which is why it had
+        //    to move here: a flush that is not ordered against the truncation
+        //    it authorises is not a checkpoint, whatever its period.
+        durable_lsns.push(self.checkpoint_sparse_vector_durable_lsn());
 
-        // 2. Flush CRDT snapshots to disk.
-        let crdts_checkpointed = self.checkpoint_crdt_engines();
+        // 3. Flush the sync idempotency gate. Rebuilt at boot only from the
+        //    `SyncSeqAdvance` WAL records, so truncating them reset it and
+        //    already-applied sync frames were admitted a second time.
+        durable_lsns.push(self.checkpoint_sync_hwm_durable_lsn());
 
-        // 3. Flush spatial R-tree indexes to disk.
-        let spatial_checkpointed = self.checkpoint_spatial_indexes();
+        // 3b. Flush the columnar engines. Memory-only on both halves — the live
+        //     memtables in `columnar_engines` AND the encoded segment bytes in
+        //     `columnar_flushed_segments`, which no code path writes to disk.
+        //     Unlike the three above, columnar replay is not idempotent
+        //     (`ColumnarOp::Update` is delete-old-PK + insert-new-row), so this
+        //     LSN also becomes the restored replay floor.
+        durable_lsns.push(self.checkpoint_columnar_durable_lsn());
 
-        // 4. Compact CSR write buffers into dense arrays for clean state.
+        // 3c. Flush the CSR graph node labels. Edges are redb-backed and
+        //     rebuilt into the CSR from the `EdgeStore` at boot, so they are not
+        //     exported; the label bitset has no store behind it at all, which is
+        //     why `wal_replay_graph_labels.rs` exists as a standalone pass — and
+        //     why truncating the records it replays lost the labels outright
+        //     while the nodes and edges around them survived.
+        durable_lsns.push(self.checkpoint_graph_label_durable_lsn());
+
+        // 3d. Flush the array engines. Same memory-only memtable as columnar,
+        //     but the durable form already exists: this calls the very
+        //     `ArrayEngine::flush` an `NDARRAY_FLUSH` calls, whose segments the
+        //     boot path already mmaps. The hazard was that nothing but that
+        //     explicit user command ever invoked it.
+        durable_lsns.push(self.checkpoint_array_durable_lsn());
+
+        // 3e. Flush the timeseries engines. Same memory-only columnar memtable
+        //     as the plain columnar profile, but — like the array engine — the
+        //     durable form already exists: this calls the very
+        //     `flush_ts_collection` the ingest path's 64 MiB threshold and the
+        //     idle timer in `handlers/compact/maintenance.rs` call, whose L1
+        //     partitions `load_ts_registries` reads back at boot. The hazard was
+        //     that a threshold and a timer are not ordered against the
+        //     truncation this checkpoint authorises: a collection ingesting
+        //     steadily below the threshold had every row of the last idle window
+        //     in memory only.
+        durable_lsns.push(self.checkpoint_ts_durable_lsn());
+
+        // 4. Flush the vector indexes. `rebuild_vector_indexes_from_store`
+        //    re-indexes every document of a vector-indexed collection from redb
+        //    at boot, so document-borne vectors survive a lost checkpoint. It
+        //    is not a full backstop: `VectorOp::Insert` writes a bare vector
+        //    with no document behind it, and that path never touches `sparse`,
+        //    so the boot scan cannot see those vectors at all.
+        durable_lsns.push(self.checkpoint_vector_durable_lsn());
+
+        // 5. Flush the CRDT engines. No store of any kind behind the `LoroDoc`s
+        //    — `load_crdt_checkpoints` plus the WAL deltas above it are the only
+        //    two sources — so this is the KV situation exactly, with a quieter
+        //    failure: the documents come back at the last checkpoint's version
+        //    and every edit since it is simply missing.
+        durable_lsns.push(self.checkpoint_crdt_durable_lsn());
+
+        // 6. Flush the spatial R-trees. The geometry of a columnar-family
+        //    (`engine='spatial'`) collection does not depend on this file
+        //    surviving: `columnar_checkpoint/geometry_restore.rs` rebuilds it
+        //    from the restored columnar rows at boot. A DOCUMENT collection's
+        //    geometry does. `rebuild_spatial_indexes_from_store` is not its
+        //    backstop despite the name — its seed selects `is_spatial()`
+        //    collections, i.e. precisely the columnar ones whose rows are not in
+        //    the `sparse` store it scans, so it rebuilds nothing for either half.
+        durable_lsns.push(self.checkpoint_spatial_durable_lsn());
+
+        // 7. Compact CSR write buffers into dense arrays for clean state. This
+        //    is an in-memory layout change ONLY — it merges each partition's
+        //    write buffer into its dense adjacency arrays and touches no file.
+        //    It contributes nothing to the durable LSN and must not be read as
+        //    if it did: what makes the CSR survive a restart is the redb
+        //    `EdgeStore` for edges, and step 3c's checkpoint for node labels.
+        //    Its failure is therefore only a missed optimisation.
         if let Err(e) = self.csr.compact_all() {
             tracing::warn!(error = %e, "CSR compaction rejected by memory governor during snapshot; skipping");
         }
 
-        // 5. Record completed flushes in the checkpoint coordinator
-        //    and advance the checkpoint LSN for WAL truncation safety.
-        self.checkpoint_coordinator
-            .record_flush("vector", vectors_checkpointed);
-        self.checkpoint_coordinator
-            .record_flush("crdt", crdts_checkpointed);
-        self.checkpoint_coordinator
-            .record_flush("spatial", spatial_checkpointed);
-        self.checkpoint_coordinator
-            .complete_checkpoint(checkpoint_lsn);
+        // 8. Clamp the watermark down to every engine's durable LSN. `min` and
+        //    not `max`: the reported LSN authorises deletion, so where the
+        //    engines disagree the WAL must keep whatever the least-durable one
+        //    still needs.
+        let checkpoint_lsn = durable_lsns
+            .iter()
+            .fold(self.watermark, |acc, lsn| acc.min(*lsn))
+            .as_u64();
 
+        // The checkpoint coordinator is deliberately NOT told about this LSN.
+        // It schedules flushes; it does not record durability. Its per-engine
+        // dirty-page counters were already settled by the contributors above,
+        // which are the only places that know whether the flush they ran landed.
         info!(
             core = self.core_id,
             checkpoint_lsn,
-            vectors_checkpointed,
-            crdts_checkpointed,
-            spatial_checkpointed,
+            watermark = self.watermark.as_u64(),
+            kv_durable_lsn = self.floors.kv_durable_lsn.as_u64(),
+            sparse_vector_durable_lsn = self.floors.sparse_vector_durable_lsn.as_u64(),
+            sync_hwm_durable_lsn = self.floors.sync_hwm_durable_lsn.as_u64(),
+            columnar_durable_lsn = self.floors.columnar_durable_lsn.as_u64(),
+            graph_label_durable_lsn = self.floors.graph_label_durable_lsn.as_u64(),
+            array_durable_lsn = self.floors.array_durable_lsn.as_u64(),
+            ts_durable_lsn = self.floors.ts_durable_lsn.as_u64(),
+            vector_durable_lsn = self.floors.vector_durable_lsn.as_u64(),
+            crdt_durable_lsn = self.floors.crdt_durable_lsn.as_u64(),
+            spatial_durable_lsn = self.floors.spatial_durable_lsn.as_u64(),
             dirty_pages = self.checkpoint_coordinator.total_dirty_pages(),
             "core checkpoint complete"
         );
@@ -326,73 +463,5 @@ impl CoreLoop {
         // Return the checkpoint LSN as the response payload.
         let payload = checkpoint_lsn.to_le_bytes().to_vec();
         self.response_with_payload(task, payload)
-    }
-
-    /// Checkpoint all CRDT tenant engines to disk.
-    ///
-    /// Each tenant's Loro state is exported per collection and written to
-    /// `{data_dir}/crdt-ckpt/core-{core_id}/tenant-{tid}-coll-{hex(collection)}.ckpt`
-    /// with atomic temp+rename. The per-core subdir is required because `data_dir` is
-    /// shared across all cores and a tenant's CRDT state is fragmented across
-    /// cores by collection — without the subdir, cores would race-overwrite
-    /// the same file and persist only a partial fragment.
-    ///
-    /// Called from both `snapshot.rs` (explicit checkpoint command) and
-    /// `compact.rs` (periodic maintenance via `maybe_run_maintenance`).
-    pub(in crate::data::executor) fn checkpoint_crdt_engines(&self) -> usize {
-        if self.crdt_engines.is_empty() {
-            return 0;
-        }
-
-        let ckpt_dir =
-            crate::data::executor::crdt_checkpoint::crdt_ckpt_dir(&self.data_dir, self.core_id);
-        if std::fs::create_dir_all(&ckpt_dir).is_err() {
-            warn!(core = self.core_id, "failed to create CRDT checkpoint dir");
-            return 0;
-        }
-
-        let mut checkpointed = 0;
-        for (tenant_id, engine) in &self.crdt_engines {
-            let tid = tenant_id.as_u64();
-            // One checkpoint file per (tenant, collection) — each collection
-            // owns its own LoroDoc. Filenames are
-            // `tenant-{id}-coll-{hex(collection)}.ckpt`, matching the loader's
-            // parse and the cluster-restore writer.
-            let snapshots = match engine.export_all_snapshots() {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        core = self.core_id,
-                        tenant = tid,
-                        error = %e,
-                        "CRDT checkpoint export failed"
-                    );
-                    continue;
-                }
-            };
-            for (collection, snapshot) in snapshots {
-                if snapshot.is_empty() {
-                    continue;
-                }
-                let fname =
-                    crate::data::executor::crdt_checkpoint::crdt_ckpt_filename(tid, &collection);
-                let ckpt_path = ckpt_dir.join(&fname);
-                let tmp_path = ckpt_dir.join(format!("{fname}.tmp"));
-                if nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &snapshot).is_ok()
-                {
-                    checkpointed += 1;
-                }
-            }
-        }
-
-        if checkpointed > 0 {
-            info!(
-                core = self.core_id,
-                checkpointed,
-                total = self.crdt_engines.len(),
-                "CRDT engines checkpointed"
-            );
-        }
-        checkpointed
     }
 }

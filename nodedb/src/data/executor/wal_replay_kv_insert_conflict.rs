@@ -112,7 +112,7 @@ impl CoreLoop {
         if disc != "kv_insert_on_conflict_update" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
         Some(
@@ -155,7 +155,7 @@ impl CoreLoop {
         if disc != "kv_insert_on_conflict_update" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
         Some(

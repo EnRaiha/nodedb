@@ -12,33 +12,35 @@
 //! `execute_columnar_delete`) that ran on first application, so replay and
 //! live semantics cannot diverge.
 //!
-//! ## Why no partition watermark gate
-//!
-//! `ColumnarOp::Update` / `ColumnarOp::Delete` target only the plain-columnar
-//! and spatial profiles (`sql_plan_convert/dml/update_delete` routes
-//! `EngineType::Columnar | EngineType::Spatial` here and nothing else). Those
-//! profiles are held in `CoreLoop::columnar_engines` /
-//! `columnar_flushed_segments` — an in-memory `MutationEngine` plus in-memory
-//! flushed segment bytes, with **no persisted `last_flushed_wal_lsn`
-//! watermark at any granularity** (that field exists only on
-//! `nodedb_types::timeseries::PartitionMeta`, used by the separate
-//! `ts_registries` / bucketed-partition machinery of the *timeseries*
-//! profile, which this op pair never targets). On every restart this state is
-//! rebuilt from scratch by full WAL replay — there is no durable partial
-//! state a replayed record could double-apply against, so there is nothing to
-//! gate. This is the same reason `replay_columnar_payload`'s `Insert` replay
-//! (in `timeseries_wal.rs`) has no per-record dedup of its own beyond the
-//! (inapplicable, no-op for this profile) `ts_registries` check above it.
-//!
-//! ## Idempotence constraint
+//! ## Idempotence constraint, and the floor that satisfies it
 //!
 //! `Delete` (tombstone bit + PK-index removal) is idempotent. `Update` is
 //! **not**: it is implemented as delete-old-PK + insert-new-row, so a second
 //! application appends a duplicate row. Correctness rests entirely on this
 //! function being invoked exactly once per record, in ascending LSN order,
-//! starting from empty engine state — exactly how `replay_timeseries_wal`
-//! drives every WAL record for a fresh `CoreLoop`. Do not call this outside
-//! that single, ordered, from-empty replay pass.
+//! against engine state that does not already contain it.
+//!
+//! That used to be guaranteed by the state being rebuilt from scratch on every
+//! restart: `ColumnarOp::Update` / `ColumnarOp::Delete` target only the
+//! plain-columnar and spatial profiles (`sql_plan_convert/dml/update_delete`
+//! routes `EngineType::Columnar | EngineType::Spatial` here and nothing else),
+//! and those profiles live in `CoreLoop::columnar_engines` /
+//! `columnar_flushed_segments` — an in-memory `MutationEngine` plus in-memory
+//! flushed segment bytes with no store behind them. Replay always started from
+//! empty, so there was no durable partial state to double-apply against.
+//!
+//! `columnar_checkpoint` ends that. Restoring a generation means replay now
+//! starts from state that already contains every record at or below the
+//! manifest's LSN, which is exactly the precondition this function's
+//! non-idempotence depends on. [`ReplayFloors::columnar`] carries that LSN and
+//! gates those records out; everything above it is absent from the restored
+//! state and must still replay. Without the gate the checkpoint would duplicate
+//! rows; without the replay above it the checkpoint would lose them.
+//!
+//! Note the gate is NOT the `last_flushed_wal_lsn` watermark of the timeseries
+//! profile: that field exists only on `nodedb_types::timeseries::PartitionMeta`,
+//! used by the separate `ts_registries` / bucketed-partition machinery, which
+//! this op pair never targets.
 
 use tracing::warn;
 
@@ -53,8 +55,9 @@ impl CoreLoop {
     /// if it is one, replay it. Returns `None` when the payload does not
     /// decode as this shape (caller falls back to `decode_batch_record`'s
     /// row-payload / legacy-tuple attempts), `Some(0)` when it decoded but was
-    /// tombstoned or the live re-execution reported a typed error (logged,
-    /// never panics), `Some(1)` on successful replay.
+    /// tombstoned, already covered by the restored columnar checkpoint, or the
+    /// live re-execution reported a typed error (logged, never panics),
+    /// `Some(1)` on successful replay.
     pub(in crate::data::executor) fn try_replay_columnar_predicate_dml(
         &mut self,
         payload: &[u8],
@@ -69,6 +72,16 @@ impl CoreLoop {
         }
 
         if tombstones.is_tombstoned(tenant_id, &record.collection, record_lsn) {
+            return Some(0);
+        }
+
+        // Already folded into the restored checkpoint. Re-executing an `Update`
+        // here would append a duplicate row (delete-old-PK + insert-new-row is
+        // not idempotent), so the gate precedes the re-execution rather than
+        // trying to detect the duplicate afterwards. Returns `Some(0)` and not
+        // `None`: the record decoded as this shape, so the caller must not fall
+        // through to its row-payload decoders and mis-classify it.
+        if self.floors.replay_floors.columnar.covers(record_lsn) {
             return Some(0);
         }
 

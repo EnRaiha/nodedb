@@ -221,6 +221,36 @@ impl CsrIndex {
         bits & (1u64 << label_id) != 0
     }
 
+    /// Every node carrying at least one label, as `(node_name, label_names)`.
+    ///
+    /// Node NAMES, not local ids: the local id of a node is assigned by
+    /// whatever order the CSR was built in (the `EdgeStore` scan on a rebuild,
+    /// or `ensure_node` vivification order on a replay), so it is not stable
+    /// across restarts. Any consumer that persists this state and installs it
+    /// back through `add_node_label` therefore reattaches each label to the
+    /// node it actually belonged to, instead of to whichever node happens to
+    /// hold that id in the next process.
+    ///
+    /// Unlabeled nodes are skipped — their bitset is zero and carries no
+    /// information.
+    pub fn labeled_nodes(&self) -> Vec<(&str, Vec<&str>)> {
+        let mut out = Vec::new();
+        for (local_id, &bits) in self.node_label_bits.iter().enumerate() {
+            if bits == 0 {
+                continue;
+            }
+            let Some(name) = self.id_to_node.get(local_id) else {
+                continue;
+            };
+            let labels = self.node_labels(local_id as u32);
+            if labels.is_empty() {
+                continue;
+            }
+            out.push((name.as_str(), labels));
+        }
+        out
+    }
+
     /// Get all label names for a node.
     pub fn node_labels(&self, node_id: u32) -> Vec<&str> {
         let bits = self

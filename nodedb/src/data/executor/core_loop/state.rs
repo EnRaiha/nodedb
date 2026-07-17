@@ -24,6 +24,7 @@ use nodedb_columnar::mutation::snapshot::FlushedSurrogateTable;
 use nodedb_graph::ShardedCsrIndex;
 use nodedb_types::{DatabaseId, OrdinalClock};
 
+use super::checkpoint_floors::CheckpointFloors;
 use super::priority_queues::PriorityQueues;
 
 /// Per-core event loop for the Data Plane.
@@ -64,6 +65,12 @@ pub struct CoreLoop {
 
     /// Current watermark LSN for this core's shard data.
     pub(crate) watermark: Lsn,
+
+    /// What this core is durable through OUTSIDE the WAL, per engine, plus the
+    /// boot-restored replay floors. Grouped in `checkpoint_floors.rs` — every
+    /// field there obeys the same rule, and the LSN this core reports to the
+    /// checkpoint manager is a fold over them.
+    pub(in crate::data::executor) floors: CheckpointFloors,
 
     /// redb-backed sparse/metadata engine for this core.
     pub(crate) sparse: SparseEngine,
@@ -276,8 +283,11 @@ pub struct CoreLoop {
     pub(in crate::data::executor) continuous_agg_mgr:
         crate::engine::timeseries::continuous_agg::ContinuousAggregateManager,
 
-    /// Checkpoint coordinator: incremental dirty page flushing across engines.
-    /// Replaces timer-based checkpoint with I/O-budget-aware progressive flush.
+    /// Schedules incremental dirty-page flushing across engines between
+    /// coordinated checkpoints, so a checkpoint never has to flush an engine's
+    /// entire backlog in one stall. It is scheduling pressure only and carries
+    /// no LSN — what this core is durable through is answered solely by the
+    /// `*_durable_lsn` fields below and the fold in `execute_checkpoint`.
     pub(in crate::data::executor) checkpoint_coordinator:
         crate::storage::checkpoint::CheckpointCoordinator,
 

@@ -89,7 +89,7 @@ impl CoreLoop {
         if disc != "kv_cas" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
         let result = self.kv_engine.cas(
@@ -136,7 +136,7 @@ impl CoreLoop {
         if disc != "kv_incr_float" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
         match self.kv_engine.incr_float(
@@ -211,7 +211,7 @@ impl CoreLoop {
         if disc != "kv_getset" {
             return None;
         }
-        if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
+        if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
             return Some(0);
         }
         self.kv_engine.getset(

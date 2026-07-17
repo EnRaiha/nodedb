@@ -125,16 +125,9 @@ impl CoreLoop {
             ts_registries: HashMap::new(),
             continuous_agg_mgr:
                 crate::engine::timeseries::continuous_agg::ContinuousAggregateManager::new(),
-            checkpoint_coordinator: {
-                let mut coord = crate::storage::checkpoint::CheckpointCoordinator::new(
-                    crate::storage::checkpoint::CheckpointConfig::default(),
-                );
-                coord.register_engine("sparse");
-                coord.register_engine("vector");
-                coord.register_engine("crdt");
-                coord.register_engine("timeseries");
-                coord
-            },
+            checkpoint_coordinator: crate::storage::checkpoint::CheckpointCoordinator::new(
+                crate::storage::checkpoint::CheckpointConfig::default(),
+            ),
             segment_compaction_config: crate::storage::compaction::CompactionConfig::default(),
             spatial_indexes: std::collections::HashMap::new(),
             spatial_doc_map: std::collections::HashMap::new(),
@@ -147,6 +140,10 @@ impl CoreLoop {
                 crate::engine::kv::current_ms(),
                 &nodedb_types::config::tuning::KvTuning::default(),
             ),
+            // A fresh core has restored nothing and flushed nothing, so every
+            // engine is durable through nothing and no replay floor is set —
+            // see `CheckpointFloors::new` for what each zero costs and why.
+            floors: crate::data::executor::core_loop::checkpoint_floors::CheckpointFloors::new(),
             array_engine,
             array_catalog,
             uring_reader: crate::data::io::uring_reader::UringReader::new(),

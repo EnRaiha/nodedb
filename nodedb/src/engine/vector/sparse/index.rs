@@ -141,7 +141,13 @@ impl SparseInvertedIndex {
     }
 
     /// Serialize to bytes for checkpoint persistence.
-    pub fn checkpoint_to_bytes(&self) -> Vec<u8> {
+    ///
+    /// Fallible on purpose. The checkpoint that writes these bytes reports an
+    /// LSN authorising the WAL segments below it to be unlinked, so an encode
+    /// failure that yielded empty bytes here would publish an EMPTY index under
+    /// a manifest claiming every document was durable — destroying the only
+    /// other copy. The error propagates instead, and the caller clamps.
+    pub fn checkpoint_to_bytes(&self) -> crate::Result<Vec<u8>> {
         let snapshot = SparseIndexSnapshot {
             next_id: self.next_id,
             documents: self
@@ -167,7 +173,13 @@ impl SparseInvertedIndex {
                 })
                 .collect(),
         };
-        zerompk::to_msgpack_vec(&snapshot).unwrap_or_default()
+        zerompk::to_msgpack_vec(&snapshot).map_err(|e| crate::Error::Serialization {
+            format: "msgpack".to_string(),
+            detail: format!(
+                "sparse vector index checkpoint encode failed for {} documents: {e}",
+                self.doc_count
+            ),
+        })
     }
 
     /// Restore from checkpoint bytes.
@@ -264,7 +276,7 @@ mod tests {
         idx.insert("doc1", &make_sv(&[(10, 0.5), (20, 0.8)]));
         idx.insert("doc2", &make_sv(&[(20, 0.3), (30, 1.0)]));
 
-        let bytes = idx.checkpoint_to_bytes();
+        let bytes = idx.checkpoint_to_bytes().expect("encode");
         let restored = SparseInvertedIndex::from_checkpoint(&bytes).unwrap();
 
         assert_eq!(restored.doc_count(), 2);

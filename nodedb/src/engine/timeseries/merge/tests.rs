@@ -36,7 +36,7 @@ fn write_test_partition(base_dir: &Path, name: &str, start_ts: i64, count: usize
     }
     let drain = mt.drain();
     writer
-        .write_partition(name, &drain, 86_400_000, 0, None)
+        .write_partition(name, &drain.view(), 86_400_000, 0, None)
         .unwrap();
     base_dir.join(name)
 }
@@ -97,7 +97,7 @@ fn merge_with_tags() {
         }
         let drain = mt.drain();
         writer
-            .write_partition(part_name, &drain, 86_400_000, 0, None)
+            .write_partition(part_name, &drain.view(), 86_400_000, 0, None)
             .unwrap();
     }
 
