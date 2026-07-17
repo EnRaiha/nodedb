@@ -222,6 +222,8 @@ async fn spawn_node_with_collections()
 async fn cross_shard_read_occ_abort_on_stale_read() {
     let (node, _data_dir, w1, w2, bread) = spawn_node_with_collections().await;
 
+    let admitted_before = admitted_total(&node);
+
     // ONE simple_query carrying BEGIN + the cross-vShard read + both buffered
     // writes, leaving the transaction OPEN (no COMMIT). The two INSERTs buffer on
     // the coordinator, so at COMMIT the write set spans two vShards → participant
@@ -279,6 +281,20 @@ async fn cross_shard_read_occ_abort_on_stale_read() {
         "expected serialization_failure (40001) for the stale cross-shard read, got: {}",
         pg_detail(&err)
     );
+
+    // Discriminator: `si_conflict_abort`'s single-shard fast path raises this same
+    // SQLSTATE without ever admitting the batch to a sequencer epoch, so the 40001
+    // assertion above alone cannot tell "aborted by the multi-participant Calvin
+    // barrier revalidating bread's read-only-participant slice" apart from "aborted
+    // for some unrelated single-shard reason". Only the barrier path admits the
+    // batch, so requiring the admitted count to advance proves the former.
+    wait_for(
+        "calvin admitted the aborted cross-shard transaction",
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || admitted_total(&node) > admitted_before,
+    )
+    .await;
 
     // Belt-and-suspenders: the aborted transaction's buffered write into w1 must
     // have rolled back — an autocommit read shows no 'a' row.
