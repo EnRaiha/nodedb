@@ -7,7 +7,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::change_stream::ChangeOperation;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::{
-    ArrayOp, ColumnarOp, CrdtOp, DocumentOp, KvOp, TimeseriesOp, VectorOp,
+    ArrayOp, ClusterArrayOp, ColumnarOp, CrdtOp, DocumentOp, KvOp, TimeseriesOp, VectorOp,
 };
 
 /// Extract write metadata from a physical plan for change event publishing.
@@ -375,10 +375,34 @@ pub(super) fn extract_write_metadata(
         // not user-data writes.
         PhysicalPlan::Meta(_) => Vec::new(),
 
-        // Cluster-mode array ops are executed by the coordinator on the
-        // Control Plane and never reach this Data-Plane dispatch path (see
-        // `PhysicalPlan::ClusterArray`'s own doc comment).
-        PhysicalPlan::ClusterArray(_) => Vec::new(),
+        // Cluster-mode array ops: like their single-node `ArrayOp` counterparts
+        // (see the `PhysicalPlan::Array` arm above), `Put`/`Delete` are
+        // data-bearing cell writes that need their own CDC event. This match
+        // arm is never reached via the normal Data-Plane dispatch funnel (see
+        // `PhysicalPlan::ClusterArray`'s own doc comment) — the coordinator
+        // dispatch path in `routing/cluster_array.rs` calls this function
+        // directly via `publish_cluster_array_change_events` after a
+        // successful execute, so it IS load-bearing there.
+        PhysicalPlan::ClusterArray(op) => cluster_array_change_meta(op),
+    }
+}
+
+/// Map a `ClusterArrayOp` to its CDC change metadata. Shared by the
+/// `PhysicalPlan::ClusterArray` arm above and the coordinator dispatch path
+/// (`publish_cluster_array_change_events`), which holds the op by reference and
+/// must not clone the whole write batch just to read the array name.
+pub(crate) fn cluster_array_change_meta(
+    op: &ClusterArrayOp,
+) -> Vec<(String, String, ChangeOperation)> {
+    match op {
+        ClusterArrayOp::Put { array_id, .. } => {
+            vec![(array_id.name.clone(), "*".into(), ChangeOperation::Insert)]
+        }
+        ClusterArrayOp::Delete { array_id, .. } => {
+            vec![(array_id.name.clone(), "*".into(), ChangeOperation::Delete)]
+        }
+        // Slice/Agg are reads — no row changed.
+        ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. } => Vec::new(),
     }
 }
 
@@ -473,6 +497,73 @@ mod tests {
                 ChangeOperation::Delete
             )]
         );
+    }
+
+    #[test]
+    fn cluster_array_put_emits_change_event() {
+        let plan = PhysicalPlan::ClusterArray(ClusterArrayOp::Put {
+            array_id: ArrayId::new(TenantId::new(1), "genome"),
+            array_id_msgpack: Vec::new(),
+            cells: Vec::new(),
+            wal_lsn: 7,
+            prefix_bits: 8,
+        });
+        let meta = extract_write_metadata(&plan, TenantId::new(1));
+        assert_eq!(
+            meta,
+            vec![(
+                "genome".to_string(),
+                "*".to_string(),
+                ChangeOperation::Insert
+            )]
+        );
+    }
+
+    #[test]
+    fn cluster_array_delete_emits_change_event() {
+        let plan = PhysicalPlan::ClusterArray(ClusterArrayOp::Delete {
+            array_id: ArrayId::new(TenantId::new(1), "genome"),
+            array_id_msgpack: Vec::new(),
+            coords: Vec::new(),
+            wal_lsn: 7,
+            prefix_bits: 8,
+        });
+        let meta = extract_write_metadata(&plan, TenantId::new(1));
+        assert_eq!(
+            meta,
+            vec![(
+                "genome".to_string(),
+                "*".to_string(),
+                ChangeOperation::Delete
+            )]
+        );
+    }
+
+    #[test]
+    fn cluster_array_slice_and_agg_emit_no_change_event() {
+        let slice = PhysicalPlan::ClusterArray(ClusterArrayOp::Slice {
+            array_id: ArrayId::new(TenantId::new(1), "genome"),
+            slice_msgpack: Vec::new(),
+            attr_projection: Vec::new(),
+            limit: 0,
+            slice_hilbert_ranges: Vec::new(),
+            prefix_bits: 8,
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        });
+        assert!(extract_write_metadata(&slice, TenantId::new(1)).is_empty());
+
+        let agg = PhysicalPlan::ClusterArray(ClusterArrayOp::Agg {
+            array_id: ArrayId::new(TenantId::new(1), "genome"),
+            attr_idx: 0,
+            reducer_msgpack: Vec::new(),
+            group_by_dim: -1,
+            slice_hilbert_ranges: Vec::new(),
+            prefix_bits: 8,
+            system_as_of: None,
+            valid_at_ms: None,
+        });
+        assert!(extract_write_metadata(&agg, TenantId::new(1)).is_empty());
     }
 
     // Graph edge writes must stay silent: implicit edges (a document INSERT

@@ -7,5 +7,6 @@ mod extract;
 mod publish;
 
 pub(crate) use publish::{
-    extract_write_change_set, publish_change_set, publish_origin_change_events,
+    extract_write_change_set, publish_change_set, publish_cluster_array_change_events,
+    publish_origin_change_events,
 };

@@ -8,7 +8,7 @@ mod dispatch;
 mod submit_write;
 mod types;
 
-pub(crate) use change_events::publish_origin_change_events;
+pub(crate) use change_events::{publish_cluster_array_change_events, publish_origin_change_events};
 pub(crate) use collect::{DispatchCollectError, collect_bounded_response};
 pub(crate) use dispatch::{dispatch_autocommit_write, dispatch_write_to_data_plane};
 pub use dispatch::{

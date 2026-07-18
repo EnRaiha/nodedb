@@ -290,7 +290,14 @@ impl NodeDbPgHandler {
                 task.plan
             {
                 let response = self
-                    .dispatch_cluster_array_task(cluster_op, projection, result_formats, addr)
+                    .dispatch_cluster_array_task(
+                        cluster_op,
+                        projection,
+                        result_formats,
+                        addr,
+                        task.tenant_id,
+                        task.database_id,
+                    )
                     .await?;
                 responses.push(response);
                 continue;

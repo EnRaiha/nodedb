@@ -8,9 +8,9 @@ use crate::bridge::envelope::{PhysicalPlan, Response};
 use crate::control::change_stream::ChangeOperation;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
-use nodedb_physical::physical_plan::TimeseriesOp;
+use nodedb_physical::physical_plan::{ClusterArrayOp, TimeseriesOp};
 
-use super::extract::extract_write_metadata;
+use super::extract::{cluster_array_change_meta, extract_write_metadata};
 
 /// Current wall-clock time as milliseconds since Unix epoch.
 ///
@@ -60,7 +60,7 @@ fn publish_change_event(
     database_id: DatabaseId,
     is_columnar_collection: bool,
     change_meta: (String, String, ChangeOperation),
-    response: &Response,
+    lsn: nodedb_types::Lsn,
 ) {
     let (collection, doc_id, op) = change_meta;
     let should_publish = if is_columnar_collection {
@@ -74,7 +74,7 @@ fn publish_change_event(
 
     use crate::control::change_stream::ChangeEvent;
     let event = ChangeEvent {
-        lsn: response.watermark_lsn,
+        lsn,
         tenant_id,
         collection,
         document_id: doc_id,
@@ -131,15 +131,16 @@ pub(crate) fn extract_write_change_set(plan: &PhysicalPlan, tenant_id: TenantId)
     }
 }
 
-/// Publish an already-extracted change set. Almost every write plan yields
-/// exactly one event; a handful of multi-row / multi-collection ops yield more
-/// than one, and reads / DDL / index maintenance yield none.
-pub(crate) fn publish_change_set(
+/// Publish an already-extracted change set at an explicit LSN. Almost every
+/// write plan yields exactly one event; a handful of multi-row /
+/// multi-collection ops yield more than one, and reads / DDL / index
+/// maintenance yield none.
+fn publish_change_set_with_lsn(
     shared: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
     change_set: WriteChangeSet,
-    response: &Response,
+    lsn: nodedb_types::Lsn,
 ) {
     let WriteChangeSet {
         is_columnar_collection,
@@ -152,9 +153,27 @@ pub(crate) fn publish_change_set(
             database_id,
             is_columnar_collection,
             meta,
-            response,
+            lsn,
         );
     }
+}
+
+/// Publish an already-extracted change set, taking the LSN from a Data-Plane
+/// [`Response`]'s watermark.
+pub(crate) fn publish_change_set(
+    shared: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    change_set: WriteChangeSet,
+    response: &Response,
+) {
+    publish_change_set_with_lsn(
+        shared,
+        tenant_id,
+        database_id,
+        change_set,
+        response.watermark_lsn,
+    );
 }
 
 /// Publish the Control-Plane change event(s) for a write this node originated
@@ -180,5 +199,34 @@ pub(crate) fn publish_origin_change_events(
         database_id,
         extract_write_change_set(plan, tenant_id),
         response,
+    );
+}
+
+/// Publish the Control-Plane change event(s) for a `ClusterArray` write.
+///
+/// `ClusterArrayOp` never reaches the SPSC bridge / Data-Plane `Response`
+/// path (see `PhysicalPlan::ClusterArray`'s own doc comment) — the coordinator
+/// dispatch loop in `routing/cluster_array.rs` executes the op directly via
+/// `ClusterArrayExecutor` and has no `Response::watermark_lsn` to read, so it
+/// calls this entry point with the `wal_lsn` the op itself carries (allocated
+/// by the Control Plane for the write) instead of going through
+/// [`publish_origin_change_events`].
+pub(crate) fn publish_cluster_array_change_events(
+    shared: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    op: &ClusterArrayOp,
+    lsn: u64,
+) {
+    let change_set = WriteChangeSet {
+        is_columnar_collection: false,
+        metas: cluster_array_change_meta(op),
+    };
+    publish_change_set_with_lsn(
+        shared,
+        tenant_id,
+        database_id,
+        change_set,
+        nodedb_types::Lsn::new(lsn),
     );
 }

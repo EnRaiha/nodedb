@@ -13,8 +13,10 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use nodedb_physical::physical_plan::ClusterArrayOp;
 
+use crate::control::server::dispatch_utils::publish_cluster_array_change_events;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::schema::OutputSchema;
+use crate::types::{DatabaseId, TenantId};
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
@@ -25,12 +27,21 @@ impl NodeDbPgHandler {
     /// Execute a single `ClusterArrayOp` via the `ArrayCoordinator` and shape
     /// its payload into one pgwire `Response`. Any carried notice is pushed to
     /// the session for `addr`.
+    ///
+    /// On a successful `Put`/`Delete` (writes; `Slice`/`Agg` are reads and
+    /// publish nothing), publishes a CDC change event keyed by the op's own
+    /// `wal_lsn` — this path never touches the SPSC bridge, so there is no
+    /// Data-Plane `Response::watermark_lsn` to read the LSN from the way the
+    /// normal dispatch funnel does (see `publish_cluster_array_change_events`'s
+    /// own doc comment).
     pub(super) async fn dispatch_cluster_array_task(
         &self,
         cluster_op: &ClusterArrayOp,
         projection: Option<&OutputSchema>,
         result_formats: &[FieldFormat],
         addr: &std::net::SocketAddr,
+        tenant_id: TenantId,
+        database_id: DatabaseId,
     ) -> PgWireResult<Response> {
         use crate::control::cluster::ClusterArrayExecutor;
         use std::sync::Arc;
@@ -63,9 +74,25 @@ impl NodeDbPgHandler {
                 message,
             )))
         })?;
+        // Publish CDC change event(s) for a successful write. `Slice`/`Agg`
+        // are reads and publish nothing; `Put`/`Delete` carry their own
+        // Control-Plane-allocated `wal_lsn` since there is no Data-Plane
+        // `Response::watermark_lsn` on this coordinator-only path.
+        let write_lsn = match cluster_op {
+            ClusterArrayOp::Put { wal_lsn, .. } | ClusterArrayOp::Delete { wal_lsn, .. } => {
+                Some(*wal_lsn)
+            }
+            ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. } => None,
+        };
+        if let Some(lsn) = write_lsn {
+            publish_cluster_array_change_events(&self.state, tenant_id, database_id, cluster_op, lsn);
+        }
+
         let cluster_plan_kind = match cluster_op {
             ClusterArrayOp::Slice { .. } => PlanKind::ArraySlice,
-            _ => PlanKind::MultiRow,
+            ClusterArrayOp::Agg { .. }
+            | ClusterArrayOp::Put { .. }
+            | ClusterArrayOp::Delete { .. } => PlanKind::MultiRow,
         };
         match compose::shape_payload_no_plan(&payload_bytes, cluster_plan_kind, projection) {
             ShapeOutcome::Rows(shaped) => {
