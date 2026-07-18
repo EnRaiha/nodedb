@@ -237,6 +237,27 @@ mod tests {
     }
 
     #[test]
+    fn slice_over_never_written_region_is_empty() {
+        // A sparse array only materializes written cells. Slicing a coordinate
+        // region that overlaps none of them returns an empty result cleanly —
+        // no crash, no error.
+        let s = schema();
+        let t = tile(&[(0, 0, 1), (5, 5, 2), (9, 9, 3)]);
+        let sl = Slice::new(vec![
+            Some(DimRange::new(
+                DomainBound::Int64(50),
+                DomainBound::Int64(60),
+            )),
+            Some(DimRange::new(
+                DomainBound::Int64(50),
+                DomainBound::Int64(60),
+            )),
+        ]);
+        let out = slice_sparse(&s, &t, &sl).unwrap();
+        assert_eq!(out.nnz(), 0);
+    }
+
+    #[test]
     fn mbr_overlap_skip_disjoint() {
         let mins = vec![DomainBound::Int64(0), DomainBound::Int64(0)];
         let maxs = vec![DomainBound::Int64(9), DomainBound::Int64(9)];
