@@ -228,10 +228,12 @@ impl CoreLoop {
             // generation, not a legitimate absence.
             let map_path = ckpt_dir.join(format!("{stem}.docmap"));
             let map_bytes = nodedb_wal::segment::read_checkpoint_framed(&map_path)?;
-            let doc_entries: Vec<(u64, String)> = zerompk::from_msgpack(&map_bytes)
-                .map_err(|source| CheckpointDecodeError::MsgpackDecode {
-                    path: map_path,
-                    source,
+            let doc_entries: Vec<(u64, String)> =
+                zerompk::from_msgpack(&map_bytes).map_err(|source| {
+                    CheckpointDecodeError::MsgpackDecode {
+                        path: map_path,
+                        source,
+                    }
                 })?;
             for (entry_id, doc_id) in doc_entries {
                 self.spatial_doc_map
