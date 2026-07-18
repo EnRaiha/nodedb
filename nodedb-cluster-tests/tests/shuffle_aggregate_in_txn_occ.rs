@@ -55,38 +55,14 @@
 
 mod common;
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use nodedb::types::{DatabaseId, VShardId};
-use tokio_postgres::SimpleQueryMessage;
 
 use common::cluster_harness::{TestClusterNode, wait_for, wait_for_async};
-
-/// Observed sequencer-group leader id from the node's local Raft status, or `0`
-/// if no leader is known yet.
-fn sequencer_leader(node: &TestClusterNode) -> u64 {
-    let Some(status_fn) = node.shared.raft_status_fn.get() else {
-        return 0;
-    };
-    status_fn()
-        .into_iter()
-        .find(|g| g.group_id == nodedb_cluster::calvin::SEQUENCER_GROUP_ID)
-        .map(|g| g.leader_id)
-        .unwrap_or(0)
-}
-
-/// Count of transactions the single-node sequencer has admitted to an epoch, or
-/// `0` if the sequencer metrics handle is not installed yet. Used to prove a
-/// COMMIT (or its abort) went through the multi-participant Calvin barrier rather
-/// than a single-shard fast path.
-fn admitted_total(node: &TestClusterNode) -> u64 {
-    node.shared
-        .sequencer_metrics
-        .get()
-        .map(|m| m.admitted_total.load(Ordering::Relaxed))
-        .unwrap_or(0)
-}
+use common::occ_shuffle::{
+    admitted_total, count_rows, has_id, open_client, pg_detail, pg_sqlstate, sequencer_leader,
+};
 
 /// Three `metrics`/`w1`/`w2` collection names whose vShard ids are pairwise
 /// distinct, so a transaction that writes two of them and reads the third is
@@ -110,52 +86,6 @@ fn distinct_vshard_triple() -> (String, String, String) {
         }
     }
     panic!("could not find three pairwise-distinct-vShard collection names in 1024 tries");
-}
-
-/// Extract the SQLSTATE code from a `tokio_postgres` error, or `None`.
-fn pg_sqlstate(e: &tokio_postgres::Error) -> Option<String> {
-    e.as_db_error().map(|db| db.code().code().to_string())
-}
-
-/// Human-readable `sqlstate: message` rendering for assertion failure context.
-fn pg_detail(e: &tokio_postgres::Error) -> String {
-    if let Some(db) = e.as_db_error() {
-        format!("{}: {}", db.code().code(), db.message())
-    } else {
-        format!("{e}")
-    }
-}
-
-/// Count `Row` messages in a simple-query result set.
-fn count_rows(msgs: &[SimpleQueryMessage]) -> usize {
-    msgs.iter()
-        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
-        .count()
-}
-
-/// `true` if any returned row's `id` column equals `id`.
-fn has_id(msgs: &[SimpleQueryMessage], id: &str) -> bool {
-    msgs.iter().any(|m| match m {
-        SimpleQueryMessage::Row(r) => r.get("id") == Some(id),
-        _ => false,
-    })
-}
-
-/// Open an additional pgwire connection to the SAME single node.
-async fn open_client(
-    node: &TestClusterNode,
-) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
-    let conn_str = format!(
-        "host=127.0.0.1 port={} user=nodedb dbname=nodedb",
-        node.pg_addr.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
-        .await
-        .expect("open extra pgwire connection to the single node");
-    let handle = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    (client, handle)
 }
 
 /// The GROUP BY aggregate over the seeded `metrics` collection (its real
