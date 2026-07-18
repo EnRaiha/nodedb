@@ -214,7 +214,9 @@ fn restored_rows_are_visible_to_a_scan() {
         restored.columnar_engines.is_empty(),
         "a freshly opened core must hold nothing before the load runs"
     );
-    restored.load_columnar_checkpoints();
+    restored
+        .load_columnar_checkpoints()
+        .expect("checkpoint load must succeed");
 
     assert_eq!(
         ids(&scan(&mut restored, coll, None)),
@@ -255,7 +257,9 @@ fn restored_prefilter_resolves_each_flushed_row_to_its_own_surrogate() {
     drop(core);
 
     let mut restored = open_core(dir.path());
-    restored.load_columnar_checkpoints();
+    restored
+        .load_columnar_checkpoints()
+        .expect("checkpoint load must succeed");
 
     // Each surrogate must select exactly its own row. An off-by-one in the
     // sidecar returns a neighbour and is caught here; a dropped sidecar returns
@@ -327,7 +331,9 @@ fn restore_preserves_lockstep_across_multiple_segments() {
     drop(core);
 
     let mut restored = open_core(dir.path());
-    restored.load_columnar_checkpoints();
+    restored
+        .load_columnar_checkpoints()
+        .expect("checkpoint load must succeed");
 
     let segs = restored
         .columnar_flushed_segments
@@ -375,7 +381,9 @@ fn restore_never_populates_one_lockstep_half_alone() {
     drop(core);
 
     let mut restored = open_core(dir.path());
-    restored.load_columnar_checkpoints();
+    restored
+        .load_columnar_checkpoints()
+        .expect("checkpoint load must succeed");
 
     assert_eq!(
         restored.columnar_flushed_segments.contains_key(&key),
@@ -399,7 +407,9 @@ fn never_flushed_collection_restores_with_both_halves_empty() {
     drop(core);
 
     let mut restored = open_core(dir.path());
-    restored.load_columnar_checkpoints();
+    restored
+        .load_columnar_checkpoints()
+        .expect("checkpoint load must succeed");
 
     assert_eq!(
         restored
@@ -453,7 +463,9 @@ fn reported_lsn_becomes_the_restored_floor_and_durable_lsn() {
         !restored.floors.replay_floors.columnar.covers(1),
         "before the load, no floor is set and nothing is gated"
     );
-    restored.load_columnar_checkpoints();
+    restored
+        .load_columnar_checkpoints()
+        .expect("checkpoint load must succeed");
 
     assert_eq!(restored.floors.columnar_durable_lsn, Lsn::new(900));
     assert!(
@@ -523,7 +535,9 @@ fn an_unpublished_generation_is_not_restored() {
     std::fs::remove_file(&manifest).expect("remove manifest");
 
     let mut restored = open_core(dir.path());
-    restored.load_columnar_checkpoints();
+    restored
+        .load_columnar_checkpoints()
+        .expect("checkpoint load must succeed");
 
     assert!(
         restored.columnar_engines.is_empty(),
@@ -566,7 +580,9 @@ fn a_republished_generation_supersedes_the_previous_one() {
     drop(core);
 
     let mut restored = open_core(dir.path());
-    restored.load_columnar_checkpoints();
+    restored
+        .load_columnar_checkpoints()
+        .expect("checkpoint load must succeed");
 
     assert_eq!(
         ids(&scan(&mut restored, coll, None)),
@@ -592,7 +608,9 @@ fn the_schema_seed_does_not_replace_a_restored_engine() {
     drop(core);
 
     let mut restored = open_core(dir.path());
-    restored.load_columnar_checkpoints();
+    restored
+        .load_columnar_checkpoints()
+        .expect("checkpoint load must succeed");
     // Exactly the boot order in `data/runtime.rs`: load, then seed.
     restored.seed_columnar_schemas(&[(TenantId::new(1), coll.to_string(), schema())]);
 
@@ -601,4 +619,35 @@ fn the_schema_seed_does_not_replace_a_restored_engine() {
         vec![1],
         "the seed must skip the restored engine, not overwrite it with an empty one"
     );
+}
+
+/// A manifest that exists but is corrupt must abort boot, not be treated as an
+/// absent generation: the WAL below the LSN it names may already be truncated,
+/// so silently restoring nothing would be permanent, unannounced data loss.
+#[test]
+fn a_corrupt_manifest_fails_the_load_instead_of_restoring_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let coll = "ck_corrupt_manifest";
+
+    let mut core = open_core(dir.path());
+    seed_collection(&mut core, coll, &[(1, "a", Surrogate(1101))], &[]);
+    core.checkpoint_columnar_engines()
+        .expect("checkpoint must publish");
+    drop(core);
+
+    // Overwrite the published manifest's bytes with garbage — a truncated /
+    // corrupted frame, not a missing file.
+    let manifest = dir
+        .path()
+        .join("columnar-ckpt")
+        .join("core-0")
+        .join(super::paths::COLUMNAR_CKPT_MANIFEST);
+    assert!(manifest.exists(), "the checkpoint published a manifest");
+    std::fs::write(&manifest, b"not a valid checkpoint frame").expect("corrupt manifest");
+
+    let mut restored = open_core(dir.path());
+    let err = restored
+        .load_columnar_checkpoints()
+        .expect_err("a corrupt manifest must fail the load, not silently skip it");
+    let _ = err;
 }

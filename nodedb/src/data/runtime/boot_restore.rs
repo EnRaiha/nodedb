@@ -26,21 +26,23 @@ pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) -> crate::Result<()> {
     // segments, which `ArrayStore::open` mmaps whenever the array is opened —
     // by replay, or lazily by the first read.
     //
-    // A corrupt or unreadable vector checkpoint is fail-stop: its `Err`
-    // propagates out of boot so the core refuses to come up, rather than
-    // silently skipping the checkpoint and serving a truncated index (the WAL
-    // below the checkpoint LSN is already gone). The other loaders still return
-    // `()` today; a later unit converts them to the same fail-stop contract.
+    // A corrupt or unreadable vector, sparse-vector, KV, or columnar
+    // checkpoint is fail-stop: its `Err` propagates out of boot so the core
+    // refuses to come up, rather than silently skipping the checkpoint and
+    // serving a truncated index (the WAL below the checkpoint LSN is already
+    // gone). The remaining loaders below still return `()`; they have other
+    // durable copies of their state (redb stores, on-disk segments) that make
+    // a skip-and-replay recoverable rather than a silent loss.
     core.load_vector_checkpoints()?;
     core.load_spatial_checkpoints();
-    core.load_sparse_vector_checkpoints();
+    core.load_sparse_vector_checkpoints()?;
     core.load_crdt_checkpoints();
     // KV has no redb store behind it, so its checkpoint is the only
     // non-WAL copy of its rows: if the WAL was truncated past the
     // checkpoint LSN, this load is the ONLY thing that brings them back.
     // It also installs the per-collection replay floors that
     // `replay_kv_wal` uses to skip records already folded in.
-    core.load_kv_checkpoints();
+    core.load_kv_checkpoints()?;
     // Columnar is memory-only on both halves — the live memtables in
     // `columnar_engines` and the encoded segment bytes in
     // `columnar_flushed_segments`, which no code path writes to disk —
@@ -59,7 +61,7 @@ pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) -> crate::Result<()> {
     // skips collections that already have an engine — restoring
     // first is what stops the seed from replacing a restored engine with
     // an empty one.
-    core.load_columnar_checkpoints();
+    core.load_columnar_checkpoints()?;
     // The sync idempotency gate is rebuilt at boot ONLY from the
     // `SyncSeqAdvance` WAL records, so once truncation passes them this
     // load is the only thing that brings the high-watermarks back.

@@ -48,7 +48,7 @@ impl CoreLoop {
         // Never reuse a generation number: a reader holding the old manifest
         // must keep seeing an intact old generation until the new one is
         // published, so the new files cannot be written over the live ones.
-        let live = self.read_kv_manifest(&ckpt_dir);
+        let live = self.read_kv_manifest(&ckpt_dir)?;
         let generation = live.as_ref().map_or(0, |m| m.generation.wrapping_add(1));
         let gen_dir = kv_ckpt_gen_dir(&ckpt_dir, generation);
         // A directory already at this exact generation can only be debris from a

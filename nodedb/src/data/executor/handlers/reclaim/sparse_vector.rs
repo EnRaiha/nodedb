@@ -75,9 +75,21 @@ pub fn reclaim_sparse_vector_checkpoints(
             continue;
         };
         // No manifest means no reachable generation for this core, so there is
-        // nothing a boot could restore and nothing to reclaim.
-        let Some(manifest) = read_sparse_vector_manifest_at(&core_dir, core_id) else {
-            continue;
+        // nothing a boot could restore and nothing to reclaim. A corrupt
+        // manifest is left for the boot path to fail loudly on; reclaim is
+        // best-effort disk cleanup, not a restore, so it just skips this core
+        // rather than aborting the whole reclaim pass.
+        let manifest = match read_sparse_vector_manifest_at(&core_dir, core_id) {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(e) => {
+                warn!(
+                    dir = %core_dir.display(),
+                    error = %e,
+                    "sparse-vector reclaim: manifest unreadable; skipping this core"
+                );
+                continue;
+            }
         };
         let gen_dir = sparse_vector_ckpt_gen_dir(&core_dir, manifest.generation);
         reclaim_generation(&gen_dir, &prefix, &mut stats);

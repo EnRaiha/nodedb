@@ -4,7 +4,7 @@
 //! install every engine with its flushed segments and surrogate sidecar, and
 //! record the replay floor it authorises.
 
-use tracing::{error, info};
+use tracing::info;
 
 use super::format::{COLUMNAR_CKPT_FORMAT_VERSION, ColumnarCheckpointFile};
 use super::paths::{columnar_ckpt_dir, columnar_ckpt_gen_dir, parse_columnar_ckpt_stem};
@@ -46,13 +46,24 @@ impl CoreLoop {
     ///
     /// The manifest's LSN then becomes the replay floor: the columnar replay
     /// arms skip the records already folded in and apply everything above.
-    pub fn load_columnar_checkpoints(&mut self) {
+    ///
+    /// # Fail-stop on corruption
+    ///
+    /// Columnar is memory-only on both halves — nothing writes the live
+    /// memtables or flushed segment bytes to disk outside this checkpoint — so
+    /// a published generation is the only non-WAL home of its rows once the
+    /// WAL below its LSN has been truncated. A checkpoint that exists but
+    /// cannot be read or decoded is therefore unrecoverable data loss: this
+    /// returns `Err` in that case instead of skipping it, and the boot
+    /// sequence refuses to bring the core up. An absent checkpoint directory
+    /// is not an error — WAL replay reconstructs everything.
+    pub fn load_columnar_checkpoints(&mut self) -> crate::Result<()> {
         let ckpt_dir = columnar_ckpt_dir(&self.data_dir, self.core_id);
         if !ckpt_dir.exists() {
-            return;
+            return Ok(());
         }
-        let Some(manifest) = self.read_columnar_manifest(&ckpt_dir) else {
-            return;
+        let Some(manifest) = self.read_columnar_manifest(&ckpt_dir)? else {
+            return Ok(());
         };
         let gen_dir = columnar_ckpt_gen_dir(&ckpt_dir, manifest.generation);
 
@@ -60,23 +71,10 @@ impl CoreLoop {
         // promises a complete set at one LSN; installing a subset and claiming
         // that LSN would silently drop the collections that failed to decode,
         // and installing a subset WITHOUT the floor would re-apply every
-        // non-idempotent Update record against the rows that did load.
-        let decoded = match self.decode_columnar_generation(&gen_dir) {
-            Ok(d) => d,
-            Err(detail) => {
-                error!(
-                    core = self.core_id,
-                    generation = manifest.generation,
-                    dir = %gen_dir.display(),
-                    %detail,
-                    "columnar checkpoint generation is unreadable; restoring NOTHING and \
-                     replaying the full WAL. Any columnar rows whose WAL segments were \
-                     already truncated are unrecoverable — this indicates data-dir \
-                     corruption or external modification"
-                );
-                return;
-            }
-        };
+        // non-idempotent Update record against the rows that did load. Either
+        // way the failure must abort boot rather than restore nothing silently
+        // — the WAL below this LSN may already be gone.
+        let decoded = self.decode_columnar_generation(&gen_dir)?;
 
         let collections = decoded.len();
         let mut segments = 0usize;
@@ -124,6 +122,7 @@ impl CoreLoop {
             durable_through_lsn = manifest.durable_through_lsn,
             "columnar checkpoint restored"
         );
+        Ok(())
     }
 
     /// Read and decode every collection file in a generation.

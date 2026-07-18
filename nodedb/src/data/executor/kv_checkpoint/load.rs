@@ -3,7 +3,7 @@
 //! The KV checkpoint load path: decode the published generation whole, install
 //! its rows and index registrations, and record the replay floor it authorises.
 
-use tracing::{error, info};
+use tracing::info;
 
 use super::decoded::{DecodedKvCollection, DecodedKvGeneration};
 use super::format::{KV_CKPT_FORMAT_VERSION, KvCheckpointFile};
@@ -28,13 +28,23 @@ impl CoreLoop {
     /// sound one. The manifest's LSN then becomes the replay floor:
     /// `replay_kv_wal` skips the records already folded in and applies
     /// everything above.
-    pub fn load_kv_checkpoints(&mut self) {
+    ///
+    /// # Fail-stop on corruption
+    ///
+    /// KV has no redb store behind it, so a published checkpoint is the only
+    /// non-WAL home of its rows once the WAL below its LSN has been truncated.
+    /// A checkpoint that exists but cannot be read or decoded is therefore
+    /// unrecoverable data loss: this returns `Err` in that case instead of
+    /// skipping it, and the boot sequence refuses to bring the core up. An
+    /// absent checkpoint directory is not an error — WAL replay reconstructs
+    /// everything.
+    pub fn load_kv_checkpoints(&mut self) -> crate::Result<()> {
         let ckpt_dir = kv_ckpt_dir(&self.data_dir, self.core_id);
         if !ckpt_dir.exists() {
-            return;
+            return Ok(());
         }
-        let Some(manifest) = self.read_kv_manifest(&ckpt_dir) else {
-            return;
+        let Some(manifest) = self.read_kv_manifest(&ckpt_dir)? else {
+            return Ok(());
         };
         let gen_dir = kv_ckpt_gen_dir(&ckpt_dir, manifest.generation);
 
@@ -43,23 +53,9 @@ impl CoreLoop {
         // that LSN would silently drop the collections that failed to decode,
         // and installing a subset WITHOUT the floor would double-apply every
         // delta record against the rows that did load. Either way the failure
-        // must be all-or-nothing.
-        let decoded = match self.decode_kv_generation(&gen_dir) {
-            Ok(d) => d,
-            Err(detail) => {
-                error!(
-                    core = self.core_id,
-                    generation = manifest.generation,
-                    dir = %gen_dir.display(),
-                    %detail,
-                    "KV checkpoint generation is unreadable; restoring NOTHING and \
-                     replaying the full WAL. Any KV rows whose WAL segments were \
-                     already truncated are unrecoverable — this indicates data-dir \
-                     corruption or external modification"
-                );
-                return;
-            }
-        };
+        // must be all-or-nothing, and it must abort boot rather than restore
+        // nothing silently — the WAL below this LSN may already be gone.
+        let decoded = self.decode_kv_generation(&gen_dir)?;
 
         let collections = decoded.len();
         let mut rows = 0usize;
@@ -87,6 +83,7 @@ impl CoreLoop {
             durable_through_lsn = manifest.durable_through_lsn,
             "KV checkpoint restored"
         );
+        Ok(())
     }
 
     /// Read and decode every collection file in a generation.
@@ -442,5 +439,44 @@ mod tests {
             inserted as usize,
             "every row must keep its own distinct surrogate across the export"
         );
+    }
+
+    /// A core rooted at `dir`, so a corrupt manifest can be planted on disk and
+    /// then read back through the real boot-time load path.
+    fn open_core_at(dir: &std::path::Path) -> CoreLoop {
+        use std::sync::Arc;
+
+        use nodedb_bridge::buffer::RingBuffer;
+        use nodedb_types::OrdinalClock;
+
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+
+        let hlc = Arc::new(OrdinalClock::new());
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, _resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        drop(req_tx); // no requests are dispatched in this test
+        CoreLoop::open(0, req_rx, resp_tx, dir, hlc).expect("CoreLoop::open")
+    }
+
+    /// A manifest that exists but is corrupt (truncated / bad frame) must fail
+    /// the load, not be treated as absent: KV has no redb store behind it, so
+    /// the checkpoint is the only non-WAL home of its rows once the WAL below
+    /// its LSN has been truncated. Silently skipping it would be permanent,
+    /// unannounced data loss.
+    #[test]
+    fn corrupt_manifest_fails_the_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = open_core_at(dir.path());
+        let ckpt_dir = kv_ckpt_dir(&core.data_dir, core.core_id);
+        std::fs::create_dir_all(&ckpt_dir).expect("create ckpt dir");
+        let manifest_path = ckpt_dir.join(KV_CKPT_MANIFEST);
+        std::fs::write(&manifest_path, b"not a valid checkpoint frame")
+            .expect("write garbage manifest");
+        drop(core);
+
+        let mut restored = open_core_at(dir.path());
+        restored
+            .load_kv_checkpoints()
+            .expect_err("a corrupt manifest must fail the load, not silently skip it");
     }
 }

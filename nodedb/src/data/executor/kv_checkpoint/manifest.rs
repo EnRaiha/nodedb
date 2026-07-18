@@ -3,59 +3,47 @@
 //! Reading the manifest that names the live KV checkpoint generation, plus the
 //! shared typed-error constructor for this module's filesystem failures.
 
-use tracing::warn;
-
 use super::format::{KV_CKPT_FORMAT_VERSION, KvCheckpointManifest};
 use super::paths::KV_CKPT_MANIFEST;
+use crate::data::executor::checkpoint_decode_error::CheckpointDecodeError;
 use crate::data::executor::core_loop::CoreLoop;
 
 impl CoreLoop {
-    /// Read the live manifest, or `None` when absent / unreadable / unknown
-    /// version.
+    /// Read the live manifest, or `Ok(None)` when the file is genuinely absent.
     ///
-    /// `None` is always safe in both directions: the write path starts a fresh
-    /// generation, and the load path restores nothing and installs no floor, so
-    /// replay falls back to the full WAL.
+    /// A present-but-unreadable, undecodable, or version-mismatched manifest is
+    /// `Err`, not `None`: the manifest is the only record of the LSN the
+    /// generation it names is durable through, and treating corruption as
+    /// "no generation" would let the caller install no floor while the WAL
+    /// below that LSN may already be gone.
     pub(super) fn read_kv_manifest(
         &self,
         ckpt_dir: &std::path::Path,
-    ) -> Option<KvCheckpointManifest> {
+    ) -> Result<Option<KvCheckpointManifest>, CheckpointDecodeError> {
         let path = ckpt_dir.join(KV_CKPT_MANIFEST);
         if !path.exists() {
-            return None;
+            return Ok(None);
         }
-        let bytes = match nodedb_wal::segment::read_checkpoint_framed(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(
-                    core = self.core_id,
-                    error = %e,
-                    "KV checkpoint manifest unreadable; treating as absent"
-                );
-                return None;
+        let bytes = nodedb_wal::segment::read_checkpoint_framed(&path).map_err(|source| {
+            CheckpointDecodeError::ReadFile {
+                path: path.clone(),
+                source,
             }
-        };
-        let manifest = match zerompk::from_msgpack::<KvCheckpointManifest>(&bytes) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    core = self.core_id,
-                    error = %e,
-                    "KV checkpoint manifest undecodable; treating as absent"
-                );
-                return None;
+        })?;
+        let manifest = zerompk::from_msgpack::<KvCheckpointManifest>(&bytes).map_err(|source| {
+            CheckpointDecodeError::MsgpackDecode {
+                path: path.clone(),
+                source,
             }
-        };
+        })?;
         if manifest.format_version != KV_CKPT_FORMAT_VERSION {
-            warn!(
-                core = self.core_id,
-                found = manifest.format_version,
-                expected = KV_CKPT_FORMAT_VERSION,
-                "unknown KV checkpoint manifest version; treating as absent"
-            );
-            return None;
+            return Err(CheckpointDecodeError::FormatVersion {
+                path: path.clone(),
+                found: manifest.format_version,
+                expected: KV_CKPT_FORMAT_VERSION,
+            });
         }
-        Some(manifest)
+        Ok(Some(manifest))
     }
 }
 

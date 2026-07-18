@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use nodedb_types::DatabaseId;
-use tracing::{error, info};
+use tracing::info;
 
 use super::manifest::read_sparse_vector_manifest_at;
 use super::paths::{parse_sparse_vector_key, sparse_vector_ckpt_dir, sparse_vector_ckpt_gen_dir};
@@ -34,13 +34,22 @@ impl CoreLoop {
     /// pinning WAL truncation at zero. It installs no replay floor: every
     /// sparse-vector WAL record is idempotent, so replay above and below the
     /// stamp both reproduce the same indexes (see this module's `mod.rs`).
-    pub fn load_sparse_vector_checkpoints(&mut self) {
+    ///
+    /// # Fail-stop on corruption
+    ///
+    /// A sparse-vector checkpoint is a non-WAL home of its indexes once the WAL
+    /// below its LSN has been truncated, so a checkpoint that exists but cannot
+    /// be read or decoded is unrecoverable data loss. This returns `Err` in
+    /// that case instead of skipping it, and the boot sequence refuses to
+    /// bring the core up. An absent checkpoint directory is not an error — WAL
+    /// replay reconstructs everything.
+    pub fn load_sparse_vector_checkpoints(&mut self) -> crate::Result<()> {
         let ckpt_dir = sparse_vector_ckpt_dir(&self.data_dir, self.core_id);
         if !ckpt_dir.exists() {
-            return;
+            return Ok(());
         }
-        let Some(manifest) = read_sparse_vector_manifest_at(&ckpt_dir, self.core_id) else {
-            return;
+        let Some(manifest) = read_sparse_vector_manifest_at(&ckpt_dir, self.core_id)? else {
+            return Ok(());
         };
         let gen_dir = sparse_vector_ckpt_gen_dir(&ckpt_dir, manifest.generation);
 
@@ -48,22 +57,9 @@ impl CoreLoop {
         // promises a complete set at one LSN; installing a subset and then
         // claiming that LSN as this engine's durable point would authorise
         // truncating the WAL records of the indexes that failed to decode.
-        let decoded = match self.decode_sparse_vector_generation(&gen_dir) {
-            Ok(d) => d,
-            Err(detail) => {
-                error!(
-                    core = self.core_id,
-                    generation = manifest.generation,
-                    dir = %gen_dir.display(),
-                    %detail,
-                    "sparse-vector checkpoint generation is unreadable; restoring NOTHING \
-                     and replaying the full WAL. Any sparse-vector documents whose WAL \
-                     segments were already truncated are unrecoverable — this indicates \
-                     data-dir corruption or external modification"
-                );
-                return;
-            }
-        };
+        // Either way the failure must abort boot rather than restore nothing
+        // silently — the WAL below this LSN may already be gone.
+        let decoded = self.decode_sparse_vector_generation(&gen_dir)?;
 
         let indexes = decoded.len();
         let mut docs = 0usize;
@@ -85,6 +81,7 @@ impl CoreLoop {
             durable_through_lsn = manifest.durable_through_lsn,
             "sparse vector checkpoint restored"
         );
+        Ok(())
     }
 
     /// Read and decode every index file in a generation.
@@ -218,7 +215,9 @@ mod tests {
         let bytes = zerompk::to_msgpack_vec(&written).expect("encode");
         nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
 
-        let decoded = read_sparse_vector_manifest_at(tmp.path(), 0).expect("manifest must read");
+        let decoded = read_sparse_vector_manifest_at(tmp.path(), 0)
+            .expect("manifest must read")
+            .expect("manifest file exists, so this must be Some");
         assert_eq!(
             decoded.durable_through_lsn, 8_128,
             "the manifest must report exactly the LSN it was written with"
@@ -228,9 +227,12 @@ mod tests {
 
     /// A manifest from a future format must be refused, not misparsed: a
     /// misparse would install indexes this build cannot read while claiming an
-    /// LSN that authorises deleting the records behind them.
+    /// LSN that authorises deleting the records behind them. Refusing it must
+    /// be a hard `Err`, not a silent "treat as absent" — the WAL below the LSN
+    /// it names may already be truncated, so silently restoring nothing would
+    /// be permanent, unannounced data loss.
     #[test]
-    fn unknown_manifest_version_is_treated_as_absent() {
+    fn unknown_manifest_version_is_rejected() {
         let written = SparseVectorCheckpointManifest {
             format_version: SPARSE_VECTOR_CKPT_FORMAT_VERSION + 1,
             generation: 1,
@@ -242,10 +244,8 @@ mod tests {
         let bytes = zerompk::to_msgpack_vec(&written).expect("encode");
         nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &path, &bytes).expect("write");
 
-        assert!(
-            read_sparse_vector_manifest_at(tmp.path(), 0).is_none(),
-            "a manifest this build cannot read must gate nothing"
-        );
+        read_sparse_vector_manifest_at(tmp.path(), 0)
+            .expect_err("a manifest this build cannot read must fail the load, not gate nothing");
     }
 
     /// No manifest means no live generation: nothing restores and nothing is
@@ -253,7 +253,32 @@ mod tests {
     #[test]
     fn absent_manifest_reads_as_none() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        assert!(read_sparse_vector_manifest_at(tmp.path(), 0).is_none());
+        assert!(
+            read_sparse_vector_manifest_at(tmp.path(), 0)
+                .expect("an absent manifest must not error")
+                .is_none()
+        );
+    }
+
+    /// A manifest that exists but is corrupt (truncated / bad frame) must fail
+    /// the load, not be treated as absent: proves the `CheckpointDecodeError`
+    /// from a bad `ReadFile` propagates all the way out of
+    /// `load_sparse_vector_checkpoints` as `Err`.
+    #[test]
+    fn corrupt_manifest_fails_the_load() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let core = open_core_at(tmp.path());
+        let ckpt_dir = sparse_vector_ckpt_dir(&core.data_dir, core.core_id);
+        std::fs::create_dir_all(&ckpt_dir).expect("create ckpt dir");
+        let manifest_path = ckpt_dir.join(SPARSE_VECTOR_CKPT_MANIFEST);
+        std::fs::write(&manifest_path, b"not a valid checkpoint frame")
+            .expect("write garbage manifest");
+        drop(core);
+
+        let mut restored = open_core_at(tmp.path());
+        restored
+            .load_sparse_vector_checkpoints()
+            .expect_err("a corrupt manifest must fail the load, not silently skip it");
     }
 
     /// A core rooted at `dir`, so two cores in one test share a data dir the way
@@ -323,7 +348,9 @@ mod tests {
             after.sparse_vector_indexes.is_empty(),
             "a fresh core holds no indexes, or this test proves nothing"
         );
-        after.load_sparse_vector_checkpoints();
+        after
+            .load_sparse_vector_checkpoints()
+            .expect("checkpoint load must succeed");
 
         assert_eq!(
             after.sparse_vector_indexes.len(),
