@@ -3,50 +3,31 @@
 //! Cross-shard OCC read validation for an in-transaction DISTRIBUTED
 //! GATHER-JOIN read driven over the NATIVE (MessagePack) transport.
 //!
-//! ## What this pins (and how it differs from the pgwire gather suite)
+//! Native mirror of `gather_join_in_txn_occ.rs`. A cross-vShard equi-join lowers
+//! to `Exchange{Gather{HashJoin}}` BY DEFAULT (no forced shuffle): the `HashJoin`
+//! is routed to the LEFT/probe collection's vShard and the RIGHT/build collection
+//! is GATHERED across all vShards, with a per-collection `DistributedReadCapture`
+//! emitted for each side. The native dispatch loop once DROPPED those captures, so
+//! an in-txn distributed read on native recorded only the collapsed left
+//! collection — the build side's read-version was discarded, its vShard never
+//! revalidated at the Calvin barrier, and a concurrent build-side write silently
+//! committed a stale join — now fixed by feeding the same captures pgwire uses.
 //!
-//! This is the native-transport mirror of `gather_join_in_txn_occ.rs`. A
-//! cross-vShard equi-join lowers to `Exchange{Gather}` wrapping a `HashJoin` BY
-//! DEFAULT — no forced shuffle. The coordinator routes the `HashJoin` to the
-//! LEFT (probe) collection's owning vShard and GATHERS the RIGHT (build)
-//! collection across all vShards. The Gather resolver emits a per-collection
-//! `DistributedReadCapture` for each side.
+//! Cases bounding the fixed behavior:
+//!  * `commits_when_neither_side_concurrently_written` — clean commit MUST SUCCEED
+//!    (captures carry the sound `coll_write_lsn`, not an over-aborting watermark).
+//!  * `occ_aborts_on_stale_probe_read` — a stale LEFT/probe read MUST abort.
+//!  * `occ_aborts_on_stale_build_read` — a stale RIGHT/build read (pgwire rival)
+//!    MUST abort: the native build-side capture hole is closed on the Gather path.
+//!  * `occ_aborts_on_native_writer_stale_read` — the build-side rival is a NATIVE
+//!    autocommit INSERT. Pre-fix the gateway leader-local autocommit path never
+//!    proposed a Raft entry nor bumped `coll_write_lsn`, so the read never went
+//!    stale and COMMIT silently succeeded; routing native writes through Raft
+//!    closes that lost-update cell.
 //!
-//! The pgwire transport already threaded those captures into the shared
-//! read-set recorder. The native dispatch loop previously DROPPED them, so an
-//! in-txn distributed read on native recorded only the plan's collapsed left
-//! collection — the build side's gathered read-version was DISCARDED and its
-//! vShard was never revalidated at the Calvin commit barrier. A concurrent
-//! write to the build collection between the in-txn read and COMMIT went
-//! UNDETECTED and the transaction silently committed a stale join. Native is the
-//! canonical transport; this suite proves the hole is now closed on native by
-//! feeding the SAME captures into the SAME shared recorder pgwire uses.
-//!
-//! Three cases bound the fixed behavior:
-//!
-//!  * `commits_when_neither_side_concurrently_written` — neither join side is
-//!    written during the txn, so both recorded real per-collection versions
-//!    still validate and COMMIT must SUCCEED (proves the captures carry the
-//!    sound `coll_write_lsn`, not an inflated global watermark that over-aborts).
-//!  * `occ_aborts_on_stale_probe_read` — a confirmed-visible concurrent write to
-//!    the LEFT/probe collection advances it past the captured probe version, so
-//!    COMMIT must abort with a serialization failure.
-//!  * `occ_aborts_on_stale_build_read` — THE LOAD-BEARING CASE: a
-//!    confirmed-visible concurrent write to the RIGHT/build collection ONLY must
-//!    STILL abort. Pre-fix, native recorded no read-set entry for the build
-//!    collection, so this would have SILENTLY committed. This case proves the
-//!    native build-side hole is closed on the NATURAL Gather path.
-//!
-//! ## Determinism
-//!
-//! No fixed sleep governs correctness. Each concurrent write is issued on a
-//! separate `NativeClient` and confirmed VISIBLE (via an autocommit `SELECT`)
-//! BEFORE the coordinator's COMMIT is issued, so the join read is provably stale
-//! at commit time — the abort is guaranteed, never racy.
-//!
-//! The native protocol surfaces the abort as an error MESSAGE (not a SQLSTATE),
-//! so the stale cases detect it via the stable text
-//! "could not serialize access due to concurrent update".
+//! Determinism: each rival write is confirmed VISIBLE (autocommit `SELECT`) before
+//! COMMIT, so the read is provably stale and the abort guaranteed. Native surfaces
+//! it as text "could not serialize access due to concurrent update".
 
 mod common;
 
@@ -279,23 +260,11 @@ async fn begin_join_read_and_buffer_writes(
         .expect("buffer write into w2");
 }
 
-/// Issue an autocommit INSERT from a SEPARATE (external) concurrent writer and
-/// confirm the new row is VISIBLE before returning — makes the native driver's
-/// in-txn read provably stale so its COMMIT must fail OCC validation.
-///
-/// The concurrent writer here uses the pgwire connection: what this test bounds
-/// is the NATIVE reader's in-transaction distributed-read OCC (recording +
-/// commit-time revalidation), for which the writer's transport is incidental.
-/// The native-writer-vs-native-reader cell is covered separately by the unit
-/// that fixes native autocommit writes advancing the per-collection OCC floor.
-async fn concurrent_write_and_confirm(node: &TestClusterNode, coll: &str) {
-    node.client
-        .simple_query(&format!(
-            "INSERT INTO {coll} (id, jk, val) VALUES ('rival', 'k1', 999)"
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("concurrent write to {coll}: {e}"));
-
+/// Wait until the rival row ('rival') is VISIBLE in `coll` via an autocommit
+/// pgwire read. Visibility is transport-independent, so this confirms a rival
+/// written over EITHER transport has landed before COMMIT — making the native
+/// driver's in-txn read provably stale so its COMMIT must fail OCC validation.
+async fn confirm_rival_visible(node: &TestClusterNode, coll: &str) {
     wait_for_async(
         "rival row visible before COMMIT",
         Duration::from_secs(10),
@@ -310,6 +279,32 @@ async fn concurrent_write_and_confirm(node: &TestClusterNode, coll: &str) {
         },
     )
     .await;
+}
+
+/// PGWIRE concurrent writer: autocommit INSERT of the rival row, confirmed
+/// visible. Bounds the NATIVE reader's in-txn OCC; writer transport is incidental.
+async fn concurrent_write_and_confirm(node: &TestClusterNode, coll: &str) {
+    node.client
+        .simple_query(&format!(
+            "INSERT INTO {coll} (id, jk, val) VALUES ('rival', 'k1', 999)"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("concurrent write to {coll}: {e}"));
+    confirm_rival_visible(node, coll).await;
+}
+
+/// NATIVE concurrent writer: the rival autocommit INSERT rides a SEPARATE native
+/// client, exercising the gateway leader-local autocommit-write path that must now
+/// PROPOSE through Raft and bump `coll_write_lsn`. Confirmed visible before COMMIT.
+async fn native_concurrent_write_and_confirm(node: &TestClusterNode, coll: &str) {
+    let writer = pinned_native_client(node);
+    writer
+        .query(&format!(
+            "INSERT INTO {coll} (id, jk, val) VALUES ('rival', 'k1', 999)"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("native concurrent write to {coll}: {e}"));
+    confirm_rival_visible(node, coll).await;
 }
 
 /// Neither join side is concurrently written, so both recorded real read versions
@@ -456,6 +451,49 @@ async fn native_gather_join_occ_aborts_on_stale_build_read() {
         0,
         "the aborted transaction's buffered write into w1 must not be visible"
     );
+
+    node.shutdown().await;
+}
+
+/// THE NATIVE-WRITER / NATIVE-READER CELL. Same stale-build-read scenario, but the
+/// rival autocommit INSERT rides a SEPARATE native client, driving the gateway's
+/// leader-local autocommit-write path. Pre-fix that path applied the row via a
+/// leader-local SPSC dispatch that never proposed a Raft entry nor bumped the build
+/// collection's `coll_write_lsn`, so the captured build version never went stale
+/// and the COMMIT SILENTLY succeeded (undetected lost-update). Routing native
+/// autocommit writes through Raft advances the build side, so COMMIT must abort.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_gather_join_occ_aborts_on_native_writer_stale_read() {
+    let (node, _data_dir, driver, left, right, w1, w2) = spawn_node_with_collections().await;
+
+    let admitted_before = admitted_total(&node);
+
+    begin_join_read_and_buffer_writes(&driver, &left, &right, &w1, &w2).await;
+
+    // NATIVE autocommit writer advances the RIGHT (build) collection ONLY. Pre-fix
+    // this native write bumped no OCC floor, so the stale read went undetected.
+    native_concurrent_write_and_confirm(&node, &right).await;
+
+    let err = driver.commit().await.expect_err(
+        "COMMIT of a stale in-txn native gather join whose build side was advanced by a NATIVE \
+         autocommit writer must abort — pre-fix the native write bumped no OCC floor and this \
+         silently committed",
+    );
+    assert!(
+        is_serialization_abort(&err),
+        "expected serialization abort for the stale BUILD-side read advanced by a native writer, \
+         got: {err}"
+    );
+
+    // The aborted transaction reached the sequencer via the multi-participant
+    // barrier (the only path that revalidates read-only participants).
+    wait_for(
+        "calvin admitted the aborted cross-shard transaction",
+        Duration::from_secs(10),
+        Duration::from_millis(25),
+        || admitted_total(&node) > admitted_before,
+    )
+    .await;
 
     node.shutdown().await;
 }
