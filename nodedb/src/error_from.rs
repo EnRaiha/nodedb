@@ -80,6 +80,43 @@ impl From<crate::storage::quarantine::engines::FtsOrQuarantine> for Error {
     }
 }
 
+impl From<nodedb_vector::error::VectorError> for Error {
+    /// A failure surfaced while loading or decoding a vector checkpoint. This
+    /// wires the vector engine's error into the crate's central `Error` so the
+    /// boot-time checkpoint loader can `?`-propagate it and fail-stop instead of
+    /// silently skipping a corrupt checkpoint (which would be silent data loss:
+    /// the WAL below the checkpoint's LSN is already truncated).
+    fn from(e: nodedb_vector::error::VectorError) -> Self {
+        use nodedb_vector::error::VectorError as Ve;
+        let detail = e.to_string();
+        match e {
+            // Memory-budget exhaustion is a resource fault, not corruption.
+            Ve::BudgetExhausted(_) => Self::MemoryExhausted {
+                engine: "vector".to_string(),
+            },
+            // A filesystem I/O fault reading segment/checkpoint bytes.
+            Ve::SegmentIo(_) => Self::Storage {
+                engine: "vector".to_string(),
+                detail,
+            },
+            // Every checkpoint decode / version / magic / dimension fault is a
+            // corrupt or unreadable checkpoint — the boot loader must fail-stop.
+            Ve::DimensionMismatch { .. }
+            | Ve::UnsupportedVersion { .. }
+            | Ve::InvalidMagic
+            | Ve::DeserializationFailed(_)
+            | Ve::CheckpointEncryptedNoKey
+            | Ve::CheckpointPlaintextKeyRequired
+            | Ve::CheckpointEncryptionError { .. }
+            | Ve::CheckpointSerializationError { .. }
+            | Ve::CheckpointDeserializationError { .. } => Self::SegmentCorrupted { detail },
+            // `VectorError` is `#[non_exhaustive]`: any future variant defaults
+            // to the safe fail-stop classification rather than being swallowed.
+            _ => Self::SegmentCorrupted { detail },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // From<Error> for NodeDbError — the public API boundary conversion
 // ---------------------------------------------------------------------------

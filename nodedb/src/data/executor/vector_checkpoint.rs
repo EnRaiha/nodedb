@@ -166,16 +166,26 @@ impl CoreLoop {
     ///
     /// For each checkpoint file, loads the index. WAL replay then only
     /// needs to process entries after the checkpoint LSN.
-    pub fn load_vector_checkpoints(&mut self) {
+    ///
+    /// # Fail-stop on corruption
+    ///
+    /// A vector checkpoint is the only non-WAL home of `VectorOp::Insert`
+    /// vectors once the WAL below its LSN has been truncated, so a checkpoint
+    /// that exists but cannot be read or decoded is unrecoverable data loss.
+    /// This returns `Err` in that case instead of skipping the file, and the
+    /// boot sequence (`load_boot_checkpoints`) refuses to bring the core up. An
+    /// absent checkpoint directory is not an error — it just means nothing has
+    /// been checkpointed yet, and WAL replay reconstructs everything.
+    pub fn load_vector_checkpoints(&mut self) -> crate::Result<()> {
         let ckpt_dir = vector_ckpt_dir(&self.data_dir, self.core_id);
         if !ckpt_dir.exists() {
-            return;
+            return Ok(());
         }
 
-        let entries = match std::fs::read_dir(&ckpt_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
+        // The directory exists but cannot be enumerated: an I/O fault that could
+        // hide checkpoint files. Fail-stop rather than silently loading none.
+        let entries = std::fs::read_dir(&ckpt_dir)
+            .map_err(|e| storage_err(&ckpt_dir, "read checkpoint dir", &e))?;
 
         let mut loaded = 0;
         for entry in entries.flatten() {
@@ -202,24 +212,14 @@ impl CoreLoop {
                 continue;
             };
 
-            let Ok(bytes) = nodedb_wal::segment::read_checkpoint_framed(&path) else {
-                continue;
-            };
+            // A framing/CRC fault (`WalError::CheckpointCorrupt`) or a decode
+            // fault (`VectorError`) below is fail-stop, not a skip: the file is
+            // present, so its bytes are the only surviving copy of these vectors
+            // once the WAL below the checkpoint LSN has been truncated.
+            let bytes = nodedb_wal::segment::read_checkpoint_framed(&path)?;
             let kek = self.segment_keks.vector_checkpoint_kek.as_ref();
-            let load_result =
-                crate::engine::vector::collection::VectorCollection::from_checkpoint(&bytes, kek);
-            let collection = match load_result {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        core = self.core_id,
-                        key = %filename,
-                        error = %e,
-                        "vector checkpoint rejected"
-                    );
-                    continue;
-                }
-            };
+            let collection =
+                crate::engine::vector::collection::VectorCollection::from_checkpoint(&bytes, kek)?;
             tracing::info!(
                 core = self.core_id,
                 key = %filename,
@@ -233,6 +233,7 @@ impl CoreLoop {
         if loaded > 0 {
             tracing::info!(core = self.core_id, loaded, "vector checkpoints loaded");
         }
+        Ok(())
     }
 }
 

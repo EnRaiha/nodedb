@@ -21,11 +21,17 @@ use crate::data::executor::core_loop::CoreLoop;
 ///
 /// The relative order of the loaders WITHIN this function is load-bearing too —
 /// each call below carries the comment stating what its position rests on.
-pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) {
+pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) -> crate::Result<()> {
     // The array engine needs no loader: its checkpoint IS its on-disk tile
     // segments, which `ArrayStore::open` mmaps whenever the array is opened —
     // by replay, or lazily by the first read.
-    core.load_vector_checkpoints();
+    //
+    // A corrupt or unreadable vector checkpoint is fail-stop: its `Err`
+    // propagates out of boot so the core refuses to come up, rather than
+    // silently skipping the checkpoint and serving a truncated index (the WAL
+    // below the checkpoint LSN is already gone). The other loaders still return
+    // `()` today; a later unit converts them to the same fail-stop contract.
+    core.load_vector_checkpoints()?;
     core.load_spatial_checkpoints();
     core.load_sparse_vector_checkpoints();
     core.load_crdt_checkpoints();
@@ -83,4 +89,5 @@ pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) {
     // partition that already held it. A timeseries ingest is an append,
     // so nothing masked the duplicate rows.
     core.load_ts_registries();
+    Ok(())
 }

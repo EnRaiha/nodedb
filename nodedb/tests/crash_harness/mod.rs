@@ -162,6 +162,45 @@ impl CrashHarness {
         );
     }
 
+    /// Spawn the server and assert that boot FAILS-STOP rather than coming up.
+    ///
+    /// Used by corruption tests that plant an unreadable checkpoint before boot:
+    /// the server must NEVER report `/healthz`-ready, and must exit non-zero
+    /// within `timeout` (the fail-stop path aborts boot, `main` returns `Err`,
+    /// and the process exits with a failure code). Panics if the server becomes
+    /// ready, exits cleanly, or neither exits nor becomes ready in time.
+    pub fn spawn_expect_boot_failure(&mut self, timeout: Duration) {
+        self.spawn();
+        let deadline = Instant::now() + timeout;
+        loop {
+            // A fail-stopped boot must never open the gateway / report ready.
+            assert!(
+                !check_healthz(self.http_port),
+                "server became ready despite a corrupt checkpoint; fail-stop did not trigger"
+            );
+            if let Some(child) = self.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        assert!(
+                            !status.success(),
+                            "server exited cleanly (0) on a corrupt checkpoint; \
+                             expected a non-zero fail-stop exit (status: {status:?})"
+                        );
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => panic!("failed to poll server process: {e}"),
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "server neither became ready nor exited within {timeout:?}; \
+                 fail-stop boot-abort did not occur"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     pub fn pgwire_conn_str(&self) -> String {
         format!(
             "host=127.0.0.1 port={} dbname=nodedb user=nodedb password=nodedb",

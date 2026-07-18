@@ -118,7 +118,8 @@ pub fn spawn_core(
             // with older rows (restore vs. replay) or leaves an empty seeded
             // engine in place of a restored one (restore vs. seed). Each stage's
             // doc comment states the constraint it rests on.
-            load_boot_checkpoints(&mut core);
+            load_boot_checkpoints(&mut core)
+                .expect("boot checkpoint load failed: corrupt or unreadable checkpoint");
             seed_catalog_state(
                 &mut core,
                 &doc_config_seed,

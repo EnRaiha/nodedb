@@ -457,7 +457,9 @@ mod tests {
         // proving durability came from the synchronous checkpoint, not replay.
         drop(core);
         let mut reopened = open_core(dir.path());
-        reopened.load_vector_checkpoints();
+        reopened
+            .load_vector_checkpoints()
+            .expect("load vector checkpoints");
         let key = CoreLoop::vector_index_key(0, 0, "emb", "");
         let restored = reopened
             .vector_collections
