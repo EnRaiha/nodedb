@@ -19,8 +19,8 @@ use crate::control::state::SharedState;
 use crate::types::TenantId;
 
 use super::fire_common::{
-    BeforeTriggersMutationParams, check_cascade_depth, fire_before_triggers_with_mutation,
-    fire_triggers,
+    BeforeTriggersMutationParams, FireTriggersParams, check_cascade_depth,
+    fire_before_triggers_with_mutation, fire_triggers,
 };
 use super::registry::DmlEvent;
 
@@ -153,14 +153,17 @@ pub async fn fire_before_delete(
 
     let bindings = RowBindings::before_delete(collection, old_fields.clone());
 
-    fire_triggers(
+    fire_triggers(FireTriggersParams {
         state,
         identity,
         tenant_id,
         collection,
-        &before_triggers,
-        &bindings,
+        triggers: &before_triggers,
+        bindings: &bindings,
         cascade_depth,
-    )
+        // BEFORE triggers run in the caller's write context, not the
+        // Event-Plane async cross-shard sender path.
+        cross_shard_origin: None,
+    })
     .await
 }

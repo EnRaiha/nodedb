@@ -6,6 +6,12 @@
 //! - Cross-shard trigger write request structure
 //! - Trigger definition registry behavior
 //! - EventSource exhaustive coverage for trigger dispatch decisions
+//!
+//! A true end-to-end cross-shard AFTER-trigger test (fire on the source's
+//! owner, land on a DIFFERENT node owning the target) does not run here — see
+//! the tracked harness gap noted at the bottom of this file. The origination
+//! logic and the send/receive path are covered elsewhere; see that note for
+//! where.
 
 use nodedb::control::trigger::TriggerRegistry;
 use nodedb::control::trigger::registry::DmlEvent;
@@ -266,3 +272,45 @@ fn all_event_sources_have_correct_trigger_behavior() {
         assert_eq!(fires, *should_fire, "{label}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Cross-shard AFTER-trigger dispatch: coverage map + tracked harness gap
+// ---------------------------------------------------------------------------
+//
+// The cross-shard trigger SENDER is implemented and wired: the origination
+// branch in `control/planner/procedural/executor/core/dispatch.rs` (gated on
+// `StatementExecutor::cross_shard_origin`) resolves each trigger-body write's
+// target vShard via `resolve_decision`, and when that resolves to
+// `RouteDecision::Remote`, builds a `CrossShardWriteRequest` and enqueues it
+// on `SharedState::cross_shard_dispatcher` instead of taking the historical
+// local Data-Plane write path.
+//
+// A true end-to-end cluster test — trigger fires on the SOURCE collection's
+// owning node, body write lands on a DIFFERENT node owning the TARGET
+// collection — cannot run against the current `nodedb-cluster-tests` harness
+// (`TestCluster`). The harness always brings up a single-data-leader
+// topology: node 1 leads every vShard's Raft group (all data groups are
+// seeded with the same membership order), so every trigger fires on node 1,
+// which also owns every possible target vShard — the `Remote` route in
+// `resolve_decision` never triggers, no matter which collection names are
+// probed. `TestCluster` exposes no leadership-transfer or leader-placement
+// API to force a source/target split across nodes.
+//
+// TRACKED FOLLOW-UP: a real e2e test needs the harness to distribute vShard
+// leadership across nodes. That requires surfacing
+// `MultiRaft::transfer_leadership` from `RunningCluster` plus a
+// `wait_for_group_leader` helper on `TestCluster`, so a test can force one
+// data group's leader onto a different node than another's before creating
+// source/target collections. Until that lands, this file cannot exercise the
+// remote-landing assertion end-to-end.
+//
+// What IS covered instead:
+// - The origination logic itself (the routing decision + enqueue gate) is
+//   unit-tested directly against `StatementExecutor::execute_sql` in
+//   `nodedb/src/control/planner/procedural/executor/core/dispatch.rs`
+//   (`cross_shard_origination_tests` module), proving the Remote-route
+//   enqueue and the Local-route non-enqueue gate.
+// - The send/receive path (dispatcher retry/DLQ/HWM-dedup, wire
+//   serialization, receiver apply) is covered by
+//   `nodedb/tests/event_cross_shard.rs` and the dispatcher's own unit tests
+//   in `nodedb/src/event/cross_shard/dispatcher.rs`.

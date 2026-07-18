@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use tracing::{debug, trace, warn};
 
+use crate::control::planner::procedural::executor::core::CrossShardOrigin;
 use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -116,6 +117,12 @@ pub async fn dispatch_triggers(
                 old_fields: old_fields.as_ref(),
                 cascade_depth: 0,
                 mode_filter,
+                cross_shard_origin: Some(CrossShardOrigin {
+                    source_lsn: event.lsn.as_u64(),
+                    source_sequence: event.sequence,
+                    source_vshard: event.vshard_id.as_u32(),
+                    source_collection: event.collection.to_string(),
+                }),
             })
             .await;
 
@@ -158,6 +165,7 @@ pub async fn dispatch_triggers(
                         next_retry_at: std::time::Instant::now(),
                         source_lsn: event.lsn.as_u64(),
                         source_sequence: event.sequence,
+                        source_vshard: event.vshard_id.as_u32(),
                         cascade_depth: 0,
                     });
                 }
@@ -187,6 +195,7 @@ pub async fn dispatch_triggers(
             next_retry_at: std::time::Instant::now(),
             source_lsn: event.lsn.as_u64(),
             source_sequence: event.sequence,
+            source_vshard: event.vshard_id.as_u32(),
             cascade_depth: 0,
         });
     }
@@ -232,6 +241,12 @@ async fn retry_fire(
         old_fields: entry.old_fields.as_ref(),
         cascade_depth: entry.cascade_depth,
         mode_filter: Some(TriggerExecutionMode::Async), // Retries are always ASYNC
+        cross_shard_origin: Some(CrossShardOrigin {
+            source_lsn: entry.source_lsn,
+            source_sequence: entry.source_sequence,
+            source_vshard: entry.source_vshard,
+            source_collection: entry.collection.clone(),
+        }),
     })
     .await
 }
@@ -256,6 +271,9 @@ pub(super) struct FireForOperationParams<'a> {
     pub cascade_depth: u32,
     /// Restricts firing to a single execution mode; `None` fires all modes.
     pub mode_filter: Option<TriggerExecutionMode>,
+    /// Source-write context, so a trigger body writing to a remote-homed
+    /// collection is dispatched to the owning node instead of the local core.
+    pub cross_shard_origin: Option<CrossShardOrigin>,
 }
 
 /// Shared trigger fire logic: routes to the correct `fire_after_*` function.
@@ -273,20 +291,22 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> cr
         old_fields,
         cascade_depth,
         mode_filter,
+        cross_shard_origin,
     } = params;
 
     match operation {
         "INSERT" => {
             if let Some(new) = new_fields {
-                fire::fire_after_insert(
+                fire::fire_after_insert(fire::FireAfterInsertParams {
                     state,
                     identity,
                     tenant_id,
                     collection,
-                    new,
+                    new_fields: new,
                     cascade_depth,
                     mode_filter,
-                )
+                    cross_shard_origin,
+                })
                 .await
             } else {
                 Ok(())
@@ -303,6 +323,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> cr
                     new_fields: new,
                     cascade_depth,
                     mode_filter,
+                    cross_shard_origin,
                 })
                 .await
             } else {
@@ -311,15 +332,16 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> cr
         }
         "DELETE" => {
             if let Some(old) = old_fields {
-                fire::fire_after_delete(
+                fire::fire_after_delete(fire::FireAfterDeleteParams {
                     state,
                     identity,
                     tenant_id,
                     collection,
-                    old,
+                    old_fields: old,
                     cascade_depth,
                     mode_filter,
-                )
+                    cross_shard_origin,
+                })
                 .await
             } else {
                 Ok(())

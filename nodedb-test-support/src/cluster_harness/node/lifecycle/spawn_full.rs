@@ -171,6 +171,25 @@ impl TestClusterNode {
             state.cluster_transport = Some(Arc::clone(&handle.transport));
             state.metadata_cache = Arc::clone(&handle.metadata_cache);
             state.group_watchers = Arc::clone(&handle.group_watchers);
+            // Wire the cross-shard event SENDER (mirrors production
+            // `bootstrap::state_wiring::wire_state`) so an AFTER-trigger body
+            // writing to a remote-homed collection is dispatched to the owning
+            // node instead of silently mis-written locally. Must be set BEFORE
+            // `EventPlane::spawn` below, whose gate spawns the dispatcher drain
+            // task only when these fields are `Some`. The receiver builds its
+            // own HWM store at Raft group setup, so `hwm_store` stays `None`.
+            let cross_shard_metrics =
+                Arc::new(nodedb::event::cross_shard::CrossShardMetrics::new());
+            state.cross_shard_dispatcher = Some(Arc::new(
+                nodedb::event::cross_shard::CrossShardDispatcher::new(
+                    handle.node_id,
+                    Arc::clone(&cross_shard_metrics),
+                ),
+            ));
+            state.cross_shard_dlq = Some(Arc::new(std::sync::Mutex::new(
+                nodedb::event::cross_shard::CrossShardDlq::open(&data_dir_path)?,
+            )));
+            state.cross_shard_metrics = Some(cross_shard_metrics);
             // Fixed test KEK so backup tests produce encrypted envelopes.
             state.backup_kek = Some(Arc::new([0x42u8; 32]));
             // Durable producer registry, sharing the credential store's

@@ -13,6 +13,7 @@
 //! - `None`: fire all AFTER triggers regardless of mode (legacy behavior)
 
 use crate::control::planner::procedural::executor::bindings::RowBindings;
+use crate::control::planner::procedural::executor::core::CrossShardOrigin;
 use crate::control::security::catalog::trigger_types::{TriggerExecutionMode, TriggerTiming};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -20,8 +21,28 @@ use crate::types::TenantId;
 
 use std::collections::HashMap;
 
-use super::fire_common::{check_cascade_depth, fire_triggers};
+use super::fire_common::{FireTriggersParams, check_cascade_depth, fire_triggers};
 use super::registry::DmlEvent;
+
+/// Parameters for [`fire_after_insert`].
+pub struct FireAfterInsertParams<'a> {
+    /// Shared server state (trigger registry, block cache).
+    pub state: &'a SharedState,
+    /// Caller identity (used unless a trigger is SECURITY DEFINER).
+    pub identity: &'a AuthenticatedIdentity,
+    /// Tenant scope for trigger lookup and execution.
+    pub tenant_id: TenantId,
+    /// Target collection name.
+    pub collection: &'a str,
+    /// Inserted row fields (bound as `NEW.*`).
+    pub new_fields: &'a HashMap<String, nodedb_types::Value>,
+    /// Current cascade depth, for infinite-loop protection.
+    pub cascade_depth: u32,
+    /// Restricts firing to a single execution mode; `None` fires all modes.
+    pub mode_filter: Option<TriggerExecutionMode>,
+    /// Cross-shard origin context (Event-Plane fire path only).
+    pub cross_shard_origin: Option<CrossShardOrigin>,
+}
 
 /// Fire AFTER ROW triggers for an INSERT operation.
 ///
@@ -33,15 +54,18 @@ use super::registry::DmlEvent;
 /// - `Some(Sync)`: only fire SYNC triggers (called from write path)
 /// - `Some(Async)`: only fire ASYNC triggers (called from Event Plane)
 /// - `None`: fire all AFTER triggers regardless of mode (legacy behavior)
-pub async fn fire_after_insert(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    collection: &str,
-    new_fields: &HashMap<String, nodedb_types::Value>,
-    cascade_depth: u32,
-    mode_filter: Option<TriggerExecutionMode>,
-) -> crate::Result<()> {
+pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> crate::Result<()> {
+    let FireAfterInsertParams {
+        state,
+        identity,
+        tenant_id,
+        collection,
+        new_fields,
+        cascade_depth,
+        mode_filter,
+        cross_shard_origin,
+    } = params;
+
     let triggers =
         state
             .trigger_registry
@@ -61,15 +85,16 @@ pub async fn fire_after_insert(
 
     let bindings = RowBindings::after_insert(collection, new_fields.clone());
 
-    fire_triggers(
+    fire_triggers(FireTriggersParams {
         state,
         identity,
         tenant_id,
         collection,
-        &after_triggers,
-        &bindings,
+        triggers: &after_triggers,
+        bindings: &bindings,
         cascade_depth,
-    )
+        cross_shard_origin,
+    })
     .await
 }
 
@@ -91,6 +116,8 @@ pub struct FireAfterUpdateParams<'a> {
     pub cascade_depth: u32,
     /// Restricts firing to a single execution mode; `None` fires all modes.
     pub mode_filter: Option<TriggerExecutionMode>,
+    /// Cross-shard origin context (Event-Plane fire path only).
+    pub cross_shard_origin: Option<CrossShardOrigin>,
 }
 
 /// Fire AFTER ROW triggers for an UPDATE operation.
@@ -107,6 +134,7 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> crate::Resu
         new_fields,
         cascade_depth,
         mode_filter,
+        cross_shard_origin,
     } = params;
 
     let triggers =
@@ -128,30 +156,54 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> crate::Resu
 
     let bindings = RowBindings::after_update(collection, old_fields.clone(), new_fields.clone());
 
-    fire_triggers(
+    fire_triggers(FireTriggersParams {
         state,
         identity,
         tenant_id,
         collection,
-        &after_triggers,
-        &bindings,
+        triggers: &after_triggers,
+        bindings: &bindings,
         cascade_depth,
-    )
+        cross_shard_origin,
+    })
     .await
+}
+
+/// Parameters for [`fire_after_delete`].
+pub struct FireAfterDeleteParams<'a> {
+    /// Shared server state (trigger registry, block cache).
+    pub state: &'a SharedState,
+    /// Caller identity (used unless a trigger is SECURITY DEFINER).
+    pub identity: &'a AuthenticatedIdentity,
+    /// Tenant scope for trigger lookup and execution.
+    pub tenant_id: TenantId,
+    /// Target collection name.
+    pub collection: &'a str,
+    /// Deleted row fields (bound as `OLD.*`).
+    pub old_fields: &'a HashMap<String, nodedb_types::Value>,
+    /// Current cascade depth, for infinite-loop protection.
+    pub cascade_depth: u32,
+    /// Restricts firing to a single execution mode; `None` fires all modes.
+    pub mode_filter: Option<TriggerExecutionMode>,
+    /// Cross-shard origin context (Event-Plane fire path only).
+    pub cross_shard_origin: Option<CrossShardOrigin>,
 }
 
 /// Fire AFTER ROW triggers for a DELETE operation.
 ///
 /// `old_fields` is the deleted row. Available as OLD.field in the trigger body.
-pub async fn fire_after_delete(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    collection: &str,
-    old_fields: &HashMap<String, nodedb_types::Value>,
-    cascade_depth: u32,
-    mode_filter: Option<TriggerExecutionMode>,
-) -> crate::Result<()> {
+pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> crate::Result<()> {
+    let FireAfterDeleteParams {
+        state,
+        identity,
+        tenant_id,
+        collection,
+        old_fields,
+        cascade_depth,
+        mode_filter,
+        cross_shard_origin,
+    } = params;
+
     let triggers =
         state
             .trigger_registry
@@ -171,15 +223,16 @@ pub async fn fire_after_delete(
 
     let bindings = RowBindings::after_delete(collection, old_fields.clone());
 
-    fire_triggers(
+    fire_triggers(FireTriggersParams {
         state,
         identity,
         tenant_id,
         collection,
-        &after_triggers,
-        &bindings,
+        triggers: &after_triggers,
+        bindings: &bindings,
         cascade_depth,
-    )
+        cross_shard_origin,
+    })
     .await
 }
 

@@ -403,6 +403,7 @@ fn retry_queue_exponential_backoff() {
         next_retry_at: std::time::Instant::now(),
         source_lsn: 100,
         source_sequence: 1,
+        source_vshard: 0,
         cascade_depth: 0,
     };
 
@@ -434,6 +435,7 @@ fn retry_queue_multiple_entries_fifo() {
             next_retry_at: now,
             source_lsn: i as u64,
             source_sequence: i as u64,
+            source_vshard: 0,
             cascade_depth: 0,
         });
     }

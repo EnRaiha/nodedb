@@ -21,13 +21,19 @@ pub(super) async fn fire_sync_after_triggers(
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
     if let Err(e) = crate::control::trigger::fire::fire_after_insert(
-        state,
-        identity,
-        tenant_id,
-        coll_name,
-        fields,
-        0,
-        Some(TriggerExecutionMode::Sync),
+        crate::control::trigger::fire::FireAfterInsertParams {
+            state,
+            identity,
+            tenant_id,
+            collection: coll_name,
+            new_fields: fields,
+            cascade_depth: 0,
+            mode_filter: Some(TriggerExecutionMode::Sync),
+            // SYNC AFTER triggers fire in the Control-Plane write path, which
+            // has no source-write LSN/HWM identity; cross-shard origination for
+            // this path is a tracked follow-up.
+            cross_shard_origin: None,
+        },
     )
     .await
     {
@@ -60,6 +66,10 @@ pub(super) async fn fire_sync_after_update_triggers(
             new_fields,
             cascade_depth: 0,
             mode_filter: Some(TriggerExecutionMode::Sync),
+            // SYNC AFTER triggers run in the Control-Plane write path (no
+            // source-write LSN/HWM identity); cross-shard origination here is a
+            // tracked follow-up.
+            cross_shard_origin: None,
         },
     )
     .await

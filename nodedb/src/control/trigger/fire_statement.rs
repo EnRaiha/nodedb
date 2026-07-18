@@ -19,7 +19,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::fire_common::{check_cascade_depth, fire_triggers};
+use super::fire_common::{FireTriggersParams, check_cascade_depth, fire_triggers};
 use super::registry::DmlEvent;
 
 /// Fire AFTER STATEMENT triggers for the given operation.
@@ -62,14 +62,17 @@ pub async fn fire_after_statement(
     // Statement-level bindings: TG_OP + TG_TABLE_NAME, no NEW/OLD.
     let bindings = RowBindings::statement(collection, event.as_str());
 
-    fire_triggers(
+    fire_triggers(FireTriggersParams {
         state,
         identity,
         tenant_id,
         collection,
-        &statement_triggers,
-        &bindings,
+        triggers: &statement_triggers,
+        bindings: &bindings,
         cascade_depth,
-    )
+        // STATEMENT triggers are outside the Event-Plane async ROW-trigger
+        // cross-shard sender path (see tracked follow-up).
+        cross_shard_origin: None,
+    })
     .await
 }

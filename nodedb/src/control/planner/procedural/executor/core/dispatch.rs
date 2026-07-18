@@ -79,6 +79,68 @@ impl<'a> StatementExecutor<'a> {
             }
         } else {
             for task in tasks {
+                // Cross-shard trigger origination: when this executor carries a
+                // source-write origin (Event-Plane AFTER-trigger fire path) AND
+                // the node is clustered, a task whose target collection is homed
+                // on a remote node must be dispatched to that node via the
+                // cross-shard event subsystem — NOT written to the local core
+                // (the historical silent mis-write). Stored procedures and
+                // normal client SQL carry no origin, so `route` is `None` and
+                // they always take the unchanged local path below.
+                if let Some(origin) = self.cross_shard_origin.as_ref() {
+                    let route = {
+                        let routing_guard = self
+                            .state
+                            .cluster_routing
+                            .as_ref()
+                            .map(|rw| rw.read().unwrap_or_else(|p| p.into_inner()));
+                        routing_guard.as_deref().map(|routing| {
+                            crate::control::gateway::router::resolve_decision(
+                                task.vshard_id.as_u32(),
+                                self.state.node_id,
+                                Some(routing),
+                                None,
+                            )
+                        })
+                    };
+
+                    match route {
+                        // Single-node (no routing table) or this node owns the
+                        // target vShard: fall through to the local write path.
+                        None | Some(crate::control::gateway::RouteDecision::Local) => {}
+                        Some(crate::control::gateway::RouteDecision::Remote {
+                            node_id, ..
+                        }) => {
+                            self.enqueue_cross_shard_write(
+                                node_id,
+                                origin,
+                                task.vshard_id.as_u32(),
+                                &bound_sql,
+                            )?;
+                            continue;
+                        }
+                        Some(crate::control::gateway::RouteDecision::LeaderUnknown {
+                            vshard_id,
+                        }) => {
+                            return Err(crate::Error::NotLeader {
+                                vshard_id: crate::types::VShardId::new(vshard_id as u32),
+                                leader_node: 0,
+                                leader_addr: String::new(),
+                            });
+                        }
+                        Some(crate::control::gateway::RouteDecision::Broadcast { .. }) => {
+                            // `resolve_decision` resolves a single vShard and
+                            // never returns Broadcast; treat as an invariant
+                            // violation rather than silently mis-routing.
+                            return Err(crate::Error::Internal {
+                                detail: "cross-shard trigger: resolve_decision returned \
+                                         Broadcast for a single vShard"
+                                    .into(),
+                            });
+                        }
+                    }
+                }
+
                 let outcome = crate::control::server::wal_dispatch::wal_append_if_write(
                     &self.state.wal,
                     task.tenant_id,
@@ -103,6 +165,49 @@ impl<'a> StatementExecutor<'a> {
                 )
                 .await?;
             }
+        }
+
+        Ok(())
+    }
+
+    /// Enqueue a trigger-originated write for delivery to the vShard's owning
+    /// node via the cross-shard event dispatcher.
+    ///
+    /// Event-Plane safe: this only performs a bounded in-memory push (the
+    /// dispatcher's per-target queue). The durable write happens on the target
+    /// node's `CrossShardReceiver`, which WAL-appends and dispatches there. No
+    /// storage I/O or remote DML executes inline here.
+    fn enqueue_cross_shard_write(
+        &self,
+        target_node: u64,
+        origin: &super::CrossShardOrigin,
+        target_vshard: u32,
+        bound_sql: &str,
+    ) -> crate::Result<()> {
+        let request = crate::event::cross_shard::types::CrossShardWriteRequest {
+            sql: bound_sql.to_string(),
+            tenant_id: self.tenant_id.as_u64(),
+            source_vshard: origin.source_vshard,
+            source_lsn: origin.source_lsn,
+            source_sequence: origin.source_sequence,
+            cascade_depth: self.cascade_depth(),
+            source_collection: origin.source_collection.clone(),
+            target_vshard,
+        };
+
+        let dispatcher =
+            self.state
+                .cross_shard_dispatcher
+                .as_ref()
+                .ok_or(crate::Error::Dispatch {
+                    detail: "cross-shard dispatcher not initialised for trigger origination"
+                        .to_string(),
+                })?;
+
+        if !dispatcher.enqueue(target_node, request) {
+            return Err(crate::Error::Dispatch {
+                detail: format!("cross-shard send queue full for target node {target_node}"),
+            });
         }
 
         Ok(())
@@ -371,5 +476,240 @@ mod tests {
         let sql = "VALUES ('a', col)";
         let folded = fold_literal_string_concat(sql);
         assert_eq!(folded, sql);
+    }
+}
+
+/// Deterministic coverage for the cross-shard trigger ORIGINATION logic
+/// (the `execute_sql` routing branch above), replacing the un-runnable
+/// full-cluster e2e test that used to live in
+/// `nodedb-cluster-tests/tests/cluster_triggers.rs` — that harness cannot
+/// place different vShards' Raft leadership on different nodes, so a
+/// same-node "remote" route never arises there. Here the routing table is
+/// built directly, so both `Local` and `Remote` decisions are reachable
+/// without a cluster.
+///
+/// The send/receive path (dispatcher retry/DLQ/HWM-dedup, wire
+/// serialization, receiver apply) is covered separately by
+/// `nodedb/tests/event_cross_shard.rs` and
+/// `nodedb/src/event/cross_shard/dispatcher.rs`'s own unit tests; this
+/// module only proves the origination gate in `execute_sql`.
+#[cfg(test)]
+mod cross_shard_origination_tests {
+    use std::sync::{Arc, RwLock};
+
+    use nodedb_cluster::RoutingTable;
+    use nodedb_types::DatabaseId;
+
+    use crate::control::planner::procedural::executor::bindings::RowBindings;
+    use crate::control::planner::procedural::executor::core::{
+        CrossShardOrigin, StatementExecutor,
+    };
+    use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity};
+    use crate::control::server::shared::ddl::neutral::collection::create::handler::create_collection;
+    use crate::control::server::shared::ddl::neutral::collection::create::request::CreateCollectionRequest;
+    use crate::control::state::SharedState;
+    use crate::event::cross_shard::{CrossShardDispatcher, CrossShardMetrics};
+    use crate::types::TenantId;
+    use crate::wal::WalManager;
+
+    /// This node's id in every fixture below.
+    const LOCAL_NODE: u64 = 1;
+    /// The other cluster member every fixture routes remote writes to.
+    const REMOTE_NODE: u64 = 2;
+
+    fn test_identity() -> AuthenticatedIdentity {
+        AuthenticatedIdentity {
+            user_id: 1,
+            username: "cross_shard_origin_test".into(),
+            tenant_id: TenantId::new(1),
+            auth_method: AuthMethod::Trust,
+            roles: vec![],
+            is_superuser: true,
+            default_database: None,
+            accessible_databases: AuthenticatedIdentity::default_database_set(true),
+        }
+    }
+
+    /// Build a `SharedState` wired for cross-shard trigger origination: a
+    /// 2-group routing table (data group 1 led by `LOCAL_NODE`, data group 2
+    /// led by `REMOTE_NODE`) plus a live `CrossShardDispatcher`. Under
+    /// `RoutingTable::uniform`, even vShards map to group 1 (local) and odd
+    /// vShards map to group 2 (remote). Also creates `coll_name` as a
+    /// `document_strict` collection with `id TEXT PRIMARY KEY` so `INSERT`
+    /// plans against it.
+    async fn build_state_with_collection(
+        dir: &tempfile::TempDir,
+        coll_name: &str,
+    ) -> Arc<SharedState> {
+        let wal_path = dir.path().join("test.wal");
+        let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
+        let (dispatcher, _data_sides) = crate::bridge::dispatch::Dispatcher::new(1, 16);
+        let mut state = SharedState::new(dispatcher, wal).unwrap();
+
+        {
+            let s = Arc::get_mut(&mut state)
+                .expect("sole owner: no clone has been taken yet in this fixture");
+            s.node_id = LOCAL_NODE;
+            let routing = RoutingTable::uniform(2, &[LOCAL_NODE, REMOTE_NODE], 1);
+            s.cluster_routing = Some(Arc::new(RwLock::new(routing)));
+            s.cross_shard_dispatcher = Some(Arc::new(CrossShardDispatcher::new(
+                LOCAL_NODE,
+                Arc::new(CrossShardMetrics::new()),
+            )));
+        }
+
+        let identity = test_identity();
+        let columns = vec![
+            ("id".to_string(), "TEXT PRIMARY KEY".to_string()),
+            ("val".to_string(), "INT".to_string()),
+        ];
+        let req = CreateCollectionRequest {
+            name: coll_name,
+            engine: Some("document_strict"),
+            columns: &columns,
+            options: &[],
+            flags: &[],
+            balanced_raw: None,
+        };
+        create_collection(&state, &identity, &req, DatabaseId::DEFAULT)
+            .await
+            .unwrap_or_else(|e| panic!("create_collection({coll_name}) failed: {e:?}"));
+
+        state
+    }
+
+    /// Find a `{prefix}_<i>` collection name whose vShard is homed on
+    /// `REMOTE_NODE` under the routing table `build_state_with_collection`
+    /// installs (odd vShard → data group 2 → `REMOTE_NODE`).
+    fn remote_homed_name(prefix: &str) -> String {
+        for i in 0..4096u32 {
+            let name = format!("{prefix}_{i}");
+            let vshard = nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, &name);
+            if vshard % 2 == 1 {
+                return name;
+            }
+        }
+        panic!("could not find a remote-homed collection name for prefix {prefix}");
+    }
+
+    /// Find a `{prefix}_<i>` collection name whose vShard is homed on
+    /// `LOCAL_NODE` (even vShard → data group 1 → `LOCAL_NODE`).
+    fn local_homed_name(prefix: &str) -> String {
+        for i in 0..4096u32 {
+            let name = format!("{prefix}_{i}");
+            let vshard = nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, &name);
+            if vshard % 2 == 0 {
+                return name;
+            }
+        }
+        panic!("could not find a local-homed collection name for prefix {prefix}");
+    }
+
+    /// WHEN `cross_shard_origin` is set AND the write's target vShard
+    /// resolves to a REMOTE node, THEN `execute_sql` enqueues a
+    /// `CrossShardWriteRequest` to that node's dispatcher queue instead of
+    /// taking the local write path. Non-vacuous: reverting the `Some(origin)`
+    /// branch in `execute_sql` back to always-local would make this test
+    /// enqueue nothing and fail the `total_pending() == 1` assertion.
+    #[tokio::test]
+    async fn trigger_write_to_remote_homed_collection_enqueues_cross_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgt = remote_homed_name("cs_origin_remote");
+        let state = build_state_with_collection(&dir, &tgt).await;
+
+        let executor = StatementExecutor::with_source(
+            &state,
+            test_identity(),
+            TenantId::new(1),
+            0,
+            crate::event::EventSource::Trigger,
+        )
+        .with_cross_shard_origin(CrossShardOrigin {
+            source_lsn: 100,
+            source_sequence: 7,
+            source_vshard: 999,
+            source_collection: "src_probe".to_string(),
+        });
+
+        let sql = format!("INSERT INTO {tgt} (id, val) VALUES ('fired', 1)");
+        executor
+            .execute_sql(&sql, &RowBindings::empty())
+            .await
+            .expect("execute_sql should enqueue the remote write, not fail");
+
+        let dispatcher = state
+            .cross_shard_dispatcher
+            .as_ref()
+            .expect("dispatcher configured by build_state_with_collection");
+        assert_eq!(
+            dispatcher.total_pending(),
+            1,
+            "exactly one cross-shard write must be enqueued"
+        );
+        assert_eq!(
+            dispatcher.active_targets(),
+            vec![REMOTE_NODE],
+            "the write must be enqueued to the target's owning node"
+        );
+
+        let pending = dispatcher.peek_pending(REMOTE_NODE);
+        assert_eq!(pending.len(), 1);
+        let req = &pending[0];
+        assert_eq!(req.sql, sql);
+        assert_eq!(req.source_lsn, 100);
+        assert_eq!(req.source_sequence, 7);
+        assert_eq!(req.source_vshard, 999);
+        assert_eq!(req.source_collection, "src_probe");
+        assert_eq!(req.cascade_depth, 0);
+        assert_eq!(
+            req.target_vshard,
+            nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, &tgt)
+        );
+    }
+
+    /// Companion gate assertion: with the SAME `cross_shard_origin` set, a
+    /// write whose target vShard resolves to `Local` (this node owns it)
+    /// must NOT be enqueued to the cross-shard dispatcher — proving the gate
+    /// is routing-driven, not "always enqueue when origin is set". No Data
+    /// Plane core is running to drain the SPSC bridge in this fixture, so the
+    /// local path's `dispatch_write_to_data_plane` await never resolves on
+    /// its own; bounding it with a timeout is enough to observe that the
+    /// cross-shard dispatcher was never touched before that await blocks.
+    #[tokio::test]
+    async fn trigger_write_to_locally_homed_collection_never_enqueues_cross_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgt = local_homed_name("cs_origin_local");
+        let state = build_state_with_collection(&dir, &tgt).await;
+
+        let executor = StatementExecutor::with_source(
+            &state,
+            test_identity(),
+            TenantId::new(1),
+            0,
+            crate::event::EventSource::Trigger,
+        )
+        .with_cross_shard_origin(CrossShardOrigin {
+            source_lsn: 1,
+            source_sequence: 1,
+            source_vshard: 0,
+            source_collection: "src_probe".to_string(),
+        });
+
+        let sql = format!("INSERT INTO {tgt} (id, val) VALUES ('local', 1)");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            executor.execute_sql(&sql, &RowBindings::empty()),
+        )
+        .await;
+
+        let dispatcher = state
+            .cross_shard_dispatcher
+            .as_ref()
+            .expect("dispatcher configured by build_state_with_collection");
+        assert_eq!(
+            dispatcher.total_pending(),
+            0,
+            "a Local-routed write must never be enqueued to the cross-shard dispatcher"
+        );
     }
 }

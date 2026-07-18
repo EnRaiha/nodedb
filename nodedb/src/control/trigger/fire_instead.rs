@@ -19,7 +19,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::fire_common::{check_cascade_depth, fire_triggers};
+use super::fire_common::{FireTriggersParams, check_cascade_depth, fire_triggers};
 use super::registry::DmlEvent;
 
 /// Result of checking for INSTEAD OF triggers.
@@ -61,15 +61,18 @@ pub async fn fire_instead_of_insert(
 
     let bindings = RowBindings::before_insert(collection, new_fields.clone());
 
-    fire_triggers(
+    fire_triggers(FireTriggersParams {
         state,
         identity,
         tenant_id,
         collection,
-        &instead_triggers,
-        &bindings,
+        triggers: &instead_triggers,
+        bindings: &bindings,
         cascade_depth,
-    )
+        // INSTEAD OF triggers replace the base DML in the caller's context;
+        // they are not part of the Event-Plane async cross-shard sender path.
+        cross_shard_origin: None,
+    })
     .await?;
 
     Ok(InsteadOfResult::Handled)
@@ -125,15 +128,18 @@ pub async fn fire_instead_of_update(
 
     let bindings = RowBindings::before_update(collection, old_fields.clone(), new_fields.clone());
 
-    fire_triggers(
+    fire_triggers(FireTriggersParams {
         state,
         identity,
         tenant_id,
         collection,
-        &instead_triggers,
-        &bindings,
+        triggers: &instead_triggers,
+        bindings: &bindings,
         cascade_depth,
-    )
+        // INSTEAD OF triggers replace the base DML in the caller's context;
+        // they are not part of the Event-Plane async cross-shard sender path.
+        cross_shard_origin: None,
+    })
     .await?;
 
     Ok(InsteadOfResult::Handled)
@@ -166,15 +172,18 @@ pub async fn fire_instead_of_delete(
 
     let bindings = RowBindings::before_delete(collection, old_fields.clone());
 
-    fire_triggers(
+    fire_triggers(FireTriggersParams {
         state,
         identity,
         tenant_id,
         collection,
-        &instead_triggers,
-        &bindings,
+        triggers: &instead_triggers,
+        bindings: &bindings,
         cascade_depth,
-    )
+        // INSTEAD OF triggers replace the base DML in the caller's context;
+        // they are not part of the Event-Plane async cross-shard sender path.
+        cross_shard_origin: None,
+    })
     .await?;
 
     Ok(InsteadOfResult::Handled)

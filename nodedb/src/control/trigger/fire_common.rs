@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use tracing::{info, warn};
 
 use crate::control::planner::procedural::executor::bindings::RowBindings;
-use crate::control::planner::procedural::executor::core::{MAX_CASCADE_DEPTH, StatementExecutor};
+use crate::control::planner::procedural::executor::core::{
+    CrossShardOrigin, MAX_CASCADE_DEPTH, StatementExecutor,
+};
 use crate::control::security::catalog::trigger_types::{StoredTrigger, TriggerSecurity};
 use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
@@ -28,6 +30,28 @@ pub fn check_cascade_depth(cascade_depth: u32, collection: &str) -> crate::Resul
     Ok(())
 }
 
+/// Parameters for [`fire_triggers`].
+pub struct FireTriggersParams<'a> {
+    /// Shared server state (block cache, dispatcher, routing).
+    pub state: &'a SharedState,
+    /// Caller identity (used unless a trigger is SECURITY DEFINER).
+    pub identity: &'a AuthenticatedIdentity,
+    /// Tenant scope for trigger execution.
+    pub tenant_id: TenantId,
+    /// Collection whose write fired these triggers.
+    pub collection: &'a str,
+    /// Triggers to run, in registration order.
+    pub triggers: &'a [StoredTrigger],
+    /// Row bindings (OLD/NEW) for WHEN evaluation and body substitution.
+    pub bindings: &'a RowBindings,
+    /// Current cascade depth, for infinite-loop protection.
+    pub cascade_depth: u32,
+    /// Cross-shard origin context (Event-Plane fire path only; `None`
+    /// otherwise). Propagated into each trigger body's executor so that DML
+    /// against a remote-homed collection is dispatched to the owning node.
+    pub cross_shard_origin: Option<CrossShardOrigin>,
+}
+
 /// Execute a list of triggers with the given bindings.
 ///
 /// Evaluates WHEN clauses, parses trigger bodies, and executes each
@@ -36,15 +60,18 @@ pub fn check_cascade_depth(cascade_depth: u32, collection: &str) -> crate::Resul
 /// Handles SECURITY DEFINER: when a trigger has `security = Definer`,
 /// the executor runs with the trigger owner's identity instead of the caller's.
 /// Tenant boundary is enforced — DEFINER identity always uses the trigger's tenant.
-pub async fn fire_triggers(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
-    collection: &str,
-    triggers: &[StoredTrigger],
-    bindings: &RowBindings,
-    cascade_depth: u32,
-) -> crate::Result<()> {
+pub async fn fire_triggers(params: FireTriggersParams<'_>) -> crate::Result<()> {
+    let FireTriggersParams {
+        state,
+        identity,
+        tenant_id,
+        collection,
+        triggers,
+        bindings,
+        cascade_depth,
+        cross_shard_origin,
+    } = params;
+
     for trigger in triggers {
         if let Some(ref when_cond) = trigger.when_condition {
             let bound_cond = bindings.substitute(when_cond);
@@ -80,13 +107,16 @@ pub async fn fire_triggers(
             "trigger invoked"
         );
 
-        let executor = StatementExecutor::with_source(
+        let mut executor = StatementExecutor::with_source(
             state,
             effective_identity,
             tenant_id,
             cascade_depth + 1,
             crate::event::EventSource::Trigger,
         );
+        if let Some(ref origin) = cross_shard_origin {
+            executor = executor.with_cross_shard_origin(origin.clone());
+        }
 
         if let Err(e) = executor.execute_block(&block, bindings).await {
             return Err(crate::Error::BadRequest {

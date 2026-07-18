@@ -50,6 +50,10 @@ pub struct RetryEntry {
     pub source_lsn: u64,
     /// Original event's sequence number.
     pub source_sequence: u64,
+    /// vShard that owns the source collection (cross-shard HWM dedup key,
+    /// carried so a retried cross-shard trigger origination keeps its dedup
+    /// identity).
+    pub source_vshard: u32,
     /// Cascade depth from the original event.
     pub cascade_depth: u32,
 }
@@ -166,6 +170,7 @@ mod tests {
             next_retry_at: Instant::now(),
             source_lsn: 100,
             source_sequence: 1,
+            source_vshard: 3,
             cascade_depth: 0,
         }
     }

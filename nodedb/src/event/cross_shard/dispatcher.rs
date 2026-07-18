@@ -138,13 +138,25 @@ impl CrossShardDispatcher {
     }
 
     /// Get all target nodes that have pending writes.
-    fn active_targets(&self) -> Vec<u64> {
+    pub(crate) fn active_targets(&self) -> Vec<u64> {
         let queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
         queues
             .iter()
             .filter(|(_, q)| !q.entries.is_empty())
             .map(|(&node_id, _)| node_id)
             .collect()
+    }
+
+    /// Test-only: snapshot every pending request queued for a target node, in
+    /// FIFO order, without draining the queue. Lets origination tests assert
+    /// on the exact `CrossShardWriteRequest` fields an `enqueue()` produced.
+    #[cfg(test)]
+    pub(crate) fn peek_pending(&self, target_node: u64) -> Vec<CrossShardWriteRequest> {
+        let queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+        queues
+            .get(&target_node)
+            .map(|q| q.entries.iter().map(|w| w.request.clone()).collect())
+            .unwrap_or_default()
     }
 }
 

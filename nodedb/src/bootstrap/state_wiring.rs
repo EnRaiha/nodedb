@@ -66,6 +66,28 @@ pub fn wire_state(
         state.cluster_transport = Some(Arc::clone(&handle.transport));
         state.metadata_cache = Arc::clone(&handle.metadata_cache);
         state.group_watchers = Arc::clone(&handle.group_watchers);
+
+        // Wire the cross-shard event SENDER subsystem (cluster mode only). This
+        // is what lets a trigger body writing to a remote-homed collection be
+        // dispatched to the owning node instead of being silently mis-written
+        // to the local core. The dispatcher's background drain task is spawned
+        // later by the Event Plane (`spawn_dispatcher_task`), which injects the
+        // transport from `cluster_transport`; its spawn gate requires the
+        // dispatcher, metrics, and DLQ to be `Some` — set here. The RECEIVER
+        // builds its OWN HWM store at Raft group setup (rooted under the node's
+        // own data_dir), so the SharedState `hwm_store` stays `None`.
+        let cross_shard_metrics = Arc::new(crate::event::cross_shard::CrossShardMetrics::new());
+        state.cross_shard_dispatcher = Some(Arc::new(
+            crate::event::cross_shard::CrossShardDispatcher::new(
+                handle.node_id,
+                Arc::clone(&cross_shard_metrics),
+            ),
+        ));
+        state.cross_shard_dlq = Some(Arc::new(std::sync::Mutex::new(
+            crate::event::cross_shard::CrossShardDlq::open(&config.server.data_dir)?,
+        )));
+        state.cross_shard_metrics = Some(cross_shard_metrics);
+
         root_span.record("node_id", handle.node_id);
     }
 

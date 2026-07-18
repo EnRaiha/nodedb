@@ -81,15 +81,21 @@ pub async fn dispatch_trigger_batch(
             let bindings =
                 when_filter::build_row_bindings(row, &batch.collection, &batch.operation);
 
-            let result = fire_common::fire_triggers(
+            let result = fire_common::fire_triggers(fire_common::FireTriggersParams {
                 state,
-                &identity,
+                identity: &identity,
                 tenant_id,
-                &batch.collection,
-                std::slice::from_ref(trigger),
-                &bindings,
-                0,
-            )
+                collection: &batch.collection,
+                triggers: std::slice::from_ref(trigger),
+                bindings: &bindings,
+                cascade_depth: 0,
+                // The batch dispatch path does not carry per-row source
+                // LSN/sequence/vShard (TriggerBatch aggregates rows and drops
+                // that context), and it is not wired into the production
+                // consumer loop. Cross-shard origination is therefore not
+                // available here; see the tracked follow-up.
+                cross_shard_origin: None,
+            })
             .await;
 
             if let Err(e) = result {
@@ -111,8 +117,12 @@ pub async fn dispatch_trigger_batch(
                     attempts: 0,
                     last_error: e.to_string(),
                     next_retry_at: std::time::Instant::now(),
+                    // The batch path does not carry per-row source
+                    // LSN/sequence/vShard (see cross_shard_origin note above);
+                    // it is not wired into the production consumer loop.
                     source_lsn: 0,
                     source_sequence: 0,
+                    source_vshard: 0,
                     cascade_depth: 0,
                 });
             }

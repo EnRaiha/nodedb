@@ -205,15 +205,19 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
     match info.event {
         DmlEvent::Insert => {
             if let Some(ref new_fields) = info.new_fields {
-                fire_after::fire_after_insert(
+                fire_after::fire_after_insert(fire_after::FireAfterInsertParams {
                     state,
                     identity,
                     tenant_id,
-                    &info.collection,
+                    collection: &info.collection,
                     new_fields,
                     cascade_depth,
-                    Some(TriggerExecutionMode::Sync),
-                )
+                    mode_filter: Some(TriggerExecutionMode::Sync),
+                    // SYNC post-dispatch triggers run in the Control-Plane write
+                    // path (no source-write LSN/HWM identity); cross-shard
+                    // origination for this path is a tracked follow-up.
+                    cross_shard_origin: None,
+                })
                 .await?;
             }
         }
@@ -229,20 +233,22 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
                 new_fields,
                 cascade_depth,
                 mode_filter: Some(TriggerExecutionMode::Sync),
+                cross_shard_origin: None,
             })
             .await?;
         }
         DmlEvent::Delete => {
             let old_fields = old_row.as_ref().unwrap_or(&empty);
-            fire_after::fire_after_delete(
+            fire_after::fire_after_delete(fire_after::FireAfterDeleteParams {
                 state,
                 identity,
                 tenant_id,
-                &info.collection,
+                collection: &info.collection,
                 old_fields,
                 cascade_depth,
-                Some(TriggerExecutionMode::Sync),
-            )
+                mode_filter: Some(TriggerExecutionMode::Sync),
+                cross_shard_origin: None,
+            })
             .await?;
         }
     }
