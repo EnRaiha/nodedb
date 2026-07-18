@@ -225,6 +225,21 @@ async fn execute_planned(
         roles: &ctx.state.roles,
         permission_cache: Some(&*perm_cache),
     };
+
+    // Forward every per-session planning GUC (vector-dim quota, force-shuffle
+    // join/agg overrides + partition counts, broadcast / shuffle-aggregate cost
+    // thresholds) into the shared query context before planning — the same
+    // protocol-neutral resolution pgwire performs, so the canonical native
+    // transport honors these overrides identically. Native plans without a plan
+    // cache, so the returned bypass flags are not needed here.
+    crate::control::server::shared::planning_overrides::apply_planning_session_overrides(
+        ctx.query_ctx,
+        ctx.sessions,
+        ctx.state,
+        ctx.peer_addr,
+        ctx.tenant_id(),
+    );
+
     let (mut tasks, output_schema) = match ctx
         .query_ctx
         .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {

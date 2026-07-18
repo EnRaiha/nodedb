@@ -93,84 +93,19 @@ impl NodeDbPgHandler {
             })?;
         let has_returning = returning_spec.is_some();
 
-        // Propagate the tenant's vector-dimension quota so ConvertContext can
-        // reject oversized vectors without an extra lock inside the planner.
-        {
-            let tenants = match self.state.tenants.lock() {
-                Ok(t) => t,
-                Err(p) => p.into_inner(),
-            };
-            self.query_ctx
-                .set_max_vector_dim(tenants.quota(tenant_id).max_vector_dim);
-        }
-
-        // Propagate the distributed shuffle-join override from the session
-        // parameter bag (set via `SET nodedb.force_shuffle_join = on` and,
-        // optionally, `SET nodedb.shuffle_num_parts = N`). The values were
-        // validated at SET time, so a parse miss here defaults to "off" / 0.
-        let force_shuffle_join = self
-            .sessions
-            .get_parameter(addr, "nodedb.force_shuffle_join")
-            .as_deref()
-            .and_then(super::super::session_cmds::parse_bool_session_value)
-            .unwrap_or(false);
-        let shuffle_num_parts = self
-            .sessions
-            .get_parameter(addr, "nodedb.shuffle_num_parts")
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
-        self.query_ctx
-            .set_force_shuffle_join(force_shuffle_join, shuffle_num_parts);
-
-        // Propagate the distributed shuffle-aggregate override from the session
-        // parameter bag (set via `SET nodedb.force_shuffle_agg = on` and,
-        // optionally, `SET nodedb.shuffle_agg_num_parts = N`). The values were
-        // validated at SET time, so a parse miss here defaults to "off" / 0.
-        let force_shuffle_agg = self
-            .sessions
-            .get_parameter(addr, "nodedb.force_shuffle_agg")
-            .as_deref()
-            .and_then(super::super::session_cmds::parse_bool_session_value)
-            .unwrap_or(false);
-        let shuffle_agg_num_parts = self
-            .sessions
-            .get_parameter(addr, "nodedb.shuffle_agg_num_parts")
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
-        self.query_ctx
-            .set_force_shuffle_agg(force_shuffle_agg, shuffle_agg_num_parts);
-
-        // Resolve the auto-shuffle cost threshold: the session override
-        // `nodedb.broadcast_threshold_bytes` when set, otherwise the node's
-        // configured `[tuning.cluster_transport] broadcast_threshold_bytes`.
-        // Passing the resolved value (not just the override) makes a SET then
-        // RESET correctly revert to the tuning default for this session.
-        let tuning_threshold = self
-            .state
-            .tuning
-            .cluster_transport
-            .broadcast_threshold_bytes;
-        let session_threshold = self
-            .sessions
-            .get_parameter(addr, "nodedb.broadcast_threshold_bytes")
-            .and_then(|v| v.parse::<usize>().ok());
-        let broadcast_threshold_bytes = session_threshold.unwrap_or(tuning_threshold);
-        self.query_ctx
-            .set_broadcast_threshold_bytes(broadcast_threshold_bytes);
-
-        // Resolve the auto-shuffle-aggregate cost threshold (distinct-group
-        // units): the session override `nodedb.shuffle_agg_threshold` when set,
-        // otherwise the planner default. Passing the resolved value (not just the
-        // override) makes a SET then RESET correctly revert to the default for
-        // this session. Mirrors `broadcast_threshold_bytes` above.
-        let session_agg_threshold = self
-            .sessions
-            .get_parameter(addr, "nodedb.shuffle_agg_threshold")
-            .and_then(|v| v.parse::<usize>().ok());
-        let shuffle_agg_threshold = session_agg_threshold
-            .unwrap_or(crate::control::planner::context::query::DEFAULT_SHUFFLE_AGG_THRESHOLD);
-        self.query_ctx
-            .set_shuffle_agg_threshold(shuffle_agg_threshold);
+        // Forward every per-session planning GUC (vector-dim quota, force-shuffle
+        // join/agg overrides + partition counts, broadcast / shuffle-aggregate
+        // cost thresholds) into the shared query context. Protocol-neutral so
+        // pgwire and native honor these identically; the returned flags drive the
+        // plan-cache bypass decision below.
+        let override_flags =
+            crate::control::server::shared::planning_overrides::apply_planning_session_overrides(
+                &self.query_ctx,
+                &self.sessions,
+                &self.state,
+                addr,
+                tenant_id,
+            );
 
         let database_id = self
             .sessions
@@ -185,37 +120,15 @@ impl NodeDbPgHandler {
         self.enforce_enum_labels_if_needed(&clean_sql, tenant_id, database_id)
             .await?;
 
-        // A session-level `nodedb.broadcast_threshold_bytes` override changes the
-        // auto-shuffle decision the same way force-shuffle does, and the cache
-        // key encodes neither knob. The node-wide tuning default is constant
-        // across sessions, so plans cached under it stay consistent and need no
-        // bypass; only a *session override* (different from the tuning default,
-        // or any explicit SET) makes the cached plan's strategy assumption
-        // unsafe to share. Treat a present session override exactly like
-        // force-shuffle: bypass read AND put.
-        let threshold_overridden = session_threshold.is_some_and(|t| t != tuning_threshold);
-
-        // A session-level `nodedb.shuffle_agg_threshold` override changes the
-        // auto-shuffle-aggregate decision the same way the broadcast threshold
-        // does, and the cache key encodes neither knob. Any explicit session
-        // override that differs from the default makes a cached plan's strategy
-        // assumption unsafe to share, so treat it exactly like the broadcast
-        // override: bypass read AND put.
-        let agg_threshold_overridden = session_agg_threshold.is_some_and(|t| {
-            t != crate::control::planner::context::query::DEFAULT_SHUFFLE_AGG_THRESHOLD
-        });
-
         // Check plan cache before full planning. The cache key is
         // `(sql_hash, schema_version)` and does NOT vary by session knob, so it
-        // is bypassed entirely while the force-shuffle override OR a non-default
-        // broadcast-threshold override is engaged: a cached plan built under a
-        // different join-strategy assumption would otherwise be served (and a
-        // strategy-specific plan must not be cached for a later default query).
-        // Skipping read AND put keeps the cache strategy-knob-free.
-        let bypass_cache = force_shuffle_join
-            || force_shuffle_agg
-            || threshold_overridden
-            || agg_threshold_overridden;
+        // is bypassed entirely while any strategy override (force-shuffle
+        // join/agg, or a non-default broadcast / shuffle-aggregate threshold) is
+        // engaged: a cached plan built under a different join-strategy assumption
+        // would otherwise be served (and a strategy-specific plan must not be
+        // cached for a later default query). Skipping read AND put keeps the
+        // cache strategy-knob-free.
+        let bypass_cache = override_flags.bypass_plan_cache();
         let cached_tasks = if bypass_cache {
             None
         } else {

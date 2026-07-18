@@ -6,20 +6,10 @@ use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::planning_overrides::parse_bool_session_value;
 
 use super::super::types::sqlstate_error;
 use super::core::NodeDbPgHandler;
-
-/// Parse a PostgreSQL-style boolean session value. Returns `None` for any
-/// value that is not a recognized boolean spelling, so the SET handler can
-/// reject it with `22023` rather than silently storing garbage.
-pub(crate) fn parse_bool_session_value(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "on" | "true" | "t" | "yes" | "y" | "1" => Some(true),
-        "off" | "false" | "f" | "no" | "n" | "0" => Some(false),
-        _ => None,
-    }
-}
 
 /// Outcome of classifying a `SET TRANSACTION` / `SET SESSION CHARACTERISTICS` command.
 enum TransactionCmd {

@@ -3,6 +3,7 @@ pub mod authorization;
 pub mod check_constraint;
 pub mod ddl;
 pub mod plan_util;
+pub mod planning_overrides;
 pub mod session;
 pub mod sql;
 pub mod write_admission;
