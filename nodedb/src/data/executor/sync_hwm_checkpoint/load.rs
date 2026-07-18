@@ -3,10 +3,11 @@
 //! The sync idempotency-gate checkpoint load path: decode the published state
 //! file whole and install both gate maps before WAL replay merges on top.
 
-use tracing::{error, info};
+use tracing::info;
 
 use super::format::{SYNC_HWM_CKPT_FORMAT_VERSION, SyncHwmCheckpointFile};
 use super::paths::{sync_hwm_ckpt_dir, sync_hwm_ckpt_state_path};
+use crate::data::executor::checkpoint_decode_error::CheckpointDecodeError;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::types::Lsn;
 
@@ -21,51 +22,36 @@ impl CoreLoop {
     /// restored maps with the same max-wins rule that built them, so no floor is
     /// needed: a record already folded in re-folds to the same value. The maps
     /// this installs are exactly what a truncated WAL can no longer rebuild.
-    pub fn load_sync_hwm_checkpoint(&mut self) {
+    pub fn load_sync_hwm_checkpoint(&mut self) -> crate::Result<()> {
         let ckpt_dir = sync_hwm_ckpt_dir(&self.data_dir, self.core_id);
         let path = sync_hwm_ckpt_state_path(&ckpt_dir);
         if !path.exists() {
-            return;
+            return Ok(());
         }
 
-        let bytes = match nodedb_wal::segment::read_checkpoint_framed(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                error!(
-                    core = self.core_id,
-                    path = %path.display(),
-                    error = %e,
-                    "sync HWM checkpoint unreadable; restoring NOTHING and rebuilding the \
-                     gate from the WAL alone. Any producer whose SyncSeqAdvance records \
-                     were already truncated will have its high-watermark reset, and \
-                     frames it had already had applied may be applied again"
-                );
-                return;
+        // A present-but-corrupt checkpoint is fail-stop, not skip-and-replay:
+        // the WAL below this generation's durable LSN may already be gone, so
+        // silently restoring nothing here would boot with a gate this build
+        // can never recover.
+        let bytes = nodedb_wal::segment::read_checkpoint_framed(&path).map_err(|source| {
+            CheckpointDecodeError::ReadFile {
+                path: path.clone(),
+                source,
             }
-        };
-        let file = match zerompk::from_msgpack::<SyncHwmCheckpointFile>(&bytes) {
-            Ok(f) => f,
-            Err(e) => {
-                error!(
-                    core = self.core_id,
-                    path = %path.display(),
-                    error = %e,
-                    "sync HWM checkpoint undecodable; restoring NOTHING and rebuilding \
-                     the gate from the WAL alone"
-                );
-                return;
+        })?;
+        let file = zerompk::from_msgpack::<SyncHwmCheckpointFile>(&bytes).map_err(|source| {
+            CheckpointDecodeError::MsgpackDecode {
+                path: path.clone(),
+                source,
             }
-        };
+        })?;
         if file.format_version != SYNC_HWM_CKPT_FORMAT_VERSION {
-            error!(
-                core = self.core_id,
-                found = file.format_version,
-                expected = SYNC_HWM_CKPT_FORMAT_VERSION,
-                "unknown sync HWM checkpoint version; restoring NOTHING. Refusing is the \
-                 safe direction: a misparsed high-watermark set too high would discard \
-                 new sync writes as already-seen"
-            );
-            return;
+            return Err(CheckpointDecodeError::FormatVersion {
+                path: path.clone(),
+                found: file.format_version,
+                expected: SYNC_HWM_CKPT_FORMAT_VERSION,
+            }
+            .into());
         }
 
         let streams = file.hwm.len();
@@ -85,6 +71,7 @@ impl CoreLoop {
             durable_through_lsn = file.durable_through_lsn,
             "sync HWM checkpoint restored"
         );
+        Ok(())
     }
 }
 
@@ -172,7 +159,9 @@ mod tests {
         drop(unrestored);
 
         let mut after = open_core_at(dir.path());
-        after.load_sync_hwm_checkpoint();
+        after
+            .load_sync_hwm_checkpoint()
+            .expect("valid checkpoint must load");
 
         assert_eq!(
             after.sync_admit(&make_prov(1, 3, 5, 1)),
@@ -215,7 +204,9 @@ mod tests {
         drop(before); // a core owns its data dir's redb exclusively
 
         let mut after = open_core_at(dir.path());
-        after.load_sync_hwm_checkpoint();
+        after
+            .load_sync_hwm_checkpoint()
+            .expect("valid checkpoint must load");
 
         // A replayed record above the restored state advances it.
         let mut maps = crate::wal::replay::SyncHwmReplayMaps::default();
@@ -243,7 +234,8 @@ mod tests {
     fn absent_checkpoint_restores_nothing() {
         let dir = TempDir::new().expect("tempdir");
         let mut core = open_core_at(dir.path());
-        core.load_sync_hwm_checkpoint();
+        core.load_sync_hwm_checkpoint()
+            .expect("an absent checkpoint is a legitimate no-op, not an error");
         assert!(core.sync_hwm.is_empty());
         assert!(core.producer_epoch_floor.is_empty());
         assert_eq!(core.floors.sync_hwm_durable_lsn, Lsn::ZERO);
@@ -251,9 +243,11 @@ mod tests {
 
     /// A file from a future format must be refused, not misparsed: a
     /// high-watermark read too high would silently discard new sync writes as
-    /// already-seen.
+    /// already-seen. It must now fail-stop the boot rather than silently
+    /// restore nothing, because the WAL below this generation's durable LSN
+    /// may already be gone.
     #[test]
-    fn unknown_version_restores_nothing() {
+    fn unknown_version_is_fail_stop() {
         let dir = TempDir::new().expect("tempdir");
         let ckpt_dir = sync_hwm_ckpt_dir(dir.path(), 0);
         std::fs::create_dir_all(&ckpt_dir).expect("mkdir");
@@ -269,15 +263,29 @@ mod tests {
         nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes).expect("write");
 
         let mut core = open_core_at(dir.path());
-        core.load_sync_hwm_checkpoint();
         assert!(
-            core.sync_hwm.is_empty(),
-            "a file this build cannot read must install nothing"
+            core.load_sync_hwm_checkpoint().is_err(),
+            "a file this build cannot read must abort the load, not restore nothing"
         );
-        assert_eq!(
-            core.floors.sync_hwm_durable_lsn,
-            Lsn::ZERO,
-            "and must claim no durability"
+    }
+
+    /// A corrupt (non-MessagePack) checkpoint body must also fail-stop the
+    /// boot — the file exists and the frame-level checksum passes, but the
+    /// payload does not decode.
+    #[test]
+    fn corrupt_msgpack_body_is_fail_stop() {
+        let dir = TempDir::new().expect("tempdir");
+        let ckpt_dir = sync_hwm_ckpt_dir(dir.path(), 0);
+        std::fs::create_dir_all(&ckpt_dir).expect("mkdir");
+        let path = sync_hwm_ckpt_state_path(&ckpt_dir);
+        let tmp = ckpt_dir.join("STATE.tmp");
+        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, b"not valid msgpack")
+            .expect("write");
+
+        let mut core = open_core_at(dir.path());
+        assert!(
+            core.load_sync_hwm_checkpoint().is_err(),
+            "an undecodable checkpoint body must abort the load, not restore nothing"
         );
     }
 }

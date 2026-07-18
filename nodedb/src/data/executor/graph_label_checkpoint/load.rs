@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 
 use super::format::{GRAPH_LABEL_CKPT_FORMAT_VERSION, GraphLabelCheckpointFile};
 use super::paths::{graph_label_ckpt_dir, graph_label_ckpt_state_path};
+use crate::data::executor::checkpoint_decode_error::CheckpointDecodeError;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::types::Lsn;
 
@@ -30,52 +31,36 @@ impl CoreLoop {
     /// gates them: both records are absolute bit operations keyed by
     /// `(node, label)`, so a record already folded into this state re-applies to
     /// the same bit.
-    pub fn load_graph_label_checkpoint(&mut self) {
+    pub fn load_graph_label_checkpoint(&mut self) -> crate::Result<()> {
         let ckpt_dir = graph_label_ckpt_dir(&self.data_dir, self.core_id);
         let path = graph_label_ckpt_state_path(&ckpt_dir);
         if !path.exists() {
-            return;
+            return Ok(());
         }
 
-        let bytes = match nodedb_wal::segment::read_checkpoint_framed(&path) {
-            Ok(b) => b,
-            Err(e) => {
-                error!(
-                    core = self.core_id,
-                    path = %path.display(),
-                    error = %e,
-                    "graph node-label checkpoint unreadable; restoring NOTHING and \
-                     rebuilding the labels from the WAL alone. Any node whose \
-                     GraphNodeLabelSet record was already truncated comes back \
-                     unlabeled — its edges survive (they are redb-backed) but a \
-                     label-scoped MATCH will no longer match it"
-                );
-                return;
+        // A present-but-corrupt checkpoint is fail-stop, not skip-and-replay:
+        // the WAL below this generation's durable LSN may already be gone, so
+        // silently restoring nothing here would boot with labels this build
+        // can never recover.
+        let bytes = nodedb_wal::segment::read_checkpoint_framed(&path).map_err(|source| {
+            CheckpointDecodeError::ReadFile {
+                path: path.clone(),
+                source,
             }
-        };
-        let file = match zerompk::from_msgpack::<GraphLabelCheckpointFile>(&bytes) {
-            Ok(f) => f,
-            Err(e) => {
-                error!(
-                    core = self.core_id,
-                    path = %path.display(),
-                    error = %e,
-                    "graph node-label checkpoint undecodable; restoring NOTHING and \
-                     rebuilding the labels from the WAL alone"
-                );
-                return;
+        })?;
+        let file = zerompk::from_msgpack::<GraphLabelCheckpointFile>(&bytes).map_err(|source| {
+            CheckpointDecodeError::MsgpackDecode {
+                path: path.clone(),
+                source,
             }
-        };
+        })?;
         if file.format_version != GRAPH_LABEL_CKPT_FORMAT_VERSION {
-            error!(
-                core = self.core_id,
-                found = file.format_version,
-                expected = GRAPH_LABEL_CKPT_FORMAT_VERSION,
-                "unknown graph node-label checkpoint version; restoring NOTHING. \
-                 Refusing is the safe direction: a misparsed file would label nodes \
-                 that were never labeled, and no later record corrects that"
-            );
-            return;
+            return Err(CheckpointDecodeError::FormatVersion {
+                path: path.clone(),
+                found: file.format_version,
+                expected: GRAPH_LABEL_CKPT_FORMAT_VERSION,
+            }
+            .into());
         }
 
         let partitions = file.partitions.len();
@@ -116,6 +101,11 @@ impl CoreLoop {
         // restore keeps it at zero: the labels that did install are still
         // installed, but this core stops authorising any truncation until it has
         // written a checkpoint of its own that succeeded end to end.
+        // A partial install is NOT decode corruption: the file itself decoded
+        // whole, and `add_node_label`'s per-call failure never claims the
+        // durable LSN, so WAL replay above it still covers every label this
+        // loop could not set. This stays a non-fatal, logged skip — only the
+        // decode swallows above are fail-stop.
         if failed > 0 {
             error!(
                 core = core_id,
@@ -125,7 +115,7 @@ impl CoreLoop {
                 "graph node-label checkpoint restored only in part; NOT claiming its \
                  durable LSN, so WAL truncation stays pinned until a flush succeeds"
             );
-            return;
+            return Ok(());
         }
         self.floors.graph_label_durable_lsn = Lsn::new(file.durable_through_lsn);
 
@@ -136,6 +126,7 @@ impl CoreLoop {
             durable_through_lsn = file.durable_through_lsn,
             "graph node-label checkpoint restored"
         );
+        Ok(())
     }
 }
 
@@ -286,7 +277,9 @@ mod tests {
         drop(unrestored);
 
         let mut after = open_core_at(dir.path());
-        after.load_graph_label_checkpoint();
+        after
+            .load_graph_label_checkpoint()
+            .expect("valid checkpoint must load");
 
         assert_eq!(
             match_sources(&after, "MATCH (a:Person)-[:KNOWS]->(b) RETURN a, b"),
@@ -328,7 +321,9 @@ mod tests {
         drop(before);
 
         let mut after = open_core_at(dir.path());
-        after.load_graph_label_checkpoint();
+        after
+            .load_graph_label_checkpoint()
+            .expect("valid checkpoint must load");
 
         let csr = after
             .csr_partition(DatabaseId::DEFAULT.as_u64(), TID)
@@ -361,7 +356,9 @@ mod tests {
         drop(before);
 
         let mut after = open_core_at(dir.path());
-        after.load_graph_label_checkpoint();
+        after
+            .load_graph_label_checkpoint()
+            .expect("valid checkpoint must load");
 
         for (tid, want, unwanted) in [(1u64, "Person", "Bot"), (2, "Bot", "Person")] {
             let csr = after
@@ -409,7 +406,9 @@ mod tests {
         drop(before);
 
         let mut after = open_core_at(dir.path());
-        after.load_graph_label_checkpoint();
+        after
+            .load_graph_label_checkpoint()
+            .expect("valid checkpoint must load");
 
         let csr = after
             .csr_partition(DatabaseId::DEFAULT.as_u64(), TID)
@@ -439,15 +438,18 @@ mod tests {
     fn absent_checkpoint_restores_nothing() {
         let dir = TempDir::new().expect("tempdir");
         let mut core = open_core_at(dir.path());
-        core.load_graph_label_checkpoint();
+        core.load_graph_label_checkpoint()
+            .expect("an absent checkpoint is a legitimate no-op, not an error");
         assert_eq!(core.csr.partition_count(), 0);
         assert_eq!(core.floors.graph_label_durable_lsn, Lsn::ZERO);
     }
 
     /// A file from a future format must be refused, not misparsed: labels the
-    /// user never set are not correctable by any later record.
+    /// user never set are not correctable by any later record. It must now
+    /// fail-stop the boot rather than silently restore nothing, because the
+    /// WAL below this generation's durable LSN may already be gone.
     #[test]
-    fn unknown_version_restores_nothing() {
+    fn unknown_version_is_fail_stop() {
         use super::super::format::GraphLabelPartition;
 
         let dir = TempDir::new().expect("tempdir");
@@ -468,16 +470,42 @@ mod tests {
         nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, &bytes).expect("write");
 
         let mut core = open_core_at(dir.path());
-        core.load_graph_label_checkpoint();
-        assert_eq!(
-            core.csr.partition_count(),
-            0,
-            "a file this build cannot read must install nothing"
-        );
-        assert_eq!(
-            core.floors.graph_label_durable_lsn,
-            Lsn::ZERO,
-            "and must claim no durability"
+        assert!(
+            core.load_graph_label_checkpoint().is_err(),
+            "a file this build cannot read must abort the load, not restore nothing"
         );
     }
+
+    /// A corrupt (non-MessagePack) checkpoint body must also fail-stop the
+    /// boot — the file exists and the frame-level checksum passes, but the
+    /// payload does not decode.
+    #[test]
+    fn corrupt_msgpack_body_is_fail_stop() {
+        let dir = TempDir::new().expect("tempdir");
+        let ckpt_dir = graph_label_ckpt_dir(dir.path(), 0);
+        std::fs::create_dir_all(&ckpt_dir).expect("mkdir");
+        let path = graph_label_ckpt_state_path(&ckpt_dir);
+        let tmp = ckpt_dir.join("STATE.tmp");
+        nodedb_wal::segment::write_checkpoint_framed(&tmp, &path, b"not valid msgpack")
+            .expect("write");
+
+        let mut core = open_core_at(dir.path());
+        assert!(
+            core.load_graph_label_checkpoint().is_err(),
+            "an undecodable checkpoint body must abort the load, not restore nothing"
+        );
+    }
+
+    // NOTE: no test exercises the `failed > 0` partial-install branch
+    // (`add_node_label` returning `Err`). That path is reached only via
+    // `GraphError::NodeOverflow`, which requires ~4.3 billion distinct nodes
+    // in one partition (see `node_overflow_guard_fires_on_fresh_node` in
+    // `nodedb-graph/src/csr/index/tests.rs`, which documents the same
+    // infeasibility and settles for a code-review-verified guard instead of a
+    // runtime one). No such test existed before this change either, so the
+    // fail-stop conversion above does not remove any prior coverage of that
+    // branch. The 64-distinct-label bitset cap that the loader's comment
+    // mentions returns `Ok(false)` from `add_node_label`, not `Err` — it is
+    // silently discarded rather than counted in `failed`, and so does not
+    // exercise this branch at all.
 }

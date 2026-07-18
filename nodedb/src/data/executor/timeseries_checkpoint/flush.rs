@@ -276,7 +276,10 @@ mod tests {
         drop(before);
 
         let mut after = Core::open_at(dir.path());
-        after.core.load_ts_registries();
+        after
+            .core
+            .load_ts_registries()
+            .expect("valid partitions must load");
         assert_eq!(
             after.scan_hosts(),
             vec!["a".to_string(), "b".to_string()],

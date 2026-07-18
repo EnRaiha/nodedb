@@ -26,13 +26,14 @@ pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) -> crate::Result<()> {
     // segments, which `ArrayStore::open` mmaps whenever the array is opened —
     // by replay, or lazily by the first read.
     //
-    // A corrupt or unreadable vector, sparse-vector, KV, or columnar
-    // checkpoint is fail-stop: its `Err` propagates out of boot so the core
-    // refuses to come up, rather than silently skipping the checkpoint and
-    // serving a truncated index (the WAL below the checkpoint LSN is already
-    // gone). The remaining loaders below still return `()`; they have other
-    // durable copies of their state (redb stores, on-disk segments) that make
-    // a skip-and-replay recoverable rather than a silent loss.
+    // A corrupt or unreadable vector, sparse-vector, KV, columnar, sync-HWM,
+    // graph-label, or timeseries-registry checkpoint is fail-stop: its `Err`
+    // propagates out of boot so the core refuses to come up, rather than
+    // silently skipping the checkpoint and serving truncated state (the WAL
+    // below the checkpoint LSN is already gone). Only `load_spatial_checkpoints`
+    // and `load_crdt_checkpoints` still return `()` below; they have other
+    // durable copies of their state (redb stores, Loro's own persistence) that
+    // make a skip-and-replay recoverable rather than a silent loss.
     core.load_vector_checkpoints()?;
     core.load_spatial_checkpoints();
     core.load_sparse_vector_checkpoints()?;
@@ -66,8 +67,10 @@ pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) -> crate::Result<()> {
     // `SyncSeqAdvance` WAL records, so once truncation passes them this
     // load is the only thing that brings the high-watermarks back.
     // `replay_all_wal` merges the records above this state into it
-    // max-wins rather than replacing it, so this must run first.
-    core.load_sync_hwm_checkpoint();
+    // max-wins rather than replacing it, so this must run first. A corrupt
+    // generation is fail-stop for the same reason KV's is: there is no other
+    // durable copy once the WAL below it is gone.
+    core.load_sync_hwm_checkpoint()?;
     // Graph EDGES need no load here — they are committed to the redb
     // `EdgeStore` at apply time and `CoreLoop::open` has already rebuilt
     // the whole CSR from it. Node LABELS have no store at all: their
@@ -77,8 +80,13 @@ pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) -> crate::Result<()> {
     // absence is quiet, since the labeled node and its edges still
     // return, only a label-scoped `MATCH` stops matching them.
     // `replay_graph_node_label_wal` then applies the records above this
-    // state; both are absolute bit operations, so no floor gates them.
-    core.load_graph_label_checkpoint();
+    // state; both are absolute bit operations, so no floor gates them. A
+    // corrupt generation is fail-stop for the same reason: there is no other
+    // durable copy of the labels once the WAL below it is gone. A per-label
+    // install fault found WHILE restoring an otherwise-valid generation is
+    // NOT this case — it never claims the durable LSN, so it stays a
+    // non-fatal, logged skip inside the loader itself.
+    core.load_graph_label_checkpoint()?;
     // Timeseries needs no checkpoint loader either — its checkpoint IS
     // the on-disk L1 partitions its flush writes. What it does need is
     // its partition REGISTRIES rebuilt from them, because that is where
@@ -89,7 +97,12 @@ pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) -> crate::Result<()> {
     // after `replay_all_wal` — so replay saw no partitions, gated
     // nothing, and re-appended every retained record on top of the
     // partition that already held it. A timeseries ingest is an append,
-    // so nothing masked the duplicate rows.
-    core.load_ts_registries();
+    // so nothing masked the duplicate rows. A committed `partition.meta`
+    // that will not decode is fail-stop: it is corruption of state this
+    // core is about to claim is durable, and skipping it quietly would
+    // under-restore the collection while leaving its records un-gated. An
+    // UNCOMMITTED partition directory (no `partition.meta` at all — the
+    // remains of an interrupted flush) is still a legitimate, silent skip.
+    core.load_ts_registries()?;
     Ok(())
 }

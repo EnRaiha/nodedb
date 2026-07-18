@@ -34,37 +34,26 @@ impl CoreLoop {
     /// timeseries ingest is an append and the scan reads partitions and memtable
     /// together, so nothing masked the duplicate rows.
     ///
-    /// A collection whose registry cannot be rebuilt is logged and skipped
-    /// rather than aborting the boot of every other collection on the core. The
-    /// consequence is bounded and self-announcing: its records replay un-gated,
-    /// which duplicates rows rather than losing them.
-    pub fn load_ts_registries(&mut self) {
+    /// A collection whose registry cannot be rebuilt is fail-stop: a
+    /// `partition.meta` that exists but will not decode is corruption of a
+    /// committed partition this core is about to claim is durable, and the WAL
+    /// below its `last_flushed_wal_lsn` gate may already be gone. Skipping it
+    /// quietly would under-restore the collection while replay still trusts
+    /// the gate it never installed.
+    pub fn load_ts_registries(&mut self) -> crate::Result<()> {
         let ts_root = self.data_dir.join("ts");
         if !ts_root.exists() {
-            return;
+            return Ok(());
         }
 
         let mut loaded = 0usize;
         let mut partitions = 0usize;
         for (database_id, tenant_id, collection) in enumerate_ts_collections(&ts_root) {
-            match self.ensure_ts_registry(tenant_id, database_id, &collection) {
-                Ok(()) => {
-                    let key = (database_id, tenant_id, collection);
-                    if let Some(reg) = self.ts_registries.get(&key) {
-                        loaded += 1;
-                        partitions += reg.partition_count();
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        core = self.core_id,
-                        collection = %collection,
-                        error = %e,
-                        "timeseries partition registry rebuild failed at boot; this \
-                         collection's records will replay UN-GATED, duplicating rows its \
-                         partitions already contain"
-                    );
-                }
+            self.ensure_ts_registry(tenant_id, database_id, &collection)?;
+            let key = (database_id, tenant_id, collection);
+            if let Some(reg) = self.ts_registries.get(&key) {
+                loaded += 1;
+                partitions += reg.partition_count();
             }
         }
 
@@ -76,6 +65,7 @@ impl CoreLoop {
                 "timeseries partition registries restored"
             );
         }
+        Ok(())
     }
 
     /// Ensure the partition registry is loaded for one timeseries collection.
@@ -305,6 +295,49 @@ mod tests {
         assert!(
             read_registry(dir.path(), None).is_err(),
             "an undecodable committed meta must surface, not be skipped"
+        );
+    }
+
+    /// The boot-time entry point must surface the same corruption, not just
+    /// the inner `read_registry` helper: a committed `partition.meta` this
+    /// core is about to claim is durable, but cannot decode, must abort the
+    /// whole boot rather than silently leave the collection un-registered
+    /// (and so un-gated against replay duplicating its rows).
+    #[test]
+    fn load_ts_registries_is_fail_stop_on_a_corrupt_partition_meta() {
+        use std::sync::Arc;
+
+        use nodedb_bridge::buffer::RingBuffer;
+
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let part = dir
+            .path()
+            .join("ts")
+            .join("0")
+            .join("1")
+            .join("metrics")
+            .join("ts-1_2");
+        std::fs::create_dir_all(&part).expect("mkdir");
+        std::fs::write(part.join("partition.meta"), b"{ not json").expect("write meta");
+
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, _resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        drop(req_tx); // no requests are dispatched in this test
+        let mut core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("CoreLoop::open");
+
+        assert!(
+            core.load_ts_registries().is_err(),
+            "a committed but undecodable partition.meta must fail the boot, not \
+             be logged and skipped"
         );
     }
 }
