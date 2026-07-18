@@ -60,8 +60,7 @@ fn hnsw_checkpoint_encrypted_at_rest() {
 
     // Restore must recover the same vectors.
     let restored = VectorCollection::from_checkpoint(&blob, Some(&key))
-        .expect("decryption must succeed with correct key")
-        .expect("checkpoint must deserialize");
+        .expect("decryption must succeed with correct key");
 
     assert_eq!(
         restored.len(),

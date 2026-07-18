@@ -78,8 +78,7 @@ fn hnsw_pq_config_survives_checkpoint_roundtrip() {
     let coll = make_built_collection_with_pq_config();
     let bytes = coll.checkpoint_to_bytes(None).unwrap();
     let restored = VectorCollection::from_checkpoint(&bytes, None)
-        .expect("checkpoint must deserialize for PQ-configured collection")
-        .unwrap();
+        .expect("checkpoint must deserialize for PQ-configured collection");
     let stats = restored.stats();
     assert_eq!(
         stats.quantization,

@@ -209,8 +209,7 @@ impl CoreLoop {
             let load_result =
                 crate::engine::vector::collection::VectorCollection::from_checkpoint(&bytes, kek);
             let collection = match load_result {
-                Ok(Some(c)) => c,
-                Ok(None) => continue,
+                Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(
                         core = self.core_id,

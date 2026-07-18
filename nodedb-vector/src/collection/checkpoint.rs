@@ -253,10 +253,14 @@ impl VectorCollection {
     ///   `SEGV`, it is decrypted with `key`. If the file is plaintext, returns
     ///   `Err(CheckpointPlaintextKeyRequired)` — refuse to silently load
     ///   unencrypted data when the operator has enabled at-rest encryption.
+    ///
+    /// Returns `Err(CheckpointDeserializationError)` if the (decrypted)
+    /// MessagePack payload, an embedded sealed-segment HNSW checkpoint, or an
+    /// embedded PQ/SQ8 codec is structurally corrupt.
     pub fn from_checkpoint(
         bytes: &[u8],
         kek: Option<&nodedb_wal::crypto::WalEncryptionKey>,
-    ) -> Result<Option<Self>, VectorError> {
+    ) -> Result<Self, VectorError> {
         let is_encrypted = bytes.len() >= 4 && bytes[0..4] == SEGV_MAGIC;
 
         let msgpack: Vec<u8>;
@@ -277,7 +281,11 @@ impl VectorCollection {
 
         let snap: CollectionSnapshot = match zerompk::from_msgpack(msgpack_ref) {
             Ok(s) => s,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                return Err(VectorError::CheckpointDeserializationError {
+                    detail: format!("collection msgpack decode: {e}"),
+                });
+            }
         };
         let metric = match snap.params_metric {
             0 => DistanceMetric::L2,
@@ -310,42 +318,62 @@ impl VectorCollection {
 
         let mut sealed = Vec::with_capacity(snap.sealed_segments.len());
         for ss in &snap.sealed_segments {
-            if let Some(index) = HnswIndex::from_checkpoint(&ss.hnsw_bytes).ok().flatten() {
-                let pq = match (&ss.pq_bytes, &ss.pq_codes) {
-                    (Some(bytes), Some(codes)) => PqCodec::from_bytes(bytes)
-                        .ok()
-                        .map(|codec| (codec, codes.clone())),
+            // Sealed segments always carry the `RKHNS\0` magic — we wrote
+            // them ourselves. Both a decode `Err` and an `Ok(None)` (magic
+            // missing) mean the checkpoint is structurally corrupt; either
+            // way the whole restore must fail rather than silently drop the
+            // segment's vectors.
+            let index = HnswIndex::from_checkpoint(&ss.hnsw_bytes)?.ok_or_else(|| {
+                VectorError::CheckpointDeserializationError {
+                    detail: "sealed segment hnsw bytes missing RKHNS magic".into(),
+                }
+            })?;
+            let pq = match (&ss.pq_bytes, &ss.pq_codes) {
+                (Some(bytes), Some(codes)) => Some((
+                    PqCodec::from_bytes(bytes).map_err(|e| {
+                        VectorError::CheckpointDeserializationError {
+                            detail: format!("PQ codec decode: {e}"),
+                        }
+                    })?,
+                    codes.clone(),
+                )),
+                _ => None,
+            };
+            // Restore SQ8 from persisted bytes — never recompute on load.
+            // A segment never carries both PQ and SQ8.
+            let sq8 = if pq.is_some() {
+                None
+            } else {
+                match (&ss.sq8_bytes, &ss.sq8_codes) {
+                    (Some(codec_bytes), Some(codes)) => Some((
+                        Sq8Codec::from_bytes(codec_bytes).map_err(|e| {
+                            VectorError::CheckpointDeserializationError {
+                                detail: format!("SQ8 codec decode: {e}"),
+                            }
+                        })?,
+                        codes.clone(),
+                    )),
                     _ => None,
-                };
-                // Restore SQ8 from persisted bytes — never recompute on load.
-                // A segment never carries both PQ and SQ8.
-                let sq8 = if pq.is_some() {
-                    None
-                } else {
-                    match (&ss.sq8_bytes, &ss.sq8_codes) {
-                        (Some(codec_bytes), Some(codes)) => Sq8Codec::from_bytes(codec_bytes)
-                            .ok()
-                            .map(|codec| (codec, codes.clone())),
-                        _ => None,
-                    }
-                };
-                sealed.push(SealedSegment {
-                    index,
-                    base_id: ss.base_id,
-                    sq8,
-                    pq,
-                    tier: StorageTier::L0Ram,
-                    mmap_vectors: None,
-                });
-            }
+                }
+            };
+            sealed.push(SealedSegment {
+                index,
+                base_id: ss.base_id,
+                sq8,
+                pq,
+                tier: StorageTier::L0Ram,
+                mmap_vectors: None,
+            });
         }
 
         for bs in &snap.building_segments {
             let mut index = HnswIndex::new(snap.dim, params.clone());
             for v in &bs.vectors {
-                index
-                    .insert(v.clone())
-                    .expect("dimension guaranteed by checkpoint");
+                index.insert(v.clone()).map_err(|e| {
+                    VectorError::CheckpointDeserializationError {
+                        detail: format!("building-segment replay insert: {e}"),
+                    }
+                })?;
             }
             // Replay building-segment tombstones onto the HNSW index.
             for (i, &dead) in bs.deleted.iter().enumerate() {
@@ -370,7 +398,7 @@ impl VectorCollection {
             hnsw: params.clone(),
             ..crate::index_config::IndexConfig::default()
         };
-        Ok(Some(Self {
+        Ok(Self {
             growing,
             growing_base_id: snap.growing_base_id,
             sealed,
@@ -412,7 +440,7 @@ impl VectorCollection {
             arena_index: None,
             checkpoint_wal_lsn: snap.checkpoint_wal_lsn,
             applied_wal_lsn: snap.checkpoint_wal_lsn,
-        }))
+        })
     }
 }
 
@@ -494,9 +522,7 @@ mod tests {
         let orig_bytes = orig_sq8.0.to_bytes();
 
         let checkpoint = coll.checkpoint_to_bytes(None).unwrap();
-        let restored = VectorCollection::from_checkpoint(&checkpoint, None)
-            .unwrap()
-            .unwrap();
+        let restored = VectorCollection::from_checkpoint(&checkpoint, None).unwrap();
 
         let restored_sealed = restored.sealed_segments();
         assert!(!restored_sealed.is_empty());
@@ -527,9 +553,7 @@ mod tests {
             coll.insert(vec![i as f32, 0.0, 0.0]);
         }
         let bytes = coll.checkpoint_to_bytes(None).unwrap();
-        let restored = VectorCollection::from_checkpoint(&bytes, None)
-            .unwrap()
-            .unwrap();
+        let restored = VectorCollection::from_checkpoint(&bytes, None).unwrap();
         assert_eq!(restored.len(), 50);
         assert_eq!(restored.dim(), 3);
 
@@ -564,9 +588,7 @@ mod tests {
         );
 
         let bytes = coll.checkpoint_to_bytes(None).unwrap();
-        let restored = VectorCollection::from_checkpoint(&bytes, None)
-            .unwrap()
-            .unwrap();
+        let restored = VectorCollection::from_checkpoint(&bytes, None).unwrap();
         assert_eq!(
             restored.checkpoint_wal_lsn(),
             42,
@@ -619,9 +641,7 @@ mod tests {
         }
 
         let bytes = coll.checkpoint_to_bytes(None).unwrap();
-        let restored = VectorCollection::from_checkpoint(&bytes, None)
-            .unwrap()
-            .unwrap();
+        let restored = VectorCollection::from_checkpoint(&bytes, None).unwrap();
 
         let pred = FilterPredicate::Eq {
             field: "category".to_string(),

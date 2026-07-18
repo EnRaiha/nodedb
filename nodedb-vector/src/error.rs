@@ -36,6 +36,9 @@ pub enum VectorError {
     /// rkyv or MessagePack serialization of a vector checkpoint failed.
     #[error("vector checkpoint serialization error: {detail}")]
     CheckpointSerializationError { detail: String },
+    /// rkyv or MessagePack deserialization of a vector checkpoint failed.
+    #[error("vector checkpoint deserialization error: {detail}")]
+    CheckpointDeserializationError { detail: String },
     /// I/O error from segment file operations (open, mmap, metadata).
     #[error("vector segment I/O error: {0}")]
     SegmentIo(#[from] std::io::Error),

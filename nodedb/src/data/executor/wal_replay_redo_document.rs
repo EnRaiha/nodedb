@@ -602,8 +602,7 @@ mod tests {
             .unwrap();
         let restored =
             crate::engine::vector::collection::VectorCollection::from_checkpoint(&bytes, None)
-                .expect("decode checkpoint")
-                .expect("non-empty checkpoint");
+                .expect("decode checkpoint");
         h.core.vector_collections.insert(key.clone(), restored);
 
         h.core

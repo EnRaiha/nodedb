@@ -120,6 +120,9 @@ impl HnswIndex {
     /// - `Err(VectorError::UnsupportedVersion)` — magic matches `RKHNS\0` but
     ///   the version byte is not `HNSW_FORMAT_VERSION`; the caller must reject
     ///   the buffer.
+    /// - `Err(VectorError::CheckpointDeserializationError)` — magic and
+    ///   version matched but the rkyv payload itself failed to decode
+    ///   (structurally corrupt checkpoint).
     pub fn from_checkpoint(bytes: &[u8]) -> Result<Option<Self>, crate::error::VectorError> {
         let header_len = HNSW_RKYV_MAGIC.len() + 1; // magic + version byte
         if bytes.len() > header_len && &bytes[..HNSW_RKYV_MAGIC.len()] == HNSW_RKYV_MAGIC {
@@ -130,23 +133,27 @@ impl HnswIndex {
                     expected: HNSW_FORMAT_VERSION,
                 });
             }
-            return Ok(Self::from_rkyv_checkpoint(&bytes[header_len..]));
+            return Ok(Some(Self::from_rkyv_checkpoint(&bytes[header_len..])?));
         }
         // No recognized magic prefix — no index to restore.
         Ok(None)
     }
 
     /// Restore from rkyv-serialized bytes.
-    fn from_rkyv_checkpoint(bytes: &[u8]) -> Option<Self> {
+    fn from_rkyv_checkpoint(bytes: &[u8]) -> Result<Self, VectorError> {
         let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
         aligned.extend_from_slice(bytes);
         let snap: HnswSnapshotRkyv =
-            rkyv::from_bytes::<HnswSnapshotRkyv, rkyv::rancor::Error>(&aligned).ok()?;
+            rkyv::from_bytes::<HnswSnapshotRkyv, rkyv::rancor::Error>(&aligned).map_err(|e| {
+                VectorError::CheckpointDeserializationError {
+                    detail: format!("hnsw rkyv decode: {e}"),
+                }
+            })?;
         Self::from_hnsw_snapshot(snap)
     }
 
     /// Reconstruct HnswIndex from deserialized snapshot fields.
-    fn from_hnsw_snapshot(snap: HnswSnapshotRkyv) -> Option<Self> {
+    fn from_hnsw_snapshot(snap: HnswSnapshotRkyv) -> Result<Self, VectorError> {
         use nodedb_types::hnsw::HnswParams;
 
         let metric = match snap.metric {
@@ -170,7 +177,7 @@ impl HnswIndex {
             .collect();
 
         let initial_capacity = snap.ef_construction.max(ARENA_INITIAL_CAPACITY);
-        Some(Self {
+        Ok(Self {
             dim: snap.dim,
             params: HnswParams {
                 m: snap.m,
@@ -264,6 +271,24 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("expected UnsupportedVersion error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn corrupt_rkyv_payload_returns_deserialization_error() {
+        // Valid magic + valid version byte, but the rkyv payload itself is
+        // garbage. This must surface as a typed decode error, not silently
+        // collapse to `Ok(None)` (which would look identical to "no
+        // checkpoint present" and drop the restore on the floor).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RKHNS\0");
+        bytes.push(super::HNSW_FORMAT_VERSION);
+        bytes.extend_from_slice(&[0xFFu8; 64]);
+
+        match HnswIndex::from_checkpoint(&bytes) {
+            Err(crate::error::VectorError::CheckpointDeserializationError { .. }) => {}
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("expected CheckpointDeserializationError, got Ok"),
         }
     }
 }
