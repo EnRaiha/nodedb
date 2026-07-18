@@ -26,18 +26,16 @@ pub(super) fn load_boot_checkpoints(core: &mut CoreLoop) -> crate::Result<()> {
     // segments, which `ArrayStore::open` mmaps whenever the array is opened —
     // by replay, or lazily by the first read.
     //
-    // A corrupt or unreadable vector, spatial, sparse-vector, KV, columnar,
-    // sync-HWM, graph-label, or timeseries-registry checkpoint is fail-stop:
-    // its `Err` propagates out of boot so the core refuses to come up, rather
-    // than silently skipping the checkpoint and serving truncated state (the
-    // WAL below the checkpoint LSN is already gone). Only
-    // `load_crdt_checkpoints` still returns `()` below; it has another
-    // durable copy of its state (Loro's own persistence) that makes a
-    // skip-and-replay recoverable rather than a silent loss.
+    // A corrupt or unreadable vector, spatial, sparse-vector, CRDT, KV,
+    // columnar, sync-HWM, graph-label, or timeseries-registry checkpoint is
+    // fail-stop: its `Err` propagates out of boot so the core refuses to
+    // come up, rather than silently skipping the checkpoint and serving
+    // truncated state (the WAL below the checkpoint LSN is already gone).
+    // Every loader below is `?`-propagated.
     core.load_vector_checkpoints()?;
     core.load_spatial_checkpoints()?;
     core.load_sparse_vector_checkpoints()?;
-    core.load_crdt_checkpoints();
+    core.load_crdt_checkpoints()?;
     // KV has no redb store behind it, so its checkpoint is the only
     // non-WAL copy of its rows: if the WAL was truncated past the
     // checkpoint LSN, this load is the ONLY thing that brings them back.
