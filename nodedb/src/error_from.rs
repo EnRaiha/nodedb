@@ -117,6 +117,24 @@ impl From<nodedb_vector::error::VectorError> for Error {
     }
 }
 
+impl From<nodedb_spatial::RTreeCheckpointError> for Error {
+    /// Every variant of `RTreeCheckpointError` names a reason a spatial
+    /// checkpoint's bytes could not be turned back into an R-tree — bad
+    /// framing, a version skew, missing/unwanted encryption, a failed
+    /// decrypt, or a failed msgpack/rkyv decode. There is no variant here
+    /// that means anything other than "this checkpoint cannot be loaded", so
+    /// every one maps to `SegmentCorrupted`: this wires the spatial engine's
+    /// error into the crate's central `Error` so the boot-time checkpoint
+    /// loader can `?`-propagate it and fail-stop instead of silently skipping
+    /// a corrupt checkpoint (which would be silent data loss: the WAL below
+    /// the checkpoint's LSN is already truncated).
+    fn from(e: nodedb_spatial::RTreeCheckpointError) -> Self {
+        Self::SegmentCorrupted {
+            detail: e.to_string(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // From<Error> for NodeDbError — the public API boundary conversion
 // ---------------------------------------------------------------------------

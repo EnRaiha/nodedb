@@ -21,6 +21,7 @@ use nodedb_types::DatabaseId;
 use super::checkpoint_encoding::{dec_component, enc_component};
 use super::checkpoint_outcome::CheckpointOutcome;
 use super::core_loop::CoreLoop;
+use crate::data::executor::checkpoint_decode_error::CheckpointDecodeError;
 use crate::types::TenantId;
 
 /// Canonical path for a core's spatial checkpoint directory.
@@ -156,16 +157,24 @@ impl CoreLoop {
     ///
     /// When `spatial_checkpoint_kek` is set, plaintext checkpoint files are
     /// rejected and encrypted files are decrypted before loading.
-    pub fn load_spatial_checkpoints(&mut self) {
+    ///
+    /// A corrupt or unreadable checkpoint (bad framing, bad CRC, an
+    /// unparseable filename, a rejected R-tree decode, or a missing/corrupt
+    /// docmap companion) is fail-stop: its `Err` propagates out of boot so
+    /// the core refuses to come up, rather than silently loading a partial
+    /// index once the WAL below the checkpoint's LSN is already truncated.
+    /// An absent checkpoint directory is not corruption and stays `Ok(())`.
+    pub fn load_spatial_checkpoints(&mut self) -> crate::Result<()> {
         let ckpt_dir = spatial_ckpt_dir(&self.data_dir, self.core_id);
         if !ckpt_dir.exists() {
-            return;
+            return Ok(());
         }
 
-        let entries = match std::fs::read_dir(&ckpt_dir) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
+        // The directory exists but cannot be enumerated: an I/O fault that
+        // could hide checkpoint files. Fail-stop rather than silently
+        // loading none.
+        let entries = std::fs::read_dir(&ckpt_dir)
+            .map_err(|e| storage_err(&ckpt_dir, "read checkpoint dir", &e))?;
 
         let mut loaded = 0;
         for entry in entries.flatten() {
@@ -183,37 +192,23 @@ impl CoreLoop {
                 continue;
             }
 
-            // Parse the filename stem into a logical key.
+            // Parse the filename stem into a logical key. This directory is
+            // engine-private (only the write path in this file creates
+            // `.ckpt` files here), so a `.ckpt` whose stem does not parse is
+            // a corrupted real checkpoint, not a foreign file to skip.
             let map_key = match parse_spatial_key(&stem) {
                 Some(k) => k,
                 None => {
-                    tracing::warn!(
-                        core = self.core_id,
-                        %stem,
-                        "failed to parse spatial checkpoint key; \
-                         skipping (WAL replay rebuilds it)"
-                    );
-                    continue;
+                    return Err(crate::Error::SegmentCorrupted {
+                        detail: format!("unparseable spatial checkpoint key: {stem}"),
+                    });
                 }
             };
 
-            let Ok(bytes) = nodedb_wal::segment::read_checkpoint_framed(&path) else {
-                continue;
-            };
+            let bytes = nodedb_wal::segment::read_checkpoint_framed(&path)?;
 
             let kek = self.segment_keks.spatial_checkpoint_kek.as_ref();
-            let rtree = match crate::engine::spatial::RTree::from_checkpoint(&bytes, kek) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        core = self.core_id,
-                        %stem,
-                        error = %e,
-                        "spatial checkpoint rejected"
-                    );
-                    continue;
-                }
-            };
+            let rtree = crate::engine::spatial::RTree::from_checkpoint(&bytes, kek)?;
 
             tracing::info!(
                 core = self.core_id,
@@ -225,21 +220,29 @@ impl CoreLoop {
             self.spatial_indexes.insert(map_key, rtree);
             loaded += 1;
 
-            // Load doc_map (keyed off the same logical key).
+            // Load doc_map (keyed off the same logical key). The doc_map is
+            // not optional company for the R-tree: `checkpoint_spatial_indexes`
+            // always writes it alongside a non-empty R-tree checkpoint, so a
+            // missing or undecodable docmap here means the R-tree's entries
+            // would resolve to nothing — an inconsistent, corrupt checkpoint
+            // generation, not a legitimate absence.
             let map_path = ckpt_dir.join(format!("{stem}.docmap"));
-            if let Ok(map_bytes) = nodedb_wal::segment::read_checkpoint_framed(&map_path)
-                && let Ok(doc_entries) = zerompk::from_msgpack::<Vec<(u64, String)>>(&map_bytes)
-            {
-                for (entry_id, doc_id) in doc_entries {
-                    self.spatial_doc_map
-                        .insert((db, tid, coll.clone(), field.clone(), entry_id), doc_id);
-                }
+            let map_bytes = nodedb_wal::segment::read_checkpoint_framed(&map_path)?;
+            let doc_entries: Vec<(u64, String)> = zerompk::from_msgpack(&map_bytes)
+                .map_err(|source| CheckpointDecodeError::MsgpackDecode {
+                    path: map_path,
+                    source,
+                })?;
+            for (entry_id, doc_id) in doc_entries {
+                self.spatial_doc_map
+                    .insert((db, tid, coll.clone(), field.clone(), entry_id), doc_id);
             }
         }
 
         if loaded > 0 {
             tracing::info!(core = self.core_id, loaded, "spatial checkpoints loaded");
         }
+        Ok(())
     }
 }
 
@@ -327,5 +330,207 @@ mod tests {
     #[test]
     fn non_numeric_stem_is_none() {
         assert!(parse_spatial_key("a_b_c_d").is_none());
+    }
+
+    /// A core rooted at `dir`, so a corrupt checkpoint can be planted on disk
+    /// and then read back through the real boot-time load path.
+    fn open_core_at(dir: &std::path::Path) -> CoreLoop {
+        use std::sync::Arc;
+
+        use nodedb_bridge::buffer::RingBuffer;
+        use nodedb_types::OrdinalClock;
+
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+
+        let hlc = Arc::new(OrdinalClock::new());
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, _resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        drop(req_tx); // no requests are dispatched in this test
+        CoreLoop::open(0, req_rx, resp_tx, dir, hlc).expect("CoreLoop::open")
+    }
+
+    /// An absent checkpoint directory is not corruption — a fresh data
+    /// directory (or one that has never checkpointed spatial indexes) must
+    /// load cleanly with nothing restored.
+    #[test]
+    fn absent_dir_is_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut core = open_core_at(dir.path());
+        core.load_spatial_checkpoints()
+            .expect("an absent checkpoint dir must not be treated as corruption");
+        assert!(core.spatial_indexes.is_empty());
+    }
+
+    /// A `.ckpt` file that exists but is not valid checkpoint framing (bad
+    /// magic / truncated / bad CRC) must fail the load, not be treated as
+    /// absent: for a document-collection index this file is the only
+    /// surviving copy of that row's geometry entry once the WAL below its LSN
+    /// is truncated. Silently skipping it would be permanent, unannounced
+    /// loss of spatial predicate coverage over rows a full scan still
+    /// returns.
+    #[test]
+    fn corrupt_ckpt_frame_fails_the_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = open_core_at(dir.path());
+        let ckpt_dir = spatial_ckpt_dir(&core.data_dir, core.core_id);
+        std::fs::create_dir_all(&ckpt_dir).expect("create ckpt dir");
+        let stem = checkpoint_stem(DatabaseId::new(0), TenantId::new(7), "pts", "geom");
+        std::fs::write(
+            ckpt_dir.join(format!("{stem}.ckpt")),
+            b"not a valid checkpoint frame",
+        )
+        .expect("write garbage checkpoint");
+        drop(core);
+
+        let mut restored = open_core_at(dir.path());
+        restored
+            .load_spatial_checkpoints()
+            .expect_err("a corrupt R-tree checkpoint frame must fail the load, not skip it");
+    }
+
+    /// A `.ckpt` filename whose stem does not parse into `(db, tid, coll,
+    /// field)` is a corrupted real checkpoint, not a foreign file to ignore —
+    /// this directory is engine-private and only ever holds files this
+    /// module wrote.
+    #[test]
+    fn unparseable_stem_fails_the_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = open_core_at(dir.path());
+        let ckpt_dir = spatial_ckpt_dir(&core.data_dir, core.core_id);
+        std::fs::create_dir_all(&ckpt_dir).expect("create ckpt dir");
+        std::fs::write(ckpt_dir.join("not_a_valid_stem.ckpt"), b"irrelevant")
+            .expect("write file with bad stem");
+        drop(core);
+
+        let mut restored = open_core_at(dir.path());
+        restored
+            .load_spatial_checkpoints()
+            .expect_err("an unparseable checkpoint filename must fail the load, not skip it");
+    }
+
+    /// A valid, non-empty R-tree checkpoint whose companion `.docmap` file is
+    /// entirely missing is an inconsistent generation: `checkpoint_spatial_indexes`
+    /// always writes the docmap alongside a non-empty R-tree checkpoint, so a
+    /// missing docmap here means the R-tree's entries would resolve to no
+    /// document at all. That must fail the load rather than restore a
+    /// half-usable index.
+    #[test]
+    fn missing_docmap_fails_the_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = open_core_at(dir.path());
+        let ckpt_dir = spatial_ckpt_dir(&core.data_dir, core.core_id);
+        std::fs::create_dir_all(&ckpt_dir).expect("create ckpt dir");
+
+        let rtree =
+            crate::engine::spatial::RTree::bulk_load(vec![crate::engine::spatial::RTreeEntry {
+                id: 1,
+                bbox: nodedb_types::BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+            }]);
+        let bytes = rtree.checkpoint_to_bytes(None).expect("encode R-tree");
+        assert!(
+            !bytes.is_empty(),
+            "a non-empty R-tree encodes non-empty bytes"
+        );
+
+        let stem = checkpoint_stem(DatabaseId::new(0), TenantId::new(7), "pts", "geom");
+        let ckpt_path = ckpt_dir.join(format!("{stem}.ckpt"));
+        let tmp_path = ckpt_dir.join(format!("{stem}.ckpt.tmp"));
+        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes)
+            .expect("publish checkpoint");
+        // Deliberately do NOT write the `.docmap` companion.
+        drop(core);
+
+        let mut restored = open_core_at(dir.path());
+        restored
+            .load_spatial_checkpoints()
+            .expect_err("a missing docmap companion must fail the load, not skip it");
+    }
+
+    /// A `.docmap` file that exists but does not decode as MessagePack must
+    /// fail the load for the same reason a missing one does: the R-tree
+    /// checkpoint's entries cannot be resolved to document ids.
+    #[test]
+    fn corrupt_docmap_fails_the_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = open_core_at(dir.path());
+        let ckpt_dir = spatial_ckpt_dir(&core.data_dir, core.core_id);
+        std::fs::create_dir_all(&ckpt_dir).expect("create ckpt dir");
+
+        let rtree =
+            crate::engine::spatial::RTree::bulk_load(vec![crate::engine::spatial::RTreeEntry {
+                id: 1,
+                bbox: nodedb_types::BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+            }]);
+        let bytes = rtree.checkpoint_to_bytes(None).expect("encode R-tree");
+
+        let stem = checkpoint_stem(DatabaseId::new(0), TenantId::new(7), "pts", "geom");
+        let ckpt_path = ckpt_dir.join(format!("{stem}.ckpt"));
+        let tmp_path = ckpt_dir.join(format!("{stem}.ckpt.tmp"));
+        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes)
+            .expect("publish checkpoint");
+
+        // Frame is valid, but the payload is not MessagePack.
+        let map_path = ckpt_dir.join(format!("{stem}.docmap"));
+        let map_tmp = ckpt_dir.join(format!("{stem}.docmap.tmp"));
+        nodedb_wal::segment::write_checkpoint_framed(&map_tmp, &map_path, b"not msgpack")
+            .expect("publish garbage docmap");
+        drop(core);
+
+        let mut restored = open_core_at(dir.path());
+        restored
+            .load_spatial_checkpoints()
+            .expect_err("an undecodable docmap must fail the load, not skip it");
+    }
+
+    /// The happy path must still succeed end to end: a valid R-tree
+    /// checkpoint paired with a valid docmap restores both the index and the
+    /// entry-id-to-document-id mapping.
+    #[test]
+    fn valid_checkpoint_and_docmap_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let core = open_core_at(dir.path());
+        let ckpt_dir = spatial_ckpt_dir(&core.data_dir, core.core_id);
+        std::fs::create_dir_all(&ckpt_dir).expect("create ckpt dir");
+
+        let rtree =
+            crate::engine::spatial::RTree::bulk_load(vec![crate::engine::spatial::RTreeEntry {
+                id: 1,
+                bbox: nodedb_types::BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+            }]);
+        let bytes = rtree.checkpoint_to_bytes(None).expect("encode R-tree");
+
+        let db = DatabaseId::new(0);
+        let tid = TenantId::new(7);
+        let stem = checkpoint_stem(db, tid, "pts", "geom");
+        let ckpt_path = ckpt_dir.join(format!("{stem}.ckpt"));
+        let tmp_path = ckpt_dir.join(format!("{stem}.ckpt.tmp"));
+        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &bytes)
+            .expect("publish checkpoint");
+
+        let doc_entries: Vec<(u64, String)> = vec![(1, "doc-1".to_string())];
+        let map_bytes = zerompk::to_msgpack_vec(&doc_entries).expect("encode docmap");
+        let map_path = ckpt_dir.join(format!("{stem}.docmap"));
+        let map_tmp = ckpt_dir.join(format!("{stem}.docmap.tmp"));
+        nodedb_wal::segment::write_checkpoint_framed(&map_tmp, &map_path, &map_bytes)
+            .expect("publish docmap");
+        drop(core);
+
+        let mut restored = open_core_at(dir.path());
+        restored
+            .load_spatial_checkpoints()
+            .expect("a valid checkpoint and docmap must load cleanly");
+
+        let key = (db, tid, "pts".to_string(), "geom".to_string());
+        let loaded_rtree = restored
+            .spatial_indexes
+            .get(&key)
+            .expect("R-tree must be restored under its logical key");
+        assert_eq!(loaded_rtree.len(), 1);
+
+        let doc_id = restored
+            .spatial_doc_map
+            .get(&(db, tid, "pts".to_string(), "geom".to_string(), 1))
+            .expect("doc_map entry must be restored");
+        assert_eq!(doc_id, "doc-1");
     }
 }
