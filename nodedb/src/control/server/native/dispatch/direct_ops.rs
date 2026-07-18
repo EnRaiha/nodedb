@@ -345,16 +345,18 @@ pub(crate) async fn handle_graph_match(
         && ctx.sessions.transaction_state(ctx.peer_addr)
             == crate::control::server::shared::session::TransactionState::InBlock
     {
-        crate::control::server::shared::session::record_read_set(
+        crate::control::server::shared::session::record_reads_for_response(
             ctx.state,
             ctx.sessions,
             ctx.peer_addr,
             ctx.tenant_id(),
-            crate::control::server::shared::session::ReadCapture {
+            crate::control::server::shared::session::ResponseReads {
                 plan: &plan_for_response,
                 watermarks: &[(vshard_id, resp.watermark_lsn)],
                 read_version_lsn: resp.read_version_lsn,
                 found: resp.status == Status::Ok,
+                shuffle_reads: &[],
+                shuffle_read_lsn_vshard: vshard_id,
             },
         )
         .await;
@@ -481,16 +483,18 @@ async fn dispatch_single_task(
                 && ctx.sessions.transaction_state(ctx.peer_addr)
                     == crate::control::server::shared::session::TransactionState::InBlock
             {
-                crate::control::server::shared::session::record_read_set(
+                crate::control::server::shared::session::record_reads_for_response(
                     ctx.state,
                     ctx.sessions,
                     ctx.peer_addr,
                     ctx.tenant_id(),
-                    crate::control::server::shared::session::ReadCapture {
+                    crate::control::server::shared::session::ResponseReads {
                         plan: &plan_for_response,
                         watermarks: &[(task_vshard, resp.watermark_lsn)],
                         read_version_lsn: resp.read_version_lsn,
                         found: resp.status == Status::Ok,
+                        shuffle_reads: &[],
+                        shuffle_read_lsn_vshard: task_vshard,
                     },
                 )
                 .await;

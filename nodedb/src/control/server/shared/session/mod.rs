@@ -19,6 +19,7 @@ mod own_writes;
 mod params;
 pub mod read_consistency;
 pub mod read_set;
+pub mod record_reads;
 mod reservation_release;
 pub mod savepoint_ops;
 pub mod staging_gate;
@@ -39,6 +40,7 @@ pub use self::params::{
     parse_show_command,
 };
 pub use self::read_set::{EngineTag, ReadCapture, ReadKey, ReadSetEntry, record_read_set};
+pub use self::record_reads::{ResponseReads, record_reads_for_response};
 pub use self::savepoint_ops::SavepointError;
 pub use self::staging_gate::{
     DetachedTxnScope, DmlTxnCtx, InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError,

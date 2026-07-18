@@ -398,56 +398,26 @@ impl NodeDbPgHandler {
                 && self.sessions.transaction_state(addr)
                     == crate::control::server::shared::session::TransactionState::InBlock
             {
-                if !shuffle_reads.is_empty() {
-                    // Distributed shuffle JOIN: record ONE read-set entry per
-                    // side capture, each from its OWN single-collection scan plan
-                    // and real observed read-version, so the commit-time OCC
-                    // validator re-homes and revalidates each side's vshard
-                    // independently (probe = left, build = right). The default
-                    // single-collection record below is SKIPPED — a `HashJoin`
-                    // plan collapses to the left collection via
-                    // `extract_collection`, so it would miss the build side
-                    // entirely (the serializability hole this closes). Each
-                    // capture's scan plan is a single-collection scan whose
-                    // `read_lsn` (single-shard SI watermark) is `ZERO` — the
-                    // cross-shard OCC comparand is the capture's per-collection
-                    // read-version. `record_read_set` still applies the session's
-                    // own-write floor per collection.
-                    for cap in &shuffle_reads {
-                        crate::control::server::shared::session::record_read_set(
-                            &self.state,
-                            &self.sessions,
-                            addr,
-                            identity.tenant_id,
-                            crate::control::server::shared::session::ReadCapture {
-                                plan: &cap.scan_plan,
-                                watermarks: &[(task_vshard, crate::types::Lsn::ZERO)],
-                                read_version_lsn: cap.read_version_lsn,
-                                found: false,
-                            },
-                        )
-                        .await;
-                    }
+                let watermarks = if shard_watermarks.is_empty() {
+                    vec![(task_vshard, resp.watermark_lsn)]
                 } else {
-                    let watermarks = if shard_watermarks.is_empty() {
-                        vec![(task_vshard, resp.watermark_lsn)]
-                    } else {
-                        shard_watermarks
-                    };
-                    crate::control::server::shared::session::record_read_set(
-                        &self.state,
-                        &self.sessions,
-                        addr,
-                        identity.tenant_id,
-                        crate::control::server::shared::session::ReadCapture {
-                            plan: &plan_for_response,
-                            watermarks: &watermarks,
-                            read_version_lsn: resp.read_version_lsn,
-                            found: resp.status == crate::bridge::envelope::Status::Ok,
-                        },
-                    )
-                    .await;
-                }
+                    shard_watermarks
+                };
+                crate::control::server::shared::session::record_reads_for_response(
+                    &self.state,
+                    &self.sessions,
+                    addr,
+                    identity.tenant_id,
+                    crate::control::server::shared::session::ResponseReads {
+                        plan: &plan_for_response,
+                        watermarks: &watermarks,
+                        read_version_lsn: resp.read_version_lsn,
+                        found: resp.status == crate::bridge::envelope::Status::Ok,
+                        shuffle_reads: &shuffle_reads,
+                        shuffle_read_lsn_vshard: task_vshard,
+                    },
+                )
+                .await;
             }
 
             // Record the session's OWN committed write-version so a later
