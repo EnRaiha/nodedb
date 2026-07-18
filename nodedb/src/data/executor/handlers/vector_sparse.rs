@@ -13,7 +13,7 @@ use crate::engine::vector::sparse::SparseInvertedIndex;
 
 impl CoreLoop {
     /// Get or create a sparse inverted index for a collection/field.
-    fn get_or_create_sparse_index(
+    pub(in crate::data::executor) fn get_or_create_sparse_index(
         &mut self,
         database_id: u64,
         tid: u64,
@@ -25,7 +25,7 @@ impl CoreLoop {
     }
 
     /// Build the tuple key for sparse vector indexes.
-    fn sparse_index_key(
+    pub(in crate::data::executor) fn sparse_index_key(
         database_id: u64,
         tid: u64,
         collection: &str,

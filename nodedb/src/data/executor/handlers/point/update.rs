@@ -394,6 +394,23 @@ impl CoreLoop {
                             },
                         );
 
+                        // Maintain the sparse inverted index the same way: the
+                        // body rewrite never touched it, so re-index the row's
+                        // sparse literal from the new body. No-op when the
+                        // collection declares no `SparseVector` column.
+                        let has_sparse = self.collection_has_sparse(tid, collection);
+                        self.update_reindex_sparse_indexes(
+                            super::update_reindex_sparse::UpdateSparseReindex {
+                                database_id,
+                                tid,
+                                collection,
+                                row_key,
+                                new_body: &updated_bytes,
+                                is_strict,
+                                has_sparse,
+                            },
+                        );
+
                         // Emit update event to Event Plane. `current_bytes`
                         // is the pre-update row already read above; the
                         // helper derives `WriteOp::Update` from the Some

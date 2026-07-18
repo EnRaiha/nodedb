@@ -359,6 +359,12 @@ impl CoreLoop {
         let vector_deletes =
             self.remove_document_vector_indexes(database_id, tid, collection, row_key);
 
+        // Sparse inverted-index cleanup, mirroring the dense-vector cascade
+        // above: drop this document's sparse posting entries under the same hex
+        // surrogate row key the put path indexed them by. A no-op unless the
+        // strict schema declares a `SparseVector` column.
+        self.remove_document_sparse_indexes(database_id, tid, collection, row_key);
+
         // Invalidate document cache.
         self.doc_cache
             .invalidate(database_id, tid, collection, row_key);

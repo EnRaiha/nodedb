@@ -16,4 +16,5 @@ pub mod overlay_lookup;
 pub mod put;
 pub mod update;
 pub mod update_reindex;
+pub mod update_reindex_sparse;
 pub mod update_reindex_vector;

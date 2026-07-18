@@ -165,16 +165,17 @@ impl CoreLoop {
         };
 
         // Gate post-apply write-set accumulation once for the whole batch so a
-        // collection with no vector field pays nothing. Each row's
-        // `apply_point_put` above reconciles storage + the btree/FTS/graph/HNSW
-        // overlays, but `wal_append_document_op` mints no redo for `BatchInsert`
-        // (row durability is redb-synchronous). On a WAL-only restart the HNSW
-        // is rebuilt only from redo `Put` records, so a vector-indexed batch
-        // insert that journals nothing would lose its rows' vectors. Carrying
-        // the surrogate + post-image back per row lets the Control Plane mint a
-        // durable `Put` redo for each (see `plan_post_apply_redo` /
-        // `append_write_set_redo`).
-        let has_vectors = self.collection_has_vectors(database_id, tid, collection);
+        // collection with no vector/sparse field pays nothing. Each row's
+        // `apply_point_put` above reconciles storage + the btree/FTS/graph/HNSW/
+        // sparse overlays, but `wal_append_document_op` mints no redo for
+        // `BatchInsert` (row durability is redb-synchronous). On a WAL-only
+        // restart the HNSW and sparse indexes are rebuilt only from redo `Put`
+        // records, so a vector- or sparse-indexed batch insert that journals
+        // nothing would lose its rows' index entries. Carrying the surrogate +
+        // post-image back per row lets the Control Plane mint a durable `Put`
+        // redo for each (see `plan_post_apply_redo` / `append_write_set_redo`).
+        let has_vectors = self.collection_has_vectors(database_id, tid, collection)
+            || self.collection_has_sparse(tid, collection);
 
         // Row key for post-commit event emission, captured as each row applies
         // successfully; the value bytes are re-borrowed from `documents` after
