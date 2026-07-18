@@ -210,6 +210,41 @@ async fn dispatch_local(
     txn_id: Option<TxnId>,
 ) -> Result<DispatchOutcome, Error> {
     let vshard_id = VShardId::new(route.vshard_id);
+
+    // Autocommit replicable writes MUST drive through Raft — exactly as the
+    // pgwire statement path and the remote-leaseholder receiver (`exec_receiver`)
+    // do: propose → WAL-append → apply → bump `coll_write_lsn` on every voter.
+    // Applying such a write via the leader-local SPSC dispatch below would commit
+    // only to this node's Data Plane and NEVER propose it to the Raft group
+    // (silent write loss on failover), nor floor a concurrent native reader's OCC
+    // comparand. `to_replicated_entry` is the single oracle for which plans are
+    // replicable writes; reads / non-write plans return `None` and fall through
+    // to the SPSC path below unchanged. Staged in-transaction writes
+    // (`txn_id.is_some()`) also fall through: they stay deferred to COMMIT's
+    // batch funnel, which appends their durable version there.
+    if txn_id.is_none()
+        && let Some(proposer) = shared.async_raft_proposer.get()
+        && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
+            tenant_id,
+            database_id,
+            vshard_id,
+            &route.plan,
+        )
+    {
+        let (payload, write_version) =
+            crate::control::wal_replication::propose_replicated_entry(shared, proposer, entry)
+                .await?;
+        return Ok(DispatchOutcome {
+            payloads: vec![payload],
+            // A write carries no read watermark (Lsn::ZERO). Its per-collection
+            // version — the applying replica's post-write `coll_write_lsn` — is
+            // surfaced via `read_version_lsn` to floor this session's later reads,
+            // matching the leader-local write path's `resp.read_version_lsn`.
+            shard_watermarks: vec![(vshard_id, Lsn::ZERO)],
+            read_version_lsn: write_version,
+        });
+    }
+
     let resp = dispatch_to_data_plane_with_txn(
         shared,
         tenant_id,
