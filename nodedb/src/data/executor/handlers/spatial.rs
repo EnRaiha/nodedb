@@ -16,7 +16,9 @@ use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::physical_plan::SpatialPredicate;
-use nodedb_types::{Surrogate, SurrogateBitmap, Value};
+use nodedb_types::{Surrogate, SurrogateBitmap};
+
+use super::spatial_refine::{apply_predicate, expand_bbox, extract_geometry, project_doc};
 
 /// Parameters for [`CoreLoop::execute_spatial_scan`].
 pub(in crate::data::executor) struct SpatialScanParams<'a> {
@@ -161,12 +163,26 @@ impl CoreLoop {
             "spatial R-tree candidates"
         );
 
-        // Pre-load all docs from scan_collection (handles both sparse and columnar).
-        let all_docs: std::collections::HashMap<String, Vec<u8>> = self
-            .scan_collection(task.request.database_id.as_u64(), tid, collection, 10_000)
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        // Candidate documents are fetched per-candidate in an ENGINE-AWARE way
+        // below. `spatial_doc_map` keys candidates differently per engine:
+        //   * Document collections (schemaless/strict) keep their rows in the
+        //     sparse engine keyed by the hex surrogate, and the doc-map records
+        //     that same hex surrogate (see `apply_point_put_spatial`).
+        //   * The `spatial` / columnar-family engine keeps its rows in columnar
+        //     keyed by the user `id` column, and the doc-map records that user
+        //     id (see `index_columnar_geometry_columns`).
+        // The refinement fetch below tries sparse first (the document-collection
+        // case) and, on a miss, resolves the candidate from a columnar id → doc
+        // map built once via `scan_collection` (the columnar-family case). This
+        // mirrors `scan_collection`'s own presence-based (columnar → sparse)
+        // routing and is correct regardless of which engine backs the row.
+        let database_id = db_id.as_u64();
+        let strict_schema = self.strict_schema_for(tid_id, collection);
+
+        // Lazily-built columnar id → document map, populated on the first
+        // candidate that is absent from the sparse store (i.e. a columnar-family
+        // collection). Never built for pure document collections.
+        let mut columnar_docs: Option<std::collections::HashMap<String, Vec<u8>>> = None;
 
         // 5. Exact predicate refinement.
         let mut results = Vec::new();
@@ -200,14 +216,62 @@ impl CoreLoop {
                 }
             }
 
-            let doc_bytes = match all_docs.get(&doc_id) {
-                Some(b) => b,
-                None => continue,
-            };
-
-            let doc = match super::super::doc_format::decode_document_value(doc_bytes) {
-                Some(d) => d,
-                None => continue,
+            // Fetch the candidate's document in an engine-aware way. A sparse
+            // hit is the document-collection case (doc-map id is the hex
+            // surrogate). A sparse miss means the row lives in columnar under
+            // the user `id` column (the `spatial` / columnar-family case), so it
+            // is resolved from the columnar id → doc map. Both forms normalise
+            // to standard msgpack maps that `decode_document_value` and
+            // `extract_geometry` read identically.
+            let doc = match self.sparse.get(database_id, tid, collection, &doc_id) {
+                Ok(Some(raw)) => {
+                    let (_, doc_mp) = crate::data::executor::scan_normalize::sparse_row_to_doc(
+                        &doc_id,
+                        &raw,
+                        strict_schema.as_ref(),
+                    );
+                    match super::super::doc_format::decode_document_value(&doc_mp) {
+                        Some(d) => d,
+                        None => continue,
+                    }
+                }
+                Ok(None) => {
+                    // Columnar-family (e.g. `engine='spatial'`) collection: the
+                    // doc-map id is the user `id` column and the row lives in
+                    // columnar, not sparse. Build the id → document map once and
+                    // reuse it across every remaining candidate.
+                    if columnar_docs.is_none() {
+                        match self.scan_collection(database_id, tid, collection, usize::MAX) {
+                            Ok(rows) => {
+                                columnar_docs = Some(rows.into_iter().collect());
+                            }
+                            Err(e) => {
+                                return self.response_error(
+                                    task,
+                                    ErrorCode::Internal {
+                                        detail: e.to_string(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    let Some(doc_mp) = columnar_docs.as_ref().and_then(|m| m.get(&doc_id)) else {
+                        continue;
+                    };
+                    match super::super::doc_format::decode_document_value(doc_mp) {
+                        Some(d) => d,
+                        None => continue,
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        err = %e,
+                        %doc_id,
+                        %collection,
+                        "sparse get failed during spatial candidate hydration; skipping row"
+                    );
+                    continue;
+                }
             };
 
             let doc_geom = match extract_geometry(&doc, field) {
@@ -369,87 +433,6 @@ impl CoreLoop {
     }
 }
 
-/// Extract geometry from a document field.
-///
-/// Handles three storage forms:
-/// - `Value::Geometry(g)` — native geometry (columnar path preserves type)
-/// - `Value::String(s)` — GeoJSON string (from SQL ST_Point → serialized)
-/// - `Value::Object(_)` — GeoJSON object (from schemaless doc storage)
-pub(in crate::data::executor) fn extract_geometry(
-    doc: &Value,
-    field: &str,
-) -> Option<nodedb_types::geometry::Geometry> {
-    let field_val = doc.get(field)?;
-    match field_val {
-        Value::Geometry(g) => Some(g.clone()),
-        Value::String(s) => sonic_rs::from_str(s).ok(),
-        Value::Object(map) => {
-            // GeoJSON object stored as Value::Object — serialize to JSON then parse.
-            let json = serde_json::Value::from(Value::Object(map.clone()));
-            serde_json::from_value(json).ok()
-        }
-        _ => None,
-    }
-}
-
-/// Apply the spatial predicate.
-pub(in crate::data::executor) fn apply_predicate(
-    predicate: &SpatialPredicate,
-    query: &nodedb_types::geometry::Geometry,
-    doc: &nodedb_types::geometry::Geometry,
-    distance_meters: f64,
-) -> bool {
-    match predicate {
-        SpatialPredicate::DWithin => {
-            crate::engine::spatial::st_dwithin(query, doc, distance_meters)
-        }
-        SpatialPredicate::Contains => crate::engine::spatial::st_contains(query, doc),
-        SpatialPredicate::Intersects => crate::engine::spatial::st_intersects(query, doc),
-        SpatialPredicate::Within => crate::engine::spatial::st_within(doc, query),
-    }
-}
-
-/// Apply projection to a document, returning `nodedb_types::Value`.
-pub(in crate::data::executor) fn project_doc(
-    doc: &Value,
-    doc_id: &str,
-    projection: &[String],
-) -> Value {
-    if projection.is_empty() {
-        // Add id if not present.
-        if let Value::Object(mut map) = doc.clone() {
-            map.entry("id".to_string())
-                .or_insert(Value::String(doc_id.to_string()));
-            Value::Object(map)
-        } else {
-            doc.clone()
-        }
-    } else {
-        let mut map = std::collections::HashMap::new();
-        map.insert("id".to_string(), Value::String(doc_id.to_string()));
-        for col in projection {
-            if let Some(v) = doc.get(col) {
-                map.insert(col.clone(), v.clone());
-            }
-        }
-        Value::Object(map)
-    }
-}
-
-/// Expand a bounding box by a distance in meters.
-fn expand_bbox(bbox: &nodedb_types::BoundingBox, meters: f64) -> nodedb_types::BoundingBox {
-    let lat_delta = meters / 111_320.0;
-    let avg_lat = ((bbox.min_lat + bbox.max_lat) / 2.0).to_radians();
-    let lng_delta = meters / (111_320.0 * avg_lat.cos().max(0.001));
-
-    nodedb_types::BoundingBox::new(
-        bbox.min_lng - lng_delta,
-        bbox.min_lat - lat_delta,
-        bbox.max_lng + lng_delta,
-        bbox.max_lat + lat_delta,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::SpatialScanParams;
@@ -605,6 +588,17 @@ mod tests {
             crate::engine::document::store::surrogate_to_doc_id(Surrogate(2))
         );
     }
+
+    // Note: the R-tree-branch by-surrogate candidate hydration
+    // (execute_spatial_scan → sparse.get → sparse_row_to_doc) is covered
+    // end-to-end by `tests/engine_surface_spatial.rs::
+    // sql_geometry_insert_into_document_collection_matches_spatial_predicate`,
+    // which drives a real SQL INSERT + ST_DWithin. That test went FAIL→PASS
+    // across the read-path fix, so it genuinely exercises the R-tree branch.
+    // An isolated `make_core` unit test cannot faithfully reproduce the full
+    // write+register+scan setup (surrogate allocation / collection
+    // registration the hydrate/decode path depends on), so the e2e test is
+    // the authoritative coverage here.
 
     #[test]
     fn empty_prefilter_returns_nothing() {

@@ -73,11 +73,14 @@ impl CoreLoop {
                     None => continue,
                 };
                 // Geometry may be stored as Value::Geometry or Value::String (GeoJSON).
+                // See `nodedb_types::geometry::from_geojson_str` — shared with the
+                // document index path (`apply_point_put_spatial`) and the read path
+                // (`extract_geometry`); keep all three in sync.
                 let geom: nodedb_types::geometry::Geometry = match field_val {
                     Value::Geometry(g) => g.clone(),
-                    Value::String(s) => match sonic_rs::from_str(s) {
-                        Ok(g) => g,
-                        Err(_) => continue,
+                    Value::String(s) => match nodedb_types::geometry::from_geojson_str(s) {
+                        Some(g) => g,
+                        None => continue,
                     },
                     _ => continue,
                 };

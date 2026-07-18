@@ -38,7 +38,9 @@ use nodedb_types::value::Value;
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::columnar_read::convert::row_to_projected_json;
-use crate::data::executor::handlers::spatial::{apply_predicate, extract_geometry, project_doc};
+use crate::data::executor::handlers::spatial_refine::{
+    apply_predicate, extract_geometry, project_doc,
+};
 use crate::data::executor::handlers::transaction::overlay::Staged;
 use crate::engine::document::store::surrogate_to_doc_id;
 use crate::types::{DatabaseId, TenantId, TxnId};

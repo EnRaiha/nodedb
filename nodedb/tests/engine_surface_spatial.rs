@@ -237,6 +237,53 @@ async fn scalar_st_distance() {
     assert!(dist > 0.0, "distance should be positive, got {dist}");
 }
 
+// ── R-tree indexing parity: DOCUMENT collections vs the `spatial` engine ────
+// SQL-inserted geometry (`ST_Point(...)`) is serialized to a GeoJSON STRING
+// field. The `spatial` engine's write path always handled that string form
+// for R-tree indexing; a DOCUMENT (schemaless) collection's index-build path
+// only recognized a GeoJSON OBJECT field, so SQL-inserted geometry into a
+// DOCUMENT collection was silently never R-tree-indexed (O(n) full-scan
+// fallback instead of O(log n)). Both paths must return identical, correct
+// results for a spatial predicate regardless of engine.
+#[tokio::test]
+async fn sql_geometry_insert_into_document_collection_matches_spatial_predicate() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION doc_geo WITH (engine='document_schemaless')")
+        .await
+        .unwrap();
+
+    // Times Square, NYC — should match a nearby ST_DWithin search.
+    srv.exec(
+        "INSERT INTO doc_geo (id, loc, name) \
+         VALUES ('p1', ST_Point(-73.9857, 40.7580), 'Times Square')",
+    )
+    .await
+    .unwrap();
+    // Paris — far away, should not match.
+    srv.exec(
+        "INSERT INTO doc_geo (id, loc, name) \
+         VALUES ('p2', ST_Point(2.3522, 48.8566), 'Paris')",
+    )
+    .await
+    .unwrap();
+
+    let rows = srv
+        .query_rows(
+            "SELECT name FROM doc_geo WHERE \
+             ST_DWithin(loc, '{\"type\":\"Point\",\"coordinates\":[-73.9857,40.7580]}', 5000)",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one row within 5 km of Times Square on a DOCUMENT \
+         collection, got {rows:?}"
+    );
+    assert_eq!(rows[0][0], "Times Square");
+}
+
 #[tokio::test]
 async fn count_spatial_rows() {
     let srv = TestServer::start().await;

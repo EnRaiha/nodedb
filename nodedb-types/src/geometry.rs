@@ -143,6 +143,21 @@ impl Geometry {
     }
 }
 
+/// Parse a GeoJSON string into a [`Geometry`].
+///
+/// Shared by every storage/read path that may encounter geometry stored as a
+/// JSON string rather than a native object — SQL `ST_Point(...)` inserts
+/// serialize to a GeoJSON string, while schemaless document writes and
+/// `Value::Geometry` keep the native form. Centralizing the string-parse core
+/// here keeps the three call sites (document index build, spatial read path,
+/// columnar geometry index) from drifting on which parser they use.
+///
+/// Uses `sonic_rs` per workspace policy (never `serde_json::from_str` for
+/// runtime JSON parsing). Returns `None` on malformed/non-geometry JSON.
+pub fn from_geojson_str(s: &str) -> Option<Geometry> {
+    sonic_rs::from_str(s).ok()
+}
+
 // ── Geo math functions ──
 
 const EARTH_RADIUS_M: f64 = 6_371_000.0;

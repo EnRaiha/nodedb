@@ -46,6 +46,7 @@ pub mod scan_budget;
 pub mod snapshot;
 pub mod sort_utils;
 pub mod spatial;
+pub mod spatial_refine;
 pub mod spatial_sync;
 pub(super) mod spill;
 pub mod text_search;

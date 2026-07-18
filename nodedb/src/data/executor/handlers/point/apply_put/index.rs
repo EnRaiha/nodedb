@@ -47,7 +47,13 @@ impl CoreLoop {
         // only the new inserts are captured for transactional undo.
         let _ = self.remove_document_spatial_indexes(database_id, tid, collection, document_id);
         // Spatial index: detect geometry fields and insert into R-tree.
-        // Tries to parse each object field as a GeoJSON Geometry.
+        // Tries to parse each field as a GeoJSON Geometry — either a native
+        // JSON object (schemaless document writes, e.g.
+        // `{"type":"Point","coordinates":[...]}`) or a JSON string containing
+        // GeoJSON (SQL `ST_Point(...)` inserts, which serialize geometry to a
+        // string). See `nodedb_types::geometry::from_geojson_str` — shared
+        // with the read path (`extract_geometry` in spatial.rs) and the
+        // columnar index path (`geometry_index.rs`); keep all three in sync.
         // If successful, computes bbox and inserts into the per-field R-tree.
         // Also writes the document to columnar_memtables so that bare table scans
         // and aggregates on spatial collections read from columnar (spatial extends columnar).
@@ -56,9 +62,14 @@ impl CoreLoop {
         {
             let mut has_geometry = false;
             for (field_name, field_value) in obj {
-                if let Ok(geom) =
-                    serde_json::from_value::<nodedb_types::geometry::Geometry>(field_value.clone())
-                {
+                let parsed_geom = match field_value {
+                    serde_json::Value::String(s) => nodedb_types::geometry::from_geojson_str(s),
+                    _ => serde_json::from_value::<nodedb_types::geometry::Geometry>(
+                        field_value.clone(),
+                    )
+                    .ok(),
+                };
+                if let Some(geom) = parsed_geom {
                     has_geometry = true;
                     let bbox = nodedb_types::bbox::geometry_bbox(&geom);
                     let db_id = nodedb_types::DatabaseId::new(database_id);
@@ -148,5 +159,107 @@ impl CoreLoop {
             }
         }
         spatial_deletes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::bridge::envelope::{Priority, Request, Status};
+    use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::data::executor::task::ExecutionTask;
+    use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+    use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+    use nodedb_types::Surrogate;
+    use std::time::{Duration, Instant};
+
+    /// An `ExecutionTask` for a `PointPut` of `document_id` with a raw JSON
+    /// document body (`value`) into `collection`, tenant 1 / database DEFAULT.
+    fn point_put_task(collection: &str, document_id: &str, value: &[u8]) -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Document(DocumentOp::PointPut {
+                collection: collection.into(),
+                document_id: document_id.into(),
+                value: value.to_vec(),
+                surrogate: Surrogate::ZERO,
+                pk_bytes: Vec::new(),
+            }),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: None,
+            resolved_now_ms: None,
+            admission: crate::bridge::envelope::Admission::Admitted,
+        })
+    }
+
+    /// A DOCUMENT-collection insert whose geometry field is a JSON **string**
+    /// containing GeoJSON — the exact shape SQL `ST_Point(...)` inserts
+    /// produce, as opposed to a GeoJSON **object**. Before the fix, only the
+    /// object shape was detected by `apply_point_put_spatial`, so this insert
+    /// never populated `spatial_indexes` (O(n) full-scan fallback instead of
+    /// the R-tree). This is a raw JSON document body (not msgpack) so
+    /// `doc_format::decode_document`'s JSON fallback path is exercised, same
+    /// as documents freshly inserted via SQL before any msgpack re-encode.
+    #[test]
+    fn sql_geometry_string_field_is_rtree_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let doc = br#"{"loc":"{\"type\":\"Point\",\"coordinates\":[1.0,2.0]}"}"#;
+        let task = point_put_task("docs", "d1", doc);
+        let resp = core.execute_point_put(&task, 1, "docs", "d1", Surrogate::ZERO, doc);
+        assert_eq!(resp.status, Status::Ok);
+
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            "docs".to_string(),
+            "loc".to_string(),
+        );
+        assert!(
+            core.spatial_indexes.contains_key(&key),
+            "SQL-inserted (string-form) geometry must be R-tree-indexed, \
+             not left to O(n) full-scan; spatial_indexes keys: {:?}",
+            core.spatial_indexes.keys().collect::<Vec<_>>()
+        );
+        let rtree = core.spatial_indexes.get(&key).unwrap();
+        assert_eq!(
+            rtree.entries().len(),
+            1,
+            "exactly one R-tree entry expected for the single inserted document"
+        );
+    }
+
+    /// Parity: an object-form GeoJSON field (schemaless doc write) is indexed
+    /// identically to the string form above — same key, one entry.
+    #[test]
+    fn object_geometry_field_is_rtree_indexed_parity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+
+        let doc = br#"{"loc":{"type":"Point","coordinates":[1.0,2.0]}}"#;
+        let task = point_put_task("docs_obj", "d1", doc);
+        let resp = core.execute_point_put(&task, 1, "docs_obj", "d1", Surrogate::ZERO, doc);
+        assert_eq!(resp.status, Status::Ok);
+
+        let key = (
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            "docs_obj".to_string(),
+            "loc".to_string(),
+        );
+        assert!(core.spatial_indexes.contains_key(&key));
+        assert_eq!(core.spatial_indexes.get(&key).unwrap().entries().len(), 1);
     }
 }
