@@ -249,6 +249,9 @@ impl CoreLoop {
                         );
                     }
                 }
+                // CDC: a node-label set surfaces as an Insert on the nameable
+                // node-label stream, carrying the added labels as `new_value`.
+                self.emit_graph_label_event(task, node_id, labels, crate::event::WriteOp::Insert);
                 self.response_ok(task)
             }
 
@@ -257,6 +260,9 @@ impl CoreLoop {
                 for label in labels {
                     partition.remove_node_label(node_id, label);
                 }
+                // CDC: a node-label removal surfaces as a Delete on the nameable
+                // node-label stream, carrying the removed labels as `old_value`.
+                self.emit_graph_label_event(task, node_id, labels, crate::event::WriteOp::Delete);
                 self.response_ok(task)
             }
 
@@ -323,5 +329,124 @@ impl CoreLoop {
                 self.execute_graph_stats(task, tid, collection.as_deref(), *as_of)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::{
+        Admission, ExemptReason, PhysicalPlan, Priority, Request, Status,
+    };
+    use crate::event::WriteOp;
+    use crate::event::bus::create_event_bus_with_capacity;
+    use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+    use nodedb_bridge::buffer::RingBuffer;
+    use std::time::{Duration, Instant};
+
+    struct CoreHarness {
+        core: CoreLoop,
+        _req_tx: nodedb_bridge::buffer::Producer<crate::bridge::dispatch::BridgeRequest>,
+        _resp_rx: nodedb_bridge::buffer::Consumer<crate::bridge::dispatch::BridgeResponse>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn make_core() -> CoreHarness {
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("open core");
+        CoreHarness {
+            core,
+            _req_tx: req_tx,
+            _resp_rx: resp_rx,
+            _dir: dir,
+        }
+    }
+
+    fn make_task_with_lsn(op: GraphOp, lsn: u64) -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Graph(op),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: Some(Lsn::new(lsn)),
+            resolved_now_ms: None,
+            admission: Admission::Exempt(ExemptReason::Read),
+        })
+    }
+
+    #[test]
+    fn set_node_labels_emits_cdc_on_nameable_label_stream() {
+        let (mut producers, mut consumers) = create_event_bus_with_capacity(1, 64);
+        let mut h = make_core();
+        h.core
+            .set_event_producer(producers.pop().expect("producer"));
+
+        let op = GraphOp::SetNodeLabels {
+            node_id: "alice".to_string(),
+            labels: vec!["Person".to_string()],
+        };
+        let task = make_task_with_lsn(op.clone(), 88);
+        let resp = h.core.dispatch_graph(&task, &op);
+        assert_eq!(resp.status, Status::Ok);
+
+        let event = consumers[0]
+            .try_recv()
+            .expect("SetNodeLabels must emit a CDC WriteEvent");
+        assert_eq!(
+            event.collection.as_ref(),
+            crate::event::graph_cdc::GRAPH_LABEL_STREAM,
+            "node-label CDC uses the nameable stream, not the NUL sentinel"
+        );
+        assert_eq!(event.row_id.as_str(), "alice");
+        assert_eq!(event.op, WriteOp::Insert);
+        assert_eq!(event.lsn, Lsn::new(88));
+    }
+
+    #[test]
+    fn remove_node_labels_emits_cdc_delete() {
+        let (mut producers, mut consumers) = create_event_bus_with_capacity(1, 64);
+        let mut h = make_core();
+        h.core
+            .set_event_producer(producers.pop().expect("producer"));
+
+        let op = GraphOp::RemoveNodeLabels {
+            node_id: "alice".to_string(),
+            labels: vec!["Person".to_string()],
+        };
+        let task = make_task_with_lsn(op.clone(), 89);
+        let resp = h.core.dispatch_graph(&task, &op);
+        assert_eq!(resp.status, Status::Ok);
+
+        let event = consumers[0]
+            .try_recv()
+            .expect("RemoveNodeLabels must emit a CDC WriteEvent");
+        assert_eq!(
+            event.collection.as_ref(),
+            crate::event::graph_cdc::GRAPH_LABEL_STREAM
+        );
+        assert_eq!(event.row_id.as_str(), "alice");
+        assert_eq!(event.op, WriteOp::Delete);
+        assert!(event.old_value.is_some(), "removed labels ride old_value");
     }
 }

@@ -8,7 +8,7 @@ pub(in crate::data::executor) mod commit_pending;
 mod decode_stored;
 pub(in crate::data::executor) mod deferred;
 mod doc_config_seed;
-mod event_emit;
+pub(in crate::data::executor) mod event_emit;
 pub(in crate::data::executor) mod filter_match;
 mod graph_partition;
 pub(in crate::data::executor) mod index_value_versions;

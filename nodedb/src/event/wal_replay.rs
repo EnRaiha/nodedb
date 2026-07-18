@@ -9,18 +9,21 @@
 //! Each WAL record type has a known payload format (see `wal_dispatch.rs`):
 //! - `Put`: `(collection, document_id, value)` for documents,
 //!   `("kv_put", collection, key, value, ttl_ms)` for KV,
-//!   `(src_id, label, dst_id, props)` for graph edges
+//!   `(collection, src_id, label, dst_id, properties)` for graph edges
 //! - `Delete`: `(collection, document_id)` for documents,
-//!   `("kv_delete", collection, keys)` for KV
+//!   `("kv_delete", collection, keys)` for KV,
+//!   `(collection, src_id, label, dst_id)` for graph edges
+//! - `GraphNodeLabelSet` / `GraphNodeLabelRemove`: `(node_id, labels)` — surface
+//!   on the nameable `__graph_node_labels__` CDC stream
 //! - `VectorPut`: `(collection, vector, dim)` — not a document write event
 //! - `VectorDelete`: `(collection, vector_id)` — not a document write event
 //!
 //! The Event Plane reconstructs events for data-mutating operations (Put,
-//! Delete, KV). A `TransactionRedo` — the durable payload of a Calvin
-//! cross-shard commit — is decomposed into one WriteEvent per write sub-op
-//! (each sub-op payload is in the same shape as its raw per-op WAL record, so
-//! the same Put/Delete parsers apply), so triggers/CDC/change-streams fire on
-//! restart. Vector and CRDT operations are handled by their own replay paths
+//! Delete, KV, graph edges + node labels). A `TransactionRedo` — the durable
+//! payload of a Calvin cross-shard commit — is decomposed into one WriteEvent
+//! per write sub-op (each sub-op payload is in the same shape as its raw per-op
+//! WAL record, so the same parsers apply), so triggers/CDC/change-streams fire
+//! on restart. Vector and CRDT operations are handled by their own replay paths
 //! and are not yet emitted as WriteEvents.
 
 use nodedb_wal::WalRecord;
@@ -28,7 +31,9 @@ use nodedb_wal::record::{RecordType, WalRecordArgs};
 use tracing::{trace, warn};
 
 use crate::event::types::WriteEvent;
-use crate::event::wal_replay_parse::{parse_delete_record, parse_put_record};
+use crate::event::wal_replay_parse::{
+    parse_delete_record, parse_graph_node_label_record, parse_put_record,
+};
 use crate::types::{Lsn, TenantId, VShardId};
 use crate::wal::WalManager;
 
@@ -153,6 +158,31 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
         // WAL LSN — the Event-Plane watermark keys on it to dedup against the
         // forward-path event (both share this LSN in the same space).
         RecordType::TransactionRedo => decompose_redo_to_events(record, sequence),
+        // Graph node-label mutations carry no natural collection (they are
+        // tenant-wide), so they surface on the nameable `__graph_node_labels__`
+        // CDC stream. The forward-path emit (Data Plane `SetNodeLabels` /
+        // `RemoveNodeLabels`) produces the same `(collection, row_id, op, value)`
+        // shape, so replayed events dedup against forward events on LSN.
+        RecordType::GraphNodeLabelSet => parse_graph_node_label_record(
+            &record.payload,
+            true,
+            tenant_id,
+            vshard_id,
+            lsn,
+            sequence,
+        )
+        .into_iter()
+        .collect(),
+        RecordType::GraphNodeLabelRemove => parse_graph_node_label_record(
+            &record.payload,
+            false,
+            tenant_id,
+            vshard_id,
+            lsn,
+            sequence,
+        )
+        .into_iter()
+        .collect(),
         // `CalvinApplied` is a payload-free applied-marker: it records that a
         // sequencer `(epoch, position)` was applied, but carries no writes. Its
         // base writes, if any, ride a separate `TransactionRedo`; a pure-read or
@@ -195,11 +225,6 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
         | RecordType::FtsDelete
         | RecordType::SpatialPut
         | RecordType::SpatialDelete
-        // GraphNodeLabelSet/Remove: not document/KV row mutations — replay is
-        // wired in `data::executor::wal_replay_graph_labels`, not the Event
-        // Plane's WriteEvent stream.
-        | RecordType::GraphNodeLabelSet
-        | RecordType::GraphNodeLabelRemove
         | RecordType::Noop => Vec::new(),
     }
 }
@@ -476,6 +501,142 @@ mod tests {
         let mut seq = 0u64;
         assert!(record_to_events(&record, &mut seq).is_empty());
         assert_eq!(seq, 0);
+    }
+
+    #[test]
+    fn graph_edge_put_replays_as_insert_event() {
+        // Forward WAL shape for an edge put: (collection, src, label, dst, props).
+        let props = b"weight=1".to_vec();
+        let payload =
+            zerompk::to_msgpack_vec(&("knows", "a", "KNOWS", "b", &props)).expect("encode");
+        let record = make_record(RecordType::Put, &payload, 3, 0, 400);
+        let mut seq = 0u64;
+        let event = one_event(&record, &mut seq);
+        assert_eq!(
+            event.collection.as_ref(),
+            "knows",
+            "edge event on its collection"
+        );
+        assert_eq!(
+            event.row_id.as_str(),
+            crate::event::graph_cdc::edge_row_id("a", "KNOWS", "b").as_str(),
+            "row_id is the (src,label,dst) composition"
+        );
+        assert_eq!(event.op, WriteOp::Insert);
+        assert_eq!(event.lsn, Lsn::new(400));
+        assert_eq!(
+            event.new_value.as_deref(),
+            Some(props.as_slice()),
+            "edge properties surface as new_value"
+        );
+    }
+
+    #[test]
+    fn graph_edge_delete_replays_as_delete_event() {
+        // Forward WAL shape for an edge delete: (collection, src, label, dst).
+        let payload = zerompk::to_msgpack_vec(&("knows", "a", "KNOWS", "b")).expect("encode");
+        let record = make_record(RecordType::Delete, &payload, 3, 0, 401);
+        let mut seq = 0u64;
+        let event = one_event(&record, &mut seq);
+        assert_eq!(event.collection.as_ref(), "knows");
+        assert_eq!(
+            event.row_id.as_str(),
+            crate::event::graph_cdc::edge_row_id("a", "KNOWS", "b").as_str()
+        );
+        assert_eq!(event.op, WriteOp::Delete);
+        assert!(event.new_value.is_none() && event.old_value.is_none());
+    }
+
+    #[test]
+    fn graph_node_label_set_replays_on_label_stream() {
+        let payload = zerompk::to_msgpack_vec(&("alice", vec!["Person".to_string()])).expect("enc");
+        let record = make_record(RecordType::GraphNodeLabelSet, &payload, 5, 0, 500);
+        let mut seq = 0u64;
+        let event = one_event(&record, &mut seq);
+        assert_eq!(
+            event.collection.as_ref(),
+            crate::event::graph_cdc::GRAPH_LABEL_STREAM,
+            "node-label events surface on the nameable stream, not the NUL sentinel"
+        );
+        assert_eq!(event.row_id.as_str(), "alice");
+        assert_eq!(event.op, WriteOp::Insert);
+        assert_eq!(event.lsn, Lsn::new(500));
+        // new_value carries the added-labels delta.
+        let map = crate::event::deserialize_event_payload(
+            event.new_value.as_deref().expect("labels delta present"),
+        )
+        .expect("delta decodes as object");
+        let labels: Vec<&str> = map
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .expect("labels array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(labels, vec!["Person"]);
+    }
+
+    #[test]
+    fn graph_node_label_remove_replays_as_delete_event() {
+        let payload = zerompk::to_msgpack_vec(&("alice", vec!["Person".to_string()])).expect("enc");
+        let record = make_record(RecordType::GraphNodeLabelRemove, &payload, 5, 0, 501);
+        let mut seq = 0u64;
+        let event = one_event(&record, &mut seq);
+        assert_eq!(
+            event.collection.as_ref(),
+            crate::event::graph_cdc::GRAPH_LABEL_STREAM
+        );
+        assert_eq!(event.row_id.as_str(), "alice");
+        assert_eq!(event.op, WriteOp::Delete);
+        assert!(
+            event.new_value.is_none() && event.old_value.is_some(),
+            "removed labels surface as old_value"
+        );
+    }
+
+    #[test]
+    fn malformed_graph_node_label_record_skipped() {
+        let record = make_record(RecordType::GraphNodeLabelSet, &[0xff, 0xff], 5, 0, 502);
+        let mut seq = 0u64;
+        assert!(record_to_events(&record, &mut seq).is_empty());
+        assert_eq!(seq, 0, "malformed label payload consumes no sequence");
+    }
+
+    /// A `TransactionRedo` (Calvin cross-shard commit) carrying a graph-edge Put
+    /// sub-op decomposes into the same edge WriteEvent the forward path emits —
+    /// proving replay parity extends through the redo reconstitution path.
+    #[test]
+    fn transaction_redo_decomposes_graph_edge_put() {
+        use crate::wal::{RedoRecord, RedoSubRecord};
+
+        let props = b"p".to_vec();
+        let edge_payload =
+            zerompk::to_msgpack_vec(&("knows", "a", "KNOWS", "b", &props)).expect("encode");
+        let redo = RedoRecord {
+            version: 1,
+            ops: vec![RedoSubRecord {
+                record_type: RecordType::Put as u32,
+                payload: edge_payload,
+            }],
+            calvin_stamp: None,
+        };
+        let record = make_record(
+            RecordType::TransactionRedo,
+            &redo.to_bytes().unwrap(),
+            9,
+            0,
+            600,
+        );
+        let mut seq = 0u64;
+        let events = record_to_events(&record, &mut seq);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].collection.as_ref(), "knows");
+        assert_eq!(
+            events[0].row_id.as_str(),
+            crate::event::graph_cdc::edge_row_id("a", "KNOWS", "b").as_str()
+        );
+        assert_eq!(events[0].op, WriteOp::Insert);
+        assert_eq!(events[0].lsn, Lsn::new(600), "sub-op inherits redo LSN");
     }
 
     fn make_record(

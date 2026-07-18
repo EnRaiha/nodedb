@@ -21,6 +21,10 @@ use tracing::warn;
 use crate::event::types::{EventSource, RowId, WriteEvent, WriteOp};
 use crate::types::{Lsn, TenantId, VShardId};
 
+/// `(op, new_value, old_value)` for a node-label CDC event — the op tag plus
+/// the label-delta payload placed on whichever side its `WriteOp` implies.
+type LabelEventFields = (WriteOp, Option<Arc<[u8]>>, Option<Arc<[u8]>>);
+
 /// Parse a `RecordType::Put` payload. May be a document put, KV put, or
 /// graph edge put — distinguished by the MessagePack structure.
 pub(super) fn parse_put_record(
@@ -168,13 +172,100 @@ pub(super) fn parse_put_record(
         });
     }
 
-    // Unrecognized Put payload (e.g., graph edge or KV expire) — skip.
+    // Try graph edge put: (collection, src_id, label, dst_id, properties).
+    // Tried after every document/KV arm above so it only ever sees genuine
+    // non-matches: it is distinguished by its 5-field shape whose 3rd/4th
+    // fields are strings (label, dst_id) and 5th is a byte blob (properties) —
+    // no document-with-surrogate `(.., Vec<u8>, .., u32)` or KV `(.., u64)`
+    // shape decodes into it. `row_id` is the same `(src,label,dst)` composition
+    // the forward emit uses, so replay events dedup against forward events.
+    if let Ok((collection, src_id, label, dst_id, properties)) =
+        zerompk::from_msgpack::<(String, String, String, String, Vec<u8>)>(payload)
+    {
+        *sequence += 1;
+        let (system_time_ms, valid_time_ms) =
+            crate::event::bitemporal_extract::extract_stamps(Some(&properties));
+        return Some(WriteEvent {
+            sequence: *sequence,
+            collection: Arc::from(collection.as_str()),
+            op: WriteOp::Insert,
+            row_id: RowId::new(
+                crate::event::graph_cdc::edge_row_id(&src_id, &label, &dst_id).as_str(),
+            ),
+            lsn,
+            tenant_id,
+            vshard_id,
+            source: EventSource::User,
+            new_value: Some(Arc::from(properties.as_slice())),
+            old_value: None,
+            system_time_ms,
+            valid_time_ms,
+            user_id: None,
+            statement_digest: None,
+        });
+    }
+
+    // Unrecognized Put payload (e.g., KV expire) — skip.
     warn!(
         lsn = lsn.as_u64(),
         payload_len = payload.len(),
         "WAL replay: unrecognized Put payload format, skipping"
     );
     None
+}
+
+/// Parse a `RecordType::GraphNodeLabelSet` / `GraphNodeLabelRemove` payload into
+/// a CDC [`WriteEvent`] on the nameable node-label stream
+/// ([`crate::event::graph_cdc::GRAPH_LABEL_STREAM`]).
+///
+/// `is_set` distinguishes set (→ [`WriteOp::Insert`], added labels as
+/// `new_value`) from remove (→ [`WriteOp::Delete`], removed labels as
+/// `old_value`). The payload shape `(node_id, labels)` and the label-delta
+/// value encoding are exactly what the forward-path emit produces, so replayed
+/// events are byte-identical to forward events and dedup on LSN. A malformed
+/// payload is logged and skipped (never a panic).
+pub(super) fn parse_graph_node_label_record(
+    payload: &[u8],
+    is_set: bool,
+    tenant_id: TenantId,
+    vshard_id: VShardId,
+    lsn: Lsn,
+    sequence: &mut u64,
+) -> Option<WriteEvent> {
+    let (node_id, labels) = match zerompk::from_msgpack::<(String, Vec<String>)>(payload) {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            warn!(
+                lsn = lsn.as_u64(),
+                payload_len = payload.len(),
+                "WAL replay: malformed graph node-label payload, skipping"
+            );
+            return None;
+        }
+    };
+    *sequence += 1;
+    let value = crate::event::graph_cdc::graph_label_delta_value(&labels);
+    let (op, new_value, old_value): LabelEventFields = if is_set {
+        (WriteOp::Insert, Some(Arc::from(value.as_slice())), None)
+    } else {
+        (WriteOp::Delete, None, Some(Arc::from(value.as_slice())))
+    };
+    Some(WriteEvent {
+        sequence: *sequence,
+        collection: Arc::from(crate::event::graph_cdc::GRAPH_LABEL_STREAM),
+        op,
+        row_id: RowId::new(node_id.as_str()),
+        lsn,
+        tenant_id,
+        vshard_id,
+        source: EventSource::User,
+        new_value,
+        old_value,
+        system_time_ms: None,
+        valid_time_ms: None,
+        user_id: None,
+        statement_digest: None,
+    })
 }
 
 /// Parse a `RecordType::Delete` payload. May be a document delete or KV delete.
@@ -267,6 +358,35 @@ pub(super) fn parse_delete_record(
             collection: Arc::from(collection.as_str()),
             op: WriteOp::Delete,
             row_id: RowId::new(document_id.as_str()),
+            lsn,
+            tenant_id,
+            vshard_id,
+            source: EventSource::User,
+            new_value: None,
+            old_value: None,
+            system_time_ms: None,
+            valid_time_ms: None,
+            user_id: None,
+            statement_digest: None,
+        });
+    }
+
+    // Try graph edge delete: (collection, src_id, label, dst_id). Four strings,
+    // tried after every document/KV arm above. It cannot collide with
+    // document-delete-with-surrogate `(String, String, Option<SyncProvenance>,
+    // u32)` (its 4th field is a `u32`, not a string) nor any shorter-arity arm.
+    // `row_id` matches the forward emit's `(src,label,dst)` composition.
+    if let Ok((collection, src_id, label, dst_id)) =
+        zerompk::from_msgpack::<(String, String, String, String)>(payload)
+    {
+        *sequence += 1;
+        return Some(WriteEvent {
+            sequence: *sequence,
+            collection: Arc::from(collection.as_str()),
+            op: WriteOp::Delete,
+            row_id: RowId::new(
+                crate::event::graph_cdc::edge_row_id(&src_id, &label, &dst_id).as_str(),
+            ),
             lsn,
             tenant_id,
             vshard_id,

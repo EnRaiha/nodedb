@@ -38,6 +38,14 @@ use crate::types::{TenantId, TxnId};
 /// CSR partition (no collection argument on the plan), so the overlay --
 /// which keys everything per-collection like every other GRAPH op -- stores
 /// label deltas under this fixed key instead of a real collection name.
+///
+/// This is the storage half of the single node-label naming pair. Its leading
+/// NUL makes it un-nameable (and thus un-subscribable) by any SQL CDC
+/// subscriber -- deliberately, since it is an internal overlay key. The
+/// nameable CDC twin every node-label `WriteEvent` carries is
+/// [`crate::event::graph_cdc::GRAPH_LABEL_STREAM`] (`"__graph_node_labels__"` --
+/// same text without the NUL). Keep the sentinel as the storage/overlay key and
+/// the twin as the CDC `collection`; they are the two ends of one mapping.
 pub(in crate::data::executor) const GRAPH_LABEL_COLL_KEY: &str = "\0__graph_node_labels__";
 
 impl CoreLoop {

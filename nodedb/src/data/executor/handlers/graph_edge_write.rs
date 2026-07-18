@@ -101,6 +101,20 @@ impl CoreLoop {
                         partition.set_node_surrogate(dst_id, dst_surrogate);
                         self.checkpoint_coordinator.mark_dirty("sparse", 1);
                         self.note_edge_write_lsn(task, tid, collection, src_id, label, dst_id);
+                        // CDC: emit after `note_edge_write_lsn` so the core
+                        // watermark (the event's LSN) already reflects this
+                        // edge's WAL LSN, matching the WAL-replay reconstruction.
+                        self.emit_graph_edge_event(
+                            task,
+                            crate::data::executor::core_loop::event_emit::GraphEdgeEvent {
+                                collection,
+                                src_id,
+                                label,
+                                dst_id,
+                                op: crate::event::WriteOp::Insert,
+                                properties: Some(properties),
+                            },
+                        );
                         self.response_ok(task)
                     }
                     Err(e) => self.response_error(
@@ -204,6 +218,20 @@ impl CoreLoop {
                 &edge.label,
                 &edge.dst_id,
             );
+            // CDC: batch edges are applied with empty properties (see
+            // `execute_edge_put_batch`'s hardcoded `&[]`), so `new_value` is an
+            // empty payload — a faithful pre-image of what was applied.
+            self.emit_graph_edge_event(
+                task,
+                crate::data::executor::core_loop::event_emit::GraphEdgeEvent {
+                    collection: &edge.collection,
+                    src_id: &edge.src_id,
+                    label: &edge.label,
+                    dst_id: &edge.dst_id,
+                    op: crate::event::WriteOp::Insert,
+                    properties: Some(&[]),
+                },
+            );
         }
         self.response_ok(task)
     }
@@ -256,6 +284,18 @@ impl CoreLoop {
                 &edge.label,
                 &edge.dst_id,
             );
+            // CDC: one Delete event per edge on the edge's own collection.
+            self.emit_graph_edge_event(
+                task,
+                crate::data::executor::core_loop::event_emit::GraphEdgeEvent {
+                    collection: &edge.collection,
+                    src_id: &edge.src_id,
+                    label: &edge.label,
+                    dst_id: &edge.dst_id,
+                    op: crate::event::WriteOp::Delete,
+                    properties: None,
+                },
+            );
         }
         self.response_ok(task)
     }
@@ -289,6 +329,19 @@ impl CoreLoop {
                 partition.remove_edge_in_collection(src_id, label, dst_id, collection);
                 self.checkpoint_coordinator.mark_dirty("sparse", 1);
                 self.note_edge_write_lsn(task, tid, collection, src_id, label, dst_id);
+                // CDC: emit after `note_edge_write_lsn` so the event LSN matches
+                // this edge's WAL LSN (the WAL-replay reconstruction key).
+                self.emit_graph_edge_event(
+                    task,
+                    crate::data::executor::core_loop::event_emit::GraphEdgeEvent {
+                        collection,
+                        src_id,
+                        label,
+                        dst_id,
+                        op: crate::event::WriteOp::Delete,
+                        properties: None,
+                    },
+                );
                 self.response_ok(task)
             }
             Err(e) => self.response_error(
@@ -327,5 +380,165 @@ impl CoreLoop {
             ),
             lsn,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::envelope::{
+        Admission, ExemptReason, PhysicalPlan, Priority, Request, Status,
+    };
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::event::WriteOp;
+    use crate::event::bus::create_event_bus_with_capacity;
+    use crate::types::{DatabaseId, Lsn, ReadConsistency, RequestId, TraceId, VShardId};
+    use nodedb_bridge::buffer::RingBuffer;
+    use nodedb_physical::physical_plan::GraphOp;
+    use std::time::{Duration, Instant};
+
+    struct CoreHarness {
+        core: CoreLoop,
+        _req_tx: nodedb_bridge::buffer::Producer<crate::bridge::dispatch::BridgeRequest>,
+        _resp_rx: nodedb_bridge::buffer::Consumer<crate::bridge::dispatch::BridgeResponse>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn make_core() -> CoreHarness {
+        use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            req_rx,
+            resp_tx,
+            dir.path(),
+            std::sync::Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("open core");
+        CoreHarness {
+            core,
+            _req_tx: req_tx,
+            _resp_rx: resp_rx,
+            _dir: dir,
+        }
+    }
+
+    /// A task carrying `wal_lsn` so the edge handlers advance the watermark to
+    /// it — the LSN the emitted CDC event then carries. The `plan` field is
+    /// unused by the edge handlers (they take params directly).
+    fn make_task_with_lsn(lsn: u64) -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(1),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Graph(GraphOp::Neighbors {
+                node_id: "x".to_string(),
+                edge_label: None,
+                direction: nodedb_graph::Direction::Out,
+                rls_filters: Vec::new(),
+            }),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: Some(Lsn::new(lsn)),
+            resolved_now_ms: None,
+            admission: Admission::Exempt(ExemptReason::Read),
+        })
+    }
+
+    #[test]
+    fn edge_put_emits_cdc_insert_on_its_collection() {
+        let (mut producers, mut consumers) = create_event_bus_with_capacity(1, 64);
+        let mut h = make_core();
+        h.core
+            .set_event_producer(producers.pop().expect("producer"));
+
+        let task = make_task_with_lsn(77);
+        let resp = h.core.execute_edge_put(
+            &task,
+            EdgePutParams {
+                tid: 1,
+                collection: "knows",
+                src_id: "a",
+                label: "KNOWS",
+                dst_id: "b",
+                properties: b"w=1",
+                src_surrogate: nodedb_types::Surrogate::new(1),
+                dst_surrogate: nodedb_types::Surrogate::new(2),
+            },
+        );
+        assert_eq!(resp.status, Status::Ok);
+
+        let event = consumers[0]
+            .try_recv()
+            .expect("edge put must emit a CDC WriteEvent");
+        assert_eq!(event.collection.as_ref(), "knows");
+        assert_eq!(
+            event.row_id.as_str(),
+            crate::event::graph_cdc::edge_row_id("a", "KNOWS", "b").as_str()
+        );
+        assert_eq!(event.op, WriteOp::Insert);
+        assert_eq!(
+            event.lsn,
+            Lsn::new(77),
+            "event LSN matches the edge's WAL LSN"
+        );
+        assert_eq!(event.new_value.as_deref(), Some(b"w=1".as_slice()));
+    }
+
+    #[test]
+    fn edge_delete_emits_cdc_delete_on_its_collection() {
+        let (mut producers, mut consumers) = create_event_bus_with_capacity(1, 64);
+        let mut h = make_core();
+        h.core
+            .set_event_producer(producers.pop().expect("producer"));
+
+        // Seed the edge so the delete has something to remove.
+        let put_task = make_task_with_lsn(80);
+        assert_eq!(
+            h.core
+                .execute_edge_put(
+                    &put_task,
+                    EdgePutParams {
+                        tid: 1,
+                        collection: "knows",
+                        src_id: "a",
+                        label: "KNOWS",
+                        dst_id: "b",
+                        properties: b"",
+                        src_surrogate: nodedb_types::Surrogate::new(1),
+                        dst_surrogate: nodedb_types::Surrogate::new(2),
+                    },
+                )
+                .status,
+            Status::Ok
+        );
+        let _ = consumers[0].try_recv(); // drain the put event
+
+        let del_task = make_task_with_lsn(81);
+        let resp = h
+            .core
+            .execute_edge_delete(&del_task, 1, "knows", "a", "KNOWS", "b");
+        assert_eq!(resp.status, Status::Ok);
+
+        let event = consumers[0]
+            .try_recv()
+            .expect("edge delete must emit a CDC WriteEvent");
+        assert_eq!(event.collection.as_ref(), "knows");
+        assert_eq!(
+            event.row_id.as_str(),
+            crate::event::graph_cdc::edge_row_id("a", "KNOWS", "b").as_str()
+        );
+        assert_eq!(event.op, WriteOp::Delete);
     }
 }
