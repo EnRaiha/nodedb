@@ -27,6 +27,7 @@ use super::sql_gateway::dispatch_task_via_gateway;
 use super::streaming::SqlOutcome;
 use super::{DispatchCtx, error_to_native, shape_error_to_native, to_native_columns_rows};
 use crate::control::server::broadcast::broadcast_count_to_all_cores;
+use crate::control::server::exchange::DistributedReadCapture;
 use crate::control::server::exchange::resolve::{Resolved, resolve_and_materialize};
 
 /// Wrap a materialized response as a non-streaming [`SqlOutcome`].
@@ -88,7 +89,11 @@ pub(super) async fn run_dispatch_loop(
             ctx.sessions,
             ctx.peer_addr,
             task,
-            |stage_task| async move { dispatch_task(ctx, stage_task).await.map(|(resp, _)| resp) },
+            |stage_task| async move {
+                dispatch_task(ctx, stage_task)
+                    .await
+                    .map(|(resp, _, _)| resp)
+            },
         )
         .await
         {
@@ -100,7 +105,9 @@ pub(super) async fn run_dispatch_loop(
                     ctx.peer_addr,
                     *task,
                     |stage_task| async move {
-                        dispatch_task(ctx, stage_task).await.map(|(resp, _)| resp)
+                        dispatch_task(ctx, stage_task)
+                            .await
+                            .map(|(resp, _, _)| resp)
                     },
                 )
                 .await
@@ -158,7 +165,7 @@ pub(super) async fn run_dispatch_loop(
 
         let plan_for_response = task.plan.clone();
         let task_vshard = task.vshard_id;
-        let (task_resp, shard_watermarks) = match dispatch_task(ctx, task).await {
+        let (task_resp, shard_watermarks, dist_reads) = match dispatch_task(ctx, task).await {
             Ok(r) => r,
             Err(e) => return resp(error_to_native(seq, &e)),
         };
@@ -182,16 +189,18 @@ pub(super) async fn run_dispatch_loop(
             } else {
                 shard_watermarks
             };
-            crate::control::server::shared::session::record_read_set(
+            crate::control::server::shared::session::record_reads_for_response(
                 ctx.state,
                 ctx.sessions,
                 ctx.peer_addr,
                 ctx.tenant_id(),
-                crate::control::server::shared::session::ReadCapture {
+                crate::control::server::shared::session::ResponseReads {
                     plan: &plan_for_response,
                     watermarks: &watermarks,
                     read_version_lsn: task_resp.read_version_lsn,
                     found: task_resp.status == Status::Ok,
+                    distributed_reads: &dist_reads,
+                    read_lsn_vshard: task_vshard,
                 },
             )
             .await;
@@ -279,7 +288,7 @@ pub(super) async fn run_dispatch_loop(
 async fn dispatch_task(
     ctx: &DispatchCtx<'_>,
     mut task: PhysicalTask,
-) -> crate::Result<(Response, Vec<(VShardId, Lsn)>)> {
+) -> crate::Result<(Response, Vec<(VShardId, Lsn)>, Vec<DistributedReadCapture>)> {
     if let crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::InsertSelect {
             target_collection,
@@ -299,7 +308,7 @@ async fn dispatch_task(
             *source_limit,
         )
         .await?;
-        return Ok((resp, Vec::new()));
+        return Ok((resp, Vec::new(), Vec::new()));
     }
 
     // Autocommit `MERGE` is orchestrated on the Control Plane
@@ -334,7 +343,7 @@ async fn dispatch_task(
             },
         )
         .await?;
-        return Ok((resp, Vec::new()));
+        return Ok((resp, Vec::new(), Vec::new()));
     }
 
     // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control Plane
@@ -373,7 +382,7 @@ async fn dispatch_task(
             },
         )
         .await?;
-        return Ok((resp, Vec::new()));
+        return Ok((resp, Vec::new(), Vec::new()));
     }
 
     // `DROP ARRAY` fans out to every core so per-core stores are released.
@@ -392,7 +401,7 @@ async fn dispatch_task(
             "dropped",
         )
         .await?;
-        return Ok((resp, Vec::new()));
+        return Ok((resp, Vec::new(), Vec::new()));
     }
 
     // Exchange resolution: materialize catalog providers and resolve any
@@ -408,8 +417,8 @@ async fn dispatch_task(
     )
     .await?
     {
-        Resolved::Gathered(resp, shard_watermarks, _shuffle_reads) => {
-            return Ok((resp, shard_watermarks));
+        Resolved::Gathered(resp, shard_watermarks, dist_reads) => {
+            return Ok((resp, shard_watermarks, dist_reads));
         }
         Resolved::Plan(resolved_plan) => {
             task.plan = resolved_plan;
@@ -418,7 +427,7 @@ async fn dispatch_task(
         // in its own effort); preserves the existing gather-then-return shape.
         Resolved::Stream(s) => {
             let resp = crate::control::server::exchange::gather::stream_to_response(s).await?;
-            return Ok((resp, Vec::new()));
+            return Ok((resp, Vec::new(), Vec::new()));
         }
     }
 
@@ -426,5 +435,5 @@ async fn dispatch_task(
     // through the gateway when available (cluster-aware routing + retry),
     // or via the local SPSC path when the gateway is not yet wired.
     let resp = dispatch_task_via_gateway(ctx, task).await?;
-    Ok((resp, Vec::new()))
+    Ok((resp, Vec::new(), Vec::new()))
 }
