@@ -175,6 +175,12 @@ impl ColumnData {
                 offsets: vec![0],
                 valid,
             },
+            // SparseVector holds a `'{id: weight}'` UTF-8 literal — string-backed.
+            ColumnType::SparseVector => Self::String {
+                data: Vec::new(),
+                offsets: vec![0],
+                valid,
+            },
             // ColumnType is #[non_exhaustive]; unknown future types are stored
             // as raw bytes until the memtable learns about them.
             _ => Self::Bytes {

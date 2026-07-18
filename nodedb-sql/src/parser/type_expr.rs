@@ -51,6 +51,9 @@ pub enum SimpleType {
     Record,
     /// Fixed-dimension float32 vector.
     Vector(u32),
+    /// Dimensionless sparse vector — a `'{id: weight}'` string literal. Unlike
+    /// `Vector(u32)` it takes no `(N)`; the sparse index carries no dimension.
+    SparseVector,
 }
 
 // ── Parser ───────────────────────────────────────────────────────────────────
@@ -144,6 +147,11 @@ fn parse_single(chars: &[char], pos: &mut usize, stop_at_gt: bool) -> Result<Typ
         "REGEX" => Ok(TypeExpr::Simple(SimpleType::Regex)),
         "RANGE" => Ok(TypeExpr::Simple(SimpleType::Range)),
         "RECORD" => Ok(TypeExpr::Simple(SimpleType::Record)),
+
+        // Dimensionless — matched before the parameterized "VECTOR" block.
+        // `read_keyword` reads the whole "SPARSEVECTOR" token, so this exact
+        // arm claims it and the "VECTOR" `(N)` parser never sees it.
+        "SPARSEVECTOR" => Ok(TypeExpr::Simple(SimpleType::SparseVector)),
 
         "VECTOR" => {
             // Expect '(' digits ')'.
@@ -335,6 +343,9 @@ fn value_matches_simple(value: &Value, simple: &SimpleType) -> bool {
         SimpleType::Range => matches!(value, Value::Range { .. }),
         SimpleType::Record => matches!(value, Value::Record { .. }),
         SimpleType::Vector(_) => matches!(value, Value::Array(_) | Value::Bytes(_)),
+        // Sparse vector arrives as a `'{id: weight}'` string literal (raw bytes
+        // are also accepted, mirroring `ColumnType::SparseVector::accepts`).
+        SimpleType::SparseVector => matches!(value, Value::String(_) | Value::Bytes(_)),
     }
 }
 
@@ -387,6 +398,27 @@ mod tests {
             parse_type_expr("VECTOR(384)").unwrap(),
             TypeExpr::Simple(SimpleType::Vector(384))
         );
+    }
+
+    #[test]
+    fn parse_sparsevector() {
+        // Dimensionless keyword parses to the SparseVector leaf type.
+        assert_eq!(
+            parse_type_expr("SPARSEVECTOR").unwrap(),
+            TypeExpr::Simple(SimpleType::SparseVector)
+        );
+        assert_eq!(
+            parse_type_expr("sparsevector").unwrap(),
+            TypeExpr::Simple(SimpleType::SparseVector)
+        );
+    }
+
+    #[test]
+    fn match_sparsevector_accepts_string_literal() {
+        let expr = parse_type_expr("SPARSEVECTOR").unwrap();
+        assert!(value_matches_type(&Value::String("{3:0.5}".into()), &expr));
+        assert!(value_matches_type(&Value::Bytes(vec![1, 2, 3]), &expr));
+        assert!(!value_matches_type(&Value::Integer(1), &expr));
     }
 
     #[test]

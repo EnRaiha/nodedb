@@ -324,6 +324,15 @@ fn encode_variable(var_data: &mut Vec<u8>, col_type: &ColumnType, value: &Value)
                 var_data.extend_from_slice(&bytes);
             }
         }
+        // SparseVector: a `'{id: weight}'` literal stored as raw UTF-8 bytes,
+        // mirroring the String path (parsed at index-build time). Raw bytes
+        // pass through unchanged.
+        (ColumnType::SparseVector, Value::String(s)) => {
+            var_data.extend_from_slice(s.as_bytes());
+        }
+        (ColumnType::SparseVector, Value::Bytes(b)) => {
+            var_data.extend_from_slice(b);
+        }
         _ => {}
     }
 }

@@ -64,6 +64,7 @@ pub fn extract_column_to_arrow(
         ColumnType::Ulid => extract_uuid(decoder, tuples, col_idx, n), // same 16-byte layout
         ColumnType::Duration => extract_int64(decoder, tuples, col_idx, n), // i64 microseconds
         ColumnType::Regex => extract_string(decoder, tuples, col_idx, n), // stored as string
+        ColumnType::SparseVector => extract_string(decoder, tuples, col_idx, n), // stored as string
         ColumnType::Vector(dim) => extract_vector(decoder, tuples, col_idx, n, *dim as usize),
         // ColumnType is #[non_exhaustive]; unknown future types are extracted
         // as binary blobs so Arrow consumers can at least receive raw bytes.

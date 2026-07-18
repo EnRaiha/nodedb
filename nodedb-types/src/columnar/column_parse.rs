@@ -38,6 +38,7 @@ impl fmt::Display for ColumnType {
             Self::Decimal { precision, scale } => write!(f, "DECIMAL({precision},{scale})"),
             Self::Geometry => f.write_str("GEOMETRY"),
             Self::Vector(dim) => write!(f, "VECTOR({dim})"),
+            Self::SparseVector => f.write_str("SPARSEVECTOR"),
             Self::Uuid => f.write_str("UUID"),
             Self::Json => f.write_str("JSON"),
             Self::Ulid => f.write_str("ULID"),
@@ -129,6 +130,11 @@ impl FromStr for ColumnType {
             "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => Ok(Self::Timestamptz),
             "SYSTEM_TIMESTAMP" | "SYSTEMTIMESTAMP" => Ok(Self::SystemTimestamp),
             "GEOMETRY" => Ok(Self::Geometry),
+            // Dimensionless: an exact keyword with no `(N)`. Placed as an exact
+            // match rather than a `starts_with` guard because "SPARSEVECTOR"
+            // does not prefix-collide with the `starts_with("VECTOR")` branch
+            // above ("SPARSEVECTOR" starts with "SPARSE", not "VECTOR").
+            "SPARSEVECTOR" => Ok(Self::SparseVector),
             "UUID" => Ok(Self::Uuid),
             "JSON" | "JSONB" => Ok(Self::Json),
             "ULID" => Ok(Self::Ulid),

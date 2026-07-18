@@ -159,7 +159,9 @@ fn convert_column_type(ct: &nodedb_types::columnar::ColumnType) -> SqlDataType {
         ColumnType::Timestamp | ColumnType::SystemTimestamp => SqlDataType::Timestamp,
         ColumnType::Timestamptz => SqlDataType::Timestamptz,
         ColumnType::Decimal { .. } => SqlDataType::Decimal,
-        ColumnType::Uuid | ColumnType::Ulid | ColumnType::Regex => SqlDataType::String,
+        ColumnType::Uuid | ColumnType::Ulid | ColumnType::Regex | ColumnType::SparseVector => {
+            SqlDataType::String
+        }
         ColumnType::Duration => SqlDataType::Int64,
         ColumnType::Array | ColumnType::Set | ColumnType::Range | ColumnType::Record => {
             SqlDataType::Bytes

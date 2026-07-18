@@ -312,6 +312,7 @@ fn sql_type_to_column_type(sql_type: &str) -> nodedb_types::columnar::ColumnType
         "BLOB" | "BYTEA" | "BINARY" => ColumnType::Bytes,
         "UUID" => ColumnType::Uuid,
         "JSON" | "JSONB" => ColumnType::Json,
+        "SPARSEVECTOR" => ColumnType::SparseVector,
         "GEOMETRY" => ColumnType::Geometry,
         _ => ColumnType::String, // VARCHAR, TEXT, STRING, and anything else
     }
@@ -382,6 +383,7 @@ fn typeguard_type_to_column_type(type_expr: &str) -> nodedb_types::columnar::Col
         "UUID" => ColumnType::Uuid,
         "GEOMETRY" => ColumnType::Geometry,
         "JSON" | "JSONB" | "OBJECT" => ColumnType::Json,
+        "SPARSEVECTOR" => ColumnType::SparseVector,
         _ => ColumnType::String, // fallback
     }
 }

@@ -52,6 +52,11 @@ pub enum ColumnType {
     Geometry,
     /// Fixed-dimension float32 vector.
     Vector(u32),
+    /// Dimensionless sparse vector (term-id → weight map). Variable-length:
+    /// a value is a quoted string literal like `'{12: 0.5, 88: 0.3}'`, stored
+    /// as inline UTF-8 bytes and parsed at index-build time. The sparse index
+    /// carries no dimension, so unlike `Vector(u32)` this type takes no `(N)`.
+    SparseVector,
     Uuid,
     /// Arbitrary nested data stored as inline MessagePack.
     /// Variable-length. Accepts any Value type.
@@ -89,6 +94,7 @@ impl ColumnType {
             | Self::Bytes
             | Self::Geometry
             | Self::Json
+            | Self::SparseVector
             | Self::Array
             | Self::Set
             | Self::Regex
@@ -136,8 +142,14 @@ impl ColumnType {
             // FLOAT4_ARRAY (1021) is the closest built-in for fixed float32 vectors.
             Self::Vector(_) => 1021,
             // Variable-length structured types: expose as JSONB so clients can
-            // parse the serialized representation.
-            Self::Array | Self::Set | Self::Range | Self::Record | Self::Regex => 3802,
+            // parse the serialized representation. `SparseVector` groups here —
+            // its `'{id: weight}'` literal reads naturally as a JSON object.
+            Self::Array
+            | Self::Set
+            | Self::Range
+            | Self::Record
+            | Self::Regex
+            | Self::SparseVector => 3802,
         }
     }
 
@@ -183,6 +195,7 @@ impl ColumnType {
                 | (Self::Regex, Value::Regex(_) | Value::String(_))
                 | (Self::Range, Value::Range { .. })
                 | (Self::Record, Value::Record { .. } | Value::String(_))
+                | (Self::SparseVector, Value::String(_) | Value::Bytes(_))
                 | (Self::Json, _)
                 | (_, Value::Null)
         )
@@ -280,6 +293,33 @@ mod tests {
             ColumnType::Vector(768)
         );
         assert!("VECTOR(0)".parse::<ColumnType>().is_err());
+    }
+
+    #[test]
+    fn sparsevector_is_variable_length_string_type() {
+        // Dimensionless: parses from the bare keyword and round-trips via Display.
+        let parsed = "SPARSEVECTOR".parse::<ColumnType>().unwrap();
+        assert_eq!(parsed, ColumnType::SparseVector);
+        assert_eq!(ColumnType::SparseVector.to_string(), "SPARSEVECTOR");
+        assert_eq!(
+            ColumnType::SparseVector
+                .to_string()
+                .parse::<ColumnType>()
+                .unwrap(),
+            ColumnType::SparseVector
+        );
+
+        // Variable-length (no fixed byte size), JSONB pg oid like the other
+        // variable-length structured types.
+        assert_eq!(ColumnType::SparseVector.fixed_size(), None);
+        assert!(ColumnType::SparseVector.is_variable_length());
+        assert_eq!(ColumnType::SparseVector.to_pg_oid(), 3802);
+
+        // Accepts the quoted string literal (and raw bytes); rejects numerics.
+        assert!(ColumnType::SparseVector.accepts(&Value::String("{3:0.5}".into())));
+        assert!(ColumnType::SparseVector.accepts(&Value::Bytes(vec![1, 2, 3])));
+        assert!(ColumnType::SparseVector.accepts(&Value::Null));
+        assert!(!ColumnType::SparseVector.accepts(&Value::Integer(1)));
     }
 
     #[test]

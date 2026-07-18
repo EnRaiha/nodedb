@@ -466,6 +466,11 @@ fn decode_variable_value(col_type: &ColumnType, raw: &[u8]) -> Value {
                 }
             }
         }
+        // SparseVector is stored as the raw UTF-8 `'{id: weight}'` literal
+        // (String path); decode it back to a string, mirroring String.
+        ColumnType::SparseVector => {
+            Value::String(std::str::from_utf8(raw).unwrap_or_default().to_string())
+        }
         _ => Value::Null,
     }
 }

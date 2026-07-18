@@ -70,7 +70,8 @@ pub(super) fn extract_row_value(
                 let bytes = &data[start..end];
 
                 match col_type {
-                    nodedb_types::columnar::ColumnType::String => {
+                    nodedb_types::columnar::ColumnType::String
+                    | nodedb_types::columnar::ColumnType::SparseVector => {
                         Value::String(String::from_utf8_lossy(bytes).into_owned())
                     }
                     nodedb_types::columnar::ColumnType::Json => {

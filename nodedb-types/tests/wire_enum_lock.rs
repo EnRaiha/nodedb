@@ -125,6 +125,7 @@ fn column_type_wire_forms() {
         (ColumnType::Regex, "Regex"),
         (ColumnType::Range, "Range"),
         (ColumnType::Record, "Record"),
+        (ColumnType::SparseVector, "SparseVector"),
     ];
 
     for (ct, expected_tag) in unit_cases {
@@ -150,6 +151,7 @@ fn column_type_wire_forms() {
             ColumnType::Regex => {}
             ColumnType::Range => {}
             ColumnType::Record => {}
+            ColumnType::SparseVector => {}
             _ => panic!("unrecognized ColumnType — update wire_enum_lock.rs"),
         }
         let v = serde_json::to_value(ct).expect("serialize");

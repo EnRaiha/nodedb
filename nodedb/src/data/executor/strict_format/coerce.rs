@@ -184,6 +184,12 @@ pub fn coerce_value(val: &Value, col_type: &ColumnType, col_name: &str) -> crate
                 detail: format!("column '{col_name}': expected VECTOR array, got {val:?}"),
             }),
         },
+        ColumnType::SparseVector => {
+            // Variable-length string-backed: the `'{id: weight}'` literal (or a
+            // raw byte form) passes through unmodified and is parsed at
+            // index-build time. Schema validation catches genuine mismatches.
+            Ok(val.clone())
+        }
         ColumnType::Geometry => Ok(Value::String(format!("{val:?}"))),
         ColumnType::Duration => match val {
             Value::Duration(_) => Ok(val.clone()),
