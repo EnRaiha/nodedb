@@ -229,7 +229,11 @@ async fn dispatch_to_data_plane_inner(
     )
     .await?
     {
-        crate::control::server::exchange::Resolved::Gathered(resp, _shard_watermarks) => {
+        crate::control::server::exchange::Resolved::Gathered(
+            resp,
+            _shard_watermarks,
+            _shuffle_reads,
+        ) => {
             return Ok(resp);
         }
         crate::control::server::exchange::Resolved::Plan(p) => p,

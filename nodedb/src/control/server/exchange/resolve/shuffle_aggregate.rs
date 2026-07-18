@@ -41,7 +41,7 @@ use futures::future::join_all;
 use nodedb_cluster::rpc_codec::DescriptorVersionEntry;
 use nodedb_cluster::{
     PartNodeEntry, RaftRpc, ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse,
-    ShuffleProduceRequest, ShuffleProduceResponse, SortKey,
+    ShuffleProduceRequest, SortKey,
 };
 use nodedb_physical::physical_plan::wire as plan_wire;
 use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
@@ -52,7 +52,9 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
 
 use super::exchange::Resolved;
-use super::peers::{distinct_data_node_count, producer_nodes, register_peers_from_topology};
+use super::peers::{
+    distinct_data_node_count, producer_nodes, register_peers_from_topology, send_produce,
+};
 
 /// Orchestrate a distributed shuffle GROUP BY aggregate.
 ///
@@ -327,40 +329,8 @@ pub async fn resolve_shuffle_aggregate(
     Ok(Resolved::Gathered(
         outcome_to_response(merged, Lsn::ZERO, Lsn::new(max_read_version_lsn)),
         Vec::new(),
+        Vec::new(),
     ))
-}
-
-/// Send one `ShuffleProduceRequest` and map the reply / RPC error to a typed
-/// coordinator error, returning the producer's observed per-collection
-/// read-version LSN on a clean produce. Fail-fast: a producer-reported terminal
-/// error aborts.
-async fn send_produce(
-    transport: &nodedb_cluster::NexarTransport,
-    node: u64,
-    req: ShuffleProduceRequest,
-) -> crate::Result<u64> {
-    match transport
-        .send_rpc(node, RaftRpc::ShuffleProduceRequest(req))
-        .await
-    {
-        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse {
-            error: None,
-            read_version_lsn,
-        })) => Ok(read_version_lsn),
-        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e), .. })) => {
-            Err(crate::Error::Internal {
-                detail: format!("shuffle aggregate produce failed on node {node}: {e:?}"),
-            })
-        }
-        Ok(other) => Err(crate::Error::Internal {
-            detail: format!(
-                "shuffle aggregate produce: unexpected reply from node {node}: {other:?}"
-            ),
-        }),
-        Err(e) => Err(crate::Error::Internal {
-            detail: format!("shuffle aggregate produce RPC to node {node} failed: {e}"),
-        }),
-    }
 }
 
 /// Send one `ShuffleAggregateConsumeRequest`, returning that part's msgpack-array

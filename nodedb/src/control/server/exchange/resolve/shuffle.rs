@@ -28,12 +28,12 @@
 
 use std::collections::BTreeSet;
 
-use futures::future::join_all;
+use futures::future::{join, join_all};
 
 use nodedb_cluster::rpc_codec::DescriptorVersionEntry;
 use nodedb_cluster::{
     JoinKeyPair, PartNodeEntry, RaftRpc, ShuffleConsumeRequest, ShuffleConsumeResponse,
-    ShuffleProduceRequest, ShuffleProduceResponse,
+    ShuffleProduceRequest,
 };
 use nodedb_physical::physical_plan::wire as plan_wire;
 use nodedb_physical::physical_plan::{PhysicalPlan, QueryOp};
@@ -44,8 +44,11 @@ use crate::control::server::payload_merge::merge_msgpack_arrays;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
 
+use super::capture::ShuffleReadCapture;
 use super::exchange::Resolved;
-use super::peers::{distinct_data_node_count, producer_nodes, register_peers_from_topology};
+use super::peers::{
+    distinct_data_node_count, producer_nodes, register_peers_from_topology, send_produce,
+};
 
 /// Orchestrate a distributed shuffle hash join.
 ///
@@ -210,8 +213,10 @@ pub async fn resolve_shuffle_join(
         detail: format!("shuffle join: num_parts {effective_num_parts} exceeds u32"),
     })?;
 
-    // 7. Dispatch ALL producers CONCURRENTLY (build side=0, probe side=1).
-    let mut produce_futures = Vec::with_capacity(build_nodes.len() + probe_nodes.len());
+    // 7. Dispatch ALL producers CONCURRENTLY (build side=0, probe side=1), but
+    //    keep the two sides' futures SEPARATE so each side's observed
+    //    per-collection read-version can be max-folded independently.
+    let mut build_produce_futures = Vec::with_capacity(build_nodes.len());
     for &node in &build_nodes {
         let req = ShuffleProduceRequest {
             shuffle_id,
@@ -227,8 +232,9 @@ pub async fn resolve_shuffle_join(
             trace_id: trace_id.0,
             descriptor_versions: Vec::<DescriptorVersionEntry>::new(),
         };
-        produce_futures.push(send_produce(transport, node, req));
+        build_produce_futures.push(send_produce(transport, node, req));
     }
+    let mut probe_produce_futures = Vec::with_capacity(probe_nodes.len());
     for &node in &probe_nodes {
         let req = ShuffleProduceRequest {
             shuffle_id,
@@ -244,11 +250,26 @@ pub async fn resolve_shuffle_join(
             trace_id: trace_id.0,
             descriptor_versions: Vec::<DescriptorVersionEntry>::new(),
         };
-        produce_futures.push(send_produce(transport, node, req));
+        probe_produce_futures.push(send_produce(transport, node, req));
     }
-    // Await ALL producers; any error fails the whole shuffle (no partial join).
-    for result in join_all(produce_futures).await {
-        result?;
+    // Await ALL producers (both sides CONCURRENTLY); any error fails the whole
+    // shuffle (no partial join). Max-fold each side's producers' observed
+    // per-collection read-version LSN independently: build ↔ right_collection,
+    // probe ↔ left_collection. Each side's producers scan the SAME single
+    // collection, so its max is that collection's `coll_write_lsn` at read time —
+    // the sound OCC read-version comparand recorded for that side.
+    let (build_results, probe_results) = join(
+        join_all(build_produce_futures),
+        join_all(probe_produce_futures),
+    )
+    .await;
+    let mut build_rv: u64 = 0;
+    for result in build_results {
+        build_rv = build_rv.max(result?);
+    }
+    let mut probe_rv: u64 = 0;
+    for result in probe_results {
+        probe_rv = probe_rv.max(result?);
     }
 
     // 8. After ALL producers succeed, dispatch consumers CONCURRENTLY — one per
@@ -298,42 +319,33 @@ pub async fn resolve_shuffle_join(
     // staged sides are consumed; there is no coordinator-side cleanup hook to
     // call here. No leak: each `(shuffle_id, part, side)` inbox is dropped by
     // the part-owner after its consume completes.
-    // Cross-node shuffle join: per-shard watermarks are not threaded through
-    // the shuffle transport, so no per-shard read versions are surfaced here.
-    // Both LSNs are therefore `ZERO` — the watermark for the same reason, and the
-    // read-version because no shuffle participant reports its collection's
-    // `coll_write_lsn` back to the coordinator. Nothing may be substituted for it:
-    // any non-zero stand-in would assert a version this path never observed.
+    //
+    // Two per-side read captures carry each side's REAL observed read version:
+    // the probe capture (left_collection) at `probe_rv`, the build capture
+    // (right_collection) at `build_rv` — folded from the producers'
+    // `ShuffleProduceResponse.read_version_lsn`. The record seam records one
+    // read-set entry per capture, re-homing and revalidating each side's vshard
+    // independently, so a concurrent write to EITHER side between the in-txn read
+    // and commit is detected (the build side was previously never recorded — the
+    // hole this closes). The response's own scalar stays `ZERO`: the captures
+    // carry the versions, and also setting the scalar would double-record the
+    // left side. The core-global watermark is not threaded through the shuffle
+    // transport and likewise stays `ZERO`.
+    let captures = vec![
+        ShuffleReadCapture {
+            scan_plan: probe_scan,
+            read_version_lsn: Lsn::new(probe_rv),
+        },
+        ShuffleReadCapture {
+            scan_plan: build_scan,
+            read_version_lsn: Lsn::new(build_rv),
+        },
+    ];
     Ok(Resolved::Gathered(
         outcome_to_response(merged, Lsn::ZERO, Lsn::ZERO),
         Vec::new(),
+        captures,
     ))
-}
-
-/// Send one `ShuffleProduceRequest` and map the reply / RPC error to a typed
-/// coordinator error. Fail-fast: a producer-reported terminal error aborts.
-async fn send_produce(
-    transport: &nodedb_cluster::NexarTransport,
-    node: u64,
-    req: ShuffleProduceRequest,
-) -> crate::Result<()> {
-    match transport
-        .send_rpc(node, RaftRpc::ShuffleProduceRequest(req))
-        .await
-    {
-        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: None, .. })) => Ok(()),
-        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e), .. })) => {
-            Err(crate::Error::Internal {
-                detail: format!("shuffle produce failed on node {node}: {e:?}"),
-            })
-        }
-        Ok(other) => Err(crate::Error::Internal {
-            detail: format!("shuffle produce: unexpected reply from node {node}: {other:?}"),
-        }),
-        Err(e) => Err(crate::Error::Internal {
-            detail: format!("shuffle produce RPC to node {node} failed: {e}"),
-        }),
-    }
 }
 
 /// Send one `ShuffleConsumeRequest`, returning that part's msgpack-array rows or

@@ -408,7 +408,9 @@ async fn dispatch_task(
     )
     .await?
     {
-        Resolved::Gathered(resp, shard_watermarks) => return Ok((resp, shard_watermarks)),
+        Resolved::Gathered(resp, shard_watermarks, _shuffle_reads) => {
+            return Ok((resp, shard_watermarks));
+        }
         Resolved::Plan(resolved_plan) => {
             task.plan = resolved_plan;
         }

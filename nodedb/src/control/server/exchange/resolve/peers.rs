@@ -11,7 +11,9 @@
 
 use std::collections::BTreeSet;
 
-use nodedb_cluster::{METADATA_GROUP_ID, RoutingTable};
+use nodedb_cluster::{
+    METADATA_GROUP_ID, RaftRpc, RoutingTable, ShuffleProduceRequest, ShuffleProduceResponse,
+};
 
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, VShardId};
@@ -82,5 +84,37 @@ pub(crate) fn register_peers_from_topology(
         {
             transport.register_peer(node, addr);
         }
+    }
+}
+
+/// Send one `ShuffleProduceRequest` and map the reply / RPC error to a typed
+/// coordinator error, returning the producer's observed per-collection
+/// read-version LSN on a clean produce. Fail-fast: a producer-reported terminal
+/// error aborts. Shared by both the shuffle-JOIN and shuffle-AGGREGATE
+/// resolvers, which each max-fold the returned LSN over their producers.
+pub(super) async fn send_produce(
+    transport: &nodedb_cluster::NexarTransport,
+    node: u64,
+    req: ShuffleProduceRequest,
+) -> crate::Result<u64> {
+    match transport
+        .send_rpc(node, RaftRpc::ShuffleProduceRequest(req))
+        .await
+    {
+        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse {
+            error: None,
+            read_version_lsn,
+        })) => Ok(read_version_lsn),
+        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e), .. })) => {
+            Err(crate::Error::Internal {
+                detail: format!("shuffle produce failed on node {node}: {e:?}"),
+            })
+        }
+        Ok(other) => Err(crate::Error::Internal {
+            detail: format!("shuffle produce: unexpected reply from node {node}: {other:?}"),
+        }),
+        Err(e) => Err(crate::Error::Internal {
+            detail: format!("shuffle produce RPC to node {node} failed: {e}"),
+        }),
     }
 }

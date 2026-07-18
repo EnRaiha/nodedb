@@ -7,7 +7,9 @@ use std::sync::Arc;
 use crate::bridge::envelope::Response;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::dispatch_utils::{WalDurability, publish_origin_change_events};
-use crate::control::server::exchange::resolve::{Resolved, resolve_and_materialize};
+use crate::control::server::exchange::resolve::{
+    Resolved, ShuffleReadCapture, resolve_and_materialize,
+};
 use crate::types::{Lsn, ReadConsistency, TraceId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -46,25 +48,41 @@ impl NodeDbPgHandler {
         identity: Option<&AuthenticatedIdentity>,
     ) -> crate::Result<Response> {
         let mut shard_watermarks = Vec::new();
-        self.dispatch_task_hlc(task, user_id, identity, &mut shard_watermarks)
-            .await
+        let mut shuffle_reads = Vec::new();
+        self.dispatch_task_hlc(
+            task,
+            user_id,
+            identity,
+            &mut shard_watermarks,
+            &mut shuffle_reads,
+        )
+        .await
     }
 
-    /// Dispatch a single physical task and return both the response and the
-    /// per-shard watermark LSNs a single-node fan gather observed (empty for a
-    /// non-gathered read). Used by the transactional read-recording seam so a
-    /// multi-core fan read records one read-set entry per participating shard.
+    /// Dispatch a single physical task and return the response, the per-shard
+    /// watermark LSNs a single-node fan gather observed (empty for a
+    /// non-gathered read), and the per-side read captures a distributed shuffle
+    /// JOIN produced (empty otherwise). Used by the transactional
+    /// read-recording seam so a multi-core fan read records one read-set entry
+    /// per participating shard, and a shuffle join records one per join side.
     pub(super) async fn dispatch_task_with_watermarks(
         &self,
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
         identity: Option<&AuthenticatedIdentity>,
-    ) -> crate::Result<(Response, Vec<(VShardId, Lsn)>)> {
+    ) -> crate::Result<(Response, Vec<(VShardId, Lsn)>, Vec<ShuffleReadCapture>)> {
         let mut shard_watermarks = Vec::new();
+        let mut shuffle_reads = Vec::new();
         let resp = self
-            .dispatch_task_hlc(task, user_id, identity, &mut shard_watermarks)
+            .dispatch_task_hlc(
+                task,
+                user_id,
+                identity,
+                &mut shard_watermarks,
+                &mut shuffle_reads,
+            )
             .await?;
-        Ok((resp, shard_watermarks))
+        Ok((resp, shard_watermarks, shuffle_reads))
     }
 
     async fn dispatch_task_hlc(
@@ -73,10 +91,11 @@ impl NodeDbPgHandler {
         user_id: Option<Arc<str>>,
         identity: Option<&AuthenticatedIdentity>,
         shard_watermarks: &mut Vec<(VShardId, Lsn)>,
+        shuffle_reads: &mut Vec<ShuffleReadCapture>,
     ) -> crate::Result<Response> {
         let tenant_id = task.tenant_id;
         let result = self
-            .dispatch_task_inner(task, user_id, identity, shard_watermarks)
+            .dispatch_task_inner(task, user_id, identity, shard_watermarks, shuffle_reads)
             .await;
         // Advance per-tenant observed write-HLC high-water on any
         // successful dispatch (local, raft-replicated, or broadcast).
@@ -97,6 +116,7 @@ impl NodeDbPgHandler {
         user_id: Option<Arc<str>>,
         identity: Option<&AuthenticatedIdentity>,
         shard_watermarks: &mut Vec<(VShardId, Lsn)>,
+        shuffle_reads: &mut Vec<ShuffleReadCapture>,
     ) -> crate::Result<Response> {
         // Reject user writes against a source database that is currently
         // frozen by a clone materializer sweep.  Reads and DDL pass through
@@ -289,8 +309,9 @@ impl NodeDbPgHandler {
             )
             .await?
             {
-                Resolved::Gathered(resp, wms) => {
+                Resolved::Gathered(resp, wms, caps) => {
                     *shard_watermarks = wms;
+                    *shuffle_reads = caps;
                     return Ok(resp);
                 }
                 Resolved::Plan(resolved_plan) => {

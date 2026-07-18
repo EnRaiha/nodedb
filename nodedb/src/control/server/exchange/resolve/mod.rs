@@ -30,11 +30,14 @@
 //!      finalized rows into a `Resolved::Gathered` response (distributed GROUP BY).
 //!    - No Exchange / no empty ProviderScan → `Resolved::Plan` unchanged.
 
+mod capture;
 pub mod exchange;
+mod join_input;
 mod materialize;
 mod peers;
 mod shuffle;
 mod shuffle_aggregate;
 
+pub use capture::ShuffleReadCapture;
 pub use exchange::{Resolved, resolve_and_materialize, resolve_exchange_in_plan};
 pub(crate) use peers::register_peers_from_topology;

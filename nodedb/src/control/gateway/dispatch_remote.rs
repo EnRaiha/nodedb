@@ -84,7 +84,11 @@ pub(super) async fn dispatch_remote(
     {
         // A root-level Gather resolved entirely at the coordinator — its merged
         // response is ready; return it instead of shipping anything.
-        crate::control::server::exchange::Resolved::Gathered(resp, shard_watermarks) => {
+        crate::control::server::exchange::Resolved::Gathered(
+            resp,
+            shard_watermarks,
+            _shuffle_reads,
+        ) => {
             return Ok(DispatchOutcome {
                 payloads: vec![resp.payload.to_vec()],
                 shard_watermarks,
@@ -244,7 +248,11 @@ pub(super) async fn dispatch_remote_stream(
         // ready response/stream — re-emit it as a single-batch / forwarded
         // stream. These do not occur for the streamable-scan plans routed here,
         // but handle exhaustively and behaviour-preservingly.
-        crate::control::server::exchange::Resolved::Gathered(resp, _shard_watermarks) => {
+        crate::control::server::exchange::Resolved::Gathered(
+            resp,
+            _shard_watermarks,
+            _shuffle_reads,
+        ) => {
             let batch = RowBatch {
                 payload: resp.payload.to_vec(),
                 watermark_lsn: resp.watermark_lsn,
