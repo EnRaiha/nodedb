@@ -21,8 +21,11 @@ use nodedb_physical::physical_plan::CrdtOp;
 /// Returns `None` for the read-only / DDL-observability variants (`Read`,
 /// `ReadConstraints`, `SetPolicy`, `GetPolicy`, `ReadAtVersion`,
 /// `GetVersionVector`, `ExportDelta`, `CompactAtVersion`) and for
-/// `RestoreToVersion`, still buffered-but-unencoded (a separate, undone
-/// encoder-omission unit not addressed here).
+/// `RestoreToVersion`. `RestoreToVersion` is deliberately not encoded here: the
+/// restore path replicates its effect as a forward delta wrapped in
+/// `CrdtOp::Apply`, which then follows the normal apply replication route.
+/// Encoding the restore op directly would double-apply the change and is
+/// non-deterministic across replicas.
 pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
     Some(match op {
         CrdtOp::Apply {
