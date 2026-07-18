@@ -9,8 +9,9 @@ use crate::rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, ReleaseReservationRequest,
     ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
-    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinInboxRequest,
-    SubmitCalvinInboxResponse, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushRequest,
+    SubmitCalvinInboxRequest, SubmitCalvinInboxResponse, SubmitCalvinTxnRequest,
+    SubmitCalvinTxnResponse, TypedClusterError,
 };
 
 use super::super::loop_core::{CommitApplier, RaftLoop};
@@ -61,13 +62,17 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
     pub(super) async fn on_shuffle_produce_impl(
         &self,
         req: ShuffleProduceRequest,
-    ) -> Option<TypedClusterError> {
+    ) -> ShuffleProduceResponse {
         match &self.shuffle_producer {
             Some(producer) => producer.on_shuffle_produce(req).await,
-            None => Some(TypedClusterError::Internal {
-                code: 0,
-                message: "shuffle producer not configured (no ShuffleProducer installed)".into(),
-            }),
+            None => ShuffleProduceResponse {
+                error: Some(TypedClusterError::Internal {
+                    code: 0,
+                    message: "shuffle producer not configured (no ShuffleProducer installed)"
+                        .into(),
+                }),
+                read_version_lsn: 0,
+            },
         }
     }
 

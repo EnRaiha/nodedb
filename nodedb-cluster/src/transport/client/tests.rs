@@ -59,7 +59,7 @@ impl RaftRpcHandler for EchoHandler {
         // Emit three deterministic chunks then clean EOF. Exercises the
         // multi-frame chunk/end envelope path end-to-end over loopback QUIC.
         for i in 0u64..3 {
-            if let Err(_e) = sink.send_chunk(vec![i as u8; 4], i + 100).await {
+            if let Err(_e) = sink.send_chunk(vec![i as u8; 4], i + 100, 0).await {
                 // Coordinator gone — stop producing, no terminal frame.
                 return None;
             }
@@ -91,8 +91,11 @@ impl RaftRpcHandler for EchoHandler {
     async fn on_shuffle_produce(
         &self,
         _req: crate::rpc_codec::ShuffleProduceRequest,
-    ) -> Option<crate::rpc_codec::TypedClusterError> {
-        None
+    ) -> crate::rpc_codec::ShuffleProduceResponse {
+        crate::rpc_codec::ShuffleProduceResponse {
+            error: None,
+            read_version_lsn: 0,
+        }
     }
 
     async fn on_shuffle_consume(

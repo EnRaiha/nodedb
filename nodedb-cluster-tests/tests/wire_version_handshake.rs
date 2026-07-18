@@ -79,8 +79,11 @@ impl RaftRpcHandler for EchoHandler {
     async fn on_shuffle_produce(
         &self,
         _req: nodedb_cluster::rpc_codec::ShuffleProduceRequest,
-    ) -> Option<nodedb_cluster::rpc_codec::TypedClusterError> {
-        None
+    ) -> nodedb_cluster::rpc_codec::ShuffleProduceResponse {
+        nodedb_cluster::rpc_codec::ShuffleProduceResponse {
+            error: None,
+            read_version_lsn: 0,
+        }
     }
 
     async fn on_shuffle_consume(
@@ -211,12 +214,15 @@ impl RaftRpcHandler for SentinelHandler {
     async fn on_shuffle_produce(
         &self,
         _req: nodedb_cluster::rpc_codec::ShuffleProduceRequest,
-    ) -> Option<nodedb_cluster::rpc_codec::TypedClusterError> {
+    ) -> nodedb_cluster::rpc_codec::ShuffleProduceResponse {
         self.invoked.store(true, Ordering::SeqCst);
-        Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
-            code: 0,
-            message: "sentinel: unexpected produce dispatch".into(),
-        })
+        nodedb_cluster::rpc_codec::ShuffleProduceResponse {
+            error: Some(nodedb_cluster::rpc_codec::TypedClusterError::Internal {
+                code: 0,
+                message: "sentinel: unexpected produce dispatch".into(),
+            }),
+            read_version_lsn: 0,
+        }
     }
 
     async fn on_shuffle_consume(

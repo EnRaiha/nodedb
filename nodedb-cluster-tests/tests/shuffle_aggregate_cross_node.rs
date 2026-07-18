@@ -187,8 +187,8 @@ async fn produce(
         .await
         .expect("send shuffle produce request");
     match resp {
-        RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: None }) => {}
-        RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e) }) => {
+        RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: None, .. }) => {}
+        RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e), .. }) => {
             panic!("produce returned terminal error: {e:?}")
         }
         other => panic!("expected ShuffleProduceResponse, got {other:?}"),

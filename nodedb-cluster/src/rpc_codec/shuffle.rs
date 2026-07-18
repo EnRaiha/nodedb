@@ -116,9 +116,20 @@ pub struct ShuffleProduceRequest {
 /// `error: None` means the producer fanned out every row and `End`ed every part
 /// cleanly. `error: Some(e)` means the local scan failed; the producer has
 /// already `End`ed every part with the same error so each receiver fails fast.
+///
+/// Cross-version safety: new fields are appended (mirroring
+/// [`ExecuteResponse`](super::execute::ExecuteResponse)'s LSN fields).
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ShuffleProduceResponse {
     pub error: Option<TypedClusterError>,
+    /// Max per-collection read-version LSN observed by the producer's local scan
+    /// (its scanned collection's `coll_write_lsn` at read time, a WAL LSN); 0 for
+    /// a failed produce. The sound comparand the coordinator max-folds across
+    /// producers for cross-shard OCC read validation of an in-transaction
+    /// distributed aggregate — distinct from the core-global watermark. Raw `u64`
+    /// on the wire, converted to `Lsn` at the coordinator via `Lsn::new`. Mirrors
+    /// [`ExecuteResponse::read_version_lsn`](super::execute::ExecuteResponse::read_version_lsn).
+    pub read_version_lsn: u64,
 }
 
 /// One `(left_key, right_key)` equi-join pair of a [`ShuffleConsumeRequest`]'s
@@ -587,8 +598,15 @@ mod tests {
 
     #[test]
     fn roundtrip_shuffle_produce_response_clean() {
-        let decoded = roundtrip_produce_resp(ShuffleProduceResponse { error: None });
+        let decoded = roundtrip_produce_resp(ShuffleProduceResponse {
+            error: None,
+            read_version_lsn: 0xABCD_1234,
+        });
         assert!(decoded.error.is_none());
+        assert_eq!(
+            decoded.read_version_lsn, 0xABCD_1234,
+            "producer read-version LSN roundtrips on the produce reply"
+        );
     }
 
     #[test]
@@ -598,7 +616,12 @@ mod tests {
                 code: 0x55,
                 message: "produce scan failed".into(),
             }),
+            read_version_lsn: 0,
         });
+        assert_eq!(
+            decoded.read_version_lsn, 0,
+            "a failed produce carries no read-version LSN"
+        );
         match decoded.error {
             Some(TypedClusterError::Internal { code, message }) => {
                 assert_eq!(code, 0x55);

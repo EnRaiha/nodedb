@@ -19,11 +19,19 @@ use crate::rpc_codec::{ExecuteRequest, ExecuteResponse, TypedClusterError};
 /// `send_chunk` returning `Err` means the client / coordinator is gone (the
 /// stream was reset or finished early): the producer MUST stop pulling and
 /// return without writing a terminal frame.
+///
+/// `read_version_lsn` is that frame's per-collection read version (its scanned
+/// collection's `coll_write_lsn` at read time), distinct from the core-global
+/// `watermark_lsn`. The shuffle fan-out sink max-folds it so the producer can
+/// report the observed read version for cross-shard OCC validation; the plain
+/// `ExecuteStream` sink (which only carries `watermark_lsn` on the wire) ignores
+/// it.
 pub trait ChunkSink: Send {
     fn send_chunk(
         &mut self,
         payload: Vec<u8>,
         watermark_lsn: u64,
+        read_version_lsn: u64,
     ) -> impl std::future::Future<Output = crate::error::Result<()>> + Send;
 }
 

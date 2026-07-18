@@ -11,8 +11,9 @@ use crate::rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
     ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
-    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinInboxRequest,
-    SubmitCalvinInboxResponse, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushRequest,
+    SubmitCalvinInboxRequest, SubmitCalvinInboxResponse, SubmitCalvinTxnRequest,
+    SubmitCalvinTxnResponse, TypedClusterError,
 };
 use crate::transport::RaftRpcHandler;
 use nodedb_raft::message::TimeoutNowRequest;
@@ -84,7 +85,7 @@ impl<A: CommitApplier, P: PlanExecutor> RaftRpcHandler for RaftLoop<A, P> {
             .await
     }
 
-    async fn on_shuffle_produce(&self, req: ShuffleProduceRequest) -> Option<TypedClusterError> {
+    async fn on_shuffle_produce(&self, req: ShuffleProduceRequest) -> ShuffleProduceResponse {
         self.on_shuffle_produce_impl(req).await
     }
 

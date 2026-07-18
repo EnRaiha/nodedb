@@ -65,7 +65,15 @@ struct QuicChunkSink<'a> {
 }
 
 impl ChunkSink for QuicChunkSink<'_> {
-    async fn send_chunk(&mut self, payload: Vec<u8>, watermark_lsn: u64) -> Result<()> {
+    async fn send_chunk(
+        &mut self,
+        payload: Vec<u8>,
+        watermark_lsn: u64,
+        // The `ExecuteStream` wire chunk only carries `watermark_lsn`; the
+        // per-collection read version is surfaced separately on the shuffle
+        // produce reply, not on this streaming path.
+        _read_version_lsn: u64,
+    ) -> Result<()> {
         let rpc = RaftRpc::ExecuteStreamChunk(ExecuteStreamChunk {
             payload,
             watermark_lsn,

@@ -11,8 +11,9 @@ use crate::rpc_codec::{
     AssignSurrogateRequest, AssignSurrogateResponse, ExecuteRequest, RaftRpc,
     ReleaseReservationRequest, ReleaseReservationResponse, ReserveReadRequest, ReserveReadResponse,
     ShuffleAggregateConsumeRequest, ShuffleAggregateConsumeResponse, ShuffleConsumeRequest,
-    ShuffleConsumeResponse, ShuffleProduceRequest, ShufflePushRequest, SubmitCalvinInboxRequest,
-    SubmitCalvinInboxResponse, SubmitCalvinTxnRequest, SubmitCalvinTxnResponse, TypedClusterError,
+    ShuffleConsumeResponse, ShuffleProduceRequest, ShuffleProduceResponse, ShufflePushRequest,
+    SubmitCalvinInboxRequest, SubmitCalvinInboxResponse, SubmitCalvinTxnRequest,
+    SubmitCalvinTxnResponse, TypedClusterError,
 };
 
 /// Trait for handling incoming Raft RPCs.
@@ -67,14 +68,17 @@ pub trait RaftRpcHandler: Send + Sync + 'static {
     /// Cross-node shuffle PRODUCER trigger (E4a). Execute the local scan
     /// fragment carried by `req`, hash-partition each output row on `req.keys`,
     /// and fan the rows out to the per-part owners as `ShufflePush` streams
-    /// (looping back for parts this node owns). Returns `None` on a clean
-    /// produce, or `Some(err)` if the scan failed (every part has already been
-    /// `End`ed with the same error). The transport writes exactly one
-    /// `ShuffleProduceResponse` carrying this outcome back to the coordinator.
+    /// (looping back for parts this node owns). Returns a
+    /// [`ShuffleProduceResponse`] whose `error` is `None` on a clean produce or
+    /// `Some(err)` if the scan failed (every part has already been `End`ed with
+    /// the same error), and whose `read_version_lsn` carries the max
+    /// per-collection read version the scan observed. The transport writes
+    /// exactly one `ShuffleProduceResponse` carrying this outcome back to the
+    /// coordinator.
     fn on_shuffle_produce(
         &self,
         req: ShuffleProduceRequest,
-    ) -> impl std::future::Future<Output = Option<TypedClusterError>> + Send;
+    ) -> impl std::future::Future<Output = ShuffleProduceResponse> + Send;
 
     /// Cross-node shuffle CONSUMER trigger (E4b). Complete the part carried by
     /// `req`: wait for both staged sides of `(shuffle_id, part)` to finalize, run

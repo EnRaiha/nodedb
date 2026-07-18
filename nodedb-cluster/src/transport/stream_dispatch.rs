@@ -15,8 +15,8 @@
 use crate::error::{ClusterError, Result};
 use crate::rpc_codec::{
     self, AssignSurrogateResponse, RaftRpc, ReleaseReservationResponse, ReserveReadResponse,
-    ShuffleAggregateConsumeResponse, ShuffleConsumeResponse, ShuffleProduceResponse,
-    SubmitCalvinInboxResponse, SubmitCalvinTxnResponse, auth_envelope,
+    ShuffleAggregateConsumeResponse, ShuffleConsumeResponse, SubmitCalvinInboxResponse,
+    SubmitCalvinTxnResponse, auth_envelope,
 };
 use crate::transport::auth_context::AuthContext;
 use crate::transport::rpc_handler::RaftRpcHandler;
@@ -47,8 +47,8 @@ pub(super) async fn try_handle_oneshot_rpc<H: RaftRpcHandler>(
     //     The reply is written on this same bidi stream's send half (mirroring
     //     the one-shot `handle_rpc` reply below), then `finish()`ed.
     if let RaftRpc::ShuffleProduceRequest(req) = request {
-        let error = handler.on_shuffle_produce(req).await;
-        let resp_rpc = RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error });
+        let resp = handler.on_shuffle_produce(req).await;
+        let resp_rpc = RaftRpc::ShuffleProduceResponse(resp);
         let resp_inner = rpc_codec::encode(&resp_rpc)?;
         let resp_seq = auth.peer_seq_out.next();
         let mut resp_envelope =

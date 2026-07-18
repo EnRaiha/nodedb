@@ -246,8 +246,13 @@ pub async fn resolve_shuffle_aggregate(
         produce_futures.push(send_produce(transport, node, req));
     }
     // Await ALL producers; any error fails the whole shuffle (no partial result).
+    // Max-fold every producer's observed per-collection read-version LSN: the
+    // producers all scan the SAME single source collection, so the max is that
+    // collection's `coll_write_lsn` at read time — the sound comparand the
+    // coordinator records for cross-shard OCC read validation of this aggregate.
+    let mut max_read_version_lsn: u64 = 0;
     for result in join_all(produce_futures).await {
-        result?;
+        max_read_version_lsn = max_read_version_lsn.max(result?);
     }
 
     // 7. After ALL producers succeed, dispatch consumers CONCURRENTLY — one per
@@ -311,30 +316,38 @@ pub async fn resolve_shuffle_aggregate(
     }
     let merged = encode_msgpack_array(&elements);
 
-    // Cross-node shuffle aggregate: per-shard watermarks are not threaded
-    // through the shuffle transport, so no per-shard read versions here. Both
-    // LSNs stay `ZERO` — no participant reports its collection's `coll_write_lsn`
-    // back to the coordinator, so there is no observed read-version to pass, and
-    // substituting one would assert a version this path never saw.
+    // The producers report the source collection's `coll_write_lsn` at read time
+    // on their `ShuffleProduceResponse`; the max-fold above is the read version
+    // this aggregate observed. Pass it as the OCC read-version comparand so an
+    // in-transaction distributed aggregate records a sound read-set entry (the
+    // aggregate is single-collection, so `record_read_set` attributes it to the
+    // right collection). The core-global `watermark_lsn` is NOT threaded through
+    // the shuffle transport and stays `ZERO`; using it as the read version would
+    // skip required aborts (it advances on writes to ANY collection).
     Ok(Resolved::Gathered(
-        outcome_to_response(merged, Lsn::ZERO, Lsn::ZERO),
+        outcome_to_response(merged, Lsn::ZERO, Lsn::new(max_read_version_lsn)),
         Vec::new(),
     ))
 }
 
 /// Send one `ShuffleProduceRequest` and map the reply / RPC error to a typed
-/// coordinator error. Fail-fast: a producer-reported terminal error aborts.
+/// coordinator error, returning the producer's observed per-collection
+/// read-version LSN on a clean produce. Fail-fast: a producer-reported terminal
+/// error aborts.
 async fn send_produce(
     transport: &nodedb_cluster::NexarTransport,
     node: u64,
     req: ShuffleProduceRequest,
-) -> crate::Result<()> {
+) -> crate::Result<u64> {
     match transport
         .send_rpc(node, RaftRpc::ShuffleProduceRequest(req))
         .await
     {
-        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: None })) => Ok(()),
-        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e) })) => {
+        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse {
+            error: None,
+            read_version_lsn,
+        })) => Ok(read_version_lsn),
+        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e), .. })) => {
             Err(crate::Error::Internal {
                 detail: format!("shuffle aggregate produce failed on node {node}: {e:?}"),
             })

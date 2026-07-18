@@ -155,6 +155,7 @@ mod tests {
         Ok(RowBatch {
             payload: json_object_batch(start, n),
             watermark_lsn: Lsn::ZERO,
+            read_version_lsn: Lsn::ZERO,
         })
     }
 

@@ -598,7 +598,7 @@ mod cross_shard_origination_tests {
         for i in 0..4096u32 {
             let name = format!("{prefix}_{i}");
             let vshard = nodedb_cluster::routing::vshard_for_collection(DatabaseId::DEFAULT, &name);
-            if vshard % 2 == 0 {
+            if vshard.is_multiple_of(2) {
                 return name;
             }
         }

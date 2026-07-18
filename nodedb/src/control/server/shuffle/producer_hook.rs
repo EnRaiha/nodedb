@@ -31,7 +31,7 @@
 
 use std::sync::Arc;
 
-use nodedb_cluster::rpc_codec::{DescriptorVersionEntry, ExecuteRequest};
+use nodedb_cluster::rpc_codec::{DescriptorVersionEntry, ExecuteRequest, ShuffleProduceResponse};
 use nodedb_cluster::{ShuffleProduceRequest, TypedClusterError};
 
 use nodedb_cluster::PlanExecutor;
@@ -55,18 +55,25 @@ impl RegistryShuffleProducer {
         Self { state }
     }
 
-    /// Run the produce, returning a terminal error (or `None` on clean produce).
+    /// Run the produce, returning a [`ShuffleProduceResponse`] whose `error` is a
+    /// terminal error (or `None` on clean produce) and whose `read_version_lsn` is
+    /// the max per-collection read version the local scan observed (`0` on
+    /// failure).
     ///
     /// Factored out of the trait method so the trait impl stays a thin shim and
     /// every early-exit error path is `?`-propagated here, then mapped to the
     /// fan-out terminal once at the call boundary.
-    async fn produce(&self, req: ShuffleProduceRequest) -> Option<TypedClusterError> {
+    async fn produce(&self, req: ShuffleProduceRequest) -> ShuffleProduceResponse {
         // The transport must have a transport handle (cluster mode) to fan out.
         let Some(transport) = self.state.cluster_transport.clone() else {
-            return Some(TypedClusterError::Internal {
-                code: 0,
-                message: "shuffle produce requires a cluster transport (single-node mode)".into(),
-            });
+            return ShuffleProduceResponse {
+                error: Some(TypedClusterError::Internal {
+                    code: 0,
+                    message: "shuffle produce requires a cluster transport (single-node mode)"
+                        .into(),
+                }),
+                read_version_lsn: 0,
+            };
         };
 
         let part_node_map: Vec<(u32, u64)> = req
@@ -118,6 +125,13 @@ impl RegistryShuffleProducer {
         // (validation reject, decode, deadline, or data-plane stream error).
         let scan_outcome = executor.execute_plan_streaming(exec_req, &mut sink).await;
 
+        // Capture the max per-collection read version the scan observed BEFORE
+        // `finish` consumes the sink. On a clean produce this is the scanned
+        // collection's `coll_write_lsn` at read time — the comparand the
+        // coordinator max-folds across producers for cross-shard OCC read
+        // validation of an in-transaction distributed aggregate.
+        let observed_read_version = sink.observed_read_version_lsn();
+
         // Finalize the fan-out: flush residuals (clean path) and `End` EVERY part
         // for this side — with the scan error if any — so each receiver's barrier
         // reaches `producer_count` and consumers fail fast on error.
@@ -125,19 +139,32 @@ impl RegistryShuffleProducer {
             // A fan-out finalize failure is itself terminal: some receiver may be
             // left without an `End`. Surface it (preferring the original scan
             // error if there was one) rather than reporting a clean produce.
-            return Some(scan_outcome.unwrap_or(TypedClusterError::Internal {
-                code: 0,
-                message: format!("shuffle produce fan-out finalize failed: {e}"),
-            }));
+            return ShuffleProduceResponse {
+                error: Some(scan_outcome.unwrap_or(TypedClusterError::Internal {
+                    code: 0,
+                    message: format!("shuffle produce fan-out finalize failed: {e}"),
+                })),
+                read_version_lsn: 0,
+            };
         }
 
-        scan_outcome
+        // On a failed scan the read version is meaningless — report 0 (mirroring
+        // `ExecuteResponse::err`). On a clean produce report the observed max.
+        let read_version_lsn = if scan_outcome.is_none() {
+            observed_read_version
+        } else {
+            0
+        };
+        ShuffleProduceResponse {
+            error: scan_outcome,
+            read_version_lsn,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl nodedb_cluster::ShuffleProducer for RegistryShuffleProducer {
-    async fn on_shuffle_produce(&self, req: ShuffleProduceRequest) -> Option<TypedClusterError> {
+    async fn on_shuffle_produce(&self, req: ShuffleProduceRequest) -> ShuffleProduceResponse {
         self.produce(req).await
     }
 }

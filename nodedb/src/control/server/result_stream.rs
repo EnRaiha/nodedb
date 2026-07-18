@@ -22,12 +22,17 @@ use crate::types::Lsn;
 /// One streamed frame of rows.
 ///
 /// `payload` is a standalone msgpack array (the exact bytes produced by a single
-/// Data-Plane scan chunk); `watermark_lsn` is that frame's read watermark.
+/// Data-Plane scan chunk); `watermark_lsn` is that frame's read watermark and
+/// `read_version_lsn` its per-collection read version.
 pub struct RowBatch {
     /// Standalone msgpack array of row elements for this frame.
     pub payload: Vec<u8>,
     /// Watermark LSN reported by the Data Plane for this frame.
     pub watermark_lsn: Lsn,
+    /// Per-collection read-version LSN for this frame (the scanned collection's
+    /// `coll_write_lsn` at read time) — the sound comparand for cross-shard OCC
+    /// read validation, distinct from the core-global `watermark_lsn`.
+    pub read_version_lsn: Lsn,
 }
 
 /// A pinned, boxed stream of [`RowBatch`]es, fallible per item.
@@ -84,6 +89,7 @@ pub(crate) fn stream_response_channel(
             yield RowBatch {
                 payload: resp.payload.to_vec(),
                 watermark_lsn: resp.watermark_lsn,
+                read_version_lsn: resp.read_version_lsn,
             };
             if is_terminal {
                 return;

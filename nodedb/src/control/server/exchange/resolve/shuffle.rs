@@ -321,8 +321,8 @@ async fn send_produce(
         .send_rpc(node, RaftRpc::ShuffleProduceRequest(req))
         .await
     {
-        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: None })) => Ok(()),
-        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e) })) => {
+        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: None, .. })) => Ok(()),
+        Ok(RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e), .. })) => {
             Err(crate::Error::Internal {
                 detail: format!("shuffle produce failed on node {node}: {e:?}"),
             })

@@ -356,7 +356,13 @@ impl LocalPlanExecutor {
             while let Some(batch) = stream.next().await {
                 match batch {
                     Ok(b) => {
-                        if let Err(_e) = sink.send_chunk(b.payload, b.watermark_lsn.as_u64()).await
+                        if let Err(_e) = sink
+                            .send_chunk(
+                                b.payload,
+                                b.watermark_lsn.as_u64(),
+                                b.read_version_lsn.as_u64(),
+                            )
+                            .await
                         {
                             // Coordinator gone — stop, no terminal frame.
                             return SinkOutcome::CoordinatorGone;

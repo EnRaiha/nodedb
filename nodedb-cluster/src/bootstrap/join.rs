@@ -583,8 +583,11 @@ mod tests {
             async fn on_shuffle_produce(
                 &self,
                 _req: crate::rpc_codec::ShuffleProduceRequest,
-            ) -> Option<crate::rpc_codec::TypedClusterError> {
-                None
+            ) -> crate::rpc_codec::ShuffleProduceResponse {
+                crate::rpc_codec::ShuffleProduceResponse {
+                    error: None,
+                    read_version_lsn: 0,
+                }
             }
 
             async fn on_shuffle_consume(

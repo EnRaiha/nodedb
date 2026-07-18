@@ -248,6 +248,7 @@ pub(super) async fn dispatch_remote_stream(
             let batch = RowBatch {
                 payload: resp.payload.to_vec(),
                 watermark_lsn: resp.watermark_lsn,
+                read_version_lsn: resp.read_version_lsn,
             };
             return Ok(Box::pin(futures::stream::once(async move { Ok(batch) })));
         }
@@ -306,6 +307,9 @@ pub(super) async fn dispatch_remote_stream(
         Some(Ok((payload, lsn))) => RowBatch {
             payload,
             watermark_lsn: Lsn::new(lsn),
+            // The `ExecuteStream` wire chunk carries only the watermark; no
+            // per-collection read version is threaded on this remote path.
+            read_version_lsn: Lsn::ZERO,
         },
         Some(Err(e)) => return Err(map_stream_cluster_error(e, vshard_id)),
         // Clean EOF with zero rows: a valid empty result. Return an empty stream.
@@ -319,6 +323,7 @@ pub(super) async fn dispatch_remote_stream(
         Ok((payload, lsn)) => Ok(RowBatch {
             payload,
             watermark_lsn: Lsn::new(lsn),
+            read_version_lsn: Lsn::ZERO,
         }),
         Err(e) => Err(Error::Dispatch {
             detail: format!("remote stream terminal error: {e}"),

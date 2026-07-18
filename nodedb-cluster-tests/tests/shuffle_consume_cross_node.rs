@@ -154,8 +154,8 @@ async fn produce_side(
         .await
         .expect("send shuffle produce request");
     match resp {
-        RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: None }) => {}
-        RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e) }) => {
+        RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: None, .. }) => {}
+        RaftRpc::ShuffleProduceResponse(ShuffleProduceResponse { error: Some(e), .. }) => {
             panic!("produce (side {side}) returned terminal error: {e:?}")
         }
         other => panic!("expected ShuffleProduceResponse, got {other:?}"),

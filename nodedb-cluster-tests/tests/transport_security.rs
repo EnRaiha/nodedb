@@ -113,8 +113,11 @@ impl RaftRpcHandler for EchoHandler {
     async fn on_shuffle_produce(
         &self,
         _req: nodedb_cluster::rpc_codec::ShuffleProduceRequest,
-    ) -> Option<nodedb_cluster::rpc_codec::TypedClusterError> {
-        None
+    ) -> nodedb_cluster::rpc_codec::ShuffleProduceResponse {
+        nodedb_cluster::rpc_codec::ShuffleProduceResponse {
+            error: None,
+            read_version_lsn: 0,
+        }
     }
 
     async fn on_shuffle_consume(
