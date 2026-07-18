@@ -189,15 +189,24 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
         // CRDT-only commit has no base WriteEvents at all (CRDT effects ride
         // `CrdtDelta` records). Nothing to emit.
         RecordType::CalvinApplied => Vec::new(),
-        // Vector, CRDT, Timeseries, and Checkpoint records are not yet
-        // emitted as WriteEvents — they have their own replay paths.
-        // They will be wired in when trigger/CDC support needs them.
+        // The records below carry NO forward-path Data-Plane WriteEvent, so
+        // there is nothing for replay to reconstruct. `record_to_events`
+        // reconstructs exactly the forward WriteEvent stream the Data Plane
+        // emits (Document / KV / Graph — see
+        // `data::executor::core_loop::event_emit`), keyed on LSN so replayed
+        // events dedup against forward ones. Emitting a WriteEvent for a record
+        // the forward path never emitted would fire triggers / audit /
+        // CRDT-sync / CDC on WAL replay and snapshot-catchup but NOT on the live
+        // write — a recovery-divergence bug. Each group states why it has no
+        // forward WriteEvent.
+        //
+        // Vector / CRDT records replay through their own Data-Plane paths and
+        // never rode the WriteEvent stream. Infra records (Checkpoint,
+        // Surrogate*, tombstone, anchors, sync HWM, Noop, …) are not row writes.
         RecordType::VectorPut
         | RecordType::VectorDelete
         | RecordType::VectorParams
         | RecordType::VectorDirectUpsert
-        | RecordType::SparseVectorPut
-        | RecordType::SparseVectorDelete
         | RecordType::MultiVectorPut
         | RecordType::MultiVectorDelete
         | RecordType::CrdtDelta
@@ -205,11 +214,7 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
         // `data::executor::wal_replay::crdt_list`, not the Event Plane's
         // WriteEvent stream.
         | RecordType::CrdtListOp
-        | RecordType::TimeseriesBatch
         | RecordType::LogBatch
-        | RecordType::ArrayPut
-        | RecordType::ArrayDelete
-        | RecordType::ArrayFlush
         | RecordType::Transaction
         | RecordType::SurrogateAlloc
         | RecordType::SurrogateBind
@@ -220,12 +225,31 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
         // SyncSeqAdvance: emitted by the sync layer; replay HWM reconstruction
         // is wired in the idempotency replay pass, not the Event Plane.
         | RecordType::SyncSeqAdvance
-        // FtsIndex, FtsDelete, SpatialPut, SpatialDelete: emission wired in 3d.
+        | RecordType::Noop
+        // Timeseries: the `TimeseriesBatch` payload is an opaque compressed
+        // samples blob, not a per-row `(collection, row_id, value)`. Its forward
+        // CDC rides the Control-Plane change stream (`publish_origin_change_events`,
+        // opt-in per collection), never the Data-Plane WriteEvent stream — so
+        // there is no forward WriteEvent to reconstruct.
+        | RecordType::TimeseriesBatch
+        // Array: `ArrayPut` / `ArrayDelete` cells decode per-cell, but the forward
+        // path emits no Data-Plane WriteEvent — array CDC rides the Control-Plane
+        // change stream (`extract_write_metadata`, keyed `(array_name, "*", op)`).
+        // `ArrayFlush` only reorganizes on-disk tiles (no logical cell).
+        | RecordType::ArrayPut
+        | RecordType::ArrayDelete
+        | RecordType::ArrayFlush
+        // FTS / Spatial / Sparse-vector: secondary index overlays over a
+        // Document/Columnar row that already publishes its own change event on the
+        // forward path. The index write emits no separate WriteEvent — one here
+        // would double-publish the underlying row (and the spatial geometry blob is
+        // zerompk-tagged, not a standard-msgpack pass-through value anyway).
         | RecordType::FtsIndex
         | RecordType::FtsDelete
         | RecordType::SpatialPut
         | RecordType::SpatialDelete
-        | RecordType::Noop => Vec::new(),
+        | RecordType::SparseVectorPut
+        | RecordType::SparseVectorDelete => Vec::new(),
     }
 }
 
@@ -637,6 +661,155 @@ mod tests {
         );
         assert_eq!(events[0].op, WriteOp::Insert);
         assert_eq!(events[0].lsn, Lsn::new(600), "sub-op inherits redo LSN");
+    }
+
+    // ── Index-engine / batch-engine replay guards ────────────────────────────
+    //
+    // Timeseries, Array, FTS, Spatial, and Sparse-vector writes emit NO
+    // Data-Plane WriteEvent on the forward path (their CDC, where it exists,
+    // rides the Control-Plane change stream, not the WAL→WriteEvent replay
+    // stream — see the `record_to_events` arms). `record_to_events`
+    // reconstructs exactly the forward stream, so a WELL-FORMED record of each
+    // of these types must yield zero events and consume no sequence. These
+    // tests use realistic payloads (not garbage) so they prove a deliberate
+    // skip, not an incidental decode failure, and guard against a future change
+    // reintroducing the recovery-divergence bug (events firing on replay but
+    // not on the live write).
+
+    #[test]
+    fn timeseries_batch_replays_no_write_event() {
+        let prov: Option<SyncProvenance> = None;
+        let payload = zerompk::to_msgpack_vec(&("timeseries", "metrics", vec![1u8, 2, 3], prov))
+            .expect("enc");
+        let record = make_record(RecordType::TimeseriesBatch, &payload, 1, 0, 700);
+        let mut seq = 0u64;
+        assert!(record_to_events(&record, &mut seq).is_empty());
+        assert_eq!(seq, 0, "timeseries batch consumes no sequence");
+    }
+
+    #[test]
+    fn array_put_and_delete_replay_no_write_event() {
+        use crate::engine::array::wal::{
+            ArrayDeletePayload, ArrayPutPayload, encode_delete_with_version,
+            encode_put_with_version,
+        };
+        use nodedb_array::types::ArrayId;
+
+        let put = ArrayPutPayload {
+            array_id: ArrayId::new(nodedb_types::TenantId::new(1), "genome"),
+            cells: Vec::new(),
+            provenance: None,
+        };
+        let put_bytes = encode_put_with_version(&put).expect("enc put");
+        let put_record = make_record(RecordType::ArrayPut, &put_bytes, 1, 0, 701);
+        let mut seq = 0u64;
+        assert!(record_to_events(&put_record, &mut seq).is_empty());
+
+        let del = ArrayDeletePayload {
+            array_id: ArrayId::new(nodedb_types::TenantId::new(1), "genome"),
+            cells: Vec::new(),
+            provenance: None,
+        };
+        let del_bytes = encode_delete_with_version(&del).expect("enc del");
+        let del_record = make_record(RecordType::ArrayDelete, &del_bytes, 1, 0, 702);
+        assert!(record_to_events(&del_record, &mut seq).is_empty());
+        assert_eq!(seq, 0, "array writes consume no sequence");
+    }
+
+    #[test]
+    fn fts_index_and_delete_replay_no_write_event() {
+        use nodedb_wal::record::{FtsDeletePayload, FtsIndexPayload};
+
+        let prov = SyncProvenance {
+            producer_id: 1,
+            epoch: 2,
+            stream_id: 3,
+            seq: 4,
+        };
+        let idx = FtsIndexPayload::new(prov.clone(), "articles", "doc-1", "hello world")
+            .to_bytes()
+            .expect("enc idx");
+        let idx_record = make_record(RecordType::FtsIndex, &idx, 1, 0, 703);
+        let mut seq = 0u64;
+        assert!(record_to_events(&idx_record, &mut seq).is_empty());
+
+        let del = FtsDeletePayload::new(prov, "articles", "doc-1")
+            .to_bytes()
+            .expect("enc del");
+        let del_record = make_record(RecordType::FtsDelete, &del, 1, 0, 704);
+        assert!(record_to_events(&del_record, &mut seq).is_empty());
+        assert_eq!(seq, 0, "fts writes consume no sequence");
+    }
+
+    #[test]
+    fn spatial_put_and_delete_replay_no_write_event() {
+        use nodedb_wal::record::{SpatialDeletePayload, SpatialPutPayload};
+
+        let prov = SyncProvenance {
+            producer_id: 5,
+            epoch: 6,
+            stream_id: 7,
+            seq: 8,
+        };
+        let put = SpatialPutPayload::new(prov.clone(), "places", "loc", "poi-1", vec![0xDE, 0xAD])
+            .to_bytes()
+            .expect("enc put");
+        let put_record = make_record(RecordType::SpatialPut, &put, 1, 0, 705);
+        let mut seq = 0u64;
+        assert!(record_to_events(&put_record, &mut seq).is_empty());
+
+        let del = SpatialDeletePayload::new(prov, "places", "loc", "poi-1")
+            .to_bytes()
+            .expect("enc del");
+        let del_record = make_record(RecordType::SpatialDelete, &del, 1, 0, 706);
+        assert!(record_to_events(&del_record, &mut seq).is_empty());
+        assert_eq!(seq, 0, "spatial writes consume no sequence");
+    }
+
+    #[test]
+    fn sparse_vector_put_and_delete_replay_no_write_event() {
+        let entries: Vec<(u32, f32)> = vec![(1, 0.5), (7, 0.25)];
+        let put =
+            zerompk::to_msgpack_vec(&("embeddings", "sparse", "doc-1", entries)).expect("enc");
+        let put_record = make_record(RecordType::SparseVectorPut, &put, 1, 0, 707);
+        let mut seq = 0u64;
+        assert!(record_to_events(&put_record, &mut seq).is_empty());
+
+        let del = zerompk::to_msgpack_vec(&("embeddings", "sparse", "doc-1")).expect("enc");
+        let del_record = make_record(RecordType::SparseVectorDelete, &del, 1, 0, 708);
+        assert!(record_to_events(&del_record, &mut seq).is_empty());
+        assert_eq!(seq, 0, "sparse-vector writes consume no sequence");
+    }
+
+    /// A `TransactionRedo` whose sub-op is an index-engine write (SparseVector)
+    /// still emits no event — the decompose path routes each sub-op back
+    /// through `record_to_events`, inheriting the same no-forward-event skip, so
+    /// a transaction-committed index write does not spuriously fire on replay.
+    #[test]
+    fn transaction_redo_with_index_sub_op_emits_no_event() {
+        use crate::wal::{RedoRecord, RedoSubRecord};
+
+        let entries: Vec<(u32, f32)> = vec![(1, 0.5)];
+        let sparse_payload =
+            zerompk::to_msgpack_vec(&("embeddings", "sparse", "doc-1", entries)).expect("enc");
+        let redo = RedoRecord {
+            version: 1,
+            ops: vec![RedoSubRecord {
+                record_type: RecordType::SparseVectorPut as u32,
+                payload: sparse_payload,
+            }],
+            calvin_stamp: None,
+        };
+        let record = make_record(
+            RecordType::TransactionRedo,
+            &redo.to_bytes().unwrap(),
+            1,
+            0,
+            709,
+        );
+        let mut seq = 0u64;
+        assert!(record_to_events(&record, &mut seq).is_empty());
+        assert_eq!(seq, 0, "index sub-op consumes no sequence on decompose");
     }
 
     fn make_record(
