@@ -17,5 +17,5 @@ pub mod streamable;
 pub use all_cores::{NodeLevelResult, execute_plan_all_local_cores};
 pub use gather::{GatherOutcome, finalize_aggregate, gather_all_cores};
 pub use resolve::{
-    Resolved, ShuffleReadCapture, resolve_and_materialize, resolve_exchange_in_plan,
+    DistributedReadCapture, Resolved, resolve_and_materialize, resolve_exchange_in_plan,
 };

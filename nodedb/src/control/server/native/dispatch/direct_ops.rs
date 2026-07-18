@@ -355,8 +355,8 @@ pub(crate) async fn handle_graph_match(
                 watermarks: &[(vshard_id, resp.watermark_lsn)],
                 read_version_lsn: resp.read_version_lsn,
                 found: resp.status == Status::Ok,
-                shuffle_reads: &[],
-                shuffle_read_lsn_vshard: vshard_id,
+                distributed_reads: &[],
+                read_lsn_vshard: vshard_id,
             },
         )
         .await;
@@ -493,8 +493,8 @@ async fn dispatch_single_task(
                         watermarks: &[(task_vshard, resp.watermark_lsn)],
                         read_version_lsn: resp.read_version_lsn,
                         found: resp.status == Status::Ok,
-                        shuffle_reads: &[],
-                        shuffle_read_lsn_vshard: task_vshard,
+                        distributed_reads: &[],
+                        read_lsn_vshard: task_vshard,
                     },
                 )
                 .await;

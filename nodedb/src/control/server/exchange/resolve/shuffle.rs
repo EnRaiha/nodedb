@@ -44,7 +44,7 @@ use crate::control::server::payload_merge::merge_msgpack_arrays;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId};
 
-use super::capture::ShuffleReadCapture;
+use super::capture::DistributedReadCapture;
 use super::exchange::Resolved;
 use super::peers::{
     distinct_data_node_count, producer_nodes, register_peers_from_topology, send_produce,
@@ -332,11 +332,11 @@ pub async fn resolve_shuffle_join(
     // left side. The core-global watermark is not threaded through the shuffle
     // transport and likewise stays `ZERO`.
     let captures = vec![
-        ShuffleReadCapture {
+        DistributedReadCapture {
             scan_plan: probe_scan,
             read_version_lsn: Lsn::new(probe_rv),
         },
-        ShuffleReadCapture {
+        DistributedReadCapture {
             scan_plan: build_scan,
             read_version_lsn: Lsn::new(build_rv),
         },

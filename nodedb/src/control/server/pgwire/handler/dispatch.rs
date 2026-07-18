@@ -8,7 +8,7 @@ use crate::bridge::envelope::Response;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::dispatch_utils::{WalDurability, publish_origin_change_events};
 use crate::control::server::exchange::resolve::{
-    Resolved, ShuffleReadCapture, resolve_and_materialize,
+    DistributedReadCapture, Resolved, resolve_and_materialize,
 };
 use crate::types::{Lsn, ReadConsistency, TraceId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
@@ -48,13 +48,13 @@ impl NodeDbPgHandler {
         identity: Option<&AuthenticatedIdentity>,
     ) -> crate::Result<Response> {
         let mut shard_watermarks = Vec::new();
-        let mut shuffle_reads = Vec::new();
+        let mut distributed_reads = Vec::new();
         self.dispatch_task_hlc(
             task,
             user_id,
             identity,
             &mut shard_watermarks,
-            &mut shuffle_reads,
+            &mut distributed_reads,
         )
         .await
     }
@@ -70,19 +70,19 @@ impl NodeDbPgHandler {
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
         identity: Option<&AuthenticatedIdentity>,
-    ) -> crate::Result<(Response, Vec<(VShardId, Lsn)>, Vec<ShuffleReadCapture>)> {
+    ) -> crate::Result<(Response, Vec<(VShardId, Lsn)>, Vec<DistributedReadCapture>)> {
         let mut shard_watermarks = Vec::new();
-        let mut shuffle_reads = Vec::new();
+        let mut distributed_reads = Vec::new();
         let resp = self
             .dispatch_task_hlc(
                 task,
                 user_id,
                 identity,
                 &mut shard_watermarks,
-                &mut shuffle_reads,
+                &mut distributed_reads,
             )
             .await?;
-        Ok((resp, shard_watermarks, shuffle_reads))
+        Ok((resp, shard_watermarks, distributed_reads))
     }
 
     async fn dispatch_task_hlc(
@@ -91,11 +91,11 @@ impl NodeDbPgHandler {
         user_id: Option<Arc<str>>,
         identity: Option<&AuthenticatedIdentity>,
         shard_watermarks: &mut Vec<(VShardId, Lsn)>,
-        shuffle_reads: &mut Vec<ShuffleReadCapture>,
+        distributed_reads: &mut Vec<DistributedReadCapture>,
     ) -> crate::Result<Response> {
         let tenant_id = task.tenant_id;
         let result = self
-            .dispatch_task_inner(task, user_id, identity, shard_watermarks, shuffle_reads)
+            .dispatch_task_inner(task, user_id, identity, shard_watermarks, distributed_reads)
             .await;
         // Advance per-tenant observed write-HLC high-water on any
         // successful dispatch (local, raft-replicated, or broadcast).
@@ -116,7 +116,7 @@ impl NodeDbPgHandler {
         user_id: Option<Arc<str>>,
         identity: Option<&AuthenticatedIdentity>,
         shard_watermarks: &mut Vec<(VShardId, Lsn)>,
-        shuffle_reads: &mut Vec<ShuffleReadCapture>,
+        distributed_reads: &mut Vec<DistributedReadCapture>,
     ) -> crate::Result<Response> {
         // Reject user writes against a source database that is currently
         // frozen by a clone materializer sweep.  Reads and DDL pass through
@@ -311,7 +311,7 @@ impl NodeDbPgHandler {
             {
                 Resolved::Gathered(resp, wms, caps) => {
                     *shard_watermarks = wms;
-                    *shuffle_reads = caps;
+                    *distributed_reads = caps;
                     return Ok(resp);
                 }
                 Resolved::Plan(resolved_plan) => {

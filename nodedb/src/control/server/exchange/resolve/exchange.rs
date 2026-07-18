@@ -27,9 +27,10 @@ use crate::control::server::exchange::gather::{
 };
 use crate::control::server::result_stream::ResultStream;
 
-use super::capture::ShuffleReadCapture;
+use super::capture::DistributedReadCapture;
 use super::join_input::{gather_join_build_side, resolve_join_input};
 use super::materialize::materialize_providers;
+use crate::control::server::exchange::full_scan::full_scan_plan_for_collection;
 
 /// Result of `resolve_and_materialize`.
 pub enum Resolved {
@@ -41,12 +42,16 @@ pub enum Resolved {
     /// single collapsed max. Empty for cross-node gathers (per-shard watermarks
     /// are not yet threaded through the gateway) and for shuffle joins.
     ///
-    /// The third field carries per-side read captures for a distributed shuffle
-    /// JOIN (one per join side: probe/left and build/right) so the record seam
-    /// records one read-set entry per side and BOTH sides' vshards are validated
-    /// at commit. Empty for every non-shuffle-JOIN gather (root gathers and
-    /// shuffle AGGREGATE carry their single read version on the response scalar).
-    Gathered(Response, Vec<(VShardId, Lsn)>, Vec<ShuffleReadCapture>),
+    /// The third field carries per-collection read captures for a distributed
+    /// read materialized on the coordinator — both the GATHER path (each base
+    /// collection under a root `Exchange{Gather}`, including both sides of a
+    /// gathered `HashJoin`) and the SHUFFLE JOIN path (probe/left and
+    /// build/right). The record seam records one read-set entry per capture, so
+    /// EVERY participating collection's vshard is validated at commit rather than
+    /// just the plan's collapsed left collection. Empty when there is no
+    /// in-transaction base-collection capture (autocommit reads, and shuffle
+    /// AGGREGATE which carries its single read version on the response scalar).
+    Gathered(Response, Vec<(VShardId, Lsn)>, Vec<DistributedReadCapture>),
     /// The plan (possibly mutated by catalog materialization or Broadcast
     /// embedding) is self-contained and should be dispatched normally.
     Plan(PhysicalPlan),
@@ -79,8 +84,20 @@ pub async fn resolve_and_materialize(
     // Pass 1: fill empty ProviderScan rows (identity-scoped, per-request).
     let plan = materialize_providers(state, identity, plan).await?;
 
-    // Pass 2: resolve Exchange nodes.
-    resolve_exchange(state, database_id, tenant_id, plan, trace_id, txn_id).await
+    // Pass 2: resolve Exchange nodes. The captures accumulator is filled at every
+    // base-collection gather point beneath the plan root and consumed (taken)
+    // once at the root arm that returns `Resolved::Gathered`.
+    let mut captures = Vec::new();
+    resolve_exchange(
+        state,
+        database_id,
+        tenant_id,
+        plan,
+        trace_id,
+        txn_id,
+        &mut captures,
+    )
+    .await
 }
 
 /// Resolve only `Exchange` nodes (pass 2), without catalog provider
@@ -101,7 +118,17 @@ pub async fn resolve_exchange_in_plan(
     trace_id: TraceId,
     txn_id: Option<TxnId>,
 ) -> crate::Result<Resolved> {
-    resolve_exchange(state, database_id, tenant_id, plan, trace_id, txn_id).await
+    let mut captures = Vec::new();
+    resolve_exchange(
+        state,
+        database_id,
+        tenant_id,
+        plan,
+        trace_id,
+        txn_id,
+        &mut captures,
+    )
+    .await
 }
 
 // ── pass 2 ───────────────────────────────────────────────────────────────────
@@ -115,6 +142,15 @@ pub async fn resolve_exchange_in_plan(
 ///   grace hash join, return `Resolved::Gathered`. `Shuffle` as a join input is
 ///   a typed error.
 /// - Anything else → `Resolved::Plan` unchanged.
+///
+/// `captures` accumulates one [`DistributedReadCapture`] per base collection an
+/// in-transaction distributed read observes: build/right sides push at their
+/// gather points in [`gather_join_build_side`] / [`resolve_join_input`], the
+/// probe/single side pushes in the root Gather arm here. Only the outermost root
+/// arm returning `Resolved::Gathered` `mem::take`s the accumulator, so every
+/// base collection is captured exactly once and taken exactly once at the true
+/// root; a nested `Exchange` that itself resolves to `Gathered` returns its
+/// already-taken captures up unchanged.
 async fn resolve_exchange(
     state: &SharedState,
     database_id: DatabaseId,
@@ -122,6 +158,7 @@ async fn resolve_exchange(
     plan: PhysicalPlan,
     trace_id: TraceId,
     txn_id: Option<TxnId>,
+    captures: &mut Vec<DistributedReadCapture>,
 ) -> crate::Result<Resolved> {
     match plan {
         // Root-level Gather: fan child to all vShards and merge. First resolve any
@@ -139,6 +176,7 @@ async fn resolve_exchange(
                 *child,
                 trace_id,
                 txn_id,
+                captures,
             ))
             .await?
             {
@@ -191,8 +229,46 @@ async fn resolve_exchange(
                 return Ok(Resolved::Stream(stream));
             }
 
+            // Determine the single base collection this gather observes for the
+            // transaction read-set BEFORE the child plan is moved into the
+            // gather. For a gathered `HashJoin` it is the probe (left) collection
+            // scanned locally on the routed vShard; the build (right) collection
+            // is captured separately at its own gather point in `join_input`. For
+            // any other single-collection gather it is the child's own
+            // collection. Only in-transaction reads need captures (the read-set
+            // is only recorded inside a transaction block), so autocommit skips
+            // the catalog lookup entirely.
+            let probe_collection: Option<String> = if txn_id.is_some() {
+                match &child {
+                    PhysicalPlan::Query(QueryOp::HashJoin {
+                        left_collection, ..
+                    }) => Some(left_collection.clone()),
+                    other => other.collection().map(str::to_owned),
+                }
+            } else {
+                None
+            };
+
             let outcome: GatherOutcome =
                 gather_all_vshards(state, tenant_id, database_id, child, trace_id, txn_id).await?;
+
+            // Record the probe/single-collection read at its OWN observed
+            // read-version (the gathered collection's `coll_write_lsn`), scoped to
+            // a bare single-collection scan so the commit-time OCC validator
+            // re-homes and revalidates exactly that collection's vshard. A
+            // `HashJoin` plan would otherwise collapse to the left collection
+            // alone via `extract_collection` and miss the build side (captured
+            // separately in `join_input`).
+            if let Some(coll) = probe_collection
+                && let Some(scan_plan) =
+                    full_scan_plan_for_collection(state, database_id, tenant_id, &coll)?
+            {
+                captures.push(DistributedReadCapture {
+                    scan_plan,
+                    read_version_lsn: outcome.read_version_lsn,
+                });
+            }
+
             let payload = if as_aggregate {
                 finalize_aggregate(&outcome.merged_array)
             } else {
@@ -201,7 +277,7 @@ async fn resolve_exchange(
             Ok(Resolved::Gathered(
                 outcome_to_response(payload, outcome.watermark_lsn, outcome.read_version_lsn),
                 outcome.shard_watermarks,
-                Vec::new(),
+                std::mem::take(captures),
             ))
         }
 
@@ -219,7 +295,7 @@ async fn resolve_exchange(
                     outcome.read_version_lsn,
                 ),
                 outcome.shard_watermarks,
-                Vec::new(),
+                std::mem::take(captures),
             ))
         }
 
@@ -282,12 +358,26 @@ async fn resolve_exchange(
             left_bitmap,
             right_bitmap,
         }) => {
-            let left_input =
-                resolve_join_input(state, database_id, tenant_id, left_input, trace_id, txn_id)
-                    .await?;
-            let mut right_input =
-                resolve_join_input(state, database_id, tenant_id, right_input, trace_id, txn_id)
-                    .await?;
+            let left_input = resolve_join_input(
+                state,
+                database_id,
+                tenant_id,
+                left_input,
+                trace_id,
+                txn_id,
+                captures,
+            )
+            .await?;
+            let mut right_input = resolve_join_input(
+                state,
+                database_id,
+                tenant_id,
+                right_input,
+                trace_id,
+                txn_id,
+                captures,
+            )
+            .await?;
 
             // Cross-node build-side gather (cluster only).
             //
@@ -317,6 +407,7 @@ async fn resolve_exchange(
                     &right_collection,
                     trace_id,
                     txn_id,
+                    captures,
                 )
                 .await?;
             }

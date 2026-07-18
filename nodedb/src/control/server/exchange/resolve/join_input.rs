@@ -9,9 +9,12 @@ use crate::control::state::SharedState;
 use crate::data::executor::response_codec::flatten_to_relational_rows;
 use crate::types::{DatabaseId, TenantId, TraceId, TxnId};
 
+use crate::control::server::exchange::full_scan::full_scan_plan_for_collection;
 use crate::control::server::exchange::gather::{
     finalize_aggregate, gather_all_cores, gather_all_vshards,
 };
+
+use super::capture::DistributedReadCapture;
 
 /// Resolve a `HashJoin` input slot.
 ///
@@ -19,6 +22,10 @@ use crate::control::server::exchange::gather::{
 /// the coordinator and replaces the slot with a `ProviderScan{None, merged_array}`.
 /// When the slot is already a `ProviderScan{None, ..}` or `None`, it is
 /// returned unchanged.
+///
+/// `captures` accumulates a [`DistributedReadCapture`] for an embedded
+/// `Exchange{Gather}` input's base collection (in-transaction reads only) so the
+/// materialized side is validated at commit like every other distributed read.
 pub(super) async fn resolve_join_input(
     state: &SharedState,
     database_id: DatabaseId,
@@ -26,6 +33,7 @@ pub(super) async fn resolve_join_input(
     input: Option<Box<PhysicalPlan>>,
     trace_id: TraceId,
     txn_id: Option<TxnId>,
+    captures: &mut Vec<DistributedReadCapture>,
 ) -> crate::Result<Option<Box<PhysicalPlan>>> {
     let Some(boxed) = input else {
         return Ok(None);
@@ -92,8 +100,26 @@ pub(super) async fn resolve_join_input(
             child,
             mode: ExchangeMode::Gather { as_aggregate },
         })) => {
+            // Capture this embedded gather's base collection for the transaction
+            // read-set before the child plan is consumed by the gather (a bare
+            // single-collection scan so `extract_collection` re-homes exactly
+            // this collection's vshard at commit). In-transaction reads only.
+            let child_collection: Option<String> = if txn_id.is_some() {
+                child.collection().map(str::to_owned)
+            } else {
+                None
+            };
             let outcome =
                 gather_all_cores(state, tenant_id, database_id, *child, trace_id, txn_id).await?;
+            if let Some(coll) = child_collection
+                && let Some(scan_plan) =
+                    full_scan_plan_for_collection(state, database_id, tenant_id, &coll)?
+            {
+                captures.push(DistributedReadCapture {
+                    scan_plan,
+                    read_version_lsn: outcome.read_version_lsn,
+                });
+            }
             let merged = if as_aggregate {
                 finalize_aggregate(&outcome.merged_array)
             } else {
@@ -137,6 +163,7 @@ pub(super) async fn gather_join_build_side(
     collection: &str,
     trace_id: TraceId,
     txn_id: Option<TxnId>,
+    captures: &mut Vec<DistributedReadCapture>,
 ) -> crate::Result<Option<Box<PhysicalPlan>>> {
     // Build a minimal, unfiltered, unprojected full-collection scan for the
     // engine via the shared builder. `Ok(None)` (no catalog / unknown
@@ -162,6 +189,18 @@ pub(super) async fn gather_join_build_side(
         return Ok(None);
     };
 
+    // Capture the build/right collection's read for the transaction read-set:
+    // its own bare full-collection scan plan + the read-version its gather
+    // observes. Previously DISCARDED — the hole that left the build side out of
+    // the read-set entirely, so a concurrent write to it between the
+    // in-transaction read and COMMIT went undetected by the OCC validator. Clone
+    // before the scan plan is moved into the gather; in-transaction reads only.
+    let capture_plan = if txn_id.is_some() {
+        Some(scan_plan.clone())
+    } else {
+        None
+    };
+
     // `Box::pin` breaks the async-fn recursion cycle: `gather_all_vshards`
     // dispatches through the gateway, which re-enters `resolve_exchange_in_plan`
     // → `resolve_exchange` → here. The cycle terminates at runtime (the scan
@@ -176,6 +215,13 @@ pub(super) async fn gather_join_build_side(
         txn_id,
     ))
     .await?;
+
+    if let Some(scan_plan) = capture_plan {
+        captures.push(DistributedReadCapture {
+            scan_plan,
+            read_version_lsn: outcome.read_version_lsn,
+        });
+    }
 
     Ok(Some(Box::new(PhysicalPlan::Query(QueryOp::ProviderScan {
         provider: None,

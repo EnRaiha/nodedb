@@ -373,7 +373,7 @@ impl NodeDbPgHandler {
             // --- Normal dispatch ---
             let user_id: Option<std::sync::Arc<str>> =
                 Some(std::sync::Arc::from(identity.username.as_str()));
-            let (resp, shard_watermarks, shuffle_reads) = self
+            let (resp, shard_watermarks, distributed_reads) = self
                 .dispatch_task_with_watermarks(task, user_id, Some(identity))
                 .await
                 .map_err(|e| {
@@ -413,8 +413,8 @@ impl NodeDbPgHandler {
                         watermarks: &watermarks,
                         read_version_lsn: resp.read_version_lsn,
                         found: resp.status == crate::bridge::envelope::Status::Ok,
-                        shuffle_reads: &shuffle_reads,
-                        shuffle_read_lsn_vshard: task_vshard,
+                        distributed_reads: &distributed_reads,
+                        read_lsn_vshard: task_vshard,
                     },
                 )
                 .await;
