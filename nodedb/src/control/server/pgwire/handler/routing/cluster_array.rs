@@ -85,7 +85,13 @@ impl NodeDbPgHandler {
             ClusterArrayOp::Slice { .. } | ClusterArrayOp::Agg { .. } => None,
         };
         if let Some(lsn) = write_lsn {
-            publish_cluster_array_change_events(&self.state, tenant_id, database_id, cluster_op, lsn);
+            publish_cluster_array_change_events(
+                &self.state,
+                tenant_id,
+                database_id,
+                cluster_op,
+                lsn,
+            );
         }
 
         let cluster_plan_kind = match cluster_op {

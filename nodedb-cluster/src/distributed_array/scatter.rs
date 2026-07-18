@@ -78,6 +78,20 @@ async fn call_with_wrong_owner_retry(
 
 use super::rpc::ShardRpcDispatch;
 
+/// Classify whether a shard error should count against the peer circuit breaker.
+///
+/// `WrongOwner` is a transient routing/ownership-churn signal, not a peer-health
+/// failure: during a rebalance or leadership cut-over a perfectly healthy shard
+/// answers `WrongOwner` until the coordinator's routing table catches up (the
+/// single retry in `call_with_wrong_owner_retry` already re-reads the live
+/// table). Counting it as a liveness failure would open the shared breaker and
+/// then fast-fail healthy shards' slice/put/agg/delete with `CircuitOpen`. Only
+/// `WrongOwner` is excluded — every genuine transport/timeout/unreachable error
+/// still counts, mirroring `RetryPolicy::is_retryable`'s conservative policy.
+fn counts_against_breaker(err: &ClusterError) -> bool {
+    !matches!(err, ClusterError::WrongOwner { .. })
+}
+
 /// Parameters governing a single fan-out round.
 pub struct FanOutParams {
     /// Shard IDs to contact (broadcast target list).
@@ -152,7 +166,9 @@ pub async fn fan_out(
                 results.push((shard_id, payload));
             }
             Err((shard_id, e)) => {
-                circuit_breaker.record_failure(shard_id as u64);
+                if counts_against_breaker(&e) {
+                    circuit_breaker.record_failure(shard_id as u64);
+                }
                 return Err(e);
             }
         }
@@ -208,7 +224,9 @@ pub async fn fan_out_partitioned(
                 results.push((shard_id, payload));
             }
             Err((shard_id, e)) => {
-                circuit_breaker.record_failure(shard_id as u64);
+                if counts_against_breaker(&e) {
+                    circuit_breaker.record_failure(shard_id as u64);
+                }
                 return Err(e);
             }
         }
@@ -517,6 +535,51 @@ mod tests {
             call_count.load(Ordering::SeqCst),
             2,
             "must have called dispatch twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_owner_does_not_trip_breaker() {
+        use crate::circuit_breaker::CircuitState;
+
+        // Both attempts return WrongOwner so the fan-out propagates the error,
+        // exercising the failure arm that would otherwise call record_failure.
+        let call_count = Arc::new(AtomicU32::new(0));
+        let dispatch: Arc<dyn ShardRpcDispatch> = Arc::new(WrongOwnerThenEchoDispatch {
+            call_count: call_count.clone(),
+            fail_count: 5, // more than the single retry can clear
+        });
+        let cb = cb();
+        let params = FanOutParams {
+            shard_ids: vec![0],
+            timeout_ms: 1000,
+            source_node: 1,
+        };
+        let err = fan_out(
+            &params,
+            super::super::opcodes::ARRAY_SHARD_SLICE_REQ,
+            b"payload",
+            &dispatch,
+            &cb,
+        )
+        .await
+        .expect_err("fan_out should propagate WrongOwner");
+
+        assert!(
+            matches!(err, ClusterError::WrongOwner { .. }),
+            "expected WrongOwner, got {err:?}"
+        );
+        // WrongOwner is a routing signal, not a health failure: the breaker
+        // must not have recorded a failure for the shard.
+        assert_eq!(
+            cb.failure_count(0),
+            0,
+            "WrongOwner must not increment the breaker failure count"
+        );
+        assert_eq!(
+            cb.state(0),
+            CircuitState::Closed,
+            "WrongOwner must leave the breaker Closed"
         );
     }
 }
