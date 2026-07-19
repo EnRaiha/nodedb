@@ -75,6 +75,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Free disk space
+        # The --all-features suite links hundreds of statically linked test
+        # binaries into target/; on a stock runner that fills the root disk,
+        # and the linker (rust-lld) then fails its mmap-backed output write
+        # with SIGBUS (signal 7) at link time. Reclaim the large preinstalled
+        # toolchains this build never uses so the link always has headroom.
+        run: |
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift
+          sudo docker image prune -af || true
+          df -h /
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
