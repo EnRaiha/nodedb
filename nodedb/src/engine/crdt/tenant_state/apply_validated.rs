@@ -20,7 +20,15 @@ use super::core::TenantCrdtEngine;
 #[derive(Debug)]
 pub enum ValidatedApplyOutcome {
     /// The delta imported and every row it wrote satisfied its constraints.
-    Clean,
+    ///
+    /// `write_set` lists the `(collection, row_id)` pairs the delta actually
+    /// wrote. The caller inspects it to enforce the one-document-per-delta
+    /// sync contract: cross-engine identity binds exactly one Control-Plane
+    /// surrogate per delta, so the Data Plane can only materialize the single
+    /// frame-declared row. A delta that wrote other or additional rows (a
+    /// client that coalesced N upserts into one delta) must be rejected
+    /// loudly — materializing just one row would silently drop the rest.
+    Clean { write_set: Vec<(String, String)> },
     /// The delta imported but a row violated a constraint. The violation has
     /// been enqueued to the DLQ; the translated type is carried for the caller.
     Rejected(ViolationType),
@@ -71,14 +79,14 @@ impl TenantCrdtEngine {
             }
         };
 
-        for (coll, row) in write_set {
-            let sg = if row == document_id {
+        for (coll, row) in &write_set {
+            let sg = if row.as_str() == document_id {
                 surrogate
             } else {
                 Surrogate::ZERO
             };
             let ValidationOutcome::Rejected(violations) =
-                self.validate_committed_row(&coll, &row, sg)
+                self.validate_committed_row(coll, row, sg)
             else {
                 continue;
             };
@@ -86,11 +94,11 @@ impl TenantCrdtEngine {
                 continue;
             };
             return ValidatedApplyOutcome::Rejected(
-                self.dlq_and_translate(&coll, delta, peer_id, violation),
+                self.dlq_and_translate(coll, delta, peer_id, violation),
             );
         }
 
-        ValidatedApplyOutcome::Clean
+        ValidatedApplyOutcome::Clean { write_set }
     }
 
     /// Enqueue a rejected delta to the DLQ and translate the internal violation
@@ -266,9 +274,52 @@ mod tests {
             "a",
             2,
         );
-        assert!(matches!(outcome, ValidatedApplyOutcome::Clean));
+        assert!(matches!(outcome, ValidatedApplyOutcome::Clean { .. }));
         assert!(engine.row_exists("users", "a"));
         assert_eq!(engine.dlq_len(), 0);
+    }
+
+    /// A delta that wrote more than the one frame-declared row surfaces every
+    /// written `(collection, row_id)` in the `Clean` write-set, so the sync
+    /// handler can detect the one-document-per-delta contract violation
+    /// instead of silently materializing a single row (regression for the
+    /// batch-coalesced-delta data-loss bug: N upserts merged into one delta
+    /// tagged with a synthetic frame id materialized zero or one of N rows).
+    #[test]
+    fn multi_doc_delta_reports_full_write_set() {
+        let mut engine = unique_engine();
+        // One Loro delta that writes two distinct rows.
+        let state = CrdtState::new(7).unwrap();
+        state
+            .upsert(
+                "users",
+                "a",
+                &[("email", LoroValue::String("a@y.com".into()))],
+            )
+            .unwrap();
+        state
+            .upsert(
+                "users",
+                "b",
+                &[("email", LoroValue::String("b@y.com".into()))],
+            )
+            .unwrap();
+        let delta = state.export_snapshot().unwrap();
+
+        // Frame claims only row "a".
+        let outcome = engine.apply_committed_delta_validated(
+            "users",
+            &delta,
+            nodedb_types::Surrogate::ZERO,
+            "a",
+            7,
+        );
+        let ValidatedApplyOutcome::Clean { write_set } = outcome else {
+            panic!("expected Clean with a populated write-set");
+        };
+        // Both rows are reported, including the one the frame did NOT declare.
+        assert!(write_set.iter().any(|(c, r)| c == "users" && r == "a"));
+        assert!(write_set.iter().any(|(c, r)| c == "users" && r == "b"));
     }
 
     #[test]
@@ -283,7 +334,7 @@ mod tests {
             "a",
             2,
         );
-        assert!(matches!(clean, ValidatedApplyOutcome::Clean));
+        assert!(matches!(clean, ValidatedApplyOutcome::Clean { .. }));
 
         // Row B reuses A's email — UNIQUE violation.
         let delta_b = row_delta(3, "b", "x@y.com", "B");

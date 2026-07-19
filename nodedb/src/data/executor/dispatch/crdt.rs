@@ -27,7 +27,7 @@ impl CoreLoop {
                 constraint_version_required,
             } => self.execute_crdt_apply(
                 task,
-                crate::data::executor::handlers::control::crdt::CrdtApplyParams {
+                crate::data::executor::handlers::control::crdt_apply::CrdtApplyParams {
                     collection,
                     document_id,
                     delta,
