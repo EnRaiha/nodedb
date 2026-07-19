@@ -7,6 +7,59 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.4.0] - 2026-07-19
+
+### ⚠️ Breaking changes
+
+- **On-disk storage layout is now database-scoped.** Every engine (Document, KV, Columnar, Timeseries, Spatial, Vector, sparse-vector, Graph, FTS) keys its storage maps and on-disk paths by `database_id`, and the PK→surrogate catalog is scoped to `(database_id, tenant_id, collection, pk)`. **A 0.3.0 data directory will not be found by a 0.4.0 binary** — a dump/reload is required to upgrade.
+- **WAL / on-disk format evolved (forward-incompatible).** New *required* WAL record types (`SyncSeqAdvance`, `FtsIndex`, `FtsDelete`, `SpatialPut`, `SpatialDelete`), a map-encoded `ColumnarWalRecord` carrying per-row surrogates, and new replayable KV / graph-label / CRDT-list / columnar-predicate records. A 0.3.0 binary cannot replay a 0.4.0 WAL; a 0.4.0 binary still replays 0.3.0 logs.
+- **`NodeDb` trait** gained CRDT movable-list operations — trait implementors and callers must update.
+- **`single_node_calvin` now defaults to `true`.** A standalone node stands up the single-node Calvin sequencer by default, and cross-core (cross-vShard) transactions commit atomically through it instead of being rejected. Restore the prior behavior with `single_node_calvin = false`.
+- **SQL authorization is now enforced across all transports.** Statements that previously bypassed authorization on the native/HTTP paths are now rejected.
+- **Cluster wire compatibility** — removed superseded iterative-WCC and GraphAlgo-BSP wire types; all cluster nodes must run the same minor version.
+
+### Added
+
+- **Distributed ACID transactions** — a deterministic Calvin sequencer for cross-shard/cross-vShard commits with per-participant vote tally, verdict barrier, and WAL-replayable redo records; a per-transaction staging overlay serving reads and buffering writes for **every** engine (point/predicate/INSERT…SELECT writes, KV atomic/batch/TTL ops, document UPSERT, columnar batch inserts, vector search, spatial predicate scans, graph single-/multi-hop/shortest-path, full-text search); full undo/rollback with index, R-tree, column-statistics, and bitemporal-aware reversal; `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` on both pgwire and the native protocol; wound-wait lock arbitration, per-vShard deterministic write fencing, and a write-admission gate at the SPSC chokepoint.
+- **MVCC read validation for distributed OCC** — LSN-versioned read-sets validated against committed write-versions at apply time; per-collection and per-index (`IndexEq`/`IndexRange`) read-version tracking; cross-shard OCC self-abort and read-only-participant handling for shuffle/gather/gathered JOINs.
+- **Distributed query execution** — cross-node streaming `Exchange` / `ProviderScan` over QUIC; distributed shuffle JOIN and shuffle GROUP BY with ANALYZE-driven cost-model auto-selection; grace-hash join with recursive re-partitioning and io_uring spill-to-disk; memory-budget-bounded streaming scans replacing silent row caps; lazy streaming of unordered `SELECT`s over pgwire, native, HTTP, and QUIC.
+- **Distributed graph** — cross-shard `MATCH` with multi-round continuation and variable-length resume cursors; distributed BSP PageRank, Personalized PageRank, and WCC; dual-homed cross-shard edge insert/delete routed through Calvin with implicit-edge reconciliation on predicate UPDATE/DELETE; owner-partitioned BFS frontier for full cross-node traversal.
+- **CRDT via SQL** — `WITH (crdt=true)` on document collections routes DML to CRDT ops with `RETURNING` support; movable-list ops over the native wire protocol and `NodeDb` trait; committed-delta validation at data-plane apply time (CHECK constraints, write-set extraction, descriptor-version fencing); validator rejections surfaced as `DeltaReject`; CRDT writes made quorum-durable under Raft.
+- **Sparse-vector engine** — a dimensionless `SPARSEVECTOR` column type threaded through parser, wire format, columnar/strict storage, and DDL; an inverted index maintained on document writes; a `sparse_score` `ORDER BY` surface for sparse-vector search.
+- **Cluster elasticity & membership** — rendezvous-hashing placement with explicit per-group placement sets; learner add/remove/auto-promotion/eviction; Raft leadership transfer via `TimeoutNow`; immediate placement reconcile on node join; leaving-voter convergence; orphan partial-snapshot GC.
+- **Raft snapshots & compaction** — a Data-Plane snapshot builder wired into the Raft SEND path; exact clear-then-install for lagging followers; CRDT state, graph edges, columnar/timeseries engine state, and the PK→surrogate identity map carried through per-group snapshots and backups; configurable Raft log auto-compaction gated on the durable Data-Plane applied watermark.
+- **Idempotent sync** — idempotent-producer wire types with frame integrity; a per-core idempotency gate for sync ingest; sync-HWM replay on startup; Raft-replicated sync writes for FTS, spatial, columnar, timeseries, and vector; collection-schema announcement and peer-collection materialization into the local catalog.
+- **Bitemporal** — a `SystemTimeScope` threaded through planner, cluster executor, clone rewriter, and the array/document/columnar/graph dispatchers; audit-log scans over the array and sparse-document stores.
+- **pgwire / SQL surface** — `version()`, `current_setting()`, `server_version_num` in startup params, and an extended `pg_catalog` evaluator for driver compatibility; `ST_MakePoint` / `ST_GeomFromText` / `ST_GeomFromWKB` in `INSERT` values; computed expressions in `GROUP BY` keys; a MySQL-style trailing `ENGINE = <name>` clause on `CREATE COLLECTION`; per-collection FTS analyzer honored in every tokenization path.
+- **`RESTORE TENANT ... FORCE`** — bypass the staleness guard on restore.
+
+### Changed
+
+- **Response shaping is now planner-driven** — a protocol-neutral output-schema builder wired into query planning drives response shaping and `Describe` across pgwire, native, and HTTP, replacing the per-transport projection paths.
+- **CDC change events are published exactly once per write**, and graph node-label/edge writes and cluster-array writes now emit CDC events; the Event-Plane receiver is wired into vShard dispatch.
+- **Native autocommit writes route through Raft**, and the durable-at-ack barrier extends to pgwire submit and ILP.
+- **License** — `nodedb-crdt`, `nodedb-mem`, and `nodedb-wal` relicensed to Apache-2.0.
+
+### Fixed
+
+- **Crash-safety hardening** — boot now fails on a corrupt/unreadable checkpoint for every engine (vector, spatial, graph-label, columnar, KV, sparse-vector, timeseries, CRDT, sync-HWM) instead of silently continuing; CRC framing added to checkpoint files; checkpoint encode/restore failures propagated instead of swallowed.
+- **WAL replay correctness** — timeseries samples are no longer rejected during replay and a mid-record flush no longer duplicates rows on recovery; per-row surrogates are persisted and restored through columnar WAL replay; complete KV WAL replay (`incr`/`expire`/`persist`/`cas`/`field_set`/`register_index`/`drop_index`) with resolved expiry instants; graph node-label and columnar predicate UPDATE/DELETE records persisted and replayed.
+- **Restore / backup** — WAL tombstones replicated via Raft on restore; plain-columnar rows re-issued durably rather than snapshot-installed; columnar/flushed-timeseries data and catalog propagated cluster-wide; replica multiplication and CRDT loss under RF>1 prevented.
+- **Tenant management** — tenant IDs allocated via a durable high-water-mark; ghost rows in `SHOW TENANTS` after `DROP TENANT` eliminated; an existence gate enforced for unknown numeric tenant IDs; `DROP`/`ALTER`/`PURGE TENANT` accept a tenant name.
+- **Security** — UTF-8 SQL parser offsets preserved; external superuser assertions prevented; OIDC providers bound to trusted tenants; credential integrity preserved across the auth lifecycle; legitimate login bursts no longer trip rate limits.
+- **KV** — TTL-expired rows reaped without stranding index entries; per-row surrogates assigned on native/RESP batch-put and MSET so cross-engine joins over bulk KV writes resolve.
+- **Cluster** — remote error codes preserved across RPC; `WrongOwner` excluded from circuit-breaker failures; Raft compaction and restart replay gated on durable apply; AFTER-trigger writes routed to the owning shard; SQL-inserted geometry indexed into the R-tree on document collections.
+- **Vector** — the prior HNSW node is removed before re-insert on a vector put.
+
+### Removed
+
+- Dead pgwire projection, catalog-propose, and DDL-router modules (superseded by the neutral shaping/DDL router).
+- Superseded iterative-WCC and GraphAlgo-BSP cluster wire types.
+- Database-scoping schema-migration machinery.
+- The unreachable Data-Plane `INSERT … SELECT` handler and the dead spatial-index rebuild backstop.
+
+---
+
 ## [0.3.0] - 2026-06-07
 
 ### ⚠️ Breaking changes

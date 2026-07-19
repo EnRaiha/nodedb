@@ -35,6 +35,15 @@ ignore = [
     "RUSTSEC-2025-0057", # fxhash (rustc-hash 1.x)
     "RUSTSEC-2025-0119", # number_prefix
     "RUSTSEC-2024-0436", # paste
+    # quick-xml XML-parsing DoS (quadratic attribute check / unbounded
+    # namespace allocation), fixed in quick-xml 0.41. Arrives transitively
+    # via object_store 0.13, whose 0.13.x line pins quick-xml <0.41; the fix
+    # requires the breaking object_store 0.14 upgrade. NodeDB only parses XML
+    # from the operator-configured object store (S3 list/error responses), so
+    # a malicious payload requires pointing the node at a hostile endpoint.
+    # Tracked follow-up: bump object_store to 0.14 and drop these two ignores.
+    "RUSTSEC-2026-0194", # quick-xml quadratic attribute-name check
+    "RUSTSEC-2026-0195", # quick-xml unbounded namespace allocation
 ]
 
 [licenses]
