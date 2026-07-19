@@ -4,6 +4,8 @@
 
 use nodedb_types::Surrogate;
 
+use super::ReturningSpec;
+
 /// CRDT engine physical operations.
 #[derive(
     Debug,
@@ -199,6 +201,10 @@ pub enum CrdtOp {
         fields_json: String,
         surrogate: Surrogate,
         partial: bool,
+        /// Response-only RETURNING projection; None for a plain write. NOT
+        /// persisted/replicated — WAL/replication reconstruct with None.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
     },
     /// Delete a document row: tombstone in the collection's Loro doc + remove
     /// from the sparse document store.
@@ -206,5 +212,9 @@ pub enum CrdtOp {
         collection: String,
         document_id: String,
         surrogate: Surrogate,
+        /// Response-only RETURNING projection; None for a plain write. NOT
+        /// persisted/replicated — WAL/replication reconstruct with None.
+        #[serde(default)]
+        returning: Option<ReturningSpec>,
     },
 }

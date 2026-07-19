@@ -131,6 +131,7 @@ pub(super) fn doc_upsert(
         fields_json: fields_json.to_owned(),
         surrogate: nodedb_types::Surrogate::new(surrogate),
         partial,
+        returning: None,
     })
 }
 
@@ -141,6 +142,7 @@ pub(super) fn doc_delete(collection: &str, document_id: &str, surrogate: u32) ->
         collection: collection.to_owned(),
         document_id: document_id.to_owned(),
         surrogate: nodedb_types::Surrogate::new(surrogate),
+        returning: None,
     })
 }
 

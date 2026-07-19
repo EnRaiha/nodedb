@@ -151,20 +151,31 @@ impl CoreLoop {
                 fields_json,
                 surrogate,
                 partial,
+                returning,
             } => self.execute_crdt_doc_upsert(
                 task,
-                collection,
-                document_id,
-                fields_json,
-                *surrogate,
-                *partial,
+                crate::data::executor::handlers::control::crdt_doc::CrdtDocUpsert {
+                    collection,
+                    document_id,
+                    fields_json,
+                    surrogate: *surrogate,
+                    partial: *partial,
+                    returning: returning.as_ref(),
+                },
             ),
 
             CrdtOp::DocDelete {
                 collection,
                 document_id,
                 surrogate,
-            } => self.execute_crdt_doc_delete(task, collection, document_id, *surrogate),
+                returning,
+            } => self.execute_crdt_doc_delete(
+                task,
+                collection,
+                document_id,
+                *surrogate,
+                returning.as_ref(),
+            ),
         }
     }
 }

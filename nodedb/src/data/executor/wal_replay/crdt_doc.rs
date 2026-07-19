@@ -92,16 +92,20 @@ impl CoreLoop {
                     fields_json: fields_json.clone(),
                     surrogate: Surrogate::new(*surrogate),
                     partial: *partial,
+                    returning: None,
                 });
                 let task =
                     Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
                 let response = self.execute_crdt_doc_upsert(
                     &task,
-                    collection,
-                    document_id,
-                    fields_json,
-                    Surrogate::new(*surrogate),
-                    *partial,
+                    crate::data::executor::handlers::control::crdt_doc::CrdtDocUpsert {
+                        collection,
+                        document_id,
+                        fields_json,
+                        surrogate: Surrogate::new(*surrogate),
+                        partial: *partial,
+                        returning: None,
+                    },
                 );
                 (collection, document_id, response)
             }
@@ -114,6 +118,7 @@ impl CoreLoop {
                     collection: collection.clone(),
                     document_id: document_id.clone(),
                     surrogate: Surrogate::new(*surrogate),
+                    returning: None,
                 });
                 let task =
                     Self::replay_task(tid, database_id, vshard, plan, Some(Lsn::new(record_lsn)));
@@ -122,6 +127,7 @@ impl CoreLoop {
                     collection,
                     document_id,
                     Surrogate::new(*surrogate),
+                    None,
                 );
                 (collection, document_id, response)
             }
@@ -225,6 +231,7 @@ mod tests {
             fields_json: fields_json.to_string(),
             surrogate: Surrogate::new(SURROGATE),
             partial,
+            returning: None,
         })
     }
 
@@ -233,6 +240,7 @@ mod tests {
             collection: COLLECTION.to_string(),
             document_id: DOCUMENT_ID.to_string(),
             surrogate: Surrogate::new(SURROGATE),
+            returning: None,
         })
     }
 

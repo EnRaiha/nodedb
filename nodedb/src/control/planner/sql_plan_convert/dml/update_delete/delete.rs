@@ -130,6 +130,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                     collection: collection.into(),
                     document_id: pk_string,
                     surrogate,
+                    returning: None,
                 })
             } else {
                 PhysicalPlan::Document(DocumentOp::PointDelete {

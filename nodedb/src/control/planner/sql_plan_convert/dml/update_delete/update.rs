@@ -41,7 +41,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         assignments,
         filters,
         target_keys,
-        returning,
+        returning: _returning,
         tenant_id,
         ctx,
     } = params;
@@ -146,26 +146,20 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
 
     // CRDT GATE: an UPDATE on a `crdt = true` document collection routes to
     // `CrdtOp::DocUpsert` with `partial = true` (LWW-per-field). Only PK-targeted
-    // SET with literal RHS is representable. Predicate (non-PK) UPDATE, non-literal
-    // RHS, and UPDATE ... RETURNING are rejected — there is NO silent fallthrough
-    // to a `DocumentOp`, which would bypass CRDT convergence. Read the flag ONCE.
+    // SET with literal RHS is representable. Predicate (non-PK) UPDATE and
+    // non-literal RHS are rejected — there is NO silent fallthrough to a
+    // `DocumentOp`, which would bypass CRDT convergence. `RETURNING` IS
+    // supported: the response-only projection is injected into the plan later
+    // and emitted by the Data Plane handler, exactly like `PointUpdate`. Read
+    // the flag ONCE.
     let is_crdt = super::super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
-    if is_crdt {
-        if returning {
-            return Err(crate::Error::BadRequest {
-                detail: format!(
-                    "UPDATE ... RETURNING on CRDT collection '{collection}' is not supported"
-                ),
-            });
-        }
-        if target_keys.is_empty() {
-            return Err(crate::Error::BadRequest {
-                detail: format!(
-                    "predicate (non-primary-key) UPDATE on CRDT collection '{collection}' is not \
-                     supported; target rows by primary key"
-                ),
-            });
-        }
+    if is_crdt && target_keys.is_empty() {
+        return Err(crate::Error::BadRequest {
+            detail: format!(
+                "predicate (non-primary-key) UPDATE on CRDT collection '{collection}' is not \
+                 supported; target rows by primary key"
+            ),
+        });
     }
     // Partial-update payload for the CRDT path, built ONCE from the literal SET
     // assignments (non-literal RHS rejected inside the builder).
@@ -246,6 +240,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                     fields_json: fields_json.clone(),
                     surrogate,
                     partial: true,
+                    returning: None,
                 })
             } else {
                 PhysicalPlan::Document(DocumentOp::PointUpdate {

@@ -1003,11 +1003,13 @@ mod tests {
                 fields_json: "{}".into(),
                 surrogate: Surrogate::ZERO,
                 partial: false,
+                returning: None,
             }),
             PhysicalPlan::Crdt(CrdtOp::DocDelete {
                 collection: "c".into(),
                 document_id: "d".into(),
                 surrogate: Surrogate::ZERO,
+                returning: None,
             }),
         ];
         for p in &plans {

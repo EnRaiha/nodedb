@@ -13,9 +13,23 @@ use nodedb_types::Surrogate;
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::doc_format;
 use crate::data::executor::handlers::point::apply_delete::PointDeleteParams;
+use crate::data::executor::handlers::returning_rows;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::document::store::surrogate_to_doc_id;
+use nodedb_physical::physical_plan::ReturningSpec;
+
+/// Borrowed arguments for [`CoreLoop::execute_crdt_doc_upsert`], grouped so the
+/// handler stays within the argument-count limit.
+pub(in crate::data::executor) struct CrdtDocUpsert<'a> {
+    pub collection: &'a str,
+    pub document_id: &'a str,
+    pub fields_json: &'a str,
+    pub surrogate: Surrogate,
+    pub partial: bool,
+    pub returning: Option<&'a ReturningSpec>,
+}
 
 impl CoreLoop {
     /// Insert-or-replace (`partial = false`) or partial-merge (`partial = true`)
@@ -23,12 +37,16 @@ impl CoreLoop {
     pub(in crate::data::executor) fn execute_crdt_doc_upsert(
         &mut self,
         task: &ExecutionTask,
-        collection: &str,
-        document_id: &str,
-        fields_json: &str,
-        surrogate: Surrogate,
-        partial: bool,
+        args: CrdtDocUpsert<'_>,
     ) -> Response {
+        let CrdtDocUpsert {
+            collection,
+            document_id,
+            fields_json,
+            surrogate,
+            partial,
+            returning,
+        } = args;
         debug!(core = self.core_id, %collection, %document_id, partial, "crdt doc upsert");
         let tenant_id = task.request.tenant_id;
         let Ok(json_map) =
@@ -78,7 +96,7 @@ impl CoreLoop {
             }
         };
 
-        if let Some(bytes) = materialized {
+        let response = if let Some(bytes) = materialized {
             self.materialize_document_write(
                 task,
                 tenant_id.as_u64(),
@@ -87,9 +105,42 @@ impl CoreLoop {
                 &bytes,
                 true,
             );
-        }
+            if let Some(spec) = returning {
+                let with_id =
+                    nodedb_query::msgpack_scan::inject_str_field(&bytes, "id", document_id);
+                let doc = doc_format::decode_document(&with_id)
+                    .unwrap_or_else(|| serde_json::json!({ "id": document_id }));
+                match returning_rows::build_rows_payload(spec, &[doc]) {
+                    Ok(payload) => self.response_with_payload(task, payload),
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("RETURNING encode: {e}"),
+                            },
+                        );
+                    }
+                }
+            } else {
+                self.response_ok(task)
+            }
+        } else if let Some(spec) = returning {
+            match returning_rows::build_rows_payload(spec, &[]) {
+                Ok(payload) => self.response_with_payload(task, payload),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("RETURNING encode: {e}"),
+                        },
+                    );
+                }
+            }
+        } else {
+            self.response_ok(task)
+        };
         self.checkpoint_coordinator.mark_dirty("crdt", 1);
-        self.response_ok(task)
+        response
     }
 
     /// Delete a document row: tombstone in the collection's Loro doc, then
@@ -102,6 +153,7 @@ impl CoreLoop {
         collection: &str,
         document_id: &str,
         surrogate: Surrogate,
+        returning: Option<&ReturningSpec>,
     ) -> Response {
         debug!(core = self.core_id, %collection, %document_id, "crdt doc delete");
         let tenant_id = task.request.tenant_id;
@@ -165,7 +217,44 @@ impl CoreLoop {
             );
         }
 
+        // Project the pre-deletion row for RETURNING. `outcome.prior_value` is
+        // only borrowed by the CDC emit above (via `.as_deref()`), so it is
+        // still available here; the user-visible `document_id` is injected as
+        // `id` exactly like PointDelete.
+        let response = if let Some(spec) = returning {
+            if let Some(prior_bytes) = outcome.prior_value.as_deref() {
+                let with_id =
+                    nodedb_query::msgpack_scan::inject_str_field(prior_bytes, "id", document_id);
+                let doc = doc_format::decode_document(&with_id)
+                    .unwrap_or_else(|| serde_json::json!({ "id": document_id }));
+                match returning_rows::build_rows_payload(spec, &[doc]) {
+                    Ok(payload) => self.response_with_payload(task, payload),
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("RETURNING encode: {e}"),
+                            },
+                        );
+                    }
+                }
+            } else {
+                match returning_rows::build_rows_payload(spec, &[]) {
+                    Ok(payload) => self.response_with_payload(task, payload),
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: format!("RETURNING encode: {e}"),
+                            },
+                        );
+                    }
+                }
+            }
+        } else {
+            self.response_ok(task)
+        };
         self.checkpoint_coordinator.mark_dirty("crdt", 1);
-        self.response_ok(task)
+        response
     }
 }

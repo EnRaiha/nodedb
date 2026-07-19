@@ -29,6 +29,13 @@ pub enum PlanKind {
 
 pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
     match plan {
+        PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+            returning: Some(_), ..
+        })
+        | PhysicalPlan::Crdt(CrdtOp::DocDelete {
+            returning: Some(_), ..
+        }) => PlanKind::ReturningRows,
+
         PhysicalPlan::Document(DocumentOp::PointGet { .. })
         | PhysicalPlan::Crdt(CrdtOp::Read { .. })
         | PhysicalPlan::Crdt(CrdtOp::GetPolicy { .. })
@@ -167,7 +174,8 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
 
         // Default: opaque execution result. The specific arms above take
         // precedence; these inner wildcards catch every unmatched op of each
-        // engine plus the engines with no arms here (Crdt, Meta, ClusterArray).
+        // engine (including the remaining `Crdt` ops not covered above) plus
+        // the engines with no arms at all here (Meta, ClusterArray).
         // Exhaustive so a new PhysicalPlan variant forces a decision.
         PhysicalPlan::Document(_)
         | PhysicalPlan::Graph(_)

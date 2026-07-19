@@ -272,6 +272,7 @@ pub(in super::super) fn convert_insert(
                         fields_json: super::crdt_gate::row_to_fields_json(row)?,
                         surrogate,
                         partial: false,
+                        returning: None,
                     })
                 } else {
                     PhysicalPlan::Document(DocumentOp::PointInsert {
@@ -413,6 +414,7 @@ pub(in super::super) fn convert_upsert(
                         fields_json: super::crdt_gate::row_to_fields_json(row)?,
                         surrogate,
                         partial: false,
+                        returning: None,
                     })
                 } else {
                     PhysicalPlan::Document(DocumentOp::Upsert {

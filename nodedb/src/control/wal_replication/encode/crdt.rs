@@ -79,6 +79,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             fields_json,
             surrogate,
             partial,
+            returning: _,
         } => doc_upsert(
             collection,
             document_id,
@@ -90,6 +91,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             collection,
             document_id,
             surrogate,
+            returning: _,
         } => doc_delete(collection, document_id, surrogate.as_u32()),
         CrdtOp::SetConstraints {
             collection,

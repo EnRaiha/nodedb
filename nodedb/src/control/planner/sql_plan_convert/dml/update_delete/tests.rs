@@ -293,16 +293,34 @@ fn non_literal_rhs_update_on_crdt_rejects() {
 }
 
 #[test]
-fn update_returning_on_crdt_rejects() {
+fn update_returning_on_crdt_routes_to_doc_upsert() {
+    // RETURNING is stripped before planning and re-injected downstream
+    // (pgwire `inject_returning_spec` attaches the spec to the CrdtOp, and the
+    // DP handler emits the projected rows). So at the convert layer a RETURNING
+    // UPDATE on a crdt collection routes to `DocUpsert` exactly like a plain
+    // UPDATE — it is NOT rejected. `returning` on the op is `None` here; the
+    // spec is attached later at the protocol boundary.
     let (ctx, _dir) = ctx_with_catalog();
     let assignments = vec![(
         "name".to_string(),
         SqlExpr::Literal(SqlValue::String("bob".to_string())),
     )];
     let keys = vec![SqlValue::String("k1".to_string())];
-    let err = convert_update(update_params("crdt_coll", &assignments, &keys, true, &ctx))
-        .expect_err("UPDATE ... RETURNING on crdt must reject");
-    assert!(matches!(err, crate::Error::BadRequest { .. }));
+    let tasks = convert_update(update_params("crdt_coll", &assignments, &keys, true, &ctx))
+        .expect("UPDATE ... RETURNING on crdt must route, not reject");
+    assert_eq!(tasks.len(), 1);
+    match &tasks[0].plan {
+        PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+            partial, returning, ..
+        }) => {
+            assert!(partial, "UPDATE SET must be a partial DocUpsert");
+            assert!(
+                returning.is_none(),
+                "RETURNING spec is attached downstream, not at convert"
+            );
+        }
+        other => panic!("expected partial CrdtOp::DocUpsert, got {other:?}"),
+    }
 }
 
 #[test]
