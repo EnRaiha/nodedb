@@ -214,11 +214,11 @@ cargo nextest run --all-features
 
 ## Release Status
 
-NodeDB Origin is in **public beta** as of **v0.1.0 (2026-05-07)**. All eight engines are feature-complete and covered by tests. The wire protocols (pgwire, HTTP, native MessagePack, RESP, ILP, WebSocket) are stable — clients written against 0.1.0 will keep working through 1.0.
+NodeDB Origin is in **public beta**; the current release is **v0.4.0 (2026-07-19)**. All eight engines are feature-complete and covered by tests. The wire protocols (pgwire, HTTP, native MessagePack, RESP, ILP, WebSocket) are stable — clients written against 0.1.0 will keep working through 1.0.
 
-**v0.1.0 — Beta (today).** Build new products on it. The public surface (SQL dialect, wire protocols, configuration) is stable; expect internal changes (storage layout, on-disk format, replication internals) between minor releases. Patch and minor bumps will land as needed — if something requires a 0.2, we ship a 0.2. The two months between beta and 1.0 are deliberately for real workloads to surface edge cases we can't manufacture in-house.
+**v0.4.0 — Beta (today).** Build new products on it. The public surface (SQL dialect, wire protocols, configuration) is stable; expect internal changes (storage layout, on-disk format, replication internals) between minor releases. Patch and minor bumps land as needed — 0.2, 0.3, and 0.4 shipped as the work demanded. The beta period is deliberately for real workloads to surface edge cases we can't manufacture in-house.
 
-**v1.0.0 — Production-ready (target: 2026-07-07).** What 1.0 guarantees:
+**v1.0.0 — Production-ready (target: after the beta hardening period).** What 1.0 guarantees:
 
 - **API & SQL stability** — semver from 1.0 onward. No breaking SQL or client-API changes within a major.
 - **Wire protocol stability** — pgwire, HTTP, native MessagePack, RESP, ILP, WebSocket frozen.
