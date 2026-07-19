@@ -44,14 +44,18 @@ const CHECKPOINT_INTERVAL_SECS: &str = "2";
 /// rotation.
 const WAL_SEGMENT_TARGET_MB: &str = "1";
 
-/// Filler payload per row. Large enough that a few dozen rows clear several
-/// 1 MiB segments, small enough to stay far under the 64 MiB WAL record cap.
-const FILLER_VALUE_BYTES: usize = 64 * 1024;
+/// Filler payload per row — deliberately large so the whole segment-sealing
+/// filler is a handful of writes, not dozens. Each filler INSERT is its own
+/// WAL fsync round-trip against a spawned (unoptimized) server, so a few big
+/// rows are dramatically faster than many small ones on a slow CI disk while
+/// sealing the same number of segments. Stays under the 1 MiB segment target
+/// (so one record fits in a segment) and far under the 64 MiB WAL record cap.
+const FILLER_VALUE_BYTES: usize = 512 * 1024;
 
 /// ~2.5 MiB of filler over a 1 MiB segment target: enough to seal at least two
 /// segments, so the canary's segment is sealed and strictly below the active
 /// one no matter where the boot records happened to land.
-const FILLER_ROWS: usize = 40;
+const FILLER_ROWS: usize = 5;
 
 /// How long to wait for the checkpoint to unlink the canary's segment. Several
 /// times the checkpoint interval, but bounded: a timeout here means truncation
