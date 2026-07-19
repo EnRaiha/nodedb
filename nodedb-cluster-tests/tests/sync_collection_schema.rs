@@ -58,6 +58,7 @@ fn descriptor(
         partition_strategy: PartitionStrategy::default_for_collection_type(&collection_type),
         collection_type,
         bitemporal,
+        crdt: false,
         fields: Vec::new(),
         primary: PrimaryEngine::Document,
         vector_primary: None,
