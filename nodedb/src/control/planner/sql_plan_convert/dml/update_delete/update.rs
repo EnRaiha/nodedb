@@ -41,7 +41,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         assignments,
         filters,
         target_keys,
-        returning: _returning,
+        returning,
         tenant_id,
         ctx,
     } = params;
@@ -144,6 +144,39 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
         }]);
     }
 
+    // CRDT GATE: an UPDATE on a `crdt = true` document collection routes to
+    // `CrdtOp::DocUpsert` with `partial = true` (LWW-per-field). Only PK-targeted
+    // SET with literal RHS is representable. Predicate (non-PK) UPDATE, non-literal
+    // RHS, and UPDATE ... RETURNING are rejected — there is NO silent fallthrough
+    // to a `DocumentOp`, which would bypass CRDT convergence. Read the flag ONCE.
+    let is_crdt = super::super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
+    if is_crdt {
+        if returning {
+            return Err(crate::Error::BadRequest {
+                detail: format!(
+                    "UPDATE ... RETURNING on CRDT collection '{collection}' is not supported"
+                ),
+            });
+        }
+        if target_keys.is_empty() {
+            return Err(crate::Error::BadRequest {
+                detail: format!(
+                    "predicate (non-primary-key) UPDATE on CRDT collection '{collection}' is not \
+                     supported; target rows by primary key"
+                ),
+            });
+        }
+    }
+    // Partial-update payload for the CRDT path, built ONCE from the literal SET
+    // assignments (non-literal RHS rejected inside the builder).
+    let crdt_fields_json = if is_crdt {
+        Some(super::super::crdt_gate::literal_assignments_to_fields_json(
+            assignments,
+        )?)
+    } else {
+        None
+    };
+
     // EDGE-BEARING GATE: an UPDATE on a schemaless-document collection that
     // carries implicit edges must NOT lower to a static `PointUpdate` for a
     // PK-equality WHERE — that op bypasses the dependent-predicate (OLLP) path
@@ -154,8 +187,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
     // collections keep the fast `PointUpdate` path below. Reached only for
     // document engines (KV / columnar / spatial returned above); strict/etc.
     // never set `has_implicit_edges`, so the flag naturally scopes this.
-    let edge_bearing =
-        !target_keys.is_empty() && document_collection_is_edge_bearing(ctx, collection)?;
+    let edge_bearing = !is_crdt
+        && !target_keys.is_empty()
+        && document_collection_is_edge_bearing(ctx, collection)?;
 
     if edge_bearing {
         // Reject `Expr` RHS to a reserved edge field: the edge reconciliation
@@ -205,18 +239,29 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
                 },
                 None => Surrogate::ZERO,
             };
-            tasks.push(PhysicalTask {
-                tenant_id,
-                vshard_id: vshard,
-                database_id: ctx.database_id,
-                plan: PhysicalPlan::Document(DocumentOp::PointUpdate {
+            let plan = if let Some(fields_json) = crdt_fields_json.as_ref() {
+                PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+                    collection: collection.into(),
+                    document_id: pk_string,
+                    fields_json: fields_json.clone(),
+                    surrogate,
+                    partial: true,
+                })
+            } else {
+                PhysicalPlan::Document(DocumentOp::PointUpdate {
                     collection: collection.into(),
                     document_id: pk_string,
                     surrogate,
                     pk_bytes,
                     updates: updates.clone(),
                     returning: None,
-                }),
+                })
+            };
+            tasks.push(PhysicalTask {
+                tenant_id,
+                vshard_id: vshard,
+                database_id: ctx.database_id,
+                plan,
                 post_set_op: PostSetOp::None,
                 txn_id: None,
             });

@@ -195,6 +195,19 @@ pub(in super::super) fn convert_insert(
     let mut tasks = Vec::new();
     let mut columnar_rows: Vec<&Vec<(String, SqlValue)>> = Vec::new();
 
+    // Detect CRDT document collections once (never re-hit the catalog per row).
+    // `IF NOT EXISTS` (ON CONFLICT DO NOTHING → `if_absent`) cannot be honored by
+    // `CrdtOp::DocUpsert`, which is an unconditional LWW full-replace: reject.
+    let is_crdt = super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
+    if is_crdt && if_absent {
+        return Err(crate::Error::BadRequest {
+            detail: format!(
+                "INSERT ... IF NOT EXISTS on CRDT collection '{collection}' is not supported; \
+                 CRDT documents converge via last-writer-wins full replace"
+            ),
+        });
+    }
+
     let mut expanded_rows: Vec<Vec<(String, SqlValue)>> = Vec::with_capacity(rows.len());
     for row in rows {
         if column_defaults.is_empty() {
@@ -252,17 +265,28 @@ pub(in super::super) fn convert_insert(
                     let s = assign_for_pk(ctx, collection, doc_id.as_bytes())?;
                     (doc_id, s)
                 };
-                tasks.push(PhysicalTask {
-                    tenant_id,
-                    vshard_id: vshard,
-                    database_id: ctx.database_id,
-                    plan: PhysicalPlan::Document(DocumentOp::PointInsert {
+                let plan = if is_crdt {
+                    PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+                        collection: collection.into(),
+                        document_id: doc_id,
+                        fields_json: super::crdt_gate::row_to_fields_json(row)?,
+                        surrogate,
+                        partial: false,
+                    })
+                } else {
+                    PhysicalPlan::Document(DocumentOp::PointInsert {
                         collection: collection.into(),
                         document_id: doc_id,
                         value: value_bytes,
                         if_absent,
                         surrogate,
-                    }),
+                    })
+                };
+                tasks.push(PhysicalTask {
+                    tenant_id,
+                    vshard_id: vshard,
+                    database_id: ctx.database_id,
+                    plan,
                     post_set_op: PostSetOp::None,
                     txn_id: None,
                 });
@@ -341,6 +365,20 @@ pub(in super::super) fn convert_upsert(
     let vshard = VShardId::from_collection_in_database(ctx.database_id, collection);
     let mut tasks = Vec::new();
 
+    // Detect CRDT document collections once. An explicit `ON CONFLICT DO UPDATE
+    // SET ...` cannot be honored: CRDT conflict resolution IS the LWW
+    // full-replace `DocUpsert` performs, so a caller-supplied merge clause has
+    // no place to run. Reject rather than silently ignore it.
+    let is_crdt = super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
+    if is_crdt && !on_conflict_updates.is_empty() {
+        return Err(crate::Error::BadRequest {
+            detail: format!(
+                "UPSERT with ON CONFLICT DO UPDATE on CRDT collection '{collection}' is not \
+                 supported; CRDT documents converge via last-writer-wins full replace"
+            ),
+        });
+    }
+
     let on_conflict_values = if on_conflict_updates.is_empty() {
         Vec::new()
     } else {
@@ -368,17 +406,28 @@ pub(in super::super) fn convert_upsert(
                     let s = assign_for_pk(ctx, collection, doc_id.as_bytes())?;
                     (doc_id, s)
                 };
-                tasks.push(PhysicalTask {
-                    tenant_id,
-                    vshard_id: vshard,
-                    database_id: ctx.database_id,
-                    plan: PhysicalPlan::Document(DocumentOp::Upsert {
+                let plan = if is_crdt {
+                    PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+                        collection: collection.into(),
+                        document_id: doc_id,
+                        fields_json: super::crdt_gate::row_to_fields_json(row)?,
+                        surrogate,
+                        partial: false,
+                    })
+                } else {
+                    PhysicalPlan::Document(DocumentOp::Upsert {
                         collection: collection.into(),
                         document_id: doc_id,
                         value: value_bytes,
                         on_conflict_updates: on_conflict_values.clone(),
                         surrogate,
-                    }),
+                    })
+                };
+                tasks.push(PhysicalTask {
+                    tenant_id,
+                    vshard_id: vshard,
+                    database_id: ctx.database_id,
+                    plan,
                     post_set_op: PostSetOp::None,
                     txn_id: None,
                 });

@@ -69,6 +69,21 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
         }]);
     }
 
+    // CRDT GATE: a DELETE on a `crdt = true` document collection routes to
+    // `CrdtOp::DocDelete` (tombstone + sparse-store removal). Only a PK-targeted
+    // DELETE is representable; a predicate (non-PK) DELETE is rejected — there is
+    // NO silent fallthrough to a `DocumentOp`, which would bypass CRDT
+    // convergence. Read the flag ONCE, before the PK loop.
+    let is_crdt = super::super::crdt_gate::document_collection_is_crdt(ctx, collection)?;
+    if is_crdt && target_keys.is_empty() {
+        return Err(crate::Error::BadRequest {
+            detail: format!(
+                "predicate (non-primary-key) DELETE on CRDT collection '{collection}' is not \
+                 supported; target rows by primary key"
+            ),
+        });
+    }
+
     // EDGE-BEARING GATE: a PK-equality delete on a schemaless-document
     // collection that carries implicit edges must NOT lower to a static
     // `PointDelete` — that op bypasses the dependent-predicate (OLLP) path
@@ -79,7 +94,8 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
     // collections keep the fast `PointDelete` path below. Reached only for
     // document engines (the KV case returned above); strict/columnar/etc.
     // never set `has_implicit_edges`, so the flag naturally scopes this.
-    if !target_keys.is_empty() && document_collection_is_edge_bearing(ctx, collection)? {
+    if !is_crdt && !target_keys.is_empty() && document_collection_is_edge_bearing(ctx, collection)?
+    {
         let effective_filter = delete_effective_filter(filters, target_keys)?;
         return Ok(vec![PhysicalTask {
             tenant_id,
@@ -109,17 +125,26 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_delete(
                 },
                 None => Surrogate::ZERO,
             };
-            tasks.push(PhysicalTask {
-                tenant_id,
-                vshard_id: vshard,
-                database_id: ctx.database_id,
-                plan: PhysicalPlan::Document(DocumentOp::PointDelete {
+            let plan = if is_crdt {
+                PhysicalPlan::Crdt(CrdtOp::DocDelete {
+                    collection: collection.into(),
+                    document_id: pk_string,
+                    surrogate,
+                })
+            } else {
+                PhysicalPlan::Document(DocumentOp::PointDelete {
                     collection: collection.into(),
                     document_id: pk_string,
                     surrogate,
                     pk_bytes,
                     returning: None,
-                }),
+                })
+            };
+            tasks.push(PhysicalTask {
+                tenant_id,
+                vshard_id: vshard,
+                database_id: ctx.database_id,
+                plan,
                 post_set_op: PostSetOp::None,
                 txn_id: None,
             });
