@@ -11,6 +11,7 @@
 pub mod all_cores;
 pub mod full_scan;
 pub mod gather;
+pub mod owning_core;
 pub mod resolve;
 pub mod streamable;
 

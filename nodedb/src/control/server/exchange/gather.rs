@@ -323,8 +323,8 @@ pub fn gather_all_cores_stream(
 ///
 /// # Single-node mode
 ///
-/// If `state.gateway` is `None` this degenerates to [`gather_all_cores`] with
-/// unchanged behaviour.
+/// If `state.gateway` is `None`, routing is delegated to
+/// [`super::owning_core::gather_single_node`] (same shape-based routing).
 ///
 /// # Cluster mode — single-vShard-homed sources (document, kv, columnar,
 /// timeseries, spatial, vector, text)
@@ -359,8 +359,18 @@ pub async fn gather_all_vshards(
     txn_id: Option<TxnId>,
 ) -> crate::Result<GatherOutcome> {
     let Some(gateway) = state.gateway.get() else {
-        // Single-node: delegate to the local fan-out path unchanged.
-        return gather_all_cores(state, tenant_id, database_id, plan, trace_id, txn_id).await;
+        // Single-node: route by plan shape (cluster-partitioned leaf → broadcast;
+        // single-vShard-homed collection → its one owning core; else broadcast
+        // fallback), mirroring the cluster branch below.
+        return super::owning_core::gather_single_node(
+            state,
+            tenant_id,
+            database_id,
+            plan,
+            trace_id,
+            txn_id,
+        )
+        .await;
     };
 
     if nodedb_physical::physical_plan::plan_contains_cluster_partitioned_leaf(&plan) {
