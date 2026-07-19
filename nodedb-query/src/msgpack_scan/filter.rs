@@ -528,6 +528,43 @@ mod tests {
         assert!(filter("score", "gt", nodedb_types::Value::Integer(80)).matches_binary(&doc));
     }
 
+    #[test]
+    fn timestamp_upper_bound_matches() {
+        let doc = encode(&json!({"t": "2026-07-02T13:00:00.000000Z"}));
+        assert!(
+            filter(
+                "t",
+                "lte",
+                nodedb_types::Value::String("2026-07-02 14:00:00".into())
+            )
+            .matches_binary(&doc)
+        );
+        assert!(
+            filter(
+                "t",
+                "lt",
+                nodedb_types::Value::String("2026-07-02 14:00:00".into())
+            )
+            .matches_binary(&doc)
+        );
+        assert!(
+            filter(
+                "t",
+                "gte",
+                nodedb_types::Value::String("2026-07-02 12:00:00".into())
+            )
+            .matches_binary(&doc)
+        );
+        assert!(
+            filter(
+                "t",
+                "eq",
+                nodedb_types::Value::String("2026-07-02 13:00:00".into())
+            )
+            .matches_binary(&doc)
+        );
+    }
+
     // ── Indexed variant tests ──────────────────────────────────────────
 
     #[test]

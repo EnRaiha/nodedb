@@ -19,7 +19,13 @@ impl Value {
             (Value::Integer(a), Value::Float(b)) => *a as f64 == *b,
             (Value::Float(a), Value::Integer(b)) => *a == *b as f64,
             (Value::Float(a), Value::Float(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
+            (Value::String(a), Value::String(b)) => {
+                a == b
+                    || matches!(
+                        (crate::NdbDateTime::parse(a), crate::NdbDateTime::parse(b)),
+                        (Some(x), Some(y)) if x.micros == y.micros
+                    )
+            }
             // Coercion: number vs string
             (Value::Integer(a), Value::String(s)) => {
                 s.parse::<i64>().is_ok_and(|n| *a == n)
@@ -33,7 +39,10 @@ impl Value {
             (Value::String(s), Value::Float(b)) => s.parse::<f64>().is_ok_and(|n| n == *b),
             // Structural equality on ND cells: same coords and same attrs.
             (Value::ArrayCell(a), Value::ArrayCell(b)) => a == b,
-            _ => false,
+            (a, b) => match (datetime_micros(a), datetime_micros(b)) {
+                (Some(x), Some(y)) => x == y,
+                _ => false,
+            },
         }
     }
 
@@ -78,6 +87,9 @@ impl Value {
         if let (Some(a), Some(b)) = (self_f64, other_f64) {
             return a.partial_cmp(&b).unwrap_or(Ordering::Equal);
         }
+        if let (Some(a), Some(b)) = (datetime_micros(self), datetime_micros(other)) {
+            return a.cmp(&b);
+        }
         let a_str = match self {
             Value::String(s) => s.as_str(),
             _ => return Ordering::Equal,
@@ -87,6 +99,17 @@ impl Value {
             _ => return Ordering::Equal,
         };
         a_str.cmp(b_str)
+    }
+}
+
+/// Epoch micros for a datetime-typed value, or a string that parses as an
+/// ISO-8601 / SQL timestamp. Returns `None` for anything not datetime-like so
+/// ordinary strings keep lexicographic ordering.
+fn datetime_micros(v: &Value) -> Option<i64> {
+    match v {
+        Value::NaiveDateTime(dt) | Value::DateTime(dt) => Some(dt.micros),
+        Value::String(s) => crate::NdbDateTime::parse(s).map(|dt| dt.micros),
+        _ => None,
     }
 }
 
@@ -158,6 +181,40 @@ mod tests {
         );
         assert_eq!(
             Value::String("z".into()).cmp_coerced(&Value::String("a".into())),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn cmp_coerced_timestamp_mismatched_string_formats() {
+        use std::cmp::Ordering;
+        let stored = Value::String("2026-07-02T13:00:00.000000Z".into());
+        assert_eq!(
+            stored.cmp_coerced(&Value::String("2026-07-02 14:00:00".into())),
+            Ordering::Less
+        );
+        assert_eq!(
+            stored.cmp_coerced(&Value::String("2026-07-02 12:00:00".into())),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn eq_coerced_timestamp_mismatched_string_formats() {
+        let stored = Value::String("2026-07-02T13:00:00.000000Z".into());
+        assert!(stored.eq_coerced(&Value::String("2026-07-02 13:00:00".into())));
+    }
+
+    #[test]
+    fn cmp_coerced_ordinary_strings_stay_lexicographic() {
+        use std::cmp::Ordering;
+        // Non-timestamp strings must NOT be datetime-coerced.
+        assert_eq!(
+            Value::String("apple".into()).cmp_coerced(&Value::String("banana".into())),
+            Ordering::Less
+        );
+        assert_eq!(
+            Value::String("zed".into()).cmp_coerced(&Value::String("abc".into())),
             Ordering::Greater
         );
     }
