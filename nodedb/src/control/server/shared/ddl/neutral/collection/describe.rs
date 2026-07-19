@@ -72,14 +72,28 @@ pub fn describe_collection(
 
     let mut rows = Vec::new();
 
-    // Always has an 'id' field.
-    push_describe_row(&mut rows, "id", "TEXT", "false");
-
+    // Synthesize the implicit 'id' field only when the collection does not
+    // already declare one — a strict collection created with an explicit
+    // `id ... PRIMARY KEY` stores `id` in `coll.fields`, so emitting the
+    // synthetic row too would list `id` twice with contradictory nullability.
+    let declares_id = coll
+        .fields
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("id"));
+    if !declares_id {
+        push_describe_row(&mut rows, "id", "TEXT", "false");
+    }
     if coll.fields.is_empty() {
         push_describe_row(&mut rows, "document", "JSON", "true");
     } else {
         for (field_name, field_type) in &coll.fields {
-            push_describe_row(&mut rows, field_name, field_type, "true");
+            let upper = field_type.to_uppercase();
+            let nullable = if upper.contains("PRIMARY KEY") || upper.contains("NOT NULL") {
+                "false"
+            } else {
+                "true"
+            };
+            push_describe_row(&mut rows, field_name, field_type, nullable);
         }
     }
 

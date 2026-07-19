@@ -84,6 +84,52 @@ async fn describe_collection_finds_it_in_non_default_database() {
     );
 }
 
+/// Regression for issue #173: `DESCRIBE` on a strict collection created with an
+/// explicit `id ... PRIMARY KEY` listed the `id` field twice — once from the
+/// unconditional synthetic `id` row and once from iterating the declared
+/// `coll.fields` — with contradictory nullability. The synthetic row is now
+/// emitted only when the collection does not already declare an `id`, and each
+/// declared field's nullability is derived from its type modifiers.
+#[tokio::test]
+async fn describe_strict_does_not_duplicate_explicit_id() {
+    let server = TestServer::start().await;
+
+    query_ok(
+        &server,
+        "CREATE COLLECTION desc_repro (id TEXT PRIMARY KEY, label TEXT) \
+         WITH (engine='document_strict')",
+    )
+    .await;
+
+    let describe_rows = server
+        .client
+        .simple_query("DESCRIBE desc_repro")
+        .await
+        .unwrap_or_else(|e| panic!("DESCRIBE desc_repro must succeed: {e}"));
+
+    let id_rows: Vec<&tokio_postgres::SimpleQueryRow> = describe_rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) if row.get("field") == Some("id") => {
+                Some(row)
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        id_rows.len(),
+        1,
+        "DESCRIBE must list the explicit `id` PK field exactly once (pre-fix: twice), \
+         got: {describe_rows:?}"
+    );
+    assert_eq!(
+        id_rows[0].get("nullable"),
+        Some("false"),
+        "the `id` PRIMARY KEY field must be non-nullable, got: {describe_rows:?}"
+    );
+}
+
 /// `SHOW COLLECTIONS` in a non-default database must list collections
 /// created in that database.
 ///
