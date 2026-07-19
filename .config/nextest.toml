@@ -58,28 +58,55 @@ slow-timeout = { period = "30s", terminate-after = 6 }
 # row and immediately kills the process, so the default 30s × 4 = 120s ceiling
 # is too tight to distinguish "slow" from "hung". Only the ceiling moves — the
 # in-test truncation wait is bounded separately and fails on its own.
-# Settings are resolved per-key by first match, so the group/threads settings
-# from the override below still apply to this binary.
+#
+# These are also the heaviest real-server tests, so they get their OWN group
+# ('server-process-serial', max-threads = 1) rather than the shared
+# 'server-process' group (max-threads = 2): running two of them at once makes
+# each contend for disk/CPU and creep toward the ceiling above, worst on a
+# small runner. Serializing just these keeps each one fast while the lighter
+# crash/shutdown tests still parallelize. They still overlap the rest of the
+# suite (different group), so this is NOT the old whole-suite eviction.
+# Settings are resolved per-key by first match, so this test-group wins over the
+# general server-process override below for this binary.
 [[profile.default.overrides]]
 filter = 'binary(crash_wal_truncation)'
+test-group = 'server-process-serial'
 slow-timeout = { period = "30s", terminate-after = 8 }
 
 # Tests that spawn REAL `nodedb` server OS processes (crash-recovery,
 # startup-failure, shutdown lifecycle). Each brings up a full Data Plane
 # (per-core threads, jemalloc arenas, listeners); running several at once
 # exhausts ports / connections and causes spurious `ConnectionRefused`.
-# Serialize them like the cluster group so at most one runs at a time.
+#
+# `test-group = 'server-process'` caps concurrency (see `[test-groups]` below)
+# so only a bounded number of these run at once. Port safety does not depend on
+# that cap: the harness picks ephemeral (OS-assigned) ports and a private
+# tempdir per instance, so any two can run side by side without colliding.
+#
+# We deliberately do NOT set `threads-required = 'num-test-threads'` here
+# (unlike the cluster group). That flag would make a running server test EVICT
+# the entire rest of the suite (every other test idles every other core for the
+# full duration of each server test), a large serial tail in stage 1. These are
+# single-node, ephemeral-port servers: the cheap in-process unit tests run
+# alongside them without stealing ports, and single-node boot is fast enough
+# that readiness does not need every core free.
 [[profile.default.overrides]]
-filter = 'binary(crash_recovery) | binary(crash_recovery_overlays) | binary(crash_recovery_analytics) | binary(crash_wal_truncation) | binary(startup_failure) | binary(shutdown_in_flight) | binary(shutdown_budget) | binary(shutdown_abort_offender) | binary(shutdown_idempotent)'
+filter = 'binary(crash_recovery) | binary(crash_recovery_overlays) | binary(crash_recovery_analytics) | binary(startup_failure) | binary(shutdown_in_flight) | binary(shutdown_budget) | binary(shutdown_abort_offender) | binary(shutdown_idempotent)'
 test-group = 'server-process'
-# Claim every slot so each real-server test runs strictly ALONE — no other
-# server-spawning test (in-process or OS-process) runs alongside to steal
-# ports/CPU and cause spurious connection failures.
-threads-required = 'num-test-threads'
 
 [test-groups]
 cluster = { max-threads = 1 }
-server-process = { max-threads = 1 }
+# Up to 2 real-server tests concurrently. Each picks ephemeral (OS-assigned)
+# ports + a private tempdir, so two running side by side never collide on
+# ports/files; 2 single-core servers fit any CI runner, and CI `retries`
+# cover the rare ephemeral-port reuse race. This shortens the serialized
+# server-process tail without reintroducing the port exhaustion the old full
+# serialization guarded against.
+server-process = { max-threads = 2 }
+# The heaviest real-server tests (WAL-truncation), serialized so two never
+# contend and creep toward their timeout ceiling. Still overlaps the rest of
+# the suite — this only prevents the heavy tests from doubling up on each other.
+server-process-serial = { max-threads = 1 }
 
 [profile.ci]
 # CI inherits the default profile (cluster group, threads-required,
