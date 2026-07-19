@@ -89,6 +89,25 @@ macro_rules! impl_scan_search_arms_for_convert_visitor {
             )
         }
 
+        fn sparse_search(
+            &mut self,
+            collection: &str,
+            field: &str,
+            query_entries: &[(u32, f32)],
+            top_k: usize,
+        ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+            super::super::scan::convert_sparse_search(
+                super::super::scan_params::SparseSearchParams {
+                    collection,
+                    field,
+                    query_entries,
+                    top_k: &top_k,
+                    tenant_id: self.tenant_id,
+                    database_id: self.ctx.database_id,
+                },
+            )
+        }
+
         fn text_search(
             &mut self,
             collection: &str,

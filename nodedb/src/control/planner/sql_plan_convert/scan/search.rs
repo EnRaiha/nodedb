@@ -8,7 +8,9 @@ use crate::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::*;
 
 use super::super::filter::serialize_filters;
-use super::super::scan_params::{HybridSearchParams, HybridSearchTripleParams, VectorSearchParams};
+use super::super::scan_params::{
+    HybridSearchParams, HybridSearchTripleParams, SparseSearchParams, VectorSearchParams,
+};
 use super::super::value::sql_value_to_nodedb_value as sql_value_to_value;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -50,6 +52,27 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_vector_search(
             ann_options,
             skip_payload_fetch: p.skip_payload_fetch,
             payload_filters,
+        }),
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    }])
+}
+
+pub(in crate::control::planner::sql_plan_convert) fn convert_sparse_search(
+    p: SparseSearchParams<'_>,
+) -> crate::Result<Vec<PhysicalTask>> {
+    let coll_qualified = super::super::convert::db_qualified(p.database_id, p.collection);
+    let collection = coll_qualified.as_str();
+    let vshard = VShardId::from_collection_in_database(p.database_id, collection);
+    Ok(vec![PhysicalTask {
+        tenant_id: p.tenant_id,
+        vshard_id: vshard,
+        database_id: p.database_id,
+        plan: PhysicalPlan::Vector(VectorOp::SparseSearch {
+            collection: collection.into(),
+            field_name: p.field.to_string(),
+            query_entries: p.query_entries.to_vec(),
+            top_k: *p.top_k,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

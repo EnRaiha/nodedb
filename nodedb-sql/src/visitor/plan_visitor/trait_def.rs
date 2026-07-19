@@ -161,6 +161,15 @@ pub trait PlanVisitor {
         ef_search: usize,
     ) -> Result<Self::Output, Self::Error>;
 
+    /// Handle [`SqlPlan::SparseSearch`].
+    fn sparse_search(
+        &mut self,
+        collection: &str,
+        field: &str,
+        query_entries: &[(u32, f32)],
+        top_k: usize,
+    ) -> Result<Self::Output, Self::Error>;
+
     /// Handle [`SqlPlan::TextSearch`].
     fn text_search(
         &mut self,

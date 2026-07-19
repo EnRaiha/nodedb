@@ -279,6 +279,13 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             ef_search,
             projection: _,
         } => visitor.multi_vector_search(collection, query_vector, *top_k, *ef_search),
+        SqlPlan::SparseSearch {
+            collection,
+            field,
+            query_entries,
+            top_k,
+            projection: _,
+        } => visitor.sparse_search(collection, field, query_entries, *top_k),
         SqlPlan::TextSearch {
             collection,
             query,

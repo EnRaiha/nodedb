@@ -34,6 +34,9 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Crdt(CrdtOp::GetPolicy { .. }) => PlanKind::SingleDocument,
 
         PhysicalPlan::Vector(VectorOp::Search { .. })
+        | PhysicalPlan::Vector(VectorOp::MultiSearch { .. })
+        | PhysicalPlan::Vector(VectorOp::MultiVectorScoreSearch { .. })
+        | PhysicalPlan::Vector(VectorOp::SparseSearch { .. })
         | PhysicalPlan::Document(DocumentOp::RangeScan { .. })
         | PhysicalPlan::Graph(GraphOp::Hop { .. })
         | PhysicalPlan::Graph(GraphOp::Neighbors { .. })
@@ -141,12 +144,30 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
             PlanKind::SingleDocument
         }
 
+        // Vector write / config ops carry no row payload to shape — they
+        // return an affected-count or status. Enumerated explicitly (not via
+        // a `Vector(_)` wildcard) so a future *read* op like `SparseSearch`
+        // cannot silently fall through to `Execution` and strand its hits.
+        PhysicalPlan::Vector(VectorOp::Insert { .. })
+        | PhysicalPlan::Vector(VectorOp::BatchInsert { .. })
+        | PhysicalPlan::Vector(VectorOp::Delete { .. })
+        | PhysicalPlan::Vector(VectorOp::DeleteBySurrogate { .. })
+        | PhysicalPlan::Vector(VectorOp::SetParams { .. })
+        | PhysicalPlan::Vector(VectorOp::QueryStats { .. })
+        | PhysicalPlan::Vector(VectorOp::Seal { .. })
+        | PhysicalPlan::Vector(VectorOp::CompactIndex { .. })
+        | PhysicalPlan::Vector(VectorOp::Rebuild { .. })
+        | PhysicalPlan::Vector(VectorOp::SparseInsert { .. })
+        | PhysicalPlan::Vector(VectorOp::SparseDelete { .. })
+        | PhysicalPlan::Vector(VectorOp::MultiVectorInsert { .. })
+        | PhysicalPlan::Vector(VectorOp::MultiVectorDelete { .. })
+        | PhysicalPlan::Vector(VectorOp::DirectUpsert { .. }) => PlanKind::Execution,
+
         // Default: opaque execution result. The specific arms above take
         // precedence; these inner wildcards catch every unmatched op of each
         // engine plus the engines with no arms here (Crdt, Meta, ClusterArray).
         // Exhaustive so a new PhysicalPlan variant forces a decision.
         PhysicalPlan::Document(_)
-        | PhysicalPlan::Vector(_)
         | PhysicalPlan::Graph(_)
         | PhysicalPlan::Kv(_)
         | PhysicalPlan::Columnar(_)

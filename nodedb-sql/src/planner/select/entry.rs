@@ -395,6 +395,16 @@ fn apply_limit(mut plan: SqlPlan, limit_clause: &Option<ast::LimitClause>) -> Sq
             // truncated, so we must NOT substitute a default row cap here.
             *l = limit_val;
         }
+        SqlPlan::SparseSearch {
+            top_k: ref mut k, ..
+        } => {
+            // `SparseSearch` returns the highest-scoring `top_k` documents, so
+            // the query's `LIMIT N` is the top-k bound. Without this the plan
+            // carries the trigger's fallback default instead of the user's N.
+            if let Some(lv) = limit_val {
+                *k = lv;
+            }
+        }
         _ => {}
     }
     plan

@@ -271,6 +271,32 @@ fn vector_distance_two_args_produces_default_ann_options() {
 }
 
 #[test]
+fn order_by_sparse_score_desc_routes_to_sparse_search() {
+    // `ORDER BY sparse_score(field, '{dim: weight, ...}') DESC LIMIT k` must
+    // route to `SqlPlan::SparseSearch` exactly as `vector_distance(...)` routes
+    // to `SqlPlan::VectorSearch`. The query literal is parsed into sorted
+    // `(dimension, weight)` entries and `top_k` tracks the LIMIT.
+    let plan = plan_select_sql(
+        "SELECT id FROM embeddings \
+         ORDER BY sparse_score(terms, '{3: 1.0, 7: 0.5}') DESC LIMIT 5",
+    );
+    let SqlPlan::SparseSearch {
+        collection,
+        field,
+        query_entries,
+        top_k,
+        ..
+    } = plan
+    else {
+        panic!("expected SparseSearch plan");
+    };
+    assert_eq!(collection, "embeddings");
+    assert_eq!(field, "terms");
+    assert_eq!(top_k, 5);
+    assert_eq!(query_entries, vec![(3, 1.0), (7, 0.5)]);
+}
+
+#[test]
 fn vector_distance_named_args_parses_ann_options() {
     let plan = plan_select_sql(
         "SELECT id FROM embeddings ORDER BY vector_distance(embedding, [1.0, 0.0], quantization => 'rabitq', oversample => 3) LIMIT 5",

@@ -53,6 +53,10 @@ pub enum SearchTrigger {
     None,
     VectorSearch,
     MultiVectorSearch,
+    /// Sparse-vector inverted-index search: `sparse_score(field, '{dim: weight, ...}')`
+    /// in ORDER BY routes to `SqlPlan::SparseSearch` and lowers to
+    /// `VectorOp::SparseSearch` (dot-product top-k over the sparse index).
+    SparseSearch,
     TextSearch,
     HybridSearch,
     TextMatch,

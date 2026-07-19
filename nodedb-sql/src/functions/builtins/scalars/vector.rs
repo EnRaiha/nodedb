@@ -61,7 +61,7 @@ pub(super) fn vector_functions() -> Vec<FunctionMeta> {
             Scalar,
             3,
             3,
-            no_trigger(),
+            SearchTrigger::SparseSearch,
             Some(ColumnType::Float64),
             arg_types::SPARSE_SCORE_ARGS,
         ),

@@ -273,6 +273,11 @@ pub fn build_output_schema<C: SqlCatalog>(
             projection,
             ..
         }
+        | SqlPlan::SparseSearch {
+            collection,
+            projection,
+            ..
+        }
         | SqlPlan::TextSearch {
             collection,
             projection,

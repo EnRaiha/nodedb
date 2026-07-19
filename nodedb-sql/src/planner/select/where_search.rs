@@ -139,7 +139,12 @@ fn dispatch_trigger(
         // these surfaces. The match is exhaustive so a new trigger added to
         // the enum will fail this file at compile time, forcing a routing
         // decision rather than another silent fall-through.
-        SearchTrigger::HybridSearch
+        // `sparse_score(...)` is an ORDER BY similarity surface (canonical form
+        // `ORDER BY sparse_score(field, '{...}') DESC LIMIT k`); it has no
+        // WHERE-clause shape, so fall through to scalar evaluation like the
+        // other non-WHERE search triggers.
+        SearchTrigger::SparseSearch
+        | SearchTrigger::HybridSearch
         | SearchTrigger::TextSearch
         | SearchTrigger::TimeBucket
         | SearchTrigger::ArraySlice

@@ -322,6 +322,22 @@ pub enum SqlPlan {
         /// Resolved SELECT target list, for output-schema derivation.
         projection: Vec<Projection>,
     },
+    /// Sparse-vector inverted-index search.
+    ///
+    /// Produced by the planner when the leading ORDER BY expression is
+    /// `sparse_score(field, '{dim: weight, ...}')`. The query literal is
+    /// parsed into `(dimension, weight)` entries at plan time. The convert
+    /// layer lowers this to `VectorOp::SparseSearch`, which returns the
+    /// `top_k` documents with the highest dot-product score — matching the
+    /// `DESC` (similarity) ordering the SQL author wrote.
+    SparseSearch {
+        collection: String,
+        field: String,
+        query_entries: Vec<(u32, f32)>,
+        top_k: usize,
+        /// Resolved SELECT target list, for output-schema derivation.
+        projection: Vec<Projection>,
+    },
     TextSearch {
         collection: String,
         /// Structured FTS query.  Use `FtsQuery::Plain { text, fuzzy }` for

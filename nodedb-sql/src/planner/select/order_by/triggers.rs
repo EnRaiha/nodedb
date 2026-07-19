@@ -17,7 +17,7 @@ use super::super::helpers::{
 use super::aliases::function_call_name;
 use super::hybrid::{no_args_rrf_score_error, plan_hybrid_from_sort};
 use super::vector_join::extract_vector_join_target;
-use crate::error::Result;
+use crate::error::{Result, SqlError};
 use crate::functions::registry::{FunctionRegistry, SearchTrigger};
 use crate::types::*;
 
@@ -91,6 +91,35 @@ pub(super) fn try_extract_sort_search(
                 // fields after `apply_order_by` returns.
                 skip_payload_fetch: false,
                 payload_filters: Vec::new(),
+                projection: source_projection(plan),
+            }))
+        }
+        SearchTrigger::SparseSearch => {
+            if args.len() < 2 {
+                return Ok(None);
+            }
+            let field = extract_column_name(&args[0])?;
+            let literal = extract_string_literal(&args[1])?;
+            // Parse `'{dim: weight, ...}'` into sorted `(dimension, weight)`
+            // entries. `top_k` is applied later by `apply_limit` from the
+            // query's `LIMIT` clause (mirrors VectorSearch — plan_select seeds
+            // `Scan::limit` as None, so this default is only a fallback).
+            let query_entries = nodedb_types::SparseVector::parse_literal(&literal)
+                .map_err(|e| SqlError::InvalidFunction {
+                    detail: format!("invalid sparse query vector in sparse_score(...): {e}"),
+                })?
+                .entries()
+                .to_vec();
+            let top_k = match plan {
+                SqlPlan::Scan { limit, .. } => limit.unwrap_or(10),
+                SqlPlan::Join { limit, .. } => limit.unwrap_or(10),
+                _ => 10,
+            };
+            Ok(Some(SqlPlan::SparseSearch {
+                collection,
+                field,
+                query_entries,
+                top_k,
                 projection: source_projection(plan),
             }))
         }

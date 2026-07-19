@@ -107,6 +107,17 @@ pub(super) struct VectorSearchParams<'a> {
     pub payload_filters: &'a [nodedb_sql::types::SqlPayloadAtom],
 }
 
+/// Parameters for `convert_sparse_search`.
+pub(super) struct SparseSearchParams<'a> {
+    pub collection: &'a str,
+    pub field: &'a str,
+    /// Query sparse vector as `(dimension, weight)` entries, parsed at plan time.
+    pub query_entries: &'a [(u32, f32)],
+    pub top_k: &'a usize,
+    pub tenant_id: TenantId,
+    pub database_id: crate::types::DatabaseId,
+}
+
 /// Parameters for `convert_hybrid_search`.
 pub(super) struct HybridSearchParams<'a> {
     pub collection: &'a str,

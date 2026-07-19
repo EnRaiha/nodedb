@@ -53,6 +53,9 @@ pub fn translate_search_response(
         ),
         PhysicalPlan::Vector(VectorOp::MultiVectorScoreSearch {
             collection, top_k, ..
+        })
+        | PhysicalPlan::Vector(VectorOp::SparseSearch {
+            collection, top_k, ..
         }) => translate_vector_search_payload(
             payload,
             state,
