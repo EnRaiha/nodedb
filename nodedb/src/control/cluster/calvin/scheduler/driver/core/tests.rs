@@ -231,6 +231,7 @@ async fn in_flight_guard_skips_replayed_txn_already_in_flight() {
         super::super::types::BlockedTxn {
             txn: txn.clone(),
             keys: BTreeSet::new(),
+            // no-determinism: test-only blocked_at timestamp for a fabricated BlockedTxn fixture.
             blocked_at: std::time::Instant::now(),
         },
     );
@@ -314,6 +315,7 @@ fn ensure_sequencer_leader(scheduler: &Scheduler) {
     // Force the election timeout to fire on the next tick so the single voter
     // campaigns and wins immediately (majority = itself).
     if let Some(node) = mr.groups_mut().get_mut(&SEQUENCER_GROUP_ID) {
+        // no-determinism: test-only forced election deadline so the single voter campaigns immediately.
         node.election_deadline_override(Instant::now() - Duration::from_millis(1));
     }
     for _ in 0..20 {

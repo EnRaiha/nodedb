@@ -62,5 +62,6 @@ pub struct SpawnCoreParams<'a> {
     /// WAL — which would otherwise let a just-restarted node serve half-rebuilt
     /// results. Dropped without firing if the core panics during open/replay,
     /// which surfaces to boot as a failed readiness gate.
+    // no-plane-separation: passive one-shot readiness Sender, fired once (`send(())`, synchronous and runtime-free) at the end of WAL replay to signal Boot; no tokio runtime or tasks run in the Data Plane.
     pub replay_done: tokio::sync::oneshot::Sender<()>,
 }

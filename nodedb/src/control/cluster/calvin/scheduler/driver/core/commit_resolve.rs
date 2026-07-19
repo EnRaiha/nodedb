@@ -87,6 +87,7 @@ impl Scheduler {
         match self.pending.get_mut(&txn_id) {
             Some(pending) => {
                 pending.commit_state = Some(CommitState::AwaitingVerdict);
+                // no-determinism: local stall-warning deadline only; the global replicated verdict, not this wall-clock, decides commit/abort.
                 pending.verdict_deadline = Some(Instant::now() + self.config.verdict_stall_warn());
             }
             None => return,
@@ -210,6 +211,7 @@ impl Scheduler {
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn check_awaiting_verdict_stalls(
         &mut self,
     ) {
+        // no-determinism: stall-detection clock drives warnings/metrics only; this path holds locks and never aborts, so it cannot affect the replicated outcome.
         let now = Instant::now();
         let stalled: Vec<TxnId> = self
             .pending
