@@ -57,7 +57,11 @@ pub async fn dispatch_register_if_needed(
         crate::control::server::shared::ddl::schema_validation::parse_fields_clause(parts);
     let mut indexes = derive_auto_indexes(fields.iter().map(|(n, _)| n.as_str()));
     extend_with_catalog_indexes(&mut indexes, &coll);
-    let _ = sql; // Reserved for future CRDT detection from SQL.
+    // `sql` is unused on this leader-side path: index derivation reads
+    // `parts`/the catalog row directly, and the `crdt` flag already
+    // travels on `StoredCollection` (set at CREATE time from `WITH
+    // (crdt=...)`), so no SQL re-parsing is needed here.
+    let _ = sql;
     dispatch_register_from_stored_inner(state, tenant_id, &coll, indexes).await
 }
 
@@ -244,7 +248,7 @@ pub(crate) fn build_doc_config_from_stored(
     };
 
     let mut config = crate::engine::document::store::CollectionConfig::new(&name);
-    config.crdt_enabled = false;
+    config.crdt_enabled = coll.crdt;
     config.storage_mode = storage_mode;
     config.enforcement = enforcement;
     config.bitemporal = coll.bitemporal;

@@ -35,6 +35,9 @@ pub struct CollectionDescriptor {
     /// Whether the collection tracks system-time + valid-time versions.
     #[msgpack(default)]
     pub bitemporal: bool,
+    /// Whether this collection uses CRDT (Loro) storage for offline-first sync.
+    #[msgpack(default)]
+    pub crdt: bool,
     /// Lightweight field type hints, e.g. `[("email", "string")]`.
     #[msgpack(default)]
     pub fields: Vec<(String, String)>,
@@ -83,6 +86,7 @@ mod tests {
             name: "users".into(),
             collection_type: CollectionType::document(),
             bitemporal: true,
+            crdt: true,
             fields: vec![("email".into(), "string".into())],
             primary: PrimaryEngine::Document,
             vector_primary: None,
@@ -105,6 +109,7 @@ mod tests {
         assert_eq!(decoded_msg.descriptor.name, "users");
         assert_eq!(decoded_msg.descriptor.tenant_id, 7);
         assert!(decoded_msg.descriptor.bitemporal);
+        assert!(decoded_msg.descriptor.crdt);
         assert_eq!(decoded_msg.descriptor.primary, PrimaryEngine::Document);
     }
 

@@ -146,6 +146,12 @@ pub struct StoredCollection {
     /// other engines ignore it.
     #[msgpack(default)]
     pub bitemporal: bool,
+    /// Whether this collection uses CRDT (Loro) storage for offline-first
+    /// sync. Document-engine-only: `CREATE COLLECTION ... WITH (crdt=true)`
+    /// is rejected at DDL time for any other collection type, so a `true`
+    /// value here always implies a document collection.
+    #[msgpack(default)]
+    pub crdt: bool,
     /// Durable CRDT conflict-resolution policy (JSON-serialized
     /// `nodedb_crdt::policy::CollectionPolicy`), set via
     /// `ALTER COLLECTION ... SET ON CONFLICT ... FOR ...`. `None` = no
@@ -292,6 +298,7 @@ impl StoredCollection {
             materialized_sums: Vec::new(),
             lvc_enabled: false,
             bitemporal: false,
+            crdt: false,
             conflict_policy: None,
             permission_tree_def: None,
             indexes: Vec::new(),

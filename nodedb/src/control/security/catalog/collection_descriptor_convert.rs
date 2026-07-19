@@ -5,7 +5,7 @@
 //! `CREATE COLLECTION` and CRDT sync produce the same descriptor shape.
 //!
 //! `From<&StoredCollection> for CollectionDescriptor` is the emit side: it
-//! reads only the 11 fields the descriptor carries, dropping ownership,
+//! reads only the 12 fields the descriptor carries, dropping ownership,
 //! timestamps, and enforcement/index/constraint state that never travels
 //! over sync. [`stored_from_descriptor`] is the receive side: it starts
 //! from [`StoredCollection::new`] (which sets sane enforcement defaults
@@ -24,6 +24,7 @@ impl From<&StoredCollection> for CollectionDescriptor {
             name: stored.name.clone(),
             collection_type: stored.collection_type.clone(),
             bitemporal: stored.bitemporal,
+            crdt: stored.crdt,
             fields: stored.fields.clone(),
             primary: stored.primary,
             vector_primary: stored.vector_primary.clone(),
@@ -49,6 +50,7 @@ pub(crate) fn stored_from_descriptor(
     stored.database_id = descriptor.database_id;
     stored.collection_type = descriptor.collection_type.clone();
     stored.bitemporal = descriptor.bitemporal;
+    stored.crdt = descriptor.crdt;
     stored.fields = descriptor.fields.clone();
     stored.primary = descriptor.primary;
     stored.vector_primary = descriptor.vector_primary.clone();
@@ -73,6 +75,7 @@ mod tests {
         assert_eq!(back.database_id, stored.database_id);
         assert_eq!(back.collection_type, stored.collection_type);
         assert_eq!(back.bitemporal, stored.bitemporal);
+        assert_eq!(back.crdt, stored.crdt);
         assert_eq!(back.fields, stored.fields);
         assert_eq!(back.primary, stored.primary);
         assert_eq!(back.vector_primary, stored.vector_primary);
@@ -87,6 +90,7 @@ mod tests {
             PartitionStrategy::default_for_collection_type(&collection_type);
         stored.collection_type = collection_type;
         stored.bitemporal = true;
+        stored.crdt = true;
         stored.declared_primary_key = Some("id".to_string());
         stored.descriptor_version = 5;
         stored
@@ -186,6 +190,16 @@ mod tests {
         assert!(descriptor.bitemporal);
         let back = stored_from_descriptor(&descriptor, "sync");
         assert!(back.bitemporal);
+    }
+
+    #[test]
+    fn crdt_flag_round_trips() {
+        let mut stored = base_stored("synced_docs", CollectionType::document());
+        stored.crdt = true;
+        let descriptor = CollectionDescriptor::from(&stored);
+        assert!(descriptor.crdt);
+        let back = stored_from_descriptor(&descriptor, "sync");
+        assert!(back.crdt);
     }
 
     #[test]

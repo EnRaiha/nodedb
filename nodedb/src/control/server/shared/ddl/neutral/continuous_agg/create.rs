@@ -209,6 +209,7 @@ pub async fn create_continuous_aggregate(
             materialized_sums: Vec::new(),
             lvc_enabled: false,
             bitemporal: false,
+            crdt: false,
             permission_tree_def: None,
             indexes: Vec::new(),
             size_bytes_estimate: 0,

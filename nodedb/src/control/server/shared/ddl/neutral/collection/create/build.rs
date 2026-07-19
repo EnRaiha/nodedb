@@ -37,6 +37,43 @@ fn err(sqlstate: &str, message: String) -> DdlError {
     }
 }
 
+/// Parse a `WITH (crdt=...)` option value as a boolean, accepting
+/// `"true"`/`"false"` case-insensitively. Any other value is a
+/// user error surfaced as a typed DDL error (SQLSTATE 42601).
+fn parse_crdt_flag(value: &str) -> Result<bool, DdlError> {
+    match value.trim() {
+        v if v.eq_ignore_ascii_case("true") => Ok(true),
+        v if v.eq_ignore_ascii_case("false") => Ok(false),
+        other => Err(err(
+            "42601",
+            format!("invalid value for WITH (crdt=...): '{other}'; expected 'true' or 'false'"),
+        )),
+    }
+}
+
+/// Resolve the CRDT storage flag from the `WITH (...)` option list.
+///
+/// A missing `crdt` option defaults to `false`. CRDT (Loro) storage is a
+/// document-engine capability, so `crdt=true` is rejected with SQLSTATE
+/// 42601 on any non-document collection rather than persisting a flag no
+/// engine would honor.
+fn resolve_crdt_flag(
+    options: &[(String, String)],
+    collection_type: &nodedb_types::CollectionType,
+) -> Result<bool, DdlError> {
+    let crdt = match options.iter().find(|(k, _)| k.eq_ignore_ascii_case("crdt")) {
+        Some((_, v)) => parse_crdt_flag(v)?,
+        None => false,
+    };
+    if crdt && !matches!(collection_type, nodedb_types::CollectionType::Document(_)) {
+        return Err(err(
+            "42601",
+            "WITH (crdt=true) is only supported on document collections".to_string(),
+        ));
+    }
+    Ok(crdt)
+}
+
 /// Per-surface configuration. The fields are the entire surface-level
 /// difference between `CREATE COLLECTION` and `CREATE TABLE`.
 pub struct Variant {
@@ -172,6 +209,8 @@ pub async fn build_and_persist(
     if hash_chain && !append_only {
         return Err(err("42601", "HASH_CHAIN requires APPEND_ONLY".to_string()));
     }
+
+    let crdt = resolve_crdt_flag(options, &collection_type)?;
     let balanced =
         parse_balanced_clause_from_raw(balanced_raw.unwrap_or("")).map_err(|e| err("42601", e))?;
 
@@ -217,6 +256,7 @@ pub async fn build_and_persist(
         materialized_sums: Vec::new(),
         lvc_enabled: false,
         bitemporal,
+        crdt,
         permission_tree_def: None,
         indexes: Vec::new(),
         size_bytes_estimate: 0,
@@ -388,6 +428,47 @@ fn create_serial_sequences(
 mod tests {
     //! Collection name validation tests. Relocated verbatim from the pgwire
     //! `pgwire::ddl::collection::create::tests` module (now deleted).
+
+    use super::resolve_crdt_flag;
+
+    fn opts(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn crdt_true_on_document_collection_resolves_true() {
+        let options = opts(&[("crdt", "true")]);
+        let flag = resolve_crdt_flag(&options, &nodedb_types::CollectionType::document())
+            .expect("crdt=true on a document collection must resolve");
+        assert!(flag);
+    }
+
+    #[test]
+    fn crdt_true_on_non_document_collection_rejected() {
+        let options = opts(&[("crdt", "true")]);
+        let err = resolve_crdt_flag(&options, &nodedb_types::CollectionType::columnar())
+            .expect_err("crdt=true on a non-document collection must be rejected");
+        assert_eq!(err.sqlstate, "42601");
+    }
+
+    #[test]
+    fn crdt_garbage_value_rejected() {
+        let options = opts(&[("crdt", "maybe")]);
+        let err = resolve_crdt_flag(&options, &nodedb_types::CollectionType::document())
+            .expect_err("a non-boolean crdt value must be rejected");
+        assert_eq!(err.sqlstate, "42601");
+    }
+
+    #[test]
+    fn crdt_absent_defaults_false() {
+        let options = opts(&[("engine", "kv")]);
+        let flag = resolve_crdt_flag(&options, &nodedb_types::CollectionType::document())
+            .expect("absent crdt option must resolve to a default");
+        assert!(!flag);
+    }
 
     /// Collection name validation: allowed chars are `[a-zA-Z0-9_-]`.
     fn validate_name(name: &str) -> bool {
