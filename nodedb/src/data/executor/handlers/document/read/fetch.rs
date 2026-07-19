@@ -129,8 +129,9 @@ impl CoreLoop {
                 // normalized to MessagePack and gets the synthetic `_ts_*`
                 // temporal columns injected BEFORE the shared downstream runs,
                 // so a user can `SELECT` / `ORDER BY` / project on them.
-                let predicate =
-                    |body: &[u8]| filter_predicates.iter().all(|f| f.matches_binary(body));
+                let predicate = |body: &[u8]| {
+                    matches_with_resolved_schema(strict_schema, filter_predicates, body)
+                };
                 let scan_limit = offset.saturating_add(limit);
                 let raw = self.sparse.versioned_scan_all(
                     task.request.database_id.as_u64(),

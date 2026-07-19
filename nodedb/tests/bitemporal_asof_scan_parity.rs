@@ -167,6 +167,72 @@ async fn asof_audit_null_honours_order_by() {
     );
 }
 
+/// Regression for issue #170: `AS OF SYSTEM TIME NULL` (all-versions audit) with
+/// a `WHERE` predicate on a strict (`document_strict`) collection returned zero
+/// rows. The audit fetch applied the predicate against the raw stored Binary
+/// Tuple body via a MessagePack-only matcher (`matches_binary`), which never
+/// matches a Binary Tuple — so every predicated audit query silently dropped
+/// every version. The fetch now resolves the strict schema before matching
+/// (`matches_with_resolved_schema`), mirroring the `AS OF <cutoff>` arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn asof_audit_null_strict_filters_by_predicate() {
+    let srv = TestServer::start().await;
+
+    srv.exec(
+        "CREATE COLLECTION btp (id STRING PRIMARY KEY, v STRING) \
+         WITH (engine='document_strict', bitemporal=true)",
+    )
+    .await
+    .expect("create strict bitemporal collection");
+
+    srv.exec("INSERT INTO btp (id, v) VALUES ('a', 'one')")
+        .await
+        .expect("insert a=one");
+    srv.exec("UPDATE btp SET v = 'two' WHERE id = 'a'")
+        .await
+        .expect("update a=two");
+    srv.exec("INSERT INTO btp (id, v) VALUES ('b', 'other')")
+        .await
+        .expect("insert b=other");
+
+    // Baseline: unfiltered audit returns every version — 'a' has two (one, two)
+    // and 'b' has one, for three rows total.
+    let all = srv
+        .query_rows("SELECT * FROM btp AS OF SYSTEM TIME NULL")
+        .await
+        .expect("unfiltered audit scan");
+    assert_eq!(
+        all.len(),
+        3,
+        "audit must return all three versions (a x2, b x1), got: {all:?}"
+    );
+
+    // Predicated audit: WHERE id='a' must return both versions of 'a', each with
+    // id='a' and a real synthetic `_ts_system` column. Pre-fix this returned 0.
+    let filtered = srv
+        .query_named_rows("SELECT * FROM btp AS OF SYSTEM TIME NULL WHERE id = 'a'")
+        .await
+        .expect("predicated audit scan");
+    assert_eq!(
+        filtered.len(),
+        2,
+        "WHERE id='a' must return both versions of 'a' (pre-fix: 0), got: {filtered:?}"
+    );
+    for row in &filtered {
+        assert_eq!(
+            row.get("id").map(String::as_str),
+            Some("a"),
+            "every filtered audit row must be id='a', got: {row:?}"
+        );
+        assert!(
+            row.get("_ts_system")
+                .and_then(|s| s.parse::<i64>().ok())
+                .is_some(),
+            "each audit row must carry a real `_ts_system` column, got: {row:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn asof_schemaless_orders_and_computes_like_current() {
     let srv = TestServer::start().await;
