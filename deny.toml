@@ -11,6 +11,9 @@
 
 [graph]
 all-features = true
+# Exclude dev-dependencies from the crate graph (the `check` CLI flag
+# `--exclude-dev` was removed in cargo-deny 0.20; it is config-only now).
+exclude-dev = true
 
 [advisories]
 version = 2

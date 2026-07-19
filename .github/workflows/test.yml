@@ -59,7 +59,7 @@ jobs:
         with:
           tool: cargo-deny
       - name: Dependency audit
-        run: cargo deny check --exclude-dev
+        run: cargo deny check
 
   # Single test job: runs the fast suite first, then the 3-node cluster
   # suite (`nodedb-cluster-tests`) on the same runner. Combining them
