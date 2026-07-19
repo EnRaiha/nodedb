@@ -177,6 +177,88 @@ async fn wal_restart_durability() {
     assert!((v - expected).abs() < 0.01);
 }
 
+/// Regression for #172: a timeseries collection must survive a GRACEFUL
+/// (SIGTERM → final-checkpoint flush) restart with EXACTLY its rows — and stay
+/// stable across a SECOND graceful restart. The two restarts are the crux the
+/// single-restart durability test above cannot see:
+///   * restart 1 exercises the final-checkpoint flush + partition stamp; a
+///     tail-loss drops the most-recent point here.
+///   * restart 2 replays against the partition stamped on restart 1; a stamp
+///     that under-covers the flushed set makes replay re-append the resident
+///     rows, so the survivors come back DOUBLED. Both faces are silent on an
+///     append-only engine, so only the exact count separates them.
+#[tokio::test]
+async fn timeseries_survives_repeated_graceful_restart_172() {
+    let srv = TestServer::start().await;
+    srv.exec(
+        "CREATE COLLECTION ts_172 \
+         COLUMNS (id TEXT, ts BIGINT TIME_KEY, val FLOAT) \
+         WITH (engine='timeseries')",
+    )
+    .await
+    .unwrap();
+
+    // Five distinct WAL records (separate INSERTs) so the last is a real tail
+    // record and any per-record flush/stamp error is observable.
+    const N: usize = 5;
+    for i in 0..N {
+        srv.exec(&format!(
+            "INSERT INTO ts_172 (id, ts, val) VALUES ('p{i}', {ts}, {i}.0)",
+            ts = 1000 + i as u64 * 1000
+        ))
+        .await
+        .unwrap();
+    }
+
+    // Live sanity: all N present before any restart, so any later discrepancy
+    // is recovery, not ingest.
+    let live = srv.query_rows("SELECT id FROM ts_172").await.unwrap();
+    assert_eq!(
+        live.len(),
+        N,
+        "all {N} points must read back pre-restart: {live:?}"
+    );
+
+    // ── Graceful restart 1 ── (runs the final checkpoint flush + stamp)
+    // `open_on_path` returns the live data dir separately (the reopened server
+    // only references the path), so we keep `dir` for the second restart rather
+    // than calling `take_dir()` on the reopened server, which would hand back a
+    // different, empty dir.
+    let (srv, dir) = srv.take_dir();
+    srv.graceful_shutdown().await;
+    let (srv2, dir) = TestServer::open_on_path(dir).await;
+
+    let after_1 = srv2
+        .query_rows("SELECT id FROM ts_172 ORDER BY ts")
+        .await
+        .unwrap();
+    assert_eq!(
+        after_1.len(),
+        N,
+        "after ONE graceful restart, exactly {N} points must remain (fewer = the \
+         tail record was lost; more = replay re-applied an already-flushed \
+         record): {after_1:?}"
+    );
+    assert_eq!(
+        after_1.last().map(|r| r[0].as_str()),
+        Some("p4"),
+        "the most-recent point must survive the first restart, not just the count"
+    );
+
+    // ── Graceful restart 2 ── (the mode that duplicated in #172)
+    srv2.graceful_shutdown().await;
+    let (srv3, _dir) = TestServer::open_on_path(dir).await;
+
+    let after_2 = srv3.query_rows("SELECT id FROM ts_172").await.unwrap();
+    assert_eq!(
+        after_2.len(),
+        N,
+        "after a SECOND graceful restart the count must still be exactly {N}; \
+         more means replay re-appended the partition-resident rows on top of \
+         themselves (#172 duplication): {after_2:?}"
+    );
+}
+
 // ── Continuous-aggregate registration must survive past the in-memory Data ──
 //
 // `CREATE CONTINUOUS AGGREGATE` currently dispatches `RegisterContinuousAggregate`
