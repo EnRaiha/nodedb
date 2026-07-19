@@ -144,6 +144,27 @@ impl CoreLoop {
                 *from_index,
                 *to_index,
             ),
+
+            CrdtOp::DocUpsert {
+                collection,
+                document_id,
+                fields_json,
+                surrogate,
+                partial,
+            } => self.execute_crdt_doc_upsert(
+                task,
+                collection,
+                document_id,
+                fields_json,
+                *surrogate,
+                *partial,
+            ),
+
+            CrdtOp::DocDelete {
+                collection,
+                document_id,
+                surrogate,
+            } => self.execute_crdt_doc_delete(task, collection, document_id, *surrogate),
         }
     }
 }

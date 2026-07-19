@@ -80,6 +80,23 @@ impl CoreLoop {
         surrogate: Surrogate,
         value: &[u8],
     ) {
+        self.materialize_document_write(task, tid, collection, surrogate, value, false);
+    }
+
+    /// Shared body of the sparse-store materialization. `index_text` gates
+    /// inverted BM25 text indexing: `false` on the CRDT sync path (a separate
+    /// `FtsIndex` frame delivers text), `true` for user SQL DML on a
+    /// `crdt='true'` collection (no separate frame — the merged row is the
+    /// only source).
+    pub(super) fn materialize_document_write(
+        &mut self,
+        task: &ExecutionTask,
+        tid: u64,
+        collection: &str,
+        surrogate: Surrogate,
+        value: &[u8],
+        index_text: bool,
+    ) {
         let database_id = task.request.database_id.as_u64();
         let storage_key = surrogate_to_doc_id(surrogate);
 
@@ -100,7 +117,7 @@ impl CoreLoop {
                 document_id: storage_key.as_str(),
                 surrogate,
                 value,
-                index_text: false,
+                index_text,
                 user_roles: &task.request.user_roles,
                 enforce: false,
                 wal_lsn: task.wal_lsn(),

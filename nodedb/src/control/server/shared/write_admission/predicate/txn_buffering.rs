@@ -215,7 +215,9 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | CrdtOp::ImportSnapshot { .. }
             | CrdtOp::ListInsert { .. }
             | CrdtOp::ListDelete { .. }
-            | CrdtOp::ListMove { .. },
+            | CrdtOp::ListMove { .. }
+            | CrdtOp::DocUpsert { .. }
+            | CrdtOp::DocDelete { .. },
         ) => true,
 
         // ---- Crdt: reads, not encoded ----
@@ -994,6 +996,18 @@ mod tests {
             PhysicalPlan::Crdt(CrdtOp::DropConstraints {
                 collection: "c".into(),
                 constraint_version: 0,
+            }),
+            PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+                collection: "c".into(),
+                document_id: "d".into(),
+                fields_json: "{}".into(),
+                surrogate: Surrogate::ZERO,
+                partial: false,
+            }),
+            PhysicalPlan::Crdt(CrdtOp::DocDelete {
+                collection: "c".into(),
+                document_id: "d".into(),
+                surrogate: Surrogate::ZERO,
             }),
         ];
         for p in &plans {

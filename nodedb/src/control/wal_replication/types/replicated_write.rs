@@ -685,6 +685,33 @@ pub enum ReplicatedWrite {
         to_index: u64,
     },
 
+    /// Insert-or-replace / partial-update a document row's scalar fields
+    /// (`CrdtOp::DocUpsert`). Carries the operation's **intent** — the JSON
+    /// field map plus the `partial` flag, not a Loro delta — because the delta
+    /// can only be computed by re-running the live `execute_crdt_doc_upsert`
+    /// handler against each replica's own Loro state (mirrors the
+    /// `CrdtDocOpWalRecord` WAL payload's replay contract). Unlike the block-
+    /// list ops, the row's own top-level `surrogate` IS carried: the live
+    /// handler uses it to gate + key the sparse-store materialization.
+    CrdtDocUpsert {
+        collection: String,
+        document_id: String,
+        surrogate: u32,
+        /// JSON-encoded field map for the row.
+        fields_json: String,
+        /// `false` = INSERT / full replace (prune absent keys); `true` =
+        /// UPDATE SET partial-merge.
+        partial: bool,
+    },
+
+    /// Delete a document row (`CrdtOp::DocDelete`). Same intent-carrying
+    /// replay contract as `CrdtDocUpsert`.
+    CrdtDocDelete {
+        collection: String,
+        document_id: String,
+        surrogate: u32,
+    },
+
     /// Dependent-read result broadcast for a Calvin txn.
     ///
     /// A passive participant proposes this entry to the per-vshard Raft group

@@ -14,6 +14,7 @@ mod checkpoint_durable_lsn;
 pub mod convert;
 pub mod crdt;
 pub mod crdt_constraints;
+pub mod crdt_doc;
 pub mod crdt_list;
 pub mod crdt_materialize;
 pub mod move_tenant;

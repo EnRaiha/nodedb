@@ -31,7 +31,9 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
     match plan {
         PhysicalPlan::Document(DocumentOp::PointGet { .. })
         | PhysicalPlan::Crdt(CrdtOp::Read { .. })
-        | PhysicalPlan::Crdt(CrdtOp::GetPolicy { .. }) => PlanKind::SingleDocument,
+        | PhysicalPlan::Crdt(CrdtOp::GetPolicy { .. })
+        | PhysicalPlan::Crdt(CrdtOp::DocUpsert { .. })
+        | PhysicalPlan::Crdt(CrdtOp::DocDelete { .. }) => PlanKind::SingleDocument,
 
         PhysicalPlan::Vector(VectorOp::Search { .. })
         | PhysicalPlan::Vector(VectorOp::MultiSearch { .. })

@@ -50,6 +50,48 @@ impl CrdtState {
         Ok(Self { doc, peer_id })
     }
 
+    /// Fetch a row's existing `LoroMap` container, or create one if absent.
+    /// Shared by `upsert` and `set_fields` — both need the same row handle
+    /// before diverging on prune-vs-preserve semantics.
+    fn row_container(&self, collection: &str, row_id: &str) -> Result<LoroMap> {
+        let coll = self.doc.get_map(collection);
+        match coll.get(row_id) {
+            Some(ValueOrContainer::Container(loro::Container::Map(m))) => Ok(m),
+            _ => coll
+                .insert_container(row_id, LoroMap::new())
+                .map_err(|e| CrdtError::Loro(e.to_string())),
+        }
+    }
+
+    /// Write `fields` onto `row_container` as scalar LWW inserts, rejecting
+    /// any key that currently holds a container value. Shared by `upsert`
+    /// and `set_fields` — both write the same way, only the prune step
+    /// (upsert-only) differs.
+    fn write_scalar_fields(
+        row_container: &LoroMap,
+        collection: &str,
+        row_id: &str,
+        fields: &[(&str, LoroValue)],
+    ) -> Result<()> {
+        for (field, value) in fields {
+            // A container-valued key can never legitimately appear in the
+            // incoming scalar projection. Overwriting one would destroy the
+            // nested container; skipping it would silently discard the
+            // caller's write. Reject instead of doing either.
+            if key_is_container(row_container, field) {
+                return Err(CrdtError::ScalarFieldShadowsContainer {
+                    collection: collection.to_string(),
+                    row_id: row_id.to_string(),
+                    field: (*field).to_string(),
+                });
+            }
+            row_container
+                .insert(field, value.clone())
+                .map_err(|e| CrdtError::Loro(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Insert or update a row in a collection.
     ///
     /// This is a REPLACE for scalar fields — every caller passes the
@@ -66,13 +108,7 @@ impl CrdtState {
         row_id: &str,
         fields: &[(&str, LoroValue)],
     ) -> Result<()> {
-        let coll = self.doc.get_map(collection);
-        let row_container = match coll.get(row_id) {
-            Some(ValueOrContainer::Container(loro::Container::Map(m))) => m,
-            _ => coll
-                .insert_container(row_id, LoroMap::new())
-                .map_err(|e| CrdtError::Loro(e.to_string()))?,
-        };
+        let row_container = self.row_container(collection, row_id)?;
 
         let incoming_keys: HashSet<&str> = fields.iter().map(|(field, _)| *field).collect();
 
@@ -94,23 +130,21 @@ impl CrdtState {
                 .map_err(|e| CrdtError::Loro(e.to_string()))?;
         }
 
-        for (field, value) in fields {
-            // A container-valued key can never legitimately appear in the
-            // incoming scalar projection. Overwriting one would destroy the
-            // nested container; skipping it would silently discard the
-            // caller's write. Reject instead of doing either.
-            if key_is_container(&row_container, field) {
-                return Err(CrdtError::ScalarFieldShadowsContainer {
-                    collection: collection.to_string(),
-                    row_id: row_id.to_string(),
-                    field: (*field).to_string(),
-                });
-            }
-            row_container
-                .insert(field, value.clone())
-                .map_err(|e| CrdtError::Loro(e.to_string()))?;
-        }
-        Ok(())
+        Self::write_scalar_fields(&row_container, collection, row_id, fields)
+    }
+
+    /// Partial-merge write: set exactly the provided scalar `fields` on a row
+    /// (LWW-per-field), creating the row if absent, leaving every untouched
+    /// key intact. This is `upsert` WITHOUT the full-projection prune step —
+    /// the UPDATE-SET semantic for `CrdtOp::DocUpsert { partial: true }`.
+    pub fn set_fields(
+        &self,
+        collection: &str,
+        row_id: &str,
+        fields: &[(&str, LoroValue)],
+    ) -> Result<()> {
+        let row_container = self.row_container(collection, row_id)?;
+        Self::write_scalar_fields(&row_container, collection, row_id, fields)
     }
 
     /// Delete a row from a collection.
@@ -313,5 +347,57 @@ impl RowLookup for CrdtState {
         exclude_row_id: Option<&str>,
     ) -> bool {
         self.field_value_exists_live(collection, field, value, exclude_row_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COLL: &str = "c";
+    const ROW: &str = "r";
+
+    #[test]
+    fn set_fields_preserves_untouched_keys_and_upsert_prunes() {
+        let state = CrdtState::new(0).expect("state");
+
+        // Full projection {a:1, b:2}.
+        state
+            .upsert(
+                COLL,
+                ROW,
+                &[("a", LoroValue::I64(1)), ("b", LoroValue::I64(2))],
+            )
+            .expect("upsert");
+
+        // Partial-merge {b:9}: `a` must survive untouched, `b` overwritten.
+        state
+            .set_fields(COLL, ROW, &[("b", LoroValue::I64(9))])
+            .expect("set_fields");
+        assert_eq!(
+            state.read_field(COLL, ROW, "a"),
+            Some(LoroValue::I64(1)),
+            "set_fields must leave the untouched key `a` intact"
+        );
+        assert_eq!(
+            state.read_field(COLL, ROW, "b"),
+            Some(LoroValue::I64(9)),
+            "set_fields must overwrite `b` to 9"
+        );
+
+        // Full-projection replace {a:5}: absent key `b` must be pruned.
+        state
+            .upsert(COLL, ROW, &[("a", LoroValue::I64(5))])
+            .expect("upsert replace");
+        assert_eq!(
+            state.read_field(COLL, ROW, "a"),
+            Some(LoroValue::I64(5)),
+            "upsert must set `a` to 5"
+        );
+        assert_eq!(
+            state.read_field(COLL, ROW, "b"),
+            None,
+            "upsert must prune key `b` absent from the projection"
+        );
     }
 }

@@ -19,6 +19,8 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Document(DocumentOp::RangeScan { collection, .. })
         | PhysicalPlan::Crdt(CrdtOp::Read { collection, .. })
         | PhysicalPlan::Crdt(CrdtOp::Apply { collection, .. })
+        | PhysicalPlan::Crdt(CrdtOp::DocUpsert { collection, .. })
+        | PhysicalPlan::Crdt(CrdtOp::DocDelete { collection, .. })
         | PhysicalPlan::Vector(VectorOp::Insert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::BatchInsert { collection, .. })
         | PhysicalPlan::Vector(VectorOp::MultiSearch { collection, .. })

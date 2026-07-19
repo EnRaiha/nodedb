@@ -67,6 +67,13 @@ impl CoreLoop {
         // delta import) that the list containers live inside.
         self.replay_crdt_list_wal(records, num_cores, tombstones);
 
+        // CRDT doc-op intent replay: re-executes field-carrying
+        // insert-or-replace / partial-update / delete of top-level rows
+        // through the same live handlers. Runs after `replay_crdt_wal` for
+        // the same reason as the list-op pass — the collection's underlying
+        // Loro document state must be restored first.
+        self.replay_crdt_doc_wal(records, num_cores, tombstones);
+
         // Reconstruct sync HWM maps from SyncSeqAdvance records so
         // post-restart deduplication is correct. Fatal on error —
         // a partially-recovered HWM is not safe to operate with.

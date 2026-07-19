@@ -55,6 +55,24 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             from_index,
             to_index,
         } => crdt::list_move(collection, document_id, list_path, *from_index, *to_index),
+        ReplicatedWrite::CrdtDocUpsert {
+            collection,
+            document_id,
+            surrogate,
+            fields_json,
+            partial,
+        } => Ok(crdt::doc_upsert(
+            collection,
+            document_id,
+            *surrogate,
+            fields_json,
+            *partial,
+        )),
+        ReplicatedWrite::CrdtDocDelete {
+            collection,
+            document_id,
+            surrogate,
+        } => Ok(crdt::doc_delete(collection, document_id, *surrogate)),
         ReplicatedWrite::ConstraintChange {
             collection,
             op,

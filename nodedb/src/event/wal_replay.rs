@@ -214,6 +214,10 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
         // `data::executor::wal_replay::crdt_list`, not the Event Plane's
         // WriteEvent stream.
         | RecordType::CrdtListOp
+        // CrdtDocOp: document-row intent, replayed by
+        // `data::executor::wal_replay::crdt_doc`, not the Event Plane's
+        // WriteEvent stream.
+        | RecordType::CrdtDocOp
         | RecordType::LogBatch
         | RecordType::Transaction
         | RecordType::SurrogateAlloc

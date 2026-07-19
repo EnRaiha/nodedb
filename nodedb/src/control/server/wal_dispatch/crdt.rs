@@ -119,6 +119,40 @@ pub(super) fn wal_append_crdt_op(
             let bytes = encode_crdt_list_op_payload(payload)?;
             Some(wal.append_crdt_list_op(tenant_id, vshard_id, database_id, &bytes)?)
         }
+        CrdtOp::DocUpsert {
+            collection,
+            document_id,
+            fields_json,
+            surrogate,
+            partial,
+        } => {
+            // Intent-logged like the block-list ops: the Data Plane builds the
+            // Loro mutation and the Control Plane has no `LoroDoc`, so the
+            // record carries the fields + partial flag and replay re-executes
+            // the live handler (see `CrdtDocOpWalRecord`'s doc comment).
+            let payload = crate::wal::CrdtDocOpWalRecord::Upsert {
+                collection: collection.clone(),
+                document_id: document_id.clone(),
+                surrogate: surrogate.as_u32(),
+                fields_json: fields_json.clone(),
+                partial: *partial,
+            };
+            let bytes = encode_crdt_doc_op_payload(payload)?;
+            Some(wal.append_crdt_doc_op(tenant_id, vshard_id, database_id, &bytes)?)
+        }
+        CrdtOp::DocDelete {
+            collection,
+            document_id,
+            surrogate,
+        } => {
+            let payload = crate::wal::CrdtDocOpWalRecord::Delete {
+                collection: collection.clone(),
+                document_id: document_id.clone(),
+                surrogate: surrogate.as_u32(),
+            };
+            let bytes = encode_crdt_doc_op_payload(payload)?;
+            Some(wal.append_crdt_doc_op(tenant_id, vshard_id, database_id, &bytes)?)
+        }
         // NotAWrite — reads / query ops / DDL that produces no engine mutation here
         CrdtOp::Read { .. }
         | CrdtOp::ReadConstraints { .. }
@@ -146,6 +180,16 @@ fn encode_crdt_list_op_payload(payload: crate::wal::CrdtListOpWalRecord) -> crat
     zerompk::to_msgpack_vec(&payload).map_err(|e| crate::Error::Serialization {
         format: "msgpack".into(),
         detail: format!("wal crdt list op: {e}"),
+    })
+}
+
+/// Encode a `CrdtDocOpWalRecord` for a `CrdtOp::DocUpsert` / `DocDelete`
+/// append. Shared by both arms above so the msgpack encode + error-mapping
+/// logic is written once.
+fn encode_crdt_doc_op_payload(payload: crate::wal::CrdtDocOpWalRecord) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(&payload).map_err(|e| crate::Error::Serialization {
+        format: "msgpack".into(),
+        detail: format!("wal crdt doc op: {e}"),
     })
 }
 
@@ -224,6 +268,36 @@ mod tests {
         assert!(has_record_of_type(
             &wal,
             nodedb_wal::record::RecordType::CrdtListOp
+        ));
+    }
+
+    #[test]
+    fn doc_upsert_appends_crdt_doc_op_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = open_wal(dir.path());
+        let plan = PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+            collection: "docs".to_string(),
+            document_id: "d1".to_string(),
+            fields_json: r#"{"a":1}"#.to_string(),
+            surrogate: Surrogate::new(3),
+            partial: false,
+        });
+
+        let outcome = super::super::wal_append_if_write(
+            &wal,
+            TenantId::new(1),
+            VShardId::new(0),
+            DatabaseId::DEFAULT,
+            &plan,
+        )
+        .expect("append");
+        assert!(
+            outcome.lsn.is_some(),
+            "DocUpsert must produce a durable LSN"
+        );
+        assert!(has_record_of_type(
+            &wal,
+            nodedb_wal::record::RecordType::CrdtDocOp
         ));
     }
 

@@ -91,7 +91,9 @@ impl CoreLoop {
                     self.note_write_lsn(db, tenant, c, None, lsn);
                 }
             }
-            PhysicalPlan::Crdt(CrdtOp::Apply { collection, .. }) => {
+            PhysicalPlan::Crdt(CrdtOp::Apply { collection, .. })
+            | PhysicalPlan::Crdt(CrdtOp::DocUpsert { collection, .. })
+            | PhysicalPlan::Crdt(CrdtOp::DocDelete { collection, .. }) => {
                 self.note_write_lsn(db, tenant, collection, None, lsn);
             }
             // No per-key/collection version recorded for reads, control ops, or

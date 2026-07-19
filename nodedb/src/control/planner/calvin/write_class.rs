@@ -199,6 +199,8 @@ fn crdt_is_write(op: &CrdtOp) -> bool {
         | CrdtOp::ListInsert { .. }
         | CrdtOp::ListDelete { .. }
         | CrdtOp::ListMove { .. }
+        | CrdtOp::DocUpsert { .. }
+        | CrdtOp::DocDelete { .. }
         | CrdtOp::SetConstraints { .. }
         | CrdtOp::DropConstraints { .. }
         | CrdtOp::RestoreToVersion { .. }

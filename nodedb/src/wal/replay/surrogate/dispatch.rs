@@ -55,6 +55,10 @@ pub fn replay_surrogate_records(
             // read `surrogate` (see `CrdtOp::ListInsert`/`ListDelete`/
             // `ListMove`'s dispatch arms, all `surrogate: _`).
             | RecordType::CrdtListOp
+            // CrdtDocOp carries the row's own surrogate, but that surrogate was
+            // allocated upstream and made durable via SurrogateAlloc/Bind — this
+            // record never allocates one, so it does not advance the hwm here.
+            | RecordType::CrdtDocOp
             | RecordType::TimeseriesBatch
             | RecordType::LogBatch
             | RecordType::ArrayPut

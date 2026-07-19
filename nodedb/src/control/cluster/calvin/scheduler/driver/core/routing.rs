@@ -253,6 +253,8 @@ fn crdt_routing(op: &CrdtOp) -> PlanRouting {
         | CrdtOp::ListInsert { collection, .. }
         | CrdtOp::ListDelete { collection, .. }
         | CrdtOp::ListMove { collection, .. }
+        | CrdtOp::DocUpsert { collection, .. }
+        | CrdtOp::DocDelete { collection, .. }
         | CrdtOp::SetConstraints { collection, .. }
         | CrdtOp::DropConstraints { collection, .. }
         | CrdtOp::RestoreToVersion { collection, .. }

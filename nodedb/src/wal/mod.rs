@@ -3,6 +3,7 @@
 pub mod archiver;
 pub mod audit_archive;
 pub mod audit_segment;
+pub mod crdt_doc_payload;
 pub mod crdt_list_payload;
 pub mod crdt_payload;
 pub mod manager;
@@ -10,6 +11,7 @@ pub mod redo;
 pub mod replay;
 
 pub use audit_segment::AuditWalSegment;
+pub(crate) use crdt_doc_payload::CrdtDocOpWalRecord;
 pub(crate) use crdt_list_payload::CrdtListOpWalRecord;
 pub(crate) use crdt_payload::CrdtDeltaWalPayload;
 pub use manager::WalManager;

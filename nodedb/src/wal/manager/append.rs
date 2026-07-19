@@ -188,6 +188,19 @@ impl WalManager {
         self.append_record(RecordType::CrdtListOp, tid, vs, db, p)
     }
 
+    /// Append a `CrdtDocOp` record. Payload is a zerompk-encoded
+    /// `CrdtDocOpWalRecord` carrying the document-row mutation intent (see that
+    /// type's doc comment for why intent, not a Loro delta, is logged).
+    pub fn append_crdt_doc_op(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        p: &[u8],
+    ) -> crate::Result<Lsn> {
+        self.append_record(RecordType::CrdtDocOp, tid, vs, db, p)
+    }
+
     /// Append a checkpoint marker. Serializes the LSN before writing.
     pub fn append_checkpoint(
         &self,

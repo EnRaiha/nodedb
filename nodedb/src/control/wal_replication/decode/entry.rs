@@ -118,6 +118,8 @@ fn to_physical_plan(
         | ReplicatedWrite::CrdtListInsert { .. }
         | ReplicatedWrite::CrdtListDelete { .. }
         | ReplicatedWrite::CrdtListMove { .. }
+        | ReplicatedWrite::CrdtDocUpsert { .. }
+        | ReplicatedWrite::CrdtDocDelete { .. }
         | ReplicatedWrite::ConstraintChange { .. } => {
             Ok((entry_crdt::decode_arm(ctx, write)?, None))
         }

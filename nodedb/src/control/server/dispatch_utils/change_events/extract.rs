@@ -361,6 +361,31 @@ pub(super) fn extract_write_metadata(
         PhysicalPlan::Crdt(CrdtOp::ImportSnapshot { collection, .. }) => {
             vec![(collection.clone(), "*".into(), ChangeOperation::Update)]
         }
+        // Document-row field-carrying ops: a full replace / partial-update is
+        // an Insert / Update respectively; a delete is a Delete.
+        PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+            collection,
+            document_id,
+            partial,
+            ..
+        }) => vec![(
+            collection.clone(),
+            document_id.clone(),
+            if *partial {
+                ChangeOperation::Update
+            } else {
+                ChangeOperation::Insert
+            },
+        )],
+        PhysicalPlan::Crdt(CrdtOp::DocDelete {
+            collection,
+            document_id,
+            ..
+        }) => vec![(
+            collection.clone(),
+            document_id.clone(),
+            ChangeOperation::Delete,
+        )],
         // Read (Read/ReadConstraints/GetPolicy/ReadAtVersion/
         // GetVersionVector/ExportDelta), history maintenance
         // (CompactAtVersion), and config/DDL (SetConstraints/

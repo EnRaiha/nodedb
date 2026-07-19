@@ -73,6 +73,24 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             to_index,
             surrogate: _,
         } => list_move(collection, document_id, list_path, *from_index, *to_index),
+        CrdtOp::DocUpsert {
+            collection,
+            document_id,
+            fields_json,
+            surrogate,
+            partial,
+        } => doc_upsert(
+            collection,
+            document_id,
+            surrogate.as_u32(),
+            fields_json,
+            *partial,
+        ),
+        CrdtOp::DocDelete {
+            collection,
+            document_id,
+            surrogate,
+        } => doc_delete(collection, document_id, surrogate.as_u32()),
         CrdtOp::SetConstraints {
             collection,
             constraint_version,
@@ -194,5 +212,29 @@ pub(super) fn list_move(
         list_path: list_path.to_owned(),
         from_index: from_index as u64,
         to_index: to_index as u64,
+    }
+}
+
+pub(super) fn doc_upsert(
+    collection: &str,
+    document_id: &str,
+    surrogate: u32,
+    fields_json: &str,
+    partial: bool,
+) -> ReplicatedWrite {
+    ReplicatedWrite::CrdtDocUpsert {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        surrogate,
+        fields_json: fields_json.to_owned(),
+        partial,
+    }
+}
+
+pub(super) fn doc_delete(collection: &str, document_id: &str, surrogate: u32) -> ReplicatedWrite {
+    ReplicatedWrite::CrdtDocDelete {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        surrogate,
     }
 }

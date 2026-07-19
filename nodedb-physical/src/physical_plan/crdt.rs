@@ -180,4 +180,31 @@ pub enum CrdtOp {
         /// Surrogate of the parent document hosting this block list.
         surrogate: Surrogate,
     },
+
+    // ─── Document row (top-level LoroMap) field-carrying ops ─────────
+    /// Insert-or-replace / partial-update a document row's scalar fields,
+    /// server-built from `fields_json` (a JSON object). Mirrors the
+    /// `ListInsert` intent-carrying contract: the Control Plane has no
+    /// `LoroDoc`, so the Data Plane handler builds the Loro mutation.
+    ///
+    /// `partial = false`: INSERT / full replace — scalar keys absent from
+    /// `fields_json` are pruned (LWW full-projection replace).
+    /// `partial = true`: UPDATE SET — only the provided fields are written
+    /// (LWW-per-field), untouched keys survive.
+    ///
+    /// `surrogate` is this row's OWN stable top-level cross-engine identity.
+    DocUpsert {
+        collection: String,
+        document_id: String,
+        fields_json: String,
+        surrogate: Surrogate,
+        partial: bool,
+    },
+    /// Delete a document row: tombstone in the collection's Loro doc + remove
+    /// from the sparse document store.
+    DocDelete {
+        collection: String,
+        document_id: String,
+        surrogate: Surrogate,
+    },
 }

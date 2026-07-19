@@ -114,6 +114,36 @@ pub(super) fn list_move(
     }))
 }
 
+/// Reconstruct `CrdtOp::DocUpsert` from its wire intent. Unlike the block-list
+/// ops, the row's own top-level `surrogate` is carried across the wire and
+/// rebuilt via `Surrogate::new` — the live dispatch handler uses it to gate +
+/// key the sparse-store materialization.
+pub(super) fn doc_upsert(
+    collection: &str,
+    document_id: &str,
+    surrogate: u32,
+    fields_json: &str,
+    partial: bool,
+) -> PhysicalPlan {
+    PhysicalPlan::Crdt(CrdtOp::DocUpsert {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        fields_json: fields_json.to_owned(),
+        surrogate: nodedb_types::Surrogate::new(surrogate),
+        partial,
+    })
+}
+
+/// Reconstruct `CrdtOp::DocDelete` from its wire intent. See [`doc_upsert`]
+/// for the surrogate note.
+pub(super) fn doc_delete(collection: &str, document_id: &str, surrogate: u32) -> PhysicalPlan {
+    PhysicalPlan::Crdt(CrdtOp::DocDelete {
+        collection: collection.to_owned(),
+        document_id: document_id.to_owned(),
+        surrogate: nodedb_types::Surrogate::new(surrogate),
+    })
+}
+
 pub(super) fn constraint_change(
     collection: &str,
     op: &ConstraintChangeOp,

@@ -93,6 +93,21 @@ pub enum RecordType {
     /// was acknowledged to the client.
     CrdtListOp = 21 | 0x8000,
 
+    /// CRDT engine: document-row intent op (`DocUpsert` / `DocDelete`) —
+    /// field-carrying insert-or-replace / partial-update / delete of a
+    /// top-level `LoroMap` row for SQL DML on a `crdt='true'` collection.
+    ///
+    /// Like `CrdtListOp`, the Data Plane builds the Loro mutation server-side
+    /// and the Control Plane has no `LoroDoc` to compute a delta from, so the
+    /// record carries the **intent** (collection, document, surrogate, fields,
+    /// partial flag) rather than a Loro delta; replay re-executes the exact
+    /// same live handler that ran on first application.
+    ///
+    /// Required: skipping this record on replay silently drops an
+    /// acknowledged document write, diverging row content from what was
+    /// acknowledged to the client.
+    CrdtDocOp = 22 | 0x8000,
+
     /// Timeseries engine: metric sample batch.
     TimeseriesBatch = 30,
 
@@ -293,6 +308,7 @@ impl RecordType {
             x if x == 17 | 0x8000 => Some(Self::MultiVectorDelete),
             x if x == 20 | 0x8000 => Some(Self::CrdtDelta),
             x if x == 21 | 0x8000 => Some(Self::CrdtListOp),
+            x if x == 22 | 0x8000 => Some(Self::CrdtDocOp),
             x if x == 50 | 0x8000 => Some(Self::Transaction),
             x if x == 58 | 0x8000 => Some(Self::TransactionRedo),
             x if x == 51 | 0x8000 => Some(Self::SurrogateAlloc),
@@ -346,6 +362,7 @@ mod tests {
             RecordType::GraphNodeLabelRemove as u32
         ));
         assert!(RecordType::is_required(RecordType::CrdtListOp as u32));
+        assert!(RecordType::is_required(RecordType::CrdtDocOp as u32));
     }
 
     #[test]
@@ -364,6 +381,7 @@ mod tests {
             RecordType::MultiVectorDelete,
             RecordType::CrdtDelta,
             RecordType::CrdtListOp,
+            RecordType::CrdtDocOp,
             RecordType::TimeseriesBatch,
             RecordType::LogBatch,
             RecordType::ArrayPut,

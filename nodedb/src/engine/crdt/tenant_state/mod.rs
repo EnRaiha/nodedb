@@ -7,6 +7,7 @@
 
 pub mod apply_validated;
 pub mod core;
+pub mod doc_mutate;
 pub mod history;
 pub mod policy;
 pub mod validate;

@@ -330,7 +330,9 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | RestoreToVersion { collection, .. }
                 | ListInsert { collection, .. }
                 | ListDelete { collection, .. }
-                | ListMove { collection, .. } => out.push(collection.clone()),
+                | ListMove { collection, .. }
+                | DocUpsert { collection, .. }
+                | DocDelete { collection, .. } => out.push(collection.clone()),
 
                 // `ImportSnapshot` is a whole-tenant Loro import and
                 // `SetConstraints` / `DropConstraints` install validator rules —

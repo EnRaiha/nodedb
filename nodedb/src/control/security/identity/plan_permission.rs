@@ -118,7 +118,9 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | CrdtOp::RestoreToVersion { .. }
             | CrdtOp::ListInsert { .. }
             | CrdtOp::ListDelete { .. }
-            | CrdtOp::ListMove { .. },
+            | CrdtOp::ListMove { .. }
+            | CrdtOp::DocUpsert { .. }
+            | CrdtOp::DocDelete { .. },
         ) => Permission::Write,
 
         PhysicalPlan::Vector(

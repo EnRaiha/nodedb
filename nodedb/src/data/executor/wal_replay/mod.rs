@@ -16,5 +16,6 @@
 
 mod array;
 mod crdt;
+mod crdt_doc;
 mod crdt_list;
 mod kv;
