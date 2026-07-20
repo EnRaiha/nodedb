@@ -574,3 +574,79 @@ async fn show_tenants_includes_tenant_name() {
         "SHOW TENANTS must report the tenant name; row was {acme:?}"
     );
 }
+
+/// Tenant names are unique: a second `CREATE TENANT` with the same name is
+/// rejected rather than minting a second tenant id sharing that name. A
+/// duplicate name makes every by-name lookup ambiguous (ownership fallback,
+/// admin provisioning, `DROP TENANT`) and strands the older tenant's objects.
+#[tokio::test]
+async fn duplicate_tenant_name_is_rejected() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE TENANT probe")
+        .await
+        .expect("first CREATE TENANT must succeed");
+
+    let err = server
+        .exec("CREATE TENANT probe")
+        .await
+        .expect_err("duplicate tenant name must be rejected");
+    assert!(
+        err.contains("already exists"),
+        "duplicate CREATE TENANT must report the name conflict, got: {err}"
+    );
+
+    // IF NOT EXISTS remains a no-op success on the same name.
+    server
+        .exec("CREATE TENANT IF NOT EXISTS probe")
+        .await
+        .expect("CREATE TENANT IF NOT EXISTS on an existing name must succeed");
+
+    let rows = server
+        .query_named_rows("SHOW TENANTS")
+        .await
+        .expect("SHOW TENANTS");
+    let named: Vec<_> = rows
+        .iter()
+        .filter(|r| r.get("name").map(String::as_str) == Some("probe"))
+        .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "exactly one tenant may carry the name 'probe'; rows were {named:?}"
+    );
+}
+
+/// A superuser can administer a pre-existing tenant-homed collection it does
+/// not own by switching the session's effective tenant. Without `SET TENANT`
+/// the superuser is scoped to its own tenant and the collection is correctly
+/// invisible; with it, ownership is satisfied by superuser status.
+#[tokio::test]
+async fn superuser_can_drop_tenant_homed_collection_after_set_tenant() {
+    let server = TestServer::start().await;
+    bootstrap_tenant_user(&server, "acme_user", "acme_notes").await;
+
+    // Unqualified, the superuser session does not see the tenant's collection.
+    let unscoped = server.exec("DROP COLLECTION acme_notes").await;
+    assert!(
+        unscoped.is_err(),
+        "superuser must not resolve a tenant-homed collection without SET TENANT"
+    );
+
+    let (svc, _h) = server
+        .connect_as("nodedb", "nodedb")
+        .await
+        .expect("superuser connect");
+    svc.simple_query("SET TENANT = 'acme'")
+        .await
+        .expect("superuser SET TENANT");
+    svc.simple_query("DROP COLLECTION acme_notes")
+        .await
+        .expect("superuser must drop a tenant-homed collection it does not own");
+
+    let remaining = svc
+        .simple_query("SELECT id FROM acme_notes")
+        .await
+        .expect_err("dropped collection must no longer resolve");
+    let _ = remaining;
+}

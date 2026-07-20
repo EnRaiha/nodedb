@@ -98,17 +98,22 @@ pub fn create_tenant(
     let name = parts[2];
     let opts = parse_tenant_options(&parts[3..])?;
 
-    // `IF NOT EXISTS`: if a tenant with this name already exists, the
-    // statement is a no-op success — do not allocate a second id.
-    if if_not_exists
-        && state
-            .credentials
-            .catalog()
-            .find_tenant_by_name(name)
-            .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
-            .is_some()
+    // Tenant names are unique. A duplicate is a no-op success under
+    // `IF NOT EXISTS` and an error otherwise — never a second tenant id
+    // sharing the name, which would make the name ambiguous for every
+    // by-name lookup (ownership fallback, admin provisioning, DROP TENANT)
+    // and silently strand the older tenant's objects.
+    if state
+        .credentials
+        .catalog()
+        .find_tenant_by_name(name)
+        .map_err(|e| ddl_err("XX000", format!("catalog read: {e}")))?
+        .is_some()
     {
-        return Ok(status("CREATE TENANT"));
+        if if_not_exists {
+            return Ok(status("CREATE TENANT"));
+        }
+        return Err(ddl_err("42710", format!("tenant '{name}' already exists")));
     }
 
     // Pick the tenant id. An explicit `ID <n>` is honored verbatim;

@@ -23,12 +23,29 @@
 //! - Every `StoredRlsPolicy.collection` exists as a
 //!   `StoredCollection` row.
 //!
-//! None of these are auto-repaired. Redb is not the source of
-//! truth — the raft log is — and the safe recovery for any
-//! redb corruption is "re-run the applier from the log",
-//! which is the operator's job. The integrity check reports
-//! every violation and the sanity-check wrapper aborts
-//! startup on any non-empty violation list.
+//! This module only *detects*; it never repairs. Redb is not the
+//! source of truth — the raft log is — and the general recovery
+//! for redb corruption is "re-run the applier from the log",
+//! which is the operator's job.
+//!
+//! Three ownership/grant classes are healed before the abort gate,
+//! because they are reachable from ordinary DDL rather than from
+//! storage corruption, and each would otherwise leave an existing
+//! data directory permanently unbootable with no repair path.
+//! `verify_and_repair` runs `repair_integrity::heal_orphan_rows`
+//! to a fixpoint over this module's output:
+//!
+//! - a primary row whose `StoredOwner` is missing — the owner row
+//!   is rebuilt from the primary's in-band owner;
+//! - `owner(...)` → `user(...)` dangling — the owner row is
+//!   restored from the primary's in-band owner when that user
+//!   still exists, otherwise reassigned to the tenant's resolved
+//!   administrative principal;
+//! - `permission(...)` → `user(...)` dangling — the grant is
+//!   revoked, since a grant to a nonexistent user confers nothing.
+//!
+//! Every other violation above is reported and left alone.
+//! Startup aborts only on violations that survive the pass.
 
 use std::collections::HashSet;
 
