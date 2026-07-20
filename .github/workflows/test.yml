@@ -75,12 +75,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Free disk space
-        # The --all-features suite links hundreds of statically linked test
-        # binaries into target/; on a stock runner that fills the root disk,
-        # and the linker (rust-lld) then fails its mmap-backed output write
-        # with SIGBUS (signal 7) at link time. Reclaim the large preinstalled
-        # toolchains this build never uses so the link always has headroom.
+      - name: Reclaim disk and record resources
+        # Building the workspace's test binaries with --all-features writes on
+        # the order of 100 GB into target/: every test binary statically links
+        # the full dependency closure and lands in the hundreds of MB, and there
+        # are hundreds of them. A stock runner starts with barely more free
+        # space than that, and when it runs out mid-link the linker's
+        # memory-mapped write aborts with SIGBUS (signal 7) rather than a clean
+        # ENOSPC — which reads like a linker crash and not a full disk.
+        #
+        # Reclaim the large preinstalled toolchains this build never uses, then
+        # record the resources a failed mmap actually depends on. The `df` runs
+        # BEFORE the build, so it shows the headroom available to it, not what
+        # remained; read it as the budget, not the outcome.
         run: |
           sudo rm -rf \
             /usr/local/lib/android \
@@ -89,7 +96,9 @@ jobs:
             /opt/hostedtoolcache/CodeQL \
             /usr/share/swift
           sudo docker image prune -af || true
-          df -h /
+          echo "== memory =="; free -h
+          echo "== filesystems =="; df -h / /tmp /dev/shm
+          echo "== cpus =="; nproc
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -119,6 +128,15 @@ jobs:
             --all-features \
             --cargo-profile ci --profile ci \
             --no-fail-fast
+      - name: Record disk after build
+        if: always()
+        # Counterpart to the pre-build reading: that one is the budget, this is
+        # what the build actually left. Runs even on failure, so a linker abort
+        # can be attributed to a full disk instead of inferred. `target/` is
+        # reported separately because it is what grows.
+        run: |
+          echo "== filesystems =="; df -h / /tmp /dev/shm
+          echo "== target/ =="; du -sh target 2>/dev/null || true
       - name: Upload JUnit report
         if: always()
         uses: actions/upload-artifact@v7

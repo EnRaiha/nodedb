@@ -273,6 +273,15 @@ debug = false
 inherits = "dev"
 debug = false
 incremental = false
+# Drop symbol tables from the linked test binaries. With --all-features every
+# test binary statically links the full dependency closure, and there are
+# hundreds of them, so target/ runs to roughly 100 GB — enough to exhaust a CI
+# runner mid-link, where the linker's memory-mapped write aborts with SIGBUS
+# instead of reporting a full disk. Stripping removes better than a third of
+# each binary, which is the difference between fitting and not. Backtraces here
+# are already unsymbolised (`debug = false`), so this costs no diagnostic value
+# the profile had.
+strip = true
 
 [profile.debugging]
 inherits = "dev"
