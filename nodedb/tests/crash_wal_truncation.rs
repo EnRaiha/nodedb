@@ -15,9 +15,10 @@
 //! Reproducing that needs three things the existing crash tests do not do, and
 //! all three are load-bearing:
 //!
-//!   1. A checkpoint cycle inside the test's lifetime. The default interval is
-//!      300s and `kv_write_survives_kill_9` finishes in ~12s, so the truncation
-//!      window never opened and the bug sat under a green suite.
+//!   1. A checkpoint cycle inside the test's lifetime. The default 300s
+//!      interval dwarfs a crash test's runtime, so the truncation window never
+//!      opened and the bug sat under a green suite until these tests forced a
+//!      short interval.
 //!   2. WAL segment ROTATION. `truncate_segments` skips the active segment
 //!      unconditionally, so with a single segment nothing is ever deleted and
 //!      this test would pass against the buggy code having proven nothing.
