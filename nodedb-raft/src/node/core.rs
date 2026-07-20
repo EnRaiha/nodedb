@@ -215,6 +215,15 @@ impl<S: LogStorage> RaftNode<S> {
         self.durable_applied
     }
 
+    /// The lowest log index still available in the retained (post-compaction)
+    /// log — `snapshot_index + 1`. A committed-entry read below this yields
+    /// [`RaftError::LogCompacted`]. Used to arm a Calvin scheduler catch-up from
+    /// the earliest replayable index so the drain never faults on a compacted
+    /// range.
+    pub fn first_available_index(&self) -> u64 {
+        self.log.snapshot_index() + 1
+    }
+
     /// Persist `index` as the durable applied floor.
     ///
     /// The caller MUST only pass an index whose state-machine effects are

@@ -3,7 +3,7 @@
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 
-use nodedb_cluster::calvin::{CalvinCompletionRegistry, SequencerStateMachine};
+use nodedb_cluster::calvin::{CalvinCompletionRegistry, SEQUENCER_GROUP_ID, SequencerStateMachine};
 use nodedb_cluster::distributed_array::{ArrayLocalExecutor, handle_array_shard_rpc};
 use nodedb_cluster::vshard_handler::{DispatchTarget, dispatch_by_type};
 use nodedb_cluster::wire::VShardEnvelope;
@@ -158,10 +158,35 @@ fn reconcile_vshard_schedulers(params: ReconcileSchedulersParams<'_>) -> crate::
         let recovery = read_applied_recovery(&shared.wal, vshard_id)?;
         let (sequenced_tx, sequenced_rx) =
             tokio::sync::mpsc::channel(scheduler_config.channel_capacity);
-        sequencer_state_machine
+
+        // The earliest committed sequencer index still in the retained log — the
+        // lower bound the spawn-time catch-up (below) arms from.
+        let first_available = raft_loop_handle
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .set_vshard_sender(vshard_id, sequenced_tx);
+            .first_available_index(SEQUENCER_GROUP_ID)
+            .unwrap_or(1);
+
+        {
+            let mut sm = sequencer_state_machine
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            sm.set_vshard_sender(vshard_id, sequenced_tx);
+            // Arm a spawn-time catch-up BEFORE the scheduler runs. A scheduler
+            // subscribes only once this node's membership in the vShard's data
+            // group lands (a late, reconcile-driven event on a forming cluster),
+            // by which point the sequencer may have already committed — and
+            // fanned out to a then-absent sender, i.e. SILENTLY skipped — epochs
+            // for this vShard. A fresh replica has nothing durably applied to
+            // rebuild from, so it would otherwise consider itself caught up and
+            // never receive those txns (cross-shard graph edges among them),
+            // losing them permanently after it becomes leader. Arming from the
+            // first available index makes the scheduler's drain replay every
+            // committed sequencer entry for this vShard applied before it
+            // subscribed; replay is idempotent (in-flight guard + Reserve/Release
+            // no-ops).
+            sm.arm_catch_up_from(vshard_id, first_available);
+        }
 
         let (read_result_tx, read_result_rx) =
             tokio::sync::mpsc::channel(scheduler_config.channel_capacity);

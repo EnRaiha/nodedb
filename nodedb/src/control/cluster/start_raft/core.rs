@@ -43,6 +43,7 @@ pub fn start_raft(
         loop_build.tracker,
         loop_build.apply_rx,
         loop_build.calvin_read_result_senders,
+        loop_build.sequencer_state_machine,
     );
 
     let ready_rx = finish_observability(

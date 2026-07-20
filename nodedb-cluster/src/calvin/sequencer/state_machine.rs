@@ -188,6 +188,62 @@ impl SequencerStateMachine {
         map.remove(&vshard)
     }
 
+    /// Arm a catch-up for `vshard` from `index` (min-collapse), so the
+    /// scheduler-side drain replays committed sequencer entries from there.
+    ///
+    /// Called when a scheduler subscribes for a vShard: the sequencer may have
+    /// already committed (and fanned out to a then-absent sender — silently
+    /// skipped) epochs for this vShard before the scheduler existed. A fresh
+    /// node has nothing durably applied to rebuild from, so it would otherwise
+    /// consider itself caught up and never replay those txns. Arming from the
+    /// first available committed index makes the drain replay every committed
+    /// entry for this vShard applied before subscription (idempotent: the
+    /// scheduler's in-flight guard and Reserve/Release no-ops absorb re-apply).
+    pub fn arm_catch_up_from(&self, vshard: u32, index: u64) {
+        self.record_catch_up(vshard, index);
+    }
+
+    /// Read (WITHOUT removing) the catch-up-from Raft index for `vshard`.
+    ///
+    /// The scheduler drain peeks rather than takes so a replay that cannot
+    /// complete this tick (committed index not yet known, transient log-read
+    /// fault) leaves the entry armed for the next tick instead of silently
+    /// dropping it — the loss the old take-then-early-return had.
+    pub fn peek_catch_up_from(&self, vshard: u32) -> Option<u64> {
+        let map = self.catch_up_from.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&vshard).copied()
+    }
+
+    /// Clear `vshard`'s catch-up entry only if its recorded index is `<= up_to`.
+    ///
+    /// Called after a successful replay of `lo ..= up_to`: the recorded miss is
+    /// now covered, so clear it — unless a concurrent drop has already lowered
+    /// the entry to an index the just-finished replay did not cover (only
+    /// possible for an index `<= up_to` given min-collapse, hence the guard is a
+    /// belt-and-braces no-op in that case). A newer drop recorded at an index
+    /// `> up_to` is preserved for the next drain.
+    pub fn clear_catch_up_up_to(&self, vshard: u32, up_to: u64) {
+        let mut map = self.catch_up_from.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(&idx) = map.get(&vshard)
+            && idx <= up_to
+        {
+            map.remove(&vshard);
+        }
+    }
+
+    /// The smallest armed catch-up index across ALL vShards, or `None` when no
+    /// catch-up is pending.
+    ///
+    /// The sequencer-group log compactor floors its compaction index at this
+    /// value so a dropped/undelivered fan-out is always replayable from the
+    /// retained log — the hold-down the scheduler-side drain's `LogCompacted`
+    /// arm depends on. Only hosted vShards ever arm a catch-up, so this never
+    /// pins compaction on a vShard this node does not serve.
+    pub fn min_catch_up_from(&self) -> Option<u64> {
+        let map = self.catch_up_from.lock().unwrap_or_else(|p| p.into_inner());
+        map.values().copied().min()
+    }
+
     /// Apply a committed Raft log entry.
     ///
     /// Decodes the `SequencerEntry`, checks epoch monotonicity, fans out to
@@ -719,6 +775,66 @@ mod tests {
         assert_eq!(sm.take_catch_up_from(va), Some(4));
         // TAKE semantics: the entry is cleared, so a second take returns None.
         assert_eq!(sm.take_catch_up_from(va), None);
+    }
+
+    /// PEEK must not consume: the scheduler drain reads the armed index, and
+    /// only clears it after a confirmed replay. A take-then-early-return (the
+    /// old shape) silently lost the miss when the replay could not complete.
+    #[test]
+    fn peek_catch_up_from_does_not_consume() {
+        let (batch, va, _vb) = make_batch_with_two_vshards();
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        let _ = tx_a.try_send(SchedulerInput::Txn(batch.txns[0].clone()));
+        let mut senders = HashMap::new();
+        senders.insert(va, tx_a);
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
+
+        sm.apply(9, &encode_entry(&SequencerEntry::EpochBatch { batch }));
+
+        // Repeated peeks keep returning the same armed index.
+        assert_eq!(sm.peek_catch_up_from(va), Some(9));
+        assert_eq!(sm.peek_catch_up_from(va), Some(9));
+    }
+
+    /// Clearing is bounded by the replayed upper bound: a miss covered by the
+    /// replay is cleared, one recorded ABOVE it survives for the next drain.
+    #[test]
+    fn clear_catch_up_up_to_respects_replayed_upper_bound() {
+        let senders = HashMap::new();
+        let sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
+        let v = 42u32;
+
+        // Armed at 5, replay covered through 10 → cleared.
+        sm.arm_catch_up_from(v, 5);
+        sm.clear_catch_up_up_to(v, 10);
+        assert_eq!(sm.peek_catch_up_from(v), None);
+
+        // Armed at 20, replay only covered through 10 → still armed.
+        sm.arm_catch_up_from(v, 20);
+        sm.clear_catch_up_up_to(v, 10);
+        assert_eq!(sm.peek_catch_up_from(v), Some(20));
+    }
+
+    /// The sequencer-log compaction hold-down floors on the LOWEST armed index
+    /// across all vShards, so no replica's replay range is compacted away.
+    #[test]
+    fn min_catch_up_from_is_lowest_armed_index_across_vshards() {
+        let senders = HashMap::new();
+        let sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
+        assert_eq!(sm.min_catch_up_from(), None);
+
+        sm.arm_catch_up_from(1, 30);
+        sm.arm_catch_up_from(2, 12);
+        sm.arm_catch_up_from(3, 25);
+        assert_eq!(sm.min_catch_up_from(), Some(12));
+
+        // Draining the lowest lifts the floor to the next outstanding miss.
+        sm.clear_catch_up_up_to(2, 12);
+        assert_eq!(sm.min_catch_up_from(), Some(25));
+
+        sm.clear_catch_up_up_to(1, 30);
+        sm.clear_catch_up_up_to(3, 25);
+        assert_eq!(sm.min_catch_up_from(), None);
     }
 
     #[test]

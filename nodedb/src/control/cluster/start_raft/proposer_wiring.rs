@@ -25,6 +25,7 @@ pub(super) fn wire_proposers(
     tracker: Arc<ProposeTracker>,
     apply_rx: mpsc::Receiver<ApplyBatch>,
     calvin_read_result_senders: Arc<Mutex<BTreeMap<u32, Sender<ReadResultEvent>>>>,
+    sequencer_state_machine: Arc<Mutex<nodedb_cluster::calvin::SequencerStateMachine>>,
 ) {
     // Wire the Raft proposer into SharedState so CP dispatch paths
     // (pgwire, HTTP, array inbound) can route writes through Raft.
@@ -58,6 +59,7 @@ pub(super) fn wire_proposers(
     // `log_compaction_threshold` is `None`.
     // Weak for the same cycle-breaking reason as `raft_proposer` above.
     let raft_loop_for_compact = Arc::downgrade(raft_loop);
+    let sm_for_compact = Arc::clone(&sequencer_state_machine);
     let compactor: Arc<crate::control::wal_replication::RaftCompactor> =
         Arc::new(move |group_id, applied_index| {
             let rl = raft_loop_for_compact
@@ -65,7 +67,37 @@ pub(super) fn wire_proposers(
                 .ok_or_else(|| crate::Error::Internal {
                     detail: "raft log compaction: cluster not running".into(),
                 })?;
-            rl.maybe_compact_group(group_id, applied_index)
+
+            // Sequencer-group hold-down. Unlike a data group — whose entries are
+            // replayable from each replica's own durable state — a cross-shard
+            // Calvin txn is re-derived on every replica ONLY from the sequencer
+            // log. A scheduler that missed a fan-out (channel full/closed, or it
+            // had not subscribed yet) recovers by replaying that log from its
+            // armed catch-up index. Compacting past an armed index destroys the
+            // only copy, permanently losing the txn on that replica — which for a
+            // cross-shard graph edge means the edge silently vanishes from that
+            // node's index. Floor the compaction boundary strictly below the
+            // lowest armed catch-up so the replay range always survives.
+            let effective_index = if group_id == nodedb_cluster::calvin::SEQUENCER_GROUP_ID {
+                match sm_for_compact
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .min_catch_up_from()
+                {
+                    // Keep index `m` itself: compaction discards entries at and
+                    // below its boundary, and the replay range starts AT `m`.
+                    Some(m) => applied_index.min(m.saturating_sub(1)),
+                    None => applied_index,
+                }
+            } else {
+                applied_index
+            };
+            if effective_index == 0 {
+                // Nothing compactable once held down.
+                return Ok(false);
+            }
+
+            rl.maybe_compact_group(group_id, effective_index)
                 .map_err(|e| crate::Error::Internal {
                     detail: format!("raft log compaction: {e}"),
                 })

@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Sender};
 
 use nodedb_cluster::calvin::{
-    CalvinCompletionRegistry, SequencerConfig, SequencerReceivers, SequencerService, new_inbox,
-    new_reservation_inbox,
+    CalvinCompletionRegistry, SequencerConfig, SequencerReceivers, SequencerService,
+    SequencerStateMachine, new_inbox, new_reservation_inbox,
 };
 
 use crate::control::cluster::calvin::executor::ollp::OllpConfig;
@@ -49,6 +49,9 @@ pub(super) struct LoopBuild {
     pub(super) apply_rx: mpsc::Receiver<ApplyBatch>,
     pub(super) calvin_read_result_senders: Arc<Mutex<BTreeMap<u32, Sender<ReadResultEvent>>>>,
     pub(super) calvin_completion_registry: Arc<CalvinCompletionRegistry>,
+    /// Shared with the compactor wiring so sequencer-group log compaction can
+    /// be held down below any armed scheduler catch-up index.
+    pub(super) sequencer_state_machine: Arc<Mutex<SequencerStateMachine>>,
 }
 
 /// Build the `RaftLoop`, consume `pending_subsystems`, build the sequencer
@@ -184,5 +187,6 @@ pub(super) fn build_raft_loop(
         apply_rx,
         calvin_read_result_senders,
         calvin_completion_registry,
+        sequencer_state_machine,
     })
 }

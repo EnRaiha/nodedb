@@ -464,6 +464,18 @@ impl MultiRaft {
         Ok(entries.to_vec())
     }
 
+    /// The lowest committed index still available in `group_id`'s retained log
+    /// (`snapshot_index + 1`), or `None` when the group is absent on this node.
+    ///
+    /// Used to arm a Calvin scheduler catch-up from the earliest replayable
+    /// sequencer index so its drain reads exactly the retained log and never
+    /// faults on a compacted range.
+    pub fn first_available_index(&self, group_id: u64) -> Option<u64> {
+        self.groups
+            .get(&group_id)
+            .map(|n| n.first_available_index())
+    }
+
     /// Auto-compact a group's log if its configured threshold has been
     /// reached, given the DATA-PLANE applied watermark `applied_index`.
     ///
