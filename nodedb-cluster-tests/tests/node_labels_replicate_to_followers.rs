@@ -76,6 +76,46 @@ async fn labeled_match_rows(
     }
 }
 
+/// Poll a label-filtered MATCH until `expected` appears, or `timeout` elapses.
+///
+/// This is the confound-free survivor read after a leader kill. A survivor can
+/// answer the MATCH *successfully* while its data group is still catching up
+/// post-failover — returning an empty (stale) result before the replicated
+/// label/edge state has been applied. `labeled_match_rows` returns on the first
+/// `Ok`, so reading it once races that catch-up window and can observe empty
+/// even though the write replicated durably. Polling until `expected` is
+/// present (retrying BOTH transient errors and empty results) closes that race:
+/// only a genuine failure to replicate — the label truly absent for the entire
+/// window — survives to the caller as a still-missing row. Returns the last
+/// observed rows so a real loss produces an informative assertion.
+async fn wait_for_labeled_match(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    expected: &(String, String),
+    timeout: Duration,
+) -> Vec<(String, String)> {
+    let deadline = Instant::now() + timeout;
+    let mut last: Vec<(String, String)> = Vec::new();
+    loop {
+        // Each probe gets a short read budget for transient post-failover
+        // errors; the outer loop owns the catch-up budget for empty results.
+        match labeled_match_rows(client, sql, Duration::from_millis(500)).await {
+            Ok(rows) => {
+                if rows.contains(expected) {
+                    return rows;
+                }
+                last = rows;
+            }
+            Err(_) if Instant::now() < deadline => {}
+            Err(_) => return last,
+        }
+        if Instant::now() >= deadline {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_labels_replicate_and_survive_leader_loss() {
     let cluster = TestCluster::spawn_three()
@@ -113,18 +153,31 @@ async fn node_labels_replicate_and_survive_leader_loss() {
     const MATCH_LABELED: &str = "MATCH (a:Person)-[:knows]->(b) RETURN a, b";
     let expected = ("alice".to_string(), "bob".to_string());
 
-    // Sanity: the labeled path is readable before the failover.
-    let landed = labeled_match_rows(
-        &cluster.nodes[0].client,
-        MATCH_LABELED,
-        Duration::from_secs(10),
-    )
-    .await
-    .expect("labeled MATCH on node 0");
-    assert!(
-        landed.contains(&expected),
-        "labeled MATCH produced no path before failover; got {landed:?}"
-    );
+    // Hard precondition: the labeled path must be readable on EVERY node before
+    // the failover. `wait_for_full_apply_convergence` falls through silently on
+    // timeout, so it does not by itself guarantee the "all three replicas have
+    // applied the label" state this test depends on. Proving the label is
+    // present on all three replicas here is what makes the post-kill assertion
+    // meaningful: with every replica holding it before the kill, Raft election
+    // safety guarantees a survivor keeps it, so a still-empty survivor read
+    // afterward is genuine loss — not a lagging replica that never converged
+    // pre-kill racing the post-failover catch-up window.
+    for node in &cluster.nodes {
+        let rows = wait_for_labeled_match(
+            &node.client,
+            MATCH_LABELED,
+            &expected,
+            Duration::from_secs(15),
+        )
+        .await;
+        assert!(
+            rows.contains(&expected),
+            "labeled path did not replicate to node {} before failover — the label \
+             never converged to every replica, so the leader-loss assertion below would \
+             be testing a non-converged cluster; got {rows:?}",
+            node.node_id,
+        );
+    }
 
     // Resolve the data group owning `alice`'s home vShard (node labels are
     // single-keyed on the node id, homed at `from_key(node_id)`) and its leader.
@@ -160,25 +213,24 @@ async fn node_labels_replicate_and_survive_leader_loss() {
         .expect("leader node present");
     nodes.remove(leader_idx).shutdown().await;
 
-    // Survivors re-elect a new leader; give the group a moment to settle.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
+    // Survivors re-elect a new leader and apply the replicated label; the poll
+    // below owns the settle + catch-up window, so no fixed pre-sleep is needed.
     for node in &nodes {
-        let rows = labeled_match_rows(&node.client, MATCH_LABELED, Duration::from_secs(20))
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "survivor node {} could not run labeled MATCH after leader death: {e}",
-                    node.node_id
-                )
-            });
+        let rows = wait_for_labeled_match(
+            &node.client,
+            MATCH_LABELED,
+            &expected,
+            Duration::from_secs(20),
+        )
+        .await;
         assert!(
             rows.contains(&expected),
-            "BUG: survivor node {} found no 'Person' label after the data-group leader \
-             was killed — SetNodeLabels was dispatched LOCAL-ONLY and never proposed \
-             through Raft, so the label was lost on failover (silent write-loss under RF>1); \
-             got {rows:?}",
-            node.node_id
+            "survivor node {} still had no 'Person' label {:?} after the data-group leader \
+             was killed and a full post-failover catch-up window elapsed — the labeled path \
+             never reached this survivor, so the SetNodeLabels write did not replicate durably \
+             via Raft (silent write-loss under RF>1); got {rows:?}",
+            node.node_id,
+            expected,
         );
     }
 
