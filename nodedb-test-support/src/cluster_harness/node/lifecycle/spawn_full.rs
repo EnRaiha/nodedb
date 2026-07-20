@@ -24,15 +24,6 @@ use crate::cluster_harness::cluster::ClusterSpawnConfig;
 use super::client_slot::ClusterTestClient;
 use super::types::{DataDir, TestClusterNode};
 
-/// Internal request deadline for harness-spawned nodes, widened well above the
-/// production 30s default. Cross-shard work on a CI runner that packs a 3-node
-/// cluster onto ~2 shared cores runs several times slower than on real
-/// hardware, so the production deadline spuriously aborts transactions that
-/// complete in ~10s locally. This value sits above the slowest observed
-/// cross-node operation yet below nextest's cluster terminate ceiling, so a
-/// genuine hang still fails cleanly instead of being masked.
-const TEST_REQUEST_DEADLINE_SECS: u64 = 120;
-
 impl TestClusterNode {
     /// [`Self::spawn_with_full_config`] entry point used by every spawn
     /// variant that does not need to reopen an existing data directory: mints
@@ -174,21 +165,6 @@ impl TestClusterNode {
         // Wire cluster handles into SharedState (mirrors main.rs).
         // `Arc::get_mut` is valid here: `shared` has not been cloned.
         if let Some(state) = Arc::get_mut(&mut shared) {
-            // Widen the internal request deadline for the test environment. In
-            // production a node owns real cores; here a 3-node cluster is packed
-            // onto a CI runner with as few as 2 shared cores (one Data-Plane
-            // core per node, plus each node's Tokio/Raft), so a heavy cross-shard
-            // transaction — e.g. an OLLP predicate delete that resolves a
-            // surrogate per matched edge across nodes — runs several times slower
-            // than on real hardware and can exceed the production 30s deadline
-            // even though it completes in ~10s locally. This is the same class of
-            // timing compensation the harness already applies via fast-election
-            // `ClusterTransportTuning`: the internal request deadline is the one
-            // knob that was still left at its production default. It only ever
-            // GRANTS headroom, so it cannot hide a regression — a genuine hang
-            // is still terminated by nextest's cluster ceiling (see
-            // `.config/nextest.toml`), which is lower than this deadline.
-            state.tuning.network.default_deadline_secs = TEST_REQUEST_DEADLINE_SECS;
             state.node_id = handle.node_id;
             state.cluster_topology = Some(Arc::clone(&handle.topology));
             state.cluster_routing = Some(Arc::clone(&handle.routing));
