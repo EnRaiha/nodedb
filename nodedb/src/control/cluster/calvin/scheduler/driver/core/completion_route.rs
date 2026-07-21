@@ -167,20 +167,30 @@ impl Scheduler {
             }
             self.commit_apply_tail(txn_id, response, None)
         } else {
-            tracing::warn!(
+            tracing::error!(
                 vshard_id = self.vshard_id,
                 epoch = txn_id.epoch,
                 position = txn_id.position,
-                "calvin: executor response was not Ok; locks NOT released (shard degraded)"
-            );
-            self.metrics.record_executor_error();
-            self.metrics.record_infra_abort(
-                crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason::IO_ERROR,
+                "calvin: executor response was not Ok; forcing infra-abort completion so locks \
+                 release and the epoch advances"
             );
             false
         };
 
         if completed {
+            self.metrics.record_completed();
+            self.on_txn_complete(txn_id);
+        } else {
+            // A failed direct apply must not leave the txn parked with its locks
+            // held: that wedges every txn queued behind those keys and freezes
+            // this vShard's epoch watermark, and no sweep re-drives the entry.
+            // Surface the infra abort and force completion — the same
+            // forward-progress contract the disconnected-channel path above
+            // follows.
+            self.metrics.record_executor_error();
+            self.metrics.record_infra_abort(
+                crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason::IO_ERROR,
+            );
             self.metrics.record_completed();
             self.on_txn_complete(txn_id);
         }

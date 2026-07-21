@@ -275,20 +275,34 @@ impl Scheduler {
                 true
             }
         } else {
-            tracing::warn!(
+            tracing::error!(
                 vshard_id = self.vshard_id,
                 epoch = txn_id.epoch,
                 position = txn_id.position,
                 committed,
-                "calvin: flush/drop response was not Ok; locks NOT released (shard degraded)"
+                "calvin: flush/drop response was not Ok while applying an already-committed \
+                 verdict; forcing infra-abort completion so locks release and the epoch advances"
             );
-            self.metrics.record_executor_error();
-            self.metrics
-                .record_infra_abort(infra_abort_reason::IO_ERROR);
             false
         };
 
         if completed {
+            self.metrics.record_completed();
+            self.on_txn_complete(txn_id);
+        } else {
+            // The cross-shard verdict is already globally durable, and a commit's
+            // resolved redo was WAL-appended before this flush — so recovery
+            // re-applies the write. A local flush/apply or WAL-marker failure is
+            // therefore an infrastructure event, NOT an outcome change. It must
+            // never leave the txn parked: holding its locks forever wedges every
+            // txn queued behind those keys and freezes this vShard's epoch
+            // watermark (which anchors cross-shard BEGIN snapshots), and nothing
+            // re-drives a non-`AwaitingVerdict` pending entry. Surface the infra
+            // abort and force completion — the same forward-progress contract the
+            // resolve/drop dispatch-failure path in `resume_on_verdict` follows.
+            self.metrics.record_executor_error();
+            self.metrics
+                .record_infra_abort(infra_abort_reason::IO_ERROR);
             self.metrics.record_completed();
             self.on_txn_complete(txn_id);
         }
