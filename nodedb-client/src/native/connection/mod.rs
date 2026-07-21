@@ -356,9 +356,10 @@ impl NativeConnection {
         op: OpCode,
         fields: TextFields,
     ) -> NodeDbResult<NativeResponse> {
+        let req_seq = self.next_seq();
         let req = NativeRequest {
             op,
-            seq: self.next_seq(),
+            seq: req_seq,
             fields: RequestFields::Text(fields),
         };
 
@@ -395,6 +396,21 @@ impl NativeConnection {
             let resp: NativeResponse = zerompk::from_msgpack(&resp_buf).map_err(|e| {
                 NodeDbError::serialization("msgpack", format!("response decode: {e}"))
             })?;
+
+            if resp.seq != req_seq {
+                // A fan-out query for a preceding request can leave stale
+                // trailing frames on the wire after that request's terminal
+                // frame was already returned to its caller. Discard any
+                // frame that doesn't belong to this request rather than
+                // misattributing it — never surface another request's rows
+                // or status as this request's response.
+                tracing::warn!(
+                    expected_seq = req_seq,
+                    got_seq = resp.seq,
+                    "native connection: discarding stale response frame"
+                );
+                continue;
+            }
 
             if resp.status == ResponseStatus::Partial {
                 if partial_columns.is_none() {
