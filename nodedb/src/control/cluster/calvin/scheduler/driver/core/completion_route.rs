@@ -153,7 +153,7 @@ impl Scheduler {
             None => {}
         }
 
-        if response.status == crate::bridge::envelope::Status::Ok {
+        let completed = if response.status == crate::bridge::envelope::Status::Ok {
             // Observe whether the applying participant reported its slice of the
             // transaction's reads as no longer current against the local write
             // versions. Direct-apply (dependent/active) observation only: the
@@ -165,7 +165,7 @@ impl Scheduler {
                     .read_set_validation_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            self.commit_apply_tail(txn_id, response, None);
+            self.commit_apply_tail(txn_id, response, None)
         } else {
             tracing::warn!(
                 vshard_id = self.vshard_id,
@@ -177,9 +177,12 @@ impl Scheduler {
             self.metrics.record_infra_abort(
                 crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason::IO_ERROR,
             );
-        }
+            false
+        };
 
-        self.metrics.record_completed();
-        self.on_txn_complete(txn_id);
+        if completed {
+            self.metrics.record_completed();
+            self.on_txn_complete(txn_id);
+        }
     }
 }

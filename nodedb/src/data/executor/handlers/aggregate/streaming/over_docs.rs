@@ -112,6 +112,8 @@ impl CoreLoop {
                         aggregates,
                         sub_group_by,
                         sub_aggregates,
+                        limit,
+                        sort_keys,
                     );
                     if self.aggregate_cache.len() < 256 {
                         self.aggregate_cache.insert(cache_key, payload.clone());

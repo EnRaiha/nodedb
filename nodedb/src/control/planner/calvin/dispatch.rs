@@ -36,7 +36,7 @@ use crate::control::planner::calvin::tx_class::build_static_tx_class;
 use crate::control::planner::calvin::types::{DispatchClass, DispatchOutcome};
 use crate::control::server::shared::session::TransactionState;
 use crate::control::server::shared::session::read_set::ReadSetEntry;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::VShardId;
 use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -67,15 +67,14 @@ pub fn is_dependent_predicate(plan: &PhysicalPlan) -> bool {
 ///
 /// Each [`ReadSetEntry`] homes to its collection's vShard using the SAME
 /// collection→vShard map `ReadWriteSet::participating_vshards` uses to derive the
-/// `TxClass` read_set's participants (`DatabaseId::DEFAULT`-scoped, matching the
-/// write path's collection homing) — so the classifier's read∪write decision and
-/// the actual Calvin participant set agree. A read with no extractable collection
-/// contributes nothing.
+/// `TxClass` read_set's participants. Each read retains its session database so
+/// classification and the database-scoped transaction class agree. A read with
+/// no extractable collection contributes nothing.
 pub fn read_vshards_of(reads: &[ReadSetEntry]) -> BTreeSet<u32> {
     reads
         .iter()
         .filter(|e| !e.collection.is_empty())
-        .map(|e| VShardId::from_collection_in_database(DatabaseId::DEFAULT, &e.collection).as_u32())
+        .map(|e| VShardId::from_collection_in_database(e.database_id, &e.collection).as_u32())
         .collect()
 }
 

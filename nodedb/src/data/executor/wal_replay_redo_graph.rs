@@ -12,10 +12,9 @@
 //! (`wal_append_if_write`):
 //!
 //! * PUT — `(collection, src_id, label, dst_id, properties, src_surrogate,
-//!   dst_surrogate)`. The autocommit shape stops at `properties`; the redo shape
-//!   appends the two endpoint surrogates because `execute_edge_put` repopulates
-//!   the CSR node→surrogate map from them (bitmap-gated traversal depends on it),
-//!   and that identity is not otherwise recoverable from the edge alone.
+//!   dst_surrogate, system_from)`. The autocommit shape stops at `properties`;
+//!   the redo shape appends endpoint surrogates and the original temporal
+//!   ordinal. Legacy seven-element transaction redo remains decodable.
 //! * DELETE — `(collection, src_id, label, dst_id)`. Byte-identical to the
 //!   autocommit shape; `execute_edge_delete` needs no surrogate.
 //!
@@ -75,10 +74,50 @@ impl CoreLoop {
             let record_lsn = record.header.lsn;
 
             if is_put {
-                let Ok((collection, src_id, label, dst_id, properties, src_sur, dst_sur)) =
+                let decoded = zerompk::from_msgpack::<(
+                    String,
+                    String,
+                    String,
+                    String,
+                    Vec<u8>,
+                    u32,
+                    u32,
+                    i64,
+                )>(&record.payload)
+                .map(
+                    |(collection, src, label, dst, props, src_sur, dst_sur, system_from)| {
+                        (
+                            collection,
+                            src,
+                            label,
+                            dst,
+                            props,
+                            src_sur,
+                            dst_sur,
+                            Some(system_from),
+                        )
+                    },
+                )
+                .or_else(|_| {
                     zerompk::from_msgpack::<(String, String, String, String, Vec<u8>, u32, u32)>(
                         &record.payload,
                     )
+                    .map(
+                        |(collection, src, label, dst, props, src_sur, dst_sur)| {
+                            (collection, src, label, dst, props, src_sur, dst_sur, None)
+                        },
+                    )
+                });
+                let Ok((
+                    collection,
+                    src_id,
+                    label,
+                    dst_id,
+                    properties,
+                    src_sur,
+                    dst_sur,
+                    system_from,
+                )) = decoded
                 else {
                     continue;
                 };
@@ -93,6 +132,7 @@ impl CoreLoop {
                 let task = Self::replay_graph_task(
                     tenant_id,
                     database_id,
+                    crate::types::VShardId::new(record.header.vshard_id),
                     record_lsn,
                     PhysicalPlan::Graph(GraphOp::EdgePut {
                         collection: collection.clone(),
@@ -104,6 +144,7 @@ impl CoreLoop {
                         dst_surrogate: nodedb_types::Surrogate::new(dst_sur),
                     }),
                 );
+                self.active_graph_system_from = system_from;
                 let response = self.execute_edge_put(
                     &task,
                     EdgePutParams {
@@ -117,6 +158,7 @@ impl CoreLoop {
                         dst_surrogate: nodedb_types::Surrogate::new(dst_sur),
                     },
                 );
+                self.active_graph_system_from = None;
                 if response.status == crate::bridge::envelope::Status::Ok {
                     puts += 1;
                 } else {
@@ -128,9 +170,20 @@ impl CoreLoop {
                     );
                 }
             } else {
-                let Ok((collection, src_id, label, dst_id)) =
-                    zerompk::from_msgpack::<(String, String, String, String)>(&record.payload)
-                else {
+                let decoded =
+                    zerompk::from_msgpack::<(String, String, String, String, i64)>(&record.payload)
+                        .map(|(collection, src, label, dst, system_from)| {
+                            (collection, src, label, dst, Some(system_from))
+                        })
+                        .or_else(|_| {
+                            zerompk::from_msgpack::<(String, String, String, String)>(
+                                &record.payload,
+                            )
+                            .map(|(collection, src, label, dst)| {
+                                (collection, src, label, dst, None)
+                            })
+                        });
+                let Ok((collection, src_id, label, dst_id, system_from)) = decoded else {
                     continue;
                 };
                 if tombstones.is_tombstoned(
@@ -144,6 +197,7 @@ impl CoreLoop {
                 let task = Self::replay_graph_task(
                     tenant_id,
                     database_id,
+                    crate::types::VShardId::new(record.header.vshard_id),
                     record_lsn,
                     PhysicalPlan::Graph(GraphOp::EdgeDelete {
                         collection: collection.clone(),
@@ -154,6 +208,7 @@ impl CoreLoop {
                         dst_surrogate: nodedb_types::Surrogate::ZERO,
                     }),
                 );
+                self.active_graph_system_from = system_from;
                 let response = self.execute_edge_delete(
                     &task,
                     tenant_id,
@@ -162,6 +217,7 @@ impl CoreLoop {
                     &label,
                     &dst_id,
                 );
+                self.active_graph_system_from = None;
                 if response.status == crate::bridge::envelope::Status::Ok {
                     deletes += 1;
                 } else {
@@ -242,10 +298,10 @@ impl CoreLoop {
     fn replay_graph_task(
         tenant_id: u64,
         database_id: DatabaseId,
+        vshard_id: crate::types::VShardId,
         record_lsn: u64,
         plan: PhysicalPlan,
     ) -> ExecutionTask {
-        let vshard_id = crate::types::VShardId::from_collection_in_database(database_id, "");
         let wal_lsn = Some(Lsn::new(record_lsn));
         ExecutionTask {
             request: Request {
@@ -315,9 +371,17 @@ mod tests {
     }
 
     fn edge_put_sub(collection: &str, src: &str, label: &str, dst: &str) -> RedoSubRecord {
-        let payload =
-            zerompk::to_msgpack_vec(&(collection, src, label, dst, b"".as_slice(), 10u32, 20u32))
-                .expect("encode edge put sub-record");
+        let payload = zerompk::to_msgpack_vec(&(
+            collection,
+            src,
+            label,
+            dst,
+            b"".as_slice(),
+            10u32,
+            20u32,
+            nodedb_types::ms_to_ordinal_upper(100),
+        ))
+        .expect("encode edge put sub-record");
         RedoSubRecord {
             record_type: RecordType::Put as u32,
             payload,
@@ -334,7 +398,7 @@ mod tests {
             record_type: RecordType::TransactionRedo as u32,
             lsn: 1,
             tenant_id,
-            vshard_id: 0,
+            vshard_id: crate::types::VShardId::from_key(b"a").as_u32(),
             database_id: 0,
             payload: redo.to_bytes().expect("encode redo record"),
             encryption_key: None,
@@ -366,6 +430,26 @@ mod tests {
             edge_count(&h, "knows", "a"),
             1,
             "graph edge must be restored from redo replay"
+        );
+        let stats = h
+            .core
+            .edge_store
+            .collection_stats(0, crate::types::TenantId::new(7), "knows", None)
+            .expect("graph stats after redo");
+        assert_eq!(stats.edge_count, 1, "source-home redo must restore stats");
+        let historical = h
+            .core
+            .edge_store
+            .collection_stats(
+                0,
+                crate::types::TenantId::new(7),
+                "knows",
+                Some(nodedb_types::ms_to_ordinal_upper(100)),
+            )
+            .expect("historical graph stats after redo");
+        assert_eq!(
+            historical.edge_count, 1,
+            "redo must restore the committed temporal version at its original time"
         );
     }
 

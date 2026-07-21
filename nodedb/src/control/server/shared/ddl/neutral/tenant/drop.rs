@@ -33,6 +33,16 @@ pub fn drop_tenant(
             "permission denied: only superuser can drop tenants",
         ));
     }
+    // Tenant teardown currently coordinates catalog rows with several
+    // in-memory security stores. It must not enter the generic transactional
+    // DDL buffer, whose rollback only discards metadata entries and cannot undo
+    // those side effects.
+    if crate::control::server::shared::session::ddl_buffer::is_active() {
+        return Err(ddl_err(
+            "0A000",
+            "DROP TENANT is not allowed inside an explicit transaction",
+        ));
+    }
 
     let (if_exists, parts) = strip_if_exists(parts, 2);
 

@@ -17,8 +17,8 @@
 use std::net::SocketAddr;
 
 use crate::control::planner::calvin::{
-    CrossShardTxnMode, TxnDispatchPosition, build_single_vshard_tx_class, dispatch_tasks_to_calvin,
-    submit_calvin_routed,
+    CrossShardTxnMode, DispatchClass, TxnDispatchPosition, build_single_vshard_tx_class,
+    classify_dispatch, dispatch_tasks_to_calvin, read_vshards_of, submit_calvin_routed,
 };
 use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::state::SharedState;
@@ -53,22 +53,35 @@ pub(super) async fn run_commit_calvin(
             if state.sequencer_inbox.get().is_none() {
                 return Some(AbortReason::Dispatch(crate::Error::SequencerUnavailable));
             }
-            // Route the buffered cross-shard batch through the sequencer-group
-            // leader via the routed submit-and-await — the whole batch commits
-            // atomically. This is the COMMIT flush of a buffered explicit block,
-            // NOT a mid-block single statement, so the mid-block cross-shard guard
-            // must not fire (hence `CommitFlush`).
-            match dispatch_tasks_to_calvin(
-                state,
-                buffered,
-                tenant_id,
-                cross_shard_mode,
-                TxnDispatchPosition::CommitFlush,
-                reads,
-                reservation_owner,
-            )
-            .await
-            {
+            // A remote single-vShard commit uses the opt-in single-participant
+            // builder; `dispatch_tasks_to_calvin` intentionally rejects that
+            // shape because its ordinary entry point is multi-shard-only.
+            let result = match classify_dispatch(buffered, &read_vshards_of(reads)) {
+                DispatchClass::SingleShard { .. } => {
+                    let mut tx_class =
+                        match build_single_vshard_tx_class(buffered, tenant_id, reads) {
+                            Ok(tx_class) => tx_class,
+                            Err(e) => return Some(AbortReason::Dispatch(e)),
+                        };
+                    tx_class.set_lock_owner(reservation_owner);
+                    submit_calvin_routed(state, tx_class).await
+                }
+                DispatchClass::MultiShard { .. } => {
+                    // Route the buffered cross-shard batch through the
+                    // sequencer-group leader via one atomic submit-and-await.
+                    dispatch_tasks_to_calvin(
+                        state,
+                        buffered,
+                        tenant_id,
+                        cross_shard_mode,
+                        TxnDispatchPosition::CommitFlush,
+                        reads,
+                        reservation_owner,
+                    )
+                    .await
+                }
+            };
+            match result {
                 Ok(_) => None,
                 Err(crate::Error::CalvinSerializationConflict) => {
                     super::hot_key::record_read_set_aborts(state, reads);

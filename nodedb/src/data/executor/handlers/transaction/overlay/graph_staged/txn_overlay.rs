@@ -79,6 +79,9 @@ pub struct GraphTxnOverlay {
     /// the transaction alive). `Cell` for the same single-threaded `!Send`
     /// interior-mutability reason.
     last_touch_ord: Cell<i64>,
+    /// Frozen system-time ordinal used by both live transaction apply and WAL
+    /// redo. Separate from lease liveness so refreshes cannot change history.
+    resolved_system_from_ord: Cell<i64>,
 }
 
 impl GraphTxnOverlay {
@@ -95,6 +98,23 @@ impl GraphTxnOverlay {
     /// The graph overlay's last lease stamp (0 if never touched).
     pub fn last_touch(&self) -> i64 {
         self.last_touch_ord.get()
+    }
+
+    /// Freeze the graph transaction's system-time ordinal on first resolve.
+    /// Retries return the same value byte-for-byte.
+    pub fn freeze_system_from(&self, candidate: i64) -> i64 {
+        let frozen = self.resolved_system_from_ord.get();
+        if frozen != 0 {
+            frozen
+        } else {
+            self.resolved_system_from_ord.set(candidate);
+            candidate
+        }
+    }
+
+    pub fn resolved_system_from(&self) -> Option<i64> {
+        let value = self.resolved_system_from_ord.get();
+        (value != 0).then_some(value)
     }
 
     /// Record an edge identity's prior state across BOTH edge sets before a

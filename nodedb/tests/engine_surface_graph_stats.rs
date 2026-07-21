@@ -63,6 +63,45 @@ async fn single_edge_collection_counts() {
 }
 
 #[tokio::test]
+async fn strict_collection_edge_counts_once_at_every_stats_surface() {
+    let srv = TestServer::start_multicores(2).await;
+    srv.exec(
+        "CREATE COLLECTION g_strict_counts (id TEXT PRIMARY KEY, name TEXT) \
+         WITH (engine='document_strict')",
+    )
+    .await
+    .unwrap();
+    srv.exec(
+        "GRAPH INSERT EDGE IN g_strict_counts FROM 'a' TO 'b' \
+         TYPE 'knows' PROPERTIES '{}'",
+    )
+    .await
+    .unwrap();
+
+    let compact = srv
+        .query_rows("SHOW GRAPH STATS 'g_strict_counts'")
+        .await
+        .unwrap();
+    let (nodes, edges, labels, labels_json) =
+        find_row(&compact, "g_strict_counts").expect("compact stats row");
+    assert_eq!(nodes, 2, "each endpoint must be counted once");
+    assert_eq!(edges, 1, "one logical insert must count as one edge");
+    assert_eq!(labels, 1, "one label must be distinct");
+    assert!(
+        labels_json.contains("\"count\":1"),
+        "per-label count must also be one: {labels_json}"
+    );
+
+    let verbose = srv
+        .query_rows("SHOW GRAPH STATS 'g_strict_counts' VERBOSE")
+        .await
+        .unwrap();
+    assert_eq!(verbose.len(), 1, "one label row expected: {verbose:?}");
+    assert_eq!(verbose[0][1], "knows");
+    assert_eq!(verbose[0][2], "1", "verbose label count");
+}
+
+#[tokio::test]
 async fn multi_label_distinct_count() {
     let srv = TestServer::start().await;
     srv.exec("CREATE COLLECTION g_multi").await.unwrap();

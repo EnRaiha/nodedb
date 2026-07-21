@@ -398,7 +398,9 @@ impl NodeDbPgHandler {
             attempt: 1,
             partial: false,
             payload: payload.into(),
-            watermark_lsn: Lsn::new(0),
+            // Replicated apply returns the authoritative participant WAL LSN.
+            // CDC ordering must use it rather than a synthetic zero watermark.
+            watermark_lsn: write_version,
             error_code: None,
             read_set_valid: None,
             read_version_lsn: write_version,

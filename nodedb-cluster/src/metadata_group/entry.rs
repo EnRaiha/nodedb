@@ -77,6 +77,26 @@ pub enum MetadataEntry {
         entries: Vec<MetadataEntry>,
     },
 
+    /// A catalog DDL proposal fenced by the replicated preparation owner.
+    /// Appliers execute `entry` only while `token` is the current owner;
+    /// superseded proposals are deterministic no-ops so they cannot wedge the
+    /// Raft apply watermark.
+    DdlPrepared {
+        token: u64,
+        entry: Box<MetadataEntry>,
+    },
+
+    /// Acquire the replicated global descriptor-preparation lease. The first
+    /// unexpired owner wins; contenders observe the winner after this entry is
+    /// applied and retry after its matching release or expiry.
+    DdlPrepareAcquire {
+        token: u64,
+    },
+    /// Release the descriptor-preparation lease iff `token` still owns it.
+    DdlPrepareRelease {
+        token: u64,
+    },
+
     // ── Topology / routing ─────────────────────────────────────────────
     TopologyChange(TopologyChange),
     RoutingChange(RoutingChange),

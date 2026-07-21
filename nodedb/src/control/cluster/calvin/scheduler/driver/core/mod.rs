@@ -45,6 +45,7 @@
 
 pub mod catch_up;
 pub mod commit_redo;
+pub mod commit_resolution_dispatch;
 pub mod commit_resolve;
 pub mod completion_route;
 pub mod dispatch;

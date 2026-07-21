@@ -168,6 +168,16 @@ impl CoreLoop {
             .ok()
             .flatten();
 
+        // Record compensation before the two-store mutation begins. The edge
+        // store is updated before CSR, so a CSR failure must still leave an
+        // undo entry for the already-written edge version/stat counters.
+        undo_log.push(UndoEntry::PutEdge {
+            collection: collection.to_string(),
+            src_id: src_id.to_string(),
+            label: label.to_string(),
+            dst_id: dst_id.to_string(),
+            old_properties,
+        });
         let resp = self.execute_edge_put(
             dummy_task,
             crate::data::executor::handlers::graph::EdgePutParams {
@@ -186,14 +196,6 @@ impl CoreLoop {
                 detail: "edge put failed".into(),
             }));
         }
-
-        undo_log.push(UndoEntry::PutEdge {
-            collection: collection.to_string(),
-            src_id: src_id.to_string(),
-            label: label.to_string(),
-            dst_id: dst_id.to_string(),
-            old_properties,
-        });
         Ok(resp)
     }
 
@@ -224,13 +226,6 @@ impl CoreLoop {
             .ok()
             .flatten();
 
-        let resp = self.execute_edge_delete(dummy_task, tid, collection, src_id, label, dst_id);
-        if resp.status == Status::Error {
-            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
-                detail: "edge delete failed".into(),
-            }));
-        }
-
         if let Some(props) = old_properties {
             undo_log.push(UndoEntry::DeleteEdge {
                 collection: collection.to_string(),
@@ -239,6 +234,12 @@ impl CoreLoop {
                 dst_id: dst_id.to_string(),
                 old_properties: props,
             });
+        }
+        let resp = self.execute_edge_delete(dummy_task, tid, collection, src_id, label, dst_id);
+        if resp.status == Status::Error {
+            return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
+                detail: "edge delete failed".into(),
+            }));
         }
         Ok(resp)
     }

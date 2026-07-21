@@ -15,17 +15,19 @@ use std::pin::Pin;
 use nodedb_types::TraceId;
 use nodedb_types::protocol::NativeResponse;
 
-use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
-use crate::control::gateway::core::QueryContext as GatewayQueryContext;
+use crate::bridge::envelope::{ErrorCode, Response};
+use crate::control::gateway::RouteDecision;
+use crate::control::server::dispatch_utils::{
+    ChangeFeedOwner, SubmitWrite, WalDurability, WriteOrdering, submit_write,
+};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::{
     AbortReason, CommitOutcome, TxnDataPlane, commit, lifecycle,
 };
 use crate::control::state::SharedState;
-use crate::types::{Lsn, RequestId};
+use crate::types::Lsn;
 use nodedb_physical::physical_task::PhysicalTask;
 
-use super::super::super::dispatch_utils;
 use super::DispatchCtx;
 
 /// Native Data-Plane dispatch seam for the neutral transaction orchestrator.
@@ -47,48 +49,44 @@ impl TxnDataPlane for NativeTxnDp<'_> {
     ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
         let state = self.state;
         Box::pin(async move {
-            match state.gateway.get() {
-                Some(gw) => {
-                    let gw_ctx = GatewayQueryContext {
+            let decision = crate::control::server::shared::session::resolve_leader(&task, state);
+            if matches!(decision, RouteDecision::Local) {
+                return submit_write(
+                    state,
+                    SubmitWrite {
                         tenant_id: task.tenant_id,
-                        trace_id: TraceId::generate(),
                         database_id: task.database_id,
+                        vshard_id: task.vshard_id,
+                        plan: task.plan,
+                        trace_id: TraceId::generate(),
+                        event_source: crate::event::EventSource::User,
                         txn_id: task.txn_id,
-                    };
-                    let payloads = gw.execute(&gw_ctx, task.plan).await?;
-                    Ok(Response {
-                        request_id: RequestId::new(0),
-                        status: Status::Ok,
-                        attempt: 0,
-                        partial: false,
-                        payload: Payload::from_vec(payloads.into_iter().next().unwrap_or_default()),
-                        watermark_lsn: Lsn::new(0),
-                        error_code: None,
-                        read_set_valid: None,
-                        read_version_lsn: crate::types::Lsn::ZERO,
-                        write_set: Vec::new(),
-                    })
-                }
-                None => {
-                    dispatch_utils::dispatch_write_to_data_plane(
-                        state,
-                        dispatch_utils::WriteDispatch {
-                            tenant_id: task.tenant_id,
-                            database_id: task.database_id,
-                            vshard_id: task.vshard_id,
-                            plan: task.plan,
-                            trace_id: TraceId::ZERO,
-                            event_source: crate::event::EventSource::User,
-                            txn_id: None,
+                        user_id: None,
+                        durability: WalDurability::CallerSupplied {
                             wal_lsn,
-                            // Batch COMMIT record, not per-task WAL append — see
-                            // `dispatch_task_no_wal`'s equivalent limitation.
                             resolved_now_ms: None,
                         },
-                    )
-                    .await
-                }
+                        ordering: WriteOrdering::Gate,
+                        change_feed: ChangeFeedOwner::Funnel,
+                    },
+                )
+                .await
+                .map(|outcome| outcome.response);
             }
+
+            if wal_lsn.is_some() {
+                return Err(crate::Error::Internal {
+                    detail: "non-local transaction commit must route through Calvin".into(),
+                });
+            }
+            let version_plan = task.plan.clone();
+            crate::control::server::shared::session::forward_to_leader(
+                state,
+                decision,
+                task,
+                &version_plan,
+            )
+            .await
         })
     }
 }

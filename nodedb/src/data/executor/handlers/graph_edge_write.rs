@@ -10,7 +10,17 @@ use tracing::debug;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use crate::types::TenantId;
+use crate::types::{TenantId, VShardId};
+
+/// Dual-homed edges are physically present on both endpoint homes. The source
+/// home is the canonical owner of logical graph cardinality, so only that
+/// participant updates persistent stats counters.
+pub(in crate::data::executor) fn owns_logical_edge_stats(
+    task: &ExecutionTask,
+    src_id: &str,
+) -> bool {
+    task.request.vshard_id == VShardId::from_key(src_id.as_bytes())
+}
 
 /// Bundled arguments for [`CoreLoop::execute_edge_put`].
 pub(in crate::data::executor) struct EdgePutParams<'a> {
@@ -60,7 +70,9 @@ impl CoreLoop {
             );
         }
 
-        let ord = self.hlc.next_ordinal();
+        let ord = self
+            .active_graph_system_from
+            .unwrap_or_else(|| self.hlc.next_ordinal());
         // Under a Calvin batch, `epoch_system_ms` is the deterministic epoch
         // timestamp; outside Calvin (every path today — no Calvin edge writes
         // yet) it is None and we fall back to the HLC-derived wall time,
@@ -70,7 +82,7 @@ impl CoreLoop {
             None => nodedb_types::ordinal_to_ms(ord),
         };
         use crate::engine::graph::edge_store::EdgeRef;
-        match self.edge_store.put_edge_versioned(
+        match self.edge_store.put_edge_versioned_with_stats(
             EdgeRef::new(
                 task.request.database_id,
                 TenantId::new(tid),
@@ -83,6 +95,7 @@ impl CoreLoop {
             ord,
             valid_from_ms,
             i64::MAX,
+            owns_logical_edge_stats(task, src_id),
         ) {
             Ok(()) => {
                 let weight = crate::engine::graph::csr::extract_weight_from_properties(properties);
@@ -160,10 +173,12 @@ impl CoreLoop {
                     },
                 );
             }
-            let ord = self.hlc.next_ordinal();
+            let ord = self
+                .active_graph_system_from
+                .unwrap_or_else(|| self.hlc.next_ordinal());
             let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
             use crate::engine::graph::edge_store::EdgeRef;
-            match self.edge_store.put_edge_versioned(
+            match self.edge_store.put_edge_versioned_with_stats(
                 EdgeRef::new(
                     task.request.database_id,
                     TenantId::new(tid),
@@ -176,6 +191,7 @@ impl CoreLoop {
                 ord,
                 valid_from_ms,
                 i64::MAX,
+                owns_logical_edge_stats(task, &edge.src_id),
             ) {
                 Ok(()) => {
                     let partition = self.csr_partition_mut(database_id, tid);
@@ -250,9 +266,11 @@ impl CoreLoop {
         );
         let database_id = task.request.database_id.as_u64();
         for edge in edges {
-            let ord = self.hlc.next_ordinal();
+            let ord = self
+                .active_graph_system_from
+                .unwrap_or_else(|| self.hlc.next_ordinal());
             use crate::engine::graph::edge_store::EdgeRef;
-            let _ = self.edge_store.soft_delete_edge(
+            let _ = self.edge_store.soft_delete_edge_with_stats(
                 EdgeRef::new(
                     task.request.database_id,
                     TenantId::new(tid),
@@ -262,6 +280,7 @@ impl CoreLoop {
                     &edge.dst_id,
                 ),
                 ord,
+                owns_logical_edge_stats(task, &edge.src_id),
             );
             let partition = self.csr_partition_mut(database_id, tid);
             partition.remove_edge_in_collection(
@@ -311,9 +330,11 @@ impl CoreLoop {
     ) -> Response {
         debug!(core = self.core_id, tid, %collection, %src_id, %label, %dst_id, "edge delete");
         let database_id = task.request.database_id.as_u64();
-        let ord = self.hlc.next_ordinal();
+        let ord = self
+            .active_graph_system_from
+            .unwrap_or_else(|| self.hlc.next_ordinal());
         use crate::engine::graph::edge_store::EdgeRef;
-        match self.edge_store.soft_delete_edge(
+        match self.edge_store.soft_delete_edge_with_stats(
             EdgeRef::new(
                 task.request.database_id,
                 TenantId::new(tid),
@@ -323,6 +344,7 @@ impl CoreLoop {
                 dst_id,
             ),
             ord,
+            owns_logical_edge_stats(task, src_id),
         ) {
             Ok(_) => {
                 let partition = self.csr_partition_mut(database_id, tid);

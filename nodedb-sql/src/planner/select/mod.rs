@@ -8,7 +8,7 @@
 
 mod entry;
 mod entry_ann;
-mod helpers;
+pub mod helpers;
 mod order_by;
 mod select_stmt;
 mod where_search;

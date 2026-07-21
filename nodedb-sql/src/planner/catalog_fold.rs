@@ -12,7 +12,11 @@
 use nodedb_types::DatabaseId;
 
 use crate::catalog::SqlCatalog;
-use crate::types::{Filter, FilterExpr, SqlExpr, SqlPlan, SqlValue};
+use crate::types::{Filter, FilterExpr, MergePlanAction, SqlExpr, SqlPlan};
+
+use super::catalog_expr_fold::fold_expr;
+use super::catalog_plan_shapes::{fold_aggregates, fold_projection, fold_sort_keys, fold_windows};
+use super::catalog_plan_validate::validate_catalog_exprs;
 
 /// Walk every `Filter` in `plan` and fold catalog-dependent cast expressions
 /// to their constant OID equivalents.
@@ -25,8 +29,9 @@ pub fn fold_catalog_exprs_in_plan(
     catalog: &dyn SqlCatalog,
     database_id: DatabaseId,
     tenant_id: u64,
-) -> SqlPlan {
-    walk_plan(plan, catalog, database_id, tenant_id)
+) -> crate::Result<SqlPlan> {
+    validate_catalog_exprs(&plan, catalog, database_id, tenant_id)?;
+    Ok(walk_plan(plan, catalog, database_id, tenant_id))
 }
 
 fn walk_plan(
@@ -41,17 +46,20 @@ fn walk_plan(
             alias,
             engine,
             mut filters,
-            projection,
-            sort_keys,
+            mut projection,
+            mut sort_keys,
             limit,
             offset,
             distinct,
-            window_functions,
+            mut window_functions,
             temporal,
         } => {
             for f in &mut filters {
                 fold_filter(f, catalog, database_id, tenant_id);
             }
+            fold_projection(&mut projection, catalog, database_id, tenant_id);
+            fold_sort_keys(&mut sort_keys, catalog, database_id, tenant_id);
+            fold_windows(&mut window_functions, catalog, database_id, tenant_id);
             SqlPlan::Scan {
                 collection,
                 alias,
@@ -67,6 +75,34 @@ fn walk_plan(
             }
         }
 
+        SqlPlan::Union { inputs, distinct } => SqlPlan::Union {
+            inputs: inputs
+                .into_iter()
+                .map(|input| walk_plan(input, catalog, database_id, tenant_id))
+                .collect(),
+            distinct,
+        },
+
+        SqlPlan::Intersect { left, right, all } => SqlPlan::Intersect {
+            left: Box::new(walk_plan(*left, catalog, database_id, tenant_id)),
+            right: Box::new(walk_plan(*right, catalog, database_id, tenant_id)),
+            all,
+        },
+
+        SqlPlan::Except { left, right, all } => SqlPlan::Except {
+            left: Box::new(walk_plan(*left, catalog, database_id, tenant_id)),
+            right: Box::new(walk_plan(*right, catalog, database_id, tenant_id)),
+            all,
+        },
+
+        SqlPlan::Cte { definitions, outer } => SqlPlan::Cte {
+            definitions: definitions
+                .into_iter()
+                .map(|(name, plan)| (name, walk_plan(plan, catalog, database_id, tenant_id)))
+                .collect(),
+            outer: Box::new(walk_plan(*outer, catalog, database_id, tenant_id)),
+        },
+
         SqlPlan::Join {
             left,
             right,
@@ -74,13 +110,14 @@ fn walk_plan(
             join_type,
             condition,
             limit,
-            projection,
+            mut projection,
             mut filters,
         } => {
             for f in &mut filters {
                 fold_filter(f, catalog, database_id, tenant_id);
             }
             let condition = condition.map(|e| fold_expr(e, catalog, database_id, tenant_id));
+            fold_projection(&mut projection, catalog, database_id, tenant_id);
             SqlPlan::Join {
                 left: Box::new(walk_plan(*left, catalog, database_id, tenant_id)),
                 right: Box::new(walk_plan(*right, catalog, database_id, tenant_id)),
@@ -93,7 +130,226 @@ fn walk_plan(
             }
         }
 
-        // All other plan variants are passed through unchanged.
+        mut plan @ (SqlPlan::PointGet { .. } | SqlPlan::RangeScan { .. }) => {
+            match &mut plan {
+                SqlPlan::PointGet { projection, .. } | SqlPlan::RangeScan { projection, .. } => {
+                    fold_projection(projection, catalog, database_id, tenant_id);
+                }
+                _ => unreachable!(),
+            }
+            plan
+        }
+
+        mut plan @ (SqlPlan::DocumentIndexLookup { .. }
+        | SqlPlan::Update { .. }
+        | SqlPlan::Delete { .. }) => {
+            match &mut plan {
+                SqlPlan::DocumentIndexLookup {
+                    filters,
+                    projection,
+                    sort_keys,
+                    window_functions,
+                    ..
+                } => {
+                    for filter in filters {
+                        fold_filter(filter, catalog, database_id, tenant_id);
+                    }
+                    fold_projection(projection, catalog, database_id, tenant_id);
+                    fold_sort_keys(sort_keys, catalog, database_id, tenant_id);
+                    fold_windows(window_functions, catalog, database_id, tenant_id);
+                }
+                SqlPlan::Delete { filters, .. } => {
+                    for filter in filters {
+                        fold_filter(filter, catalog, database_id, tenant_id);
+                    }
+                }
+                SqlPlan::Update {
+                    assignments,
+                    filters,
+                    ..
+                } => {
+                    for (_, expr) in assignments {
+                        let owned = std::mem::replace(expr, SqlExpr::Wildcard);
+                        *expr = fold_expr(owned, catalog, database_id, tenant_id);
+                    }
+                    for filter in filters {
+                        fold_filter(filter, catalog, database_id, tenant_id);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            plan
+        }
+
+        SqlPlan::UpdateFrom {
+            collection,
+            engine,
+            source,
+            target_join_col,
+            source_join_col,
+            mut assignments,
+            mut target_filters,
+            returning,
+        } => {
+            for (_, expr) in &mut assignments {
+                let owned = std::mem::replace(expr, SqlExpr::Wildcard);
+                *expr = fold_expr(owned, catalog, database_id, tenant_id);
+            }
+            for filter in &mut target_filters {
+                fold_filter(filter, catalog, database_id, tenant_id);
+            }
+            SqlPlan::UpdateFrom {
+                collection,
+                engine,
+                source: Box::new(walk_plan(*source, catalog, database_id, tenant_id)),
+                target_join_col,
+                source_join_col,
+                assignments,
+                target_filters,
+                returning,
+            }
+        }
+
+        SqlPlan::InsertSelect {
+            target,
+            source,
+            limit,
+        } => SqlPlan::InsertSelect {
+            target,
+            source: Box::new(walk_plan(*source, catalog, database_id, tenant_id)),
+            limit,
+        },
+
+        SqlPlan::Aggregate {
+            input,
+            mut group_by,
+            group_by_aliases,
+            output_order,
+            mut aggregates,
+            mut having,
+            limit,
+            grouping_sets,
+            mut sort_keys,
+        } => {
+            for expr in &mut group_by {
+                let owned = std::mem::replace(expr, SqlExpr::Wildcard);
+                *expr = fold_expr(owned, catalog, database_id, tenant_id);
+            }
+            fold_aggregates(&mut aggregates, catalog, database_id, tenant_id);
+            for filter in &mut having {
+                fold_filter(filter, catalog, database_id, tenant_id);
+            }
+            fold_sort_keys(&mut sort_keys, catalog, database_id, tenant_id);
+            SqlPlan::Aggregate {
+                input: Box::new(walk_plan(*input, catalog, database_id, tenant_id)),
+                group_by,
+                group_by_aliases,
+                output_order,
+                aggregates,
+                having,
+                limit,
+                grouping_sets,
+                sort_keys,
+            }
+        }
+
+        SqlPlan::LateralTopK {
+            outer,
+            outer_alias,
+            inner_collection,
+            mut inner_filters,
+            mut inner_order_by,
+            inner_limit,
+            correlation_keys,
+            lateral_alias,
+            mut projection,
+            left_join,
+        } => {
+            for filter in &mut inner_filters {
+                fold_filter(filter, catalog, database_id, tenant_id);
+            }
+            fold_sort_keys(&mut inner_order_by, catalog, database_id, tenant_id);
+            fold_projection(&mut projection, catalog, database_id, tenant_id);
+            SqlPlan::LateralTopK {
+                outer: Box::new(walk_plan(*outer, catalog, database_id, tenant_id)),
+                outer_alias,
+                inner_collection,
+                inner_filters,
+                inner_order_by,
+                inner_limit,
+                correlation_keys,
+                lateral_alias,
+                projection,
+                left_join,
+            }
+        }
+
+        SqlPlan::LateralLoop {
+            outer,
+            outer_alias,
+            inner,
+            correlation_predicates,
+            lateral_alias,
+            mut projection,
+            outer_row_cap,
+            left_join,
+        } => {
+            fold_projection(&mut projection, catalog, database_id, tenant_id);
+            SqlPlan::LateralLoop {
+                outer: Box::new(walk_plan(*outer, catalog, database_id, tenant_id)),
+                outer_alias,
+                inner: Box::new(walk_plan(*inner, catalog, database_id, tenant_id)),
+                correlation_predicates,
+                lateral_alias,
+                projection,
+                outer_row_cap,
+                left_join,
+            }
+        }
+
+        SqlPlan::Merge {
+            target,
+            engine,
+            source,
+            target_join_col,
+            source_join_col,
+            source_alias,
+            mut clauses,
+            returning,
+        } => {
+            for clause in &mut clauses {
+                for filter in &mut clause.extra_predicate {
+                    fold_filter(filter, catalog, database_id, tenant_id);
+                }
+                match &mut clause.action {
+                    MergePlanAction::Update { assignments } => {
+                        for (_, expr) in assignments {
+                            let owned = std::mem::replace(expr, SqlExpr::Wildcard);
+                            *expr = fold_expr(owned, catalog, database_id, tenant_id);
+                        }
+                    }
+                    MergePlanAction::Insert { values, .. } => {
+                        for expr in values {
+                            let owned = std::mem::replace(expr, SqlExpr::Wildcard);
+                            *expr = fold_expr(owned, catalog, database_id, tenant_id);
+                        }
+                    }
+                    MergePlanAction::Delete | MergePlanAction::DoNothing => {}
+                }
+            }
+            SqlPlan::Merge {
+                target,
+                engine,
+                source: Box::new(walk_plan(*source, catalog, database_id, tenant_id)),
+                target_join_col,
+                source_join_col,
+                source_alias,
+                clauses,
+                returning,
+            }
+        }
+
+        // Plan variants without expression-bearing filters pass through unchanged.
         other => other,
     }
 }
@@ -132,144 +388,5 @@ fn fold_filter_expr(
         | FilterExpr::Between { .. }
         | FilterExpr::IsNull { .. }
         | FilterExpr::IsNotNull { .. } => {}
-    }
-}
-
-/// Recursively fold catalog-dependent expressions to constants.
-fn fold_expr(
-    expr: SqlExpr,
-    catalog: &dyn SqlCatalog,
-    database_id: DatabaseId,
-    tenant_id: u64,
-) -> SqlExpr {
-    match expr {
-        // `'name'::regclass` or `'name'::regtype` → OID literal.
-        // We match on both in a single arm to avoid partial-move issues.
-        SqlExpr::Cast {
-            expr: inner_expr,
-            to_type,
-        } => {
-            let upper = to_type.to_ascii_uppercase();
-            if upper == "REGCLASS" {
-                if let SqlExpr::Literal(SqlValue::String(ref name)) = *inner_expr
-                    && let Some(oid) = catalog.resolve_regclass(database_id, tenant_id, name)
-                {
-                    return SqlExpr::Literal(SqlValue::Int(oid));
-                }
-            } else if upper == "REGTYPE"
-                && let SqlExpr::Literal(SqlValue::String(ref name)) = *inner_expr
-                && let Some(oid) = catalog.resolve_regtype(name)
-            {
-                return SqlExpr::Literal(SqlValue::Int(oid));
-            }
-            // Non-catalog cast: recurse into inner expression.
-            SqlExpr::Cast {
-                expr: Box::new(fold_expr(*inner_expr, catalog, database_id, tenant_id)),
-                to_type,
-            }
-        }
-
-        // Recurse into BinaryOp children.
-        SqlExpr::BinaryOp { left, op, right } => SqlExpr::BinaryOp {
-            left: Box::new(fold_expr(*left, catalog, database_id, tenant_id)),
-            op,
-            right: Box::new(fold_expr(*right, catalog, database_id, tenant_id)),
-        },
-
-        // Recurse into InList.
-        SqlExpr::InList {
-            expr,
-            list,
-            negated,
-        } => SqlExpr::InList {
-            expr: Box::new(fold_expr(*expr, catalog, database_id, tenant_id)),
-            list: list
-                .into_iter()
-                .map(|e| fold_expr(e, catalog, database_id, tenant_id))
-                .collect(),
-            negated,
-        },
-
-        // Recurse into IsNull.
-        SqlExpr::IsNull { expr, negated } => SqlExpr::IsNull {
-            expr: Box::new(fold_expr(*expr, catalog, database_id, tenant_id)),
-            negated,
-        },
-
-        // Recurse into UnaryOp.
-        SqlExpr::UnaryOp { op, expr } => SqlExpr::UnaryOp {
-            op,
-            expr: Box::new(fold_expr(*expr, catalog, database_id, tenant_id)),
-        },
-
-        // Recurse into ArrayLiteral elements.
-        SqlExpr::ArrayLiteral(elems) => SqlExpr::ArrayLiteral(
-            elems
-                .into_iter()
-                .map(|e| fold_expr(e, catalog, database_id, tenant_id))
-                .collect(),
-        ),
-
-        // Recurse into Function args.
-        SqlExpr::Function {
-            name,
-            args,
-            distinct,
-        } => SqlExpr::Function {
-            name,
-            args: args
-                .into_iter()
-                .map(|a| fold_expr(a, catalog, database_id, tenant_id))
-                .collect(),
-            distinct,
-        },
-
-        // Recurse into Between bounds.
-        SqlExpr::Between {
-            expr,
-            low,
-            high,
-            negated,
-        } => SqlExpr::Between {
-            expr: Box::new(fold_expr(*expr, catalog, database_id, tenant_id)),
-            low: Box::new(fold_expr(*low, catalog, database_id, tenant_id)),
-            high: Box::new(fold_expr(*high, catalog, database_id, tenant_id)),
-            negated,
-        },
-
-        // Recurse into Like.
-        SqlExpr::Like {
-            expr,
-            pattern,
-            negated,
-            case_insensitive,
-        } => SqlExpr::Like {
-            expr: Box::new(fold_expr(*expr, catalog, database_id, tenant_id)),
-            pattern: Box::new(fold_expr(*pattern, catalog, database_id, tenant_id)),
-            negated,
-            case_insensitive,
-        },
-
-        // Recurse into Case.
-        SqlExpr::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => SqlExpr::Case {
-            operand: operand.map(|e| Box::new(fold_expr(*e, catalog, database_id, tenant_id))),
-            when_then: when_then
-                .into_iter()
-                .map(|(w, t)| {
-                    (
-                        fold_expr(w, catalog, database_id, tenant_id),
-                        fold_expr(t, catalog, database_id, tenant_id),
-                    )
-                })
-                .collect(),
-            else_expr: else_expr.map(|e| Box::new(fold_expr(*e, catalog, database_id, tenant_id))),
-        },
-
-        // Leaf nodes: Column, Literal, Wildcard, Subquery — pass through.
-        leaf => leaf,
     }
 }

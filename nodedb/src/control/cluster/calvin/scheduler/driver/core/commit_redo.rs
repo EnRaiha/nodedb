@@ -16,7 +16,7 @@ use super::scheduler::Scheduler;
 use crate::bridge::envelope::{Response, Status};
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason;
-use crate::types::{DatabaseId, VShardId};
+use crate::types::VShardId;
 use crate::wal::{CalvinStamp, RedoRecord};
 use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_plan::meta::MetaOp;
@@ -72,6 +72,7 @@ impl Scheduler {
             return;
         };
         let tenant_id = pending.txn.tx_class.tenant_id;
+        let database_id = pending.txn.tx_class.database_id;
 
         let redo_lsn = if redo.ops.is_empty() {
             None
@@ -79,7 +80,7 @@ impl Scheduler {
             match self.shared.wal.append_transaction_redo(
                 tenant_id,
                 VShardId::new(self.vshard_id),
-                DatabaseId::DEFAULT,
+                database_id,
                 &redo,
             ) {
                 Ok(lsn) => Some(lsn),
@@ -139,6 +140,7 @@ impl Scheduler {
             return false;
         };
         let tenant_id = pending.txn.tx_class.tenant_id;
+        let database_id = pending.txn.tx_class.database_id;
         let epoch = txn_id.epoch;
         let position = txn_id.position;
 
@@ -146,7 +148,7 @@ impl Scheduler {
         let plan = PhysicalPlan::Meta(MetaOp::CalvinResolve { epoch, position });
         // A resolve reads the staged overlay only; it writes no WAL record
         // itself, so no committed LSN rides on this envelope.
-        let request = self.build_exempt_request(request_id, tenant_id, plan, None);
+        let request = self.build_exempt_request(request_id, tenant_id, database_id, plan, None);
 
         let resp_rx = self.shared.tracker.register(request_id);
         let dispatch_result = match self.shared.dispatcher.lock() {

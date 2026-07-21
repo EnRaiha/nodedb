@@ -240,6 +240,9 @@ impl CoreLoop {
             }
         }
         if let Some(graph_overlay) = self.graph_txn_overlays.get(&txn_id) {
+            // Freeze temporal identity independently from the overlay's lease
+            // refresh stamp. Resolve retries reuse the exact same ordinal.
+            let graph_system_from = graph_overlay.freeze_system_from(self.hlc.next_ordinal());
             for collection in &graph_collections {
                 let coll_key = (
                     task.request.database_id,
@@ -251,6 +254,7 @@ impl CoreLoop {
                     &coll_key,
                     collection,
                     &edge_surrogates,
+                    graph_system_from,
                     &mut ops,
                 )?;
             }
@@ -1814,8 +1818,8 @@ mod tests {
         assert_eq!(redo.ops.len(), 1, "one staged edge put -> one sub-record");
         assert_eq!(redo.ops[0].record_type, RecordType::Put as u32);
 
-        let (collection, src_id, label, dst_id, properties, src_sur, dst_sur) =
-            zerompk::from_msgpack::<(String, String, String, String, Vec<u8>, u32, u32)>(
+        let (collection, src_id, label, dst_id, properties, src_sur, dst_sur, system_from) =
+            zerompk::from_msgpack::<(String, String, String, String, Vec<u8>, u32, u32, i64)>(
                 &redo.ops[0].payload,
             )
             .expect("decode edge put tuple");
@@ -1826,6 +1830,10 @@ mod tests {
         assert_eq!(properties, vec![9, 9]);
         assert_eq!(src_sur, 10, "src surrogate must come from the plan node");
         assert_eq!(dst_sur, 20, "dst surrogate must come from the plan node");
+        assert!(
+            system_from > 0,
+            "resolve must freeze a real graph system-time ordinal"
+        );
 
         // Replay into a fresh core: the CSR node->surrogate map must be
         // repopulated from the two trailing surrogates.
@@ -1901,13 +1909,14 @@ mod tests {
         assert_eq!(redo.ops.len(), 1);
         assert_eq!(redo.ops[0].record_type, RecordType::Delete as u32);
 
-        let (collection, src_id, label, dst_id) =
-            zerompk::from_msgpack::<(String, String, String, String)>(&redo.ops[0].payload)
-                .expect("decode edge delete tuple");
+        let (collection, src_id, label, dst_id, system_from) =
+            zerompk::from_msgpack::<(String, String, String, String, i64)>(&redo.ops[0].payload)
+                .expect("decode timestamped edge delete tuple");
         assert_eq!(collection, "g");
         assert_eq!(src_id, "a");
         assert_eq!(label, "knows");
         assert_eq!(dst_id, "b");
+        assert!(system_from > 0);
 
         // Seed the edge in a fresh core, then replay the delete removes it.
         let (mut dst_core, _dst_dir) = make_core();

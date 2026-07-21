@@ -12,9 +12,9 @@ use std::net::SocketAddr;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
-use super::commit::drop_txn_overlay;
 use super::ddl_buffer;
 use super::outcome::TxnDataPlane;
+use super::overlay_drop::drop_txn_overlay;
 use super::store::SessionStore;
 
 /// Run the neutral BEGIN sequence: anchor the snapshot LSN, activate the DDL

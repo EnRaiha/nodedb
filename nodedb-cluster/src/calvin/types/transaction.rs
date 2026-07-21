@@ -59,6 +59,11 @@ impl ReadWriteSet {
     /// serialized bytes remain deterministic regardless of how `VShardId`
     /// is computed.
     pub fn participating_vshards(&self) -> Vec<VShardId> {
+        self.participating_vshards_in_database(DatabaseId::DEFAULT)
+    }
+
+    /// Derive participants using database-scoped collection homes.
+    pub fn participating_vshards_in_database(&self, database_id: DatabaseId) -> Vec<VShardId> {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
         for engine_set in &self.0 {
@@ -74,10 +79,8 @@ impl ReadWriteSet {
                 EngineKeySet::Document { .. }
                 | EngineKeySet::Vector { .. }
                 | EngineKeySet::Kv { .. } => {
-                    let vshard = VShardId::from_collection_in_database(
-                        DatabaseId::DEFAULT,
-                        engine_set.collection(),
-                    );
+                    let vshard =
+                        VShardId::from_collection_in_database(database_id, engine_set.collection());
                     if seen.insert(vshard.as_u32()) {
                         result.push(vshard);
                     }
@@ -129,6 +132,10 @@ pub struct TxClass {
     /// Tenant scope. All keys in `read_set` and `write_set` must belong to
     /// this tenant; cross-tenant transactions are rejected at construction.
     pub tenant_id: TenantId,
+    /// Database scope used for collection homing, execution, WAL, and CDC.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub database_id: DatabaseId,
     /// Optional dependent-read specification.
     ///
     /// When present, this transaction is a dependent-read Calvin txn: the
@@ -190,11 +197,33 @@ impl TxClass {
         dependent_reads: Option<DependentReadSpec>,
         versioned_reads: VersionedReadSet,
     ) -> Result<Self, CalvinError> {
+        Self::new_in_database(
+            read_set,
+            write_set,
+            plans,
+            tenant_id,
+            DatabaseId::DEFAULT,
+            dependent_reads,
+            versioned_reads,
+        )
+    }
+
+    /// Construct a validated multi-vshard class in an explicit database.
+    pub fn new_in_database(
+        read_set: ReadWriteSet,
+        write_set: ReadWriteSet,
+        plans: Vec<u8>,
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        dependent_reads: Option<DependentReadSpec>,
+        versioned_reads: VersionedReadSet,
+    ) -> Result<Self, CalvinError> {
         Self::new_checked(
             read_set,
             write_set,
             plans,
             tenant_id,
+            database_id,
             dependent_reads,
             versioned_reads,
             false,
@@ -225,11 +254,33 @@ impl TxClass {
         dependent_reads: Option<DependentReadSpec>,
         versioned_reads: VersionedReadSet,
     ) -> Result<Self, CalvinError> {
+        Self::new_single_vshard_in_database(
+            read_set,
+            write_set,
+            plans,
+            tenant_id,
+            DatabaseId::DEFAULT,
+            dependent_reads,
+            versioned_reads,
+        )
+    }
+
+    /// Construct a single-vshard class in an explicit database.
+    pub fn new_single_vshard_in_database(
+        read_set: ReadWriteSet,
+        write_set: ReadWriteSet,
+        plans: Vec<u8>,
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        dependent_reads: Option<DependentReadSpec>,
+        versioned_reads: VersionedReadSet,
+    ) -> Result<Self, CalvinError> {
         Self::new_checked(
             read_set,
             write_set,
             plans,
             tenant_id,
+            database_id,
             dependent_reads,
             versioned_reads,
             true,
@@ -239,11 +290,13 @@ impl TxClass {
     /// Shared construction body. `allow_single_vshard` relaxes the participant
     /// floor from 2 (multi-vshard) to 1 (single-vshard opt-in); an empty write
     /// set and a zero-participant write set are rejected on both paths.
+    #[allow(clippy::too_many_arguments)] // shared validation for both constructor modes
     fn new_checked(
         read_set: ReadWriteSet,
         write_set: ReadWriteSet,
         plans: Vec<u8>,
         tenant_id: TenantId,
+        database_id: DatabaseId,
         dependent_reads: Option<DependentReadSpec>,
         versioned_reads: VersionedReadSet,
         allow_single_vshard: bool,
@@ -251,7 +304,7 @@ impl TxClass {
         if write_set.is_empty() {
             return Err(CalvinError::EmptyWriteSet);
         }
-        let mut participating_vshards = write_set.participating_vshards();
+        let mut participating_vshards = write_set.participating_vshards_in_database(database_id);
         let min_participants = if allow_single_vshard { 1 } else { 2 };
         // The participant FLOOR is computed from the WRITE set ONLY, and BEFORE
         // the read-set union below: a txn that writes a single shard but reads N
@@ -270,7 +323,7 @@ impl TxClass {
         // `new_checked` and `restore_derived` — `participating_vshards` is
         // `#[serde(skip)]` and re-derived on decode, so an encoded and a decoded
         // `TxClass` would disagree on their participant set if the two diverged.
-        for v in read_set.participating_vshards() {
+        for v in read_set.participating_vshards_in_database(database_id) {
             if !participating_vshards
                 .iter()
                 .any(|e| e.as_u32() == v.as_u32())
@@ -299,6 +352,7 @@ impl TxClass {
             write_set,
             plans,
             tenant_id,
+            database_id,
             dependent_reads,
             versioned_reads,
             lock_owner: None,
@@ -341,11 +395,16 @@ impl TxClass {
     /// Call this immediately after deserializing a `TxClass` that came off
     /// the wire or out of the Raft log.
     pub fn restore_derived(&mut self) {
-        let mut vshards = self.write_set.participating_vshards();
+        let mut vshards = self
+            .write_set
+            .participating_vshards_in_database(self.database_id);
         // Union the read set's participating vShards — MUST match `new_checked`'s
         // union exactly so a decoded `TxClass` derives the identical participant
         // set the encoder computed (participants are not serialized).
-        for v in self.read_set.participating_vshards() {
+        for v in self
+            .read_set
+            .participating_vshards_in_database(self.database_id)
+        {
             if !vshards.iter().any(|e| e.as_u32() == v.as_u32()) {
                 vshards.push(v);
             }
@@ -444,6 +503,25 @@ mod tests {
     /// map-encoded with the original fields only. Proves an old serialized
     /// `TxClass` (no `versioned_reads` key) still decodes — the field defaults
     /// to empty — so Raft-logged transactions survive the schema addition.
+    #[test]
+    fn database_scope_survives_msgpack_roundtrip() {
+        let tx = TxClass::new_in_database(
+            ReadWriteSet::new(vec![]),
+            two_home_write_set(),
+            vec![0x01],
+            TenantId::new(1),
+            DatabaseId::new(9),
+            None,
+            VersionedReadSet::default(),
+        )
+        .expect("valid TxClass");
+        let bytes = zerompk::to_msgpack_vec(&tx).expect("encode");
+        let mut decoded: TxClass = zerompk::from_msgpack(&bytes).expect("decode");
+        decoded.restore_derived();
+        assert_eq!(decoded.database_id, DatabaseId::new(9));
+        assert_eq!(decoded.participating_vshards(), tx.participating_vshards());
+    }
+
     #[derive(zerompk::ToMessagePack)]
     #[msgpack(map)]
     struct LegacyTxClass {
@@ -469,6 +547,7 @@ mod tests {
         assert!(decoded.versioned_reads.is_empty());
         assert!(decoded.dependent_reads.is_none());
         assert_eq!(decoded.tenant_id, TenantId::new(3));
+        assert_eq!(decoded.database_id, DatabaseId::DEFAULT);
         assert_eq!(decoded.plans, vec![0x01, 0x02]);
         assert_eq!(decoded.participating_vshards().len(), 2);
     }

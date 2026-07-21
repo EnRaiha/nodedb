@@ -111,12 +111,24 @@ impl CoreLoop {
 
     // ── Graph ────────────────────────────────────────────────────────────────
 
+    #[cfg(test)]
     pub(super) fn apply_undo_edge(
         &mut self,
         did: u64,
         tid: u64,
         entry_index: usize,
         entry: UndoEntry,
+    ) -> Result<(), (usize, String)> {
+        self.apply_undo_edge_with_stats(did, tid, entry_index, entry, true)
+    }
+
+    pub(super) fn apply_undo_edge_with_stats(
+        &mut self,
+        did: u64,
+        tid: u64,
+        entry_index: usize,
+        entry: UndoEntry,
+        account_stats: bool,
     ) -> Result<(), (usize, String)> {
         use crate::engine::graph::edge_store::EdgeRef;
         let database = nodedb_types::DatabaseId::new(did);
@@ -135,7 +147,14 @@ impl CoreLoop {
                 if let Some(old_props) = old_properties {
                     let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
                     self.edge_store
-                        .put_edge_versioned(edge_ref, &old_props, ord, valid_from_ms, i64::MAX)
+                        .put_edge_versioned_with_stats(
+                            edge_ref,
+                            &old_props,
+                            ord,
+                            valid_from_ms,
+                            i64::MAX,
+                            account_stats,
+                        )
                         .map_err(|e| {
                             let detail = format!(
                                 "edge restore {collection} {src_id}-[{label}]->{dst_id}: {e}"
@@ -147,9 +166,35 @@ impl CoreLoop {
                             );
                             (entry_index, detail)
                         })?;
+                    let weight =
+                        crate::engine::graph::csr::extract_weight_from_properties(&old_props);
+                    let partition = self.csr_partition_mut(did, tid);
+                    partition.remove_edge_in_collection(&src_id, &label, &dst_id, &collection);
+                    let csr_res = if weight != 1.0 {
+                        partition.add_edge_weighted_in_collection(
+                            &src_id,
+                            &label,
+                            &dst_id,
+                            &collection,
+                            weight,
+                        )
+                    } else {
+                        partition.add_edge_in_collection(&src_id, &label, &dst_id, &collection)
+                    };
+                    csr_res.map_err(|e| {
+                        let detail =
+                            format!("CSR restore {collection} {src_id}-[{label}]->{dst_id}: {e}");
+                        error!(
+                            core = self.core_id, entry_index,
+                            error = %detail,
+                            "transaction undo: CSR restore failed after edge_store restore; \
+                             shard state unknown"
+                        );
+                        (entry_index, detail)
+                    })?;
                 } else {
                     self.edge_store
-                        .soft_delete_edge(edge_ref, ord)
+                        .soft_delete_edge_with_stats(edge_ref, ord, account_stats)
                         .map_err(|e| {
                             let detail = format!(
                                 "edge tombstone {collection} {src_id}-[{label}]->{dst_id}: {e}"
@@ -181,12 +226,13 @@ impl CoreLoop {
                 let ord = self.hlc.next_ordinal();
                 let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
                 self.edge_store
-                    .put_edge_versioned(
+                    .put_edge_versioned_with_stats(
                         EdgeRef::new(database, tenant, &collection, &src_id, &label, &dst_id),
                         &old_properties,
                         ord,
                         valid_from_ms,
                         i64::MAX,
+                        account_stats,
                     )
                     .map_err(|e| {
                         let detail = format!(

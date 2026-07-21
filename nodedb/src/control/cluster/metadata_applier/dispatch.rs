@@ -33,6 +33,29 @@ impl MetadataCommitApplier {
         entry: &MetadataEntry,
         raft_index: u64,
     ) -> Result<(), crate::Error> {
+        // A prepared DDL is conditionally applied under the replicated owner
+        // token. A superseded proposal is a deterministic no-op: rejecting a
+        // committed stale token would wedge the Raft apply watermark forever.
+        if let MetadataEntry::DdlPrepared { token, entry } = entry {
+            let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) else {
+                return Ok(());
+            };
+            let owns_lease = shared
+                .metadata_ddl_owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some_and(|(current, _)| current == *token);
+            if !owns_lease {
+                debug!(token, raft_index, "skipping superseded prepared DDL");
+                return Ok(());
+            }
+            self.apply_host_side_effects(entry.as_ref(), raft_index)?;
+            shared
+                .metadata_ddl_applied_token
+                .store(*token, std::sync::atomic::Ordering::Release);
+            return Ok(());
+        }
+
         // Atomic batches unpack one level: the sub-entries are
         // applied individually so each gets its own audit record
         // stamped with the same raft_index (they committed at the
@@ -56,6 +79,30 @@ impl MetadataCommitApplier {
             } => return self.apply_drain_start(descriptor_id, *up_to_version, *expires_at),
             MetadataEntry::DescriptorDrainEnd { descriptor_id } => {
                 return self.apply_drain_end(descriptor_id);
+            }
+            MetadataEntry::DdlPrepareAcquire { token } => {
+                if let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) {
+                    let mut owner = shared
+                        .metadata_ddl_owner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if owner.is_none() || owner.is_some_and(|(current, _)| current == *token) {
+                        *owner = Some((*token, std::time::Instant::now()));
+                    }
+                }
+                return Ok(());
+            }
+            MetadataEntry::DdlPrepareRelease { token } => {
+                if let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) {
+                    let mut owner = shared
+                        .metadata_ddl_owner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if owner.is_some_and(|(current, _)| current == *token) {
+                        *owner = None;
+                    }
+                }
+                return Ok(());
             }
             MetadataEntry::CaTrustChange {
                 add_ca_cert,

@@ -374,9 +374,9 @@ impl NativeConnection {
         self.stream.flush().await.map_err(io_err)?;
 
         let mut combined_rows: Vec<Vec<nodedb_types::Value>> = Vec::new();
-        let mut final_resp: Option<NativeResponse> = None;
+        let mut partial_columns: Option<Vec<String>> = None;
 
-        loop {
+        let final_resp = loop {
             let mut len_buf = [0u8; FRAME_HEADER_LEN];
             self.stream.read_exact(&mut len_buf).await.map_err(io_err)?;
             let resp_len = u32::from_be_bytes(len_buf);
@@ -397,29 +397,35 @@ impl NativeConnection {
             })?;
 
             if resp.status == ResponseStatus::Partial {
+                if partial_columns.is_none() {
+                    partial_columns = resp.columns;
+                }
                 if let Some(rows) = resp.rows {
                     combined_rows.extend(rows);
                 }
-                if final_resp.is_none() {
-                    final_resp = Some(NativeResponse { rows: None, ..resp });
-                }
-            } else {
-                if combined_rows.is_empty() {
-                    final_resp = Some(resp);
-                } else {
-                    if let Some(ref rows) = resp.rows {
-                        combined_rows.extend(rows.iter().cloned());
-                    }
-                    let mut merged = final_resp.unwrap_or(resp);
-                    merged.rows = Some(combined_rows);
-                    merged.status = ResponseStatus::Ok;
-                    final_resp = Some(merged);
-                }
-                break;
+                continue;
             }
-        }
 
-        final_resp.ok_or_else(|| NodeDbError::internal("no final response received"))
+            // The terminal frame owns status and all terminal metadata. In
+            // particular, never turn a stream error into success merely
+            // because earlier partial rows were received.
+            if resp.status == ResponseStatus::Error {
+                break resp;
+            }
+            let mut terminal = resp;
+            if let Some(rows) = terminal.rows.take() {
+                combined_rows.extend(rows);
+            }
+            if !combined_rows.is_empty() {
+                terminal.rows = Some(combined_rows);
+            }
+            if terminal.columns.is_none() {
+                terminal.columns = partial_columns;
+            }
+            break terminal;
+        };
+
+        Ok(final_resp)
     }
 }
 

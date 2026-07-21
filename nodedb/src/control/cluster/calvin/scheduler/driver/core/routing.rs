@@ -38,22 +38,41 @@ pub(crate) enum PlanRouting {
     Unroutable(&'static str),
 }
 
+pub(crate) fn homes_versioned_read(
+    reads: &nodedb_types::calvin::VersionedReadSet,
+    database_id: DatabaseId,
+    vshard_id: u32,
+) -> bool {
+    reads.iter().any(|entry| {
+        VShardId::from_collection_in_database(database_id, &entry.collection).as_u32() == vshard_id
+    })
+}
+
+fn collection_vshard_in_database(database_id: DatabaseId, collection: &str) -> VShardId {
+    VShardId::from_collection_in_database(database_id, collection)
+}
+
+#[cfg(test)]
 fn collection_vshard(collection: &str) -> VShardId {
-    VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection)
+    collection_vshard_in_database(DatabaseId::DEFAULT, collection)
 }
 
 /// Returns the routing decision for `plan`. Exhaustive over every
 /// `PhysicalPlan` variant and every op nested inside it — adding a new
 /// variant anywhere in this tree is a compile error, never a silent gap.
 pub(crate) fn plan_vshard(plan: &PhysicalPlan) -> PlanRouting {
+    plan_vshard_in_database(plan, DatabaseId::DEFAULT)
+}
+
+pub(crate) fn plan_vshard_in_database(plan: &PhysicalPlan, database_id: DatabaseId) -> PlanRouting {
     match plan {
-        PhysicalPlan::Document(op) => document_routing(op),
-        PhysicalPlan::Kv(op) => kv_routing(op),
-        PhysicalPlan::Vector(op) => vector_routing(op),
+        PhysicalPlan::Document(op) => document_routing(op, database_id),
+        PhysicalPlan::Kv(op) => kv_routing(op, database_id),
+        PhysicalPlan::Vector(op) => vector_routing(op, database_id),
         PhysicalPlan::Graph(op) => graph_routing(op),
-        PhysicalPlan::Timeseries(op) => timeseries_routing(op),
-        PhysicalPlan::Columnar(op) => columnar_routing(op),
-        PhysicalPlan::Crdt(op) => crdt_routing(op),
+        PhysicalPlan::Timeseries(op) => timeseries_routing(op, database_id),
+        PhysicalPlan::Columnar(op) => columnar_routing(op, database_id),
+        PhysicalPlan::Crdt(op) => crdt_routing(op, database_id),
         PhysicalPlan::Array(op) => array_routing(op),
         // Cluster-fanned-out array ops are handled entirely by the
         // Control-Plane `ArrayCoordinator` and never dispatched to the Data
@@ -68,7 +87,7 @@ pub(crate) fn plan_vshard(plan: &PhysicalPlan) -> PlanRouting {
     }
 }
 
-fn document_routing(op: &DocumentOp) -> PlanRouting {
+fn document_routing(op: &DocumentOp, database_id: DatabaseId) -> PlanRouting {
     match op {
         DocumentOp::PointPut { collection, .. }
         | DocumentOp::PointInsert { collection, .. }
@@ -79,11 +98,14 @@ fn document_routing(op: &DocumentOp) -> PlanRouting {
         | DocumentOp::BulkUpdate { collection, .. }
         | DocumentOp::BulkDelete { collection, .. }
         | DocumentOp::Truncate { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard(collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
         DocumentOp::InsertSelect {
             target_collection, ..
-        } => PlanRouting::Vshards(vec![collection_vshard(target_collection)]),
+        } => PlanRouting::Vshards(vec![collection_vshard_in_database(
+            database_id,
+            target_collection,
+        )]),
         // Both join the target with a DIFFERENT source collection; nothing on
         // the plan enforces the two live on the same vshard.
         DocumentOp::Merge { .. } | DocumentOp::UpdateFromJoin { .. } => PlanRouting::Unroutable(
@@ -102,7 +124,7 @@ fn document_routing(op: &DocumentOp) -> PlanRouting {
     }
 }
 
-fn kv_routing(op: &KvOp) -> PlanRouting {
+fn kv_routing(op: &KvOp, database_id: DatabaseId) -> PlanRouting {
     match op {
         KvOp::Put { collection, .. }
         | KvOp::Insert { collection, .. }
@@ -121,7 +143,7 @@ fn kv_routing(op: &KvOp) -> PlanRouting {
         // Transfer moves value between two KEYS in the SAME collection field,
         // so it stays single-home unlike `TransferItem` below.
         | KvOp::Transfer { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard(collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
         // Source and dest are DIFFERENT collections; no co-location guarantee.
         KvOp::TransferItem { .. } => PlanRouting::Unroutable(
@@ -145,7 +167,7 @@ fn kv_routing(op: &KvOp) -> PlanRouting {
     }
 }
 
-fn vector_routing(op: &VectorOp) -> PlanRouting {
+fn vector_routing(op: &VectorOp, database_id: DatabaseId) -> PlanRouting {
     match op {
         VectorOp::Insert { collection, .. }
         | VectorOp::BatchInsert { collection, .. }
@@ -156,7 +178,7 @@ fn vector_routing(op: &VectorOp) -> PlanRouting {
         | VectorOp::MultiVectorInsert { collection, .. }
         | VectorOp::MultiVectorDelete { collection, .. }
         | VectorOp::DirectUpsert { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard(collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
         VectorOp::Search { .. }
         | VectorOp::MultiSearch { .. }
@@ -227,27 +249,27 @@ fn graph_routing(op: &GraphOp) -> PlanRouting {
     }
 }
 
-fn timeseries_routing(op: &TimeseriesOp) -> PlanRouting {
+fn timeseries_routing(op: &TimeseriesOp, database_id: DatabaseId) -> PlanRouting {
     match op {
         TimeseriesOp::Ingest { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard(collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
         TimeseriesOp::Scan { .. } => PlanRouting::NotAWrite,
     }
 }
 
-fn columnar_routing(op: &ColumnarOp) -> PlanRouting {
+fn columnar_routing(op: &ColumnarOp, database_id: DatabaseId) -> PlanRouting {
     match op {
         ColumnarOp::Insert { collection, .. }
         | ColumnarOp::Update { collection, .. }
         | ColumnarOp::Delete { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard(collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
         ColumnarOp::Scan { .. } | ColumnarOp::MaterializeScan { .. } => PlanRouting::NotAWrite,
     }
 }
 
-fn crdt_routing(op: &CrdtOp) -> PlanRouting {
+fn crdt_routing(op: &CrdtOp, database_id: DatabaseId) -> PlanRouting {
     match op {
         CrdtOp::Apply { collection, .. }
         | CrdtOp::ListInsert { collection, .. }
@@ -259,7 +281,7 @@ fn crdt_routing(op: &CrdtOp) -> PlanRouting {
         | CrdtOp::DropConstraints { collection, .. }
         | CrdtOp::RestoreToVersion { collection, .. }
         | CrdtOp::ImportSnapshot { collection, .. } => {
-            PlanRouting::Vshards(vec![collection_vshard(collection)])
+            PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
         CrdtOp::Read { .. }
         | CrdtOp::ReadConstraints { .. }
@@ -469,6 +491,28 @@ mod tests {
         });
         let want = collection_vshard("docs").as_u32();
         assert_eq!(vshards_of(&plan), vec![want]);
+    }
+
+    #[test]
+    fn collection_routing_preserves_database_scope() {
+        let collection = (0..2048)
+            .map(|i| format!("db_scoped_{i}"))
+            .find(|name| {
+                collection_vshard_in_database(DatabaseId::DEFAULT, name)
+                    != collection_vshard_in_database(DatabaseId::new(7), name)
+            })
+            .expect("collection whose home differs by database");
+        let plan = PhysicalPlan::Document(DocumentOp::Truncate {
+            collection: collection.clone(),
+            restart_identity: false,
+        });
+        let expected = collection_vshard_in_database(DatabaseId::new(7), &collection);
+        match plan_vshard_in_database(&plan, DatabaseId::new(7)) {
+            PlanRouting::Vshards(actual) => assert_eq!(actual, vec![expected]),
+            PlanRouting::ControlPlaneOnly | PlanRouting::NotAWrite | PlanRouting::Unroutable(_) => {
+                panic!("document truncate must be database-scoped")
+            }
+        }
     }
 
     #[test]

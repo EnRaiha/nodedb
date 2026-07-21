@@ -490,6 +490,10 @@ pub struct CoreLoop {
     pub(in crate::data::executor) active_bitemporal_stamps:
         HashMap<u32, crate::data::executor::handlers::transaction::overlay::BitemporalStamp>,
 
+    /// Transaction-resolved graph system-time ordinal used for every edge
+    /// mutation in the current live apply/replay scope.
+    pub(in crate::data::executor) active_graph_system_from: Option<i64>,
+
     /// Staged Calvin write plans awaiting the local commit verdict, keyed by
     /// `(epoch, position, vshard)`. `CalvinExecuteStatic` validates a
     /// transaction and inserts its plans here WITHOUT mutating base; the

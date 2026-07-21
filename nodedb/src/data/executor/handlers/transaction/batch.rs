@@ -66,9 +66,14 @@ impl CoreLoop {
         // it is cleared the moment `run_sub_plans` returns (any path).
         if let Some(txn_id) = txn_id {
             self.load_bitemporal_stamps_for_txn(txn_id);
+            self.active_graph_system_from = self
+                .graph_txn_overlays
+                .get(&txn_id)
+                .and_then(|overlay| overlay.resolved_system_from());
         }
         let sub = self.run_sub_plans(task, tid, plans, undo_log, crdt_deltas);
         self.active_bitemporal_stamps.clear();
+        self.active_graph_system_from = None;
         let (last_response, undo_log, crdt_deltas) = match sub {
             Ok(v) => v,
             Err(resp) => return resp,
@@ -152,7 +157,8 @@ impl CoreLoop {
         for (i, plan) in plans.iter().enumerate() {
             let user_roles = &task.request.user_roles;
             let outcome = catch_unwind(AssertUnwindSafe(|| {
-                let r = self.execute_tx_sub_plan(
+                let r = self.execute_tx_sub_plan_from_batch(
+                    task,
                     tid,
                     plan,
                     &mut undo_log,
@@ -193,9 +199,10 @@ impl CoreLoop {
                     // Roll back all previous writes in reverse order.
                     // If rollback itself fails, the shard state is unknown —
                     // return RollbackFailed (never warn-and-continue).
-                    let rollback_error_code = match self.rollback_undo_log(
-                        crate::types::DatabaseId::DEFAULT.as_u64(),
+                    let rollback_error_code = match self.rollback_undo_log_at(
+                        task.request.database_id.as_u64(),
                         tid,
+                        task.request.vshard_id,
                         undo_log,
                     ) {
                         Ok(()) => error_code,
@@ -255,9 +262,10 @@ impl CoreLoop {
                 "BALANCED constraint violated, rolling back {} operations",
                 undo_log.len()
             );
-            let rollback_error_code = match self.rollback_undo_log(
-                crate::types::DatabaseId::DEFAULT.as_u64(),
+            let rollback_error_code = match self.rollback_undo_log_at(
+                task.request.database_id.as_u64(),
                 tid,
+                task.request.vshard_id,
                 undo_log,
             ) {
                 Ok(()) => error_code,

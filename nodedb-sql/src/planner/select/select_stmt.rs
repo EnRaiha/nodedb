@@ -5,7 +5,7 @@
 use nodedb_types::DatabaseId;
 use sqlparser::ast::{self, Select};
 
-use super::helpers::{convert_projection, convert_where_to_filters, eval_constant_expr};
+use super::helpers::{convert_projection, convert_where_to_filters};
 use super::where_search::try_extract_where_search;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
@@ -68,7 +68,9 @@ pub(super) fn plan_select(
             match proj {
                 Projection::Computed { expr, alias } => {
                     columns.push(alias.clone());
-                    values.push(eval_constant_expr(expr, functions));
+                    values.push(crate::planner::catalog_expr_fold::eval_catalog_constant(
+                        expr, catalog, functions,
+                    )?);
                 }
                 Projection::Column(name) => {
                     columns.push(name.clone());

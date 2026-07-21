@@ -408,8 +408,16 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
         }
 
         // ── Meta ─────────────────────────────────────────────────────────
+        PhysicalPlan::Meta(nodedb_physical::physical_plan::MetaOp::TransactionBatch {
+            plans,
+            ..
+        }) => {
+            for plan in plans {
+                out.extend(touched_collections(plan));
+            }
+        }
         PhysicalPlan::Meta(_) => {
-            // Meta ops target infrastructure, not user collections.
+            // Other Meta ops target infrastructure, not user collections.
         }
 
         // ── Array ────────────────────────────────────────────────────────

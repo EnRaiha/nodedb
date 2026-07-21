@@ -49,13 +49,18 @@ use crate::control::security::catalog::SystemCatalog;
 /// function — it is strictly the "pre-stamping compat mode"
 /// sentinel.
 pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> CatalogEntry {
-    let hlc = clock.now();
+    let mut hlc = clock.now();
     match entry {
         CatalogEntry::PutCollection(mut stored) => {
             let prior = catalog
                 .get_collection(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten();
+            if let Some(prior_hlc) = prior.as_ref().map(|c| c.modification_hlc)
+                && prior_hlc >= hlc
+            {
+                hlc = clock.update(prior_hlc);
+            }
             let prior_descriptor = prior.as_ref().map(|c| c.descriptor_version).unwrap_or(0);
             stored.descriptor_version = prior_descriptor.saturating_add(1);
             // Constraint version bumps ONLY when the derived constraint set
@@ -83,25 +88,16 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
                 .get_collection(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten();
-            let prior_descriptor = prior.as_ref().map(|c| c.descriptor_version).unwrap_or(0);
-            stored.descriptor_version = prior_descriptor.saturating_add(1);
-            // Constraint version bumps ONLY when the derived constraint set
-            // actually changes, so an unrelated ALTER never advances the
-            // apply-time fence key and never transiently rejects in-flight
-            // CRDT deltas. `Constraint: Eq` + name-sorted translator make the
-            // set comparison exact and order-stable.
-            let prior_constraint_version =
-                prior.as_ref().map(|c| c.constraint_version).unwrap_or(0);
-            let prior_set = prior
-                .as_ref()
-                .map(crate::control::security::catalog::collection_constraints)
-                .unwrap_or_default();
+            // Existing is a semantic no-op. Freeze the exact persisted record
+            // rather than manufacturing an unpersisted next version; this also
+            // makes later full-log replay payload-identical and lets a following
+            // real mutation in the same batch advance from the true prior.
+            if let Some(prior) = prior {
+                return CatalogEntry::PutCollectionIfAbsent(Box::new(prior));
+            }
+            stored.descriptor_version = 1;
             let new_set = crate::control::security::catalog::collection_constraints(&stored);
-            stored.constraint_version = if new_set != prior_set {
-                prior_constraint_version.saturating_add(1)
-            } else {
-                prior_constraint_version
-            };
+            stored.constraint_version = u64::from(!new_set.is_empty());
             stored.modification_hlc = hlc;
             CatalogEntry::PutCollectionIfAbsent(stored)
         }
@@ -218,50 +214,322 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
     }
 }
 
-/// Validate a carried collection descriptor version (frozen at
-/// propose time and replicated verbatim) against this node's local
-/// prior, before the applier persists it. Enforces that a replayed or
-/// re-delivered entry is idempotent and that a real anomaly halts the
-/// apply watermark loudly instead of diverging silently.
-///
-/// - carried `0`: compat mode / unstamped (unit tests) — skipped.
-/// - carried `== prior`: idempotent re-apply / replay of an
-///   already-applied entry — allowed (the write is the same value).
-/// - carried `== prior + 1`: normal new version — allowed.
-/// - carried `< prior` (regression) or `> prior + 1` (gap): a real
-///   anomaly / corruption — returns a loud typed error.
-///
-/// Only the collection `Put*` variants carry a version derived from a
-/// per-descriptor `prior + 1` counter and are validated here; every
-/// other variant is a no-op. Determinism for all stamped variants is
-/// already guaranteed by verbatim application — this check is the
-/// additional guard against a corrupt or reordered collection entry.
-pub fn validate(entry: &CatalogEntry, catalog: &SystemCatalog) -> Result<(), crate::Error> {
-    let (descriptor, carried, prior) = match entry {
-        CatalogEntry::PutCollection(stored) | CatalogEntry::PutCollectionIfAbsent(stored) => {
-            let prior = catalog
+/// Stamp a transactional DDL batch in statement order. Persisted catalog
+/// state seeds the first mutation of each descriptor; a prior mutation of the
+/// same descriptor in this batch seeds the next one.
+pub fn stamp_batch(
+    entries: Vec<CatalogEntry>,
+    clock: &HlcClock,
+    catalog: &SystemCatalog,
+) -> Vec<CatalogEntry> {
+    let mut stamped_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mut stamped = stamp(entry, clock, catalog);
+        if let Some(prior) = stamped_entries
+            .iter()
+            .rev()
+            .find(|prior| same_descriptor(prior, &stamped))
+        {
+            stamped = advance_after(prior, stamped);
+        }
+        stamped_entries.push(stamped);
+    }
+    stamped_entries
+}
+
+fn same_descriptor(prior: &CatalogEntry, current: &CatalogEntry) -> bool {
+    match (prior, current) {
+        (
+            CatalogEntry::PutCollection(a) | CatalogEntry::PutCollectionIfAbsent(a),
+            CatalogEntry::PutCollection(b) | CatalogEntry::PutCollectionIfAbsent(b),
+        ) => a.database_id == b.database_id && a.tenant_id == b.tenant_id && a.name == b.name,
+        (CatalogEntry::PutMaterializedView(a), CatalogEntry::PutMaterializedView(b)) => {
+            a.tenant_id == b.tenant_id && a.name == b.name
+        }
+        (CatalogEntry::PutFunction(a), CatalogEntry::PutFunction(b)) => {
+            a.tenant_id == b.tenant_id && a.name == b.name
+        }
+        (CatalogEntry::PutProcedure(a), CatalogEntry::PutProcedure(b)) => {
+            a.tenant_id == b.tenant_id && a.name == b.name
+        }
+        (CatalogEntry::PutTrigger(a), CatalogEntry::PutTrigger(b)) => {
+            a.tenant_id == b.tenant_id && a.name == b.name
+        }
+        (CatalogEntry::PutSequence(a), CatalogEntry::PutSequence(b)) => {
+            a.tenant_id == b.tenant_id && a.name == b.name
+        }
+        (CatalogEntry::PutContinuousAggregate(a), CatalogEntry::PutContinuousAggregate(b)) => {
+            a.database_id == b.database_id && a.tenant_id == b.tenant_id && a.name == b.name
+        }
+        _ => false,
+    }
+}
+
+fn advance_after(prior: &CatalogEntry, current: CatalogEntry) -> CatalogEntry {
+    match (prior, current) {
+        (
+            CatalogEntry::PutCollection(prior) | CatalogEntry::PutCollectionIfAbsent(prior),
+            CatalogEntry::PutCollection(mut current),
+        ) => {
+            advance_collection(prior, &mut current);
+            CatalogEntry::PutCollection(current)
+        }
+        (
+            CatalogEntry::PutCollection(prior) | CatalogEntry::PutCollectionIfAbsent(prior),
+            CatalogEntry::PutCollectionIfAbsent(mut current),
+        ) => {
+            advance_collection(prior, &mut current);
+            CatalogEntry::PutCollectionIfAbsent(current)
+        }
+        (
+            CatalogEntry::PutMaterializedView(prior),
+            CatalogEntry::PutMaterializedView(mut current),
+        ) => {
+            current.descriptor_version = prior.descriptor_version.saturating_add(1);
+            CatalogEntry::PutMaterializedView(current)
+        }
+        (CatalogEntry::PutFunction(prior), CatalogEntry::PutFunction(mut current)) => {
+            current.descriptor_version = prior.descriptor_version.saturating_add(1);
+            CatalogEntry::PutFunction(current)
+        }
+        (CatalogEntry::PutProcedure(prior), CatalogEntry::PutProcedure(mut current)) => {
+            current.descriptor_version = prior.descriptor_version.saturating_add(1);
+            CatalogEntry::PutProcedure(current)
+        }
+        (CatalogEntry::PutTrigger(prior), CatalogEntry::PutTrigger(mut current)) => {
+            current.descriptor_version = prior.descriptor_version.saturating_add(1);
+            CatalogEntry::PutTrigger(current)
+        }
+        (CatalogEntry::PutSequence(prior), CatalogEntry::PutSequence(mut current)) => {
+            current.descriptor_version = prior.descriptor_version.saturating_add(1);
+            CatalogEntry::PutSequence(current)
+        }
+        (
+            CatalogEntry::PutContinuousAggregate(prior),
+            CatalogEntry::PutContinuousAggregate(mut current),
+        ) => {
+            current.descriptor_version = prior.descriptor_version.saturating_add(1);
+            CatalogEntry::PutContinuousAggregate(current)
+        }
+        (_, current) => current,
+    }
+}
+
+fn advance_collection(
+    prior: &crate::control::security::catalog::StoredCollection,
+    current: &mut crate::control::security::catalog::StoredCollection,
+) {
+    current.descriptor_version = prior.descriptor_version.saturating_add(1);
+    let prior_set = crate::control::security::catalog::collection_constraints(prior);
+    let current_set = crate::control::security::catalog::collection_constraints(current);
+    current.constraint_version = if prior_set == current_set {
+        prior.constraint_version
+    } else {
+        prior.constraint_version.saturating_add(1)
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationOutcome {
+    Apply,
+    AlreadyApplied,
+}
+
+/// Validate every descriptor-bearing `Put*` entry against the locally
+/// persisted version before applying it. Historical replay is idempotent for
+/// all descriptor families, while equal-version conflicts and forward gaps
+/// remain loud anomalies.
+pub fn validate(
+    entry: &CatalogEntry,
+    catalog: &SystemCatalog,
+) -> Result<ValidationOutcome, crate::Error> {
+    match entry {
+        CatalogEntry::PutCollection(stored) => {
+            let current = catalog
                 .get_collection(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
-                .flatten()
-                .map(|c| c.descriptor_version)
-                .unwrap_or(0);
-            (stored.name.clone(), stored.descriptor_version, prior)
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
         }
-        _ => return Ok(()),
-    };
+        CatalogEntry::PutCollectionIfAbsent(stored) => {
+            let current = catalog
+                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            if current.is_some() {
+                Ok(ValidationOutcome::AlreadyApplied)
+            } else {
+                validate_one(
+                    &stored.name,
+                    stored.descriptor_version,
+                    stored.as_ref(),
+                    None,
+                    0,
+                    stored.modification_hlc,
+                    nodedb_types::Hlc::ZERO,
+                )
+            }
+        }
+        CatalogEntry::PutMaterializedView(stored) => {
+            let current = catalog
+                .get_materialized_view(stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutFunction(stored) => {
+            let current = catalog
+                .get_function(stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutProcedure(stored) => {
+            let current = catalog
+                .get_procedure(stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutTrigger(stored) => {
+            let current = catalog
+                .get_trigger(stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutSequence(stored) => {
+            let current = catalog
+                .get_sequence(stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutContinuousAggregate(stored) => {
+            let current = catalog
+                .get_continuous_aggregate(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        _ => Ok(ValidationOutcome::Apply),
+    }
+}
 
-    // Sentinel `0` is the pre-stamping / compat-mode marker; downstream
-    // resolvers treat it as `1`. Nothing to validate.
+fn validate_one<T: zerompk::ToMessagePack>(
+    name: &str,
+    carried: u64,
+    incoming: &T,
+    current: Option<&T>,
+    prior: u64,
+    incoming_hlc: nodedb_types::Hlc,
+    current_hlc: nodedb_types::Hlc,
+) -> Result<ValidationOutcome, crate::Error> {
     if carried == 0 {
-        return Ok(());
+        return Ok(ValidationOutcome::Apply);
     }
-
-    if carried == prior || carried == prior.saturating_add(1) {
-        return Ok(());
+    // A recreated descriptor restarts its numeric version namespace. Once a
+    // newer lifecycle is persisted, every older-HLC record is historical even
+    // if its old numeric version is greater than the recreated version.
+    if current.is_some() && incoming_hlc < current_hlc {
+        return Ok(ValidationOutcome::AlreadyApplied);
     }
-
+    if carried < prior {
+        return Ok(ValidationOutcome::AlreadyApplied);
+    }
+    if carried == prior {
+        let same_payload = current
+            .map(|persisted| {
+                let incoming = zerompk::to_msgpack_vec(incoming);
+                let persisted = zerompk::to_msgpack_vec(persisted);
+                matches!((incoming, persisted), (Ok(a), Ok(b)) if a == b)
+            })
+            .unwrap_or(false);
+        return if same_payload {
+            Ok(ValidationOutcome::AlreadyApplied)
+        } else {
+            Err(crate::Error::DescriptorVersionAnomaly {
+                descriptor: name.to_string(),
+                carried,
+                prior,
+            })
+        };
+    }
+    if carried == prior.saturating_add(1) {
+        return Ok(ValidationOutcome::Apply);
+    }
     Err(crate::Error::DescriptorVersionAnomaly {
-        descriptor,
+        descriptor: name.to_string(),
         carried,
         prior,
     })
@@ -270,7 +538,7 @@ pub fn validate(entry: &CatalogEntry, catalog: &SystemCatalog) -> Result<(), cra
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::security::catalog::StoredCollection;
+    use crate::control::security::catalog::{StoredCollection, StoredSequence};
     use crate::control::security::credential::CredentialStore;
     use nodedb_types::DatabaseId;
     use std::sync::Arc;
@@ -322,6 +590,75 @@ mod tests {
     }
 
     #[test]
+    fn stamp_batch_advances_repeated_collection_mutations() {
+        let (store, _tmp) = make_catalog();
+        let clock = HlcClock::new();
+        let entries = vec![
+            CatalogEntry::PutCollection(Box::new(StoredCollection::new(1, "orders", "tester"))),
+            CatalogEntry::PutCollection(Box::new(StoredCollection::new(1, "orders", "tester"))),
+        ];
+        let stamped = stamp_batch(entries, &clock, store.catalog());
+        let CatalogEntry::PutCollection(first) = &stamped[0] else {
+            panic!("expected first collection");
+        };
+        let CatalogEntry::PutCollection(second) = &stamped[1] else {
+            panic!("expected second collection");
+        };
+        assert_eq!(first.descriptor_version, 1);
+        assert_eq!(second.descriptor_version, 2);
+    }
+
+    #[test]
+    fn stamp_batch_existing_if_absent_does_not_consume_a_version() {
+        let (store, _tmp) = make_catalog();
+        let clock = HlcClock::new();
+        seed_prior(store.catalog(), "orders", 1);
+        let mut announcement = StoredCollection::new(1, "orders", "remote");
+        announcement.descriptor_version = 0;
+        let update = StoredCollection::new(1, "orders", "updated");
+        let stamped = stamp_batch(
+            vec![
+                CatalogEntry::PutCollectionIfAbsent(Box::new(announcement)),
+                CatalogEntry::PutCollection(Box::new(update)),
+            ],
+            &clock,
+            store.catalog(),
+        );
+        let CatalogEntry::PutCollectionIfAbsent(noop) = &stamped[0] else {
+            panic!("expected create-only entry");
+        };
+        let CatalogEntry::PutCollection(update) = &stamped[1] else {
+            panic!("expected real update");
+        };
+        assert_eq!(noop.descriptor_version, 1);
+        assert_eq!(noop.owner, "tester");
+        assert_eq!(update.descriptor_version, 2);
+    }
+
+    #[test]
+    fn stamp_batch_advances_repeated_sequence_mutations() {
+        let (store, _tmp) = make_catalog();
+        let clock = HlcClock::new();
+        let sequence = StoredSequence::new(1, "invoice_seq".into(), "tester".into());
+        let stamped = stamp_batch(
+            vec![
+                CatalogEntry::PutSequence(Box::new(sequence.clone())),
+                CatalogEntry::PutSequence(Box::new(sequence)),
+            ],
+            &clock,
+            store.catalog(),
+        );
+        let CatalogEntry::PutSequence(first) = &stamped[0] else {
+            panic!("expected first sequence");
+        };
+        let CatalogEntry::PutSequence(second) = &stamped[1] else {
+            panic!("expected second sequence");
+        };
+        assert_eq!(first.descriptor_version, 1);
+        assert_eq!(second.descriptor_version, 2);
+    }
+
+    #[test]
     fn stamp_ignores_deletes() {
         let (store, _tmp) = make_catalog();
         let clock = HlcClock::new();
@@ -354,16 +691,28 @@ mod tests {
         let (store, _tmp) = make_catalog();
         let catalog = store.catalog();
         // No prior record (prior = 0), carried = 1 → prior + 1.
-        assert!(validate(&collection_with_version("orders", 1), catalog).is_ok());
+        assert!(matches!(
+            validate(&collection_with_version("orders", 1), catalog),
+            Ok(ValidationOutcome::Apply)
+        ));
     }
 
     #[test]
     fn validate_allows_idempotent_replay() {
         let (store, _tmp) = make_catalog();
         let catalog = store.catalog();
-        seed_prior(catalog, "orders", 3);
-        // Re-delivery / full-log replay: carried == prior.
-        assert!(validate(&collection_with_version("orders", 3), catalog).is_ok());
+        let entry = collection_with_version("orders", 3);
+        let CatalogEntry::PutCollection(stored) = &entry else {
+            unreachable!();
+        };
+        catalog
+            .put_collection(DatabaseId::DEFAULT, stored)
+            .expect("seed exact prior");
+        // Re-delivery / full-log replay: carried == prior and payload-identical.
+        assert!(matches!(
+            validate(&entry, catalog),
+            Ok(ValidationOutcome::AlreadyApplied)
+        ));
     }
 
     #[test]
@@ -371,7 +720,10 @@ mod tests {
         let (store, _tmp) = make_catalog();
         let catalog = store.catalog();
         seed_prior(catalog, "orders", 3);
-        assert!(validate(&collection_with_version("orders", 4), catalog).is_ok());
+        assert!(matches!(
+            validate(&collection_with_version("orders", 4), catalog),
+            Ok(ValidationOutcome::Apply)
+        ));
     }
 
     #[test]
@@ -380,7 +732,10 @@ mod tests {
         let catalog = store.catalog();
         seed_prior(catalog, "orders", 3);
         // Compat mode / unstamped entry: version 0 is never validated.
-        assert!(validate(&collection_with_version("orders", 0), catalog).is_ok());
+        assert!(matches!(
+            validate(&collection_with_version("orders", 0), catalog),
+            Ok(ValidationOutcome::Apply)
+        ));
     }
 
     #[test]
@@ -402,18 +757,86 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_regression() {
+    fn validate_acknowledges_stale_historical_replay() {
         let (store, _tmp) = make_catalog();
         let catalog = store.catalog();
         seed_prior(catalog, "orders", 5);
-        // carried = 2 < prior = 5 → regression anomaly.
-        let err = validate(&collection_with_version("orders", 2), catalog)
-            .expect_err("regression must be rejected");
+        assert!(matches!(
+            validate(&collection_with_version("orders", 2), catalog),
+            Ok(ValidationOutcome::AlreadyApplied)
+        ));
+    }
+
+    #[test]
+    fn validate_treats_older_higher_version_as_prior_incarnation() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        let mut current = StoredCollection::new(1, "orders", "new_owner");
+        current.descriptor_version = 1;
+        current.modification_hlc = nodedb_types::Hlc::new(20, 0);
+        catalog
+            .put_collection(DatabaseId::DEFAULT, &current)
+            .expect("seed recreated collection");
+
+        let mut historical = StoredCollection::new(1, "orders", "old_owner");
+        historical.descriptor_version = 5;
+        historical.modification_hlc = nodedb_types::Hlc::new(10, 0);
+        assert!(matches!(
+            validate(&CatalogEntry::PutCollection(Box::new(historical)), catalog),
+            Ok(ValidationOutcome::AlreadyApplied)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_newer_divergent_equal_version() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        let mut current = StoredCollection::new(1, "orders", "first");
+        current.descriptor_version = 2;
+        current.modification_hlc = nodedb_types::Hlc::new(10, 0);
+        catalog
+            .put_collection(DatabaseId::DEFAULT, &current)
+            .expect("seed current collection");
+        let mut conflict = current;
+        conflict.owner = "conflict".into();
+        conflict.modification_hlc = nodedb_types::Hlc::new(11, 0);
+        assert!(matches!(
+            validate(&CatalogEntry::PutCollection(Box::new(conflict)), catalog),
+            Err(crate::Error::DescriptorVersionAnomaly { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_acknowledges_stale_sequence_replay() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        let mut persisted = StoredSequence::new(1, "invoice_seq".into(), "tester".into());
+        persisted.descriptor_version = 4;
+        catalog.put_sequence(&persisted).expect("seed sequence");
+
+        let mut historical = persisted.clone();
+        historical.descriptor_version = 2;
+        historical.increment = 5;
+        assert!(matches!(
+            validate(&CatalogEntry::PutSequence(Box::new(historical)), catalog),
+            Ok(ValidationOutcome::AlreadyApplied)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_divergent_payload_at_same_version() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        seed_prior(catalog, "orders", 3);
+        let mut divergent = StoredCollection::new(1, "orders", "different-owner");
+        divergent.descriptor_version = 3;
+        let err = validate(&CatalogEntry::PutCollection(Box::new(divergent)), catalog)
+            .expect_err("same-version divergent payload must be rejected");
         assert!(matches!(
             err,
             crate::Error::DescriptorVersionAnomaly {
-                carried: 2,
-                prior: 5,
+                carried: 3,
+                prior: 3,
                 ..
             }
         ));

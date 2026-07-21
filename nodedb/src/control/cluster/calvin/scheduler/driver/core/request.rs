@@ -22,13 +22,14 @@ impl Scheduler {
         &self,
         request_id: RequestId,
         tenant_id: TenantId,
+        database_id: DatabaseId,
         plan: PhysicalPlan,
         wal_lsn: Option<Lsn>,
     ) -> Request {
         Request {
             request_id,
             tenant_id,
-            database_id: DatabaseId::DEFAULT,
+            database_id,
             vshard_id: VShardId::new(self.vshard_id),
             plan,
             // no-determinism: scheduler deadline controls waiting, not ordered state.

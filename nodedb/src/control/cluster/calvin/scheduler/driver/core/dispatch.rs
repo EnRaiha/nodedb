@@ -8,7 +8,7 @@ use tracing::error;
 
 use nodedb_cluster::calvin::types::SequencedTxn;
 
-use super::routing::{PlanRouting, plan_vshard};
+use super::routing::PlanRouting;
 use super::scheduler::Scheduler;
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::types::{DatabaseId, VShardId};
@@ -30,6 +30,28 @@ use nodedb_physical::physical_plan::meta::MetaOp;
 /// so its rows are still deposited) while ALSO carrying the affected-count of a
 /// plain (non-RETURNING) write — which a RETURNING-only gate dropped, making a
 /// routed plain write report zero rows affected.
+fn participant_change_sets(
+    plans: &[PhysicalPlan],
+    tenant_id: crate::types::TenantId,
+    vshard_id: u32,
+) -> Vec<crate::control::server::dispatch_utils::WriteChangeSet> {
+    plans
+        .iter()
+        .filter(|plan| match plan {
+            // Edge plans are dual-homed; only the source participant publishes
+            // the one logical Control-Plane event.
+            PhysicalPlan::Graph(
+                nodedb_physical::physical_plan::GraphOp::EdgePut { src_id, .. }
+                | nodedb_physical::physical_plan::GraphOp::EdgeDelete { src_id, .. },
+            ) => VShardId::from_key(src_id.as_bytes()).as_u32() == vshard_id,
+            _ => true,
+        })
+        .map(|plan| {
+            crate::control::server::dispatch_utils::extract_write_change_set(plan, tenant_id)
+        })
+        .collect()
+}
+
 pub(crate) fn plans_have_primary_write(plans: &[PhysicalPlan]) -> bool {
     plans.iter().any(|plan| {
         crate::control::planner::calvin::is_write_plan(plan)
@@ -108,12 +130,13 @@ impl Scheduler {
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn local_calvin_plans(
         &self,
         plans: Vec<PhysicalPlan>,
+        database_id: DatabaseId,
         epoch: u64,
         position: u32,
     ) -> crate::Result<Vec<PhysicalPlan>> {
         let mut local = Vec::new();
         for plan in plans {
-            match plan_vshard(&plan) {
+            match super::routing::plan_vshard_in_database(&plan, database_id) {
                 PlanRouting::Vshards(vshards) => {
                     if vshards.iter().any(|v| v.as_u32() == self.vshard_id) {
                         local.push(plan);
@@ -154,23 +177,6 @@ impl Scheduler {
         Ok(local)
     }
 
-    /// Whether any of this transaction's LSN-versioned reads homes to THIS
-    /// scheduler's vShard — i.e. this node is a READ participant that must
-    /// validate its slice of the read-set even if it holds no local write.
-    ///
-    /// Homing uses the SAME `(DatabaseId::DEFAULT, collection)` function the
-    /// Data Plane's `read_set_still_current` filters with, so the scheduler and
-    /// the apply core agree on exactly which reads this vShard owns.
-    fn homes_any_local_read(
-        &self,
-        versioned_reads: &nodedb_types::calvin::VersionedReadSet,
-    ) -> bool {
-        versioned_reads.iter().any(|entry| {
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, &entry.collection).as_u32()
-                == self.vshard_id
-        })
-    }
-
     /// Dispatch a static-set ready transaction to the Data Plane executor.
     pub(in crate::control::cluster::calvin::scheduler::driver::core) fn dispatch_txn(
         &mut self,
@@ -196,7 +202,8 @@ impl Scheduler {
                 return;
             }
         };
-        let local = match self.local_calvin_plans(plans, epoch, position) {
+        let local = match self.local_calvin_plans(plans, txn.tx_class.database_id, epoch, position)
+        {
             Ok(p) => p,
             Err(e) => {
                 error!(
@@ -217,7 +224,13 @@ impl Scheduler {
         // still validate its slice of the read-set and cast a real commit/abort
         // vote — or a routing bug (neither writes nor reads home here). Only the
         // latter is an error; the former stages a validate-only task below.
-        if local.is_empty() && !self.homes_any_local_read(&txn.tx_class.versioned_reads) {
+        if local.is_empty()
+            && !super::routing::homes_versioned_read(
+                &txn.tx_class.versioned_reads,
+                txn.tx_class.database_id,
+                self.vshard_id,
+            )
+        {
             let e = crate::Error::Internal {
                 detail: format!(
                     "calvin txn {epoch}/{position} homes no local write plans or reads \
@@ -270,6 +283,7 @@ impl Scheduler {
         let request_id = self.next_request_id();
         let has_primary_write = plans_have_primary_write(&plans);
         let has_returning = plans_have_returning(&plans);
+        let change_sets = participant_change_sets(&plans, tenant_id, self.vshard_id);
         let plan = PhysicalPlan::Meta(MetaOp::CalvinExecuteStatic {
             epoch,
             position,
@@ -286,7 +300,8 @@ impl Scheduler {
         // Calvin allocates the CalvinApplied WAL LSN post-apply (in the
         // scheduler's response handler), so no committed LSN is known at
         // dispatch time to stamp here.
-        let request = self.build_exempt_request(request_id, tenant_id, plan, None);
+        let request =
+            self.build_exempt_request(request_id, tenant_id, txn.tx_class.database_id, plan, None);
 
         let resp_rx = self.shared.tracker.register(request_id);
 
@@ -323,6 +338,7 @@ impl Scheduler {
                 dispatch_time: dispatch_instant,
                 has_primary_write,
                 has_returning,
+                change_sets,
                 // This dispatch STAGED the txn (validate + buffer, no apply);
                 // its response carries the local commit vote that drives the
                 // subsequent flush-or-drop.
@@ -363,7 +379,8 @@ impl Scheduler {
                 return;
             }
         };
-        let plans = match self.local_calvin_plans(plans, epoch, position) {
+        let plans = match self.local_calvin_plans(plans, txn.tx_class.database_id, epoch, position)
+        {
             Ok(p) if !p.is_empty() => p,
             Ok(_) => {
                 // A dependent-read active txn dispatched here always carries a
@@ -405,6 +422,7 @@ impl Scheduler {
         };
         let has_primary_write = plans_have_primary_write(&plans);
         let has_returning = plans_have_returning(&plans);
+        let change_sets = participant_change_sets(&plans, tenant_id, self.vshard_id);
         let plan = PhysicalPlan::Meta(MetaOp::CalvinExecuteActive {
             epoch,
             position,
@@ -418,7 +436,8 @@ impl Scheduler {
         // Calvin allocates the CalvinApplied WAL LSN post-apply (in the
         // scheduler's response handler), so no committed LSN is known at
         // dispatch time to stamp here.
-        let request = self.build_exempt_request(request_id, tenant_id, plan, None);
+        let request =
+            self.build_exempt_request(request_id, tenant_id, txn.tx_class.database_id, plan, None);
 
         let resp_rx = self.shared.tracker.register(request_id);
 
@@ -455,6 +474,7 @@ impl Scheduler {
                 dispatch_time: dispatch_instant,
                 has_primary_write,
                 has_returning,
+                change_sets,
                 // The dependent-read active path now STAGES (leader-verify OLLP
                 // + buffer, no base apply); its response drives the same
                 // resolve → redo → flush as the static path, restoring

@@ -164,19 +164,45 @@ impl SqlCatalog for OriginCatalog {
         _tenant_id: u64,
         name: &str,
     ) -> Option<i64> {
+        let name = nodedb_sql::catalog::normalize_regclass_name(name)?;
+
         // Check system/catalog relation OIDs first.
         if let Some(&oid) = crate::control::server::pgwire::catalog::oid::SYSTEM_REL_OIDS
             .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, o)| o)
+            .find(|(relation, _)| *relation == name)
+            .map(|(_, oid)| oid)
         {
             return Some(oid);
         }
-        // Fall back to the stable hash-derived OID for user collections.
+
+        // A hash-derived OID is stable only after catalog existence has been
+        // established. Fabricating one for an unknown name makes regclass
+        // predicates silently compare against a relation that does not exist.
+        let stored = self
+            .credentials
+            .catalog()
+            .get_collection(self.database_id, self.tenant_id, &name)
+            .ok()
+            .flatten()
+            .filter(|stored| stored.is_active)?;
+
+        // A folded regclass literal is a schema dependency just like a scan of
+        // the relation. Record it so dropping or altering the target invalidates
+        // a cached physical plan that embeds its OID.
+        let descriptor_id = DescriptorId::new(
+            self.tenant_id,
+            DescriptorKind::Collection,
+            stored.name.clone(),
+        );
+        self.recorded_versions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record(descriptor_id, stored.descriptor_version.max(1));
+
         Some(
             crate::control::server::pgwire::catalog::oid::stable_collection_oid(
                 self.tenant_id,
-                name,
+                &name,
             ),
         )
     }

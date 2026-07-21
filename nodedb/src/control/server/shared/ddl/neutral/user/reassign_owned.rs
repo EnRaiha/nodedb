@@ -40,7 +40,8 @@ use super::super::super::result::DdlError;
 /// parent-replicated kinds each own a primary `Stored*` record with an
 /// in-band `owner` field; `Index` is the standalone path (a bare
 /// `StoredOwner` row with no parent record).
-enum OwnerKind {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwnerKind {
     Collection,
     Function,
     Procedure,
@@ -58,7 +59,7 @@ impl OwnerKind {
     /// means the writer of that owner row introduced a kind this module
     /// does not yet handle — the caller turns that into a hard error so
     /// the drop fails closed instead of leaking a dangling reference.
-    fn from_object_type(s: &str) -> Option<Self> {
+    pub(super) fn from_object_type(s: &str) -> Option<Self> {
         Some(match s {
             object_type::COLLECTION => Self::Collection,
             object_type::FUNCTION => Self::Function,
@@ -334,7 +335,7 @@ fn reassign_one(
 
 /// Revoke every grant whose grantee is the dropped user, so no
 /// `permission.grantee → user` reference outlives the user row.
-fn sweep_grants(
+pub(super) fn sweep_grants(
     state: &SharedState,
     catalog: &SystemCatalog,
     username: &str,
@@ -397,7 +398,7 @@ fn persist_owner_local_in_database(
     Ok(())
 }
 
-fn propose(state: &SharedState, entry: &CatalogEntry) -> Result<u64, DdlError> {
+pub(super) fn propose(state: &SharedState, entry: &CatalogEntry) -> Result<u64, DdlError> {
     propose_catalog_entry(state, entry).map_err(|e| ddl_err(format!("metadata propose: {e}")))
 }
 
@@ -408,7 +409,7 @@ fn missing(object_type: &str, name: &str) -> DdlError {
     ))
 }
 
-fn ddl_err(message: String) -> DdlError {
+pub(super) fn ddl_err(message: String) -> DdlError {
     DdlError {
         sqlstate: "XX000".to_string(),
         message,

@@ -5,9 +5,8 @@
 //! ## Complexity
 //!
 //! - `as_of = None` (live snapshot): O(1) summary read + O(distinct_labels) label scan.
-//!   If the summary row is missing (cold-start / schema upgrade), triggers a lazy rebuild
-//!   via a full EDGES prefix scan and atomically writes the result back. Subsequent calls
-//!   are O(1) per the summary row.
+//!   Legacy or missing ownership-aware summaries fall back to a full EDGES prefix scan
+//!   and carry edge identities so the Control Plane can deduplicate dual-home replicas.
 //!
 //! - `as_of = Some(ts)`: falls back to a full EDGES prefix scan for the matching
 //!   collection, materialising counts at the given system-time ordinal. O(edges-in-collection).
@@ -27,9 +26,7 @@ use nodedb_types::TenantId;
 use crate::engine::graph::edge_store::store::{EDGES, EdgeStore, redb_err};
 use crate::engine::graph::edge_store::temporal::keys::{is_sentinel, parse_versioned_edge_key};
 
-use super::table::{
-    CollectionStats, GRAPH_STATS, LabelRow, SummaryRow, label_key, label_prefix, summary_key,
-};
+use super::table::{CollectionStats, GRAPH_STATS, LabelRow, SummaryRow, label_prefix, summary_key};
 
 impl EdgeStore {
     /// Live or historical stats for a single `(tenant, collection)` pair.
@@ -37,9 +34,9 @@ impl EdgeStore {
     /// Returns zeros when no edges exist — not an error.
     ///
     /// When `as_of` is `None` the result is served from the persistent summary
-    /// row (O(1) + O(distinct_labels)). If the summary row is absent, a lazy
-    /// rebuild is triggered via a full prefix scan of EDGES, and the result is
-    /// cached atomically for future calls.
+    /// row (O(1) + O(distinct_labels)). A legacy or absent ownership-aware
+    /// summary falls back to a full prefix scan of EDGES and returns logical
+    /// identities for exact cross-core deduplication.
     ///
     /// When `as_of` is `Some(ordinal)` the function performs a full prefix scan
     /// of EDGES and materialises counts at that system-time ordinal.
@@ -61,8 +58,7 @@ impl EdgeStore {
     ///
     /// With `as_of = None`: scans `GRAPH_STATS` summary rows for the tenant
     /// (O(collections-with-stats)), then does O(distinct_labels) label scan
-    /// per collection. If the summary row for any collection is absent but EDGES
-    /// has entries for it, triggers a lazy rebuild.
+    /// per collection. Legacy or absent summaries fall back to EDGES scans.
     ///
     /// With `as_of = Some(ts)`: scans all EDGES for the tenant once, grouping by
     /// collection and materialising counts at ordinal `ts`. O(total-edges-for-tenant).
@@ -104,6 +100,11 @@ impl EdgeStore {
         if let Some(bytes) = summary_bytes {
             let summary = SummaryRow::decode(bytes.value())?;
             drop(bytes);
+            if summary.ownership_version == 0 {
+                drop(stats_table);
+                drop(read_txn);
+                return self.collection_stats_historical(db, tid, collection, i64::MAX);
+            }
             let labels = read_labels_from_table(&stats_table, db, t, collection)?;
             return Ok(CollectionStats {
                 collection: collection.to_string(),
@@ -111,6 +112,8 @@ impl EdgeStore {
                 distinct_node_count: summary.distinct_node_count,
                 distinct_label_count: summary.distinct_label_count,
                 labels,
+                logical_edges: Vec::new(),
+                exact_scan: false,
             });
         }
         drop(stats_table);
@@ -124,10 +127,11 @@ impl EdgeStore {
             return Ok(CollectionStats::zero(collection.to_string()));
         }
 
-        // Rebuild: scan live EDGES for this collection at current-state.
-        let rebuilt = self.collection_stats_historical(db, tid, collection, i64::MAX)?;
-        self.write_stats_atomically(db, tid, collection, &rebuilt)?;
-        Ok(rebuilt)
+        // A physical-edge scan is exact locally and carries logical identities
+        // for cross-core union. Do not cache it as a summary: this store may be
+        // the destination-home replica, and only request routing can establish
+        // which physical copy owns global cardinality.
+        self.collection_stats_historical(db, tid, collection, i64::MAX)
     }
 
     fn tenant_stats_live(&self, db: u64, tid: TenantId) -> crate::Result<Vec<CollectionStats>> {
@@ -160,7 +164,8 @@ impl EdgeStore {
         drop(read_txn);
 
         if collections.is_empty() {
-            // No summary rows exist — scan EDGES to discover collections and rebuild.
+            // No ownership-aware summary rows exist — scan EDGES and return
+            // logical identities for cross-core deduplication.
             return self.tenant_stats_historical(db, tid, i64::MAX);
         }
 
@@ -279,45 +284,6 @@ impl EdgeStore {
             }
         }
     }
-
-    fn write_stats_atomically(
-        &self,
-        db: u64,
-        tid: TenantId,
-        collection: &str,
-        stats: &CollectionStats,
-    ) -> crate::Result<()> {
-        let t = tid.as_u64();
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| redb_err("begin_write (rebuild)", e))?;
-        {
-            let mut st = write_txn
-                .open_table(GRAPH_STATS)
-                .map_err(|e| redb_err("open graph_stats (rebuild)", e))?;
-
-            let summary = SummaryRow {
-                edge_count: stats.edge_count,
-                distinct_node_count: stats.distinct_node_count,
-                distinct_label_count: stats.distinct_label_count,
-            };
-            let skey = summary_key(collection);
-            st.insert((db, t, skey.as_str()), summary.encode()?.as_slice())
-                .map_err(|e| redb_err("insert rebuilt summary", e))?;
-
-            for (label, count) in &stats.labels {
-                let lkey = label_key(collection, label);
-                let lrow = LabelRow { count: *count };
-                st.insert((db, t, lkey.as_str()), lrow.encode()?.as_slice())
-                    .map_err(|e| redb_err("insert rebuilt label", e))?;
-            }
-        }
-        write_txn
-            .commit()
-            .map_err(|e| redb_err("commit rebuild", e))?;
-        Ok(())
-    }
 }
 
 // ── free functions ────────────────────────────────────────────────────────────
@@ -403,12 +369,14 @@ fn materialise_collection_stats(
     let mut edge_count = 0u64;
     let mut label_counts: HashMap<String, u64> = HashMap::new();
     let mut node_refs: HashMap<String, u32> = HashMap::new();
+    let mut logical_edges = Vec::new();
 
     for entry in bases.values() {
         if entry.is_sentinel {
             continue;
         }
         edge_count += 1;
+        logical_edges.push((entry.src.clone(), entry.label.clone(), entry.dst.clone()));
         *label_counts.entry(entry.label.clone()).or_insert(0) += 1;
         *node_refs.entry(entry.src.clone()).or_insert(0) += 1;
         if entry.src != entry.dst {
@@ -427,6 +395,8 @@ fn materialise_collection_stats(
         distinct_node_count,
         distinct_label_count,
         labels,
+        logical_edges,
+        exact_scan: true,
     })
 }
 
@@ -451,12 +421,14 @@ impl CollectionAccum {
         let mut edge_count = 0u64;
         let mut label_counts: HashMap<String, u64> = HashMap::new();
         let mut node_refs: HashMap<String, u32> = HashMap::new();
+        let mut logical_edges = Vec::new();
 
         for entry in self.bases.values() {
             if entry.is_sentinel {
                 continue;
             }
             edge_count += 1;
+            logical_edges.push((entry.src.clone(), entry.label.clone(), entry.dst.clone()));
             *label_counts.entry(entry.label.clone()).or_insert(0) += 1;
             *node_refs.entry(entry.src.clone()).or_insert(0) += 1;
             if entry.src != entry.dst {
@@ -475,6 +447,8 @@ impl CollectionAccum {
             distinct_node_count,
             distinct_label_count,
             labels,
+            logical_edges,
+            exact_scan: true,
         }
     }
 }

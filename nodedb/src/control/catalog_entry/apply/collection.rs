@@ -36,37 +36,25 @@ pub fn put(stored: &StoredCollection, catalog: &SystemCatalog) {
 /// the create path mirrors `put`'s body precisely so replay/snapshot
 /// re-application stays idempotent.
 pub fn put_if_absent(stored: &StoredCollection, catalog: &SystemCatalog) {
-    match catalog.get_collection(stored.database_id, stored.tenant_id, &stored.name) {
-        Ok(Some(_)) => {
-            debug!(
-                collection = %stored.name,
-                tenant = stored.tenant_id,
-                "catalog_entry: put_collection_if_absent skipped existing collection"
-            );
-        }
-        Ok(None) => {
-            if let Err(e) = catalog.put_collection(stored.database_id, stored) {
-                warn!(
-                    collection = %stored.name,
-                    tenant = stored.tenant_id,
-                    error = %e,
-                    "catalog_entry: put_collection_if_absent put_collection failed"
-                );
-            }
-            super::owner::put_parent_owner_in_database(
-                object_type::COLLECTION,
-                stored.database_id.as_u64(),
-                stored.tenant_id,
-                &stored.name,
-                &stored.owner,
-                catalog,
-            );
-        }
+    match catalog.put_collection_if_absent(stored.database_id, stored) {
+        Ok(true) => super::owner::put_parent_owner_in_database(
+            object_type::COLLECTION,
+            stored.database_id.as_u64(),
+            stored.tenant_id,
+            &stored.name,
+            &stored.owner,
+            catalog,
+        ),
+        Ok(false) => debug!(
+            collection = %stored.name,
+            tenant = stored.tenant_id,
+            "catalog_entry: put_collection_if_absent skipped existing collection"
+        ),
         Err(e) => warn!(
             collection = %stored.name,
             tenant = stored.tenant_id,
             error = %e,
-            "catalog_entry: put_collection_if_absent get failed"
+            "catalog_entry: atomic put_collection_if_absent failed"
         ),
     }
 }

@@ -47,7 +47,7 @@ use nodedb_physical::physical_task::PhysicalTask;
 /// Resolve the current leader for `task`'s target vShard against live Raft
 /// leadership (falling back to the routing-table hint), so a staging choke point
 /// can branch between its existing local dispatch and a remote forward.
-pub(super) fn resolve_leader(task: &PhysicalTask, state: &SharedState) -> RouteDecision {
+pub(crate) fn resolve_leader(task: &PhysicalTask, state: &SharedState) -> RouteDecision {
     resolve_for_vshard(state, task.vshard_id.as_u32())
 }
 
@@ -67,7 +67,7 @@ pub(super) fn resolve_leader(task: &PhysicalTask, state: &SharedState) -> RouteD
 /// write, so the forwarded stage carries the same descriptor versions a normal
 /// remote write would and is not spuriously rejected; a `DropTxnOverlay` touches
 /// no user collection, so its version set is empty.
-pub(super) async fn forward_to_leader(
+pub(crate) async fn forward_to_leader(
     state: &SharedState,
     decision: RouteDecision,
     forward_task: PhysicalTask,

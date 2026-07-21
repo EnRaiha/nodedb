@@ -199,6 +199,10 @@ impl SharedState {
             )
             .0,
             group_watchers: Arc::new(nodedb_cluster::GroupAppliedWatchers::new()),
+            metadata_ddl_lock: std::sync::Mutex::new(()),
+            metadata_ddl_owner: std::sync::Mutex::new(None),
+            metadata_ddl_applied_token: std::sync::atomic::AtomicU64::new(0),
+            metadata_ddl_token_seq: std::sync::atomic::AtomicU64::new(1),
             metadata_raft: std::sync::OnceLock::new(),
             propose_tracker: std::sync::OnceLock::new(),
             raft_proposer: std::sync::OnceLock::new(),

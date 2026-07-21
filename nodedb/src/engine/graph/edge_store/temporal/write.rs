@@ -3,11 +3,14 @@
 //! Bitemporal write paths on `EdgeStore`:
 //! `put_edge_versioned`, `soft_delete_edge`, `gdpr_erase_edge`.
 
+use redb::ReadableTable;
+
 use super::keys::{
     EdgeRef, GDPR_ERASURE_SENTINEL, TOMBSTONE_SENTINEL, edge_version_prefix, is_sentinel,
     versioned_edge_key,
 };
 use super::payload::EdgeValuePayload;
+use crate::engine::graph::edge_store::stats::table::{GRAPH_STATS, SummaryRow, summary_key};
 use crate::engine::graph::edge_store::stats::update::{
     EdgeStatsKey, decrement_for_delete, increment_for_insert,
 };
@@ -28,6 +31,29 @@ impl EdgeStore {
         system_from: i64,
         valid_from_ms: i64,
         valid_until_ms: i64,
+    ) -> crate::Result<()> {
+        self.put_edge_versioned_with_stats(
+            edge,
+            properties,
+            system_from,
+            valid_from_ms,
+            valid_until_ms,
+            true,
+        )
+    }
+
+    /// Write a version while allowing a dual-home replica to skip logical
+    /// cardinality accounting. Cross-vShard graph writes persist the same edge
+    /// on both endpoint homes for OUT and IN traversal, but only the source home
+    /// owns the logical edge for global statistics.
+    pub fn put_edge_versioned_with_stats(
+        &self,
+        edge: EdgeRef<'_>,
+        properties: &[u8],
+        system_from: i64,
+        valid_from_ms: i64,
+        valid_until_ms: i64,
+        account_stats: bool,
     ) -> crate::Result<()> {
         let fwd = versioned_edge_key(edge.collection, edge.src, edge.label, edge.dst, system_from)?;
         let rev = versioned_edge_key(edge.collection, edge.dst, edge.label, edge.src, system_from)?;
@@ -57,18 +83,41 @@ impl EdgeStore {
                 .map_err(|e| redb_err("insert reverse", e))?;
             drop(rev_t);
 
-            increment_for_insert(
-                &write_txn,
-                EdgeStatsKey {
-                    db: d,
-                    tid: t,
-                    collection: edge.collection,
-                    label: edge.label,
-                    src: edge.src,
-                    dst: edge.dst,
-                },
-                system_from,
-            )?;
+            if account_stats {
+                increment_for_insert(
+                    &write_txn,
+                    EdgeStatsKey {
+                        db: d,
+                        tid: t,
+                        collection: edge.collection,
+                        label: edge.label,
+                        src: edge.src,
+                        dst: edge.dst,
+                    },
+                    system_from,
+                )?;
+            } else {
+                // Suppress the lazy edge-scan rebuild on a destination-only
+                // replica: absence of a summary means "legacy stats missing",
+                // while an explicit zero summary means "this shard owns no
+                // logical edges for this collection". Preserve an existing
+                // nonzero summary because this core may canonically own other
+                // source-homed edges in the same collection.
+                let key = summary_key(edge.collection);
+                let mut stats = write_txn
+                    .open_table(GRAPH_STATS)
+                    .map_err(|e| redb_err("open graph_stats", e))?;
+                if stats
+                    .get((d, t, key.as_str()))
+                    .map_err(|e| redb_err("read graph summary", e))?
+                    .is_none()
+                {
+                    let zero = SummaryRow::zero().encode()?;
+                    stats
+                        .insert((d, t, key.as_str()), zero.as_slice())
+                        .map_err(|e| redb_err("insert zero graph summary", e))?;
+                }
+            }
         }
         write_txn.commit().map_err(|e| redb_err("commit", e))?;
         Ok(())
@@ -140,13 +189,24 @@ impl EdgeStore {
 
     /// Append a tombstone version at `system_from`.
     pub fn soft_delete_edge(&self, edge: EdgeRef<'_>, system_from: i64) -> crate::Result<()> {
-        self.write_sentinel(edge, system_from, TOMBSTONE_SENTINEL)
+        self.write_sentinel(edge, system_from, TOMBSTONE_SENTINEL, true)
+    }
+
+    /// Append a tombstone without double-decrementing global statistics on the
+    /// destination-home replica of a dual-homed edge.
+    pub fn soft_delete_edge_with_stats(
+        &self,
+        edge: EdgeRef<'_>,
+        system_from: i64,
+        account_stats: bool,
+    ) -> crate::Result<()> {
+        self.write_sentinel(edge, system_from, TOMBSTONE_SENTINEL, account_stats)
     }
 
     /// Append a GDPR-erasure version — distinct from a soft-delete so audits
     /// can distinguish user-visible removal from regulatory erasure.
     pub fn gdpr_erase_edge(&self, edge: EdgeRef<'_>, system_from: i64) -> crate::Result<()> {
-        self.write_sentinel(edge, system_from, GDPR_ERASURE_SENTINEL)
+        self.write_sentinel(edge, system_from, GDPR_ERASURE_SENTINEL, true)
     }
 
     fn write_sentinel(
@@ -154,6 +214,7 @@ impl EdgeStore {
         edge: EdgeRef<'_>,
         system_from: i64,
         sentinel: &[u8],
+        account_stats: bool,
     ) -> crate::Result<()> {
         debug_assert!(
             is_sentinel(sentinel),
@@ -185,18 +246,20 @@ impl EdgeStore {
                 .map_err(|e| redb_err("insert sentinel reverse", e))?;
             drop(rev_t);
 
-            decrement_for_delete(
-                &write_txn,
-                EdgeStatsKey {
-                    db: d,
-                    tid: t,
-                    collection: edge.collection,
-                    label: edge.label,
-                    src: edge.src,
-                    dst: edge.dst,
-                },
-                system_from,
-            )?;
+            if account_stats {
+                decrement_for_delete(
+                    &write_txn,
+                    EdgeStatsKey {
+                        db: d,
+                        tid: t,
+                        collection: edge.collection,
+                        label: edge.label,
+                        src: edge.src,
+                        dst: edge.dst,
+                    },
+                    system_from,
+                )?;
+            }
         }
         write_txn
             .commit()

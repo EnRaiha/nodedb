@@ -9,7 +9,7 @@
 //! surrogates a redo PUT carries and an autocommit PUT does not:
 //!
 //! * A staged edge put → `RecordType::Put`, `(collection, src_id, label,
-//!   dst_id, properties, src_surrogate, dst_surrogate)`. Replay's
+//!   dst_id, properties, src_surrogate, dst_surrogate, system_from)`. Replay's
 //!   `execute_edge_put` repopulates the CSR node→surrogate map from the two
 //!   trailing surrogates, so they must be present and correct.
 //! * A staged edge tombstone → `RecordType::Delete`, `(collection, src_id,
@@ -87,6 +87,7 @@ pub(super) fn serialize_graph_collection(
     coll_key: &GraphCollKey,
     collection: &str,
     edge_surrogates: &BTreeMap<EdgeIdentityKey, (u32, u32)>,
+    system_from: i64,
     ops: &mut Vec<RedoSubRecord>,
 ) -> crate::Result<()> {
     let mut puts: BTreeMap<(String, String, String), Vec<u8>> = BTreeMap::new();
@@ -126,6 +127,7 @@ pub(super) fn serialize_graph_collection(
             properties,
             src_surrogate,
             dst_surrogate,
+            system_from,
         ))
         .map_err(|e| crate::Error::Serialization {
             format: "msgpack".into(),
@@ -138,12 +140,17 @@ pub(super) fn serialize_graph_collection(
     }
 
     for (src, label, dst) in deletes {
-        let payload =
-            zerompk::to_msgpack_vec(&(collection, src.as_str(), label.as_str(), dst.as_str()))
-                .map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("graph resolve edge delete: {e}"),
-                })?;
+        let payload = zerompk::to_msgpack_vec(&(
+            collection,
+            src.as_str(),
+            label.as_str(),
+            dst.as_str(),
+            system_from,
+        ))
+        .map_err(|e| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("graph resolve edge delete: {e}"),
+        })?;
         ops.push(RedoSubRecord {
             record_type: RecordType::Delete as u32,
             payload,
@@ -312,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn edge_put_emits_seven_element_tuple_with_surrogates() {
+    fn edge_put_emits_timestamped_tuple_with_surrogates() {
         let mut overlay = GraphTxnOverlay::new();
         overlay.stage_edge_put(coll_key("g"), "a", "knows", "b", vec![1, 2, 3]);
 
@@ -328,13 +335,13 @@ mod tests {
         );
 
         let mut ops = Vec::new();
-        serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, &mut ops)
+        serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, 123, &mut ops)
             .expect("serialize edge put");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].record_type, RecordType::Put as u32);
 
-        let (collection, src, label, dst, properties, src_sur, dst_sur) =
-            zerompk::from_msgpack::<(String, String, String, String, Vec<u8>, u32, u32)>(
+        let (collection, src, label, dst, properties, src_sur, dst_sur, system_from) =
+            zerompk::from_msgpack::<(String, String, String, String, Vec<u8>, u32, u32, i64)>(
                 &ops[0].payload,
             )
             .expect("decode edge put tuple");
@@ -345,6 +352,7 @@ mod tests {
         assert_eq!(properties, vec![1, 2, 3]);
         assert_eq!(src_sur, 10);
         assert_eq!(dst_sur, 20);
+        assert_eq!(system_from, 123);
     }
 
     #[test]
@@ -355,7 +363,7 @@ mod tests {
         let surrogates = BTreeMap::new();
         let mut ops = Vec::new();
         let result =
-            serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, &mut ops);
+            serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, 123, &mut ops);
         assert!(
             result.is_err(),
             "a staged put with no matching plan-carried surrogates must error, not invent one"
@@ -369,7 +377,7 @@ mod tests {
 
         let surrogates = BTreeMap::new();
         let mut ops = Vec::new();
-        serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, &mut ops)
+        serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, 123, &mut ops)
             .expect("serialize edge delete");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].record_type, RecordType::Delete as u32);
@@ -404,12 +412,12 @@ mod tests {
         }
 
         let mut ops = Vec::new();
-        serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, &mut ops)
+        serialize_graph_collection(&overlay, &coll_key("g"), "g", &surrogates, 123, &mut ops)
             .expect("serialize");
         let srcs: Vec<String> = ops
             .iter()
             .map(|op| {
-                zerompk::from_msgpack::<(String, String, String, String, Vec<u8>, u32, u32)>(
+                zerompk::from_msgpack::<(String, String, String, String, Vec<u8>, u32, u32, i64)>(
                     &op.payload,
                 )
                 .expect("decode")

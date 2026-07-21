@@ -127,6 +127,8 @@ impl CoreLoop {
                 aggregates,
                 sub_group_by,
                 sub_aggregates,
+                limit,
+                sort_keys,
             );
             if let Some(cached) = self.aggregate_cache.get(&cache_key) {
                 debug!(core = self.core_id, %collection, "aggregate cache hit");
@@ -279,6 +281,8 @@ impl CoreLoop {
                                 aggregates,
                                 sub_group_by,
                                 sub_aggregates,
+                                limit,
+                                sort_keys,
                             );
                             if self.aggregate_cache.len() < 256 {
                                 self.aggregate_cache.insert(cache_key, payload.clone());

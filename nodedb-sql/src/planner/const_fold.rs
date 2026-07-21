@@ -85,6 +85,9 @@ fn fold_cast(inner: SqlValue, to_type: &str) -> Option<SqlValue> {
         .unwrap_or(upper.as_str());
 
     match base {
+        // REGCLASS needs the session catalog. Keep the cast intact for the
+        // contextual catalog-fold pass rather than erasing it to a string.
+        "REGCLASS" => None,
         "NUMERIC" | "DECIMAL" => match inner {
             SqlValue::Decimal(d) => Some(SqlValue::Decimal(d)),
             SqlValue::Int(i) => Some(SqlValue::Decimal(rust_decimal::Decimal::from(i))),
