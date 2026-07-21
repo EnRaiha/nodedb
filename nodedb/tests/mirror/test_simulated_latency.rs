@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use nodedb_types::{DatabaseId, Lsn, MirrorMode, MirrorOrigin, MirrorStatus};
+use nodedb_types::{DatabaseId, Lsn, MirrorLagRecord, MirrorMode, MirrorOrigin, MirrorStatus};
 use tempfile::TempDir;
 
 use nodedb::control::server::pgwire::ddl::database::{
@@ -51,6 +51,7 @@ fn mirror_simulated_cross_region_latency() {
         db_id,
         &origin,
         ReadConsistency::BoundedStaleness(Duration::from_millis(1_000)),
+        now_ms(),
     ) {
         MirrorReadOutcome::ServeLocally => {}
         MirrorReadOutcome::Reject { message, .. } => {
@@ -64,6 +65,7 @@ fn mirror_simulated_cross_region_latency() {
         db_id,
         &origin,
         ReadConsistency::BoundedStaleness(Duration::from_millis(100)),
+        now_ms(),
     ) {
         MirrorReadOutcome::Reject { sqlstate_code, .. } => {
             assert_eq!(
@@ -93,9 +95,21 @@ fn mirror_simulated_latency_at_threshold_boundary() {
     let catalog = open_tmp_catalog(&dir);
     let db_id = DatabaseId::new(5002);
 
-    // Simulate RTT exactly at the BoundedStaleness window: 199 ms lag,
-    // 200 ms bound — must pass.
-    inject_lag_record_for_id(&catalog, db_id, 199, 1);
+    // Fix `now` and derive `last_apply_ms` from it so the computed lag is
+    // exactly 199 ms — one millisecond inside the 200 ms bound — regardless of
+    // how long lag injection takes. Passing the same `now` into the check keeps
+    // this boundary deterministic; reading the wall clock inside the check would
+    // add real elapsed time to the lag and flake the assertion on a slow runner.
+    let now = now_ms();
+    catalog
+        .put_mirror_lag(
+            db_id,
+            &MirrorLagRecord {
+                last_applied_lsn: Lsn::new(1),
+                last_apply_ms: now.saturating_sub(199),
+            },
+        )
+        .expect("inject lag record");
 
     let origin = MirrorOrigin {
         source_cluster: TEST_SOURCE_CLUSTER.to_string(),
@@ -110,6 +124,7 @@ fn mirror_simulated_latency_at_threshold_boundary() {
         db_id,
         &origin,
         ReadConsistency::BoundedStaleness(Duration::from_millis(200)),
+        now,
     ) {
         MirrorReadOutcome::ServeLocally => {}
         MirrorReadOutcome::Reject { message, .. } => {

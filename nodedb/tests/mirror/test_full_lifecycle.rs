@@ -124,6 +124,7 @@ fn mirror_full_lifecycle() {
         db_id,
         origin,
         ReadConsistency::BoundedStaleness(Duration::from_secs(5)),
+        now_ms(),
     ) {
         MirrorReadOutcome::ServeLocally => {}
         MirrorReadOutcome::Reject { message, .. } => {
@@ -159,7 +160,7 @@ fn mirror_full_lifecycle() {
         ReadConsistency::Eventual,
         ReadConsistency::BoundedStaleness(Duration::from_millis(1)),
     ] {
-        match check_mirror_read_consistency(&catalog, db_id, origin, consistency) {
+        match check_mirror_read_consistency(&catalog, db_id, origin, consistency, now_ms()) {
             MirrorReadOutcome::ServeLocally => {}
             MirrorReadOutcome::Reject { message, .. } => {
                 panic!("Promoted mirror must serve all reads locally: {message}");

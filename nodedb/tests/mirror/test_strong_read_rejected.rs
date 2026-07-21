@@ -14,7 +14,7 @@ use nodedb::control::server::pgwire::ddl::database::{
 };
 use nodedb::types::ReadConsistency;
 
-use super::helpers::{TEST_SOURCE_CLUSTER, open_tmp_catalog};
+use super::helpers::{TEST_SOURCE_CLUSTER, now_ms, open_tmp_catalog};
 
 fn following_origin() -> MirrorOrigin {
     MirrorOrigin {
@@ -33,7 +33,8 @@ fn mirror_strong_read_rejected() {
     let db_id = DatabaseId::new(1001);
     let origin = following_origin();
 
-    let outcome = check_mirror_read_consistency(&catalog, db_id, &origin, ReadConsistency::Strong);
+    let outcome =
+        check_mirror_read_consistency(&catalog, db_id, &origin, ReadConsistency::Strong, now_ms());
 
     match outcome {
         MirrorReadOutcome::Reject {
@@ -69,7 +70,8 @@ fn mirror_strong_read_rejected_degraded() {
         status: MirrorStatus::Degraded { lag_ms: 8_000 },
     };
 
-    let outcome = check_mirror_read_consistency(&catalog, db_id, &origin, ReadConsistency::Strong);
+    let outcome =
+        check_mirror_read_consistency(&catalog, db_id, &origin, ReadConsistency::Strong, now_ms());
 
     match outcome {
         MirrorReadOutcome::Reject { sqlstate_code, .. } => {
@@ -97,7 +99,8 @@ fn mirror_strong_read_rejected_disconnected() {
         status: MirrorStatus::Disconnected,
     };
 
-    let outcome = check_mirror_read_consistency(&catalog, db_id, &origin, ReadConsistency::Strong);
+    let outcome =
+        check_mirror_read_consistency(&catalog, db_id, &origin, ReadConsistency::Strong, now_ms());
 
     match outcome {
         MirrorReadOutcome::Reject { sqlstate_code, .. } => {

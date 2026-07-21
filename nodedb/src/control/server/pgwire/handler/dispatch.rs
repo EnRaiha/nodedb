@@ -159,11 +159,16 @@ impl NodeDbPgHandler {
             // Consistency defaults to Strong: mirrors are not the source leader,
             // so reads are rejected unless the session has explicitly opted into
             // BoundedStaleness or Eventual.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::ZERO)
+                .as_millis() as u64;
             let outcome = check_mirror_read_consistency(
                 catalog,
                 task.database_id,
                 origin,
                 ReadConsistency::Strong,
+                now_ms,
             );
             if let MirrorReadOutcome::Reject { message, .. } = outcome {
                 return Err(crate::Error::StaleReadNotLeader {

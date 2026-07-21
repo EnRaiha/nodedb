@@ -14,7 +14,7 @@ use nodedb::control::server::pgwire::ddl::database::{
 };
 use nodedb::types::ReadConsistency;
 
-use super::helpers::{TEST_SOURCE_CLUSTER, inject_lag_record_for_id, open_tmp_catalog};
+use super::helpers::{TEST_SOURCE_CLUSTER, inject_lag_record_for_id, now_ms, open_tmp_catalog};
 
 #[test]
 fn mirror_eventual_read_serves_local() {
@@ -35,7 +35,13 @@ fn mirror_eventual_read_serves_local() {
     };
 
     // Eventual always serves locally regardless of lag.
-    match check_mirror_read_consistency(&catalog, db_id, &origin, ReadConsistency::Eventual) {
+    match check_mirror_read_consistency(
+        &catalog,
+        db_id,
+        &origin,
+        ReadConsistency::Eventual,
+        now_ms(),
+    ) {
         MirrorReadOutcome::ServeLocally => {}
         MirrorReadOutcome::Reject { message, .. } => {
             panic!("Eventual read must always serve locally, got reject: {message}");
@@ -57,7 +63,13 @@ fn mirror_eventual_serves_even_when_disconnected() {
         status: MirrorStatus::Disconnected,
     };
 
-    match check_mirror_read_consistency(&catalog, db_id, &origin, ReadConsistency::Eventual) {
+    match check_mirror_read_consistency(
+        &catalog,
+        db_id,
+        &origin,
+        ReadConsistency::Eventual,
+        now_ms(),
+    ) {
         MirrorReadOutcome::ServeLocally => {}
         MirrorReadOutcome::Reject { message, .. } => {
             panic!("Eventual read on Disconnected mirror must still serve locally: {message}");

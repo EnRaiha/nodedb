@@ -20,8 +20,6 @@
 //!   This is the lowest-latency option and is correct for use cases that
 //!   accept CRDT-style monotonic convergence (e.g. mobile/edge workloads).
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
 use nodedb_types::error::sqlstate;
 use nodedb_types::{DatabaseId, MirrorOrigin, MirrorStatus};
 
@@ -52,11 +50,17 @@ pub enum MirrorReadOutcome {
 /// `promoted` is true when the mirror has been promoted and the database
 /// is now a writable primary — in that case all consistency levels are
 /// served locally (no longer a mirror).
+/// `now_ms` is the current wall-clock time (ms since epoch), supplied by the
+/// caller rather than read internally so the staleness comparison is a pure
+/// function of its inputs — this keeps `BoundedStaleness` boundary tests
+/// deterministic instead of racing the wall clock between lag injection and
+/// the check.
 pub fn check_mirror_read_consistency(
     catalog: &SystemCatalog,
     mirror_db_id: DatabaseId,
     mirror_origin: &MirrorOrigin,
     consistency: ReadConsistency,
+    now_ms: u64,
 ) -> MirrorReadOutcome {
     // A promoted mirror is a normal writable database — serve all reads locally.
     if matches!(mirror_origin.status, MirrorStatus::Promoted) {
@@ -105,11 +109,6 @@ pub fn check_mirror_read_consistency(
                     };
                 }
             };
-
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_millis() as u64;
 
             let actual_lag_ms = now_ms.saturating_sub(last_apply_ms);
             let max_lag_ms = max_lag.as_millis() as u64;
@@ -176,7 +175,13 @@ mod tests {
         let db_id = DatabaseId::new(1024);
         let origin = sample_origin(MirrorStatus::Following);
 
-        match check_mirror_read_consistency(&catalog, db_id, &origin, ReadConsistency::Strong) {
+        match check_mirror_read_consistency(
+            &catalog,
+            db_id,
+            &origin,
+            ReadConsistency::Strong,
+            now_ms(),
+        ) {
             MirrorReadOutcome::Reject {
                 sqlstate_code,
                 message,
@@ -198,7 +203,13 @@ mod tests {
         let db_id = DatabaseId::new(1025);
         let origin = sample_origin(MirrorStatus::Following);
 
-        match check_mirror_read_consistency(&catalog, db_id, &origin, ReadConsistency::Eventual) {
+        match check_mirror_read_consistency(
+            &catalog,
+            db_id,
+            &origin,
+            ReadConsistency::Eventual,
+            now_ms(),
+        ) {
             MirrorReadOutcome::ServeLocally => {}
             MirrorReadOutcome::Reject { message, .. } => {
                 panic!("Eventual should serve locally, got reject: {message}")
@@ -226,7 +237,7 @@ mod tests {
             .unwrap();
 
         let bound = ReadConsistency::BoundedStaleness(Duration::from_secs(10));
-        match check_mirror_read_consistency(&catalog, db_id, &origin, bound) {
+        match check_mirror_read_consistency(&catalog, db_id, &origin, bound, now_ms()) {
             MirrorReadOutcome::ServeLocally => {}
             MirrorReadOutcome::Reject { message, .. } => {
                 panic!("Fresh mirror should serve locally, got reject: {message}")
@@ -255,7 +266,7 @@ mod tests {
 
         // Bound = 5 seconds; actual lag ≈ 60 seconds.
         let bound = ReadConsistency::BoundedStaleness(Duration::from_secs(5));
-        match check_mirror_read_consistency(&catalog, db_id, &origin, bound) {
+        match check_mirror_read_consistency(&catalog, db_id, &origin, bound, now_ms()) {
             MirrorReadOutcome::Reject {
                 sqlstate_code,
                 message,
@@ -282,7 +293,7 @@ mod tests {
             ReadConsistency::Eventual,
             ReadConsistency::BoundedStaleness(Duration::from_secs(1)),
         ] {
-            match check_mirror_read_consistency(&catalog, db_id, &origin, consistency) {
+            match check_mirror_read_consistency(&catalog, db_id, &origin, consistency, now_ms()) {
                 MirrorReadOutcome::ServeLocally => {}
                 MirrorReadOutcome::Reject { message, .. } => {
                     panic!("Promoted mirror should always serve locally, got: {message}")
