@@ -86,7 +86,7 @@ fn collection_on_nonzero_core() -> String {
         let vshard =
             VShardId::from_collection_in_database(nodedb::types::DatabaseId::DEFAULT, &name)
                 .as_u32();
-        if vshard as usize % NUM_CORES != 0 {
+        if !(vshard as usize).is_multiple_of(NUM_CORES) {
             return name;
         }
     }
