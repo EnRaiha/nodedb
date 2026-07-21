@@ -133,3 +133,66 @@ async fn drop_then_recreate_same_name_starts_empty() {
         "re-created collection must start empty; old rows resurrected: {after:?}"
     );
 }
+
+/// The strict-engine twin of `drop_then_recreate_same_name_starts_empty`.
+/// A `document_strict` collection stores its Binary Tuples under the same
+/// name-derived `{db}:{tenant}:{name}:` prefix that a re-CREATE reuses —
+/// collection identity is not per-creation. DROP must purge every stored
+/// tuple (and its indexes) so a re-created same-name strict collection starts
+/// empty; otherwise the old tuples are inherited by the new incarnation and
+/// scan as all-NULL ghosts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_then_recreate_document_strict_starts_empty() {
+    let srv = TestServer::start().await;
+
+    srv.exec(
+        "CREATE COLLECTION recycled_strict (id TEXT PRIMARY KEY, title TEXT, body TEXT) \
+         WITH (engine='document_strict')",
+    )
+    .await
+    .unwrap();
+    for i in 0..7u32 {
+        srv.exec(&format!(
+            "INSERT INTO recycled_strict (id, title, body) VALUES ('smoke_{i}', 't{i}', 'b{i}')"
+        ))
+        .await
+        .unwrap();
+    }
+    let before = srv
+        .query_rows("SELECT id FROM recycled_strict")
+        .await
+        .unwrap();
+    assert_eq!(
+        before.len(),
+        7,
+        "7 rows must exist before DROP, got {before:?}"
+    );
+
+    srv.exec("DROP COLLECTION recycled_strict").await.unwrap();
+    srv.exec(
+        "CREATE COLLECTION recycled_strict (id TEXT PRIMARY KEY, title TEXT, body TEXT) \
+         WITH (engine='document_strict')",
+    )
+    .await
+    .unwrap();
+
+    let after = srv
+        .query_rows("SELECT id FROM recycled_strict")
+        .await
+        .unwrap();
+    assert_eq!(
+        after.len(),
+        0,
+        "re-created strict collection must start empty; old tuples resurrected: {after:?}"
+    );
+
+    let count = srv
+        .query_text("SELECT COUNT(*) FROM recycled_strict")
+        .await
+        .unwrap();
+    assert_eq!(
+        count,
+        vec!["0".to_string()],
+        "COUNT(*) on a freshly re-created strict collection must be 0, got {count:?}"
+    );
+}

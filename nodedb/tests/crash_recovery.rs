@@ -40,6 +40,67 @@ async fn committed_write_survives_kill_9() {
     );
 }
 
+/// After a hard crash and WAL replay, the primary-key point-lookup index and
+/// the sequential-scan surface must agree for a document_strict collection.
+/// The reported ghost tuples were rows the scan returned but no point-lookup
+/// (`WHERE id = ...`) nor `COUNT(*)` could reach — a PK-index-vs-tuple-store
+/// divergence that surfaced after restart cycles. A single kill -9 + reopen
+/// must never produce that split: every scan-visible row is reachable by its
+/// own primary key, and `COUNT(*)` equals the scanned row count.
+#[tokio::test(flavor = "multi_thread")]
+async fn pk_index_and_scan_agree_after_kill_9() {
+    let mut h = CrashHarness::new();
+    h.spawn();
+    h.wait_ready(Duration::from_secs(20));
+
+    h.exec(
+        "CREATE COLLECTION ghost_check (id TEXT PRIMARY KEY, title TEXT) \
+         WITH (engine='document_strict')",
+    )
+    .await;
+    for i in 0..7u32 {
+        h.exec(&format!(
+            "INSERT INTO ghost_check (id, title) VALUES ('smoke_{i}', 't{i}')"
+        ))
+        .await;
+    }
+
+    h.kill_9();
+    h.reopen();
+
+    let mut scan = h.query_col("SELECT id FROM ghost_check", "id").await;
+    scan.sort();
+    let expected: Vec<String> = (0..7u32).map(|i| format!("smoke_{i}")).collect();
+    assert_eq!(
+        scan, expected,
+        "all 7 committed rows must survive kill -9 + WAL replay (got {scan:?})"
+    );
+
+    // Every scan-visible row must be reachable by its own PK point-lookup;
+    // a scan-visible row unreachable by point-lookup is a ghost tuple.
+    for id in &scan {
+        let point = h
+            .query_col(
+                &format!("SELECT id FROM ghost_check WHERE id = '{id}'"),
+                "id",
+            )
+            .await;
+        assert_eq!(
+            point,
+            vec![id.clone()],
+            "scanned row '{id}' unreachable by point-lookup after crash recovery — a ghost tuple (got {point:?})"
+        );
+    }
+
+    // COUNT(*) must agree with the scan, not exclude the recovered rows.
+    let count = h.query_col_idx("SELECT COUNT(*) FROM ghost_check", 0).await;
+    assert_eq!(
+        count,
+        vec!["7".to_string()],
+        "COUNT(*) must equal the scanned row count after crash recovery (got {count:?})"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_write_survives_kill_9() {
     let mut h = CrashHarness::new();

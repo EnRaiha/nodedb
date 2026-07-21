@@ -153,14 +153,27 @@ async fn native_committed_txn_row_visible_to_point_and_filtered_reads() {
         &format!("INSERT INTO {coll} (id, name) VALUES ('a1', 'alpha')"),
     )
     .await;
-    assert_eq!(insert.status, ResponseStatus::Ok, "in-tx INSERT: {insert:?}");
+    assert_eq!(
+        insert.status,
+        ResponseStatus::Ok,
+        "in-tx INSERT: {insert:?}"
+    );
 
     let commit = request_drain(&mut stream, 3, OpCode::Commit, TextFields::default()).await;
     assert_eq!(commit.status, ResponseStatus::Ok, "COMMIT op: {commit:?}");
 
     // PK point lookup on the writing connection.
-    let point = sql_drain(&mut stream, 4, &format!("SELECT id FROM {coll} WHERE id = 'a1'")).await;
-    assert_ne!(point.status, ResponseStatus::Error, "point lookup: {point:?}");
+    let point = sql_drain(
+        &mut stream,
+        4,
+        &format!("SELECT id FROM {coll} WHERE id = 'a1'"),
+    )
+    .await;
+    assert_ne!(
+        point.status,
+        ResponseStatus::Error,
+        "point lookup: {point:?}"
+    );
     assert_eq!(
         first_cell(&point),
         Some(Value::String("a1".into())),
@@ -174,7 +187,11 @@ async fn native_committed_txn_row_visible_to_point_and_filtered_reads() {
         &format!("SELECT count(*) FROM {coll} WHERE name = 'alpha'"),
     )
     .await;
-    assert_ne!(count.status, ResponseStatus::Error, "filtered count: {count:?}");
+    assert_ne!(
+        count.status,
+        ResponseStatus::Error,
+        "filtered count: {count:?}"
+    );
     assert_eq!(
         first_cell(&count),
         Some(Value::Integer(1)),
@@ -193,7 +210,12 @@ async fn native_committed_txn_row_visible_to_point_and_filtered_reads() {
 
     // Fresh connection — the miss must not persist across sessions.
     let mut fresh = native_session(&server).await;
-    let point2 = sql_drain(&mut fresh, 1, &format!("SELECT id FROM {coll} WHERE id = 'a1'")).await;
+    let point2 = sql_drain(
+        &mut fresh,
+        1,
+        &format!("SELECT id FROM {coll} WHERE id = 'a1'"),
+    )
+    .await;
     assert_ne!(
         point2.status,
         ResponseStatus::Error,

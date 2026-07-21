@@ -77,10 +77,77 @@ pub fn qualified_name(table: Option<&str>, name: &str) -> String {
 
 /// Convert a WHERE expression into a list of Filter.
 pub fn convert_where_to_filters(expr: &ast::Expr) -> Result<Vec<Filter>> {
-    let sql_expr = convert_expr(expr)?;
+    let sql_expr = canonicalize_predicate(convert_expr(expr)?);
     Ok(vec![Filter {
         expr: FilterExpr::Expr(sql_expr),
     }])
+}
+
+/// Canonicalize comparison operand order so a bare column always sits on the
+/// left of a comparison (`column <op> literal`), flipping the operator when a
+/// swap happens (`5 < id` → `id > 5`).
+///
+/// Written literal-first (`'x' = id`), a predicate is logically identical to
+/// its column-first spelling but reaches the planner in a shape only some
+/// extractors recognize: the primary-key point-get rewrite accepts
+/// `column = literal` but not `literal = column`, so the two spellings would
+/// route to different physical operators (index point-lookup vs sequential
+/// scan) that disagree whenever the index and the stored tuples diverge.
+/// Normalizing at this single WHERE→filter choke point guarantees every
+/// downstream extractor — point-get, index lookup, scan-filter fast path —
+/// sees one canonical shape.
+fn canonicalize_predicate(expr: SqlExpr) -> SqlExpr {
+    match expr {
+        SqlExpr::BinaryOp { left, op, right } => {
+            let left = canonicalize_predicate(*left);
+            let right = canonicalize_predicate(*right);
+            // Only swap when the column sits on the right and the left side is
+            // not itself a bare column — the exact shape (`literal = column`)
+            // the point-get / fast-path extractors fail to recognize.
+            if let Some(flipped) = flip_comparison(op)
+                && !matches!(left, SqlExpr::Column { .. })
+                && matches!(right, SqlExpr::Column { .. })
+            {
+                return SqlExpr::BinaryOp {
+                    left: Box::new(right),
+                    op: flipped,
+                    right: Box::new(left),
+                };
+            }
+            SqlExpr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            }
+        }
+        SqlExpr::UnaryOp { op, expr } => SqlExpr::UnaryOp {
+            op,
+            expr: Box::new(canonicalize_predicate(*expr)),
+        },
+        other => other,
+    }
+}
+
+/// Map a comparison operator to the operator that preserves meaning when its
+/// two operands are swapped. Returns `None` for non-comparison operators
+/// (arithmetic, logical, string), which are never operand-swapped here.
+fn flip_comparison(op: BinaryOp) -> Option<BinaryOp> {
+    match op {
+        BinaryOp::Eq => Some(BinaryOp::Eq),
+        BinaryOp::Ne => Some(BinaryOp::Ne),
+        BinaryOp::Gt => Some(BinaryOp::Lt),
+        BinaryOp::Ge => Some(BinaryOp::Le),
+        BinaryOp::Lt => Some(BinaryOp::Gt),
+        BinaryOp::Le => Some(BinaryOp::Ge),
+        BinaryOp::Add
+        | BinaryOp::Sub
+        | BinaryOp::Mul
+        | BinaryOp::Div
+        | BinaryOp::Mod
+        | BinaryOp::And
+        | BinaryOp::Or
+        | BinaryOp::Concat => None,
+    }
 }
 
 pub fn extract_func_args(func: &ast::Function) -> Result<Vec<ast::Expr>> {

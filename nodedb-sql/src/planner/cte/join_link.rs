@@ -76,10 +76,11 @@ pub(super) fn extract_recursive_info(expr: &SetExpr, cte_name: &str) -> Result<R
 
     let mut filters = Vec::new();
     if let Some(where_expr) = &select.selection {
-        let converted = crate::resolver::expr::convert_expr(where_expr)?;
-        filters.push(Filter {
-            expr: FilterExpr::Expr(converted),
-        });
+        // Route through the shared WHERE→filter converter so the predicate is
+        // operand-order canonicalized like every other WHERE clause.
+        filters.extend(crate::planner::select::convert_where_to_filters(
+            where_expr,
+        )?);
     }
 
     Ok((filters, join_link))

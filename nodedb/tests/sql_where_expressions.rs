@@ -270,3 +270,85 @@ async fn column_arithmetic_in_where_is_evaluated() {
     assert_eq!(rows.len(), 1);
     assert!(rows[0].contains("i1"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn is_null_does_not_match_non_null_column() {
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION nn_rows (\
+                id STRING PRIMARY KEY, \
+                body STRING) WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO nn_rows (id, body) VALUES ('seed_a1', 'x')")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO nn_rows (id, body) VALUES ('seed_a2', 'y')")
+        .await
+        .unwrap();
+
+    // `id` is non-NULL on every row, so `IS NULL` must match nothing and
+    // `IS NOT NULL` must match everything. The reported degradation had this
+    // inverted — `id IS NULL` matched the healthy, non-NULL rows.
+    let is_null = server
+        .query_text("SELECT id FROM nn_rows WHERE id IS NULL")
+        .await
+        .unwrap();
+    assert!(
+        is_null.is_empty(),
+        "`id IS NULL` must not match rows whose id is non-NULL, got {is_null:?}"
+    );
+
+    let is_not_null = server
+        .query_rows("SELECT id FROM nn_rows WHERE id IS NOT NULL")
+        .await
+        .unwrap();
+    assert_eq!(
+        is_not_null.len(),
+        2,
+        "`id IS NOT NULL` must match every non-NULL row, got {is_not_null:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_where_is_null_does_not_touch_non_null_rows() {
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION nn_del (\
+                id STRING PRIMARY KEY, \
+                body STRING) WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    for i in 1..=3u32 {
+        server
+            .exec(&format!(
+                "INSERT INTO nn_del (id, body) VALUES ('seed_a{i}', 'v{i}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Catastrophic-inversion guard: `DELETE WHERE id IS NULL` must remove zero
+    // rows when every id is non-NULL. The reported inversion deleted the three
+    // committed rows instead of leaving them untouched.
+    server
+        .exec("DELETE FROM nn_del WHERE id IS NULL")
+        .await
+        .unwrap();
+
+    let remaining = server.query_rows("SELECT id FROM nn_del").await.unwrap();
+    assert_eq!(
+        remaining.len(),
+        3,
+        "DELETE WHERE id IS NULL must not delete rows whose id is non-NULL; \
+         all 3 must remain, got {remaining:?}"
+    );
+}
