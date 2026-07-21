@@ -1,35 +1,29 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Dispatch `MetaOp::UnregisterCollection` to the local Data Plane.
+//! Result-checked `UnregisterCollection` fan-out to every local Data Plane core.
 //!
-//! Called from `catalog_entry::post_apply::async_dispatch::collection::purge_async`
-//! on **every node** (leader and followers) so each node's Data
-//! Plane reclaims its own local L1/L2 storage for the purged
-//! collection symmetrically with the metadata row removal.
+//! Collection-scoped state is present on multiple cores (including aggregate
+//! caches and engine-local segments), so purge completion means every core has
+//! acknowledged reclaim. All requests are dispatched before responses are
+//! awaited; any send, timeout, channel, or handler failure aborts the barrier.
 
-use crate::bridge::envelope::{PhysicalPlan, Status};
-use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
+use std::time::{Duration, Instant};
+
+use futures::future::join_all;
 use nodedb_physical::physical_plan::MetaOp;
 
-/// Dispatch `MetaOp::UnregisterCollection { tenant_id, name, purge_lsn }`
-/// to this node's Data Plane so `clear_collection_all_engines` reclaims
-/// every engine's redb + versioned storage for the purged collection.
+use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
+use crate::control::state::SharedState;
+use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
+
+/// Dispatch `MetaOp::UnregisterCollection` to every local core and require an
+/// `Ok` acknowledgement from each one.
 ///
-/// **Result-checked.** This is the correctness-critical half of a DROP:
-/// the catalog row has already been removed at apply, so if the engine
-/// purge does not actually succeed, engine rows survive behind a gone
-/// catalog row (the resurrection hole on re-CREATE). The Data-Plane
-/// handler is fail-closed and returns a `Status::Error` response on a
-/// failed engine purge, but the shared `dispatch_to_data_plane` hands
-/// that back as `Ok(response)` regardless of `response.status` (its
-/// contract is used broadly and must not change). We therefore inspect
-/// `response.status` HERE and turn an error response — or a transport
-/// error, or a deadline — into a propagated `Err`. The caller records a
-/// durable pending-reclaim entry so the purge is retried at-least-once
-/// rather than lost to a warn log.
-///
-/// Idempotent: safe to re-dispatch after a partial or failed attempt.
+/// The catalog row has already been removed when this runs. Returning success
+/// after only a subset of cores reclaimed would allow a same-name re-CREATE to
+/// observe predecessor state, so partial success is always an error. The caller
+/// records a durable pending-reclaim entry and the applied-index barrier fails
+/// closed.
 pub async fn dispatch_unregister_collection(
     state: &SharedState,
     database_id: u64,
@@ -39,36 +33,86 @@ pub async fn dispatch_unregister_collection(
 ) -> crate::Result<()> {
     let tenant = TenantId::new(tenant_id);
     let database = DatabaseId::new(database_id);
-    let vshard = VShardId::from_collection_in_database(database, name);
-    let plan = PhysicalPlan::Meta(MetaOp::UnregisterCollection {
-        tenant_id,
-        name: name.to_string(),
-        purge_lsn,
-    });
+    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
+    let num_cores = state
+        .dispatcher
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .num_cores();
+    let mut receivers = Vec::with_capacity(num_cores);
 
-    let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
-        state,
-        tenant,
-        database,
-        vshard,
-        plan,
-        TraceId::ZERO,
-    )
-    .await?;
-
-    if response.status == Status::Error {
-        let detail = match response.error_code {
-            Some(code) => format!("{code:?}"),
-            None => "engine purge returned Status::Error with no error_code".to_string(),
-        };
-        return Err(crate::Error::Storage {
-            engine: "collection-purge".into(),
-            detail: format!(
-                "UnregisterCollection for tenant {tenant_id} collection '{name}' \
-                 failed on the local Data Plane: {detail}"
-            ),
-        });
+    {
+        let mut dispatcher = state
+            .dispatcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for core_id in 0..num_cores {
+            let request_id = state.next_request_id();
+            let request = Request {
+                request_id,
+                tenant_id: tenant,
+                database_id: database,
+                vshard_id: VShardId::new(core_id as u32),
+                plan: PhysicalPlan::Meta(MetaOp::UnregisterCollection {
+                    tenant_id,
+                    name: name.to_string(),
+                    purge_lsn,
+                }),
+                deadline: Instant::now() + timeout,
+                priority: Priority::Background,
+                trace_id: TraceId::ZERO,
+                consistency: ReadConsistency::Strong,
+                idempotency_key: None,
+                event_source: crate::event::EventSource::User,
+                user_roles: Vec::new(),
+                user_id: None,
+                statement_digest: None,
+                txn_id: None,
+                wal_lsn: None,
+                resolved_now_ms: None,
+                admission: crate::bridge::envelope::Admission::Exempt(
+                    crate::bridge::envelope::ExemptReason::AlreadyOrdered,
+                ),
+            };
+            let receiver = state.tracker.register(request_id);
+            if let Err(error) = dispatcher.dispatch_to_core(core_id, request) {
+                state.tracker.cancel(&request_id);
+                for (registered_id, _, _) in &receivers {
+                    state.tracker.cancel(registered_id);
+                }
+                return Err(error);
+            }
+            receivers.push((request_id, core_id, receiver));
+        }
     }
 
+    let responses = join_all(receivers.into_iter().map(
+        |(_request_id, core_id, mut receiver)| async move {
+            let response = tokio::time::timeout(timeout, receiver.recv())
+                .await
+                .map_err(|_| crate::Error::Dispatch {
+                    detail: format!("collection reclaim timed out on core {core_id}"),
+                })?
+                .ok_or_else(|| crate::Error::Dispatch {
+                    detail: format!("collection reclaim channel closed on core {core_id}"),
+                })?;
+            if response.status != Status::Ok {
+                return Err(crate::Error::Storage {
+                    engine: "collection-purge".into(),
+                    detail: format!(
+                        "UnregisterCollection for tenant {tenant_id} collection '{name}' \
+                         failed on core {core_id}: {:?}",
+                        response.error_code
+                    ),
+                });
+            }
+            Ok(())
+        },
+    ))
+    .await;
+
+    for response in responses {
+        response?;
+    }
     Ok(())
 }

@@ -15,14 +15,34 @@
 //! engines that write per-collection checkpoint or partition files
 //! under `{data_dir}/...`.
 
+use std::path::PathBuf;
+
+use thiserror::Error;
+
 pub mod sparse_vector;
 pub mod spatial;
 pub mod timeseries;
 pub mod vector;
 
-/// Summary of a single engine's reclaim pass. Byte counts are
-/// best-effort — missing files count as 0, IO errors are warn-logged
-/// and skipped (idempotent).
+/// A persistent L1 surface could not be fully reclaimed. Callers must not
+/// release the collection lifecycle barrier after this error.
+#[derive(Debug, Error)]
+pub enum ReclaimError {
+    #[error("{operation} failed for '{}': {source}", path.display())]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("sparse-vector manifest at '{}' is unreadable: {detail}", path.display())]
+    SparseManifest { path: PathBuf, detail: String },
+}
+
+pub type Result<T> = std::result::Result<T, ReclaimError>;
+
+/// Summary of a single engine's reclaim pass. Missing files count as zero;
+/// actual I/O failures are returned to the lifecycle barrier.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReclaimStats {
     pub files_unlinked: u32,

@@ -96,7 +96,7 @@ impl TestClusterNode {
             &data_dir_path.join("test.wal"),
         )?);
         let wal_records: Arc<[nodedb_wal::WalRecord]> = Arc::from(wal.replay()?.into_boxed_slice());
-        let replay_tombstones = nodedb_wal::extract_tombstones(&wal_records);
+        let replay_tombstones = nodedb_wal::extract_tombstones(&wal_records).unwrap();
         let (dispatcher, data_sides) = Dispatcher::new(num_cores, 1024);
         let (event_producers, event_consumers) = create_event_bus(num_cores);
 

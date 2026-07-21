@@ -98,8 +98,8 @@ impl CrdtSyncDelivery {
     }
 
     /// Broadcast a `CollectionPurged` control frame to every session
-    /// currently subscribed to `(tenant_id, collection)`. Runs when
-    /// `purge_async` finishes the per-node reclaim, so every online
+    /// currently subscribed to `(tenant_id, collection)`. Runs when the
+    /// per-node reclaim barrier finishes, so every online
     /// Lite client learns about the hard-delete within one network
     /// round-trip and can drop local state. Offline clients pick it
     /// up on reconnect via the `last_seen_lsn` replay path.

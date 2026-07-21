@@ -11,9 +11,9 @@
 
 use std::path::Path;
 
-use tracing::{debug, warn};
+use tracing::debug;
 
-use super::ReclaimStats;
+use super::{ReclaimError, ReclaimStats, Result};
 use crate::data::executor::handlers::timeseries::paths::ts_collection_dir;
 
 /// Recursively remove the partition directory for `collection`.
@@ -24,24 +24,23 @@ pub fn reclaim_timeseries_partitions(
     database_id: u64,
     tenant_id: u64,
     collection: &str,
-) -> ReclaimStats {
+) -> Result<ReclaimStats> {
     let partition_dir = ts_collection_dir(data_dir, database_id, tenant_id, collection);
-    if !partition_dir.exists() {
-        return ReclaimStats::default();
-    }
-
     let mut stats = ReclaimStats::default();
     tally_tree(&partition_dir, &mut stats);
 
-    if let Err(e) = std::fs::remove_dir_all(&partition_dir) {
-        warn!(
-            dir = %partition_dir.display(),
-            error = %e,
-            "timeseries reclaim: remove_dir_all failed; partial state left for next attempt"
-        );
-        // Return whatever we tallied; the next idempotent purge will
-        // pick up the rest.
-        return stats;
+    match std::fs::remove_dir_all(&partition_dir) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReclaimStats::default());
+        }
+        Err(source) => {
+            return Err(ReclaimError::Io {
+                operation: "remove timeseries partition directory",
+                path: partition_dir,
+                source,
+            });
+        }
     }
     debug!(
         dir = %partition_dir.display(),
@@ -49,7 +48,7 @@ pub fn reclaim_timeseries_partitions(
         bytes = stats.bytes_freed,
         "timeseries reclaim: partition directory removed"
     );
-    stats
+    Ok(stats)
 }
 
 /// Walk the tree rooted at `root`, accumulating file count and byte
@@ -96,7 +95,7 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("x.bin"), b"keep").unwrap();
 
-        let stats = reclaim_timeseries_partitions(base, 0, 1, "metrics");
+        let stats = reclaim_timeseries_partitions(base, 0, 1, "metrics").unwrap();
         assert_eq!(stats.files_unlinked, 3);
         assert_eq!(stats.bytes_freed, 4 + 2 + 1);
         assert!(!ts_collection_dir(base, 0, 1, "metrics").exists());
@@ -106,7 +105,7 @@ mod tests {
     #[test]
     fn missing_dir_is_noop() {
         let tmp = TempDir::new().unwrap();
-        let s = reclaim_timeseries_partitions(tmp.path(), 0, 1, "nope");
+        let s = reclaim_timeseries_partitions(tmp.path(), 0, 1, "nope").unwrap();
         assert_eq!(s.files_unlinked, 0);
     }
 }

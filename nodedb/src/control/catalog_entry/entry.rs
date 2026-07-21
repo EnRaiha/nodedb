@@ -174,9 +174,10 @@ pub enum CatalogEntry {
     /// refresh loop picks up the new definition on its next tick
     /// and starts materializing rows from source → target.
     PutMaterializedView(Box<StoredMaterializedView>),
-    /// Delete a materialized view definition. The target
-    /// collection is NOT deleted — operators drop it separately
-    /// with `DROP COLLECTION` if desired.
+    /// Delete a materialized-view definition and its implementation-owned
+    /// target collection as one replicated catalog mutation. Post-apply waits
+    /// for collection-wide Data Plane reclaim before advancing the applied
+    /// index, so a same-name re-CREATE starts from a fresh incarnation.
     DeleteMaterializedView { tenant_id: u64, name: String },
 
     // ── Continuous Aggregate ───────────────────────────────────────

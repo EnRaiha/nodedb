@@ -2,8 +2,6 @@
 
 //! `CREATE TIMESERIES <name> [WITH (key = 'value', ...)]`
 
-use nodedb_types::DatabaseId;
-
 use crate::control::security::catalog::StoredCollection;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -28,16 +26,19 @@ pub fn create_timeseries(
     let name = parts[2].to_lowercase();
     let tenant_id = identity.tenant_id;
 
-    if let Ok(Some(_)) =
-        state
-            .credentials
-            .catalog()
-            .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name)
+    match state
+        .credentials
+        .catalog()
+        .get_collection(database_id, tenant_id.as_u64(), &name)
     {
-        return Err(ddl_err(
-            "42P07",
-            format!("collection '{name}' already exists"),
-        ));
+        Ok(Some(_)) => {
+            return Err(ddl_err(
+                "42P07",
+                format!("collection '{name}' already exists"),
+            ));
+        }
+        Ok(None) => {}
+        Err(error) => return Err(ddl_err("XX000", error.to_string())),
     }
 
     let config_json = parse_with_clause(parts);

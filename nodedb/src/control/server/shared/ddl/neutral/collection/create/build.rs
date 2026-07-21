@@ -124,8 +124,35 @@ pub async fn build_and_persist(
 
     let tenant_id = identity.tenant_id;
 
-    // Check if the object already exists.
+    // Metadata Raft serializes clustered DDL. Without it, hold an exclusive
+    // per-name lifecycle guard across validation, any predecessor reclaim,
+    // catalog creation, and Data Plane registration.
+    let mut local_lifecycle = if state.metadata_raft.get().is_none() {
+        Some(
+            state
+                .quiesce
+                .acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), name)
+                .await,
+        )
+    } else {
+        None
+    };
+
+    // A materialized-view definition durably owns its same-name target even if
+    // a crash occurred between definition and target registration.
     let catalog = state.credentials.catalog();
+    if catalog
+        .get_materialized_view(tenant_id.as_u64(), name)
+        .map_err(|error| err("XX000", error.to_string()))?
+        .is_some()
+    {
+        return Err(err(
+            "42P07",
+            format!("materialized view '{name}' already owns this collection name"),
+        ));
+    }
+
+    // Check if the object already exists.
     if let Ok(Some(existing)) = catalog.get_collection(database_id, tenant_id.as_u64(), name) {
         if existing.is_active {
             return Err(err(
@@ -152,14 +179,22 @@ pub async fn build_and_persist(
         // catalog row, ABORT the CREATE rather than build a new
         // collection over un-purged data (which would resurrect the
         // stale rows). Surface as an internal error to the client.
-        crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
-            state,
-            tenant_id.as_u64(),
-            name,
-            purge_lsn,
-        )
-        .await
-        .map_err(|e| err("XX000", e.to_string()))?;
+        let purge_result =
+            crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
+                state,
+                database_id.as_u64(),
+                tenant_id.as_u64(),
+                name,
+                purge_lsn,
+                local_lifecycle.is_some(),
+            )
+            .await;
+        if let Err(error) = purge_result {
+            if let Some(guard) = local_lifecycle.take() {
+                guard.disarm();
+            }
+            return Err(err("XX000", error.to_string()));
+        }
     }
 
     let now = std::time::SystemTime::now()

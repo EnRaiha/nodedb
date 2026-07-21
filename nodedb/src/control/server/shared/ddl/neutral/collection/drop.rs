@@ -183,6 +183,18 @@ pub fn drop_collection(
     // joins them on the absent-name branch.
     {
         let catalog = state.credentials.catalog();
+        if catalog
+            .get_materialized_view(tenant_id.as_u64(), name)
+            .map_err(|error| err("XX000", error.to_string()))?
+            .is_some()
+        {
+            return Err(err(
+                "2BP01",
+                format!(
+                    "collection '{name}' is owned by a materialized view; drop the materialized view"
+                ),
+            ));
+        }
         match catalog.get_collection(database_id, tenant_id.as_u64(), name) {
             Ok(Some(coll)) if coll.is_active => {}
             Ok(Some(_)) if purge => {}
@@ -240,21 +252,43 @@ pub fn drop_collection(
             name: name.to_string(),
         }
     };
+    // Without metadata Raft, acquire the per-name lifecycle guard before the
+    // catalog mutation and hold it through local reclaim.
+    let mut local_lifecycle = if state.metadata_raft.get().is_none() {
+        Some(
+            state
+                .quiesce
+                .try_acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), name)
+                .ok_or_else(|| err("55006", format!("collection '{name}' lifecycle is busy")))?,
+        )
+    } else {
+        None
+    };
     let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", e.to_string()))?;
+        .map_err(|error| err("XX000", error.to_string()))?;
     if log_index == 0 {
         let catalog = state.credentials.catalog();
-        // Single-node / no-cluster fallback: apply the catalog mutation
-        // directly, matching what the applier would have done on a
-        // clustered deployment.
         if purge {
-            crate::control::catalog_entry::apply::collection::purge(
-                database_id.as_u64(),
-                tenant_id.as_u64(),
-                name,
-                catalog,
-            )
-            .map_err(|e| err("XX000", e.to_string()))?;
+            let purge_lsn = state.wal.next_lsn().as_u64();
+            let purge_result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
+                        state,
+                        database_id.as_u64(),
+                        tenant_id.as_u64(),
+                        name,
+                        purge_lsn,
+                        local_lifecycle.is_some(),
+                    )
+                    .await
+                })
+            });
+            if let Err(error) = purge_result {
+                if let Some(guard) = local_lifecycle.take() {
+                    guard.disarm();
+                }
+                panic!("local collection reclaim failed: {error}");
+            }
             state
                 .permissions
                 .install_replicated_remove_owner_in_database(

@@ -147,6 +147,110 @@ async fn refresh_applies_group_by_aggregate() {
     );
 }
 
+/// Dropping and re-creating a materialized view under the same name creates a
+/// new target. Before its first refresh, a scalar aggregate over that empty
+/// target must return the zero-row identity rather than the predecessor's
+/// cached result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_then_recreate_materialized_view_discards_cached_aggregates() {
+    let server = TestServer::start().await;
+
+    server.exec("CREATE COLLECTION mv_reuse_src").await.unwrap();
+    server
+        .exec("INSERT INTO mv_reuse_src { id: 'r1', value: 1 }")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO mv_reuse_src { id: 'r2', value: 2 }")
+        .await
+        .unwrap();
+    server
+        .exec(
+            "CREATE MATERIALIZED VIEW mv_reuse ON mv_reuse_src AS \
+             SELECT id, value FROM mv_reuse_src",
+        )
+        .await
+        .unwrap();
+    server
+        .exec("REFRESH MATERIALIZED VIEW mv_reuse")
+        .await
+        .unwrap();
+
+    let predecessor = server
+        .query_text("SELECT COUNT(*) FROM mv_reuse")
+        .await
+        .unwrap();
+    assert_eq!(predecessor, vec!["2".to_string()]);
+
+    assert!(
+        server.exec("DROP COLLECTION mv_reuse PURGE").await.is_err(),
+        "a materialized-view target cannot be dropped independently of its owner"
+    );
+
+    server
+        .exec("DROP MATERIALIZED VIEW mv_reuse")
+        .await
+        .unwrap();
+    server
+        .exec(
+            "CREATE MATERIALIZED VIEW mv_reuse ON mv_reuse_src AS \
+             SELECT id, value FROM mv_reuse_src",
+        )
+        .await
+        .unwrap();
+
+    let replacement_rows = server.query_rows("SELECT id FROM mv_reuse").await.unwrap();
+    assert!(
+        replacement_rows.is_empty(),
+        "new materialized-view target must start without predecessor rows: {replacement_rows:?}"
+    );
+
+    let replacement = server
+        .query_text("SELECT COUNT(*) FROM mv_reuse")
+        .await
+        .unwrap();
+    assert_eq!(
+        replacement,
+        vec!["0".to_string()],
+        "new materialized-view target must not inherit predecessor aggregates"
+    );
+}
+
+/// A materialized view owns and purges its same-name target collection.
+/// Creation must therefore reject a pre-existing user collection rather than
+/// silently adopting storage that DROP MATERIALIZED VIEW would later erase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_rejects_user_collection_with_same_name() {
+    let server = TestServer::start().await;
+
+    server.exec("CREATE COLLECTION mv_owner_src").await.unwrap();
+    server
+        .exec("CREATE COLLECTION mv_owned_name")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO mv_owned_name { id: 'keep', value: 7 }")
+        .await
+        .unwrap();
+
+    let result = server
+        .exec(
+            "CREATE MATERIALIZED VIEW mv_owned_name ON mv_owner_src AS \
+             SELECT id FROM mv_owner_src",
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "materialized view must not adopt a user-owned same-name collection"
+    );
+
+    let rows = server
+        .query_rows("SELECT id FROM mv_owned_name")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![vec!["keep".to_string()]]);
+}
+
 /// A view whose SELECT joins two collections must materialize the
 /// joined rows, not copies of one source's raw docs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

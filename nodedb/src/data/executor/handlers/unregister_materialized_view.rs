@@ -66,10 +66,14 @@ impl CoreLoop {
         self.doc_cache
             .evict_collection(task.request.database_id.as_u64(), tenant_id, name);
 
-        // Aggregate + chain-hash + doc-config caches are all keyed
-        // `(tenant, collection_or_mv_name)` — same retain sweep.
-        self.aggregate_cache
-            .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &nm));
+        // Derived-result entries encode query shape after a NUL-terminated
+        // object-name prefix. Use the canonical lifecycle sweep rather than
+        // comparing that encoded key to the bare materialized-view name.
+        self.invalidate_aggregate_cache_for_collection(
+            task.request.database_id.as_u64(),
+            tenant_id,
+            name,
+        );
         self.chain_hashes
             .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &nm));
         self.doc_configs

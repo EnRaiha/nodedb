@@ -35,10 +35,11 @@ pub mod wal_tombstone;
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::security::catalog::SystemCatalog;
 
-/// Apply `entry` to `catalog`. Best-effort: per-variant errors are
-/// logged + swallowed inside the family handlers so a single write
-/// failure doesn't stall the raft apply path. Startup replay will
-/// re-run the entry if needed.
+/// Apply `entry` to `catalog`. Most per-variant errors are logged and
+/// swallowed so startup replay can retry them. Compound lifecycle mutations
+/// whose partial application would expose stale object state (currently
+/// materialized-view definition + target deletion) fail closed by panicking
+/// the applying node.
 ///
 /// Debug builds run the full referential-integrity verifier after
 /// every apply and panic on any violation. This catches the
@@ -100,19 +101,11 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             tenant_id,
             name,
         } => {
-            // Raft apply runs symmetrically on every node and must not
-            // abort on a per-node catalog storage hiccup — log and
-            // continue, exactly as before. The swallow is now an
-            // explicit choice at the call site rather than hidden
-            // inside `purge`; the interactive re-CREATE caller makes
-            // the opposite choice and propagates.
-            if let Err(e) = collection::purge(*database_id, *tenant_id, name, catalog) {
-                tracing::warn!(
-                    collection = %name,
-                    tenant = tenant_id,
-                    error = %e,
-                    "catalog_entry: purge_collection apply failed"
-                );
+            // Preserve an inactive catalog row until synchronous post-apply
+            // storage reclaim succeeds. This row is the restart-durable
+            // same-name lifecycle barrier.
+            if let Err(error) = collection::prepare_purge(*database_id, *tenant_id, name, catalog) {
+                panic!("collection catalog purge preparation failed: {error}");
             }
         }
         CatalogEntry::PutSequence(stored) => sequence::put(stored, catalog),
@@ -148,7 +141,9 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
         CatalogEntry::RevokeApiKey { key_id } => api_key::revoke(key_id, catalog),
         CatalogEntry::PutMaterializedView(stored) => materialized_view::put(stored, catalog),
         CatalogEntry::DeleteMaterializedView { tenant_id, name } => {
-            materialized_view::delete(*tenant_id, name, catalog)
+            if let Err(error) = materialized_view::delete(*tenant_id, name, catalog) {
+                panic!("materialized-view catalog deletion failed: {error}");
+            }
         }
         CatalogEntry::PutContinuousAggregate(stored) => continuous_aggregate::put(stored, catalog),
         CatalogEntry::DeleteContinuousAggregate {

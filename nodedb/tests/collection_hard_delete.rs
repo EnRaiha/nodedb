@@ -174,10 +174,11 @@ fn reclaim_handlers_are_idempotent_on_missing_files() {
 
     // All four reclaim helpers must return default stats on a fresh
     // empty data dir.
-    let vector = reclaim::vector::reclaim_vector_checkpoints(base, 0, TENANT, "x");
-    let spatial = reclaim::spatial::reclaim_spatial_checkpoints(base, 0, TENANT, "x");
-    let sparse = reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, 0, TENANT, "x");
-    let ts = reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x");
+    let vector = reclaim::vector::reclaim_vector_checkpoints(base, 0, TENANT, "x").unwrap();
+    let spatial = reclaim::spatial::reclaim_spatial_checkpoints(base, 0, TENANT, "x").unwrap();
+    let sparse =
+        reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, 0, TENANT, "x").unwrap();
+    let ts = reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x").unwrap();
 
     assert_eq!(vector.files_unlinked, 0);
     assert_eq!(spatial.files_unlinked, 0);
@@ -185,10 +186,10 @@ fn reclaim_handlers_are_idempotent_on_missing_files() {
     assert_eq!(ts.files_unlinked, 0);
 
     // Re-running must still succeed (no "already deleted" error).
-    let _ = reclaim::vector::reclaim_vector_checkpoints(base, 0, TENANT, "x");
-    let _ = reclaim::spatial::reclaim_spatial_checkpoints(base, 0, TENANT, "x");
-    let _ = reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, 0, TENANT, "x");
-    let _ = reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x");
+    reclaim::vector::reclaim_vector_checkpoints(base, 0, TENANT, "x").unwrap();
+    reclaim::spatial::reclaim_spatial_checkpoints(base, 0, TENANT, "x").unwrap();
+    reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(base, 0, TENANT, "x").unwrap();
+    reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x").unwrap();
 }
 
 /// The reclaim handlers don't touch other tenants' or other
@@ -204,7 +205,7 @@ fn reclaim_is_scoped_to_tenant_and_collection() {
     std::fs::write(vec_dir.join("0:1:orders.ckpt"), b"b").unwrap();
     std::fs::write(vec_dir.join("0:2:users.ckpt"), b"c").unwrap();
 
-    let stats = reclaim::vector::reclaim_vector_checkpoints(base, 0, 1, "users");
+    let stats = reclaim::vector::reclaim_vector_checkpoints(base, 0, 1, "users").unwrap();
     assert_eq!(stats.files_unlinked, 1);
     assert!(!vec_dir.join("0:1:users.ckpt").exists());
     // Siblings untouched.

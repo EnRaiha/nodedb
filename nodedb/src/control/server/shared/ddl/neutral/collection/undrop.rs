@@ -44,6 +44,24 @@ pub fn undrop_collection(
     let name = name_lower.as_str();
     let tenant_id = identity.tenant_id;
 
+    // Metadata Raft serializes clustered lifecycle mutations. The local
+    // fallback must acquire the same exclusive name guard as CREATE/DROP
+    // before reading the preserved descriptor, otherwise it can restore an
+    // incarnation that a concurrent purge has already superseded.
+    let _local_lifecycle = if state.metadata_raft.get().is_none() {
+        Some(
+            state
+                .quiesce
+                .try_acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), name)
+                .ok_or_else(|| DdlError {
+                    sqlstate: "55006".to_string(),
+                    message: format!("collection '{name}' lifecycle is busy"),
+                })?,
+        )
+    } else {
+        None
+    };
+
     let catalog = state.credentials.catalog();
 
     // Look up the soft-deleted record. Three distinct failures:

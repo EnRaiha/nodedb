@@ -150,24 +150,19 @@ pub async fn await_cluster_ready(
         return Err(e);
     }
 
+    // A pending name-scoped reclaim must complete before the gateway opens.
+    // Otherwise a same-name CREATE can install a replacement that the delayed
+    // retry subsequently erases. Fail readiness and let the operator restart
+    // after the underlying storage fault is resolved.
+    if let Err(error) = crate::event::collection_gc::pending_reclaim::drain_once(shared).await {
+        data_groups_gate.fail(format!("pending collection reclaim failed: {error}"));
+        return Err(anyhow::anyhow!(
+            "pending collection reclaim failed during startup: {error}"
+        ));
+    }
+
     data_groups_gate.fire();
     transport_gate.fire();
-
-    // Boot-repair outstanding engine purges: a node that crashed with a
-    // dropped collection's catalog row already removed but its redb +
-    // versioned engine purge incomplete recorded a `_system.pending_reclaim`
-    // entry (or would have, had it stayed up). Drain that table once at
-    // boot — re-running the engine purge for each pending entry — so the
-    // reclaim completes promptly instead of waiting for the first worker
-    // tick. NOT a readiness gate: a purge hiccup must never wedge boot, so
-    // this is spawned and any per-entry failure is left for the
-    // pending-reclaim worker to retry.
-    {
-        let drain_shared = Arc::clone(shared);
-        tokio::spawn(async move {
-            crate::event::collection_gc::pending_reclaim::drain_once(&drain_shared).await;
-        });
-    }
 
     // Warm the QUIC peer cache so the first replicated request
     // after boot doesn't pay a cold dial.

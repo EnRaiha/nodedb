@@ -51,6 +51,20 @@ pub async fn create_materialized_view(
         return create_streaming_mv(state, identity, &name, &query_sql).await;
     }
 
+    // Metadata Raft serializes clustered DDL. Without it, hold an exclusive
+    // name lifecycle guard through definition+target creation and Data Plane
+    // registration so DROP or another CREATE cannot interleave.
+    let _local_lifecycle = if state.metadata_raft.get().is_none() {
+        Some(
+            state
+                .quiesce
+                .acquire_lifecycle(0, tenant_id.as_u64(), &name)
+                .await,
+        )
+    } else {
+        None
+    };
+
     // Validate source collection exists.
     {
         let catalog = state.credentials.catalog();
@@ -69,6 +83,10 @@ pub async fn create_materialized_view(
                 "42P07",
                 format!("materialized view '{name}' already exists"),
             ));
+        }
+        if let Ok(Some(_)) = catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name)
+        {
+            return Err(err("42P07", format!("collection '{name}' already exists")));
         }
     }
 
@@ -98,68 +116,58 @@ pub async fn create_materialized_view(
         crate::control::catalog_entry::CatalogEntry::PutMaterializedView(Box::new(view.clone()));
     propose_and_apply(state, &entry)?;
 
-    // Create the view's target collection so REFRESH can insert into it
-    // and clients can SELECT from it like any other collection. Skipped
-    // when a collection of the same name already exists (idempotent).
-    let target_exists = {
-        let catalog = state.credentials.catalog();
-        matches!(
-            catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name),
-            Ok(Some(c)) if c.is_active
-        )
+    // Create the implementation-owned target collection so REFRESH can insert
+    // into it and clients can SELECT from it. The pre-check rejects every
+    // same-name collection; DROP may therefore purge this target without ever
+    // deleting a user-owned collection.
+    let target = StoredCollection {
+        tenant_id: tenant_id.as_u64(),
+        name: name.clone(),
+        owner: identity.username.clone(),
+        created_at: now,
+        descriptor_version: 0,
+        constraint_version: 0,
+        modification_hlc: nodedb_types::Hlc::ZERO,
+        fields: Vec::new(),
+        field_defs: Vec::new(),
+        event_defs: Vec::new(),
+        collection_type: nodedb_types::CollectionType::document(),
+        timeseries_config: None,
+        conflict_policy: None,
+        is_active: true,
+        append_only: false,
+        hash_chain: false,
+        balanced: None,
+        last_chain_hash: None,
+        period_lock: None,
+        retention_period: None,
+        legal_holds: Vec::new(),
+        state_constraints: Vec::new(),
+        transition_checks: Vec::new(),
+        type_guards: Vec::new(),
+        check_constraints: Vec::new(),
+        materialized_sums: Vec::new(),
+        lvc_enabled: false,
+        bitemporal: false,
+        crdt: false,
+        permission_tree_def: None,
+        indexes: Vec::new(),
+        size_bytes_estimate: 0,
+        primary: nodedb_types::PrimaryEngine::Document,
+        vector_primary: None,
+        partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
+        database_id: nodedb_types::DatabaseId::DEFAULT,
+        cloned_from: None,
+        clone_status: nodedb_types::CloneStatus::default(),
+        has_implicit_edges: false,
+        declared_primary_key: None,
     };
-    if !target_exists {
-        let target = StoredCollection {
-            tenant_id: tenant_id.as_u64(),
-            name: name.clone(),
-            owner: identity.username.clone(),
-            created_at: now,
-            descriptor_version: 0,
-            constraint_version: 0,
-            modification_hlc: nodedb_types::Hlc::ZERO,
-            fields: Vec::new(),
-            field_defs: Vec::new(),
-            event_defs: Vec::new(),
-            collection_type: nodedb_types::CollectionType::document(),
-            timeseries_config: None,
-            conflict_policy: None,
-            is_active: true,
-            append_only: false,
-            hash_chain: false,
-            balanced: None,
-            last_chain_hash: None,
-            period_lock: None,
-            retention_period: None,
-            legal_holds: Vec::new(),
-            state_constraints: Vec::new(),
-            transition_checks: Vec::new(),
-            type_guards: Vec::new(),
-            check_constraints: Vec::new(),
-            materialized_sums: Vec::new(),
-            lvc_enabled: false,
-            bitemporal: false,
-            crdt: false,
-            permission_tree_def: None,
-            indexes: Vec::new(),
-            size_bytes_estimate: 0,
-            primary: nodedb_types::PrimaryEngine::Document,
-            vector_primary: None,
-            partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
-            database_id: nodedb_types::DatabaseId::DEFAULT,
-            cloned_from: None,
-            clone_status: nodedb_types::CloneStatus::default(),
-            has_implicit_edges: false,
-            declared_primary_key: None,
-        };
-        let coll_entry =
-            crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(target.clone()));
-        propose_and_apply(state, &coll_entry)?;
-        // Register the target with this node's Data Plane so writes
-        // encode correctly and scans can find the collection.
-        super::super::collection::dispatch_register_from_stored(state, &target)
-            .await
-            .map_err(|e| err("XX000", e.to_string()))?;
-    }
+    let coll_entry =
+        crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(target.clone()));
+    propose_and_apply(state, &coll_entry)?;
+    super::super::collection::dispatch_register_from_stored(state, &target)
+        .await
+        .map_err(|e| err("XX000", e.to_string()))?;
 
     tracing::info!(
         view = name,

@@ -12,9 +12,9 @@ use tokio::sync::Notify;
 pub(super) struct CollectionState {
     /// Number of scans currently open against this collection.
     pub(super) open_scans: usize,
-    /// `true` once `begin_drain` has been called; new scans are rejected
-    /// and the collection is waiting for `open_scans` to reach 0.
-    pub(super) draining: bool,
+    /// Number of lifecycle operations currently holding the collection drain.
+    /// CREATE remains blocked until every holder completes.
+    pub(super) drain_holders: usize,
 }
 
 /// Why `try_start_scan` refused a new scan.
@@ -72,7 +72,7 @@ impl CollectionQuiesce {
             .states
             .entry((database_id, tenant_id, collection.to_string()))
             .or_default();
-        if entry.draining {
+        if entry.drain_holders > 0 {
             return Err(ScanStartError::Draining);
         }
         entry.open_scans += 1;
@@ -100,7 +100,7 @@ impl CollectionQuiesce {
         inner
             .states
             .get(&(database_id, tenant_id, collection.to_string()))
-            .is_some_and(|s| s.draining)
+            .is_some_and(|s| s.drain_holders > 0)
     }
 
     pub(super) fn release_scan(&self, database_id: u64, tenant_id: u64, collection: &str) {

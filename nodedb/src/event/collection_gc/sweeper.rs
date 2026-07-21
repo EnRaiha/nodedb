@@ -70,7 +70,7 @@ async fn run_loop(shared: Arc<SharedState>) {
         // per-tenant overrides are resolved inside `sweep_once` via
         // `effective_retention_for_tenant`.
         let (interval, retention, _) = load_settings(&shared);
-        if let Err(e) = sweep_once(&shared, retention) {
+        if let Err(e) = sweep_once(&shared, retention).await {
             warn!(error = %e, "collection-gc sweep failed; will retry next tick");
         }
         tokio::time::sleep(interval).await;
@@ -104,7 +104,7 @@ fn effective_retention_for_tenant(
 
 /// Single sweep pass. Public for testability — callers can drive the
 /// sweeper synchronously in tests without waiting on the interval.
-pub fn sweep_once(shared: &SharedState, retention: Duration) -> crate::Result<()> {
+pub async fn sweep_once(shared: &SharedState, retention: Duration) -> crate::Result<()> {
     let catalog = shared.credentials.catalog();
 
     let now_ns = SystemTime::now()
@@ -145,7 +145,38 @@ pub fn sweep_once(shared: &SharedState, retention: Duration) -> crate::Result<()
                     name: coll.name.clone(),
                 };
                 match crate::control::metadata_proposer::propose_catalog_entry(shared, &entry) {
-                    Ok(_) => {
+                    Ok(log_index) => {
+                        if log_index == 0 {
+                            let mut lifecycle = Some(
+                                shared
+                                    .quiesce
+                                    .acquire_lifecycle(
+                                        coll.database_id.as_u64(),
+                                        coll.tenant_id,
+                                        &coll.name,
+                                    )
+                                    .await,
+                            );
+                            let purge_lsn = shared.wal.next_lsn().as_u64();
+                            if let Err(error) = crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
+                                shared,
+                                coll.database_id.as_u64(),
+                                coll.tenant_id,
+                                &coll.name,
+                                purge_lsn,
+                                true,
+                            )
+                            .await
+                            {
+                                if let Some(guard) = lifecycle.take() {
+                                    guard.disarm();
+                                }
+                                return Err(crate::Error::Storage {
+                                    engine: "collection-gc".into(),
+                                    detail: error.to_string(),
+                                });
+                            }
+                        }
                         proposed += 1;
                         debug!(
                             tenant = coll.tenant_id,
