@@ -335,6 +335,26 @@ async fn dispatch_single_shard(
         }
     };
 
+    // Re-verify local vShard ownership immediately before the durable WAL
+    // append. `run_commit` resolved this vShard as `Local`, but a leadership
+    // handoff can land during the `ResolveTxn` await above. Without this
+    // re-check the transaction redo would be appended to a WAL this node no
+    // longer owns, and the batch dispatch below (which re-resolves leadership)
+    // would then reject the now-non-local commit — leaving an orphaned durable
+    // redo record behind while the client is told the commit aborted. Aborting
+    // here, BEFORE any durable write, keeps the failure side-effect-free and
+    // retryable: the client's retry re-enters `run_commit`, sees the vShard is
+    // non-local, and routes the commit through Calvin's replicated barrier.
+    if !matches!(
+        crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard(
+            state,
+            vshard_id.as_u32(),
+        ),
+        RouteDecision::Local
+    ) {
+        return Some(AbortReason::Serialization);
+    }
+
     // 2. Write-ahead the transaction as ONE replayable `TransactionRedo` record
     //    (each sub-op keeps its real engine `record_type`). `None` when the txn
     //    has no durable writes (all reads / CRDT / text). Its LSN stamps the
