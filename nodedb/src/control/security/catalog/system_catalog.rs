@@ -20,6 +20,8 @@ use super::types::*;
 #[derive(Clone)]
 pub struct SystemCatalog {
     pub(super) db: Arc<Database>,
+    #[cfg(test)]
+    pub(super) fail_next_user_counter_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SystemCatalog {
@@ -37,7 +39,11 @@ impl SystemCatalog {
             info!(path = %path.display(), "system catalog opened");
         }
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            #[cfg(test)]
+            fail_next_user_counter_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
     }
 
     /// Open a non-persistent system catalog backed by an in-memory redb
@@ -48,7 +54,17 @@ impl SystemCatalog {
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .map_err(|e| catalog_err("open in-memory", e))?;
         Self::ensure_bootstrapped(&db)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            #[cfg(test)]
+            fail_next_user_counter_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_user_counter_write_for_test(&self) {
+        self.fail_next_user_counter_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Bootstrap every `_system.*` table from the canonical registry —

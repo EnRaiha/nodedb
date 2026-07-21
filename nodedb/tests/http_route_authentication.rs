@@ -48,6 +48,12 @@ async fn start_http(auth_mode: AuthMode) -> TestServer {
     let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("auth.wal")).unwrap());
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
     let shared = SharedState::new(dispatcher, wal).unwrap();
+    if auth_mode == AuthMode::Trust {
+        shared
+            .credentials
+            .bootstrap_trust_superuser("nodedb")
+            .expect("bootstrap trust superuser");
+    }
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_addr = listener.local_addr().unwrap();
@@ -80,6 +86,57 @@ fn is_unauthorized_ish(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::UNAUTHORIZED
         || status == reqwest::StatusCode::FORBIDDEN
         || status == reqwest::StatusCode::BAD_REQUEST
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_trust_auth_uses_configured_durable_identity() {
+    let srv = start_http(AuthMode::Trust).await;
+    let app_state = nodedb::control::server::http::auth::AppState {
+        shared: Arc::clone(&srv.shared),
+        auth_mode: AuthMode::Trust,
+        query_ctx: Arc::new(nodedb::control::planner::context::QueryContext::for_state(
+            &srv.shared,
+        )),
+    };
+
+    let identity = nodedb::control::server::http::auth::resolve_identity(
+        &axum::http::HeaderMap::new(),
+        &app_state,
+        "127.0.0.1:1",
+    )
+    .expect("configured HTTP trust identity");
+
+    assert_eq!(identity.username, "nodedb");
+    assert_ne!(identity.user_id, 0, "trust identity must be durable");
+    assert!(identity.is_superuser);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_trust_auth_rejects_without_configured_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wal = Arc::new(
+        WalManager::open_for_testing(&dir.path().join("unconfigured-auth.wal")).expect("open WAL"),
+    );
+    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+    let shared = SharedState::new(dispatcher, wal).expect("shared state");
+    let app_state = nodedb::control::server::http::auth::AppState {
+        shared: Arc::clone(&shared),
+        auth_mode: AuthMode::Trust,
+        query_ctx: Arc::new(nodedb::control::planner::context::QueryContext::for_state(
+            &shared,
+        )),
+    };
+
+    let result = nodedb::control::server::http::auth::resolve_identity(
+        &axum::http::HeaderMap::new(),
+        &app_state,
+        "127.0.0.1:1",
+    );
+
+    assert!(
+        result.is_err(),
+        "HTTP trust auth must fail closed before identity bootstrap"
+    );
 }
 
 // ─── /v1/streams/{s}/poll ────────────────────────────────────────────────────

@@ -13,7 +13,6 @@ use nodedb::config::auth::AuthMode;
 use nodedb::control::server::pgwire::listener::PgListener;
 use nodedb::control::state::SharedState;
 use nodedb::event::{EventPlane, create_event_bus};
-use nodedb::types::TenantId;
 use nodedb::wal::WalManager;
 
 use super::support::{bind_http_listener, bind_native_listener, init_test_memory_governor};
@@ -121,6 +120,15 @@ impl TestServer {
         (server, data_dir)
     }
 
+    /// Reopen a credential store in trust mode without provisioning the normal
+    /// harness superuser. The returned server has no preconnected harness client;
+    /// callers can exercise the production bootstrap path explicitly.
+    pub async fn open_on_path_empty_store_trust(dir: TestDataDir) -> (Self, TestDataDir) {
+        let data_dir = TestDataDir(dir.0);
+        let server = Self::start_on_dir_ref(data_dir.path(), None, AuthMode::Trust, false).await;
+        (server, data_dir)
+    }
+
     /// Reopen an empty credential store in password mode without provisioning
     /// the normal harness superuser. The returned server has no preconnected
     /// harness client; callers must open the connection under test themselves.
@@ -175,12 +183,14 @@ impl TestServer {
                 .unwrap(),
         );
         if provision_superuser {
-            let _ = credentials.create_user(
-                "nodedb",
-                "nodedb",
-                TenantId::new(1),
-                vec![nodedb::control::security::identity::Role::Superuser],
-            );
+            match auth_mode {
+                AuthMode::Trust => credentials
+                    .bootstrap_trust_superuser("nodedb")
+                    .expect("bootstrap trust superuser"),
+                _ => credentials
+                    .bootstrap_superuser("nodedb", "nodedb")
+                    .expect("bootstrap password superuser"),
+            }
         }
         let mut shared =
             SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)

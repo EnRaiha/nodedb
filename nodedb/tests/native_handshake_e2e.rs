@@ -19,6 +19,7 @@ use nodedb::wal::WalManager;
 /// A minimal NodeDB server with the native protocol listener running.
 struct NativeTestServer {
     addr: std::net::SocketAddr,
+    shared: Arc<SharedState>,
     shutdown_bus: nodedb::control::shutdown::ShutdownBus,
     poller_shutdown_tx: tokio::sync::watch::Sender<bool>,
     core_stop_tx: std::sync::mpsc::Sender<()>,
@@ -39,6 +40,10 @@ impl NativeTestServer {
         let (event_producers, event_consumers) = create_event_bus(1);
 
         let shared = SharedState::new(dispatcher, Arc::clone(&wal)).unwrap();
+        shared
+            .credentials
+            .bootstrap_trust_superuser("nodedb")
+            .expect("bootstrap trust superuser");
 
         let data_side = data_sides.into_iter().next().unwrap();
         let core_dir = dir.path().to_path_buf();
@@ -124,6 +129,7 @@ impl NativeTestServer {
 
         Self {
             addr,
+            shared,
             shutdown_bus,
             poller_shutdown_tx,
             core_stop_tx,
@@ -223,6 +229,47 @@ async fn native_handshake_connect_succeeds() {
 
     assert!(result.is_ok(), "handshake failed: {result:?}");
     assert_eq!(result.unwrap(), 1, "negotiated proto_version should be 1");
+}
+
+#[tokio::test]
+async fn native_trust_auth_uses_configured_durable_identity() {
+    let server = NativeTestServer::start().await;
+    let body = serde_json::json!({"method": "trust"});
+
+    let (identity, warning) = nodedb::control::server::session_auth::authenticate(
+        &server.shared,
+        &AuthMode::Trust,
+        &body,
+        "127.0.0.1:1",
+    )
+    .await
+    .expect("configured trust authentication");
+
+    assert_eq!(identity.username, "nodedb");
+    assert_ne!(identity.user_id, 0, "trust identity must be durable");
+    assert!(identity.is_superuser);
+    assert!(warning.is_none());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_trust_auth_rejects_unknown_explicit_username() {
+    let server = NativeTestServer::start().await;
+    let body = serde_json::json!({"method": "trust", "username": "unknown"});
+
+    let result = nodedb::control::server::session_auth::authenticate(
+        &server.shared,
+        &AuthMode::Trust,
+        &body,
+        "127.0.0.1:1",
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(nodedb::Error::RejectedAuthz { .. })),
+        "unknown trust username must fail closed: {result:?}"
+    );
+    server.shutdown().await;
 }
 
 #[tokio::test]

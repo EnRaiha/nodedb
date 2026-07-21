@@ -17,7 +17,7 @@ use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::identity::{trust_identity, verify_api_key_identity};
+use super::identity::{configured_trust_identity, trust_identity, verify_api_key_identity};
 
 /// Minimum wall-clock time for any authentication attempt that ends in failure.
 ///
@@ -67,14 +67,34 @@ pub async fn authenticate(
                 });
             }
 
-            let username = body["username"].as_str().unwrap_or("anonymous");
-            let identity = trust_identity(state, username);
+            let requested_username = body["username"].as_str();
+            let identity = requested_username
+                .and_then(|username| trust_identity(state, username))
+                .or_else(|| {
+                    requested_username
+                        .is_none()
+                        .then(|| configured_trust_identity(state))
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    let username = requested_username.unwrap_or("<configured>");
+                    state.audit_record(
+                        AuditEvent::AuthFailure,
+                        None,
+                        peer_addr,
+                        &format!("native trust auth rejected: user '{username}' does not exist"),
+                    );
+                    crate::Error::RejectedAuthz {
+                        tenant_id: TenantId::new(0),
+                        resource: format!("trust user '{username}' does not exist"),
+                    }
+                })?;
 
             state.audit_record(
                 AuditEvent::AuthSuccess,
                 Some(identity.tenant_id),
                 peer_addr,
-                &format!("native trust auth: {username}"),
+                &format!("native trust auth: {}", identity.username),
             );
             state.auth_metrics.record_auth_success("trust");
 

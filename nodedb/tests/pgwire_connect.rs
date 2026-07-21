@@ -21,6 +21,10 @@ async fn pgwire_connect_and_query() {
 
     let (dispatcher, data_sides) = Dispatcher::new(1, 64);
     let shared = SharedState::new(dispatcher, wal).unwrap();
+    shared
+        .credentials
+        .bootstrap_trust_superuser("nodedb")
+        .expect("materialize configured trust superuser");
 
     // Start a Data Plane core in a background thread.
     let data_side = data_sides.into_iter().next().unwrap();

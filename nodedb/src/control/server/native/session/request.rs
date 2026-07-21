@@ -47,8 +47,15 @@ impl NativeSession {
         // All other ops require authentication.
         if self.identity.is_none() {
             if self.auth_mode == AuthMode::Trust {
-                let trust_id =
-                    super::super::super::session_auth::trust_identity(&self.state, "anonymous");
+                let Some(trust_id) =
+                    super::super::super::session_auth::configured_trust_identity(&self.state)
+                else {
+                    return SqlOutcome::Response(Box::new(NativeResponse::error(
+                        seq,
+                        "28000",
+                        "configured trust identity is unavailable",
+                    )));
+                };
                 self.auth_context = Some(super::super::super::session_auth::build_auth_context(
                     &trust_id,
                 ));

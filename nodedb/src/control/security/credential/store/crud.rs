@@ -343,6 +343,7 @@ mod tests {
         CredentialStore,
     };
     use crate::control::security::identity::Role;
+    use crate::control::security::time::now_secs;
     use crate::types::TenantId;
 
     #[test]
@@ -432,5 +433,26 @@ mod tests {
         assert!(after.scram_salted_password.is_empty());
         assert_user_unchanged(&before, &after);
         assert_eq!(store.current_version(user_id), version);
+    }
+
+    #[test]
+    fn update_password_clears_must_change_and_sets_changed_at() {
+        let store = CredentialStore::new().expect("in-memory credential store");
+        store
+            .create_user("eve", "old", TenantId::new(1), vec![Role::ReadWrite])
+            .expect("create user");
+        store
+            .set_must_change_password("eve", true)
+            .expect("set password policy");
+
+        let before = now_secs();
+        store
+            .update_password("eve", "new")
+            .expect("update password");
+        let after = now_secs();
+        let record = store.get_user("eve").expect("updated user");
+
+        assert!(!record.must_change_password);
+        assert!(record.password_changed_at >= before && record.password_changed_at <= after + 1);
     }
 }

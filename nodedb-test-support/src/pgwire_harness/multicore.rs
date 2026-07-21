@@ -13,7 +13,6 @@ use nodedb::config::auth::AuthMode;
 use nodedb::control::server::pgwire::listener::PgListener;
 use nodedb::control::state::SharedState;
 use nodedb::event::{EventPlane, create_event_bus};
-use nodedb::types::TenantId;
 use nodedb::wal::WalManager;
 
 use super::support::{bind_http_listener, bind_native_listener, init_test_memory_governor};
@@ -41,12 +40,9 @@ impl TestServer {
             nodedb::control::security::credential::store::CredentialStore::open(&catalog_path)
                 .unwrap(),
         );
-        let _ = credentials.create_user(
-            "nodedb",
-            "nodedb",
-            TenantId::new(1),
-            vec![nodedb::control::security::identity::Role::Superuser],
-        );
+        credentials
+            .bootstrap_trust_superuser("nodedb")
+            .expect("bootstrap trust superuser");
         let mut shared =
             SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)
                 .expect("build shared state");

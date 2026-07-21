@@ -114,12 +114,16 @@ impl Session {
 
     /// Ensure the session is authenticated before dispatching a non-auth op.
     ///
-    /// In trust mode, auto-authenticates as `"anonymous"` on the first frame.
-    /// Otherwise rejects with `RejectedAuthz` if no identity is bound yet.
+    /// In trust mode, auto-authenticates as the configured durable principal on
+    /// the first frame. Otherwise rejects if no identity is bound yet.
     pub(super) fn ensure_authenticated(&mut self) -> crate::Result<()> {
         if self.identity.is_none() {
             if self.auth_mode == crate::config::auth::AuthMode::Trust {
-                let trust_id = super::super::session_auth::trust_identity(&self.state, "anonymous");
+                let trust_id = super::super::session_auth::configured_trust_identity(&self.state)
+                    .ok_or_else(|| crate::Error::RejectedAuthz {
+                    tenant_id: TenantId::new(0),
+                    resource: "configured trust identity is unavailable".into(),
+                })?;
                 self.register_session(&trust_id, None);
                 self.identity = Some(trust_id);
             } else {

@@ -43,36 +43,42 @@ pub fn replay_surrogate_wal(shared: &Arc<SharedState>, wal_records: &Arc<[WalRec
     }
 }
 
-/// Bootstrap the superuser credential from config / data dir, or warn about trust mode.
+/// Materialize the configured superuser before any listener starts.
 pub fn bootstrap_superuser(shared: &Arc<SharedState>, config: &ServerConfig) -> anyhow::Result<()> {
-    let auth_mode = config.auth.mode.clone();
-    match config
-        .auth
-        .resolve_superuser_password(&config.server.data_dir)
-    {
-        Ok(Some(password)) => {
+    match &config.auth.mode {
+        crate::config::auth::AuthMode::Trust => {
             shared
                 .credentials
-                .bootstrap_superuser(&config.auth.superuser_name, &password)?;
+                .bootstrap_trust_superuser(&config.auth.superuser_name)?;
             info!(
                 user = config.auth.superuser_name,
-                mode = ?auth_mode,
-                "superuser bootstrapped"
+                mode = ?config.auth.mode,
+                "trust-mode superuser bootstrapped"
             );
-        }
-        Ok(None) => {
-            // Trust mode — no credentials needed, but operators must opt in explicitly.
             warn!("╔══════════════════════════════════════════════════════════════╗");
             warn!("║  WARNING: NodeDB is running in TRUST mode.                  ║");
-            warn!("║  ALL connections are accepted WITHOUT credentials.           ║");
+            warn!("║  Password credentials are NOT verified.                    ║");
             warn!("║  This is UNSAFE for any environment beyond local dev/CI.    ║");
             warn!("║  Set auth.mode = \"password\" (or \"certificate\") to require   ║");
             warn!("║  credentials. Trust mode must be an explicit operator       ║");
             warn!("║  opt-in — it is never the NodeDB default.                   ║");
             warn!("╚══════════════════════════════════════════════════════════════╝");
         }
-        Err(e) => {
-            return Err(e.into());
+        crate::config::auth::AuthMode::Password | crate::config::auth::AuthMode::Certificate => {
+            let password = config
+                .auth
+                .resolve_superuser_password(&config.server.data_dir)?
+                .ok_or_else(|| crate::Error::Config {
+                    detail: "superuser password resolution returned no credential".into(),
+                })?;
+            shared
+                .credentials
+                .bootstrap_superuser(&config.auth.superuser_name, &password)?;
+            info!(
+                user = config.auth.superuser_name,
+                mode = ?config.auth.mode,
+                "superuser bootstrapped"
+            );
         }
     }
     Ok(())
