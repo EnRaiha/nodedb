@@ -6,7 +6,7 @@
 
 use tracing::debug;
 
-use super::cache_key::{aggregate_cache_key, legacy_aggregate_pairs};
+use super::cache_key::{AggregateCacheKeyInputs, aggregate_cache_key, legacy_aggregate_pairs};
 use super::rows::{apply_user_aliases_to_rows, sort_aggregated_rows};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::bridge::scan_filter::ScanFilter;
@@ -119,8 +119,8 @@ impl CoreLoop {
 
         // Fast path: incremental aggregate cache.
         if filters.is_empty() && having.is_empty() {
-            let cache_key = aggregate_cache_key(
-                task.request.database_id.as_u64(),
+            let cache_key = aggregate_cache_key(AggregateCacheKeyInputs {
+                database_id: task.request.database_id.as_u64(),
                 tid,
                 collection,
                 group_by,
@@ -129,7 +129,7 @@ impl CoreLoop {
                 sub_aggregates,
                 limit,
                 sort_keys,
-            );
+            });
             if let Some(cached) = self.aggregate_cache.get(&cache_key) {
                 debug!(core = self.core_id, %collection, "aggregate cache hit");
                 return self.response_with_payload(task, cached.clone());
@@ -273,8 +273,8 @@ impl CoreLoop {
                 ) {
                     Ok(payload) => {
                         if filters.is_empty() && having.is_empty() {
-                            let cache_key = aggregate_cache_key(
-                                task.request.database_id.as_u64(),
+                            let cache_key = aggregate_cache_key(AggregateCacheKeyInputs {
+                                database_id: task.request.database_id.as_u64(),
                                 tid,
                                 collection,
                                 group_by,
@@ -283,7 +283,7 @@ impl CoreLoop {
                                 sub_aggregates,
                                 limit,
                                 sort_keys,
-                            );
+                            });
                             if self.aggregate_cache.len() < 256 {
                                 self.aggregate_cache.insert(cache_key, payload.clone());
                             }

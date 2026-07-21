@@ -46,19 +46,37 @@ fn aggregate_specs_key(aggregates: &[AggregateSpec]) -> String {
         .join(",")
 }
 
-#[allow(clippy::too_many_arguments)] // complete query shape is the cache identity
+/// Complete query shape that constitutes an aggregate result's cache identity.
+/// Every field participates in the key — two aggregate queries that differ in
+/// any one of them (output aliases, `LIMIT`, `ORDER BY`, sub-aggregation) must
+/// not collide on a shared cache entry.
+pub(super) struct AggregateCacheKeyInputs<'a> {
+    pub database_id: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub group_by: &'a [GroupKeySpec],
+    pub aggregates: &'a [AggregateSpec],
+    pub sub_group_by: &'a [String],
+    pub sub_aggregates: &'a [AggregateSpec],
+    pub limit: usize,
+    pub sort_keys: &'a [(String, bool)],
+}
+
 pub(super) fn aggregate_cache_key(
-    database_id: u64,
-    tid: u64,
-    collection: &str,
-    group_by: &[GroupKeySpec],
-    aggregates: &[AggregateSpec],
-    sub_group_by: &[String],
-    sub_aggregates: &[AggregateSpec],
-    limit: usize,
-    sort_keys: &[(String, bool)],
+    inputs: AggregateCacheKeyInputs<'_>,
 ) -> (crate::types::DatabaseId, crate::types::TenantId, String) {
     use std::fmt::Write;
+    let AggregateCacheKeyInputs {
+        database_id,
+        tid,
+        collection,
+        group_by,
+        aggregates,
+        sub_group_by,
+        sub_aggregates,
+        limit,
+        sort_keys,
+    } = inputs;
     let mut rest = format!(
         "{collection}\0{}\0{}",
         group_specs_key(group_by),
