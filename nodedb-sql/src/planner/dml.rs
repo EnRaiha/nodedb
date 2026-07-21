@@ -7,6 +7,7 @@ use sqlparser::ast::{self};
 
 use super::dml_helpers::{
     build_kv_insert_plan, build_vector_primary_insert_plan, convert_value_rows,
+    resolve_insert_columns,
 };
 use crate::engine_rules::{self, InsertParams};
 use crate::error::{Result, SqlError};
@@ -118,6 +119,9 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
     };
 
     // KV engine: key and value are fundamentally separate — handle directly.
+    // Positional column binding (below) does not apply here: the KV path
+    // matches columns by name against `pk_col`/`"key"`/`"ttl"`, which is
+    // orthogonal to declared column order.
     if info.engine == EngineType::KeyValue {
         let intent = if if_absent {
             KvInsertIntent::InsertIfAbsent
@@ -133,6 +137,11 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
             info.primary_key.as_deref(),
         );
     }
+
+    // Positional INSERT (no column list): bind values to the collection's
+    // declared column order so named projections/predicates can find them
+    // (#202). No-op for named inserts and schemaless collections.
+    let columns = resolve_insert_columns(columns, &info, rows_ast)?;
 
     // Vector-primary collection: bypass document encoding.
     if info.primary == nodedb_types::PrimaryEngine::Vector
@@ -199,7 +208,8 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
         }
     };
 
-    // KV: upsert is just a PUT (natural overwrite).
+    // KV: upsert is just a PUT (natural overwrite). Positional column
+    // binding (below) does not apply here — see `plan_insert`.
     if info.engine == EngineType::KeyValue {
         return build_kv_insert_plan(
             table_name,
@@ -210,6 +220,10 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
             info.primary_key.as_deref(),
         );
     }
+
+    // Positional UPSERT (no column list): bind to the collection's declared
+    // column order — see `plan_insert` for the full rationale (#202).
+    let columns = resolve_insert_columns(columns, &info, rows_ast)?;
 
     let rows = convert_value_rows(&columns, rows_ast)?;
     let column_defaults: Vec<(String, String)> = info
@@ -282,6 +296,10 @@ fn plan_upsert_with_on_conflict(
             info.primary_key.as_deref(),
         );
     }
+
+    // Positional UPSERT (no column list): bind to the collection's declared
+    // column order — see `plan_insert` for the full rationale (#202).
+    let columns = resolve_insert_columns(columns, &info, rows_ast)?;
 
     let rows = convert_value_rows(&columns, rows_ast)?;
     let column_defaults: Vec<(String, String)> = info
