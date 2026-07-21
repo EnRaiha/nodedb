@@ -77,7 +77,9 @@ pub fn resolve_identity(
     }
 
     if state.auth_mode == AuthMode::Trust {
-        return Ok(session_auth::trust_identity(&state.shared, "anonymous"));
+        return session_auth::configured_trust_identity(&state.shared).ok_or_else(|| {
+            ApiError::Unauthorized("configured trust identity is unavailable".into())
+        });
     }
 
     Err(ApiError::Unauthorized(

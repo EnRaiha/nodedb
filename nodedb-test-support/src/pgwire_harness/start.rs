@@ -161,17 +161,17 @@ impl TestServer {
             credential_store.set_lockout_policy(max_failed, lockout_secs, 0);
         }
         let credentials = Arc::new(credential_store);
-        // Provision the harness superuser `nodedb` so Trust-mode strict
-        // identity resolution accepts the default test connection. The
-        // bootstrap exception in the handler only fires when the store
-        // is empty, which would break as soon as any DDL creates a user.
+        // Mirror production bootstrap so trust-mode listeners resolve a durable
+        // configured principal rather than fabricating an ephemeral identity.
         if cfg.provision_superuser {
-            let _ = credentials.create_user(
-                "nodedb",
-                "nodedb",
-                nodedb::types::TenantId::new(1),
-                vec![nodedb::control::security::identity::Role::Superuser],
-            );
+            match cfg.auth_mode {
+                AuthMode::Trust => credentials
+                    .bootstrap_trust_superuser("nodedb")
+                    .expect("bootstrap trust superuser"),
+                _ => credentials
+                    .bootstrap_superuser("nodedb", "nodedb")
+                    .expect("bootstrap password superuser"),
+            }
         }
         // Ensure the built-in `default` database (id 0) is present in the
         // catalog so `USE DATABASE default` and `\c default` work in tests.

@@ -196,6 +196,10 @@ async fn pgwire_tls_ssl_request_and_select_1() {
         build_tls_acceptor(&tls_settings).expect("build TLS acceptor from self-signed cert");
 
     let state = make_state();
+    state
+        .credentials
+        .bootstrap_trust_superuser("nodedb")
+        .expect("materialize configured trust superuser");
 
     let pg_listener =
         nodedb::control::server::pgwire::listener::PgListener::bind("127.0.0.1:0".parse().unwrap())

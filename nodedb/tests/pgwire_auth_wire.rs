@@ -8,8 +8,11 @@ mod common;
 use std::sync::Arc;
 
 use common::{pgwire_auth_helpers::make_state, pgwire_harness::TestServer};
+use nodedb::config::auth::AuthMode;
 use nodedb::control::security::identity::Role;
 use nodedb::types::TenantId;
+use nodedb::{ServerConfig, bootstrap};
+use nodedb_types::DatabaseId;
 use tokio_postgres::SimpleQueryMessage;
 
 async fn connect_empty_store_trust(
@@ -25,16 +28,61 @@ async fn connect_empty_store_trust(
     let (client, connection) = config
         .connect(tokio_postgres::NoTls)
         .await
-        .expect("trust mode must accept a client-selected identity");
+        .expect("trust mode must accept the stored configured identity");
     let connection_handle = tokio::spawn(async move {
         let _ = connection.await;
     });
     (client, connection_handle)
 }
 
+fn trust_config() -> ServerConfig {
+    let mut config = ServerConfig::default();
+    config.auth.mode = AuthMode::Trust;
+    config.auth.superuser_name = "nodedb".to_owned();
+    config
+}
+
+fn bootstrap_trust_superuser(server: &TestServer) {
+    bootstrap::credentials::bootstrap_superuser(&server.shared, &trust_config())
+        .expect("trust-mode superuser bootstrap must succeed");
+}
+
+async fn assert_configured_trust_superuser_survives(sql: &str) {
+    let server = TestServer::start_empty_store_trust().await;
+    bootstrap_trust_superuser(&server);
+    let username = "nodedb";
+    let (client, connection_handle) = connect_empty_store_trust(&server, username).await;
+
+    client
+        .simple_query(sql)
+        .await
+        .unwrap_or_else(|error| panic!("trusted superuser DDL failed for {sql}: {error}"));
+
+    let (reconnected, reconnect_handle) = connect_empty_store_trust(&server, username).await;
+    let messages = reconnected
+        .simple_query("SHOW SESSION")
+        .await
+        .expect("credential mutation must not revoke the configured trust identity");
+    let session_username = messages.iter().find_map(|message| match message {
+        SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+        _ => None,
+    });
+    assert_eq!(session_username, Some(username.to_owned()));
+
+    drop(reconnected);
+    reconnect_handle.abort();
+    let _ = reconnect_handle.await;
+    drop(client);
+    connection_handle.abort();
+    let _ = connection_handle.await;
+    server.graceful_shutdown().await;
+}
+
 #[tokio::test]
 async fn pgwire_ddl_roundtrip() {
     let state = make_state();
+    bootstrap::credentials::bootstrap_superuser(&state, &trust_config())
+        .expect("materialize configured trust superuser");
 
     let pg_listener =
         nodedb::control::server::pgwire::listener::PgListener::bind("127.0.0.1:0".parse().unwrap())
@@ -95,39 +143,53 @@ async fn pgwire_ddl_roundtrip() {
 }
 
 #[tokio::test]
-async fn trust_session_identity_is_not_persisted_across_password_restart() {
+async fn trust_bootstrap_materializes_configured_superuser() {
     let server = TestServer::start_empty_store_trust().await;
-    let username = "ephemeral_wire_identity";
+    bootstrap_trust_superuser(&server);
 
-    let (client, connection_handle) = connect_empty_store_trust(&server, username).await;
+    let user = server
+        .shared
+        .credentials
+        .get_user("nodedb")
+        .expect("configured trust superuser must have a durable catalog identity");
+    assert!(user.is_superuser);
+    assert_eq!(user.tenant_id, TenantId::new(1));
 
-    let messages = client
-        .simple_query("SHOW SESSION")
+    server.graceful_shutdown().await;
+}
+
+#[tokio::test]
+async fn trust_configured_superuser_survives_tenant_creation() {
+    assert_configured_trust_superuser_survives("CREATE TENANT alpha").await;
+}
+
+#[tokio::test]
+async fn trust_configured_superuser_survives_user_creation() {
+    assert_configured_trust_superuser_survives(
+        "CREATE USER alice WITH PASSWORD 'strong-secret' ROLE readonly",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn trust_configured_superuser_survives_service_account_creation() {
+    assert_configured_trust_superuser_survives("CREATE SERVICE ACCOUNT batch_processor").await;
+}
+
+#[tokio::test]
+async fn trust_catalog_owners_remain_valid_across_restart() {
+    let server = TestServer::start_empty_store_trust().await;
+    bootstrap_trust_superuser(&server);
+    let (client, connection_handle) = connect_empty_store_trust(&server, "nodedb").await;
+
+    client
+        .simple_query("CREATE COLLECTION trust_owned_records")
         .await
-        .expect("trusted connection must retain the client-selected identity");
-    let session_username = messages.iter().find_map(|message| match message {
-        SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
-        _ => None,
-    });
-    assert_eq!(session_username, Some(username.to_owned()));
-
-    // Parse and Execute must use the same startup-bound resolver as the
-    // simple-query path; this identity has no credential-store record.
-    let statement = client
-        .prepare("SELECT 1 AS prepared_identity")
+        .expect("trusted superuser must create an owned collection");
+    client
+        .simple_query("CREATE TENANT alpha")
         .await
-        .expect("prepared Parse must resolve the ephemeral trust identity");
-    let rows = client
-        .query(&statement, &[])
-        .await
-        .expect("prepared Execute must resolve the ephemeral trust identity");
-    assert_eq!(rows.len(), 1);
-
-    let credentials = &server.shared.credentials;
-    assert!(
-        credentials.get_user(username).is_none(),
-        "a trust-mode client-selected identity must not become a credential"
-    );
+        .expect("trusted superuser must create a tenant");
 
     drop(client);
     connection_handle.abort();
@@ -135,36 +197,93 @@ async fn trust_session_identity_is_not_persisted_across_password_restart() {
     let (server, data_dir) = server.take_dir();
     server.graceful_shutdown().await;
 
-    let (reopened, _data_dir) = TestServer::open_on_path_empty_store_password(data_dir).await;
+    let (reopened, _data_dir) = TestServer::open_on_path_empty_store_trust(data_dir).await;
+    bootstrap_trust_superuser(&reopened);
+    let report = nodedb::control::cluster::recovery_check::verify_and_repair(&reopened.shared)
+        .await
+        .expect("catalog sanity check must complete");
     assert!(
-        reopened.shared.credentials.get_user(username).is_none(),
-        "the trust-mode session identity must not be persisted across restart"
+        report.is_acceptable(),
+        "configured trust ownership must remain startup-safe: {report}"
+    );
+    assert_eq!(
+        report.integrity_repaired, 0,
+        "valid configured-superuser ownership must not require startup repair"
     );
 
-    let mut password_config = tokio_postgres::Config::new();
-    password_config
-        .host("127.0.0.1")
-        .port(reopened.pg_port)
-        .user(username)
-        .password("")
-        .dbname("default");
-    let password_login_rejected = password_config
-        .connect(tokio_postgres::NoTls)
-        .await
-        .is_err();
+    let collection = reopened
+        .shared
+        .credentials
+        .catalog()
+        .get_collection(DatabaseId::DEFAULT, 1, "trust_owned_records")
+        .expect("collection catalog lookup")
+        .expect("owned collection must survive restart");
+    assert_eq!(collection.owner, "nodedb");
 
     reopened.graceful_shutdown().await;
-
-    assert!(
-        password_login_rejected,
-        "a client-selected trust identity must not authenticate in password mode"
-    );
 }
 
 #[tokio::test]
-async fn trust_identity_survives_discard_all_without_credential_persistence() {
+async fn trust_mode_rejects_unmaterialized_identity() {
     let server = TestServer::start_empty_store_trust().await;
-    let username = "discard_all_ephemeral_wire_identity";
+
+    let result = server
+        .connect_as_database("unmaterialized_identity", "ignored", "default")
+        .await;
+
+    assert!(
+        result.is_err(),
+        "trust mode must skip password verification without fabricating an identity"
+    );
+    server.graceful_shutdown().await;
+}
+
+#[tokio::test]
+async fn trust_superuser_identity_survives_password_mode_restart() {
+    let server = TestServer::start_empty_store_trust().await;
+    bootstrap_trust_superuser(&server);
+    let original_user_id = server
+        .shared
+        .credentials
+        .get_user("nodedb")
+        .expect("trust superuser")
+        .user_id;
+    let (server, data_dir) = server.take_dir();
+    server.graceful_shutdown().await;
+
+    let (reopened, _data_dir) = TestServer::open_on_path_empty_store_password(data_dir).await;
+    reopened
+        .shared
+        .credentials
+        .bootstrap_superuser("nodedb", "operator-password")
+        .expect("replace internal trust credential");
+    let password_user = reopened
+        .shared
+        .credentials
+        .get_user("nodedb")
+        .expect("password superuser");
+    assert_eq!(password_user.user_id, original_user_id);
+
+    let (client, connection_handle) = reopened
+        .connect_as_database("nodedb", "operator-password", "default")
+        .await
+        .expect("password bootstrap must authenticate the durable identity");
+    client
+        .simple_query("SELECT 1")
+        .await
+        .expect("password-authenticated query");
+
+    drop(client);
+    connection_handle.abort();
+    let _ = connection_handle.await;
+    reopened.graceful_shutdown().await;
+}
+
+#[tokio::test]
+async fn trust_configured_identity_survives_discard_all() {
+    let server = TestServer::start_empty_store_trust().await;
+    bootstrap_trust_superuser(&server);
+    let username = "nodedb";
     let (client, connection_handle) = connect_empty_store_trust(&server, username).await;
 
     client
@@ -212,8 +331,8 @@ async fn trust_identity_survives_discard_all_without_credential_persistence() {
         });
     assert_eq!(consistency, Some("strong".to_owned()));
     assert!(
-        server.shared.credentials.get_user(username).is_none(),
-        "DISCARD ALL must not persist an ephemeral trust identity"
+        server.shared.credentials.get_user(username).is_some(),
+        "DISCARD ALL must retain the durable configured trust identity"
     );
 
     drop(client);

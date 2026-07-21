@@ -138,3 +138,68 @@ impl UserRecord {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backward_compat_stored_user_defaults() {
+        let created_at_epoch: u64 = 1_700_000_000;
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(
+            &mut buf,
+            &rmpv::Value::Map(vec![
+                (
+                    rmpv::Value::String("user_id".into()),
+                    rmpv::Value::Integer(rmpv::Integer::from(42u64)),
+                ),
+                (
+                    rmpv::Value::String("username".into()),
+                    rmpv::Value::String("legacy_user".into()),
+                ),
+                (
+                    rmpv::Value::String("tenant_id".into()),
+                    rmpv::Value::Integer(rmpv::Integer::from(1u32)),
+                ),
+                (
+                    rmpv::Value::String("password_hash".into()),
+                    rmpv::Value::String("$argon2id$fake_hash".into()),
+                ),
+                (
+                    rmpv::Value::String("scram_salt".into()),
+                    rmpv::Value::Binary(vec![1, 2, 3]),
+                ),
+                (
+                    rmpv::Value::String("scram_salted_password".into()),
+                    rmpv::Value::Binary(vec![4, 5, 6]),
+                ),
+                (
+                    rmpv::Value::String("roles".into()),
+                    rmpv::Value::Array(vec![rmpv::Value::String("read_write".into())]),
+                ),
+                (
+                    rmpv::Value::String("is_superuser".into()),
+                    rmpv::Value::Boolean(false),
+                ),
+                (
+                    rmpv::Value::String("is_active".into()),
+                    rmpv::Value::Boolean(true),
+                ),
+                (
+                    rmpv::Value::String("created_at".into()),
+                    rmpv::Value::Integer(rmpv::Integer::from(created_at_epoch)),
+                ),
+            ]),
+        )
+        .expect("encode legacy StoredUser");
+
+        let stored: StoredUser = zerompk::from_msgpack(&buf).expect("decode legacy StoredUser");
+        assert!(!stored.must_change_password);
+        assert_eq!(stored.password_changed_at, 0);
+
+        let record = UserRecord::from_stored(stored);
+        assert!(!record.must_change_password);
+        assert_eq!(record.password_changed_at, created_at_epoch);
+    }
+}

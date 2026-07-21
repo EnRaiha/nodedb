@@ -269,22 +269,25 @@ impl NodeDbPgHandler {
                 self.handle_rollback(identity, addr).await?;
             }
 
-            // Trust connections cannot safely re-resolve an empty-store
-            // identity from the credential store on later statements, because
-            // that identity is intentionally ephemeral. Rebuild a Trust base
-            // identity only after overlay cleanup; while a transaction is
-            // active the session retains its effective identity so teardown
-            // targets the correct tenant's staging overlays.
+            // Rebuild the durable Trust identity only after overlay cleanup;
+            // while a transaction is active the session retains its effective
+            // identity so teardown targets the correct tenant's staging overlays.
             let authenticated_identity =
                 if matches!(&self.auth_mode, crate::config::auth::AuthMode::Trust) {
-                    if identity.user_id == 0 {
-                        let mut base_identity = identity.clone();
-                        base_identity.tenant_id = crate::types::TenantId::new(1);
-                        Some(base_identity)
-                    } else {
+                    Some(
                         stored_user_identity(&self.state, &identity.username, AuthMethod::Trust)
                             .filter(|current_identity| current_identity.user_id == identity.user_id)
-                    }
+                            .ok_or_else(|| {
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "FATAL".to_owned(),
+                                    "28000".to_owned(),
+                                    format!(
+                                        "trust auth: user '{}' does not exist",
+                                        identity.username
+                                    ),
+                                )))
+                            })?,
+                    )
                 } else {
                     None
                 };

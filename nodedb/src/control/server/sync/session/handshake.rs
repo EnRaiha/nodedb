@@ -8,10 +8,8 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
-use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::jwt::JwtValidator;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
 
 use super::super::dlq::DeviceMetadata;
 use super::super::wire::*;
@@ -76,19 +74,23 @@ impl SyncSession {
             return SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack);
         }
 
-        // Trust mode: empty token auto-authenticates as default identity.
+        // Trust mode: an empty token resolves to the configured durable
+        // principal. Never fabricate an identity that cannot own catalog data.
         if msg.jwt_token.is_empty() {
-            let identity = AuthenticatedIdentity {
-                user_id: 0,
-                username: "sync-client".into(),
-                tenant_id: TenantId::new(1),
-                auth_method: crate::control::security::identity::AuthMethod::Trust,
-                roles: vec![crate::control::security::identity::Role::ReadWrite],
-                is_superuser: false,
-                default_database: None,
-                accessible_databases: crate::control::security::identity::DatabaseSet::Some(
-                    smallvec::smallvec![nodedb_types::id::DatabaseId::DEFAULT],
-                ),
+            let Some(identity) = shared.and_then(|state| {
+                crate::control::server::session_auth::configured_trust_identity(state)
+            }) else {
+                let ack = HandshakeAckMsg {
+                    success: false,
+                    session_id: self.session_id.clone(),
+                    server_clock: current_server_clock,
+                    error: Some("configured trust identity is unavailable".into()),
+                    fork_detected: false,
+                    server_wire_version: crate::version::WIRE_FORMAT_VERSION,
+                    producer_id: 0,
+                    accepted_epoch: 0,
+                };
+                return SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack);
             };
             self.tenant_id = Some(identity.tenant_id);
             self.username = Some(identity.username.clone());
@@ -452,10 +454,13 @@ mod tests {
 
     use nodedb_types::sync::wire::{HandshakeAckMsg, HandshakeMsg};
 
+    use crate::bridge::dispatch::Dispatcher;
     use crate::control::security::catalog::SystemCatalog;
     use crate::control::security::jwt::{JwtConfig, JwtValidator};
     use crate::control::server::sync::session::state::SyncSession;
+    use crate::control::state::SharedState;
     use crate::control::sync_producer::registry::SyncProducerRegistry;
+    use crate::wal::WalManager;
 
     fn make_handshake(wire_version: u16) -> HandshakeMsg {
         HandshakeMsg {
@@ -472,6 +477,55 @@ mod tests {
     fn open_registry(dir: &std::path::Path) -> SyncProducerRegistry {
         let catalog = Arc::new(SystemCatalog::open(&dir.join("system.redb")).unwrap());
         SyncProducerRegistry::open(catalog).unwrap()
+    }
+
+    fn trust_state() -> (Arc<SharedState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("sync-trust.wal")).expect("open WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("shared state");
+        state
+            .credentials
+            .bootstrap_trust_superuser("nodedb")
+            .expect("bootstrap trust superuser");
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn empty_token_uses_configured_durable_trust_identity() {
+        let (state, _dir) = trust_state();
+        let mut session = SyncSession::new("test-session".into());
+        let validator = JwtValidator::new(JwtConfig::default());
+        let msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
+
+        let frame = session
+            .handle_handshake(&msg, &validator, HashMap::new(), Some(&state))
+            .expect("handshake response");
+        let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
+
+        assert!(ack.success, "configured trust handshake should succeed");
+        let identity = session.identity.expect("durable trust identity");
+        assert_eq!(identity.username, "nodedb");
+        assert_ne!(identity.user_id, 0);
+        assert!(identity.is_superuser);
+    }
+
+    #[test]
+    fn empty_token_without_configured_identity_fails_closed() {
+        let mut session = SyncSession::new("test-session".into());
+        let validator = JwtValidator::new(JwtConfig::default());
+        let msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
+
+        let frame = session
+            .handle_handshake(&msg, &validator, HashMap::new(), None)
+            .expect("handshake response");
+        let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
+
+        assert!(!ack.success);
+        assert!(!session.authenticated);
+        assert!(session.identity.is_none());
     }
 
     #[test]

@@ -7,7 +7,7 @@ use smallvec::SmallVec;
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::credential::record::UserRecord;
-use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, DatabaseSet, Role};
+use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, DatabaseSet};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
@@ -135,22 +135,14 @@ pub fn verify_api_key_identity(
     Some(identity)
 }
 
-/// Build a default trust-mode identity for a given username.
-///
-/// Used by both explicit auth requests and auto-auth on first frame.
-pub fn trust_identity(state: &SharedState, username: &str) -> AuthenticatedIdentity {
-    if let Some(id) = stored_user_identity(state, username, AuthMethod::Trust) {
-        id
-    } else {
-        AuthenticatedIdentity {
-            user_id: 0,
-            username: username.to_string(),
-            tenant_id: TenantId::new(1),
-            auth_method: AuthMethod::Trust,
-            roles: vec![Role::Superuser],
-            is_superuser: true,
-            default_database: None,
-            accessible_databases: DatabaseSet::All,
-        }
-    }
+/// Resolve an explicit trust-mode username to a durable stored identity.
+pub fn trust_identity(state: &SharedState, username: &str) -> Option<AuthenticatedIdentity> {
+    stored_user_identity(state, username, AuthMethod::Trust)
+}
+
+/// Resolve the configured durable principal for protocols that auto-authenticate
+/// in trust mode without a client-supplied username.
+pub fn configured_trust_identity(state: &SharedState) -> Option<AuthenticatedIdentity> {
+    let username = state.credentials.configured_trust_superuser().ok()??;
+    stored_user_identity(state, &username, AuthMethod::Trust)
 }

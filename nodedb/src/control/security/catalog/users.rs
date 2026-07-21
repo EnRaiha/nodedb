@@ -2,7 +2,7 @@
 
 //! User CRUD operations for the system catalog.
 
-use super::types::{StoredUser, SystemCatalog, USERS, catalog_err};
+use super::types::{METADATA, StoredUser, SystemCatalog, USERS, catalog_err};
 
 impl SystemCatalog {
     /// Load all active users from the catalog.
@@ -69,6 +69,46 @@ impl SystemCatalog {
         write_txn.commit().map_err(|e| catalog_err("commit", e))?;
 
         Ok(())
+    }
+
+    /// Atomically write a newly allocated user and advance the durable ID counter.
+    pub fn put_user_with_next_user_id(
+        &self,
+        user: &StoredUser,
+        next_user_id: u64,
+    ) -> crate::Result<()> {
+        let bytes = zerompk::to_msgpack_vec(user).map_err(|e| catalog_err("serialize user", e))?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("write txn", e))?;
+        {
+            let mut users = write_txn
+                .open_table(USERS)
+                .map_err(|e| catalog_err("open users", e))?;
+            users
+                .insert(user.username.as_str(), bytes.as_slice())
+                .map_err(|e| catalog_err("insert user", e))?;
+        }
+        {
+            let mut metadata = write_txn
+                .open_table(METADATA)
+                .map_err(|e| catalog_err("open metadata", e))?;
+            metadata
+                .insert("next_user_id", next_user_id.to_le_bytes().as_slice())
+                .map_err(|e| catalog_err("insert next_user_id", e))?;
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_user_counter_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(crate::Error::Storage {
+                engine: "catalog".into(),
+                detail: "injected user/counter transaction failure".into(),
+            });
+        }
+        write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
     /// Delete a user record from the catalog.

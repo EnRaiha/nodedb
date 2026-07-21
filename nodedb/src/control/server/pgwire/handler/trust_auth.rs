@@ -11,15 +11,14 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity};
-use crate::control::server::session_auth::identity::{stored_user_identity, trust_identity};
+use crate::control::server::session_auth::identity::stored_user_identity;
 
 use super::core::NodeDbPgHandler;
 
 impl NodeDbPgHandler {
-    /// Trust-mode username resolution. A known username receives its stored
-    /// identity with the Trust auth method. With an empty credential store,
-    /// the startup username instead receives an ephemeral tenant-1 superuser
-    /// identity that exists only in this connection's session entry.
+    /// Trust-mode username resolution. The username must resolve to a durable
+    /// stored identity; trust mode skips credential verification, not identity
+    /// materialization or authorization.
     ///
     /// Runs after startup parameters are saved to client metadata and before
     /// AuthenticationOk is announced, so an unknown user never reaches
@@ -37,10 +36,6 @@ impl NodeDbPgHandler {
 
         if let Some(identity) = stored_user_identity(&self.state, &username, AuthMethod::Trust) {
             return Ok(identity);
-        }
-
-        if self.state.credentials.is_empty() {
-            return Ok(trust_identity(&self.state, &username));
         }
 
         let source = client.socket_addr().to_string();

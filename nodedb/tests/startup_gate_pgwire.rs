@@ -104,6 +104,10 @@ fn spawn_fake_data_plane(mut data_side: CoreChannelDataSide) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pgwire_accept_blocked_until_gateway_enable() {
     let (shared, _seq, gw_gate, data_sides, _dir) = make_gated_state();
+    shared
+        .credentials
+        .bootstrap_trust_superuser("nodedb")
+        .expect("materialize configured trust superuser");
     let startup_gate = Arc::clone(&shared.startup);
 
     // Bind a real pgwire socket on an ephemeral port.

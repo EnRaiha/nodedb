@@ -47,28 +47,22 @@ pub(super) fn resolve_session_identity<C: ClientInfo>(
                 )))
             })?;
 
-            // Empty-store Trust identities have no persisted user record and
-            // must stay bound to this connection. Persisted users, however,
-            // retain the prior per-request lookup so role changes and grants
-            // are applied before every simple, Parse, and Execute path. The
+            // Re-resolve the durable identity on every simple, Parse, and
+            // Execute path so role/grant changes take effect immediately. The
             // user ID must still match the identity bound at startup: a DROP
             // followed by same-name recreation must not inherit this socket.
-            if startup_identity.user_id == 0 {
-                startup_identity
-            } else {
-                stored_user_identity(state, &startup_identity.username, AuthMethod::Trust)
-                    .filter(|current_identity| current_identity.user_id == startup_identity.user_id)
-                    .ok_or_else(|| {
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "FATAL".to_owned(),
-                            "28000".to_owned(),
-                            format!(
-                                "trust auth: user '{}' does not exist",
-                                startup_identity.username
-                            ),
-                        )))
-                    })?
-            }
+            stored_user_identity(state, &startup_identity.username, AuthMethod::Trust)
+                .filter(|current_identity| current_identity.user_id == startup_identity.user_id)
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_owned(),
+                        "28000".to_owned(),
+                        format!(
+                            "trust auth: user '{}' does not exist",
+                            startup_identity.username
+                        ),
+                    )))
+                })?
         }
         AuthMode::Password | AuthMode::Certificate => {
             stored_user_identity(state, &username, AuthMethod::ScramSha256).ok_or_else(|| {

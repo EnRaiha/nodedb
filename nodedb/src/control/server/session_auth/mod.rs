@@ -20,5 +20,8 @@ pub use context::{
     extract_and_apply_on_deny,
 };
 pub use guards::{check_blacklist, check_rate_limit};
-pub use identity::{resolve_certificate_identity, trust_identity, verify_api_key_identity};
+pub use identity::{
+    configured_trust_identity, resolve_certificate_identity, trust_identity,
+    verify_api_key_identity,
+};
 pub use native::{AUTH_FLOOR, authenticate};

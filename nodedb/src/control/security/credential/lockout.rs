@@ -10,7 +10,7 @@ use crate::control::security::audit::{AuditEmitContext, AuditEmitter, AuditEvent
 use crate::control::security::catalog::StoredLockoutRecord;
 use crate::types::TenantId;
 
-use super::store::{CredentialStore, read_lock, write_lock};
+use super::store::core::{CredentialStore, read_lock, write_lock};
 
 /// Tracks failed login attempts for lockout enforcement.
 #[derive(Debug, Clone)]

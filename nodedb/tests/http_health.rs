@@ -28,6 +28,10 @@ async fn start_http() -> TestServer {
         Arc::new(WalManager::open_for_testing(&dir.path().join("health.wal")).expect("open wal"));
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
     let shared = SharedState::new(dispatcher, wal).unwrap();
+    shared
+        .credentials
+        .bootstrap_trust_superuser("nodedb")
+        .expect("bootstrap trust superuser");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

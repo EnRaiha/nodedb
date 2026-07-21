@@ -331,3 +331,160 @@ impl CredentialStore {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::security::identity::Role;
+    use crate::types::TenantId;
+
+    #[test]
+    fn in_memory_create_and_verify() {
+        let store = CredentialStore::new().expect("in-memory credential store");
+        store
+            .bootstrap_superuser("nodedb", "secret")
+            .expect("bootstrap superuser");
+        assert!(store.verify_password("nodedb", "secret"));
+        assert!(!store.verify_password("nodedb", "wrong"));
+    }
+
+    #[test]
+    fn scram_blocks_expired_account_no_grace() {
+        let store = CredentialStore::new().expect("in-memory credential store");
+        store
+            .create_user("frank", "pass", TenantId::new(1), vec![Role::ReadWrite])
+            .expect("create user");
+        store
+            .users
+            .write()
+            .expect("users lock")
+            .get_mut("frank")
+            .expect("frank")
+            .password_expires_at = 1;
+
+        assert!(matches!(
+            store.get_scram_credentials("frank"),
+            ScramLookup::Rejected(AuthRejection::PolicyDenied)
+        ));
+    }
+
+    #[test]
+    fn scram_allows_expired_account_within_grace_with_warning() {
+        let mut store = CredentialStore::new().expect("in-memory credential store");
+        store.password_expiry_grace_days = 30;
+        store
+            .create_user(
+                "grace_user",
+                "pass",
+                TenantId::new(1),
+                vec![Role::ReadWrite],
+            )
+            .expect("create user");
+        store
+            .users
+            .write()
+            .expect("users lock")
+            .get_mut("grace_user")
+            .expect("grace_user")
+            .password_expires_at = crate::control::security::time::now_secs() - 1;
+
+        let credentials = match store.get_scram_credentials("grace_user") {
+            ScramLookup::Found(credentials) => credentials,
+            ScramLookup::Rejected(reason) => panic!("unexpected rejection: {reason:?}"),
+        };
+        let warning = credentials
+            .warning
+            .expect("grace-period login should carry a warning");
+        assert!(
+            warning.contains("grace") || warning.contains("expired"),
+            "warning should mention expiry or grace: {warning}"
+        );
+    }
+
+    #[test]
+    fn scram_blocks_must_change_password_no_grace() {
+        let store = CredentialStore::new().expect("in-memory credential store");
+        store
+            .create_user("hank", "pass", TenantId::new(1), vec![Role::ReadWrite])
+            .expect("create user");
+        store
+            .set_must_change_password("hank", true)
+            .expect("set password policy");
+
+        assert!(matches!(
+            store.get_scram_credentials("hank"),
+            ScramLookup::Rejected(AuthRejection::PolicyDenied)
+        ));
+    }
+
+    #[test]
+    fn verify_password_blocks_expired_account() {
+        let store = CredentialStore::new().expect("in-memory credential store");
+        store
+            .create_user(
+                "ivan",
+                "correct_pass",
+                TenantId::new(1),
+                vec![Role::ReadWrite],
+            )
+            .expect("create user");
+        store
+            .users
+            .write()
+            .expect("users lock")
+            .get_mut("ivan")
+            .expect("ivan")
+            .password_expires_at = 1;
+
+        assert!(matches!(
+            store.verify_password_with_status("ivan", "correct_pass"),
+            PasswordVerification::Rejected(AuthRejection::PolicyDenied)
+        ));
+    }
+
+    #[test]
+    fn wrong_password_remains_credential_failure_when_policy_blocked() {
+        let store = CredentialStore::new().expect("in-memory credential store");
+        store
+            .create_user(
+                "karl",
+                "correct_pass",
+                TenantId::new(1),
+                vec![Role::ReadWrite],
+            )
+            .expect("create user");
+        store
+            .users
+            .write()
+            .expect("users lock")
+            .get_mut("karl")
+            .expect("karl")
+            .password_expires_at = 1;
+
+        assert!(matches!(
+            store.verify_password_with_status("karl", "wrong_pass"),
+            PasswordVerification::Rejected(AuthRejection::BadCredential)
+        ));
+    }
+
+    #[test]
+    fn verify_password_grace_period_emits_warning() {
+        let mut store = CredentialStore::new().expect("in-memory credential store");
+        store.password_expiry_grace_days = 7;
+        store
+            .create_user("judy", "pass", TenantId::new(1), vec![Role::ReadWrite])
+            .expect("create user");
+        store
+            .users
+            .write()
+            .expect("users lock")
+            .get_mut("judy")
+            .expect("judy")
+            .password_expires_at = crate::control::security::time::now_secs() - 1;
+
+        match store.verify_password_with_status("judy", "pass") {
+            PasswordVerification::Verified(warning) => assert!(warning.is_some()),
+            PasswordVerification::Rejected(reason) => panic!("unexpected rejection: {reason:?}"),
+        }
+    }
+}
