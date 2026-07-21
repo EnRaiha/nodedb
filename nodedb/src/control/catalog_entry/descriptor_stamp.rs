@@ -504,7 +504,12 @@ fn validate_one<T: zerompk::ToMessagePack>(
     if current.is_some() && incoming_hlc < current_hlc {
         return Ok(ValidationOutcome::AlreadyApplied);
     }
-    if carried < prior {
+    // A lower carried version is a stale historical replay only when its clock
+    // is not ahead of the persisted record (older or equal — legacy records
+    // predating HLC stamping share the ZERO clock). A regressed version paired
+    // with a strictly newer HLC is a genuine anomaly (a corrupted or misordered
+    // proposal, a stamping race) and must fall through to be rejected loudly.
+    if carried < prior && incoming_hlc <= current_hlc {
         return Ok(ValidationOutcome::AlreadyApplied);
     }
     if carried == prior {
