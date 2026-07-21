@@ -152,8 +152,13 @@ pub async fn build_and_persist(
         ));
     }
 
-    // Check if the object already exists.
-    if let Ok(Some(existing)) = catalog.get_collection(database_id, tenant_id.as_u64(), name) {
+    // Check if the object already exists. A catalog-read fault must abort the
+    // CREATE — proceeding as if no row exists could build a fresh collection
+    // over a soft-deleted incarnation's still-present storage.
+    let existing = catalog
+        .get_collection(database_id, tenant_id.as_u64(), name)
+        .map_err(|error| err("XX000", error.to_string()))?;
+    if let Some(existing) = existing {
         if existing.is_active {
             return Err(err(
                 "42P07",
@@ -189,11 +194,16 @@ pub async fn build_and_persist(
                 local_lifecycle.is_some(),
             )
             .await;
-        if let Err(error) = purge_result {
-            if let Some(guard) = local_lifecycle.take() {
+        if let Err(failure) = purge_result {
+            // Only disarm when a durable retry record owns the drain. Otherwise
+            // let the guard release the in-memory hold so this same-name CREATE
+            // can be retried against the durable inactive catalog row.
+            if failure.retry_queued
+                && let Some(guard) = local_lifecycle.take()
+            {
                 guard.disarm();
             }
-            return Err(err("XX000", error.to_string()));
+            return Err(err("XX000", failure.error.to_string()));
         }
     }
 

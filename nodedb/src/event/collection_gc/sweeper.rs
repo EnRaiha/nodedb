@@ -168,12 +168,16 @@ pub async fn sweep_once(shared: &SharedState, retention: Duration) -> crate::Res
                             )
                             .await
                             {
-                                if let Some(guard) = lifecycle.take() {
+                                // Disarm only when a durable retry record owns
+                                // the drain; a no-retry failure releases the
+                                // hold via the guard's Drop so the next sweep
+                                // (or a same-name CREATE) is not wedged.
+                                if error.retry_queued && let Some(guard) = lifecycle.take() {
                                     guard.disarm();
                                 }
                                 return Err(crate::Error::Storage {
                                     engine: "collection-gc".into(),
-                                    detail: error.to_string(),
+                                    detail: error.error.to_string(),
                                 });
                             }
                         }

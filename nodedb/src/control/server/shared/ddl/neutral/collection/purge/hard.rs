@@ -20,8 +20,7 @@
 //! new collection. No engine is special-cased: the reclaim dispatch
 //! covers every engine exactly as `DROP ... PURGE` does.
 
-use nodedb_types::error::NodeDbError;
-
+use crate::control::catalog_entry::post_apply::ReclaimFailure;
 use crate::control::state::SharedState;
 
 /// Hard-purge `(tenant_id, name)`: remove the catalog metadata row
@@ -53,11 +52,13 @@ pub(crate) async fn hard_purge_collection(
     name: &str,
     purge_lsn: u64,
     drain_already_held: bool,
-) -> Result<(), NodeDbError> {
+) -> Result<(), ReclaimFailure> {
     // 1. Remove the catalog metadata row (primary StoredCollection,
     //    owner row, surrogate map) — the synchronous half of the
     //    `PurgeCollection` applier. Propagate failure: if the old row
-    //    survives, the new collection must NOT register over it.
+    //    survives, the new collection must NOT register over it. This runs
+    //    before any durable retry record is queued, so it is a `no_retry`
+    //    failure — the caller releases its lifecycle guard.
     {
         let catalog = state.credentials.catalog();
         crate::control::catalog_entry::apply::collection::prepare_purge(
@@ -65,7 +66,8 @@ pub(crate) async fn hard_purge_collection(
             tenant_id,
             name,
             catalog,
-        )?;
+        )
+        .map_err(ReclaimFailure::no_retry)?;
     }
 
     // 2. Reclaim engine-local storage on the Data Plane (WAL tombstone,

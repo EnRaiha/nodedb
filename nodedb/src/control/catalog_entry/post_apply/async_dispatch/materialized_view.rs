@@ -24,7 +24,7 @@ pub async fn delete_async(
     name: String,
     purge_lsn: u64,
     shared: Arc<SharedState>,
-) -> crate::Result<()> {
+) -> Result<(), super::collection::ReclaimFailure> {
     super::collection::reclaim_collection_storage(&shared, 0, tenant_id, &name, purge_lsn, false)
         .await
 }

@@ -283,11 +283,16 @@ pub fn drop_collection(
                     .await
                 })
             });
-            if let Err(error) = purge_result {
-                if let Some(guard) = local_lifecycle.take() {
+            if let Err(failure) = purge_result {
+                // Disarm only when a durable retry record owns the drain; on a
+                // no-retry failure the guard's unwind Drop releases the hold so
+                // a same-name CREATE is not wedged behind an orphaned drain.
+                if failure.retry_queued
+                    && let Some(guard) = local_lifecycle.take()
+                {
                     guard.disarm();
                 }
-                panic!("local collection reclaim failed: {error}");
+                panic!("local collection reclaim failed: {}", failure.error);
             }
             state
                 .permissions

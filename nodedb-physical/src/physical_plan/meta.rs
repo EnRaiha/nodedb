@@ -131,6 +131,15 @@ pub enum MetaOp {
         tenant_id: u64,
         name: String,
         purge_lsn: u64,
+        /// Whether this core must reclaim the collection's shared on-disk L1
+        /// checkpoint/partition files. Those paths are keyed by
+        /// `(database, tenant, collection)` — not by core — so the Control
+        /// Plane sets this `true` for exactly one core (the collection's
+        /// homing vshard) in the all-cores fan-out. Every core still evicts
+        /// its own per-core in-memory state; only the shared-path unlink /
+        /// `remove_dir_all` is single-cored, so concurrent cores cannot race
+        /// on the same tree.
+        reclaim_l1_files: bool,
     },
 
     /// Reclaim every local Data Plane resource for a single

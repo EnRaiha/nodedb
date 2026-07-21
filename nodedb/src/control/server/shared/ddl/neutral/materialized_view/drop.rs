@@ -140,11 +140,18 @@ pub fn drop_materialized_view(
                 .await
             })
         });
-        if let Err(error) = purge_result {
-            if let Some(guard) = local_lifecycle.take() {
+        if let Err(failure) = purge_result {
+            // Disarm only when a durable retry record owns the drain; a
+            // no-retry failure releases the hold via the guard's unwind Drop.
+            if failure.retry_queued
+                && let Some(guard) = local_lifecycle.take()
+            {
                 guard.disarm();
             }
-            panic!("local materialized-view target reclaim failed: {error}");
+            panic!(
+                "local materialized-view target reclaim failed: {}",
+                failure.error
+            );
         }
     }
 

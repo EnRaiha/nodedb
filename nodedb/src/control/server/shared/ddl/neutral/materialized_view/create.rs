@@ -78,13 +78,23 @@ pub async fn create_materialized_view(
             }
         }
 
-        if let Ok(Some(_)) = catalog.get_materialized_view(tenant_id.as_u64(), &name) {
+        // A catalog-read fault must abort the CREATE: proceeding could adopt a
+        // same-name target over an object whose existence check transiently
+        // failed.
+        if catalog
+            .get_materialized_view(tenant_id.as_u64(), &name)
+            .map_err(|error| err("XX000", error.to_string()))?
+            .is_some()
+        {
             return Err(err(
                 "42P07",
                 format!("materialized view '{name}' already exists"),
             ));
         }
-        if let Ok(Some(_)) = catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name)
+        if catalog
+            .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name)
+            .map_err(|error| err("XX000", error.to_string()))?
+            .is_some()
         {
             return Err(err("42P07", format!("collection '{name}' already exists")));
         }

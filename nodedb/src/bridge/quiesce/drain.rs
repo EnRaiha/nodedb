@@ -153,27 +153,6 @@ impl CollectionQuiesce {
         }
     }
 
-    /// Wait until no lifecycle drain owns `(database, tenant, collection)`.
-    pub async fn wait_until_not_draining(
-        &self,
-        database_id: u64,
-        tenant_id: u64,
-        collection: &str,
-    ) {
-        loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            // Register before checking the state. `notify_waiters` does not
-            // store a permit for a future waiter, so checking first would lose
-            // a clear/forget notification in the check-to-poll gap.
-            notified.as_mut().enable();
-            if !self.is_draining(database_id, tenant_id, collection) {
-                return;
-            }
-            notified.await;
-        }
-    }
-
     /// Returns a future that resolves once every open scan against
     /// `(tenant_id, collection)` has completed. Safe to await from the
     /// Control Plane (tokio) — internally uses [`tokio::sync::Notify`]
@@ -314,19 +293,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_waiter_resumes_after_lifecycle_drain_is_forgotten() {
+    async fn single_lifecycle_holder_clears_on_forget() {
         let q = CollectionQuiesce::new();
         q.begin_drain(DB, 1, "c");
-
-        let q_clone = Arc::clone(&q);
-        let waiter = tokio::spawn(async move {
-            q_clone.wait_until_not_draining(DB, 1, "c").await;
-        });
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
+        assert!(q.is_draining(DB, 1, "c"));
 
         q.forget(DB, 1, "c");
-        waiter.await.unwrap();
+        assert!(!q.is_draining(DB, 1, "c"));
     }
 
     #[tokio::test]
@@ -346,23 +319,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_waiter_requires_every_lifecycle_holder_to_finish() {
+    async fn is_draining_until_every_lifecycle_holder_forgets() {
         let q = CollectionQuiesce::new();
         q.begin_drain(DB, 1, "c");
         q.begin_drain(DB, 1, "c");
 
-        let q_clone = Arc::clone(&q);
-        let waiter = tokio::spawn(async move {
-            q_clone.wait_until_not_draining(DB, 1, "c").await;
-        });
-        tokio::task::yield_now().await;
-
+        // One holder released — still draining while the other holds.
         q.forget(DB, 1, "c");
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
+        assert!(q.is_draining(DB, 1, "c"));
 
+        // Last holder released — drain clears.
         q.forget(DB, 1, "c");
-        waiter.await.unwrap();
+        assert!(!q.is_draining(DB, 1, "c"));
     }
 
     #[tokio::test]

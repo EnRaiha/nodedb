@@ -46,6 +46,14 @@ pub async fn dispatch_unregister_collection(
             .dispatcher
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The shared on-disk L1 files are keyed by (database, tenant,
+        // collection), so exactly one core reclaims them. Route to the
+        // collection's homing vshard; fall back to core 0 if the router
+        // cannot resolve it, so the files are never orphaned.
+        let homing_core = dispatcher
+            .router()
+            .resolve(VShardId::from_collection_in_database(database, name))
+            .unwrap_or(0);
         for core_id in 0..num_cores {
             let request_id = state.next_request_id();
             let request = Request {
@@ -57,6 +65,7 @@ pub async fn dispatch_unregister_collection(
                     tenant_id,
                     name: name.to_string(),
                     purge_lsn,
+                    reclaim_l1_files: core_id == homing_core,
                 }),
                 deadline: Instant::now() + timeout,
                 priority: Priority::Background,
