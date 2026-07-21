@@ -16,10 +16,6 @@ use nodedb_types::TraceId;
 use nodedb_types::protocol::NativeResponse;
 
 use crate::bridge::envelope::{ErrorCode, Response};
-use crate::control::gateway::RouteDecision;
-use crate::control::server::dispatch_utils::{
-    ChangeFeedOwner, SubmitWrite, WalDurability, WriteOrdering, submit_write,
-};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::{
     AbortReason, CommitOutcome, TxnDataPlane, commit, lifecycle,
@@ -28,15 +24,17 @@ use crate::control::state::SharedState;
 use crate::types::Lsn;
 use nodedb_physical::physical_task::PhysicalTask;
 
+use super::super::super::dispatch_utils;
 use super::DispatchCtx;
 
 /// Native Data-Plane dispatch seam for the neutral transaction orchestrator.
 ///
-/// Routes a task through the cluster gateway when one is configured, otherwise
-/// through the direct SPSC dispatch path — the exact branch native COMMIT used
-/// before extraction. The gateway path synthesizes an `Ok` [`Response`] on
-/// success (carrying the first vShard payload so overlay-marker meta-ops still
-/// decode), and surfaces gateway errors as a Rust `Err`.
+/// Always dispatches through the direct SPSC write path using the task's
+/// pre-classified `vshard_id`, mirroring pgwire's `dispatch_task_no_wal`.
+/// The gateway must NOT be used here: commit-time tasks carry `MetaOp` plans
+/// (`ResolveTxn`, `TransactionBatch`) with no named collection, so the
+/// gateway's router cannot derive a route for them and falls back to
+/// vShard 0 — durably applying the commit batch on the wrong core (#193).
 pub(crate) struct NativeTxnDp<'a> {
     pub(crate) state: &'a SharedState,
 }
@@ -49,42 +47,21 @@ impl TxnDataPlane for NativeTxnDp<'_> {
     ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
         let state = self.state;
         Box::pin(async move {
-            let decision = crate::control::server::shared::session::resolve_leader(&task, state);
-            if matches!(decision, RouteDecision::Local) {
-                return submit_write(
-                    state,
-                    SubmitWrite {
-                        tenant_id: task.tenant_id,
-                        database_id: task.database_id,
-                        vshard_id: task.vshard_id,
-                        plan: task.plan,
-                        trace_id: TraceId::generate(),
-                        event_source: crate::event::EventSource::User,
-                        txn_id: task.txn_id,
-                        user_id: None,
-                        durability: WalDurability::CallerSupplied {
-                            wal_lsn,
-                            resolved_now_ms: None,
-                        },
-                        ordering: WriteOrdering::Gate,
-                        change_feed: ChangeFeedOwner::Funnel,
-                    },
-                )
-                .await
-                .map(|outcome| outcome.response);
-            }
-
-            if wal_lsn.is_some() {
-                return Err(crate::Error::Internal {
-                    detail: "non-local transaction commit must route through Calvin".into(),
-                });
-            }
-            let version_plan = task.plan.clone();
-            crate::control::server::shared::session::forward_to_leader(
+            dispatch_utils::dispatch_write_to_data_plane(
                 state,
-                decision,
-                task,
-                &version_plan,
+                dispatch_utils::WriteDispatch {
+                    tenant_id: task.tenant_id,
+                    database_id: task.database_id,
+                    vshard_id: task.vshard_id,
+                    plan: task.plan,
+                    trace_id: TraceId::ZERO,
+                    event_source: crate::event::EventSource::User,
+                    txn_id: None,
+                    wal_lsn,
+                    // Batch COMMIT record, not per-task WAL append — see
+                    // `dispatch_task_no_wal`'s equivalent limitation.
+                    resolved_now_ms: None,
+                },
             )
             .await
         })

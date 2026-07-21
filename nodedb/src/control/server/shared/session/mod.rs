@@ -35,7 +35,6 @@ pub mod plan_cache;
 pub mod prepared_cache;
 
 pub use self::cross_shard_mode::{CrossShardTxnMode, parse_value as parse_cross_shard_value};
-pub(crate) use self::leader_forward::{forward_to_leader, resolve_leader};
 pub use self::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
 pub use self::params::{
     is_known_pg_runtime_parameter, is_known_settable_runtime_parameter, parse_set_command,

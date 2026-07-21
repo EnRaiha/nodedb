@@ -109,22 +109,50 @@ pub(super) fn emit_ddl_audit(
     // `descriptor_kind` + `descriptor_name`.
     let _ = std::any::type_name::<StoredCollection>();
 
-    let mut log = match shared.audit.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
+    // Hand the record off rather than taking the audit mutex here.
+    //
+    // This runs on the Raft metadata apply loop — the single thread that
+    // applies committed entries for group 0. Blocking it on a process-wide
+    // mutex lets audit-log contention stall EVERY metadata apply, and with it
+    // collection materialization, DDL, and any proposer waiting on the applied
+    // index. That is a liveness bug rather than a slow path: one contended
+    // acquisition here was measured parking the loop for a full 5s propose
+    // timeout, so peer `CollectionSchema` announces never materialized and the
+    // engine writes that followed them were rejected as unknown collections.
+    //
+    // The record's payload is fully built above and needs nothing further from
+    // the apply loop, so deferring the emit keeps the compliance row (no silent
+    // drop) while letting the loop advance. Hash-chain integrity is unaffected:
+    // `record_with_auth` allocates the sequence number under the same mutex, so
+    // chain order follows lock-acquisition order exactly as it does for every
+    // other audit writer.
+    let audit = std::sync::Arc::clone(&shared.audit);
+    let emit = move || {
+        let mut log = match audit.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        log.record_with_auth(
+            AuditEvent::DdlChange,
+            None,
+            None,
+            "metadata_group",
+            &detail_json,
+            &AuditAuth {
+                user_id,
+                user_name,
+                session_id: String::new(),
+            },
+        );
     };
-    log.record_with_auth(
-        AuditEvent::DdlChange,
-        None,
-        None,
-        "metadata_group",
-        &detail_json,
-        &AuditAuth {
-            user_id,
-            user_name,
-            session_id: String::new(),
-        },
-    );
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(emit);
+        }
+        // No reactor (unit tests, non-Tokio callers): emit inline. There is no
+        // apply loop to protect in that context.
+        Err(_) => emit(),
+    }
 }
 
 /// Return `(descriptor_name, version_after, hlc_string)` for a
