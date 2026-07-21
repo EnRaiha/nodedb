@@ -22,6 +22,13 @@ async fn full_request_response_roundtrip() {
 
     let (dispatcher, data_sides) = Dispatcher::new(1, 64);
     let shared = SharedState::new(dispatcher, wal).unwrap();
+    // Trust-mode sessions auto-authenticate as the configured durable principal
+    // on the first frame; materialize it so `configured_trust_identity` resolves
+    // instead of rejecting with "configured trust identity is unavailable".
+    shared
+        .credentials
+        .bootstrap_trust_superuser("nodedb")
+        .expect("bootstrap trust superuser");
 
     // Start a Data Plane core in a background thread.
     let data_side = data_sides.into_iter().next().unwrap();

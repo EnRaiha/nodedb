@@ -59,14 +59,18 @@ impl NativeTestServer {
             nodedb::control::security::credential::store::CredentialStore::open(&catalog_path)
                 .expect("open credential store");
         let credentials = Arc::new(credential_store);
-        // Provision the harness superuser `nodedb` so Trust-mode strict
-        // identity resolution accepts the default test connection.
-        let _ = credentials.create_user(
-            "nodedb",
-            "nodedb",
-            nodedb::types::TenantId::new(1),
-            vec![nodedb::control::security::identity::Role::Superuser],
-        );
+        // Mirror production bootstrap so trust-mode listeners resolve a durable
+        // configured principal rather than fabricating an ephemeral identity.
+        // The configured trust superuser is what `configured_trust_identity`
+        // reads on the first native frame; `create_user` alone does not set it.
+        match auth_mode {
+            AuthMode::Trust => credentials
+                .bootstrap_trust_superuser("nodedb")
+                .expect("bootstrap trust superuser"),
+            _ => credentials
+                .bootstrap_superuser("nodedb", "nodedb")
+                .expect("bootstrap password superuser"),
+        }
         // Ensure the built-in `default` database (id 0) is present in the
         // catalog so the default connection database works in tests.
         let _ = credentials.catalog().bootstrap_default_database();
