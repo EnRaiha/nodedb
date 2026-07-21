@@ -178,6 +178,13 @@ pub async fn submit_and_await_calvin_with_timeout(
     }
 }
 
+/// Backoff schedule (milliseconds) for waiting on the sequencer-group leader
+/// election before a cross-shard submit. Covers the brief post-startup window
+/// (a fresh single-node cluster elects in a couple of seconds) and short
+/// re-election gaps. Bounded: once the schedule is exhausted a genuinely
+/// leaderless cluster surfaces a typed error rather than hanging.
+const SEQUENCER_LEADER_WAIT_BACKOFF_MS: &[u64] = &[50, 100, 200, 400, 800, 1000, 1000, 1000];
+
 /// Submit a cross-shard Calvin `tx_class`, routing it to the sequencer-group
 /// leader so it is actually sequenced and acked.
 ///
@@ -189,8 +196,10 @@ pub async fn submit_and_await_calvin_with_timeout(
 ///   topology, then send one `SubmitCalvinTxnRequest` (carrying the
 ///   msgpack-encoded `TxClass`); the leader runs the submit-and-await and
 ///   replies. Map transport / leader errors to a typed `crate::Error`.
-/// - **No leader elected (0 / none)**: return a typed error — never submit
-///   locally, since a non-leader submit is silently discarded.
+/// - **No leader elected (0 / none)**: wait through
+///   [`SEQUENCER_LEADER_WAIT_BACKOFF_MS`] for an election, then return a typed
+///   error — never submit on a non-leader, since that submit is silently
+///   discarded.
 pub async fn submit_calvin_routed(
     state: &SharedState,
     tx_class: TxClass,
@@ -211,17 +220,30 @@ pub async fn submit_calvin_routed(
     let status_fn = state.raft_status_fn.get().ok_or_else(|| Error::Internal {
         detail: "calvin-submit: raft status fn not installed (cluster not started)".to_owned(),
     })?;
-    let leader = status_fn()
-        .into_iter()
-        .find(|g| g.group_id == SEQUENCER_GROUP_ID)
-        .map(|g| g.leader_id)
-        .unwrap_or(0);
 
-    // `0` = no sequencer leader elected yet. We must NOT submit locally: a
-    // non-leader submit is drained and discarded by the local sequencer service,
-    // so the caller would time out at the assignment phase. Surface a typed error
-    // (same divergence-safety contract as the routed-surrogate leader==0 path) so
-    // the caller retries once an election resolves.
+    // `leader_id == 0` means no sequencer leader is elected YET — the brief
+    // window right after startup (the client gateway can open before the
+    // sequencer group finishes its first election) or during a re-election.
+    // Submitting on a non-leader is drained and discarded, so we must not; but
+    // `leader == 0` also guarantees NOTHING has been submitted, so waiting for
+    // the election to resolve and re-reading is safe and idempotent. Poll with
+    // bounded backoff (mirroring the gateway's NotLeader retry) rather than
+    // failing the client's very first write on a freshly-ready node; only a
+    // genuinely leaderless cluster exhausts the schedule and surfaces the error.
+    let mut leader = 0;
+    for (attempt, &backoff_ms) in SEQUENCER_LEADER_WAIT_BACKOFF_MS.iter().enumerate() {
+        leader = status_fn()
+            .into_iter()
+            .find(|g| g.group_id == SEQUENCER_GROUP_ID)
+            .map(|g| g.leader_id)
+            .unwrap_or(0);
+        if leader != 0 {
+            break;
+        }
+        if attempt + 1 < SEQUENCER_LEADER_WAIT_BACKOFF_MS.len() {
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        }
+    }
     if leader == 0 {
         return Err(Error::Internal {
             detail: "calvin-submit: no sequencer leader elected yet; cannot submit cross-shard \
