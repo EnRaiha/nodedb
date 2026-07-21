@@ -159,6 +159,46 @@ pub(super) fn validate_catalog_exprs(
                 }
             }
         }
+        SqlPlan::VectorSearch {
+            filters,
+            projection,
+            ..
+        } => {
+            validate_filters(filters, catalog, database_id, tenant_id)?;
+            validate_projection(projection, catalog, database_id, tenant_id)?;
+        }
+        SqlPlan::MultiVectorSearch { projection, .. }
+        | SqlPlan::SparseSearch { projection, .. }
+        | SqlPlan::HybridSearch { projection, .. }
+        | SqlPlan::HybridSearchTriple { projection, .. } => {
+            validate_projection(projection, catalog, database_id, tenant_id)?;
+        }
+        SqlPlan::TextSearch {
+            filters,
+            projection,
+            ..
+        } => {
+            validate_filters(filters, catalog, database_id, tenant_id)?;
+            validate_projection(projection, catalog, database_id, tenant_id)?;
+        }
+        SqlPlan::SpatialScan {
+            attribute_filters,
+            projection,
+            ..
+        } => {
+            validate_filters(attribute_filters, catalog, database_id, tenant_id)?;
+            validate_projection(projection, catalog, database_id, tenant_id)?;
+        }
+        SqlPlan::RecursiveScan {
+            base_filters,
+            recursive_filters,
+            projection,
+            ..
+        } => {
+            validate_filters(base_filters, catalog, database_id, tenant_id)?;
+            validate_filters(recursive_filters, catalog, database_id, tenant_id)?;
+            validate_projection(projection, catalog, database_id, tenant_id)?;
+        }
         _ => {}
     }
     Ok(())

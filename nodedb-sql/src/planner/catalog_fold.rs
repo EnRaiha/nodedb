@@ -349,6 +349,76 @@ fn walk_plan(
             }
         }
 
+        mut plan @ (SqlPlan::VectorSearch { .. }
+        | SqlPlan::TextSearch { .. }
+        | SqlPlan::SpatialScan { .. }
+        | SqlPlan::RecursiveScan { .. }) => {
+            match &mut plan {
+                SqlPlan::VectorSearch {
+                    filters,
+                    projection,
+                    ..
+                } => {
+                    for filter in filters {
+                        fold_filter(filter, catalog, database_id, tenant_id);
+                    }
+                    fold_projection(projection, catalog, database_id, tenant_id);
+                }
+                SqlPlan::TextSearch {
+                    filters,
+                    projection,
+                    ..
+                } => {
+                    for filter in filters {
+                        fold_filter(filter, catalog, database_id, tenant_id);
+                    }
+                    fold_projection(projection, catalog, database_id, tenant_id);
+                }
+                SqlPlan::SpatialScan {
+                    attribute_filters,
+                    projection,
+                    ..
+                } => {
+                    for filter in attribute_filters {
+                        fold_filter(filter, catalog, database_id, tenant_id);
+                    }
+                    fold_projection(projection, catalog, database_id, tenant_id);
+                }
+                SqlPlan::RecursiveScan {
+                    base_filters,
+                    recursive_filters,
+                    projection,
+                    ..
+                } => {
+                    for filter in base_filters {
+                        fold_filter(filter, catalog, database_id, tenant_id);
+                    }
+                    for filter in recursive_filters {
+                        fold_filter(filter, catalog, database_id, tenant_id);
+                    }
+                    fold_projection(projection, catalog, database_id, tenant_id);
+                }
+                _ => unreachable!(),
+            }
+            plan
+        }
+
+        mut plan @ (SqlPlan::MultiVectorSearch { .. }
+        | SqlPlan::SparseSearch { .. }
+        | SqlPlan::HybridSearch { .. }
+        | SqlPlan::HybridSearchTriple { .. }) => {
+            match &mut plan {
+                SqlPlan::MultiVectorSearch { projection, .. }
+                | SqlPlan::SparseSearch { projection, .. }
+                | SqlPlan::HybridSearch { projection, .. }
+                | SqlPlan::HybridSearchTriple { projection, .. } => {
+                    fold_projection(projection, catalog, database_id, tenant_id);
+                }
+                _ => unreachable!(),
+            }
+            plan
+        }
+
         // Plan variants without expression-bearing filters pass through unchanged.
         other => other,
     }
