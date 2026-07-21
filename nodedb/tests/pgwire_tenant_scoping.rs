@@ -196,12 +196,15 @@ async fn tenant_user_cannot_see_other_tenants_collection_as_empty() {
     let result = query_as(&server, "svc_xtn", "SELECT secret FROM t1_only").await;
     match result {
         Err(msg) => {
-            // Accept both legacy "unknown table" and the canonical
-            // "table not found" wording — semantics are identical
-            // (cross-tenant isolation enforced via lookup failure).
+            // Cross-tenant isolation is enforced via lookup failure: the
+            // collection must appear absent. Accept the legacy "unknown table"
+            // / "table not found" wordings and the now-canonical
+            // "does not exist" (SQLSTATE 42P01) — semantics are identical.
             let lower = msg.to_lowercase();
             assert!(
-                lower.contains("unknown table") || lower.contains("table not found"),
+                lower.contains("unknown table")
+                    || lower.contains("table not found")
+                    || lower.contains("does not exist"),
                 "expected isolation error, got: {msg}"
             );
         }

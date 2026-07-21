@@ -234,9 +234,12 @@ async fn cross_database_collection_looks_absent() {
     server
         .expect_error(
             "SELECT * FROM cross_secret",
-            // The error must match the "not found" family; it must NOT
-            // mention a distinct "database boundary" code.
-            "not found",
+            // Must surface as the canonical absent-collection error
+            // (`does not exist`, SQLSTATE 42P01) — indistinguishable from a
+            // truly-absent collection. It must NOT mention a distinct
+            // "database boundary" code that would leak the collection's
+            // existence in another database.
+            "does not exist",
         )
         .await;
 }

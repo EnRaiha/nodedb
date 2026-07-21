@@ -252,7 +252,7 @@ async fn unicode_identifier_before_returning_preserves_connection() {
     let server = TestServer::start().await;
 
     server
-        .expect_error("DELETE FROM missingﬀﬀ RETURNING *", "not found")
+        .expect_error("DELETE FROM missingﬀﬀ RETURNING *", "does not exist")
         .await;
     let rows = server
         .query_text("SELECT 1")
