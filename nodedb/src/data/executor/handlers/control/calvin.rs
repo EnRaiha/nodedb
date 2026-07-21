@@ -180,15 +180,14 @@ impl CoreLoop {
         // base install below reuses the exact stamp the redo carries rather than
         // minting a fresh one. Empty when this transaction wrote no bitemporal
         // document rows or resolve never ran.
-        let bitemporal_stamps: Vec<(u32, BitemporalStamp)> =
-            match calvin_synthetic_txn_id(epoch, position, vshard_id) {
-                Ok(synthetic) => self
-                    .txn_overlays
-                    .get(&synthetic)
-                    .map(|overlay| overlay.all_bitemporal_stamps().collect())
-                    .unwrap_or_default(),
-                Err(_) => Vec::new(),
-            };
+        let synthetic_txn_id = calvin_synthetic_txn_id(epoch, position, vshard_id).ok();
+        let bitemporal_stamps: Vec<(u32, BitemporalStamp)> = synthetic_txn_id
+            .and_then(|synthetic| self.txn_overlays.get(&synthetic))
+            .map(|overlay| overlay.all_bitemporal_stamps().collect())
+            .unwrap_or_default();
+        let graph_system_from = synthetic_txn_id
+            .and_then(|synthetic| self.graph_txn_overlays.get(&synthetic))
+            .and_then(|overlay| overlay.resolved_system_from());
         // Drop the synthetic overlay entry staged by
         // `execute_calvin_execute_static` unconditionally, before the apply
         // below: idempotent no-op on a duplicate dispatch.
@@ -224,6 +223,7 @@ impl CoreLoop {
         for (surrogate, stamp) in bitemporal_stamps {
             self.active_bitemporal_stamps.insert(surrogate, stamp);
         }
+        self.active_graph_system_from = graph_system_from;
         // The read-set was already validated at stage time and drives the
         // flush/drop decision; the replay itself carries no read-set to re-check.
         // Scope the flush key so `record_batch_index_write_values` stages this

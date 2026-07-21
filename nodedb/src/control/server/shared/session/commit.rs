@@ -1,33 +1,22 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Protocol-neutral COMMIT orchestrator.
-//!
-//! Drives the full commit sequence off the neutral session state: snapshot
-//! isolation conflict detection (with read-your-own-write exclusion), WAL
-//! transaction batching, single-shard vs Calvin multi-shard dispatch, staging
-//! overlay release, deferred offset flush, GAP_FREE sequence finalization,
-//! buffered DDL propose, and cursor/notify flush. Every Data-Plane dispatch
-//! goes through the injected [`TxnDataPlane`] seam so both pgwire and native
-//! drive this one core; transports only shape the returned [`CommitOutcome`].
+//! Protocol-neutral COMMIT orchestration shared by pgwire and native sessions.
 
 use std::net::SocketAddr;
 
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
 use crate::control::gateway::RouteDecision;
-use crate::control::gateway::retry::retry_not_leader;
 use crate::control::planner::calvin::{DispatchClass, classify_dispatch, read_vshards_of};
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::graph_dispatch::cluster_resolve::gateway_shared;
 use crate::control::server::shared::plan_util::extract_collection;
 use crate::control::state::SharedState;
 use nodedb_cluster::calvin::types::ReleaseReason;
-use nodedb_cluster::{MetadataEntry, encode_entry};
 use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::ddl_buffer;
-use super::leader_forward::{forward_to_leader, resolve_leader};
 use super::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
+use super::overlay_drop::drop_txn_overlay;
 use super::read_set::ReadSetEntry;
 use super::store::SessionStore;
 
@@ -100,17 +89,42 @@ pub async fn run_commit(
                 }
             }
             DispatchClass::SingleShard { vshard: vshard_id } => {
-                if let Some(outcome) =
-                    si_conflict_abort(sessions, addr, state, &read_set, &written_collections)
-                {
-                    super::reservation_release::release_and_rollback(state, sessions, addr).await;
-                    return outcome;
-                }
-                if let Some(reason) =
-                    dispatch_single_shard(state, dp, &buffered, tenant_id, vshard_id).await
-                {
-                    super::reservation_release::release_and_rollback(state, sessions, addr).await;
-                    return CommitOutcome::Aborted { reason };
+                let leader =
+                    crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard(
+                        state,
+                        vshard_id.as_u32(),
+                    );
+                if !matches!(leader, RouteDecision::Local) {
+                    // The interactive transaction WAL record belongs to this
+                    // coordinator and cannot be forwarded as a bare remote
+                    // Data-Plane LSN. Route a non-local single-shard commit
+                    // through Calvin's replicated Vote/Verdict barrier instead;
+                    // this gives it the same leader routing, OCC, durability,
+                    // and apply ordering as any multi-participant commit.
+                    if let Some(reason) = super::commit_calvin::run_commit_calvin(
+                        sessions, addr, state, &buffered, tenant_id, &read_set,
+                    )
+                    .await
+                    {
+                        super::reservation_release::release_and_rollback(state, sessions, addr)
+                            .await;
+                        return CommitOutcome::Aborted { reason };
+                    }
+                } else {
+                    if let Some(outcome) =
+                        si_conflict_abort(sessions, addr, state, &read_set, &written_collections)
+                    {
+                        super::reservation_release::release_and_rollback(state, sessions, addr)
+                            .await;
+                        return outcome;
+                    }
+                    if let Some(reason) =
+                        dispatch_single_shard(state, dp, &buffered, tenant_id, vshard_id).await
+                    {
+                        super::reservation_release::release_and_rollback(state, sessions, addr)
+                            .await;
+                        return CommitOutcome::Aborted { reason };
+                    }
                 }
             }
         }
@@ -207,7 +221,7 @@ pub async fn run_commit(
     }
 
     // Flush any buffered DDL entries as a single atomic batch.
-    if let Some(reason) = flush_buffered_ddl(state) {
+    if let Some(reason) = ddl_buffer::flush(state) {
         return CommitOutcome::Aborted { reason };
     }
 
@@ -273,6 +287,14 @@ async fn dispatch_single_shard(
     vshard_id: crate::types::VShardId,
 ) -> Option<AbortReason> {
     let plans: Vec<PhysicalPlan> = buffered.iter().map(|t| t.plan.clone()).collect();
+    let database_id = buffered
+        .first()
+        .map_or(crate::types::DatabaseId::DEFAULT, |task| task.database_id);
+    if buffered.iter().any(|task| task.database_id != database_id) {
+        return Some(AbortReason::Dispatch(crate::Error::BadRequest {
+            detail: "transaction spans multiple databases".to_owned(),
+        }));
+    }
 
     // txn_id is present for any staged commit (buffer_write stamps it).
     let Some(txn_id) = buffered.first().and_then(|t| t.txn_id) else {
@@ -287,7 +309,7 @@ async fn dispatch_single_shard(
     let resolve_task = PhysicalTask {
         tenant_id,
         vshard_id,
-        database_id: crate::types::DatabaseId::DEFAULT,
+        database_id,
         plan: PhysicalPlan::Meta(MetaOp::ResolveTxn {
             txn_id,
             plans: plans.clone(),
@@ -313,6 +335,26 @@ async fn dispatch_single_shard(
         }
     };
 
+    // Re-verify local vShard ownership immediately before the durable WAL
+    // append. `run_commit` resolved this vShard as `Local`, but a leadership
+    // handoff can land during the `ResolveTxn` await above. Without this
+    // re-check the transaction redo would be appended to a WAL this node no
+    // longer owns, and the batch dispatch below (which re-resolves leadership)
+    // would then reject the now-non-local commit — leaving an orphaned durable
+    // redo record behind while the client is told the commit aborted. Aborting
+    // here, BEFORE any durable write, keeps the failure side-effect-free and
+    // retryable: the client's retry re-enters `run_commit`, sees the vShard is
+    // non-local, and routes the commit through Calvin's replicated barrier.
+    if !matches!(
+        crate::control::server::graph_dispatch::cluster_resolve::resolve_for_vshard(
+            state,
+            vshard_id.as_u32(),
+        ),
+        RouteDecision::Local
+    ) {
+        return Some(AbortReason::Serialization);
+    }
+
     // 2. Write-ahead the transaction as ONE replayable `TransactionRedo` record
     //    (each sub-op keeps its real engine `record_type`). `None` when the txn
     //    has no durable writes (all reads / CRDT / text). Its LSN stamps the
@@ -321,12 +363,10 @@ async fn dispatch_single_shard(
     let wal_lsn = if redo.ops.is_empty() {
         None
     } else {
-        match state.wal.append_transaction_redo(
-            tenant_id,
-            vshard_id,
-            crate::types::DatabaseId::DEFAULT,
-            &redo,
-        ) {
+        match state
+            .wal
+            .append_transaction_redo(tenant_id, vshard_id, database_id, &redo)
+        {
             Ok(lsn) => Some(lsn),
             Err(e) => {
                 return Some(AbortReason::Dispatch(crate::Error::Internal {
@@ -338,7 +378,7 @@ async fn dispatch_single_shard(
     let batch_task = PhysicalTask {
         tenant_id,
         vshard_id,
-        database_id: crate::types::DatabaseId::DEFAULT,
+        database_id,
         plan: PhysicalPlan::Meta(MetaOp::TransactionBatch {
             plans,
             // Reuse the resolve-time bitemporal stamps recorded in this
@@ -368,116 +408,5 @@ pub(super) fn classify_batch_dispatch(result: crate::Result<Response>) -> Option
             code: resp.error_code.as_deref().cloned(),
         }),
         Ok(_) => None,
-    }
-}
-
-/// Flush any DDL buffered during the transaction as a single atomic metadata
-/// Raft batch. Returns `Some(reason)` on encode/propose failure.
-fn flush_buffered_ddl(state: &SharedState) -> Option<AbortReason> {
-    let payloads = ddl_buffer::take()?;
-    if payloads.is_empty() {
-        return None;
-    }
-    // Each buffered entry carries the audit context captured at its own
-    // statement boundary (not COMMIT time). Map to `CatalogDdlAudited` when
-    // present so every sub-DDL gets its own audit record on every replica.
-    let sub_entries: Vec<MetadataEntry> = payloads
-        .into_iter()
-        .map(|e| match e.audit {
-            Some(ctx) => MetadataEntry::CatalogDdlAudited {
-                payload: e.payload,
-                auth_user_id: ctx.auth_user_id,
-                auth_user_name: ctx.auth_user_name,
-                sql_text: ctx.sql_text,
-            },
-            None => MetadataEntry::CatalogDdl { payload: e.payload },
-        })
-        .collect();
-    let batch = MetadataEntry::Batch {
-        entries: sub_entries,
-    };
-    if let Some(handle) = state.metadata_raft.get() {
-        let raw = match encode_entry(&batch) {
-            Ok(raw) => raw,
-            Err(e) => {
-                return Some(AbortReason::DdlPropose(crate::Error::Internal {
-                    detail: format!("DDL batch encode: {e}"),
-                }));
-            }
-        };
-        if let Err(e) = handle.propose(raw) {
-            return Some(AbortReason::DdlPropose(crate::Error::Internal {
-                detail: format!("DDL batch propose: {e}"),
-            }));
-        }
-    }
-    None
-}
-
-/// Release a transaction's staging overlay on a vShard that hosted staged
-/// writes. Dispatched AFTER the durable resolution (COMMIT batch flush /
-/// ROLLBACK) on the vShard's CURRENT leader: when this node leads the vShard (or
-/// single-node) the existing WAL-free local dispatch runs unchanged; otherwise
-/// the `DropTxnOverlay` is forwarded to the remote leader keyed by `txn_id` — the
-/// same node the matching `StageWrite` reached, since stage / read / drop all
-/// resolve to the vShard's leader (see [`super::leader_forward`]).
-///
-/// Returns the dispatch/forward error rather than swallowing it, so the caller
-/// (COMMIT / ROLLBACK) sees a teardown failure and decides how to surface it —
-/// a `LeaderUnknown` resolution fails closed as `Error::NotLeader` inside
-/// [`forward_to_leader`]. The remote arm retries a transient `NotLeader` /
-/// `RetryableLeaderChange` a bounded number of times (see [`retry_not_leader`])
-/// before that error is returned, so a momentary leader election does not
-/// strand the overlay after a single forward attempt.
-pub(super) async fn drop_txn_overlay(
-    state: &SharedState,
-    dp: &impl TxnDataPlane,
-    tenant_id: crate::types::TenantId,
-    vshard_id: crate::types::VShardId,
-    txn_id: crate::types::TxnId,
-) -> crate::Result<()> {
-    // The overlay id travels inside the plan (the Data-Plane handler reads it
-    // from `MetaOp::DropTxnOverlay`); the request `txn_id` stamp additionally
-    // keys the leader's per-transaction overlay when forwarded (inert locally).
-    let drop_plan = PhysicalPlan::Meta(MetaOp::DropTxnOverlay { txn_id });
-    let task = PhysicalTask {
-        tenant_id,
-        vshard_id,
-        database_id: crate::types::DatabaseId::DEFAULT,
-        plan: drop_plan.clone(),
-        post_set_op: PostSetOp::None,
-        txn_id: Some(txn_id),
-    };
-    // Overlay teardown is not a write — no WAL record, no write version.
-    match resolve_leader(&task, state) {
-        RouteDecision::Local => {
-            dp.dispatch_no_wal(task, None).await?;
-            Ok(())
-        }
-        _ => {
-            // A transient leader-election failure at COMMIT/ROLLBACK must not
-            // strand the overlay after a single forward attempt: retry the
-            // remote drop up to `retry_not_leader`'s bounded budget (3
-            // attempts, ~50ms then ~100ms backoff between them), re-resolving
-            // the leader on every
-            // attempt so a routing-table hint refreshed by a prior
-            // `NotLeader` (or a mid-retry leadership handback to this node)
-            // is picked up rather than repeatedly re-forwarding to a now-dead
-            // target.
-            let shared = gateway_shared(state)?;
-            let routing_ref = shared.cluster_routing.as_deref();
-            retry_not_leader(routing_ref, |_attempt| {
-                let task = task.clone();
-                let drop_plan = drop_plan.clone();
-                async move {
-                    match resolve_leader(&task, state) {
-                        RouteDecision::Local => dp.dispatch_no_wal(task, None).await,
-                        remote => forward_to_leader(state, remote, task, &drop_plan).await,
-                    }
-                }
-            })
-            .await
-            .map(|_| ())
-        }
     }
 }

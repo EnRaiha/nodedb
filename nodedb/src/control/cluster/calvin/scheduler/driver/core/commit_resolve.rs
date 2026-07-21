@@ -22,8 +22,6 @@ use super::scheduler::Scheduler;
 use crate::bridge::envelope::{Response, Status};
 use crate::control::cluster::calvin::scheduler::lock_manager::TxnId;
 use crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason;
-use nodedb_physical::physical_plan::PhysicalPlan;
-use nodedb_physical::physical_plan::meta::MetaOp;
 
 impl Scheduler {
     /// Cast this participant's local commit vote for a staged transaction, then
@@ -261,9 +259,9 @@ impl Scheduler {
         committed: bool,
         redo_lsn: Option<crate::types::Lsn>,
     ) {
-        if response.status == Status::Ok {
+        let completed = if response.status == Status::Ok {
             if committed {
-                self.commit_apply_tail(txn_id, response, redo_lsn);
+                self.commit_apply_tail(txn_id, response, redo_lsn)
             } else {
                 self.propose_sequencer_entry(
                     SequencerEntry::CompletionAck {
@@ -274,22 +272,40 @@ impl Scheduler {
                     txn_id,
                     "completion ack (dropped)",
                 );
+                true
             }
         } else {
-            tracing::warn!(
+            tracing::error!(
                 vshard_id = self.vshard_id,
                 epoch = txn_id.epoch,
                 position = txn_id.position,
                 committed,
-                "calvin: flush/drop response was not Ok; locks NOT released (shard degraded)"
+                "calvin: flush/drop response was not Ok while applying an already-committed \
+                 verdict; forcing infra-abort completion so locks release and the epoch advances"
             );
+            false
+        };
+
+        if completed {
+            self.metrics.record_completed();
+            self.on_txn_complete(txn_id);
+        } else {
+            // The cross-shard verdict is already globally durable, and a commit's
+            // resolved redo was WAL-appended before this flush — so recovery
+            // re-applies the write. A local flush/apply or WAL-marker failure is
+            // therefore an infrastructure event, NOT an outcome change. It must
+            // never leave the txn parked: holding its locks forever wedges every
+            // txn queued behind those keys and freezes this vShard's epoch
+            // watermark (which anchors cross-shard BEGIN snapshots), and nothing
+            // re-drives a non-`AwaitingVerdict` pending entry. Surface the infra
+            // abort and force completion — the same forward-progress contract the
+            // resolve/drop dispatch-failure path in `resume_on_verdict` follows.
             self.metrics.record_executor_error();
             self.metrics
                 .record_infra_abort(infra_abort_reason::IO_ERROR);
+            self.metrics.record_completed();
+            self.on_txn_complete(txn_id);
         }
-
-        self.metrics.record_completed();
-        self.on_txn_complete(txn_id);
     }
 
     /// Deposit the applied result, durably mark the apply, record the apply's
@@ -310,7 +326,7 @@ impl Scheduler {
         txn_id: TxnId,
         response: Response,
         redo_lsn: Option<crate::types::Lsn>,
-    ) {
+    ) -> bool {
         // Deposit the FULL applied Response (affected-count + watermark + any
         // RETURNING rows) into the local sidecar BEFORE proposing the replicated
         // CompletionAck. The ack fires the coordinator's completion oneshot on
@@ -395,12 +411,15 @@ impl Scheduler {
                 }
             }
         }
-        match redo_lsn {
+        let applied_lsn = match redo_lsn {
             // The TransactionRedo record already durably marks this apply — the
             // SAME shard-local WAL-LSN space fast-path writes and read
             // watermarks use. Record the apply's per-key write versions at it;
             // no second (CalvinApplied) marker is written.
-            Some(lsn) => self.record_calvin_write_versions(txn_id, lsn),
+            Some(lsn) => {
+                self.record_calvin_write_versions(txn_id, lsn);
+                Some(lsn)
+            }
             None => match self.shared.wal.append_calvin_applied(
                 crate::types::VShardId::new(self.vshard_id),
                 txn_id.epoch,
@@ -410,7 +429,10 @@ impl Scheduler {
                 // apply — the SAME shard-local WAL-LSN space fast-path writes and
                 // read watermarks use. Record the apply's per-key write versions
                 // at it now that it exists (it did not at dispatch time).
-                Ok(applied_lsn) => self.record_calvin_write_versions(txn_id, applied_lsn),
+                Ok(applied_lsn) => {
+                    self.record_calvin_write_versions(txn_id, applied_lsn);
+                    Some(applied_lsn)
+                }
                 Err(e) => {
                     tracing::error!(
                         vshard_id = self.vshard_id,
@@ -419,8 +441,33 @@ impl Scheduler {
                         error = %e,
                         "calvin: failed to write CalvinApplied WAL record"
                     );
+                    None
                 }
             },
+        };
+        let Some(lsn) = applied_lsn else {
+            // The apply cannot be acknowledged without a durable participant
+            // LSN: CDC and write-version consumers would otherwise observe a
+            // successful commit with no authoritative ordering point.
+            return false;
+        };
+        // Control change-stream events are distinct from Data-Plane
+        // WriteEvents. Publish the participant-local logical manifests once,
+        // from the data-group leader, at the authoritative committed LSN.
+        if self.is_group_leader()
+            && let Some(pending) = self.pending.get_mut(&txn_id)
+        {
+            let tenant_id = pending.txn.tx_class.tenant_id;
+            let database_id = pending.txn.tx_class.database_id;
+            for change_set in std::mem::take(&mut pending.change_sets) {
+                crate::control::server::dispatch_utils::publish_change_set_with_lsn(
+                    &self.shared,
+                    tenant_id,
+                    database_id,
+                    change_set,
+                    lsn,
+                );
+            }
         }
         self.propose_sequencer_entry(
             SequencerEntry::CompletionAck {
@@ -431,66 +478,6 @@ impl Scheduler {
             txn_id,
             "completion ack",
         );
-    }
-
-    /// Dispatch a flush (`committed = true`) or drop (`committed = false`) of a
-    /// staged transaction's commit-pending buffer back to its core, registering
-    /// a response bridge so the resolve response re-enters the completion loop.
-    ///
-    /// `wal_lsn` is the just-appended `TransactionRedo` LSN for a flush whose
-    /// resolved redo carried ops (`Some`); `None` for a drop, or a flush whose
-    /// resolved redo was empty (falls back to the `CalvinApplied` marker in
-    /// `commit_apply_tail`).
-    ///
-    /// Returns `false` if the dispatch failed (the caller then completes the txn
-    /// as an infra error). Mirrors the exempt dispatch shape of the
-    /// static/active dispatch and the write-version record op.
-    pub(in crate::control::cluster::calvin::scheduler::driver::core) fn dispatch_commit_resolution(
-        &mut self,
-        txn_id: TxnId,
-        committed: bool,
-        wal_lsn: Option<crate::types::Lsn>,
-    ) -> bool {
-        let Some(pending) = self.pending.get(&txn_id) else {
-            return false;
-        };
-        let tenant_id = pending.txn.tx_class.tenant_id;
-        let epoch = txn_id.epoch;
-        let position = txn_id.position;
-
-        let plan = if committed {
-            PhysicalPlan::Meta(MetaOp::CalvinFlush { epoch, position })
-        } else {
-            PhysicalPlan::Meta(MetaOp::CalvinDrop { epoch, position })
-        };
-
-        let request_id = self.next_request_id();
-        // The redo record (if any) was already WAL-appended by the caller
-        // before this dispatch — see `finish_redo_resolve` — so its LSN
-        // rides on the envelope here rather than being allocated post-apply.
-        let request = self.build_exempt_request(request_id, tenant_id, plan, wal_lsn);
-
-        let resp_rx = self.shared.tracker.register(request_id);
-        let dispatch_result = match self.shared.dispatcher.lock() {
-            Ok(mut d) => d.dispatch(request),
-            Err(poisoned) => poisoned.into_inner().dispatch(request),
-        };
-        if let Err(e) = dispatch_result {
-            self.shared.tracker.cancel(&request_id);
-            tracing::error!(
-                vshard_id = self.vshard_id,
-                epoch,
-                position,
-                committed,
-                error = %e,
-                "calvin: flush/drop dispatch failed"
-            );
-            return false;
-        }
-
-        // The resolve response re-enters the completion loop under the SAME
-        // txn_id, now in `AwaitingResolve`, where `finish_resolved_commit` runs.
-        self.spawn_response_bridge(txn_id, request_id, resp_rx);
         true
     }
 }

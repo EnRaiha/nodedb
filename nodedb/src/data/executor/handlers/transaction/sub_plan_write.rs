@@ -155,20 +155,13 @@ impl CoreLoop {
             dst_surrogate,
         } = params;
 
-        let old_properties = self
-            .edge_store
-            .get_edge(
-                dummy_task.request.database_id.as_u64(),
-                nodedb_types::TenantId::new(tid),
-                collection,
-                src_id,
-                label,
-                dst_id,
-            )
-            .ok()
-            .flatten();
-
-        let resp = self.execute_edge_put(
+        // The compensation entry is recorded inside `execute_edge_put_with_undo`
+        // at the only safe point — after the edge-store version is durably
+        // written and before the fallible CSR mutation. Recording it here, up
+        // front, would leave a phantom undo entry when dangling-endpoint
+        // validation or the edge-store write itself rejects, corrupting
+        // bitemporal history on rollback.
+        let resp = self.execute_edge_put_with_undo(
             dummy_task,
             crate::data::executor::handlers::graph::EdgePutParams {
                 tid,
@@ -180,20 +173,13 @@ impl CoreLoop {
                 src_surrogate,
                 dst_surrogate,
             },
+            Some(undo_log),
         );
         if resp.status == Status::Error {
             return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "edge put failed".into(),
             }));
         }
-
-        undo_log.push(UndoEntry::PutEdge {
-            collection: collection.to_string(),
-            src_id: src_id.to_string(),
-            label: label.to_string(),
-            dst_id: dst_id.to_string(),
-            old_properties,
-        });
         Ok(resp)
     }
 
@@ -211,34 +197,26 @@ impl CoreLoop {
             label,
             dst_id,
         } = params;
-        let old_properties = self
-            .edge_store
-            .get_edge(
-                dummy_task.request.database_id.as_u64(),
-                nodedb_types::TenantId::new(tid),
+
+        // Compensation is recorded inside `execute_edge_delete_with_undo` only
+        // after the tombstone is durably written (and only when a live
+        // pre-image existed), so a rejected/failed delete leaves no phantom
+        // re-insert entry behind.
+        let resp = self.execute_edge_delete_with_undo(
+            dummy_task,
+            crate::data::executor::handlers::graph::EdgeDeleteParams {
+                tid,
                 collection,
                 src_id,
                 label,
                 dst_id,
-            )
-            .ok()
-            .flatten();
-
-        let resp = self.execute_edge_delete(dummy_task, tid, collection, src_id, label, dst_id);
+            },
+            Some(undo_log),
+        );
         if resp.status == Status::Error {
             return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
                 detail: "edge delete failed".into(),
             }));
-        }
-
-        if let Some(props) = old_properties {
-            undo_log.push(UndoEntry::DeleteEdge {
-                collection: collection.to_string(),
-                src_id: src_id.to_string(),
-                label: label.to_string(),
-                dst_id: dst_id.to_string(),
-                old_properties: props,
-            });
         }
         Ok(resp)
     }

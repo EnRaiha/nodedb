@@ -10,7 +10,17 @@ use tracing::debug;
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
-use crate::types::TenantId;
+use crate::types::{TenantId, VShardId};
+
+/// Dual-homed edges are physically present on both endpoint homes. The source
+/// home is the canonical owner of logical graph cardinality, so only that
+/// participant updates persistent stats counters.
+pub(in crate::data::executor) fn owns_logical_edge_stats(
+    task: &ExecutionTask,
+    src_id: &str,
+) -> bool {
+    task.request.vshard_id == VShardId::from_key(src_id.as_bytes())
+}
 
 /// Bundled arguments for [`CoreLoop::execute_edge_put`].
 pub(in crate::data::executor) struct EdgePutParams<'a> {
@@ -24,11 +34,38 @@ pub(in crate::data::executor) struct EdgePutParams<'a> {
     pub dst_surrogate: nodedb_types::Surrogate,
 }
 
+/// Bundled arguments for [`CoreLoop::execute_edge_delete`].
+pub(in crate::data::executor) struct EdgeDeleteParams<'a> {
+    pub tid: u64,
+    pub collection: &'a str,
+    pub src_id: &'a str,
+    pub label: &'a str,
+    pub dst_id: &'a str,
+}
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_edge_put(
         &mut self,
         task: &ExecutionTask,
         params: EdgePutParams<'_>,
+    ) -> Response {
+        self.execute_edge_put_with_undo(task, params, None)
+    }
+
+    /// Edge upsert with optional transactional compensation.
+    ///
+    /// When `undo` is `Some`, the `UndoEntry::PutEdge` is recorded at the one
+    /// correct point: *after* the edge-store version is durably written and
+    /// *before* the fallible CSR mutation. Recording it earlier (before the
+    /// dangling-endpoint validation or the edge-store write) would leave a
+    /// compensation entry for an operation that never touched storage — on
+    /// rollback that entry would soft-delete or re-insert a version that never
+    /// existed, corrupting bitemporal edge history.
+    pub(in crate::data::executor) fn execute_edge_put_with_undo(
+        &mut self,
+        task: &ExecutionTask,
+        params: EdgePutParams<'_>,
+        undo: Option<&mut Vec<crate::data::executor::handlers::transaction::undo::UndoEntry>>,
     ) -> Response {
         let EdgePutParams {
             tid,
@@ -60,7 +97,26 @@ impl CoreLoop {
             );
         }
 
-        let ord = self.hlc.next_ordinal();
+        // Capture the pre-image only when a compensation record is requested.
+        let old_properties = if undo.is_some() {
+            self.edge_store
+                .get_edge(
+                    database_id,
+                    TenantId::new(tid),
+                    collection,
+                    src_id,
+                    label,
+                    dst_id,
+                )
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        let ord = self
+            .active_graph_system_from
+            .unwrap_or_else(|| self.hlc.next_ordinal());
         // Under a Calvin batch, `epoch_system_ms` is the deterministic epoch
         // timestamp; outside Calvin (every path today — no Calvin edge writes
         // yet) it is None and we fall back to the HLC-derived wall time,
@@ -70,7 +126,7 @@ impl CoreLoop {
             None => nodedb_types::ordinal_to_ms(ord),
         };
         use crate::engine::graph::edge_store::EdgeRef;
-        match self.edge_store.put_edge_versioned(
+        match self.edge_store.put_edge_versioned_with_stats(
             EdgeRef::new(
                 task.request.database_id,
                 TenantId::new(tid),
@@ -83,8 +139,22 @@ impl CoreLoop {
             ord,
             valid_from_ms,
             i64::MAX,
+            owns_logical_edge_stats(task, src_id),
         ) {
             Ok(()) => {
+                // Edge-store version is now durable; the compensation entry is
+                // valid from here on even if the CSR mutation below fails.
+                if let Some(undo) = undo {
+                    undo.push(
+                        crate::data::executor::handlers::transaction::undo::UndoEntry::PutEdge {
+                            collection: collection.to_string(),
+                            src_id: src_id.to_string(),
+                            label: label.to_string(),
+                            dst_id: dst_id.to_string(),
+                            old_properties,
+                        },
+                    );
+                }
                 let weight = crate::engine::graph::csr::extract_weight_from_properties(properties);
                 let partition = self.csr_partition_mut(database_id, tid);
                 let csr_result = if weight != 1.0 {
@@ -160,10 +230,12 @@ impl CoreLoop {
                     },
                 );
             }
-            let ord = self.hlc.next_ordinal();
+            let ord = self
+                .active_graph_system_from
+                .unwrap_or_else(|| self.hlc.next_ordinal());
             let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
             use crate::engine::graph::edge_store::EdgeRef;
-            match self.edge_store.put_edge_versioned(
+            match self.edge_store.put_edge_versioned_with_stats(
                 EdgeRef::new(
                     task.request.database_id,
                     TenantId::new(tid),
@@ -176,6 +248,7 @@ impl CoreLoop {
                 ord,
                 valid_from_ms,
                 i64::MAX,
+                owns_logical_edge_stats(task, &edge.src_id),
             ) {
                 Ok(()) => {
                     let partition = self.csr_partition_mut(database_id, tid);
@@ -250,9 +323,11 @@ impl CoreLoop {
         );
         let database_id = task.request.database_id.as_u64();
         for edge in edges {
-            let ord = self.hlc.next_ordinal();
+            let ord = self
+                .active_graph_system_from
+                .unwrap_or_else(|| self.hlc.next_ordinal());
             use crate::engine::graph::edge_store::EdgeRef;
-            let _ = self.edge_store.soft_delete_edge(
+            let _ = self.edge_store.soft_delete_edge_with_stats(
                 EdgeRef::new(
                     task.request.database_id,
                     TenantId::new(tid),
@@ -262,6 +337,7 @@ impl CoreLoop {
                     &edge.dst_id,
                 ),
                 ord,
+                owns_logical_edge_stats(task, &edge.src_id),
             );
             let partition = self.csr_partition_mut(database_id, tid);
             partition.remove_edge_in_collection(
@@ -309,11 +385,63 @@ impl CoreLoop {
         label: &str,
         dst_id: &str,
     ) -> Response {
+        self.execute_edge_delete_with_undo(
+            task,
+            EdgeDeleteParams {
+                tid,
+                collection,
+                src_id,
+                label,
+                dst_id,
+            },
+            None,
+        )
+    }
+
+    /// Edge delete with optional transactional compensation.
+    ///
+    /// The `UndoEntry::DeleteEdge` is recorded only when a live pre-image
+    /// existed *and* the tombstone was durably written — never speculatively
+    /// before the write. A phantom entry would otherwise re-insert an edge that
+    /// was never deleted when the surrounding transaction rolls back.
+    pub(in crate::data::executor) fn execute_edge_delete_with_undo(
+        &mut self,
+        task: &ExecutionTask,
+        params: EdgeDeleteParams<'_>,
+        undo: Option<&mut Vec<crate::data::executor::handlers::transaction::undo::UndoEntry>>,
+    ) -> Response {
+        let EdgeDeleteParams {
+            tid,
+            collection,
+            src_id,
+            label,
+            dst_id,
+        } = params;
         debug!(core = self.core_id, tid, %collection, %src_id, %label, %dst_id, "edge delete");
         let database_id = task.request.database_id.as_u64();
-        let ord = self.hlc.next_ordinal();
+
+        // Capture the pre-image only when a compensation record is requested.
+        let old_properties = if undo.is_some() {
+            self.edge_store
+                .get_edge(
+                    database_id,
+                    TenantId::new(tid),
+                    collection,
+                    src_id,
+                    label,
+                    dst_id,
+                )
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
+        let ord = self
+            .active_graph_system_from
+            .unwrap_or_else(|| self.hlc.next_ordinal());
         use crate::engine::graph::edge_store::EdgeRef;
-        match self.edge_store.soft_delete_edge(
+        match self.edge_store.soft_delete_edge_with_stats(
             EdgeRef::new(
                 task.request.database_id,
                 TenantId::new(tid),
@@ -323,8 +451,21 @@ impl CoreLoop {
                 dst_id,
             ),
             ord,
+            owns_logical_edge_stats(task, src_id),
         ) {
             Ok(_) => {
+                // Tombstone is durable; record the compensation for a rollback.
+                if let (Some(undo), Some(props)) = (undo, old_properties) {
+                    undo.push(
+                        crate::data::executor::handlers::transaction::undo::UndoEntry::DeleteEdge {
+                            collection: collection.to_string(),
+                            src_id: src_id.to_string(),
+                            label: label.to_string(),
+                            dst_id: dst_id.to_string(),
+                            old_properties: props,
+                        },
+                    );
+                }
                 let partition = self.csr_partition_mut(database_id, tid);
                 partition.remove_edge_in_collection(src_id, label, dst_id, collection);
                 self.checkpoint_coordinator.mark_dirty("sparse", 1);

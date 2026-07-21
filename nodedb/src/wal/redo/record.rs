@@ -91,6 +91,73 @@ pub struct CalvinStamp {
     pub vshard_id: u32,
 }
 
+/// Redo sub-record payload for a graph edge upsert — the payload bytes of a
+/// [`RecordType::Put`](nodedb_wal::record::RecordType::Put) sub-record inside a
+/// graph `RedoRecord`.
+///
+/// One shared definition for every encode and decode site so the field set is a
+/// compile-time invariant. This replaced a positional tuple that silently
+/// drifted in arity across its ~half-dozen encode/decode sites — appending a
+/// field there produced runtime `ArrayLengthMismatch` (or a silently-skipped
+/// record that lost the write) at whichever site was not updated in lockstep.
+///
+/// Map-encoded (`#[msgpack(map)]`), keying fields by name so the set can grow
+/// additively — the same idiom [`RedoRecord`] uses. `system_from` is
+/// `#[msgpack(default)]`, so a record written before that field existed decodes
+/// it to `None`, preserving legacy records without a separate fallback path.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+#[msgpack(map)]
+pub struct EdgePutRedo {
+    pub collection: String,
+    pub src_id: String,
+    pub label: String,
+    pub dst_id: String,
+    pub properties: Vec<u8>,
+    pub src_surrogate: u32,
+    pub dst_surrogate: u32,
+    /// Frozen bitemporal `system_from` ordinal for deterministic cross-replica
+    /// replay. `None` in legacy records that predate the field.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub system_from: Option<i64>,
+}
+
+/// Redo sub-record payload for a graph edge delete — the payload bytes of a
+/// [`RecordType::Delete`](nodedb_wal::record::RecordType::Delete) sub-record
+/// inside a graph `RedoRecord`. See [`EdgePutRedo`] for why this is a struct
+/// rather than a positional tuple.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+#[msgpack(map)]
+pub struct EdgeDeleteRedo {
+    pub collection: String,
+    pub src_id: String,
+    pub label: String,
+    pub dst_id: String,
+    /// Frozen bitemporal `system_from` ordinal for deterministic cross-replica
+    /// replay. `None` in legacy records that predate the field.
+    #[serde(default)]
+    #[msgpack(default)]
+    pub system_from: Option<i64>,
+}
+
 impl RedoRecord {
     /// Serialize to a zerompk MessagePack payload for WAL append.
     pub fn to_bytes(&self) -> crate::Result<Vec<u8>> {

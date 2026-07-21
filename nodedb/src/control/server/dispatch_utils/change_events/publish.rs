@@ -135,7 +135,7 @@ pub(crate) fn extract_write_change_set(plan: &PhysicalPlan, tenant_id: TenantId)
 /// write plan yields exactly one event; a handful of multi-row /
 /// multi-collection ops yield more than one, and reads / DDL / index
 /// maintenance yield none.
-fn publish_change_set_with_lsn(
+pub(crate) fn publish_change_set_with_lsn(
     shared: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,

@@ -28,6 +28,7 @@ impl CoreLoop {
     /// Each helper handles that engine's write sub-ops (pushing an
     /// `UndoEntry`) and routes every other sub-op through the standard
     /// read-only / DDL dispatch path.
+    #[cfg(test)]
     pub(super) fn execute_tx_sub_plan(
         &mut self,
         tid: u64,
@@ -36,21 +37,50 @@ impl CoreLoop {
         crdt_deltas: &mut Vec<(Vec<u8>, u64, String)>,
         user_roles: &[String],
     ) -> Result<Response, ErrorCode> {
-        let dummy_task = Self::build_dummy_task(tid);
+        let task = Self::build_dummy_task(tid);
+        self.execute_tx_sub_plan_with_task(&task, tid, plan, undo_log, crdt_deltas, user_roles)
+    }
 
+    /// Replay a sub-plan with the parent batch's database and vShard identity.
+    /// Calvin executes the same logical batch on each participant, so erasing
+    /// this routing identity makes every replica appear to be vShard zero and
+    /// breaks canonical-owner side effects such as graph statistics.
+    pub(super) fn execute_tx_sub_plan_from_batch(
+        &mut self,
+        parent: &ExecutionTask,
+        tid: u64,
+        plan: &PhysicalPlan,
+        undo_log: &mut Vec<UndoEntry>,
+        crdt_deltas: &mut Vec<(Vec<u8>, u64, String)>,
+        user_roles: &[String],
+    ) -> Result<Response, ErrorCode> {
+        let task =
+            Self::build_dummy_task_at(tid, parent.request.database_id, parent.request.vshard_id);
+        self.execute_tx_sub_plan_with_task(&task, tid, plan, undo_log, crdt_deltas, user_roles)
+    }
+
+    fn execute_tx_sub_plan_with_task(
+        &mut self,
+        dummy_task: &ExecutionTask,
+        tid: u64,
+        plan: &PhysicalPlan,
+        undo_log: &mut Vec<UndoEntry>,
+        crdt_deltas: &mut Vec<(Vec<u8>, u64, String)>,
+        user_roles: &[String],
+    ) -> Result<Response, ErrorCode> {
         match plan {
             PhysicalPlan::Document(op) => {
-                self.exec_tx_document(&dummy_task, tid, plan, op, user_roles, undo_log)
+                self.exec_tx_document(dummy_task, tid, plan, op, user_roles, undo_log)
             }
-            PhysicalPlan::Vector(op) => self.exec_tx_vector(&dummy_task, tid, plan, op, undo_log),
-            PhysicalPlan::Graph(op) => self.exec_tx_graph(&dummy_task, tid, plan, op, undo_log),
-            PhysicalPlan::Crdt(op) => self.exec_tx_crdt(&dummy_task, tid, plan, op, crdt_deltas),
-            PhysicalPlan::Kv(kv_op) => self.execute_tx_kv(&dummy_task, tid, kv_op, undo_log),
+            PhysicalPlan::Vector(op) => self.exec_tx_vector(dummy_task, tid, plan, op, undo_log),
+            PhysicalPlan::Graph(op) => self.exec_tx_graph(dummy_task, tid, plan, op, undo_log),
+            PhysicalPlan::Crdt(op) => self.exec_tx_crdt(dummy_task, tid, plan, op, crdt_deltas),
+            PhysicalPlan::Kv(kv_op) => self.execute_tx_kv(dummy_task, tid, kv_op, undo_log),
             PhysicalPlan::Columnar(op) => {
-                self.exec_tx_columnar(&dummy_task, tid, plan, op, undo_log)
+                self.exec_tx_columnar(dummy_task, tid, plan, op, undo_log)
             }
             PhysicalPlan::Timeseries(op) => {
-                self.exec_tx_timeseries(&dummy_task, tid, plan, op, undo_log)
+                self.exec_tx_timeseries(dummy_task, tid, plan, op, undo_log)
             }
             PhysicalPlan::Spatial(_)
             | PhysicalPlan::Text(_)
@@ -66,12 +96,21 @@ impl CoreLoop {
     /// no-determinism: the deadline is ephemeral, not written to WAL. The
     /// placeholder `plan` (a no-op `Meta::Cancel`) is never executed; it
     /// only carries request metadata for response building.
+    #[cfg(test)]
     pub(super) fn build_dummy_task(tid: u64) -> ExecutionTask {
+        Self::build_dummy_task_at(tid, DatabaseId::DEFAULT, crate::types::VShardId::new(0))
+    }
+
+    fn build_dummy_task_at(
+        tid: u64,
+        database_id: DatabaseId,
+        vshard_id: crate::types::VShardId,
+    ) -> ExecutionTask {
         ExecutionTask::new(crate::bridge::envelope::Request {
             request_id: crate::types::RequestId::new(0),
             tenant_id: TenantId::new(tid),
-            database_id: DatabaseId::DEFAULT,
-            vshard_id: crate::types::VShardId::new(0),
+            database_id,
+            vshard_id,
             plan: PhysicalPlan::Meta(MetaOp::Cancel {
                 target_request_id: crate::types::RequestId::new(0),
             }),
@@ -259,6 +298,45 @@ impl CoreLoop {
                 },
                 undo_log,
             ),
+
+            GraphOp::EdgePutBatch { edges } => {
+                let mut response = self.response_ok(dummy_task);
+                for edge in edges {
+                    response = self.exec_tx_edge_put(
+                        dummy_task,
+                        tid,
+                        TxEdgePutParams {
+                            collection: &edge.collection,
+                            src_id: &edge.src_id,
+                            label: &edge.label,
+                            dst_id: &edge.dst_id,
+                            properties: &[],
+                            src_surrogate: edge.src_surrogate,
+                            dst_surrogate: edge.dst_surrogate,
+                        },
+                        undo_log,
+                    )?;
+                }
+                Ok(response)
+            }
+
+            GraphOp::EdgeDeleteBatch { edges } => {
+                let mut response = self.response_ok(dummy_task);
+                for edge in edges {
+                    response = self.exec_tx_edge_delete(
+                        dummy_task,
+                        tid,
+                        TxEdgeDeleteParams {
+                            collection: &edge.collection,
+                            src_id: &edge.src_id,
+                            label: &edge.label,
+                            dst_id: &edge.dst_id,
+                        },
+                        undo_log,
+                    )?;
+                }
+                Ok(response)
+            }
 
             _ => self.exec_tx_passthrough(tid, plan),
         }

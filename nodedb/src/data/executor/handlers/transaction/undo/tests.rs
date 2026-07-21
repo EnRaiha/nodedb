@@ -790,6 +790,104 @@ fn edge_cascade_delete_rollback_restores_csr_and_edge_store() {
     );
 }
 
+#[test]
+fn graph_edge_update_undo_restores_csr_weight() {
+    use crate::engine::graph::edge_store::EdgeRef;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+    let tenant = TenantId::new(TID);
+    let old_properties = nodedb_types::json_to_msgpack(&serde_json::json!({ "weight": 2.5 }))
+        .expect("encode old edge properties");
+    let new_properties = nodedb_types::json_to_msgpack(&serde_json::json!({ "weight": 9.0 }))
+        .expect("encode new edge properties");
+    let edge = EdgeRef::new(
+        crate::types::DatabaseId::new(DB),
+        tenant,
+        "c",
+        "alice",
+        "KNOWS",
+        "bob",
+    );
+    core.edge_store
+        .put_edge_versioned(edge, &new_properties, 10, 10, i64::MAX)
+        .expect("seed updated edge");
+    core.csr_partition_mut(DB, TID)
+        .add_edge_weighted_in_collection("alice", "KNOWS", "bob", "c", 9.0)
+        .expect("seed updated CSR edge");
+
+    core.apply_undo_edge(
+        DB,
+        TID,
+        0,
+        UndoEntry::PutEdge {
+            collection: "c".into(),
+            src_id: "alice".into(),
+            label: "KNOWS".into(),
+            dst_id: "bob".into(),
+            old_properties: Some(old_properties),
+        },
+    )
+    .expect("undo edge update");
+
+    assert_eq!(
+        core.csr_partition_mut(DB, TID)
+            .edge_weight("alice", "KNOWS", "bob"),
+        Some(2.5),
+        "rollback must restore the committed CSR traversal weight"
+    );
+}
+
+#[test]
+fn tx_edge_put_to_deleted_node_records_no_phantom_undo() {
+    use crate::bridge::envelope::Status;
+    use crate::data::executor::core_loop::tests::make_default_task;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+    let tenant = TenantId::new(TID);
+
+    // The destination node is soft-deleted, so the edge insert is rejected by
+    // `execute_edge_put`'s dangling-endpoint validation BEFORE any store write.
+    core.mark_node_deleted(DB, TID, "bob");
+
+    let task = make_default_task();
+    let mut undo_log: Vec<UndoEntry> = Vec::new();
+    let resp = core.execute_edge_put_with_undo(
+        &task,
+        crate::data::executor::handlers::graph::EdgePutParams {
+            tid: TID,
+            collection: "c",
+            src_id: "alice",
+            label: "KNOWS",
+            dst_id: "bob",
+            properties: b"p1",
+            src_surrogate: nodedb_types::Surrogate::ZERO,
+            dst_surrogate: nodedb_types::Surrogate::ZERO,
+        },
+        Some(&mut undo_log),
+    );
+
+    assert_eq!(
+        resp.status,
+        Status::Error,
+        "an edge insert to a deleted node must be rejected"
+    );
+    assert!(
+        undo_log.is_empty(),
+        "a rejected insert must record NO compensation entry; a phantom PutEdge \
+         undo would soft-delete a never-written edge on rollback, corrupting \
+         bitemporal history"
+    );
+    assert!(
+        core.edge_store
+            .get_edge(DB, tenant, "c", "alice", "KNOWS", "bob")
+            .unwrap()
+            .is_none(),
+        "the rejected insert must not have written any edge version"
+    );
+}
+
 // ── Column-stats undo ─────────────────────────────────────────────────────────
 
 fn stats_key_str() -> String {

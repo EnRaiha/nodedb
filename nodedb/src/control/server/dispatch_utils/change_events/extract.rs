@@ -7,7 +7,7 @@ use crate::bridge::envelope::PhysicalPlan;
 use crate::control::change_stream::ChangeOperation;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::{
-    ArrayOp, ClusterArrayOp, ColumnarOp, CrdtOp, DocumentOp, KvOp, TimeseriesOp, VectorOp,
+    ArrayOp, ClusterArrayOp, ColumnarOp, CrdtOp, DocumentOp, KvOp, MetaOp, TimeseriesOp, VectorOp,
 };
 
 /// Extract write metadata from a physical plan for change event publishing.
@@ -396,8 +396,13 @@ pub(super) fn extract_write_metadata(
         // read-only.
         PhysicalPlan::Query(_) => Vec::new(),
 
-        // Meta: WAL/cancel/snapshot/compact/checkpoint are maintenance ops,
-        // not user-data writes.
+        // A committed transaction batch publishes the same logical row events
+        // its constituent writes would have emitted under autocommit. Overlay
+        // and maintenance Meta operations remain event-free.
+        PhysicalPlan::Meta(MetaOp::TransactionBatch { plans, .. }) => plans
+            .iter()
+            .flat_map(|plan| extract_write_metadata(plan, _tenant_id))
+            .collect(),
         PhysicalPlan::Meta(_) => Vec::new(),
 
         // Cluster-mode array ops: like their single-node `ArrayOp` counterparts
@@ -444,6 +449,37 @@ mod tests {
     // writes stay silent (see `graph_edge_put_emits_no_change_event`) to
     // avoid double-publishing implicit-edge writes alongside their
     // underlying `DocumentOp` event.
+
+    #[test]
+    fn transaction_batch_emits_each_subplan_change_event() {
+        let plan = PhysicalPlan::Meta(MetaOp::TransactionBatch {
+            plans: vec![
+                PhysicalPlan::Document(DocumentOp::PointPut {
+                    collection: "users".into(),
+                    document_id: "u1".into(),
+                    value: Vec::new(),
+                    surrogate: Surrogate::new(1),
+                    pk_bytes: Vec::new(),
+                }),
+                PhysicalPlan::Document(DocumentOp::PointDelete {
+                    collection: "users".into(),
+                    document_id: "u2".into(),
+                    surrogate: Surrogate::new(2),
+                    pk_bytes: Vec::new(),
+                    returning: None,
+                }),
+            ],
+            txn_id: None,
+        });
+        let meta = extract_write_metadata(&plan, TenantId::new(1));
+        assert_eq!(
+            meta,
+            vec![
+                ("users".into(), "u1".into(), ChangeOperation::Insert),
+                ("users".into(), "u2".into(), ChangeOperation::Delete),
+            ]
+        );
+    }
 
     #[test]
     fn columnar_insert_emits_change_event() {

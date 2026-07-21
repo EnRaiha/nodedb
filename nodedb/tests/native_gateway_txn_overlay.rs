@@ -213,3 +213,130 @@ async fn native_in_txn_sql_select_reads_own_write() {
         "ROLLBACK must hide the staged write, got: {after_rows:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_commit_makes_strict_row_visible_to_every_read_path() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION native_committed_visibility \
+             (id TEXT PRIMARY KEY, name TEXT) WITH (engine='document_strict')",
+        )
+        .await
+        .expect("create strict collection");
+
+    let mut stream = native_session(&server).await;
+    let begin = send_begin_opcode(&mut stream, 1).await;
+    assert_eq!(begin.status, ResponseStatus::Ok, "BEGIN: {begin:?}");
+
+    let insert = send_sql(
+        &mut stream,
+        2,
+        "INSERT INTO native_committed_visibility (id, name) VALUES ('a1', 'alpha')",
+    )
+    .await;
+    assert_eq!(insert.status, ResponseStatus::Ok, "INSERT: {insert:?}");
+
+    let commit = send_request(&mut stream, 3, OpCode::Commit, TextFields::default()).await;
+    assert_eq!(commit.status, ResponseStatus::Ok, "COMMIT: {commit:?}");
+    assert!(
+        server
+            .shared
+            .surrogate_assigner
+            .lookup(
+                nodedb_types::DatabaseId::DEFAULT,
+                nodedb_types::TenantId::new(1),
+                "native_committed_visibility",
+                b"a1",
+            )
+            .expect("lookup committed PK binding")
+            .is_some(),
+        "planning the transactional insert must publish the stable PK binding"
+    );
+
+    let point_read = send_sql(
+        &mut stream,
+        4,
+        "SELECT id FROM native_committed_visibility WHERE id = 'a1'",
+    )
+    .await;
+    assert_eq!(
+        point_read
+            .rows
+            .as_ref()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.first()),
+        Some(&Value::String("a1".into())),
+        "PK lookup must agree with the full scan after COMMIT: {point_read:?}"
+    );
+
+    let mut scan_session = native_session(&server).await;
+    let full_scan = send_sql(
+        &mut scan_session,
+        1,
+        "SELECT id FROM native_committed_visibility",
+    )
+    .await;
+    assert_eq!(
+        full_scan
+            .rows
+            .as_ref()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.first()),
+        Some(&Value::String("a1".into())),
+        "full scan control must see the durable row: {full_scan:?}"
+    );
+    let post_scan_point = send_sql(
+        &mut scan_session,
+        2,
+        "SELECT id FROM native_committed_visibility WHERE id = 'a1'",
+    )
+    .await;
+    assert_eq!(
+        post_scan_point.seq, 2,
+        "the harness must drain any extra scan frames before the next response"
+    );
+    assert_eq!(
+        post_scan_point
+            .rows
+            .as_ref()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.first()),
+        Some(&Value::String("a1".into())),
+        "same-session point lookup after a fan-out scan must not consume a stale frame"
+    );
+
+    let mut aggregate_session = native_session(&server).await;
+    let filtered_count = send_sql(
+        &mut aggregate_session,
+        1,
+        "SELECT count(*) FROM native_committed_visibility WHERE name = 'alpha'",
+    )
+    .await;
+    assert_eq!(
+        filtered_count
+            .rows
+            .as_ref()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.first()),
+        Some(&Value::Integer(1)),
+        "filtered aggregate must see the committed row: {filtered_count:?}"
+    );
+
+    let mut fresh = native_session(&server).await;
+    let fresh_point = send_sql(
+        &mut fresh,
+        1,
+        "SELECT id FROM native_committed_visibility WHERE id = 'a1'",
+    )
+    .await;
+    assert_eq!(
+        fresh_point
+            .rows
+            .as_ref()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.first()),
+        Some(&Value::String("a1".into())),
+        "committed PK visibility must survive connection boundaries: {fresh_point:?}"
+    );
+}

@@ -101,7 +101,7 @@ pub fn extract_func_args(func: &ast::Function) -> Result<Vec<ast::Expr>> {
 /// `const_fold::fold_constant` helper so that zero-arg scalar functions
 /// like `now()` and `current_timestamp` go through the same evaluator
 /// as the runtime expression path.
-pub(super) fn eval_constant_expr(expr: &SqlExpr, functions: &FunctionRegistry) -> SqlValue {
+pub(crate) fn eval_constant_expr(expr: &SqlExpr, functions: &FunctionRegistry) -> SqlValue {
     crate::planner::const_fold::fold_constant(expr, functions).unwrap_or(SqlValue::Null)
 }
 

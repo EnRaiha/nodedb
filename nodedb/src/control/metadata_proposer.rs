@@ -22,8 +22,9 @@
 //!    `Error::Config { detail: "metadata propose: not leader ..." }`.
 //!    Gateway-side redirection will make this transparent.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, WaitOutcome, encode_entry};
 
@@ -49,6 +50,8 @@ pub const DEFAULT_PROPOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `propose_catalog_entry_with_drain_timeout` can pass a longer
 /// value if an operator is willing to wait.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(35);
+const DDL_PREPARE_LEASE: Duration = Duration::from_secs(60);
+const DDL_PREPARE_WAIT: Duration = Duration::from_secs(70);
 
 /// Type-erased handle for proposing to the metadata raft group.
 ///
@@ -120,6 +123,130 @@ impl MetadataRaftHandle for RaftLoopProposerHandle {
     }
 }
 
+fn wall_now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
+
+fn propose_metadata_and_wait(
+    shared: &SharedState,
+    handle: &dyn MetadataRaftHandle,
+    entry: &MetadataEntry,
+    timeout: Duration,
+) -> Result<u64, Error> {
+    let raw = encode_entry(entry).map_err(|e| Error::Config {
+        detail: format!("metadata entry encode: {e}"),
+    })?;
+    let index = handle.propose(raw)?;
+    let watcher = shared.applied_index_watcher(METADATA_GROUP_ID);
+    let outcome = tokio::task::block_in_place(|| watcher.wait_for(index, timeout));
+    match outcome {
+        WaitOutcome::Reached => Ok(index),
+        WaitOutcome::TimedOut => Err(Error::Config {
+            detail: format!(
+                "metadata propose timed out after {timeout:?} waiting for log index {index} (current: {})",
+                watcher.current()
+            ),
+        }),
+        WaitOutcome::GroupGone => Err(Error::Config {
+            detail: "metadata group no longer hosted on this node".into(),
+        }),
+    }
+}
+
+/// RAII ownership of the metadata-Raft-serialized descriptor preparation lease.
+/// The matching release is itself replicated, so another node cannot stamp from
+/// the same prior catalog version until this guard is dropped and that release
+/// has applied.
+pub(crate) struct DdlPrepareGuard<'a> {
+    shared: &'a SharedState,
+    handle: &'a dyn MetadataRaftHandle,
+    token: u64,
+}
+
+impl DdlPrepareGuard<'_> {
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
+}
+
+impl Drop for DdlPrepareGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = propose_metadata_and_wait(
+            self.shared,
+            self.handle,
+            &MetadataEntry::DdlPrepareRelease { token: self.token },
+            DEFAULT_PROPOSE_TIMEOUT,
+        ) {
+            tracing::error!(token = self.token, %error, "metadata DDL lease release failed");
+        }
+    }
+}
+
+pub(crate) fn acquire_ddl_prepare_lease<'a>(
+    shared: &'a SharedState,
+    handle: &'a dyn MetadataRaftHandle,
+) -> Result<DdlPrepareGuard<'a>, Error> {
+    let sequence = shared
+        .metadata_ddl_token_seq
+        .fetch_add(1, Ordering::Relaxed);
+    let token = shared.node_id.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ wall_now_ns().rotate_left(17)
+        ^ sequence;
+    let deadline = Instant::now() + DDL_PREPARE_WAIT;
+
+    loop {
+        propose_metadata_and_wait(
+            shared,
+            handle,
+            &MetadataEntry::DdlPrepareAcquire { token },
+            DEFAULT_PROPOSE_TIMEOUT,
+        )?;
+
+        loop {
+            let owner = *shared
+                .metadata_ddl_owner
+                .lock()
+                .map_err(|_| Error::Config {
+                    detail: "metadata DDL owner lock poisoned".into(),
+                })?;
+            match owner {
+                Some((current, _)) if current == token => {
+                    return Ok(DdlPrepareGuard {
+                        shared,
+                        handle,
+                        token,
+                    });
+                }
+                Some((current, acquired_at))
+                    if shared.is_metadata_leader()
+                        && acquired_at.elapsed() >= DDL_PREPARE_LEASE =>
+                {
+                    propose_metadata_and_wait(
+                        shared,
+                        handle,
+                        &MetadataEntry::DdlPrepareRelease { token: current },
+                        DEFAULT_PROPOSE_TIMEOUT,
+                    )?;
+                    break;
+                }
+                None => break,
+                Some(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Some(_) => {
+                    return Err(Error::Config {
+                        detail: "metadata DDL preparation lease timed out".into(),
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// Propose a `CatalogEntry` and block until the local applied-index
 /// watcher confirms the entry has been applied on this node.
 ///
@@ -157,6 +284,20 @@ pub fn propose_catalog_entry_with_timeout(
             return Ok(0);
         }
     }
+
+    // Transactional DDL must remain unstamped until COMMIT: the batch
+    // preparation path stamps entries sequentially so repeated mutations of
+    // one descriptor receive distinct versions.
+    if crate::control::server::shared::session::ddl_buffer::try_buffer(entry.clone()) {
+        return Ok(0);
+    }
+
+    // Serialize preparation through local apply confirmation. Without this,
+    // concurrent proposers can both observe persisted version N and emit N+1.
+    let _local_ddl_guard = shared.metadata_ddl_lock.lock().map_err(|_| Error::Config {
+        detail: "metadata DDL preparation lock poisoned".into(),
+    })?;
+    let distributed_ddl_guard = acquire_ddl_prepare_lease(shared, handle.as_ref())?;
 
     // Drain for Put* variants that carry descriptor_version.
     // Leases acquired at plan time are refcounted and held
@@ -210,19 +351,11 @@ pub fn propose_catalog_entry_with_timeout(
 
     let payload = catalog_entry::encode(entry)?;
 
-    // DDL transaction buffer: if a transactional DDL session is
-    // active on this thread (BEGIN ... COMMIT), buffer the payload
-    // instead of proposing immediately. The buffered entries will
-    // be proposed as a single MetadataEntry::Batch at COMMIT time.
-    if crate::control::server::shared::session::ddl_buffer::try_buffer(payload.clone()) {
-        return Ok(0);
-    }
-
     // Attach J.4 audit context when the pgwire statement boundary
     // installed one. Internal callers (descriptor lease grant/release,
     // drain proposer) run outside that scope and emit the plain
     // `CatalogDdl` variant — they have no SQL text to log.
-    let metadata_entry = match crate::control::server::shared::session::audit_context::current() {
+    let catalog_entry = match crate::control::server::shared::session::audit_context::current() {
         Some(ctx) => MetadataEntry::CatalogDdlAudited {
             payload,
             auth_user_id: ctx.auth_user_id,
@@ -230,6 +363,10 @@ pub fn propose_catalog_entry_with_timeout(
             sql_text: ctx.sql_text,
         },
         None => MetadataEntry::CatalogDdl { payload },
+    };
+    let metadata_entry = MetadataEntry::DdlPrepared {
+        token: distributed_ddl_guard.token(),
+        entry: Box::new(catalog_entry),
     };
     let raw = encode_entry(&metadata_entry).map_err(|e| Error::Config {
         detail: format!("metadata entry encode: {e}"),
@@ -246,7 +383,15 @@ pub fn propose_catalog_entry_with_timeout(
     // in `block_in_place` so tokio reassigns a fresh worker.
     let outcome = tokio::task::block_in_place(|| watcher.wait_for(log_index, timeout));
     match outcome {
-        WaitOutcome::Reached => Ok(log_index),
+        WaitOutcome::Reached
+            if shared.metadata_ddl_applied_token.load(Ordering::Acquire)
+                == distributed_ddl_guard.token() =>
+        {
+            Ok(log_index)
+        }
+        WaitOutcome::Reached => Err(Error::Config {
+            detail: "metadata DDL preparation ownership was superseded before apply".into(),
+        }),
         WaitOutcome::TimedOut => Err(Error::Config {
             detail: format!(
                 "metadata propose timed out after {:?} waiting for log index {} (current: {})",

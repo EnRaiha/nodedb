@@ -50,6 +50,7 @@ impl Scheduler {
             return;
         };
         let tenant_id = pending.txn.tx_class.tenant_id;
+        let database_id = pending.txn.tx_class.database_id;
         let plans = match super::super::helpers::decode_plans(&pending.txn.tx_class.plans) {
             Ok(p) => p,
             Err(e) => {
@@ -69,7 +70,7 @@ impl Scheduler {
         // without a per-key or collection version, so no gate on plan kind is
         // applied here — gating on a narrower write predicate would silently
         // skip recordable writes (e.g. a CRDT apply) and reopen the version gap.
-        let local = match self.local_calvin_plans(plans, epoch, position) {
+        let local = match self.local_calvin_plans(plans, database_id, epoch, position) {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(
@@ -92,7 +93,8 @@ impl Scheduler {
         });
         // The committed write-LSN for this Calvin apply — recorded against
         // every key the plans wrote, in the same WAL-LSN space as fast-path.
-        let request = self.build_exempt_request(request_id, tenant_id, plan, Some(applied_lsn));
+        let request =
+            self.build_exempt_request(request_id, tenant_id, database_id, plan, Some(applied_lsn));
 
         // Register so the response routes to a real receiver (not the
         // unknown-request warning path), then discard it — the recording is

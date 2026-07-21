@@ -15,9 +15,14 @@
 
 use std::cell::RefCell;
 
-use super::audit_context::AuditCtx;
+use crate::control::catalog_entry::CatalogEntry;
+use crate::control::state::SharedState;
+use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, encode_entry};
 
-/// One buffered DDL statement: the encoded `CatalogEntry` payload
+use super::audit_context::AuditCtx;
+use super::outcome::AbortReason;
+
+/// One buffered DDL statement: the unstamped `CatalogEntry`
 /// plus the optional audit context captured from
 /// [`super::audit_context::current()`] at buffer time. The audit
 /// context is stamped at *statement* time, not at COMMIT time, so
@@ -25,11 +30,11 @@ use super::audit_context::AuditCtx;
 /// produced it (not just the COMMIT).
 #[derive(Debug, Clone)]
 pub struct BufferedDdl {
-    pub payload: Vec<u8>,
+    pub entry: CatalogEntry,
     pub audit: Option<AuditCtx>,
 }
 
-/// Encoded DDL payloads buffered during a transaction.
+/// Unstamped DDL entries buffered during a transaction.
 pub type DdlBuffer = Vec<BufferedDdl>;
 
 thread_local! {
@@ -55,15 +60,15 @@ pub fn activate() {
     });
 }
 
-/// Try to buffer a DDL payload. Returns `true` if the buffer is
-/// active and the payload was pushed. Returns `false` if no buffer
-/// is active (caller should propose normally).
-pub fn try_buffer(payload: Vec<u8>) -> bool {
+/// Try to buffer an unstamped DDL entry. Returns `true` if the buffer is
+/// active and the entry was pushed. Returns `false` if no buffer is active
+/// (caller should prepare and propose normally).
+pub fn try_buffer(entry: CatalogEntry) -> bool {
     ACTIVE_BUFFER.with(|b| {
         let mut guard = b.borrow_mut();
         if let Some(buf) = guard.as_mut() {
             buf.push(BufferedDdl {
-                payload,
+                entry,
                 audit: super::audit_context::current(),
             });
             true
@@ -86,6 +91,123 @@ pub fn discard() {
     });
 }
 
+/// Flush buffered entries as one fenced metadata-Raft batch.
+pub(super) fn flush(state: &SharedState) -> Option<AbortReason> {
+    let buffered = take()?;
+    if buffered.is_empty() {
+        return None;
+    }
+    let handle = state.metadata_raft.get()?;
+    let _local_guard = match state.metadata_ddl_lock.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Some(AbortReason::DdlPropose(crate::Error::Internal {
+                detail: "metadata DDL preparation lock poisoned".into(),
+            }));
+        }
+    };
+    let distributed_guard = match crate::control::metadata_proposer::acquire_ddl_prepare_lease(
+        state,
+        handle.as_ref(),
+    ) {
+        Ok(guard) => guard,
+        Err(error) => return Some(AbortReason::DdlPropose(error)),
+    };
+
+    for item in &buffered {
+        if let Some((descriptor_id, prior_version)) =
+            crate::control::lease::descriptor_id_and_prior_version(&item.entry, state)
+            && prior_version > 0
+            && let Err(error) = crate::control::lease::drain_for_ddl(
+                state,
+                descriptor_id,
+                prior_version,
+                crate::control::metadata_proposer::DEFAULT_DRAIN_TIMEOUT,
+            )
+        {
+            return Some(AbortReason::DdlPropose(error));
+        }
+    }
+    let audits: Vec<_> = buffered.iter().map(|item| item.audit.clone()).collect();
+    let entries: Vec<_> = buffered.into_iter().map(|item| item.entry).collect();
+    let stamped = if state
+        .cluster_version_view()
+        .can_activate_feature(crate::control::rolling_upgrade::DESCRIPTOR_VERSIONING_VERSION)
+    {
+        crate::control::catalog_entry::descriptor_stamp::stamp_batch(
+            entries,
+            &state.hlc_clock,
+            state.credentials.catalog(),
+        )
+    } else {
+        entries
+    };
+
+    let mut sub_entries = Vec::with_capacity(stamped.len());
+    for (entry, audit) in stamped.into_iter().zip(audits) {
+        let payload = match crate::control::catalog_entry::encode(&entry) {
+            Ok(payload) => payload,
+            Err(error) => return Some(AbortReason::DdlPropose(error)),
+        };
+        sub_entries.push(match audit {
+            Some(ctx) => MetadataEntry::CatalogDdlAudited {
+                payload,
+                auth_user_id: ctx.auth_user_id,
+                auth_user_name: ctx.auth_user_name,
+                sql_text: ctx.sql_text,
+            },
+            None => MetadataEntry::CatalogDdl { payload },
+        });
+    }
+    let prepared = MetadataEntry::DdlPrepared {
+        token: distributed_guard.token(),
+        entry: Box::new(MetadataEntry::Batch {
+            entries: sub_entries,
+        }),
+    };
+    let raw = match encode_entry(&prepared) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return Some(AbortReason::DdlPropose(crate::Error::Internal {
+                detail: format!("DDL batch encode: {error}"),
+            }));
+        }
+    };
+    let log_index = match handle.propose(raw) {
+        Ok(index) => index,
+        Err(error) => {
+            return Some(AbortReason::DdlPropose(crate::Error::Internal {
+                detail: format!("DDL batch propose: {error}"),
+            }));
+        }
+    };
+    let watcher = state.applied_index_watcher(METADATA_GROUP_ID);
+    let outcome = tokio::task::block_in_place(|| {
+        watcher.wait_for(
+            log_index,
+            crate::control::metadata_proposer::DEFAULT_PROPOSE_TIMEOUT,
+        )
+    });
+    if !outcome.is_reached() {
+        return Some(AbortReason::DdlPropose(crate::Error::Internal {
+            detail: format!(
+                "DDL batch propose timed out waiting for log index {log_index} (current: {})",
+                watcher.current()
+            ),
+        }));
+    }
+    if state
+        .metadata_ddl_applied_token
+        .load(std::sync::atomic::Ordering::Acquire)
+        != distributed_guard.token()
+    {
+        return Some(AbortReason::DdlPropose(crate::Error::Internal {
+            detail: "DDL preparation ownership was superseded before apply".into(),
+        }));
+    }
+    None
+}
+
 /// Returns `true` if a DDL buffer is currently active on this thread.
 pub fn is_active() -> bool {
     ACTIVE_BUFFER.with(|b| b.borrow().is_some())
@@ -101,10 +223,17 @@ pub fn buffer_len() -> usize {
 mod tests {
     use super::*;
 
+    fn sample_entry(name: &str) -> CatalogEntry {
+        CatalogEntry::DeleteSequence {
+            tenant_id: 1,
+            name: name.to_string(),
+        }
+    }
+
     #[test]
     fn inactive_buffer_does_not_capture() {
         discard(); // ensure clean state
-        assert!(!try_buffer(vec![1, 2, 3]));
+        assert!(!try_buffer(sample_entry("one")));
         assert!(!is_active());
     }
 
@@ -112,19 +241,25 @@ mod tests {
     fn active_buffer_captures() {
         activate();
         assert!(is_active());
-        assert!(try_buffer(vec![1]));
-        assert!(try_buffer(vec![2]));
+        assert!(try_buffer(sample_entry("one")));
+        assert!(try_buffer(sample_entry("two")));
         let buf = take().unwrap();
         assert_eq!(buf.len(), 2);
-        assert_eq!(buf[0].payload, vec![1]);
-        assert_eq!(buf[1].payload, vec![2]);
+        assert!(matches!(
+            &buf[0].entry,
+            CatalogEntry::DeleteSequence { name, .. } if name == "one"
+        ));
+        assert!(matches!(
+            &buf[1].entry,
+            CatalogEntry::DeleteSequence { name, .. } if name == "two"
+        ));
         assert!(!is_active());
     }
 
     #[test]
     fn discard_clears_buffer() {
         activate();
-        try_buffer(vec![1]);
+        try_buffer(sample_entry("one"));
         discard();
         assert!(!is_active());
         assert!(take().is_none());

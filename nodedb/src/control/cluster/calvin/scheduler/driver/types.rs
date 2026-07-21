@@ -42,6 +42,9 @@ pub(super) struct PendingTxn {
     /// multiple plain-write participants (a multi-collection cross-shard COMMIT)
     /// coalesce without conflict.
     pub has_returning: bool,
+    /// Participant-local Control-Plane change manifests. Consumed once after
+    /// durable COMMIT apply; graph dual-home replicas are excluded at capture.
+    pub change_sets: Vec<crate::control::server::dispatch_utils::WriteChangeSet>,
     /// Commit-resolution state for a static-set Calvin txn.
     ///
     /// `Some(CommitState::Staged)` for a static txn dispatched via the

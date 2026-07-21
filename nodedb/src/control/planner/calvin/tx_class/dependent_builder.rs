@@ -19,7 +19,7 @@ use crate::types::VShardId;
 use nodedb_cluster::calvin::types::{EngineKeySet, ReadWriteSet, SortedVec, TxClass};
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 
 use super::shared::{
     collection_name_from_plan, read_set_from, surrogate_from_plan, versioned_reads_from,
@@ -105,6 +105,17 @@ fn build_dependent_tx_class_impl(
     allow_single_vshard: bool,
 ) -> crate::Result<TxClass> {
     use std::collections::BTreeMap;
+
+    let database_id = tasks
+        .first()
+        .map_or(DatabaseId::DEFAULT, |task| task.database_id);
+    if tasks.iter().any(|task| task.database_id != database_id)
+        || reads.iter().any(|read| read.database_id != database_id)
+    {
+        return Err(Error::BadRequest {
+            detail: "Calvin transaction spans multiple databases".to_owned(),
+        });
+    }
 
     // Accumulate per-collection surrogate sets. The OLLP collection uses the
     // predicted surrogates; all other tasks use static key extraction.
@@ -208,20 +219,22 @@ fn build_dependent_tx_class_impl(
     let versioned_reads = versioned_reads_from(reads);
 
     let result = if allow_single_vshard {
-        TxClass::new_single_vshard(
+        TxClass::new_single_vshard_in_database(
             read_set,
             write_set,
             plans_bytes,
             tenant_id,
+            database_id,
             None,
             versioned_reads,
         )
     } else {
-        TxClass::new(
+        TxClass::new_in_database(
             read_set,
             write_set,
             plans_bytes,
             tenant_id,
+            database_id,
             None,
             versioned_reads,
         )

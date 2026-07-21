@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! SharedState struct definition — all fields for the Control Plane.
-
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -21,32 +19,20 @@ use crate::control::server::sync::dlq::SyncDlq;
 use crate::control::state::calvin_counters::CalvinCounters;
 use crate::wal::WalManager;
 
-/// Shared state accessible by all Control Plane sessions.
-///
-/// Connects TCP sessions to the Data Plane via Dispatcher/SPSC bridge and to the WAL.
-/// All fields are `Send + Sync` — safe for sharing across Tokio tasks.
 pub struct SharedState {
-    /// Routes requests to Data Plane cores via SPSC.
     pub dispatcher: Mutex<Dispatcher>,
-    /// Tracks in-flight requests and routes responses back to sessions.
     pub tracker: RequestTracker,
-    /// Write-ahead log for durability.
     pub wal: Arc<WalManager>,
     /// Collection-scoped scan quiesce registry for safe `PurgeCollection` reclaim.
     pub quiesce: Arc<crate::bridge::quiesce::CollectionQuiesce>,
-    /// Credential store for user authentication.
     pub credentials: Arc<CredentialStore>,
     /// Audit log — Control Plane only; emitters must be `Send + Sync`.
     pub audit: Arc<Mutex<AuditLog>>,
-    /// API key store.
     pub api_keys: ApiKeyStore,
-    /// Custom role store (inheritance, CRUD).
     pub roles: RoleStore,
-    /// Collection-level permission grants + ownership.
     pub permissions: PermissionStore,
     /// Per-tenant quota enforcement.
     pub tenants: Mutex<TenantIsolation>,
-    /// Row-Level Security policy store for sync delta enforcement.
     pub rls: RlsPolicyStore,
     /// User + IP blacklist store (O(1) lookup, TTL for temp bans).
     pub blacklist: crate::control::security::blacklist::store::BlacklistStore,
@@ -118,6 +104,15 @@ pub struct SharedState {
     >,
     /// Per-Raft-group apply watermark registry for commit-wait and drain paths.
     pub group_watchers: Arc<nodedb_cluster::GroupAppliedWatchers>,
+    /// Serializes this node's attempts to acquire the replicated descriptor
+    /// preparation lease.
+    pub metadata_ddl_lock: Mutex<()>,
+    /// Replicated preparation owner plus local monotonic apply time.
+    pub metadata_ddl_owner: Mutex<Option<(u64, std::time::Instant)>>,
+    /// Most recent fenced DDL token applied while its owner remained current.
+    pub metadata_ddl_applied_token: AtomicU64,
+    /// Per-node uniqueness component for descriptor-preparation lease tokens.
+    pub metadata_ddl_token_seq: AtomicU64,
     /// Handle for proposing to the metadata raft group. Set by `start_raft`; None in single-node mode.
     pub metadata_raft: OnceLock<Arc<dyn crate::control::metadata_proposer::MetadataRaftHandle>>,
     /// Propose tracker for distributed writes. Set by `start_raft`; absent in single-node mode.

@@ -86,6 +86,10 @@ impl QueryContext {
                 collection: name,
                 retention_expires_at_ns,
             },
+            nodedb_sql::SqlError::UnknownTable { name } => crate::Error::CollectionNotFound {
+                tenant_id,
+                collection: name,
+            },
             other => crate::Error::PlanError {
                 detail: format!("{other}"),
             },
@@ -103,7 +107,16 @@ impl QueryContext {
                     tenant_id.as_u64(),
                 )
             })
-            .collect();
+            .collect::<nodedb_sql::Result<_>>()
+            .map_err(|error| match error {
+                nodedb_sql::SqlError::UnknownTable { name } => crate::Error::CollectionNotFound {
+                    tenant_id,
+                    collection: name,
+                },
+                other => crate::Error::PlanError {
+                    detail: other.to_string(),
+                },
+            })?;
         let version_set = catalog.take_recorded_versions();
         let ctx = crate::control::planner::sql_plan_convert::ConvertContext {
             retention_registry: self.retention_registry.clone(),
@@ -262,11 +275,17 @@ impl QueryContext {
         // adapter fresh keeps the adapter's state per-plan and
         // allows future extension.
         let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
-        let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog).map_err(|e| {
-            crate::Error::PlanError {
-                detail: format!("{e}"),
-            }
-        })?;
+        let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog).map_err(
+            |error| match error {
+                nodedb_sql::SqlError::UnknownTable { name } => crate::Error::CollectionNotFound {
+                    tenant_id,
+                    collection: name,
+                },
+                other => crate::Error::PlanError {
+                    detail: other.to_string(),
+                },
+            },
+        )?;
         let plans: Vec<_> = raw_plans
             .into_iter()
             .map(|p| {
@@ -277,7 +296,16 @@ impl QueryContext {
                     tenant_id.as_u64(),
                 )
             })
-            .collect();
+            .collect::<nodedb_sql::Result<_>>()
+            .map_err(|error| match error {
+                nodedb_sql::SqlError::UnknownTable { name } => crate::Error::CollectionNotFound {
+                    tenant_id,
+                    collection: name,
+                },
+                other => crate::Error::PlanError {
+                    detail: other.to_string(),
+                },
+            })?;
         let ctx = crate::control::planner::sql_plan_convert::ConvertContext {
             retention_registry: self.retention_registry.clone(),
             array_catalog: self.array_catalog.clone(),

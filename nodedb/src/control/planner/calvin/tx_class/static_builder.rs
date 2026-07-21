@@ -10,7 +10,7 @@ use crate::types::VShardId;
 use nodedb_cluster::calvin::types::{EngineKeySet, ReadWriteSet, SortedVec, TxClass};
 use nodedb_physical::physical_plan::{GraphOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 
 use super::shared::{
     collection_name_from_plan, kv_write_keys, read_set_from, surrogate_from_plan,
@@ -71,6 +71,17 @@ fn build_static_tx_class_impl(
     allow_single_vshard: bool,
 ) -> crate::Result<TxClass> {
     use std::collections::HashMap;
+
+    let database_id = tasks
+        .first()
+        .map_or(DatabaseId::DEFAULT, |task| task.database_id);
+    if tasks.iter().any(|task| task.database_id != database_id)
+        || reads.iter().any(|read| read.database_id != database_id)
+    {
+        return Err(Error::BadRequest {
+            detail: "Calvin transaction spans multiple databases".to_owned(),
+        });
+    }
 
     // Collect surrogates per collection for non-edge write tasks.
     let mut doc_surrogates: HashMap<String, Vec<u32>> = HashMap::new();
@@ -228,20 +239,22 @@ fn build_static_tx_class_impl(
     let versioned_reads = versioned_reads_from(&owned_reads);
 
     let result = if allow_single_vshard {
-        TxClass::new_single_vshard(
+        TxClass::new_single_vshard_in_database(
             read_set,
             write_set,
             plans_bytes,
             tenant_id,
+            database_id,
             None,
             versioned_reads,
         )
     } else {
-        TxClass::new(
+        TxClass::new_in_database(
             read_set,
             write_set,
             plans_bytes,
             tenant_id,
+            database_id,
             None,
             versioned_reads,
         )
@@ -304,6 +317,26 @@ mod tests {
             // `versioned_reads_from` propagates; give it the same synthetic LSN.
             read_version_lsn: Lsn::new(read_lsn),
         }
+    }
+
+    #[test]
+    fn single_vshard_builder_preserves_database_scope() {
+        let mut task = point_insert_task("db_scoped", 1);
+        task.database_id = DatabaseId::new(7);
+        let tx = build_single_vshard_tx_class(&[task], TenantId::new(1), &[])
+            .expect("valid single-vshard TxClass");
+        assert_eq!(tx.database_id, DatabaseId::new(7));
+    }
+
+    #[test]
+    fn builder_rejects_cross_database_batches() {
+        let (col_a, col_b) = two_distinct_collections();
+        let first = point_insert_task(&col_a, 1);
+        let mut second = point_insert_task(&col_b, 2);
+        second.database_id = DatabaseId::new(7);
+        let error = build_static_tx_class(&[first, second], TenantId::new(1), &[])
+            .expect_err("cross-database Calvin batch must fail");
+        assert!(error.to_string().contains("multiple databases"));
     }
 
     #[test]

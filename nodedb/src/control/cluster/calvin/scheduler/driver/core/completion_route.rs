@@ -153,7 +153,7 @@ impl Scheduler {
             None => {}
         }
 
-        if response.status == crate::bridge::envelope::Status::Ok {
+        let completed = if response.status == crate::bridge::envelope::Status::Ok {
             // Observe whether the applying participant reported its slice of the
             // transaction's reads as no longer current against the local write
             // versions. Direct-apply (dependent/active) observation only: the
@@ -165,21 +165,34 @@ impl Scheduler {
                     .read_set_validation_failures
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            self.commit_apply_tail(txn_id, response, None);
+            self.commit_apply_tail(txn_id, response, None)
         } else {
-            tracing::warn!(
+            tracing::error!(
                 vshard_id = self.vshard_id,
                 epoch = txn_id.epoch,
                 position = txn_id.position,
-                "calvin: executor response was not Ok; locks NOT released (shard degraded)"
+                "calvin: executor response was not Ok; forcing infra-abort completion so locks \
+                 release and the epoch advances"
             );
+            false
+        };
+
+        if completed {
+            self.metrics.record_completed();
+            self.on_txn_complete(txn_id);
+        } else {
+            // A failed direct apply must not leave the txn parked with its locks
+            // held: that wedges every txn queued behind those keys and freezes
+            // this vShard's epoch watermark, and no sweep re-drives the entry.
+            // Surface the infra abort and force completion — the same
+            // forward-progress contract the disconnected-channel path above
+            // follows.
             self.metrics.record_executor_error();
             self.metrics.record_infra_abort(
                 crate::control::cluster::calvin::scheduler::metrics::infra_abort_reason::IO_ERROR,
             );
+            self.metrics.record_completed();
+            self.on_txn_complete(txn_id);
         }
-
-        self.metrics.record_completed();
-        self.on_txn_complete(txn_id);
     }
 }

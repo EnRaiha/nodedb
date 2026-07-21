@@ -8,6 +8,74 @@ use thiserror::Error;
 use crate::types::CollectionInfo;
 use crate::types_array::{ArrayAttrAst, ArrayDimAst};
 
+/// Normalize the PostgreSQL identifier spelling accepted by `regclass` input.
+///
+/// Unquoted identifiers fold to lowercase, quoted identifiers preserve case and
+/// support doubled quote escapes. NodeDB currently exposes user relations in
+/// `public` and catalog relations in `pg_catalog`; those qualifiers resolve to
+/// the same canonical relation name used by the catalog adapters.
+pub fn normalize_regclass_name(input: &str) -> Option<String> {
+    fn parse_part(raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if !raw.starts_with('"') {
+            return (!raw.contains('"')).then(|| raw.to_ascii_lowercase());
+        }
+
+        let mut chars = raw.char_indices().peekable();
+        chars.next();
+        let mut out = String::new();
+        let mut closed_at = None;
+        while let Some((idx, ch)) = chars.next() {
+            if ch != '"' {
+                out.push(ch);
+                continue;
+            }
+            if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                chars.next();
+                out.push('"');
+            } else {
+                closed_at = Some(idx + ch.len_utf8());
+                break;
+            }
+        }
+        let end = closed_at?;
+        raw[end..].trim().is_empty().then_some(out)
+    }
+
+    let mut parts = Vec::new();
+    let mut quoted = false;
+    let mut start = 0;
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let (idx, ch) = chars[i];
+        if ch == '"' {
+            if quoted && i + 1 < chars.len() && chars[i + 1].1 == '"' {
+                i += 2;
+                continue;
+            }
+            quoted = !quoted;
+        } else if ch == '.' && !quoted {
+            parts.push(parse_part(&input[start..idx])?);
+            start = idx + 1;
+        }
+        i += 1;
+    }
+    if quoted {
+        return None;
+    }
+    parts.push(parse_part(&input[start..])?);
+
+    match parts.as_slice() {
+        [name] => Some(name.clone()),
+        [schema, name] if schema == "public" || schema == "pg_catalog" => Some(name.clone()),
+        _ => None,
+    }
+}
+
 /// Errors surfaced by `SqlCatalog` implementations.
 ///
 /// Only one variant today — callers pattern-match directly and

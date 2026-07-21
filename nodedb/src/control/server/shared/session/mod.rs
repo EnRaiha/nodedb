@@ -15,6 +15,7 @@ mod listen;
 mod live;
 mod notice;
 pub mod outcome;
+pub mod overlay_drop;
 mod own_writes;
 mod params;
 pub mod read_consistency;

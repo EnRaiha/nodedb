@@ -21,13 +21,33 @@ impl CoreLoop {
         tid: u64,
         undo_log: Vec<UndoEntry>,
     ) -> Result<(), (usize, String)> {
+        self.rollback_undo_log_inner(did, tid, None, undo_log)
+    }
+
+    pub(in crate::data::executor::handlers) fn rollback_undo_log_at(
+        &mut self,
+        did: u64,
+        tid: u64,
+        vshard_id: crate::types::VShardId,
+        undo_log: Vec<UndoEntry>,
+    ) -> Result<(), (usize, String)> {
+        self.rollback_undo_log_inner(did, tid, Some(vshard_id), undo_log)
+    }
+
+    fn rollback_undo_log_inner(
+        &mut self,
+        did: u64,
+        tid: u64,
+        vshard_id: Option<crate::types::VShardId>,
+        undo_log: Vec<UndoEntry>,
+    ) -> Result<(), (usize, String)> {
         let total = undo_log.len();
         for (rev_idx, entry) in undo_log.into_iter().rev().enumerate() {
             // Convert reversed index back to original forward-order index for
             // diagnostics (makes it easier to correlate with the sub-plan that
             // produced this undo entry).
             let original_idx = total.saturating_sub(1 + rev_idx);
-            self.apply_undo_entry(did, tid, original_idx, entry)?;
+            self.apply_undo_entry(did, tid, vshard_id, original_idx, entry)?;
         }
         Ok(())
     }
@@ -39,6 +59,7 @@ impl CoreLoop {
         &mut self,
         did: u64,
         tid: u64,
+        vshard_id: Option<crate::types::VShardId>,
         entry_index: usize,
         entry: UndoEntry,
     ) -> Result<(), (usize, String)> {
@@ -52,8 +73,11 @@ impl CoreLoop {
             UndoEntry::SpatialInsert { .. } | UndoEntry::SpatialDelete { .. } => {
                 self.apply_undo_spatial(entry_index, entry)
             }
-            UndoEntry::PutEdge { .. } | UndoEntry::DeleteEdge { .. } => {
-                self.apply_undo_edge(did, tid, entry_index, entry)
+            UndoEntry::PutEdge { ref src_id, .. } | UndoEntry::DeleteEdge { ref src_id, .. } => {
+                let account_stats = vshard_id.is_none_or(|vshard_id| {
+                    vshard_id == crate::types::VShardId::from_key(src_id.as_bytes())
+                });
+                self.apply_undo_edge_with_stats(did, tid, entry_index, entry, account_stats)
             }
             UndoEntry::KvPut { .. }
             | UndoEntry::KvDelete { .. }

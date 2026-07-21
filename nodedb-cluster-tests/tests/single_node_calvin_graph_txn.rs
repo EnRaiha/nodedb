@@ -51,16 +51,30 @@ fn sequencer_leader(node: &TestClusterNode) -> u64 {
 /// between them is genuinely cross-shard. Deterministic: `VShardId::from_key` is
 /// a pure function of the key bytes, and it is how `insert_edge` homes each
 /// endpoint. Same key-picking approach as the sibling `single_node_calvin` suite.
-fn distinct_vshard_node_keys() -> (String, String) {
+fn distinct_core_node_keys(num_cores: u32) -> (String, String) {
     let dst = "sncgtx_hub".to_string();
     let vdst = VShardId::from_key(dst.as_bytes()).as_u32();
     for i in 0u32..4096 {
         let src = format!("sncgtx_src_{i}");
-        if VShardId::from_key(src.as_bytes()).as_u32() != vdst {
+        let vsrc = VShardId::from_key(src.as_bytes()).as_u32();
+        if vsrc != vdst && vsrc % num_cores != vdst % num_cores {
             return (src, dst);
         }
     }
-    panic!("could not find a node key on a distinct vShard from the hub in 4096 tries");
+    panic!("could not find node keys on distinct vShards and cores in 4096 tries");
+}
+
+fn another_source_on_distinct_core(num_cores: u32, first: &str, dst: &str) -> String {
+    let first_core = VShardId::from_key(first.as_bytes()).as_u32() % num_cores;
+    let dst_core = VShardId::from_key(dst.as_bytes()).as_u32() % num_cores;
+    for i in 0u32..4096 {
+        let candidate = format!("sncgtx_other_src_{i}");
+        let core = VShardId::from_key(candidate.as_bytes()).as_u32() % num_cores;
+        if candidate != first && core != first_core && core != dst_core {
+            return candidate;
+        }
+    }
+    panic!("could not find a second source on a distinct core");
 }
 
 /// Run `GRAPH NEIGHBORS OF '<node>' LABEL '<label>' DIRECTION <dir>` and return
@@ -126,7 +140,7 @@ async fn dual_home_edge_stages_both_overlays_and_rollback_tears_down() {
     )
     .await;
 
-    let (src, dst) = distinct_vshard_node_keys();
+    let (src, dst) = distinct_core_node_keys(4);
     let label = "l";
 
     node.client.simple_query("BEGIN").await.expect("BEGIN");
@@ -180,6 +194,205 @@ async fn dual_home_edge_stages_both_overlays_and_rollback_tears_down() {
         "after ROLLBACK the staged edge must be gone from dst '{dst}' (vdst \
          overlay dropped), got: {in_dst_after:?}"
     );
+
+    node.shutdown().await;
+}
+
+/// Calvin publishes one lightweight Control change event per committed
+/// participant-local document write, ordered by each participant's durable LSN.
+/// A rolled-back transaction publishes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn calvin_commit_publishes_control_changes_at_participant_lsns() {
+    let node = TestClusterNode::spawn_single_node_calvin(4)
+        .await
+        .expect("spawn standalone single-node-calvin server");
+    wait_for(
+        "single-node sequencer leader elected",
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || sequencer_leader(&node) == node.node_id,
+    )
+    .await;
+
+    let first = "sncgtx_cdc_a";
+    let second = (0..4096)
+        .map(|i| format!("sncgtx_cdc_b_{i}"))
+        .find(|candidate| {
+            VShardId::from_collection_in_database(nodedb_types::DatabaseId::DEFAULT, candidate)
+                != VShardId::from_collection_in_database(nodedb_types::DatabaseId::DEFAULT, first)
+        })
+        .expect("collection on a distinct vShard");
+    for collection in [first, second.as_str()] {
+        node.client
+            .simple_query(&format!(
+                "CREATE COLLECTION {collection} (id TEXT PRIMARY KEY, value TEXT)"
+            ))
+            .await
+            .expect("create CDC collection");
+    }
+
+    let mut subscription = node.shared.change_stream.subscribe(None, None);
+    node.client.simple_query("BEGIN").await.expect("BEGIN");
+    node.client
+        .simple_query(&format!(
+            "INSERT INTO {first} (id, value) VALUES ('a', 'one')"
+        ))
+        .await
+        .expect("stage first write");
+    node.client
+        .simple_query(&format!(
+            "INSERT INTO {second} (id, value) VALUES ('b', 'two')"
+        ))
+        .await
+        .expect("stage second write");
+    node.client.simple_query("COMMIT").await.expect("COMMIT");
+
+    let mut collections = std::collections::BTreeSet::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), subscription.recv_filtered())
+            .await
+            .expect("committed Calvin write must publish a Control event")
+            .expect("change-stream receiver remains open");
+        assert_ne!(
+            event.lsn.as_u64(),
+            0,
+            "CDC event must carry participant LSN"
+        );
+        collections.insert(event.collection);
+    }
+    assert_eq!(
+        collections,
+        std::collections::BTreeSet::from([first.to_string(), second.clone()])
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), subscription.recv_filtered())
+            .await
+            .is_err(),
+        "each logical write must publish exactly once"
+    );
+
+    node.client
+        .simple_query("BEGIN")
+        .await
+        .expect("second BEGIN");
+    node.client
+        .simple_query(&format!(
+            "INSERT INTO {first} (id, value) VALUES ('aborted', 'no')"
+        ))
+        .await
+        .expect("stage aborted write");
+    node.client
+        .simple_query("ROLLBACK")
+        .await
+        .expect("ROLLBACK");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), subscription.recv_filtered())
+            .await
+            .is_err(),
+        "aborted Calvin write must not publish a Control event"
+    );
+
+    node.shutdown().await;
+}
+
+/// A dual-home edge has two physical endpoint representations but is one
+/// logical edge. Stats must deduplicate those representations rather than
+/// exposing storage topology in user-visible cardinalities.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dual_home_edge_counts_once_in_graph_stats() {
+    let node = TestClusterNode::spawn_single_node_calvin(4)
+        .await
+        .expect("spawn standalone single-node-calvin server");
+    wait_for(
+        "single-node sequencer leader elected",
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || sequencer_leader(&node) == node.node_id,
+    )
+    .await;
+    wait_for(
+        "single-node metadata leader elected",
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        || node.shared.is_metadata_leader(),
+    )
+    .await;
+
+    node.client
+        .simple_query(
+            "CREATE COLLECTION sncgtx_stats (id TEXT PRIMARY KEY, name TEXT) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .expect("create graph stats collection");
+    let (src, dst) = distinct_core_node_keys(4);
+    node.client
+        .simple_query(&format!(
+            "GRAPH INSERT EDGE IN sncgtx_stats FROM '{src}' TO '{dst}' \
+             TYPE 'knows' PROPERTIES '{{}}'"
+        ))
+        .await
+        .expect("insert first dual-home edge");
+    let other_src = another_source_on_distinct_core(4, &src, &dst);
+    node.client
+        .simple_query(&format!(
+            "GRAPH INSERT EDGE IN sncgtx_stats FROM '{other_src}' TO '{dst}' \
+             TYPE 'knows' PROPERTIES '{{}}'"
+        ))
+        .await
+        .expect("insert second edge sharing the destination");
+
+    let messages = node
+        .client
+        .simple_query("SHOW GRAPH STATS 'sncgtx_stats'")
+        .await
+        .expect("show graph stats");
+    let row = messages
+        .iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .expect("graph stats row");
+
+    assert_eq!(row.get("node_count"), Some("3"));
+    assert_eq!(row.get("edge_count"), Some("2"));
+    let labels: serde_json::Value =
+        serde_json::from_str(row.get("labels").expect("labels JSON")).expect("valid labels JSON");
+    assert_eq!(labels[0]["label"], "knows");
+    assert_eq!(labels[0]["count"], 2);
+
+    // Historical stats scan physical edge versions rather than live summary
+    // counters. It must union the two endpoint-home replicas by logical edge
+    // identity instead of reintroducing the same doubled cardinality.
+    let future_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_millis() as i64
+        + 1_000;
+    let historical = node
+        .client
+        .simple_query(&format!(
+            "SHOW GRAPH STATS 'sncgtx_stats' AS OF SYSTEM TIME {future_ms}"
+        ))
+        .await
+        .expect("show historical graph stats");
+    let historical_row = historical
+        .iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .expect("historical graph stats row");
+    assert_eq!(historical_row.get("node_count"), Some("3"));
+    assert_eq!(historical_row.get("edge_count"), Some("2"));
+    let historical_labels: serde_json::Value = serde_json::from_str(
+        historical_row
+            .get("labels")
+            .expect("historical labels JSON"),
+    )
+    .expect("valid historical labels JSON");
+    assert_eq!(historical_labels[0]["count"], 2);
 
     node.shutdown().await;
 }

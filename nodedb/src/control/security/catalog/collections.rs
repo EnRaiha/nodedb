@@ -46,6 +46,44 @@ impl SystemCatalog {
         write_txn.commit().map_err(|e| catalog_err("commit", e))
     }
 
+    /// Insert a collection only when its catalog key is absent.
+    ///
+    /// The existence check and insert share one redb write transaction, so
+    /// concurrent direct-mode schema announcements cannot overwrite the first
+    /// winner after both observed absence.
+    pub fn put_collection_if_absent(
+        &self,
+        database_id: DatabaseId,
+        coll: &StoredCollection,
+    ) -> crate::Result<bool> {
+        let inner_key = format!("{}:{}", coll.tenant_id, coll.name);
+        let bytes =
+            zerompk::to_msgpack_vec(coll).map_err(|e| catalog_err("serialize collection", e))?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("write txn", e))?;
+        let inserted = {
+            let mut table = write_txn
+                .open_table(COLLECTIONS)
+                .map_err(|e| catalog_err("open collections", e))?;
+            if table
+                .get((database_id.as_u64(), inner_key.as_str()))
+                .map_err(|e| catalog_err("get collection", e))?
+                .is_some()
+            {
+                false
+            } else {
+                table
+                    .insert((database_id.as_u64(), inner_key.as_str()), bytes.as_slice())
+                    .map_err(|e| catalog_err("insert collection", e))?;
+                true
+            }
+        };
+        write_txn.commit().map_err(|e| catalog_err("commit", e))?;
+        Ok(inserted)
+    }
+
     /// Load all collections for a tenant within a database.
     pub fn load_collections_for_tenant(
         &self,

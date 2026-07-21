@@ -33,7 +33,7 @@ pub(in crate::data::executor) mod graph_traversal;
 #[path = "graph_txn_merge.rs"]
 pub(in crate::data::executor) mod graph_txn_merge;
 
-pub(in crate::data::executor) use graph_edge_write::EdgePutParams;
+pub(in crate::data::executor) use graph_edge_write::{EdgeDeleteParams, EdgePutParams};
 
 use graph_txn_merge::merge_graph_txn_overlay_neighbors;
 

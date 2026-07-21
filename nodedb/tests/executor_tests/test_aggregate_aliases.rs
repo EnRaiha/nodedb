@@ -95,3 +95,204 @@ fn aggregate_output_uses_user_alias_but_having_reads_canonical_key() {
     assert!(rows[0].get("count(*)").is_none());
     assert!(rows[0].get("avg(score)").is_none());
 }
+
+fn grouped_count_plan(user_alias: &str) -> PhysicalPlan {
+    grouped_count_shape_plan(user_alias, 10, Vec::new())
+}
+
+fn computed_group_count_plan(function: &str) -> PhysicalPlan {
+    PhysicalPlan::Query(QueryOp::Aggregate {
+        collection: "cache_alias_users".into(),
+        input: None,
+        group_by: vec![GroupKeySpec {
+            output_name: "group_0".into(),
+            field: None,
+            expr: Some(nodedb_query::expr::SqlExpr::Function {
+                name: function.into(),
+                args: vec![nodedb_query::expr::SqlExpr::Column("department".into())],
+            }),
+        }],
+        aggregates: vec![AggregateSpec {
+            function: "count".into(),
+            alias: "count(*)".into(),
+            user_alias: Some("row_count".into()),
+            field: "*".into(),
+            expr: None,
+        }],
+        filters: Vec::new(),
+        having: Vec::new(),
+        limit: 10,
+        sub_group_by: Vec::new(),
+        sub_aggregates: Vec::new(),
+        grouping_sets: Vec::new(),
+        sort_keys: Vec::new(),
+    })
+}
+
+fn grouped_count_shape_plan(
+    user_alias: &str,
+    limit: usize,
+    sort_keys: Vec<(String, bool)>,
+) -> PhysicalPlan {
+    PhysicalPlan::Query(QueryOp::Aggregate {
+        collection: "cache_alias_users".into(),
+        input: None,
+        group_by: vec![GroupKeySpec::column("department")],
+        aggregates: vec![AggregateSpec {
+            function: "count".into(),
+            alias: "count(*)".into(),
+            user_alias: Some(user_alias.into()),
+            field: "*".into(),
+            expr: None,
+        }],
+        filters: Vec::new(),
+        having: Vec::new(),
+        limit,
+        sub_group_by: Vec::new(),
+        sub_aggregates: Vec::new(),
+        grouping_sets: Vec::new(),
+        sort_keys,
+    })
+}
+
+#[test]
+fn aggregate_cache_separates_user_facing_output_aliases() {
+    let mut ctx = make_ctx();
+
+    for (idx, id) in ["u1", "u2"].into_iter().enumerate() {
+        let doc = nodedb_types::json_to_msgpack(&serde_json::json!({
+            "id": id,
+            "department": "tools",
+        }))
+        .expect("encode document");
+        send_ok(
+            &mut ctx.core,
+            &mut ctx.tx,
+            &mut ctx.rx,
+            PhysicalPlan::Document(DocumentOp::PointPut {
+                collection: "cache_alias_users".into(),
+                document_id: id.into(),
+                value: doc,
+                surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
+                pk_bytes: Vec::new(),
+            }),
+        );
+    }
+
+    let first = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        grouped_count_plan("first_count"),
+    );
+    let first_rows = payload_value(&first);
+    assert_eq!(first_rows[0]["first_count"].as_u64(), Some(2));
+
+    let second = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        grouped_count_plan("second_count"),
+    );
+    let second_rows = payload_value(&second);
+    assert_eq!(
+        second_rows[0]["second_count"].as_u64(),
+        Some(2),
+        "a cache hit must preserve the requesting query's output schema: {second_rows}"
+    );
+    assert!(second_rows[0].get("first_count").is_none());
+    assert!(second_rows[0].get("count(*)").is_none());
+}
+
+#[test]
+fn aggregate_cache_separates_computed_group_expressions() {
+    let mut ctx = make_ctx();
+    for (idx, department) in ["Alpha", "alpha"].into_iter().enumerate() {
+        let id = format!("computed-{idx}");
+        let doc = nodedb_types::json_to_msgpack(&serde_json::json!({
+            "id": id,
+            "department": department,
+        }))
+        .expect("encode document");
+        send_ok(
+            &mut ctx.core,
+            &mut ctx.tx,
+            &mut ctx.rx,
+            PhysicalPlan::Document(DocumentOp::PointPut {
+                collection: "cache_alias_users".into(),
+                document_id: id,
+                value: doc,
+                surrogate: nodedb_types::Surrogate::new((idx as u32) + 1),
+                pk_bytes: Vec::new(),
+            }),
+        );
+    }
+
+    let lower = payload_value(&send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        computed_group_count_plan("lower"),
+    ));
+    assert_eq!(lower[0]["group_0"], "alpha");
+    assert_eq!(lower[0]["row_count"].as_u64(), Some(2));
+
+    let upper = payload_value(&send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        computed_group_count_plan("upper"),
+    ));
+    assert_eq!(upper[0]["group_0"], "ALPHA");
+    assert_eq!(upper[0]["row_count"].as_u64(), Some(2));
+}
+
+#[test]
+fn aggregate_cache_separates_limit_and_sort_shape() {
+    let mut ctx = make_ctx();
+    let mut surrogate = 1u32;
+    for (department, count) in [("alpha", 1), ("beta", 2), ("gamma", 3)] {
+        for index in 0..count {
+            let id = format!("{department}-{index}");
+            let doc = nodedb_types::json_to_msgpack(&serde_json::json!({
+                "id": id,
+                "department": department,
+            }))
+            .expect("encode document");
+            send_ok(
+                &mut ctx.core,
+                &mut ctx.tx,
+                &mut ctx.rx,
+                PhysicalPlan::Document(DocumentOp::PointPut {
+                    collection: "cache_alias_users".into(),
+                    document_id: id,
+                    value: doc,
+                    surrogate: nodedb_types::Surrogate::new(surrogate),
+                    pk_bytes: Vec::new(),
+                }),
+            );
+            surrogate += 1;
+        }
+    }
+
+    let ascending = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        grouped_count_shape_plan("row_count", 1, vec![("row_count".into(), true)]),
+    );
+    let ascending_rows = payload_value(&ascending);
+    assert_eq!(ascending_rows.as_array().map(Vec::len), Some(1));
+    assert_eq!(ascending_rows[0]["row_count"].as_u64(), Some(1));
+
+    let descending = send_ok(
+        &mut ctx.core,
+        &mut ctx.tx,
+        &mut ctx.rx,
+        grouped_count_shape_plan("row_count", 2, vec![("row_count".into(), false)]),
+    );
+    let descending_rows = payload_value(&descending);
+    assert_eq!(descending_rows.as_array().map(Vec::len), Some(2));
+    assert_eq!(descending_rows[0]["row_count"].as_u64(), Some(3));
+    assert_eq!(descending_rows[1]["row_count"].as_u64(), Some(2));
+}

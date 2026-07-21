@@ -15,7 +15,7 @@ pub(crate) use crdt_doc_payload::CrdtDocOpWalRecord;
 pub(crate) use crdt_list_payload::CrdtListOpWalRecord;
 pub(crate) use crdt_payload::CrdtDeltaWalPayload;
 pub use manager::WalManager;
-pub use redo::{CalvinStamp, RedoRecord, RedoSubRecord};
+pub use redo::{CalvinStamp, EdgeDeleteRedo, EdgePutRedo, RedoRecord, RedoSubRecord};
 pub use replay::SyncHwmReplayMaps;
 pub use replay::SyncHwmReplayStats;
 pub use replay::replay_surrogate_records;

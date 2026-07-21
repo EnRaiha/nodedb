@@ -120,11 +120,65 @@ pub async fn send_request(
     let json_bytes = sonic_rs::to_vec(&req).expect("json encode");
     write_frame(stream, &json_bytes).await;
 
-    let response_payload = tokio::time::timeout(Duration::from_secs(5), read_frame(stream))
-        .await
-        .expect("timeout waiting for response")
-        .expect("response frame");
-    sonic_rs::from_slice(&response_payload).expect("json decode NativeResponse")
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut accumulated: Option<NativeResponse> = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let response_payload = tokio::time::timeout(remaining, read_frame(stream))
+            .await
+            .expect("timeout waiting for response")
+            .expect("response frame");
+        let response: NativeResponse =
+            sonic_rs::from_slice(&response_payload).expect("json decode NativeResponse");
+        if response.seq == seq {
+            if response.status == nodedb_types::protocol::ResponseStatus::Partial {
+                if let Some(aggregate) = accumulated.as_mut() {
+                    if aggregate.columns.is_none() {
+                        aggregate.columns = response.columns;
+                    }
+                    aggregate
+                        .rows
+                        .get_or_insert_default()
+                        .extend(response.rows.unwrap_or_default());
+                    if let Some(rows_affected) = response.rows_affected {
+                        aggregate.rows_affected =
+                            Some(aggregate.rows_affected.unwrap_or(0) + rows_affected);
+                    }
+                    aggregate.watermark_lsn = aggregate.watermark_lsn.max(response.watermark_lsn);
+                } else {
+                    accumulated = Some(response);
+                }
+                continue;
+            }
+            if let Some(mut aggregate) = accumulated {
+                if aggregate.columns.is_none() {
+                    aggregate.columns = response.columns;
+                }
+                aggregate
+                    .rows
+                    .get_or_insert_default()
+                    .extend(response.rows.unwrap_or_default());
+                if let Some(rows_affected) = response.rows_affected {
+                    aggregate.rows_affected =
+                        Some(aggregate.rows_affected.unwrap_or(0) + rows_affected);
+                }
+                aggregate.watermark_lsn = aggregate.watermark_lsn.max(response.watermark_lsn);
+                aggregate.status = response.status;
+                aggregate.error = response.error;
+                aggregate.auth = response.auth;
+                aggregate.warnings.extend(response.warnings);
+                return aggregate;
+            }
+            return response;
+        }
+        assert!(
+            response.seq < seq,
+            "native response sequence advanced past request: expected {seq}, got {}",
+            response.seq
+        );
+        // Fan-out queries can leave additional frames for the preceding request.
+        // Drain those stale frames rather than misattributing one to this request.
+    }
 }
 
 /// Authenticate a fresh native connection with an API key. The JSON Auth

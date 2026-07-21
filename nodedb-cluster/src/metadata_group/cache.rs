@@ -131,6 +131,13 @@ impl MetadataCache {
                 }
             }
             MetadataEntry::DescriptorDrainEnd { .. } => {}
+            MetadataEntry::DdlPrepareAcquire { .. } | MetadataEntry::DdlPrepareRelease { .. } => {
+                // Host-side ephemeral coordination state; replay rebuilds it.
+            }
+            MetadataEntry::DdlPrepared { .. } => {
+                // The host-side applier unwraps and fences this entry. The cache
+                // owns no preparation outcome state.
+            }
             MetadataEntry::CaTrustChange { .. } => {
                 // CA trust mutations are host-side only: the production
                 // applier in the nodedb crate writes/deletes

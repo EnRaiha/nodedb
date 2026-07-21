@@ -18,9 +18,16 @@ impl CoreLoop {
         task: &ExecutionTask,
         tid: u64,
         collection: Option<&str>,
-        as_of: Option<i64>,
+        as_of_ms: Option<i64>,
     ) -> Response {
-        debug!(core = self.core_id, tid, ?collection, ?as_of, "graph stats");
+        debug!(
+            core = self.core_id,
+            tid,
+            ?collection,
+            ?as_of_ms,
+            "graph stats"
+        );
+        let as_of = as_of_ms.map(nodedb_types::ms_to_ordinal_upper);
         let database_id = task.request.database_id.as_u64();
         let tenant = TenantId::new(tid);
         let result: Vec<CollectionStats> = match collection {

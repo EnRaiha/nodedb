@@ -86,9 +86,13 @@ pub async fn show_graph_stats(
         )?;
     }
 
+    // Exact logical-edge scans are required even for current-time reads:
+    // source-owned summaries cannot deduplicate a destination shared by edges
+    // from different source vShards, and mixed legacy/current collections may
+    // have no summary row at all. Identity union below is the correctness path.
     let plan = PhysicalPlan::Graph(GraphOp::Stats {
         collection: collection.clone(),
-        as_of,
+        as_of: as_of.or(Some(i64::MAX)),
     });
 
     let resp = broadcast_to_all_cores(state, identity.tenant_id, database_id, plan, TraceId::ZERO)
@@ -157,6 +161,10 @@ fn filter_active_collections(
 /// label counts and re-deriving `distinct_label_count` from the merged set.
 fn aggregate_by_collection(entries: Vec<CollectionStats>) -> Vec<CollectionStats> {
     let mut label_acc: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut historical_edges: BTreeMap<
+        String,
+        std::collections::BTreeSet<(String, String, String)>,
+    > = BTreeMap::new();
     let mut by_name: BTreeMap<String, CollectionStats> = BTreeMap::new();
 
     for e in entries {
@@ -173,14 +181,32 @@ fn aggregate_by_collection(entries: Vec<CollectionStats>) -> Vec<CollectionStats
             let slot = labels.entry(label).or_insert(0);
             *slot = slot.saturating_add(count);
         }
+        historical_edges
+            .entry(e.collection)
+            .or_default()
+            .extend(e.logical_edges);
     }
 
     let mut result: Vec<CollectionStats> = Vec::with_capacity(by_name.len());
     for (collection, mut acc) in by_name {
-        let labels_map = label_acc.remove(&collection).unwrap_or_default();
-        let labels: Vec<(String, u64)> = labels_map.into_iter().collect();
-        acc.distinct_label_count = labels.len() as u64;
-        acc.labels = labels;
+        let exact_edges = historical_edges.remove(&collection).unwrap_or_default();
+        if exact_edges.is_empty() {
+            let labels_map = label_acc.remove(&collection).unwrap_or_default();
+            acc.labels = labels_map.into_iter().collect();
+        } else {
+            let mut nodes = std::collections::BTreeSet::new();
+            let mut labels = BTreeMap::<String, u64>::new();
+            for (src, label, dst) in &exact_edges {
+                nodes.insert(src);
+                nodes.insert(dst);
+                *labels.entry(label.clone()).or_default() += 1;
+            }
+            acc.edge_count = exact_edges.len() as u64;
+            acc.distinct_node_count = nodes.len() as u64;
+            acc.labels = labels.into_iter().collect();
+            acc.logical_edges = exact_edges.into_iter().collect();
+        }
+        acc.distinct_label_count = acc.labels.len() as u64;
         result.push(acc);
     }
     result

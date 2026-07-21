@@ -59,12 +59,21 @@ impl MetadataCommitApplier {
         // value — idempotent by construction, with no per-node drift.
         //
         // Before persisting, validate the carried version against this
-        // node's local prior so a genuine regression or gap surfaces as a
-        // loud typed error (halting the apply watermark for this entry and
-        // forcing Raft re-delivery) rather than silently writing a
-        // divergent value. A version of `0` (compat mode / unit tests) is
-        // skipped by the validator.
-        catalog_entry::descriptor_stamp::validate(&stamped, catalog)?;
+        // node's local prior. Historical entries encountered during a full-log
+        // replay are acknowledged without overwriting newer state or repeating
+        // post-apply side effects. Forward gaps and same-version divergent
+        // payloads remain loud typed errors. A version of `0` (compat mode /
+        // unit tests) is applied without version fencing.
+        if matches!(
+            catalog_entry::descriptor_stamp::validate(&stamped, catalog)?,
+            catalog_entry::descriptor_stamp::ValidationOutcome::AlreadyApplied
+        ) {
+            debug!(
+                kind = stamped.kind(),
+                "catalog_entry: descriptor entry already superseded or applied"
+            );
+            return Ok(());
+        }
 
         debug!(kind = stamped.kind(), "catalog_entry: applying to redb");
         if !catalog_entry::apply::apply_to(&stamped, catalog) {
