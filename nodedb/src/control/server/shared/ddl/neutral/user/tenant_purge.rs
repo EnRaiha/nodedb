@@ -11,16 +11,20 @@ use crate::types::TenantId;
 use super::super::super::result::DdlError;
 use super::reassign_owned::{OwnerKind, ddl_err, propose, sweep_grants};
 
+/// Purge every object owned by the tenant administrator during `DROP TENANT`,
+/// returning the number of owned objects deleted so the caller can record an
+/// accurate audit trail for the destructive teardown.
 pub(super) fn purge_owned_for_tenant_teardown(
     state: &SharedState,
     username: &str,
     tenant: TenantId,
-) -> Result<(), DdlError> {
+) -> Result<usize, DdlError> {
     let catalog = state.credentials.catalog();
     let mut owned = catalog
         .owners_for_user(username, tenant.as_u64())
         .map_err(|e| ddl_err(format!("load owner rows: {e}")))?;
     owned.sort_by_key(|owner| owner.object_type == object_type::COLLECTION);
+    let purged = owned.len();
 
     for owner in owned {
         let kind = OwnerKind::from_object_type(&owner.object_type).ok_or_else(|| {
@@ -48,7 +52,8 @@ pub(super) fn purge_owned_for_tenant_teardown(
                 );
         }
     }
-    sweep_grants(state, catalog, username)
+    sweep_grants(state, catalog, username)?;
+    Ok(purged)
 }
 
 fn purge_collection_rls_policies(

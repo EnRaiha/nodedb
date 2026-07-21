@@ -19,6 +19,16 @@ use super::super::auth_support::{require_tenant_admin, status, strip_if_exists};
 use super::reassign_owned::reassign_owned_and_sweep_grants;
 use super::tenant_purge::purge_owned_for_tenant_teardown;
 
+/// How a dropped user's owned objects were disposed of, for the audit trail.
+enum OwnershipDisposition {
+    /// Objects were reassigned to the named tenant administrator.
+    Reassigned(String),
+    /// The user owned nothing that required reassignment.
+    NoneOwned,
+    /// Tenant teardown purged the given number of owned objects outright.
+    Purged(usize),
+}
+
 /// DROP USER [IF EXISTS] <name>
 pub fn drop_user(
     state: &SharedState,
@@ -106,11 +116,22 @@ fn drop_user_inner(
     // user, BEFORE removing the user row. Fail-closed: any error here
     // aborts the drop, because a partially-reassigned-then-deleted user
     // is exactly the dangling-reference bug this guards against.
-    let admin_name = if tenant_teardown {
-        purge_owned_for_tenant_teardown(state, username, user_tenant)?;
-        None
+    //
+    // During tenant teardown the owned objects are purged outright (the
+    // tenant is going away), so the audit trail must record the destructive
+    // purge — not misreport it as "nothing owned" the way the reassign path's
+    // `None` does.
+    let disposition = if tenant_teardown {
+        OwnershipDisposition::Purged(purge_owned_for_tenant_teardown(
+            state,
+            username,
+            user_tenant,
+        )?)
     } else {
-        reassign_owned_and_sweep_grants(state, username, user_tenant)?
+        match reassign_owned_and_sweep_grants(state, username, user_tenant)? {
+            Some(admin_name) => OwnershipDisposition::Reassigned(admin_name),
+            None => OwnershipDisposition::NoneOwned,
+        }
     };
 
     // `DropUser` fully removes the identity record on every node —
@@ -145,11 +166,18 @@ fn drop_user_inner(
     };
 
     if dropped {
-        let detail = match admin_name {
-            Some(admin_name) => {
+        let detail = match disposition {
+            OwnershipDisposition::Reassigned(admin_name) => {
                 format!("dropped user '{username}' (ownership reassigned to '{admin_name}')")
             }
-            None => format!("dropped user '{username}' (no owned objects required reassignment)"),
+            OwnershipDisposition::NoneOwned => {
+                format!("dropped user '{username}' (no owned objects required reassignment)")
+            }
+            OwnershipDisposition::Purged(purged) => {
+                format!(
+                    "dropped user '{username}' (tenant teardown purged {purged} owned object(s))"
+                )
+            }
         };
         state.audit_record(
             AuditEvent::PrivilegeChange,
