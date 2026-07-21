@@ -22,11 +22,21 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Link the workspace's test binaries with mold instead of the default BFD
+  # linker. With --all-features every test binary statically links the full
+  # dependency closure and there are hundreds of them, so linking — not
+  # codegen — dominates the cold-cache build. mold cuts that link time several-
+  # fold. Applies to both jobs; installed via apt below.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
 jobs:
   lint:
     name: Lint & Check
-    runs-on: ubuntu-latest
+    # Free ARM64 runner for public repos: ~40% faster per-core than
+    # ubuntu-latest at the same (zero) cost. The release workflows already
+    # build on ubuntu-24.04-arm, so the toolchain + system deps are proven
+    # on this ISA.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
@@ -41,7 +51,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake clang libclang-dev pkg-config protobuf-compiler perl \
-            libcurl4-openssl-dev libsasl2-dev
+            libcurl4-openssl-dev libsasl2-dev mold
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run clippy
@@ -72,7 +82,8 @@ jobs:
   # serialised by `.config/nextest.toml`'s `cluster` test group.
   test:
     name: Test
-    runs-on: ubuntu-latest
+    # Free ARM64 runner — see the lint job for rationale.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
       - name: Reclaim disk and record resources
@@ -109,7 +120,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             cmake clang libclang-dev pkg-config protobuf-compiler perl \
-            libcurl4-openssl-dev libsasl2-dev
+            libcurl4-openssl-dev libsasl2-dev mold
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:

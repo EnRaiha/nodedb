@@ -110,20 +110,26 @@ server-process-serial = { max-threads = 1 }
 
 [profile.ci]
 # CI inherits the default profile (cluster group, threads-required,
-# slow-timeout) and adds:
-#   - more retries: CI runners are ~2× slower per-core than dev
-#     workstations, so the cluster tests' in-test `wait_for`
-#     budgets are proportionally tighter. Three retries (four total
-#     attempts) buys headroom for jitter without papering over real
-#     regressions — a genuinely broken test fails four times in a row.
-#   - JUnit XML: picked up by the workflow's artifact upload.
+# slow-timeout) and adds retries + JUnit XML.
+#
+# Retries are scoped, not blanket. The bulk of the suite (unit tests +
+# single-node server tests) is deterministic; the ONE non-cluster flake
+# source is the rare ephemeral-port reuse race in the `server-process`
+# group, which a single retry covers. So the profile-wide retry is just
+# `count = 1` (two attempts). A blanket high count here is worse than
+# useless: nextest resolves retries per-test with overrides winning over
+# the profile-wide value, so a high number here never even reached the
+# cluster tests (their `default` override pins count = 2) — it only
+# multiplied the timeout tail of every slow single-node server test by
+# 4×. The cluster tests get their genuine CI headroom from the dedicated
+# override below instead.
 #
 # NOTE: we deliberately do NOT bump `slow-timeout` here. The
 # slow-timeout only controls when nextest gives up on a stuck
 # *process*; it does NOT extend the test's internal `wait_for`
 # budgets. Once a `wait_for` panics, the test has already failed —
 # making nextest wait longer just wastes CI minutes on cleanup.
-retries = { backoff = "fixed", count = 3, delay = "2s" }
+retries = { backoff = "fixed", count = 1, delay = "2s" }
 fail-fast = false
 
 # Four cluster tests are excluded from the CI profile ONLY. They still run under
@@ -156,6 +162,17 @@ not (
     or test(native_implicit_edge_delete_cleans_reverse_cross_node)
 )
 """
+
+# CI-only cluster headroom. On CI runners (~2× slower per-core than a dev
+# workstation) the cluster tests' in-test `wait_for` budgets are proportionally
+# tighter, so 3-node bring-up jitter needs more retry headroom than the
+# `default` profile's count = 2. Four attempts absorbs startup jitter without
+# hiding regressions — a genuinely broken test fails four times in a row. This
+# `ci`-profile override is checked before the `default`-profile cluster override
+# and so wins under `--profile ci`; local `cargo nextest run` still gets count = 2.
+[[profile.ci.overrides]]
+filter = 'package(nodedb-cluster-tests)'
+retries = { backoff = "fixed", count = 3, delay = "2s" }
 
 [profile.ci.junit]
 path = "junit.xml"
