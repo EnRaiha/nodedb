@@ -92,7 +92,14 @@ impl CoreLoop {
                 tenant_id,
                 name,
                 purge_lsn,
-            } => self.execute_unregister_collection(task, *tenant_id, name, *purge_lsn),
+                reclaim_l1_files,
+            } => self.execute_unregister_collection(
+                task,
+                *tenant_id,
+                name,
+                *purge_lsn,
+                *reclaim_l1_files,
+            ),
 
             MetaOp::UnregisterMaterializedView { tenant_id, name } => {
                 self.execute_unregister_materialized_view(task, *tenant_id, name)

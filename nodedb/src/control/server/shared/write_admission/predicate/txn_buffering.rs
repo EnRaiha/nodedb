@@ -1697,6 +1697,7 @@ mod tests {
                 tenant_id: 1,
                 name: "c".into(),
                 purge_lsn: 0,
+                reclaim_l1_files: true,
             }),
             PhysicalPlan::Meta(MetaOp::UnregisterMaterializedView {
                 tenant_id: 1,

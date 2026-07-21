@@ -45,6 +45,9 @@ impl CoreLoop {
                 crate::types::TenantId::new(*tid_raw),
                 coll,
                 true,
+                // Single-core clear-then-install: reclaim this collection's
+                // shared L1 files here (no concurrent-core race to avoid).
+                true,
             ) {
                 return self.response_error(
                     task,

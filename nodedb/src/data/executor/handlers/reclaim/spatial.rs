@@ -11,9 +11,9 @@
 
 use std::path::Path;
 
-use tracing::{debug, warn};
+use tracing::debug;
 
-use super::ReclaimStats;
+use super::{ReclaimError, ReclaimStats, Result};
 use crate::data::executor::spatial_checkpoint::spatial_checkpoint_prefix;
 
 /// Unlink every spatial checkpoint + docmap file for
@@ -23,29 +23,33 @@ pub fn reclaim_spatial_checkpoints(
     database_id: u64,
     tenant_id: u64,
     collection: &str,
-) -> ReclaimStats {
+) -> Result<ReclaimStats> {
     let ckpt_dir = data_dir.join("spatial-ckpt");
-    if !ckpt_dir.exists() {
-        return ReclaimStats::default();
-    }
+    let entries = match std::fs::read_dir(&ckpt_dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReclaimStats::default());
+        }
+        Err(source) => {
+            return Err(ReclaimError::Io {
+                operation: "read spatial checkpoint directory",
+                path: ckpt_dir,
+                source,
+            });
+        }
+    };
 
     // Build the prefix via the shared encoder so it always matches the
     // filenames produced by `checkpoint_spatial_indexes`.
     let prefix = spatial_checkpoint_prefix(database_id, tenant_id, collection);
 
     let mut stats = ReclaimStats::default();
-    let entries = match std::fs::read_dir(&ckpt_dir) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(
-                dir = %ckpt_dir.display(),
-                error = %e,
-                "spatial reclaim: failed to read ckpt dir"
-            );
-            return stats;
-        }
-    };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|source| ReclaimError::Io {
+            operation: "read spatial checkpoint entry",
+            path: ckpt_dir.clone(),
+            source,
+        })?;
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
@@ -68,14 +72,17 @@ pub fn reclaim_spatial_checkpoints(
                 stats.bytes_freed = stats.bytes_freed.saturating_add(size);
                 debug!(path = %path.display(), size, "spatial reclaim: unlinked");
             }
-            Err(e) => warn!(
-                path = %path.display(),
-                error = %e,
-                "spatial reclaim: unlink failed"
-            ),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ReclaimError::Io {
+                    operation: "unlink spatial checkpoint",
+                    path,
+                    source,
+                });
+            }
         }
     }
-    stats
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -106,7 +113,7 @@ mod tests {
         // Keep: different database.
         write(&ckpt.join("1_1_places_geom.ckpt"), b"keep3");
 
-        let stats = reclaim_spatial_checkpoints(base, 0, 1, "places");
+        let stats = reclaim_spatial_checkpoints(base, 0, 1, "places").unwrap();
         assert_eq!(stats.files_unlinked, 3);
         assert_eq!(stats.bytes_freed, 1 + 2 + 3);
         assert!(ckpt.join("0_1_stores_geom.ckpt").exists());
@@ -117,7 +124,7 @@ mod tests {
     #[test]
     fn empty_dir_is_noop() {
         let tmp = TempDir::new().unwrap();
-        let s = reclaim_spatial_checkpoints(tmp.path(), 0, 1, "x");
+        let s = reclaim_spatial_checkpoints(tmp.path(), 0, 1, "x").unwrap();
         assert_eq!(s.files_unlinked, 0);
     }
 }

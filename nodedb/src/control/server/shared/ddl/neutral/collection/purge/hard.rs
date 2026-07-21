@@ -14,14 +14,13 @@
 //! This composes the two halves the `DROP COLLECTION ... PURGE`
 //! applier runs on every node — the catalog-row removal
 //! (`apply::collection::purge`) and the storage reclaim
-//! (`post_apply::async_dispatch::collection::reclaim_collection_storage`,
-//! the borrowed core of `purge_async`) — into one awaitable the
+//! (`post_apply::async_dispatch::collection::reclaim_collection_storage`) —
+//! into one awaitable the
 //! Control Plane can drive inline before it proceeds to persist the
 //! new collection. No engine is special-cased: the reclaim dispatch
 //! covers every engine exactly as `DROP ... PURGE` does.
 
-use nodedb_types::error::NodeDbError;
-
+use crate::control::catalog_entry::post_apply::ReclaimFailure;
 use crate::control::state::SharedState;
 
 /// Hard-purge `(tenant_id, name)`: remove the catalog metadata row
@@ -48,17 +47,27 @@ use crate::control::state::SharedState;
 /// Lite broadcast) still log-and-continue.
 pub(crate) async fn hard_purge_collection(
     state: &SharedState,
+    database_id: u64,
     tenant_id: u64,
     name: &str,
     purge_lsn: u64,
-) -> Result<(), NodeDbError> {
+    drain_already_held: bool,
+) -> Result<(), ReclaimFailure> {
     // 1. Remove the catalog metadata row (primary StoredCollection,
     //    owner row, surrogate map) — the synchronous half of the
     //    `PurgeCollection` applier. Propagate failure: if the old row
-    //    survives, the new collection must NOT register over it.
+    //    survives, the new collection must NOT register over it. This runs
+    //    before any durable retry record is queued, so it is a `no_retry`
+    //    failure — the caller releases its lifecycle guard.
     {
         let catalog = state.credentials.catalog();
-        crate::control::catalog_entry::apply::collection::purge(0, tenant_id, name, catalog)?;
+        crate::control::catalog_entry::apply::collection::prepare_purge(
+            database_id,
+            tenant_id,
+            name,
+            catalog,
+        )
+        .map_err(ReclaimFailure::no_retry)?;
     }
 
     // 2. Reclaim engine-local storage on the Data Plane (WAL tombstone,
@@ -66,7 +75,12 @@ pub(crate) async fn hard_purge_collection(
     //    dispatch, Lite `CollectionPurged` broadcast) — the async half
     //    of the `PurgeCollection` post-apply, shared verbatim.
     crate::control::catalog_entry::post_apply::reclaim_collection_storage(
-        state, 0, tenant_id, name, purge_lsn,
+        state,
+        database_id,
+        tenant_id,
+        name,
+        purge_lsn,
+        drain_already_held,
     )
     .await?;
 

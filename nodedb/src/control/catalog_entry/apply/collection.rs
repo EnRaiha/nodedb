@@ -59,58 +59,52 @@ pub fn put_if_absent(stored: &StoredCollection, catalog: &SystemCatalog) {
     }
 }
 
-/// Hard-delete the catalog metadata for a collection: primary
-/// `StoredCollection` row, owner row, and surrogate ↔ PK map.
-///
-/// Returns `Err` if any storage step that actually removes data
-/// fails. Callers with different failure semantics decide what to do:
-/// the raft applier (`apply_to_inner`) runs symmetrically on every
-/// node and log-and-continues, while the interactive re-CREATE
-/// hard-purge propagates so a `CREATE COLLECTION` never builds over
-/// data that was not actually purged. Reporting the error rather than
-/// swallowing it is what lets each caller make that choice.
-pub fn purge(
+/// Persist the fail-closed catalog half of a purge before touching storage.
+/// The inactive row survives crashes and prevents same-name CREATE/UNDROP from
+/// crossing an incomplete reclaim.
+pub fn prepare_purge(
     database_id: u64,
     tenant_id: u64,
     name: &str,
     catalog: &SystemCatalog,
 ) -> crate::Result<()> {
     let database_id = DatabaseId::new(database_id);
-    // Hard delete of the primary StoredCollection row. Symmetric
-    // with `apply/function.rs::delete` and the other hard-delete
-    // peers: remove the primary, then remove the owner row.
-    //
-    // The two-step DROP → retention-expiry → PURGE flow means the
-    // record may already be absent when this runs (operator-driven
-    // PURGE on a record the GC sweeper already reclaimed). The
-    // `delete_collection` helper is idempotent and returns `false`
-    // in that case, which is fine — we still call
-    // `delete_parent_owner` because the owner row may linger
-    // independently.
-    let removed = catalog.delete_collection(database_id, tenant_id, name)?;
-    debug!(
-        collection = %name,
-        tenant = tenant_id,
-        removed,
-        "catalog_entry: purge_collection primary row removed"
-    );
-    super::owner::delete_parent_owner_in_database(
+    if let Some(mut stored) = catalog.get_collection(database_id, tenant_id, name)? {
+        stored.is_active = false;
+        catalog.put_collection(database_id, &stored)?;
+    }
+    Ok(())
+}
+
+/// Remove catalog metadata only after every persistent engine surface has been
+/// reclaimed. The primary inactive row is deleted last, so any intermediate
+/// failure continues to block same-name lifecycle operations across restart.
+pub fn finalize_purge(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    let database_id = DatabaseId::new(database_id);
+    super::owner::delete_parent_owner_in_database_checked(
         object_type::COLLECTION,
         database_id.as_u64(),
         tenant_id,
         name,
         catalog,
-    );
-    // Wipe the surrogate ↔ PK map for this collection. Surrogates are
-    // collection-scoped; once the primary row is gone they can never
-    // be observed again, so leaving the catalog rows behind would
-    // just be allocator-bloat. Mirrors the array-drop cleanup in
-    // `array_convert::convert_drop_array`.
+    )?;
     catalog.delete_all_surrogates_for_collection(
         database_id,
         nodedb_types::TenantId::new(tenant_id),
         name,
     )?;
+    let removed = catalog.delete_collection(database_id, tenant_id, name)?;
+    debug!(
+        collection = %name,
+        tenant = tenant_id,
+        removed,
+        "catalog_entry: purge_collection finalized"
+    );
     Ok(())
 }
 

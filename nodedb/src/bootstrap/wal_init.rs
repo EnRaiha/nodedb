@@ -68,43 +68,29 @@ pub fn init_wal(
          for at-rest catalog encryption"
     );
 
-    let tombstones = load_tombstones(config, &wal_records);
+    let tombstones = load_tombstones(config, &wal_records)?;
     Ok((wal, wal_records, tombstones))
 }
 
 fn load_tombstones(
     config: &ServerConfig,
     wal_records: &Arc<[nodedb_wal::WalRecord]>,
-) -> nodedb_wal::TombstoneSet {
+) -> anyhow::Result<nodedb_wal::TombstoneSet> {
     let catalog_path = config.catalog_path();
-    let mut set = nodedb_wal::extract_tombstones(wal_records);
-    match crate::control::security::catalog::SystemCatalog::open(&catalog_path) {
-        Ok(catalog) => match catalog.load_wal_tombstones() {
-            Ok(persisted) => {
-                if !persisted.is_empty() {
-                    info!(
-                        persisted = persisted.len(),
-                        in_wal = set.len(),
-                        "merging persisted collection tombstones into replay set"
-                    );
-                }
-                set.extend(persisted);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "failed to load _system.wal_tombstones at startup — \
-                     replay will see WAL-extracted tombstones only"
-                );
-            }
-        },
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "could not open system catalog to load persisted WAL tombstones — \
-                 falling back to WAL-extracted set"
-            );
-        }
+    let mut set = nodedb_wal::extract_tombstones(wal_records)
+        .map_err(|error| anyhow::anyhow!("extract WAL tombstones: {error}"))?;
+    let catalog = crate::control::security::catalog::SystemCatalog::open(&catalog_path)
+        .map_err(|error| anyhow::anyhow!("open catalog for WAL tombstones: {error}"))?;
+    let persisted = catalog
+        .load_wal_tombstones()
+        .map_err(|error| anyhow::anyhow!("load persisted WAL tombstones: {error}"))?;
+    if !persisted.is_empty() {
+        info!(
+            persisted = persisted.len(),
+            in_wal = set.len(),
+            "merging persisted collection tombstones into replay set"
+        );
     }
-    set
+    set.extend(persisted);
+    Ok(set)
 }

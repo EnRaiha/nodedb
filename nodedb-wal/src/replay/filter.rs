@@ -125,11 +125,9 @@ impl std::ops::Deref for DatabaseTombstones<'_> {
 /// Single-pass extraction: walk `records`, decode every
 /// `CollectionTombstoned` entry, and return the resulting set.
 ///
-/// Records that fail to decode are logged and skipped — replay callers
-/// that need hard failure on corrupt tombstones should validate CRCs
-/// upstream; a CRC-passing but structurally corrupt payload is an
-/// out-of-band programmer bug, not a run-time recoverable condition.
-pub fn extract_tombstones(records: &[WalRecord]) -> TombstoneSet {
+/// A malformed tombstone fails extraction. Skipping one would replay writes
+/// below an unknown purge boundary and can resurrect a dropped collection.
+pub fn extract_tombstones(records: &[WalRecord]) -> crate::Result<TombstoneSet> {
     let mut set = TombstoneSet::new();
     for record in records {
         let Some(kind) = RecordType::from_raw(record.logical_record_type()) else {
@@ -142,22 +140,15 @@ pub fn extract_tombstones(records: &[WalRecord]) -> TombstoneSet {
         // they carry only a collection name and an LSN, no secrets.
         // If payload-level encryption is later extended to tombstones,
         // this call site changes to `decrypt_payload_ring` first.
-        match CollectionTombstonePayload::from_bytes(&record.payload) {
-            Ok(payload) => set.insert(
-                record.header.database_id,
-                record.header.tenant_id,
-                payload.collection,
-                payload.purge_lsn,
-            ),
-            Err(e) => tracing::warn!(
-                lsn = record.header.lsn,
-                tenant_id = record.header.tenant_id,
-                error = %e,
-                "skipping malformed CollectionTombstoned record during tombstone extraction",
-            ),
-        }
+        let payload = CollectionTombstonePayload::from_bytes(&record.payload)?;
+        set.insert(
+            record.header.database_id,
+            record.header.tenant_id,
+            payload.collection,
+            payload.purge_lsn,
+        );
     }
-    set
+    Ok(set)
 }
 
 #[cfg(test)]
@@ -217,7 +208,7 @@ mod tests {
             tombstone_record(7, 1, "orders", 150, 11),
             tombstone_record(8, 1, "users", 200, 12),
         ];
-        let set = extract_tombstones(&records);
+        let set = extract_tombstones(&records).unwrap();
         assert_eq!(set.len(), 3);
         assert_eq!(set.purge_lsn(7, 1, "users"), Some(100));
         assert_eq!(set.purge_lsn(7, 1, "orders"), Some(150));
@@ -251,12 +242,12 @@ mod tests {
             })
             .unwrap(),
         ];
-        let set = extract_tombstones(&records);
+        let set = extract_tombstones(&records).unwrap();
         assert_eq!(set.len(), 1);
     }
 
     #[test]
-    fn extract_tolerates_corrupt_payload() {
+    fn extract_rejects_corrupt_payload() {
         // Build a tombstone-typed record whose payload is too short to decode.
         let bogus = WalRecord::new(WalRecordArgs {
             record_type: RecordType::CollectionTombstoned as u32,
@@ -270,13 +261,10 @@ mod tests {
         })
         .unwrap();
         let records = vec![bogus, tombstone_record(0, 1, "users", 100, 10)];
-        let set = extract_tombstones(&records);
-        assert_eq!(
-            set.len(),
-            1,
-            "valid tombstone still captured despite peer corruption"
+        assert!(
+            extract_tombstones(&records).is_err(),
+            "malformed tombstone must fail replay rather than lose a purge boundary"
         );
-        assert_eq!(set.purge_lsn(0, 1, "users"), Some(100));
     }
 
     #[test]

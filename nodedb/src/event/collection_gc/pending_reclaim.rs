@@ -49,28 +49,28 @@ async fn run_loop(shared: Arc<SharedState>) {
     );
     loop {
         tokio::time::sleep(TICK_INTERVAL).await;
-        drain_once(&shared).await;
+        if let Err(error) = drain_once(&shared).await {
+            warn!(error = %error, "pending-reclaim worker pass incomplete");
+        }
     }
 }
 
 /// One worker pass: re-run the engine purge for every queued entry.
 /// Public for the boot-time drain and for testing.
-pub async fn drain_once(shared: &SharedState) {
+pub async fn drain_once(shared: &SharedState) -> crate::Result<()> {
     let catalog = shared.credentials.catalog();
-
-    let queue = match catalog.load_pending_reclaim_queue() {
-        Ok(q) => q,
-        Err(e) => {
-            warn!(error = %e, "pending-reclaim: failed to load queue");
-            return;
-        }
-    };
-
-    if queue.is_empty() {
-        return;
-    }
+    let queue = catalog.load_pending_reclaim_queue()?;
+    let mut last_error = None;
 
     for entry in queue {
+        if !shared
+            .quiesce
+            .is_draining(entry.database_id, entry.tenant_id, &entry.name)
+        {
+            shared
+                .quiesce
+                .begin_drain(entry.database_id, entry.tenant_id, &entry.name);
+        }
         match crate::control::server::shared::ddl::neutral::collection::purge::dispatch_unregister_collection(
             shared,
             entry.database_id,
@@ -81,15 +81,40 @@ pub async fn drain_once(shared: &SharedState) {
         .await
         {
             Ok(()) => {
-                if let Err(e) = catalog.remove_pending_reclaim(entry.database_id, entry.tenant_id, &entry.name) {
+                if let Err(error) =
+                    crate::control::catalog_entry::apply::collection::finalize_purge(
+                        entry.database_id,
+                        entry.tenant_id,
+                        &entry.name,
+                        catalog,
+                    )
+                {
                     warn!(
                         tenant = entry.tenant_id,
                         collection = %entry.name,
-                        error = %e,
-                        "pending-reclaim: purged engine rows but failed to reap queue entry"
+                        error = %error,
+                        "pending-reclaim: engine rows purged but catalog finalization failed"
                     );
+                    last_error = Some(error.to_string());
                     continue;
                 }
+                if let Err(error) = catalog.remove_pending_reclaim(
+                    entry.database_id,
+                    entry.tenant_id,
+                    &entry.name,
+                ) {
+                    warn!(
+                        tenant = entry.tenant_id,
+                        collection = %entry.name,
+                        error = %error,
+                        "pending-reclaim: purged engine rows but failed to reap queue entry"
+                    );
+                    last_error = Some(error.to_string());
+                    continue;
+                }
+                shared
+                    .quiesce
+                    .forget(entry.database_id, entry.tenant_id, &entry.name);
                 debug!(
                     tenant = entry.tenant_id,
                     collection = %entry.name,
@@ -121,7 +146,16 @@ pub async fn drain_once(shared: &SharedState) {
                     error = %msg,
                     "pending-reclaim: engine purge failed; will retry next tick"
                 );
+                last_error = Some(msg);
             }
         }
     }
+
+    if let Some(detail) = last_error {
+        return Err(crate::Error::Storage {
+            engine: "pending-reclaim".into(),
+            detail,
+        });
+    }
+    Ok(())
 }

@@ -61,8 +61,8 @@ pub async fn put_async(stored: StoredCollection, shared: Arc<SharedState>) {
 /// in-memory owner entry + any permission-cache entries keyed on
 /// the purged collection. The primary `StoredCollection` redb row
 /// is already gone at this point (removed by `apply/collection.rs::purge`).
-/// The Data Plane `UnregisterCollection` dispatch is the async half
-/// and lives in `async_dispatch/collection.rs::purge_async`.
+/// The result-checked Data Plane `UnregisterCollection` barrier lives in
+/// `async_dispatch/collection.rs::reclaim_collection_storage`.
 pub fn purge_sync(database_id: u64, tenant_id: u64, name: String, shared: Arc<SharedState>) {
     let owner_removed = shared
         .permissions

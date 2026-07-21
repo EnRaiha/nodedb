@@ -18,9 +18,14 @@
 //! synchronously on the calling tokio worker thread. The raft tick loop always
 //! runs on a tokio worker thread, so `block_in_place` is valid here.
 //!
-//! All other variants (purge, MV delete, etc.) are fire-and-forget and are
-//! spawned as background tasks — their correctness does not depend on
-//! completing before the watcher bumps.
+//! Collection purge and materialized-view deletion have the same ordering
+//! requirement: all local Data Plane cores must reclaim the old incarnation
+//! before the applied-index watcher advances, because a same-name re-CREATE may
+//! immediately follow. Reclaim failure is fatal to the applying node; the
+//! durable pending-reclaim record is drained on restart before stale state can
+//! be served.
+//!
+//! Variants without a read-after-apply dependency remain fire-and-forget.
 
 use std::sync::Arc;
 
@@ -93,19 +98,39 @@ pub fn spawn_post_apply_async_side_effects(
             tenant_id,
             name,
         } => {
-            tokio::spawn(async move {
-                collection::purge_async(database_id, tenant_id, name, raft_index, shared).await;
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    collection::reclaim_collection_storage(
+                        &shared,
+                        database_id,
+                        tenant_id,
+                        &name,
+                        raft_index,
+                        false,
+                    )
+                    .await
+                })
             });
+            if let Err(error) = result {
+                panic!("collection post-apply reclaim failed: {error}");
+            }
         }
-        // `DeleteMaterializedView` now has async follow-up: every
-        // node dispatches `MetaOp::UnregisterMaterializedView` to its
-        // local Data Plane so the MV's columnar segment files +
-        // per-core in-memory state get reclaimed on followers, not
-        // just on the leader. Runs on every node; idempotent.
+        // SYNCHRONOUS: every node must clear the view target's per-core state
+        // before its applied-index watcher advances. Otherwise a same-name
+        // re-CREATE can observe cached aggregates from the dropped target.
+        // A failure is fatal: the metadata deletion is already committed, so
+        // continuing would serve an inconsistent catalog/Data Plane pair;
+        // restart safely reconstructs the in-memory cache from empty state.
         CatalogEntry::DeleteMaterializedView { tenant_id, name } => {
-            tokio::spawn(async move {
-                super::materialized_view::delete_async(tenant_id, name, shared).await;
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    super::materialized_view::delete_async(tenant_id, name, raft_index, shared)
+                        .await
+                })
             });
+            if let Err(error) = result {
+                panic!("materialized-view post-apply reclaim failed: {error}");
+            }
         }
         // `PutContinuousAggregate` dispatches register to every core on
         // this node so the local `continuous_agg_mgr` picks up the new

@@ -172,7 +172,7 @@ impl TestServer {
         let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
         let wal_records: Arc<[nodedb_wal::WalRecord]> =
             Arc::from(wal.replay().unwrap().into_boxed_slice());
-        let replay_tombstones = nodedb_wal::extract_tombstones(&wal_records);
+        let replay_tombstones = nodedb_wal::extract_tombstones(&wal_records).unwrap();
 
         let (dispatcher, data_sides) = Dispatcher::new(1, 64);
         let (event_producers, event_consumers) = create_event_bus(1);

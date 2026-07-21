@@ -136,3 +136,25 @@ pub(super) fn delete_parent_owner_in_database(
         );
     }
 }
+
+/// Fail-closed owner deletion for compound lifecycle mutations whose primary
+/// and owner rows must advance atomically.
+pub(super) fn delete_parent_owner_checked(
+    object_type: &'static str,
+    tenant_id: u64,
+    object_name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    delete_parent_owner_in_database_checked(object_type, 0, tenant_id, object_name, catalog)
+}
+
+pub(super) fn delete_parent_owner_in_database_checked(
+    object_type: &'static str,
+    database_id: u64,
+    tenant_id: u64,
+    object_name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    catalog.delete_owner(object_type, database_id, tenant_id, object_name)?;
+    Ok(())
+}

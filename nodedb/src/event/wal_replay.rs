@@ -85,7 +85,7 @@ fn convert_records_to_events(
     // Collection tombstones shadow any prior write in the same stream.
     // Extract once, then drop events whose `(tenant, collection, lsn)`
     // is covered.
-    let tombstones = nodedb_wal::extract_tombstones(records);
+    let tombstones = nodedb_wal::extract_tombstones(records)?;
 
     for record in records {
         let vshard_id = record.header.vshard_id as usize;

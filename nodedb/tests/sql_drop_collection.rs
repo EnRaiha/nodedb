@@ -167,6 +167,15 @@ async fn drop_then_recreate_document_strict_starts_empty() {
         7,
         "7 rows must exist before DROP, got {before:?}"
     );
+    let cached_before = srv
+        .query_text("SELECT COUNT(*) FROM recycled_strict")
+        .await
+        .unwrap();
+    assert_eq!(
+        cached_before,
+        vec!["7".to_string()],
+        "COUNT(*) must reflect the predecessor before DROP, got {cached_before:?}"
+    );
 
     srv.exec("DROP COLLECTION recycled_strict").await.unwrap();
     srv.exec(
@@ -194,5 +203,43 @@ async fn drop_then_recreate_document_strict_starts_empty() {
         count,
         vec!["0".to_string()],
         "COUNT(*) on a freshly re-created strict collection must be 0, got {count:?}"
+    );
+}
+
+/// Grouped aggregates over a same-name re-CREATE must observe the new
+/// collection incarnation. With no rows in the replacement, SQL aggregate
+/// semantics require zero groups rather than groups cached from its predecessor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_then_recreate_discards_predecessor_grouped_aggregates() {
+    let srv = TestServer::start().await;
+
+    srv.exec("CREATE COLLECTION recycled_groups").await.unwrap();
+    srv.exec("INSERT INTO recycled_groups { id: 'a', bucket: 'old' }")
+        .await
+        .unwrap();
+    srv.exec("INSERT INTO recycled_groups { id: 'b', bucket: 'old' }")
+        .await
+        .unwrap();
+
+    let predecessor = srv
+        .query_rows("SELECT bucket, COUNT(*) AS n FROM recycled_groups GROUP BY bucket")
+        .await
+        .unwrap();
+    assert_eq!(
+        predecessor.len(),
+        1,
+        "predecessor must produce one cached group, got {predecessor:?}"
+    );
+
+    srv.exec("DROP COLLECTION recycled_groups").await.unwrap();
+    srv.exec("CREATE COLLECTION recycled_groups").await.unwrap();
+
+    let replacement = srv
+        .query_rows("SELECT bucket, COUNT(*) AS n FROM recycled_groups GROUP BY bucket")
+        .await
+        .unwrap();
+    assert!(
+        replacement.is_empty(),
+        "empty replacement must not inherit predecessor groups: {replacement:?}"
     );
 }

@@ -95,7 +95,7 @@ fn extract_and_shadow_writes_before_purge_lsn() {
     writer.sync().unwrap();
 
     let records = read_all(&path);
-    let set: TombstoneSet = extract_tombstones(&records);
+    let set: TombstoneSet = extract_tombstones(&records).unwrap();
 
     assert_eq!(set.len(), 1);
     assert_eq!(set.purge_lsn(0, 1, "users"), Some(purge_lsn));
@@ -159,7 +159,7 @@ fn multiple_tombstones_keep_highest_purge_lsn() {
     writer.sync().unwrap();
 
     let records = read_all(&path);
-    let set = extract_tombstones(&records);
+    let set = extract_tombstones(&records).unwrap();
     assert_eq!(set.purge_lsn(0, 1, "users"), Some(500));
     assert!(set.is_tombstoned(0, 1, "users", 499));
     assert!(!set.is_tombstoned(0, 1, "users", 500));
@@ -179,6 +179,6 @@ fn extract_ignores_unrelated_record_types() {
 
     let records = read_all(&path);
     assert_eq!(records.len(), 4);
-    let set = extract_tombstones(&records);
+    let set = extract_tombstones(&records).unwrap();
     assert!(set.is_empty());
 }

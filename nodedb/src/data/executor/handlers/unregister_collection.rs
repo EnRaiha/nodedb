@@ -123,6 +123,7 @@ impl CoreLoop {
         tenant_id: u64,
         collection: &str,
         purge_lsn: u64,
+        reclaim_l1_files: bool,
     ) -> Response {
         info!(
             core = self.core_id,
@@ -145,6 +146,7 @@ impl CoreLoop {
             TenantId::new(tenant_id),
             collection,
             false,
+            reclaim_l1_files,
         ) {
             Ok(stats) => stats,
             // Fail-closed: a failed engine purge must surface as an error so
@@ -233,12 +235,20 @@ impl CoreLoop {
     /// Fail-closed: any persistent-engine reclaim that fails after its bounded
     /// retries propagates as `Err`; the caller must abort the purge rather than
     /// let a partially-cleared collection have its catalog row removed.
+    ///
+    /// `reclaim_l1_files` gates the shared on-disk L1 unlink pass. Those paths
+    /// are keyed by `(database, tenant, collection)` — not by core — so in the
+    /// all-cores `UnregisterCollection` fan-out only the homing core passes
+    /// `true`; other cores still evict their own per-core in-memory state but
+    /// must not race `remove_dir_all`/`unlink` on the same tree. Single-core
+    /// callers (snapshot restore) pass `true`.
     pub(in crate::data::executor) fn clear_collection_all_engines(
         &mut self,
         database_id: DatabaseId,
         tenant_id: TenantId,
         collection: &str,
         preserve_collection_metadata: bool,
+        reclaim_l1_files: bool,
     ) -> crate::Result<ClearCollectionStats> {
         let db = database_id;
         let tid = tenant_id;
@@ -368,42 +378,79 @@ impl CoreLoop {
         // strict, FTS, graph edges) already reclaimed above; engines
         // with no per-collection persistent file (KV hash index,
         // CRDT — per-tenant checkpoint) are N/A.
+        // Shared on-disk L1 files are keyed by (database, tenant, collection),
+        // not by core. Only the homing core reclaims them so concurrent cores
+        // in the all-cores fan-out cannot race `remove_dir_all`/`unlink` on the
+        // same tree and turn a benign concurrent-removal errno into a fatal
+        // barrier failure.
         let mut l1 = reclaim::ReclaimStats::default();
-        l1.merge(reclaim::vector::reclaim_vector_checkpoints(
-            &self.data_dir,
-            db_raw,
-            tid_raw,
-            collection,
-        ));
-        l1.merge(reclaim::spatial::reclaim_spatial_checkpoints(
-            &self.data_dir,
-            db_raw,
-            tid_raw,
-            collection,
-        ));
-        l1.merge(reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(
-            &self.data_dir,
-            db_raw,
-            tid_raw,
-            collection,
-        ));
-        l1.merge(reclaim::timeseries::reclaim_timeseries_partitions(
-            &self.data_dir,
-            db_raw,
-            tid_raw,
-            collection,
-        ));
+        if reclaim_l1_files {
+            l1.merge(retry_reclaim(
+                "vector checkpoints",
+                tid_raw,
+                collection,
+                || {
+                    reclaim::vector::reclaim_vector_checkpoints(
+                        &self.data_dir,
+                        db_raw,
+                        tid_raw,
+                        collection,
+                    )
+                },
+            )?);
+            l1.merge(retry_reclaim(
+                "spatial checkpoints",
+                tid_raw,
+                collection,
+                || {
+                    reclaim::spatial::reclaim_spatial_checkpoints(
+                        &self.data_dir,
+                        db_raw,
+                        tid_raw,
+                        collection,
+                    )
+                },
+            )?);
+            l1.merge(retry_reclaim(
+                "sparse-vector checkpoints",
+                tid_raw,
+                collection,
+                || {
+                    reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(
+                        &self.data_dir,
+                        db_raw,
+                        tid_raw,
+                        collection,
+                    )
+                },
+            )?);
+            l1.merge(retry_reclaim(
+                "timeseries partitions",
+                tid_raw,
+                collection,
+                || {
+                    reclaim::timeseries::reclaim_timeseries_partitions(
+                        &self.data_dir,
+                        db_raw,
+                        tid_raw,
+                        collection,
+                    )
+                },
+            )?);
+        }
 
-        // Doc configs + chain hashes + aggregate cache: the collection's schema
-        // and derived metadata. Preserved for clear-then-install (the snapshot
-        // carries row data, not the collection definition); removed on a full DROP.
+        // Doc configs + chain hashes + derived-result cache: the collection's
+        // schema and metadata. Preserved for clear-then-install (the snapshot
+        // carries row data, not the collection definition); removed on a full
+        // DROP. Cache entries encode query shape after a NUL-terminated
+        // collection prefix, so lifecycle eviction must use the canonical
+        // invalidation API rather than compare the encoded key to `coll`.
         if !preserve_collection_metadata {
             self.doc_configs
                 .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
             self.chain_hashes
                 .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
-            self.aggregate_cache
-                .retain(|(d, t, c), _| !(*d == db && *t == tid && c == &coll));
+            self.invalidate_aggregate_cache_for_collection(db_raw, tid_raw, collection);
         }
 
         Ok(ClearCollectionStats {
@@ -418,5 +465,58 @@ impl CoreLoop {
             crdt_rows_removed,
             l1,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nodedb_bridge::buffer::RingBuffer;
+
+    use super::*;
+    use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+
+    fn open_core() -> (CoreLoop, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_request_tx, request_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (response_tx, _response_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        let core = CoreLoop::open(
+            0,
+            request_rx,
+            response_tx,
+            dir.path(),
+            Arc::new(nodedb_types::OrdinalClock::new()),
+        )
+        .expect("open core loop");
+        (core, dir)
+    }
+
+    #[test]
+    fn full_clear_removes_encoded_derived_cache_entries() {
+        let (mut core, _dir) = open_core();
+        let database = DatabaseId::DEFAULT;
+        let tenant = TenantId::new(1);
+
+        core.aggregate_cache.insert(
+            (database, tenant, "products\0count(*)".to_string()),
+            vec![1],
+        );
+        core.aggregate_cache.insert(
+            (database, tenant, "products\0facet:brand".to_string()),
+            vec![2],
+        );
+        core.aggregate_cache
+            .insert((database, tenant, "other\0count(*)".to_string()), vec![3]);
+
+        core.clear_collection_all_engines(database, tenant, "products", false, true)
+            .expect("full collection clear");
+
+        assert_eq!(core.aggregate_cache.len(), 1);
+        assert!(
+            core.aggregate_cache
+                .contains_key(&(database, tenant, "other\0count(*)".to_string())),
+            "collection-scoped clear must preserve another collection's cache"
+        );
     }
 }

@@ -9,20 +9,45 @@ use std::task::{Context, Poll};
 
 use super::refcount::CollectionQuiesce;
 
+/// Exclusive per-name lifecycle hold used by no-Raft DDL.
+///
+/// Dropping the guard releases one drain hold and wakes CREATE waiters. Call
+/// [`disarm`](LifecycleDrainGuard::disarm) after ownership is transferred to a
+/// durable pending-reclaim record.
+pub struct LifecycleDrainGuard {
+    registry: Arc<CollectionQuiesce>,
+    database_id: u64,
+    tenant_id: u64,
+    collection: String,
+    active: bool,
+}
+
+impl LifecycleDrainGuard {
+    pub fn disarm(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for LifecycleDrainGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.registry
+                .clear_drain(self.database_id, self.tenant_id, &self.collection);
+        }
+    }
+}
+
 impl CollectionQuiesce {
-    /// Mark `(tenant_id, collection)` as draining. After this call:
-    /// - `try_start_scan` returns `ScanStartError::Draining`.
-    /// - `wait_until_drained` can be awaited to block until open scans
-    ///   reach zero.
-    ///
-    /// Idempotent: calling twice is a no-op on the second call.
+    /// Acquire one lifecycle drain hold for `(database, tenant, collection)`.
+    /// New scans and same-name CREATE operations remain blocked until every
+    /// matching hold is released by `clear_drain` or `forget`.
     pub fn begin_drain(&self, database_id: u64, tenant_id: u64, collection: &str) {
         let mut inner = self.inner_mut();
         let entry = inner
             .states
             .entry((database_id, tenant_id, collection.to_string()))
             .or_default();
-        entry.draining = true;
+        entry.drain_holders = entry.drain_holders.saturating_add(1);
     }
 
     /// Stop the drain marker, allowing new scans again. Only called when
@@ -32,12 +57,18 @@ impl CollectionQuiesce {
     /// is garbage-collected via `forget`.
     pub fn clear_drain(&self, database_id: u64, tenant_id: u64, collection: &str) {
         let mut inner = self.inner_mut();
-        if let Some(state) = inner
-            .states
-            .get_mut(&(database_id, tenant_id, collection.to_string()))
-        {
-            state.draining = false;
+        let key = (database_id, tenant_id, collection.to_string());
+        let remove = if let Some(state) = inner.states.get_mut(&key) {
+            state.drain_holders = state.drain_holders.saturating_sub(1);
+            state.drain_holders == 0 && state.open_scans == 0
+        } else {
+            false
+        };
+        if remove {
+            inner.states.remove(&key);
         }
+        drop(inner);
+        self.notify.notify_waiters();
     }
 
     /// Drop the entry entirely once reclaim has completed. After this,
@@ -45,9 +76,81 @@ impl CollectionQuiesce {
     /// the purge handler right before emitting the reclaim ack.
     pub fn forget(&self, database_id: u64, tenant_id: u64, collection: &str) {
         let mut inner = self.inner_mut();
-        inner
+        let key = (database_id, tenant_id, collection.to_string());
+        let remove = if let Some(state) = inner.states.get_mut(&key) {
+            state.drain_holders = state.drain_holders.saturating_sub(1);
+            state.drain_holders == 0
+        } else {
+            false
+        };
+        if remove {
+            inner.states.remove(&key);
+        }
+        drop(inner);
+        self.notify.notify_waiters();
+    }
+
+    /// Try to acquire the exclusive lifecycle drain without waiting.
+    /// Synchronous DDL uses this form because it may run on a current-thread
+    /// Tokio runtime where blocking on an async waiter would panic.
+    pub fn try_acquire_lifecycle(
+        self: &Arc<Self>,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+    ) -> Option<LifecycleDrainGuard> {
+        let mut inner = self.inner_mut();
+        let entry = inner
             .states
-            .remove(&(database_id, tenant_id, collection.to_string()));
+            .entry((database_id, tenant_id, collection.to_string()))
+            .or_default();
+        if entry.drain_holders > 0 {
+            return None;
+        }
+        entry.drain_holders = 1;
+        Some(LifecycleDrainGuard {
+            registry: Arc::clone(self),
+            database_id,
+            tenant_id,
+            collection: collection.to_string(),
+            active: true,
+        })
+    }
+
+    /// Exclusively acquire the lifecycle drain for one collection name.
+    ///
+    /// The check-and-acquire is performed under the registry mutex, so two
+    /// concurrent local DDL operations cannot both enter the destructive
+    /// lifecycle section.
+    pub async fn acquire_lifecycle(
+        self: &Arc<Self>,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+    ) -> LifecycleDrainGuard {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut inner = self.inner_mut();
+                let entry = inner
+                    .states
+                    .entry((database_id, tenant_id, collection.to_string()))
+                    .or_default();
+                if entry.drain_holders == 0 {
+                    entry.drain_holders = 1;
+                    return LifecycleDrainGuard {
+                        registry: Arc::clone(self),
+                        database_id,
+                        tenant_id,
+                        collection: collection.to_string(),
+                        active: true,
+                    };
+                }
+            }
+            notified.await;
+        }
     }
 
     /// Returns a future that resolves once every open scan against
@@ -187,6 +290,47 @@ mod tests {
 
         drop(g2);
         drain_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_lifecycle_holder_clears_on_forget() {
+        let q = CollectionQuiesce::new();
+        q.begin_drain(DB, 1, "c");
+        assert!(q.is_draining(DB, 1, "c"));
+
+        q.forget(DB, 1, "c");
+        assert!(!q.is_draining(DB, 1, "c"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_acquisition_is_exclusive() {
+        let q = CollectionQuiesce::new();
+        let first = q.acquire_lifecycle(DB, 1, "c").await;
+
+        let q_clone = Arc::clone(&q);
+        let second = tokio::spawn(async move { q_clone.acquire_lifecycle(DB, 1, "c").await });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+
+        drop(first);
+        let second = second.await.unwrap();
+        drop(second);
+        assert!(!q.is_draining(DB, 1, "c"));
+    }
+
+    #[tokio::test]
+    async fn is_draining_until_every_lifecycle_holder_forgets() {
+        let q = CollectionQuiesce::new();
+        q.begin_drain(DB, 1, "c");
+        q.begin_drain(DB, 1, "c");
+
+        // One holder released — still draining while the other holds.
+        q.forget(DB, 1, "c");
+        assert!(q.is_draining(DB, 1, "c"));
+
+        // Last holder released — drain clears.
+        q.forget(DB, 1, "c");
+        assert!(!q.is_draining(DB, 1, "c"));
     }
 
     #[tokio::test]
