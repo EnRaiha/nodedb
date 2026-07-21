@@ -74,50 +74,20 @@ impl CoreLoop {
             let record_lsn = record.header.lsn;
 
             if is_put {
-                let decoded = zerompk::from_msgpack::<(
-                    String,
-                    String,
-                    String,
-                    String,
-                    Vec<u8>,
-                    u32,
-                    u32,
-                    i64,
-                )>(&record.payload)
-                .map(
-                    |(collection, src, label, dst, props, src_sur, dst_sur, system_from)| {
-                        (
-                            collection,
-                            src,
-                            label,
-                            dst,
-                            props,
-                            src_sur,
-                            dst_sur,
-                            Some(system_from),
-                        )
-                    },
-                )
-                .or_else(|_| {
-                    zerompk::from_msgpack::<(String, String, String, String, Vec<u8>, u32, u32)>(
-                        &record.payload,
-                    )
-                    .map(
-                        |(collection, src, label, dst, props, src_sur, dst_sur)| {
-                            (collection, src, label, dst, props, src_sur, dst_sur, None)
-                        },
-                    )
-                });
-                let Ok((
+                // One struct decodes both the current record and any legacy
+                // record predating `system_from` (tolerant array decode →
+                // `None`), so there is no hand-maintained fallback tuple to
+                // drift out of sync with the encoder.
+                let Ok(crate::wal::EdgePutRedo {
                     collection,
                     src_id,
                     label,
                     dst_id,
                     properties,
-                    src_sur,
-                    dst_sur,
+                    src_surrogate: src_sur,
+                    dst_surrogate: dst_sur,
                     system_from,
-                )) = decoded
+                }) = zerompk::from_msgpack::<crate::wal::EdgePutRedo>(&record.payload)
                 else {
                     continue;
                 };
@@ -170,20 +140,17 @@ impl CoreLoop {
                     );
                 }
             } else {
-                let decoded =
-                    zerompk::from_msgpack::<(String, String, String, String, i64)>(&record.payload)
-                        .map(|(collection, src, label, dst, system_from)| {
-                            (collection, src, label, dst, Some(system_from))
-                        })
-                        .or_else(|_| {
-                            zerompk::from_msgpack::<(String, String, String, String)>(
-                                &record.payload,
-                            )
-                            .map(|(collection, src, label, dst)| {
-                                (collection, src, label, dst, None)
-                            })
-                        });
-                let Ok((collection, src_id, label, dst_id, system_from)) = decoded else {
+                // One struct decodes both the current record and any legacy
+                // record predating `system_from` (tolerant array decode →
+                // `None`), so there is no hand-maintained fallback tuple.
+                let Ok(crate::wal::EdgeDeleteRedo {
+                    collection,
+                    src_id,
+                    label,
+                    dst_id,
+                    system_from,
+                }) = zerompk::from_msgpack::<crate::wal::EdgeDeleteRedo>(&record.payload)
+                else {
                     continue;
                 };
                 if tombstones.is_tombstoned(
@@ -371,16 +338,16 @@ mod tests {
     }
 
     fn edge_put_sub(collection: &str, src: &str, label: &str, dst: &str) -> RedoSubRecord {
-        let payload = zerompk::to_msgpack_vec(&(
-            collection,
-            src,
-            label,
-            dst,
-            b"".as_slice(),
-            10u32,
-            20u32,
-            nodedb_types::ms_to_ordinal_upper(100),
-        ))
+        let payload = zerompk::to_msgpack_vec(&crate::wal::EdgePutRedo {
+            collection: collection.to_string(),
+            src_id: src.to_string(),
+            label: label.to_string(),
+            dst_id: dst.to_string(),
+            properties: Vec::new(),
+            src_surrogate: 10,
+            dst_surrogate: 20,
+            system_from: Some(nodedb_types::ms_to_ordinal_upper(100)),
+        })
         .expect("encode edge put sub-record");
         RedoSubRecord {
             record_type: RecordType::Put as u32,

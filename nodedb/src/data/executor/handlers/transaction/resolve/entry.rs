@@ -1818,20 +1818,23 @@ mod tests {
         assert_eq!(redo.ops.len(), 1, "one staged edge put -> one sub-record");
         assert_eq!(redo.ops[0].record_type, RecordType::Put as u32);
 
-        let (collection, src_id, label, dst_id, properties, src_sur, dst_sur, system_from) =
-            zerompk::from_msgpack::<(String, String, String, String, Vec<u8>, u32, u32, i64)>(
-                &redo.ops[0].payload,
-            )
-            .expect("decode edge put tuple");
-        assert_eq!(collection, "g");
-        assert_eq!(src_id, "a");
-        assert_eq!(label, "knows");
-        assert_eq!(dst_id, "b");
-        assert_eq!(properties, vec![9, 9]);
-        assert_eq!(src_sur, 10, "src surrogate must come from the plan node");
-        assert_eq!(dst_sur, 20, "dst surrogate must come from the plan node");
+        let decoded = zerompk::from_msgpack::<crate::wal::EdgePutRedo>(&redo.ops[0].payload)
+            .expect("decode edge put redo");
+        assert_eq!(decoded.collection, "g");
+        assert_eq!(decoded.src_id, "a");
+        assert_eq!(decoded.label, "knows");
+        assert_eq!(decoded.dst_id, "b");
+        assert_eq!(decoded.properties, vec![9, 9]);
+        assert_eq!(
+            decoded.src_surrogate, 10,
+            "src surrogate must come from the plan node"
+        );
+        assert_eq!(
+            decoded.dst_surrogate, 20,
+            "dst surrogate must come from the plan node"
+        );
         assert!(
-            system_from > 0,
+            decoded.system_from.is_some_and(|s| s > 0),
             "resolve must freeze a real graph system-time ordinal"
         );
 
@@ -1909,17 +1912,23 @@ mod tests {
         assert_eq!(redo.ops.len(), 1);
         assert_eq!(redo.ops[0].record_type, RecordType::Delete as u32);
 
-        let (collection, src_id, label, dst_id, system_from) =
-            zerompk::from_msgpack::<(String, String, String, String, i64)>(&redo.ops[0].payload)
-                .expect("decode timestamped edge delete tuple");
-        assert_eq!(collection, "g");
-        assert_eq!(src_id, "a");
-        assert_eq!(label, "knows");
-        assert_eq!(dst_id, "b");
-        assert!(system_from > 0);
+        let decoded = zerompk::from_msgpack::<crate::wal::EdgeDeleteRedo>(&redo.ops[0].payload)
+            .expect("decode timestamped edge delete redo");
+        assert_eq!(decoded.collection, "g");
+        assert_eq!(decoded.src_id, "a");
+        assert_eq!(decoded.label, "knows");
+        assert_eq!(decoded.dst_id, "b");
+        assert!(decoded.system_from.is_some_and(|s| s > 0));
 
-        // Seed the edge in a fresh core, then replay the delete removes it.
+        // Seed the pre-existing edge in a fresh core at a system-time ordinal
+        // EARLIER than the delete's frozen `system_from`. In production the
+        // edge's own (earlier) put is replayed before the delete, so the
+        // tombstone is the newer version and hides it; freezing the seed here
+        // reproduces that ordering rather than stamping the seed with a fresh
+        // `next_ordinal` that would (incorrectly) post-date the tombstone.
         let (mut dst_core, _dst_dir) = make_core();
+        dst_core.active_graph_system_from =
+            Some(decoded.system_from.expect("delete froze a system_from") - 1);
         dst_core.execute_edge_put(
             &task,
             EdgePutParams {
@@ -1933,6 +1942,7 @@ mod tests {
                 dst_surrogate: Surrogate::new(2),
             },
         );
+        dst_core.active_graph_system_from = None;
         assert_eq!(
             dst_core
                 .edge_store

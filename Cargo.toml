@@ -164,7 +164,7 @@ chrono = { version = "0.4", features = ["std"], default-features = false }
 
 # MessagePack
 rmpv = "1"
-zerompk = { version = "0.5", features = ["std", "derive"] }
+zerompk = { version = "0.6", features = ["std", "derive"] }
 
 # Bitmap
 roaring = "0.11"

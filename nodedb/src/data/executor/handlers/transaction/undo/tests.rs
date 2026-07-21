@@ -838,6 +838,56 @@ fn graph_edge_update_undo_restores_csr_weight() {
     );
 }
 
+#[test]
+fn tx_edge_put_to_deleted_node_records_no_phantom_undo() {
+    use crate::bridge::envelope::Status;
+    use crate::data::executor::core_loop::tests::make_default_task;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+    let tenant = TenantId::new(TID);
+
+    // The destination node is soft-deleted, so the edge insert is rejected by
+    // `execute_edge_put`'s dangling-endpoint validation BEFORE any store write.
+    core.mark_node_deleted(DB, TID, "bob");
+
+    let task = make_default_task();
+    let mut undo_log: Vec<UndoEntry> = Vec::new();
+    let resp = core.execute_edge_put_with_undo(
+        &task,
+        crate::data::executor::handlers::graph::EdgePutParams {
+            tid: TID,
+            collection: "c",
+            src_id: "alice",
+            label: "KNOWS",
+            dst_id: "bob",
+            properties: b"p1",
+            src_surrogate: nodedb_types::Surrogate::ZERO,
+            dst_surrogate: nodedb_types::Surrogate::ZERO,
+        },
+        Some(&mut undo_log),
+    );
+
+    assert_eq!(
+        resp.status,
+        Status::Error,
+        "an edge insert to a deleted node must be rejected"
+    );
+    assert!(
+        undo_log.is_empty(),
+        "a rejected insert must record NO compensation entry; a phantom PutEdge \
+         undo would soft-delete a never-written edge on rollback, corrupting \
+         bitemporal history"
+    );
+    assert!(
+        core.edge_store
+            .get_edge(DB, tenant, "c", "alice", "KNOWS", "bob")
+            .unwrap()
+            .is_none(),
+        "the rejected insert must not have written any edge version"
+    );
+}
+
 // ── Column-stats undo ─────────────────────────────────────────────────────────
 
 fn stats_key_str() -> String {

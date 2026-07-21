@@ -45,6 +45,23 @@ pub fn make_core_with_dir(
     (core, req_tx, resp_rx)
 }
 
+/// A minimal `ExecutionTask` (DEFAULT database/tenant, vShard 0, no WAL LSN)
+/// for handler unit tests that only read `request.database_id`. The carried
+/// plan is inert — edge/point handlers take their parameters directly.
+pub fn make_default_task() -> crate::data::executor::task::ExecutionTask {
+    crate::data::executor::task::ExecutionTask::new(make_request(PhysicalPlan::Document(
+        DocumentOp::PointGet {
+            collection: "x".into(),
+            document_id: "y".into(),
+            surrogate: Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            rls_filters: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        },
+    )))
+}
+
 fn make_request(plan: PhysicalPlan) -> Request {
     Request {
         request_id: RequestId::new(1),

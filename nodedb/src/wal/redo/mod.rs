@@ -3,4 +3,4 @@
 pub mod record;
 pub mod replay;
 
-pub use record::{CalvinStamp, RedoRecord, RedoSubRecord};
+pub use record::{CalvinStamp, EdgeDeleteRedo, EdgePutRedo, RedoRecord, RedoSubRecord};
