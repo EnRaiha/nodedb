@@ -14,7 +14,7 @@ categories = ["encoding", "data-structures"]
 
 [dependencies]
 nodedb-types = { workspace = true }
-arrow = { version = "58", default-features = false, features = ["ffi"] }
+arrow = { workspace = true, features = ["ffi"] }
 thiserror = { workspace = true }
 rust_decimal = { workspace = true }
 uuid = { workspace = true }
