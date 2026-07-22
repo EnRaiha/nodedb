@@ -107,6 +107,10 @@ pub(crate) fn streaming_shaped_response(
         .iter()
         .map(|c| c.display_name.clone())
         .collect();
+    // Cells live in the shaped row maps under unique per-column keys
+    // (display names may repeat across columns, e.g. `SELECT w.id, b.id`);
+    // derive the same keys the shaper used so every column reads its own cell.
+    let cell_keys = crate::control::server::response_shape::project::cell_keys(&display_columns);
     // Advertise each projected column's real catalog type so the streaming
     // path's RowDescription OIDs match the non-streaming `shaped_query_response`
     // (and the extended-query Describe path); `column_types` also drives the
@@ -160,7 +164,7 @@ pub(crate) fn streaming_shaped_response(
                     break;
                 }
                 let encoded =
-                    encode_shaped_row(&row_schema, &display_columns, &column_types, &row_formats, row)?;
+                    encode_shaped_row(&row_schema, &cell_keys, &column_types, &row_formats, row)?;
                 emitted += 1;
                 yield encoded;
             }

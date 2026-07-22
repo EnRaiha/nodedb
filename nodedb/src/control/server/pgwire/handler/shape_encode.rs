@@ -28,22 +28,27 @@ use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 
 use super::super::ddl_encode::col_type_to_field_with_format;
 
-/// Encode one flat row object into a pgwire `DataRow`, using `columns` (in
-/// order) to look up cells in `row` and `column_types` (parallel to `columns`)
-/// to pick each cell's text rendering.
+/// Encode one flat row object into a pgwire `DataRow`, using `cell_keys` (in
+/// order) to look up cells in `row` and `column_types` (parallel to
+/// `cell_keys`) to pick each cell's text rendering.
+///
+/// `cell_keys` are the per-column unique row-map keys derived from the
+/// display names via `response_shape::project::cell_keys` — identical to the
+/// display names except where those repeat (`SELECT w.id, b.id`), in which
+/// case later duplicates carry a `_n` suffix so both cells survive the map.
 ///
 /// Missing keys and explicit JSON `null` both encode as SQL NULL. Every other
 /// cell renders per its column type via [`encode_typed_cell`]; a
 /// missing/short `column_types` entry defaults to `Text`.
 pub(in crate::control::server::pgwire) fn encode_shaped_row(
     schema: &Arc<Vec<FieldInfo>>,
-    columns: &[String],
+    cell_keys: &[String],
     column_types: &[DdlColType],
     formats: &[FieldFormat],
     row: &serde_json::Map<String, serde_json::Value>,
 ) -> PgWireResult<DataRow> {
     let mut encoder = DataRowEncoder::new(schema.clone());
-    for (idx, name) in columns.iter().enumerate() {
+    for (idx, name) in cell_keys.iter().enumerate() {
         let ct = column_types.get(idx).copied().unwrap_or(DdlColType::Text);
         let format = formats.get(idx).copied().unwrap_or(FieldFormat::Text);
         match row.get(name) {
@@ -159,9 +164,12 @@ pub(in crate::control::server::pgwire) fn shaped_query_response(
         .collect();
     let schema = Arc::new(fields);
 
+    // Cells live in the row maps under unique per-column keys (display names
+    // may repeat across columns); derive the same keys the shaper used.
+    let keys = crate::control::server::response_shape::project::cell_keys(&columns);
     let encoded_rows: Vec<PgWireResult<DataRow>> = rows
         .iter()
-        .map(|row| encode_shaped_row(&schema, &columns, &column_types, formats, row))
+        .map(|row| encode_shaped_row(&schema, &keys, &column_types, formats, row))
         .collect();
 
     let response = Response::Query(QueryResponse::new(

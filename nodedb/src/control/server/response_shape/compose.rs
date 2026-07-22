@@ -244,9 +244,15 @@ pub fn shape_decoded_rows(decoded: &JsonValue, projection: Option<&OutputSchema>
             let lookup_keys: Vec<String> = s.columns.iter().map(|c| c.lookup_key.clone()).collect();
             let display_names: Vec<String> =
                 s.columns.iter().map(|c| c.display_name.clone()).collect();
+            // Row cells are stored under per-column unique keys, not display
+            // names: duplicate display names (`SELECT w.id, b.id` → `id`,
+            // `id`) would collide in the row map and collapse both wire
+            // columns to the last value. Encoders re-derive the same keys via
+            // `cell_keys` when reading cells.
+            let keys = super::project::cell_keys(&display_names);
             let projected_rows = rows
                 .iter()
-                .map(|row| project_row(row, &lookup_keys, &display_names))
+                .map(|row| project_row(row, &lookup_keys, &display_names, &keys))
                 .collect();
             // Carry each projected column's real catalog type, aligned in
             // order with `display_names`. Only the pgwire encoder consumes
@@ -280,10 +286,15 @@ pub fn shape_decoded_rows(decoded: &JsonValue, projection: Option<&OutputSchema>
 /// Select and rename one flat row's fields per the projection lists, trying
 /// each candidate key in order: the full lookup key, then the bare
 /// (post-dot) column name, then the SELECT alias.
+///
+/// Cells are inserted under `cell_keys` (unique per column, see
+/// [`super::project::cell_keys`]) rather than the display names, which may
+/// repeat across columns and would otherwise collapse in the output map.
 fn project_row(
     row: &Map<String, JsonValue>,
     lookup_keys: &[String],
     display_names: &[String],
+    cell_keys: &[String],
 ) -> Map<String, JsonValue> {
     let mut out = Map::new();
     for (i, lookup_key) in lookup_keys.iter().enumerate() {
@@ -313,7 +324,8 @@ fn project_row(
             })
             .cloned()
             .unwrap_or(JsonValue::Null);
-        out.insert(display_name.to_string(), value);
+        let cell_key = cell_keys.get(i).map(String::as_str).unwrap_or(display_name);
+        out.insert(cell_key.to_string(), value);
     }
     out
 }
@@ -370,5 +382,46 @@ fn single_result_row(text: String) -> ShapedRows {
         column_types: ShapedRows::text_types(1),
         rows: vec![map],
         notice: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two projected columns sharing the display name `id` (`SELECT w.id,
+    /// b.id`) must keep both values in the shaped row instead of collapsing
+    /// to the last table's value.
+    #[test]
+    fn project_row_keeps_both_columns_with_duplicate_display_names() {
+        let mut row = Map::new();
+        row.insert("w.id".to_string(), JsonValue::String("w1".to_string()));
+        row.insert("b.id".to_string(), JsonValue::String("b1".to_string()));
+
+        let lookup_keys = vec!["w.id".to_string(), "b.id".to_string()];
+        let display_names = vec!["id".to_string(), "id".to_string()];
+        let keys = super::super::project::cell_keys(&display_names);
+
+        let out = project_row(&row, &lookup_keys, &display_names, &keys);
+        assert_eq!(out.len(), 2, "both cells must survive the projection");
+        assert_eq!(out.get("id"), Some(&JsonValue::String("w1".to_string())));
+        assert_eq!(out.get("id_1"), Some(&JsonValue::String("b1".to_string())));
+    }
+
+    /// Duplicate-free projections still store cells under the display name
+    /// (`cell_keys` is the identity), so existing readers are unaffected.
+    #[test]
+    fn project_row_uses_display_names_when_unique() {
+        let mut row = Map::new();
+        row.insert("w.id".to_string(), JsonValue::String("w1".to_string()));
+        row.insert("b.title".to_string(), JsonValue::String("t".to_string()));
+
+        let lookup_keys = vec!["w.id".to_string(), "b.title".to_string()];
+        let display_names = vec!["id".to_string(), "title".to_string()];
+        let keys = super::super::project::cell_keys(&display_names);
+
+        let out = project_row(&row, &lookup_keys, &display_names, &keys);
+        assert_eq!(out.get("id"), Some(&JsonValue::String("w1".to_string())));
+        assert_eq!(out.get("title"), Some(&JsonValue::String("t".to_string())));
     }
 }
