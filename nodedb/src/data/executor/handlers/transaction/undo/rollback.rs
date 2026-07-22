@@ -89,7 +89,7 @@ impl CoreLoop {
             UndoEntry::ColumnarInsert { .. }
             | UndoEntry::ColumnarUpdate { .. }
             | UndoEntry::ColumnarDelete { .. } => self.apply_undo_columnar(entry_index, entry),
-            UndoEntry::TimeseriesIngest { .. } => self.apply_undo_timeseries(entry_index, entry),
+            UndoEntry::TimeseriesIngest(_) => self.apply_undo_timeseries(entry_index, entry),
             UndoEntry::StatsRestore { .. } => self.apply_undo_stats(entry_index, entry),
             UndoEntry::MarkNodeDeleted { .. } => self.apply_undo_mark_node(entry_index, entry),
         }

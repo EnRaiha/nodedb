@@ -22,4 +22,4 @@ mod parity_tests;
 #[cfg(test)]
 mod tests;
 
-pub(in crate::data::executor) use entry::UndoEntry;
+pub(in crate::data::executor) use entry::{TimeseriesIngestUndo, UndoEntry};

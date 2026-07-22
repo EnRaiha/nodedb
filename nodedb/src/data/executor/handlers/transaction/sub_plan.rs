@@ -54,6 +54,16 @@ impl CoreLoop {
         crdt_deltas: &mut Vec<(Vec<u8>, u64, String)>,
         user_roles: &[String],
     ) -> Result<Response, ErrorCode> {
+        // A deferred timeseries ingest must receive the enclosing transaction
+        // record's WAL LSN. The synthetic task below intentionally has no LSN
+        // (the batch records ordinary write versions only after commit), but
+        // the timeseries partition stamp is its own replay floor. Losing the
+        // enclosing LSN here would let a later flush stamp zero and replay the
+        // committed transaction on top of its partition after restart.
+        if let PhysicalPlan::Timeseries(op) = plan {
+            return self.exec_tx_timeseries(parent, tid, plan, op, undo_log);
+        }
+
         let task =
             Self::build_dummy_task_at(tid, parent.request.database_id, parent.request.vshard_id);
         self.execute_tx_sub_plan_with_task(&task, tid, plan, undo_log, crdt_deltas, user_roles)
@@ -447,7 +457,10 @@ impl CoreLoop {
                     collection,
                     payload,
                     format,
-                    wal_lsn: *wal_lsn,
+                    // The enclosing transaction record, when present, is
+                    // the durable identity of this ingest. A plan-local LSN is
+                    // only a compatibility fallback for direct unit callers.
+                    wal_lsn: dummy_task.wal_lsn().map(|lsn| lsn.as_u64()).or(*wal_lsn),
                 },
                 undo_log,
             ),

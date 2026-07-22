@@ -15,6 +15,7 @@ use nodedb_types::timeseries::SeriesId;
 ///
 /// Stores the most recent `(timestamp_ms, value)` for each series.
 /// Updated in the write path after every memtable insert.
+#[derive(Clone)]
 pub struct LastValueCache {
     entries: HashMap<SeriesId, LastValueEntry>,
 }

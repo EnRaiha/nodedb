@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 mod batch;
+mod batch_crdt;
 pub(in crate::data::executor) mod index_write_values;
 pub mod overlay;
 mod overlay_gauge;

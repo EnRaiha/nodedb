@@ -210,6 +210,7 @@ impl CoreLoop {
             format,
             wal_lsn: Some(record_lsn),
             provenance: provenance.as_ref(),
+            mode: crate::data::executor::handlers::timeseries::TimeseriesApplyMode::Immediate,
         });
         if response.status != crate::bridge::envelope::Status::Ok {
             tracing::warn!(

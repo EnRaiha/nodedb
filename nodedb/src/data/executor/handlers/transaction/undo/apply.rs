@@ -10,7 +10,7 @@ use tracing::error;
 
 use crate::data::executor::core_loop::CoreLoop;
 
-use super::UndoEntry;
+use super::{TimeseriesIngestUndo, UndoEntry};
 
 impl CoreLoop {
     // ── Vector ───────────────────────────────────────────────────────────────
@@ -348,20 +348,98 @@ impl CoreLoop {
         entry: UndoEntry,
     ) -> Result<(), (usize, String)> {
         match entry {
-            UndoEntry::TimeseriesIngest {
-                collection_key,
-                row_count_before,
-            } => {
-                if let Some(mt) = self.columnar_memtables.get_mut(&collection_key) {
-                    mt.truncate_to(row_count_before);
-                }
-                // If memtable is absent, no rows were ingested — nothing to undo.
-                Ok(())
+            UndoEntry::TimeseriesIngest(token) => {
+                self.restore_timeseries_ingest_preimage(entry_index, token)
             }
             _ => Err((
                 entry_index,
                 "apply_undo_timeseries called with non-timeseries entry".to_string(),
             )),
         }
+    }
+
+    fn restore_timeseries_ingest_preimage(
+        &mut self,
+        entry_index: usize,
+        token: TimeseriesIngestUndo,
+    ) -> Result<(), (usize, String)> {
+        let TimeseriesIngestUndo {
+            collection_key,
+            memtable_before,
+            memtable_config_before,
+            memtable_memory_bytes_before,
+            last_value_cache_before,
+            max_ingested_lsn_before,
+            last_ts_ingest_before,
+            reservation_bytes_before,
+        } = token;
+
+        // Commit-deferred ingest must not touch reservations. Treat a mismatch
+        // as fatal rather than dropping/recharging a token and corrupting the
+        // governor's accounting during a failed transaction.
+        let reservation_now = self
+            .columnar_memtable_mem
+            .get(&collection_key)
+            .map(nodedb_mem::ReservationToken::size);
+        if reservation_now != reservation_bytes_before {
+            return Err((
+                entry_index,
+                format!(
+                    "timeseries reservation changed during deferred ingest for {:?}: before {:?}, now {:?}",
+                    collection_key, reservation_bytes_before, reservation_now
+                ),
+            ));
+        }
+
+        match (
+            memtable_before,
+            memtable_config_before,
+            memtable_memory_bytes_before,
+        ) {
+            (Some(snapshot), Some(config), Some(memory_bytes)) => {
+                let mut restored =
+                    crate::engine::timeseries::columnar_memtable::ColumnarMemtable::from_snapshot(
+                        snapshot, config,
+                    )
+                    .map_err(|error| {
+                        (
+                            entry_index,
+                            format!("timeseries memtable snapshot restore failed: {error}"),
+                        )
+                    })?;
+                restored.restore_memory_bytes_for_undo(memory_bytes);
+                self.columnar_memtables
+                    .insert(collection_key.clone(), restored);
+            }
+            (None, None, None) => {
+                self.columnar_memtables.remove(&collection_key);
+            }
+            _ => {
+                return Err((
+                    entry_index,
+                    "timeseries undo token has inconsistent memtable pre-image fields".into(),
+                ));
+            }
+        }
+
+        match last_value_cache_before {
+            Some(cache) => {
+                self.ts_last_value_caches
+                    .insert(collection_key.clone(), cache);
+            }
+            None => {
+                self.ts_last_value_caches.remove(&collection_key);
+            }
+        }
+        match max_ingested_lsn_before {
+            Some(lsn) => {
+                self.ts_max_ingested_lsn.insert(collection_key, lsn);
+            }
+            None => {
+                self.ts_max_ingested_lsn.remove(&collection_key);
+            }
+        }
+        self.last_ts_ingest = last_ts_ingest_before;
+        Ok(())
     }
 }

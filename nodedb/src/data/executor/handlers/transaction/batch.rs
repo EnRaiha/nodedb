@@ -22,7 +22,7 @@ use super::undo::UndoEntry;
 /// A CRDT delta buffered during a transaction batch: `(delta_bytes, id,
 /// collection)`. Deltas accumulate in a scratch buffer and are applied to
 /// the LoroDoc only on full-batch success.
-type CrdtDelta = (Vec<u8>, u64, String);
+pub(super) type CrdtDelta = (Vec<u8>, u64, String);
 
 impl CoreLoop {
     /// Execute a transaction batch atomically.
@@ -79,14 +79,62 @@ impl CoreLoop {
             Err(resp) => return resp,
         };
 
-        let undo_log = match self.apply_balanced_constraint_check(task, tid, undo_log) {
-            Ok(u) => u,
-            Err(resp) => return resp,
-        };
-
-        if let Some(resp) = self.apply_crdt_deltas(task, tid, crdt_deltas) {
-            return resp;
+        let constraint_check = catch_unwind(AssertUnwindSafe(|| {
+            self.check_balanced_constraints(task.request.database_id.as_u64(), tid, &undo_log)
+        }));
+        match constraint_check {
+            Ok(Ok(())) => {}
+            Ok(Err(error_code)) => {
+                warn!(
+                    core = self.core_id,
+                    "BALANCED constraint violated, rolling back {} operations",
+                    undo_log.len()
+                );
+                return self.rollback_transaction_failure(
+                    task,
+                    tid,
+                    undo_log,
+                    self.response_error(task, error_code),
+                );
+            }
+            Err(payload) => {
+                let detail = panic_payload_to_string(payload.as_ref());
+                error!(
+                    core = self.core_id,
+                    panic = %detail,
+                    "BALANCED constraint check panicked; routing through rollback"
+                );
+                return self.rollback_transaction_failure(
+                    task,
+                    tid,
+                    undo_log,
+                    self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("panic in BALANCED constraint check: {detail}"),
+                        },
+                    ),
+                );
+            }
         }
+
+        let crdt_delta_count = crdt_deltas.len();
+        let undo_log = match self.apply_crdt_deltas_or_rollback(task, tid, undo_log, crdt_deltas) {
+            Ok(undo_log) => undo_log,
+            Err(response) => return response,
+        };
+        if crdt_delta_count > 0 {
+            // Match the direct CRDT apply path: successful transaction-batch
+            // imports must become checkpoint work, but never before the full
+            // batch's rollback gates have succeeded.
+            self.checkpoint_coordinator
+                .mark_dirty("crdt", crdt_delta_count);
+        }
+
+        // All transactional gates have succeeded. Only now may timeseries
+        // publish its write floor/timer/checkpoint/reservation state or start
+        // best-effort post-commit maintenance.
+        self.finalize_deferred_timeseries_ingests(task, &undo_log);
 
         debug!(
             core = self.core_id,
@@ -107,6 +155,9 @@ impl CoreLoop {
             request_id: task.request_id(),
             status: Status::Ok,
             attempt: 1,
+            // `partial` means another response frame will follow. A failed
+            // best-effort maintenance flush leaves this committed transaction
+            // durable in the memtable/WAL, but does not produce another frame.
             partial: false,
             payload: last_response.payload,
             watermark_lsn: self.watermark,
@@ -196,17 +247,21 @@ impl CoreLoop {
                         undo_log.len()
                     );
 
-                    // Roll back all previous writes in reverse order.
-                    // If rollback itself fails, the shard state is unknown —
-                    // return RollbackFailed (never warn-and-continue).
-                    let rollback_error_code = match self.rollback_undo_log_at(
-                        task.request.database_id.as_u64(),
-                        tid,
-                        task.request.vshard_id,
-                        undo_log,
-                    ) {
-                        Ok(()) => error_code,
-                        Err((entry_index, detail)) => {
+                    // Roll back all previous writes in reverse order. An undo
+                    // panic is no safer than an `Err`: catch it and surface the
+                    // same terminal `RollbackFailed` contract instead of
+                    // unwinding past a half-restored transaction.
+                    let undo_len = undo_log.len();
+                    let rollback_error_code = match catch_unwind(AssertUnwindSafe(|| {
+                        self.rollback_undo_log_at(
+                            task.request.database_id.as_u64(),
+                            tid,
+                            task.request.vshard_id,
+                            undo_log,
+                        )
+                    })) {
+                        Ok(Ok(())) => error_code,
+                        Ok(Err((entry_index, detail))) => {
                             error!(
                                 core = self.core_id,
                                 plan_index = i,
@@ -217,6 +272,24 @@ impl CoreLoop {
                             );
                             crate::bridge::envelope::ErrorCode::RollbackFailed {
                                 entry_index,
+                                detail,
+                            }
+                        }
+                        Err(payload) => {
+                            let detail = format!(
+                                "panic during transaction rollback: {}",
+                                panic_payload_to_string(payload.as_ref())
+                            );
+                            error!(
+                                core = self.core_id,
+                                plan_index = i,
+                                entry_index = undo_len,
+                                detail = %detail,
+                                "transaction rollback panicked; shard state unknown — \
+                                 restart required for WAL replay"
+                            );
+                            crate::bridge::envelope::ErrorCode::RollbackFailed {
+                                entry_index: undo_len,
                                 detail,
                             }
                         }
@@ -244,69 +317,13 @@ impl CoreLoop {
         Ok((last_response, undo_log, crdt_deltas))
     }
 
-    /// Pre-commit: check the `BALANCED` constraint across all inserts in
-    /// this transaction. On violation, rolls back and returns the terminal
-    /// error `Response`; on success, hands the undo log back for the
-    /// deferred-trigger step.
-    fn apply_balanced_constraint_check(
-        &mut self,
-        task: &ExecutionTask,
-        tid: u64,
-        undo_log: Vec<UndoEntry>,
-    ) -> Result<Vec<UndoEntry>, Response> {
-        if let Err(error_code) =
-            self.check_balanced_constraints(task.request.database_id.as_u64(), tid, &undo_log)
-        {
-            warn!(
-                core = self.core_id,
-                "BALANCED constraint violated, rolling back {} operations",
-                undo_log.len()
-            );
-            let rollback_error_code = match self.rollback_undo_log_at(
-                task.request.database_id.as_u64(),
-                tid,
-                task.request.vshard_id,
-                undo_log,
-            ) {
-                Ok(()) => error_code,
-                Err((entry_index, detail)) => {
-                    error!(
-                        core = self.core_id,
-                        entry_index,
-                        detail = %detail,
-                        "transaction rollback failed (BALANCED constraint path); \
-                         shard state unknown — restart required for WAL replay"
-                    );
-                    crate::bridge::envelope::ErrorCode::RollbackFailed {
-                        entry_index,
-                        detail,
-                    }
-                }
-            };
-            return Err(Response {
-                request_id: task.request_id(),
-                status: Status::Error,
-                attempt: 1,
-                partial: false,
-                payload: crate::bridge::envelope::Payload::empty(),
-                watermark_lsn: self.watermark,
-                error_code: Some(Box::new(rollback_error_code)),
-                read_set_valid: None,
-                read_version_lsn: crate::types::Lsn::ZERO,
-                write_set: Vec::new(),
-            });
-        }
-        Ok(undo_log)
-    }
-
     /// Apply all buffered CRDT deltas now that every sub-plan and the
     /// `BALANCED` constraint check have succeeded.
     ///
-    /// Failure here means the CRDT state is inconsistent with the
-    /// already-committed forward writes — returns a `RollbackFailed`
-    /// `Response` so the client knows the shard needs a restart to restore
-    /// consistency via WAL replay. Never warn-and-continue.
-    fn apply_crdt_deltas(
+    /// A failure is returned to the caller, which rolls every forward write
+    /// back through the same undo log before responding. Never leave CRDT and
+    /// engine state on different sides of a failed transaction boundary.
+    pub(super) fn apply_crdt_deltas(
         &mut self,
         task: &ExecutionTask,
         tid: u64,
@@ -331,8 +348,7 @@ impl CoreLoop {
                             core = self.core_id,
                             crdt_delta_index = crdt_idx,
                             error = %e,
-                            "CRDT delta apply failed after forward writes committed; \
-                             shard state unknown — restart required for WAL replay"
+                            "CRDT delta apply failed; transaction rollback required"
                         );
                         return Some(Response {
                             request_id: task.request_id(),
@@ -342,8 +358,7 @@ impl CoreLoop {
                             payload: crate::bridge::envelope::Payload::empty(),
                             watermark_lsn: self.watermark,
                             error_code: Some(Box::new(
-                                crate::bridge::envelope::ErrorCode::RollbackFailed {
-                                    entry_index: crdt_idx,
+                                crate::bridge::envelope::ErrorCode::Internal {
                                     detail: format!("CRDT delta apply failed: {e}"),
                                 },
                             )),
@@ -352,14 +367,16 @@ impl CoreLoop {
                             write_set: Vec::new(),
                         });
                     }
+                    // This runs after the import so rollback coverage includes
+                    // panics that occur once an earlier delta is already live.
+                    crate::fail_point!("transaction_batch::after_crdt_delta");
                 }
                 Err(e) => {
                     error!(
                         core = self.core_id,
                         crdt_delta_index = crdt_idx,
                         error = %e,
-                        "CRDT engine not found after forward writes committed; \
-                         shard state unknown — restart required for WAL replay"
+                        "CRDT engine not found; transaction rollback required"
                     );
                     return Some(Response {
                         request_id: task.request_id(),
@@ -368,12 +385,9 @@ impl CoreLoop {
                         partial: false,
                         payload: crate::bridge::envelope::Payload::empty(),
                         watermark_lsn: self.watermark,
-                        error_code: Some(Box::new(
-                            crate::bridge::envelope::ErrorCode::RollbackFailed {
-                                entry_index: crdt_idx,
-                                detail: format!("CRDT engine not available: {e}"),
-                            },
-                        )),
+                        error_code: Some(Box::new(crate::bridge::envelope::ErrorCode::Internal {
+                            detail: format!("CRDT engine not available: {e}"),
+                        })),
                         read_set_valid: None,
                         read_version_lsn: crate::types::Lsn::ZERO,
                         write_set: Vec::new(),
@@ -436,7 +450,7 @@ impl CoreLoop {
 /// Best-effort conversion of a panic payload to a human-readable string.
 /// Tries the two common payload types (`&'static str` and `String`); falls
 /// back to `"<non-string panic payload>"` for anything else.
-fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+pub(super) fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {

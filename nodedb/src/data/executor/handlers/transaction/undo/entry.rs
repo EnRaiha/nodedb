@@ -3,7 +3,31 @@
 //! `UndoEntry` — tracks a single write operation for rollback purposes.
 
 use crate::data::executor::spatial_key::SpatialIndexKey;
+use crate::engine::timeseries::columnar_memtable::{ColumnarMemtableConfig, MemtableSnapshot};
+use crate::engine::timeseries::last_value_cache::LastValueCache;
 use crate::types::TenantId;
+
+/// Complete in-memory pre-image for one transaction-deferred timeseries ingest.
+///
+/// The token is captured before the ingest can create a memtable, evolve a
+/// schema, append rows, mutate tag dictionaries or update the last-value
+/// cache. Deferred ingest deliberately leaves timer, checkpoint and reservation
+/// accounting untouched; their prior presence/size is still recorded so undo
+/// can verify that invariant rather than silently accepting accounting drift.
+pub(in crate::data::executor) struct TimeseriesIngestUndo {
+    pub collection_key: (nodedb_types::DatabaseId, TenantId, String),
+    pub memtable_before: Option<MemtableSnapshot>,
+    pub memtable_config_before: Option<ColumnarMemtableConfig>,
+    /// The pre-image's reported resident footprint. Snapshot reconstruction
+    /// intentionally does not retain `Vec` spare capacity, but the memory
+    /// governor's live reservation must still match the pre-transaction
+    /// accounting after rollback.
+    pub memtable_memory_bytes_before: Option<usize>,
+    pub last_value_cache_before: Option<LastValueCache>,
+    pub max_ingested_lsn_before: Option<u64>,
+    pub last_ts_ingest_before: Option<std::time::Instant>,
+    pub reservation_bytes_before: Option<usize>,
+}
 
 /// Tracks a write operation for rollback purposes.
 pub(in crate::data::executor) enum UndoEntry {
@@ -272,11 +296,11 @@ pub(in crate::data::executor) enum UndoEntry {
         collection_key: (nodedb_types::DatabaseId, TenantId, String),
         restored: Vec<(Vec<u8>, nodedb_columnar::pk_index::RowLocation)>,
     },
-    /// Undo a timeseries ingest by truncating the in-memory columnar memtable.
-    TimeseriesIngest {
-        collection_key: (nodedb_types::DatabaseId, TenantId, String),
-        row_count_before: u64,
-    },
+    /// Undo a transaction-deferred timeseries ingest from its complete
+    /// pre-image. Row-count truncation is insufficient: ingest can evolve
+    /// schema/dictionaries and update the last-value cache before a later
+    /// sub-plan fails.
+    TimeseriesIngest(TimeseriesIngestUndo),
     /// Undo a column-stats observe by restoring the pre-image captured before
     /// the read-modify-write.
     ///

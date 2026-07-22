@@ -11,13 +11,13 @@ use nodedb_columnar::pk_index::RowLocation;
 
 use crate::bridge::envelope::{ErrorCode, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::timeseries::TimeseriesIngestExec;
+use crate::data::executor::handlers::timeseries::{TimeseriesApplyMode, TimeseriesIngestExec};
 use crate::data::executor::task::ExecutionTask;
 use crate::types::TenantId;
 use nodedb_physical::physical_plan::ColumnarInsertIntent;
 use nodedb_physical::physical_plan::document::UpdateValue;
 
-use super::undo::UndoEntry;
+use super::undo::{TimeseriesIngestUndo, UndoEntry};
 
 /// Captured undo state for a pending columnar insert: the list of new PK bytes
 /// to insert, paired with the prior `RowLocation` of any displaced memtable rows.
@@ -176,8 +176,12 @@ impl CoreLoop {
 
     /// Execute a timeseries ingest in a transaction context.
     ///
-    /// Captures the memtable row count before ingest so the undo log can
-    /// truncate back to that point on batch failure.
+    /// Captures the complete in-memory pre-image before deferred ingest.
+    ///
+    /// Transactional ingest may evolve schema and symbol dictionaries, create
+    /// a memtable, update the last-value cache and advance an LSN. A row count
+    /// cannot restore those mutations, so the undo token owns snapshots of all
+    /// mutable state before any ingest code runs.
     pub(super) fn execute_tx_timeseries_ingest(
         &mut self,
         task: &ExecutionTask,
@@ -193,12 +197,32 @@ impl CoreLoop {
         } = params;
         let collection_key = (task.request.database_id, tid, collection.to_string());
 
-        let row_count_before = self
-            .columnar_memtables
-            .get(&collection_key)
-            .map(|mt| mt.row_count())
-            .unwrap_or(0);
+        let undo = TimeseriesIngestUndo {
+            collection_key: collection_key.clone(),
+            memtable_before: self
+                .columnar_memtables
+                .get(&collection_key)
+                .map(|memtable| memtable.export_snapshot()),
+            memtable_config_before: self
+                .columnar_memtables
+                .get(&collection_key)
+                .map(|memtable| memtable.config()),
+            memtable_memory_bytes_before: self
+                .columnar_memtables
+                .get(&collection_key)
+                .map(|memtable| memtable.memory_bytes()),
+            last_value_cache_before: self.ts_last_value_caches.get(&collection_key).cloned(),
+            max_ingested_lsn_before: self.ts_max_ingested_lsn.get(&collection_key).copied(),
+            last_ts_ingest_before: self.last_ts_ingest,
+            reservation_bytes_before: self
+                .columnar_memtable_mem
+                .get(&collection_key)
+                .map(nodedb_mem::ReservationToken::size),
+        };
 
+        // Push before mutation. A panic in ingest is caught by the batch
+        // driver, which can then restore this exact pre-image.
+        undo_log.push(UndoEntry::TimeseriesIngest(undo));
         let resp = self.execute_timeseries_ingest(TimeseriesIngestExec {
             task,
             tid,
@@ -207,6 +231,7 @@ impl CoreLoop {
             format,
             wal_lsn,
             provenance: None,
+            mode: TimeseriesApplyMode::CommitDeferred,
         });
         if resp.status == Status::Error {
             return Err(resp.error_code.map(|c| *c).unwrap_or(ErrorCode::Internal {
@@ -214,10 +239,6 @@ impl CoreLoop {
             }));
         }
 
-        undo_log.push(UndoEntry::TimeseriesIngest {
-            collection_key,
-            row_count_before,
-        });
         Ok(resp)
     }
 }

@@ -4,23 +4,27 @@
 
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
+use super::ingest_dispatch::TimeseriesIngestParams;
 use super::msgpack_decode::{self, MsgpackValue};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::task::ExecutionTask;
 
 impl CoreLoop {
     /// Payload is a msgpack array of maps (same schema as JSON ingest but in msgpack).
     /// Converts each row to an ILP line and delegates to the ILP ingest path.
     pub(super) fn execute_msgpack_ingest(
         &mut self,
-        task: &ExecutionTask,
-        tid: crate::types::TenantId,
-        collection: &str,
-        payload: &[u8],
-        wal_lsn: Option<u64>,
-        now_ms: i64,
+        params: TimeseriesIngestParams<'_>,
     ) -> Response {
+        let TimeseriesIngestParams {
+            task,
+            tid,
+            collection,
+            payload,
+            wal_lsn,
+            now_ms,
+            mode,
+        } = params;
         let measurement = collection
             .split_once(':')
             .map(|(_, name)| name)
@@ -135,20 +139,29 @@ impl CoreLoop {
             );
         }
 
-        self.execute_ilp_ingest(task, tid, collection, ilp_buf.as_bytes(), wal_lsn, now_ms)
+        self.execute_ilp_ingest(TimeseriesIngestParams {
+            task,
+            tid,
+            collection,
+            payload: ilp_buf.as_bytes(),
+            wal_lsn,
+            now_ms,
+            mode,
+        })
     }
 
     /// Payload is a JSON array like: `[{"id":"e1","ts":"2024-01-01T00:00:00Z","value":42.0}]`.
     /// Converts each row to an ILP line and delegates to the ILP ingest path.
-    pub(super) fn execute_json_ingest(
-        &mut self,
-        task: &ExecutionTask,
-        tid: crate::types::TenantId,
-        collection: &str,
-        payload: &[u8],
-        wal_lsn: Option<u64>,
-        now_ms: i64,
-    ) -> Response {
+    pub(super) fn execute_json_ingest(&mut self, params: TimeseriesIngestParams<'_>) -> Response {
+        let TimeseriesIngestParams {
+            task,
+            tid,
+            collection,
+            payload,
+            wal_lsn,
+            now_ms,
+            mode,
+        } = params;
         let rows: sonic_rs::Array = match sonic_rs::from_slice(payload) {
             Ok(r) => r,
             Err(e) => {
@@ -251,7 +264,15 @@ impl CoreLoop {
             );
         }
 
-        self.execute_ilp_ingest(task, tid, collection, ilp_buf.as_bytes(), wal_lsn, now_ms)
+        self.execute_ilp_ingest(TimeseriesIngestParams {
+            task,
+            tid,
+            collection,
+            payload: ilp_buf.as_bytes(),
+            wal_lsn,
+            now_ms,
+            mode,
+        })
     }
 }
 

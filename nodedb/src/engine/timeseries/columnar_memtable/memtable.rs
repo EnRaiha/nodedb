@@ -403,6 +403,24 @@ impl ColumnarMemtable {
         &self.schema
     }
 
+    /// Return the immutable admission configuration used to construct this
+    /// memtable. Transaction undo uses this with a snapshot so restoration
+    /// preserves the original limits even if live operator tuning changed.
+    pub fn config(&self) -> ColumnarMemtableConfig {
+        self.config.clone()
+    }
+
+    /// Restore the pre-transaction resident-byte accounting after replacing
+    /// the memtable from a logical snapshot.
+    ///
+    /// A snapshot preserves values and dictionaries, but rebuilding its vectors
+    /// intentionally does not preserve their spare capacity. Transaction undo
+    /// retains the original governor reservation, so it must also reinstate the
+    /// original reported footprint rather than silently undercounting it.
+    pub(crate) fn restore_memory_bytes_for_undo(&mut self, memory_bytes: usize) {
+        self.memory_bytes = memory_bytes;
+    }
+
     /// Export a lossless snapshot (carries column types + symbol dicts). INFALLIBLE.
     pub fn export_snapshot(&self) -> MemtableSnapshot {
         let columns: Vec<_> = self.columns.iter().map(column_to_snapshot).collect();

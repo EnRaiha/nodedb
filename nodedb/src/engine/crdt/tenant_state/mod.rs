@@ -10,6 +10,7 @@ pub mod core;
 pub mod doc_mutate;
 pub mod history;
 pub mod policy;
+mod snapshot_restore;
 pub mod validate;
 
 #[cfg(test)]

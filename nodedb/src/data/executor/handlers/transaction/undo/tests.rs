@@ -3,13 +3,283 @@
 //! Unit tests for document undo — bitemporal version reversal, hash-chain
 //! reversal, and backward-compatibility of the plain (non-versioned) path.
 
-use super::UndoEntry;
-use crate::data::executor::core_loop::tests::make_core_with_dir;
+use super::{TimeseriesIngestUndo, UndoEntry};
+use crate::data::executor::core_loop::tests::{make_core_with_dir, make_default_task};
 use crate::engine::sparse::btree_versioned::{VersionedIndexEntry, VersionedPut};
+use crate::engine::timeseries::columnar_memtable::{
+    ColumnType, ColumnValue, ColumnarMemtable, ColumnarMemtableConfig, ColumnarSchema,
+};
+use crate::engine::timeseries::last_value_cache::LastValueCache;
 use crate::types::TenantId;
 
 const DB: u64 = 0;
 const TID: u64 = 1;
+
+fn timeseries_config() -> ColumnarMemtableConfig {
+    ColumnarMemtableConfig {
+        max_memory_bytes: 1024 * 1024,
+        hard_memory_limit: 2 * 1024 * 1024,
+        max_tag_cardinality: 100,
+    }
+}
+
+fn timeseries_memtable() -> ColumnarMemtable {
+    ColumnarMemtable::new(
+        ColumnarSchema {
+            columns: vec![
+                ("timestamp".into(), ColumnType::Timestamp),
+                ("value".into(), ColumnType::Float64),
+                ("host".into(), ColumnType::Symbol),
+            ],
+            timestamp_idx: 0,
+            codecs: vec![nodedb_codec::ColumnCodec::Auto; 3],
+        },
+        timeseries_config(),
+    )
+}
+
+#[test]
+fn timeseries_undo_restores_schema_dictionary_lvc_lsn_and_timer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+    let key = (
+        crate::types::DatabaseId::new(DB),
+        TenantId::new(TID),
+        "metrics".into(),
+    );
+    let mut memtable = timeseries_memtable();
+    memtable
+        .ingest_row(
+            1,
+            &[
+                ColumnValue::Timestamp(10),
+                ColumnValue::Float64(1.0),
+                ColumnValue::Symbol("old-host".into()),
+            ],
+        )
+        .expect("seed ingest");
+    let snapshot = memtable.export_snapshot();
+    let config = memtable.config();
+    let memory_bytes = memtable.memory_bytes();
+    core.columnar_memtables.insert(key.clone(), memtable);
+    let mut cache = LastValueCache::new();
+    cache.update(1, 10, 1.0);
+    core.ts_last_value_caches.insert(key.clone(), cache.clone());
+    core.ts_max_ingested_lsn.insert(key.clone(), 7);
+    let prior_timer = std::time::Instant::now();
+    core.last_ts_ingest = Some(prior_timer);
+
+    let token = TimeseriesIngestUndo {
+        collection_key: key.clone(),
+        memtable_before: Some(snapshot),
+        memtable_config_before: Some(config),
+        memtable_memory_bytes_before: Some(memory_bytes),
+        last_value_cache_before: Some(cache),
+        max_ingested_lsn_before: Some(7),
+        last_ts_ingest_before: Some(prior_timer),
+        reservation_bytes_before: None,
+    };
+    let memtable = core.columnar_memtables.get_mut(&key).expect("memtable");
+    memtable.add_column("region".into(), ColumnType::Symbol);
+    memtable
+        .ingest_row(
+            2,
+            &[
+                ColumnValue::Timestamp(20),
+                ColumnValue::Float64(2.0),
+                ColumnValue::Symbol("new-host".into()),
+                ColumnValue::Symbol("west".into()),
+            ],
+        )
+        .expect("mutate ingest");
+    core.ts_last_value_caches
+        .get_mut(&key)
+        .expect("cache")
+        .update(1, 20, 2.0);
+    core.ts_max_ingested_lsn.insert(key.clone(), 99);
+    core.last_ts_ingest = Some(std::time::Instant::now());
+
+    core.apply_undo_timeseries(0, UndoEntry::TimeseriesIngest(token))
+        .expect("undo");
+    let restored = core
+        .columnar_memtables
+        .get(&key)
+        .expect("restored memtable");
+    assert_eq!(restored.row_count(), 1);
+    assert_eq!(restored.memory_bytes(), memory_bytes);
+    assert_eq!(restored.schema().columns.len(), 3);
+    assert_eq!(
+        restored.symbol_dict(2).expect("dictionary").get(0),
+        Some("old-host")
+    );
+    assert_eq!(
+        core.ts_last_value_caches
+            .get(&key)
+            .and_then(|cache| cache.get(1))
+            .map(|entry| (entry.ts, entry.value)),
+        Some((10, 1.0))
+    );
+    assert_eq!(core.ts_max_ingested_lsn.get(&key), Some(&7));
+    assert_eq!(core.last_ts_ingest, Some(prior_timer));
+}
+
+#[test]
+fn timeseries_undo_removes_newly_created_collection_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+    let key = (
+        crate::types::DatabaseId::new(DB),
+        TenantId::new(TID),
+        "new_metrics".into(),
+    );
+    let token = TimeseriesIngestUndo {
+        collection_key: key.clone(),
+        memtable_before: None,
+        memtable_config_before: None,
+        memtable_memory_bytes_before: None,
+        last_value_cache_before: None,
+        max_ingested_lsn_before: None,
+        last_ts_ingest_before: None,
+        reservation_bytes_before: None,
+    };
+    core.columnar_memtables
+        .insert(key.clone(), timeseries_memtable());
+    core.ts_last_value_caches
+        .insert(key.clone(), LastValueCache::new());
+    core.ts_max_ingested_lsn.insert(key.clone(), 1);
+    core.last_ts_ingest = Some(std::time::Instant::now());
+
+    core.apply_undo_timeseries(0, UndoEntry::TimeseriesIngest(token))
+        .expect("undo");
+    assert!(!core.columnar_memtables.contains_key(&key));
+    assert!(!core.ts_last_value_caches.contains_key(&key));
+    assert!(!core.ts_max_ingested_lsn.contains_key(&key));
+    assert!(core.last_ts_ingest.is_none());
+}
+
+#[test]
+fn repeated_timeseries_ingests_restore_the_initial_preimage_on_abort() {
+    use crate::bridge::envelope::PhysicalPlan;
+    use nodedb_physical::physical_plan::TimeseriesOp;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+    let task = make_default_task();
+    let plans = [
+        PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: "metrics".into(),
+            payload: b"metrics value=1i 1000000000\n".to_vec(),
+            format: "ilp".into(),
+            wal_lsn: None,
+            surrogates: Vec::new(),
+            provenance: None,
+        }),
+        PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: "metrics".into(),
+            payload: b"other_measurement value=2i 2000000000\n".to_vec(),
+            format: "ilp".into(),
+            wal_lsn: None,
+            surrogates: Vec::new(),
+            provenance: None,
+        }),
+    ];
+
+    let response = core.execute_transaction_batch(&task, TID, &plans, &[], None);
+
+    assert_eq!(response.status, crate::bridge::envelope::Status::Error);
+    assert!(
+        !core.columnar_memtables.contains_key(&(
+            crate::types::DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "metrics".to_string(),
+        )),
+        "reverse-order rollback must restore the pre-transaction absence after repeated ingests"
+    );
+    assert!(
+        !core.ts_last_value_caches.contains_key(&(
+            crate::types::DatabaseId::DEFAULT,
+            TenantId::new(TID),
+            "metrics".to_string(),
+        )),
+        "the last-value cache must follow the same initial pre-image"
+    );
+}
+
+#[test]
+fn transactional_timeseries_flush_uses_the_enclosing_wal_lsn() {
+    use std::time::{Duration, Instant};
+
+    use crate::bridge::envelope::{
+        Admission, ExemptReason, PhysicalPlan, Priority, Request, Status,
+    };
+    use crate::data::executor::task::ExecutionTask;
+    use crate::types::{Lsn, RequestId, TraceId, VShardId};
+    use nodedb_physical::physical_plan::{MetaOp, TimeseriesOp};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+    let lsn = 42;
+    let task = ExecutionTask::with_wal_lsn(
+        Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(TID),
+            database_id: crate::types::DatabaseId::new(DB),
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Meta(MetaOp::Cancel {
+                target_request_id: RequestId::new(0),
+            }),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: crate::types::ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: Some(Lsn::new(lsn)),
+            resolved_now_ms: None,
+            admission: Admission::Exempt(ExemptReason::AlreadyOrdered),
+        },
+        Some(Lsn::new(lsn)),
+    );
+    let plans = [PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+        collection: "metrics".into(),
+        payload: b"metrics value=1i 1000000000\n".to_vec(),
+        format: "ilp".into(),
+        // Buffered transaction plans normally have no per-op LSN. The
+        // transaction record's LSN above must become the partition stamp.
+        wal_lsn: None,
+        surrogates: Vec::new(),
+        provenance: None,
+    })];
+
+    let response = core.execute_transaction_batch(&task, TID, &plans, &[], None);
+    assert_eq!(response.status, Status::Ok);
+    let key = (
+        crate::types::DatabaseId::new(DB),
+        TenantId::new(TID),
+        "metrics".to_string(),
+    );
+    assert_eq!(core.ts_max_ingested_lsn.get(&key), Some(&lsn));
+
+    core.flush_ts_collection(
+        TenantId::new(TID),
+        crate::types::DatabaseId::new(DB),
+        "metrics",
+        0,
+    )
+    .expect("flush committed transaction rows");
+    let max_flushed_lsn = core
+        .ts_registries
+        .get(&key)
+        .expect("partition registry")
+        .iter()
+        .map(|(_, entry)| entry.meta.last_flushed_wal_lsn)
+        .max();
+    assert_eq!(max_flushed_lsn, Some(lsn));
+}
 
 fn seed_version(core: &crate::data::executor::core_loop::CoreLoop, doc: &str, t: i64, body: &[u8]) {
     core.sparse

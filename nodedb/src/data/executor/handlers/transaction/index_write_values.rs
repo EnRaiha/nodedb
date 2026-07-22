@@ -74,7 +74,7 @@ fn entry_index_tuples(entry: &UndoEntry) -> Option<(String, Vec<(String, String)
         | UndoEntry::ColumnarInsert { .. }
         | UndoEntry::ColumnarUpdate { .. }
         | UndoEntry::ColumnarDelete { .. }
-        | UndoEntry::TimeseriesIngest { .. }
+        | UndoEntry::TimeseriesIngest(_)
         | UndoEntry::StatsRestore { .. } => None,
     }
 }

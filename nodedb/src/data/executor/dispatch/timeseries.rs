@@ -60,6 +60,7 @@ impl CoreLoop {
                 format,
                 wal_lsn: *wal_lsn,
                 provenance: provenance.as_ref(),
+                mode: crate::data::executor::handlers::timeseries::TimeseriesApplyMode::Immediate,
             }),
         }
     }
