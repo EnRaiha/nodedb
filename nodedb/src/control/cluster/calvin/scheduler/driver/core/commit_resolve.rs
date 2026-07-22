@@ -49,7 +49,11 @@ impl Scheduler {
         txn_id: TxnId,
         staged_response: &Response,
     ) {
-        let committed = staged_response.read_set_valid != Some(false);
+        // A staged error is always an abort vote. Only successful staged
+        // responses may use `None` for the dependent-read path; accepting an
+        // error-plus-None as commit would let a failed participant flush after
+        // its peers received a global commit verdict.
+        let committed = staged_commit_vote(staged_response);
 
         // Durably propose this participant's commit vote via the sequencer
         // Raft group, leader-guarded like `OllpMismatch`: only the data-group
@@ -479,5 +483,49 @@ impl Scheduler {
             "completion ack",
         );
         true
+    }
+}
+
+/// Derive a local staged vote without ever treating an executor error as a
+/// commit. `None` remains affirmative only for a successful dependent-read or
+/// active staged response, which has no versioned read-set.
+fn staged_commit_vote(response: &Response) -> bool {
+    response.status == Status::Ok && response.read_set_valid != Some(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::staged_commit_vote;
+    use crate::bridge::envelope::{Payload, Response, Status};
+    use crate::types::{Lsn, RequestId};
+
+    fn staged_response(status: Status, read_set_valid: Option<bool>) -> Response {
+        Response {
+            request_id: RequestId::new(1),
+            status,
+            attempt: 1,
+            partial: false,
+            payload: Payload::empty(),
+            watermark_lsn: Lsn::ZERO,
+            error_code: None,
+            read_set_valid,
+            read_version_lsn: Lsn::ZERO,
+            write_set: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn executor_error_is_an_explicit_abort_vote_even_without_read_set_field() {
+        assert!(!staged_commit_vote(&staged_response(Status::Error, None)));
+        assert!(!staged_commit_vote(&staged_response(
+            Status::Error,
+            Some(true)
+        )));
+        assert!(!staged_commit_vote(&staged_response(
+            Status::Ok,
+            Some(false)
+        )));
+        assert!(staged_commit_vote(&staged_response(Status::Ok, None)));
+        assert!(staged_commit_vote(&staged_response(Status::Ok, Some(true))));
     }
 }

@@ -128,32 +128,54 @@ use nodedb_cluster::calvin::types::{
     EngineKeySet, ReadWriteSet, SchedulerInput, SequencedTxn, SortedVec, TxClass, VersionedReadSet,
 };
 use nodedb_cluster::calvin::{CalvinCompletionRegistry, SequencerStateMachine};
+use nodedb_physical::physical_plan::PhysicalPlan;
+use nodedb_physical::physical_plan::meta::MetaOp;
 use nodedb_types::TenantId;
 
+use super::super::types::{CommitState, PendingTxn};
 use super::scheduler::{Scheduler, SchedulerParams};
 use crate::bridge::dispatch::Dispatcher;
+use crate::bridge::envelope::{Payload, Response, Status};
 use crate::control::cluster::calvin::scheduler::metrics::SchedulerMetrics;
 use crate::control::cluster::calvin::scheduler::{
     AppliedGate, NOT_YET_APPLIED_EPOCH, SchedulerConfig,
 };
 use crate::control::state::SharedState;
+use crate::types::{Lsn, RequestId};
 use crate::wal::WalManager;
 
 /// Build a minimally-wired `Scheduler` for driver-level unit tests. The Data
-/// Plane is NOT started — these tests exercise only the Control-Plane routing /
-/// guard logic that never dispatches, so no core loop is needed. The returned
-/// `TempDir` must be kept alive for the scheduler's lifetime (backs the WAL and
+/// Plane is NOT started — tests exercise Control-Plane routing, guards, and
+/// request dispatch only, so no core loop is needed. The returned `TempDir`
+/// must be kept alive for the scheduler's lifetime (backs the WAL and
 /// Raft storage).
 fn build_test_scheduler(vshard_id: u32) -> (Scheduler, tempfile::TempDir) {
+    let registry = CalvinCompletionRegistry::new_detached();
+    let (scheduler, dir, _data_side) = build_test_scheduler_with_data_side(vshard_id, registry);
+    (scheduler, dir)
+}
+
+/// Same minimal scheduler fixture, retaining its Data-Plane request receiver
+/// for tests that must observe scheduler dispatches.
+fn build_test_scheduler_with_data_side(
+    vshard_id: u32,
+    registry: Arc<CalvinCompletionRegistry>,
+) -> (
+    Scheduler,
+    tempfile::TempDir,
+    crate::bridge::dispatch::CoreChannelDataSide,
+) {
     let dir = tempfile::tempdir().unwrap();
     let wal = Arc::new(WalManager::open_for_testing(&dir.path().join("test.wal")).unwrap());
-    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+    let (dispatcher, mut data_sides) = Dispatcher::new(1, 64);
+    let data_side = data_sides
+        .pop()
+        .expect("one configured core has one data side");
     let shared = SharedState::new(dispatcher, wal).unwrap();
 
     let rt = RoutingTable::uniform(1, &[1], 1);
     let multi_raft = Arc::new(Mutex::new(MultiRaft::new(1, rt, dir.path().to_path_buf())));
 
-    let registry = CalvinCompletionRegistry::new_detached();
     let sequencer_state_machine = Arc::new(Mutex::new(SequencerStateMachine::new(
         HashMap::new(),
         Arc::clone(&registry),
@@ -162,7 +184,8 @@ fn build_test_scheduler(vshard_id: u32) -> (Scheduler, tempfile::TempDir) {
     let (_tx, receiver) = tokio::sync::mpsc::channel(16);
     let (_rr_tx, read_result_rx) = tokio::sync::mpsc::channel(16);
     let (_prom_tx, promotion_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (_v_tx, verdict_rx) = tokio::sync::mpsc::channel(16);
+    let (verdict_tx, verdict_rx) = tokio::sync::mpsc::channel(16);
+    registry.register_verdict_signal_sender(vshard_id, verdict_tx);
 
     let lock_manager = Arc::new(Mutex::new(LockManager::new()));
 
@@ -189,10 +212,38 @@ fn build_test_scheduler(vshard_id: u32) -> (Scheduler, tempfile::TempDir) {
         registry,
         verdict_rx,
     });
-    (scheduler, dir)
+    (scheduler, dir, data_side)
 }
 
 /// Build a static-write `SequencedTxn` at `(epoch, position)`.
+fn staged_pending(txn: SequencedTxn, txn_id: TxnId) -> PendingTxn {
+    PendingTxn {
+        txn,
+        lock_owner: txn_id,
+        dispatch_time: std::time::Instant::now(),
+        has_primary_write: true,
+        has_returning: false,
+        change_sets: Vec::new(),
+        commit_state: Some(CommitState::Staged),
+        verdict_deadline: None,
+    }
+}
+
+fn staged_response(status: Status, read_set_valid: Option<bool>) -> Response {
+    Response {
+        request_id: RequestId::new(1),
+        status,
+        attempt: 1,
+        partial: false,
+        payload: Payload::empty(),
+        watermark_lsn: Lsn::ZERO,
+        error_code: None,
+        read_set_valid,
+        read_version_lsn: Lsn::ZERO,
+        write_set: Vec::new(),
+    }
+}
+
 fn make_sequenced_txn(epoch: u64, position: u32) -> SequencedTxn {
     let write_set = ReadWriteSet::new(vec![EngineKeySet::Document {
         collection: "test_coll".to_string(),
@@ -613,4 +664,92 @@ async fn is_caught_up_true_when_no_rebuild_target_exists() {
         scheduler.is_caught_up(),
         "no rebuild target (greenfield node) must report caught-up"
     );
+}
+
+/// A false vote from either participant makes the only global verdict abort;
+/// applying that durable verdict broadcasts the abort to every parked local
+/// participant. The scheduler's `resume_on_verdict(false)` then dispatches a
+/// drop, never a resolve/flush, on each recipient.
+#[tokio::test]
+async fn two_participant_false_vote_broadcasts_global_abort_to_every_scheduler() {
+    let registry = CalvinCompletionRegistry::new_detached();
+    let txn = nodedb_cluster::calvin::TxnId::new(14, 2);
+    let txn_id = TxnId::new(14, 2);
+    let (mut first_scheduler, _first_dir, mut first_data) =
+        build_test_scheduler_with_data_side(7, Arc::clone(&registry));
+    let (mut second_scheduler, _second_dir, mut second_data) =
+        build_test_scheduler_with_data_side(9, Arc::clone(&registry));
+    first_scheduler
+        .pending
+        .insert(txn_id, staged_pending(make_sequenced_txn(14, 2), txn_id));
+    second_scheduler
+        .pending
+        .insert(txn_id, staged_pending(make_sequenced_txn(14, 2), txn_id));
+
+    // Local staging votes only park their own staged slices; neither the
+    // affirmative nor the failed participant may resolve or drop unilaterally.
+    first_scheduler.resolve_staged_commit(txn_id, &staged_response(Status::Ok, Some(true)));
+    second_scheduler.resolve_staged_commit(txn_id, &staged_response(Status::Error, None));
+    for (scheduler, data_side) in [
+        (&first_scheduler, &mut first_data),
+        (&second_scheduler, &mut second_data),
+    ] {
+        assert!(matches!(
+            scheduler
+                .pending
+                .get(&txn_id)
+                .and_then(|pending| pending.commit_state),
+            Some(CommitState::AwaitingVerdict)
+        ));
+        assert!(data_side.request_rx.try_pop().is_err());
+    }
+
+    // Model the replicated vote entries and their resulting durable verdict.
+    // The shared registry sends each scheduler's actual registered channel.
+    registry.seed_expected(txn, 2);
+    registry.note_vote(txn, 7, true);
+    assert!(registry.drain_unproposed_verdicts().is_empty());
+    registry.note_vote(txn, 9, false);
+    assert_eq!(registry.drain_unproposed_verdicts(), vec![(txn, false)]);
+    registry.note_verdict(txn, false);
+    assert_eq!(registry.verdict(txn), Some(false));
+
+    let first_signal = first_scheduler
+        .verdict_rx
+        .try_recv()
+        .expect("registry must signal the first registered scheduler");
+    let second_signal = second_scheduler
+        .verdict_rx
+        .try_recv()
+        .expect("registry must signal the second registered scheduler");
+    first_scheduler.handle_verdict_signal(first_signal);
+    second_scheduler.handle_verdict_signal(second_signal);
+
+    for (scheduler, data_side) in [
+        (&first_scheduler, &mut first_data),
+        (&second_scheduler, &mut second_data),
+    ] {
+        assert!(matches!(
+            scheduler
+                .pending
+                .get(&txn_id)
+                .and_then(|pending| pending.commit_state),
+            Some(CommitState::AwaitingResolve {
+                committed: false,
+                redo_lsn: None
+            })
+        ));
+        let request = data_side
+            .request_rx
+            .try_pop()
+            .expect("global abort must dispatch a drop to every participant");
+        assert!(matches!(
+            request.inner.plan,
+            PhysicalPlan::Meta(MetaOp::CalvinDrop {
+                epoch: 14,
+                position: 2
+            })
+        ));
+        assert!(data_side.request_rx.try_pop().is_err());
+    }
 }

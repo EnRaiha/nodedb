@@ -29,6 +29,8 @@
 //! scheduler's response path) after a successful response is received through
 //! the SPSC bridge; not here in the Data Plane.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use tracing::{debug, info_span};
 
 use nodedb_cluster::calvin::types::PassiveReadKey;
@@ -110,16 +112,55 @@ impl CoreLoop {
         )
         .entered();
 
+        // Derive the synthetic transaction identity before ANY mutation. A
+        // representational failure must not leave either a pending buffer or an
+        // overlay behind for a transaction that cannot later be resolved.
+        let synthetic_txn_id = match calvin_synthetic_txn_id(epoch, position, vshard_id) {
+            Ok(id) => id,
+            Err(error) => {
+                return self.calvin_stage_failure(task, epoch, position, vshard_id, error);
+            }
+        };
+
+        // Stage every plan before publishing `PendingCommit`. Panic isolation
+        // cleans both staging representations after any failure.
+        let stage_result = catch_unwind(AssertUnwindSafe(|| {
+            for plan in plans {
+                self.stage_calvin_overlay(task, synthetic_txn_id, *tenant_id, plan)?;
+                // Test-only fault boundary after a potentially-mutating stage.
+                crate::fail_point!("calvin_static::during_overlay_stage");
+            }
+            Ok::<(), crate::Error>(())
+        }));
+        match stage_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return self.calvin_stage_failure(task, epoch, position, vshard_id, error);
+            }
+            Err(payload) => {
+                return self.calvin_stage_failure(
+                    task,
+                    epoch,
+                    position,
+                    vshard_id,
+                    ErrorCode::Internal {
+                        detail: format!(
+                            "panic while staging static Calvin transaction: {}",
+                            calvin_panic_payload_to_string(payload.as_ref())
+                        ),
+                    },
+                );
+            }
+        }
+
         // Local commit vote: is this participant's slice of the read-set still
         // current against the local write versions? Empty read-set is vacuously
-        // current. Read-only — no base mutation here.
+        // current. Read-only — no base mutation here. A stale-read false vote
+        // retains the fully staged state until the durable global verdict.
         let vote = self.read_set_still_current(task, tenant_id.as_u64(), versioned_reads);
 
-        // Stage the write plans for commit, keyed by this participant's vShard
-        // so co-located slices of the same multi-participant transaction (which
-        // share `(epoch, position)`) never clobber one another on a shared core.
-        // The verdict-driven flush replays them through
-        // `execute_transaction_batch`; the drop discards them.
+        // Publish only a fully staged transaction. The verdict-driven flush
+        // replays this raw plan buffer; a global abort drops it and its overlay.
         self.commit_pending.insert(
             (epoch, position, vshard_id),
             PendingCommit {
@@ -129,19 +170,6 @@ impl CoreLoop {
                 is_group_leader,
             },
         );
-
-        // Also stage each write plan into `txn_overlays` under a synthetic
-        // `TxnId` (producer side for a future `CalvinResolve`); additive to
-        // `commit_pending` above, which stays the sole durable apply.
-        let synthetic_txn_id = match calvin_synthetic_txn_id(epoch, position, vshard_id) {
-            Ok(id) => id,
-            Err(e) => return self.response_error(task, e),
-        };
-        for plan in plans {
-            if let Err(e) = self.stage_calvin_overlay(task, synthetic_txn_id, *tenant_id, plan) {
-                return self.response_error(task, e);
-            }
-        }
 
         Response {
             request_id: task.request_id(),
@@ -155,6 +183,28 @@ impl CoreLoop {
             read_version_lsn: crate::types::Lsn::ZERO,
             write_set: Vec::new(),
         }
+    }
+
+    /// Clean failed static staging and return an explicit abort vote.
+    /// Defensive removal clears document/KV and graph overlays plus their gauge.
+    fn calvin_stage_failure<E>(
+        &mut self,
+        task: &ExecutionTask,
+        epoch: u64,
+        position: u32,
+        vshard_id: u32,
+        error: E,
+    ) -> Response
+    where
+        E: Into<ErrorCode>,
+    {
+        self.commit_pending.remove(&(epoch, position, vshard_id));
+        self.drop_calvin_synthetic_overlay(epoch, position, vshard_id);
+        let mut response = self.response_error(task, error.into());
+        // Scheduler treats this as a durable local abort vote and still waits
+        // for the authoritative global verdict before issuing any drop.
+        response.read_set_valid = Some(false);
+        response
     }
 
     /// Flush a staged Calvin transaction to base storage.
@@ -437,6 +487,15 @@ impl CoreLoop {
         }
     }
 }
+fn calvin_panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "<non-string panic payload>".to_owned()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -563,6 +622,166 @@ mod tests {
                 .and_then(|o| o.get(&coll_key, 7)),
             Some(&Staged::Put(expected_body)),
             "the Calvin write plan must be staged into the synthetic-TxnId overlay"
+        );
+    }
+
+    #[test]
+    fn synthetic_id_failure_leaves_no_pending_or_overlay_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let task = make_task();
+        let tenant_id = TenantId::new(1);
+        let epoch_outside_synthetic_range = 1_u64 << 33;
+
+        let response = core.execute_calvin_execute_static(
+            &task,
+            CalvinExecCtx {
+                epoch: epoch_outside_synthetic_range,
+                position: 0,
+                epoch_system_ms: 0,
+                is_group_leader: true,
+            },
+            &tenant_id,
+            &[point_insert_plan("orders", "o1", 7)],
+            &[],
+        );
+
+        assert_eq!(response.status, Status::Error);
+        assert_eq!(response.read_set_valid, Some(false));
+        assert!(core.commit_pending.is_empty());
+        assert!(core.txn_overlays.is_empty());
+        assert!(core.graph_txn_overlays.is_empty());
+    }
+
+    #[test]
+    fn static_stage_error_cleans_all_prior_overlay_state_before_voting_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let metrics = std::sync::Arc::new(crate::control::metrics::SystemMetrics::new());
+        core.metrics = Some(metrics.clone());
+        let gauge = || {
+            metrics
+                .active_txn_overlays
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let baseline = gauge();
+        let task = make_task();
+        let tenant_id = TenantId::new(1);
+        let ctx = CalvinExecCtx {
+            epoch: 9,
+            position: 3,
+            epoch_system_ms: 0,
+            is_group_leader: true,
+        };
+        let vshard = task.request.vshard_id.as_u32();
+        let synthetic = calvin_synthetic_txn_id(9, 3, vshard).unwrap();
+        core.graph_txn_overlay_mut(synthetic);
+        assert_eq!(
+            gauge(),
+            baseline + 1,
+            "graph staging must increment the gauge"
+        );
+        // The first plan adds a document overlay; the second is invalid without
+        // an OLLP prediction and must clean both overlays atomically.
+        let plans = vec![
+            point_insert_plan("orders", "o1", 7),
+            bulk_delete_plan("orders", None),
+        ];
+
+        let response = core.execute_calvin_execute_static(&task, ctx, &tenant_id, &plans, &[]);
+
+        assert_eq!(response.status, Status::Error);
+        assert_eq!(response.read_set_valid, Some(false));
+        assert!(!core.commit_pending.contains_key(&(9, 3, vshard)));
+        assert!(!core.txn_overlays.contains_key(&synthetic));
+        assert!(!core.graph_txn_overlays.contains_key(&synthetic));
+        assert_eq!(
+            gauge(),
+            baseline,
+            "failed staging must restore the overlay gauge"
+        );
+    }
+
+    #[test]
+    fn static_stage_error_also_cleans_existing_graph_overlay_for_synthetic_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let task = make_task();
+        let tenant_id = TenantId::new(1);
+        let vshard = task.request.vshard_id.as_u32();
+        let synthetic = calvin_synthetic_txn_id(9, 5, vshard).unwrap();
+        // Use the graph-overlay choke point so this regression also covers its
+        // gauge accounting without requiring a graph catalog fixture.
+        core.graph_txn_overlay_mut(synthetic);
+
+        let response = core.execute_calvin_execute_static(
+            &task,
+            CalvinExecCtx {
+                epoch: 9,
+                position: 5,
+                epoch_system_ms: 0,
+                is_group_leader: true,
+            },
+            &tenant_id,
+            &[bulk_delete_plan("orders", None)],
+            &[],
+        );
+
+        assert_eq!(response.read_set_valid, Some(false));
+        assert!(!core.graph_txn_overlays.contains_key(&synthetic));
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn static_stage_panic_cleans_prior_overlay_state_before_voting_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let metrics = std::sync::Arc::new(crate::control::metrics::SystemMetrics::new());
+        core.metrics = Some(metrics.clone());
+        let gauge = || {
+            metrics
+                .active_txn_overlays
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let baseline = gauge();
+        let task = make_task();
+        let tenant_id = TenantId::new(1);
+        let ctx = CalvinExecCtx {
+            epoch: 9,
+            position: 4,
+            epoch_system_ms: 0,
+            is_group_leader: true,
+        };
+        let vshard = task.request.vshard_id.as_u32();
+        let synthetic = calvin_synthetic_txn_id(9, 4, vshard).unwrap();
+        core.graph_txn_overlay_mut(synthetic);
+        assert_eq!(
+            gauge(),
+            baseline + 1,
+            "graph staging must increment the gauge"
+        );
+        let _fail = crate::fail_point::FailGuard::install(
+            "calvin_static::during_overlay_stage",
+            crate::fail_point::FailAction::Panic,
+        );
+
+        let response = core.execute_calvin_execute_static(
+            &task,
+            ctx,
+            &tenant_id,
+            &[point_insert_plan("orders", "o1", 7)],
+            &[],
+        );
+
+        assert_eq!(response.status, Status::Error);
+        assert_eq!(response.read_set_valid, Some(false));
+        assert!(!core.commit_pending.contains_key(&(9, 4, vshard)));
+        assert!(!core.txn_overlays.contains_key(&synthetic));
+        assert!(!core.graph_txn_overlays.contains_key(&synthetic));
+        assert_eq!(
+            gauge(),
+            baseline,
+            "panic cleanup must restore the overlay gauge"
         );
     }
 

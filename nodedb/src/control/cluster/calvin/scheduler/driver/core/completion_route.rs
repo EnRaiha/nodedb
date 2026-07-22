@@ -119,6 +119,10 @@ impl Scheduler {
         let commit_state = self.pending.get(&txn_id).and_then(|p| p.commit_state);
         match commit_state {
             Some(CommitState::Staged) => {
+                // Stage failures remain participants in the barrier:
+                // `resolve_staged_commit` turns any `Status::Error` into an
+                // explicit false vote, parks locally, and waits for the
+                // durable global verdict before issuing a drop.
                 self.resolve_staged_commit(txn_id, &response);
                 return;
             }
