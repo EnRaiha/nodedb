@@ -107,6 +107,11 @@ impl TestClusterNode {
                 &data_dir_path.join("system.redb"),
             )?,
         );
+        // Mirror production/pgwire-harness bootstrap: both listeners run in
+        // `AuthMode::Trust`, which resolves — but never fabricates — a durable
+        // stored identity. Without this every node rejects the harness connect
+        // with `trust auth: user 'nodedb' does not exist`.
+        credentials.bootstrap_trust_superuser("nodedb")?;
         let mut shared =
             SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)?;
 
