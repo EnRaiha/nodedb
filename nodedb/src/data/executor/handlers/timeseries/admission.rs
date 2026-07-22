@@ -106,8 +106,8 @@ fn symbol_value<'l, 'a: 'l>(line: &'l IlpLine<'a>, col_name: &str) -> &'l str {
     let tag: Option<&'l str> = line
         .tags
         .iter()
-        .find(|&&(k, _)| k == col_name)
-        .map(|&(_, v)| v);
+        .find(|(key, _)| key.as_ref() == col_name)
+        .map(|(_, value)| value.as_ref());
     tag.or_else(|| ilp_ingest::find_field_str_ref(&line.fields, col_name))
         .unwrap_or_default()
 }

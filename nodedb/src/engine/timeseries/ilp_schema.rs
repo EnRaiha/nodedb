@@ -27,14 +27,14 @@ pub fn infer_schema(lines: &[IlpLine<'_>]) -> ColumnarSchema {
     let mut seen_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for line in lines {
-        for &(key, _) in &line.tags {
+        for (key, _) in &line.tags {
             if seen_tags.insert(key.to_string()) {
                 tag_keys.push(key.to_string());
             }
         }
-        for &(key, ref val) in &line.fields {
+        for (key, value) in &line.fields {
             if seen_fields.insert(key.to_string()) {
-                let col_type = match val {
+                let col_type = match value {
                     FieldValue::Float(_) => ColumnType::Float64,
                     FieldValue::Int(_) | FieldValue::UInt(_) => ColumnType::Int64,
                     FieldValue::Str(_) => ColumnType::Symbol,
@@ -102,14 +102,14 @@ pub fn evolve_schema(memtable: &mut ColumnarMemtable, lines: &[IlpLine<'_>]) {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for line in lines {
-        for &(key, _) in &line.tags {
-            if !existing.contains(key) && seen.insert(key.to_string()) {
+        for (key, _) in &line.tags {
+            if !existing.contains(key.as_ref()) && seen.insert(key.to_string()) {
                 new_columns.push((key.to_string(), ColumnType::Symbol));
             }
         }
-        for &(key, ref val) in &line.fields {
-            if !existing.contains(key) && seen.insert(key.to_string()) {
-                let col_type = match val {
+        for (key, value) in &line.fields {
+            if !existing.contains(key.as_ref()) && seen.insert(key.to_string()) {
+                let col_type = match value {
                     FieldValue::Float(_) => ColumnType::Float64,
                     FieldValue::Int(_) | FieldValue::UInt(_) => ColumnType::Int64,
                     FieldValue::Str(_) => ColumnType::Symbol,

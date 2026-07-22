@@ -6,6 +6,7 @@
 //! columnar memtable. Schema inference / evolution lives in the sibling
 //! `ilp_schema` module.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::columnar_memtable::{ColumnType, ColumnValue, ColumnarMemtable};
@@ -69,9 +70,9 @@ pub fn ingest_batch_with_lvc(
         let tags: Vec<(String, String)> = line
             .tags
             .iter()
-            .map(|&(k, v)| (k.to_string(), v.to_string()))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
-        let key = SeriesKey::new(line.measurement, tags);
+        let key = SeriesKey::new(line.measurement.as_ref(), tags);
         let series_id = key.to_series_id(0);
         series_keys.entry(series_id).or_insert(key);
 
@@ -95,8 +96,8 @@ pub fn ingest_batch_with_lvc(
                     let val: String = line
                         .tags
                         .iter()
-                        .find(|&&(k, _)| k == col_name)
-                        .map(|&(_, v)| v.to_string())
+                        .find(|(key, _)| key.as_ref() == col_name)
+                        .map(|(_, value)| value.to_string())
                         .or_else(|| find_field_str(&line.fields, col_name))
                         .unwrap_or_default();
                     values.push(ColumnValue::Symbol(val));
@@ -144,7 +145,7 @@ pub fn ingest_batch_with_lvc(
     (accepted, rejected)
 }
 
-fn find_field_str(fields: &[(&str, FieldValue)], name: &str) -> Option<String> {
+fn find_field_str<'a>(fields: &[(Cow<'a, str>, FieldValue<'a>)], name: &str) -> Option<String> {
     find_field_str_ref(fields, name).map(str::to_string)
 }
 
@@ -154,24 +155,24 @@ fn find_field_str(fields: &[(&str, FieldValue)], name: &str) -> Option<String> {
 /// its value, but the admission gate only needs to PROBE the symbol
 /// dictionaries with it. Both go through this one lookup so the gate can never
 /// answer about a different value than the ingest would insert.
-pub(crate) fn find_field_str_ref<'f>(
-    fields: &'f [(&str, FieldValue)],
+pub(crate) fn find_field_str_ref<'f, 'a>(
+    fields: &'f [(Cow<'a, str>, FieldValue<'a>)],
     name: &str,
 ) -> Option<&'f str> {
-    for (k, v) in fields {
-        if *k == name
-            && let FieldValue::Str(s) = v
+    for (key, value) in fields {
+        if key.as_ref() == name
+            && let FieldValue::Str(value) = value
         {
-            return Some(s.as_str());
+            return Some(value.as_ref());
         }
     }
     None
 }
 
-fn find_field_f64(fields: &[(&str, FieldValue)], name: &str) -> f64 {
-    for &(k, ref v) in fields {
-        if k == name {
-            return match v {
+fn find_field_f64<'a>(fields: &[(Cow<'a, str>, FieldValue<'a>)], name: &str) -> f64 {
+    for (key, value) in fields {
+        if key.as_ref() == name {
+            return match value {
                 FieldValue::Float(f) => *f,
                 FieldValue::Int(i) => *i as f64,
                 FieldValue::UInt(u) => *u as f64,
@@ -189,14 +190,14 @@ fn find_field_f64(fields: &[(&str, FieldValue)], name: &str) -> f64 {
     f64::NAN
 }
 
-fn find_field_i64(fields: &[(&str, FieldValue)], name: &str) -> i64 {
+fn find_field_i64<'a>(fields: &[(Cow<'a, str>, FieldValue<'a>)], name: &str) -> i64 {
     find_field_i64_opt(fields, name).unwrap_or(0)
 }
 
-fn find_field_i64_opt(fields: &[(&str, FieldValue)], name: &str) -> Option<i64> {
-    for &(k, ref v) in fields {
-        if k == name {
-            return Some(match v {
+fn find_field_i64_opt<'a>(fields: &[(Cow<'a, str>, FieldValue<'a>)], name: &str) -> Option<i64> {
+    for (key, value) in fields {
+        if key.as_ref() == name {
+            return Some(match value {
                 FieldValue::Int(i) => *i,
                 FieldValue::UInt(u) => *u as i64,
                 FieldValue::Float(f) => *f as i64,
@@ -232,10 +233,7 @@ mod tests {
     fn infer_schema_from_ilp() {
         let input = "cpu,host=a,dc=us value=0.64,count=100i 1000000000\n\
                      cpu,host=b,dc=eu value=0.55,count=200i 2000000000";
-        let lines: Vec<_> = parse_batch(input)
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let lines = parse_batch(input).expect("valid ILP batch").into_lines();
         let schema = infer_schema(&lines);
 
         // timestamp + 2 tags + 2 fields = 5 columns.
@@ -259,10 +257,7 @@ mod tests {
         // row; an `AS OF VALID TIME` query at the event time must find it.
         let input = "temp,sensor=s1 reading=22.5,_ts_valid_from=1000i,_ts_valid_until=2000i \
                      1500000000000000";
-        let lines: Vec<_> = parse_batch(input)
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let lines = parse_batch(input).expect("valid ILP batch").into_lines();
 
         let mut schema = infer_schema(&lines);
         ensure_bitemporal_columns(&mut schema);
@@ -327,10 +322,7 @@ mod tests {
         let input = "cpu,host=server01 usage=0.64 1434055562000000000\n\
                      cpu,host=server02 usage=0.55 1434055563000000000\n\
                      cpu,host=server01 usage=0.72 1434055564000000000";
-        let lines: Vec<_> = parse_batch(input)
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let lines = parse_batch(input).expect("valid ILP batch").into_lines();
         let schema = infer_schema(&lines);
 
         let mut mt = ColumnarMemtable::new(schema, default_config());
@@ -346,10 +338,7 @@ mod tests {
     #[test]
     fn timestamp_ns_to_ms_conversion() {
         let input = "temp value=22.5 1704067200000000000"; // 2024-01-01 00:00:00 UTC in ns
-        let lines: Vec<_> = parse_batch(input)
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let lines = parse_batch(input).expect("valid ILP batch").into_lines();
         let schema = infer_schema(&lines);
 
         let mut mt = ColumnarMemtable::new(schema, default_config());
@@ -363,10 +352,7 @@ mod tests {
     #[test]
     fn missing_timestamp_uses_default() {
         let input = "temp value=22.5"; // no timestamp
-        let lines: Vec<_> = parse_batch(input)
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let lines = parse_batch(input).expect("valid ILP batch").into_lines();
         let schema = infer_schema(&lines);
 
         let mut mt = ColumnarMemtable::new(schema, default_config());
@@ -381,10 +367,7 @@ mod tests {
     #[test]
     fn mixed_field_types() {
         let input = "sensor temp=72.5,humidity=45i,active=true 1000000000";
-        let lines: Vec<_> = parse_batch(input)
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let lines = parse_batch(input).expect("valid ILP batch").into_lines();
         let schema = infer_schema(&lines);
 
         let mut mt = ColumnarMemtable::new(schema, default_config());
@@ -397,10 +380,7 @@ mod tests {
     fn string_fields_stored_as_symbol() {
         let input =
             r#"dns,client=10.0.0.1 qname="bigquery.googleapis.com",elapsed_ms=12.5 1000000000"#;
-        let lines: Vec<_> = parse_batch(input)
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let lines = parse_batch(input).expect("valid ILP batch").into_lines();
         let schema = infer_schema(&lines);
 
         // qname should be Symbol, not Float64.

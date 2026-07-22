@@ -190,8 +190,6 @@ async fn handle_ilp_connection(
     .map_err(|_| crate::Error::BadRequest {
         detail: "ILP authentication failed".into(),
     })?;
-    let tenant_id = authenticated_context.identity().tenant_id;
-    let database_id = authenticated_context.database_id();
     let _admission = match IlpConnectionAdmission::acquire(state, &authenticated_context) {
         Ok(admission) => admission,
         Err(_) => {
@@ -241,23 +239,27 @@ async fn handle_ilp_connection(
                         let line = match std::str::from_utf8(line_bytes) {
                             Ok(s) => s,
                             Err(_) => {
-                                warn!(%peer, "ILP line is not valid UTF-8 — skipping");
-                                line_buf.clear();
-                                continue;
+                                return Err(crate::Error::BadRequest {
+                                    detail: "ILP payload is not valid UTF-8".into(),
+                                });
                             }
                         };
 
-                        if line.is_empty() || line.starts_with('#') {
+                        if line.trim().is_empty() || line.trim_start().starts_with('#') {
                             line_buf.clear();
                             continue;
                         }
 
-                        if !batch.is_empty()
-                            && batch.len().saturating_add(line.len() + 1) > MAX_ILP_BATCH_BYTES
+                        let separator_bytes = if batch.is_empty() { 0 } else { 1 };
+                        if batch
+                            .len()
+                            .saturating_add(separator_bytes)
+                            .saturating_add(line.len())
+                            > MAX_ILP_BATCH_BYTES
                         {
                             let flushed = line_count;
                             total_ingested +=
-                                flush_ilp_batch(state, tenant_id, database_id, &batch).await?;
+                                flush_ilp_batch(state, &authenticated_context, &batch).await?;
                             batch.clear();
                             line_count = 0;
 
@@ -272,8 +274,10 @@ async fn handle_ilp_connection(
                             );
                         }
 
+                        if !batch.is_empty() {
+                            batch.push('\n');
+                        }
                         batch.push_str(line);
-                        batch.push('\n');
                         line_count += 1;
                         line_buf.clear();
 
@@ -281,7 +285,7 @@ async fn handle_ilp_connection(
                         if line_count >= batch_target {
                             let flushed = line_count;
                             total_ingested +=
-                                flush_ilp_batch(state, tenant_id, database_id, &batch).await?;
+                                flush_ilp_batch(state, &authenticated_context, &batch).await?;
                             batch.clear();
                             line_count = 0;
 
@@ -302,9 +306,11 @@ async fn handle_ilp_connection(
                             %peer,
                             error = %error,
                             limit = MAX_ILP_LINE_BYTES,
-                            "ILP line read failed — dropping connection"
+                            "ILP line read failed — rejecting connection"
                         );
-                        break;
+                        return Err(crate::Error::BadRequest {
+                            detail: "ILP line rejected".into(),
+                        });
                     }
                 }
             }
@@ -313,7 +319,7 @@ async fn handle_ilp_connection(
                 if !batch.is_empty() {
                     let flushed = line_count;
                     total_ingested +=
-                        flush_ilp_batch(state, tenant_id, database_id, &batch).await?;
+                        flush_ilp_batch(state, &authenticated_context, &batch).await?;
                     batch.clear();
                     line_count = 0;
 
@@ -333,13 +339,13 @@ async fn handle_ilp_connection(
 
     // Flush remaining.
     if !batch.is_empty() {
-        total_ingested += flush_ilp_batch(state, tenant_id, database_id, &batch).await?;
+        total_ingested += flush_ilp_batch(state, &authenticated_context, &batch).await?;
     }
 
     debug!(
         %peer,
         total_ingested,
-        database_id = ?database_id,
+        database_id = ?authenticated_context.database_id(),
         "ILP connection closed"
     );
     Ok(())
@@ -466,16 +472,5 @@ mod tests {
 
         assert!(result.is_err());
         assert!(line.is_empty());
-    }
-
-    #[test]
-    fn extract_collection_from_ilp() {
-        let batch = "cpu,host=server01 value=0.64 1000\nmem,host=server01 used=1024 2000\n";
-        let collection = batch
-            .lines()
-            .find(|l| !l.is_empty() && !l.starts_with('#'))
-            .and_then(|l| l.split([',', ' ']).next())
-            .unwrap_or("default_metrics");
-        assert_eq!(collection, "cpu");
     }
 }

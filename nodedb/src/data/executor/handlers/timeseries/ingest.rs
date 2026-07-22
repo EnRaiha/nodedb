@@ -204,26 +204,44 @@ impl CoreLoop {
         let key = (task.request.database_id, tid, collection.to_string());
         let input = match std::str::from_utf8(payload) {
             Ok(s) => s,
-            Err(e) => {
+            Err(_) => {
                 return self.response_error(
                     task,
-                    ErrorCode::Internal {
-                        detail: format!("invalid UTF-8 in ILP: {e}"),
+                    ErrorCode::RejectedPrevalidation {
+                        reason: "ILP payload is not valid UTF-8".into(),
                     },
                 );
             }
         };
 
-        let lines: Vec<_> = ilp::parse_batch(input)
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let lines = match ilp::parse_batch(input) {
+            Ok(batch) => batch.into_lines(),
+            Err(error) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::RejectedPrevalidation {
+                        reason: error.to_string(),
+                    },
+                );
+            }
+        };
 
         if lines.is_empty() {
             return self.response_error(
                 task,
-                ErrorCode::Internal {
-                    detail: "no valid ILP lines in payload".into(),
+                ErrorCode::RejectedPrevalidation {
+                    reason: "no ILP data lines in payload".into(),
+                },
+            );
+        }
+        if lines
+            .iter()
+            .any(|line| line.measurement.as_ref() != collection)
+        {
+            return self.response_error(
+                task,
+                ErrorCode::RejectedPrevalidation {
+                    reason: "ILP measurements must match the routed collection".into(),
                 },
             );
         }
