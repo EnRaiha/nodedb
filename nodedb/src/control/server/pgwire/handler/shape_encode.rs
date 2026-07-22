@@ -146,6 +146,10 @@ pub(in crate::control::server::pgwire) fn shaped_query_response(
     shaped: ShapedRows,
     formats: &[FieldFormat],
 ) -> (Response, Option<String>) {
+    // Cells live in the row maps under per-column keys that differ from the
+    // display names only when two columns share a name; derived here before
+    // the struct is destructured.
+    let keys = shaped.cell_keys();
     let ShapedRows {
         columns,
         column_types,
@@ -164,9 +168,6 @@ pub(in crate::control::server::pgwire) fn shaped_query_response(
         .collect();
     let schema = Arc::new(fields);
 
-    // Cells live in the row maps under unique per-column keys (display names
-    // may repeat across columns); derive the same keys the shaper used.
-    let keys = crate::control::server::response_shape::project::cell_keys(&columns);
     let encoded_rows: Vec<PgWireResult<DataRow>> = rows
         .iter()
         .map(|row| encode_shaped_row(&schema, &keys, &column_types, formats, row))

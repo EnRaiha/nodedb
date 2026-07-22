@@ -122,6 +122,9 @@ pub(super) fn ndjson_body_stream(
                     return;
                 }
             };
+            // Row maps are keyed by `ShapedRows::cell_keys`, so each NDJSON
+            // line serializes as-is; two output columns sharing a name emit
+            // `{"id": …, "id_1": …}` rather than collapsing to one cell.
             let shaped = shape_decoded_rows(&value, projection.as_ref());
             for row in shaped.rows {
                 if emitted >= limit {

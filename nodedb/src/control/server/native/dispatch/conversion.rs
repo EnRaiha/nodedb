@@ -146,10 +146,10 @@ pub(crate) fn calvin_native_response(
 /// `json_to_value_display`; a column absent from a given row's map becomes
 /// `Value::Null`.
 pub(crate) fn to_native_columns_rows(shaped: &ShapedRows) -> (Vec<String>, Vec<Vec<Value>>) {
-    // Cells live in the row maps under unique per-column keys (display names
-    // may repeat across columns, e.g. `SELECT w.id, b.id`); derive the same
-    // keys the shaper used so every column reads its own cell.
-    let cell_keys = crate::control::server::response_shape::project::cell_keys(&shaped.columns);
+    // Cells live in the row maps under per-column keys (display names may
+    // repeat across columns, e.g. `SELECT w.id, b.id`), so read through the
+    // shared accessor rather than by display name.
+    let cell_keys = shaped.cell_keys();
     let rows = shaped
         .rows
         .iter()

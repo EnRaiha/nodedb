@@ -220,3 +220,76 @@ async fn http_vector_search_serializes_distance() {
         "distance must be numeric, got {distance:?}"
     );
 }
+
+// ── duplicate output column names ────────────────────────────────────────────
+
+/// POST `sql` to `/v1/query/stream` and return one parsed JSON value per
+/// NDJSON line.
+async fn query_stream_lines(http_port: u16, sql: &str) -> Vec<serde_json::Value> {
+    let url = format!("http://127.0.0.1:{http_port}/v1/query/stream");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({ "sql": sql }))
+        .send()
+        .await
+        .expect("POST /v1/query/stream");
+    assert!(
+        resp.status().is_success(),
+        "stream query must succeed over HTTP: {} — sql={sql}",
+        resp.status()
+    );
+    let body = resp.text().await.expect("read NDJSON body");
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("parse NDJSON line {l:?}: {e}")))
+        .collect()
+}
+
+/// Two joined collections both projecting `id` must keep BOTH values in the
+/// HTTP JSON row. A JSON object cannot repeat a key, so the second column
+/// lands under the `_<n>`-suffixed cell key (`id_1`) — dropping it would
+/// silently lose a projected column, which is what the row map did before
+/// cells were keyed independently of the display name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_keeps_both_cells_for_duplicate_column_names() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION nb_dup_w (id TEXT PRIMARY KEY, wname TEXT) WITH (engine='document_strict')")
+        .await
+        .expect("create nb_dup_w");
+    srv.exec("CREATE COLLECTION nb_dup_b (id TEXT PRIMARY KEY, ref TEXT) WITH (engine='document_strict')")
+        .await
+        .expect("create nb_dup_b");
+    srv.exec("INSERT INTO nb_dup_w (id, wname) VALUES ('w1','alpha')")
+        .await
+        .expect("insert nb_dup_w");
+    srv.exec("INSERT INTO nb_dup_b (id, ref) VALUES ('b1','w1')")
+        .await
+        .expect("insert nb_dup_b");
+
+    let sql = "SELECT w.id, b.id FROM nb_dup_w w JOIN nb_dup_b b ON b.ref = w.id";
+    let rows = query_rows(srv.http_port, sql).await;
+    let stream_rows = query_stream_lines(srv.http_port, sql).await;
+    srv.graceful_shutdown().await;
+
+    assert_eq!(rows.len(), 1, "one joined row expected: {rows:?}");
+    let obj = rows[0].as_object().expect("row is a JSON object");
+    assert_eq!(
+        obj.get("id").and_then(|v| v.as_str()),
+        Some("w1"),
+        "first `id` must carry the left table's value: {obj:?}"
+    );
+    assert_eq!(
+        obj.get("id_1").and_then(|v| v.as_str()),
+        Some("b1"),
+        "the duplicate `id` must survive under the suffixed key: {obj:?}"
+    );
+
+    // The NDJSON streaming path serializes the same row maps, so it carries
+    // the identical contract.
+    assert_eq!(stream_rows.len(), 1, "one streamed row: {stream_rows:?}");
+    let stream_obj = stream_rows[0]
+        .as_object()
+        .expect("streamed row is an object");
+    assert_eq!(stream_obj.get("id").and_then(|v| v.as_str()), Some("w1"));
+    assert_eq!(stream_obj.get("id_1").and_then(|v| v.as_str()), Some("b1"));
+}
