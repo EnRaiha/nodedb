@@ -8,6 +8,7 @@ pub mod dispatch_utils;
 pub mod exchange;
 pub mod graph_dispatch;
 pub mod http;
+pub(crate) mod ilp_auth;
 pub mod ilp_listener;
 pub mod listener;
 pub mod native;

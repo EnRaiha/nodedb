@@ -46,9 +46,9 @@ pub(crate) async fn setup(
     // Create shared connection semaphore — enforced across all listeners.
     let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(config.server.max_connections));
 
-    // Per-database and per-tenant connection semaphore registry.
-    // Populated at runtime when ALTER DATABASE/TENANT SET QUOTA configures max_connections.
-    let admission_registry = Arc::new(nodedb::control::server::admission::AdmissionRegistry::new());
+    // Reuse the admission registry owned by SharedState so every transport
+    // observes the same runtime database and tenant connection quotas.
+    let admission_registry = Arc::clone(&shared.admission_registry);
     tracing::info!(
         max_connections = config.server.max_connections,
         "connection limit configured"

@@ -38,11 +38,10 @@ pub(super) fn wal_append_timeseries_op(
         } => {
             // WAL bypass: skip WAL if collection has wal=false in timeseries_config.
             if let Some(creds) = credentials
-                && let Ok(Some(coll)) = creds.catalog().get_collection(
-                    DatabaseId::DEFAULT,
-                    tenant_id.as_u64(),
-                    collection,
-                )
+                && let Ok(Some(coll)) =
+                    creds
+                        .catalog()
+                        .get_collection(database_id, tenant_id.as_u64(), collection)
                 && let Some(config) = coll.get_timeseries_config()
                 && config.get("wal").and_then(|v| v.as_str()) == Some("false")
             {
@@ -115,6 +114,17 @@ pub(crate) fn encode_columnar_batch_payload(
     })
 }
 
+/// Stable routing and collection scope for a timeseries WAL append.
+///
+/// Keeping these fields together prevents callers from accidentally mixing the
+/// authenticated database or tenant with a payload from another scope.
+pub(crate) struct TimeseriesWalAppendContext<'a> {
+    pub tenant_id: TenantId,
+    pub vshard_id: VShardId,
+    pub database_id: DatabaseId,
+    pub collection: &'a str,
+}
+
 /// Append a timeseries batch to WAL and return the assigned LSN.
 ///
 /// Used by the ILP listener and the sync timeseries handler to propagate the
@@ -123,16 +133,19 @@ pub(crate) fn encode_columnar_batch_payload(
 ///
 /// `provenance` is `None` for the ILP direct-ingest path; the sync path passes
 /// the frame's `SyncProvenance` so the WAL record carries full idempotency context.
-pub fn wal_append_timeseries(
+pub(crate) fn wal_append_timeseries(
     wal: &WalManager,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    collection: &str,
+    context: TimeseriesWalAppendContext<'_>,
     payload: &[u8],
     provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
     credentials: Option<&CredentialStore>,
 ) -> crate::Result<Option<nodedb_types::Lsn>> {
-    let database_id = DatabaseId::DEFAULT;
+    let TimeseriesWalAppendContext {
+        tenant_id,
+        vshard_id,
+        database_id,
+        collection,
+    } = context;
     // WAL bypass check.
     if let Some(creds) = credentials
         && let Ok(Some(coll)) =

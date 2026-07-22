@@ -30,14 +30,36 @@ impl FrameFormat {
             FrameFormat::MessagePack
         }
     }
+
+    /// Detect a payload format while permitting JSON's legal leading
+    /// whitespace. Native requests must be objects, so every other leading
+    /// byte is treated as MessagePack and subsequently decoded fail-closed.
+    pub(crate) fn detect_payload(payload: &[u8]) -> Self {
+        payload
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .map_or(Self::MessagePack, Self::detect)
+    }
 }
 
-/// Read a single frame from the stream.
+/// Read a single frame using the protocol-wide maximum frame size.
 ///
 /// Returns `Ok(None)` on clean EOF (client disconnected).
 /// Returns `Err` on framing errors or I/O failures.
 pub async fn read_frame<R: AsyncRead + Unpin>(stream: &mut R) -> crate::Result<Option<Vec<u8>>> {
-    // Read 4-byte length prefix.
+    read_frame_with_max(stream, MAX_FRAME_SIZE).await
+}
+
+/// Read a single frame with a caller-supplied maximum payload size.
+///
+/// The length is validated before allocation, allowing protocol adapters with
+/// tighter limits than the general native protocol to reuse the same framing
+/// implementation safely.
+pub(crate) async fn read_frame_with_max<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    max_frame_size: u32,
+) -> crate::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; FRAME_HEADER_LEN];
     match stream.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -46,9 +68,9 @@ pub async fn read_frame<R: AsyncRead + Unpin>(stream: &mut R) -> crate::Result<O
     }
 
     let payload_len = u32::from_be_bytes(len_buf);
-    if payload_len > MAX_FRAME_SIZE {
+    if payload_len > max_frame_size {
         return Err(crate::Error::BadRequest {
-            detail: format!("frame size {payload_len} exceeds maximum {MAX_FRAME_SIZE}"),
+            detail: format!("frame size {payload_len} exceeds maximum {max_frame_size}"),
         });
     }
     if payload_len == 0 {
@@ -134,6 +156,14 @@ mod tests {
     }
 
     #[test]
+    fn detect_payload_accepts_json_leading_whitespace() {
+        assert_eq!(
+            FrameFormat::detect_payload(b" \r\n{\"op\":\"auth\"}"),
+            FrameFormat::Json
+        );
+    }
+
+    #[test]
     fn json_roundtrip() {
         let req = NativeRequest {
             op: OpCode::Ping,
@@ -215,6 +245,18 @@ mod tests {
         let bad_len = (MAX_FRAME_SIZE + 1).to_be_bytes();
         let mut cursor = std::io::Cursor::new(bad_len.to_vec());
         let result = read_frame(&mut cursor).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_frame_allowed_by_default_limit() {
+        let bounded_max: u32 = 64;
+        let payload_len: u32 = bounded_max + 1;
+        let mut bytes = payload_len.to_be_bytes().to_vec();
+        bytes.extend(std::iter::repeat_n(0, payload_len as usize));
+        let mut cursor = std::io::Cursor::new(bytes);
+
+        let result = read_frame_with_max(&mut cursor, bounded_max).await;
         assert!(result.is_err());
     }
 }

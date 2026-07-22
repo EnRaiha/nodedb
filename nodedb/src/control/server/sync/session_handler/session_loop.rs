@@ -230,6 +230,39 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
                         continue;
                     }
 
+                    // Decode the CRDT message once for authorization and final dispatch.
+                    let delta_msg = if frame.msg_type == SyncMessageType::DeltaPush {
+                        frame.decode_body::<DeltaPushMsg>()
+                    } else {
+                        None
+                    };
+                    if let Some(delta_msg) = delta_msg.as_ref() {
+                        let authorized = shared.as_ref().is_some_and(|shared| {
+                            super::super::async_dispatch::authorize_delta_write(
+                                shared,
+                                session.identity.as_ref(),
+                                &delta_msg.collection,
+                            )
+                            .is_ok()
+                        });
+                        if !authorized {
+                            // Never run the generic handler without authorization:
+                            // it mutates session accounting before its provisional ACK.
+                            if let Some(reject) =
+                                super::super::async_dispatch::permission_denied_delta_reject(
+                                    delta_msg,
+                                )
+                                && ws
+                                    .send(Message::Binary(reject.to_bytes().into()))
+                                    .await
+                                    .is_err()
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+
                     let response = if let Some(shared) = shared.as_ref() {
                         let rls_store = &shared.rls;
                         let mut audit = shared.audit.lock().unwrap_or_else(|p| p.into_inner());
@@ -249,15 +282,13 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
                     if let Some(response) = response {
                         let final_response = if response.msg_type == SyncMessageType::DeltaAck
                             && let Some(shared) = shared.as_ref()
-                            && let Some(delta_msg) = frame.decode_body::<DeltaPushMsg>()
+                            && let Some(delta_msg) = delta_msg.as_ref()
                         {
                             super::super::async_dispatch::apply_delta_and_finalize(
                                 shared,
-                                &delta_msg,
+                                delta_msg,
                                 response,
-                                session
-                                    .tenant_id
-                                    .unwrap_or_else(|| crate::types::TenantId::new(0)),
+                                session.identity.as_ref(),
                                 session.producer_id,
                                 session.accepted_epoch,
                             )

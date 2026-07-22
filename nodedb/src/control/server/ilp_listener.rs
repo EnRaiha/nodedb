@@ -6,22 +6,27 @@
 //! reads newline-delimited ILP lines, parses them, and dispatches
 //! `TimeseriesIngest` plans to the Data Plane via SPSC.
 //!
-//! Protocol: raw TCP, one ILP line per newline. No HTTP overhead.
-//! Compatible with `telegraf`, `vector`, and InfluxDB client libraries.
+//! Protocol: native Hello/Auth prelude followed by one ILP line per newline.
+//! The prelude is mandatory; direct unauthenticated ILP clients are rejected.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 /// Maximum byte length of a single ILP line. Lines exceeding this are
 /// rejected and the connection is dropped to prevent memory exhaustion.
 const MAX_ILP_LINE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+/// Per-connection aggregate cap. A batch must not turn many individually
+/// valid lines into an unbounded allocation before its timer/line flush.
+const MAX_ILP_BATCH_BYTES: usize = MAX_ILP_LINE_BYTES;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
+use crate::config::auth::AuthMode;
 use crate::control::server::conn_stream::ConnStream;
+use crate::control::server::ilp_auth::AuthenticatedIlpContext;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
@@ -56,6 +61,7 @@ impl IlpListener {
     pub async fn run(
         self,
         state: Arc<SharedState>,
+        auth_mode: AuthMode,
         conn_semaphore: Arc<Semaphore>,
         tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
         startup_gate: Arc<crate::control::startup::StartupGate>,
@@ -97,6 +103,7 @@ impl IlpListener {
                                 }
                             };
                             let state = Arc::clone(&state);
+                            let auth_mode = auth_mode.clone();
 
                             if let Some(ref acceptor) = tls_acceptor {
                                 let acceptor = acceptor.clone();
@@ -109,7 +116,7 @@ impl IlpListener {
                                     {
                                         Ok(Ok(tls_stream)) => {
                                             let cs = ConnStream::tls(tls_stream);
-                                            if let Err(e) = handle_ilp_connection(cs, peer, &state).await {
+                                            if let Err(e) = handle_ilp_connection(cs, peer, &state, &auth_mode).await {
                                                 warn!(%peer, error = %e, "ILP TLS connection error (data may be lost)");
                                             }
                                         }
@@ -125,7 +132,7 @@ impl IlpListener {
                             } else {
                                 connections.spawn(async move {
                                     let cs = ConnStream::plain(stream);
-                                    if let Err(e) = handle_ilp_connection(cs, peer, &state).await {
+                                    if let Err(e) = handle_ilp_connection(cs, peer, &state, &auth_mode).await {
                                         warn!(%peer, error = %e, "ILP connection error (data may be lost)");
                                     }
                                     drop(permit);
@@ -165,11 +172,46 @@ impl IlpListener {
 /// Larger batches amortize per-batch overhead (WAL append, memtable lock,
 /// partition lookup).
 async fn handle_ilp_connection(
-    stream: ConnStream,
+    mut stream: ConnStream,
     peer: SocketAddr,
     state: &SharedState,
+    auth_mode: &AuthMode,
 ) -> crate::Result<()> {
-    debug!(%peer, "ILP connection accepted");
+    // The native Hello/Auth prelude must finish before line parsing, tenant
+    // accounting, or any ingest side effect. Authentication failures consume
+    // no ILP bytes and the dropped stream cannot enter the ingest loop.
+    let authenticated_context = crate::control::server::ilp_auth::authenticate_ilp_connection(
+        &mut stream,
+        state,
+        auth_mode,
+        &peer.to_string(),
+    )
+    .await
+    .map_err(|_| crate::Error::BadRequest {
+        detail: "ILP authentication failed".into(),
+    })?;
+    let tenant_id = authenticated_context.identity().tenant_id;
+    let database_id = authenticated_context.database_id();
+    let _admission = match IlpConnectionAdmission::acquire(state, &authenticated_context) {
+        Ok(admission) => admission,
+        Err(_) => {
+            crate::control::server::ilp_auth::write_ilp_auth_failure(
+                &mut stream,
+                &authenticated_context,
+            )
+            .await;
+            return Err(crate::Error::BadRequest {
+                detail: "ILP authentication failed".into(),
+            });
+        }
+    };
+    crate::control::server::ilp_auth::write_ilp_auth_success(&mut stream, &authenticated_context)
+        .await
+        .map_err(|_| crate::Error::BadRequest {
+            detail: "ILP authentication failed".into(),
+        })?;
+
+    debug!(%peer, "authenticated ILP connection accepted");
 
     let mut reader = BufReader::new(stream);
     let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
@@ -183,33 +225,13 @@ async fn handle_ilp_connection(
     let mut window = tokio::time::interval(std::time::Duration::from_millis(50));
     window.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let tenant_id = TenantId::new(1);
-
-    // Per-tenant connection tracking.
-    if let Err(e) = state.check_tenant_connection(tenant_id) {
-        warn!(%peer, error = %e, "ILP connection rejected: tenant connection limit");
-        return Err(e);
-    }
-    state.tenant_connection_start(tenant_id);
-
     loop {
         tokio::select! {
             // Read next line with an enforced byte-length cap.
-            result = reader.read_until(b'\n', &mut line_buf) => {
+            result = read_bounded_ilp_line(&mut reader, &mut line_buf, MAX_ILP_LINE_BYTES) => {
                 match result {
-                    Ok(0) => break, // Connection closed (EOF).
-                    Ok(_) => {
-                        // Enforce line length limit before any allocation.
-                        if line_buf.len() > MAX_ILP_LINE_BYTES {
-                            warn!(
-                                %peer,
-                                len = line_buf.len(),
-                                limit = MAX_ILP_LINE_BYTES,
-                                "ILP line exceeds maximum length — dropping connection"
-                            );
-                            break;
-                        }
-
+                    Ok(false) => break, // Connection closed (EOF).
+                    Ok(true) => {
                         // Strip trailing newline / CRLF.
                         let line_bytes = line_buf
                             .strip_suffix(b"\r\n")
@@ -230,6 +252,26 @@ async fn handle_ilp_connection(
                             continue;
                         }
 
+                        if !batch.is_empty()
+                            && batch.len().saturating_add(line.len() + 1) > MAX_ILP_BATCH_BYTES
+                        {
+                            let flushed = line_count;
+                            total_ingested +=
+                                flush_ilp_batch(state, tenant_id, database_id, &batch).await?;
+                            batch.clear();
+                            line_count = 0;
+
+                            rate_estimator.record(flushed);
+                            let (new_target, new_window_ms) = rate_estimator.suggest_batch_params();
+                            batch_target = new_target;
+                            window = tokio::time::interval(
+                                std::time::Duration::from_millis(new_window_ms),
+                            );
+                            window.set_missed_tick_behavior(
+                                tokio::time::MissedTickBehavior::Delay,
+                            );
+                        }
+
                         batch.push_str(line);
                         batch.push('\n');
                         line_count += 1;
@@ -238,7 +280,8 @@ async fn handle_ilp_connection(
                         // Flush when batch reaches adaptive target.
                         if line_count >= batch_target {
                             let flushed = line_count;
-                            total_ingested += flush_ilp_batch(state, tenant_id, &batch).await?;
+                            total_ingested +=
+                                flush_ilp_batch(state, tenant_id, database_id, &batch).await?;
                             batch.clear();
                             line_count = 0;
 
@@ -254,14 +297,23 @@ async fn handle_ilp_connection(
                             );
                         }
                     }
-                    Err(_) => break, // Read error.
+                    Err(error) => {
+                        warn!(
+                            %peer,
+                            error = %error,
+                            limit = MAX_ILP_LINE_BYTES,
+                            "ILP line read failed — dropping connection"
+                        );
+                        break;
+                    }
                 }
             }
             // Timer-based flush (for low-rate connections).
             _ = window.tick() => {
                 if !batch.is_empty() {
                     let flushed = line_count;
-                    total_ingested += flush_ilp_batch(state, tenant_id, &batch).await?;
+                    total_ingested +=
+                        flush_ilp_batch(state, tenant_id, database_id, &batch).await?;
                     batch.clear();
                     line_count = 0;
 
@@ -281,16 +333,141 @@ async fn handle_ilp_connection(
 
     // Flush remaining.
     if !batch.is_empty() {
-        total_ingested += flush_ilp_batch(state, tenant_id, &batch).await?;
+        total_ingested += flush_ilp_batch(state, tenant_id, database_id, &batch).await?;
     }
 
-    state.tenant_connection_end(tenant_id);
-    debug!(%peer, total_ingested, "ILP connection closed");
+    debug!(
+        %peer,
+        total_ingested,
+        database_id = ?database_id,
+        "ILP connection closed"
+    );
     Ok(())
+}
+
+/// Connection-scoped tenant accounting and quota permits.
+///
+/// The permit fields release configured database/tenant limits on every return
+/// path, while `Drop` balances the legacy tenant activity accounting.
+struct IlpConnectionAdmission<'a> {
+    state: &'a SharedState,
+    tenant_id: TenantId,
+    _database_permit: Option<OwnedSemaphorePermit>,
+    _tenant_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl<'a> IlpConnectionAdmission<'a> {
+    fn acquire(state: &'a SharedState, context: &AuthenticatedIlpContext) -> crate::Result<Self> {
+        let tenant_id = context.identity().tenant_id;
+        let database_id = context.database_id();
+
+        let database_permit = state
+            .admission_registry
+            .try_acquire_database(database_id)
+            .map_err(|_| crate::Error::BadRequest {
+                detail: "ILP admission denied".into(),
+            })?;
+        let tenant_permit = state
+            .admission_registry
+            .try_acquire_tenant(database_id, tenant_id)
+            .map_err(|_| crate::Error::BadRequest {
+                detail: "ILP admission denied".into(),
+            })?;
+
+        start_tenant_connection(state, tenant_id)?;
+        Ok(Self {
+            state,
+            tenant_id,
+            _database_permit: database_permit,
+            _tenant_permit: tenant_permit,
+        })
+    }
+}
+
+impl Drop for IlpConnectionAdmission<'_> {
+    fn drop(&mut self) {
+        self.state.tenant_connection_end(self.tenant_id);
+    }
+}
+
+/// Atomically check and account for the legacy per-tenant connection cap.
+///
+/// The database/tenant semaphore permits above cover configured catalog
+/// quotas; this lock also protects the legacy tenant-isolation counter from a
+/// check-then-increment race when it has its own max-connections setting.
+fn start_tenant_connection(state: &SharedState, tenant_id: TenantId) -> crate::Result<()> {
+    let mut tenants = state
+        .tenants
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !matches!(
+        tenants.check_connection(tenant_id),
+        crate::control::security::tenant::QuotaCheck::Allowed
+    ) {
+        return Err(crate::Error::BadRequest {
+            detail: "ILP admission denied".into(),
+        });
+    }
+    tenants.connection_start(tenant_id);
+    Ok(())
+}
+
+/// Read one ILP line without allowing `BufReader` to allocate beyond the
+/// configured line limit while it searches for a newline.
+async fn read_bounded_ilp_line<R>(
+    reader: &mut R,
+    line_buf: &mut Vec<u8>,
+    max_line_bytes: usize,
+) -> std::io::Result<bool>
+where
+    R: AsyncBufRead + Unpin,
+{
+    loop {
+        let (consumed, complete) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(!line_buf.is_empty());
+            }
+            let consumed = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |position| position + 1);
+            if consumed > max_line_bytes.saturating_sub(line_buf.len()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ILP line exceeds maximum length",
+                ));
+            }
+            line_buf.extend_from_slice(&available[..consumed]);
+            (
+                consumed,
+                consumed < available.len() || available[consumed - 1] == b'\n',
+            )
+        };
+        reader.consume(consumed);
+        if complete {
+            return Ok(true);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::BufReader;
+
+    use super::read_bounded_ilp_line;
+
+    #[tokio::test]
+    async fn bounded_line_reader_rejects_before_copying_an_oversized_line() {
+        let mut reader = BufReader::new(std::io::Cursor::new(b"12345\n".to_vec()));
+        let mut line = Vec::new();
+
+        let result = read_bounded_ilp_line(&mut reader, &mut line, 4).await;
+
+        assert!(result.is_err());
+        assert!(line.is_empty());
+    }
+
     #[test]
     fn extract_collection_from_ilp() {
         let batch = "cpu,host=server01 value=0.64 1000\nmem,host=server01 used=1024 2000\n";
