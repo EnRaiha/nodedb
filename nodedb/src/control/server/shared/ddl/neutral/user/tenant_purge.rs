@@ -41,6 +41,34 @@ pub(super) fn purge_owned_for_tenant_teardown(
         crate::control::catalog_entry::apply::local::apply_locally_if_needed(
             state, &entry, log_index,
         );
+        // A `PurgeCollection` apply only deactivates the catalog row — the
+        // durable owner/collection deletion and storage reclaim are the
+        // post-apply half. On the clustered path the metadata applier schedules
+        // that reclaim on every node; on the single-node path (`log_index == 0`)
+        // there is no applier, so drive the same reclaim `drop.rs` runs inline.
+        // Without this the teardown leaves the owner row and never reclaims the
+        // collection's storage. Other owner kinds delete fully in their apply.
+        if kind == OwnerKind::Collection && log_index == 0 {
+            let purge_lsn = state.wal.next_lsn().as_u64();
+            let reclaim = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(
+                    crate::control::server::shared::ddl::neutral::collection::purge::hard_purge_collection(
+                        state,
+                        owner.database_id,
+                        tenant.as_u64(),
+                        &owner.object_name,
+                        purge_lsn,
+                        false,
+                    ),
+                )
+            });
+            reclaim.map_err(|failure| {
+                ddl_err(format!(
+                    "tenant teardown collection reclaim failed for '{}': {}",
+                    owner.object_name, failure.error
+                ))
+            })?;
+        }
         if log_index == 0 {
             state
                 .permissions

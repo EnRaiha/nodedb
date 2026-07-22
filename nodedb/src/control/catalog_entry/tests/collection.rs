@@ -102,6 +102,10 @@ fn purge_collection_is_scoped_to_database() {
     apply_to(&CatalogEntry::PutCollection(Box::new(default)), catalog);
     apply_to(&CatalogEntry::PutCollection(Box::new(other)), catalog);
 
+    // A `PurgeCollection` apply only deactivates the catalog row (the
+    // crash-durable same-name barrier); the row/owner/surrogate deletion is the
+    // `finalize_purge` half that runs once storage reclaim succeeds. Drive both
+    // to assert the delete is scoped to the target database.
     apply_to(
         &CatalogEntry::PurgeCollection {
             database_id: 9,
@@ -110,6 +114,8 @@ fn purge_collection_is_scoped_to_database() {
         },
         catalog,
     );
+    crate::control::catalog_entry::apply::collection::finalize_purge(9, 1, "shared", catalog)
+        .expect("finalize purge for database 9");
 
     assert!(
         catalog
