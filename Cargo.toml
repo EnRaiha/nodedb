@@ -265,6 +265,13 @@ fluxbench = "0.1"
 
 [profile.dev]
 debug = "line-tables-only"
+# Strip symbol tables from dev/test binaries. With --all-features every test
+# binary statically links the full dependency closure, and there are hundreds of
+# them, so an unstripped target/ runs to ~100 GB. Stripping removes better than a
+# third of each binary. This unsymbolises panics/backtraces on ordinary dev
+# builds; when you need to debug, build with `--profile debugging`, which keeps
+# full symbols (see below).
+strip = true
 
 [profile.dev.package."*"]
 debug = false
@@ -286,3 +293,5 @@ strip = true
 [profile.debugging]
 inherits = "dev"
 debug = true
+# dev strips symbols; override it here so the debugging profile stays symbolised.
+strip = false
