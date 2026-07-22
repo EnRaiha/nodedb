@@ -2,14 +2,18 @@
 
 //! CRDT delta apply dispatch and dispatch-failure compensation classification.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::warn;
 
 use nodedb_types::sync::wire::{EngineKind, SyncProvenance, stream_id_for};
 
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 use super::super::wire::{
     CompensationHint, DeltaPushMsg, DeltaRejectMsg, SyncFrame, SyncMessageType,
@@ -40,23 +44,25 @@ pub(crate) async fn apply_delta_and_finalize(
     shared: &SharedState,
     delta_msg: &DeltaPushMsg,
     ack_frame: SyncFrame,
-    session_tenant: TenantId,
+    identity: Option<&AuthenticatedIdentity>,
     session_producer_id: u64,
     session_epoch: u64,
 ) -> Option<SyncFrame> {
     use crate::bridge::envelope::PhysicalPlan;
     use nodedb_physical::physical_plan::CrdtOp;
 
+    // Authorize before quota, surrogate allocation, catalog lookup, plan
+    // construction, or dispatch. The tenant is derived only from the
+    // handshake-bound identity; an absent identity fails closed without a
+    // fallback tenant or reconstructed principal.
+    let tenant_id = match authorize_delta_write(shared, identity, &delta_msg.collection) {
+        Ok(tenant_id) => tenant_id,
+        Err(_) => return permission_denied_delta_reject(delta_msg),
+    };
+
     // Dispatch a CrdtApply plan to the Data Plane. If the CRDT engine
     // rejects it (constraint violation), we get an error back.
     // Uses EventSource::CrdtSync so triggers are NOT fired on replicated deltas.
-    //
-    // The tenant comes from the session's handshake-assigned identity — NOT a
-    // hardcoded default. Constraints (and the per-tenant CRDT validator) are
-    // installed under the session's tenant by DDL + the reconcile loop; applying
-    // the delta under a different tenant would validate it against an empty
-    // constraint set and silently bypass enforcement.
-    let tenant_id = session_tenant;
 
     // Quota enforcement — reject before dispatch.
     if let Err(e) = shared.check_tenant_quota(tenant_id) {
@@ -73,7 +79,7 @@ pub(crate) async fn apply_delta_and_finalize(
     }
 
     let surrogate = match shared.surrogate_assigner.assign(
-        crate::types::DatabaseId::DEFAULT,
+        DatabaseId::DEFAULT,
         tenant_id,
         &delta_msg.collection,
         delta_msg.document_id.as_bytes(),
@@ -122,7 +128,7 @@ pub(crate) async fn apply_delta_and_finalize(
         .credentials
         .catalog()
         .get_collection(
-            crate::types::DatabaseId::DEFAULT,
+            DatabaseId::DEFAULT,
             tenant_id.as_u64(),
             &delta_msg.collection,
         )
@@ -238,6 +244,64 @@ pub(crate) async fn apply_delta_and_finalize(
     }
 }
 
+/// Fail closed unless the handshake-bound identity has write access to the
+/// target collection. This is used at both the session boundary (before its
+/// bookkeeping and validation side effects) and again immediately before plan
+/// construction, so a permission revocation between those points cannot reach
+/// the Data Plane.
+pub(in crate::control::server::sync) fn authorize_delta_write(
+    shared: &SharedState,
+    identity: Option<&AuthenticatedIdentity>,
+    collection: &str,
+) -> Result<TenantId, DeltaAuthorizationFailure> {
+    let audit = ArcAuditEmitter(Arc::clone(&shared.audit));
+    authorize_delta_write_with(
+        identity,
+        collection,
+        &shared.permissions,
+        &shared.roles,
+        &audit,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::control::server::sync) enum DeltaAuthorizationFailure {
+    IdentityNotEstablished,
+    PermissionDenied,
+}
+
+fn authorize_delta_write_with(
+    identity: Option<&AuthenticatedIdentity>,
+    collection: &str,
+    permissions: &crate::control::security::permission::PermissionStore,
+    roles: &crate::control::security::role::RoleStore,
+    audit: &dyn crate::control::security::audit::AuditEmitter,
+) -> Result<TenantId, DeltaAuthorizationFailure> {
+    let identity = identity.ok_or(DeltaAuthorizationFailure::IdentityNotEstablished)?;
+    authorize_collection(
+        identity,
+        DatabaseId::DEFAULT,
+        collection,
+        Permission::Write,
+        permissions,
+        roles,
+        audit,
+    )
+    .map_err(|_| DeltaAuthorizationFailure::PermissionDenied)?;
+    Ok(identity.tenant_id)
+}
+
+pub(in crate::control::server::sync) fn permission_denied_delta_reject(
+    delta_msg: &DeltaPushMsg,
+) -> Option<SyncFrame> {
+    let reject = DeltaRejectMsg {
+        mutation_id: delta_msg.mutation_id,
+        reason: "permission denied".into(),
+        compensation: Some(CompensationHint::PermissionDenied),
+    };
+    SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject)
+}
+
 /// Map a Data-Plane dispatch failure to a typed wire [`CompensationHint`].
 ///
 /// Classification is by error **type**, never by substring-matching the message.
@@ -300,10 +364,110 @@ fn compensation_hint_for_dispatch_error(e: &crate::Error) -> CompensationHint {
 
 #[cfg(test)]
 mod tests {
-    use super::compensation_hint_for_dispatch_error;
+    use super::{
+        DeltaAuthorizationFailure, authorize_delta_write_with,
+        compensation_hint_for_dispatch_error, permission_denied_delta_reject,
+    };
     use crate::bridge::envelope::ErrorCode;
+    use crate::control::security::audit::NoopAuditEmitter;
+    use crate::control::security::audit::emitter::test_helpers::CapturingEmitter;
+    use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, Permission};
+    use crate::control::security::permission::PermissionStore;
+    use crate::control::security::role::RoleStore;
     use crate::types::TenantId;
     use nodedb_types::sync::compensation::CompensationHint;
+    use nodedb_types::sync::wire::{DeltaPushMsg, DeltaRejectMsg, SyncMessageType};
+
+    fn identity() -> AuthenticatedIdentity {
+        AuthenticatedIdentity {
+            user_id: 7,
+            username: "writer".into(),
+            tenant_id: TenantId::new(9),
+            auth_method: AuthMethod::ApiKey,
+            roles: Vec::new(),
+            is_superuser: false,
+            default_database: None,
+            accessible_databases: AuthenticatedIdentity::default_database_set(false),
+        }
+    }
+
+    fn delta() -> DeltaPushMsg {
+        DeltaPushMsg {
+            collection: "orders".into(),
+            document_id: "order-1".into(),
+            delta: Vec::new(),
+            peer_id: 1,
+            mutation_id: 42,
+            checksum: 0,
+            device_valid_time_ms: None,
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
+        }
+    }
+
+    #[test]
+    fn ungranted_delta_is_denied_and_audited_once() {
+        let identity = identity();
+        let permissions = PermissionStore::new();
+        let roles = RoleStore::new();
+        let audit = CapturingEmitter::new();
+
+        let result =
+            authorize_delta_write_with(Some(&identity), "orders", &permissions, &roles, &audit);
+
+        assert_eq!(result, Err(DeltaAuthorizationFailure::PermissionDenied));
+        assert_eq!(audit.recorded().len(), 1);
+        let frame =
+            permission_denied_delta_reject(&delta()).expect("permission rejection must encode");
+        assert_eq!(frame.msg_type, SyncMessageType::DeltaReject);
+        let reject: DeltaRejectMsg = frame
+            .decode_body()
+            .expect("permission rejection must decode");
+        assert_eq!(
+            reject.compensation,
+            Some(CompensationHint::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn missing_identity_fails_closed_without_audit_principal() {
+        let permissions = PermissionStore::new();
+        let roles = RoleStore::new();
+        let audit = CapturingEmitter::new();
+
+        assert_eq!(
+            authorize_delta_write_with(None, "orders", &permissions, &roles, &audit),
+            Err(DeltaAuthorizationFailure::IdentityNotEstablished)
+        );
+        assert!(audit.recorded().is_empty());
+    }
+
+    #[test]
+    fn write_granted_delta_uses_handshake_identity_tenant() {
+        let identity = identity();
+        let permissions = PermissionStore::new();
+        permissions
+            .grant(
+                "collection:9:orders",
+                "user:writer",
+                Permission::Write,
+                "admin",
+                None,
+            )
+            .expect("in-memory grant must succeed");
+        let roles = RoleStore::new();
+        let tenant_id = authorize_delta_write_with(
+            Some(&identity),
+            "orders",
+            &permissions,
+            &roles,
+            &NoopAuditEmitter,
+        )
+        .expect("write grant must authorize dispatch");
+
+        assert_eq!(tenant_id, TenantId::new(9));
+    }
 
     #[test]
     fn preserved_data_plane_constraint_maps_to_custom_with_real_name() {
