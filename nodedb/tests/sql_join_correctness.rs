@@ -338,3 +338,60 @@ async fn natural_join_is_not_cartesian() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// LIMIT with post-join filters
+// ---------------------------------------------------------------------------
+
+/// A join carrying both a post-join WHERE predicate and a LIMIT must return
+/// the matching rows: the LIMIT applies to the filtered result, never to the
+/// pre-filter probe output.
+#[tokio::test]
+async fn join_with_post_filter_and_wide_limit_keeps_matching_rows() {
+    let server = TestServer::start().await;
+    setup_join_tables(&server).await;
+
+    let unlimited = server
+        .query_text(
+            "SELECT j_t2.id FROM j_t1 \
+             JOIN j_t2 ON j_t2.t1_id = j_t1.id \
+             WHERE j_t2.y = 200",
+        )
+        .await
+        .expect("join with WHERE evaluates");
+    assert_eq!(unlimited, vec!["q".to_string()]);
+
+    let limited = server
+        .query_text(
+            "SELECT j_t2.id FROM j_t1 \
+             JOIN j_t2 ON j_t2.t1_id = j_t1.id \
+             WHERE j_t2.y = 200 LIMIT 5",
+        )
+        .await
+        .expect("join with WHERE and LIMIT evaluates");
+    assert_eq!(
+        limited, unlimited,
+        "a LIMIT wider than the filtered result must not drop matching rows"
+    );
+}
+
+/// A LIMIT narrower than the filtered result still truncates.
+#[tokio::test]
+async fn join_with_post_filter_honors_narrow_limit() {
+    let server = TestServer::start().await;
+    setup_join_tables(&server).await;
+
+    let rows = server
+        .query_text(
+            "SELECT j_t2.id FROM j_t1 \
+             JOIN j_t2 ON j_t2.t1_id = j_t1.id \
+             WHERE j_t2.y > 0 LIMIT 1",
+        )
+        .await
+        .expect("join with WHERE and LIMIT evaluates");
+    assert_eq!(
+        rows.len(),
+        1,
+        "LIMIT 1 must truncate the filtered rows to one: {rows:?}"
+    );
+}

@@ -333,7 +333,17 @@ impl CoreLoop {
         // budget) and, if the probe fills it, surface a deterministic
         // `ResourcesExhausted` rather than dropping the excess rows. A budget
         // of 0 means "unlimited" → truly unbounded output.
-        let (probe_limit, enforce_output_budget) = if join.limit != usize::MAX {
+        //
+        // A user LIMIT may only cap the probe when there are no post-join
+        // WHERE filters: `filter_and_project` runs AFTER the probe, so
+        // truncating to `n` first would emit the first `n` ON-matched rows and
+        // then discard those failing the WHERE clause — under-filling (or
+        // emptying) the result even though later probe rows match. With
+        // post-filters present the probe runs under the budget ceiling and the
+        // user LIMIT is applied after filtering, below.
+        let has_post_filters = !join.post_filter_bytes.is_empty();
+        let (probe_limit, enforce_output_budget) = if join.limit != usize::MAX && !has_post_filters
+        {
             (join.limit, false)
         } else if budget == 0 {
             (usize::MAX, false)
@@ -372,6 +382,13 @@ impl CoreLoop {
                     detail: e.to_string(),
                 },
             );
+        }
+
+        // Deferred user LIMIT: when post-join WHERE filters exist the probe
+        // ran unbounded (see above) so the LIMIT must be applied here, after
+        // the filters have retained the matching rows.
+        if has_post_filters && join.limit != usize::MAX {
+            results.truncate(join.limit);
         }
 
         let payload = super::super::super::response_codec::encode_binary_rows(&results);
