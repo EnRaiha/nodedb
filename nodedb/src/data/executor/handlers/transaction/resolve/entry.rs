@@ -2526,15 +2526,16 @@ mod tests {
         assert_eq!(redo.ops.len(), 1, "one timeseries ingest -> one sub-record");
         assert_eq!(redo.ops[0].record_type, RecordType::TimeseriesBatch as u32);
 
-        // The payload is the 4-element tuple tagged "timeseries" (a msgpack
-        // array), distinct from the columnar map form.
-        let (kind, collection, _payload, _prov) =
-            zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>)>(
+        // The payload is the format-preserving 5-element tuple tagged
+        // "timeseries" (a msgpack array), distinct from the columnar map form.
+        let (kind, collection, _payload, _prov, format) =
+            zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>, String)>(
                 &redo.ops[0].payload,
             )
-            .expect("decode timeseries 4-tuple");
+            .expect("decode timeseries 5-tuple");
         assert_eq!(kind, "timeseries");
         assert_eq!(collection, "metrics");
+        assert_eq!(format, "samples");
 
         let record = wrap_redo(&redo);
         let (mut dst, _dst_dir) = make_core();
@@ -2554,6 +2555,67 @@ mod tests {
             Some(1),
             "timeseries sample must replay into the memtable"
         );
+    }
+
+    /// A canonical ILP MessagePack ingest preserves its format discriminator
+    /// through resolve and WAL replay. This guards the escaped protocol values
+    /// which the ordinary MessagePack-row decoder cannot represent.
+    #[test]
+    fn ilp_msgpack_timeseries_ingest_resolves_and_replays_canonical_rows() {
+        let (mut src, _src_dir) = make_core();
+        let task = make_task();
+        let txn = TxnId::new(44);
+        let line = r"cpu\,load,host\ name=west\,1 count=18446744073709551615u 1700000000000000001";
+        let payload =
+            zerompk::to_msgpack_vec(&vec![line.to_string()]).expect("encode canonical ILP lines");
+        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: "cpu,load".to_string(),
+            payload: payload.clone(),
+            format: "ilp-msgpack".to_string(),
+            wal_lsn: None,
+            surrogates: vec![Surrogate::new(701)],
+            provenance: None,
+        });
+
+        let redo = decode_redo(&src.execute_resolve_txn(&task, TID, txn, &[plan]));
+        assert_eq!(redo.ops.len(), 1);
+        let (kind, collection, replay_payload, _provenance, format) =
+            zerompk::from_msgpack::<(String, String, Vec<u8>, Option<SyncProvenance>, String)>(
+                &redo.ops[0].payload,
+            )
+            .expect("decode format-preserving timeseries redo");
+        assert_eq!(kind, "timeseries");
+        assert_eq!(collection, "cpu,load");
+        assert_eq!(format, "ilp-msgpack");
+        assert_eq!(replay_payload, payload);
+
+        let record = wrap_redo(&redo);
+        let (mut dst, _dst_dir) = make_core();
+        dst.replay_transaction_redo_wal(
+            std::slice::from_ref(&record),
+            1,
+            &nodedb_wal::TombstoneSet::new(),
+        );
+
+        let memtable = dst
+            .columnar_memtables
+            .get(&coll_key("cpu,load"))
+            .expect("canonical ILP replay must create its collection memtable");
+        assert_eq!(memtable.row_count(), 1);
+        assert_eq!(memtable.min_ts(), 1_700_000_000_000);
+        assert_eq!(memtable.max_ts(), 1_700_000_000_000);
+        let snapshot = memtable.export_snapshot();
+        let host_column = snapshot
+            .schema_columns
+            .iter()
+            .position(|(name, _)| name == "host name")
+            .expect("escaped tag name must remain a schema column");
+        let dictionary = snapshot
+            .symbol_dicts
+            .iter()
+            .find(|(index, _)| *index == host_column)
+            .expect("escaped tag value must be dictionary encoded");
+        assert_eq!(dictionary.1.get_id("west,1"), Some(0));
     }
 
     /// `Columnar::Update` / `Columnar::Delete` are predicate DML: resolve emits

@@ -18,77 +18,7 @@ use crate::types::ReadConsistency;
 use nodedb_physical::physical_plan::{ColumnarInsertIntent, ColumnarOp, TimeseriesOp};
 use nodedb_types::timeseries::MetricSample;
 
-/// Decoded fields of a `TimeseriesBatch` WAL record.
-///
-/// `kind` is `Some("columnar")` / `Some("timeseries")` for tagged records and
-/// `None` for the legacy 2-tuple shape. `surrogates` is only non-empty for
-/// map-shaped columnar records that carried per-row cross-engine identity.
-type DecodedBatchRecord = (
-    Option<String>,
-    String,
-    Vec<u8>,
-    Option<nodedb_types::sync::wire::SyncProvenance>,
-    Vec<nodedb_types::Surrogate>,
-);
-
-/// Decode a `TimeseriesBatch` WAL payload into its logical fields.
-///
-/// Tries the shapes in newest-first order:
-/// 1. Map-shaped [`nodedb_types::columnar::ColumnarWalRecord`] — the current
-///    columnar encoding, which carries per-row surrogates.
-/// 2. Legacy 4-tuple `(kind, collection, payload, provenance)` — current
-///    timeseries encoding and pre-surrogate columnar records.
-/// 3. Legacy 3-tuple `(kind, collection, payload)`.
-/// 4. Legacy 2-tuple `(collection, payload)` (untagged).
-///
-/// The map form (1) is a msgpack map while the tuple forms (2-4) are msgpack
-/// arrays, so they are unambiguous: a timeseries 4-tuple never matches (1) and
-/// a legacy columnar 4-tuple falls through to (2) with empty surrogates.
-/// Returns `Err(())` only when none of the shapes decode.
-fn decode_batch_record(payload: &[u8]) -> Result<DecodedBatchRecord, ()> {
-    if let Ok(rec) = zerompk::from_msgpack::<nodedb_types::columnar::ColumnarWalRecord>(payload) {
-        return Ok((
-            Some(rec.kind),
-            rec.collection,
-            rec.payload,
-            rec.provenance,
-            rec.surrogates,
-        ));
-    }
-    zerompk::from_msgpack::<(
-        String,
-        String,
-        Vec<u8>,
-        Option<nodedb_types::sync::wire::SyncProvenance>,
-    )>(payload)
-    .map(|(kind, collection, payload, prov)| (Some(kind), collection, payload, prov, Vec::new()))
-    .or_else(|_| {
-        zerompk::from_msgpack::<(String, String, Vec<u8>)>(payload)
-            .map(|(kind, collection, payload)| (Some(kind), collection, payload, None, Vec::new()))
-    })
-    .or_else(|_| {
-        zerompk::from_msgpack::<(String, Vec<u8>)>(payload)
-            .map(|(collection, payload)| (None, collection, payload, None, Vec::new()))
-    })
-    .map_err(|_| ())
-}
-
-/// Record-level fields for replaying a single columnar WAL batch.
-///
-/// Groups the collection identity, raw payload, LSN, sync provenance, and
-/// cross-engine surrogates that together describe one columnar replay
-/// operation, reducing the argument count on
-/// [`CoreLoop::replay_columnar_payload`].
-struct ColumnarReplayArgs<'a> {
-    collection: &'a str,
-    payload: &'a [u8],
-    record_lsn: u64,
-    provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
-    /// Per-row surrogates index-aligned with `payload` rows. An empty `Vec`
-    /// falls back to fresh surrogate allocation (legacy records / sync path).
-    surrogates: Vec<nodedb_types::Surrogate>,
-}
-
+use super::timeseries_wal_decode::{ColumnarReplayArgs, TimeseriesReplayArgs, decode_batch_record};
 impl CoreLoop {
     /// Build a synthetic replay `ExecutionTask` embedding `plan`.
     ///
@@ -151,11 +81,15 @@ impl CoreLoop {
         &mut self,
         tid: crate::types::TenantId,
         db_id: DatabaseId,
-        collection: &str,
-        payload: &[u8],
-        record_lsn: u64,
-        provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
+        args: TimeseriesReplayArgs<'_>,
     ) -> usize {
+        let TimeseriesReplayArgs {
+            collection,
+            payload,
+            record_lsn,
+            provenance,
+            format,
+        } = args;
         if let Ok(batch) =
             zerompk::from_msgpack::<nodedb_types::timeseries::TimeseriesWalBatch>(payload)
         {
@@ -183,11 +117,13 @@ impl CoreLoop {
             return sample_count;
         }
 
-        let format = if std::str::from_utf8(payload).is_ok() {
-            "ilp"
-        } else {
-            "msgpack"
-        };
+        let format = format.unwrap_or_else(|| {
+            if std::str::from_utf8(payload).is_ok() {
+                "ilp"
+            } else {
+                "msgpack"
+            }
+        });
         let task = Self::replay_task(
             tid,
             db_id,
@@ -218,6 +154,9 @@ impl CoreLoop {
                 response.error_code
             );
             return 0;
+        }
+        if format == "ilp-msgpack" {
+            return zerompk::from_msgpack::<Vec<String>>(payload).map_or(0, |rows| rows.len());
         }
         match nodedb_types::value_from_msgpack(payload) {
             Ok(nodedb_types::Value::Array(rows)) => rows.len(),
@@ -352,8 +291,14 @@ impl CoreLoop {
             // surrogates. Records iterate in LSN order (guaranteed by the WAL
             // segment layout), so provenance-aware replay processes seq in
             // order.
-            let Ok((kind, raw_collection, payload, record_provenance, record_surrogates)) =
-                decode_batch_record(&record.payload)
+            let Ok((
+                kind,
+                raw_collection,
+                payload,
+                record_provenance,
+                record_format,
+                record_surrogates,
+            )) = decode_batch_record(&record.payload)
             else {
                 tracing::warn!(
                     core = self.core_id,
@@ -430,10 +375,13 @@ impl CoreLoop {
                 Some("timeseries") | None => self.replay_timeseries_payload(
                     tid_id,
                     db_id,
-                    collection,
-                    &payload,
-                    record_lsn,
-                    record_provenance,
+                    TimeseriesReplayArgs {
+                        collection,
+                        payload: &payload,
+                        record_lsn,
+                        provenance: record_provenance,
+                        format: record_format.as_deref(),
+                    },
                 ),
                 Some(other) => {
                     tracing::warn!(
@@ -465,7 +413,7 @@ impl CoreLoop {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_batch_record;
+    use super::super::timeseries_wal_decode::decode_batch_record;
     use crate::data::executor::core_loop::CoreLoop;
     use crate::data::executor::core_loop::write_index::CollKey;
     use crate::types::{DatabaseId, Lsn, TenantId};
@@ -764,12 +712,13 @@ mod tests {
         };
         let bytes = zerompk::to_msgpack_vec(&rec).expect("encode map record");
 
-        let (kind, collection, payload, provenance, surrogates) =
+        let (kind, collection, payload, provenance, format, surrogates) =
             decode_batch_record(&bytes).expect("decode map record");
         assert_eq!(kind.as_deref(), Some("columnar"));
         assert_eq!(collection, "events");
         assert_eq!(payload, vec![7, 8, 9]);
         assert_eq!(provenance, Some(prov));
+        assert_eq!(format, None);
         assert_eq!(surrogates, vec![Surrogate::new(100), Surrogate::new(101)]);
     }
 
@@ -786,12 +735,13 @@ mod tests {
         ))
         .expect("encode legacy columnar tuple");
 
-        let (kind, collection, payload, provenance, surrogates) =
+        let (kind, collection, payload, provenance, format, surrogates) =
             decode_batch_record(&bytes).expect("decode legacy tuple");
         assert_eq!(kind.as_deref(), Some("columnar"));
         assert_eq!(collection, "events");
         assert_eq!(payload, vec![1, 2, 3]);
         assert_eq!(provenance, None);
+        assert_eq!(format, None);
         assert!(surrogates.is_empty());
     }
 
@@ -809,11 +759,12 @@ mod tests {
         ))
         .expect("encode timeseries tuple");
 
-        let (kind, collection, payload, _provenance, surrogates) =
+        let (kind, collection, payload, _provenance, format, surrogates) =
             decode_batch_record(&bytes).expect("decode timeseries tuple");
         assert_eq!(kind.as_deref(), Some("timeseries"));
         assert_eq!(collection, "metrics");
         assert_eq!(payload, vec![4, 5, 6]);
+        assert_eq!(format, None);
         assert!(surrogates.is_empty());
     }
 
@@ -821,11 +772,32 @@ mod tests {
     fn legacy_untagged_two_tuple_decodes() {
         let bytes = zerompk::to_msgpack_vec(&("metrics".to_string(), vec![1u8, 2]))
             .expect("encode 2-tuple");
-        let (kind, collection, payload, _, surrogates) =
+        let (kind, collection, payload, _, format, surrogates) =
             decode_batch_record(&bytes).expect("decode 2-tuple");
         assert_eq!(kind, None);
         assert_eq!(collection, "metrics");
         assert_eq!(payload, vec![1, 2]);
+        assert_eq!(format, None);
+        assert!(surrogates.is_empty())
+    }
+
+    #[test]
+    fn format_preserving_timeseries_tuple_decodes_before_legacy_shapes() {
+        let bytes = zerompk::to_msgpack_vec(&(
+            "timeseries".to_string(),
+            "cpu".to_string(),
+            vec![
+                0x91, 0xa9, b'c', b'p', b'u', b' ', b'v', b'a', b'l', b'u', b'e',
+            ],
+            None::<SyncProvenance>,
+            "ilp-msgpack".to_string(),
+        ))
+        .expect("encode format-preserving tuple");
+        let (kind, collection, _payload, _provenance, format, surrogates) =
+            decode_batch_record(&bytes).expect("decode format-preserving tuple");
+        assert_eq!(kind.as_deref(), Some("timeseries"));
+        assert_eq!(collection, "cpu");
+        assert_eq!(format.as_deref(), Some("ilp-msgpack"));
         assert!(surrogates.is_empty());
     }
 }

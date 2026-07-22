@@ -12,11 +12,13 @@
 //! `MetaOp::ResolveTxn` already does for session transactions
 //! (`resolve/entry.rs`).
 
-use nodedb_physical::physical_plan::{DocumentOp, GraphOp, PhysicalPlan};
+use nodedb_physical::physical_plan::{DocumentOp, GraphOp, PhysicalPlan, TimeseriesOp};
 
-use crate::bridge::envelope::{Response, Status};
+use crate::bridge::envelope::{ErrorCode, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
-use crate::data::executor::handlers::transaction::stage_write::StageCtx;
+use crate::data::executor::handlers::transaction::stage_write::{
+    StageCtx, StageTimeseriesInsertParams,
+};
 use crate::data::executor::task::ExecutionTask;
 use crate::types::{TenantId, TxnId};
 
@@ -39,17 +41,18 @@ impl CoreLoop {
     /// staged, but via the predicted-surrogate-set primitives in
     /// [`calvin_overlay_stage_bulk`][super::calvin_overlay_stage_bulk] rather
     /// than a live predicate rescan — see that module's docs for the
-    /// determinism rationale. The columnar / spatial / timeseries
-    /// predicate-write ops remain unstaged — a separate follow-up unit.
-    /// Falling through to a no-op here for those is safe for THIS unit
-    /// because nothing yet reads `txn_overlays` for their Calvin path.
+    /// determinism rationale. `TimeseriesOp::Ingest` is staged through the
+    /// same canonical row decoder as session writes; its per-row tokens are
+    /// overlay-local and never become base-storage identities. Columnar and
+    /// spatial predicate writes remain unstaged because they have no
+    /// deterministic post-image overlay representation.
     pub(in crate::data::executor) fn stage_calvin_overlay(
         &mut self,
         task: &ExecutionTask,
         txn_id: TxnId,
         tenant_id: TenantId,
         plan: &PhysicalPlan,
-    ) -> crate::Result<()> {
+    ) -> Result<(), ErrorCode> {
         let tid = tenant_id.as_u64();
         match plan {
             PhysicalPlan::Document(DocumentOp::PointInsert {
@@ -110,29 +113,51 @@ impl CoreLoop {
                 collection,
                 ollp_predicted_surrogates,
                 ..
-            }) => self.stage_calvin_bulk_delete(
-                task,
-                tid,
-                txn_id,
-                collection,
-                ollp_predicted_surrogates.as_deref(),
-            ),
+            }) => self
+                .stage_calvin_bulk_delete(
+                    task,
+                    tid,
+                    txn_id,
+                    collection,
+                    ollp_predicted_surrogates.as_deref(),
+                )
+                .map_err(ErrorCode::from),
             PhysicalPlan::Document(DocumentOp::BulkUpdate {
                 collection,
                 updates,
                 ollp_predicted_surrogates,
                 ..
-            }) => self.stage_calvin_bulk_update(
-                task,
-                tid,
-                txn_id,
-                collection,
-                updates,
-                ollp_predicted_surrogates.as_deref(),
-            ),
+            }) => self
+                .stage_calvin_bulk_update(
+                    task,
+                    tid,
+                    txn_id,
+                    collection,
+                    updates,
+                    ollp_predicted_surrogates.as_deref(),
+                )
+                .map_err(ErrorCode::from),
             PhysicalPlan::Kv(op) => {
                 let resp = self.execute_stage_kv(task, tid, txn_id, op);
                 Self::stage_result(&resp)
+            }
+            PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+                collection,
+                payload,
+                format,
+                surrogates,
+                ..
+            }) => {
+                let response = self.stage_timeseries_insert(StageTimeseriesInsertParams {
+                    task,
+                    tid,
+                    txn_id,
+                    collection,
+                    payload,
+                    format,
+                    surrogates,
+                });
+                Self::stage_result(&response)
             }
             PhysicalPlan::Graph(
                 op @ (GraphOp::EdgePut { .. }
@@ -152,16 +177,13 @@ impl CoreLoop {
     /// Turn a staging handler's `Response` into a `Result`, so a staging
     /// failure propagates loudly to the Calvin caller instead of being
     /// silently swallowed.
-    fn stage_result(resp: &Response) -> crate::Result<()> {
+    fn stage_result(resp: &Response) -> Result<(), ErrorCode> {
         if resp.status == Status::Error {
-            let detail = resp
-                .error_code
-                .as_ref()
-                .map(|e| format!("{e:?}"))
-                .unwrap_or_else(|| "unknown staging error".to_string());
-            return Err(crate::Error::Internal {
-                detail: format!("calvin overlay staging failed: {detail}"),
-            });
+            return Err(resp.error_code.as_deref().cloned().unwrap_or_else(|| {
+                ErrorCode::Internal {
+                    detail: "calvin overlay staging failed without an error code".into(),
+                }
+            }));
         }
         Ok(())
     }

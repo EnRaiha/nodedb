@@ -9,7 +9,56 @@ use super::msgpack_decode::{self, MsgpackValue};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 
+/// Decode the canonical ILP row envelope used by the Calvin path.
+///
+/// Caller-provided malformed bytes are rejected before ingest. An inability to
+/// re-encode an already decoded value is an internal serialization failure.
+fn decode_canonical_ilp_lines(payload: &[u8]) -> Result<Vec<String>, ErrorCode> {
+    let lines: Vec<String> =
+        zerompk::from_msgpack(payload).map_err(|error| ErrorCode::RejectedPrevalidation {
+            reason: format!("invalid canonical ILP payload: {error}"),
+        })?;
+    if lines.is_empty() {
+        return Err(ErrorCode::RejectedPrevalidation {
+            reason: "empty canonical ILP payload".into(),
+        });
+    }
+    let canonical = zerompk::to_msgpack_vec(&lines).map_err(|error| ErrorCode::Internal {
+        detail: format!("canonical ILP payload re-encode failed: {error}"),
+    })?;
+    if canonical != payload
+        || lines
+            .iter()
+            .any(|line| line.contains('\n') || line.contains('\r'))
+    {
+        return Err(ErrorCode::RejectedPrevalidation {
+            reason: "malformed canonical ILP line payload".into(),
+        });
+    }
+    Ok(lines)
+}
+
 impl CoreLoop {
+    /// Decode the canonical Calvin ILP representation without reformatting any
+    /// identifiers, unsigned values, escaped tags, or nanosecond timestamps.
+    pub(super) fn execute_ilp_msgpack_ingest(
+        &mut self,
+        params: TimeseriesIngestParams<'_>,
+    ) -> Response {
+        let TimeseriesIngestParams { task, payload, .. } = &params;
+        // Calvin produces canonical zerompk. This rejects trailing bytes and
+        // alternate encodings before any memtable mutation.
+        let lines = match decode_canonical_ilp_lines(payload) {
+            Ok(lines) => lines,
+            Err(error) => return self.response_error(task, error),
+        };
+        let joined = lines.join("\n");
+        self.execute_ilp_ingest(TimeseriesIngestParams {
+            payload: joined.as_bytes(),
+            ..params
+        })
+    }
+
     /// Payload is a msgpack array of maps (same schema as JSON ingest but in msgpack).
     /// Converts each row to an ILP line and delegates to the ILP ingest path.
     pub(super) fn execute_msgpack_ingest(
@@ -301,4 +350,35 @@ fn parse_ts_string_to_nanos(s: &str) -> Option<i64> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_canonical_ilp_lines;
+    use crate::bridge::envelope::ErrorCode;
+
+    #[test]
+    fn canonical_ilp_msgpack_roundtrip_preserves_raw_protocol_values() {
+        let lines =
+            vec![r"cpu,host=west\,1 u=18446744073709551615u 1234567890123456789".to_owned()];
+        let payload = zerompk::to_msgpack_vec(&lines).expect("encode");
+        assert_eq!(decode_canonical_ilp_lines(&payload).expect("decode"), lines);
+    }
+
+    #[test]
+    fn canonical_ilp_msgpack_rejects_trailing_or_multiline_values() {
+        let mut payload =
+            zerompk::to_msgpack_vec(&vec!["cpu value=1i".to_owned()]).expect("encode");
+        payload.push(0);
+        assert!(matches!(
+            decode_canonical_ilp_lines(&payload),
+            Err(ErrorCode::RejectedPrevalidation { .. })
+        ));
+        let newline = zerompk::to_msgpack_vec(&vec!["cpu value=1i\nmem value=2i".to_owned()])
+            .expect("encode");
+        assert!(matches!(
+            decode_canonical_ilp_lines(&newline),
+            Err(ErrorCode::RejectedPrevalidation { .. })
+        ));
+    }
 }

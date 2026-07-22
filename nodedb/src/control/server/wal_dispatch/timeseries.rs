@@ -69,11 +69,10 @@ pub(super) fn wal_append_timeseries_op(
 /// Encode the payload of a `TimeseriesBatch` WAL record for a timeseries
 /// ingest.
 ///
-/// Produces the 4-element tuple `("timeseries", collection, payload,
-/// provenance)`. The `"timeseries"` kind tag steers `decode_batch_record` /
-/// `replay_timeseries_wal` to the timeseries replay path. The ONE encoder for
-/// this shape: the autocommit `TimeseriesOp::Ingest` arm, `wal_append_timeseries`,
-/// and the transaction-resolve serializer all call it.
+/// Produces the legacy 4-element tuple `("timeseries", collection, payload,
+/// provenance)`. New transaction redo must instead use
+/// [`encode_timeseries_batch_payload_with_format`] so replay retains the
+/// format discriminator; this encoder remains for backward-compatible callers.
 pub(crate) fn encode_timeseries_batch_payload(
     collection: &str,
     payload: &[u8],
@@ -83,6 +82,25 @@ pub(crate) fn encode_timeseries_batch_payload(
         crate::Error::Serialization {
             format: "msgpack".into(),
             detail: format!("wal timeseries batch: {e}"),
+        }
+    })
+}
+
+/// Encode the format-preserving 5-element timeseries WAL/redo tuple.
+///
+/// The final format field is required for transaction redo because payload
+/// bytes alone cannot distinguish canonical ILP MessagePack from ordinary row
+/// MessagePack. Replay decodes this shape before all legacy tuple forms.
+pub(crate) fn encode_timeseries_batch_payload_with_format(
+    collection: &str,
+    payload: &[u8],
+    provenance: Option<&nodedb_types::sync::wire::SyncProvenance>,
+    format: &str,
+) -> crate::Result<Vec<u8>> {
+    zerompk::to_msgpack_vec(&("timeseries", collection, payload, provenance, format)).map_err(|e| {
+        crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: format!("wal timeseries batch with format: {e}"),
         }
     })
 }

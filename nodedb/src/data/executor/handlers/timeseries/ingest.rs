@@ -22,6 +22,84 @@ use super::admission;
 use super::ingest_dispatch::{TimeseriesApplyMode, TimeseriesIngestParams};
 
 impl CoreLoop {
+    /// Check every condition that could reject a commit-deferred ILP ingest
+    /// before it is allowed to cast a Calvin commit vote. The simulation is
+    /// deliberately isolated from live state: schema evolution and dictionary
+    /// probes run against an exact snapshot clone, so this cannot publish a
+    /// schema, consume tag IDs, or create a memtable.
+    pub(in crate::data::executor) fn prevalidate_deferred_ilp_ingest(
+        &self,
+        task: &crate::data::executor::task::ExecutionTask,
+        tid: crate::types::TenantId,
+        collection: &str,
+        lines: &[ilp::IlpLine<'_>],
+    ) -> Result<(), ErrorCode> {
+        let key = (task.request.database_id, tid, collection.to_string());
+        let bitemporal =
+            self.is_bitemporal(task.request.database_id.as_u64(), tid.as_u64(), collection);
+        let existing = self.columnar_memtables.get(&key);
+        let live_resident = existing.map(ColumnarMemtable::memory_bytes);
+        let mut simulation = match existing {
+            Some(memtable) => {
+                ColumnarMemtable::from_snapshot(memtable.export_snapshot(), memtable.config())
+                    .map_err(|error| ErrorCode::Internal {
+                        detail: format!(
+                            "failed to clone timeseries memtable for admission: {error}"
+                        ),
+                    })?
+            }
+            None => {
+                let mut schema = ilp_ingest::infer_schema(lines);
+                if bitemporal {
+                    ilp_ingest::ensure_bitemporal_columns(&mut schema);
+                }
+                ColumnarMemtable::new(schema, ColumnarMemtableConfig::from_tuning(&self.ts_tuning))
+            }
+        };
+        // Snapshots retain rows and dictionaries but not spare vector capacity,
+        // so their baseline footprint can be lower than the live memtable.
+        // Simulate only the schema change, then apply that delta to the live
+        // resident bytes; otherwise a full live memtable could vote yes.
+        let simulation_baseline = simulation.memory_bytes();
+        if existing.is_some() {
+            ilp_ingest::evolve_schema(&mut simulation, lines);
+        }
+
+        if !admission::has_tag_headroom(&simulation, lines, self.ts_tuning.max_tag_cardinality) {
+            return Err(ErrorCode::RejectedPrevalidation {
+                reason: "transactional timeseries ingest exceeds tag dictionary headroom".into(),
+            });
+        }
+
+        let governor_pressure = self.governor.as_ref().is_some_and(|governor| {
+            governor
+                .try_reserve(
+                    task.request.database_id,
+                    tid,
+                    nodedb_mem::EngineId::Timeseries,
+                    0,
+                )
+                .is_err()
+        });
+        let resident = match live_resident {
+            Some(live) => live.saturating_add(
+                simulation
+                    .memory_bytes()
+                    .saturating_sub(simulation_baseline),
+            ),
+            None => simulation.memory_bytes(),
+        };
+        if resident >= self.ts_tuning.memtable_budget_bytes
+            || resident >= self.ts_tuning.memtable_hard_limit_bytes
+            || governor_pressure
+        {
+            return Err(ErrorCode::RejectedPrevalidation {
+                reason: "transactional timeseries ingest requires a flush before mutation".into(),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) fn execute_ilp_ingest(&mut self, params: TimeseriesIngestParams<'_>) -> Response {
         let TimeseriesIngestParams {
             task,
@@ -78,17 +156,9 @@ impl CoreLoop {
         }
 
         if mode == TimeseriesApplyMode::CommitDeferred
-            && self.columnar_memtables.get(&key).is_some_and(|memtable| {
-                !admission::has_tag_headroom(memtable, &lines, self.ts_tuning.max_tag_cardinality)
-            })
+            && let Err(error) = self.prevalidate_deferred_ilp_ingest(task, tid, collection, &lines)
         {
-            return self.response_error(
-                task,
-                ErrorCode::RejectedPrevalidation {
-                    reason: "transactional timeseries ingest exceeds tag dictionary headroom"
-                        .into(),
-                },
-            );
+            return self.response_error(task, error);
         }
 
         let bitemporal =

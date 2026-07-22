@@ -147,6 +147,7 @@ impl CoreLoop {
             PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
                 collection,
                 payload,
+                format,
                 surrogates,
                 ..
             }) => {
@@ -156,6 +157,7 @@ impl CoreLoop {
                     txn_id,
                     collection,
                     payload,
+                    format,
                     surrogates,
                 });
             }

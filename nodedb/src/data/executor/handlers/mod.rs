@@ -56,6 +56,7 @@ pub mod text_search_triple;
 pub mod timeseries;
 mod timeseries_gap_fill;
 pub mod timeseries_wal;
+pub(super) mod timeseries_wal_decode;
 pub mod transaction;
 pub mod truncate;
 pub mod unregister_collection;

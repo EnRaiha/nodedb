@@ -162,6 +162,15 @@ impl CoreLoop {
                 now_ms,
                 mode,
             }),
+            "ilp-msgpack" => self.execute_ilp_msgpack_ingest(TimeseriesIngestParams {
+                task,
+                tid,
+                collection,
+                payload,
+                wal_lsn,
+                now_ms,
+                mode,
+            }),
             "json" => self.execute_json_ingest(TimeseriesIngestParams {
                 task,
                 tid,

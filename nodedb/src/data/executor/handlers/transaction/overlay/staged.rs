@@ -84,6 +84,16 @@ pub struct CollectionOverlay {
     bitemporal_by_surrogate: HashMap<u32, BitemporalStamp>,
 }
 
+impl CollectionOverlay {
+    /// Whether this collection carries no staged state in any sidecar.
+    fn is_empty(&self) -> bool {
+        self.by_surrogate.is_empty()
+            && self.doc_id_to_surrogate.is_empty()
+            && self.ttl_by_surrogate.is_empty()
+            && self.bitemporal_by_surrogate.is_empty()
+    }
+}
+
 /// One overlay slot's state captured immediately before a staged value/TTL
 /// mutation overwrote it. The undo journal of these entries is what makes
 /// `ROLLBACK TO SAVEPOINT` correct: last-writer-wins overwrite in
@@ -315,6 +325,7 @@ impl TxnOverlay {
                 }
             }
         }
+        self.collections.retain(|_, overlay| !overlay.is_empty());
     }
 
     /// Look up the staged TTL delta for `surrogate` in the given collection.
@@ -568,6 +579,34 @@ mod tests {
         let mut overlay = TxnOverlay::new();
         overlay.set_ttl(key("a"), 1, "6b", StagedTtl::ExpireAt(1_000));
         assert_eq!(overlay.get_ttl(&key("b"), 1), None);
+    }
+
+    #[test]
+    fn rollback_prunes_post_marker_collection_without_touching_prior_collection() {
+        let mut overlay = TxnOverlay::new();
+        let retained = key("retained");
+        let post_marker = key("post_marker");
+        overlay.insert_put(retained.clone(), 7, "stable", vec![1, 2, 3]);
+        let marker = overlay.journal_len();
+
+        overlay.insert_put(post_marker.clone(), 9, "temporary", vec![4, 5]);
+        overlay.rollback_to(marker);
+
+        assert!(
+            !overlay.collections.contains_key(&post_marker),
+            "a collection created entirely after the savepoint must be removed"
+        );
+        assert_eq!(overlay.collections.len(), 1);
+        assert_eq!(
+            overlay.get(&retained, 7),
+            Some(&Staged::Put(vec![1, 2, 3])),
+            "the pre-savepoint body must remain byte-exact"
+        );
+        assert_eq!(
+            overlay.get_by_doc_id(&retained, "stable"),
+            Some(&Staged::Put(vec![1, 2, 3]))
+        );
+        assert_eq!(overlay.journal_len(), marker);
     }
 
     #[test]

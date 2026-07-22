@@ -130,7 +130,7 @@ impl CoreLoop {
                 // Test-only fault boundary after a potentially-mutating stage.
                 crate::fail_point!("calvin_static::during_overlay_stage");
             }
-            Ok::<(), crate::Error>(())
+            Ok::<(), ErrorCode>(())
         }));
         match stage_result {
             Ok(Ok(())) => {}
@@ -501,7 +501,7 @@ fn calvin_panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> Strin
 mod tests {
     use std::time::{Duration, Instant};
 
-    use nodedb_physical::physical_plan::DocumentOp;
+    use nodedb_physical::physical_plan::{DocumentOp, TimeseriesOp};
     use nodedb_types::Surrogate;
 
     use super::*;
@@ -561,6 +561,17 @@ mod tests {
             value: doc_value("a", "1"),
             if_absent: false,
             surrogate: Surrogate::new(surrogate),
+        })
+    }
+
+    fn canonical_ilp_plan(collection: &str, lines: Vec<&str>, tokens: Vec<u32>) -> PhysicalPlan {
+        PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: collection.to_owned(),
+            payload: zerompk::to_msgpack_vec(&lines).expect("canonical ILP payload"),
+            format: "ilp-msgpack".to_owned(),
+            wal_lsn: None,
+            surrogates: tokens.into_iter().map(Surrogate::new).collect(),
+            provenance: None,
         })
     }
 
@@ -783,6 +794,114 @@ mod tests {
             baseline,
             "panic cleanup must restore the overlay gauge"
         );
+    }
+
+    #[test]
+    fn static_calvin_ilp_staging_is_all_or_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let task = make_task();
+        let tenant = TenantId::new(1);
+        let vshard = task.request.vshard_id.as_u32();
+        let synthetic = calvin_synthetic_txn_id(21, 1, vshard).expect("synthetic transaction id");
+
+        let malformed = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection: "cpu".to_owned(),
+            payload: vec![0xc1],
+            format: "ilp-msgpack".to_owned(),
+            wal_lsn: None,
+            surrogates: vec![Surrogate::new(1)],
+            provenance: None,
+        });
+        let failed = core.execute_calvin_execute_static(
+            &task,
+            CalvinExecCtx {
+                epoch: 21,
+                position: 1,
+                epoch_system_ms: 0,
+                is_group_leader: true,
+            },
+            &tenant,
+            &[malformed],
+            &[],
+        );
+        assert_eq!(failed.read_set_valid, Some(false));
+        assert!(matches!(
+            failed.error_code.as_deref(),
+            Some(ErrorCode::RejectedPrevalidation { .. })
+        ));
+        assert!(!core.commit_pending.contains_key(&(21, 1, vshard)));
+        assert!(!core.txn_overlays.contains_key(&synthetic));
+
+        let valid = canonical_ilp_plan("cpu", vec!["cpu value=1i", "cpu value=2i"], vec![1, 2]);
+        let staged = core.execute_calvin_execute_static(
+            &task,
+            CalvinExecCtx {
+                epoch: 21,
+                position: 1,
+                epoch_system_ms: 0,
+                is_group_leader: true,
+            },
+            &tenant,
+            &[valid],
+            &[],
+        );
+        assert_eq!(staged.read_set_valid, Some(true));
+        assert_eq!(
+            core.txn_overlays
+                .get(&synthetic)
+                .map(|overlay| overlay.len()),
+            Some(2)
+        );
+
+        let mismatch = canonical_ilp_plan("cpu", vec!["memory value=1i"], vec![3]);
+        let failed = core.execute_calvin_execute_static(
+            &task,
+            CalvinExecCtx {
+                epoch: 21,
+                position: 2,
+                epoch_system_ms: 0,
+                is_group_leader: true,
+            },
+            &tenant,
+            &[mismatch],
+            &[],
+        );
+        let mismatch_id = calvin_synthetic_txn_id(21, 2, vshard).expect("synthetic transaction id");
+        assert_eq!(failed.read_set_valid, Some(false));
+        assert!(!core.commit_pending.contains_key(&(21, 2, vshard)));
+        assert!(!core.txn_overlays.contains_key(&mismatch_id));
+
+        core.ts_tuning.max_tag_cardinality = 1;
+        let overflow = canonical_ilp_plan(
+            "cpu",
+            vec!["cpu,host=a value=1i", "cpu,host=b value=2i"],
+            vec![4, 5],
+        );
+        let failed = core.execute_calvin_execute_static(
+            &task,
+            CalvinExecCtx {
+                epoch: 21,
+                position: 3,
+                epoch_system_ms: 0,
+                is_group_leader: true,
+            },
+            &tenant,
+            &[overflow],
+            &[],
+        );
+        let overflow_id = calvin_synthetic_txn_id(21, 3, vshard).expect("synthetic transaction id");
+        assert_eq!(failed.status, Status::Error);
+        assert_eq!(failed.read_set_valid, Some(false));
+        assert!(matches!(
+            failed.error_code.as_deref(),
+            Some(ErrorCode::RejectedPrevalidation { .. })
+        ));
+        assert!(
+            !core.commit_pending.contains_key(&(21, 3, vshard)),
+            "a rejected stage cannot reach the TransactionRedo-producing flush path"
+        );
+        assert!(!core.txn_overlays.contains_key(&overflow_id));
     }
 
     #[test]

@@ -20,9 +20,10 @@
 //!   with `kind = "columnar"`, carrying the per-row cross-engine surrogates.
 //!   `decode_batch_record` matches the msgpack map first and routes it to
 //!   `replay_columnar_payload`.
-//! * Timeseries `Ingest` → the 4-element tuple `("timeseries", collection,
-//!   payload, provenance)`. The msgpack array never matches the map form, so it
-//!   falls through to the timeseries replay path.
+//! * Timeseries `Ingest` → the format-preserving 5-element tuple
+//!   `("timeseries", collection, payload, provenance, format)`. The msgpack
+//!   array never matches the map form, so it falls through to the timeseries
+//!   replay path without relying on payload-byte heuristics.
 //!
 //! ## Predicate DML
 //!
@@ -44,7 +45,8 @@ use nodedb_physical::physical_plan::{ColumnarOp, TimeseriesOp};
 use nodedb_wal::record::RecordType;
 
 use crate::control::server::wal_dispatch::{
-    encode_columnar_batch_payload, encode_columnar_dml_payload, encode_timeseries_batch_payload,
+    encode_columnar_batch_payload, encode_columnar_dml_payload,
+    encode_timeseries_batch_payload_with_format,
 };
 use crate::wal::RedoSubRecord;
 
@@ -131,13 +133,17 @@ pub(super) fn serialize_timeseries_op(
         TimeseriesOp::Ingest {
             collection,
             payload,
-            format: _,
+            format,
             wal_lsn: _,
             surrogates: _,
             provenance,
         } => {
-            let sub_payload =
-                encode_timeseries_batch_payload(collection, payload, provenance.as_ref())?;
+            let sub_payload = encode_timeseries_batch_payload_with_format(
+                collection,
+                payload,
+                provenance.as_ref(),
+                format,
+            )?;
             ops.push(RedoSubRecord {
                 record_type: RecordType::TimeseriesBatch as u32,
                 payload: sub_payload,

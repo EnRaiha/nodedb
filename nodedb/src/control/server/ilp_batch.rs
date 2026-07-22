@@ -5,19 +5,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sonic_rs;
 use tracing::warn;
 
-use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
-use crate::control::gateway::GatewayErrorMap;
-use crate::control::gateway::core::QueryContext;
+use crate::bridge::envelope::PhysicalPlan;
+use crate::control::planner::calvin::{
+    TxnDispatchPosition, dispatch_strict_atomic_tasks_to_calvin,
+};
 use crate::control::security::audit::{ArcAuditEmitter, AuditEmitter};
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::ilp_auth::AuthenticatedIlpContext;
 use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, Lsn, RequestId, TenantId, TraceId, VShardId};
+use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::TimeseriesOp;
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+use nodedb_types::Surrogate;
 
 /// EWMA-based rate estimator for adaptive ILP batch sizing.
 pub(super) struct IlpRateEstimator {
@@ -71,12 +73,14 @@ impl IlpRateEstimator {
 
 /// Preflighted raw ILP lines for one canonical measurement.
 ///
-/// `raw_batch` preserves the accepted physical source lines in their original
-/// order; only their routing and authorization key is canonicalized.
+/// `raw_lines` preserve physical source order; map iteration canonicalizes
+/// measurement order. `catalog_fields` is a rebuildable control-plane projection
+/// of the authoritative timeseries-engine schema.
 #[derive(Debug, PartialEq, Eq)]
 struct IlpMeasurementBatch {
     measurement: String,
-    raw_batch: String,
+    raw_lines: Vec<String>,
+    catalog_fields: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +89,8 @@ enum IlpPreflightFailure {
     PermissionDenied,
 }
 
-/// Parse and authorize every unique collection before quota accounting, WAL,
-/// catalog mutation, plan construction, gateway execution, or SPSC dispatch.
+/// Parse and authorize every unique collection before quota accounting, task
+/// construction, sequencer submission, or catalog projection work.
 ///
 /// A `BTreeMap` gives canonical deterministic authorization/dispatch order,
 /// while appending each original raw line preserves source order within a
@@ -105,17 +109,16 @@ fn preflight_ilp_batch(
         return Err(IlpPreflightFailure::Parse);
     }
 
-    let mut grouped = BTreeMap::<String, String>::new();
+    let mut grouped = BTreeMap::<String, Vec<String>>::new();
     for line in parsed.lines() {
-        let entry = grouped.entry(line.measurement.to_string()).or_default();
-        if !entry.is_empty() {
-            entry.push('\n');
-        }
-        entry.push_str(line.raw);
+        grouped
+            .entry(line.measurement.to_string())
+            .or_default()
+            .push(line.raw.to_owned());
     }
 
     let mut groups = Vec::with_capacity(grouped.len());
-    for (measurement, raw_batch) in grouped {
+    for (measurement, raw_lines) in grouped {
         authorize_collection(
             identity,
             database_id,
@@ -126,9 +129,29 @@ fn preflight_ilp_batch(
             audit,
         )
         .map_err(|_| IlpPreflightFailure::PermissionDenied)?;
+        let grouped_source = raw_lines.join("\n");
+        let parsed_group = crate::engine::timeseries::ilp::parse_batch(&grouped_source)
+            .map_err(|_| IlpPreflightFailure::Parse)?;
+        let schema = crate::engine::timeseries::ilp_ingest::infer_schema(parsed_group.lines());
+        let catalog_fields = schema
+            .columns
+            .iter()
+            .map(|(name, ty)| {
+                let sql_type = match ty {
+                    crate::engine::timeseries::columnar_memtable::ColumnType::Timestamp => {
+                        "TIMESTAMP"
+                    }
+                    crate::engine::timeseries::columnar_memtable::ColumnType::Float64 => "FLOAT",
+                    crate::engine::timeseries::columnar_memtable::ColumnType::Int64 => "BIGINT",
+                    crate::engine::timeseries::columnar_memtable::ColumnType::Symbol => "VARCHAR",
+                };
+                (name.clone(), sql_type.to_owned())
+            })
+            .collect();
         groups.push(IlpMeasurementBatch {
             measurement,
-            raw_batch,
+            raw_lines,
+            catalog_fields,
         });
     }
     Ok(groups)
@@ -190,142 +213,100 @@ async fn flush_ilp_batch_inner(
     database_id: DatabaseId,
     groups: Vec<IlpMeasurementBatch>,
 ) -> crate::Result<u64> {
-    let mut total_accepted = 0u64;
+    let total_rows = preflighted_row_count(&groups)?;
+    let tasks = build_ilp_calvin_tasks(tenant_id, database_id, &groups)?;
 
+    // One Calvin submit stages every measurement and makes the TransactionRedo
+    // the sole durability record; no per-measurement WAL or direct dispatch may
+    // race ahead of a later measurement failure.
+    let _ = dispatch_strict_atomic_tasks_to_calvin(
+        state,
+        &tasks,
+        tenant_id,
+        TxnDispatchPosition::Autocommit,
+        &[],
+        None,
+    )
+    .await?;
+
+    // Timeseries owns authoritative schema. Catalog fields are a rebuildable
+    // control-plane projection; update failures are loud but cannot turn an
+    // already committed Calvin write into a retryable client failure.
+    let catalog = state.credentials.catalog();
     for group in groups {
-        let collection = group.measurement;
-        // Route all lines for a canonical collection to the same vShard as its
-        // collection scan. The parser has already authenticated this exact key.
-        let vshard_id = VShardId::from_collection_in_database(database_id, &collection);
-        let payload_bytes = group.raw_batch.into_bytes();
-
-        // Append to WAL first — returns the assigned LSN for dedup tracking.
-        let wal_lsn = crate::control::server::wal_dispatch::wal_append_timeseries(
-            &state.wal,
-            crate::control::server::wal_dispatch::TimeseriesWalAppendContext {
-                tenant_id,
-                vshard_id,
-                database_id,
-                collection: &collection,
-            },
-            &payload_bytes,
-            None,
-            Some(&state.credentials),
-        )?
-        .map(|lsn| lsn.as_u64());
-
-        let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-            collection: collection.clone(),
-            payload: payload_bytes,
-            format: "ilp".to_string(),
-            wal_lsn,
-            surrogates: Vec::new(),
-            provenance: None,
-        });
-
-        let response = match state.gateway.get() {
-            Some(gw) => {
-                let gw_ctx = QueryContext {
-                    tenant_id,
-                    trace_id: TraceId::generate(),
-                    database_id,
-                    txn_id: None,
-                };
-                gw.execute(&gw_ctx, plan)
-                    .await
-                    .inspect_err(|err| {
-                        let msg = GatewayErrorMap::to_resp(err);
-                        warn!(
-                            collection = %collection,
-                            vshard_id = vshard_id.as_u32(),
-                            error = %msg,
-                            "ILP gateway dispatch error (batch dropped)"
-                        );
-                    })
-                    .map(|payloads| {
-                        let payload = payloads
-                            .into_iter()
-                            .next()
-                            .map(Payload::from_vec)
-                            .unwrap_or_else(Payload::empty);
-                        Response {
-                            request_id: RequestId::new(0),
-                            status: Status::Ok,
-                            attempt: 0,
-                            partial: false,
-                            payload,
-                            watermark_lsn: Lsn::new(0),
-                            error_code: None,
-                            read_set_valid: None,
-                            read_version_lsn: crate::types::Lsn::ZERO,
-                            write_set: Vec::new(),
-                        }
-                    })?
-            }
-            None => {
-                crate::control::server::dispatch_utils::dispatch_to_data_plane(
-                    state,
-                    tenant_id,
-                    database_id,
-                    vshard_id,
-                    plan,
-                    TraceId::ZERO,
-                )
-                .await?
-            }
-        };
-
-        // Durable-at-ack barrier: the batch was appended to the WAL above, but
-        // `wal_append_timeseries` only buffers the record and mints its `Lsn` —
-        // the fsync is deferred. Without this barrier a `kill -9` loses the
-        // buffered bytes after the caller was already told the rows were
-        // accepted. Timeseries rows live only in the `MutationEngine` memtable
-        // until a restart replays the WAL, so the WAL is their sole durability
-        // path. Mirrors the barrier in `submit_to_data_plane` and
-        // `dispatch_utils::dispatch::dispatch_to_data_plane_inner`.
-        if response.status == Status::Ok
-            && let Some(lsn) = wal_lsn
-        {
-            state.wal.wait_durable(Lsn::new(lsn)).await?;
-        }
-
-        if !response.payload.is_empty()
-            && let Ok(v) = sonic_rs::from_slice::<serde_json::Value>(&response.payload)
-        {
-            total_accepted += v.get("accepted").and_then(|a| a.as_u64()).unwrap_or(0);
-
-            if let Some(schema_cols) = v.get("schema_columns").and_then(|s| s.as_array()) {
-                let fields: Vec<(String, String)> = schema_cols
-                    .iter()
-                    .filter_map(|pair| {
-                        let arr = pair.as_array()?;
-                        Some((
-                            arr.first()?.as_str()?.to_string(),
-                            arr.get(1)?.as_str()?.to_string(),
-                        ))
-                    })
-                    .collect();
-
-                let catalog = state.credentials.catalog();
-                if !fields.is_empty()
-                    && let Ok(Some(mut coll)) =
-                        catalog.get_collection(database_id, tenant_id.as_u64(), &collection)
-                    && coll.fields != fields
-                {
-                    coll.fields = fields;
-                    if let Err(e) = catalog.put_collection(database_id, &coll) {
-                        tracing::warn!(
-                            collection = %collection,
-                            error = %e,
-                            "failed to propagate ILP schema to catalog",
-                        );
-                    }
-                }
-            }
+        match catalog.merge_collection_fields(
+            database_id,
+            tenant_id.as_u64(),
+            &group.measurement,
+            &group.catalog_fields,
+        ) {
+            Ok(_) => {}
+            // This is a rebuildable control-plane projection. The data commit is
+            // already durable, so logging is required but retrying the client
+            // request would risk a duplicate write.
+            Err(error) => warn!(
+                collection = %group.measurement,
+                error = %error,
+                "failed to merge ILP catalog schema projection after committed Calvin write"
+            ),
         }
     }
+    Ok(total_rows)
+}
 
-    Ok(total_accepted)
+fn preflighted_row_count(groups: &[IlpMeasurementBatch]) -> crate::Result<u64> {
+    groups.iter().try_fold(0u64, |total, group| {
+        u64::try_from(group.raw_lines.len())
+            .ok()
+            .and_then(|count| total.checked_add(count))
+            .ok_or(crate::Error::BadRequest {
+                detail: "ILP row count exceeds protocol limit".into(),
+            })
+    })
+}
+
+/// Convert canonical preflight groups into one deterministic Calvin task each.
+fn build_ilp_calvin_tasks(
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    groups: &[IlpMeasurementBatch],
+) -> crate::Result<Vec<PhysicalTask>> {
+    groups
+        .iter()
+        .map(|group| {
+            let payload = zerompk::to_msgpack_vec(&group.raw_lines).map_err(|error| {
+                crate::Error::Serialization {
+                    format: "msgpack".into(),
+                    detail: format!("failed to encode canonical ILP lines: {error}"),
+                }
+            })?;
+            let surrogates = (1..=group.raw_lines.len())
+                .map(|row| {
+                    u32::try_from(row)
+                        .map(Surrogate::new)
+                        .map_err(|_| crate::Error::BadRequest {
+                            detail: "ILP measurement row count exceeds u32 overlay-token limit"
+                                .into(),
+                        })
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(PhysicalTask {
+                tenant_id,
+                database_id,
+                vshard_id: VShardId::from_collection_in_database(database_id, &group.measurement),
+                plan: PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+                    collection: group.measurement.clone(),
+                    payload,
+                    format: "ilp-msgpack".into(),
+                    wal_lsn: None,
+                    surrogates,
+                    provenance: None,
+                }),
+                post_set_op: PostSetOp::None,
+                txn_id: None,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -338,7 +319,9 @@ mod tests {
     };
     use crate::control::security::permission::PermissionStore;
     use crate::control::security::role::RoleStore;
-    use crate::types::{DatabaseId, TenantId};
+    use crate::types::{DatabaseId, TenantId, VShardId};
+    use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
+    use nodedb_types::Surrogate;
 
     fn identity(database_id: DatabaseId) -> AuthenticatedIdentity {
         AuthenticatedIdentity {
@@ -385,9 +368,9 @@ mod tests {
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].measurement, "cpu");
-        assert_eq!(groups[0].raw_batch, "cpu value=2i");
+        assert_eq!(groups[0].raw_lines, vec!["cpu value=2i"]);
         assert_eq!(groups[1].measurement, "mem");
-        assert_eq!(groups[1].raw_batch, "mem value=1i\nmem value=3i");
+        assert_eq!(groups[1].raw_lines, vec!["mem value=1i", "mem value=3i"]);
     }
 
     #[test]
@@ -404,8 +387,8 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].measurement, "cpu load");
         assert_eq!(
-            groups[0].raw_batch,
-            " cpu\\ load value=1i\ncpu\\ load value=2i"
+            groups[0].raw_lines,
+            vec![" cpu\\ load value=1i", "cpu\\ load value=2i"]
         );
     }
 
@@ -514,5 +497,67 @@ mod tests {
         .expect("the explicitly bound non-default database is authorized");
 
         assert_eq!(groups[0].measurement, "cpu");
+    }
+
+    #[test]
+    fn accepted_count_is_preflighted_row_total_not_task_count() {
+        let groups = vec![
+            super::IlpMeasurementBatch {
+                measurement: "cpu".into(),
+                raw_lines: vec!["cpu value=1i".into(), "cpu value=2i".into()],
+                catalog_fields: Vec::new(),
+            },
+            super::IlpMeasurementBatch {
+                measurement: "mem".into(),
+                raw_lines: vec!["mem value=3i".into()],
+                catalog_fields: Vec::new(),
+            },
+        ];
+        assert_eq!(super::preflighted_row_count(&groups).expect("count"), 3);
+    }
+
+    #[test]
+    fn task_builder_is_deterministic_and_uses_overlay_tokens() {
+        let permissions = PermissionStore::new();
+        grant_write(&permissions, "cpu");
+        grant_write(&permissions, "mem");
+        let database_id = DatabaseId::new(7);
+        let groups = preflight_ilp_batch(
+            &identity(database_id),
+            database_id,
+            "mem value=1i\ncpu value=2i\ncpu value=3i\n",
+            &permissions,
+            &RoleStore::new(),
+            &NoopAuditEmitter,
+        )
+        .expect("preflight");
+        let tasks =
+            super::build_ilp_calvin_tasks(TenantId::new(9), database_id, &groups).expect("tasks");
+        assert_eq!(tasks.len(), 2);
+        let PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
+            collection,
+            payload,
+            format,
+            wal_lsn,
+            surrogates,
+            ..
+        }) = &tasks[0].plan
+        else {
+            panic!("timeseries task")
+        };
+        assert_eq!(collection, "cpu");
+        assert_eq!(format, "ilp-msgpack");
+        assert_eq!(*wal_lsn, None);
+        assert_eq!(surrogates, &vec![Surrogate::new(1), Surrogate::new(2)]);
+        assert_eq!(
+            zerompk::from_msgpack::<Vec<String>>(payload).expect("payload"),
+            vec!["cpu value=2i", "cpu value=3i"]
+        );
+        assert_eq!(tasks[0].tenant_id, TenantId::new(9));
+        assert_eq!(tasks[0].database_id, database_id);
+        assert_eq!(
+            tasks[0].vshard_id,
+            VShardId::from_collection_in_database(database_id, "cpu")
+        );
     }
 }
