@@ -548,6 +548,86 @@ async fn cross_vtable_join_filters_on_joined_column() {
     );
 }
 
+/// A JOIN carrying BOTH a WHERE predicate and a LIMIT must still return the
+/// matching rows. The WHERE clause on a catalog join is evaluated after the
+/// join (there is no scan to push it into), so a LIMIT applied during the
+/// probe would cap the output before filtering and drop — often empty — the
+/// rows that actually match.
+#[tokio::test]
+async fn cross_vtable_join_with_where_and_limit_returns_matching_rows() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION reflect_join_where_limit (id INTEGER PRIMARY KEY)")
+        .await
+        .expect("create collection");
+
+    let unlimited = srv
+        .query_text(
+            "SELECT t.typname FROM pg_type t \
+             LEFT JOIN pg_range r ON t.oid = r.rngtypid \
+             WHERE t.typname = 'int4'",
+        )
+        .await
+        .expect("join with WHERE evaluates");
+    assert_eq!(
+        unlimited,
+        vec!["int4".to_string()],
+        "baseline: the unlimited join must return the matching type"
+    );
+
+    let limited = srv
+        .query_text(
+            "SELECT t.typname FROM pg_type t \
+             LEFT JOIN pg_range r ON t.oid = r.rngtypid \
+             WHERE t.typname = 'int4' LIMIT 5",
+        )
+        .await
+        .expect("join with WHERE and LIMIT evaluates");
+    assert_eq!(
+        limited, unlimited,
+        "a LIMIT wider than the result must not drop rows that satisfy the WHERE clause"
+    );
+}
+
+/// A LIMIT narrower than the filtered result set still truncates — the LIMIT
+/// moves after the post-join filter, it is not discarded.
+#[tokio::test]
+async fn cross_vtable_join_with_where_honors_narrow_limit() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION reflect_narrow_limit_a (id INTEGER PRIMARY KEY)")
+        .await
+        .expect("create collection");
+    srv.exec("CREATE COLLECTION reflect_narrow_limit_b (id INTEGER PRIMARY KEY)")
+        .await
+        .expect("create collection");
+
+    let unlimited = srv
+        .query_text(
+            "SELECT c.relname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public'",
+        )
+        .await
+        .expect("join with WHERE evaluates");
+    assert!(
+        unlimited.len() > 1,
+        "test needs a multi-row baseline to check truncation, got {unlimited:?}"
+    );
+
+    let limited = srv
+        .query_text(
+            "SELECT c.relname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' LIMIT 1",
+        )
+        .await
+        .expect("join with WHERE and LIMIT evaluates");
+    assert_eq!(
+        limited.len(),
+        1,
+        "LIMIT 1 must truncate the filtered rows to one: {limited:?}"
+    );
+}
+
 /// The three-way `pg_class ⋈ pg_attribute ⋈ pg_type` join is the literal
 /// shape `\d <table>` emits to describe a relation's columns and their types.
 #[tokio::test]

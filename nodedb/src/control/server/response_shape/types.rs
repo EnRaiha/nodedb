@@ -228,6 +228,10 @@ pub struct ShapedRows {
     /// type OIDs; the native and http entrypoints ignore it. `Text` is used
     /// wherever the source type is unknown.
     pub column_types: Vec<DdlColType>,
+    /// One map per row. Cells are keyed by [`ShapedRows::cell_keys`], NOT by
+    /// `columns` directly — SQL output names may repeat (`SELECT w.id, b.id`
+    /// displays both as `id`) and a map cannot hold two cells under one key.
+    /// Read cells through `cell_keys` so each column reads its own value.
     pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
     pub notice: Option<String>,
 }
@@ -237,5 +241,25 @@ impl ShapedRows {
     /// construction sites whose consumers (native/http) ignore column types.
     pub fn text_types(n: usize) -> Vec<DdlColType> {
         vec![DdlColType::Text; n]
+    }
+
+    /// Per-column keys for reading cells out of [`ShapedRows::rows`], parallel
+    /// to `columns`.
+    ///
+    /// This is the single source of truth every consumer shares — the pgwire
+    /// encoders, the native converter, and the HTTP JSON serializers all key
+    /// rows through it, so the row-map layout can never drift from what a
+    /// consumer expects.
+    ///
+    /// Identical to `columns` unless two output columns share a name, in which
+    /// case later duplicates take a `_<n>` suffix (see
+    /// [`super::project::cell_keys`]). Because the HTTP transports serialize a
+    /// row map directly to JSON, that suffix is user-visible there: a
+    /// duplicate-name `SELECT w.id, b.id` emits `{"id": …, "id_1": …}`, since
+    /// a JSON object likewise cannot carry the same key twice. pgwire and
+    /// native are positional on the wire and still report both columns as
+    /// `id`, matching PostgreSQL.
+    pub fn cell_keys(&self) -> Vec<String> {
+        super::project::cell_keys(&self.columns)
     }
 }

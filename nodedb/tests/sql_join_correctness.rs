@@ -338,3 +338,109 @@ async fn natural_join_is_not_cartesian() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Qualified same-name projections
+// ---------------------------------------------------------------------------
+
+/// Unaliased table-qualified projections of same-named columns must each
+/// resolve to their own table's value: `SELECT j_t1.id, j_t2.id` returns the
+/// left value in the first column and the right value in the second, not the
+/// last table's value in both. (Aliased projections already behaved; this
+/// pins the unaliased path, where both output columns display as `id`.)
+#[tokio::test]
+async fn qualified_same_name_columns_resolve_per_table_without_aliases() {
+    let server = TestServer::start().await;
+    setup_join_tables(&server).await;
+
+    let rows = server
+        .query_rows(
+            "SELECT j_t1.id, j_t2.id FROM j_t1 \
+             JOIN j_t2 ON j_t2.t1_id = j_t1.id \
+             WHERE j_t2.id = 'p'",
+        )
+        .await
+        .expect("join with unaliased qualified same-name projections");
+
+    assert_eq!(
+        rows,
+        vec![vec!["a".to_string(), "p".to_string()]],
+        "each qualified `id` projection must carry its own table's value"
+    );
+}
+
+/// The aliased spelling of the same projection stays correct (guard against
+/// the unaliased fix regressing the alias path).
+#[tokio::test]
+async fn qualified_same_name_columns_resolve_per_table_with_aliases() {
+    let server = TestServer::start().await;
+    setup_join_tables(&server).await;
+
+    let rows = server
+        .query_rows(
+            "SELECT j_t1.id AS t1_id, j_t2.id AS t2_id FROM j_t1 \
+             JOIN j_t2 ON j_t2.t1_id = j_t1.id \
+             WHERE j_t2.id = 'p'",
+        )
+        .await
+        .expect("join with aliased qualified same-name projections");
+
+    assert_eq!(rows, vec![vec!["a".to_string(), "p".to_string()]]);
+}
+
+// ---------------------------------------------------------------------------
+// LIMIT with post-join filters
+// ---------------------------------------------------------------------------
+
+/// A join carrying both a post-join WHERE predicate and a LIMIT must return
+/// the matching rows: the LIMIT applies to the filtered result, never to the
+/// pre-filter probe output.
+#[tokio::test]
+async fn join_with_post_filter_and_wide_limit_keeps_matching_rows() {
+    let server = TestServer::start().await;
+    setup_join_tables(&server).await;
+
+    let unlimited = server
+        .query_text(
+            "SELECT j_t2.id FROM j_t1 \
+             JOIN j_t2 ON j_t2.t1_id = j_t1.id \
+             WHERE j_t2.y = 200",
+        )
+        .await
+        .expect("join with WHERE evaluates");
+    assert_eq!(unlimited, vec!["q".to_string()]);
+
+    let limited = server
+        .query_text(
+            "SELECT j_t2.id FROM j_t1 \
+             JOIN j_t2 ON j_t2.t1_id = j_t1.id \
+             WHERE j_t2.y = 200 LIMIT 5",
+        )
+        .await
+        .expect("join with WHERE and LIMIT evaluates");
+    assert_eq!(
+        limited, unlimited,
+        "a LIMIT wider than the filtered result must not drop matching rows"
+    );
+}
+
+/// A LIMIT narrower than the filtered result still truncates.
+#[tokio::test]
+async fn join_with_post_filter_honors_narrow_limit() {
+    let server = TestServer::start().await;
+    setup_join_tables(&server).await;
+
+    let rows = server
+        .query_text(
+            "SELECT j_t2.id FROM j_t1 \
+             JOIN j_t2 ON j_t2.t1_id = j_t1.id \
+             WHERE j_t2.y > 0 LIMIT 1",
+        )
+        .await
+        .expect("join with WHERE and LIMIT evaluates");
+    assert_eq!(
+        rows.len(),
+        1,
+        "LIMIT 1 must truncate the filtered rows to one: {rows:?}"
+    );
+}
