@@ -92,6 +92,13 @@ fn pinned_native_client(node: &TestClusterNode) -> NativeClient {
     NativeClient::new(PoolConfig {
         addr: format!("127.0.0.1:{}", node.native_port),
         max_size: 1,
+        // The cluster harness runs trust auth with `nodedb` as the sole
+        // materialized superuser; the `PoolConfig` default user is `admin`,
+        // which trust mode rejects as a non-existent identity. Authenticate as
+        // the harness superuser, matching the pgwire path (`user=nodedb`).
+        auth: nodedb_types::protocol::AuthMethod::Trust {
+            username: "nodedb".into(),
+        },
         ..Default::default()
     })
 }

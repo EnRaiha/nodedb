@@ -105,7 +105,10 @@ async fn soft_drop_named_collection_stats_still_deactivated() {
 
 /// `DROP ... PURGE` must still fully remove edges and stats — the hard-purge
 /// path is untouched by this fix and must keep working exactly as before.
-#[tokio::test]
+///
+/// Multi-threaded runtime: the single-node purge path reclaims storage inline
+/// via `block_in_place`, which panics on the current-thread runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hard_purge_removes_edges_and_stats() {
     let srv = TestServer::start().await;
     srv.exec("CREATE COLLECTION g_hard_purge").await.unwrap();
