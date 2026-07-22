@@ -73,25 +73,45 @@ impl IlpRateEstimator {
 pub(super) async fn flush_ilp_batch(
     state: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     batch: &str,
 ) -> crate::Result<u64> {
-    // Quota enforcement — reject before WAL append or dispatch.
+    // Quota enforcement — reject before WAL append or dispatch. The guard is
+    // cancellation-safe, unlike manually pairing `start`/`end` around `await`.
     state.check_tenant_quota(tenant_id)?;
-    state.tenant_request_start(tenant_id);
+    let _request = TenantRequestAccounting::start(state, tenant_id);
 
-    let result = flush_ilp_batch_inner(state, tenant_id, batch).await;
-    state.tenant_request_end(tenant_id);
-    result
+    flush_ilp_batch_inner(state, tenant_id, database_id, batch).await
+}
+
+/// Cancellation-safe tenant request accounting for one ILP batch.
+struct TenantRequestAccounting<'a> {
+    state: &'a SharedState,
+    tenant_id: TenantId,
+}
+
+impl<'a> TenantRequestAccounting<'a> {
+    fn start(state: &'a SharedState, tenant_id: TenantId) -> Self {
+        state.tenant_request_start(tenant_id);
+        Self { state, tenant_id }
+    }
+}
+
+impl Drop for TenantRequestAccounting<'_> {
+    fn drop(&mut self) {
+        self.state.tenant_request_end(self.tenant_id);
+    }
 }
 
 /// Inner dispatch logic for ILP batch (separated for clean quota bookkeeping).
 async fn flush_ilp_batch_inner(
     state: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     batch: &str,
 ) -> crate::Result<u64> {
-    // ILP protocol carries no database selector; all ops target DatabaseId::DEFAULT.
-    // Fast path: extract collection from first line.
+    // The listener binds this database to the authenticated connection before
+    // any ILP bytes are accepted. Fast path: extract collection from first line.
     let collection = batch
         .lines()
         .find(|l| !l.is_empty() && !l.starts_with('#'))
@@ -104,7 +124,7 @@ async fn flush_ilp_batch_inner(
     // the memtable data on the correct Data Plane core.
     // Per-series sharding is deferred until the scan path supports
     // fan-out across multiple cores.
-    let collection_vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
+    let collection_vshard = VShardId::from_collection_in_database(database_id, &collection);
     let mut shard_batches: std::collections::HashMap<u32, String> =
         std::collections::HashMap::new();
 
@@ -127,9 +147,12 @@ async fn flush_ilp_batch_inner(
         // Append to WAL first — returns the assigned LSN for dedup tracking.
         let wal_lsn = crate::control::server::wal_dispatch::wal_append_timeseries(
             &state.wal,
-            tenant_id,
-            vshard_id,
-            &collection,
+            crate::control::server::wal_dispatch::TimeseriesWalAppendContext {
+                tenant_id,
+                vshard_id,
+                database_id,
+                collection: &collection,
+            },
             &payload_bytes,
             None,
             Some(&state.credentials),
@@ -150,7 +173,7 @@ async fn flush_ilp_batch_inner(
                 let gw_ctx = QueryContext {
                     tenant_id,
                     trace_id: TraceId::generate(),
-                    database_id: nodedb_types::id::DatabaseId::DEFAULT,
+                    database_id,
                     txn_id: None,
                 };
                 gw.execute(&gw_ctx, plan)
@@ -188,7 +211,7 @@ async fn flush_ilp_batch_inner(
                 crate::control::server::dispatch_utils::dispatch_to_data_plane(
                     state,
                     tenant_id,
-                    DatabaseId::DEFAULT,
+                    database_id,
                     vshard_id,
                     plan,
                     TraceId::ZERO,
@@ -231,11 +254,11 @@ async fn flush_ilp_batch_inner(
                 let catalog = state.credentials.catalog();
                 if !fields.is_empty()
                     && let Ok(Some(mut coll)) =
-                        catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection)
+                        catalog.get_collection(database_id, tenant_id.as_u64(), &collection)
                     && coll.fields != fields
                 {
                     coll.fields = fields;
-                    if let Err(e) = catalog.put_collection(DatabaseId::DEFAULT, &coll) {
+                    if let Err(e) = catalog.put_collection(database_id, &coll) {
                         tracing::warn!(
                             collection = %collection,
                             error = %e,

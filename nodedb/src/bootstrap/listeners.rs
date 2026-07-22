@@ -111,13 +111,21 @@ pub async fn spawn_protocol_listeners(
     // ILP TCP listener (if configured).
     if let Some(ilp) = ilp_listener {
         let shared_ilp = Arc::clone(&shared);
+        let ilp_auth_mode = config.auth.mode.clone();
         let conn_sem_ilp = Arc::clone(&conn_semaphore);
         let ilp_tls = tls_for(ilp_tls_enabled);
         let startup_gate_ilp = Arc::clone(&startup_gate);
         let bus_ilp = shutdown_bus.clone();
         tokio::spawn(async move {
             if let Err(e) = ilp
-                .run(shared_ilp, conn_sem_ilp, ilp_tls, startup_gate_ilp, bus_ilp)
+                .run(
+                    shared_ilp,
+                    ilp_auth_mode,
+                    conn_sem_ilp,
+                    ilp_tls,
+                    startup_gate_ilp,
+                    bus_ilp,
+                )
                 .await
             {
                 tracing::error!(error = %e, "ILP listener failed");

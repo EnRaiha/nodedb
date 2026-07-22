@@ -24,7 +24,8 @@ pub use core::{
     wal_append_if_write_with_creds,
 };
 pub use stamp::stamp_minted_lsn;
-pub use timeseries::{ColumnarWalAppendArgs, wal_append_columnar, wal_append_timeseries};
+pub use timeseries::{ColumnarWalAppendArgs, wal_append_columnar};
+pub(crate) use timeseries::{TimeseriesWalAppendContext, wal_append_timeseries};
 pub use vector::{
     VectorDeleteWalArgs, VectorPutWalArgs, wal_append_vector_delete_by_surrogate,
     wal_append_vector_put,

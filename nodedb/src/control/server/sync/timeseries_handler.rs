@@ -29,6 +29,14 @@ use crate::types::{DatabaseId, TenantId, VShardId};
 /// handler can decode the [`SyncAckResult`] for gate status propagation.
 #[async_trait]
 pub trait TimeseriesDispatcher: Send + Sync {
+    /// Immutable database scope selected for this connection.
+    ///
+    /// The default retains compatibility for external dispatcher
+    /// implementations; production overrides it with the session-bound value.
+    fn database_id(&self) -> DatabaseId {
+        DatabaseId::DEFAULT
+    }
+
     async fn dispatch_ingest(
         &self,
         tenant_id: TenantId,
@@ -46,10 +54,15 @@ pub trait TimeseriesDispatcher: Send + Sync {
 /// re-fired on synced data.
 pub struct SharedStateTimeseriesDispatcher<'a> {
     pub shared: &'a crate::control::state::SharedState,
+    pub(crate) database_id: DatabaseId,
 }
 
 #[async_trait]
 impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
+    fn database_id(&self) -> DatabaseId {
+        self.database_id
+    }
+
     async fn dispatch_ingest(
         &self,
         tenant_id: TenantId,
@@ -59,10 +72,13 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
         provenance: nodedb_types::sync::wire::SyncProvenance,
     ) -> crate::Result<Vec<u8>> {
         use crate::bridge::envelope::PhysicalPlan;
-        use crate::control::server::wal_dispatch::wal_append_timeseries;
+        use crate::control::server::wal_dispatch::{
+            TimeseriesWalAppendContext, wal_append_timeseries,
+        };
         use nodedb_physical::physical_plan::TimeseriesOp;
 
         let prov = provenance;
+        let database_id = self.database_id;
 
         let payload_bytes = ilp_payload.into_bytes();
 
@@ -70,9 +86,12 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
         // Data Plane. This is the canonical LSN for dedup tracking.
         let wal_lsn = wal_append_timeseries(
             &self.shared.wal,
-            tenant_id,
-            vshard,
-            &collection,
+            TimeseriesWalAppendContext {
+                tenant_id,
+                vshard_id: vshard,
+                database_id,
+                collection: &collection,
+            },
             &payload_bytes,
             Some(&prov),
             Some(&self.shared.credentials),
@@ -88,7 +107,16 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             provenance: Some(prov),
         });
 
-        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
+        super::raft_dispatch::dispatch_write_replicated(
+            self.shared,
+            tenant_id,
+            database_id,
+            &collection,
+            plan,
+            std::time::Duration::from_secs(self.shared.tuning.network.default_deadline_secs),
+            crate::event::EventSource::CrdtSync,
+        )
+        .await
     }
 }
 
@@ -132,15 +160,17 @@ impl SyncSession {
         self.last_activity = std::time::Instant::now();
 
         if !self.authenticated {
-            let ack = TimeseriesAckMsg {
-                collection: msg.collection.clone(),
-                accepted: 0,
-                rejected: msg.sample_count,
-                lsn: 0,
-                applied_seq: 0,
-                status: AckStatus::Applied,
-            };
-            return SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack);
+            return rejected_timeseries_ack(msg);
+        }
+        let Some(identity) = self.identity.as_ref() else {
+            // `authenticated` is never a substitute for a handshake-bound
+            // identity: it could otherwise write under a fabricated tenant.
+            return rejected_timeseries_ack(msg);
+        };
+        let tenant_id = identity.tenant_id;
+        let database_id = dispatcher.database_id();
+        if !identity.can_access_database(database_id) {
+            return rejected_timeseries_ack(msg);
         }
 
         // Decode Gorilla blocks to verify integrity.
@@ -185,8 +215,7 @@ impl SyncSession {
             "timeseries push decoded, dispatching to Data Plane"
         );
 
-        let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
+        let vshard = VShardId::from_collection_in_database(database_id, &msg.collection);
 
         match dispatcher
             .dispatch_ingest(
@@ -253,6 +282,18 @@ impl SyncSession {
     }
 }
 
+fn rejected_timeseries_ack(msg: &TimeseriesPushMsg) -> Option<SyncFrame> {
+    let ack = TimeseriesAckMsg {
+        collection: msg.collection.clone(),
+        accepted: 0,
+        rejected: msg.sample_count,
+        lsn: 0,
+        applied_seq: 0,
+        status: AckStatus::Applied,
+    };
+    SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -264,10 +305,11 @@ mod tests {
 
     // ── Mock dispatcher ──────────────────────────────────────────────────────
 
-    type MockCallLog = Arc<Mutex<Vec<(TenantId, String, String)>>>;
+    type MockCallLog = Arc<Mutex<Vec<(TenantId, DatabaseId, VShardId, String, String)>>>;
 
     struct MockDispatcher {
         calls: MockCallLog,
+        database_id: DatabaseId,
         result: crate::Result<Vec<u8>>,
     }
 
@@ -278,6 +320,7 @@ mod tests {
             (
                 Self {
                     calls: calls.clone(),
+                    database_id: DatabaseId::DEFAULT,
                     result: Ok(Vec::new()),
                 },
                 calls,
@@ -287,6 +330,7 @@ mod tests {
         fn err() -> Self {
             Self {
                 calls: Arc::new(Mutex::new(Vec::new())),
+                database_id: DatabaseId::DEFAULT,
                 result: Err(crate::Error::Internal {
                     detail: "mock failure".to_string(),
                 }),
@@ -296,18 +340,25 @@ mod tests {
 
     #[async_trait]
     impl TimeseriesDispatcher for MockDispatcher {
+        fn database_id(&self) -> DatabaseId {
+            self.database_id
+        }
+
         async fn dispatch_ingest(
             &self,
             tenant_id: TenantId,
-            _vshard: VShardId,
+            vshard: VShardId,
             collection: String,
             ilp_payload: String,
             _provenance: nodedb_types::sync::wire::SyncProvenance,
         ) -> crate::Result<Vec<u8>> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((tenant_id, collection, ilp_payload));
+            self.calls.lock().unwrap().push((
+                tenant_id,
+                self.database_id,
+                vshard,
+                collection,
+                ilp_payload,
+            ));
             match &self.result {
                 Ok(b) => Ok(b.clone()),
                 Err(e) => Err(crate::Error::Internal {
@@ -319,6 +370,23 @@ mod tests {
 
     fn make_session() -> SyncSession {
         SyncSession::new("test-session".to_string())
+    }
+
+    fn authenticate(session: &mut SyncSession) {
+        session.authenticated = true;
+        session.identity = Some(crate::control::security::identity::AuthenticatedIdentity {
+            user_id: 1,
+            username: "test".into(),
+            tenant_id: TenantId::new(1),
+            auth_method: crate::control::security::identity::AuthMethod::ApiKey,
+            roles: Vec::new(),
+            is_superuser: false,
+            default_database: None,
+            accessible_databases:
+                crate::control::security::identity::AuthenticatedIdentity::default_database_set(
+                    false,
+                ),
+        });
     }
 
     /// Build a minimal `TimeseriesPushMsg` with valid Gorilla-encoded blocks
@@ -374,9 +442,47 @@ mod tests {
     // ── Test: authenticated, successful dispatch → accepted ACK ─────────────
 
     #[tokio::test]
-    async fn test_authenticated_dispatches_and_acks() {
+    async fn authenticated_without_identity_rejects_without_dispatch() {
         let mut session = make_session();
         session.authenticated = true;
+        let (mock, calls) = MockDispatcher::ok();
+        let msg = make_push_msg("metrics");
+
+        let frame = session.handle_timeseries_push(&msg, &mock).await;
+
+        assert!(frame.is_some());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_default_database_is_propagated_to_dispatch() {
+        let mut session = make_session();
+        authenticate(&mut session);
+        let database_id = DatabaseId::new(8);
+        let identity = session.identity.as_mut().expect("authenticated identity");
+        identity.default_database = Some(database_id);
+        identity.is_superuser = true;
+        identity.accessible_databases =
+            crate::control::security::identity::AuthenticatedIdentity::default_database_set(true);
+        let (mut mock, calls) = MockDispatcher::ok();
+        mock.database_id = database_id;
+        let msg = make_push_msg("metrics");
+
+        let _ = session.handle_timeseries_push(&msg, &mock).await;
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, database_id);
+        assert_eq!(
+            calls[0].2,
+            VShardId::from_collection_in_database(database_id, "metrics")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_dispatches_and_acks() {
+        let mut session = make_session();
+        authenticate(&mut session);
         let (mock, calls) = MockDispatcher::ok();
         let msg = make_push_msg("metrics");
 
@@ -389,10 +495,16 @@ mod tests {
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "dispatcher must be called exactly once");
-        assert_eq!(calls[0].1, "metrics");
+        assert_eq!(calls[0].0, TenantId::new(1));
+        assert_eq!(calls[0].1, DatabaseId::DEFAULT);
+        assert_eq!(
+            calls[0].2,
+            VShardId::from_collection_in_database(DatabaseId::DEFAULT, "metrics")
+        );
+        assert_eq!(calls[0].3, "metrics");
         // ILP payload must contain the collection name and lite_id.
-        assert!(calls[0].2.contains("metrics"));
-        assert!(calls[0].2.contains("lite-1"));
+        assert!(calls[0].4.contains("metrics"));
+        assert!(calls[0].4.contains("lite-1"));
     }
 
     // ── Test: dispatcher returns Err → rejection ACK, no panic ──────────────
@@ -400,7 +512,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_failure_returns_rejection_ack() {
         let mut session = make_session();
-        session.authenticated = true;
+        authenticate(&mut session);
         let mock = MockDispatcher::err();
         let msg = make_push_msg("metrics");
 

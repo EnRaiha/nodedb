@@ -21,6 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use nodedb::bridge::dispatch::Dispatcher;
+use nodedb::config::auth::AuthMode;
 use nodedb::control::server::ilp_listener::IlpListener;
 use nodedb::control::startup::{StartupPhase, StartupSequencer};
 use nodedb::control::state::SharedState;
@@ -88,6 +89,7 @@ async fn ilp_accept_blocked_until_gateway_enable() {
         let _ = ilp_listener
             .run(
                 shared_ilp,
+                AuthMode::Trust,
                 Arc::new(tokio::sync::Semaphore::new(128)),
                 None,
                 gate_for_listener,
