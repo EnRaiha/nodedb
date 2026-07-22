@@ -49,6 +49,20 @@ pub enum SqlError {
         declared: usize,
     },
 
+    /// A positional `INSERT`/`UPSERT` into a Key-Value collection supplied
+    /// no explicit column list. The KV path splits key/value by matching
+    /// column *names* against `pk_col`/`"key"`/`"ttl"`, so without a column
+    /// list there is no principled key/value split — binding positionally
+    /// would silently write an empty-keyed, empty-valued row (all such rows
+    /// collide). Rejected rather than guessed at, mirroring
+    /// [`InsertColumnArityMismatch`].
+    #[error(
+        "INSERT/UPSERT into KV collection '{collection}': supply an explicit \
+         column list (KV needs named key/value columns; a positional VALUES \
+         row has no key to bind to)"
+    )]
+    PositionalKvInsertUnsupported { collection: String },
+
     /// A descriptor the planner depends on is being drained by
     /// an in-flight DDL. Callers (pgwire handlers) should retry
     /// the whole statement after a short backoff. Propagated

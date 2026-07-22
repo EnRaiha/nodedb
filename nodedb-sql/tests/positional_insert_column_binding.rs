@@ -203,29 +203,18 @@ fn positional_upsert_binds_declared_column_names() {
     );
 }
 
-/// KV collections separate key/value by name match against `pk_col`/
-/// `"key"`/`"ttl"`, not by declared column order — this fix intentionally
-/// leaves that path untouched (see judgment call in the PR description).
-///
-/// Pre-existing (out-of-scope) behaviour pinned here: `build_kv_insert_plan`
-/// walks `columns.iter().enumerate()` to build the value map, so an empty
-/// (positional) column list yields an EMPTY value map and an empty-string
-/// key — it never falls back to `col{i}` the way `convert_value_rows` does,
-/// because it isn't built from that helper. That is a real gap for
-/// positional KV inserts, but a separate, wider problem than #202
-/// (there is no principled key/value split to fall back to without a
-/// column list at all); this test only pins that this fix does not change
-/// that existing behaviour.
+/// KV collections split key/value by matching column *names* against
+/// `pk_col`/`"key"`/`"ttl"`, not by declared column order. A positional
+/// insert supplies no column list, so there is no key to bind to —
+/// `build_kv_insert_plan` would otherwise emit an empty-keyed, empty-valued
+/// entry (every such row colliding, all data silently dropped). It is
+/// rejected outright, mirroring the arity-overflow decision.
 #[test]
-fn positional_insert_on_kv_collection_is_unaffected() {
-    let plan = plan_one("INSERT INTO kv_probe VALUES ('k1', 'v1')");
-    match plan {
-        SqlPlan::KvInsert { entries, .. } => {
-            assert_eq!(entries.len(), 1);
-            let (key, value_cols) = &entries[0];
-            assert_eq!(*key, SqlValue::String(String::new()));
-            assert_eq!(value_cols, &Vec::<(String, SqlValue)>::new());
-        }
-        other => panic!("expected a KvInsert plan, got {other:?}"),
-    }
+fn positional_insert_on_kv_collection_is_rejected() {
+    let err = plan_sql("INSERT INTO kv_probe VALUES ('k1', 'v1')", &Catalog)
+        .expect_err("positional KV insert has no key/value column names to bind to");
+    assert!(
+        matches!(err, SqlError::PositionalKvInsertUnsupported { .. }),
+        "expected PositionalKvInsertUnsupported, got {err:?}"
+    );
 }

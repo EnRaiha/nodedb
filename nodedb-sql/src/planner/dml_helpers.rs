@@ -278,6 +278,16 @@ pub(super) fn build_kv_insert_plan(
     on_conflict_updates: Vec<(String, SqlExpr)>,
     pk_col: Option<&str>,
 ) -> Result<Vec<SqlPlan>> {
+    // Positional KV insert (no column list): the key/value split below is
+    // driven entirely by matching column *names* against `key_col_name`/
+    // `"ttl"`. With an empty `columns` list there is no key to bind to, so
+    // every row would silently become an empty-keyed, empty-valued entry
+    // (all colliding). Reject rather than corrupt.
+    if columns.is_empty() {
+        return Err(SqlError::PositionalKvInsertUnsupported {
+            collection: table_name,
+        });
+    }
     let key_col_name = pk_col.unwrap_or("key");
     let key_idx = columns.iter().position(|c| c == key_col_name);
     let ttl_idx = columns.iter().position(|c| c == "ttl");
