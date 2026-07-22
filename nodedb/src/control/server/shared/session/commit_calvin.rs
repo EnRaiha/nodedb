@@ -2,11 +2,11 @@
 
 //! Calvin multi-shard arm of the neutral COMMIT orchestrator.
 //!
-//! Routes a transaction whose buffered writes span two or more vShards through
-//! the Calvin sequencer. Strict mode routes the whole buffered batch to the
-//! sequencer-group leader via `dispatch_tasks_to_calvin` — one atomic
-//! cross-shard transaction bound by the durable Vote/Verdict barrier.
-//! Best-effort mode groups the buffered writes by vShard and submits each group
+//! Routes a transaction's buffered writes through the Calvin sequencer. Strict
+//! mode routes the whole buffered batch to the sequencer-group leader through
+//! the universal strict atomic task-set entry point — one transaction bound by
+//! the durable Vote/Verdict barrier. Best-effort mode groups writes by vShard
+//! and submits each group
 //! as an INDEPENDENT single-vShard Calvin transaction (via
 //! `build_single_vshard_tx_class` then `submit_calvin_routed`) — the SAME
 //! deterministic sequencer funnel, so each vShard gets an epoch-anchored
@@ -17,8 +17,8 @@
 use std::net::SocketAddr;
 
 use crate::control::planner::calvin::{
-    CrossShardTxnMode, DispatchClass, TxnDispatchPosition, build_single_vshard_tx_class,
-    classify_dispatch, dispatch_tasks_to_calvin, read_vshards_of, submit_calvin_routed,
+    CrossShardTxnMode, TxnDispatchPosition, build_single_vshard_tx_class,
+    dispatch_strict_atomic_tasks_to_calvin, submit_calvin_routed,
 };
 use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::state::SharedState;
@@ -48,39 +48,17 @@ pub(super) async fn run_commit_calvin(
 
     match cross_shard_mode {
         CrossShardTxnMode::Strict => {
-            // The sequencer inbox must be wired for the strict cross-shard path;
-            // surface a deployment-neutral `SequencerUnavailable` if it is not.
-            if state.sequencer_inbox.get().is_none() {
-                return Some(AbortReason::Dispatch(crate::Error::SequencerUnavailable));
-            }
-            // A remote single-vShard commit uses the opt-in single-participant
-            // builder; `dispatch_tasks_to_calvin` intentionally rejects that
-            // shape because its ordinary entry point is multi-shard-only.
-            let result = match classify_dispatch(buffered, &read_vshards_of(reads)) {
-                DispatchClass::SingleShard { .. } => {
-                    let mut tx_class =
-                        match build_single_vshard_tx_class(buffered, tenant_id, reads) {
-                            Ok(tx_class) => tx_class,
-                            Err(e) => return Some(AbortReason::Dispatch(e)),
-                        };
-                    tx_class.set_lock_owner(reservation_owner);
-                    submit_calvin_routed(state, tx_class).await
-                }
-                DispatchClass::MultiShard { .. } => {
-                    // Route the buffered cross-shard batch through the
-                    // sequencer-group leader via one atomic submit-and-await.
-                    dispatch_tasks_to_calvin(
-                        state,
-                        buffered,
-                        tenant_id,
-                        cross_shard_mode,
-                        TxnDispatchPosition::CommitFlush,
-                        reads,
-                        reservation_owner,
-                    )
-                    .await
-                }
-            };
+            // One universal strict admission path builds either a single- or
+            // multi-participant class and submits exactly once to the sequencer.
+            let result = dispatch_strict_atomic_tasks_to_calvin(
+                state,
+                buffered,
+                tenant_id,
+                TxnDispatchPosition::CommitFlush,
+                reads,
+                reservation_owner,
+            )
+            .await;
             match result {
                 Ok(_) => None,
                 Err(crate::Error::CalvinSerializationConflict) => {

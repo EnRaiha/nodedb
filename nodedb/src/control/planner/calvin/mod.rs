@@ -22,7 +22,7 @@ pub use dispatch::{
     classify_dispatch, dispatch_calvin_or_fast, is_dependent_predicate, is_write_plan,
     predicate_class, read_vshards_of,
 };
-pub use dispatch_multi::dispatch_tasks_to_calvin;
+pub use dispatch_multi::{dispatch_strict_atomic_tasks_to_calvin, dispatch_tasks_to_calvin};
 pub use explain::calvin_explain_preamble;
 pub use predicate::predicate_class_for_filters;
 pub use retry_loop::{DependentRetryArgs, run_dependent_with_retry};
