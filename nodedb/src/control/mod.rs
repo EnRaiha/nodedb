@@ -49,6 +49,7 @@ pub mod trace_context;
 pub mod trace_export;
 pub mod trigger;
 pub mod update_from_join_orchestrator;
+pub mod vshard_admission;
 pub mod wal_catchup;
 pub mod wal_replication;
 

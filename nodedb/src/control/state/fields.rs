@@ -19,6 +19,12 @@ use crate::control::server::sync::dlq::SyncDlq;
 use crate::control::state::calvin_counters::CalvinCounters;
 use crate::wal::WalManager;
 
+/// Atomically installed Raft proposal handles.
+pub(super) struct AsyncRaftProposerPair {
+    pub(super) sequenced: Arc<crate::control::wal_replication::AsyncRaftProposer>,
+    pub(super) raw: Arc<crate::control::wal_replication::AsyncRaftProposer>,
+}
+
 pub struct SharedState {
     pub dispatcher: Mutex<Dispatcher>,
     pub tracker: RequestTracker,
@@ -115,23 +121,16 @@ pub struct SharedState {
     pub metadata_ddl_token_seq: AtomicU64,
     /// Handle for proposing to the metadata raft group. Set by `start_raft`; None in single-node mode.
     pub metadata_raft: OnceLock<Arc<dyn crate::control::metadata_proposer::MetadataRaftHandle>>,
-    /// Propose tracker for distributed writes. Set by `start_raft`; absent in single-node mode.
+    /// Propose tracker for distributed writes; absent in single-node mode.
     pub propose_tracker: OnceLock<Arc<crate::control::wal_replication::ProposeTracker>>,
-    /// Raft propose function. Set by `start_raft`; absent in single-node mode.
+    /// Raft proposer; absent in single-node mode.
     pub raft_proposer: OnceLock<Arc<crate::control::wal_replication::RaftProposer>>,
-    /// Async Raft propose with transparent leader forwarding (for array sync inbound handlers).
-    pub async_raft_proposer: OnceLock<Arc<crate::control::wal_replication::AsyncRaftProposer>>,
-    /// Raft log-compaction trigger. Set by `start_raft`; absent in single-node
-    /// mode. Invoked by `run_apply_loop` after a committed entry has been
-    /// durably applied to the Data Plane (gated on the applied watermark, not
-    /// raft's commit index). No-op when `log_compaction_threshold` is `None`.
+    /// Atomically installed sequenced and narrowly scoped raw proposal handles.
+    pub(super) async_raft_proposer_pair: OnceLock<AsyncRaftProposerPair>,
+    pub vshard_admission_sequencer: Arc<crate::control::vshard_admission::VShardAdmissionSequencer>,
+    /// Raft log compaction after durable Data-Plane apply; absent in single-node mode.
     pub raft_compactor: OnceLock<Arc<crate::control::wal_replication::RaftCompactor>>,
-    /// Durable Raft applied-index sink. Set by `start_raft`; absent in
-    /// single-node mode. Invoked by `run_apply_loop` after a committed entry's
-    /// redo record has been WAL-fsynced, so the next boot resumes Raft delivery
-    /// above it and no entry is applied by both WAL replay and Raft replay.
-    /// Deliberately NOT raft's in-memory `last_applied`, which advances at
-    /// enqueue time and is therefore ahead of durability.
+    /// Durable post-WAL apply index; never Raft's in-memory enqueue watermark.
     pub raft_applied_index_sink:
         OnceLock<Arc<crate::control::wal_replication::RaftAppliedIndexSink>>,
     /// Query Raft group statuses for observability (unset in single-node mode).

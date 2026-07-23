@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `From` impls wiring domain errors into `Error` and converting to the
-//! public `NodeDbError` boundary type.
+//! Internal and public error conversions.
 
 use nodedb_types::error::NodeDbError;
 
 use crate::types::TenantId;
 
 use super::Error;
-
-// ---------------------------------------------------------------------------
-// From impls for domain-specific errors → Error
-// ---------------------------------------------------------------------------
 
 impl From<nodedb_query::expr_parse::ExprParseError> for Error {
     fn from(e: nodedb_query::expr_parse::ExprParseError) -> Self {
@@ -81,26 +76,18 @@ impl From<crate::storage::quarantine::engines::FtsOrQuarantine> for Error {
 }
 
 impl From<nodedb_vector::error::VectorError> for Error {
-    /// A failure surfaced while loading or decoding a vector checkpoint. This
-    /// wires the vector engine's error into the crate's central `Error` so the
-    /// boot-time checkpoint loader can `?`-propagate it and fail-stop instead of
-    /// silently skipping a corrupt checkpoint (which would be silent data loss:
-    /// the WAL below the checkpoint's LSN is already truncated).
+    /// Checkpoint failures fail-stop because replay history may be truncated.
     fn from(e: nodedb_vector::error::VectorError) -> Self {
         use nodedb_vector::error::VectorError as Ve;
         let detail = e.to_string();
         match e {
-            // Memory-budget exhaustion is a resource fault, not corruption.
             Ve::BudgetExhausted(_) => Self::MemoryExhausted {
                 engine: "vector".to_string(),
             },
-            // A filesystem I/O fault reading segment/checkpoint bytes.
             Ve::SegmentIo(_) => Self::Storage {
                 engine: "vector".to_string(),
                 detail,
             },
-            // Every checkpoint decode / version / magic / dimension fault is a
-            // corrupt or unreadable checkpoint — the boot loader must fail-stop.
             Ve::DimensionMismatch { .. }
             | Ve::UnsupportedVersion { .. }
             | Ve::InvalidMagic
@@ -110,24 +97,14 @@ impl From<nodedb_vector::error::VectorError> for Error {
             | Ve::CheckpointEncryptionError { .. }
             | Ve::CheckpointSerializationError { .. }
             | Ve::CheckpointDeserializationError { .. } => Self::SegmentCorrupted { detail },
-            // `VectorError` is `#[non_exhaustive]`: any future variant defaults
-            // to the safe fail-stop classification rather than being swallowed.
+            // Unknown vector errors fail-stop.
             _ => Self::SegmentCorrupted { detail },
         }
     }
 }
 
 impl From<nodedb_spatial::RTreeCheckpointError> for Error {
-    /// Every variant of `RTreeCheckpointError` names a reason a spatial
-    /// checkpoint's bytes could not be turned back into an R-tree — bad
-    /// framing, a version skew, missing/unwanted encryption, a failed
-    /// decrypt, or a failed msgpack/rkyv decode. There is no variant here
-    /// that means anything other than "this checkpoint cannot be loaded", so
-    /// every one maps to `SegmentCorrupted`: this wires the spatial engine's
-    /// error into the crate's central `Error` so the boot-time checkpoint
-    /// loader can `?`-propagate it and fail-stop instead of silently skipping
-    /// a corrupt checkpoint (which would be silent data loss: the WAL below
-    /// the checkpoint's LSN is already truncated).
+    /// Spatial checkpoint failures fail-stop as segment corruption.
     fn from(e: nodedb_spatial::RTreeCheckpointError) -> Self {
         Self::SegmentCorrupted {
             detail: e.to_string(),
@@ -135,14 +112,9 @@ impl From<nodedb_spatial::RTreeCheckpointError> for Error {
     }
 }
 
-// ---------------------------------------------------------------------------
-// From<Error> for NodeDbError — the public API boundary conversion
-// ---------------------------------------------------------------------------
-
 impl From<Error> for NodeDbError {
     fn from(e: Error) -> Self {
         match e {
-            // Write path
             Error::RejectedConstraint {
                 collection, detail, ..
             } => NodeDbError::constraint_violation(collection, detail),
@@ -204,7 +176,6 @@ impl From<Error> for NodeDbError {
             } => NodeDbError::insufficient_balance(collection, format!("key {key}: {detail}")),
             Error::RateExceeded { gate, detail, .. } => NodeDbError::rate_exceeded(gate, detail),
 
-            // Read path
             Error::CollectionNotFound { collection, .. } => {
                 NodeDbError::collection_not_found(collection)
             }
@@ -218,7 +189,13 @@ impl From<Error> for NodeDbError {
                 ..
             } => NodeDbError::collection_deactivated(collection, retention_expires_at_ns),
 
-            // Routing / Cluster
+            Error::VShardAdmissionCapacityExceeded {
+                vshard_id,
+                capacity,
+            } => NodeDbError::rate_exceeded(
+                "vshard_admission",
+                format!("vshard {vshard_id} admission queue is full (capacity {capacity})"),
+            ),
             Error::NoLeader { vshard_id } => {
                 NodeDbError::no_leader(format!("vshard {vshard_id} has no serving leader"))
             }
@@ -231,7 +208,6 @@ impl From<Error> for NodeDbError {
                 NodeDbError::bad_request(err.to_string())
             }
 
-            // Client input
             Error::BadRequest { detail } => NodeDbError::bad_request(detail),
             Error::QuotaOvercommit { field, detail } => {
                 NodeDbError::quota_overcommit(field, detail)
@@ -255,7 +231,6 @@ impl From<Error> for NodeDbError {
                 NodeDbError::bad_request(format!("{limit_name} = {value} exceeds server cap {max}"))
             }
 
-            // Infrastructure — flatten to opaque public variants
             Error::Wal(wal_err) => NodeDbError::wal(wal_err),
             Error::Dispatch { detail } => NodeDbError::dispatch(detail),
             Error::Storage { detail, .. } => NodeDbError::storage(detail),
@@ -357,9 +332,7 @@ impl From<Error> for NodeDbError {
             Error::OidcNoDefaultDatabase { sub } => NodeDbError::bad_request(format!(
                 "OIDC: no default database resolved for sub '{sub}'"
             )),
-            // A Data-Plane error code that propagated to the public boundary.
-            // Faithfully surface the typed code's meaning; fall back to internal
-            // for codes without a dedicated public constructor.
+            // Preserve typed Data-Plane failures; unknown codes stay internal.
             Error::DataPlane(code) => {
                 use crate::bridge::envelope::ErrorCode as Ec;
                 match code {
@@ -376,16 +349,7 @@ impl From<Error> for NodeDbError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// TypedClusterError ↔ Error conversions
-// ---------------------------------------------------------------------------
-
-/// Convert a wire-level typed cluster error into the internal `Error` type.
-///
-/// Used by the C-β gateway layer (C-γ) to translate remote executor errors
-/// into actionable local errors. The `NotLeader` variant preserves the
-/// machine-readable group/term fields so the gateway retry loop can update
-/// its routing table.
+/// Preserve wire-level cluster classifications for local retry handling.
 impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
     fn from(e: nodedb_cluster::rpc_codec::TypedClusterError) -> Self {
         use nodedb_cluster::rpc_codec::TypedClusterError;
@@ -396,8 +360,7 @@ impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
                 leader_addr,
                 ..
             } => Error::NotLeader {
-                // Clamp group_id to valid vShard range — group IDs may exceed 1024
-                // for cluster-managed Raft groups; best-effort for display purposes.
+                // Clamp cluster-managed group IDs for vShard display.
                 vshard_id: crate::types::VShardId::new(
                     (group_id as u32).min(crate::types::VShardId::COUNT - 1),
                 ),
@@ -413,10 +376,7 @@ impl From<nodedb_cluster::rpc_codec::TypedClusterError> for Error {
                 request_id: crate::types::RequestId::new(0),
             },
             TypedClusterError::Internal { code, message } => {
-                // `code == 0` covers legacy peers that never populated the field, and
-                // an out-of-range value covers a future wire code this build doesn't
-                // know about yet — both degrade to the pre-existing generic behaviour
-                // rather than losing the message or panicking on a bad cast.
+                // Legacy or unknown codes retain their message without panicking.
                 match u16::try_from(code) {
                     Ok(code_u16) if code_u16 != 0 => Error::RemoteTyped {
                         code: nodedb_types::error::ErrorCode(code_u16),
@@ -458,10 +418,7 @@ impl From<Error> for nodedb_cluster::rpc_codec::TypedClusterError {
                 message,
             },
             other => {
-                // Derive a real numeric code instead of hardcoding 0, so a
-                // multi-hop forward (this node re-encoding a local error for a
-                // further remote call) still lets the eventual client recover
-                // the classification instead of seeing a bare internal error.
+                // Preserve classification across multi-hop forwarding.
                 let message = other.to_string();
                 let code = u32::from(NodeDbError::from(other).code().0);
                 TypedClusterError::Internal { code, message }

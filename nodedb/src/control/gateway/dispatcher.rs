@@ -223,7 +223,7 @@ async fn dispatch_local(
     // (`txn_id.is_some()`) also fall through: they stay deferred to COMMIT's
     // batch funnel, which appends their durable version there.
     if txn_id.is_none()
-        && let Some(proposer) = shared.async_raft_proposer.get()
+        && let Some(proposer) = shared.async_raft_proposer()
         && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
             tenant_id,
             database_id,

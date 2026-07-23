@@ -38,7 +38,7 @@ impl OriginArrayInbound {
 
         // Use the async proposer (with transparent leader forwarding + apply
         // wait) when available. It returns the apply payload directly.
-        if let Some(async_proposer) = self.shared().async_raft_proposer.get().map(|a| a.as_ref()) {
+        if let Some(async_proposer) = self.shared().async_raft_proposer().map(|a| a.as_ref()) {
             return match async_proposer(vshard_id, idempotency_key, data).await {
                 Ok((_payload, _committed_version)) => Ok(()),
                 Err(e) => {

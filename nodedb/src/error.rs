@@ -2,14 +2,7 @@
 
 use crate::types::{DatabaseId, RequestId, TenantId, VShardId};
 
-/// Internal error classes for NodeDB Origin.
-///
-/// Every error is actionable — clients can programmatically handle each variant.
-/// Cross-plane errors surface deterministic codes, never opaque strings.
-///
-/// At the public API boundary, `Error` converts to [`nodedb_types::error::NodeDbError`] via `From`,
-/// so external consumers never see infrastructure details like `WalError` or
-/// `CrdtError`.
+/// Internal actionable errors; public conversion hides infrastructure details.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     // --- Write path errors ---
@@ -50,11 +43,7 @@ pub enum Error {
         document_id: String,
     },
 
-    /// A cross-shard Calvin transaction's global OCC verdict was ABORT: a
-    /// participant's read-set validation failed at the cross-shard commit
-    /// barrier, so the writes were dropped. A serialization failure — the
-    /// client should retry the whole transaction. Maps to SQLSTATE `40001`
-    /// (serialization_failure) on both the pgwire and native transports.
+    /// Cross-shard OCC abort; clients retry as SQLSTATE `40001`.
     #[error(
         "cross-shard transaction aborted: serialization conflict (read-set validation failed); retry"
     )]
@@ -135,6 +124,12 @@ pub enum Error {
     },
 
     // --- Routing errors ---
+    #[error("vshard admission queue for {vshard_id} is full (capacity {capacity})")]
+    VShardAdmissionCapacityExceeded {
+        vshard_id: VShardId,
+        capacity: usize,
+    },
+
     #[error("vshard {vshard_id} has no serving leader")]
     NoLeader { vshard_id: VShardId },
 
@@ -148,16 +143,7 @@ pub enum Error {
     #[error("query fan-out exceeded: {shards_touched} shards > limit {limit}")]
     FanOutExceeded { shards_touched: u16, limit: u16 },
 
-    /// A cross-collection write op (`MERGE`, `UPDATE ... FROM`, KV
-    /// `TransferItem`) reads a SOURCE collection and writes a TARGET collection
-    /// in a single Data-Plane handler that reads the source from the target
-    /// core's LOCAL store. Each collection name hashes to its own vShard
-    /// independently, so on a multi-core node source and target can land on
-    /// DIFFERENT cores; the source read would then hit an empty store and
-    /// return a silently wrong (empty) result. Until cross-core source-shipping
-    /// lands, the op is refused rather than run. On a single-core node every
-    /// vShard maps to core 0, so this never fires (the op is genuinely
-    /// co-resident).
+    /// Refuses non-colocated cross-collection writes to prevent wrong reads.
     #[error(
         "cross-collection {op} requires source '{source_collection}' and target \
          '{target_collection}' on the same core; they map to different cores \
@@ -170,10 +156,7 @@ pub enum Error {
         target_collection: String,
     },
 
-    /// Database is temporarily frozen because a clone materializer is reading
-    /// from it as the source.  The write must be retried after the materializer
-    /// sweep completes.  Maps to SQLSTATE `40001` (serialization_failure) so
-    /// clients that already handle write conflicts will retry automatically.
+    /// Clone materialization freeze; mapped to retryable SQLSTATE `40001`.
     #[error("database {database_id} is frozen for clone materialization; retry shortly")]
     SourceFrozen { database_id: DatabaseId },
 
@@ -181,33 +164,17 @@ pub enum Error {
     #[error("bad request: {detail}")]
     BadRequest { detail: String },
 
-    /// The proposed quota allocation would push the sum past the configured
-    /// ceiling. The `field` names the over-budget dimension.
     #[error("quota overcommit on field '{field}': {detail}")]
     QuotaOvercommit { field: String, detail: String },
 
     #[error("query plan error: {detail}")]
     PlanError { detail: String },
 
-    /// The planner tried to acquire a descriptor lease at a version
-    /// being drained by an in-flight DDL. The pgwire layer catches
-    /// this variant and retries the whole statement up to
-    /// `PLAN_RETRY_BUDGET` times with backoff. If every retry
-    /// fails, the error surfaces to the client.
+    /// Descriptor lease conflict; pgwire retries within `PLAN_RETRY_BUDGET`.
     #[error("retryable schema change on {descriptor}")]
     RetryableSchemaChanged { descriptor: String },
 
-    /// The Raft entry the proposer was waiting on at `(group_id, log_index)`
-    /// was overwritten by a leader-election no-op (the previous leader
-    /// stepped down before the user entry committed; the new leader
-    /// committed an empty entry at the same index, truncating the
-    /// uncommitted data).
-    ///
-    /// **Critical**: this is the silent-data-loss bug killer — without
-    /// surfacing this case, `tracker.complete(Ok([]))` on the no-op
-    /// would tell the proposer their INSERT succeeded when in fact
-    /// the row was never replicated. Callers (gateway, async raft
-    /// proposer) MUST treat this as retryable and re-propose.
+    /// Leader-change overwrite; callers must re-propose to avoid false success.
     #[error(
         "raft entry at group {group_id} index {log_index} was overwritten by leader change; retry needed"
     )]
@@ -248,9 +215,7 @@ pub enum Error {
     #[error("memory budget exhausted for engine {engine}")]
     MemoryExhausted { engine: String },
 
-    /// Memory pressure at Emergency level — the named engine is over 95% budget.
-    /// The write is rejected; the caller must retry when pressure subsides.
-    /// Maps to SQLSTATE 53200 (out_of_memory / insufficient_resources).
+    /// Emergency memory pressure; reject and retry as SQLSTATE `53200`.
     #[error("backpressure: engine {engine} is at Emergency pressure; retry later")]
     Backpressure { engine: nodedb_mem::EngineId },
 
@@ -275,10 +240,7 @@ pub enum Error {
     #[error("internal error: {detail}")]
     Internal { detail: String },
 
-    /// A typed error surfaced from a remote node during cluster RPC. Preserves the
-    /// transmitted numeric `ErrorCode` alongside the message so the client-facing
-    /// mapping can recover the precise classification instead of collapsing every
-    /// remote failure to a generic internal error.
+    /// Remote typed error preserves its transmitted classification.
     #[error("remote error [{code}]: {message}")]
     RemoteTyped {
         code: nodedb_types::error::ErrorCode,
@@ -295,21 +257,14 @@ pub enum Error {
         prior: u64,
     },
 
-    /// A deterministic typed error code returned by the Data Plane across the
-    /// SPSC bridge. Preserves the [`crate::bridge::envelope::ErrorCode`] instead
-    /// of flattening it to an opaque string, so Control-Plane callers (e.g. the
-    /// CRDT sync delta path) can classify the failure by type rather than by
-    /// substring-matching a human message. Upholds the crate contract that
-    /// cross-plane errors surface deterministic codes, never opaque strings.
+    /// Typed Data-Plane error preserves deterministic cross-plane classification.
     #[error("data plane error: {0:?}")]
     DataPlane(crate::bridge::envelope::ErrorCode),
 
     #[error("promql error: {0}")]
     Promql(#[from] crate::control::promql::PromqlError),
 
-    /// DROP / PURGE refused because other catalog objects still
-    /// reference the target. Operator must either drop them first or
-    /// retry with `CASCADE`. `dependents` lists `(kind, name)` pairs.
+    /// DROP/PURGE has catalog dependents; `CASCADE` is required.
     #[error(
         "cannot drop {root_kind} '{root_name}' for tenant {tenant_id}: \
          {dependent_count} dependent object(s) exist; use CASCADE to drop them atomically"
@@ -322,9 +277,7 @@ pub enum Error {
         dependents: Vec<(String, String)>,
     },
 
-    /// MV-graph cycle detected (or graph exceeded `MAX_DEPTH`) during
-    /// cascade enumeration. Treated as a blocker rather than silently
-    /// truncating.
+    /// Cascade graph cycle or depth cap blocks mutation.
     #[error(
         "cascade cycle or depth limit ({depth}) exceeded while enumerating \
          dependents of '{root}' for tenant {tenant_id}"
@@ -335,12 +288,7 @@ pub enum Error {
         depth: usize,
     },
 
-    /// A cross-shard write was attempted inside an explicit transaction block.
-    ///
-    /// Calvin cross-shard atomicity requires auto-commit (single-statement).
-    /// Options:
-    ///   1. Remove BEGIN/COMMIT to use auto-commit.
-    ///   2. SET cross_shard_txn = 'best_effort_non_atomic' for non-atomic dispatch.
+    /// Cross-shard Calvin writes require auto-commit.
     #[error(
         "cross-shard write inside explicit transaction block is not supported. \
          Calvin cross-shard atomicity requires auto-commit (single-statement). \
@@ -357,7 +305,7 @@ pub enum Error {
     )]
     SequencerUnavailable,
 
-    /// New login rejected because the active-session registry is at capacity.
+    /// Active-session capacity reached.
     #[error("session cap ({cap}) exceeded — rejecting new login")]
     SessionCapExceeded { cap: usize },
 
@@ -381,8 +329,7 @@ pub enum Error {
     #[error("OIDC token rejected: authenticated provider has no tenant binding")]
     OidcProviderTenantUnbound,
 
-    /// OIDC bearer token rejected because its authenticated provider references
-    /// a tenant that was deleted or cannot be read from the catalog.
+    /// OIDC provider tenant is absent or unreadable.
     #[error("OIDC token rejected: authenticated provider tenant is unavailable")]
     OidcProviderTenantUnavailable { tenant_id: u64 },
 
@@ -424,10 +371,7 @@ pub enum Error {
     )]
     OllpExhausted { retries: u8 },
 
-    /// A write was attempted on a mirror database that has not yet been promoted.
-    ///
-    /// Mirrors are read-only replicas of a source database. All writes are rejected
-    /// until the mirror is promoted via `ALTER DATABASE <name> PROMOTE`.
+    /// Unpromoted mirrors are read-only.
     #[error("database '{database}' is a read-only mirror; promote it before writing")]
     MirrorReadOnly { database: String },
 

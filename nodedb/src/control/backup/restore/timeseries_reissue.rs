@@ -314,7 +314,7 @@ pub async fn reissue_timeseries_durably(
 ) -> crate::Result<()> {
     let vshard = VShardId::from_collection_in_database(database_id, collection);
 
-    if let Some(proposer) = state.async_raft_proposer.get() {
+    if let Some(proposer) = state.async_raft_proposer() {
         let entry = crate::control::wal_replication::to_replicated_entry(
             tenant_id,
             database_id,
