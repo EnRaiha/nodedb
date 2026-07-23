@@ -22,6 +22,14 @@ pub enum CodecError {
     #[error("compression failed: {detail}")]
     CompressFailed { detail: String },
 
+    /// A decoded resource declaration exceeds the application's hard limit.
+    #[error("resource limit exceeded for {resource}: requested {requested} bytes, limit {limit}")]
+    ResourceLimit {
+        resource: String,
+        requested: usize,
+        limit: usize,
+    },
+
     /// The codec stored in metadata doesn't match the expected codec.
     #[error("codec mismatch: expected {expected}, found {found}")]
     CodecMismatch { expected: String, found: String },

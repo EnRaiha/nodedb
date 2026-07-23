@@ -31,7 +31,7 @@ pub fn encode_i64_pipeline(values: &[i64], codec: ColumnCodec) -> Result<Vec<u8>
         ColumnCodec::FastLanesLz4 => encode_fastlanes_lz4_i64(values),
         ColumnCodec::PcodecLz4 => {
             let pco_bytes = crate::pcodec::encode_i64(values)?;
-            Ok(crate::lz4::encode(&pco_bytes))
+            crate::lz4::encode(&pco_bytes)
         }
         // Cascading chains — rANS terminal (cold tier).
         ColumnCodec::DeltaFastLanesRans => encode_delta_fastlanes_rans(values),
@@ -45,7 +45,7 @@ pub fn encode_i64_pipeline(values: &[i64], codec: ColumnCodec) -> Result<Vec<u8>
         }
         ColumnCodec::Lz4 => {
             let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            Ok(crate::lz4::encode(&raw))
+            crate::lz4::encode(&raw)
         }
         ColumnCodec::Zstd => {
             let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -62,11 +62,11 @@ pub fn encode_f64_pipeline(values: &[f64], codec: ColumnCodec) -> Result<Vec<u8>
         ColumnCodec::AlpFastLanesLz4 => encode_alp_fastlanes_lz4(values),
         ColumnCodec::AlpRdLz4 => {
             let alp_rd_bytes = crate::alp_rd::encode(values)?;
-            Ok(crate::lz4::encode(&alp_rd_bytes))
+            crate::lz4::encode(&alp_rd_bytes)
         }
         ColumnCodec::PcodecLz4 => {
             let pco_bytes = crate::pcodec::encode_f64(values)?;
-            Ok(crate::lz4::encode(&pco_bytes))
+            crate::lz4::encode(&pco_bytes)
         }
         // Cascading chains — rANS terminal (cold tier).
         ColumnCodec::AlpFastLanesRans => encode_alp_fastlanes_rans(values),
@@ -78,7 +78,7 @@ pub fn encode_f64_pipeline(values: &[f64], codec: ColumnCodec) -> Result<Vec<u8>
         }
         ColumnCodec::Lz4 => {
             let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            Ok(crate::lz4::encode(&raw))
+            crate::lz4::encode(&raw)
         }
         ColumnCodec::Zstd => {
             let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -94,14 +94,14 @@ pub fn encode_bytes_pipeline(raw: &[u8], codec: ColumnCodec) -> Result<Vec<u8>, 
         ColumnCodec::FsstLz4 => {
             // FSST expects an array of strings. Treat raw as a single blob.
             let fsst_bytes = crate::fsst::encode(&[raw]);
-            Ok(crate::lz4::encode(&fsst_bytes))
+            crate::lz4::encode(&fsst_bytes)
         }
         ColumnCodec::FsstRans => {
             let fsst_bytes = crate::fsst::encode(&[raw]);
-            Ok(crate::rans::encode(&fsst_bytes))
+            crate::rans::encode(&fsst_bytes)
         }
         ColumnCodec::Raw => Ok(crate::raw::encode(raw)),
-        ColumnCodec::Lz4 => Ok(crate::lz4::encode(raw)),
+        ColumnCodec::Lz4 => crate::lz4::encode(raw),
         ColumnCodec::Zstd => crate::zstd_codec::encode(raw),
         ColumnCodec::FastLanesLz4 => {
             // Symbol IDs are u32 — convert to i64, FastLanes pack, lz4.
@@ -228,7 +228,7 @@ fn encode_alp_fastlanes_lz4(values: &[f64]) -> Result<Vec<u8>, CodecError> {
     // Stage 1: ALP encodes f64 → FastLanes-packed i64 bytes.
     let alp_encoded = crate::alp::encode(values);
     // Stage 2: LZ4 terminal compression on the ALP output.
-    Ok(crate::lz4::encode(&alp_encoded))
+    crate::lz4::encode(&alp_encoded)
 }
 
 fn decode_alp_fastlanes_lz4(data: &[u8]) -> Result<Vec<f64>, CodecError> {
@@ -240,7 +240,7 @@ fn decode_alp_fastlanes_lz4(data: &[u8]) -> Result<Vec<f64>, CodecError> {
 /// Delta → FastLanes → LZ4: i64 timestamps and counters.
 fn encode_delta_fastlanes_lz4(values: &[i64]) -> Result<Vec<u8>, CodecError> {
     if values.is_empty() {
-        return Ok(crate::lz4::encode(&crate::fastlanes::encode(&[])));
+        return crate::lz4::encode(&crate::fastlanes::encode(&[]));
     }
 
     // Stage 1a: Compute deltas.
@@ -254,7 +254,7 @@ fn encode_delta_fastlanes_lz4(values: &[i64]) -> Result<Vec<u8>, CodecError> {
     let packed = crate::fastlanes::encode(&deltas);
 
     // Stage 2: LZ4 terminal.
-    Ok(crate::lz4::encode(&packed))
+    crate::lz4::encode(&packed)
 }
 
 fn decode_delta_fastlanes_lz4(data: &[u8]) -> Result<Vec<i64>, CodecError> {
@@ -280,7 +280,7 @@ fn decode_delta_fastlanes_lz4(data: &[u8]) -> Result<Vec<i64>, CodecError> {
 /// FastLanes → LZ4: raw integers (symbol IDs, non-delta columns).
 fn encode_fastlanes_lz4_i64(values: &[i64]) -> Result<Vec<u8>, CodecError> {
     let packed = crate::fastlanes::encode(values);
-    Ok(crate::lz4::encode(&packed))
+    crate::lz4::encode(&packed)
 }
 
 fn decode_fastlanes_lz4_i64(data: &[u8]) -> Result<Vec<i64>, CodecError> {
@@ -291,7 +291,7 @@ fn decode_fastlanes_lz4_i64(data: &[u8]) -> Result<Vec<i64>, CodecError> {
 /// ALP → FastLanes → rANS: f64 metrics cold tier.
 fn encode_alp_fastlanes_rans(values: &[f64]) -> Result<Vec<u8>, CodecError> {
     let alp_encoded = crate::alp::encode(values);
-    Ok(crate::rans::encode(&alp_encoded))
+    crate::rans::encode(&alp_encoded)
 }
 
 fn decode_alp_fastlanes_rans(data: &[u8]) -> Result<Vec<f64>, CodecError> {
@@ -302,7 +302,7 @@ fn decode_alp_fastlanes_rans(data: &[u8]) -> Result<Vec<f64>, CodecError> {
 /// Delta → FastLanes → rANS: i64 cold tier.
 fn encode_delta_fastlanes_rans(values: &[i64]) -> Result<Vec<u8>, CodecError> {
     if values.is_empty() {
-        return Ok(crate::rans::encode(&crate::fastlanes::encode(&[])));
+        return crate::rans::encode(&crate::fastlanes::encode(&[]));
     }
 
     let mut deltas = Vec::with_capacity(values.len());
@@ -312,7 +312,7 @@ fn encode_delta_fastlanes_rans(values: &[i64]) -> Result<Vec<u8>, CodecError> {
     }
 
     let packed = crate::fastlanes::encode(&deltas);
-    Ok(crate::rans::encode(&packed))
+    crate::rans::encode(&packed)
 }
 
 fn decode_delta_fastlanes_rans(data: &[u8]) -> Result<Vec<i64>, CodecError> {

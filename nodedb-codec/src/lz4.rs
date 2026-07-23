@@ -1,403 +1,432 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! LZ4 block compression codec for string/log columns.
+//! Bounded LZ4 block compression for byte columns.
 //!
-//! Uses `lz4_flex` (pure Rust, WASM-compatible) for fast decompression
-//! with reasonable compression ratios (3-5x for typical log text).
-//!
-//! Data is split into 4KB blocks for random access: to read row N,
-//! decompress only the block containing that row, not the entire column.
-//!
-//! Wire format:
-//! ```text
-//! [4 bytes] total uncompressed size (LE u32)
-//! [4 bytes] block size (LE u32, default 4096)
-//! [4 bytes] block count (LE u32)
-//! [block_count × 4 bytes] compressed block lengths (LE u32 each)
-//! [block_count × N bytes] compressed blocks (concatenated)
-//! ```
-//!
-//! The block length table allows seeking to any block without
-//! decompressing preceding blocks.
+//! Frames contain a declared total, block size, block count, a length table,
+//! and independently compressed blocks. Decoding validates all framing before
+//! allocation and each LZ4 block before extending the result.
 
+use crate::bounds::{
+    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, encode_u32_len,
+    u32_to_usize,
+};
 use crate::error::CodecError;
 
 /// Default block size for LZ4 compression (4 KiB).
 const DEFAULT_BLOCK_SIZE: usize = 4096;
-
-// ---------------------------------------------------------------------------
-// Public encode / decode API
-// ---------------------------------------------------------------------------
+const HEADER_SIZE: usize = 12;
+const MIN_BLOCK_SIZE: usize = 64;
 
 /// Compress raw bytes using LZ4 block compression.
-///
-/// Splits input into `block_size` blocks, compresses each independently.
-pub fn encode(data: &[u8]) -> Vec<u8> {
+pub fn encode(data: &[u8]) -> Result<Vec<u8>, CodecError> {
     encode_with_block_size(data, DEFAULT_BLOCK_SIZE)
 }
 
 /// Compress with a custom block size (useful for testing or tuning).
-pub fn encode_with_block_size(data: &[u8], block_size: usize) -> Vec<u8> {
-    let block_size = block_size.max(64); // minimum 64 bytes
+///
+/// Inputs and framing fields are rejected with typed errors when they exceed
+/// the application or wire-format limits.
+pub fn encode_with_block_size(data: &[u8], block_size: usize) -> Result<Vec<u8>, CodecError> {
+    let total_len = encode_input_len(data.len(), "LZ4")?;
+    let block_size = block_size.max(MIN_BLOCK_SIZE);
+    decoded_len(block_size, "LZ4 block")?;
+    let block_size_u32 = encode_u32_len(block_size, "LZ4 block size")?;
     let block_count = if data.is_empty() {
         0
     } else {
         data.len().div_ceil(block_size)
     };
-
-    // Pre-allocate: header(12) + block_lengths(4*N) + compressed_blocks.
-    let mut out = Vec::with_capacity(12 + block_count * 4 + data.len());
-
-    // Header.
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(block_size as u32).to_le_bytes());
-    out.extend_from_slice(&(block_count as u32).to_le_bytes());
-
-    // Reserve space for block length table (filled in after compression).
+    let block_count_u32 = encode_u32_len(block_count, "LZ4 block count")?;
+    let table_len = checked_mul(block_count, 4, "LZ4 block-length table")?;
+    let initial_capacity = checked_add(
+        checked_add(HEADER_SIZE, table_len, "LZ4 output header")?,
+        data.len(),
+        "LZ4 output capacity",
+    )?;
+    let mut out = Vec::with_capacity(initial_capacity);
+    out.extend_from_slice(&total_len.to_le_bytes());
+    out.extend_from_slice(&block_size_u32.to_le_bytes());
+    out.extend_from_slice(&block_count_u32.to_le_bytes());
     let lengths_offset = out.len();
-    out.resize(lengths_offset + block_count * 4, 0);
+    out.resize(lengths_offset + table_len, 0);
 
-    // Compress each block.
-    for (i, chunk) in data.chunks(block_size).enumerate() {
+    for (index, chunk) in data.chunks(block_size).enumerate() {
         let compressed = lz4_flex::compress_prepend_size(chunk);
-        let compressed_len = compressed.len() as u32;
-
-        // Write block length into the table.
-        let table_pos = lengths_offset + i * 4;
+        let compressed_len = encode_u32_len(compressed.len(), "LZ4 compressed block")?;
+        let table_pos = lengths_offset + index * 4;
         out[table_pos..table_pos + 4].copy_from_slice(&compressed_len.to_le_bytes());
-
-        // Append compressed block.
         out.extend_from_slice(&compressed);
     }
-
-    out
+    Ok(out)
 }
 
 /// Decompress LZ4 block-compressed bytes back to raw data.
 pub fn decode(data: &[u8]) -> Result<Vec<u8>, CodecError> {
     let header = read_header(data)?;
-
-    if header.block_count == 0 {
-        return Ok(Vec::new());
-    }
-
     let mut result = Vec::with_capacity(header.uncompressed_size);
     let mut block_offset = header.data_offset;
 
-    for i in 0..header.block_count {
-        let compressed_len = header.block_lengths[i];
-        let block_end = block_offset + compressed_len;
-
-        if block_end > data.len() {
-            return Err(CodecError::Truncated {
-                expected: block_end,
-                actual: data.len(),
-            });
-        }
-
-        let block_data = &data[block_offset..block_end];
-        let decompressed = lz4_flex::decompress_size_prepended(block_data).map_err(|e| {
+    for (index, &compressed_len) in header.block_lengths.iter().enumerate() {
+        let block = checked_range(data, block_offset, compressed_len, "LZ4 block range")?;
+        let expected_block_len = expected_block_len(&header, index)?;
+        validate_prepended_size(block, expected_block_len, index)?;
+        let decompressed = lz4_flex::decompress_size_prepended(block).map_err(|error| {
             CodecError::DecompressFailed {
-                detail: format!("LZ4 block {i}: {e}"),
+                detail: format!("LZ4 block {index}: {error}"),
             }
         })?;
-
+        if decompressed.len() != expected_block_len {
+            return Err(CodecError::Corrupt {
+                detail: format!(
+                    "LZ4 block {index} decoded {} bytes, expected {expected_block_len}",
+                    decompressed.len()
+                ),
+            });
+        }
         result.extend_from_slice(&decompressed);
-        block_offset = block_end;
+        block_offset = checked_add(block_offset, compressed_len, "LZ4 block offset")?;
     }
-
     if result.len() != header.uncompressed_size {
         return Err(CodecError::Corrupt {
             detail: format!(
-                "uncompressed size mismatch: header says {}, got {}",
+                "LZ4 uncompressed size mismatch: header says {}, got {}",
                 header.uncompressed_size,
                 result.len()
             ),
         });
     }
-
     Ok(result)
 }
 
 /// Decompress a single block by index (for random access).
-///
-/// Returns the decompressed bytes of just that block.
 pub fn decode_block(data: &[u8], block_idx: usize) -> Result<Vec<u8>, CodecError> {
     let header = read_header(data)?;
-
-    if block_idx >= header.block_count {
+    let compressed_len =
+        *header
+            .block_lengths
+            .get(block_idx)
+            .ok_or_else(|| CodecError::Corrupt {
+                detail: format!("LZ4 block index {block_idx} out of range"),
+            })?;
+    let mut block_offset = header.data_offset;
+    for &len in &header.block_lengths[..block_idx] {
+        block_offset = checked_add(block_offset, len, "LZ4 preceding block offset")?;
+    }
+    let block = checked_range(data, block_offset, compressed_len, "LZ4 block range")?;
+    let expected_len = expected_block_len(&header, block_idx)?;
+    validate_prepended_size(block, expected_len, block_idx)?;
+    let decoded = lz4_flex::decompress_size_prepended(block).map_err(|error| {
+        CodecError::DecompressFailed {
+            detail: format!("LZ4 block {block_idx}: {error}"),
+        }
+    })?;
+    if decoded.len() != expected_len {
         return Err(CodecError::Corrupt {
             detail: format!(
-                "block index {block_idx} out of range (block_count={})",
-                header.block_count
+                "LZ4 block {block_idx} decoded {} bytes, expected {expected_len}",
+                decoded.len()
             ),
         });
     }
-
-    // Sum lengths of preceding blocks to find this block's offset.
-    let mut block_offset = header.data_offset;
-    for i in 0..block_idx {
-        block_offset += header.block_lengths[i];
-    }
-
-    let compressed_len = header.block_lengths[block_idx];
-    let block_end = block_offset + compressed_len;
-
-    if block_end > data.len() {
-        return Err(CodecError::Truncated {
-            expected: block_end,
-            actual: data.len(),
-        });
-    }
-
-    let block_data = &data[block_offset..block_end];
-    lz4_flex::decompress_size_prepended(block_data).map_err(|e| CodecError::DecompressFailed {
-        detail: format!("LZ4 block {block_idx}: {e}"),
-    })
+    Ok(decoded)
 }
-
-// ---------------------------------------------------------------------------
-// Header parsing
-// ---------------------------------------------------------------------------
 
 struct Lz4Header {
     uncompressed_size: usize,
-    block_count: usize,
+    block_size: usize,
     block_lengths: Vec<usize>,
-    /// Byte offset where compressed block data starts.
     data_offset: usize,
 }
 
 fn read_header(data: &[u8]) -> Result<Lz4Header, CodecError> {
-    if data.len() < 12 {
-        return Err(CodecError::Truncated {
-            expected: 12,
-            actual: data.len(),
+    checked_range(data, 0, HEADER_SIZE, "LZ4 header")?;
+    let uncompressed_size = decoded_len(
+        u32_to_usize(read_u32(data, 0, "LZ4 size")?, "LZ4 size")?,
+        "LZ4",
+    )?;
+    let block_size = u32_to_usize(read_u32(data, 4, "LZ4 block size")?, "LZ4 block size")?;
+    let block_count = u32_to_usize(read_u32(data, 8, "LZ4 block count")?, "LZ4 block count")?;
+    if !(MIN_BLOCK_SIZE..=crate::bounds::MAX_DECODED_BYTES).contains(&block_size) {
+        return Err(CodecError::Corrupt {
+            detail: "invalid LZ4 block size".into(),
         });
     }
-
-    let uncompressed_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let _block_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let block_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-
-    let lengths_end = 12 + block_count * 4;
-    if data.len() < lengths_end {
-        return Err(CodecError::Truncated {
-            expected: lengths_end,
-            actual: data.len(),
+    let expected_count = if uncompressed_size == 0 {
+        0
+    } else {
+        uncompressed_size.div_ceil(block_size)
+    };
+    if block_count != expected_count {
+        return Err(CodecError::Corrupt {
+            detail: "LZ4 block count does not match declared output".into(),
         });
     }
-
-    let block_lengths: Vec<usize> = data[12..lengths_end]
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
-        .collect();
-
+    let table_len = checked_mul(block_count, 4, "LZ4 block-length table")?;
+    let data_offset = checked_add(HEADER_SIZE, table_len, "LZ4 data offset")?;
+    let table = checked_range(data, HEADER_SIZE, table_len, "LZ4 block-length table")?;
+    let mut block_lengths = Vec::with_capacity(block_count);
+    let mut total_compressed = 0usize;
+    for bytes in table.chunks_exact(4) {
+        let len = u32_to_usize(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            "LZ4 block length",
+        )?;
+        total_compressed = checked_add(total_compressed, len, "LZ4 compressed payload")?;
+        block_lengths.push(len);
+    }
+    checked_range(
+        data,
+        data_offset,
+        total_compressed,
+        "LZ4 compressed payload",
+    )?;
+    if checked_add(data_offset, total_compressed, "LZ4 frame end")? != data.len() {
+        return Err(CodecError::Corrupt {
+            detail: "trailing bytes after LZ4 frame".into(),
+        });
+    }
     Ok(Lz4Header {
         uncompressed_size,
-        block_count,
+        block_size,
         block_lengths,
-        data_offset: lengths_end,
+        data_offset,
     })
 }
 
-// ---------------------------------------------------------------------------
-// Streaming encoder / decoder types
-// ---------------------------------------------------------------------------
+fn read_u32(data: &[u8], offset: usize, context: &str) -> Result<u32, CodecError> {
+    let bytes = checked_range(data, offset, 4, context)?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn expected_block_len(header: &Lz4Header, index: usize) -> Result<usize, CodecError> {
+    let position = checked_mul(index, header.block_size, "LZ4 block position")?;
+    let remaining = header
+        .uncompressed_size
+        .checked_sub(position)
+        .ok_or_else(|| CodecError::Corrupt {
+            detail: "LZ4 block position exceeds declared output".into(),
+        })?;
+    Ok(remaining.min(header.block_size))
+}
+
+fn validate_prepended_size(block: &[u8], expected: usize, index: usize) -> Result<(), CodecError> {
+    let size = u32_to_usize(
+        read_u32(block, 0, "LZ4 block size prefix")?,
+        "LZ4 prepended output size",
+    )?;
+    if size != expected {
+        return Err(CodecError::Corrupt {
+            detail: format!("LZ4 block {index} declares {size} bytes, expected {expected}"),
+        });
+    }
+    Ok(())
+}
 
 /// Streaming LZ4 encoder. Accumulates data and compresses on `finish()`.
 pub struct Lz4Encoder {
     buf: Vec<u8>,
     block_size: usize,
 }
-
 impl Lz4Encoder {
     pub fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(4096),
+            buf: Vec::with_capacity(DEFAULT_BLOCK_SIZE),
             block_size: DEFAULT_BLOCK_SIZE,
         }
     }
-
-    pub fn with_block_size(block_size: usize) -> Self {
-        Self {
-            buf: Vec::with_capacity(block_size),
-            block_size: block_size.max(64),
-        }
+    pub fn with_block_size(block_size: usize) -> Result<Self, CodecError> {
+        let block_size = block_size.max(MIN_BLOCK_SIZE);
+        decoded_len(block_size, "LZ4 block")?;
+        Ok(Self {
+            buf: Vec::new(),
+            block_size,
+        })
     }
-
-    pub fn push(&mut self, data: &[u8]) {
+    pub fn push(&mut self, data: &[u8]) -> Result<(), CodecError> {
+        let next_len = checked_add(self.buf.len(), data.len(), "LZ4 streaming input")?;
+        decoded_len(next_len, "LZ4 streaming input")?;
         self.buf.extend_from_slice(data);
+        Ok(())
     }
-
     pub fn len(&self) -> usize {
         self.buf.len()
     }
-
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
-
-    pub fn finish(self) -> Vec<u8> {
+    pub fn finish(self) -> Result<Vec<u8>, CodecError> {
         encode_with_block_size(&self.buf, self.block_size)
     }
 }
-
 impl Default for Lz4Encoder {
     fn default() -> Self {
         Self::new()
     }
 }
-
-/// LZ4 decoder wrapper.
 pub struct Lz4Decoder;
-
 impl Lz4Decoder {
-    /// Decompress all blocks.
     pub fn decode_all(data: &[u8]) -> Result<Vec<u8>, CodecError> {
         decode(data)
     }
-
-    /// Decompress a single block by index.
     pub fn decode_block(data: &[u8], block_idx: usize) -> Result<Vec<u8>, CodecError> {
         decode_block(data, block_idx)
     }
-
-    /// Number of blocks in the compressed data.
     pub fn block_count(data: &[u8]) -> Result<usize, CodecError> {
-        let header = read_header(data)?;
-        Ok(header.block_count)
+        Ok(read_header(data)?.block_lengths.len())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bounds::MAX_DECODED_BYTES;
 
     #[test]
     fn empty_roundtrip() {
-        let encoded = encode(&[]);
-        let decoded = decode(&encoded).unwrap();
-        assert!(decoded.is_empty());
+        let encoded = encode(&[]).expect("encode");
+        assert!(decode(&encoded).expect("decode").is_empty());
     }
 
     #[test]
     fn small_data_roundtrip() {
         let data = b"hello world, this is a log message";
-        let encoded = encode(data);
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded, data);
+        let encoded = encode(data).expect("encode");
+        assert_eq!(decode(&encoded).expect("decode"), data);
     }
 
     #[test]
     fn large_data_multiple_blocks() {
-        // Generate ~40KB of log-like data (10 blocks of 4KB each).
         let mut data = Vec::new();
         for i in 0..1000 {
             let line = format!(
-                "2024-01-15T10:30:{:02}.000Z INFO server.handler request_id={} method=GET path=/api/v1/metrics status=200 duration_ms={}\n",
+                "2024-01-15T10:30:{:02}.000Z INFO request_id={} status=200 duration_ms={}\n",
                 i % 60,
                 10000 + i,
                 i * 3 + 1
             );
             data.extend_from_slice(line.as_bytes());
         }
-
-        let encoded = encode(&data);
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded, data);
-
-        // LZ4 should achieve at least 2x compression on structured logs.
-        let ratio = data.len() as f64 / encoded.len() as f64;
-        assert!(
-            ratio > 2.0,
-            "expected >2x compression for structured logs, got {ratio:.1}x"
-        );
+        let encoded = encode(&data).expect("encode");
+        assert_eq!(decode(&encoded).expect("decode"), data);
+        assert!(data.len() as f64 / encoded.len() as f64 > 2.0);
     }
 
     #[test]
     fn random_access_block() {
-        let data: Vec<u8> = (0..20000).map(|i| (i % 256) as u8).collect();
+        let data: Vec<u8> = (0..20_000).map(|i| (i % 256) as u8).collect();
         let block_size = 4096;
-        let encoded = encode_with_block_size(&data, block_size);
-
-        let block_count = Lz4Decoder::block_count(&encoded).unwrap();
+        let encoded = encode_with_block_size(&data, block_size).expect("encode");
+        let block_count = Lz4Decoder::block_count(&encoded).expect("count");
         assert_eq!(block_count, data.len().div_ceil(block_size));
-
-        // Decompress each block individually and verify.
         let mut reassembled = Vec::new();
-        for i in 0..block_count {
-            let block = decode_block(&encoded, i).unwrap();
-            reassembled.extend_from_slice(&block);
+        for index in 0..block_count {
+            reassembled.extend_from_slice(&decode_block(&encoded, index).expect("block"));
         }
         assert_eq!(reassembled, data);
     }
 
     #[test]
     fn out_of_range_block_index() {
-        let data = b"some data here";
-        let encoded = encode(data);
+        let encoded = encode(b"some data here").expect("encode");
         assert!(decode_block(&encoded, 999).is_err());
     }
 
     #[test]
-    fn compressible_log_data() {
-        // Highly repetitive log lines.
+    fn compressible_log_data_exceeds_three_to_one() {
         let line = "2024-01-15 ERROR database connection timeout host=db-prod-01 retry=3\n";
-        let data: Vec<u8> = line.as_bytes().repeat(500);
-        let encoded = encode(&data);
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded, data);
-
-        let ratio = data.len() as f64 / encoded.len() as f64;
-        assert!(
-            ratio > 3.0,
-            "highly repetitive logs should compress >3x, got {ratio:.1}x"
-        );
+        let data = line.as_bytes().repeat(500);
+        let encoded = encode(&data).expect("encode");
+        assert_eq!(decode(&encoded).expect("decode"), data);
+        assert!(data.len() as f64 / encoded.len() as f64 > 3.0);
     }
 
     #[test]
-    fn incompressible_data() {
-        // Random bytes — LZ4 may expand slightly but shouldn't fail.
+    fn incompressible_data_roundtrip() {
         let mut data = vec![0u8; 10_000];
         let mut rng: u64 = 9999;
         for byte in &mut data {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
             *byte = (rng >> 33) as u8;
         }
-        let encoded = encode(&data);
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded, data);
+        let encoded = encode(&data).expect("encode");
+        assert_eq!(decode(&encoded).expect("decode"), data);
     }
 
     #[test]
     fn streaming_encoder() {
-        let parts = [b"hello ".as_ref(), b"world".as_ref(), b" test".as_ref()];
-        let full: Vec<u8> = parts.iter().flat_map(|p| p.iter().copied()).collect();
-
-        let mut enc = Lz4Encoder::new();
-        for part in &parts {
-            enc.push(part);
-        }
-        let encoded = enc.finish();
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded, full);
+        let mut encoder = Lz4Encoder::new();
+        encoder.push(b"hello ").expect("push");
+        encoder.push(b"world").expect("push");
+        let encoded = encoder.finish().expect("finish");
+        assert_eq!(decode(&encoded).expect("decode"), b"hello world");
     }
 
     #[test]
     fn custom_block_size() {
         let data = vec![42u8; 10_000];
-        let encoded = encode_with_block_size(&data, 1024);
-        let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded, data);
-
-        let block_count = Lz4Decoder::block_count(&encoded).unwrap();
-        assert_eq!(block_count, 10); // 10000 / 1024 rounded up
+        let encoded = encode_with_block_size(&data, 1024).expect("encode");
+        assert_eq!(decode(&encoded).expect("decode"), data);
+        assert_eq!(Lz4Decoder::block_count(&encoded).expect("count"), 10);
     }
 
     #[test]
-    fn truncated_input_errors() {
+    fn rejects_huge_count_and_output_before_allocation() {
+        let mut frame = vec![0; HEADER_SIZE];
+        frame[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        frame[4..8].copy_from_slice(&64u32.to_le_bytes());
+        frame[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode(&frame),
+            Err(CodecError::ResourceLimit { .. })
+        ));
+        assert!(decoded_len(MAX_DECODED_BYTES + 1, "test").is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_table_payload_and_oversized_block_output() {
         assert!(decode(&[]).is_err());
-        assert!(decode(&[0; 8]).is_err()); // too short for header
+        assert!(decode(&[0; 8]).is_err());
+        let mut frame = vec![0; HEADER_SIZE];
+        frame[0..4].copy_from_slice(&64u32.to_le_bytes());
+        frame[4..8].copy_from_slice(&64u32.to_le_bytes());
+        frame[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(decode(&frame), Err(CodecError::Truncated { .. })));
+        frame.extend_from_slice(&4u32.to_le_bytes());
+        frame.extend_from_slice(&65u32.to_le_bytes());
+        assert!(matches!(decode(&frame), Err(CodecError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn random_access_rejects_short_nonfinal_block() {
+        let encoded = encode_with_block_size(&[7; 128], 64).expect("encode");
+        let first_len = read_u32(&encoded, HEADER_SIZE, "first length").expect("length") as usize;
+        let second_start = HEADER_SIZE + 8 + first_len;
+        let empty = lz4_flex::compress_prepend_size(&[]);
+        let mut malformed = encoded[..HEADER_SIZE + 8].to_vec();
+        malformed[HEADER_SIZE..HEADER_SIZE + 4]
+            .copy_from_slice(&(empty.len() as u32).to_le_bytes());
+        malformed.extend_from_slice(&empty);
+        malformed.extend_from_slice(&encoded[second_start..]);
+        assert!(matches!(
+            decode_block(&malformed, 0),
+            Err(CodecError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn encoder_constructor_and_stream_reject_oversize_before_allocation() {
+        assert!(matches!(
+            Lz4Encoder::with_block_size(usize::MAX),
+            Err(CodecError::ResourceLimit { .. })
+        ));
+        let mut encoder = Lz4Encoder {
+            buf: vec![0; MAX_DECODED_BYTES],
+            block_size: DEFAULT_BLOCK_SIZE,
+        };
+        assert!(matches!(
+            encoder.push(&[1]),
+            Err(CodecError::ResourceLimit { .. })
+        ));
+        assert_eq!(encoder.len(), MAX_DECODED_BYTES);
     }
 }

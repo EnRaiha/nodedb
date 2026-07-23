@@ -19,6 +19,9 @@
 //! [N bytes] interleaved rANS bitstream (4 streams)
 //! ```
 
+use crate::bounds::{
+    checked_add, checked_range, decoded_len, encode_input_len, encode_u32_len, u32_to_usize,
+};
 use crate::error::CodecError;
 
 /// Number of interleaved streams.
@@ -30,6 +33,7 @@ const PROB_SCALE: u32 = 1 << PROB_BITS;
 
 /// rANS state lower bound.
 const RANS_L: u32 = 1 << 23;
+const RANS_STATE_UPPER_BOUND: u32 = RANS_L << 8;
 
 /// Frequency table header size: 256 × 4 bytes = 1024 bytes.
 const FREQ_TABLE_SIZE: usize = 256 * 4;
@@ -42,11 +46,12 @@ const HEADER_SIZE: usize = 4 + FREQ_TABLE_SIZE + 4;
 // ---------------------------------------------------------------------------
 
 /// Compress bytes using interleaved rANS.
-pub fn encode(data: &[u8]) -> Vec<u8> {
+pub fn encode(data: &[u8]) -> Result<Vec<u8>, CodecError> {
+    let encoded_len = encode_input_len(data.len(), "rANS")?;
     if data.is_empty() {
         let out = vec![0u8; HEADER_SIZE];
         // uncompressed_size = 0, freq table = all zeros, compressed_size = 0
-        return out;
+        return Ok(out);
     }
 
     // Build frequency table.
@@ -99,7 +104,7 @@ pub fn encode(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_SIZE + total_compressed + NUM_STREAMS * 4);
 
     // Header: uncompressed size.
-    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&encoded_len.to_le_bytes());
 
     // Frequency table (raw counts for decoding).
     for &f in &norm_freqs {
@@ -108,11 +113,13 @@ pub fn encode(data: &[u8]) -> Vec<u8> {
 
     // Compressed size.
     let comp_payload_size = total_compressed + NUM_STREAMS * 4; // streams + per-stream sizes
-    out.extend_from_slice(&(comp_payload_size as u32).to_le_bytes());
+    out.extend_from_slice(
+        &encode_u32_len(comp_payload_size, "rANS compressed payload")?.to_le_bytes(),
+    );
 
     // Per-stream sizes (4 bytes each).
     for s in &streams {
-        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(&encode_u32_len(s.len(), "rANS stream")?.to_le_bytes());
     }
 
     // Stream data (reversed — rANS bitstream is read backward).
@@ -120,101 +127,129 @@ pub fn encode(data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(s);
     }
 
-    out
+    Ok(out)
 }
 
 /// Decompress interleaved rANS data.
 pub fn decode(data: &[u8]) -> Result<Vec<u8>, CodecError> {
-    if data.len() < HEADER_SIZE {
-        return Err(CodecError::Truncated {
-            expected: HEADER_SIZE,
-            actual: data.len(),
-        });
+    let header = checked_range(data, 0, HEADER_SIZE, "rANS header")?;
+    let uncompressed_size = decoded_len(
+        u32_to_usize(
+            u32::from_le_bytes(header[0..4].try_into().map_err(|_| CodecError::Corrupt {
+                detail: "rANS output size".into(),
+            })?),
+            "rANS output",
+        )?,
+        "rANS",
+    )?;
+    let mut norm_freqs = [0u32; 256];
+    for (index, frequency) in norm_freqs.iter_mut().enumerate() {
+        let offset = 4 + index * 4;
+        *frequency = u32::from_le_bytes(header[offset..offset + 4].try_into().map_err(|_| {
+            CodecError::Corrupt {
+                detail: "rANS frequency".into(),
+            }
+        })?);
     }
-
-    let uncompressed_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let compressed_size = u32_to_usize(
+        u32::from_le_bytes(header[HEADER_SIZE - 4..].try_into().map_err(|_| {
+            CodecError::Corrupt {
+                detail: "rANS compressed size".into(),
+            }
+        })?),
+        "rANS compressed size",
+    )?;
     if uncompressed_size == 0 {
+        if compressed_size != 0 || data.len() != HEADER_SIZE {
+            return Err(CodecError::Corrupt {
+                detail: "nonempty rANS payload for empty output".into(),
+            });
+        }
         return Ok(Vec::new());
     }
-
-    // Read frequency table.
-    let mut norm_freqs = [0u32; 256];
-    for (i, freq) in norm_freqs.iter_mut().enumerate() {
-        let pos = 4 + i * 4;
-        *freq = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-    }
-
-    let (cum_freqs, sym_freqs) = build_cum_table(&norm_freqs);
-
-    // Build reverse lookup table for decoding.
-    let lookup = build_decode_table(&cum_freqs, &sym_freqs);
-
-    let _comp_size = u32::from_le_bytes([
-        data[HEADER_SIZE - 4],
-        data[HEADER_SIZE - 3],
-        data[HEADER_SIZE - 2],
-        data[HEADER_SIZE - 1],
-    ]) as usize;
-
-    // Read per-stream sizes.
-    let mut pos = HEADER_SIZE;
-    if pos + NUM_STREAMS * 4 > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + NUM_STREAMS * 4,
-            actual: data.len(),
+    validate_frequencies(&norm_freqs)?;
+    let stream_sizes_len = NUM_STREAMS * 4;
+    let frame = checked_range(
+        data,
+        HEADER_SIZE,
+        compressed_size,
+        "rANS compressed payload",
+    )?;
+    if checked_add(HEADER_SIZE, compressed_size, "rANS frame end")? != data.len() {
+        return Err(CodecError::Corrupt {
+            detail: "trailing bytes after rANS frame".into(),
         });
     }
-
-    let mut stream_sizes = [0usize; NUM_STREAMS];
-    for size in stream_sizes.iter_mut() {
-        *size =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4;
+    if compressed_size < stream_sizes_len {
+        return Err(CodecError::Corrupt {
+            detail: "rANS compressed size omits stream sizes".into(),
+        });
     }
-
-    // Read streams.
-    let mut stream_data: [Vec<u8>; NUM_STREAMS] = std::array::from_fn(|_| Vec::new());
-    for i in 0..NUM_STREAMS {
-        let end = pos + stream_sizes[i];
-        if end > data.len() {
-            return Err(CodecError::Truncated {
-                expected: end,
-                actual: data.len(),
+    let mut stream_sizes = [0usize; NUM_STREAMS];
+    let mut payload_len = 0usize;
+    for (index, size) in stream_sizes.iter_mut().enumerate() {
+        let start = index * 4;
+        *size = u32_to_usize(
+            u32::from_le_bytes(frame[start..start + 4].try_into().map_err(|_| {
+                CodecError::Corrupt {
+                    detail: "rANS stream size".into(),
+                }
+            })?),
+            "rANS stream size",
+        )?;
+        if *size < 4 {
+            return Err(CodecError::Corrupt {
+                detail: format!("rANS stream {index} too short for state"),
             });
         }
-        stream_data[i] = data[pos..end].to_vec();
-        pos += stream_sizes[i];
+        payload_len = checked_add(payload_len, *size, "rANS stream lengths")?;
     }
-
-    // Initialize states from the end of each stream.
+    if checked_add(stream_sizes_len, payload_len, "rANS stream framing")? != compressed_size {
+        return Err(CodecError::Corrupt {
+            detail: "rANS compressed-size metadata mismatch".into(),
+        });
+    }
+    let (cum_freqs, sym_freqs) = build_cum_table(&norm_freqs);
+    let lookup = build_decode_table(&cum_freqs, &sym_freqs);
+    let mut streams: [&[u8]; NUM_STREAMS] = [&[]; NUM_STREAMS];
+    let mut pos = stream_sizes_len;
+    for (index, stream) in streams.iter_mut().enumerate() {
+        *stream = checked_range(frame, pos, stream_sizes[index], "rANS stream range")?;
+        pos = checked_add(pos, stream_sizes[index], "rANS stream offset")?;
+    }
     let mut states = [0u32; NUM_STREAMS];
     let mut stream_pos = [0usize; NUM_STREAMS];
-    for i in 0..NUM_STREAMS {
-        let s = &stream_data[i];
-        if s.len() < 4 {
+    for index in 0..NUM_STREAMS {
+        let stream = streams[index];
+        let end = stream.len();
+        states[index] = u32::from_le_bytes(stream[end - 4..end].try_into().map_err(|_| {
+            CodecError::Corrupt {
+                detail: "rANS state".into(),
+            }
+        })?);
+        if !(RANS_L..RANS_STATE_UPPER_BOUND).contains(&states[index]) {
             return Err(CodecError::Corrupt {
-                detail: format!("rANS stream {i} too short for state"),
+                detail: format!("rANS stream {index} has invalid initial state"),
             });
         }
-        let end = s.len();
-        states[i] = u32::from_le_bytes([s[end - 4], s[end - 3], s[end - 2], s[end - 1]]);
-        stream_pos[i] = end - 4;
+        stream_pos[index] = end - 4;
     }
-
-    // Decode forward.
     let mut output = vec![0u8; uncompressed_size];
-    for (i, out_byte) in output.iter_mut().enumerate() {
-        let stream_idx = i % NUM_STREAMS;
-        let (sym, new_state) =
-            rans_decode_symbol(states[stream_idx], &lookup, &cum_freqs, &sym_freqs);
-        *out_byte = sym;
-        states[stream_idx] = rans_decode_renorm(
-            new_state,
-            &stream_data[stream_idx],
-            &mut stream_pos[stream_idx],
-        );
+    for (index, out_byte) in output.iter_mut().enumerate() {
+        let stream_index = index % NUM_STREAMS;
+        let (symbol, state) =
+            rans_decode_symbol(states[stream_index], &lookup, &cum_freqs, &sym_freqs);
+        *out_byte = symbol;
+        states[stream_index] =
+            rans_decode_renorm(state, streams[stream_index], &mut stream_pos[stream_index]);
     }
-
+    for index in 0..NUM_STREAMS {
+        if stream_pos[index] != 0 || states[index] != RANS_L {
+            return Err(CodecError::Corrupt {
+                detail: format!("rANS stream {index} has noncanonical terminal state"),
+            });
+        }
+    }
     Ok(output)
 }
 
@@ -260,6 +295,23 @@ fn rans_decode_renorm(mut state: u32, stream: &[u8], pos: &mut usize) -> u32 {
 // ---------------------------------------------------------------------------
 // Frequency table operations
 // ---------------------------------------------------------------------------
+
+fn validate_frequencies(freqs: &[u32; 256]) -> Result<(), CodecError> {
+    let mut total = 0u32;
+    for &frequency in freqs {
+        total = total
+            .checked_add(frequency)
+            .ok_or_else(|| CodecError::Corrupt {
+                detail: "rANS frequency total overflows".into(),
+            })?;
+    }
+    if total != PROB_SCALE {
+        return Err(CodecError::Corrupt {
+            detail: format!("rANS frequencies sum to {total}, expected {PROB_SCALE}"),
+        });
+    }
+    Ok(())
+}
 
 /// Normalize raw frequencies to sum to PROB_SCALE.
 fn normalize_frequencies(freqs: &[u32; 256], total: usize) -> [u32; 256] {
@@ -337,14 +389,14 @@ mod tests {
 
     #[test]
     fn empty_roundtrip() {
-        let encoded = encode(&[]);
+        let encoded = encode(&[]).expect("encode");
         let decoded = decode(&encoded).unwrap();
         assert!(decoded.is_empty());
     }
 
     #[test]
     fn single_byte() {
-        let encoded = encode(&[42]);
+        let encoded = encode(&[42]).expect("encode");
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded, vec![42]);
     }
@@ -352,7 +404,7 @@ mod tests {
     #[test]
     fn repeated_bytes() {
         let data = vec![0u8; 10_000];
-        let encoded = encode(&data);
+        let encoded = encode(&data).expect("encode");
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded, data);
 
@@ -368,7 +420,7 @@ mod tests {
     fn text_data() {
         let text = b"the quick brown fox jumps over the lazy dog. ";
         let data: Vec<u8> = text.iter().copied().cycle().take(10_000).collect();
-        let encoded = encode(&data);
+        let encoded = encode(&data).expect("encode");
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded, data);
 
@@ -385,7 +437,7 @@ mod tests {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
             *byte = (rng >> 33) as u8;
         }
-        let encoded = encode(&data);
+        let encoded = encode(&data).expect("encode");
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded, data);
     }
@@ -394,7 +446,7 @@ mod tests {
     fn all_byte_values() {
         // All 256 byte values present.
         let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
-        let encoded = encode(&data);
+        let encoded = encode(&data).expect("encode");
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded, data);
     }
@@ -406,7 +458,7 @@ mod tests {
         for i in 0..1000 {
             data[i * 10] = 1;
         }
-        let encoded = encode(&data);
+        let encoded = encode(&data).expect("encode");
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded, data);
 
@@ -424,7 +476,7 @@ mod tests {
         for i in 0..10_000 {
             data.push((i % 16) as u8); // Low entropy, 4 bits/byte → 2x compression.
         }
-        let encoded = encode(&data);
+        let encoded = encode(&data).expect("encode");
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded, data);
 
@@ -439,5 +491,59 @@ mod tests {
     fn truncated_input_errors() {
         assert!(decode(&[]).is_err());
         assert!(decode(&[1, 0, 0, 0]).is_err()); // too short for freq table
+    }
+
+    #[test]
+    fn hostile_lengths_and_frequencies_fail_before_output_allocation() {
+        let mut frame = vec![0u8; HEADER_SIZE];
+        frame[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode(&frame),
+            Err(CodecError::ResourceLimit { .. })
+        ));
+
+        let encoded = encode(b"bounded rans").expect("encode");
+        let mut malformed = encoded.clone();
+        malformed[4..8].copy_from_slice(&PROB_SCALE.wrapping_add(1).to_le_bytes());
+        assert!(matches!(
+            decode(&malformed),
+            Err(CodecError::Corrupt { .. })
+        ));
+        let mut bad_size = encoded;
+        bad_size[HEADER_SIZE - 4..HEADER_SIZE].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode(&bad_size).is_err());
+    }
+
+    #[test]
+    fn noncanonical_stream_padding_and_high_state_are_rejected() {
+        let encoded = encode(&[42]).expect("encode");
+        let size_start = HEADER_SIZE;
+        let stream_zero_size = u32::from_le_bytes([
+            encoded[size_start],
+            encoded[size_start + 1],
+            encoded[size_start + 2],
+            encoded[size_start + 3],
+        ]);
+        let stream_zero_start = HEADER_SIZE + NUM_STREAMS * 4;
+        let state_start = stream_zero_start + stream_zero_size as usize - 4;
+
+        let mut padded = encoded.clone();
+        padded.insert(state_start, 0xaa);
+        padded[size_start..size_start + 4].copy_from_slice(&(stream_zero_size + 1).to_le_bytes());
+        let compressed_size = u32::from_le_bytes([
+            padded[HEADER_SIZE - 4],
+            padded[HEADER_SIZE - 3],
+            padded[HEADER_SIZE - 2],
+            padded[HEADER_SIZE - 1],
+        ]);
+        padded[HEADER_SIZE - 4..HEADER_SIZE].copy_from_slice(&(compressed_size + 1).to_le_bytes());
+        assert!(matches!(decode(&padded), Err(CodecError::Corrupt { .. })));
+
+        let mut high_state = encoded;
+        high_state[state_start..state_start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode(&high_state),
+            Err(CodecError::Corrupt { .. })
+        ));
     }
 }

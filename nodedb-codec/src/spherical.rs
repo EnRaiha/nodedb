@@ -51,7 +51,7 @@ pub fn encode(data: &[f32], dims: usize, vectors: usize) -> Result<Vec<u8>, Code
 
     // Convert f32 to bytes and compress with lz4.
     let raw_bytes: Vec<u8> = transformed.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let compressed = crate::lz4::encode(&raw_bytes);
+    let compressed = crate::lz4::encode(&raw_bytes)?;
 
     Ok(build_header(
         dims as u32,
@@ -67,7 +67,7 @@ pub fn encode(data: &[f32], dims: usize, vectors: usize) -> Result<Vec<u8>, Code
 /// doesn't help.
 pub fn encode_raw(data: &[f32], dims: usize, vectors: usize) -> Result<Vec<u8>, CodecError> {
     let raw_bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-    let compressed = crate::lz4::encode(&raw_bytes);
+    let compressed = crate::lz4::encode(&raw_bytes)?;
 
     Ok(build_header(dims as u32, vectors as u32, 0, &compressed))
 }

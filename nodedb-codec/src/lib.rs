@@ -21,6 +21,7 @@
 
 pub mod alp;
 pub mod alp_rd;
+mod bounds;
 pub mod codec_types;
 pub mod crdt_compress;
 pub mod delta;
