@@ -139,7 +139,7 @@ impl CoreLoop {
         }
     }
 
-    /// Restore a CRDT document to a historical version.
+    /// Generate a CRDT forward restore delta from a historical version.
     pub(in crate::data::executor) fn execute_crdt_restore(
         &mut self,
         task: &ExecutionTask,
@@ -160,7 +160,7 @@ impl CoreLoop {
                 );
             }
         };
-        match engine.restore_to_version(collection, document_id, target_version_json) {
+        match engine.preview_restore_to_version(collection, document_id, target_version_json) {
             Ok(delta) => self.response_with_payload(task, delta),
             Err(e) => self.response_error(
                 task,
@@ -233,6 +233,7 @@ impl CoreLoop {
         match engine.import_snapshot_bytes(collection, bytes) {
             Ok(()) => {
                 self.checkpoint_coordinator.mark_dirty("crdt", 1);
+                self.note_collection_write_lsn(task, collection);
                 self.response_ok(task)
             }
             Err(e) => {

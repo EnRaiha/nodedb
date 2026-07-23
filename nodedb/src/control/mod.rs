@@ -11,6 +11,7 @@ pub mod checkpoint_manager;
 pub mod clone;
 pub mod cluster;
 pub mod cold_tier;
+pub mod crdt_admission;
 pub mod custom_type;
 pub mod database;
 pub mod distributed_applier;

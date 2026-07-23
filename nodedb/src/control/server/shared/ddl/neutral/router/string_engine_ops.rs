@@ -264,6 +264,9 @@ pub(super) async fn try_string(
         return Some(spatial::create_spatial_index(state, identity, &parts));
     }
     if upper.starts_with("CRDT MERGE ") {
+        if crdt_apply_forbidden_in_transaction(txn_ctx) {
+            return Some(Err(crdt_transaction_error()));
+        }
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(dsl::crdt_merge(state, identity, database_id, &parts).await);
     }
@@ -275,6 +278,9 @@ pub(super) async fn try_string(
         return Some(crdt_ops::crdt_state(state, identity, database_id, sql).await);
     }
     if upper.starts_with("SELECT CRDT_APPLY(") || upper.starts_with("SELECT CRDT_APPLY (") {
+        if crdt_apply_forbidden_in_transaction(txn_ctx) {
+            return Some(Err(crdt_transaction_error()));
+        }
         return Some(crdt_ops::crdt_apply(state, identity, database_id, sql).await);
     }
 
@@ -322,4 +328,48 @@ pub(super) async fn try_string(
     }
 
     None
+}
+
+fn crdt_apply_forbidden_in_transaction(txn_ctx: &DmlTxnCtx<'_>) -> bool {
+    txn_ctx.sessions.transaction_state(txn_ctx.addr)
+        != crate::control::server::shared::session::TransactionState::Idle
+}
+
+fn crdt_transaction_error() -> DdlError {
+    DdlError {
+        sqlstate: "25001".to_owned(),
+        message: crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::server::shared::session::SessionStore;
+
+    #[test]
+    fn crdt_apply_and_merge_are_forbidden_in_active_or_failed_transactions() {
+        let sessions = SessionStore::new();
+        let addr = "127.0.0.1:5399".parse().expect("test address");
+        sessions.ensure_session(addr);
+        let ctx = DmlTxnCtx {
+            sessions: &sessions,
+            addr: &addr,
+        };
+        assert!(!crdt_apply_forbidden_in_transaction(&ctx));
+
+        sessions
+            .begin(&addr, crate::types::Lsn::new(1), 0)
+            .expect("begin");
+        assert!(crdt_apply_forbidden_in_transaction(&ctx));
+        sessions.fail_transaction(&addr);
+        assert!(crdt_apply_forbidden_in_transaction(&ctx));
+
+        let error = crdt_transaction_error();
+        assert_eq!(error.sqlstate, "25001");
+        assert_eq!(
+            error.message,
+            crate::Error::CrdtApplyForbiddenInTransaction.to_string()
+        );
+    }
 }

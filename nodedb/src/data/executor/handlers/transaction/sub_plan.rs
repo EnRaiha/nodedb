@@ -352,26 +352,22 @@ impl CoreLoop {
         }
     }
 
-    /// CRDT engine: deltas are buffered (not applied) until commit; every
-    /// other `CrdtOp` passes through the standard dispatch path.
+    /// CRDT raw deltas cannot be part of a transaction batch: their exact
+    /// post-merge authorization must be evaluated at the serialized admission
+    /// boundary before any durable proposal. Document operations remain
+    /// transaction-capable through their own staged handlers.
     fn exec_tx_crdt(
         &mut self,
-        dummy_task: &ExecutionTask,
+        _dummy_task: &ExecutionTask,
         tid: u64,
         plan: &PhysicalPlan,
         op: &CrdtOp,
-        crdt_deltas: &mut Vec<(Vec<u8>, u64, String)>,
+        _crdt_deltas: &mut Vec<(Vec<u8>, u64, String)>,
     ) -> Result<Response, ErrorCode> {
         match op {
-            CrdtOp::Apply {
-                collection,
-                delta,
-                peer_id,
-                ..
-            } => {
-                crdt_deltas.push((delta.clone(), *peer_id, collection.clone()));
-                Ok(self.response_ok(dummy_task))
-            }
+            CrdtOp::Apply { .. } => Err(ErrorCode::Unsupported {
+                detail: "CRDT Apply is not supported inside transaction batches".into(),
+            }),
             _ => self.exec_tx_passthrough(tid, plan),
         }
     }

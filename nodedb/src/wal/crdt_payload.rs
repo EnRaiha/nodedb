@@ -1,24 +1,189 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Self-describing WAL payload for CRDT delta records.
-//!
-//! Both the writer (`control/server/wal_dispatch/core.rs`) and the reader
-//! (`data/executor/wal_replay/crdt.rs`) live in this crate and use this single
-//! struct, encoded/decoded with `zerompk`, so there is exactly one
-//! unambiguous decode path — no arity guessing.
+//! Versioned, self-describing WAL payloads for CRDT delta records.
 
-/// WAL payload for a `RecordType::CrdtDelta` record.
+use nodedb_types::sync::wire::SyncProvenance;
+
+const CRDT_DELTA_WAL_FORMAT_V2: u8 = 2;
+const CRDT_DELTA_WAL_FORMAT_V3: u8 = 3;
+
+/// Normalized CRDT WAL payload used by replay.
 ///
-/// `collection` is `Some(_)` for every record written by the current binary —
-/// both per-document delta applies (`CrdtOp::Apply`) and per-collection snapshot
-/// imports (`CrdtOp::ImportSnapshot`) route to a single collection's LoroDoc.
-/// `None` only appears in pre-per-collection records from an earlier dev binary
-/// and is skipped on replay (no released data to preserve).
-#[derive(
-    serde::Serialize, serde::Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
-)]
+/// Current writers encode the explicit V3 form, which retains the exact row
+/// identity required to rebuild the sparse projection. Decoding accepts the
+/// previous fenced V2 shape and the exact three-field legacy form.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrdtDeltaWalPayload {
     pub bytes: Vec<u8>,
     pub collection: Option<String>,
-    pub provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
+    pub provenance: Option<SyncProvenance>,
+    pub expected_frontier_digest: Option<[u8; 32]>,
+    pub document_id: Option<String>,
+    pub surrogate: Option<u32>,
+}
+
+#[derive(zerompk::ToMessagePack, zerompk::FromMessagePack)]
+struct CrdtDeltaWalPayloadV3 {
+    format: u8,
+    bytes: Vec<u8>,
+    collection: Option<String>,
+    provenance: Option<SyncProvenance>,
+    expected_frontier_digest: Option<[u8; 32]>,
+    document_id: Option<String>,
+    surrogate: Option<u32>,
+}
+
+/// Exact fenced wire shape emitted before sparse replay identity was retained.
+#[derive(zerompk::ToMessagePack, zerompk::FromMessagePack)]
+struct CrdtDeltaWalPayloadV2 {
+    format: u8,
+    bytes: Vec<u8>,
+    collection: Option<String>,
+    provenance: Option<SyncProvenance>,
+    expected_frontier_digest: Option<[u8; 32]>,
+}
+
+/// Exact wire shape emitted by pre-fence binaries.
+#[derive(zerompk::ToMessagePack, zerompk::FromMessagePack)]
+struct LegacyCrdtDeltaWalPayload {
+    bytes: Vec<u8>,
+    collection: Option<String>,
+    provenance: Option<SyncProvenance>,
+}
+
+impl CrdtDeltaWalPayload {
+    pub(crate) fn new(
+        bytes: Vec<u8>,
+        collection: Option<String>,
+        provenance: Option<SyncProvenance>,
+        expected_frontier_digest: Option<[u8; 32]>,
+        document_id: Option<String>,
+        surrogate: Option<u32>,
+    ) -> Self {
+        Self {
+            bytes,
+            collection,
+            provenance,
+            expected_frontier_digest,
+            document_id,
+            surrogate,
+        }
+    }
+
+    /// Encode the current explicit V3 wire format.
+    pub(crate) fn encode(&self) -> Result<Vec<u8>, zerompk::Error> {
+        zerompk::to_msgpack_vec(&CrdtDeltaWalPayloadV3 {
+            format: CRDT_DELTA_WAL_FORMAT_V3,
+            bytes: self.bytes.clone(),
+            collection: self.collection.clone(),
+            provenance: self.provenance.clone(),
+            expected_frontier_digest: self.expected_frontier_digest,
+            document_id: self.document_id.clone(),
+            surrogate: self.surrogate,
+        })
+    }
+
+    /// Decode V3, the previous exact V2 form, or the exact legacy three-field
+    /// representation. No missing-field defaults or arity widening are used.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, zerompk::Error> {
+        if let Ok(v3) = zerompk::from_msgpack::<CrdtDeltaWalPayloadV3>(bytes)
+            && v3.format == CRDT_DELTA_WAL_FORMAT_V3
+        {
+            return Ok(Self::new(
+                v3.bytes,
+                v3.collection,
+                v3.provenance,
+                v3.expected_frontier_digest,
+                v3.document_id,
+                v3.surrogate,
+            ));
+        }
+        if let Ok(v2) = zerompk::from_msgpack::<CrdtDeltaWalPayloadV2>(bytes)
+            && v2.format == CRDT_DELTA_WAL_FORMAT_V2
+        {
+            return Ok(Self::new(
+                v2.bytes,
+                v2.collection,
+                v2.provenance,
+                v2.expected_frontier_digest,
+                None,
+                None,
+            ));
+        }
+        zerompk::from_msgpack::<LegacyCrdtDeltaWalPayload>(bytes).map(|legacy| {
+            Self::new(
+                legacy.bytes,
+                legacy.collection,
+                legacy.provenance,
+                None,
+                None,
+                None,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn encode_v2_for_test(&self) -> Result<Vec<u8>, zerompk::Error> {
+        zerompk::to_msgpack_vec(&CrdtDeltaWalPayloadV2 {
+            format: CRDT_DELTA_WAL_FORMAT_V2,
+            bytes: self.bytes.clone(),
+            collection: self.collection.clone(),
+            provenance: self.provenance.clone(),
+            expected_frontier_digest: self.expected_frontier_digest,
+        })
+    }
+
+    #[cfg(test)]
+    fn encode_legacy_for_test(&self) -> Result<Vec<u8>, zerompk::Error> {
+        zerompk::to_msgpack_vec(&LegacyCrdtDeltaWalPayload {
+            bytes: self.bytes.clone(),
+            collection: self.collection.clone(),
+            provenance: self.provenance.clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_exact_legacy_three_field_payload() {
+        let legacy =
+            CrdtDeltaWalPayload::new(vec![1, 2], Some("docs".into()), None, None, None, None);
+        let decoded =
+            CrdtDeltaWalPayload::decode(&legacy.encode_legacy_for_test().expect("encode"))
+                .expect("decode legacy");
+        assert_eq!(decoded, legacy);
+    }
+
+    #[test]
+    fn decodes_previous_fenced_v2_without_projection_identity() {
+        let v2 = CrdtDeltaWalPayload::new(
+            vec![3, 4],
+            Some("docs".into()),
+            None,
+            Some([0xa5; 32]),
+            None,
+            None,
+        );
+        let decoded = CrdtDeltaWalPayload::decode(&v2.encode_v2_for_test().expect("encode"))
+            .expect("decode v2");
+        assert_eq!(decoded, v2);
+    }
+
+    #[test]
+    fn v3_round_trips_fenced_projection_identity() {
+        let payload = CrdtDeltaWalPayload::new(
+            vec![3, 4],
+            Some("docs".into()),
+            None,
+            Some([0xa5; 32]),
+            Some("doc-1".into()),
+            Some(42),
+        );
+        let decoded =
+            CrdtDeltaWalPayload::decode(&payload.encode().expect("encode")).expect("decode v3");
+        assert_eq!(decoded, payload);
+    }
 }

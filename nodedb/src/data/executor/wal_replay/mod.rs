@@ -10,12 +10,14 @@
 //! `wal_replay_kv_field.rs`. The `kv_register_index` / `kv_drop_index`
 //! secondary-index replay lives in `wal_replay_kv_index.rs`.
 //!
-//! Split by engine concern: `kv` (`replay_kv_wal`), `crdt` (`replay_crdt_wal`),
-//! `crdt_list` (`replay_crdt_list_wal`, for the position-based block-list
-//! intent ops), `array` (`ensure_array_open_for_replay` + `replay_array_wal`).
+//! Split by engine concern: `kv` (`replay_kv_wal`), CRDT record decoders
+//! (`crdt`, `crdt_list`, and `crdt_doc`) coordinated by `crdt_ordered` into
+//! one global-LSN replay stream, and `array` (`ensure_array_open_for_replay` +
+//! `replay_array_wal`).
 
 mod array;
 mod crdt;
 mod crdt_doc;
 mod crdt_list;
+mod crdt_ordered;
 mod kv;

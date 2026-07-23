@@ -210,9 +210,10 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         ) => false,
 
         // ---- Crdt: encoded (buffered) ----
+        // Raw delta applies must pass serialized preview admission before any
+        // durable proposal, so they are rejected by `route_in_tx_write`.
         PhysicalPlan::Crdt(
-            CrdtOp::Apply { .. }
-            | CrdtOp::ImportSnapshot { .. }
+            CrdtOp::ImportSnapshot { .. }
             | CrdtOp::ListInsert { .. }
             | CrdtOp::ListDelete { .. }
             | CrdtOp::ListMove { .. }
@@ -220,9 +221,10 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | CrdtOp::DocDelete { .. },
         ) => true,
 
-        // ---- Crdt: reads, not encoded ----
+        // ---- Crdt: raw Apply is rejected in transactions; reads are not encoded ----
         PhysicalPlan::Crdt(
-            CrdtOp::Read { .. }
+            CrdtOp::Apply { .. }
+            | CrdtOp::Read { .. }
             | CrdtOp::PreviewApply { .. }
             | CrdtOp::ReadConstraints { .. }
             | CrdtOp::GetPolicy { .. }
@@ -238,10 +240,8 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         // with no reject arm. Buffering closes the prior atomicity gap
         // (statement used to execute immediately and survive ROLLBACK) at
         // the cost of RYOW loss + the no-undo gap (module doc). For
-        // `SetConstraints` / `DropConstraints` specifically, RYOW loss is
-        // more than cosmetic: a same-transaction `CrdtOp::Apply` validated
-        // against `constraint_version_required` now validates against the
-        // OLD installed constraint version until COMMIT installs the new one.
+        // `SetConstraints` / `DropConstraints` retain their established
+        // buffered behavior; raw CRDT Apply is rejected before this classifier.
         PhysicalPlan::Crdt(
             CrdtOp::SetConstraints { .. }
             | CrdtOp::DropConstraints { .. }
@@ -915,22 +915,27 @@ mod tests {
     }
 
     #[test]
+    fn raw_crdt_apply_is_not_transaction_bufferable() {
+        let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
+            collection: "c".into(),
+            document_id: "d".into(),
+            delta: Vec::new(),
+            peer_id: 0,
+            mutation_id: 0,
+            surrogate: Surrogate::ZERO,
+            provenance: None,
+            constraint_version_required: 0,
+            expected_frontier_digest: None,
+        });
+        assert!(!plan_requires_txn_buffering(&plan));
+    }
+
+    #[test]
     fn crdt_variants_match_oracle() {
         let plans = vec![
             PhysicalPlan::Crdt(CrdtOp::Read {
                 collection: "c".into(),
                 document_id: "d".into(),
-            }),
-            PhysicalPlan::Crdt(CrdtOp::Apply {
-                collection: "c".into(),
-                document_id: "d".into(),
-                delta: Vec::new(),
-                peer_id: 0,
-                mutation_id: 0,
-                surrogate: Surrogate::ZERO,
-                provenance: None,
-                constraint_version_required: 0,
-                expected_frontier_digest: None,
             }),
             PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
                 tenant_id: 1,

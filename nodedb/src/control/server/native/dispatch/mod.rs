@@ -9,6 +9,8 @@ mod direct_ops;
 mod edge_recon_gate;
 mod limits;
 mod plan_builder;
+pub(crate) mod raw_dispatch;
+pub(crate) mod response;
 mod session_ops;
 mod sql;
 mod sql_admin;

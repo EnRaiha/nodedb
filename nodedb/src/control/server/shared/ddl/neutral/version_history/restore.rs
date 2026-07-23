@@ -4,15 +4,17 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
-use crate::control::server::wal_dispatch::wal_append_if_write;
 use crate::control::state::SharedState;
-use crate::control::wal_replication::{propose_replicated_entry, to_replicated_entry};
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::DatabaseId;
+#[cfg(test)]
+use crate::types::TenantId;
+#[cfg(test)]
 use nodedb_physical::physical_plan::CrdtOp;
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
+#[cfg(test)]
 use nodedb_types::Surrogate;
 
 use super::super::super::result::{DdlError, DdlResult};
@@ -50,41 +52,24 @@ pub async fn restore_version(
         .assign(database_id, tenant_id, &collection, doc_id.as_bytes())
         .map_err(|e| err("XX000", format!("surrogate assign: {e}")))?;
 
-    let plan = PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
-        collection: collection.clone(),
-        document_id: doc_id.clone(),
-        target_version_json: vv_json,
-        surrogate,
-    });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let delta = dispatch_async(state, tenant_id, database_id, &collection, plan, timeout)
-        .await
-        .map_err(|e| err("XX000", format!("restore dispatch: {e}")))?;
-
-    // `execute_crdt_restore` -> `restore_to_version` already mutated the live
-    // Loro doc directly and returned the forward delta as its response
-    // payload (see `data/executor/handlers/control/crdt.rs`). An empty delta
-    // means the target version equals the current state (no-op restore) —
-    // nothing to log or replicate. A non-empty delta must still be made
-    // durable and cluster-visible, or a crash / follower read silently
-    // reverts to the pre-restore state after the client was told it
-    // succeeded.
-    if !delta.is_empty() {
-        let _lsn = persist_restore_delta(
-            state,
-            RestoreDeltaParams {
-                tenant_id,
-                database_id,
-                collection: &collection,
-                document_id: &doc_id,
-                surrogate,
-                peer_id: identity.user_id,
-                delta,
-            },
-        )
-        .await
-        .map_err(|e| err("XX000", format!("restore delta persist: {e}")))?;
-    }
+    crate::control::crdt_admission::dispatch_crdt_restore_admitted(
+        state,
+        crate::control::crdt_admission::CrdtRestoreAdmissionRequest {
+            tenant_id,
+            database_id,
+            collection: &collection,
+            document_id: &doc_id,
+            target_version_json: &vv_json,
+            surrogate,
+            peer_id: identity.user_id,
+            timeout,
+            event_source: crate::event::EventSource::User,
+            policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+        },
+    )
+    .await
+    .map_err(|e| err("XX000", format!("restore dispatch: {e}")))?;
 
     state
         .audit
@@ -103,7 +88,8 @@ pub async fn restore_version(
     }])
 }
 
-/// Parameters for [`persist_restore_delta`].
+/// Parameters for the legacy apply-only test seam.
+#[cfg(test)]
 struct RestoreDeltaParams<'a> {
     tenant_id: TenantId,
     database_id: DatabaseId,
@@ -117,28 +103,11 @@ struct RestoreDeltaParams<'a> {
     delta: Vec<u8>,
 }
 
-/// Durably log and, on a cluster, replicate the forward delta a completed
-/// RESTORE already applied directly to the local Loro doc.
-///
-/// The delta is wrapped as a `CrdtOp::Apply` plan solely so it can be fed
-/// through the exact WAL-append (`wal_append_if_write`) and Raft-encode
-/// (`to_replicated_entry`) machinery `CrdtOp::Apply` already uses — this
-/// plan is never dispatched to the local Data Plane a second time. `surrogate`
-/// and `mutation_id` are carried only to satisfy the plan's shape: neither
-/// `wal_append_if_write`'s `CrdtOp::Apply` arm nor `to_replicated_entry`'s
-/// reads them, and on a cluster every replica (including this one, via the
-/// Raft apply loop) re-derives its own surrogate binding for `document_id`
-/// deterministically rather than trusting the wire value.
-///
-/// Ordering is apply-then-log, not write-ahead, because the delta does not
-/// exist until the Data-Plane handler has already produced it: a crash
-/// before this call loses the same in-memory mutation a WAL record would
-/// have described, and a crash after it replays (or a follower re-applies)
-/// an idempotent, commutative Loro delta — the two converge either way.
-///
-/// Returns the WAL LSN allocated on the single-node path (`Some`), or `None`
-/// on the cluster path — durability there comes from the Raft quorum commit
-/// `propose_replicated_entry` awaits, not from this node's own local WAL.
+/// Route RESTORE's generated forward delta through the same serialized,
+/// fenced CRDT admission boundary as every ordinary `CrdtOp::Apply`.
+/// Loro imports are idempotent, so replaying the just-produced delta on the
+/// local replica is safe while ensuring every replica observes the fence.
+#[cfg(test)]
 async fn persist_restore_delta(
     state: &SharedState,
     params: RestoreDeltaParams<'_>,
@@ -152,7 +121,6 @@ async fn persist_restore_delta(
         peer_id,
         delta,
     } = params;
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
     let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
         collection: collection.to_string(),
         document_id: document_id.to_string(),
@@ -165,19 +133,20 @@ async fn persist_restore_delta(
         expected_frontier_digest: None,
     });
 
-    if let Some(proposer) = state.async_raft_proposer() {
-        let entry =
-            to_replicated_entry(tenant_id, database_id, vshard_id, &plan).ok_or_else(|| {
-                crate::Error::Internal {
-                    detail: "restore: crdt apply delta did not map to a replicated write".into(),
-                }
-            })?;
-        propose_replicated_entry(state, proposer, entry).await?;
-        return Ok(None);
-    }
-
-    let outcome = wal_append_if_write(&state.wal, tenant_id, vshard_id, database_id, &plan)?;
-    Ok(outcome.lsn)
+    let outcome = crate::control::crdt_admission::dispatch_crdt_apply_admitted_outcome(
+        state,
+        crate::control::crdt_admission::CrdtApplyAdmissionRequest {
+            tenant_id,
+            database_id,
+            collection,
+            plan,
+            timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+            event_source: crate::event::EventSource::User,
+            policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+        },
+    )
+    .await?;
+    Ok((outcome.write_version != crate::types::Lsn::ZERO).then_some(outcome.write_version))
 }
 
 /// Parse: RESTORE collection SET VERSION = 'checkpoint' WHERE id = 'doc-id'
@@ -220,11 +189,16 @@ fn parse_restore(sql: &str) -> Result<(String, String, String), DdlError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
     use loro::LoroValue;
     use nodedb_crdt::state::CrdtState;
 
     use super::*;
-    use crate::bridge::dispatch::Dispatcher;
+    use crate::bridge::dispatch::{BridgeResponse, CoreChannelDataSide, Dispatcher};
+    use crate::bridge::envelope::{Response, Status};
+    use crate::types::Lsn;
     use crate::wal::WalManager;
 
     #[test]
@@ -240,20 +214,92 @@ mod tests {
     /// Build a `SharedState` with a real single-node `WalManager` and no Raft
     /// proposer configured, so `persist_restore_delta` takes the WAL-append
     /// fallback branch. The returned `TempDir` must outlive the state.
-    async fn test_state() -> (std::sync::Arc<SharedState>, tempfile::TempDir) {
+    async fn test_state() -> (Arc<SharedState>, CoreChannelDataSide, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let wal = std::sync::Arc::new(
-            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open wal"),
-        );
-        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let wal =
+            Arc::new(WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open wal"));
+        let (dispatcher, mut data_sides) = Dispatcher::new(1, 64);
+        let side = data_sides.pop().expect("one data side");
         let state = SharedState::new(dispatcher, wal).expect("shared state");
-        (state, dir)
+        (state, side, dir)
     }
 
-    /// Drives the real `restore_to_version` handler (the function backing
-    /// `CrdtOp::RestoreToVersion`) to obtain a genuine forward delta, instead
-    /// of hand-rolling one: upsert "v1", capture its version, upsert "v2",
-    /// then restore back to the "v1" version.
+    async fn respond_restore_apply(
+        state: Arc<SharedState>,
+        mut side: CoreChannelDataSide,
+        digest: [u8; 32],
+        delta: Vec<u8>,
+    ) {
+        let preview = zerompk::to_msgpack_vec(&nodedb_types::CrdtPreviewResult {
+            post_image_msgpack: vec![0xc0],
+            imported_ops: 1,
+            frontier_digest: digest,
+        })
+        .expect("preview payload");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut handled = 0;
+        while handled < 3 && Instant::now() < deadline {
+            if let Ok(request) = side.request_rx.try_pop() {
+                let request = request.inner;
+                let request_id = request.request_id;
+                let write_version = request.wal_lsn.unwrap_or(Lsn::ZERO);
+                match request.plan {
+                    PhysicalPlan::Crdt(CrdtOp::RestoreToVersion { .. }) if handled == 0 => {}
+                    PhysicalPlan::Crdt(CrdtOp::PreviewApply { delta: actual, .. })
+                        if handled == 1 =>
+                    {
+                        assert_eq!(actual, delta);
+                    }
+                    PhysicalPlan::Crdt(CrdtOp::Apply {
+                        delta: actual,
+                        expected_frontier_digest: Some(actual_digest),
+                        ..
+                    }) if handled == 2 => {
+                        assert_eq!(actual, delta);
+                        assert_eq!(actual_digest, digest);
+                    }
+                    other => panic!("unexpected restore admission request: {other:?}"),
+                }
+                let payload = match handled {
+                    0 => delta.clone(),
+                    1 => preview.clone(),
+                    _ => Vec::new(),
+                };
+                side.response_tx
+                    .try_push(BridgeResponse {
+                        inner: Response {
+                            request_id,
+                            status: Status::Ok,
+                            attempt: 1,
+                            partial: false,
+                            payload: payload.into(),
+                            watermark_lsn: Lsn::ZERO,
+                            error_code: None,
+                            read_set_valid: None,
+                            read_version_lsn: if handled == 2 {
+                                write_version
+                            } else {
+                                Lsn::ZERO
+                            },
+                            write_set: Vec::new(),
+                        },
+                    })
+                    .expect("response queue capacity");
+                handled += 1;
+            }
+            state.poll_and_route_responses();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            handled, 3,
+            "restore admission must generate, preview, then apply"
+        );
+        state.poll_and_route_responses();
+    }
+
+    /// Generates the same read-only forward delta as `CrdtOp::RestoreToVersion`:
+    /// upsert "v1", capture its version, upsert "v2", then preview restoration
+    /// back to the "v1" version.
     ///
     /// Returns the pre-restore snapshot alongside the delta. A forward delta is
     /// exported relative to a version vector, so it only carries the ops after
@@ -271,7 +317,7 @@ mod tests {
             .expect("upsert v2");
         let pre_restore = engine.export_snapshot().expect("pre-restore snapshot");
         let delta = engine
-            .restore_to_version("notes", "doc1", &vv1)
+            .preview_restore_to_version("notes", "doc1", &vv1)
             .expect("restore to v1");
         (pre_restore, delta)
     }
@@ -284,21 +330,42 @@ mod tests {
             "restoring to a genuinely different prior version must produce a non-empty forward delta"
         );
 
-        let (state, _dir) = test_state().await;
-        let lsn = persist_restore_delta(
+        let (state, side, _dir) = test_state().await;
+        let pre_restore_state = CrdtState::new(99).expect("pre-restore state");
+        pre_restore_state
+            .import(&pre_restore)
+            .expect("import pre-restore state");
+        let expected_frontier = nodedb_crdt::state::frontier_digest::domain_frontier_digest(
+            5,
+            DatabaseId::DEFAULT.as_u64(),
+            "notes",
+            Some(&pre_restore_state),
+        );
+        let responder = tokio::spawn(respond_restore_apply(
+            Arc::clone(&state),
+            side,
+            expected_frontier,
+            delta.clone(),
+        ));
+        let outcome = crate::control::crdt_admission::dispatch_crdt_restore_admitted(
             &state,
-            RestoreDeltaParams {
+            crate::control::crdt_admission::CrdtRestoreAdmissionRequest {
                 tenant_id: TenantId::new(5),
                 database_id: DatabaseId::DEFAULT,
                 collection: "notes",
                 document_id: "doc1",
+                target_version_json: "{}",
                 surrogate: Surrogate(1),
                 peer_id: 42,
-                delta: delta.clone(),
+                timeout: Duration::from_secs(2),
+                event_source: crate::event::EventSource::User,
+                policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
             },
         )
         .await
         .expect("persist restore delta");
+        let lsn = outcome.map(|outcome| outcome.write_version);
+        responder.await.expect("restore responder");
         assert!(
             lsn.is_some(),
             "the current bug: RESTORE dispatches with wal_lsn: None and appends nothing; \
@@ -316,8 +383,9 @@ mod tests {
             records[0].header.record_type,
             nodedb_wal::record::RecordType::CrdtDelta as u32
         );
-        let payload = zerompk::from_msgpack::<crate::wal::CrdtDeltaWalPayload>(&records[0].payload)
+        let payload = crate::wal::CrdtDeltaWalPayload::decode(&records[0].payload)
             .expect("decode wal payload");
+        assert_eq!(payload.expected_frontier_digest, Some(expected_frontier));
         assert_eq!(
             payload.bytes, delta,
             "the WAL record must carry the exact delta bytes the restore handler produced"
@@ -361,7 +429,7 @@ mod tests {
         );
 
         // Mirrors `restore_version`'s `if !delta.is_empty()` gate.
-        let (state, _dir) = test_state().await;
+        let (state, _side, _dir) = test_state().await;
         if !delta.is_empty() {
             persist_restore_delta(
                 &state,

@@ -76,6 +76,7 @@ pub async fn propose_sync_write(
                 tokio::time::sleep(Duration::from_millis(*backoff_ms)).await;
                 continue;
             }
+            Err(other @ crate::Error::DataPlane(_)) => return Err(other),
             Err(other) => {
                 return Err(crate::Error::Dispatch {
                     detail: format!("raft propose failed: {other}"),
@@ -104,6 +105,16 @@ pub async fn propose_sync_write(
 ///
 /// Single-node path: falls through to
 /// [`crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source`].
+fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> crate::Result<()> {
+    if matches!(
+        plan,
+        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
+    ) {
+        return Err(crate::Error::CrdtApplyRequiresAdmission);
+    }
+    Ok(())
+}
+
 pub async fn dispatch_sync_response(
     state: &SharedState,
     tenant_id: TenantId,
@@ -112,6 +123,7 @@ pub async fn dispatch_sync_response(
     trace_id: TraceId,
     event_source: EventSource,
 ) -> crate::Result<Response> {
+    reject_unadmitted_crdt_apply(&plan)?;
     // The sync inbound envelope carries no session database yet (see
     // `dispatch_sync_bytes` below), so this path is scoped to the default
     // database, same as its local-fallback branch a few lines down.
@@ -206,6 +218,24 @@ pub async fn dispatch_sync_bytes(
 ) -> crate::Result<Vec<u8>> {
     // The sync inbound envelope carries no session database yet, so the Lite
     // sync path is scoped to the default database.
+    if matches!(
+        &plan,
+        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
+    ) {
+        return crate::control::crdt_admission::dispatch_crdt_apply_admitted(
+            state,
+            crate::control::crdt_admission::CrdtApplyAdmissionRequest {
+                tenant_id,
+                database_id: DatabaseId::DEFAULT,
+                collection,
+                plan,
+                timeout,
+                event_source,
+                policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+            },
+        )
+        .await;
+    }
     dispatch_write_replicated(
         state,
         tenant_id,
@@ -244,7 +274,12 @@ pub async fn dispatch_write_replicated(
     timeout: Duration,
     event_source: EventSource,
 ) -> crate::Result<Vec<u8>> {
+    reject_unadmitted_crdt_apply(&plan)?;
     let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    let local_frontier_mutation = matches!(
+        &plan,
+        PhysicalPlan::Crdt(op) if crate::control::crdt_admission::changes_crdt_frontier(op)
+    );
 
     if let Some(proposer) = state.async_raft_proposer()
         && let Some(entry) = to_replicated_entry(tenant_id, database_id, vshard_id, &plan)
@@ -252,7 +287,23 @@ pub async fn dispatch_write_replicated(
         return propose_sync_write(state, entry, proposer).await;
     }
 
-    let resp =
+    let resp = if local_frontier_mutation {
+        state
+            .vshard_admission_sequencer
+            .run(vshard_id, || async {
+                crate::control::server::shared::ddl::sync_dispatch::dispatch_async_response_with_source(
+                    state,
+                    tenant_id,
+                    database_id,
+                    collection,
+                    plan,
+                    timeout,
+                    event_source,
+                )
+                .await
+            })
+            .await?
+    } else {
         crate::control::server::shared::ddl::sync_dispatch::dispatch_async_response_with_source(
             state,
             tenant_id,
@@ -262,7 +313,8 @@ pub async fn dispatch_write_replicated(
             timeout,
             event_source,
         )
-        .await?;
+        .await?
+    };
 
     if resp.status != Status::Ok {
         // Preserve the typed Data-Plane error code so the CRDT delta path can
@@ -280,4 +332,31 @@ pub async fn dispatch_write_replicated(
     // success path (the Response-returning core leaves this to the caller).
     state.advance_tenant_write_hlc(tenant_id.as_u64());
     Ok(resp.payload.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_physical::physical_plan::CrdtOp;
+    use nodedb_types::Surrogate;
+
+    use super::*;
+
+    #[test]
+    fn generic_sync_dispatch_rejects_unadmitted_apply() {
+        let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
+            collection: "docs".into(),
+            document_id: "doc-1".into(),
+            delta: Vec::new(),
+            peer_id: 1,
+            mutation_id: 1,
+            surrogate: Surrogate::ZERO,
+            provenance: None,
+            constraint_version_required: 0,
+            expected_frontier_digest: None,
+        });
+        assert!(matches!(
+            reject_unadmitted_crdt_apply(&plan),
+            Err(crate::Error::CrdtApplyRequiresAdmission)
+        ));
+    }
 }

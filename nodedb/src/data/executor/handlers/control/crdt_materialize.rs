@@ -46,7 +46,7 @@ impl CoreLoop {
     /// the raw `value` a native put receives; `apply_point_put` canonicalizes
     /// (or Binary-Tuple-encodes) internally, so encoding here would diverge
     /// from the native pipeline.
-    pub(super) fn encode_crdt_row(
+    pub(crate) fn encode_crdt_row(
         engine: &TenantCrdtEngine,
         collection: &str,
         document_id: &str,
@@ -72,7 +72,7 @@ impl CoreLoop {
     /// frame. Any failure is logged and swallowed (the transaction is dropped,
     /// leaving no partial write) so a materialization miss never wedges the
     /// sync stream.
-    pub(super) fn materialize_synced_document(
+    pub(crate) fn materialize_synced_document(
         &mut self,
         task: &ExecutionTask,
         tid: u64,

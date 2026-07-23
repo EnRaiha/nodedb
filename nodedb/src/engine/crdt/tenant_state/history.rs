@@ -80,6 +80,24 @@ impl TenantCrdtEngine {
         }
     }
 
+    /// Generate a forward restore delta without changing tenant CRDT state.
+    pub fn preview_restore_to_version(
+        &self,
+        collection: &str,
+        document_id: &str,
+        target_version_json: &str,
+    ) -> crate::Result<Vec<u8>> {
+        let vv = json_to_vv(target_version_json)?;
+        let state = self.collections.get(collection).ok_or_else(|| {
+            crate::Error::Crdt(nodedb_crdt::CrdtError::Loro(
+                "document did not exist at target version".into(),
+            ))
+        })?;
+        state
+            .preview_restore_to_version(collection, document_id, &vv)
+            .map_err(crate::Error::Crdt)
+    }
+
     /// Restore a document to a historical version (forward mutation).
     pub fn restore_to_version(
         &self,

@@ -5,14 +5,10 @@
 use nodedb_types::protocol::{NativeResponse, OpCode, TextFields};
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
-use crate::control::gateway::GatewayErrorMap;
-use crate::control::gateway::core::QueryContext as GatewayQueryContext;
 use crate::control::planner::calvin::{
     CrossShardTxnMode, DispatchClass, TxnDispatchPosition, classify_dispatch,
     dispatch_tasks_to_calvin,
 };
-use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
-use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::staging_gate::{
     InTxnRoute, StagingGateError, route_in_tx_write,
@@ -20,8 +16,9 @@ use crate::control::server::shared::session::staging_gate::{
 use crate::types::{Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use super::super::super::dispatch_utils;
-use super::{DispatchCtx, error_to_native, shape_error_to_native, to_native_columns_rows};
+use super::raw_dispatch::dispatch_single_task_raw;
+use super::response::data_plane_response_to_native;
+use super::{DispatchCtx, error_to_native};
 
 /// Dispatch a direct Data Plane operation by opcode.
 pub(crate) async fn handle_direct_op(
@@ -470,12 +467,8 @@ async fn dispatch_single_task(
         .await
     {
         Ok(resp) => {
-            // Track direct-op reads (PointGet / RangeScan / VectorSearch / KV
-            // Get) for conflict detection at the protocol-neutral layer, so
-            // native direct-ops record identically to native SQL and pgwire.
-            // Absent-key reads record too (a `NotFound` is a validatable phantom
-            // observation). Direct ops are single-shard, so one watermark → one
-            // entry.
+            // Track direct-op reads, including NotFound phantom observations,
+            // identically to native SQL and pgwire conflict detection.
             let records_read = resp.status == Status::Ok
                 || resp.error_code.as_deref()
                     == Some(&crate::bridge::envelope::ErrorCode::NotFound);
@@ -502,152 +495,5 @@ async fn dispatch_single_task(
             data_plane_response_to_native(ctx, seq, &plan_for_response, &resp)
         }
         Err(e) => error_to_native(seq, &e),
-    }
-}
-
-/// Dispatch one plan via the gateway (when wired) or the local SPSC path and
-/// return the raw Data-Plane [`Response`] without native conversion.
-///
-/// Factored out of [`dispatch_single_task`] so MATCH dispatch can unwrap the
-/// `{rows, frontier}` envelope before native conversion while every other
-/// direct op keeps its prior convert-in-place behaviour.
-///
-/// `txn_id` is the connection's active transaction id (`None` in autocommit),
-/// threaded through to the Data Plane exactly like the native SQL path's
-/// `dispatch_task_via_gateway` (see `sql_gateway.rs`) so direct-op reads can
-/// resolve this transaction's staging overlay for read-your-own-writes.
-async fn dispatch_single_task_raw(
-    ctx: &DispatchCtx<'_>,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    plan: PhysicalPlan,
-    txn_id: Option<TxnId>,
-) -> crate::Result<Response> {
-    match ctx.state.gateway.get() {
-        Some(gw) => {
-            let gw_ctx = GatewayQueryContext {
-                tenant_id,
-                trace_id: TraceId::generate(),
-                database_id: ctx.database_id(),
-                txn_id,
-            };
-            match gw.execute(&gw_ctx, plan).await {
-                Ok(payloads) => Ok(gateway_payloads_to_response(payloads)),
-                Err(e) => {
-                    let (_code, msg) = GatewayErrorMap::to_native(&e);
-                    Err(crate::Error::Dispatch { detail: msg })
-                }
-            }
-        }
-        None => {
-            // Local SPSC path (single-node boot, before the gateway is wired):
-            // the gateway would otherwise own WAL durability on the target node,
-            // so the write must be appended locally. The append is performed
-            // inside the dispatch core, under the write-admission guard and just
-            // before the enqueue, so LSN order matches apply order. This covers
-            // every local dispatch — the no-edge fast path AND each task of a
-            // single-shard edge bundle — so an implicit edge written on the boot
-            // path is durable. (Cross-shard bundles route via Calvin, which owns
-            // its own replicated durability and never reaches this branch.)
-            let database_id = ctx.database_id();
-            dispatch_utils::dispatch_autocommit_write(
-                ctx.state,
-                dispatch_utils::AutocommitWrite {
-                    tenant_id,
-                    database_id,
-                    vshard_id,
-                    plan,
-                    trace_id: TraceId::ZERO,
-                    event_source: crate::event::EventSource::User,
-                    txn_id,
-                },
-            )
-            .await
-        }
-    }
-}
-
-/// Convert gateway `Vec<Vec<u8>>` payloads into a synthetic `Response`.
-fn gateway_payloads_to_response(payloads: Vec<Vec<u8>>) -> Response {
-    let payload = payloads
-        .into_iter()
-        .next()
-        .map(Payload::from_vec)
-        .unwrap_or_else(Payload::empty);
-    Response {
-        request_id: RequestId::new(0),
-        status: Status::Ok,
-        attempt: 0,
-        partial: false,
-        payload,
-        watermark_lsn: Lsn::new(0),
-        error_code: None,
-        read_set_valid: None,
-        read_version_lsn: crate::types::Lsn::ZERO,
-        write_set: Vec::new(),
-    }
-}
-
-/// Convert a raw Data-Plane [`Response`] into a [`NativeResponse`], shaping
-/// a non-empty payload through the shared composed shaper.
-///
-/// Direct ops (`OpCode::PointGet`, `VectorSearch`, `GraphMatch`, ...) have no
-/// SQL text, so there is no SELECT-list to project — `projection` is always
-/// `None` here, matching pgwire's own direct-op (`{ }` field syntax / RESP)
-/// handlers, which likewise never apply column projection.
-fn data_plane_response_to_native(
-    ctx: &DispatchCtx<'_>,
-    seq: u64,
-    plan: &PhysicalPlan,
-    resp: &Response,
-) -> NativeResponse {
-    if resp.status == Status::Error {
-        let msg = if resp.payload.is_empty() {
-            resp.error_code
-                .as_ref()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_else(|| "unknown error".into())
-        } else {
-            String::from_utf8_lossy(&resp.payload).into_owned()
-        };
-        return NativeResponse::error(seq, "XX000", msg);
-    }
-
-    if resp.payload.is_empty() {
-        let mut r = NativeResponse::ok(seq);
-        r.watermark_lsn = resp.watermark_lsn.as_u64();
-        return r;
-    }
-
-    let plan_kind = describe_plan(plan);
-    match shape_response_materialized(
-        &resp.payload,
-        plan,
-        plan_kind,
-        None,
-        ctx.state,
-        ctx.database_id(),
-        ctx.tenant_id(),
-    ) {
-        Ok(ShapeOutcome::Rows(shaped)) => {
-            let (columns, rows) = to_native_columns_rows(&shaped);
-            NativeResponse {
-                seq,
-                status: nodedb_types::protocol::ResponseStatus::Ok,
-                columns: Some(columns),
-                rows: Some(rows),
-                rows_affected: None,
-                watermark_lsn: resp.watermark_lsn.as_u64(),
-                error: None,
-                auth: None,
-                warnings: shaped.notice.into_iter().collect(),
-            }
-        }
-        Ok(ShapeOutcome::Passthrough) => {
-            let mut r = NativeResponse::ok(seq);
-            r.watermark_lsn = resp.watermark_lsn.as_u64();
-            r
-        }
-        Err(e) => shape_error_to_native(seq, &e),
     }
 }

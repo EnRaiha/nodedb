@@ -196,6 +196,17 @@ impl From<Error> for NodeDbError {
                 "vshard_admission",
                 format!("vshard {vshard_id} admission queue is full (capacity {capacity})"),
             ),
+            Error::CrdtAdmissionRetriesExhausted { .. } => NodeDbError::write_conflict(
+                "crdt",
+                "CRDT frontier changed repeatedly; retry the write",
+            ),
+            Error::CrdtAdmissionInvalidPlan { .. }
+            | Error::CrdtAdmissionCallerFence
+            | Error::CrdtApplyRequiresAdmission
+            | Error::CrdtApplyForbiddenInTransaction => {
+                NodeDbError::bad_request("invalid CRDT admission request".to_owned())
+            }
+            Error::CrdtAdmissionTimeout { .. } => NodeDbError::deadline_exceeded(),
             Error::NoLeader { vshard_id } => {
                 NodeDbError::no_leader(format!("vshard {vshard_id} has no serving leader"))
             }

@@ -188,7 +188,9 @@ pub(super) fn wire_proposers(
                     // success. Other errors stay wrapped for
                     // diagnostics.
                     .map_err(|e| match e {
-                        crate::Error::RetryableLeaderChange { .. } => e,
+                        crate::Error::RetryableLeaderChange { .. } | crate::Error::DataPlane(_) => {
+                            e
+                        }
                         other => crate::Error::Dispatch {
                             detail: format!("apply error: {other}"),
                         },

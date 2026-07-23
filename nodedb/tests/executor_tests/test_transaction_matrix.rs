@@ -347,9 +347,8 @@ fn rollback_matrix_graph_then_graph_and_vector_fail() {
 // ---------------------------------------------------------------------------
 // Pair: CRDT (first, buffered) × Vector (second, fails)
 // CRDT deltas are buffered and never applied to LoroDoc until commit.
-// If the batch fails, CRDT deltas are discarded — no undo needed.
-// This test asserts the batch fails cleanly and the doc co-written
-// with the CRDT op is also rolled back.
+// Raw CRDT Apply is forbidden in transaction batches because it bypasses
+// serialized preview admission. It must reject before any sibling mutation.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -363,7 +362,7 @@ fn rollback_matrix_crdt_buffered_then_vector_fail() {
     send_ok(&mut core, &mut tx, &mut rx, vector_set_params("vec"));
     send_ok(&mut core, &mut tx, &mut rx, vector_seed("vec"));
 
-    // TransactionBatch: CRDT apply (buffered) + doc overwrite + failing vector.
+    // TransactionBatch: forbidden CRDT Apply + writes that must never run.
     let crdt_delta: Vec<u8> = vec![0u8; 8]; // minimal placeholder delta
     let resp = send_raw(
         &mut core,
@@ -389,6 +388,10 @@ fn rollback_matrix_crdt_buffered_then_vector_fail() {
         }),
     );
     assert_eq!(resp.status, Status::Error);
+    assert!(matches!(
+        resp.error_code.as_deref(),
+        Some(ErrorCode::Unsupported { detail }) if detail == "CRDT Apply is not supported inside transaction batches"
+    ));
     // Rollback must succeed (not RollbackFailed).
     assert!(
         !matches!(

@@ -21,6 +21,7 @@ use std::time::Duration;
 use nodedb_cluster::rpc_codec::TypedClusterError;
 
 use crate::Error;
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn;
 use crate::control::server::result_stream::ResultStream;
 use crate::control::state::SharedState;
@@ -211,6 +212,15 @@ async fn dispatch_local(
 ) -> Result<DispatchOutcome, Error> {
     let vshard_id = VShardId::new(route.vshard_id);
 
+    if txn_id.is_some()
+        && matches!(
+            &route.plan,
+            PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
+        )
+    {
+        return Err(Error::CrdtApplyForbiddenInTransaction);
+    }
+
     // Autocommit replicable writes MUST drive through Raft — exactly as the
     // pgwire statement path and the remote-leaseholder receiver (`exec_receiver`)
     // do: propose → WAL-append → apply → bump `coll_write_lsn` on every voter.
@@ -222,6 +232,67 @@ async fn dispatch_local(
     // to the SPSC path below unchanged. Staged in-transaction writes
     // (`txn_id.is_some()`) also fall through: they stay deferred to COMMIT's
     // batch funnel, which appends their durable version there.
+    if txn_id.is_none()
+        && let Some(collection) = match &route.plan {
+            PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply {
+                collection,
+                ..
+            }) => Some(collection.clone()),
+            _ => None,
+        }
+    {
+        let outcome = crate::control::crdt_admission::dispatch_crdt_apply_admitted_outcome(
+            shared,
+            crate::control::crdt_admission::CrdtApplyAdmissionRequest {
+                tenant_id,
+                database_id,
+                collection: &collection,
+                plan: route.plan,
+                timeout: std::time::Duration::from_secs(
+                    shared.tuning.network.default_deadline_secs,
+                ),
+                event_source: crate::event::EventSource::User,
+                policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+            },
+        )
+        .await?;
+        return Ok(DispatchOutcome {
+            payloads: vec![outcome.payload],
+            shard_watermarks: vec![(vshard_id, Lsn::ZERO)],
+            read_version_lsn: outcome.write_version,
+        });
+    }
+
+    // In local mode, frontier-changing CRDT operations have no Raft ordering.
+    // Serialize their complete Data Plane dispatch; replicated/transactional
+    // paths rely on the fenced-apply retry rather than this local mutex.
+    if txn_id.is_none()
+        && shared.async_raft_proposer().is_none()
+        && let PhysicalPlan::Crdt(op) = &route.plan
+        && crate::control::crdt_admission::changes_crdt_frontier(op)
+    {
+        let resp = shared
+            .vshard_admission_sequencer
+            .run(vshard_id, || async {
+                dispatch_to_data_plane_with_txn(
+                    shared,
+                    tenant_id,
+                    database_id,
+                    vshard_id,
+                    route.plan,
+                    trace_id,
+                    None,
+                )
+                .await
+            })
+            .await?;
+        return Ok(DispatchOutcome {
+            payloads: vec![resp.payload.to_vec()],
+            shard_watermarks: vec![(vshard_id, resp.watermark_lsn)],
+            read_version_lsn: resp.read_version_lsn,
+        });
+    }
+
     if txn_id.is_none()
         && let Some(proposer) = shared.async_raft_proposer()
         && let Some(entry) = crate::control::wal_replication::to_replicated_entry(

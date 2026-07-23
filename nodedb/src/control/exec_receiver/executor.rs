@@ -21,6 +21,7 @@ use tracing::{Instrument, info_span};
 use nodedb_cluster::forward::{ChunkSink, PlanExecutor};
 use nodedb_cluster::rpc_codec::{ExecuteRequest, ExecuteResponse, TypedClusterError};
 
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::exchange::execute_plan_all_local_cores;
 use crate::control::state::SharedState;
 use crate::control::trace_export::EmitSpanParams;
@@ -256,6 +257,42 @@ impl LocalPlanExecutor {
                 .map(|name| nodedb_cluster::routing::vshard_for_collection(database_id, &name))
                 .unwrap_or(0),
         );
+        if let PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply {
+            collection,
+            ..
+        }) = &plan
+        {
+            let collection = collection.clone();
+            if req.txn_id.is_some() {
+                return ExecuteResponse::err(TypedClusterError::Internal {
+                    code: PLAN_DECODE_FAILED,
+                    message: crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
+                });
+            }
+            return match crate::control::crdt_admission::dispatch_crdt_apply_admitted_outcome(
+                &self.state,
+                crate::control::crdt_admission::CrdtApplyAdmissionRequest {
+                    tenant_id,
+                    database_id,
+                    collection: &collection,
+                    plan,
+                    timeout: deadline,
+                    event_source: crate::event::EventSource::User,
+                    policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+                },
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    ExecuteResponse::ok(vec![outcome.payload], 0, outcome.write_version.as_u64())
+                }
+                Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
+                    code: PLAN_DECODE_FAILED,
+                    message: error.to_string(),
+                }),
+            };
+        }
+
         if let Some(proposer) = self.state.async_raft_proposer()
             && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
                 tenant_id,

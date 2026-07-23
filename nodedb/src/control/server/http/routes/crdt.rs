@@ -72,14 +72,19 @@ pub async fn crdt_apply(
     // — lost to followers and entirely on leader failover. This handler is scoped
     // to the default database (matching its surrogate assignment above).
     state.shared.tenant_request_start(identity.tenant_id);
-    let result = crate::control::server::sync::raft_dispatch::dispatch_write_replicated(
+    let result = crate::control::crdt_admission::dispatch_crdt_apply_admitted(
         &state.shared,
-        identity.tenant_id,
-        crate::types::DatabaseId::DEFAULT,
-        &collection,
-        plan,
-        std::time::Duration::from_secs(state.shared.tuning.network.default_deadline_secs),
-        crate::event::EventSource::User,
+        crate::control::crdt_admission::CrdtApplyAdmissionRequest {
+            tenant_id: identity.tenant_id,
+            database_id: crate::types::DatabaseId::DEFAULT,
+            collection: &collection,
+            plan,
+            timeout: std::time::Duration::from_secs(
+                state.shared.tuning.network.default_deadline_secs,
+            ),
+            event_source: crate::event::EventSource::User,
+            policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+        },
     )
     .await;
     state.shared.tenant_request_end(identity.tenant_id);

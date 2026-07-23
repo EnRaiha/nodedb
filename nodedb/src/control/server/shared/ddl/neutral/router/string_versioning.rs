@@ -5,6 +5,7 @@
 //! graph index / tree operations.
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::{DmlTxnCtx, TransactionState};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -21,6 +22,7 @@ pub(super) async fn try_string(
     sql: &str,
     upper: &str,
     database_id: DatabaseId,
+    txn_ctx: &DmlTxnCtx<'_>,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     // Version history. None of `CREATE CHECKPOINT`, `DROP CHECKPOINT`, `SHOW
     // VERSIONS OF`, `SELECT … AT VERSION`, `SELECT DIFF(…)`, `RESTORE … SET
@@ -54,6 +56,12 @@ pub(super) async fn try_string(
         return Some(version_history::diff::select_diff(state, identity, database_id, sql).await);
     }
     if upper.starts_with("RESTORE ") && upper.contains("SET VERSION") {
+        if restore_forbidden_in_transaction(txn_ctx) {
+            return Some(Err(DdlError {
+                sqlstate: "25001".to_owned(),
+                message: crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
+            }));
+        }
         return Some(
             version_history::restore::restore_version(state, identity, database_id, sql).await,
         );
@@ -224,4 +232,32 @@ pub(super) async fn try_string(
     }
 
     None
+}
+
+fn restore_forbidden_in_transaction(txn_ctx: &DmlTxnCtx<'_>) -> bool {
+    txn_ctx.sessions.transaction_state(txn_ctx.addr) != TransactionState::Idle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::server::shared::session::SessionStore;
+
+    #[test]
+    fn restore_is_forbidden_in_active_or_failed_transactions() {
+        let sessions = SessionStore::new();
+        let addr = "127.0.0.1:5400".parse().expect("test address");
+        sessions.ensure_session(addr);
+        let ctx = DmlTxnCtx {
+            sessions: &sessions,
+            addr: &addr,
+        };
+        assert!(!restore_forbidden_in_transaction(&ctx));
+        sessions
+            .begin(&addr, crate::types::Lsn::new(1), 0)
+            .expect("begin");
+        assert!(restore_forbidden_in_transaction(&ctx));
+        sessions.fail_transaction(&addr);
+        assert!(restore_forbidden_in_transaction(&ctx));
+    }
 }

@@ -26,22 +26,27 @@ pub(super) fn wal_append_crdt_op(
     let appended = match op {
         CrdtOp::Apply {
             collection,
+            document_id,
             delta,
+            surrogate,
             provenance,
+            expected_frontier_digest,
             ..
         } => {
-            // Wrap delta bytes with collection and provenance so the replay decoder can
-            // reconstruct idempotency context and route to the correct collection.
-            let payload = crate::wal::CrdtDeltaWalPayload {
-                bytes: delta.clone(),
-                collection: Some(collection.clone()),
-                provenance: provenance.clone(),
-            };
-            let crdt_payload =
-                zerompk::to_msgpack_vec(&payload).map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal crdt delta: {e}"),
-                })?;
+            // Versioned payload preserves the admission fence for deterministic
+            // crash replay; legacy records decode without a fence.
+            let payload = crate::wal::CrdtDeltaWalPayload::new(
+                delta.clone(),
+                Some(collection.clone()),
+                provenance.clone(),
+                *expected_frontier_digest,
+                Some(document_id.clone()),
+                Some(surrogate.as_u32()),
+            );
+            let crdt_payload = payload.encode().map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal crdt delta: {e}"),
+            })?;
             Some(wal.append_crdt_delta(tenant_id, vshard_id, database_id, &crdt_payload)?)
         }
         CrdtOp::ImportSnapshot {
@@ -51,16 +56,18 @@ pub(super) fn wal_append_crdt_op(
             // `apply_committed_delta` are the same idempotent Loro `state.import`,
             // so the snapshot rides the CRDT delta record and replays identically,
             // routed to the same collection. No provenance (not a per-doc sync op).
-            let payload = crate::wal::CrdtDeltaWalPayload {
-                bytes: bytes.clone(),
-                collection: Some(collection.clone()),
-                provenance: None,
-            };
-            let crdt_payload =
-                zerompk::to_msgpack_vec(&payload).map_err(|e| crate::Error::Serialization {
-                    format: "msgpack".into(),
-                    detail: format!("wal crdt snapshot import: {e}"),
-                })?;
+            let payload = crate::wal::CrdtDeltaWalPayload::new(
+                bytes.clone(),
+                Some(collection.clone()),
+                None,
+                None,
+                None,
+                None,
+            );
+            let crdt_payload = payload.encode().map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal crdt snapshot import: {e}"),
+            })?;
             Some(wal.append_crdt_delta(tenant_id, vshard_id, database_id, &crdt_payload)?)
         }
         CrdtOp::ListInsert {

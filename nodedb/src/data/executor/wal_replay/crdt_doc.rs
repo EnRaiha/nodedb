@@ -254,6 +254,80 @@ mod tests {
         }
     }
 
+    fn string_field<'a>(map: &'a loro::LoroValue, key: &str) -> Option<&'a str> {
+        let loro::LoroValue::Map(m) = map else {
+            return None;
+        };
+        match m.get(key) {
+            Some(loro::LoroValue::String(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn earlier_doc_intent_replays_before_later_snapshot_across_record_classes() {
+        let dir = tempfile::tempdir().expect("wal tempdir");
+        let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
+        let tid = TenantId::new(TID);
+        let vs = VShardId::new(0);
+        let db = DatabaseId::DEFAULT;
+
+        wal_append_if_write(
+            &wal,
+            tid,
+            vs,
+            db,
+            &upsert_plan(r#"{"body":"intent"}"#, false),
+        )
+        .expect("append earlier doc intent");
+
+        let source = nodedb_crdt::CrdtState::new(999).expect("snapshot source");
+        for index in 0..16 {
+            source
+                .upsert(
+                    COLLECTION,
+                    DOCUMENT_ID,
+                    &[(
+                        "body",
+                        loro::LoroValue::String(format!("snapshot-{index}").into()),
+                    )],
+                )
+                .expect("advance snapshot source");
+        }
+        let snapshot = source.export_snapshot().expect("snapshot bytes");
+        wal_append_if_write(
+            &wal,
+            tid,
+            vs,
+            db,
+            &PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
+                tenant_id: TID,
+                collection: COLLECTION.into(),
+                bytes: snapshot,
+            }),
+        )
+        .expect("append later snapshot");
+        wal.sync().expect("wal sync");
+
+        let mut records = wal.replay().expect("wal replay read");
+        records.reverse();
+        let mut h = make_core();
+        h.core
+            .replay_crdt_wal_ordered(&records, 1, &TombstoneSet::new());
+
+        let row = h
+            .core
+            .get_crdt_engine(db, tid)
+            .expect("engine")
+            .read_row(COLLECTION, DOCUMENT_ID)
+            .expect("row present");
+        assert_eq!(
+            string_field(&row, "body"),
+            Some("snapshot-15"),
+            "the later snapshot must win; replaying record classes in bulk would re-execute the older intent last"
+        );
+    }
+
     #[test]
     fn doc_upsert_replace_then_partial_set_then_delete_reconstructs_after_replay_from_empty() {
         let dir = tempfile::tempdir().expect("wal tempdir");
@@ -276,12 +350,14 @@ mod tests {
             );
         }
         wal.sync().expect("wal sync");
-        let records = wal.replay().expect("wal replay read");
+        let mut records = wal.replay().expect("wal replay read");
+        // Startup input order is not trusted; ordered replay must restore WAL
+        // LSN order and apply each document intent exactly once.
+        records.reverse();
 
         let mut h = make_core();
         let tombstones = TombstoneSet::new();
-        h.core.replay_crdt_wal(&records, 1, &tombstones);
-        h.core.replay_crdt_doc_wal(&records, 1, &tombstones);
+        h.core.replay_crdt_wal_ordered(&records, 1, &tombstones);
 
         let engine = h.core.get_crdt_engine(db, tid).expect("engine");
         let row = engine

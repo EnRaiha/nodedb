@@ -68,7 +68,7 @@ impl CoreLoop {
     /// surrogate per extra row; materializing just one would silently drop the
     /// rest. Returns a human-readable detail naming the offending rows so the
     /// caller surfaces the violation instead of losing data.
-    fn single_document_write_set(
+    pub(crate) fn single_document_write_set(
         collection: &str,
         document_id: &str,
         write_set: &[(String, String)],
@@ -129,6 +129,7 @@ impl CoreLoop {
             // before the sparse write below takes &self. On a Clean apply we
             // read the merged row back and encode it while the borrow is live,
             // carrying the materialized bytes out.
+            let mut imported_authoritative = false;
             let materialized = {
                 let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
                     Ok(e) => e,
@@ -151,6 +152,7 @@ impl CoreLoop {
                 );
                 match outcome {
                     ValidatedApplyOutcome::Clean { write_set } => {
+                        imported_authoritative = true;
                         // Enforce the one-document-per-delta contract before
                         // materializing: a delta that wrote rows other than the
                         // frame target has no surrogate for those rows, so
@@ -168,6 +170,7 @@ impl CoreLoop {
                         }
                     }
                     ValidatedApplyOutcome::Rejected(vt) => {
+                        imported_authoritative = true;
                         debug!(core = self.core_id, %collection, reason = %vt, "crdt apply violated constraint (DLQ)");
                         Ok(None)
                     }
@@ -177,9 +180,11 @@ impl CoreLoop {
                     }
                 }
             };
-            // engine borrow dropped here. The Loro import already happened, so
-            // the checkpoint must capture it regardless of the outcome below.
-            self.checkpoint_coordinator.mark_dirty("crdt", 1);
+            // Engine borrow dropped here. A clean or constraint-rejected Loro
+            // import changed authoritative state; malformed bytes did not.
+            if imported_authoritative {
+                self.checkpoint_coordinator.mark_dirty("crdt", 1);
+            }
             // Materialize into the sparse document store so DocumentScan /
             // ShapeSnapshot see the synced document — unless the delta violated
             // the one-document-per-delta contract, in which case reject loudly
@@ -193,9 +198,20 @@ impl CoreLoop {
                         surrogate,
                         &bytes,
                     );
+                    if imported_authoritative {
+                        self.note_collection_write_lsn(task, collection);
+                    }
+                }
+                Ok(None) if imported_authoritative => {
+                    // Headless and constraint-rejected imports have no sparse
+                    // projection, but still changed authoritative Loro state.
+                    self.note_collection_write_lsn(task, collection);
                 }
                 Ok(None) => {}
                 Err(detail) => {
+                    if imported_authoritative {
+                        self.note_collection_write_lsn(task, collection);
+                    }
                     warn!(
                         core = self.core_id,
                         %collection,
@@ -316,6 +332,7 @@ impl CoreLoop {
                 };
                 // engine borrow is dropped here; mark_dirty / sync_commit take
                 // &mut self, and the sparse materialize takes &self.
+                let mut imported_authoritative = false;
                 let reject = match outcome {
                     GateOutcome::Pending { installed } => {
                         // Create-race: the constraints this delta was admitted
@@ -340,6 +357,7 @@ impl CoreLoop {
                         })
                     }
                     GateOutcome::Applied(ValidatedApplyOutcome::Clean { write_set }) => {
+                        imported_authoritative = true;
                         self.checkpoint_coordinator.mark_dirty("crdt", 1);
                         // Enforce the one-document-per-delta sync contract. A
                         // delta that coalesced multiple documents (or targeted
@@ -362,6 +380,7 @@ impl CoreLoop {
                         }
                     }
                     GateOutcome::Applied(ValidatedApplyOutcome::Rejected(vt)) => {
+                        imported_authoritative = true;
                         self.checkpoint_coordinator.mark_dirty("crdt", 1);
                         Some(vt)
                     }
@@ -385,6 +404,9 @@ impl CoreLoop {
                         surrogate,
                         &bytes,
                     );
+                }
+                if imported_authoritative {
+                    self.note_collection_write_lsn(task, collection);
                 }
                 // Advance the HWM unconditionally after apply — a rejected,
                 // fenced, or malformed delta must not wedge the sync stream.

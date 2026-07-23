@@ -289,14 +289,17 @@ impl Session {
         // group routing), NOT the document-keyed `vshard_id` used for local
         // core locality above.
         let collection = body["collection"].as_str().unwrap_or("default");
-        let payload = crate::control::server::sync::raft_dispatch::dispatch_write_replicated(
+        let payload = crate::control::crdt_admission::dispatch_crdt_apply_admitted(
             &self.state,
-            tenant_id,
-            database_id,
-            collection,
-            plan,
-            Duration::from_secs(self.state.tuning.network.default_deadline_secs),
-            crate::event::EventSource::User,
+            crate::control::crdt_admission::CrdtApplyAdmissionRequest {
+                tenant_id,
+                database_id,
+                collection,
+                plan,
+                timeout: Duration::from_secs(self.state.tuning.network.default_deadline_secs),
+                event_source: crate::event::EventSource::User,
+                policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+            },
         )
         .await?;
         let payload_str = String::from_utf8_lossy(&payload).into_owned();

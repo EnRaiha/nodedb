@@ -90,14 +90,17 @@ pub async fn crdt_merge(
 
     // Route the merge result through the Raft proposer gate so the applied delta
     // is quorum-durable under replication, not lost to followers on failover.
-    crate::control::server::sync::raft_dispatch::dispatch_write_replicated(
+    crate::control::crdt_admission::dispatch_crdt_apply_admitted(
         state,
-        tenant_id,
-        database_id,
-        collection,
-        apply_plan,
-        Duration::from_secs(state.tuning.network.default_deadline_secs),
-        crate::event::EventSource::User,
+        crate::control::crdt_admission::CrdtApplyAdmissionRequest {
+            tenant_id,
+            database_id,
+            collection,
+            plan: apply_plan,
+            timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+            event_source: crate::event::EventSource::User,
+            policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+        },
     )
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;

@@ -32,6 +32,35 @@ use super::applied_index::{AppliedPrefix, save_applied_index};
 use super::applier::ApplyBatch;
 use super::propose_tracker::{AppliedWrite, ProposeTracker};
 
+fn committed_response_result(
+    response: &crate::bridge::envelope::Response,
+) -> crate::Result<AppliedWrite> {
+    if response.status == Status::Ok {
+        return Ok(AppliedWrite::from_response(response));
+    }
+    if let Some(error @ crate::bridge::envelope::ErrorCode::CrdtFrontierMismatch { .. }) =
+        response.error_code.as_deref()
+    {
+        return Err(crate::Error::DataPlane(error.clone()));
+    }
+    let reason = response
+        .error_code
+        .as_ref()
+        .map(|code| format!("{code:?}"))
+        .unwrap_or_else(|| "execution error".into());
+    tracing::warn!(reason = %reason, "applying committed write failed");
+    Err(crate::Error::Internal { detail: reason })
+}
+
+fn deterministic_crdt_fence_noop(result: &crate::Result<AppliedWrite>) -> bool {
+    matches!(
+        result,
+        Err(crate::Error::DataPlane(
+            crate::bridge::envelope::ErrorCode::CrdtFrontierMismatch { .. }
+        ))
+    )
+}
+
 /// Run the background loop that applies committed Raft entries to the local Data Plane.
 ///
 /// This task reads from the apply channel, deserializes each entry, dispatches
@@ -372,20 +401,7 @@ pub async fn run_apply_loop(
                 // wire, so the propose waiter is the only place it can be
                 // handed back.
                 Ok(resp) if resp.status == Status::Ok => Ok(AppliedWrite::from_response(&resp)),
-                Ok(resp) => {
-                    let reason = resp
-                        .error_code
-                        .as_ref()
-                        .map(|c| format!("{c:?}"))
-                        .unwrap_or_else(|| "execution error".into());
-                    tracing::warn!(
-                        group_id = batch.group_id,
-                        index = entry.index,
-                        reason = %reason,
-                        "applying committed write failed"
-                    );
-                    Err(crate::Error::Internal { detail: reason })
-                }
+                Ok(resp) => committed_response_result(&resp),
                 Err(e) => {
                     tracing::warn!(
                         group_id = batch.group_id,
@@ -399,7 +415,7 @@ pub async fn run_apply_loop(
                 }
             };
 
-            let applied_ok = result.is_ok();
+            let applied_ok = result.is_ok() || deterministic_crdt_fence_noop(&result);
             tracker.complete(batch.group_id, entry.index, applied_key, result);
 
             // Extend the batch's durable prefix. On success `submit_write`'s
@@ -473,5 +489,31 @@ fn maybe_compact_log(state: &Arc<SharedState>, group_id: u64, applied_index: u64
                 "raft log compaction failed"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fenced_frontier_mismatch_completes_retry_and_advances_durable_prefix() {
+        let result: crate::Result<AppliedWrite> = Err(crate::Error::DataPlane(
+            crate::bridge::envelope::ErrorCode::CrdtFrontierMismatch {
+                expected: [1; 32],
+                actual: [2; 32],
+            },
+        ));
+        assert!(deterministic_crdt_fence_noop(&result));
+        assert!(matches!(
+            result,
+            Err(crate::Error::DataPlane(
+                crate::bridge::envelope::ErrorCode::CrdtFrontierMismatch { .. }
+            ))
+        ));
+
+        let mut prefix = AppliedPrefix::new();
+        prefix.record(17, deterministic_crdt_fence_noop(&result));
+        assert_eq!(prefix.floor(), Some(17));
     }
 }

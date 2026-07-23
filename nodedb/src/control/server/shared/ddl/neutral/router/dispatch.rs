@@ -51,7 +51,8 @@ pub async fn try_dispatch(
     if let Some(r) = string_streaming::try_string(state, identity, sql, &upper, database_id).await {
         return Some(r);
     }
-    if let Some(r) = string_versioning::try_string(state, identity, sql, &upper, database_id).await
+    if let Some(r) =
+        string_versioning::try_string(state, identity, sql, &upper, database_id, txn_ctx).await
     {
         return Some(r);
     }

@@ -130,6 +130,30 @@ pub enum Error {
         capacity: usize,
     },
 
+    #[error("CRDT admission exhausted {attempts} stale-frontier retries on {vshard_id}")]
+    CrdtAdmissionRetriesExhausted {
+        vshard_id: VShardId,
+        attempts: usize,
+    },
+
+    #[error("CRDT admission rejected an invalid plan: {reason}")]
+    CrdtAdmissionInvalidPlan { reason: &'static str },
+
+    #[error("CRDT admission rejects caller-supplied frontier fences")]
+    CrdtAdmissionCallerFence,
+
+    #[error("CRDT Apply requires the serialized admission boundary")]
+    CrdtApplyRequiresAdmission,
+
+    #[error("CRDT Apply is not supported inside explicit transactions")]
+    CrdtApplyForbiddenInTransaction,
+
+    #[error("CRDT admission timed out on {vshard_id} after {timeout_ms}ms")]
+    CrdtAdmissionTimeout {
+        vshard_id: VShardId,
+        timeout_ms: u64,
+    },
+
     #[error("vshard {vshard_id} has no serving leader")]
     NoLeader { vshard_id: VShardId },
 

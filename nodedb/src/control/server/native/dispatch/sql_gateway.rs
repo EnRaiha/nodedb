@@ -11,7 +11,6 @@
 use crate::bridge::envelope::{Payload, Response, Status};
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext as GatewayQueryContext;
-use crate::control::server::dispatch_utils;
 use crate::types::{Lsn, RequestId, TraceId};
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -54,22 +53,8 @@ pub(super) async fn dispatch_task_via_gateway(
                 .map(payloads_to_response)
         }
         None => {
-            // Boot fallback: no gateway yet, dispatch locally. The WAL append is
-            // performed inside the dispatch core, under the write-admission guard
-            // and just before the enqueue, so LSN order matches apply order.
-            dispatch_utils::dispatch_autocommit_write(
-                ctx.state,
-                dispatch_utils::AutocommitWrite {
-                    tenant_id,
-                    database_id,
-                    vshard_id,
-                    plan,
-                    trace_id: TraceId::ZERO,
-                    event_source: crate::event::EventSource::User,
-                    txn_id,
-                },
-            )
-            .await
+            super::raw_dispatch::dispatch_without_gateway(ctx, tenant_id, vshard_id, plan, txn_id)
+                .await
         }
     }
 }

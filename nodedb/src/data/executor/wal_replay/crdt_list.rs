@@ -379,12 +379,15 @@ mod tests {
 
         // Seed the empty `blocks` list via the existing `CrdtDelta` path
         // (durable, but out of scope for this unit).
-        let seed_payload = crate::wal::CrdtDeltaWalPayload {
-            bytes: seed_empty_blocks_list_bytes(),
-            collection: Some(COLLECTION.to_string()),
-            provenance: None,
-        };
-        let seed_bytes = zerompk::to_msgpack_vec(&seed_payload).expect("encode seed");
+        let seed_payload = crate::wal::CrdtDeltaWalPayload::new(
+            seed_empty_blocks_list_bytes(),
+            Some(COLLECTION.to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let seed_bytes = seed_payload.encode().expect("encode seed");
         wal.append_crdt_delta(tid, vs, db, &seed_bytes)
             .expect("append seed");
 
@@ -407,8 +410,7 @@ mod tests {
 
         let mut h = make_core();
         let tombstones = TombstoneSet::new();
-        h.core.replay_crdt_wal(&records, 1, &tombstones);
-        h.core.replay_crdt_list_wal(&records, 1, &tombstones);
+        h.core.replay_crdt_wal_ordered(&records, 1, &tombstones);
 
         let engine = h.core.get_crdt_engine(db, tid).expect("engine");
         let len = engine
@@ -454,12 +456,15 @@ mod tests {
         let vs = VShardId::new(0);
         let db = DatabaseId::DEFAULT;
 
-        let seed_payload = crate::wal::CrdtDeltaWalPayload {
-            bytes: seed_empty_blocks_list_bytes(),
-            collection: Some(COLLECTION.to_string()),
-            provenance: None,
-        };
-        let seed_bytes = zerompk::to_msgpack_vec(&seed_payload).expect("encode seed");
+        let seed_payload = crate::wal::CrdtDeltaWalPayload::new(
+            seed_empty_blocks_list_bytes(),
+            Some(COLLECTION.to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let seed_bytes = seed_payload.encode().expect("encode seed");
         wal.append_crdt_delta(tid, vs, db, &seed_bytes)
             .expect("append seed");
 
@@ -484,8 +489,7 @@ mod tests {
 
         let mut h = make_core();
         let tombstones = TombstoneSet::new();
-        h.core.replay_crdt_wal(&records, 1, &tombstones);
-        h.core.replay_crdt_list_wal(&records, 1, &tombstones);
+        h.core.replay_crdt_wal_ordered(&records, 1, &tombstones);
 
         let engine = h.core.get_crdt_engine(db, tid).expect("engine");
         let len = engine

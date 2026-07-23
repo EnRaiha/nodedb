@@ -131,6 +131,96 @@ mod tests {
     }
 
     #[test]
+    fn restore_handler_generates_delta_without_mutating_authoritative_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _request_tx, _response_rx) = make_core_with_dir(dir.path());
+        let mut task = task();
+        let source = nodedb_crdt::CrdtState::new(42).expect("source");
+        source
+            .upsert("docs", "one", &[("value", LoroValue::String("v1".into()))])
+            .expect("v1");
+        source
+            .upsert("docs", "one", &[("value", LoroValue::String("v2".into()))])
+            .expect("v2");
+        let snapshot = source.export_snapshot().expect("snapshot");
+        let mut tenant = crate::engine::crdt::tenant_state::TenantCrdtEngine::new(
+            TenantId::new(1),
+            42,
+            nodedb_crdt::ConstraintSet::new(),
+        )
+        .expect("tenant engine");
+        tenant
+            .import_snapshot_bytes("docs", &snapshot)
+            .expect("tenant snapshot");
+        let version_json = tenant.version_vector_json("docs").expect("version json");
+        assert!(
+            tenant
+                .preview_restore_to_version("docs", "one", &version_json)
+                .expect("tenant preview")
+                .is_empty(),
+            "sanity: imported snapshot is at its current version"
+        );
+        let historical_json = {
+            let historical_source = nodedb_crdt::CrdtState::new(42).expect("historical source");
+            historical_source
+                .upsert("docs", "one", &[("value", LoroValue::String("v1".into()))])
+                .expect("historical v1");
+            let historical_snapshot = historical_source
+                .export_snapshot()
+                .expect("historical snapshot");
+            let mut historical_tenant = crate::engine::crdt::tenant_state::TenantCrdtEngine::new(
+                TenantId::new(1),
+                42,
+                nodedb_crdt::ConstraintSet::new(),
+            )
+            .expect("historical tenant");
+            historical_tenant
+                .import_snapshot_bytes("docs", &historical_snapshot)
+                .expect("historical import");
+            historical_tenant
+                .version_vector_json("docs")
+                .expect("historical version")
+        };
+        task.request.wal_lsn = Some(crate::types::Lsn::new(73));
+        task.wal_lsn = Some(crate::types::Lsn::new(73));
+        task.request.plan = nodedb_physical::physical_plan::PhysicalPlan::Crdt(
+            nodedb_physical::physical_plan::CrdtOp::ImportSnapshot {
+                tenant_id: 1,
+                collection: "docs".into(),
+                bytes: snapshot.clone(),
+            },
+        );
+        let import = core.execute_crdt_import_snapshot(&task, 1, "docs", &snapshot);
+        assert_eq!(import.status, Status::Ok);
+        assert_eq!(import.read_version_lsn, crate::types::Lsn::new(73));
+        assert_eq!(import.watermark_lsn, crate::types::Lsn::new(73));
+        let before = core
+            .execute_crdt_read(&task, "docs", "one")
+            .payload
+            .to_vec();
+        let dirty_before = core.checkpoint_coordinator.total_dirty_pages();
+        let hwm_before = core.sync_hwm.clone();
+
+        let restore = core.execute_crdt_restore(&task, "docs", "one", &historical_json);
+        assert_eq!(restore.status, Status::Ok);
+        assert!(
+            !restore.payload.is_empty(),
+            "restore must produce a forward delta"
+        );
+        assert_eq!(
+            core.execute_crdt_read(&task, "docs", "one")
+                .payload
+                .to_vec(),
+            before
+        );
+        assert_eq!(
+            core.checkpoint_coordinator.total_dirty_pages(),
+            dirty_before
+        );
+        assert_eq!(core.sync_hwm, hwm_before);
+    }
+
+    #[test]
     fn preview_missing_collection_returns_typed_post_image_without_residue() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut core, _request_tx, _response_rx) = make_core_with_dir(dir.path());
@@ -293,12 +383,27 @@ mod tests {
     fn matching_frontier_applies_and_stale_frontier_is_side_effect_free() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut core, _request_tx, _response_rx) = make_core_with_dir(dir.path());
-        let task = task();
+        let mut task = task();
+        task.request.wal_lsn = Some(crate::types::Lsn::new(91));
+        task.wal_lsn = Some(crate::types::Lsn::new(91));
         let delta = snapshot_delta("docs", "one", "value");
         let preview = preview_response(&mut core, &task, "docs", "one", &delta);
         let preview: CrdtPreviewResult =
             zerompk::from_msgpack(preview.payload.as_bytes()).expect("preview result");
         let surrogate = Surrogate::new(77);
+        task.request.plan = nodedb_physical::physical_plan::PhysicalPlan::Crdt(
+            nodedb_physical::physical_plan::CrdtOp::Apply {
+                collection: "docs".into(),
+                document_id: "one".into(),
+                delta: delta.clone(),
+                peer_id: 42,
+                mutation_id: 1,
+                surrogate,
+                provenance: None,
+                constraint_version_required: 0,
+                expected_frontier_digest: Some(preview.frontier_digest),
+            },
+        );
 
         let applied = core.execute_crdt_apply(
             &task,
@@ -314,6 +419,8 @@ mod tests {
             },
         );
         assert_eq!(applied.status, Status::Ok);
+        assert_eq!(applied.read_version_lsn, crate::types::Lsn::new(91));
+        assert_eq!(applied.watermark_lsn, crate::types::Lsn::new(91));
         assert!(
             core.crdt_engines
                 .get(&(DatabaseId::DEFAULT, TenantId::new(1)))

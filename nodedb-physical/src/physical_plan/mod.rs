@@ -242,6 +242,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Crdt(CrdtOp::Read { collection, .. })
             | PhysicalPlan::Crdt(CrdtOp::PreviewApply { collection, .. })
             | PhysicalPlan::Crdt(CrdtOp::Apply { collection, .. })
+            | PhysicalPlan::Crdt(CrdtOp::ImportSnapshot { collection, .. })
             | PhysicalPlan::Vector(VectorOp::Insert { collection, .. })
             | PhysicalPlan::Vector(VectorOp::BatchInsert { collection, .. })
             | PhysicalPlan::Vector(VectorOp::MultiSearch { collection, .. })

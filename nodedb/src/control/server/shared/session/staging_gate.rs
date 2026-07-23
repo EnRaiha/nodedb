@@ -26,7 +26,7 @@ use crate::control::server::shared::sql::staging_predicates::{
 };
 use crate::control::server::shared::write_admission::plan_requires_txn_buffering;
 use crate::control::state::SharedState;
-use nodedb_physical::physical_plan::MetaOp;
+use nodedb_physical::physical_plan::{CrdtOp, MetaOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::leader_forward::{forward_to_leader, resolve_leader};
@@ -150,6 +150,12 @@ where
 {
     if sessions.transaction_state(addr) != TransactionState::InBlock {
         return Ok(InTxnRoute::Read(Box::new(task)));
+    }
+
+    if matches!(&task.plan, PhysicalPlan::Crdt(CrdtOp::Apply { .. })) {
+        return Err(StagingGateError::Dispatch(
+            crate::Error::CrdtApplyForbiddenInTransaction,
+        ));
     }
 
     let is_write = plan_requires_txn_buffering(&task.plan);

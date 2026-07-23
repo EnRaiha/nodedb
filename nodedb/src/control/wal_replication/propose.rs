@@ -65,6 +65,7 @@ pub async fn propose_replicated_entry(
                 tokio::time::sleep(std::time::Duration::from_millis(*backoff_ms)).await;
                 continue;
             }
+            Err(other @ crate::Error::DataPlane(_)) => return Err(other),
             Err(other) => {
                 return Err(crate::Error::Dispatch {
                     detail: format!("raft propose failed: {other}"),

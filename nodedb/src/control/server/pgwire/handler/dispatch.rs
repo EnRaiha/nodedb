@@ -11,6 +11,7 @@ use crate::control::server::exchange::resolve::{
     DistributedReadCapture, Resolved, resolve_and_materialize,
 };
 use crate::types::{Lsn, ReadConsistency, TraceId, VShardId};
+use nodedb_physical::physical_plan::{CrdtOp, PhysicalPlan};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::core::NodeDbPgHandler;
@@ -335,6 +336,8 @@ impl NodeDbPgHandler {
             }
         }
 
+        reject_unadmitted_crdt_apply(&task.plan)?;
+
         if let Some(async_proposer) = self.state.async_raft_proposer()
             && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
                 task.tenant_id,
@@ -475,6 +478,7 @@ impl NodeDbPgHandler {
                 database_id: task.database_id,
             });
         }
+        reject_unadmitted_crdt_apply(&task.plan)?;
         let txn_id = task.txn_id;
         // The transaction's writes were durably recorded under a single
         // `RecordType::Transaction` WAL record at COMMIT; per-task WAL append is
@@ -502,8 +506,38 @@ impl NodeDbPgHandler {
     }
 }
 
+fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> crate::Result<()> {
+    if matches!(plan, PhysicalPlan::Crdt(CrdtOp::Apply { .. })) {
+        return Err(crate::Error::CrdtApplyRequiresAdmission);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use nodedb_types::Surrogate;
+
+    use super::*;
+
+    #[test]
+    fn generic_pgwire_dispatch_rejects_unadmitted_apply() {
+        let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
+            collection: "docs".into(),
+            document_id: "doc-1".into(),
+            delta: Vec::new(),
+            peer_id: 1,
+            mutation_id: 1,
+            surrogate: Surrogate::ZERO,
+            provenance: None,
+            constraint_version_required: 0,
+            expected_frontier_digest: None,
+        });
+        assert!(matches!(
+            reject_unadmitted_crdt_apply(&plan),
+            Err(crate::Error::CrdtApplyRequiresAdmission)
+        ));
+    }
+
     #[test]
     fn dispatch_task_compile_check() {
         // Confirm the dispatch module compiles without the old two-phase join

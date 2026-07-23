@@ -30,10 +30,10 @@ use std::time::Duration;
 use nodedb_types::id::DatabaseId;
 
 use crate::Error;
-use crate::bridge::envelope::PhysicalPlan;
-use crate::control::server::shared::ddl::sync_dispatch;
-use crate::control::server::wal_dispatch::wal_append_if_write;
+use crate::bridge::envelope::{PhysicalPlan, Status};
+use crate::control::server::dispatch_utils::{AutocommitWrite, dispatch_autocommit_write};
 use crate::control::state::SharedState;
+use crate::event::EventSource;
 use crate::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::CrdtOp;
 
@@ -75,18 +75,47 @@ async fn reissue_crdt_collection(
         return Ok(());
     }
 
-    // Single-node: WAL first (durable for restart replay), then install live.
-    wal_append_if_write(&state.wal, tenant_id, vshard, database_id, &plan)?;
-    sync_dispatch::dispatch_async(
-        state,
-        tenant_id,
-        database_id,
-        collection,
-        plan,
-        REISSUE_TIMEOUT,
-    )
-    .await?;
-    Ok(())
+    // Single-node: hold the frontier slot across WAL append, live import, and
+    // the durable-at-ack fsync barrier. The clustered branch above is already
+    // sequenced by its public proposer.
+    state
+        .vshard_admission_sequencer
+        .run(vshard, || async {
+            let response = tokio::time::timeout(
+                REISSUE_TIMEOUT,
+                dispatch_autocommit_write(
+                    state,
+                    AutocommitWrite {
+                        tenant_id,
+                        database_id,
+                        vshard_id: vshard,
+                        plan,
+                        trace_id: crate::types::TraceId::ZERO,
+                        event_source: EventSource::CrdtSync,
+                        txn_id: None,
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| Error::Internal {
+                detail: format!(
+                    "restore reissue: CRDT import timed out after {}ms",
+                    REISSUE_TIMEOUT.as_millis()
+                ),
+            })??;
+            if response.status != Status::Ok {
+                return Err(response
+                    .error_code
+                    .as_deref()
+                    .cloned()
+                    .map(Error::DataPlane)
+                    .unwrap_or_else(|| Error::Internal {
+                        detail: "restore reissue: CRDT import failed without an error code".into(),
+                    }));
+            }
+            Ok(())
+        })
+        .await
 }
 
 /// Durably re-issue every restored CRDT collection snapshot.
