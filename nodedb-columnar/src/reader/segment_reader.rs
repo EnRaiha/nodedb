@@ -23,6 +23,20 @@ use super::block_decode::{
 };
 use super::types::DecodedColumn;
 
+fn checked_slice(data: &[u8], start: usize, len: usize) -> Result<&[u8], ColumnarError> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| ColumnarError::Corruption {
+            segment_id: None,
+            reason: "column block range overflow".into(),
+            offset: None,
+        })?;
+    data.get(start..end).ok_or(ColumnarError::TruncatedSegment {
+        expected: end,
+        got: data.len(),
+    })
+}
+
 /// Reads and decodes columns from a segment byte buffer.
 ///
 /// Supports column projection (only decode requested columns) and block
@@ -206,7 +220,26 @@ impl<'a> SegmentReader<'a> {
         let my_preds: Vec<&ScanPredicate> =
             predicates.iter().filter(|p| p.col_idx == col_idx).collect();
 
-        let col_start = HEADER_SIZE + col_meta.offset as usize;
+        let col_offset =
+            usize::try_from(col_meta.offset).map_err(|_| ColumnarError::Corruption {
+                segment_id: None,
+                reason: "column offset does not fit usize".into(),
+                offset: None,
+            })?;
+        let col_start =
+            HEADER_SIZE
+                .checked_add(col_offset)
+                .ok_or_else(|| ColumnarError::Corruption {
+                    segment_id: None,
+                    reason: "column offset range overflow".into(),
+                    offset: None,
+                })?;
+        if col_start > self.data.len() {
+            return Err(ColumnarError::TruncatedSegment {
+                expected: col_start,
+                got: self.data.len(),
+            });
+        }
         let mut cursor = col_start;
         let col_type = infer_column_type(col_meta);
         let mut result = empty_decoded(&col_type);
@@ -215,21 +248,37 @@ impl<'a> SegmentReader<'a> {
         for block_stat in &col_meta.block_stats {
             let block_row_count = block_stat.row_count;
 
-            if cursor + 4 > self.data.len() {
-                return Err(ColumnarError::TruncatedSegment {
-                    expected: cursor + 4,
-                    got: self.data.len(),
-                });
-            }
-            let block_len = u32::from_le_bytes([
-                self.data[cursor],
-                self.data[cursor + 1],
-                self.data[cursor + 2],
-                self.data[cursor + 3],
-            ]) as usize;
-            cursor += 4;
-            let block_data = &self.data[cursor..cursor + block_len];
-            cursor += block_len;
+            let header_end = cursor
+                .checked_add(4)
+                .ok_or_else(|| ColumnarError::Corruption {
+                    segment_id: None,
+                    reason: "column block header range overflow".into(),
+                    offset: None,
+                })?;
+            let header =
+                self.data
+                    .get(cursor..header_end)
+                    .ok_or(ColumnarError::TruncatedSegment {
+                        expected: header_end,
+                        got: self.data.len(),
+                    })?;
+            let block_len = usize::try_from(u32::from_le_bytes([
+                header[0], header[1], header[2], header[3],
+            ]))
+            .map_err(|_| ColumnarError::Corruption {
+                segment_id: None,
+                reason: "column block length does not fit usize".into(),
+                offset: None,
+            })?;
+            let block_data = checked_slice(self.data, header_end, block_len)?;
+            cursor =
+                header_end
+                    .checked_add(block_len)
+                    .ok_or_else(|| ColumnarError::Corruption {
+                        segment_id: None,
+                        reason: "column block range overflow".into(),
+                        offset: None,
+                    })?;
 
             // Skip via predicate pushdown.
             let pred_skip = my_preds.iter().any(|p| p.can_skip_block(block_stat));
@@ -265,5 +314,26 @@ impl<'a> SegmentReader<'a> {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_slice;
+    use crate::error::ColumnarError;
+
+    #[test]
+    fn block_range_rejects_truncated_and_overflowed_lengths() {
+        assert!(matches!(
+            checked_slice(&[0; 4], 2, 4),
+            Err(ColumnarError::TruncatedSegment {
+                expected: 6,
+                got: 4
+            })
+        ));
+        assert!(matches!(
+            checked_slice(&[], usize::MAX, 1),
+            Err(ColumnarError::Corruption { .. })
+        ));
     }
 }

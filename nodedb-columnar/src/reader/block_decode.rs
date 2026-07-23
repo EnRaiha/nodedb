@@ -209,14 +209,53 @@ pub(super) fn decode_block(
             // Variable-length layout: [offset_len: u32][compressed_offsets][compressed_data].
             if payload.len() < 4 {
                 return Err(ColumnarError::TruncatedSegment {
-                    expected: bitmap_size + 4,
+                    expected: bitmap_size.checked_add(4).ok_or_else(|| {
+                        ColumnarError::Corruption {
+                            segment_id: None,
+                            reason: "variable-length bitmap range overflow".into(),
+                            offset: None,
+                        }
+                    })?,
                     got: block_data.len(),
                 });
             }
-            let offset_len =
-                u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-            let offset_data = &payload[4..4 + offset_len];
-            let string_data = &payload[4 + offset_len..];
+            let offset_len = usize::try_from(u32::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]))
+            .map_err(|_| ColumnarError::Corruption {
+                segment_id: None,
+                reason: "variable-length offset table length does not fit usize".into(),
+                offset: None,
+            })?;
+            let offset_end =
+                4usize
+                    .checked_add(offset_len)
+                    .ok_or_else(|| ColumnarError::Corruption {
+                        segment_id: None,
+                        reason: "variable-length offset table range overflow".into(),
+                        offset: None,
+                    })?;
+            let offset_data =
+                payload
+                    .get(4..offset_end)
+                    .ok_or(ColumnarError::TruncatedSegment {
+                        expected: bitmap_size.checked_add(offset_end).ok_or_else(|| {
+                            ColumnarError::Corruption {
+                                segment_id: None,
+                                reason: "variable-length block length overflow".into(),
+                                offset: None,
+                            }
+                        })?,
+                        got: block_data.len(),
+                    })?;
+            let string_data =
+                payload
+                    .get(offset_end..)
+                    .ok_or_else(|| ColumnarError::Corruption {
+                        segment_id: None,
+                        reason: "variable-length data range is invalid".into(),
+                        offset: None,
+                    })?;
 
             let decoded_offsets =
                 nodedb_codec::decode_i64_pipeline(offset_data, ColumnCodec::DeltaFastLanesLz4)?;
@@ -306,6 +345,29 @@ mod tests {
     use crate::memtable::ColumnarMemtable;
     use crate::predicate::ScanPredicate;
     use crate::writer::SegmentWriter;
+
+    #[test]
+    fn varlen_offset_table_range_must_fit_payload() {
+        let mut result = DecodedColumn::Binary {
+            data: Vec::new(),
+            offsets: Vec::new(),
+            valid: Vec::new(),
+        };
+        // One validity byte, then an offset-table length larger than the
+        // remaining payload. The decoder must reject it before slicing.
+        let block = [0x01, 0xff, 0xff, 0xff, 0x7f];
+        assert!(matches!(
+            super::decode_block(
+                &mut result,
+                &block,
+                &super::ColumnKind::VarLen,
+                nodedb_codec::ResolvedColumnCodec::FsstLz4,
+                1,
+                None,
+            ),
+            Err(crate::error::ColumnarError::TruncatedSegment { .. })
+        ));
+    }
 
     fn write_test_segment(rows: usize) -> Vec<u8> {
         let schema = ColumnarSchema::new(vec![

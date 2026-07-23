@@ -9,10 +9,13 @@
 use nodedb_types::columnar::{ColumnType, SchemaOps, StrictSchema};
 
 use crate::encode::{FORMAT_VERSION, MAGIC};
-use nodedb_types::datetime::NdbDateTime;
 use nodedb_types::value::Value;
 
 use crate::error::StrictError;
+
+#[path = "decode/value.rs"]
+mod value_decode;
+use value_decode::{decode_fixed_value, decode_variable_value};
 
 /// Decodes fields from Binary Tuples according to a fixed schema.
 ///
@@ -32,6 +35,8 @@ pub struct TupleDecoder {
     var_count: usize,
     /// Size of the tuple header: 4 (version) + null_bitmap_size.
     header_size: usize,
+    /// Whether schema-derived layout arithmetic fit in `usize`.
+    layout_valid: bool,
 }
 
 impl TupleDecoder {
@@ -41,21 +46,34 @@ impl TupleDecoder {
         let mut var_table_index = Vec::with_capacity(schema.columns.len());
         let mut fixed_offset = 0usize;
         let mut var_idx = 0usize;
+        let mut layout_valid = true;
 
         for col in &schema.columns {
             if let Some(size) = col.column_type.fixed_size() {
                 fixed_offsets.push(Some(fixed_offset));
                 var_table_index.push(None);
-                fixed_offset += size;
+                match fixed_offset.checked_add(size) {
+                    Some(next) => fixed_offset = next,
+                    None => layout_valid = false,
+                }
             } else {
                 fixed_offsets.push(None);
                 var_table_index.push(Some(var_idx));
-                var_idx += 1;
+                match var_idx.checked_add(1) {
+                    Some(next) => var_idx = next,
+                    None => layout_valid = false,
+                }
             }
         }
 
         // Header: magic(4) + format_version(1) + schema_version(4) + null_bitmap.
-        let header_size = 9 + schema.null_bitmap_size();
+        let header_size = match 9usize.checked_add(schema.null_bitmap_size()) {
+            Some(size) => size,
+            None => {
+                layout_valid = false;
+                0
+            }
+        };
 
         Self {
             schema: schema.clone(),
@@ -64,6 +82,7 @@ impl TupleDecoder {
             var_table_index,
             var_count: var_idx,
             header_size,
+            layout_valid,
         }
     }
 
@@ -100,7 +119,18 @@ impl TupleDecoder {
         self.check_bounds(col_idx)?;
         self.check_min_size(tuple)?;
 
-        let bitmap_byte = tuple[9 + col_idx / 8];
+        let bitmap_offset = 9usize
+            .checked_add(col_idx / 8)
+            .ok_or_else(|| self.corrupt_layout())?;
+        let bitmap_byte = tuple
+            .get(bitmap_offset)
+            .copied()
+            .ok_or(StrictError::TruncatedTuple {
+                expected: bitmap_offset
+                    .checked_add(1)
+                    .ok_or_else(|| self.corrupt_layout())?,
+                got: tuple.len(),
+            })?;
         Ok(bitmap_byte & (1 << (col_idx % 8)) != 0)
     }
 
@@ -131,17 +161,14 @@ impl TupleDecoder {
                 column: self.schema.columns[col_idx].name.clone(),
                 expected: self.schema.columns[col_idx].column_type,
             })?;
-        let start = self.header_size + offset;
-        let end = start + size;
+        let start = self.checked_layout_add(self.header_size, offset)?;
+        let end = self.checked_layout_add(start, size)?;
+        let raw = tuple.get(start..end).ok_or(StrictError::TruncatedTuple {
+            expected: end,
+            got: tuple.len(),
+        })?;
 
-        if end > tuple.len() {
-            return Err(StrictError::TruncatedTuple {
-                expected: end,
-                got: tuple.len(),
-            });
-        }
-
-        Ok(Some(&tuple[start..end]))
+        Ok(Some(raw))
     }
 
     /// Extract raw bytes for a variable-length column. Returns `None` if null.
@@ -164,41 +191,54 @@ impl TupleDecoder {
             expected: self.schema.columns[col_idx].column_type,
         })?;
 
-        let table_start = self.header_size + self.fixed_section_size;
-        let entry_pos = table_start + var_idx * 4;
-        let next_pos = entry_pos + 4;
+        let table_start = self.checked_layout_add(self.header_size, self.fixed_section_size)?;
+        let entry_offset = var_idx
+            .checked_mul(4)
+            .ok_or_else(|| self.corrupt_layout())?;
+        let entry_pos = self.checked_layout_add(table_start, entry_offset)?;
+        let next_pos = self.checked_layout_add(entry_pos, 4)?;
+        let table_end = self.checked_layout_add(next_pos, 4)?;
 
-        if next_pos + 4 > tuple.len() {
-            return Err(StrictError::TruncatedTuple {
-                expected: next_pos + 4,
+        let entry = tuple
+            .get(entry_pos..next_pos)
+            .ok_or(StrictError::TruncatedTuple {
+                expected: table_end,
                 got: tuple.len(),
-            });
+            })?;
+        let next_entry = tuple
+            .get(next_pos..table_end)
+            .ok_or(StrictError::TruncatedTuple {
+                expected: table_end,
+                got: tuple.len(),
+            })?;
+        let offset = u32::from_le_bytes(entry.try_into().map_err(|_| self.corrupt_layout())?);
+        let next_offset =
+            u32::from_le_bytes(next_entry.try_into().map_err(|_| self.corrupt_layout())?);
+
+        let table_entries = self
+            .var_count
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(4))
+            .ok_or_else(|| self.corrupt_layout())?;
+        let var_data_start = self.checked_layout_add(table_start, table_entries)?;
+        let abs_start = self.checked_layout_add(
+            var_data_start,
+            usize::try_from(offset).map_err(|_| self.corrupt_offset(offset, tuple.len()))?,
+        )?;
+        let abs_end = self.checked_layout_add(
+            var_data_start,
+            usize::try_from(next_offset)
+                .map_err(|_| self.corrupt_offset(next_offset, tuple.len()))?,
+        )?;
+
+        if abs_start > abs_end || abs_end > tuple.len() {
+            return Err(self.corrupt_offset(next_offset, tuple.len()));
         }
 
-        // Safety: bounds checked above — entry_pos..+4 and next_pos..+4 are within tuple.
-        let offset = u32::from_le_bytes(
-            tuple[entry_pos..entry_pos + 4]
-                .try_into()
-                .expect("4-byte slice from bounds-checked range"),
-        );
-        let next_offset = u32::from_le_bytes(
-            tuple[next_pos..next_pos + 4]
-                .try_into()
-                .expect("4-byte slice from bounds-checked range"),
-        );
-
-        let var_data_start = table_start + (self.var_count + 1) * 4;
-        let abs_start = var_data_start + offset as usize;
-        let abs_end = var_data_start + next_offset as usize;
-
-        if abs_end > tuple.len() {
-            return Err(StrictError::CorruptOffset {
-                offset: next_offset,
-                len: tuple.len(),
-            });
-        }
-
-        Ok(Some(&tuple[abs_start..abs_end]))
+        tuple
+            .get(abs_start..abs_end)
+            .map(Some)
+            .ok_or_else(|| self.corrupt_offset(next_offset, tuple.len()))
     }
 
     /// Extract a column value as a `Value`, performing type-aware decoding.
@@ -321,13 +361,18 @@ impl TupleDecoder {
     }
 
     /// Byte offset where the variable offset table starts.
-    pub fn offset_table_start(&self) -> usize {
-        self.header_size + self.fixed_section_size
+    pub fn offset_table_start(&self) -> Result<usize, StrictError> {
+        self.checked_layout_add(self.header_size, self.fixed_section_size)
     }
 
     /// Byte offset where variable data starts.
-    pub fn var_data_start(&self) -> usize {
-        self.offset_table_start() + (self.var_count + 1) * 4
+    pub fn var_data_start(&self) -> Result<usize, StrictError> {
+        let entry_bytes = self
+            .var_count
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(4))
+            .ok_or_else(|| self.corrupt_layout())?;
+        self.checked_layout_add(self.offset_table_start()?, entry_bytes)
     }
 
     /// Number of variable-length columns in the schema.
@@ -340,7 +385,9 @@ impl TupleDecoder {
     pub fn fixed_field_location(&self, col_idx: usize) -> Option<(usize, usize)> {
         let offset = self.fixed_offsets.get(col_idx).copied().flatten()?;
         let size = self.schema.columns[col_idx].column_type.fixed_size()?;
-        Some((self.header_size + offset, size))
+        self.header_size
+            .checked_add(offset)
+            .map(|start| (start, size))
     }
 
     /// Index in the variable offset table for a column.
@@ -363,6 +410,9 @@ impl TupleDecoder {
     }
 
     fn check_min_size(&self, tuple: &[u8]) -> Result<(), StrictError> {
+        if !self.layout_valid {
+            return Err(self.corrupt_layout());
+        }
         let min = self.header_size;
         if tuple.len() < min {
             Err(StrictError::TruncatedTuple {
@@ -375,8 +425,30 @@ impl TupleDecoder {
     }
 
     fn is_null_unchecked(&self, tuple: &[u8], col_idx: usize) -> bool {
-        let bitmap_byte = tuple[9 + col_idx / 8];
+        let bitmap_offset = 9usize.checked_add(col_idx / 8);
+        let bitmap_byte = bitmap_offset
+            .and_then(|offset| tuple.get(offset))
+            .copied()
+            .unwrap_or(0);
         bitmap_byte & (1 << (col_idx % 8)) != 0
+    }
+
+    fn checked_layout_add(&self, start: usize, len: usize) -> Result<usize, StrictError> {
+        start.checked_add(len).ok_or_else(|| self.corrupt_layout())
+    }
+
+    fn corrupt_layout(&self) -> StrictError {
+        StrictError::CorruptOffset {
+            offset: u32::MAX,
+            len: 0,
+        }
+    }
+
+    fn corrupt_offset(&self, offset: u32, tuple_len: usize) -> StrictError {
+        StrictError::CorruptOffset {
+            offset,
+            len: tuple_len,
+        }
     }
 }
 
@@ -393,91 +465,10 @@ fn extract_i64(decoder: &TupleDecoder, tuple: &[u8], col_idx: usize) -> Result<i
     ]))
 }
 
-/// Decode a fixed-size raw byte slice into a Value.
-fn decode_fixed_value(col_type: &ColumnType, raw: &[u8]) -> Value {
-    match col_type {
-        ColumnType::Int64 => Value::Integer(i64::from_le_bytes([
-            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-        ])),
-        ColumnType::Float64 => Value::Float(f64::from_le_bytes([
-            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-        ])),
-        ColumnType::Bool => Value::Bool(raw[0] != 0),
-        ColumnType::Timestamp => {
-            let micros = i64::from_le_bytes([
-                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-            ]);
-            Value::NaiveDateTime(NdbDateTime::from_micros(micros))
-        }
-        ColumnType::Timestamptz => {
-            let micros = i64::from_le_bytes([
-                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-            ]);
-            Value::DateTime(NdbDateTime::from_micros(micros))
-        }
-        ColumnType::Decimal { .. } => {
-            let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&raw[..16]);
-            Value::Decimal(rust_decimal::Decimal::deserialize(bytes))
-        }
-        ColumnType::Uuid => {
-            let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&raw[..16]);
-            let parsed = uuid::Uuid::from_bytes(bytes);
-            Value::Uuid(parsed.to_string())
-        }
-        ColumnType::Vector(dim) => {
-            let d = *dim as usize;
-            let mut floats = Vec::with_capacity(d);
-            for i in 0..d {
-                let off = i * 4;
-                let bytes = [raw[off], raw[off + 1], raw[off + 2], raw[off + 3]];
-                let f = f32::from_le_bytes(bytes);
-                floats.push(Value::Float(f as f64));
-            }
-            Value::Array(floats)
-        }
-        _ => Value::Null, // Unreachable for fixed types.
-    }
-}
-
-/// Decode a variable-length raw byte slice into a Value.
-fn decode_variable_value(col_type: &ColumnType, raw: &[u8]) -> Value {
-    match col_type {
-        ColumnType::String => {
-            Value::String(std::str::from_utf8(raw).unwrap_or_default().to_string())
-        }
-        ColumnType::Bytes => Value::Bytes(raw.to_vec()),
-        ColumnType::Geometry => {
-            // Try JSON (native Geometry encoding), fall back to string (WKT passthrough).
-            if let Ok(geom) = sonic_rs::from_slice::<nodedb_types::geometry::Geometry>(raw) {
-                Value::Geometry(geom)
-            } else {
-                Value::String(std::str::from_utf8(raw).unwrap_or_default().to_string())
-            }
-        }
-        ColumnType::Json => {
-            // Deserialize MessagePack bytes back to Value.
-            match nodedb_types::value_from_msgpack(raw) {
-                Ok(val) => val,
-                Err(e) => {
-                    tracing::warn!(len = raw.len(), error = %e, "corrupted JSON msgpack in tuple");
-                    Value::Null
-                }
-            }
-        }
-        // SparseVector is stored as the raw UTF-8 `'{id: weight}'` literal
-        // (String path); decode it back to a string, mirroring String.
-        ColumnType::SparseVector => {
-            Value::String(std::str::from_utf8(raw).unwrap_or_default().to_string())
-        }
-        _ => Value::Null,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use nodedb_types::columnar::ColumnDef;
+    use nodedb_types::datetime::NdbDateTime;
 
     use super::*;
     use crate::encode::TupleEncoder;
@@ -944,6 +935,31 @@ mod tests {
         // Original columns still decode correctly.
         let id = decoder.extract_value_versioned(&tuple, 0, 2).unwrap();
         assert_eq!(id, Value::Integer(7));
+    }
+
+    #[test]
+    fn variable_offsets_reject_reversed_and_truncated_ranges() {
+        let schema = StrictSchema::new(vec![ColumnDef::required("text", ColumnType::String)])
+            .expect("schema");
+        let decoder = TupleDecoder::new(&schema);
+
+        // Header (10 bytes), then the two-entry variable offset table. The
+        // second offset precedes the first, which must never reach slicing.
+        let mut reversed = vec![0u8; 18];
+        reversed[..4].copy_from_slice(&MAGIC.to_le_bytes());
+        reversed[4] = FORMAT_VERSION;
+        reversed[10..14].copy_from_slice(&5u32.to_le_bytes());
+        reversed[14..18].copy_from_slice(&4u32.to_le_bytes());
+        assert!(matches!(
+            decoder.extract_variable_raw(&reversed, 0),
+            Err(StrictError::CorruptOffset { offset: 4, len: 18 })
+        ));
+
+        let truncated = &reversed[..14];
+        assert!(matches!(
+            decoder.extract_variable_raw(truncated, 0),
+            Err(StrictError::TruncatedTuple { .. })
+        ));
     }
 
     #[test]

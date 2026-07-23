@@ -27,6 +27,16 @@ use memmap2::Mmap;
 use crate::error::{Result, WalError};
 use crate::record::{HEADER_SIZE, RecordHeader, RecordType, WAL_MAGIC, WalRecord};
 
+fn checked_range_end(start: usize, len: usize, limit: usize) -> Result<Option<usize>> {
+    let end = start.checked_add(len).ok_or_else(|| {
+        WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mmap WAL offset overflow",
+        ))
+    })?;
+    Ok((end <= limit).then_some(end))
+}
+
 /// Module-scoped atomic counters for observing mmap and fadvise behaviour in
 /// production. These counters are incremented by the live code paths (open,
 /// madvise, fadvise) and may be read from tests or from a metrics scrape.
@@ -58,14 +68,17 @@ fn fadv_dontneed(fd: &std::fs::File, len: usize, path: &Path) {
     }
     #[cfg(target_os = "linux")]
     {
-        let rc = unsafe {
-            libc::posix_fadvise(
-                fd.as_raw_fd(),
-                0,
-                len as libc::off_t,
-                libc::POSIX_FADV_DONTNEED,
-            )
+        let len = match libc::off_t::try_from(len) {
+            Ok(len) => len,
+            Err(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "WAL segment length does not fit posix_fadvise offset; skipping cache release",
+                );
+                return;
+            }
         };
+        let rc = unsafe { libc::posix_fadvise(fd.as_raw_fd(), 0, len, libc::POSIX_FADV_DONTNEED) };
         if rc == 0 {
             observability::FADV_DONTNEED_COUNT.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -157,15 +170,17 @@ impl MmapWalReader {
         let data = &self.mmap[..];
 
         loop {
-            // Check if we have enough bytes for a header.
-            if self.offset + HEADER_SIZE > data.len() {
+            // Check if we have enough bytes for a header without unchecked
+            // offset arithmetic. A short trailing header is a torn tail.
+            let Some(header_end) = checked_range_end(self.offset, HEADER_SIZE, data.len())? else {
                 return Ok(None);
-            }
+            };
 
             // Parse header.
-            let header_bytes: &[u8; HEADER_SIZE] = data[self.offset..self.offset + HEADER_SIZE]
-                .try_into()
-                .map_err(|_| {
+            let header_bytes: &[u8; HEADER_SIZE] = data
+                .get(self.offset..header_end)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| {
                     WalError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "header slice conversion failed",
@@ -178,21 +193,39 @@ impl MmapWalReader {
                 return Ok(None);
             }
 
-            // Validate version.
-            if header.validate(self.offset as u64).is_err() {
-                return Ok(None);
+            // Oversized declarations are explicit errors before allocation;
+            // ordinary malformed headers preserve committed-prefix semantics.
+            let header_offset = u64::try_from(self.offset).map_err(|_| {
+                WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "mmap WAL offset does not fit u64",
+                ))
+            })?;
+            match header.validate(header_offset) {
+                Ok(()) => {}
+                Err(error @ WalError::PayloadTooLarge { .. }) => return Err(error),
+                Err(_) => return Ok(None),
             }
 
-            let payload_len = header.payload_len as usize;
-            let record_end = self.offset + HEADER_SIZE + payload_len;
-
-            // Check if payload is fully within the mmap'd region.
-            if record_end > data.len() {
+            let payload_len =
+                usize::try_from(header.payload_len).map_err(|_| WalError::PayloadTooLarge {
+                    size: usize::MAX,
+                    max: crate::record::MAX_WAL_PAYLOAD_SIZE,
+                })?;
+            let Some(record_end) = checked_range_end(header_end, payload_len, data.len())? else {
                 return Ok(None); // Torn write at segment end.
-            }
+            };
 
-            // Extract payload (copies from mmap to owned Vec).
-            let payload = data[self.offset + HEADER_SIZE..record_end].to_vec();
+            // Extract payload only after the bounded header validation above.
+            let payload = data
+                .get(header_end..record_end)
+                .ok_or_else(|| {
+                    WalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "payload slice conversion failed",
+                    ))
+                })?
+                .to_vec();
             self.offset = record_end;
 
             let record = WalRecord { header, payload };
@@ -476,6 +509,59 @@ mod tests {
         let reader = MmapWalReader::open(&path).unwrap();
         let records: Vec<WalRecord> = reader.records().collect::<Result<Vec<_>>>().unwrap();
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn mmap_reader_truncated_payload_stops_at_committed_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated-payload.wal");
+        let header = RecordHeader {
+            magic: WAL_MAGIC,
+            format_version: crate::record::WAL_FORMAT_VERSION,
+            record_type: RecordType::Put as u32,
+            lsn: 1,
+            tenant_id: 1,
+            vshard_id: 0,
+            payload_len: 1,
+            database_id: 0,
+            reserved: [0; 8],
+            crc32c: 0,
+        };
+        std::fs::write(&path, header.to_bytes()).unwrap();
+
+        let mut reader = MmapWalReader::open(&path).unwrap();
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_payload_header_is_a_typed_error_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.wal");
+        let header = RecordHeader {
+            magic: WAL_MAGIC,
+            format_version: crate::record::WAL_FORMAT_VERSION,
+            record_type: RecordType::Put as u32,
+            lsn: 1,
+            tenant_id: 1,
+            vshard_id: 0,
+            payload_len: (crate::record::MAX_WAL_PAYLOAD_SIZE + 1) as u32,
+            database_id: 0,
+            reserved: [0; 8],
+            crc32c: 0,
+        };
+        std::fs::write(&path, header.to_bytes()).unwrap();
+
+        let mut reader = MmapWalReader::open(&path).unwrap();
+        assert!(matches!(
+            reader.next_record(),
+            Err(WalError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn checked_range_end_rejects_overflow_and_short_ranges() {
+        assert!(checked_range_end(usize::MAX, 1, usize::MAX).is_err());
+        assert_eq!(checked_range_end(5, 2, 6).unwrap(), None);
     }
 
     #[test]

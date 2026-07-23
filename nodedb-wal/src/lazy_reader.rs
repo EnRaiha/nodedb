@@ -30,7 +30,16 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{Result, WalError};
-use crate::record::{HEADER_SIZE, RecordHeader, WalRecord};
+use crate::record::{HEADER_SIZE, MAX_WAL_PAYLOAD_SIZE, RecordHeader, WalRecord};
+
+fn checked_offset_add(offset: u64, len: u64) -> Result<u64> {
+    offset.checked_add(len).ok_or_else(|| {
+        WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WAL lazy-reader offset overflow",
+        ))
+    })
+}
 
 /// Lazy WAL reader that separates header reading from payload reading.
 pub struct LazyWalReader {
@@ -77,8 +86,22 @@ impl LazyWalReader {
 
         let header = RecordHeader::from_bytes(&header_buf);
 
-        if header.validate(self.offset - HEADER_SIZE as u64).is_err() {
-            return Ok(None);
+        let header_size = u64::try_from(HEADER_SIZE).map_err(|_| {
+            WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL header size does not fit u64",
+            ))
+        })?;
+        let header_offset = self.offset.checked_sub(header_size).ok_or_else(|| {
+            WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL header offset underflow",
+            ))
+        })?;
+        match header.validate(header_offset) {
+            Ok(()) => {}
+            Err(error @ WalError::PayloadTooLarge { .. }) => return Err(error),
+            Err(_) => return Ok(None),
         }
 
         // Check for unknown required record types.
@@ -101,7 +124,13 @@ impl LazyWalReader {
     /// and before calling `next_header()` again (unless `skip_payload()`
     /// was called instead).
     pub fn read_payload(&mut self, header: &RecordHeader) -> Result<Vec<u8>> {
-        let mut payload = vec![0u8; header.payload_len as usize];
+        header.validate(self.offset)?;
+        let payload_len =
+            usize::try_from(header.payload_len).map_err(|_| WalError::PayloadTooLarge {
+                size: usize::MAX,
+                max: MAX_WAL_PAYLOAD_SIZE,
+            })?;
+        let mut payload = vec![0u8; payload_len];
         if !payload.is_empty() {
             match self.read_exact(&mut payload) {
                 Ok(()) => {}
@@ -149,12 +178,31 @@ impl LazyWalReader {
     ///
     /// This is the key optimization: non-matching records skip I/O entirely.
     pub fn skip_payload(&mut self, header: &RecordHeader) -> Result<()> {
-        let len = header.payload_len as u64;
+        header.validate(self.offset)?;
+        let len = u64::from(header.payload_len);
+        let target = checked_offset_add(self.offset, len)?;
+        let file_len = self.file.metadata()?.len();
+        if target > file_len {
+            return Err(WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "torn write: incomplete payload while skipping",
+            )));
+        }
         if len > 0 {
-            self.file
-                .seek(SeekFrom::Current(len as i64))
-                .map_err(WalError::Io)?;
-            self.offset += len;
+            let signed_len = i64::try_from(len).map_err(|_| {
+                WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WAL lazy-reader skip length does not fit i64",
+                ))
+            })?;
+            let position = self.file.seek(SeekFrom::Current(signed_len))?;
+            if position != target {
+                return Err(WalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WAL lazy-reader seek did not reach bounded target",
+                )));
+            }
+            self.offset = target;
         }
         Ok(())
     }
@@ -165,8 +213,15 @@ impl LazyWalReader {
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        let len = u64::try_from(buf.len()).map_err(|_| {
+            WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL lazy-reader read length does not fit u64",
+            ))
+        })?;
+        let next_offset = checked_offset_add(self.offset, len)?;
         self.file.read_exact(buf)?;
-        self.offset += buf.len() as u64;
+        self.offset = next_offset;
         Ok(())
     }
 }
@@ -271,6 +326,62 @@ mod tests {
         assert_eq!(vector_payloads.len(), 1);
         assert_eq!(vector_payloads[0], b"small-vec");
         assert_eq!(skipped, 3);
+    }
+
+    #[test]
+    fn oversized_payload_header_is_a_typed_error_before_skip_or_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.wal");
+        let header = RecordHeader {
+            magic: crate::record::WAL_MAGIC,
+            format_version: crate::record::WAL_FORMAT_VERSION,
+            record_type: RecordType::Put as u32,
+            lsn: 1,
+            tenant_id: 1,
+            vshard_id: 0,
+            payload_len: (MAX_WAL_PAYLOAD_SIZE + 1) as u32,
+            database_id: 0,
+            reserved: [0; 8],
+            crc32c: 0,
+        };
+        std::fs::write(&path, header.to_bytes()).unwrap();
+
+        let mut reader = LazyWalReader::open(&path).unwrap();
+        assert!(matches!(
+            reader.next_header(),
+            Err(WalError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn skip_payload_rejects_truncated_tail_without_seeking_beyond_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.wal");
+        let mut writer = WalWriter::open_without_direct_io(&path).unwrap();
+        writer
+            .append(RecordType::Put as u32, 1, 0, 0, b"payload")
+            .unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+        let length = std::fs::metadata(&path).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length - 1)
+            .unwrap();
+
+        let mut reader = LazyWalReader::open(&path).unwrap();
+        let header = reader.next_header().unwrap().expect("header");
+        assert!(
+            matches!(reader.skip_payload(&header), Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+        );
+        assert_eq!(reader.offset(), HEADER_SIZE as u64);
+    }
+
+    #[test]
+    fn checked_offset_add_rejects_overflow() {
+        assert!(checked_offset_add(u64::MAX, 1).is_err());
     }
 
     #[test]

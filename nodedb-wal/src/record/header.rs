@@ -139,6 +139,17 @@ impl RecordHeader {
                 supported: WAL_FORMAT_VERSION,
             });
         }
+        let payload_len =
+            usize::try_from(self.payload_len).map_err(|_| WalError::PayloadTooLarge {
+                size: usize::MAX,
+                max: MAX_WAL_PAYLOAD_SIZE,
+            })?;
+        if payload_len > MAX_WAL_PAYLOAD_SIZE {
+            return Err(WalError::PayloadTooLarge {
+                size: payload_len,
+                max: MAX_WAL_PAYLOAD_SIZE,
+            });
+        }
         Ok(())
     }
 }
@@ -272,6 +283,19 @@ mod tests {
         assert!(matches!(
             header.validate(0),
             Err(WalError::InvalidMagic { .. })
+        ));
+    }
+
+    #[test]
+    fn payload_larger_than_limit_is_rejected_before_reading() {
+        let mut header = make_header(0, 0);
+        header.payload_len = (MAX_WAL_PAYLOAD_SIZE + 1) as u32;
+        assert!(matches!(
+            header.validate(0),
+            Err(WalError::PayloadTooLarge {
+                size,
+                max: MAX_WAL_PAYLOAD_SIZE,
+            }) if size == MAX_WAL_PAYLOAD_SIZE + 1
         ));
     }
 

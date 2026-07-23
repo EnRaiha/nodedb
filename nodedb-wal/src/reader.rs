@@ -23,6 +23,21 @@ use crate::error::{Result, WalError};
 use crate::preamble::{PREAMBLE_SIZE, SegmentPreamble, WAL_PREAMBLE_MAGIC};
 use crate::record::{HEADER_SIZE, RecordHeader, RecordType, WalRecord};
 
+fn checked_offset_add(offset: u64, len: usize) -> Result<u64> {
+    let len = u64::try_from(len).map_err(|_| {
+        WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WAL read length does not fit u64",
+        ))
+    })?;
+    offset.checked_add(len).ok_or_else(|| {
+        WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WAL read offset overflow",
+        ))
+    })
+}
+
 /// Sequential WAL reader.
 pub struct WalReader {
     file: File,
@@ -94,14 +109,36 @@ impl WalReader {
 
             let header = RecordHeader::from_bytes(&header_buf);
 
-            // Validate magic and version.
-            if header.validate(self.offset - HEADER_SIZE as u64).is_err() {
-                // Corruption or end of valid data — treat as end of committed prefix.
-                return Ok(None);
+            // Validate before using the attacker-controlled payload length for
+            // allocation. Malformed oversized declarations are explicit errors;
+            // ordinary corruption remains the end of the committed prefix.
+            let header_offset = self
+                .offset
+                .checked_sub(u64::try_from(HEADER_SIZE).map_err(|_| {
+                    WalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "WAL header size does not fit u64",
+                    ))
+                })?)
+                .ok_or_else(|| {
+                    WalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "WAL header offset underflow",
+                    ))
+                })?;
+            match header.validate(header_offset) {
+                Ok(()) => {}
+                Err(error @ WalError::PayloadTooLarge { .. }) => return Err(error),
+                Err(_) => return Ok(None),
             }
 
-            // Read payload.
-            let mut payload = vec![0u8; header.payload_len as usize];
+            // Read payload only after the bounded header validation above.
+            let payload_len =
+                usize::try_from(header.payload_len).map_err(|_| WalError::PayloadTooLarge {
+                    size: usize::MAX,
+                    max: crate::record::MAX_WAL_PAYLOAD_SIZE,
+                })?;
+            let mut payload = vec![0u8; payload_len];
             if !payload.is_empty() {
                 match self.read_exact(&mut payload) {
                     Ok(()) => {}
@@ -123,7 +160,7 @@ impl WalReader {
                         lsn = header.lsn,
                         "recovered torn write from double-write buffer"
                     );
-                    self.offset += recovered.payload.len() as u64;
+                    self.offset = checked_offset_add(self.offset, recovered.payload.len())?;
                     return Ok(Some(recovered));
                 }
                 return Ok(None);
@@ -157,8 +194,9 @@ impl WalReader {
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        let next_offset = checked_offset_add(self.offset, buf.len())?;
         self.file.read_exact(buf)?;
-        self.offset += buf.len() as u64;
+        self.offset = next_offset;
         Ok(())
     }
 }
@@ -186,7 +224,13 @@ fn try_read_preamble(file: &mut File) -> Result<(Option<SegmentPreamble>, u64)> 
         // Parse and validate the preamble. An unsupported version is a hard
         // error — do not silently fall through to record scanning.
         let preamble = SegmentPreamble::from_bytes(&buf, &WAL_PREAMBLE_MAGIC)?;
-        Ok((Some(preamble), PREAMBLE_SIZE as u64))
+        let preamble_size = u64::try_from(PREAMBLE_SIZE).map_err(|_| {
+            WalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL preamble size does not fit u64",
+            ))
+        })?;
+        Ok((Some(preamble), preamble_size))
     } else {
         // First bytes are not the preamble magic — rewind and read as records.
         file.seek(std::io::SeekFrom::Start(0))?;
@@ -301,6 +345,36 @@ mod tests {
         let records: Vec<_> = reader.records().collect::<Result<_>>().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].payload, b"good-record");
+    }
+
+    #[test]
+    fn oversized_payload_header_is_a_typed_error_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.wal");
+        let header = RecordHeader {
+            magic: crate::record::WAL_MAGIC,
+            format_version: crate::record::WAL_FORMAT_VERSION,
+            record_type: RecordType::Put as u32,
+            lsn: 1,
+            tenant_id: 1,
+            vshard_id: 0,
+            payload_len: (crate::record::MAX_WAL_PAYLOAD_SIZE + 1) as u32,
+            database_id: 0,
+            reserved: [0; 8],
+            crc32c: 0,
+        };
+        std::fs::write(&path, header.to_bytes()).unwrap();
+
+        let mut reader = WalReader::open(&path).unwrap();
+        assert!(matches!(
+            reader.next_record(),
+            Err(WalError::PayloadTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn checked_offset_add_rejects_overflow() {
+        assert!(checked_offset_add(u64::MAX, 1).is_err());
     }
 
     #[test]
