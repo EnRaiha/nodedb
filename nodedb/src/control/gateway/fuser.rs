@@ -87,9 +87,8 @@ fn decode_msgpack_array(bytes: &[u8]) -> Result<Vec<MpValue>, Error> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    let mut cursor = std::io::Cursor::new(bytes);
     let value: MpValue =
-        rmpv::decode::read_value(&mut cursor).map_err(|e| Error::Serialization {
+        crate::util::bounded_msgpack::read_value(bytes).map_err(|e| Error::Serialization {
             format: "msgpack".into(),
             detail: format!("fuser: decode failed: {e}"),
         })?;

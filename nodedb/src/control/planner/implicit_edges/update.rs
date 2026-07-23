@@ -144,7 +144,7 @@ pub fn parse_edge_field_overrides(
 /// Decode a standard-msgpack literal value, returning `Some(s)` only when it is
 /// a string. Mirrors `extract_edge`'s rmpv decode of edge-field values.
 fn decode_literal_string(bytes: &[u8]) -> Option<String> {
-    let decoded = rmpv::decode::read_value(&mut &bytes[..]).ok()?;
+    let decoded = crate::util::bounded_msgpack::read_value(bytes).ok()?;
     decoded.as_str().map(str::to_string)
 }
 
@@ -152,7 +152,7 @@ fn decode_literal_string(bytes: &[u8]) -> Option<String> {
 /// for null / non-numeric / non-finite. Mirrors the numeric `weight` decode in
 /// `extract_edge` (F64 / F32 / Integer → f64, filtered to finite).
 fn decode_literal_weight(bytes: &[u8]) -> Option<f64> {
-    let decoded = rmpv::decode::read_value(&mut &bytes[..]).ok()?;
+    let decoded = crate::util::bounded_msgpack::read_value(bytes).ok()?;
     match decoded {
         rmpv::Value::F64(f) => Some(f),
         rmpv::Value::F32(f) => Some(f as f64),

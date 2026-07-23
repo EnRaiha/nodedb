@@ -205,7 +205,7 @@ fn decode_aggregate_response(
     }
 
     let value: rmpv::Value =
-        rmpv::decode::read_value(&mut &payload[..]).map_err(|e| crate::Error::Internal {
+        crate::util::bounded_msgpack::read_value(payload).map_err(|e| crate::Error::Internal {
             detail: format!("decode aggregate response: {e}"),
         })?;
 

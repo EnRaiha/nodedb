@@ -21,7 +21,7 @@ impl<'a> DocumentEngine<'a> {
         };
         match bytes_opt {
             Some(bytes) => {
-                let rmpv_val = rmpv::decode::read_value(&mut bytes.as_slice()).map_err(|e| {
+                let rmpv_val = crate::util::bounded_msgpack::read_value(&bytes).map_err(|e| {
                     crate::Error::Serialization {
                         format: "msgpack".into(),
                         detail: format!("decode: {e}"),

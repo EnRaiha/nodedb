@@ -286,7 +286,7 @@ pub fn extract_edge_properties(
         let edge_properties = properties;
 
         // Parse MessagePack properties.
-        let Ok(val) = rmpv::decode::read_value(&mut edge_properties.as_slice()) else {
+        let Ok(val) = crate::util::bounded_msgpack::read_value(edge_properties) else {
             continue;
         };
 

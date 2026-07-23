@@ -30,7 +30,7 @@ impl<'a> DocumentEngine<'a> {
                 sys_from,
             )?;
             if let Some(config) = self.configs.get(collection)
-                && let Ok(rmpv_val) = rmpv::decode::read_value(&mut &body[..])
+                && let Ok(rmpv_val) = crate::util::bounded_msgpack::read_value(&body)
             {
                 for index_path in &config.index_paths {
                     for v in

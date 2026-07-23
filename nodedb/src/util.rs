@@ -2,6 +2,8 @@
 
 //! Shared utility functions.
 
+pub mod bounded_msgpack;
+
 /// FNV-1a 64-bit hash of a byte slice.
 ///
 /// Deterministic, non-cryptographic hash suitable for in-process IDs

@@ -63,7 +63,7 @@ impl<'a> DocumentEngine<'a> {
         }
 
         if let Some(config) = self.configs.get(collection)
-            && let Ok(value) = rmpv::decode::read_value(&mut &msgpack_bytes[..])
+            && let Ok(value) = crate::util::bounded_msgpack::read_value(msgpack_bytes)
         {
             for index_path in &config.index_paths {
                 let values =

@@ -154,7 +154,7 @@ impl TriggerBatchRow {
 /// dynamic msgpack parsing, then converts each value to `nodedb_types::Value`.
 fn decode_msgpack_to_value_map(bytes: &[u8], row_id: &str) -> Option<HashMap<String, Value>> {
     // Try msgpack first.
-    if let Ok(rmpv::Value::Map(pairs)) = rmpv::decode::read_value(&mut &bytes[..]) {
+    if let Ok(rmpv::Value::Map(pairs)) = crate::util::bounded_msgpack::read_value(bytes) {
         let mut map = HashMap::with_capacity(pairs.len());
         for (k, v) in &pairs {
             if let rmpv::Value::String(key) = k

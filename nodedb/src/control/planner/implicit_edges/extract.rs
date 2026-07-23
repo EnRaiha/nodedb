@@ -31,7 +31,7 @@ pub(super) fn extract_edge(collection: &str, value: &[u8]) -> Option<ImplicitEdg
     // bytes `_from`. Avoid decoding non-edge documents on the hot path.
     memmem::find(value, b"_from")?;
 
-    let decoded = rmpv::decode::read_value(&mut &value[..]).ok()?;
+    let decoded = crate::util::bounded_msgpack::read_value(value).ok()?;
     let rmpv::Value::Map(entries) = decoded else {
         return None;
     };

@@ -40,7 +40,7 @@ pub(super) fn emit_memtable_row(
             &mut buf, mt, *col_idx, col_type, col_data, idx,
         );
     }
-    rmpv::decode::read_value(&mut buf.as_slice()).unwrap_or(rmpv::Value::Nil)
+    crate::util::bounded_msgpack::read_value(&buf).unwrap_or(rmpv::Value::Nil)
 }
 
 /// Emit a single row from a disk partition as rmpv::Value::Map.
