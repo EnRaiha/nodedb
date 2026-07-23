@@ -112,6 +112,18 @@ pub enum ArrayError {
     /// (incompatible) Loro format version would silently corrupt state.
     #[error("loro snapshot version mismatch: expected {expected}, got {got}")]
     LoroSnapshotVersionMismatch { expected: u8, got: u8 },
+
+    /// An encoded Loro schema snapshot exceeds its pre-import byte budget.
+    #[error("loro schema snapshot exceeds byte limit: {actual} > {limit}")]
+    LoroSnapshotTooLarge { limit: usize, actual: usize },
+
+    /// Loro metadata could not be decoded before schema snapshot import.
+    #[error("loro schema snapshot metadata is malformed: {detail}")]
+    LoroSnapshotMalformed { detail: String },
+
+    /// An encoded Loro schema snapshot carries too many operations.
+    #[error("loro schema snapshot has too many operations: {actual} > {limit}")]
+    LoroSnapshotOperationLimitExceeded { limit: usize, actual: usize },
 }
 
 impl ArrayError {
@@ -134,6 +146,9 @@ impl ArrayError {
             | ArrayError::InvalidOp { .. }
             | ArrayError::LoroError { .. }
             | ArrayError::LoroSnapshotVersionMismatch { .. }
+            | ArrayError::LoroSnapshotTooLarge { .. }
+            | ArrayError::LoroSnapshotMalformed { .. }
+            | ArrayError::LoroSnapshotOperationLimitExceeded { .. }
             | ArrayError::MissingKek
             | ArrayError::KekRequired
             | ArrayError::EncryptionFailed { .. }

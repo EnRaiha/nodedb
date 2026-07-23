@@ -29,6 +29,27 @@ use crate::sync::replica_id::ReplicaId;
 /// with a clear error rather than silently corrupting state.
 pub const LORO_FORMAT_VERSION: u8 = 1;
 
+/// Maximum enveloped Loro schema snapshot bytes accepted before metadata
+/// decoding or import allocation.
+pub const MAX_LORO_SCHEMA_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum operations physically encoded in an admitted schema snapshot.
+pub const MAX_LORO_SCHEMA_SNAPSHOT_OPERATIONS: usize = 100_000;
+
+#[derive(Debug, Clone, Copy)]
+struct SchemaSnapshotLimits {
+    max_bytes: usize,
+    max_operations: usize,
+}
+
+impl Default for SchemaSnapshotLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_LORO_SCHEMA_SNAPSHOT_BYTES,
+            max_operations: MAX_LORO_SCHEMA_SNAPSHOT_OPERATIONS,
+        }
+    }
+}
+
 /// Loro-backed CRDT document tracking a single array's schema.
 ///
 /// The schema is stored as a MessagePack blob at root map key `"content"`.
@@ -127,7 +148,22 @@ impl SchemaDoc {
         remote_hlc: Hlc,
         generator: &HlcGenerator,
     ) -> ArrayResult<()> {
-        let loro_bytes = strip_envelope(bytes)?;
+        self.import_snapshot_with_limits(
+            bytes,
+            remote_hlc,
+            generator,
+            SchemaSnapshotLimits::default(),
+        )
+    }
+
+    fn import_snapshot_with_limits(
+        &mut self,
+        bytes: &[u8],
+        remote_hlc: Hlc,
+        generator: &HlcGenerator,
+        limits: SchemaSnapshotLimits,
+    ) -> ArrayResult<()> {
+        let loro_bytes = admit_snapshot(bytes, limits)?;
         self.doc
             .import(loro_bytes)
             .map_err(|e| ArrayError::LoroError {
@@ -153,7 +189,20 @@ impl SchemaDoc {
         bytes: &[u8],
         committed_hlc: Hlc,
     ) -> ArrayResult<()> {
-        let loro_bytes = strip_envelope(bytes)?;
+        self.import_snapshot_replicated_with_limits(
+            bytes,
+            committed_hlc,
+            SchemaSnapshotLimits::default(),
+        )
+    }
+
+    fn import_snapshot_replicated_with_limits(
+        &mut self,
+        bytes: &[u8],
+        committed_hlc: Hlc,
+        limits: SchemaSnapshotLimits,
+    ) -> ArrayResult<()> {
+        let loro_bytes = admit_snapshot(bytes, limits)?;
         self.doc
             .import(loro_bytes)
             .map_err(|e| ArrayError::LoroError {
@@ -210,10 +259,65 @@ impl SchemaDoc {
 
 // ─── Envelope helpers ─────────────────────────────────────────────────────────
 
-/// Strip the one-byte version prefix from an enveloped snapshot buffer.
+/// Admit an enveloped Loro schema snapshot before its raw bytes reach Loro.
 ///
-/// Returns a slice into `bytes` starting after the version byte, or an error
-/// if the buffer is empty or the version does not match [`LORO_FORMAT_VERSION`].
+/// The byte and encoded-operation budgets, authenticated metadata parse, and
+/// checked operation range all complete before the caller can mutate schema
+/// state or observe an HLC.
+fn admit_snapshot(bytes: &[u8], limits: SchemaSnapshotLimits) -> ArrayResult<&[u8]> {
+    if bytes.len() > limits.max_bytes {
+        return Err(ArrayError::LoroSnapshotTooLarge {
+            limit: limits.max_bytes,
+            actual: bytes.len(),
+        });
+    }
+    let loro_bytes = strip_envelope(bytes)?;
+    let metadata = loro::LoroDoc::decode_import_blob_meta(loro_bytes, true).map_err(|error| {
+        ArrayError::LoroSnapshotMalformed {
+            detail: error.to_string(),
+        }
+    })?;
+    let operation_count =
+        encoded_operation_count(&metadata.partial_start_vv, &metadata.partial_end_vv)?;
+    if operation_count > limits.max_operations {
+        return Err(ArrayError::LoroSnapshotOperationLimitExceeded {
+            limit: limits.max_operations,
+            actual: operation_count,
+        });
+    }
+    Ok(loro_bytes)
+}
+
+fn encoded_operation_count(
+    start: &loro::VersionVector,
+    end: &loro::VersionVector,
+) -> ArrayResult<usize> {
+    for (peer, start_counter) in start.iter() {
+        if end.get(peer).copied().unwrap_or_default() < *start_counter {
+            return Err(ArrayError::LoroSnapshotMalformed {
+                detail: "Loro operation range regresses".into(),
+            });
+        }
+    }
+    end.iter().try_fold(0usize, |total, (peer, end_counter)| {
+        let start_counter = start.get(peer).copied().unwrap_or_default();
+        let operations = end_counter.checked_sub(start_counter).ok_or_else(|| {
+            ArrayError::LoroSnapshotMalformed {
+                detail: "Loro operation range regresses".into(),
+            }
+        })?;
+        let operations =
+            usize::try_from(operations).map_err(|_| ArrayError::LoroSnapshotMalformed {
+                detail: "Loro operation count does not fit platform usize".into(),
+            })?;
+        total
+            .checked_add(operations)
+            .ok_or_else(|| ArrayError::LoroSnapshotMalformed {
+                detail: "Loro operation count overflow".into(),
+            })
+    })
+}
+
 fn strip_envelope(bytes: &[u8]) -> ArrayResult<&[u8]> {
     match bytes.first() {
         None => Err(ArrayError::SegmentCorruption {
@@ -339,6 +443,71 @@ mod tests {
         let snapshot = doc.export_snapshot().unwrap();
         assert!(!snapshot.is_empty());
         assert_eq!(snapshot[0], LORO_FORMAT_VERSION);
+    }
+
+    #[test]
+    fn pre_import_admission_rejections_preserve_schema_and_hlc() {
+        let generator = generator(1);
+        let baseline = simple_schema("baseline");
+        let mut doc = SchemaDoc::from_schema(replica(1), &baseline, &generator).unwrap();
+        let before_hlc = doc.schema_hlc();
+        let limits = SchemaSnapshotLimits {
+            max_bytes: 1,
+            max_operations: 1,
+        };
+        let result = doc.import_snapshot_with_limits(
+            &[LORO_FORMAT_VERSION, 0],
+            Hlc::ZERO,
+            &generator,
+            limits,
+        );
+        assert!(matches!(
+            result,
+            Err(ArrayError::LoroSnapshotTooLarge { .. })
+        ));
+        assert_eq!(doc.to_schema().unwrap(), baseline);
+        assert_eq!(doc.schema_hlc(), before_hlc);
+
+        let result = doc.import_snapshot_with_limits(
+            &[LORO_FORMAT_VERSION, 0xff],
+            Hlc::ZERO,
+            &generator,
+            SchemaSnapshotLimits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(ArrayError::LoroSnapshotMalformed { .. })
+        ));
+        assert_eq!(doc.to_schema().unwrap(), baseline);
+        assert_eq!(doc.schema_hlc(), before_hlc);
+    }
+
+    #[test]
+    fn operation_admission_rejects_before_mutating_replicated_schema() {
+        let source_generator = generator(2);
+        let source =
+            SchemaDoc::from_schema(replica(2), &simple_schema("source"), &source_generator)
+                .unwrap();
+        let snapshot = source.export_snapshot().unwrap();
+
+        let target_generator = generator(1);
+        let baseline = simple_schema("baseline");
+        let mut target = SchemaDoc::from_schema(replica(1), &baseline, &target_generator).unwrap();
+        let before_hlc = target.schema_hlc();
+        let result = target.import_snapshot_replicated_with_limits(
+            &snapshot,
+            source.schema_hlc(),
+            SchemaSnapshotLimits {
+                max_bytes: snapshot.len(),
+                max_operations: 0,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(ArrayError::LoroSnapshotOperationLimitExceeded { .. })
+        ));
+        assert_eq!(target.to_schema().unwrap(), baseline);
+        assert_eq!(target.schema_hlc(), before_hlc);
     }
 
     #[test]
