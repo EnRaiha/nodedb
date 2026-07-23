@@ -9,6 +9,7 @@ use loro::{LoroDoc, LoroMap, LoroValue, ValueOrContainer};
 use crate::error::{CrdtError, Result};
 
 use super::core::CrdtState;
+use super::import_admission::{CrdtImportLimits, admit_import};
 use super::restore_containers;
 
 impl CrdtState {
@@ -70,6 +71,7 @@ impl CrdtState {
         new_doc
             .set_peer_id(self.peer_id)
             .map_err(|e| CrdtError::Loro(format!("set peer_id on compacted doc: {e}")))?;
+        admit_import(&snapshot, &new_doc.oplog_vv(), CrdtImportLimits::default())?;
         new_doc
             .import(&snapshot)
             .map_err(|e| CrdtError::Loro(format!("shallow snapshot import: {e}")))?;

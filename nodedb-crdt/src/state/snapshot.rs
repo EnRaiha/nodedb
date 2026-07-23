@@ -7,6 +7,7 @@ use loro::LoroDoc;
 use crate::error::{CrdtError, Result};
 
 use super::core::CrdtState;
+use super::import_admission::{CrdtImportLimits, admit_import};
 
 impl CrdtState {
     /// Export the current state as bytes for sync.
@@ -16,8 +17,17 @@ impl CrdtState {
             .map_err(|e| CrdtError::Loro(format!("snapshot export failed: {e}")))
     }
 
-    /// Import remote updates.
+    /// Import remote updates under the finite default byte and operation caps.
     pub fn import(&self, data: &[u8]) -> Result<()> {
+        self.import_with_limits(data, CrdtImportLimits::default())
+    }
+
+    /// Import remote updates after bounded authenticated metadata admission.
+    ///
+    /// The limits are checked before Loro can import the blob, so rejected
+    /// bytes never mutate this document or allocate an import graph.
+    pub fn import_with_limits(&self, data: &[u8], limits: CrdtImportLimits) -> Result<()> {
+        admit_import(data, &self.doc.oplog_vv(), limits)?;
         self.doc
             .import(data)
             .map_err(|e| CrdtError::DeltaApplyFailed(e.to_string()))?;
@@ -53,6 +63,9 @@ impl CrdtState {
         new_doc
             .set_peer_id(self.peer_id)
             .map_err(|e| CrdtError::Loro(format!("failed to set peer_id on compacted doc: {e}")))?;
+        // This snapshot is generated locally, but it remains finite and goes
+        // through the same metadata/range admission before import.
+        admit_import(&snapshot, &new_doc.oplog_vv(), CrdtImportLimits::default())?;
         new_doc
             .import(&snapshot)
             .map_err(|e| CrdtError::Loro(format!("shallow snapshot import: {e}")))?;
@@ -73,5 +86,127 @@ impl CrdtState {
             .export(loro::ExportMode::Snapshot)
             .map(|s| s.len())
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use loro::LoroValue;
+
+    use super::*;
+
+    fn source_delta() -> Vec<u8> {
+        let source = CrdtState::new(7).expect("source state");
+        source
+            .upsert(
+                "docs",
+                "row",
+                &[("title", LoroValue::String("value".into()))],
+            )
+            .expect("source write");
+        let empty = loro::VersionVector::default();
+        source.export_updates_since(&empty).expect("source delta")
+    }
+
+    #[test]
+    fn import_rejects_oversize_before_state_mutation() {
+        let state = CrdtState::new(1).expect("state");
+        let before = state.frontier();
+        let result = state.import_with_limits(
+            &[0u8; 2],
+            CrdtImportLimits {
+                max_bytes: 1,
+                max_encoded_operations: 1,
+                max_new_operations: 1,
+            },
+        );
+        assert!(matches!(result, Err(CrdtError::ImportTooLarge { .. })));
+        assert_eq!(state.frontier(), before);
+    }
+
+    #[test]
+    fn import_rejects_malformed_metadata_before_state_mutation() {
+        let state = CrdtState::new(1).expect("state");
+        let before = state.frontier();
+        assert!(matches!(
+            state.import(&[0xff]),
+            Err(CrdtError::ImportMalformed { .. })
+        ));
+        assert_eq!(state.frontier(), before);
+    }
+
+    #[test]
+    fn import_rejects_operation_limit_before_state_mutation() {
+        let delta = source_delta();
+        let state = CrdtState::new(1).expect("state");
+        let before = state.frontier();
+        let result = state.import_with_limits(
+            &delta,
+            CrdtImportLimits {
+                max_bytes: delta.len(),
+                max_encoded_operations: 0,
+                max_new_operations: 0,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(CrdtError::ImportOperationLimitExceeded { .. })
+        ));
+        assert_eq!(state.frontier(), before);
+        assert!(!state.row_exists("docs", "row"));
+    }
+
+    #[test]
+    fn already_known_operations_still_count_toward_decode_budget() {
+        let delta = source_delta();
+        let state = CrdtState::new(1).expect("state");
+        state.import(&delta).expect("initial import");
+        let before = state.frontier();
+        let result = state.import_with_limits(
+            &delta,
+            CrdtImportLimits {
+                max_bytes: delta.len(),
+                max_encoded_operations: 0,
+                max_new_operations: 0,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(CrdtError::ImportOperationLimitExceeded { .. })
+        ));
+        assert_eq!(state.frontier(), before);
+    }
+
+    #[test]
+    fn stale_replay_after_receiver_advances_is_idempotent() {
+        let source = CrdtState::new(7).expect("source");
+        let empty = loro::VersionVector::default();
+        source
+            .upsert("docs", "row", &[("value", LoroValue::I64(1))])
+            .expect("first write");
+        let stale = source.export_updates_since(&empty).expect("stale delta");
+        source
+            .set_fields("docs", "row", &[("value", LoroValue::I64(2))])
+            .expect("second write");
+        let current = source.export_updates_since(&empty).expect("current delta");
+
+        let receiver = CrdtState::new(1).expect("receiver");
+        receiver.import(&current).expect("advance receiver");
+        let before = receiver.frontier();
+        receiver.import(&stale).expect("stale replay is idempotent");
+        assert_eq!(receiver.frontier(), before);
+    }
+
+    #[test]
+    fn bounded_import_accepts_valid_delta_and_snapshot() {
+        let delta = source_delta();
+        let state = CrdtState::new(1).expect("state");
+        state.import(&delta).expect("bounded delta import");
+        assert!(state.row_exists("docs", "row"));
+
+        let snapshot = state.export_snapshot().expect("snapshot");
+        let restored = CrdtState::new(2).expect("restored state");
+        restored.import(&snapshot).expect("bounded snapshot import");
+        assert!(restored.row_exists("docs", "row"));
     }
 }

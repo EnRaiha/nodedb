@@ -17,6 +17,24 @@ pub enum CrdtError {
     #[error("delta application failed: {0}")]
     DeltaApplyFailed(String),
 
+    /// A generic CRDT import exceeded its encoded byte limit before metadata
+    /// parsing, forking, or import.
+    #[error("CRDT import exceeds byte limit: {actual} > {limit}")]
+    ImportTooLarge { limit: usize, actual: usize },
+
+    /// Authenticated Loro import metadata could not be decoded.
+    #[error("CRDT import metadata malformed: {detail}")]
+    ImportMalformed { detail: String },
+
+    /// Authenticated Loro import metadata contained a regressing or
+    /// unrepresentable operation range.
+    #[error("CRDT import operation range is invalid")]
+    ImportInvalidOperationRange,
+
+    /// A generic CRDT import encoded or contributed more operations than its limit.
+    #[error("CRDT import has too many operations: {actual} > {limit}")]
+    ImportOperationLimitExceeded { limit: usize, actual: usize },
+
     /// A delta preview exceeded its encoded byte limit before import.
     #[error("delta preview exceeds byte limit: {actual} > {limit}")]
     PreviewDeltaTooLarge { limit: usize, actual: usize },

@@ -16,9 +16,13 @@ use crate::error::{CrdtError, Result};
 use crate::loro_value::loro_to_value;
 
 use super::core::CrdtState;
+use super::import_admission::{CrdtImportLimits, admit_import};
 
 /// Maximum raw CRDT delta bytes accepted by the default authoritative preview.
 pub const DEFAULT_MAX_DELTA_BYTES: usize = 1024 * 1024;
+/// Maximum operations physically encoded in any previewed delta, including
+/// operations already known to the authoritative state.
+pub const DEFAULT_MAX_ENCODED_DELTA_OPS: usize = 100_000;
 /// Maximum canonical MessagePack post-image bytes emitted by the default preview.
 pub const DEFAULT_MAX_POST_IMAGE_BYTES: usize = 1024 * 1024;
 
@@ -77,13 +81,6 @@ impl CrdtState {
         expected_row: &str,
         limits: CrdtDeltaPreviewLimits,
     ) -> Result<CrdtDeltaPreview> {
-        if delta.len() > limits.max_delta_bytes {
-            return Err(CrdtError::PreviewDeltaTooLarge {
-                limit: limits.max_delta_bytes,
-                actual: delta.len(),
-            });
-        }
-
         // Loro's `fork` enters a barrier and commits a pending auto-commit
         // transaction on its source. Refuse before calling any barrier/frontier
         // API so preview is strictly non-mutating.
@@ -99,22 +96,26 @@ impl CrdtState {
         // a pre-import admission gate, including for deltas that would otherwise
         // be parked for missing causal dependencies.
         let authoritative_oplog = self.doc.oplog_vv();
-        let metadata = loro::LoroDoc::decode_import_blob_meta(delta, true).map_err(|error| {
-            CrdtError::PreviewMalformed {
-                detail: error.to_string(),
-            }
-        })?;
-        let predicted_imported_ops = predicted_new_operations(
-            &metadata.partial_start_vv,
-            &metadata.partial_end_vv,
+        let predicted_imported_ops = admit_import(
+            delta,
             &authoritative_oplog,
-        )?;
-        if predicted_imported_ops > limits.max_imported_ops {
-            return Err(CrdtError::PreviewOperationLimitExceeded {
-                limit: limits.max_imported_ops,
-                actual: predicted_imported_ops,
-            });
-        }
+            CrdtImportLimits {
+                max_bytes: limits.max_delta_bytes,
+                max_encoded_operations: DEFAULT_MAX_ENCODED_DELTA_OPS,
+                max_new_operations: limits.max_imported_ops,
+            },
+        )
+        .map_err(|error| match error {
+            CrdtError::ImportTooLarge { limit, actual } => {
+                CrdtError::PreviewDeltaTooLarge { limit, actual }
+            }
+            CrdtError::ImportMalformed { detail } => CrdtError::PreviewMalformed { detail },
+            CrdtError::ImportInvalidOperationRange => CrdtError::PreviewInvalidOperationRange,
+            CrdtError::ImportOperationLimitExceeded { limit, actual } => {
+                CrdtError::PreviewOperationLimitExceeded { limit, actual }
+            }
+            _ => error,
+        })?;
 
         // The source is quiescent, so Loro's fork cannot publish source state.
         let fork = self.doc.fork();
@@ -272,38 +273,6 @@ impl From<&LoroValue> for CanonicalLoroValue {
             LoroValue::Container(_) => Self::Null,
         }
     }
-}
-
-/// Predict the exact new operations an import can contribute from its verified
-/// Loro envelope metadata. Per peer the imported half-open range is
-/// `[partial_start, partial_end)` and the already-held prefix ends at `current`.
-/// Any malformed/regressing range is rejected before a fork/import can allocate
-/// or park causal dependencies.
-fn predicted_new_operations(
-    start: &loro::VersionVector,
-    end: &loro::VersionVector,
-    current: &loro::VersionVector,
-) -> Result<usize> {
-    for (peer, start_counter) in start.iter() {
-        let end_counter = end.get(peer).copied().unwrap_or_default();
-        if end_counter < *start_counter {
-            return Err(CrdtError::PreviewInvalidOperationRange);
-        }
-    }
-    end.iter().try_fold(0usize, |total, (peer, end_counter)| {
-        let start_counter = start.get(peer).copied().unwrap_or_default();
-        if *end_counter < start_counter {
-            return Err(CrdtError::PreviewInvalidOperationRange);
-        }
-        let current_counter = current.get(peer).copied().unwrap_or_default();
-        let new_start = start_counter.max(current_counter);
-        let new_operations = end_counter.checked_sub(new_start).unwrap_or_default();
-        let new_operations =
-            usize::try_from(new_operations).map_err(|_| CrdtError::PreviewInvalidOperationRange)?;
-        total
-            .checked_add(new_operations)
-            .ok_or(CrdtError::PreviewInvalidOperationRange)
-    })
 }
 
 /// Count only positive per-peer oplog advances contributed by one import.
@@ -726,6 +695,36 @@ mod tests {
             zerompk::to_msgpack_vec(&Some(CanonicalLoroValue::Null))
                 .expect("null canonical encoding")
         );
+    }
+
+    #[test]
+    fn stale_preview_after_receiver_advances_is_idempotent() {
+        let source = CrdtState::new(2).expect("source");
+        let empty = loro::VersionVector::default();
+        source
+            .upsert(
+                "docs",
+                "one",
+                &[("value", LoroValue::String("first".into()))],
+            )
+            .expect("first write");
+        let stale = source.export_updates_since(&empty).expect("stale delta");
+        source
+            .set_fields(
+                "docs",
+                "one",
+                &[("value", LoroValue::String("second".into()))],
+            )
+            .expect("second write");
+        let current = source.export_updates_since(&empty).expect("current delta");
+
+        let receiver = CrdtState::new(1).expect("receiver");
+        receiver.import(&current).expect("advance receiver");
+        let preview = receiver
+            .preview_delta(&stale, "docs", "one", CrdtDeltaPreviewLimits::default())
+            .expect("stale preview is idempotent");
+        assert_eq!(preview.imported_ops, 0);
+        assert!(preview.write_set.is_empty());
     }
 
     #[test]

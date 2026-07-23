@@ -61,17 +61,6 @@ impl CrdtState {
         })
     }
 
-    /// Borrow the underlying `LoroDoc` for read-only version/delta operations
-    /// (`oplog_vv`, `export`) and the engine's delta-wrapping helper, which runs
-    /// a mutation closure between two version snapshots. The borrow is tied to
-    /// `&self`, so it cannot outlive the single-owner state or be moved across
-    /// threads; callers must not clone it into an independent handle, which
-    /// would defeat the single-owner guarantee around the preview fork section.
-    #[must_use]
-    pub fn doc(&self) -> &LoroDoc {
-        &self.doc
-    }
-
     /// Fetch a row's existing `LoroMap` container, or create one if absent.
     /// Shared by `upsert` and `set_fields` — both need the same row handle
     /// before diverging on prune-vs-preserve semantics.
