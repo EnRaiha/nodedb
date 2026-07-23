@@ -251,16 +251,14 @@ fn restore_to_current_version_is_empty() {
 /// container-valued key inside the row `LoroMap`. Returns the single block's
 /// id so callers can assert it survived.
 fn attach_nested_block_list(state: &CrdtState, collection: &str, row_id: &str) {
-    let coll = state.doc().get_map(collection);
-    let row = match coll.get(row_id) {
-        Some(loro::ValueOrContainer::Container(loro::Container::Map(m))) => m,
-        _ => panic!("expected row '{row_id}' to already exist as a map"),
-    };
-    let blocks = row
-        .insert_container("blocks", loro::LoroMovableList::new())
-        .unwrap();
-    let blk0 = blocks.insert_container(0, loro::LoroMap::new()).unwrap();
-    blk0.insert("id", LoroValue::String("blk-0".into()))
+    state
+        .list_insert_fields(
+            collection,
+            row_id,
+            "blocks",
+            0,
+            &[("id".into(), LoroValue::String("blk-0".into()))],
+        )
         .unwrap();
 }
 
@@ -287,10 +285,11 @@ fn upsert_preserves_nested_movable_list_across_disjoint_scalar_upsert() {
         )
         .unwrap();
 
-    let len = crate::list_ops::list_length(state.doc(), "pages", "doc-1", "blocks").unwrap();
+    let len = state.list_length("pages", "doc-1", "blocks").unwrap();
     assert_eq!(len, 1, "nested block list must survive an unrelated upsert");
 
-    let val = crate::list_ops::list_get(state.doc(), "pages", "doc-1", "blocks", 0)
+    let val = state
+        .list_get("pages", "doc-1", "blocks", 0)
         .unwrap()
         .unwrap();
     if let LoroValue::Map(map) = val {
@@ -375,9 +374,10 @@ fn restore_to_version_preserves_nested_movable_list_as_live_container() {
     // The restored block list must be a live, queryable CRDT container —
     // not a flattened/dangling value produced by routing the historical
     // container through the scalar `insert` path.
-    let len = crate::list_ops::list_length(state.doc(), "pages", "doc-1", "blocks").unwrap();
+    let len = state.list_length("pages", "doc-1", "blocks").unwrap();
     assert_eq!(len, 1);
-    let val = crate::list_ops::list_get(state.doc(), "pages", "doc-1", "blocks", 0)
+    let val = state
+        .list_get("pages", "doc-1", "blocks", 0)
         .unwrap()
         .unwrap();
     if let LoroValue::Map(map) = val {

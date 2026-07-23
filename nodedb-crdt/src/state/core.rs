@@ -2,7 +2,9 @@
 
 //! CrdtState core: document handle, row CRUD, uniqueness probes.
 
+use std::cell::Cell;
 use std::collections::HashSet;
+use std::marker::PhantomData;
 
 use loro::{LoroDoc, LoroMap, LoroValue, ValueOrContainer};
 
@@ -37,8 +39,13 @@ fn key_is_container(row: &LoroMap, key: &str) -> bool {
 /// on-the-wire container layout matches across Origin and Lite and a raw Loro
 /// `import` of a peer's delta merges into the same container.
 pub struct CrdtState {
-    pub(super) doc: LoroDoc,
+    /// Kept private to this state module so callers cannot clone or share a
+    /// raw Loro handle around the preview's pending-check/fork critical section.
+    pub(in crate::state) doc: LoroDoc,
     pub(super) peer_id: u64,
+    /// Loro auto-commit state must stay single-owner. This makes accidental
+    /// cross-thread sharing of a `CrdtState` a compile error.
+    pub(super) _single_owner: PhantomData<Cell<()>>,
 }
 
 impl CrdtState {
@@ -47,7 +54,11 @@ impl CrdtState {
         let doc = LoroDoc::new();
         doc.set_peer_id(peer_id)
             .map_err(|e| CrdtError::Loro(format!("failed to set peer_id {peer_id}: {e}")))?;
-        Ok(Self { doc, peer_id })
+        Ok(Self {
+            doc,
+            peer_id,
+            _single_owner: PhantomData,
+        })
     }
 
     /// Fetch a row's existing `LoroMap` container, or create one if absent.
@@ -153,6 +164,68 @@ impl CrdtState {
         coll.delete(row_id)
             .map_err(|e| CrdtError::Loro(e.to_string()))?;
         Ok(())
+    }
+
+    /// Insert a block-map into one row's movable list and populate scalar fields.
+    /// The raw document handle never leaves this state object.
+    pub fn list_insert_fields(
+        &self,
+        collection: &str,
+        row_id: &str,
+        list_path: &str,
+        index: usize,
+        fields: &[(String, LoroValue)],
+    ) -> Result<()> {
+        let block = crate::list_ops::list_insert_container(
+            &self.doc, collection, row_id, list_path, index,
+        )?;
+        for (key, value) in fields {
+            block
+                .insert(key.as_str(), value.clone())
+                .map_err(|error| CrdtError::Loro(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Delete one block from a row-owned movable list.
+    pub fn list_delete(
+        &self,
+        collection: &str,
+        row_id: &str,
+        list_path: &str,
+        index: usize,
+    ) -> Result<()> {
+        crate::list_ops::list_delete(&self.doc, collection, row_id, list_path, index)
+    }
+
+    /// Move one block within a row-owned movable list.
+    pub fn list_move(
+        &self,
+        collection: &str,
+        row_id: &str,
+        list_path: &str,
+        from_index: usize,
+        to_index: usize,
+    ) -> Result<()> {
+        crate::list_ops::list_move(
+            &self.doc, collection, row_id, list_path, from_index, to_index,
+        )
+    }
+
+    /// Return one row-owned movable list's length.
+    pub fn list_length(&self, collection: &str, row_id: &str, list_path: &str) -> Result<usize> {
+        crate::list_ops::list_length(&self.doc, collection, row_id, list_path)
+    }
+
+    /// Read one value from a row-owned movable list without exposing its doc.
+    pub fn list_get(
+        &self,
+        collection: &str,
+        row_id: &str,
+        list_path: &str,
+        index: usize,
+    ) -> Result<Option<LoroValue>> {
+        crate::list_ops::list_get(&self.doc, collection, row_id, list_path, index)
     }
 
     /// Delete all rows in a collection. Returns the number of rows deleted.
@@ -311,11 +384,6 @@ impl CrdtState {
             }
         }
         out
-    }
-
-    /// Get the underlying LoroDoc for advanced operations.
-    pub fn doc(&self) -> &LoroDoc {
-        &self.doc
     }
 
     /// Peer ID of this state.

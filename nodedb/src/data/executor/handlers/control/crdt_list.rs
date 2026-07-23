@@ -34,55 +34,26 @@ impl CoreLoop {
                 );
             }
         };
-        let doc = match engine.collection_doc(collection) {
-            Ok(d) => d,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-
-        // Parse fields and insert as LoroMap container.
-        let map = match nodedb_crdt::list_ops::list_insert_container(
-            doc,
-            collection,
-            document_id,
-            list_path,
-            index,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-
-        // Populate fields from JSON.
-        if let Ok(fields) =
-            sonic_rs::from_str::<serde_json::Map<String, serde_json::Value>>(fields_json)
-        {
-            for (key, val) in &fields {
-                let loro_val = super::convert::json_to_loro_value(val);
-                if let Err(e) = map.insert(key, loro_val) {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
-                }
-            }
+        let fields =
+            match sonic_rs::from_str::<serde_json::Map<String, serde_json::Value>>(fields_json) {
+                Ok(fields) => fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), super::convert::json_to_loro_value(value)))
+                    .collect::<Vec<_>>(),
+                // Preserve the existing list-insert contract: malformed optional
+                // field JSON creates an empty block map rather than changing the
+                // structural list mutation into a typed request failure.
+                Err(_) => Vec::new(),
+            };
+        match engine.list_insert_fields(collection, document_id, list_path, index, &fields) {
+            Ok(()) => self.response_ok(task),
+            Err(error) => self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: error.to_string(),
+                },
+            ),
         }
-
-        self.response_ok(task)
     }
 
     /// Delete a block from a document's block list.
@@ -107,23 +78,12 @@ impl CoreLoop {
                 );
             }
         };
-        let doc = match engine.collection_doc(collection) {
-            Ok(d) => d,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-        match nodedb_crdt::list_ops::list_delete(doc, collection, document_id, list_path, index) {
+        match engine.list_delete(collection, document_id, list_path, index) {
             Ok(()) => self.response_ok(task),
-            Err(e) => self.response_error(
+            Err(error) => self.response_error(
                 task,
                 ErrorCode::Internal {
-                    detail: e.to_string(),
+                    detail: error.to_string(),
                 },
             ),
         }
@@ -152,30 +112,12 @@ impl CoreLoop {
                 );
             }
         };
-        let doc = match engine.collection_doc(collection) {
-            Ok(d) => d,
-            Err(e) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: e.to_string(),
-                    },
-                );
-            }
-        };
-        match nodedb_crdt::list_ops::list_move(
-            doc,
-            collection,
-            document_id,
-            list_path,
-            from_index,
-            to_index,
-        ) {
+        match engine.list_move(collection, document_id, list_path, from_index, to_index) {
             Ok(()) => self.response_ok(task),
-            Err(e) => self.response_error(
+            Err(error) => self.response_error(
                 task,
                 ErrorCode::Internal {
-                    detail: e.to_string(),
+                    detail: error.to_string(),
                 },
             ),
         }

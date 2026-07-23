@@ -138,14 +138,6 @@ impl TenantCrdtEngine {
         self.array_surrogate_ids.insert(id.into());
     }
 
-    /// Borrow the `LoroDoc` for a collection, creating empty state if absent.
-    ///
-    /// Used by the block-list (LoroList) operations, which mutate containers
-    /// directly through the doc handle.
-    pub fn collection_doc(&mut self, collection: &str) -> crate::Result<&loro::LoroDoc> {
-        Ok(self.state_mut(collection)?.doc())
-    }
-
     /// Export one collection's CRDT state as binary snapshot bytes.
     ///
     /// Returns `None` when the collection has no local state.

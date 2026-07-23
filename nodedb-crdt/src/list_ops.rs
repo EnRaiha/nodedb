@@ -265,10 +265,19 @@ fn get_or_create_movable_list(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::CrdtState;
 
-    fn setup_doc_with_blocks() -> CrdtState {
-        let state = CrdtState::new(1).unwrap();
+    trait TestDoc {
+        fn doc(&self) -> &LoroDoc;
+    }
+
+    impl TestDoc for LoroDoc {
+        fn doc(&self) -> &LoroDoc {
+            self
+        }
+    }
+
+    fn setup_doc_with_blocks() -> LoroDoc {
+        let state = LoroDoc::new();
         let coll = state.doc().get_map("pages");
         let row = coll.insert_container("doc-1", LoroMap::new()).unwrap();
 
@@ -415,8 +424,8 @@ mod tests {
 
     /// A row with no list at `list_path` yet — the setup previous agents
     /// couldn't reach without `get_or_create_movable_list`.
-    fn setup_bare_row(row_id: &str) -> CrdtState {
-        let state = CrdtState::new(1).unwrap();
+    fn setup_bare_row(row_id: &str) -> LoroDoc {
+        let state = LoroDoc::new();
         let coll = state.doc().get_map("pages");
         let row = coll.insert_container(row_id, LoroMap::new()).unwrap();
         row.insert("title", LoroValue::String("Bare".into()))

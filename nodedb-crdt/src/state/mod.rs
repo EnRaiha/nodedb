@@ -9,6 +9,7 @@
 pub mod bitemporal_archive;
 pub mod core;
 pub mod history;
+pub mod preview;
 pub(crate) mod restore_containers;
 pub mod snapshot;
 pub mod write_set;
@@ -17,3 +18,4 @@ pub mod write_set;
 mod tests;
 
 pub use core::CrdtState;
+pub use preview::{CrdtDeltaPreview, CrdtDeltaPreviewLimits};

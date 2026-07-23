@@ -46,5 +46,5 @@ pub use policy::{
 };
 pub use row_lookup::RowLookup;
 pub use signing::{DeltaSigner, DeviceRegistry};
-pub use state::CrdtState;
+pub use state::{CrdtDeltaPreview, CrdtDeltaPreviewLimits, CrdtState};
 pub use validator::{ValidationOutcome, Validator};

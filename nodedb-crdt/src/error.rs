@@ -17,6 +17,50 @@ pub enum CrdtError {
     #[error("delta application failed: {0}")]
     DeltaApplyFailed(String),
 
+    /// A delta preview exceeded its encoded byte limit before import.
+    #[error("delta preview exceeds byte limit: {actual} > {limit}")]
+    PreviewDeltaTooLarge { limit: usize, actual: usize },
+
+    /// Preview requires a quiescent authoritative state and refuses to commit
+    /// a caller's pending auto-commit transaction as a side effect of forking.
+    #[error("delta preview source has {operations} pending operations")]
+    PreviewSourceTransactionPending { operations: usize },
+
+    /// A delta preview could not decode the supplied Loro update bytes.
+    #[error("delta preview malformed: {detail}")]
+    PreviewMalformed { detail: String },
+
+    /// A delta preview depends on operations absent from the authoritative state.
+    #[error("delta preview has pending dependencies")]
+    PreviewPendingDependencies,
+
+    /// An imported operation range was malformed or overflowed while counted.
+    #[error("delta preview operation range is invalid")]
+    PreviewInvalidOperationRange,
+
+    /// A delta preview imported more operations than its explicit limit.
+    #[error("delta preview imports too many operations: {actual} > {limit}")]
+    PreviewOperationLimitExceeded { limit: usize, actual: usize },
+
+    /// A delta preview wrote more rows than its explicit limit.
+    #[error("delta preview writes too many rows: {actual} > {limit}")]
+    PreviewWriteSetLimitExceeded { limit: usize, actual: usize },
+
+    /// A non-idempotent delta preview did not write its declared target row.
+    #[error(
+        "delta preview target mismatch: expected `{expected_collection}/{expected_row}`, got `{actual_collection}/{actual_row}`"
+    )]
+    PreviewTargetMismatch {
+        expected_collection: String,
+        expected_row: String,
+        actual_collection: String,
+        actual_row: String,
+    },
+
+    /// A delta preview's canonical post-image exceeds its explicit byte limit.
+    #[error("delta preview post-image exceeds byte limit: {actual} > {limit}")]
+    PreviewPostImageTooLarge { limit: usize, actual: usize },
+
     /// Loro internal error.
     #[error("loro error: {0}")]
     Loro(String),

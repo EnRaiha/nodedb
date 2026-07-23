@@ -9,6 +9,7 @@ pub mod apply_validated;
 pub mod core;
 pub mod doc_mutate;
 pub mod history;
+pub mod list_ops;
 pub mod policy;
 mod snapshot_restore;
 pub mod validate;

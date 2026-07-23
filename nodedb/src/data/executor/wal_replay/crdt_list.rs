@@ -252,7 +252,7 @@ impl CoreLoop {
 mod tests {
     use std::sync::Arc;
 
-    use loro::{LoroMap, LoroMovableList};
+    use loro::{LoroDoc, LoroMap, LoroMovableList};
     use nodedb_physical::physical_plan::CrdtOp;
     use nodedb_wal::TombstoneSet;
 
@@ -305,14 +305,16 @@ mod tests {
     /// `CrdtOp::Apply`/`ImportSnapshot` already use, deliberately not part of
     /// what this unit is adding.
     fn seed_empty_blocks_list_bytes() -> Vec<u8> {
-        let state = nodedb_crdt::state::CrdtState::new(0).expect("state");
-        let coll = state.doc().get_map(COLLECTION);
+        let state = LoroDoc::new();
+        let coll = state.get_map(COLLECTION);
         let row = coll
             .insert_container(DOCUMENT_ID, LoroMap::new())
             .expect("insert row");
         row.insert_container("blocks", LoroMovableList::new())
             .expect("insert blocks list");
-        state.export_snapshot().expect("export snapshot")
+        state
+            .export(loro::ExportMode::Snapshot)
+            .expect("export snapshot")
     }
 
     fn list_insert_plan(index: usize, fields_json: &str) -> PhysicalPlan {
@@ -409,8 +411,8 @@ mod tests {
         h.core.replay_crdt_list_wal(&records, 1, &tombstones);
 
         let engine = h.core.get_crdt_engine(db, tid).expect("engine");
-        let doc = engine.collection_doc(COLLECTION).expect("doc");
-        let len = nodedb_crdt::list_ops::list_length(doc, COLLECTION, DOCUMENT_ID, "blocks")
+        let len = engine
+            .list_length(COLLECTION, DOCUMENT_ID, "blocks")
             .expect("list length");
         assert_eq!(
             len, 1,
@@ -418,7 +420,8 @@ mod tests {
              (pre-fix: ListInsert/ListMove/ListDelete were never WAL-logged, \
              so replay only restored the empty seed list)"
         );
-        let remaining = nodedb_crdt::list_ops::list_get(doc, COLLECTION, DOCUMENT_ID, "blocks", 0)
+        let remaining = engine
+            .list_get(COLLECTION, DOCUMENT_ID, "blocks", 0)
             .expect("list get")
             .expect("block present");
         if let loro::LoroValue::Map(map) = remaining {
@@ -485,14 +488,15 @@ mod tests {
         h.core.replay_crdt_list_wal(&records, 1, &tombstones);
 
         let engine = h.core.get_crdt_engine(db, tid).expect("engine");
-        let doc = engine.collection_doc(COLLECTION).expect("doc");
-        let len = nodedb_crdt::list_ops::list_length(doc, COLLECTION, DOCUMENT_ID, "blocks")
+        let len = engine
+            .list_length(COLLECTION, DOCUMENT_ID, "blocks")
             .expect("list length");
         assert_eq!(len, 4, "all four inserted blocks must survive the move");
 
         let expected_order = ["blk-0", "blk-3", "blk-1", "blk-2"];
         for (i, expected_id) in expected_order.iter().enumerate() {
-            let cell = nodedb_crdt::list_ops::list_get(doc, COLLECTION, DOCUMENT_ID, "blocks", i)
+            let cell = engine
+                .list_get(COLLECTION, DOCUMENT_ID, "blocks", i)
                 .expect("list get")
                 .unwrap_or_else(|| panic!("block present at index {i}"));
             let loro::LoroValue::Map(map) = cell else {
