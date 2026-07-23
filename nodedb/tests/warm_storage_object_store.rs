@@ -8,9 +8,14 @@
 
 use std::sync::Arc;
 
+use nodedb_wal::crypto::WalEncryptionKey;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{ObjectStore, ObjectStoreExt};
+
+fn test_encryption_key() -> WalEncryptionKey {
+    WalEncryptionKey::from_bytes(&[0x5A; 32]).expect("test encryption key")
+}
 
 // ── Snapshot: InMemory backend ───────────────────────────────────────────────
 
@@ -30,44 +35,57 @@ async fn snapshot_write_read_delete_in_memory() {
     }
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let encryption_key = test_encryption_key();
 
     // Write two snapshots.
     let (meta1, prefix1) = create_base_snapshot(
         &store,
         vec![(0, make_core_bytes(10)), (1, make_core_bytes(20))],
         "node-a",
-        None,
+        Some(&encryption_key),
     )
     .await
     .unwrap();
 
-    let (meta2, prefix2) =
-        create_base_snapshot(&store, vec![(0, make_core_bytes(100))], "node-a", None)
-            .await
-            .unwrap();
+    let (meta2, prefix2) = create_base_snapshot(
+        &store,
+        vec![(0, make_core_bytes(100))],
+        "node-a",
+        Some(&encryption_key),
+    )
+    .await
+    .unwrap();
 
     // Read back manifests.
-    let m1 = load_manifest(&store, &prefix1).await.unwrap();
+    let m1 = load_manifest(&store, &prefix1, &encryption_key)
+        .await
+        .unwrap();
     assert_eq!(m1.num_cores, 2);
     assert_eq!(m1.meta.snapshot_id, meta1.snapshot_id);
 
-    let m2 = load_manifest(&store, &prefix2).await.unwrap();
+    let m2 = load_manifest(&store, &prefix2, &encryption_key)
+        .await
+        .unwrap();
     assert_eq!(m2.num_cores, 1);
     assert_eq!(m2.meta.snapshot_id, meta2.snapshot_id);
 
     // Read back core snapshots.
-    let core0 = load_core_snapshot(&store, &prefix1, 0, None).await.unwrap();
+    let core0 = load_core_snapshot(&store, &prefix1, 0, Some(&encryption_key))
+        .await
+        .unwrap();
     assert_eq!(core0.watermark, 10);
-    let core1 = load_core_snapshot(&store, &prefix1, 1, None).await.unwrap();
+    let core1 = load_core_snapshot(&store, &prefix1, 1, Some(&encryption_key))
+        .await
+        .unwrap();
     assert_eq!(core1.watermark, 20);
 
     // Discover and rebuild catalog.
-    let found = discover_snapshots(&store).await;
+    let found = discover_snapshots(&store, &encryption_key).await;
     assert_eq!(found.len(), 2);
     // Sorted by end_lsn.
     assert!(found[0].1.meta.end_lsn <= found[1].1.meta.end_lsn);
 
-    let catalog = rebuild_catalog(&store).await;
+    let catalog = rebuild_catalog(&store, &encryption_key).await;
     assert_eq!(catalog.len(), 2);
 
     // Delete the first snapshot.
@@ -82,7 +100,9 @@ async fn snapshot_write_read_delete_in_memory() {
     );
 
     // Remaining snapshot still readable.
-    let m2_reload = load_manifest(&store, &prefix2).await.unwrap();
+    let m2_reload = load_manifest(&store, &prefix2, &encryption_key)
+        .await
+        .unwrap();
     assert_eq!(m2_reload.meta.snapshot_id, meta2.snapshot_id);
 }
 
@@ -105,17 +125,26 @@ async fn snapshot_write_read_local_filesystem() {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let encryption_key = test_encryption_key();
 
-    let (meta, prefix) =
-        create_base_snapshot(&store, vec![(0, make_core_bytes(77))], "local-node", None)
-            .await
-            .unwrap();
+    let (meta, prefix) = create_base_snapshot(
+        &store,
+        vec![(0, make_core_bytes(77))],
+        "local-node",
+        Some(&encryption_key),
+    )
+    .await
+    .unwrap();
 
-    let manifest = load_manifest(&store, &prefix).await.unwrap();
+    let manifest = load_manifest(&store, &prefix, &encryption_key)
+        .await
+        .unwrap();
     assert_eq!(manifest.meta.snapshot_id, meta.snapshot_id);
     assert_eq!(manifest.num_cores, 1);
 
-    let core = load_core_snapshot(&store, &prefix, 0, None).await.unwrap();
+    let core = load_core_snapshot(&store, &prefix, 0, Some(&encryption_key))
+        .await
+        .unwrap();
     assert_eq!(core.watermark, 77);
 
     // Verify the file actually exists on disk.
@@ -188,6 +217,7 @@ async fn snapshot_bytes_roundtrip_write_and_restore() {
     use nodedb::storage::snapshot_writer::create_base_snapshot;
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let encryption_key = test_encryption_key();
 
     // Build a CoreSnapshot with one sparse document, one HNSW index, and one
     // CRDT state — enough content to verify all restore paths are exercised.
@@ -218,9 +248,14 @@ async fn snapshot_bytes_roundtrip_write_and_restore() {
     };
 
     let snap_bytes = snap.to_bytes().unwrap();
-    let (meta, prefix) = create_base_snapshot(&store, vec![(0, snap_bytes)], "test-node", None)
-        .await
-        .unwrap();
+    let (meta, prefix) = create_base_snapshot(
+        &store,
+        vec![(0, snap_bytes)],
+        "test-node",
+        Some(&encryption_key),
+    )
+    .await
+    .unwrap();
 
     // ── Verify object-store objects ──────────────────────────────────────────
     // The manifest and exactly one core .snap blob must be present.
@@ -259,7 +294,7 @@ async fn snapshot_bytes_roundtrip_write_and_restore() {
     let data_dir = dir.path().join("restored");
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let result = execute_restore(&data_dir, &prefix, &store, &store, &[])
+    let result = execute_restore(&data_dir, &prefix, &store, &store, &[], &encryption_key)
         .await
         .unwrap();
 

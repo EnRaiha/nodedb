@@ -4,8 +4,8 @@
 //! configured, and the same KEK is required to restore.
 //!
 //! Asserts:
-//! - Bytes stored in the object store contain the SEGP preamble magic.
-//! - Stored bytes do NOT contain the plaintext snapshot payload.
+//! - Bytes stored in the object store contain the authenticated SSEG envelope.
+//! - Stored bytes do NOT contain the plaintext snapshot payload or footer.
 //! - Drop + reopen with the same key successfully recovers the CoreSnapshot.
 
 use std::sync::Arc;
@@ -53,19 +53,14 @@ async fn segment_encrypted_at_rest_restart_roundtrip() {
     let raw_result = store.get(&snap_key).await.expect("get core snap");
     let raw: Vec<u8> = raw_result.bytes().await.expect("read bytes").to_vec();
 
-    // SEGP magic must be present at offset 0.
-    assert_eq!(
-        &raw[..4],
-        b"SEGP",
-        "encrypted snap must start with SEGP preamble magic"
-    );
-
-    // SYNS footer magic must be present at end (last 4 bytes of FOOTER_SIZE=58).
-    let syns_offset = raw.len() - 58;
-    assert_eq!(
-        &raw[syns_offset..syns_offset + 4],
-        b"SYNS",
-        "encrypted snap must end with SYNS segment footer magic"
+    // The sole version-1 envelope starts with SSEG and has a 36-byte
+    // authenticated preamble. The footer is inside ciphertext.
+    assert_eq!(&raw[..4], b"SSEG");
+    assert_eq!(&raw[4..6], &1u16.to_le_bytes());
+    assert!(raw.len() >= 36 + 16, "envelope must include AEAD tag");
+    assert!(
+        !raw.windows(4).any(|window| window == b"SYNS"),
+        "segment footer must not be exposed outside authenticated ciphertext"
     );
 
     // Plaintext payload must NOT appear anywhere in the stored bytes.
@@ -76,8 +71,8 @@ async fn segment_encrypted_at_rest_restart_roundtrip() {
         "plaintext snapshot bytes must not appear in the encrypted segment bytes"
     );
 
-    // Simulate restart: new key instance, same bytes. Epoch is read from the
-    // SEGP preamble so decryption succeeds even with a freshly-constructed key.
+    // Simulate restart: a fresh key instance derives the per-envelope data key
+    // from the authenticated random salt and decrypts successfully.
     let key_v2 = WalEncryptionKey::from_bytes(&KEK).expect("build key v2");
     let restored = load_core_snapshot(&store, &prefix, 0, Some(&key_v2))
         .await

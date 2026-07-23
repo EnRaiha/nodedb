@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::server::ColdStorageSettings;
 use crate::control::state::SharedState;
+use crate::storage::segment::decrypt_untrusted_segment_bytes;
 
 /// Spawn the cold tiering background task.
 ///
@@ -64,7 +65,14 @@ pub fn spawn_cold_tier_task(
                 }
             };
 
-            run_tier_cycle_at(&cold, &segments_dir, tier_after, &prefix).await;
+            let key = match shared.wal.encryption_key().cloned() {
+                Some(key) => key,
+                None => {
+                    warn!("cold tier: refusing object-store uploads without a WAL encryption key");
+                    return;
+                }
+            };
+            run_tier_cycle_at(&cold, &segments_dir, tier_after, &prefix, &key).await;
         }
     })
 }
@@ -78,6 +86,7 @@ pub(crate) async fn run_tier_cycle_at(
     segments_dir: &std::path::Path,
     tier_after: Duration,
     prefix: &str,
+    key: &nodedb_wal::crypto::WalEncryptionKey,
 ) {
     let now = SystemTime::now();
 
@@ -125,7 +134,7 @@ pub(crate) async fn run_tier_cycle_at(
         let object_path = format!("{}segments/{}", prefix, segment_name);
         let entry_path_clone = entry_path.clone();
 
-        match upload_raw_segment(cold, &entry_path_clone, &object_path).await {
+        match upload_raw_segment(cold, &entry_path_clone, &object_path, key).await {
             Ok(()) => {
                 info!(
                     segment = %segment_name,
@@ -175,6 +184,7 @@ async fn upload_raw_segment(
     cold: &crate::storage::cold::ColdStorage,
     local_path: &std::path::Path,
     object_path: &str,
+    key: &nodedb_wal::crypto::WalEncryptionKey,
 ) -> crate::Result<()> {
     let path_buf = local_path.to_path_buf();
     let data = tokio::task::spawn_blocking(move || std::fs::read(&path_buf))
@@ -185,6 +195,11 @@ async fn upload_raw_segment(
         .map_err(|e| crate::Error::Internal {
             detail: format!("read segment file: {e}"),
         })?;
+
+    decrypt_untrusted_segment_bytes(&data, key).map_err(|error| crate::Error::Storage {
+        engine: "cold-tier".into(),
+        detail: format!("refusing unauthenticated segment upload: {error}"),
+    })?;
 
     let store = cold.object_store();
     let opath = object_store::path::Path::from(object_path.to_owned());
@@ -224,4 +239,40 @@ async fn read_dir_sync(dir: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
 fn file_age(path: &std::path::Path, now: SystemTime) -> Option<Duration> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     now.duration_since(modified).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::cold::{ColdStorageConfig, ParquetCompression};
+    use object_store::ObjectStoreExt;
+
+    #[tokio::test]
+    async fn forged_sseg_framing_is_not_uploaded_or_deleted() {
+        let local = tempfile::tempdir().expect("local segment directory");
+        let cold_dir = tempfile::tempdir().expect("cold object directory");
+        let path = local.path().join("forged.seg");
+        let mut forged = vec![0u8; 36 + nodedb_wal::crypto::AUTH_TAG_SIZE];
+        forged[..4].copy_from_slice(b"SSEG");
+        forged[4..6].copy_from_slice(&1u16.to_le_bytes());
+        std::fs::write(&path, forged).expect("write forged envelope");
+
+        let cold = crate::storage::cold::ColdStorage::new(ColdStorageConfig {
+            local_dir: Some(cold_dir.path().to_path_buf()),
+            compression: ParquetCompression::Zstd,
+            ..ColdStorageConfig::default()
+        })
+        .expect("cold storage");
+        let key = nodedb_wal::crypto::WalEncryptionKey::from_bytes(&[0xA5; 32])
+            .expect("test encryption key");
+
+        assert!(
+            upload_raw_segment(&cold, &path, "segments/forged.seg", &key)
+                .await
+                .is_err()
+        );
+        assert!(path.exists(), "forged source must not be deleted");
+        let object = object_store::path::Path::from("segments/forged.seg");
+        assert!(cold.object_store().head(&object).await.is_err());
+    }
 }

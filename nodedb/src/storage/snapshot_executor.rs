@@ -56,6 +56,7 @@ pub struct RestoreResult {
 /// `restore_store` is the object store holding the restore marker (same as
 ///   `snapshot_store` in practice; passed separately for flexibility).
 /// `wal_records` are all available WAL records (already loaded by the caller).
+/// `encryption_key` authenticates mandatory object-store snapshot envelopes.
 ///
 /// This is an **offline operation** — must not be called while serving traffic.
 pub async fn execute_restore(
@@ -64,8 +65,9 @@ pub async fn execute_restore(
     snapshot_store: &Arc<dyn ObjectStore>,
     restore_store: &Arc<dyn ObjectStore>,
     wal_records: &[nodedb_wal::WalRecord],
+    encryption_key: &nodedb_wal::crypto::WalEncryptionKey,
 ) -> crate::Result<RestoreResult> {
-    let manifest = load_manifest(snapshot_store, prefix).await?;
+    let manifest = load_manifest(snapshot_store, prefix, encryption_key).await?;
     let snapshot_lsn = manifest.meta.end_lsn.as_u64();
 
     info!(
@@ -79,7 +81,8 @@ pub async fn execute_restore(
     let mut total_vectors = 0u64;
 
     for core_id in 0..manifest.num_cores {
-        let core_snap = load_core_snapshot(snapshot_store, prefix, core_id, None).await?;
+        let core_snap =
+            load_core_snapshot(snapshot_store, prefix, core_id, Some(encryption_key)).await?;
         let (docs, vectors) = restore_core_state(data_dir, core_id, &core_snap)?;
         total_docs += docs;
         total_vectors += vectors;
@@ -355,12 +358,18 @@ mod tests {
 
         let snap_bytes = snap.to_bytes().unwrap();
         let core_snaps = vec![(0, snap_bytes)];
-        let (meta, prefix) =
-            crate::storage::snapshot_writer::create_base_snapshot(&store, core_snaps, "test", None)
-                .await
-                .unwrap();
+        let encryption_key = nodedb_wal::crypto::WalEncryptionKey::from_bytes(&[0xA5; 32])
+            .expect("test encryption key");
+        let (meta, prefix) = crate::storage::snapshot_writer::create_base_snapshot(
+            &store,
+            core_snaps,
+            "test",
+            Some(&encryption_key),
+        )
+        .await
+        .unwrap();
 
-        let result = execute_restore(&data_dir, &prefix, &store, &store, &[])
+        let result = execute_restore(&data_dir, &prefix, &store, &store, &[], &encryption_key)
             .await
             .unwrap();
         assert_eq!(result.snapshot_id, meta.snapshot_id);

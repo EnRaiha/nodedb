@@ -37,11 +37,16 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use tracing::{info, warn};
 
 use crate::data::snapshot::CoreSnapshot;
-use crate::storage::segment::{SegmentFooter, decrypt_segment_bytes, encrypt_segment_bytes};
 use crate::storage::snapshot::{
     SNAPSHOT_FORMAT_VERSION, SnapshotCatalog, SnapshotKind, SnapshotMeta,
 };
 use crate::types::Lsn;
+
+mod object_envelope;
+use object_envelope::{
+    SNAPSHOT_CORE_KIND, SNAPSHOT_MANIFEST_KIND, check_snapshot_object_size,
+    decrypt_snapshot_object, encrypt_snapshot_object,
+};
 
 /// Monotonic snapshot ID counter.
 static SNAPSHOT_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -154,20 +159,36 @@ fn snapshot_prefix(snapshot_id: u64, lsn: u64) -> String {
 /// `core_snapshots` contains `(core_id, snapshot_bytes)` pairs collected
 /// from all Data Plane cores via `PhysicalPlan::CreateSnapshot`.
 ///
-/// When `encryption_key` is `Some`, each core `.snap` payload is encrypted
-/// (AES-256-GCM) before being written. The manifest is always plaintext.
+/// Every core and manifest object is an authenticated, context-bound segment
+/// envelope. A key is mandatory at this untrusted storage boundary.
 ///
 /// Returns the snapshot metadata and the object-store prefix where files
 /// were written (e.g. `"snap-000001-lsn00000000000000000100"`).
 pub async fn create_base_snapshot(
     store: &Arc<dyn ObjectStore>,
-    core_snapshots: Vec<(usize, Vec<u8>)>,
+    mut core_snapshots: Vec<(usize, Vec<u8>)>,
     node_name: &str,
     encryption_key: Option<&nodedb_wal::crypto::WalEncryptionKey>,
 ) -> crate::Result<(SnapshotMeta, String)> {
     if core_snapshots.is_empty() {
         return Err(crate::Error::BadRequest {
             detail: "no core snapshots provided".into(),
+        });
+    }
+
+    let encryption_key = encryption_key.ok_or_else(|| crate::Error::Storage {
+        engine: "snapshot".into(),
+        detail: "object-store snapshots require an encryption key".into(),
+    })?;
+
+    core_snapshots.sort_unstable_by_key(|(core_id, _)| *core_id);
+    if core_snapshots
+        .iter()
+        .enumerate()
+        .any(|(expected, (core_id, _))| *core_id != expected)
+    {
+        return Err(crate::Error::BadRequest {
+            detail: "snapshot core IDs must be unique and contiguous from zero".into(),
         });
     }
 
@@ -195,16 +216,18 @@ pub async fn create_base_snapshot(
         let filename = format!("core-{core_id}.snap");
         let object_key = ObjectPath::from(format!("{prefix}/{filename}"));
 
-        let payload_bytes: Vec<u8> = if let Some(key) = encryption_key {
-            let watermark = CoreSnapshot::from_bytes(bytes)
-                .map(|s| s.watermark)
-                .unwrap_or(min_watermark);
-            let lsn = Lsn::new(watermark);
-            let footer = SegmentFooter::new(node_name, crc32c::crc32c(bytes), lsn, lsn);
-            encrypt_segment_bytes(bytes, &footer, Some(key))?
-        } else {
-            bytes.clone()
-        };
+        let watermark = CoreSnapshot::from_bytes(bytes)
+            .map(|snapshot| snapshot.watermark)
+            .unwrap_or(min_watermark);
+        let payload_bytes = encrypt_snapshot_object(
+            bytes,
+            &prefix,
+            SNAPSHOT_CORE_KIND,
+            Some(*core_id),
+            node_name,
+            watermark,
+            encryption_key,
+        )?;
 
         store
             .put(&object_key, PutPayload::from(payload_bytes))
@@ -247,6 +270,15 @@ pub async fn create_base_snapshot(
         })?;
 
     let manifest_key = ObjectPath::from(format!("{prefix}/manifest.msgpack"));
+    let manifest_bytes = encrypt_snapshot_object(
+        &manifest_bytes,
+        &prefix,
+        SNAPSHOT_MANIFEST_KIND,
+        None,
+        node_name,
+        max_watermark,
+        encryption_key,
+    )?;
     store
         .put(&manifest_key, PutPayload::from(manifest_bytes))
         .await
@@ -272,6 +304,7 @@ pub async fn create_base_snapshot(
 pub async fn load_manifest(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
+    encryption_key: &nodedb_wal::crypto::WalEncryptionKey,
 ) -> crate::Result<SnapshotManifest> {
     let manifest_key = ObjectPath::from(format!("{prefix}/manifest.msgpack"));
     let result = store
@@ -281,44 +314,71 @@ pub async fn load_manifest(
             engine: "snapshot".into(),
             detail: format!("get manifest {manifest_key}: {e}"),
         })?;
-    let bytes = result.bytes().await.map_err(|e| crate::Error::Storage {
+    check_snapshot_object_size(result.meta.size, "snapshot manifest")?;
+    let raw = result.bytes().await.map_err(|e| crate::Error::Storage {
         engine: "snapshot".into(),
         detail: format!("read manifest bytes: {e}"),
     })?;
+    let bytes =
+        decrypt_snapshot_object(&raw, prefix, SNAPSHOT_MANIFEST_KIND, None, encryption_key)?;
     let manifest: SnapshotManifest =
         zerompk::from_msgpack(&bytes).map_err(|e| crate::Error::Serialization {
             format: "msgpack".into(),
             detail: format!("snapshot manifest: {e}"),
         })?;
     manifest.meta.validate_format_version()?;
+    if snapshot_prefix(manifest.meta.snapshot_id, manifest.meta.begin_lsn.as_u64()) != prefix {
+        return Err(crate::Error::Storage {
+            engine: "snapshot".into(),
+            detail: "snapshot manifest metadata does not match canonical prefix".into(),
+        });
+    }
+    if manifest.num_cores != manifest.core_files.len()
+        || manifest
+            .core_files
+            .iter()
+            .enumerate()
+            .any(|(core_id, name)| name != &format!("core-{core_id}.snap"))
+    {
+        return Err(crate::Error::Storage {
+            engine: "snapshot".into(),
+            detail: "snapshot manifest core object list is non-canonical".into(),
+        });
+    }
     Ok(manifest)
 }
 
 /// Load a per-core snapshot from the object store.
 ///
-/// When `encryption_key` is `Some`, the bytes are decrypted before
-/// deserialization. When `None`, raw bytes are deserialized directly.
+/// The object is decrypted from its mandatory authenticated envelope before
+/// deserialization. A missing key is rejected before any object payload use.
 pub async fn load_core_snapshot(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
     core_id: usize,
     encryption_key: Option<&nodedb_wal::crypto::WalEncryptionKey>,
 ) -> crate::Result<CoreSnapshot> {
+    let encryption_key = encryption_key.ok_or_else(|| crate::Error::Storage {
+        engine: "snapshot".into(),
+        detail: "object-store snapshots require an encryption key".into(),
+    })?;
     let key = ObjectPath::from(format!("{prefix}/core-{core_id}.snap"));
     let result = store.get(&key).await.map_err(|e| crate::Error::Storage {
         engine: "snapshot".into(),
         detail: format!("get core-{core_id} snapshot: {e}"),
     })?;
+    check_snapshot_object_size(result.meta.size, &format!("core-{core_id} snapshot"))?;
     let raw = result.bytes().await.map_err(|e| crate::Error::Storage {
         engine: "snapshot".into(),
         detail: format!("read core-{core_id} bytes: {e}"),
     })?;
-
-    let bytes = if encryption_key.is_some() {
-        decrypt_segment_bytes(&raw, encryption_key)?
-    } else {
-        raw.to_vec()
-    };
+    let bytes = decrypt_snapshot_object(
+        &raw,
+        prefix,
+        SNAPSHOT_CORE_KIND,
+        Some(core_id),
+        encryption_key,
+    )?;
 
     CoreSnapshot::from_bytes(&bytes).ok_or_else(|| crate::Error::Serialization {
         format: "msgpack".into(),
@@ -329,7 +389,10 @@ pub async fn load_core_snapshot(
 /// Discover all snapshot prefixes in the object store.
 ///
 /// Returns manifests sorted by `end_lsn` (oldest first).
-pub async fn discover_snapshots(store: &Arc<dyn ObjectStore>) -> Vec<(String, SnapshotManifest)> {
+pub async fn discover_snapshots(
+    store: &Arc<dyn ObjectStore>,
+    encryption_key: &nodedb_wal::crypto::WalEncryptionKey,
+) -> Vec<(String, SnapshotManifest)> {
     use object_store::ListResult;
 
     let list_result: ListResult = match store.list_with_delimiter(None).await {
@@ -344,7 +407,7 @@ pub async fn discover_snapshots(store: &Arc<dyn ObjectStore>) -> Vec<(String, Sn
     for common_prefix in list_result.common_prefixes {
         // The prefix path ends with "/"; strip it to get the plain prefix name.
         let prefix_str = common_prefix.as_ref().trim_end_matches('/').to_string();
-        match load_manifest(store, &prefix_str).await {
+        match load_manifest(store, &prefix_str, encryption_key).await {
             Ok(manifest) => results.push((prefix_str, manifest)),
             Err(e) => {
                 warn!(
@@ -361,9 +424,12 @@ pub async fn discover_snapshots(store: &Arc<dyn ObjectStore>) -> Vec<(String, Sn
 }
 
 /// Rebuild the snapshot catalog from the object store on startup.
-pub async fn rebuild_catalog(store: &Arc<dyn ObjectStore>) -> SnapshotCatalog {
+pub async fn rebuild_catalog(
+    store: &Arc<dyn ObjectStore>,
+    encryption_key: &nodedb_wal::crypto::WalEncryptionKey,
+) -> SnapshotCatalog {
     let mut catalog = SnapshotCatalog::new();
-    for (_, manifest) in discover_snapshots(store).await {
+    for (_, manifest) in discover_snapshots(store, encryption_key).await {
         catalog.add(manifest.meta);
     }
     catalog
@@ -401,6 +467,7 @@ pub async fn delete_snapshot(store: &Arc<dyn ObjectStore>, prefix: &str) -> crat
 mod tests {
     use super::*;
     use crate::data::snapshot::CoreSnapshot;
+    use futures::TryStreamExt;
     use object_store::memory::InMemory;
 
     fn make_core_snapshot(watermark: u64) -> Vec<u8> {
@@ -415,12 +482,17 @@ mod tests {
         Arc::new(InMemory::new())
     }
 
+    fn test_key() -> nodedb_wal::crypto::WalEncryptionKey {
+        nodedb_wal::crypto::WalEncryptionKey::from_bytes(&[0xA5; 32]).expect("test encryption key")
+    }
+
     #[tokio::test]
     async fn create_and_load_snapshot() {
         let store = in_memory_store();
         let core_snaps = vec![(0, make_core_snapshot(100)), (1, make_core_snapshot(105))];
 
-        let (meta, prefix) = create_base_snapshot(&store, core_snaps, "test-node", None)
+        let key = test_key();
+        let (meta, prefix) = create_base_snapshot(&store, core_snaps, "test-node", Some(&key))
             .await
             .unwrap();
 
@@ -429,33 +501,102 @@ mod tests {
         assert_eq!(meta.kind, SnapshotKind::Base);
         assert!(meta.data_bytes > 0);
 
-        let manifest = load_manifest(&store, &prefix).await.unwrap();
+        let manifest = load_manifest(&store, &prefix, &key).await.unwrap();
         assert_eq!(manifest.num_cores, 2);
         assert_eq!(manifest.core_files.len(), 2);
         assert_eq!(manifest.meta.snapshot_id, meta.snapshot_id);
 
-        let core0 = load_core_snapshot(&store, &prefix, 0, None).await.unwrap();
+        let core0 = load_core_snapshot(&store, &prefix, 0, Some(&key))
+            .await
+            .unwrap();
         assert_eq!(core0.watermark, 100);
-        let core1 = load_core_snapshot(&store, &prefix, 1, None).await.unwrap();
+        let core1 = load_core_snapshot(&store, &prefix, 1, Some(&key))
+            .await
+            .unwrap();
         assert_eq!(core1.watermark, 105);
+    }
+
+    #[tokio::test]
+    async fn authenticated_context_rejects_snapshot_and_core_substitution() {
+        let store = in_memory_store();
+        let key = test_key();
+        let (_, first) =
+            create_base_snapshot(&store, vec![(0, make_core_snapshot(10))], "n1", Some(&key))
+                .await
+                .unwrap();
+        let (_, second) = create_base_snapshot(
+            &store,
+            vec![(0, make_core_snapshot(20)), (1, make_core_snapshot(21))],
+            "n1",
+            Some(&key),
+        )
+        .await
+        .unwrap();
+
+        let first_core = ObjectPath::from(format!("{first}/core-0.snap"));
+        let second_core = ObjectPath::from(format!("{second}/core-0.snap"));
+        let second_core_one = ObjectPath::from(format!("{second}/core-1.snap"));
+        let wrong_core = store
+            .get(&second_core_one)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        store
+            .put(&second_core, PutPayload::from(wrong_core))
+            .await
+            .unwrap();
+        assert!(
+            load_core_snapshot(&store, &second, 0, Some(&key))
+                .await
+                .is_err()
+        );
+
+        let replay = store.get(&first_core).await.unwrap().bytes().await.unwrap();
+        store
+            .put(&second_core, PutPayload::from(replay))
+            .await
+            .unwrap();
+        assert!(
+            load_core_snapshot(&store, &second, 0, Some(&key))
+                .await
+                .is_err()
+        );
+
+        let first_manifest = ObjectPath::from(format!("{first}/manifest.msgpack"));
+        let second_manifest = ObjectPath::from(format!("{second}/manifest.msgpack"));
+        let replay = store
+            .get(&first_manifest)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        store
+            .put(&second_manifest, PutPayload::from(replay))
+            .await
+            .unwrap();
+        assert!(load_manifest(&store, &second, &key).await.is_err());
     }
 
     #[tokio::test]
     async fn discover_and_rebuild_catalog() {
         let store = in_memory_store();
 
-        create_base_snapshot(&store, vec![(0, make_core_snapshot(50))], "n1", None)
+        let key = test_key();
+        create_base_snapshot(&store, vec![(0, make_core_snapshot(50))], "n1", Some(&key))
             .await
             .unwrap();
-        create_base_snapshot(&store, vec![(0, make_core_snapshot(200))], "n1", None)
+        create_base_snapshot(&store, vec![(0, make_core_snapshot(200))], "n1", Some(&key))
             .await
             .unwrap();
 
-        let found = discover_snapshots(&store).await;
+        let found = discover_snapshots(&store, &key).await;
         assert_eq!(found.len(), 2);
         assert!(found[0].1.meta.end_lsn <= found[1].1.meta.end_lsn);
 
-        let catalog = rebuild_catalog(&store).await;
+        let catalog = rebuild_catalog(&store, &key).await;
         assert_eq!(catalog.len(), 2);
         assert!(catalog.find_base(Lsn::new(100)).is_some());
     }
@@ -463,8 +604,9 @@ mod tests {
     #[tokio::test]
     async fn delete_snapshot_removes_objects() {
         let store = in_memory_store();
+        let key = test_key();
         let (_, prefix) =
-            create_base_snapshot(&store, vec![(0, make_core_snapshot(10))], "n1", None)
+            create_base_snapshot(&store, vec![(0, make_core_snapshot(10))], "n1", Some(&key))
                 .await
                 .unwrap();
 
@@ -476,6 +618,65 @@ mod tests {
 
         // Manifest must be gone.
         assert!(store.head(&key).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn object_store_snapshots_reject_missing_keys_and_plaintext_payloads() {
+        let store = in_memory_store();
+        assert!(
+            create_base_snapshot(&store, vec![(0, make_core_snapshot(1))], "n1", None)
+                .await
+                .is_err()
+        );
+
+        let prefix = "untrusted-plaintext";
+        let object = ObjectPath::from(format!("{prefix}/core-0.snap"));
+        store
+            .put(&object, PutPayload::from(make_core_snapshot(1)))
+            .await
+            .expect("write plaintext fixture");
+        let key = test_key();
+        assert!(
+            load_core_snapshot(&store, prefix, 0, Some(&key))
+                .await
+                .is_err()
+        );
+        assert!(load_core_snapshot(&store, prefix, 0, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_core_id_sets_are_rejected_before_object_writes() {
+        for core_snapshots in [
+            vec![(1, make_core_snapshot(1))],
+            vec![(0, make_core_snapshot(1)), (0, make_core_snapshot(2))],
+            vec![(0, make_core_snapshot(1)), (2, make_core_snapshot(2))],
+        ] {
+            let store = in_memory_store();
+            let key = test_key();
+            assert!(
+                create_base_snapshot(&store, core_snapshots, "n1", Some(&key))
+                    .await
+                    .is_err()
+            );
+            let objects: Vec<_> = store.list(None).try_collect().await.unwrap();
+            assert!(objects.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_order_core_ids_are_canonicalized() {
+        let store = in_memory_store();
+        let key = test_key();
+        let (_, prefix) = create_base_snapshot(
+            &store,
+            vec![(1, make_core_snapshot(2)), (0, make_core_snapshot(1))],
+            "n1",
+            Some(&key),
+        )
+        .await
+        .unwrap();
+        let manifest = load_manifest(&store, &prefix, &key).await.unwrap();
+        assert_eq!(manifest.core_files, ["core-0.snap", "core-1.snap"]);
     }
 
     #[tokio::test]
@@ -498,13 +699,16 @@ mod tests {
             Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
 
         let core_snaps = vec![(0, make_core_snapshot(77))];
-        let (meta, prefix) = create_base_snapshot(&store, core_snaps, "local-node", None)
+        let key = test_key();
+        let (meta, prefix) = create_base_snapshot(&store, core_snaps, "local-node", Some(&key))
             .await
             .unwrap();
 
         assert_eq!(meta.begin_lsn, Lsn::new(77));
 
-        let loaded = load_core_snapshot(&store, &prefix, 0, None).await.unwrap();
+        let loaded = load_core_snapshot(&store, &prefix, 0, Some(&key))
+            .await
+            .unwrap();
         assert_eq!(loaded.watermark, 77);
     }
 }
