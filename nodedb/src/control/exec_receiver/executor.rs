@@ -256,7 +256,7 @@ impl LocalPlanExecutor {
                 .map(|name| nodedb_cluster::routing::vshard_for_collection(database_id, &name))
                 .unwrap_or(0),
         );
-        if let Some(proposer) = self.state.async_raft_proposer.get()
+        if let Some(proposer) = self.state.async_raft_proposer()
             && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
                 tenant_id,
                 database_id,

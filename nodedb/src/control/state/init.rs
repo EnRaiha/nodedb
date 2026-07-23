@@ -148,7 +148,10 @@ impl SharedState {
             metadata_raft: std::sync::OnceLock::new(),
             propose_tracker: std::sync::OnceLock::new(),
             raft_proposer: std::sync::OnceLock::new(),
-            async_raft_proposer: std::sync::OnceLock::new(),
+            async_raft_proposer_pair: std::sync::OnceLock::new(),
+            vshard_admission_sequencer: Arc::new(
+                crate::control::vshard_admission::VShardAdmissionSequencer::new(),
+            ),
             raft_compactor: std::sync::OnceLock::new(),
             raft_applied_index_sink: std::sync::OnceLock::new(),
             raft_status_fn: std::sync::OnceLock::new(),

@@ -165,7 +165,7 @@ async fn persist_restore_delta(
         expected_frontier_digest: None,
     });
 
-    if let Some(proposer) = state.async_raft_proposer.get() {
+    if let Some(proposer) = state.async_raft_proposer() {
         let entry =
             to_replicated_entry(tenant_id, database_id, vshard_id, &plan).ok_or_else(|| {
                 crate::Error::Internal {

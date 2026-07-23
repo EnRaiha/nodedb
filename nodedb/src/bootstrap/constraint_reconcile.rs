@@ -110,7 +110,7 @@ pub async fn reconcile_once(
     };
     // No proposer installed yet (still bootstrapping the Raft layer):
     // skip this pass and retry next tick.
-    let Some(proposer) = shared.async_raft_proposer.get() else {
+    let Some(proposer) = shared.async_raft_proposer() else {
         return 0;
     };
     let proposer = Arc::clone(proposer);

@@ -26,7 +26,7 @@ pub(super) fn wire_proposers(
     apply_rx: mpsc::Receiver<ApplyBatch>,
     calvin_read_result_senders: Arc<Mutex<BTreeMap<u32, Sender<ReadResultEvent>>>>,
     sequencer_state_machine: Arc<Mutex<nodedb_cluster::calvin::SequencerStateMachine>>,
-) {
+) -> crate::Result<()> {
     // Wire the Raft proposer into SharedState so CP dispatch paths
     // (pgwire, HTTP, array inbound) can route writes through Raft.
     // Hold `raft_loop` weakly: `SharedState` owns this closure, and the
@@ -205,9 +205,7 @@ pub(super) fn wire_proposers(
                     .map(|applied| (applied.payload, applied.write_version))
             })
         });
-    if shared.async_raft_proposer.set(async_proposer).is_err() {
-        tracing::warn!("async_raft_proposer already set — start_raft appears to have run twice");
-    }
+    crate::control::vshard_admission::install_async_raft_proposer(shared, async_proposer)?;
 
     // Spawn the background apply loop. It reads from the mpsc channel
     // pushed by `DistributedApplier::apply_committed`, dispatches to the
@@ -240,4 +238,5 @@ pub(super) fn wire_proposers(
             }
         },
     );
+    Ok(())
 }

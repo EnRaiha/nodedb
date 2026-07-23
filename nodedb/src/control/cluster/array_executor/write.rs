@@ -118,7 +118,7 @@ impl DataPlaneArrayExecutor {
         wal_lsn: u64,
         op_label: &str,
     ) -> Result<u64> {
-        if let Some(proposer) = self.state.async_raft_proposer.get() {
+        if let Some(proposer) = self.state.async_raft_proposer() {
             let vshard = derive_vshard(array_id, representative_hilbert_prefix, prefix_bits)?;
             // Array writes are database-scoped by convention to the default
             // database on the apply path (the wire req carries no database and

@@ -2,7 +2,7 @@
 
 //! SharedState impl methods: quota, audit, polling, memory estimates.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tracing::warn;
 
@@ -12,6 +12,36 @@ use crate::types::TenantId;
 use super::SharedState;
 
 impl SharedState {
+    /// Sequenced Raft proposer for ordinary writes; absent outside cluster mode.
+    pub(crate) fn async_raft_proposer(
+        &self,
+    ) -> Option<&Arc<crate::control::wal_replication::AsyncRaftProposer>> {
+        self.async_raft_proposer_pair
+            .get()
+            .map(|pair| &pair.sequenced)
+    }
+
+    /// Raw proposer used only while a CRDT admission holds the vShard sequence.
+    /// Ordinary writes must use [`Self::async_raft_proposer`].
+    pub(in crate::control) fn raw_async_raft_proposer(
+        &self,
+    ) -> Option<&Arc<crate::control::wal_replication::AsyncRaftProposer>> {
+        self.async_raft_proposer_pair.get().map(|pair| &pair.raw)
+    }
+
+    /// Install both Raft proposal handles atomically during cluster startup.
+    pub(in crate::control) fn install_async_raft_proposer_pair(
+        &self,
+        sequenced: Arc<crate::control::wal_replication::AsyncRaftProposer>,
+        raw: Arc<crate::control::wal_replication::AsyncRaftProposer>,
+    ) -> crate::Result<()> {
+        self.async_raft_proposer_pair
+            .set(super::fields::AsyncRaftProposerPair { sequenced, raw })
+            .map_err(|_| crate::Error::Internal {
+                detail: "async raft proposer already installed".into(),
+            })
+    }
+
     /// Whether this node is the leader of the metadata Raft group.
     ///
     /// Reuses the installed `raft_status_fn` snapshot (set by `start_raft`),
