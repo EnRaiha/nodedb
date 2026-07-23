@@ -36,6 +36,25 @@ pub(crate) async fn handle_direct_op(
     let vshard_id = ctx.vshard_for_key(vshard_key);
     let tenant_id = ctx.tenant_id();
 
+    // CRDT Apply allocates a surrogate while planning, so authorize the exact
+    // collection before any planner-side state or admission preview is touched.
+    if matches!(op, OpCode::CrdtApply) {
+        let audit = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
+            &ctx.state.audit,
+        ));
+        if let Err(error) = crate::control::server::shared::authorization::authorize_collection(
+            ctx.identity,
+            ctx.database_id(),
+            &collection,
+            crate::control::security::identity::Permission::Write,
+            &ctx.state.permissions,
+            &ctx.state.roles,
+            &audit,
+        ) {
+            return error_to_native(seq, &crate::Error::from(error));
+        }
+    }
+
     // Per-operation cap enforcement (vector dim, top_k, batch size, etc.).
     if let Err(e) = super::limits::check_op_limits(ctx.state, fields) {
         return NativeResponse::error(seq, "0A000", e.to_string());

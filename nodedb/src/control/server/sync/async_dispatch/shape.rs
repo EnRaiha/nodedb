@@ -260,7 +260,7 @@ fn filter_snapshot_by_predicate(
     let mut matching: Vec<(String, Vec<u8>)> = Vec::new();
 
     for (doc_id, data_bytes) in docs {
-        let doc_json = crate::control::server::sync::security::delta_bytes_to_json(&data_bytes);
+        let doc_json = super::super::shape::handler::decode_document_or_empty(&data_bytes);
         if matches_metadata_filter(&doc_json, &filter) {
             matching.push((doc_id, data_bytes));
         }

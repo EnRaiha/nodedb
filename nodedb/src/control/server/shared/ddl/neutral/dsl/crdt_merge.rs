@@ -5,7 +5,10 @@
 use std::time::Duration;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy;
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
@@ -47,6 +50,20 @@ pub async fn crdt_merge(
         .get(to_idx + 1)
         .map(|s| s.trim_matches('\'').trim_matches('"'))
         .ok_or_else(|| ddl_err("42601", "missing target document ID"))?;
+
+    let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+    for permission in [Permission::Read, Permission::Write] {
+        authorize_collection(
+            identity,
+            database_id,
+            collection,
+            permission,
+            &state.permissions,
+            &state.roles,
+            &audit,
+        )
+        .map_err(|error| ddl_err("42501", format!("permission denied: {}", error.resource())))?;
+    }
 
     let source_plan = PhysicalPlan::Crdt(CrdtOp::Read {
         collection: collection.to_string(),
@@ -90,6 +107,15 @@ pub async fn crdt_merge(
 
     // Route the merge result through the Raft proposer gate so the applied delta
     // is quorum-durable under replication, not lost to followers on failover.
+    let policy = ExternalCrdtPostImagePolicy::from_identity(
+        tenant_id,
+        database_id,
+        collection,
+        identity,
+        "sql".into(),
+        &state.rls,
+        &audit,
+    );
     crate::control::crdt_admission::dispatch_crdt_apply_admitted(
         state,
         crate::control::crdt_admission::CrdtApplyAdmissionRequest {
@@ -99,7 +125,7 @@ pub async fn crdt_merge(
             plan: apply_plan,
             timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
             event_source: crate::event::EventSource::User,
-            policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+            policy: &policy,
         },
     )
     .await

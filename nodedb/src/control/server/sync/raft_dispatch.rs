@@ -215,6 +215,7 @@ pub async fn dispatch_sync_bytes(
     plan: PhysicalPlan,
     timeout: Duration,
     event_source: EventSource,
+    policy: &dyn crate::control::crdt_admission::CrdtPostImagePolicy,
 ) -> crate::Result<Vec<u8>> {
     // The sync inbound envelope carries no session database yet, so the Lite
     // sync path is scoped to the default database.
@@ -231,7 +232,7 @@ pub async fn dispatch_sync_bytes(
                 plan,
                 timeout,
                 event_source,
-                policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+                policy,
             },
         )
         .await;

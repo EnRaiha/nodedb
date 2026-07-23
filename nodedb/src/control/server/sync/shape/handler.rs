@@ -137,14 +137,32 @@ pub fn handle_unsubscribe(session_id: &str, msg: &ShapeUnsubscribeMsg, registry:
     debug!(session = session_id, shape_id = %msg.shape_id, "shape unsubscribed");
 }
 
+/// Decode a materialized document payload for shape predicate evaluation.
+///
+/// Shape filtering is a delivery concern, not an authorization decision. An
+/// undecodable payload becomes an empty object so it cannot match a field
+/// predicate; exact CRDT RLS uses the separate authoritative post-image policy.
+pub(in crate::control::server::sync) fn decode_document_or_empty(
+    bytes: &[u8],
+) -> serde_json::Value {
+    if let Ok(json) = sonic_rs::from_slice::<serde_json::Value>(bytes) {
+        return json;
+    }
+    if let Ok(json_string) = nodedb_types::json_msgpack::msgpack_to_json_string(bytes)
+        && let Ok(value) = sonic_rs::from_str::<serde_json::Value>(&json_string)
+    {
+        return value;
+    }
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
 /// Evaluate a mutation against all shapes and generate ShapeDelta frames.
 ///
 /// Called by the WAL tail loop when a committed mutation is observed.
 /// Returns `(session_id, SyncFrame)` pairs for each matching subscription.
 ///
-/// The delta bytes are decoded to JSON for predicate evaluation. Opaque CRDT
-/// deltas that cannot be decoded yield an empty object, so all field predicates
-/// pass vacuously — consistent with the RLS evaluator behaviour for such deltas.
+/// The payload bytes are decoded to JSON for shape predicate evaluation.
+/// Undecodable payloads become an empty object and cannot satisfy field filters.
 pub fn evaluate_and_generate_deltas(
     tenant_id: u64,
     collection: &str,
@@ -154,7 +172,7 @@ pub fn evaluate_and_generate_deltas(
     lsn: u64,
     registry: &ShapeRegistry,
 ) -> Vec<(String, SyncFrame)> {
-    let doc_json = crate::control::server::sync::security::delta_bytes_to_json(delta);
+    let doc_json = decode_document_or_empty(delta);
     let matches = registry.evaluate_mutation(tenant_id, collection, doc_id, &doc_json);
 
     matches

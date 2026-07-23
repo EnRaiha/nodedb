@@ -17,6 +17,11 @@ use crate::loro_value::loro_to_value;
 
 use super::core::CrdtState;
 
+/// Maximum raw CRDT delta bytes accepted by the default authoritative preview.
+pub const DEFAULT_MAX_DELTA_BYTES: usize = 1024 * 1024;
+/// Maximum canonical MessagePack post-image bytes emitted by the default preview.
+pub const DEFAULT_MAX_POST_IMAGE_BYTES: usize = 1024 * 1024;
+
 /// Explicit resource limits for [`CrdtState::preview_delta`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrdtDeltaPreviewLimits {
@@ -34,10 +39,10 @@ pub struct CrdtDeltaPreviewLimits {
 impl Default for CrdtDeltaPreviewLimits {
     fn default() -> Self {
         Self {
-            max_delta_bytes: 1024 * 1024,
+            max_delta_bytes: DEFAULT_MAX_DELTA_BYTES,
             max_imported_ops: 10_000,
             max_write_set_entries: 1,
-            max_post_image_bytes: 1024 * 1024,
+            max_post_image_bytes: DEFAULT_MAX_POST_IMAGE_BYTES,
         }
     }
 }

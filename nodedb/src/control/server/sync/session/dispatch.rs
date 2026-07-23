@@ -19,10 +19,11 @@ use super::state::SyncSession;
 impl SyncSession {
     /// Process an incoming frame and return a response frame (if any).
     ///
-    /// Security-context parameters are optional — when provided,
-    /// per-delta RLS enforcement, rate limiting, silent rejection,
-    /// and DLQ persistence are active. `None` puts the session in
-    /// permissive mode (testing / internal replication channels).
+    /// Security-context parameters provide rate limiting, audit, and DLQ
+    /// persistence. Exact CRDT RLS is not evaluated here because raw deltas
+    /// cannot describe the merged row; admission evaluates the authoritative
+    /// Data-Plane preview before WAL. `rls_store` remains only for protocol
+    /// compatibility while callers migrate to the admission boundary.
     ///
     /// `shared` is forwarded to `handle_handshake` so the durable
     /// `SyncProducerRegistry` can be consulted during the Lite client

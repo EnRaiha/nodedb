@@ -25,13 +25,7 @@ pub(crate) fn build_apply(
     collection: &str,
 ) -> crate::Result<PhysicalPlan> {
     let document_id = require_doc_id(fields)?;
-    let delta = fields
-        .delta
-        .as_ref()
-        .ok_or_else(|| crate::Error::BadRequest {
-            detail: "missing 'delta'".to_string(),
-        })?
-        .clone();
+    let delta = bounded_delta(fields)?;
     let peer_id = fields.peer_id.unwrap_or(0);
 
     // Use provided mutation_id, or generate deterministic one from content hash.
@@ -63,6 +57,23 @@ pub(crate) fn build_apply(
         constraint_version_required: 0,
         expected_frontier_digest: None,
     }))
+}
+
+fn bounded_delta(fields: &TextFields) -> crate::Result<Vec<u8>> {
+    let delta = fields
+        .delta
+        .as_ref()
+        .ok_or_else(|| crate::Error::BadRequest {
+            detail: "missing 'delta'".to_string(),
+        })?;
+    if delta.len() > nodedb_crdt::DEFAULT_MAX_DELTA_BYTES {
+        return Err(crate::Error::LimitExceeded {
+            limit_name: "max_crdt_delta_bytes",
+            value: delta.len() as u64,
+            max: nodedb_crdt::DEFAULT_MAX_DELTA_BYTES as u64,
+        });
+    }
+    Ok(delta.clone())
 }
 
 pub(crate) fn build_alter_policy(
@@ -218,6 +229,27 @@ mod tests {
             list_to_index: Some(5),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn apply_delta_hard_limit_is_checked_before_planning() {
+        let exact = TextFields {
+            delta: Some(vec![0; nodedb_crdt::DEFAULT_MAX_DELTA_BYTES]),
+            ..Default::default()
+        };
+        assert_eq!(
+            bounded_delta(&exact).expect("exact limit").len(),
+            nodedb_crdt::DEFAULT_MAX_DELTA_BYTES
+        );
+
+        let oversized = TextFields {
+            delta: Some(vec![0; nodedb_crdt::DEFAULT_MAX_DELTA_BYTES + 1]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            bounded_delta(&oversized),
+            Err(crate::Error::LimitExceeded { .. })
+        ));
     }
 
     #[test]

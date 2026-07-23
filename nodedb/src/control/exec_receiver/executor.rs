@@ -32,6 +32,19 @@ use super::support::{
     PLAN_DECODE_FAILED, SinkOutcome, plan_contains_exchange, stream_error_to_typed,
 };
 
+fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> Result<(), TypedClusterError> {
+    if matches!(
+        plan,
+        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
+    ) {
+        return Err(TypedClusterError::Internal {
+            code: PLAN_DECODE_FAILED,
+            message: crate::Error::CrdtApplyRequiresAdmission.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Executes pre-planned `PhysicalPlan` on the local Data Plane.
 pub struct LocalPlanExecutor {
     state: Arc<SharedState>,
@@ -257,40 +270,8 @@ impl LocalPlanExecutor {
                 .map(|name| nodedb_cluster::routing::vshard_for_collection(database_id, &name))
                 .unwrap_or(0),
         );
-        if let PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply {
-            collection,
-            ..
-        }) = &plan
-        {
-            let collection = collection.clone();
-            if req.txn_id.is_some() {
-                return ExecuteResponse::err(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: crate::Error::CrdtApplyForbiddenInTransaction.to_string(),
-                });
-            }
-            return match crate::control::crdt_admission::dispatch_crdt_apply_admitted_outcome(
-                &self.state,
-                crate::control::crdt_admission::CrdtApplyAdmissionRequest {
-                    tenant_id,
-                    database_id,
-                    collection: &collection,
-                    plan,
-                    timeout: deadline,
-                    event_source: crate::event::EventSource::User,
-                    policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
-                },
-            )
-            .await
-            {
-                Ok(outcome) => {
-                    ExecuteResponse::ok(vec![outcome.payload], 0, outcome.write_version.as_u64())
-                }
-                Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
-                    code: PLAN_DECODE_FAILED,
-                    message: error.to_string(),
-                }),
-            };
+        if let Err(error) = reject_unadmitted_crdt_apply(&plan) {
+            return ExecuteResponse::err(error);
         }
 
         if let Some(proposer) = self.state.async_raft_proposer()
@@ -366,6 +347,10 @@ impl LocalPlanExecutor {
             Err(e) => return Some(e),
         };
 
+        if let Err(error) = reject_unadmitted_crdt_apply(&plan) {
+            return Some(error);
+        }
+
         let tenant_id = crate::types::TenantId::new(req.tenant_id);
         let trace_id = nodedb_types::TraceId(req.trace_id);
 
@@ -421,5 +406,31 @@ impl LocalPlanExecutor {
                 elapsed_ms: deadline.as_millis() as u64,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_physical::physical_plan::CrdtOp;
+
+    #[test]
+    fn every_remote_execution_mode_rejects_unadmitted_crdt_apply() {
+        let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
+            collection: "docs".into(),
+            document_id: "doc-1".into(),
+            delta: Vec::new(),
+            peer_id: 1,
+            mutation_id: 1,
+            surrogate: nodedb_types::Surrogate::ZERO,
+            provenance: None,
+            constraint_version_required: 0,
+            expected_frontier_digest: None,
+        });
+
+        assert!(matches!(
+            reject_unadmitted_crdt_apply(&plan),
+            Err(TypedClusterError::Internal { .. })
+        ));
     }
 }

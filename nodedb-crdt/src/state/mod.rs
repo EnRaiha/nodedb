@@ -19,4 +19,6 @@ pub mod write_set;
 mod tests;
 
 pub use core::CrdtState;
-pub use preview::{CrdtDeltaPreview, CrdtDeltaPreviewLimits};
+pub use preview::{
+    CrdtDeltaPreview, CrdtDeltaPreviewLimits, DEFAULT_MAX_DELTA_BYTES, DEFAULT_MAX_POST_IMAGE_BYTES,
+};

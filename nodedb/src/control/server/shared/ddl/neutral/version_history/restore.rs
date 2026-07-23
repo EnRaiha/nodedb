@@ -6,7 +6,10 @@ use std::time::Duration;
 
 #[cfg(test)]
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy;
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 #[cfg(test)]
@@ -38,6 +41,17 @@ pub async fn restore_version(
 ) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, checkpoint_name, doc_id) = parse_restore(sql)?;
     let tenant_id = identity.tenant_id;
+    let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+    authorize_collection(
+        identity,
+        database_id,
+        &collection,
+        Permission::Write,
+        &state.permissions,
+        &state.roles,
+        &audit,
+    )
+    .map_err(|error| err("42501", format!("permission denied: {}", error.resource())))?;
 
     let vv_json = super::at_version::resolve_checkpoint_vv(
         state,
@@ -53,6 +67,15 @@ pub async fn restore_version(
         .map_err(|e| err("XX000", format!("surrogate assign: {e}")))?;
 
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
+    let policy = ExternalCrdtPostImagePolicy::from_identity(
+        tenant_id,
+        database_id,
+        &collection,
+        identity,
+        "sql".into(),
+        &state.rls,
+        &audit,
+    );
     crate::control::crdt_admission::dispatch_crdt_restore_admitted(
         state,
         crate::control::crdt_admission::CrdtRestoreAdmissionRequest {
@@ -65,7 +88,7 @@ pub async fn restore_version(
             peer_id: identity.user_id,
             timeout,
             event_source: crate::event::EventSource::User,
-            policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+            policy: &policy,
         },
     )
     .await

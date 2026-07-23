@@ -66,6 +66,24 @@ impl Session {
 
         let collection = body["collection"].as_str().unwrap_or("default").to_string();
 
+        // Apply planning assigns a surrogate, so enforce the collection grant
+        // before constructing the plan or touching planner-side identity state.
+        if op == "crdt_apply" {
+            let audit = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
+                &self.state.audit,
+            ));
+            crate::control::server::shared::authorization::authorize_collection(
+                identity,
+                database_id,
+                &collection,
+                crate::control::security::identity::Permission::Write,
+                &self.state.permissions,
+                &self.state.roles,
+                &audit,
+            )
+            .map_err(crate::Error::from)?;
+        }
+
         // Determine vShard from collection + document_id for data locality.
         let vshard_key = body["document_id"].as_str().unwrap_or(&collection);
         let vshard_id = VShardId::from_key(vshard_key.as_bytes());
@@ -189,6 +207,13 @@ impl Session {
                         detail: "missing 'delta'".into(),
                     })?;
                 // Decode base64 delta. For now accept raw bytes if not valid base64.
+                if delta_b64.len() > nodedb_crdt::DEFAULT_MAX_DELTA_BYTES {
+                    return Err(crate::Error::LimitExceeded {
+                        limit_name: "max_crdt_delta_bytes",
+                        value: delta_b64.len() as u64,
+                        max: nodedb_crdt::DEFAULT_MAX_DELTA_BYTES as u64,
+                    });
+                }
                 let delta = delta_b64.as_bytes().to_vec();
                 let peer_id = body["peer_id"].as_u64().unwrap_or(0);
                 let surrogate = self.state.surrogate_assigner.assign(
@@ -289,6 +314,26 @@ impl Session {
         // group routing), NOT the document-keyed `vshard_id` used for local
         // core locality above.
         let collection = body["collection"].as_str().unwrap_or("default");
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| crate::Error::RejectedAuthz {
+                tenant_id,
+                resource: "authenticated identity required for CRDT apply".into(),
+            })?;
+        let audit = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
+            &self.state.audit,
+        ));
+        let policy =
+            crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
+                tenant_id,
+                database_id,
+                collection,
+                identity,
+                "native".into(),
+                &self.state.rls,
+                &audit,
+            );
         let payload = crate::control::crdt_admission::dispatch_crdt_apply_admitted(
             &self.state,
             crate::control::crdt_admission::CrdtApplyAdmissionRequest {
@@ -298,7 +343,7 @@ impl Session {
                 plan,
                 timeout: Duration::from_secs(self.state.tuning.network.default_deadline_secs),
                 event_source: crate::event::EventSource::User,
-                policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+                policy: &policy,
             },
         )
         .await?;

@@ -11,12 +11,18 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::Permission;
 use crate::control::server::http::auth::{ApiError, AppState, resolve_identity};
 use crate::control::server::http::types::{HttpCrdtApplyRequest, HttpCrdtApplyResponse};
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::server::shared::ddl::sql_parse::hex_decode;
 use nodedb_physical::physical_plan::CrdtOp;
 
 use super::document::extract_request_id;
+
+/// Maximum encoded JSON request body for one CRDT apply request.
+pub const CRDT_HTTP_BODY_MAX_BYTES: usize = 2 * nodedb_crdt::DEFAULT_MAX_DELTA_BYTES + 4096;
 
 /// POST /v1/collections/{name}/crdt/apply
 ///
@@ -37,9 +43,21 @@ pub async fn crdt_apply(
 ) -> Result<impl IntoResponse, ApiError> {
     let identity = resolve_identity(&headers, &state, "http")?;
 
-    // Decode delta from hex.
-    let delta = hex_decode(&body.delta)
-        .ok_or_else(|| ApiError::BadRequest("invalid hex in 'delta' field".into()))?;
+    let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.shared.audit));
+    authorize_collection(
+        &identity,
+        crate::types::DatabaseId::DEFAULT,
+        &collection,
+        Permission::Write,
+        &state.shared.permissions,
+        &state.shared.roles,
+        &audit,
+    )
+    .map_err(crate::Error::from)
+    .map_err(ApiError::from)?;
+
+    // Decode and bound the external delta before allocating identity state.
+    let delta = decode_bounded_delta(&body.delta)?;
 
     let _trace_id = extract_request_id(&headers);
 
@@ -72,6 +90,15 @@ pub async fn crdt_apply(
     // — lost to followers and entirely on leader failover. This handler is scoped
     // to the default database (matching its surrogate assignment above).
     state.shared.tenant_request_start(identity.tenant_id);
+    let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
+        identity.tenant_id,
+        crate::types::DatabaseId::DEFAULT,
+        &collection,
+        &identity,
+        "http".into(),
+        &state.shared.rls,
+        &audit,
+    );
     let result = crate::control::crdt_admission::dispatch_crdt_apply_admitted(
         &state.shared,
         crate::control::crdt_admission::CrdtApplyAdmissionRequest {
@@ -83,16 +110,52 @@ pub async fn crdt_apply(
                 state.shared.tuning.network.default_deadline_secs,
             ),
             event_source: crate::event::EventSource::User,
-            policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+            policy: &policy,
         },
     )
     .await;
     state.shared.tenant_request_end(identity.tenant_id);
 
-    result.map_err(|e| ApiError::Internal(e.to_string()))?;
+    result.map_err(ApiError::from)?;
 
     Ok(axum::Json(HttpCrdtApplyResponse::ok(
         collection,
         body.doc_id,
     )))
+}
+
+fn decode_bounded_delta(encoded: &str) -> Result<Vec<u8>, ApiError> {
+    let delta = hex_decode(encoded)
+        .ok_or_else(|| ApiError::BadRequest("invalid hex in 'delta' field".into()))?;
+    if delta.len() > nodedb_crdt::DEFAULT_MAX_DELTA_BYTES {
+        return Err(ApiError::HttpStatus(
+            413,
+            "CRDT delta exceeds maximum size".into(),
+        ));
+    }
+    Ok(delta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_delta_limit_is_exact_and_invalid_hex_is_bad_request() {
+        let exact = "00".repeat(nodedb_crdt::DEFAULT_MAX_DELTA_BYTES);
+        assert_eq!(
+            decode_bounded_delta(&exact).expect("exact limit").len(),
+            nodedb_crdt::DEFAULT_MAX_DELTA_BYTES
+        );
+
+        let oversized = "00".repeat(nodedb_crdt::DEFAULT_MAX_DELTA_BYTES + 1);
+        assert!(matches!(
+            decode_bounded_delta(&oversized),
+            Err(ApiError::HttpStatus(413, _))
+        ));
+        assert!(matches!(
+            decode_bounded_delta("xyz"),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
 }

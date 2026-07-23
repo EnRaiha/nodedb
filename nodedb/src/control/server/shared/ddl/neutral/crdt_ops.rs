@@ -13,8 +13,11 @@ use std::time::Duration;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy;
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::server::shared::ddl::sql_parse::hex_decode;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
@@ -130,11 +133,37 @@ pub async fn crdt_apply(
     let collection = &args[0];
     let document_id = &args[1];
     let delta_str = &args[2];
+    if delta_str.len() > nodedb_crdt::DEFAULT_MAX_DELTA_BYTES.saturating_mul(2) {
+        return Err(DdlError {
+            sqlstate: "54000".into(),
+            message: "CRDT delta exceeds maximum size".into(),
+        });
+    }
 
     // Try hex decode first, then treat as raw bytes.
     let delta = hex_decode(delta_str).unwrap_or_else(|| delta_str.as_bytes().to_vec());
+    if delta.len() > nodedb_crdt::DEFAULT_MAX_DELTA_BYTES {
+        return Err(DdlError {
+            sqlstate: "54000".into(),
+            message: "CRDT delta exceeds maximum size".into(),
+        });
+    }
 
     let tenant_id = identity.tenant_id;
+    let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+    authorize_collection(
+        identity,
+        database_id,
+        collection,
+        Permission::Write,
+        &state.permissions,
+        &state.roles,
+        &audit,
+    )
+    .map_err(|error| DdlError {
+        sqlstate: "42501".into(),
+        message: format!("permission denied: {}", error.resource()),
+    })?;
 
     let surrogate = state
         .surrogate_assigner
@@ -160,6 +189,15 @@ pub async fn crdt_apply(
     // Route through the Raft proposer gate so the delta is quorum-durable under
     // replication. A local-only dispatch would land the delta on the receiving
     // node only — it would be lost to every follower and entirely on failover.
+    let policy = ExternalCrdtPostImagePolicy::from_identity(
+        tenant_id,
+        database_id,
+        collection,
+        identity,
+        "sql".into(),
+        &state.rls,
+        &audit,
+    );
     crate::control::crdt_admission::dispatch_crdt_apply_admitted(
         state,
         crate::control::crdt_admission::CrdtApplyAdmissionRequest {
@@ -169,7 +207,7 @@ pub async fn crdt_apply(
             plan,
             timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
             event_source: crate::event::EventSource::User,
-            policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
+            policy: &policy,
         },
     )
     .await

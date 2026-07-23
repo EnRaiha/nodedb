@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
-
 //! WebSocket session loop for NodeDB-Lite sync connections.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 
 use tracing::{info, warn};
 

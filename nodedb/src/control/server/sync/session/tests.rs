@@ -116,7 +116,7 @@ fn delta_push_accepted_when_authenticated() {
 }
 
 #[test]
-fn delta_push_rls_silent_rejection() {
+fn delta_push_defers_rls_until_authoritative_admission() {
     let mut session = make_authenticated_session();
 
     use crate::control::security::predicate::{CompareOp, PredicateValue, RlsPredicate};
@@ -162,13 +162,43 @@ fn delta_push_rls_silent_rejection() {
     let response =
         session.handle_delta_push(&msg, Some(&rls_store), Some(&mut audit_log), Some(&mut dlq));
 
-    assert!(response.is_none());
-    assert_eq!(session.mutations_silent_dropped, 1);
+    assert_eq!(
+        response.expect("preliminary ack").msg_type,
+        SyncMessageType::DeltaAck
+    );
+    assert_eq!(session.mutations_silent_dropped, 0);
+    assert_eq!(session.mutations_processed, 1);
+    assert_eq!(audit_log.len(), 0);
+    assert_eq!(dlq.total_entries(), 0);
+}
+
+#[test]
+fn oversized_delta_rejects_before_rate_limit_or_dlq_clone() {
+    let mut session = make_authenticated_session();
+    let mut audit_log = AuditLog::new(100);
+    let mut dlq = SyncDlq::new(DlqConfig::default());
+    let msg = DeltaPushMsg {
+        collection: "orders".into(),
+        document_id: "o1".into(),
+        delta: vec![0; nodedb_crdt::DEFAULT_MAX_DELTA_BYTES + 1],
+        peer_id: 1,
+        mutation_id: 43,
+        checksum: 0,
+        device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
+    };
+
+    let response = session
+        .handle_delta_push(&msg, None, Some(&mut audit_log), Some(&mut dlq))
+        .expect("oversized reject");
+    assert_eq!(response.msg_type, SyncMessageType::DeltaReject);
+    assert_eq!(session.mutations_rejected, 1);
     assert_eq!(session.mutations_processed, 0);
-    assert_eq!(audit_log.len(), 1);
-    assert_eq!(dlq.total_entries(), 1);
-    let entries = dlq.entries_for_collection(1, "orders");
-    assert_eq!(entries[0].mutation_id, 42);
+    assert_eq!(session.mutations_silent_dropped, 0);
+    assert_eq!(audit_log.len(), 0);
+    assert_eq!(dlq.total_entries(), 0);
 }
 
 #[test]

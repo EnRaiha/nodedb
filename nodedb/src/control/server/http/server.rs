@@ -41,7 +41,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -114,7 +114,9 @@ fn build_router(state: AppState) -> Router {
         )
         .route(
             "/v1/collections/{name}/crdt/apply",
-            post(routes::crdt::crdt_apply),
+            post(routes::crdt::crdt_apply).layer(DefaultBodyLimit::max(
+                routes::crdt::CRDT_HTTP_BODY_MAX_BYTES,
+            )),
         )
         .route("/v1/cdc/{collection}/poll", get(routes::cdc::poll_changes))
         .route(

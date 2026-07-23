@@ -84,6 +84,7 @@ pub async fn dispatch_route(params: DispatchRouteParams<'_>) -> Result<DispatchO
         version_set,
         txn_id,
     } = params;
+    reject_unadmitted_crdt_apply(&route.plan)?;
     match route.decision {
         RouteDecision::Local => {
             dispatch_local(route, shared, tenant_id, database_id, trace_id, txn_id).await
@@ -145,6 +146,16 @@ pub struct DispatchRouteStreamParams<'a> {
 /// - `Remote` → [`dispatch_remote_stream`] (eager first frame + retry split).
 /// - `Broadcast` → unreachable (router splits broadcasts before dispatch).
 /// - `LeaderUnknown` → `NotLeader` so the gateway retry loop re-resolves.
+fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> Result<(), Error> {
+    if matches!(
+        plan,
+        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
+    ) {
+        return Err(Error::CrdtApplyRequiresAdmission);
+    }
+    Ok(())
+}
+
 pub async fn dispatch_route_stream(
     args: DispatchRouteStreamParams<'_>,
 ) -> Result<ResultStream, Error> {
@@ -157,6 +168,7 @@ pub async fn dispatch_route_stream(
         deadline_ms,
         version_set,
     } = args;
+    reject_unadmitted_crdt_apply(&route.plan)?;
     match route.decision {
         // Cluster gateway route dispatch: no session-transaction context
         // crosses this boundary yet, so `None`. TRACKED: cross-node
@@ -219,48 +231,6 @@ async fn dispatch_local(
         )
     {
         return Err(Error::CrdtApplyForbiddenInTransaction);
-    }
-
-    // Autocommit replicable writes MUST drive through Raft — exactly as the
-    // pgwire statement path and the remote-leaseholder receiver (`exec_receiver`)
-    // do: propose → WAL-append → apply → bump `coll_write_lsn` on every voter.
-    // Applying such a write via the leader-local SPSC dispatch below would commit
-    // only to this node's Data Plane and NEVER propose it to the Raft group
-    // (silent write loss on failover), nor floor a concurrent native reader's OCC
-    // comparand. `to_replicated_entry` is the single oracle for which plans are
-    // replicable writes; reads / non-write plans return `None` and fall through
-    // to the SPSC path below unchanged. Staged in-transaction writes
-    // (`txn_id.is_some()`) also fall through: they stay deferred to COMMIT's
-    // batch funnel, which appends their durable version there.
-    if txn_id.is_none()
-        && let Some(collection) = match &route.plan {
-            PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply {
-                collection,
-                ..
-            }) => Some(collection.clone()),
-            _ => None,
-        }
-    {
-        let outcome = crate::control::crdt_admission::dispatch_crdt_apply_admitted_outcome(
-            shared,
-            crate::control::crdt_admission::CrdtApplyAdmissionRequest {
-                tenant_id,
-                database_id,
-                collection: &collection,
-                plan: route.plan,
-                timeout: std::time::Duration::from_secs(
-                    shared.tuning.network.default_deadline_secs,
-                ),
-                event_source: crate::event::EventSource::User,
-                policy: &crate::control::crdt_admission::TrustedInternalCrdtPolicy,
-            },
-        )
-        .await?;
-        return Ok(DispatchOutcome {
-            payloads: vec![outcome.payload],
-            shard_watermarks: vec![(vshard_id, Lsn::ZERO)],
-            read_version_lsn: outcome.write_version,
-        });
     }
 
     // In local mode, frontier-changing CRDT operations have no Raft ordering.
@@ -402,6 +372,25 @@ mod tests {
         assert!(matches!(
             map_typed_cluster_error(err, 0),
             Error::DeadlineExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn gateway_rejects_unadmitted_crdt_apply_before_route_selection() {
+        let plan = PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply {
+            collection: "docs".into(),
+            document_id: "doc".into(),
+            delta: vec![1],
+            peer_id: 1,
+            mutation_id: 1,
+            surrogate: nodedb_types::Surrogate::ZERO,
+            provenance: None,
+            constraint_version_required: 0,
+            expected_frontier_digest: None,
+        });
+        assert!(matches!(
+            reject_unadmitted_crdt_apply(&plan),
+            Err(Error::CrdtApplyRequiresAdmission)
         ));
     }
 }

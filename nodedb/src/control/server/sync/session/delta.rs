@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Delta push: rate limit, CRC32C integrity, RLS, replay dedup.
+//! Delta push: bounded envelope validation, rate limit, CRC32C integrity, replay dedup.
+//!
+//! Exact RLS is evaluated later by CRDT admission against the authoritative
+//! post-merge preview, never against raw attacker-controlled delta bytes.
 
 use std::time::Instant;
 
@@ -10,7 +13,7 @@ use crate::control::security::audit::AuditLog;
 use crate::control::security::rls::RlsPolicyStore;
 
 use super::super::dlq::{DlqEnqueueParams, SyncDlq, ViolationType};
-use super::super::security::{SyncRejectionReason, enforce_rls_on_delta, log_silent_rejection};
+use super::super::security::{SyncRejectionReason, log_silent_rejection};
 use super::super::wire::*;
 use super::state::SyncSession;
 
@@ -22,7 +25,7 @@ impl SyncSession {
     pub fn handle_delta_push(
         &mut self,
         msg: &DeltaPushMsg,
-        rls_store: Option<&RlsPolicyStore>,
+        _rls_store: Option<&RlsPolicyStore>,
         audit_log: Option<&mut AuditLog>,
         dlq: Option<&mut SyncDlq>,
     ) -> Option<SyncFrame> {
@@ -44,6 +47,16 @@ impl SyncSession {
                 mutation_id: msg.mutation_id,
                 reason: "empty delta".into(),
                 compensation: None,
+            };
+            return SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject);
+        }
+
+        if msg.delta.len() > nodedb_crdt::DEFAULT_MAX_DELTA_BYTES {
+            self.mutations_rejected += 1;
+            let reject = DeltaRejectMsg {
+                mutation_id: msg.mutation_id,
+                reason: "CRDT delta exceeds maximum size".into(),
+                compensation: Some(CompensationHint::IntegrityViolation),
             };
             return SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject);
         }
@@ -121,39 +134,9 @@ impl SyncSession {
             return None;
         }
 
-        // RLS enforcement.
-        if let Some(rls) = rls_store
-            && let Err(reason) = enforce_rls_on_delta(msg, &identity, rls)
-        {
-            if let Some(audit) = audit_log {
-                log_silent_rejection(audit, &self.session_id, &identity, msg, &reason);
-            }
-            if let Some(q) = dlq {
-                let violation = match &reason {
-                    SyncRejectionReason::RlsPolicyViolation { policy_name } => {
-                        ViolationType::RlsPolicyViolation {
-                            policy_name: policy_name.clone(),
-                        }
-                    }
-                    _ => ViolationType::PermissionDenied,
-                };
-                q.enqueue(DlqEnqueueParams {
-                    session_id: self.session_id.clone(),
-                    tenant_id: identity.tenant_id.as_u64(),
-                    username: identity.username.clone(),
-                    collection: msg.collection.clone(),
-                    document_id: msg.document_id.clone(),
-                    mutation_id: msg.mutation_id,
-                    peer_id: msg.peer_id,
-                    delta: msg.delta.clone(),
-                    violation_type: violation,
-                    compensation: Some(CompensationHint::PermissionDenied),
-                    device_metadata: self.device_metadata.clone(),
-                });
-            }
-            self.mutations_silent_dropped += 1;
-            return None;
-        }
+        // Raw delta bytes do not describe the post-merge row. The admission
+        // policy receives the authoritative preview and performs exact RLS
+        // before WAL.
 
         self.mutations_processed += 1;
 

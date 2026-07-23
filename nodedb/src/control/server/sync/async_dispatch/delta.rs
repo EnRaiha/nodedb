@@ -59,6 +59,20 @@ pub(crate) async fn apply_delta_and_finalize(
         Ok(tenant_id) => tenant_id,
         Err(_) => return permission_denied_delta_reject(delta_msg),
     };
+    let identity = match identity {
+        Some(identity) => identity,
+        None => return permission_denied_delta_reject(delta_msg),
+    };
+    let audit = ArcAuditEmitter(std::sync::Arc::clone(&shared.audit));
+    let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
+        tenant_id,
+        DatabaseId::DEFAULT,
+        &delta_msg.collection,
+        identity,
+        "sync".into(),
+        &shared.rls,
+        &audit,
+    );
 
     // Dispatch a CrdtApply plan to the Data Plane. If the CRDT engine
     // rejects it (constraint violation), we get an error back.
@@ -157,6 +171,7 @@ pub(crate) async fn apply_delta_and_finalize(
         plan,
         Duration::from_secs(10),
         crate::event::EventSource::CrdtSync,
+        &policy,
     )
     .await;
     shared.tenant_request_end(tenant_id);
