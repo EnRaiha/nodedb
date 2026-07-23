@@ -621,8 +621,8 @@ fn columnar_segment_tampered_ciphertext_rejected() {
     let part_dir = tmp.path().join("tamper-part");
     let col_path = part_dir.join("timestamp.col");
     let mut bytes = std::fs::read(&col_path).unwrap();
-    // Flip a byte inside the ciphertext (after the 16B preamble).
-    bytes[20] ^= 0xFF;
+    // Flip a byte inside ciphertext after the current envelope preamble.
+    bytes[nodedb_wal::crypto::SEGMENT_ENVELOPE_PREAMBLE_SIZE + 2] ^= 0xFF;
     std::fs::write(&col_path, &bytes).unwrap();
 
     let err = ColumnarSegmentReader::read_column(

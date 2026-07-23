@@ -712,7 +712,7 @@ mod tests {
     fn array_segment_tampered_ciphertext_rejected() {
         let s = schema();
         let mut encrypted = write_encrypted(&s, TileId::snapshot(1));
-        // Flip a byte after the 16-byte preamble.
+        // Flip a byte in ciphertext after the current envelope preamble.
         encrypted[nodedb_wal::crypto::SEGMENT_ENVELOPE_PREAMBLE_SIZE + 2] ^= 0xFF;
         let kek = test_kek();
         assert!(OwnedSegmentReader::open_with_kek(&encrypted, Some(&kek)).is_err());

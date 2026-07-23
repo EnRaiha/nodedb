@@ -39,7 +39,7 @@
 //!
 //! ```text
 //! ┌───────────────────────────────────────┐
-//! │  SEGT preamble (16 bytes)             │  ← encrypted payload marker
+//! │  SEGT preamble (36 bytes)             │  ← salt + random nonce, all AAD
 //! │  AES-256-GCM ciphertext               │  ← columns + sparse index
 //! │    (includes 16B auth tag)            │
 //! ├───────────────────────────────────────┤

@@ -52,7 +52,7 @@ fn hnsw_checkpoint_encrypted_at_rest() {
     // Plaintext of a known float (vector[5] = [5.0, 0.0, 0.0, 0.0]) must
     // not appear as a raw IEEE 754 LE bytes sequence in the ciphertext.
     let five_f32: [u8; 4] = 5.0f32.to_le_bytes();
-    let ciphertext = &blob[16..]; // skip preamble
+    let ciphertext = &blob[nodedb_wal::crypto::SEGMENT_ENVELOPE_PREAMBLE_SIZE..];
     assert!(
         !ciphertext.windows(4).any(|w| w == five_f32),
         "plaintext float bytes (5.0f32) must not appear verbatim in ciphertext"

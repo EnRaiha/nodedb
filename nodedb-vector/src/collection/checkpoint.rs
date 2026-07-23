@@ -11,13 +11,12 @@
 //!
 //! ```text
 //! [SEGV (4B)] [version_u16_le (2B)] [cipher_alg_u8 (1B)] [kid_u8 (1B)]
-//! [epoch (4B)] [reserved (4B)] [AES-256-GCM ciphertext of msgpack payload]
+//! [HKDF salt (16B)] [random nonce (12B)] [AES-256-GCM ciphertext + tag]
 //! ```
 //!
-//! The first 16 bytes form a `SegmentPreamble` (reusing the existing preamble
-//! layout with a distinct `SEGV` magic). These 16 bytes are included as AAD,
-//! preventing preamble-swap attacks. The nonce is `(epoch, lsn=0)` — epoch
-//! provides per-write uniqueness even without an LSN.
+//! The complete current preamble is authenticated as AAD. Each envelope uses
+//! its salt and nonce to derive a one-use data key from the KEK, eliminating
+//! restart-sensitive nonce state.
 
 use std::collections::HashMap;
 

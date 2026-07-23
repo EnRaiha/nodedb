@@ -25,6 +25,12 @@ use crate::error::{Result, WalError};
 use crate::record::HEADER_SIZE;
 use crate::secure_mem::SecureKey;
 
+pub use crate::segment_envelope::{
+    SEGMENT_ENVELOPE_DATA_KEY_ENCRYPTION_BUDGET, SEGMENT_ENVELOPE_MAX_PLAINTEXT_BYTES,
+    SEGMENT_ENVELOPE_MIN_SIZE, SEGMENT_ENVELOPE_PREAMBLE_SIZE, decrypt_segment_envelope,
+    encrypt_segment_envelope,
+};
+
 /// Security gate for WAL key files: enforces no-symlink, regular-file,
 /// Unix mode bits (no group/world), and owner-UID checks.
 ///
@@ -213,6 +219,10 @@ impl WalEncryptionKey {
         &self.epoch
     }
 
+    pub(crate) fn key_bytes(&self) -> &[u8; 32] {
+        self.key.as_bytes()
+    }
+
     /// Decrypt a payload. Input is ciphertext + auth_tag (16 bytes at end).
     ///
     /// - `epoch`: must be the epoch that was used during encryption, read from
@@ -348,105 +358,6 @@ impl KeyRing {
 
 /// AES-256-GCM auth tag size in bytes.
 pub const AUTH_TAG_SIZE: usize = 16;
-
-// ── Segment envelope ───────────────────────────────────────────────────────
-//
-// Shared at-rest framing reused by every engine (array, columnar, vector,
-// spatial, timeseries) so the AES-256-GCM call site lives in one place.
-//
-// Layout:
-// ```text
-// [magic (4B)] [version_u16_le (2B)] [cipher_u8 (1B)] [kid_u8 (1B)]
-// [epoch (4B)] [reserved (4B)] [AES-256-GCM ciphertext (plaintext + 16B tag)]
-// ```
-//
-// The 16-byte preamble is supplied as AAD, preventing preamble-swap attacks.
-// The nonce is derived from `(epoch, lsn = 0)`; per-write random epoch
-// guarantees nonce uniqueness without needing a monotonic counter.
-
-/// Size of the segment envelope preamble in bytes.
-pub const SEGMENT_ENVELOPE_PREAMBLE_SIZE: usize = 16;
-
-/// Minimum size of a valid encrypted envelope: preamble + AES-GCM auth tag.
-pub const SEGMENT_ENVELOPE_MIN_SIZE: usize = SEGMENT_ENVELOPE_PREAMBLE_SIZE + AUTH_TAG_SIZE;
-
-/// Current segment-envelope preamble layout version.
-const SEGMENT_ENVELOPE_VERSION: u16 = 1;
-
-/// Cipher algorithm tag stored in the preamble: 0 = AES-256-GCM.
-const SEGMENT_ENVELOPE_CIPHER_AES_256_GCM: u8 = 0;
-
-/// Fixed LSN input for envelope nonces. Per-write random epoch (stored in
-/// the preamble) is what actually disambiguates nonces.
-const SEGMENT_ENVELOPE_NONCE_LSN: u64 = 0;
-
-fn encode_envelope_preamble(
-    magic: &[u8; 4],
-    epoch: &[u8; 4],
-) -> [u8; SEGMENT_ENVELOPE_PREAMBLE_SIZE] {
-    let mut buf = [0u8; SEGMENT_ENVELOPE_PREAMBLE_SIZE];
-    buf[0..4].copy_from_slice(magic);
-    buf[4..6].copy_from_slice(&SEGMENT_ENVELOPE_VERSION.to_le_bytes());
-    buf[6] = SEGMENT_ENVELOPE_CIPHER_AES_256_GCM;
-    buf[7] = 0; // kid = 0 (current KEK)
-    buf[8..12].copy_from_slice(epoch);
-    // buf[12..16] = reserved zeros
-    buf
-}
-
-/// Encrypt `plaintext` into a self-describing segment envelope.
-///
-/// Returns `preamble || AES-256-GCM(plaintext) || auth_tag`. The caller
-/// supplies the 4-byte `magic` that identifies its envelope variant
-/// (`SEGA`, `SEGC`, `SEGT`, `SEGV`, …).
-pub fn encrypt_segment_envelope(
-    key: &WalEncryptionKey,
-    magic: &[u8; 4],
-    plaintext: &[u8],
-) -> Result<Vec<u8>> {
-    let fresh_key = key.with_fresh_epoch()?;
-    let epoch = *fresh_key.epoch();
-    let preamble = encode_envelope_preamble(magic, &epoch);
-    let ciphertext = fresh_key.encrypt_aad(SEGMENT_ENVELOPE_NONCE_LSN, &preamble, plaintext)?;
-    let mut out = Vec::with_capacity(SEGMENT_ENVELOPE_PREAMBLE_SIZE + ciphertext.len());
-    out.extend_from_slice(&preamble);
-    out.extend_from_slice(&ciphertext);
-    Ok(out)
-}
-
-/// Decrypt a segment envelope produced by [`encrypt_segment_envelope`].
-///
-/// The caller supplies the expected `magic`; mismatches surface as
-/// [`WalError::EncryptionError`].
-pub fn decrypt_segment_envelope(
-    key: &WalEncryptionKey,
-    magic: &[u8; 4],
-    blob: &[u8],
-) -> Result<Vec<u8>> {
-    if blob.len() < SEGMENT_ENVELOPE_MIN_SIZE {
-        return Err(WalError::EncryptionError {
-            detail: "encrypted envelope too short".into(),
-        });
-    }
-    let preamble: [u8; SEGMENT_ENVELOPE_PREAMBLE_SIZE] = blob[..SEGMENT_ENVELOPE_PREAMBLE_SIZE]
-        .try_into()
-        .expect("slice is preamble size");
-    if &preamble[0..4] != magic {
-        return Err(WalError::EncryptionError {
-            detail: "envelope preamble magic mismatch".into(),
-        });
-    }
-    let version = u16::from_le_bytes([preamble[4], preamble[5]]);
-    if version != SEGMENT_ENVELOPE_VERSION {
-        return Err(WalError::EncryptionError {
-            detail: format!("unsupported envelope preamble version {version}"),
-        });
-    }
-    let mut epoch = [0u8; 4];
-    epoch.copy_from_slice(&preamble[8..12]);
-    let ciphertext = &blob[SEGMENT_ENVELOPE_PREAMBLE_SIZE..];
-    key.decrypt_aad(&epoch, SEGMENT_ENVELOPE_NONCE_LSN, &preamble, ciphertext)
-}
 
 /// Generate a fresh random 4-byte epoch.
 ///

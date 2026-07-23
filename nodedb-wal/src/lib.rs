@@ -38,6 +38,7 @@ pub mod recovery;
 pub mod replay;
 pub mod secure_mem;
 pub mod segment;
+mod segment_envelope;
 pub mod segmented;
 pub mod temporal_purge;
 pub mod tombstone;

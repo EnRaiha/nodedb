@@ -11,12 +11,12 @@
 //!
 //! ```text
 //! [SEGV (4B)] [version_u16_le (2B)] [cipher_alg_u8 (1B)] [kid_u8 (1B)]
-//! [epoch (4B)] [reserved (4B)] [AES-256-GCM ciphertext of the inner payload]
+//! [HKDF salt (16B)] [random nonce (12B)] [AES-256-GCM ciphertext + tag]
 //! ```
 //!
 //! The inner payload is either the raw rkyv bytes for R-tree or the msgpack
-//! bytes for geohash — the existing plaintext format. The nonce is
-//! `(epoch, lsn=0)`, and the 16-byte preamble is used as AAD.
+//! bytes for geohash. The complete preamble is AAD, and each envelope derives
+//! a one-use data key from its KEK, salt, nonce, and domain metadata.
 //!
 //! Storage key scheme (in redb under Namespace::Spatial):
 //! - `{collection}\x00{field}\x00rtree` → serialized R-tree entries
@@ -494,8 +494,8 @@ mod tests {
         tree.insert(make_entry(1, 10.0, 20.0));
 
         let mut enc_bytes = tree.checkpoint_to_bytes(Some(&kek)).unwrap();
-        // Flip a byte in the ciphertext region (after the 16-byte preamble).
-        enc_bytes[20] ^= 0xFF;
+        // Flip a byte in the ciphertext region after the current preamble.
+        enc_bytes[nodedb_wal::crypto::SEGMENT_ENVELOPE_PREAMBLE_SIZE + 2] ^= 0xFF;
 
         assert!(matches!(
             RTree::from_checkpoint(&enc_bytes, Some(&kek)),
