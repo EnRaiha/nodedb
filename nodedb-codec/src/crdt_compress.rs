@@ -11,6 +11,13 @@
 //! - Sync bandwidth reduction (Pattern B)
 //! - Long-term storage efficiency (Pattern C)
 
+use std::collections::HashSet;
+use std::mem::size_of;
+
+use crate::bounds::{
+    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, encode_u32_len,
+    u32_to_usize,
+};
 use crate::error::CodecError;
 
 /// A CRDT operation for compression.
@@ -42,16 +49,24 @@ pub fn encode(ops: &[CrdtOp]) -> Result<Vec<u8>, CodecError> {
         return Ok(0u32.to_le_bytes().to_vec());
     }
 
-    let count = ops.len() as u32;
+    let count = encode_input_len(ops.len(), "CRDT operation count")?;
 
     // Build actor dictionary.
     let mut actor_dict: Vec<u64> = Vec::new();
-    let mut actor_map = std::collections::HashMap::new();
+    let mut actor_map: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
     for op in ops {
         actor_map.entry(op.actor_id).or_insert_with(|| {
-            let idx = actor_dict.len() as u16;
+            let idx = actor_dict.len();
             actor_dict.push(op.actor_id);
             idx
+        });
+    }
+
+    if actor_dict.len() > u16::MAX as usize {
+        return Err(CodecError::ResourceLimit {
+            resource: "CRDT actor dictionary entries".into(),
+            requested: actor_dict.len(),
+            limit: u16::MAX as usize,
         });
     }
 
@@ -65,27 +80,56 @@ pub fn encode(ops: &[CrdtOp]) -> Result<Vec<u8>, CodecError> {
         ops.iter().map(|op| actor_map[&op.actor_id] as u8).collect()
     } else {
         ops.iter()
-            .flat_map(|op| actor_map[&op.actor_id].to_le_bytes())
+            .flat_map(|op| (actor_map[&op.actor_id] as u16).to_le_bytes())
             .collect()
     };
 
     // FSST-compress content (treat each op's content as a separate string).
     let content_refs: Vec<&[u8]> = ops.iter().map(|op| op.content.as_slice()).collect();
-    let content_block = crate::fsst::encode(&content_refs);
+    let content_block = crate::fsst::encode(&content_refs)?;
 
     // Build output.
-    let mut out = Vec::new();
+    let actor_bytes = checked_mul(actor_dict.len(), 8, "CRDT actor dictionary")?;
+    let capacity = checked_add(
+        checked_add(
+            checked_add(6, actor_bytes, "CRDT output")?,
+            checked_add(4, lamport_block.len(), "CRDT output")?,
+            "CRDT output",
+        )?,
+        checked_add(
+            checked_add(5, actor_indices.len(), "CRDT output")?,
+            checked_add(4, content_block.len(), "CRDT output")?,
+            "CRDT output",
+        )?,
+        "CRDT output",
+    )?;
+    decoded_len(capacity, "CRDT output")?;
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&count.to_le_bytes());
-    out.extend_from_slice(&(actor_dict.len() as u16).to_le_bytes());
+    out.extend_from_slice(
+        &u16::try_from(actor_dict.len())
+            .map_err(|_| CodecError::ResourceLimit {
+                resource: "CRDT actor dictionary entries".into(),
+                requested: actor_dict.len(),
+                limit: u16::MAX as usize,
+            })?
+            .to_le_bytes(),
+    );
     for &actor in &actor_dict {
         out.extend_from_slice(&actor.to_le_bytes());
     }
-    out.extend_from_slice(&(lamport_block.len() as u32).to_le_bytes());
+    out.extend_from_slice(
+        &encode_u32_len(lamport_block.len(), "CRDT Lamport block")?.to_le_bytes(),
+    );
     out.extend_from_slice(&lamport_block);
     out.push(if use_u8 { 1 } else { 2 }); // index width marker
-    out.extend_from_slice(&(actor_indices.len() as u32).to_le_bytes());
+    out.extend_from_slice(
+        &encode_u32_len(actor_indices.len(), "CRDT actor-index block")?.to_le_bytes(),
+    );
     out.extend_from_slice(&actor_indices);
-    out.extend_from_slice(&(content_block.len() as u32).to_le_bytes());
+    out.extend_from_slice(
+        &encode_u32_len(content_block.len(), "CRDT content block")?.to_le_bytes(),
+    );
     out.extend_from_slice(&content_block);
 
     Ok(out)
@@ -100,139 +144,176 @@ pub fn decode(data: &[u8]) -> Result<Vec<CrdtOp>, CodecError> {
         });
     }
 
-    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let count = u32_to_usize(
+        u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        "CRDT operation count",
+    )?;
+    let per_operation_overhead = checked_add(
+        size_of::<CrdtOp>(),
+        checked_add(
+            size_of::<i64>(),
+            size_of::<usize>(),
+            "CRDT temporary operation overhead",
+        )?,
+        "CRDT decoded operation overhead",
+    )?;
+    decoded_len(
+        checked_mul(count, per_operation_overhead, "CRDT decoded operations")?,
+        "CRDT",
+    )?;
     if count == 0 {
+        if data.len() != 4 {
+            return Err(CodecError::Corrupt {
+                detail: "non-canonical empty CRDT frame".into(),
+            });
+        }
         return Ok(Vec::new());
     }
 
     let mut pos = 4;
-
-    // Actor dictionary.
-    if pos + 2 > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + 2,
-            actual: data.len(),
+    let actor_count = usize::from(u16::from_le_bytes(
+        checked_range(data, pos, 2, "CRDT actor count")?
+            .try_into()
+            .map_err(|_| CodecError::Corrupt {
+                detail: "invalid CRDT actor count".into(),
+            })?,
+    ));
+    if actor_count == 0 || actor_count > count {
+        return Err(CodecError::Corrupt {
+            detail: "CRDT actor count is invalid".into(),
         });
     }
-    let actor_count = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-    pos += 2;
-
-    let actor_bytes = actor_count * 8;
-    if pos + actor_bytes > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + actor_bytes,
-            actual: data.len(),
-        });
-    }
-    let actor_dict: Vec<u64> = data[pos..pos + actor_bytes]
+    pos = checked_add(pos, 2, "CRDT actor cursor")?;
+    let actor_bytes = checked_mul(actor_count, 8, "CRDT actor dictionary")?;
+    let actor_data = checked_range(data, pos, actor_bytes, "CRDT actor dictionary")?;
+    let actor_dict: Vec<u64> = actor_data
         .chunks_exact(8)
-        .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-        .collect();
-    pos += actor_bytes;
-
-    // Lamport block.
-    if pos + 4 > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + 4,
-            actual: data.len(),
+        .map(|c| {
+            Ok(u64::from_le_bytes(c.try_into().map_err(|_| {
+                CodecError::Corrupt {
+                    detail: "invalid CRDT actor".into(),
+                }
+            })?))
+        })
+        .collect::<Result<_, _>>()?;
+    let unique_actors: HashSet<u64> = actor_dict.iter().copied().collect();
+    if unique_actors.len() != actor_dict.len() {
+        return Err(CodecError::Corrupt {
+            detail: "duplicate CRDT actor dictionary entry".into(),
         });
     }
-    let lamport_size =
-        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-    pos += 4;
-    if pos + lamport_size > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + lamport_size,
-            actual: data.len(),
+    pos = checked_add(pos, actor_bytes, "CRDT actor cursor")?;
+    let lamport_size = u32_to_usize(
+        u32::from_le_bytes(
+            checked_range(data, pos, 4, "CRDT Lamport size")?
+                .try_into()
+                .map_err(|_| CodecError::Corrupt {
+                    detail: "invalid CRDT Lamport size".into(),
+                })?,
+        ),
+        "CRDT Lamport block",
+    )?;
+    pos = checked_add(pos, 4, "CRDT Lamport cursor")?;
+    let lamports = crate::delta::decode(checked_range(
+        data,
+        pos,
+        lamport_size,
+        "CRDT Lamport block",
+    )?)?;
+    if lamports.len() != count {
+        return Err(CodecError::Corrupt {
+            detail: "CRDT Lamport count mismatch".into(),
         });
     }
-    let lamports = crate::delta::decode(&data[pos..pos + lamport_size])?;
-    pos += lamport_size;
-
-    // Actor index width + data.
-    if pos >= data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + 1,
-            actual: data.len(),
+    pos = checked_add(pos, lamport_size, "CRDT Lamport cursor")?;
+    let index_width = checked_range(data, pos, 1, "CRDT actor-index width")?[0];
+    let expected_width = if actor_count <= 256 { 1 } else { 2 };
+    if index_width != expected_width {
+        return Err(CodecError::Corrupt {
+            detail: "CRDT actor-index width is non-canonical".into(),
         });
     }
-    let index_width = data[pos];
-    pos += 1;
-
-    if pos + 4 > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + 4,
-            actual: data.len(),
+    pos = checked_add(pos, 1, "CRDT actor-index cursor")?;
+    let index_size = u32_to_usize(
+        u32::from_le_bytes(
+            checked_range(data, pos, 4, "CRDT actor-index size")?
+                .try_into()
+                .map_err(|_| CodecError::Corrupt {
+                    detail: "invalid CRDT actor-index size".into(),
+                })?,
+        ),
+        "CRDT actor-index block",
+    )?;
+    pos = checked_add(pos, 4, "CRDT actor-index cursor")?;
+    let expected_index_size = checked_mul(count, usize::from(index_width), "CRDT actor indices")?;
+    if index_size != expected_index_size {
+        return Err(CodecError::Corrupt {
+            detail: "CRDT actor-index count mismatch".into(),
         });
     }
-    let index_size =
-        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-    pos += 4;
-    if pos + index_size > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + index_size,
-            actual: data.len(),
-        });
-    }
+    let index_data = checked_range(data, pos, index_size, "CRDT actor-index block")?;
     let actor_indices: Vec<usize> = if index_width == 1 {
-        data[pos..pos + index_size]
-            .iter()
-            .map(|&b| b as usize)
-            .collect()
+        index_data.iter().map(|&index| usize::from(index)).collect()
     } else {
-        data[pos..pos + index_size]
+        index_data
             .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]) as usize)
+            .map(|chunk| usize::from(u16::from_le_bytes([chunk[0], chunk[1]])))
             .collect()
     };
-    pos += index_size;
-
-    // Content block.
-    if pos + 4 > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + 4,
-            actual: data.len(),
+    if actor_indices.iter().any(|&index| index >= actor_count) {
+        return Err(CodecError::Corrupt {
+            detail: "CRDT actor index out of range".into(),
         });
     }
-    let content_size =
-        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-    pos += 4;
-    if pos + content_size > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + content_size,
-            actual: data.len(),
+    let mut first_seen = vec![false; actor_count];
+    let mut next_actor = 0usize;
+    for &index in &actor_indices {
+        if !first_seen[index] {
+            if index != next_actor {
+                return Err(CodecError::Corrupt {
+                    detail: "CRDT actor dictionary is not in first-use order".into(),
+                });
+            }
+            first_seen[index] = true;
+            next_actor += 1;
+        }
+    }
+    if next_actor != actor_count {
+        return Err(CodecError::Corrupt {
+            detail: "CRDT actor dictionary contains unused entries".into(),
         });
     }
-    let contents = crate::fsst::decode(&data[pos..pos + content_size])?;
+    pos = checked_add(pos, index_size, "CRDT actor-index cursor")?;
+    let content_size = u32_to_usize(
+        u32::from_le_bytes(
+            checked_range(data, pos, 4, "CRDT content size")?
+                .try_into()
+                .map_err(|_| CodecError::Corrupt {
+                    detail: "invalid CRDT content size".into(),
+                })?,
+        ),
+        "CRDT content block",
+    )?;
+    pos = checked_add(pos, 4, "CRDT content cursor")?;
+    let contents = crate::fsst::decode(checked_range(
+        data,
+        pos,
+        content_size,
+        "CRDT content block",
+    )?)?;
+    if contents.len() != count || checked_add(pos, content_size, "CRDT frame end")? != data.len() {
+        return Err(CodecError::Corrupt {
+            detail: "CRDT content count or frame length mismatch".into(),
+        });
+    }
 
     // Reconstruct ops.
     let mut ops = Vec::with_capacity(count);
     for i in 0..count {
-        let lamport = if i < lamports.len() {
-            lamports[i] as u64
-        } else {
-            0
-        };
-        let actor_idx = if i < actor_indices.len() {
-            actor_indices[i]
-        } else {
-            0
-        };
-        let actor_id = if actor_idx < actor_dict.len() {
-            actor_dict[actor_idx]
-        } else {
-            0
-        };
-        let content = if i < contents.len() {
-            contents[i].clone()
-        } else {
-            Vec::new()
-        };
-
         ops.push(CrdtOp {
-            lamport,
-            actor_id,
-            content,
+            lamport: lamports[i] as u64,
+            actor_id: actor_dict[actor_indices[i]],
+            content: contents[i].clone(),
         });
     }
 
@@ -306,6 +387,47 @@ mod tests {
             ratio > 1.2,
             "CRDT ops should compress >1.2x, got {ratio:.2}x"
         );
+    }
+
+    #[test]
+    fn rejects_count_mismatch_invalid_indices_and_trailing_bytes() {
+        let ops = vec![CrdtOp {
+            lamport: 1,
+            actor_id: 7,
+            content: b"x".to_vec(),
+        }];
+        let mut trailing = encode(&ops).unwrap();
+        trailing.push(0);
+        assert!(matches!(decode(&trailing), Err(CodecError::Corrupt { .. })));
+
+        let mut malformed = encode(&ops).unwrap();
+        let actor_count = usize::from(u16::from_le_bytes([malformed[4], malformed[5]]));
+        let mut cursor = 6 + actor_count * 8;
+        let lamport_size =
+            u32::from_le_bytes(malformed[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4 + lamport_size + 1 + 4;
+        malformed[cursor] = 1;
+        assert!(matches!(
+            decode(&malformed),
+            Err(CodecError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn wide_actor_indices_roundtrip() {
+        let ops: Vec<CrdtOp> = (0..300)
+            .map(|i| CrdtOp {
+                lamport: i,
+                actor_id: i,
+                content: vec![b'x'],
+            })
+            .collect();
+        let encoded = encode(&ops).unwrap();
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded.len(), ops.len());
+        for (expected, actual) in ops.iter().zip(&decoded) {
+            assert_eq!(actual.actor_id, expected.actor_id);
+        }
     }
 
     #[test]

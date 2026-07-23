@@ -27,6 +27,11 @@
 //! [count × ceil(cut/8) bytes] tail bits (packed, little-endian)
 //! ```
 
+use std::mem::size_of;
+
+use crate::bounds::{
+    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, u32_to_usize,
+};
 use crate::error::CodecError;
 
 use crate::CODEC_SAMPLE_SIZE;
@@ -37,7 +42,9 @@ use crate::CODEC_SAMPLE_SIZE;
 
 /// Encode f64 values using ALP-RD (front-bit dictionary + raw tail bits).
 pub fn encode(values: &[f64]) -> Result<Vec<u8>, CodecError> {
-    let count = values.len() as u32;
+    let decoded_bytes = checked_mul(values.len(), size_of::<f64>(), "ALP-RD input bytes")?;
+    decoded_len(decoded_bytes, "ALP-RD input")?;
+    let count = encode_input_len(values.len(), "ALP-RD value count")?;
 
     if values.is_empty() {
         let mut out = Vec::with_capacity(7);
@@ -62,6 +69,11 @@ pub fn encode(values: &[f64]) -> Result<Vec<u8>, CodecError> {
     let mut dict: Vec<u64> = fronts.clone();
     dict.sort_unstable();
     dict.dedup();
+    let dict_size = u16::try_from(dict.len()).map_err(|_| CodecError::ResourceLimit {
+        resource: "ALP-RD dictionary entries".into(),
+        requested: dict.len(),
+        limit: u16::MAX as usize,
+    })?;
 
     // Map front values to dictionary indices.
     // Safety: `dict` is built from `fronts` via sort+dedup, so every front value
@@ -77,15 +89,26 @@ pub fn encode(values: &[f64]) -> Result<Vec<u8>, CodecError> {
         })
         .collect::<Result<_, _>>()?;
 
-    let dict_size = dict.len() as u16;
     let use_u8_indices = dict.len() <= 256;
 
     // Build output.
-    let mut out = Vec::with_capacity(
-        7 + dict.len() * 8
-            + values.len() * if use_u8_indices { 1 } else { 2 }
-            + values.len() * tail_bytes_per_value,
-    );
+    let dict_bytes = checked_mul(dict.len(), 8, "ALP-RD dictionary")?;
+    let index_bytes = checked_mul(
+        values.len(),
+        if use_u8_indices { 1 } else { 2 },
+        "ALP-RD indices",
+    )?;
+    let tail_bytes = checked_mul(values.len(), tail_bytes_per_value, "ALP-RD tails")?;
+    let capacity = checked_add(
+        checked_add(
+            checked_add(7, dict_bytes, "ALP-RD output")?,
+            index_bytes,
+            "ALP-RD output",
+        )?,
+        tail_bytes,
+        "ALP-RD output",
+    )?;
+    let mut out = Vec::with_capacity(capacity);
 
     // Header.
     out.extend_from_slice(&count.to_le_bytes());
@@ -128,15 +151,27 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
         });
     }
 
-    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let count = u32_to_usize(
+        u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        "ALP-RD value count",
+    )?;
+    decoded_len(
+        checked_mul(count, size_of::<f64>(), "ALP-RD decoded values")?,
+        "ALP-RD",
+    )?;
     let cut = data[4];
-    let dict_size = u16::from_le_bytes([data[5], data[6]]) as usize;
+    let dict_size = usize::from(u16::from_le_bytes([data[5], data[6]]));
 
     if count == 0 {
+        if dict_size != 0 || data.len() != 7 {
+            return Err(CodecError::Corrupt {
+                detail: "non-canonical empty ALP-RD frame".into(),
+            });
+        }
         return Ok(Vec::new());
     }
 
-    if cut > 64 {
+    if cut > 63 {
         return Err(CodecError::Corrupt {
             detail: format!("invalid ALP-RD cut position: {cut}"),
         });
@@ -144,20 +179,21 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
 
     let tail_bytes_per_value = (cut as usize).div_ceil(8);
     let tail_mask: u64 = if cut == 0 { 0 } else { (1u64 << cut) - 1 };
+    if dict_size == 0 || dict_size > count {
+        return Err(CodecError::Corrupt {
+            detail: "ALP-RD dictionary count is invalid".into(),
+        });
+    }
     let use_u8_indices = dict_size <= 256;
 
     // Read dictionary.
     let mut pos = 7;
-    let dict_bytes = dict_size * 8;
-    if pos + dict_bytes > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + dict_bytes,
-            actual: data.len(),
-        });
-    }
+    let dict_bytes = checked_mul(dict_size, 8, "ALP-RD dictionary")?;
+    checked_range(data, pos, dict_bytes, "ALP-RD dictionary")?;
     let mut dict = Vec::with_capacity(dict_size);
+    let mut previous = None;
     for _ in 0..dict_size {
-        dict.push(u64::from_le_bytes([
+        let entry = u64::from_le_bytes([
             data[pos],
             data[pos + 1],
             data[pos + 2],
@@ -166,38 +202,44 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
             data[pos + 5],
             data[pos + 6],
             data[pos + 7],
-        ]));
-        pos += 8;
+        ]);
+        if entry > (u64::MAX >> cut) || previous.is_some_and(|value| entry <= value) {
+            return Err(CodecError::Corrupt {
+                detail: "ALP-RD dictionary is non-canonical".into(),
+            });
+        }
+        previous = Some(entry);
+        dict.push(entry);
+        pos = checked_add(pos, 8, "ALP-RD dictionary cursor")?;
     }
 
     // Read indices.
-    let index_bytes = count * if use_u8_indices { 1 } else { 2 };
-    if pos + index_bytes > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + index_bytes,
-            actual: data.len(),
-        });
-    }
+    let index_bytes = checked_mul(count, if use_u8_indices { 1 } else { 2 }, "ALP-RD indices")?;
+    checked_range(data, pos, index_bytes, "ALP-RD indices")?;
     let mut indices = Vec::with_capacity(count);
     if use_u8_indices {
         for i in 0..count {
             indices.push(data[pos + i] as usize);
         }
-        pos += count;
+        pos = checked_add(pos, count, "ALP-RD index cursor")?;
     } else {
         for i in 0..count {
-            let idx_pos = pos + i * 2;
+            let idx_pos = checked_add(
+                pos,
+                checked_mul(i, 2, "ALP-RD index offset")?,
+                "ALP-RD index position",
+            )?;
             indices.push(u16::from_le_bytes([data[idx_pos], data[idx_pos + 1]]) as usize);
         }
-        pos += count * 2;
+        pos = checked_add(pos, index_bytes, "ALP-RD index cursor")?;
     }
 
     // Read tail bits.
-    let tail_total = count * tail_bytes_per_value;
-    if pos + tail_total > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + tail_total,
-            actual: data.len(),
+    let tail_total = checked_mul(count, tail_bytes_per_value, "ALP-RD tails")?;
+    let tails = checked_range(data, pos, tail_total, "ALP-RD tails")?;
+    if checked_add(pos, tail_total, "ALP-RD frame end")? != data.len() {
+        return Err(CodecError::Corrupt {
+            detail: "trailing bytes after ALP-RD frame".into(),
         });
     }
 
@@ -211,9 +253,19 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
 
         let front = dict[idx] << cut;
         let mut tail = 0u64;
-        let tail_pos = pos + i * tail_bytes_per_value;
+        let tail_pos = checked_mul(i, tail_bytes_per_value, "ALP-RD tail offset")?;
         for byte_idx in 0..tail_bytes_per_value {
-            tail |= (data[tail_pos + byte_idx] as u64) << (byte_idx * 8);
+            tail |= (tails[tail_pos + byte_idx] as u64) << (byte_idx * 8);
+        }
+        let final_bits = usize::from(cut) % 8;
+        if final_bits != 0 {
+            let last = tails[tail_pos + tail_bytes_per_value - 1];
+            let padding_mask = !((1u8 << final_bits) - 1);
+            if last & padding_mask != 0 {
+                return Err(CodecError::Corrupt {
+                    detail: "non-zero ALP-RD tail padding".into(),
+                });
+            }
         }
         tail &= tail_mask;
 
@@ -339,8 +391,39 @@ mod tests {
     }
 
     #[test]
-    fn truncated_errors() {
+    fn rejects_invalid_layout_and_trailing_bytes() {
         assert!(decode(&[]).is_err());
-        assert!(decode(&[1, 0, 0, 0, 48, 0]).is_err()); // too short
+        assert!(decode(&[1, 0, 0, 0, 48, 0]).is_err());
+        let mut encoded = encode(&[1.25]).unwrap();
+        encoded.push(0);
+        assert!(matches!(decode(&encoded), Err(CodecError::Corrupt { .. })));
+        let mut invalid_index = encode(&[1.25]).unwrap();
+        let dict_size = usize::from(u16::from_le_bytes([invalid_index[5], invalid_index[6]]));
+        let index_start = 7 + dict_size * 8;
+        invalid_index[index_start] = u8::MAX;
+        assert!(matches!(
+            decode(&invalid_index),
+            Err(CodecError::Corrupt { .. })
+        ));
+
+        let mut padded_tail = Vec::new();
+        padded_tail.extend_from_slice(&1u32.to_le_bytes());
+        padded_tail.push(1);
+        padded_tail.extend_from_slice(&1u16.to_le_bytes());
+        padded_tail.extend_from_slice(&0u64.to_le_bytes());
+        padded_tail.push(0);
+        padded_tail.push(0x80);
+        assert!(matches!(
+            decode(&padded_tail),
+            Err(CodecError::Corrupt { .. })
+        ));
+
+        let mut wide_front = padded_tail;
+        wide_front[7..15].copy_from_slice(&u64::MAX.to_le_bytes());
+        wide_front[16] = 0;
+        assert!(matches!(
+            decode(&wide_front),
+            Err(CodecError::Corrupt { .. })
+        ));
     }
 }

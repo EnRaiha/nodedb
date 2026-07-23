@@ -93,11 +93,11 @@ pub fn encode_bytes_pipeline(raw: &[u8], codec: ColumnCodec) -> Result<Vec<u8>, 
     match codec {
         ColumnCodec::FsstLz4 => {
             // FSST expects an array of strings. Treat raw as a single blob.
-            let fsst_bytes = crate::fsst::encode(&[raw]);
+            let fsst_bytes = crate::fsst::encode(&[raw])?;
             crate::lz4::encode(&fsst_bytes)
         }
         ColumnCodec::FsstRans => {
-            let fsst_bytes = crate::fsst::encode(&[raw]);
+            let fsst_bytes = crate::fsst::encode(&[raw])?;
             crate::rans::encode(&fsst_bytes)
         }
         ColumnCodec::Raw => Ok(crate::raw::encode(raw)),

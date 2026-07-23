@@ -26,7 +26,10 @@
 
 use std::mem::size_of;
 
-use crate::bounds::{checked_add, checked_mul, decoded_len, encode_input_len, encode_u32_len};
+use crate::bounds::{
+    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, encode_u32_len,
+    u32_to_usize,
+};
 use crate::error::CodecError;
 use crate::fastlanes;
 
@@ -179,8 +182,15 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
         });
     }
 
-    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let _encode_exp = data[4];
+    let count = u32_to_usize(
+        u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        "ALP value count",
+    )?;
+    decoded_len(
+        checked_mul(count, size_of::<f64>(), "ALP decoded values")?,
+        "ALP",
+    )?;
+    let encode_exp = data[4];
     let decode_exp = data[5];
     let mode = match data[6] {
         0 => DecodeMode::MultiplyInverse,
@@ -191,33 +201,58 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
             });
         }
     };
-    let exception_count = u32::from_le_bytes([data[7], data[8], data[9], data[10]]) as usize;
+    let exception_count = u32_to_usize(
+        u32::from_le_bytes([data[7], data[8], data[9], data[10]]),
+        "ALP exception count",
+    )?;
 
     if count == 0 {
+        if exception_count != 0 || data.len() != HEADER_SIZE {
+            return Err(CodecError::Corrupt {
+                detail: "non-canonical empty ALP frame".into(),
+            });
+        }
         return Ok(Vec::new());
     }
-
-    if decode_exp > MAX_EXPONENT {
+    if exception_count > count {
         return Err(CodecError::Corrupt {
-            detail: format!("invalid ALP decode_exp {decode_exp}"),
+            detail: "ALP exception count exceeds value count".into(),
+        });
+    }
+
+    if encode_exp > MAX_EXPONENT || decode_exp > MAX_EXPONENT {
+        return Err(CodecError::Corrupt {
+            detail: format!("invalid ALP exponents encode={encode_exp}, decode={decode_exp}"),
         });
     }
 
     // Read exceptions.
-    let exceptions_size = exception_count * 12;
-    let exceptions_end = HEADER_SIZE + exceptions_size;
-    if data.len() < exceptions_end {
-        return Err(CodecError::Truncated {
-            expected: exceptions_end,
-            actual: data.len(),
-        });
-    }
+    decoded_len(
+        checked_mul(
+            exception_count,
+            size_of::<(usize, u64)>(),
+            "ALP exception allocation",
+        )?,
+        "ALP exceptions",
+    )?;
+    let exceptions_size = checked_mul(exception_count, 12, "ALP exceptions")?;
+    let exceptions_end = checked_add(HEADER_SIZE, exceptions_size, "ALP exceptions")?;
+    checked_range(data, HEADER_SIZE, exceptions_size, "ALP exceptions")?;
 
     let mut exceptions = Vec::with_capacity(exception_count);
     let mut pos = HEADER_SIZE;
+    let mut previous_index = None;
     for _ in 0..exception_count {
-        let idx =
-            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        let idx = u32_to_usize(
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]),
+            "ALP exception index",
+        )?;
+        if idx >= count || previous_index.is_some_and(|previous| idx <= previous) {
+            return Err(CodecError::Corrupt {
+                detail: "ALP exceptions must be ordered unique in-range indices".into(),
+            });
+        }
+        previous_index = Some(idx);
         let bits = u64::from_le_bytes([
             data[pos + 4],
             data[pos + 5],
@@ -253,11 +288,17 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
         values.push(alp_decode_value(int_val, decode_exp, mode));
     }
 
-    // Patch exceptions.
+    // Patch exceptions. The encoder uses a zero integer placeholder and only
+    // emits an exception when the original value cannot round-trip.
+    let factor = POW10[encode_exp as usize];
     for &(idx, bits) in &exceptions {
-        if idx < values.len() {
-            values[idx] = f64::from_bits(bits);
+        let value = f64::from_bits(bits);
+        if encoded_ints[idx] != 0 || try_alp_encode(value, factor, decode_exp, mode).is_some() {
+            return Err(CodecError::Corrupt {
+                detail: "non-canonical ALP exception".into(),
+            });
         }
+        values[idx] = value;
     }
 
     Ok(values)
@@ -603,6 +644,32 @@ mod tests {
         for (i, (a, b)) in values.iter().zip(decoded.iter()).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "mismatch at {i}");
         }
+    }
+
+    #[test]
+    fn rejects_noncanonical_exception_layout() {
+        let mut encoded = encode(&[f64::NAN, 1.0]);
+        let first_exception = 11;
+        encoded[first_exception..first_exception + 4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(decode(&encoded), Err(CodecError::Corrupt { .. })));
+        let mut empty = encode(&[]);
+        empty.push(0);
+        assert!(matches!(decode(&empty), Err(CodecError::Corrupt { .. })));
+
+        let mut bad_exponent = encode(&[1.0]);
+        bad_exponent[4] = MAX_EXPONENT + 1;
+        assert!(matches!(
+            decode(&bad_exponent),
+            Err(CodecError::Corrupt { .. })
+        ));
+
+        let mut nonzero_placeholder = encode(&[f64::NAN]);
+        let nested_min = 11 + 12 + 6 + 3;
+        nonzero_placeholder[nested_min..nested_min + 8].copy_from_slice(&1i64.to_le_bytes());
+        assert!(matches!(
+            decode(&nonzero_placeholder),
+            Err(CodecError::Corrupt { .. })
+        ));
     }
 
     #[test]

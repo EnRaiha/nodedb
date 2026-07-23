@@ -26,6 +26,12 @@
 //! Escape mechanism: byte value 255 followed by a literal byte encodes
 //! bytes not covered by any symbol. Symbol indices are 0..254.
 
+use std::mem::size_of;
+
+use crate::bounds::{
+    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, encode_u32_len,
+    u32_to_usize,
+};
 use crate::error::CodecError;
 
 /// Maximum number of symbols in the table (reserve 255 as escape).
@@ -153,17 +159,48 @@ fn longest_symbol_match(symbols: &[Vec<u8>], data: &[u8], pos: usize) -> usize {
 ///
 /// Trains a symbol table on the input, then encodes each string as a
 /// sequence of symbol indices and escaped literals.
-pub fn encode(strings: &[&[u8]]) -> Vec<u8> {
+pub fn encode(strings: &[&[u8]]) -> Result<Vec<u8>, CodecError> {
+    encode_input_len(strings.len(), "FSST string count")?;
+    let input_bytes = strings.iter().try_fold(0usize, |total, string| {
+        checked_add(total, string.len(), "FSST input bytes")
+    })?;
+    decoded_len(input_bytes, "FSST input")?;
     let table = SymbolTable::train(strings);
 
     // Encode each string.
     let mut encoded_strings: Vec<Vec<u8>> = Vec::with_capacity(strings.len());
     for s in strings {
-        encoded_strings.push(encode_string(&table, s));
+        encoded_strings.push(encode_string(&table, s)?);
     }
 
     // Build wire format.
-    let mut out = Vec::new();
+    // Encoded strings with offset table.
+    let total_encoded = encoded_strings.iter().try_fold(0usize, |total, string| {
+        checked_add(total, string.len(), "FSST encoded bytes")
+    })?;
+    decoded_len(total_encoded, "FSST encoded bytes")?;
+    let total_encoded_u32 = encode_u32_len(total_encoded, "FSST encoded bytes")?;
+    let offset_bytes = checked_mul(strings.len(), 4, "FSST offsets")?;
+    decoded_len(offset_bytes, "FSST offsets")?;
+    let symbol_bytes = table.symbols.iter().try_fold(0usize, |total, symbol| {
+        checked_add(
+            checked_add(total, 1, "FSST symbols")?,
+            symbol.len(),
+            "FSST symbols",
+        )
+    })?;
+    let output_len = checked_add(
+        checked_add(
+            checked_add(2, symbol_bytes, "FSST output")?,
+            8,
+            "FSST output",
+        )?,
+        checked_add(offset_bytes, total_encoded, "FSST output")?,
+        "FSST output",
+    )?;
+    decoded_len(output_len, "FSST output")?;
+    let string_count = encode_input_len(strings.len(), "FSST string count")?;
+    let mut out = Vec::with_capacity(output_len);
 
     // Symbol table.
     out.extend_from_slice(&(table.symbol_count() as u16).to_le_bytes());
@@ -171,17 +208,14 @@ pub fn encode(strings: &[&[u8]]) -> Vec<u8> {
         out.push(sym.len() as u8);
         out.extend_from_slice(sym);
     }
-
-    // Encoded strings with offset table.
-    let total_encoded: usize = encoded_strings.iter().map(|s| s.len()).sum();
-    out.extend_from_slice(&(total_encoded as u32).to_le_bytes());
-    out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+    out.extend_from_slice(&total_encoded_u32.to_le_bytes());
+    out.extend_from_slice(&string_count.to_le_bytes());
 
     // Cumulative offsets.
-    let mut offset = 0u32;
+    let mut offset = 0usize;
     for es in &encoded_strings {
-        offset += es.len() as u32;
-        out.extend_from_slice(&offset.to_le_bytes());
+        offset = checked_add(offset, es.len(), "FSST string offset")?;
+        out.extend_from_slice(&encode_u32_len(offset, "FSST string offset")?.to_le_bytes());
     }
 
     // Encoded data.
@@ -189,7 +223,7 @@ pub fn encode(strings: &[&[u8]]) -> Vec<u8> {
         out.extend_from_slice(es);
     }
 
-    out
+    Ok(out)
 }
 
 /// Decode FSST-compressed data back to strings.
@@ -202,78 +236,98 @@ pub fn decode(data: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
     }
 
     // Read symbol table.
-    let sym_count = u16::from_le_bytes([data[0], data[1]]) as usize;
+    let sym_count = usize::from(u16::from_le_bytes([data[0], data[1]]));
+    if sym_count > MAX_SYMBOLS {
+        return Err(CodecError::Corrupt {
+            detail: "FSST symbol count exceeds maximum".into(),
+        });
+    }
     let mut pos = 2;
     let mut symbols: Vec<Vec<u8>> = Vec::with_capacity(sym_count);
 
     for _ in 0..sym_count {
-        if pos >= data.len() {
-            return Err(CodecError::Truncated {
-                expected: pos + 1,
-                actual: data.len(),
+        let len = usize::from(checked_range(data, pos, 1, "FSST symbol length")?[0]);
+        pos = checked_add(pos, 1, "FSST symbol cursor")?;
+        if len == 0 || len > MAX_SYMBOL_LEN {
+            return Err(CodecError::Corrupt {
+                detail: "FSST symbol length is invalid".into(),
             });
         }
-        let len = data[pos] as usize;
-        pos += 1;
-        if pos + len > data.len() {
-            return Err(CodecError::Truncated {
-                expected: pos + len,
-                actual: data.len(),
+        let symbol = checked_range(data, pos, len, "FSST symbol")?;
+        if symbols.iter().any(|existing| existing == symbol) {
+            return Err(CodecError::Corrupt {
+                detail: "duplicate FSST symbol".into(),
             });
         }
-        symbols.push(data[pos..pos + len].to_vec());
-        pos += len;
+        symbols.push(symbol.to_vec());
+        pos = checked_add(pos, len, "FSST symbol cursor")?;
     }
 
     // Read header.
-    if pos + 8 > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + 8,
-            actual: data.len(),
-        });
-    }
-    let _total_encoded =
-        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-    pos += 4;
-    let string_count =
-        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-    pos += 4;
+    let header = checked_range(data, pos, 8, "FSST header")?;
+    let total_encoded = u32_to_usize(
+        u32::from_le_bytes([header[0], header[1], header[2], header[3]]),
+        "FSST encoded length",
+    )?;
+    let string_count = u32_to_usize(
+        u32::from_le_bytes([header[4], header[5], header[6], header[7]]),
+        "FSST string count",
+    )?;
+    decoded_len(total_encoded, "FSST")?;
+    let container_bytes = checked_add(
+        checked_mul(string_count, size_of::<usize>(), "FSST offset allocation")?,
+        checked_mul(string_count, size_of::<Vec<u8>>(), "FSST result allocation")?,
+        "FSST container allocations",
+    )?;
+    decoded_len(container_bytes, "FSST containers")?;
+    pos = checked_add(pos, 8, "FSST header cursor")?;
 
     // Read offsets.
-    let offsets_size = string_count * 4;
-    if pos + offsets_size > data.len() {
-        return Err(CodecError::Truncated {
-            expected: pos + offsets_size,
-            actual: data.len(),
-        });
-    }
+    let offsets_size = checked_mul(string_count, 4, "FSST offsets")?;
+    decoded_len(offsets_size, "FSST offsets")?;
+    let offsets_data = checked_range(data, pos, offsets_size, "FSST offsets")?;
     let mut offsets = Vec::with_capacity(string_count);
     for i in 0..string_count {
-        let off_pos = pos + i * 4;
-        offsets.push(u32::from_le_bytes([
-            data[off_pos],
-            data[off_pos + 1],
-            data[off_pos + 2],
-            data[off_pos + 3],
-        ]) as usize);
+        let off_pos = checked_mul(i, 4, "FSST offset position")?;
+        offsets.push(u32_to_usize(
+            u32::from_le_bytes([
+                offsets_data[off_pos],
+                offsets_data[off_pos + 1],
+                offsets_data[off_pos + 2],
+                offsets_data[off_pos + 3],
+            ]),
+            "FSST string offset",
+        )?);
     }
-    pos += offsets_size;
-
-    let encoded_data = &data[pos..];
+    pos = checked_add(pos, offsets_size, "FSST data cursor")?;
+    let encoded_data = checked_range(data, pos, total_encoded, "FSST encoded data")?;
+    if checked_add(pos, total_encoded, "FSST frame end")? != data.len() {
+        return Err(CodecError::Corrupt {
+            detail: "trailing bytes after FSST frame".into(),
+        });
+    }
 
     // Decode each string.
     let mut result = Vec::with_capacity(string_count);
     let mut prev_end = 0;
+    let mut decoded_total = 0usize;
     for &end in &offsets {
-        if end > encoded_data.len() {
-            return Err(CodecError::Truncated {
-                expected: pos + end,
-                actual: data.len(),
+        if end < prev_end || end > encoded_data.len() {
+            return Err(CodecError::Corrupt {
+                detail: "FSST string offsets are not monotonic and in range".into(),
             });
         }
         let encoded_str = &encoded_data[prev_end..end];
-        result.push(decode_string(&symbols, encoded_str)?);
+        let decoded = decode_string(&symbols, encoded_str)?;
+        decoded_total = checked_add(decoded_total, decoded.len(), "FSST decoded bytes")?;
+        decoded_len(decoded_total, "FSST")?;
+        result.push(decoded);
         prev_end = end;
+    }
+    if prev_end != total_encoded {
+        return Err(CodecError::Corrupt {
+            detail: "FSST offsets do not consume encoded data".into(),
+        });
     }
 
     Ok(result)
@@ -281,7 +335,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
 
 /// Convenience: encode a single contiguous byte buffer that contains
 /// multiple strings separated by a delimiter (e.g., newlines for log data).
-pub fn encode_delimited(data: &[u8], delimiter: u8) -> Vec<u8> {
+pub fn encode_delimited(data: &[u8], delimiter: u8) -> Result<Vec<u8>, CodecError> {
+    decoded_len(data.len(), "FSST delimited input")?;
     let strings: Vec<&[u8]> = data.split(|&b| b == delimiter).collect();
     encode(&strings)
 }
@@ -291,6 +346,13 @@ pub fn decode_delimited(data: &[u8], delimiter: u8) -> Result<Vec<u8>, CodecErro
     let strings = decode(data)?;
     let mut out = Vec::new();
     for (i, s) in strings.iter().enumerate() {
+        let separator = usize::from(i > 0);
+        let next_len = checked_add(
+            checked_add(out.len(), separator, "FSST delimited output")?,
+            s.len(),
+            "FSST delimited output",
+        )?;
+        decoded_len(next_len, "FSST delimited output")?;
         if i > 0 {
             out.push(delimiter);
         }
@@ -303,8 +365,10 @@ pub fn decode_delimited(data: &[u8], delimiter: u8) -> Result<Vec<u8>, CodecErro
 // Per-string encode / decode
 // ---------------------------------------------------------------------------
 
-fn encode_string(table: &SymbolTable, input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
+fn encode_string(table: &SymbolTable, input: &[u8]) -> Result<Vec<u8>, CodecError> {
+    let capacity = checked_mul(input.len(), 2, "FSST encoded string")?;
+    decoded_len(capacity, "FSST encoded string")?;
+    let mut out = Vec::with_capacity(capacity);
     let mut pos = 0;
 
     while pos < input.len() {
@@ -327,11 +391,13 @@ fn encode_string(table: &SymbolTable, input: &[u8]) -> Vec<u8> {
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn decode_string(symbols: &[Vec<u8>], encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
-    let mut out = Vec::with_capacity(encoded.len() * 2);
+    let capacity = checked_mul(encoded.len(), MAX_SYMBOL_LEN, "FSST decoded string")?;
+    decoded_len(capacity, "FSST decoded string")?;
+    let mut out = Vec::with_capacity(capacity);
     let mut pos = 0;
 
     while pos < encoded.len() {
@@ -358,6 +424,8 @@ fn decode_string(symbols: &[Vec<u8>], encoded: &[u8]) -> Result<Vec<u8>, CodecEr
                     ),
                 });
             }
+            let next_len = checked_add(out.len(), symbols[idx].len(), "FSST decoded string")?;
+            decoded_len(next_len, "FSST decoded string")?;
             out.extend_from_slice(&symbols[idx]);
         }
     }
@@ -368,6 +436,14 @@ fn decode_string(symbols: &[Vec<u8>], encoded: &[u8]) -> Result<Vec<u8>, CodecEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode(strings: &[&[u8]]) -> Vec<u8> {
+        super::encode(strings).expect("test FSST encode")
+    }
+
+    fn encode_delimited(data: &[u8], delimiter: u8) -> Vec<u8> {
+        super::encode_delimited(data, delimiter).expect("test FSST delimited encode")
+    }
 
     #[test]
     fn empty_input() {
@@ -506,9 +582,26 @@ mod tests {
     }
 
     #[test]
-    fn truncated_input_errors() {
+    fn malformed_sections_and_trailing_bytes_are_rejected() {
         assert!(decode(&[]).is_err());
         assert!(decode(&[1]).is_err());
+        let mut encoded = encode(&[b"hello".as_slice()]);
+        encoded.push(0);
+        assert!(matches!(decode(&encoded), Err(CodecError::Corrupt { .. })));
+        let mut invalid_offset = encode(&[b"hello".as_slice()]);
+        let symbol_count = usize::from(u16::from_le_bytes([invalid_offset[0], invalid_offset[1]]));
+        let mut cursor = 2;
+        for _ in 0..symbol_count {
+            cursor += 1 + usize::from(invalid_offset[cursor]);
+        }
+        let offsets_start = cursor + 8;
+        // The encoder's single-string final offset is the encoded-data length;
+        // zero makes the remaining encoded data unreachable.
+        invalid_offset[offsets_start..offsets_start + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            decode(&invalid_offset),
+            Err(CodecError::Corrupt { .. })
+        ));
     }
 
     #[test]
