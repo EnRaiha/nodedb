@@ -166,6 +166,11 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             sqlstate::SERIALIZATION_FAILURE,
             "optimistic predicate retry required; transaction will be retried".into(),
         ),
+        ErrorCode::CrdtFrontierMismatch { .. } => (
+            "ERROR",
+            sqlstate::SERIALIZATION_FAILURE,
+            "CRDT state changed after preview; retry the write".into(),
+        ),
         ErrorCode::TxnOverlayMemoryExceeded { limit } => (
             "ERROR",
             sqlstate::PROGRAM_LIMIT_EXCEEDED,

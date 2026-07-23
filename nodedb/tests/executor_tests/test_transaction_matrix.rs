@@ -381,6 +381,7 @@ fn rollback_matrix_crdt_buffered_then_vector_fail() {
                     surrogate: nodedb_types::Surrogate::ZERO,
                     provenance: None,
                     constraint_version_required: 0,
+                    expected_frontier_digest: None,
                 }),
                 doc_put("docs", b"modified"),
                 vector_fail("vec"),

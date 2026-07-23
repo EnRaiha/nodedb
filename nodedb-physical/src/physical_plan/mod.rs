@@ -240,6 +240,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Vector(VectorOp::Search { collection, .. })
             | PhysicalPlan::Document(DocumentOp::RangeScan { collection, .. })
             | PhysicalPlan::Crdt(CrdtOp::Read { collection, .. })
+            | PhysicalPlan::Crdt(CrdtOp::PreviewApply { collection, .. })
             | PhysicalPlan::Crdt(CrdtOp::Apply { collection, .. })
             | PhysicalPlan::Vector(VectorOp::Insert { collection, .. })
             | PhysicalPlan::Vector(VectorOp::BatchInsert { collection, .. })

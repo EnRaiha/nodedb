@@ -50,6 +50,9 @@ pub enum CrdtOp {
         /// construction site does not admit against a catalog record.
         #[serde(default)]
         constraint_version_required: u64,
+        /// Optional preview fence. `None` preserves legacy/replay behavior.
+        #[serde(default)]
+        expected_frontier_digest: Option<[u8; 32]>,
     },
 
     /// Import a per-collection Loro snapshot into the tenant CRDT engine.
@@ -216,5 +219,15 @@ pub enum CrdtOp {
         /// persisted/replicated — WAL/replication reconstruct with None.
         #[serde(default)]
         returning: Option<ReturningSpec>,
+    },
+
+    /// Bounded, read-only preview of a CRDT delta against its target state.
+    ///
+    /// Appended to preserve every existing enum discriminator in durable WAL
+    /// and replication records.
+    PreviewApply {
+        collection: String,
+        document_id: String,
+        delta: Vec<u8>,
     },
 }

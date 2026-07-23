@@ -206,6 +206,7 @@ fn crdt_is_write(op: &CrdtOp) -> bool {
         | CrdtOp::RestoreToVersion { .. }
         | CrdtOp::ImportSnapshot { .. } => true,
         CrdtOp::Read { .. }
+        | CrdtOp::PreviewApply { .. }
         | CrdtOp::ReadConstraints { .. }
         | CrdtOp::GetPolicy { .. }
         | CrdtOp::ReadAtVersion { .. }

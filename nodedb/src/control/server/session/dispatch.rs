@@ -207,6 +207,7 @@ impl Session {
                     provenance: None,
                     // Direct session write, not a replicated peer sync.
                     constraint_version_required: 0,
+                    expected_frontier_digest: None,
                 })
             }
             "graph_rag_fusion" => {

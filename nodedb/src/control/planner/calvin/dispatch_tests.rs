@@ -28,6 +28,7 @@ fn crdt_apply_task(vshard: u32) -> PhysicalTask {
             surrogate: nodedb_types::Surrogate::new(1),
             provenance: None,
             constraint_version_required: 0,
+            expected_frontier_digest: None,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,

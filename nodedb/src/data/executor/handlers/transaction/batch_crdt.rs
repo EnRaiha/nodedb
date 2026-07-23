@@ -385,6 +385,7 @@ mod tests {
                 surrogate: nodedb_types::Surrogate::ZERO,
                 provenance: None,
                 constraint_version_required: 0,
+                expected_frontier_digest: None,
             }),
         ];
         let _fail = crate::fail_point::FailGuard::install(
@@ -431,6 +432,7 @@ mod tests {
                 surrogate: nodedb_types::Surrogate::ZERO,
                 provenance: None,
                 constraint_version_required: 0,
+                expected_frontier_digest: None,
             }),
         ];
         let _fail = crate::fail_point::FailGuard::install(
@@ -497,6 +499,7 @@ mod tests {
                 surrogate: nodedb_types::Surrogate::ZERO,
                 provenance: None,
                 constraint_version_required: 0,
+                expected_frontier_digest: None,
             }),
             PhysicalPlan::Crdt(CrdtOp::Apply {
                 collection: "crdt".into(),
@@ -507,6 +510,7 @@ mod tests {
                 surrogate: nodedb_types::Surrogate::ZERO,
                 provenance: None,
                 constraint_version_required: 0,
+                expected_frontier_digest: None,
             }),
         ];
 
@@ -550,6 +554,7 @@ mod tests {
                 surrogate: nodedb_types::Surrogate::ZERO,
                 provenance: None,
                 constraint_version_required: 0,
+                expected_frontier_digest: None,
             }),
             PhysicalPlan::Crdt(CrdtOp::Apply {
                 collection: "crdt".into(),
@@ -560,6 +565,7 @@ mod tests {
                 surrogate: nodedb_types::Surrogate::ZERO,
                 provenance: None,
                 constraint_version_required: 0,
+                expected_frontier_digest: None,
             }),
         ];
 

@@ -16,6 +16,12 @@ impl CoreLoop {
                 document_id,
             } => self.execute_crdt_read(task, collection, document_id),
 
+            CrdtOp::PreviewApply {
+                collection,
+                document_id,
+                delta,
+            } => self.execute_crdt_preview_apply(task, collection, document_id, delta),
+
             CrdtOp::Apply {
                 collection,
                 document_id,
@@ -25,6 +31,7 @@ impl CoreLoop {
                 surrogate,
                 provenance,
                 constraint_version_required,
+                expected_frontier_digest,
             } => self.execute_crdt_apply(
                 task,
                 crate::data::executor::handlers::control::crdt_apply::CrdtApplyParams {
@@ -35,6 +42,7 @@ impl CoreLoop {
                     peer_id: *peer_id,
                     provenance: provenance.as_ref(),
                     constraint_version_required: *constraint_version_required,
+                    expected_frontier_digest: *expected_frontier_digest,
                 },
             ),
 

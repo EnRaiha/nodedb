@@ -64,6 +64,7 @@ pub async fn crdt_apply(
         provenance: None,
         // Local HTTP write, not a replicated peer sync — no constraint fence.
         constraint_version_required: 0,
+        expected_frontier_digest: None,
     });
 
     // Route through the Raft proposer gate so the delta is quorum-durable under

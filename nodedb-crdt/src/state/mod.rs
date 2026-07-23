@@ -8,6 +8,7 @@
 
 pub mod bitemporal_archive;
 pub mod core;
+pub mod frontier_digest;
 pub mod history;
 pub mod preview;
 pub(crate) mod restore_containers;

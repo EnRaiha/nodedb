@@ -82,7 +82,11 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
 
         // Analyzer-binding DDL config write — opaque execution result, same
         // as `VectorOp::SetParams`.
-        PhysicalPlan::Text(TextOp::SetAnalyzer { .. }) => PlanKind::Execution,
+        PhysicalPlan::Text(TextOp::SetAnalyzer { .. })
+        // Preview results are an internal typed zerompk control-plane value,
+        // never a client document row. Preserve the bytes for the admission
+        // caller to decode as `CrdtPreviewResult`.
+        | PhysicalPlan::Crdt(CrdtOp::PreviewApply { .. }) => PlanKind::Execution,
 
         PhysicalPlan::Kv(KvOp::Get { .. }) | PhysicalPlan::Kv(KvOp::FieldGet { .. }) => {
             PlanKind::SingleDocument
@@ -261,5 +265,21 @@ impl ShapedRows {
     /// `id`, matching PostgreSQL.
     pub fn cell_keys(&self) -> Vec<String> {
         super::project::cell_keys(&self.columns)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crdt_preview_is_an_opaque_execution_plan() {
+        let plan = PhysicalPlan::Crdt(CrdtOp::PreviewApply {
+            collection: "tasks".to_string(),
+            document_id: "task-1".to_string(),
+            delta: vec![0x92, 0x01],
+        });
+
+        assert!(matches!(describe_plan(&plan), PlanKind::Execution));
     }
 }

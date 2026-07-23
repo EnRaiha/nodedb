@@ -114,6 +114,7 @@ fn to_physical_plan(
         | ReplicatedWrite::DirectUpsert { .. } => Ok((vector::decode_arm(ctx, write)?, None)),
         // CRDT family (`PhysicalPlan::Crdt`).
         ReplicatedWrite::CrdtApply { .. }
+        | ReplicatedWrite::CrdtApplyFenced { .. }
         | ReplicatedWrite::CrdtImportCollection { .. }
         | ReplicatedWrite::CrdtListInsert { .. }
         | ReplicatedWrite::CrdtListDelete { .. }

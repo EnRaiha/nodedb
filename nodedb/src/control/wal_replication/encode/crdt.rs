@@ -37,6 +37,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             surrogate: _,
             provenance,
             constraint_version_required,
+            expected_frontier_digest,
         } => apply(
             collection,
             document_id,
@@ -44,6 +45,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             *peer_id,
             super::entry::encode_provenance(provenance),
             *constraint_version_required,
+            *expected_frontier_digest,
         ),
         CrdtOp::ImportSnapshot {
             tenant_id,
@@ -103,6 +105,7 @@ pub(super) fn encode(op: &CrdtOp) -> Option<ReplicatedWrite> {
             constraint_version,
         } => drop_constraints(collection, *constraint_version),
         CrdtOp::Read { .. }
+        | CrdtOp::PreviewApply { .. }
         | CrdtOp::ReadConstraints { .. }
         | CrdtOp::SetPolicy { .. }
         | CrdtOp::GetPolicy { .. }
@@ -147,14 +150,26 @@ pub(super) fn apply(
     peer_id: u64,
     provenance: Option<Vec<u8>>,
     constraint_version_required: u64,
+    expected_frontier_digest: Option<[u8; 32]>,
 ) -> ReplicatedWrite {
-    ReplicatedWrite::CrdtApply {
-        collection: collection.to_owned(),
-        document_id: document_id.to_owned(),
-        delta: delta.to_vec(),
-        peer_id,
-        provenance,
-        constraint_version_required,
+    match expected_frontier_digest {
+        Some(expected_frontier_digest) => ReplicatedWrite::CrdtApplyFenced {
+            collection: collection.to_owned(),
+            document_id: document_id.to_owned(),
+            delta: delta.to_vec(),
+            peer_id,
+            provenance,
+            constraint_version_required,
+            expected_frontier_digest,
+        },
+        None => ReplicatedWrite::CrdtApply {
+            collection: collection.to_owned(),
+            document_id: document_id.to_owned(),
+            delta: delta.to_vec(),
+            peer_id,
+            provenance,
+            constraint_version_required,
+        },
     }
 }
 

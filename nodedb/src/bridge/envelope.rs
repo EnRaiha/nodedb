@@ -356,6 +356,11 @@ pub enum ErrorCode {
     RejectedAuthz,
     /// Write conflict — client should retry.
     ConflictRetry,
+    /// A CRDT apply no longer matches the domain-bound frontier it previewed.
+    CrdtFrontierMismatch {
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
     /// Fan-out limit exceeded for graph/scatter queries.
     FanOutExceeded,
     /// Memory budget exhausted — DataFusion should spill.

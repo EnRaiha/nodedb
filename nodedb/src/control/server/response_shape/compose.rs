@@ -387,7 +387,87 @@ fn single_result_row(text: String) -> ShapedRows {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use crate::wal::WalManager;
+    use nodedb_types::CrdtPreviewResult;
+
     use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::server::response_shape::types::describe_plan;
+
+    fn preview_plan() -> PhysicalPlan {
+        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::PreviewApply {
+            collection: "tasks".to_string(),
+            document_id: "task-1".to_string(),
+            delta: vec![0x92, 0x01],
+        })
+    }
+
+    fn preview_payload() -> (CrdtPreviewResult, Vec<u8>) {
+        let result = CrdtPreviewResult {
+            post_image_msgpack: vec![0xc0],
+            imported_ops: 17,
+            frontier_digest: [0x5a; 32],
+        };
+        let payload = zerompk::to_msgpack_vec(&result).expect("preview result serializes");
+        (result, payload)
+    }
+
+    /// Build the minimum real shared state needed by the materialized entry
+    /// point. Execution plans return before consulting it, which is exactly
+    /// the property this test protects.
+    fn shared_state() -> Arc<SharedState> {
+        let directory = tempfile::tempdir().expect("temporary WAL directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("response-shape.wal"))
+                .expect("test WAL"),
+        );
+        let (dispatcher, _) = Dispatcher::new(1, 1);
+        SharedState::new(dispatcher, wal).expect("test shared state")
+    }
+
+    #[tokio::test]
+    async fn crdt_preview_is_byte_preserving_through_both_shaping_entry_points() {
+        let plan = preview_plan();
+        let kind = describe_plan(&plan);
+        assert!(matches!(kind, PlanKind::Execution));
+        let (expected, payload) = preview_payload();
+        let original_payload = payload.clone();
+
+        let materialized = shape_response_materialized(
+            &payload,
+            &plan,
+            kind,
+            None,
+            &shared_state(),
+            DatabaseId::new(1),
+            TenantId::new(1),
+        )
+        .expect("execution plan passthrough");
+        assert!(matches!(materialized, ShapeOutcome::Passthrough));
+        assert_eq!(
+            payload, original_payload,
+            "materialized path must not rewrite bytes"
+        );
+        assert_eq!(
+            zerompk::from_msgpack::<CrdtPreviewResult>(&payload)
+                .expect("materialized passthrough remains decodable"),
+            expected
+        );
+
+        let no_plan = shape_payload_no_plan(&payload, kind, None);
+        assert!(matches!(no_plan, ShapeOutcome::Passthrough));
+        assert_eq!(
+            payload, original_payload,
+            "no-plan path must not rewrite bytes"
+        );
+        assert_eq!(
+            zerompk::from_msgpack::<CrdtPreviewResult>(&payload)
+                .expect("no-plan passthrough remains decodable"),
+            expected
+        );
+    }
 
     /// Two projected columns sharing the display name `id` (`SELECT w.id,
     /// b.id`) must keep both values in the shaped row instead of collapsing

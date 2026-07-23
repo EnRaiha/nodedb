@@ -323,6 +323,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
             use CrdtOp::*;
             match op {
                 Read { collection, .. }
+                | PreviewApply { collection, .. }
                 | Apply { collection, .. }
                 | SetPolicy { collection, .. }
                 | GetPolicy { collection, .. }

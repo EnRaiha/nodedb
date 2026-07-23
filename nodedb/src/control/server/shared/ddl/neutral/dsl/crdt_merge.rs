@@ -85,6 +85,7 @@ pub async fn crdt_merge(
         provenance: None,
         // Server-side merge result, not a replicated peer sync — no fence.
         constraint_version_required: 0,
+        expected_frontier_digest: None,
     });
 
     // Route the merge result through the Raft proposer gate so the applied delta

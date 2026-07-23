@@ -157,6 +157,7 @@ pub(super) fn wal_append_crdt_op(
         }
         // NotAWrite — reads / query ops / DDL that produces no engine mutation here
         CrdtOp::Read { .. }
+        | CrdtOp::PreviewApply { .. }
         | CrdtOp::ReadConstraints { .. }
         | CrdtOp::GetPolicy { .. }
         | CrdtOp::SetPolicy { .. }
@@ -225,6 +226,7 @@ mod tests {
             surrogate: Surrogate::new(3),
             provenance: None,
             constraint_version_required: 0,
+            expected_frontier_digest: None,
         });
 
         let outcome = super::super::wal_append_if_write(

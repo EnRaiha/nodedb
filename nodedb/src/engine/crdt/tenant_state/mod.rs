@@ -11,6 +11,7 @@ pub mod doc_mutate;
 pub mod history;
 pub mod list_ops;
 pub mod policy;
+pub mod preview;
 mod snapshot_restore;
 pub mod validate;
 

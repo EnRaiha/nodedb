@@ -146,6 +146,7 @@ pub(crate) async fn apply_delta_and_finalize(
         surrogate,
         provenance: Some(prov),
         constraint_version_required,
+        expected_frontier_digest: None,
     });
 
     shared.tenant_request_start(tenant_id);

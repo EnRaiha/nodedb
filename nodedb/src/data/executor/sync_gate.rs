@@ -54,31 +54,15 @@ pub(in crate::data::executor) fn ack_status_from_admit(d: &SyncAdmit) -> AckStat
 }
 
 impl CoreLoop {
-    /// Check whether a sync frame carrying `prov` should be applied.
+    /// Classify a sync frame without changing epoch fencing or the HWM.
     ///
-    /// Logic (exact):
-    /// 1. Look up `producer_epoch_floor[producer_id]` (default 0).
-    /// 2. If `prov.epoch < floor` → `Fenced` (no state change).
-    /// 3. If `prov.epoch > floor` → fence-forward: update `producer_epoch_floor`
-    ///    and continue (new generation; accept the frame).
-    /// 4. Look up `sync_hwm[(producer_id, stream_id)]` (default 0).
-    /// 5. If `prov.seq <= hwm` → `Duplicate`.
-    /// 6. If `prov.seq > hwm + 1` → `Gap { expected: hwm + 1 }`.
-    /// 7. Otherwise (`prov.seq == hwm + 1`) → `Apply`.
-    ///
-    /// Note: this method does **not** advance `sync_hwm`. Call
-    /// [`CoreLoop::sync_commit`] after WAL durability to advance it.
-    /// The epoch fence-forward in step 3 is applied immediately because
-    /// a higher epoch is monotonic and will be persisted durably via the
-    /// registry/WAL as well.
-    ///
-    /// Callers wired in Stage 3; HWM advance via `sync_commit` post-WAL-commit.
-    pub(in crate::data::executor) fn sync_admit(&mut self, prov: &SyncProvenance) -> SyncAdmit {
-        // `producer_id == 0` is the reserved "no producer identity" sentinel
-        // (the allocator issues ids starting at 1). Writes without a registered
-        // producer — local/non-sync writes and clients that have not completed
-        // the fenced handshake — are not part of the idempotent-producer protocol
-        // and must apply unconditionally (no dedup, no fence, no HWM tracking).
+    /// This is the side-effect-free half of [`Self::sync_admit`]. Callers that
+    /// must validate another precondition before consuming a newer producer
+    /// epoch use it first; normal ingest must use `sync_admit` to retain the
+    /// monotonic epoch-floor update.
+    pub(in crate::data::executor) fn sync_classify(&self, prov: &SyncProvenance) -> SyncAdmit {
+        // Producer zero is the local/unidentified sentinel and is deliberately
+        // outside the producer sequencing protocol.
         if prov.producer_id == 0 {
             return SyncAdmit::Apply;
         }
@@ -88,14 +72,8 @@ impl CoreLoop {
             .get(&prov.producer_id)
             .copied()
             .unwrap_or(0);
-
         if prov.epoch < floor {
             return SyncAdmit::Fenced;
-        }
-
-        if prov.epoch > floor {
-            self.producer_epoch_floor
-                .insert(prov.producer_id, prov.epoch);
         }
 
         let hwm = self
@@ -103,16 +81,35 @@ impl CoreLoop {
             .get(&(prov.producer_id, prov.stream_id))
             .copied()
             .unwrap_or(0);
-
         if prov.seq <= hwm {
             return SyncAdmit::Duplicate;
         }
-
         if prov.seq > hwm + 1 {
             return SyncAdmit::Gap { expected: hwm + 1 };
         }
-
         SyncAdmit::Apply
+    }
+
+    /// Admit a sync frame and fence-forward a newer producer epoch.
+    ///
+    /// This preserves the historical admission semantics: every non-fenced
+    /// frame from a newer epoch advances the epoch floor immediately, while
+    /// HWM advancement remains the caller's post-durability responsibility.
+    pub(in crate::data::executor) fn sync_admit(&mut self, prov: &SyncProvenance) -> SyncAdmit {
+        let admit = self.sync_classify(prov);
+        if prov.producer_id != 0
+            && !matches!(admit, SyncAdmit::Fenced)
+            && self
+                .producer_epoch_floor
+                .get(&prov.producer_id)
+                .copied()
+                .unwrap_or(0)
+                < prov.epoch
+        {
+            self.producer_epoch_floor
+                .insert(prov.producer_id, prov.epoch);
+        }
+        admit
     }
 
     /// Epoch-only fence check for engines that use their own dedup/ordering mechanism

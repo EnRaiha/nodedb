@@ -77,6 +77,7 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
                 | CrdtOp::SetConstraints { collection, .. }
                 | CrdtOp::DropConstraints { collection, .. }
                 | CrdtOp::ReadConstraints { collection, .. }
+                | CrdtOp::PreviewApply { collection, .. }
                 | CrdtOp::GetVersionVector { collection, .. }
                 | CrdtOp::ExportDelta { collection, .. }
                 | CrdtOp::CompactAtVersion { collection, .. },

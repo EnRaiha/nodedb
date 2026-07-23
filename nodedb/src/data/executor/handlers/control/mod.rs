@@ -18,6 +18,7 @@ pub mod crdt_constraints;
 pub mod crdt_doc;
 pub mod crdt_list;
 pub mod crdt_materialize;
+pub mod crdt_preview;
 pub mod move_tenant;
 mod range_scan_versioned;
 pub mod reindex;

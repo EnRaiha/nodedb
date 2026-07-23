@@ -8,15 +8,26 @@ use super::ctx::{DecodeCtx, assign_or_zero};
 use crate::bridge::envelope::PhysicalPlan;
 use nodedb_physical::physical_plan::CrdtOp;
 
-pub(super) fn apply(
-    ctx: &DecodeCtx,
-    collection: &str,
-    document_id: &str,
-    delta: &[u8],
-    peer_id: u64,
-    provenance_bytes: &Option<Vec<u8>>,
-    constraint_version_required: u64,
-) -> crate::Result<PhysicalPlan> {
+pub(super) struct ApplyArgs<'a> {
+    pub(super) collection: &'a str,
+    pub(super) document_id: &'a str,
+    pub(super) delta: &'a [u8],
+    pub(super) peer_id: u64,
+    pub(super) provenance_bytes: &'a Option<Vec<u8>>,
+    pub(super) constraint_version_required: u64,
+    pub(super) expected_frontier_digest: Option<[u8; 32]>,
+}
+
+pub(super) fn apply(ctx: &DecodeCtx, args: ApplyArgs<'_>) -> crate::Result<PhysicalPlan> {
+    let ApplyArgs {
+        collection,
+        document_id,
+        delta,
+        peer_id,
+        provenance_bytes,
+        constraint_version_required,
+        expected_frontier_digest,
+    } = args;
     let surrogate = assign_or_zero(ctx, collection, document_id.as_bytes())?;
     let provenance = decode_sync_engines::decode_provenance(provenance_bytes)?;
     Ok(PhysicalPlan::Crdt(CrdtOp::Apply {
@@ -28,6 +39,7 @@ pub(super) fn apply(
         surrogate,
         provenance,
         constraint_version_required,
+        expected_frontier_digest,
     }))
 }
 

@@ -23,12 +23,35 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             constraint_version_required,
         } => crdt::apply(
             ctx,
+            crdt::ApplyArgs {
+                collection,
+                document_id,
+                delta,
+                peer_id: *peer_id,
+                provenance_bytes: provenance,
+                constraint_version_required: *constraint_version_required,
+                expected_frontier_digest: None,
+            },
+        ),
+        ReplicatedWrite::CrdtApplyFenced {
             collection,
             document_id,
             delta,
-            *peer_id,
+            peer_id,
             provenance,
-            *constraint_version_required,
+            constraint_version_required,
+            expected_frontier_digest,
+        } => crdt::apply(
+            ctx,
+            crdt::ApplyArgs {
+                collection,
+                document_id,
+                delta,
+                peer_id: *peer_id,
+                provenance_bytes: provenance,
+                constraint_version_required: *constraint_version_required,
+                expected_frontier_digest: Some(*expected_frontier_digest),
+            },
         ),
         ReplicatedWrite::CrdtImportCollection {
             tenant_id,

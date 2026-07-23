@@ -51,8 +51,8 @@ pub struct CrdtDeltaPreview {
     pub post_image: Option<nodedb_types::Value>,
     /// Deterministic canonical MessagePack representation of [`post_image`](Self::post_image).
     pub post_image_msgpack: Vec<u8>,
-    /// SHA-256 over sorted, fixed-width `(peer, counter)` frontier entries.
-    pub frontier_digest: [u8; 32],
+    /// SHA-256 over the post-import sorted `(peer, counter)` frontier entries.
+    pub resulting_frontier_digest: [u8; 32],
     /// Number of new operations contributed beyond the fork's prior oplog
     /// version vector.
     pub imported_ops: usize,
@@ -180,7 +180,7 @@ impl CrdtState {
             write_set,
             post_image,
             post_image_msgpack,
-            frontier_digest: frontier_digest(&resulting_frontier),
+            resulting_frontier_digest: CrdtState::frontier_digest_from(&resulting_frontier),
             imported_ops,
         })
     }
@@ -333,15 +333,22 @@ fn positive_oplog_advance(
 }
 
 /// Produce a stable digest independent of Loro's frontier-map iteration order.
-fn frontier_digest(frontier: &loro::Frontiers) -> [u8; 32] {
-    let mut entries: Vec<_> = frontier.iter().collect();
-    entries.sort_unstable_by_key(|id| (id.peer, id.counter));
-    let mut hasher = Sha256::new();
-    for id in entries {
-        hasher.update(id.peer.to_be_bytes());
-        hasher.update(id.counter.to_be_bytes());
+impl CrdtState {
+    /// Digest the current Loro frontier without mutating or committing it.
+    pub fn frontier_digest(&self) -> [u8; 32] {
+        Self::frontier_digest_from(&self.doc.state_frontiers())
     }
-    hasher.finalize().into()
+
+    fn frontier_digest_from(frontier: &loro::Frontiers) -> [u8; 32] {
+        let mut entries: Vec<_> = frontier.iter().collect();
+        entries.sort_unstable_by_key(|id| (id.peer, id.counter));
+        let mut hasher = Sha256::new();
+        for id in entries {
+            hasher.update(id.peer.to_be_bytes());
+            hasher.update(id.counter.to_be_bytes());
+        }
+        hasher.finalize().into()
+    }
 }
 
 #[cfg(test)]
@@ -733,6 +740,9 @@ mod tests {
             first.post_image,
             Some(nodedb_types::Value::Object(_))
         ));
-        assert_eq!(first.frontier_digest, second.frontier_digest);
+        assert_eq!(
+            first.resulting_frontier_digest,
+            second.resulting_frontier_digest
+        );
     }
 }

@@ -25,6 +25,7 @@ fn is_write_plan_true_for_crdt_apply() {
         surrogate: Surrogate::ZERO,
         provenance: None,
         constraint_version_required: 0,
+        expected_frontier_digest: None,
     });
     assert!(is_write_plan(&plan), "CrdtOp::Apply must be a write");
 }

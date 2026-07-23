@@ -33,9 +33,30 @@ pub(in crate::data::executor) struct CrdtApplyParams<'a> {
     pub peer_id: u64,
     pub provenance: Option<&'a SyncProvenance>,
     pub constraint_version_required: u64,
+    pub expected_frontier_digest: Option<[u8; 32]>,
 }
 
 impl CoreLoop {
+    /// Read the current domain-bound CRDT frontier without creating an engine.
+    fn current_crdt_frontier_digest(
+        &self,
+        database_id: crate::types::DatabaseId,
+        tenant_id: crate::types::TenantId,
+        collection: &str,
+    ) -> [u8; 32] {
+        self.crdt_engines
+            .get(&(database_id, tenant_id))
+            .map(|engine| engine.frontier_digest(database_id, collection))
+            .unwrap_or_else(|| {
+                nodedb_crdt::state::frontier_digest::domain_frontier_digest(
+                    tenant_id.as_u64(),
+                    database_id.as_u64(),
+                    collection,
+                    None,
+                )
+            })
+    }
+
     /// Enforce the one-document-per-delta contract: every row a validated delta
     /// wrote must be exactly the frame-declared `(collection, document_id)`.
     ///
@@ -83,11 +104,25 @@ impl CoreLoop {
             peer_id,
             provenance,
             constraint_version_required,
+            expected_frontier_digest,
         } = params;
         let tenant_id = task.request.tenant_id;
 
         let Some(prov) = provenance else {
             // Non-sync path (SQL / native client): validate + apply, no gate.
+            if let Some(expected) = expected_frontier_digest {
+                let actual = self.current_crdt_frontier_digest(
+                    task.request.database_id,
+                    tenant_id,
+                    collection,
+                );
+                if expected != actual {
+                    return self.response_error(
+                        task,
+                        ErrorCode::CrdtFrontierMismatch { expected, actual },
+                    );
+                }
+            }
             // There is no client to reject here, so the validated outcome is
             // only observed for its DLQ side effect and logged.
             // Borrow the engine in a nested block so the &mut borrow is dropped
@@ -180,12 +215,47 @@ impl CoreLoop {
             return self.response_ok(task);
         };
 
-        // Sync path: run the idempotency gate before touching the engine.
-        // Call sync_admit first (exclusive &mut self borrow, no engine borrow).
-        let admit = self.sync_admit(prov);
+        // A frontier fence is an admission precondition, not an apply-time
+        // validation. Classify first without consuming a newer producer epoch;
+        // for every non-Apply result retain the established mutating admission
+        // path and its epoch-floor semantics.
+        let classified = self.sync_classify(prov);
+        if !matches!(classified, SyncAdmit::Apply) {
+            let admit = self.sync_admit(prov);
+            let current_hwm = self.sync_hwm_value(prov.producer_id, prov.stream_id);
+            let (status, applied_seq) = match admit {
+                SyncAdmit::Duplicate => (AckStatus::Duplicate, current_hwm),
+                SyncAdmit::Fenced => (AckStatus::Fenced, current_hwm),
+                SyncAdmit::Gap { expected } => (AckStatus::Gap { expected }, current_hwm),
+                SyncAdmit::Apply => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: "sync admission classification changed unexpectedly".into(),
+                        },
+                    );
+                }
+            };
+            return self.sync_ack_response_ext(task, status, applied_seq, None);
+        }
 
-        // Snapshot the current HWM for Duplicate / Fenced / Gap responses
-        // before any engine borrow.
+        // Verify a fenced write against immutable state before creating an
+        // engine, observing constraints, advancing an epoch floor/HWM, or
+        // touching checkpoint and sparse state. An absent engine has the
+        // canonical empty-domain digest.
+        if let Some(expected) = expected_frontier_digest {
+            let actual =
+                self.current_crdt_frontier_digest(task.request.database_id, tenant_id, collection);
+            if expected != actual {
+                return self
+                    .response_error(task, ErrorCode::CrdtFrontierMismatch { expected, actual });
+            }
+        }
+
+        // The fence passed, so now perform normal mutating admission. This is
+        // intentionally after the frontier check: a stale higher-epoch frame
+        // must leave the producer floor unchanged.
+        let admit = self.sync_admit(prov);
         let current_hwm = self.sync_hwm_value(prov.producer_id, prov.stream_id);
 
         let (status, applied_seq, reject) = match admit {

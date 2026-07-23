@@ -162,6 +162,7 @@ async fn persist_restore_delta(
         surrogate,
         provenance: None,
         constraint_version_required: 0,
+        expected_frontier_digest: None,
     });
 
     if let Some(proposer) = state.async_raft_proposer.get() {

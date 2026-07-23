@@ -304,6 +304,7 @@ pub fn crdt_apply(collection: &str, doc_id: &str) -> PhysicalPlan {
         surrogate: nodedb_types::Surrogate::ZERO,
         provenance: None,
         constraint_version_required: 0,
+        expected_frontier_digest: None,
     })
 }
 

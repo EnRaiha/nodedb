@@ -23,6 +23,7 @@ pub mod collection;
 pub mod collection_config;
 pub mod columnar;
 pub mod conversion;
+pub mod crdt_preview;
 pub mod datetime;
 pub mod diagnostic;
 pub mod document;
@@ -77,6 +78,7 @@ pub use columnar::{
     ColumnDef, ColumnType, ColumnarProfile, ColumnarSchema, DocumentMode, SchemaError, StrictSchema,
 };
 pub use config::TuningConfig;
+pub use crdt_preview::CrdtPreviewResult;
 pub use datetime::{NdbDateTime, NdbDateTimeError, NdbDuration};
 pub use document::Document;
 pub use dropped_collection::DroppedCollection;

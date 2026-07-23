@@ -223,6 +223,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         // ---- Crdt: reads, not encoded ----
         PhysicalPlan::Crdt(
             CrdtOp::Read { .. }
+            | CrdtOp::PreviewApply { .. }
             | CrdtOp::ReadConstraints { .. }
             | CrdtOp::GetPolicy { .. }
             | CrdtOp::ReadAtVersion { .. }
@@ -929,6 +930,7 @@ mod tests {
                 surrogate: Surrogate::ZERO,
                 provenance: None,
                 constraint_version_required: 0,
+                expected_frontier_digest: None,
             }),
             PhysicalPlan::Crdt(CrdtOp::ImportSnapshot {
                 tenant_id: 1,

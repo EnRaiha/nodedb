@@ -61,6 +61,7 @@ pub(crate) fn build_apply(
         // the apply-time write-gate open. Catalog-based stamping here is a
         // tracked follow-up (parity with the sync admission path).
         constraint_version_required: 0,
+        expected_frontier_digest: None,
     }))
 }
 

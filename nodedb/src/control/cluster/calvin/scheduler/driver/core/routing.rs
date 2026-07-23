@@ -284,6 +284,7 @@ fn crdt_routing(op: &CrdtOp, database_id: DatabaseId) -> PlanRouting {
             PlanRouting::Vshards(vec![collection_vshard_in_database(database_id, collection)])
         }
         CrdtOp::Read { .. }
+        | CrdtOp::PreviewApply { .. }
         | CrdtOp::ReadConstraints { .. }
         | CrdtOp::GetPolicy { .. }
         | CrdtOp::ReadAtVersion { .. }

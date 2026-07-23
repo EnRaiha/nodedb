@@ -134,6 +134,15 @@ fn all_write_variants_serialize() {
             provenance: None,
             constraint_version_required: 0,
         },
+        ReplicatedWrite::CrdtApplyFenced {
+            collection: "c".into(),
+            document_id: "d".into(),
+            delta: vec![0xAC],
+            peer_id: 8,
+            provenance: None,
+            constraint_version_required: 1,
+            expected_frontier_digest: [1; 32],
+        },
         ReplicatedWrite::EdgePut {
             collection: "col".into(),
             src_id: "a".into(),
@@ -359,7 +368,7 @@ fn vector_insert_provenance_roundtrip() {
 }
 
 #[test]
-fn crdt_apply_provenance_roundtrip() {
+fn crdt_apply_legacy_and_fenced_wire_compatibility() {
     let tenant = TenantId::new(1);
     let vshard = VShardId::new(0);
     let prov = SyncProvenance {
@@ -379,9 +388,14 @@ fn crdt_apply_provenance_roundtrip() {
         surrogate: nodedb_types::Surrogate::ZERO,
         provenance: Some(prov.clone()),
         constraint_version_required: 42,
+        expected_frontier_digest: Some([42; 32]),
     });
     let entry = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan)
         .expect("CrdtApply should produce a ReplicatedEntry");
+    assert!(matches!(
+        &entry.write,
+        ReplicatedWrite::CrdtApplyFenced { .. }
+    ));
     let bytes = entry.to_bytes();
     let (_, _, decoded_plan, _) = decode::from_replicated_entry(&bytes, None)
         .expect("from_replicated_entry error")
@@ -390,6 +404,7 @@ fn crdt_apply_provenance_roundtrip() {
         PhysicalPlan::Crdt(CrdtOp::Apply {
             provenance,
             constraint_version_required,
+            expected_frontier_digest,
             ..
         }) => {
             assert_eq!(
@@ -401,35 +416,47 @@ fn crdt_apply_provenance_roundtrip() {
                 constraint_version_required, 42,
                 "CrdtApply constraint_version_required should round-trip"
             );
+            assert_eq!(
+                expected_frontier_digest,
+                Some([42; 32]),
+                "CrdtApply expected_frontier_digest should round-trip"
+            );
         }
         other => panic!("expected CrdtApply, got {other:?}"),
     }
 
-    // Without provenance.
-    let plan_none = PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: "docs".into(),
-        document_id: "doc-1".into(),
-        delta: vec![0xDE, 0xAD],
-        peer_id: 7,
-        mutation_id: 0,
-        surrogate: nodedb_types::Surrogate::ZERO,
-        provenance: None,
-        constraint_version_required: 0,
-    });
-    let entry_none = to_replicated_entry(tenant, DatabaseId::DEFAULT, vshard, &plan_none)
-        .expect("CrdtApply(no provenance) should produce a ReplicatedEntry");
-    let bytes_none = entry_none.to_bytes();
-    let (_, _, decoded_none, _) = decode::from_replicated_entry(&bytes_none, None)
-        .expect("from_replicated_entry error")
-        .expect("from_replicated_entry returned None");
-    match decoded_none {
-        PhysicalPlan::Crdt(CrdtOp::Apply { provenance, .. }) => {
+    // Construct the legacy enum shape directly. Its positional bytes must
+    // still decode through the full replicated-entry path with no fence.
+    let legacy = ReplicatedEntry::new(
+        tenant.as_u64(),
+        DatabaseId::DEFAULT.as_u64(),
+        vshard.as_u32(),
+        ReplicatedWrite::CrdtApply {
+            collection: "docs".into(),
+            document_id: "doc-legacy".into(),
+            delta: vec![0xBE, 0xEF],
+            peer_id: 8,
+            provenance: None,
+            constraint_version_required: 0,
+        },
+    );
+    let legacy_bytes = legacy.to_bytes();
+    let (_, _, decoded_legacy, _) = decode::from_replicated_entry(&legacy_bytes, None)
+        .expect("legacy CrdtApply must decode")
+        .expect("legacy CrdtApply must produce a plan");
+    match decoded_legacy {
+        PhysicalPlan::Crdt(CrdtOp::Apply {
+            provenance,
+            expected_frontier_digest,
+            ..
+        }) => {
+            assert_eq!(provenance, None, "legacy provenance should remain absent");
             assert_eq!(
-                provenance, None,
-                "None provenance should round-trip as None"
+                expected_frontier_digest, None,
+                "legacy CrdtApply must decode without a frontier fence"
             );
         }
-        other => panic!("expected CrdtApply, got {other:?}"),
+        other => panic!("expected legacy CrdtApply, got {other:?}"),
     }
 }
 

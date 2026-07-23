@@ -255,6 +255,7 @@ fn crdt_apply_byte_identical() {
                 surrogate: nodedb_types::Surrogate::ZERO,
                 provenance: None,
                 constraint_version_required: 0,
+                expected_frontier_digest: None,
             })
         })
         .collect();
