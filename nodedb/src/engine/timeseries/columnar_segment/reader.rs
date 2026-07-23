@@ -288,24 +288,40 @@ impl ColumnarSegmentReader {
         }
     }
 
-    /// Interpret mmap'd raw LE bytes as an i64 slice (zero-copy).
-    pub fn mmap_as_i64(bytes: &[u8]) -> Result<&[i64], SegmentError> {
-        if !bytes.len().is_multiple_of(8) {
+    /// Parse raw little-endian bytes as owned i64 values.
+    ///
+    /// Returning owned values is portable across mmap and decrypted `Vec<u8>`
+    /// backing stores, neither of which guarantees i64 alignment.
+    pub fn mmap_as_i64(bytes: &[u8]) -> Result<Vec<i64>, SegmentError> {
+        let chunks = bytes.chunks_exact(8);
+        if !chunks.remainder().is_empty() {
             return Err(SegmentError::Corrupt(
-                "i64 mmap not aligned to 8 bytes".into(),
+                "i64 byte length is not a multiple of 8".into(),
             ));
         }
-        Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i64, bytes.len() / 8) })
+        Ok(chunks
+            .map(|chunk| {
+                i64::from_le_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ])
+            })
+            .collect())
     }
 
-    /// Interpret mmap'd raw LE bytes as a u32 slice (zero-copy).
-    pub fn mmap_as_u32(bytes: &[u8]) -> Result<&[u32], SegmentError> {
-        if !bytes.len().is_multiple_of(4) {
+    /// Parse raw little-endian bytes as owned u32 values.
+    ///
+    /// Returning owned values is portable across mmap and decrypted `Vec<u8>`
+    /// backing stores, neither of which guarantees u32 alignment.
+    pub fn mmap_as_u32(bytes: &[u8]) -> Result<Vec<u32>, SegmentError> {
+        let chunks = bytes.chunks_exact(4);
+        if !chunks.remainder().is_empty() {
             return Err(SegmentError::Corrupt(
-                "u32 mmap not aligned to 4 bytes".into(),
+                "u32 byte length is not a multiple of 4".into(),
             ));
         }
-        Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u32, bytes.len() / 4) })
+        Ok(chunks
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect())
     }
 
     /// Read the sparse primary index for a partition.
@@ -394,5 +410,35 @@ pub(super) fn decrypt_segment_file(
         (None, true) => Err(SegmentError::MissingKek),
         (Some(key), true) => decrypt_file(key, raw),
         (Some(_), false) => Err(SegmentError::UnexpectedPlaintext),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ColumnarSegmentReader;
+
+    #[test]
+    fn mmap_integer_parsers_accept_unaligned_little_endian_subslices() {
+        let mut i64_fixture = vec![0xFF];
+        i64_fixture.extend_from_slice(&(-7i64).to_le_bytes());
+        i64_fixture.extend_from_slice(&(i64::MAX).to_le_bytes());
+        assert_eq!(
+            ColumnarSegmentReader::mmap_as_i64(&i64_fixture[1..]).unwrap(),
+            vec![-7, i64::MAX]
+        );
+
+        let mut u32_fixture = vec![0xFF];
+        u32_fixture.extend_from_slice(&0x0102_0304u32.to_le_bytes());
+        u32_fixture.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            ColumnarSegmentReader::mmap_as_u32(&u32_fixture[1..]).unwrap(),
+            vec![0x0102_0304, u32::MAX]
+        );
+    }
+
+    #[test]
+    fn mmap_integer_parsers_reject_partial_little_endian_words() {
+        assert!(ColumnarSegmentReader::mmap_as_i64(&[0; 7]).is_err());
+        assert!(ColumnarSegmentReader::mmap_as_u32(&[0; 3]).is_err());
     }
 }

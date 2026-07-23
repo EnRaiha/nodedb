@@ -62,9 +62,9 @@ impl QuantMode {
 
 // ── QuantHeader ────────────────────────────────────────────────────────────
 
-/// 32-byte interleaved header preceding the packed bit array.
+/// 32-byte little-endian header preceding the packed bit array.
 ///
-/// `#[repr(C)]` for stable layout; serializable via raw bytes.
+/// The wire layout is explicit and does not depend on Rust struct layout.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct QuantHeader {
@@ -84,8 +84,51 @@ pub struct QuantHeader {
     pub reserved: [u8; 8],
 }
 
-// Compile-time assertion: header is exactly 32 bytes.
-const _: () = assert!(core::mem::size_of::<QuantHeader>() == 32);
+/// Serialized version-1 header width.
+const QUANT_HEADER_BYTES: usize = 32;
+
+const _: () = assert!(core::mem::size_of::<QuantHeader>() == QUANT_HEADER_BYTES);
+
+impl QuantHeader {
+    /// Serialize this header in the fixed version-1 little-endian layout.
+    fn to_le_bytes(self) -> [u8; QUANT_HEADER_BYTES] {
+        let mut bytes = [0u8; QUANT_HEADER_BYTES];
+        bytes[0..2].copy_from_slice(&self.quant_mode.to_le_bytes());
+        bytes[2..4].copy_from_slice(&self.dim.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.global_scale.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.residual_norm.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.dot_quantized.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.outlier_bitmask.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.reserved);
+        bytes
+    }
+
+    /// Parse a fixed version-1 little-endian header without alignment assumptions.
+    fn from_le_bytes(bytes: &[u8]) -> Result<Self, CodecError> {
+        let header = bytes.get(..QUANT_HEADER_BYTES).ok_or_else(|| CodecError::LayoutError {
+            detail: format!(
+                "buffer too short for quantized vector header: need {QUANT_HEADER_BYTES} bytes, got {}",
+                bytes.len()
+            ),
+        })?;
+        Ok(Self {
+            quant_mode: u16::from_le_bytes([header[0], header[1]]),
+            dim: u16::from_le_bytes([header[2], header[3]]),
+            global_scale: f32::from_le_bytes([header[4], header[5], header[6], header[7]]),
+            residual_norm: f32::from_le_bytes([header[8], header[9], header[10], header[11]]),
+            dot_quantized: f32::from_le_bytes([header[12], header[13], header[14], header[15]]),
+            outlier_bitmask: u64::from_le_bytes([
+                header[16], header[17], header[18], header[19], header[20], header[21], header[22],
+                header[23],
+            ]),
+            reserved: header[24..32]
+                .try_into()
+                .map_err(|_| CodecError::LayoutError {
+                    detail: "quantized vector reserved header bytes are truncated".into(),
+                })?,
+        })
+    }
+}
 
 // ── Layout constants ────────────────────────────────────────────────────────
 
@@ -105,7 +148,7 @@ const ALIGN: usize = 128;
 pub fn target_size(quant_mode: QuantMode, dim: u16, outlier_count: u32) -> usize {
     let packed_bits_bytes = packed_bits_len(quant_mode, dim);
     let outlier_bytes = outlier_count as usize * OUTLIER_ENTRY_BYTES;
-    let raw = core::mem::size_of::<QuantHeader>() + packed_bits_bytes + outlier_bytes;
+    let raw = QUANT_HEADER_BYTES + packed_bits_bytes + outlier_bytes;
     round_up_128(raw)
 }
 
@@ -135,7 +178,9 @@ fn round_up_128(n: usize) -> usize {
 /// The total allocation is always a multiple of 128 bytes (one AVX-512
 /// cache-line pair).
 pub struct UnifiedQuantizedVector {
-    /// Backing storage.  Always a multiple of 128 bytes.
+    /// Parsed fixed-layout header, retained separately from the byte buffer.
+    header: QuantHeader,
+    /// Backing storage. Always a multiple of 128 bytes.
     buf: Vec<u8>,
     /// Byte length of the packed-bits region (excludes header and outliers).
     packed_bits_len: usize,
@@ -178,18 +223,14 @@ impl UnifiedQuantizedVector {
             }
         }
 
-        let header_bytes = core::mem::size_of::<QuantHeader>();
+        let header_bytes = QUANT_HEADER_BYTES;
         let outlier_bytes = outliers.len() * OUTLIER_ENTRY_BYTES;
         let raw = header_bytes + packed_bits.len() + outlier_bytes;
         let total = round_up_128(raw);
 
         let mut buf = vec![0u8; total];
 
-        // Write header via raw copy (QuantHeader is repr(C), no padding issues).
-        let header_src = unsafe {
-            core::slice::from_raw_parts(&header as *const QuantHeader as *const u8, header_bytes)
-        };
-        buf[..header_bytes].copy_from_slice(header_src);
+        buf[..header_bytes].copy_from_slice(&header.to_le_bytes());
 
         // Write packed bits.
         let pb_start = header_bytes;
@@ -205,6 +246,7 @@ impl UnifiedQuantizedVector {
         }
 
         Ok(Self {
+            header,
             buf,
             packed_bits_len: packed_bits.len(),
         })
@@ -212,18 +254,16 @@ impl UnifiedQuantizedVector {
 
     // ── Accessors ────────────────────────────────────────────────────────────
 
-    /// Zero-copy reference to the header (first 32 bytes).
+    /// Parsed fixed-layout header.
     #[inline]
     pub fn header(&self) -> &QuantHeader {
-        let ptr = self.buf.as_ptr() as *const QuantHeader;
-        // SAFETY: buf is always at least 32 bytes and QuantHeader is repr(C).
-        unsafe { &*ptr }
+        &self.header
     }
 
     /// Slice of the packed-bit region.
     #[inline]
     pub fn packed_bits(&self) -> &[u8] {
-        let start = core::mem::size_of::<QuantHeader>();
+        let start = QUANT_HEADER_BYTES;
         &self.buf[start..start + self.packed_bits_len]
     }
 
@@ -253,7 +293,7 @@ impl UnifiedQuantizedVector {
         let mask = bitmask & ((1u64 << slot).wrapping_sub(1));
         let offset = mask.count_ones() as usize;
 
-        let header_bytes = core::mem::size_of::<QuantHeader>();
+        let header_bytes = QUANT_HEADER_BYTES;
         let base = header_bytes + self.packed_bits_len + offset * OUTLIER_ENTRY_BYTES;
 
         let dim_idx = u32::from_le_bytes(self.buf[base..base + 4].try_into().ok()?);
@@ -274,6 +314,7 @@ impl UnifiedQuantizedVector {
 ///
 /// Suitable for reads from the io_uring page cache — no allocation required.
 pub struct UnifiedQuantizedVectorRef<'a> {
+    header: QuantHeader,
     buf: &'a [u8],
     packed_bits_len: usize,
 }
@@ -286,34 +327,43 @@ impl<'a> UnifiedQuantizedVectorRef<'a> {
     /// Returns [`CodecError::LayoutError`] if the slice is shorter than 32 bytes
     /// (minimum header size).
     pub fn from_bytes(buf: &'a [u8], packed_bits_len: usize) -> Result<Self, CodecError> {
-        let header_bytes = core::mem::size_of::<QuantHeader>();
-        if buf.len() < header_bytes + packed_bits_len {
+        let header = QuantHeader::from_le_bytes(buf)?;
+        let outlier_bytes = (header.outlier_bitmask.count_ones() as usize)
+            .checked_mul(OUTLIER_ENTRY_BYTES)
+            .ok_or_else(|| CodecError::LayoutError {
+                detail: "quantized vector outlier length overflow".into(),
+            })?;
+        let required = QUANT_HEADER_BYTES
+            .checked_add(packed_bits_len)
+            .and_then(|length| length.checked_add(outlier_bytes))
+            .ok_or_else(|| CodecError::LayoutError {
+                detail: "quantized vector length overflow".into(),
+            })?;
+        if buf.len() < required {
             return Err(CodecError::LayoutError {
                 detail: format!(
-                    "buffer too short: need at least {} bytes, got {}",
-                    header_bytes + packed_bits_len,
+                    "buffer too short: need at least {required} bytes, got {}",
                     buf.len()
                 ),
             });
         }
         Ok(Self {
+            header,
             buf,
             packed_bits_len,
         })
     }
 
-    /// Zero-copy header reference.
+    /// Parsed fixed-layout header.
     #[inline]
     pub fn header(&self) -> &QuantHeader {
-        let ptr = self.buf.as_ptr() as *const QuantHeader;
-        // SAFETY: validated in from_bytes that buf.len() >= 32.
-        unsafe { &*ptr }
+        &self.header
     }
 
     /// Packed-bits slice.
     #[inline]
     pub fn packed_bits(&self) -> &[u8] {
-        let start = core::mem::size_of::<QuantHeader>();
+        let start = QUANT_HEADER_BYTES;
         &self.buf[start..start + self.packed_bits_len]
     }
 
@@ -335,11 +385,13 @@ impl<'a> UnifiedQuantizedVectorRef<'a> {
         let mask = bitmask & ((1u64 << slot).wrapping_sub(1));
         let offset = mask.count_ones() as usize;
 
-        let header_bytes = core::mem::size_of::<QuantHeader>();
-        let base = header_bytes + self.packed_bits_len + offset * OUTLIER_ENTRY_BYTES;
+        let base = QUANT_HEADER_BYTES
+            .checked_add(self.packed_bits_len)?
+            .checked_add(offset.checked_mul(OUTLIER_ENTRY_BYTES)?)?;
+        let entry = self.buf.get(base..base.checked_add(OUTLIER_ENTRY_BYTES)?)?;
 
-        let dim_idx = u32::from_le_bytes(self.buf[base..base + 4].try_into().ok()?);
-        let value = f32::from_le_bytes(self.buf[base + 4..base + 8].try_into().ok()?);
+        let dim_idx = u32::from_le_bytes(entry[0..4].try_into().ok()?);
+        let value = f32::from_le_bytes(entry[4..8].try_into().ok()?);
         Some((dim_idx, value))
     }
 }
@@ -364,8 +416,34 @@ mod tests {
 
     #[test]
     fn header_is_32_bytes() {
-        // Also enforced by the const assert above; belt-and-suspenders.
-        assert_eq!(core::mem::size_of::<QuantHeader>(), 32);
+        assert_eq!(QUANT_HEADER_BYTES, 32);
+    }
+
+    #[test]
+    fn header_parses_explicit_little_endian_fixture_from_unaligned_subslice() {
+        let header = QuantHeader {
+            quant_mode: 0x1234,
+            dim: 0x5678,
+            global_scale: f32::from_bits(0x3FC0_0000),
+            residual_norm: f32::from_bits(0xBF40_0000),
+            dot_quantized: f32::from_bits(0x4040_0000),
+            outlier_bitmask: 0x1122_3344_5566_7788,
+            reserved: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let mut fixture = vec![0xFF];
+        fixture.extend_from_slice(&header.to_le_bytes());
+        fixture.extend_from_slice(&[0u8; 64 * OUTLIER_ENTRY_BYTES]);
+
+        let view = UnifiedQuantizedVectorRef::from_bytes(&fixture[1..], 0)
+            .expect("unaligned header fixture parses");
+        let parsed = view.header();
+        assert_eq!(parsed.quant_mode, 0x1234);
+        assert_eq!(parsed.dim, 0x5678);
+        assert_eq!(parsed.global_scale.to_bits(), 0x3FC0_0000);
+        assert_eq!(parsed.residual_norm.to_bits(), 0xBF40_0000);
+        assert_eq!(parsed.dot_quantized.to_bits(), 0x4040_0000);
+        assert_eq!(parsed.outlier_bitmask, 0x1122_3344_5566_7788);
+        assert_eq!(parsed.reserved, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -468,6 +546,22 @@ mod tests {
         let (dim, val) = vref.outlier_at(10).unwrap();
         assert_eq!(dim, 10);
         assert!((val - 7.77).abs() < 1e-5);
+    }
+
+    #[test]
+    fn borrowed_view_rejects_truncated_outliers_and_length_overflow() {
+        let header = QuantHeader {
+            quant_mode: QuantMode::Bbq as u16,
+            dim: 1,
+            global_scale: 1.0,
+            residual_norm: 0.0,
+            dot_quantized: 0.0,
+            outlier_bitmask: 1,
+            reserved: [0; 8],
+        };
+        let bytes = header.to_le_bytes();
+        assert!(UnifiedQuantizedVectorRef::from_bytes(&bytes, 0).is_err());
+        assert!(UnifiedQuantizedVectorRef::from_bytes(&bytes, usize::MAX).is_err());
     }
 
     #[test]
