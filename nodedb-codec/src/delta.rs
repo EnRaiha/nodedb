@@ -18,6 +18,9 @@
 //! Compression: monotonic counters with small increments → ~1-2 bytes/sample.
 //! Non-monotonic data → ~2-4 bytes/sample (still better than raw 8 bytes).
 
+use std::mem::size_of;
+
+use crate::bounds::{checked_add, checked_mul, decoded_len, encode_input_len, u32_to_usize};
 use crate::error::CodecError;
 
 // ---------------------------------------------------------------------------
@@ -58,26 +61,32 @@ fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
 ///
 /// Returns `(value, bytes_consumed)`.
 fn read_varint(data: &[u8]) -> Result<(u64, usize), CodecError> {
-    let mut value: u64 = 0;
-    let mut shift: u32 = 0;
-
-    for (i, &byte) in data.iter().enumerate() {
-        if shift >= 70 {
+    let mut value = 0u64;
+    for (index, &byte) in data.iter().enumerate() {
+        if index >= 10 {
             return Err(CodecError::Corrupt {
-                detail: "varint too long (>10 bytes)".into(),
+                detail: "varint exceeds ten bytes".into(),
             });
         }
-
-        value |= ((byte & 0x7F) as u64) << shift;
-        shift += 7;
-
+        let payload = u64::from(byte & 0x7f);
+        if index == 9 && (byte & 0x80 != 0 || payload > 1) {
+            return Err(CodecError::Corrupt {
+                detail: "varint overflows u64".into(),
+            });
+        }
+        value |= payload << (index * 7);
         if byte & 0x80 == 0 {
-            return Ok((value, i + 1));
+            if index > 0 && payload == 0 {
+                return Err(CodecError::Corrupt {
+                    detail: "varint is noncanonical".into(),
+                });
+            }
+            return Ok((value, index + 1));
         }
     }
 
     Err(CodecError::Truncated {
-        expected: data.len() + 1,
+        expected: checked_add(data.len(), 1, "Delta varint length")?,
         actual: data.len(),
     })
 }
@@ -87,15 +96,19 @@ fn read_varint(data: &[u8]) -> Result<(u64, usize), CodecError> {
 // ---------------------------------------------------------------------------
 
 /// Encode a slice of i64 values using Delta + ZigZag-varint compression.
-pub fn encode(values: &[i64]) -> Vec<u8> {
-    let count = values.len() as u32;
-    // Estimate: header(4) + first_value(8) + ~2 bytes per delta.
-    let mut out = Vec::with_capacity(12 + values.len() * 2);
+pub fn encode(values: &[i64]) -> Result<Vec<u8>, CodecError> {
+    let count = encode_value_count(values.len(), "Delta")?;
+    let estimated = checked_add(
+        12,
+        checked_mul(values.len(), 2, "Delta output estimate")?,
+        "Delta output estimate",
+    )?;
+    let mut out = Vec::with_capacity(estimated);
 
     out.extend_from_slice(&count.to_le_bytes());
 
     if values.is_empty() {
-        return out;
+        return Ok(out);
     }
 
     out.extend_from_slice(&values[0].to_le_bytes());
@@ -105,7 +118,7 @@ pub fn encode(values: &[i64]) -> Vec<u8> {
         write_varint(&mut out, zigzag_encode(delta));
     }
 
-    out
+    Ok(out)
 }
 
 /// Decode Delta-compressed bytes back to i64 values.
@@ -117,11 +130,20 @@ pub fn decode(data: &[u8]) -> Result<Vec<i64>, CodecError> {
         });
     }
 
-    let count = u32::from_le_bytes(data[0..4].try_into().map_err(|_| CodecError::Corrupt {
-        detail: "invalid header".into(),
-    })?) as usize;
+    let count = u32_to_usize(
+        u32::from_le_bytes(data[0..4].try_into().map_err(|_| CodecError::Corrupt {
+            detail: "invalid header".into(),
+        })?),
+        "Delta value count",
+    )?;
+    validate_value_count(count, "Delta")?;
 
     if count == 0 {
+        if data.len() != 4 {
+            return Err(CodecError::Corrupt {
+                detail: "trailing bytes after empty Delta frame".into(),
+            });
+        }
         return Ok(Vec::new());
     }
 
@@ -144,18 +166,38 @@ pub fn decode(data: &[u8]) -> Result<Vec<i64>, CodecError> {
     for _ in 1..count {
         if offset >= data.len() {
             return Err(CodecError::Truncated {
-                expected: offset + 1,
+                expected: checked_add(offset, 1, "Delta varint offset")?,
                 actual: data.len(),
             });
         }
-        let (encoded_delta, consumed) = read_varint(&data[offset..])?;
+        let tail = data.get(offset..).ok_or(CodecError::Truncated {
+            expected: checked_add(offset, 1, "Delta varint offset")?,
+            actual: data.len(),
+        })?;
+        let (encoded_delta, consumed) = read_varint(tail)?;
         let delta = zigzag_decode(encoded_delta);
         let value = values[values.len() - 1].wrapping_add(delta);
         values.push(value);
-        offset += consumed;
+        offset = checked_add(offset, consumed, "Delta varint offset")?;
+    }
+    if offset != data.len() {
+        return Err(CodecError::Corrupt {
+            detail: "trailing bytes after Delta frame".into(),
+        });
     }
 
     Ok(values)
+}
+
+fn encode_value_count(len: usize, codec: &str) -> Result<u32, CodecError> {
+    validate_value_count(len, codec)?;
+    encode_input_len(len, codec)
+}
+
+fn validate_value_count(count: usize, codec: &str) -> Result<(), CodecError> {
+    let bytes = checked_mul(count, size_of::<i64>(), "integer decoded bytes")?;
+    decoded_len(bytes, codec)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -175,19 +217,25 @@ impl DeltaEncoder {
         }
     }
 
-    pub fn push(&mut self, value: i64) {
+    pub fn push(&mut self, value: i64) -> Result<(), CodecError> {
+        let next = checked_add(self.values.len(), 1, "Delta streaming count")?;
+        validate_value_count(next, "Delta streaming input")?;
         self.values.push(value);
+        Ok(())
     }
 
-    pub fn push_batch(&mut self, values: &[i64]) {
+    pub fn push_batch(&mut self, values: &[i64]) -> Result<(), CodecError> {
+        let next = checked_add(self.values.len(), values.len(), "Delta streaming count")?;
+        validate_value_count(next, "Delta streaming input")?;
         self.values.extend_from_slice(values);
+        Ok(())
     }
 
     pub fn count(&self) -> usize {
         self.values.len()
     }
 
-    pub fn finish(self) -> Vec<u8> {
+    pub fn finish(self) -> Result<Vec<u8>, CodecError> {
         encode(&self.values)
     }
 }
@@ -232,6 +280,10 @@ impl DeltaDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode(values: &[i64]) -> Vec<u8> {
+        super::encode(values).expect("test Delta encode")
+    }
 
     #[test]
     fn zigzag_roundtrip() {
@@ -365,9 +417,9 @@ mod tests {
 
         let mut enc = DeltaEncoder::new();
         for &v in &values {
-            enc.push(v);
+            enc.push(v).expect("push");
         }
-        assert_eq!(enc.finish(), batch);
+        assert_eq!(enc.finish().expect("finish"), batch);
     }
 
     #[test]
@@ -386,6 +438,32 @@ mod tests {
     fn truncated_input_errors() {
         assert!(decode(&[]).is_err());
         assert!(decode(&[1, 0, 0, 0]).is_err()); // count=1, no value
+    }
+
+    #[test]
+    fn rejects_overflowed_noncanonical_and_huge_input_before_allocation() {
+        assert!(matches!(
+            read_varint(&[0x80, 0x00]),
+            Err(CodecError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            read_varint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02]),
+            Err(CodecError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            read_varint(&[0x80; 10]),
+            Err(CodecError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            read_varint(&[0x80]),
+            Err(CodecError::Truncated { .. })
+        ));
+        let mut huge = u32::MAX.to_le_bytes().to_vec();
+        huge.extend_from_slice(&[0; 8]);
+        assert!(matches!(
+            decode(&huge),
+            Err(CodecError::ResourceLimit { .. })
+        ));
     }
 
     #[test]

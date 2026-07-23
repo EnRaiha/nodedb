@@ -29,9 +29,9 @@ fn codec_err(e: CodecError) -> ArrayError {
 // Surrogates: Vec<Surrogate> via fastlanes (u32 widened to i64)
 // ---------------------------------------------------------------------------
 
-pub fn encode_surrogates(surrogates: &[Surrogate]) -> Vec<u8> {
+pub fn encode_surrogates(surrogates: &[Surrogate]) -> ArrayResult<Vec<u8>> {
     let as_i64: Vec<i64> = surrogates.iter().map(|s| s.as_u32() as i64).collect();
-    nodedb_codec::fastlanes::encode(&as_i64)
+    nodedb_codec::fastlanes::encode(&as_i64).map_err(codec_err)
 }
 
 pub fn decode_surrogates(data: &[u8]) -> ArrayResult<Vec<Surrogate>> {
@@ -116,7 +116,7 @@ pub fn encode_attr_col(values: &[CellValue]) -> ArrayResult<Vec<u8>> {
                 _ => 0,
             })
             .collect();
-        let encoded = nodedb_codec::fastlanes::encode(&ints);
+        let encoded = nodedb_codec::fastlanes::encode(&ints).map_err(codec_err)?;
         let mut out = vec![ATTR_TAG_INT64];
         out.extend_from_slice(&encoded);
         return Ok(out);
@@ -221,6 +221,10 @@ pub fn decode_attr_col(data: &[u8]) -> ArrayResult<Vec<CellValue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_surrogates(values: &[Surrogate]) -> Vec<u8> {
+        super::encode_surrogates(values).expect("test surrogate encode")
+    }
 
     #[test]
     fn surrogates_empty_roundtrip() {

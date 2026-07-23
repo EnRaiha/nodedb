@@ -91,7 +91,11 @@ pub fn encode_coord_axis(dict: &DimDict, out: &mut Vec<u8>) -> ArrayResult<()> {
     if let Some(ints) = try_encode_int64_dict(&dict.values) {
         out.push(DICT_TAG_INT64_FASTLANES);
         out.extend_from_slice(&(ints.len() as u32).to_le_bytes());
-        let encoded = nodedb_codec::fastlanes::encode(&ints);
+        let encoded = nodedb_codec::fastlanes::encode(&ints).map_err(|error| {
+            ArrayError::SegmentCorruption {
+                detail: format!("coordinate FastLanes encode: {error}"),
+            }
+        })?;
         out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
         out.extend_from_slice(&encoded);
     } else {

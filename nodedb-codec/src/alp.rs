@@ -24,6 +24,9 @@
 //! Reference: "ALP: Adaptive Lossless floating-Point Compression"
 //! (Afroozeh et al., SIGMOD 2023)
 
+use std::mem::size_of;
+
+use crate::bounds::{checked_add, checked_mul, decoded_len, encode_input_len, encode_u32_len};
 use crate::error::CodecError;
 use crate::fastlanes;
 
@@ -87,8 +90,10 @@ use crate::CODEC_SAMPLE_SIZE;
 /// Finds the optimal decimal exponent, converts to integers, stores
 /// exceptions for values that don't round-trip, and bit-packs the integers
 /// via FastLanes.
-pub fn encode(values: &[f64]) -> Vec<u8> {
-    let count = values.len() as u32;
+pub fn encode(values: &[f64]) -> Result<Vec<u8>, CodecError> {
+    let decoded_bytes = checked_mul(values.len(), size_of::<f64>(), "ALP input bytes")?;
+    decoded_len(decoded_bytes, "ALP input")?;
+    let count = encode_input_len(values.len(), "ALP value count")?;
 
     if values.is_empty() {
         let mut out = Vec::with_capacity(11);
@@ -97,7 +102,7 @@ pub fn encode(values: &[f64]) -> Vec<u8> {
         out.push(0); // decode exponent
         out.push(0); // mode
         out.extend_from_slice(&0u32.to_le_bytes()); // exception count
-        return out;
+        return Ok(out);
     }
 
     // Step 1: Find optimal parameters by sampling.
@@ -116,17 +121,30 @@ pub fn encode(values: &[f64]) -> Vec<u8> {
             }
             None => {
                 // Exception: store original bits, use 0 as placeholder in int array.
-                exceptions.push((i as u32, val.to_bits()));
+                exceptions.push((
+                    u32::try_from(i).map_err(|_| CodecError::ResourceLimit {
+                        resource: "ALP exception index".into(),
+                        requested: i,
+                        limit: u32::MAX as usize,
+                    })?,
+                    val.to_bits(),
+                ));
                 encoded_ints.push(0);
             }
         }
     }
 
     // Step 3: Build output.
-    let exception_count = exceptions.len() as u32;
-    let packed_ints = fastlanes::encode(&encoded_ints);
+    let exception_count = encode_u32_len(exceptions.len(), "ALP exception count")?;
+    let packed_ints = fastlanes::encode(&encoded_ints)?;
 
-    let mut out = Vec::with_capacity(10 + exceptions.len() * 12 + packed_ints.len());
+    let exceptions_size = checked_mul(exceptions.len(), 12, "ALP exceptions")?;
+    let capacity = checked_add(
+        checked_add(11, exceptions_size, "ALP output")?,
+        packed_ints.len(),
+        "ALP output",
+    )?;
+    let mut out = Vec::with_capacity(capacity);
 
     // Header.
     out.extend_from_slice(&count.to_le_bytes());
@@ -147,7 +165,7 @@ pub fn encode(values: &[f64]) -> Vec<u8> {
     // Packed integers.
     out.extend_from_slice(&packed_ints);
 
-    out
+    Ok(out)
 }
 
 /// Decode ALP-compressed bytes back to f64 values.
@@ -402,6 +420,10 @@ fn find_best_params(values: &[f64]) -> AlpParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode(values: &[f64]) -> Vec<u8> {
+        super::encode(values).expect("test ALP encode")
+    }
 
     #[test]
     fn empty_roundtrip() {

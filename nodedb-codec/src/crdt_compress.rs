@@ -57,7 +57,7 @@ pub fn encode(ops: &[CrdtOp]) -> Result<Vec<u8>, CodecError> {
 
     // Delta-encode Lamport timestamps.
     let lamports: Vec<i64> = ops.iter().map(|op| op.lamport as i64).collect();
-    let lamport_block = crate::delta::encode(&lamports);
+    let lamport_block = crate::delta::encode(&lamports)?;
 
     // Actor indices.
     let use_u8 = actor_dict.len() <= 256;

@@ -27,8 +27,13 @@
 mod bits;
 mod block;
 
+use std::mem::size_of;
+
 pub use block::bit_width_for_range;
 
+use crate::bounds::{
+    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, u32_to_usize,
+};
 use crate::error::CodecError;
 use block::{decode_block, encode_block, skip_block};
 
@@ -45,26 +50,28 @@ const GLOBAL_HEADER_SIZE: usize = 6;
 // ---------------------------------------------------------------------------
 
 /// Encode a slice of i64 values using FOR + bit-packing.
-pub fn encode(values: &[i64]) -> Vec<u8> {
-    let total_count = values.len() as u32;
-    let block_count = if values.is_empty() {
-        0u16
-    } else {
-        values.len().div_ceil(BLOCK_SIZE) as u16
-    };
-
-    let mut out = Vec::with_capacity(GLOBAL_HEADER_SIZE + values.len() * 5);
-
-    // Global header.
+pub fn encode(values: &[i64]) -> Result<Vec<u8>, CodecError> {
+    let total_bytes = checked_mul(values.len(), size_of::<i64>(), "FastLanes input bytes")?;
+    decoded_len(total_bytes, "FastLanes input")?;
+    let total_count = encode_input_len(values.len(), "FastLanes value count")?;
+    let block_count = values.len().div_ceil(BLOCK_SIZE);
+    let block_count = u16::try_from(block_count).map_err(|_| CodecError::ResourceLimit {
+        resource: "FastLanes block count".into(),
+        requested: block_count,
+        limit: u16::MAX as usize,
+    })?;
+    let estimated = checked_add(
+        GLOBAL_HEADER_SIZE,
+        checked_mul(values.len(), 5, "FastLanes output estimate")?,
+        "FastLanes output estimate",
+    )?;
+    let mut out = Vec::with_capacity(estimated);
     out.extend_from_slice(&total_count.to_le_bytes());
     out.extend_from_slice(&block_count.to_le_bytes());
-
-    // Encode each block.
     for chunk in values.chunks(BLOCK_SIZE) {
-        encode_block(chunk, &mut out);
+        encode_block(chunk, &mut out)?;
     }
-
-    out
+    Ok(out)
 }
 
 /// Decode FOR + bit-packed bytes back to i64 values.
@@ -76,20 +83,32 @@ pub fn decode(data: &[u8]) -> Result<Vec<i64>, CodecError> {
         });
     }
 
-    let total_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let block_count = u16::from_le_bytes([data[4], data[5]]) as usize;
-
+    let (total_count, block_count) = parse_header(data)?;
     if total_count == 0 {
+        if data.len() != GLOBAL_HEADER_SIZE {
+            return Err(CodecError::Corrupt {
+                detail: "trailing bytes after empty FastLanes frame".into(),
+            });
+        }
         return Ok(Vec::new());
     }
 
     let mut values = Vec::with_capacity(total_count);
     let mut offset = GLOBAL_HEADER_SIZE;
-
     for block_idx in 0..block_count {
-        offset = decode_block(data, offset, &mut values, block_idx)?;
+        offset = decode_block(
+            data,
+            offset,
+            &mut values,
+            block_idx,
+            expected_block_count(total_count, block_idx)?,
+        )?;
     }
-
+    if offset != data.len() {
+        return Err(CodecError::Corrupt {
+            detail: "trailing bytes after FastLanes frame".into(),
+        });
+    }
     if values.len() != total_count {
         return Err(CodecError::Corrupt {
             detail: format!(
@@ -113,12 +132,17 @@ pub fn block_byte_offsets(data: &[u8]) -> Result<Vec<usize>, CodecError> {
             actual: data.len(),
         });
     }
-    let num_blocks = u16::from_le_bytes([data[4], data[5]]) as usize;
+    let (total_count, num_blocks) = parse_header(data)?;
     let mut offsets = Vec::with_capacity(num_blocks);
     let mut pos = GLOBAL_HEADER_SIZE;
     for i in 0..num_blocks {
         offsets.push(pos);
-        pos = skip_block(data, pos, i)?;
+        pos = skip_block(data, pos, i, expected_block_count(total_count, i)?)?;
+    }
+    if pos != data.len() {
+        return Err(CodecError::Corrupt {
+            detail: "trailing bytes after FastLanes frame".into(),
+        });
     }
     Ok(offsets)
 }
@@ -138,7 +162,8 @@ pub fn decode_block_range(
             actual: data.len(),
         });
     }
-    let num_blocks = u16::from_le_bytes([data[4], data[5]]) as usize;
+    let (total_count, num_blocks) = parse_header(data)?;
+    validate_frame(data, total_count, num_blocks)?;
     if start_block >= num_blocks || end_block > num_blocks || start_block >= end_block {
         return Ok(Vec::new());
     }
@@ -146,13 +171,27 @@ pub fn decode_block_range(
     // Skip to start_block.
     let mut offset = GLOBAL_HEADER_SIZE;
     for i in 0..start_block {
-        offset = skip_block(data, offset, i)?;
+        offset = skip_block(data, offset, i, expected_block_count(total_count, i)?)?;
     }
 
-    // Decode [start_block..end_block).
-    let mut values = Vec::new();
+    let selected_count = (start_block..end_block).try_fold(0usize, |count, index| {
+        checked_add(
+            count,
+            expected_block_count(total_count, index)?,
+            "FastLanes range count",
+        )
+    })?;
+    let selected_bytes = checked_mul(selected_count, size_of::<i64>(), "FastLanes range bytes")?;
+    decoded_len(selected_bytes, "FastLanes range")?;
+    let mut values = Vec::with_capacity(selected_count);
     for i in start_block..end_block {
-        offset = decode_block(data, offset, &mut values, i)?;
+        offset = decode_block(
+            data,
+            offset,
+            &mut values,
+            i,
+            expected_block_count(total_count, i)?,
+        )?;
     }
     Ok(values)
 }
@@ -165,7 +204,7 @@ pub fn block_count(data: &[u8]) -> Result<usize, CodecError> {
             actual: data.len(),
         });
     }
-    Ok(u16::from_le_bytes([data[4], data[5]]) as usize)
+    Ok(parse_header(data)?.1)
 }
 
 /// Decode a single block by index without decoding the entire stream.
@@ -180,7 +219,8 @@ pub fn decode_single_block(data: &[u8], block_idx: usize) -> Result<Vec<i64>, Co
             actual: data.len(),
         });
     }
-    let num_blocks = u16::from_le_bytes([data[4], data[5]]) as usize;
+    let (total_count, num_blocks) = parse_header(data)?;
+    validate_frame(data, total_count, num_blocks)?;
     if block_idx >= num_blocks {
         return Err(CodecError::Corrupt {
             detail: format!("block_idx {block_idx} >= block_count {num_blocks}"),
@@ -190,11 +230,12 @@ pub fn decode_single_block(data: &[u8], block_idx: usize) -> Result<Vec<i64>, Co
     // Skip to the target block by iterating headers.
     let mut offset = GLOBAL_HEADER_SIZE;
     for i in 0..block_idx {
-        offset = skip_block(data, offset, i)?;
+        offset = skip_block(data, offset, i, expected_block_count(total_count, i)?)?;
     }
 
-    let mut values = Vec::new();
-    decode_block(data, offset, &mut values, block_idx)?;
+    let expected_count = expected_block_count(total_count, block_idx)?;
+    let mut values = Vec::with_capacity(expected_count);
+    decode_block(data, offset, &mut values, block_idx, expected_count)?;
     Ok(values)
 }
 
@@ -203,6 +244,7 @@ pub fn decode_single_block(data: &[u8], block_idx: usize) -> Result<Vec<i64>, Co
 pub struct BlockIterator<'a> {
     data: &'a [u8],
     offset: usize,
+    total_count: usize,
     blocks_remaining: usize,
     current_block: usize,
 }
@@ -216,10 +258,12 @@ impl<'a> BlockIterator<'a> {
                 actual: data.len(),
             });
         }
-        let num_blocks = u16::from_le_bytes([data[4], data[5]]) as usize;
+        let (total_count, num_blocks) = parse_header(data)?;
+        validate_frame(data, total_count, num_blocks)?;
         Ok(Self {
             data,
             offset: GLOBAL_HEADER_SIZE,
+            total_count,
             blocks_remaining: num_blocks,
             current_block: 0,
         })
@@ -230,11 +274,64 @@ impl<'a> BlockIterator<'a> {
         if self.blocks_remaining == 0 {
             return Ok(());
         }
-        self.offset = skip_block(self.data, self.offset, self.current_block)?;
+        self.offset = skip_block(
+            self.data,
+            self.offset,
+            self.current_block,
+            expected_block_count(self.total_count, self.current_block)?,
+        )?;
         self.current_block += 1;
         self.blocks_remaining -= 1;
         Ok(())
     }
+}
+
+fn parse_header(data: &[u8]) -> Result<(usize, usize), CodecError> {
+    let header = checked_range(data, 0, GLOBAL_HEADER_SIZE, "FastLanes header")?;
+    let total_count = u32_to_usize(
+        u32::from_le_bytes([header[0], header[1], header[2], header[3]]),
+        "FastLanes value count",
+    )?;
+    let decoded_bytes = checked_mul(total_count, size_of::<i64>(), "FastLanes decoded bytes")?;
+    decoded_len(decoded_bytes, "FastLanes")?;
+    let block_count = usize::from(u16::from_le_bytes([header[4], header[5]]));
+    let expected_blocks = total_count.div_ceil(BLOCK_SIZE);
+    if block_count != expected_blocks {
+        return Err(CodecError::Corrupt {
+            detail: format!(
+                "FastLanes block count {block_count} does not match value count {total_count}"
+            ),
+        });
+    }
+    Ok((total_count, block_count))
+}
+
+fn validate_frame(data: &[u8], total_count: usize, block_count: usize) -> Result<(), CodecError> {
+    let mut offset = GLOBAL_HEADER_SIZE;
+    for block_idx in 0..block_count {
+        offset = skip_block(
+            data,
+            offset,
+            block_idx,
+            expected_block_count(total_count, block_idx)?,
+        )?;
+    }
+    if offset != data.len() {
+        return Err(CodecError::Corrupt {
+            detail: "trailing bytes after FastLanes frame".into(),
+        });
+    }
+    Ok(())
+}
+
+fn expected_block_count(total_count: usize, block_idx: usize) -> Result<usize, CodecError> {
+    let start = checked_mul(block_idx, BLOCK_SIZE, "FastLanes block start")?;
+    let remaining = total_count
+        .checked_sub(start)
+        .ok_or_else(|| CodecError::Corrupt {
+            detail: "FastLanes block index exceeds declared count".into(),
+        })?;
+    Ok(remaining.min(BLOCK_SIZE))
 }
 
 impl Iterator for BlockIterator<'_> {
@@ -244,15 +341,28 @@ impl Iterator for BlockIterator<'_> {
         if self.blocks_remaining == 0 {
             return None;
         }
-        let mut values = Vec::new();
-        match decode_block(self.data, self.offset, &mut values, self.current_block) {
+        let expected_count = match expected_block_count(self.total_count, self.current_block) {
+            Ok(count) => count,
+            Err(error) => return Some(Err(error)),
+        };
+        let mut values = Vec::with_capacity(expected_count);
+        match decode_block(
+            self.data,
+            self.offset,
+            &mut values,
+            self.current_block,
+            expected_count,
+        ) {
             Ok(new_offset) => {
                 self.offset = new_offset;
                 self.current_block += 1;
                 self.blocks_remaining -= 1;
                 Some(Ok(values))
             }
-            Err(e) => Some(Err(e)),
+            Err(error) => {
+                self.blocks_remaining = 0;
+                Some(Err(error))
+            }
         }
     }
 
@@ -264,6 +374,10 @@ impl Iterator for BlockIterator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode(values: &[i64]) -> Vec<u8> {
+        super::encode(values).expect("test FastLanes encode")
+    }
 
     #[test]
     fn empty_roundtrip() {
@@ -501,5 +615,71 @@ mod tests {
         iter.skip_block().unwrap(); // skip block 0
         let b1 = iter.next().unwrap().unwrap();
         assert_eq!(b1, &values[1024..2048]);
+    }
+
+    #[test]
+    fn hostile_counts_and_block_shapes_fail_before_allocation_or_looping() {
+        let mut huge = vec![0; GLOBAL_HEADER_SIZE];
+        huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        huge[4..].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(matches!(
+            decode(&huge),
+            Err(CodecError::ResourceLimit { .. })
+        ));
+
+        let mut mismatched = vec![0; GLOBAL_HEADER_SIZE];
+        mismatched[..4].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            decode(&mismatched),
+            Err(CodecError::Corrupt { .. })
+        ));
+
+        let mut bad_block = encode(&[1, 2]);
+        bad_block[GLOBAL_HEADER_SIZE..GLOBAL_HEADER_SIZE + 2].copy_from_slice(&1u16.to_le_bytes());
+        assert!(matches!(
+            decode(&bad_block),
+            Err(CodecError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn nonzero_final_padding_is_rejected_by_all_offset_scans() {
+        let mut encoded = encode(&[1, 2]);
+        *encoded.last_mut().expect("packed byte") |= 0x80;
+        assert!(matches!(decode(&encoded), Err(CodecError::Corrupt { .. })));
+        assert!(matches!(
+            block_byte_offsets(&encoded),
+            Err(CodecError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            decode_block_range(&encoded, 0, 1),
+            Err(CodecError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            decode_single_block(&encoded, 0),
+            Err(CodecError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            BlockIterator::new(&encoded),
+            Err(CodecError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn truncated_packed_block_is_rejected_by_all_offset_scans() {
+        let mut encoded = encode(&[1, 2]);
+        encoded.pop();
+        assert!(matches!(
+            decode(&encoded),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert!(matches!(
+            block_byte_offsets(&encoded),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert!(matches!(
+            decode_single_block(&encoded, 0),
+            Err(CodecError::Truncated { .. })
+        ));
     }
 }

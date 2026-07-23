@@ -90,7 +90,7 @@ fn encode_structural(tile: &SparseTile, out: &mut Vec<u8>) -> ArrayResult<()> {
     }
 
     // Surrogates.
-    let surr_bytes = encode_surrogates(&tile.surrogates);
+    let surr_bytes = encode_surrogates(&tile.surrogates)?;
     write_framed(&surr_bytes, out);
 
     // Row kinds.

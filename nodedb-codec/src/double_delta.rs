@@ -29,6 +29,9 @@
 //! - `1110` + 12 bits → dod in [-2047, 2048]
 //! - `1111` + 64 bits → arbitrary dod
 
+use std::mem::size_of;
+
+use crate::bounds::{checked_add, checked_mul, decoded_len, encode_input_len, u32_to_usize};
 use crate::error::CodecError;
 
 // ---------------------------------------------------------------------------
@@ -67,6 +70,20 @@ impl BitWriter {
         }
     }
 
+    fn try_write_bit(&mut self, bit: bool) -> Result<(), CodecError> {
+        checked_add(self.bit_pos, 1, "DoubleDelta bit offset")?;
+        self.write_bit(bit);
+        Ok(())
+    }
+
+    fn try_write_bits(&mut self, value: u64, num_bits: usize) -> Result<(), CodecError> {
+        checked_add(self.bit_pos, num_bits, "DoubleDelta bit offset")?;
+        for i in (0..num_bits).rev() {
+            self.write_bit((value >> i) & 1 == 1);
+        }
+        Ok(())
+    }
+
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.buf
     }
@@ -90,13 +107,13 @@ impl<'a> BitReader<'a> {
         let byte_idx = self.bit_pos / 8;
         if byte_idx >= self.buf.len() {
             return Err(CodecError::Truncated {
-                expected: byte_idx + 1,
+                expected: checked_add(byte_idx, 1, "DoubleDelta bit byte index")?,
                 actual: self.buf.len(),
             });
         }
         let bit_idx = 7 - (self.bit_pos % 8);
         let bit = (self.buf[byte_idx] >> bit_idx) & 1 == 1;
-        self.bit_pos += 1;
+        self.bit_pos = checked_add(self.bit_pos, 1, "DoubleDelta bit offset")?;
         Ok(bit)
     }
 
@@ -114,27 +131,28 @@ impl<'a> BitReader<'a> {
 // ---------------------------------------------------------------------------
 
 /// Encode a slice of i64 values using DoubleDelta compression.
-pub fn encode(values: &[i64]) -> Vec<u8> {
-    let count = values.len() as u32;
-    let mut out = Vec::with_capacity(20 + values.len() / 4);
+pub fn encode(values: &[i64]) -> Result<Vec<u8>, CodecError> {
+    let count = encode_value_count(values.len(), "DoubleDelta")?;
+    let estimated = checked_add(20, values.len() / 4, "DoubleDelta output estimate")?;
+    let mut out = Vec::with_capacity(estimated);
 
     out.extend_from_slice(&count.to_le_bytes());
 
     if values.is_empty() {
-        return out;
+        return Ok(out);
     }
 
     out.extend_from_slice(&values[0].to_le_bytes());
 
     if values.len() == 1 {
-        return out;
+        return Ok(out);
     }
 
     let first_delta = values[1].wrapping_sub(values[0]);
     out.extend_from_slice(&first_delta.to_le_bytes());
 
     if values.len() == 2 {
-        return out;
+        return Ok(out);
     }
 
     let mut bs = BitWriter::new();
@@ -143,12 +161,12 @@ pub fn encode(values: &[i64]) -> Vec<u8> {
     for i in 2..values.len() {
         let delta = values[i].wrapping_sub(values[i - 1]);
         let dod = delta.wrapping_sub(prev_delta);
-        encode_dod(&mut bs, dod);
+        encode_dod(&mut bs, dod)?;
         prev_delta = delta;
     }
 
     out.extend_from_slice(bs.as_bytes());
-    out
+    Ok(out)
 }
 
 /// Decode DoubleDelta-compressed bytes back to i64 values.
@@ -160,11 +178,20 @@ pub fn decode(data: &[u8]) -> Result<Vec<i64>, CodecError> {
         });
     }
 
-    let count = u32::from_le_bytes(data[0..4].try_into().map_err(|_| CodecError::Corrupt {
-        detail: "invalid header".into(),
-    })?) as usize;
+    let count = u32_to_usize(
+        u32::from_le_bytes(data[0..4].try_into().map_err(|_| CodecError::Corrupt {
+            detail: "invalid header".into(),
+        })?),
+        "DoubleDelta value count",
+    )?;
+    validate_value_count(count, "DoubleDelta")?;
 
     if count == 0 {
+        if data.len() != 4 {
+            return Err(CodecError::Corrupt {
+                detail: "trailing bytes after empty DoubleDelta frame".into(),
+            });
+        }
         return Ok(Vec::new());
     }
 
@@ -184,6 +211,11 @@ pub fn decode(data: &[u8]) -> Result<Vec<i64>, CodecError> {
     values.push(first_value);
 
     if count == 1 {
+        if data.len() != 12 {
+            return Err(CodecError::Corrupt {
+                detail: "trailing bytes after single-value DoubleDelta frame".into(),
+            });
+        }
         return Ok(values);
     }
 
@@ -201,6 +233,11 @@ pub fn decode(data: &[u8]) -> Result<Vec<i64>, CodecError> {
     values.push(first_value.wrapping_add(first_delta));
 
     if count == 2 {
+        if data.len() != 20 {
+            return Err(CodecError::Corrupt {
+                detail: "trailing bytes after two-value DoubleDelta frame".into(),
+            });
+        }
         return Ok(values);
     }
 
@@ -214,6 +251,21 @@ pub fn decode(data: &[u8]) -> Result<Vec<i64>, CodecError> {
         values.push(value);
         prev_delta = delta;
     }
+    let used_bytes = reader.bit_pos.div_ceil(8);
+    if used_bytes != reader.buf.len() {
+        return Err(CodecError::Corrupt {
+            detail: "trailing bytes after DoubleDelta frame".into(),
+        });
+    }
+    if !reader.bit_pos.is_multiple_of(8) {
+        let unused_bits = 8 - reader.bit_pos % 8;
+        let padding_mask = (1u8 << unused_bits) - 1;
+        if reader.buf[used_bytes - 1] & padding_mask != 0 {
+            return Err(CodecError::Corrupt {
+                detail: "nonzero DoubleDelta padding bits".into(),
+            });
+        }
+    }
 
     Ok(values)
 }
@@ -222,21 +274,21 @@ pub fn decode(data: &[u8]) -> Result<Vec<i64>, CodecError> {
 // DoD bit encoding / decoding
 // ---------------------------------------------------------------------------
 
-fn encode_dod(bs: &mut BitWriter, dod: i64) {
+fn encode_dod(bs: &mut BitWriter, dod: i64) -> Result<(), CodecError> {
     if dod == 0 {
-        bs.write_bit(false);
+        bs.try_write_bit(false)
     } else if (-64..=63).contains(&dod) {
-        bs.write_bits(0b10, 2);
-        bs.write_bits((dod as u64) & 0x7F, 7);
+        bs.try_write_bits(0b10, 2)?;
+        bs.try_write_bits((dod as u64) & 0x7F, 7)
     } else if (-256..=255).contains(&dod) {
-        bs.write_bits(0b110, 3);
-        bs.write_bits((dod as u64) & 0x1FF, 9);
+        bs.try_write_bits(0b110, 3)?;
+        bs.try_write_bits((dod as u64) & 0x1FF, 9)
     } else if (-2048..=2047).contains(&dod) {
-        bs.write_bits(0b1110, 4);
-        bs.write_bits((dod as u64) & 0xFFF, 12);
+        bs.try_write_bits(0b1110, 4)?;
+        bs.try_write_bits((dod as u64) & 0xFFF, 12)
     } else {
-        bs.write_bits(0b1111, 4);
-        bs.write_bits(dod as u64, 64);
+        bs.try_write_bits(0b1111, 4)?;
+        bs.try_write_bits(dod as u64, 64)
     }
 }
 
@@ -273,6 +325,17 @@ fn sign_extend(value: i64, bits: u32) -> i64 {
     (value << shift) >> shift
 }
 
+fn encode_value_count(len: usize, codec: &str) -> Result<u32, CodecError> {
+    validate_value_count(len, codec)?;
+    encode_input_len(len, codec)
+}
+
+fn validate_value_count(count: usize, codec: &str) -> Result<(), CodecError> {
+    let bytes = checked_mul(count, size_of::<i64>(), "integer decoded bytes")?;
+    decoded_len(bytes, codec)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Re-export types for lib.rs consistency
 // ---------------------------------------------------------------------------
@@ -291,13 +354,23 @@ impl DoubleDeltaEncoder {
     }
 
     /// Append a single i64 value.
-    pub fn push(&mut self, value: i64) {
+    pub fn push(&mut self, value: i64) -> Result<(), CodecError> {
+        let next = checked_add(self.values.len(), 1, "DoubleDelta streaming count")?;
+        validate_value_count(next, "DoubleDelta streaming input")?;
         self.values.push(value);
+        Ok(())
     }
 
     /// Append a batch of i64 values.
-    pub fn push_batch(&mut self, values: &[i64]) {
+    pub fn push_batch(&mut self, values: &[i64]) -> Result<(), CodecError> {
+        let next = checked_add(
+            self.values.len(),
+            values.len(),
+            "DoubleDelta streaming count",
+        )?;
+        validate_value_count(next, "DoubleDelta streaming input")?;
         self.values.extend_from_slice(values);
+        Ok(())
     }
 
     /// Number of values encoded so far.
@@ -306,7 +379,7 @@ impl DoubleDeltaEncoder {
     }
 
     /// Finish encoding and return compressed bytes.
-    pub fn finish(self) -> Vec<u8> {
+    pub fn finish(self) -> Result<Vec<u8>, CodecError> {
         encode(&self.values)
     }
 }
@@ -355,6 +428,10 @@ impl DoubleDeltaDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode(values: &[i64]) -> Vec<u8> {
+        super::encode(values).expect("test DoubleDelta encode")
+    }
 
     #[test]
     fn empty_roundtrip() {
@@ -471,9 +548,9 @@ mod tests {
 
         let mut enc = DoubleDeltaEncoder::new();
         for &v in &values {
-            enc.push(v);
+            enc.push(v).expect("push");
         }
-        let stream_encoded = enc.finish();
+        let stream_encoded = enc.finish().expect("finish");
 
         assert_eq!(batch_encoded, stream_encoded);
     }
@@ -489,6 +566,25 @@ mod tests {
         }
         assert_eq!(dec.next_value(), None);
         assert_eq!(dec.remaining(), 0);
+    }
+
+    #[test]
+    fn huge_count_and_noncanonical_tail_are_rejected_before_decode_work() {
+        let mut huge = u32::MAX.to_le_bytes().to_vec();
+        huge.extend_from_slice(&[0; 16]);
+        assert!(matches!(
+            decode(&huge),
+            Err(CodecError::ResourceLimit { .. })
+        ));
+
+        let mut one = encode(&[7]);
+        one.push(1);
+        assert!(matches!(decode(&one), Err(CodecError::Corrupt { .. })));
+
+        let mut padded = encode(&[0, 1, 2]);
+        let last = padded.len() - 1;
+        padded[last] |= 1;
+        assert!(matches!(decode(&padded), Err(CodecError::Corrupt { .. })));
     }
 
     #[test]
