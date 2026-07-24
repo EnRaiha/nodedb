@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! SQL string-literal escaping.
+//! Client-compatible alias for the shared SQL literal quoting chokepoint.
 
-/// Render a `&str` as a SQL string literal: single-quote-doubled and
-/// wrapped in single quotes. Matches `standard_conforming_strings=on`
-/// behavior (PG 9.1+ default), the only mode the server runs in.
-///
-/// Centralizes the escape so call sites can't drift into raw `format!`s
-/// without going through it — every `'foo'` written into a SQL string
-/// inside this crate goes through here.
-pub(crate) fn quote_string_literal(s: &str) -> String {
-    let escaped = s.replace('\'', "''");
-    format!("'{escaped}'")
-}
+pub(crate) use nodedb_types::quote_literal as quote_string_literal;
 
 #[cfg(test)]
 mod tests {

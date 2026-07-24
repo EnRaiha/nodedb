@@ -48,6 +48,7 @@ pub mod pg_compat;
 pub mod protocol;
 pub mod result;
 pub mod sparse_vector;
+pub mod sql_quote;
 pub mod surrogate;
 pub mod surrogate_bitmap;
 pub mod sync;
@@ -106,6 +107,7 @@ pub use quota::{
 };
 pub use result::{QueryResult, SearchResult, SubGraph};
 pub use sparse_vector::{SparseVector, SparseVectorError};
+pub use sql_quote::{quote_ident, quote_literal};
 pub use surrogate::Surrogate;
 pub use surrogate_bitmap::SurrogateBitmap;
 pub use sync::compensation::CompensationHint;

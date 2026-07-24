@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! SQL identifier escaping.
+//! Client-compatible alias for the shared SQL identifier quoting chokepoint.
 
-/// Quote a SQL identifier (collection / column name) by doubling any
-/// internal double-quotes and wrapping the result in double-quotes —
-/// the SQL standard rule that PostgreSQL applies under
-/// `standard_conforming_strings=on`.
-pub(crate) fn quote_identifier(name: &str) -> String {
-    let escaped = name.replace('"', "\"\"");
-    format!("\"{escaped}\"")
-}
+pub(crate) use nodedb_types::quote_ident as quote_identifier;
 
 #[cfg(test)]
 mod tests {
