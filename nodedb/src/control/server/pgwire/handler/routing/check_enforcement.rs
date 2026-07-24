@@ -14,6 +14,7 @@ use nodedb_sql::parser::preprocess::lex::{
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
+use crate::control::security::identity::AuthenticatedIdentity;
 use crate::types::TenantId;
 
 use super::super::core::NodeDbPgHandler;
@@ -48,6 +49,7 @@ impl NodeDbPgHandler {
     pub(super) async fn enforce_check_constraints_if_needed(
         &self,
         sql: &str,
+        identity: &AuthenticatedIdentity,
         tenant_id: TenantId,
         database_id: DatabaseId,
     ) -> PgWireResult<()> {
@@ -95,7 +97,8 @@ impl NodeDbPgHandler {
 
         crate::control::server::shared::check_constraint::enforce_check_constraints(
             &self.state,
-            tenant_id,
+            identity,
+            database_id,
             &coll.check_constraints,
             &fields,
         )

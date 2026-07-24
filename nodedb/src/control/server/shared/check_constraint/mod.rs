@@ -12,3 +12,4 @@ mod simple;
 mod subquery;
 
 pub use enforce::enforce_check_constraints;
+pub(crate) use subquery::validate_in_subquery_check;

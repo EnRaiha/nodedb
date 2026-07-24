@@ -113,7 +113,7 @@ impl NodeDbPgHandler {
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
         // Enforce general CHECK constraints for INSERT/UPDATE before planning.
-        self.enforce_check_constraints_if_needed(&clean_sql, tenant_id, database_id)
+        self.enforce_check_constraints_if_needed(&clean_sql, identity, tenant_id, database_id)
             .await?;
 
         // Validate enum-typed column values for INSERT/UPDATE before planning.

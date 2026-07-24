@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use crate::control::security::catalog::types::CheckConstraintDef;
+use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::DdlError;
 use crate::control::state::SharedState;
 
@@ -24,13 +25,14 @@ use super::subquery::enforce_subquery_check;
 ///   dispatch a `SELECT` query, check the result.
 pub async fn enforce_check_constraints(
     state: &SharedState,
-    tenant_id: nodedb_types::TenantId,
+    identity: &AuthenticatedIdentity,
+    database_id: nodedb_types::DatabaseId,
     constraints: &[CheckConstraintDef],
     fields: &HashMap<String, nodedb_types::Value>,
 ) -> Result<(), DdlError> {
     for constraint in constraints {
         if constraint.has_subquery {
-            enforce_subquery_check(state, tenant_id, constraint, fields).await?;
+            enforce_subquery_check(state, identity, database_id, constraint, fields).await?;
         } else {
             enforce_simple_check(constraint, fields)?;
         }

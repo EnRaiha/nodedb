@@ -15,21 +15,19 @@ use super::support::err;
 /// - `expr IN (SELECT col FROM tbl [WHERE ...])`
 /// - `expr NOT IN (SELECT col FROM tbl [WHERE ...])`
 pub(super) fn validate_subquery_pattern(check_sql: &str) -> Result<(), DdlError> {
-    let upper = check_sql.to_uppercase();
-
-    if upper.contains(" IN (SELECT ") || upper.contains(" IN(SELECT ") {
-        return Ok(());
-    }
-
-    Err(err(
-        "0A000",
-        &format!(
-            "unsupported subquery CHECK pattern. \
-             Supported: `expr IN (SELECT col FROM tbl)`, \
-             `expr NOT IN (SELECT col FROM tbl)`. \
-             Got: {check_sql}"
-        ),
-    ))
+    crate::control::server::shared::check_constraint::validate_in_subquery_check(check_sql).map_err(
+        |detail| {
+            err(
+                "0A000",
+                &format!(
+                    "unsupported subquery CHECK pattern. \
+                     Supported: `expr IN (SELECT col FROM tbl)`, \
+                     `expr NOT IN (SELECT col FROM tbl)`. \
+                     Got: {check_sql}. {detail}"
+                ),
+            )
+        },
+    )
 }
 
 /// Strip `NEW.` prefix for validation parsing.
@@ -54,4 +52,15 @@ pub(super) fn strip_new_prefix_for_validation(sql: &str) -> String {
         i += 1;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_compound_subquery_checks_before_persistence() {
+        assert!(validate_subquery_pattern("NEW.role IN (SELECT name FROM roles)").is_ok());
+        assert!(validate_subquery_pattern("NEW.role IN (SELECT name FROM roles) OR true").is_err());
+    }
 }

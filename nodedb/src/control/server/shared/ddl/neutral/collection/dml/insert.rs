@@ -133,7 +133,8 @@ pub async fn insert_document(
             && let Err(e) =
                 crate::control::server::shared::check_constraint::enforce_check_constraints(
                     state,
-                    tenant_id,
+                    identity,
+                    database_id,
                     &coll_def.check_constraints,
                     &fields,
                 )
