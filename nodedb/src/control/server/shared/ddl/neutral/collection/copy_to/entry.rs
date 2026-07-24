@@ -6,7 +6,7 @@
 //! module (now deleted) except for the result type, which is [`DdlResult`] /
 //! [`DdlError`] throughout instead of pgwire `Response` / `PgWireResult`.
 
-use nodedb_types::DatabaseId;
+use nodedb_types::{DatabaseId, quote_ident};
 use std::path::Path;
 
 use sonic_rs;
@@ -92,7 +92,7 @@ pub async fn copy_to_file(
 /// Build a SELECT SQL string from the source.
 fn build_select_sql(source: &CopyToSource) -> Result<String, DdlError> {
     match source {
-        CopyToSource::Collection(coll) => Ok(format!("SELECT * FROM {coll}")),
+        CopyToSource::Collection(coll) => Ok(format!("SELECT * FROM {}", quote_ident(coll))),
         CopyToSource::Query(q) => Ok(q.clone()),
     }
 }
@@ -123,15 +123,18 @@ async fn execute_and_collect(
     identity: &AuthenticatedIdentity,
     select_sql: &str,
 ) -> Result<Vec<serde_json::Value>, DdlError> {
-    let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-    let (tasks, _output_schema) = query_ctx
-        .plan_sql(
+    let (tasks, _output_schema) =
+        crate::control::server::shared::ddl::neutral::planning::plan_authorized_sql(
+            state,
+            identity,
             select_sql,
-            identity.tenant_id,
-            crate::types::DatabaseId::DEFAULT,
+            DatabaseId::DEFAULT,
         )
         .await
-        .map_err(|e| ddl_err("42601", format!("COPY TO: query planning failed: {e}")))?;
+        .map_err(|error| DdlError {
+            sqlstate: error.sqlstate,
+            message: format!("COPY TO: {}", error.message),
+        })?;
 
     let mut all_rows: Vec<serde_json::Value> = Vec::new();
 
@@ -206,4 +209,31 @@ fn validate_path(path: &str) -> Result<(), DdlError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_collection_scan_quotes_identifier() {
+        let sql = build_select_sql(&CopyToSource::Collection(
+            "orders\"; DELETE FROM audit_log; --".to_string(),
+        ))
+        .expect("collection scan SQL builds");
+
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"orders\"\"; DELETE FROM audit_log; --\""
+        );
+    }
+
+    #[test]
+    fn query_source_is_not_reconstructed() {
+        let query = "SELECT * FROM safe_source WHERE note = 'literal'".to_string();
+        assert_eq!(
+            build_select_sql(&CopyToSource::Query(query.clone())).expect("query SQL builds"),
+            query
+        );
+    }
 }

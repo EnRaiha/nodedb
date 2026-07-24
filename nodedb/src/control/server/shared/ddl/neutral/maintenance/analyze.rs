@@ -7,7 +7,7 @@
 //! min/max computation. Results stored in the system catalog for
 //! DataFusion cost-based optimization.
 
-use nodedb_types::DatabaseId;
+use nodedb_types::{DatabaseId, quote_ident};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -54,41 +54,32 @@ pub async fn handle_analyze(
     };
 
     // Dispatch a scan to the Data Plane to collect all rows.
-    let scan_sql = format!("SELECT * FROM {collection}");
-    let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-    let rows = match query_ctx
-        .plan_sql(
+    let scan_sql = format!("SELECT * FROM {}", quote_ident(&collection));
+    let (tasks, _output_schema) =
+        crate::control::server::shared::ddl::neutral::planning::plan_authorized_sql(
+            state,
+            identity,
             &scan_sql,
-            identity.tenant_id,
-            crate::types::DatabaseId::DEFAULT,
+            DatabaseId::DEFAULT,
+        )
+        .await?;
+    let mut rows = Vec::new();
+    for task in tasks {
+        let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+            state,
+            task.tenant_id,
+            task.database_id,
+            task.vshard_id,
+            task.plan,
+            TraceId::ZERO,
         )
         .await
-    {
-        Ok((tasks, _output_schema)) => {
-            let mut json_rows = Vec::new();
-            for task in tasks {
-                let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
-                    state,
-                    task.tenant_id,
-                    task.database_id,
-                    task.vshard_id,
-                    task.plan,
-                    TraceId::ZERO,
-                )
-                .await;
-                if let Ok(resp) = resp
-                    && !resp.payload.is_empty()
-                {
-                    let json = crate::data::executor::response_codec::decode_payload_to_json(
-                        &resp.payload,
-                    );
-                    json_rows.push(json);
-                }
-            }
-            json_rows
+        .map_err(|error| ddl_err("XX000", format!("ANALYZE scan failed: {error}")))?;
+        if !resp.payload.is_empty() {
+            let json = crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
+            rows.push(json);
         }
-        Err(_) => Vec::new(), // Scan failed — store zero stats.
-    };
+    }
 
     let now = now_ms();
 

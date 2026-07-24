@@ -50,6 +50,7 @@ pub mod oidc;
 pub mod org_ddl;
 pub mod period_lock;
 pub mod permission_tree;
+pub mod planning;
 pub mod procedure;
 pub mod query_functions;
 pub mod rate_gate;
