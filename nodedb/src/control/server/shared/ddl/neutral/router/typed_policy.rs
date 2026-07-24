@@ -19,7 +19,7 @@ use super::super::synonym_group;
 pub(super) async fn try_typed(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    sql: &str,
+    _sql: &str,
     database_id: DatabaseId,
     stmt: &NodedbStatement,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
@@ -58,36 +58,25 @@ pub(super) async fn try_typed(
             name,
             collection,
             if_exists,
-        }) => {
-            // IF EXISTS on a non-existing policy short-circuits to the tag,
-            // folded from the pgwire guard (which checks existence against the
-            // identity tenant). The existing case and the non-IF-EXISTS case
-            // fall through to the token-based handler, which re-derives the name
-            // / collection / TENANT override from `parts` exactly as the pgwire
-            // string dispatch did.
-            let tid = identity.tenant_id.as_u64();
-            if *if_exists && !state.rls.policy_exists(tid, collection, name) {
-                return Some(Ok(vec![DdlResult::Status {
-                    command: "DROP RLS POLICY".to_string(),
-                    rows_affected: None,
-                }]));
-            }
-            let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(rls::drop_rls_policy(state, identity, &parts))
-        }
+            tenant_id_override,
+        }) => Some(rls::drop_rls_policy(
+            state,
+            identity,
+            name,
+            collection,
+            *if_exists,
+            *tenant_id_override,
+        )),
 
-        NodedbStatement::Policy(PolicyStmt::ShowRlsPolicies { .. }) => {
-            // The AST recognizes the broader `SHOW RLS POLI…` prefix, but the
-            // pgwire string dispatch only handled `SHOW RLS POLICIES` /
-            // `SHOW RLS POLICY`; narrower inputs fell through to the planner.
-            // Replicate that exact prefix guard by returning None otherwise.
-            let upper = sql.to_uppercase();
-            if !(upper.starts_with("SHOW RLS POLICIES") || upper.starts_with("SHOW RLS POLICY")) {
-                return None;
-            }
-            let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(rls::show_rls_policies(state, identity, &parts))
-        }
+        NodedbStatement::Policy(PolicyStmt::ShowRlsPolicies {
+            collection,
+            tenant_id_override,
+        }) => Some(rls::show_rls_policies(
+            state,
+            identity,
+            collection.as_deref(),
+            *tenant_id_override,
+        )),
 
         NodedbStatement::Policy(PolicyStmt::CreateEnumType { name, labels }) => {
             Some(custom_type::create_enum_type(state, identity, name, labels))

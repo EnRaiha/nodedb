@@ -96,6 +96,33 @@ fn status(command: &str) -> Vec<DdlResult> {
     }]
 }
 
+/// Resolve and authorize the tenant scope for RLS administration.
+///
+/// Tenant administrators may manage only their authenticated tenant. An
+/// explicit cross-tenant target is reserved for superusers.
+fn authorize_rls_scope(
+    identity: &AuthenticatedIdentity,
+    tenant_id_override: Option<u64>,
+) -> Result<u64, DdlError> {
+    if !identity.is_superuser && !identity.roles.contains(&Role::TenantAdmin) {
+        return Err(DdlError {
+            sqlstate: "42501".to_string(),
+            message: "permission denied: requires superuser or tenant_admin".to_string(),
+        });
+    }
+
+    let own_tenant_id = identity.tenant_id.as_u64();
+    let tenant_id = tenant_id_override.unwrap_or(own_tenant_id);
+    if tenant_id != own_tenant_id && !identity.is_superuser {
+        return Err(DdlError {
+            sqlstate: "42501".to_string(),
+            message: "permission denied: cross-tenant RLS administration requires superuser"
+                .to_string(),
+        });
+    }
+    Ok(tenant_id)
+}
+
 /// `CREATE RLS POLICY <name> ON <collection> FOR <read|write|all>
 ///     USING (<predicate>) [RESTRICTIVE] [TENANT <id>] [ON DENY ...]`
 ///
@@ -115,14 +142,7 @@ pub fn create_rls_policy(
         on_deny_raw,
         tenant_id_override,
     } = *req;
-    if !identity.is_superuser && !identity.roles.contains(&Role::TenantAdmin) {
-        return Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: "permission denied: requires superuser or tenant_admin".to_string(),
-        });
-    }
-
-    let tenant_id = tenant_id_override.unwrap_or(identity.tenant_id.as_u64());
+    let tenant_id = authorize_rls_scope(identity, tenant_id_override)?;
 
     let policy_type_label = policy_type_raw.to_uppercase();
     let policy_type = match policy_type_label.as_str() {
@@ -195,7 +215,7 @@ pub fn create_rls_policy(
     let mode_str = if is_restrictive { " RESTRICTIVE" } else { "" };
     state.audit_record(
         AuditEvent::AdminAction,
-        Some(identity.tenant_id),
+        Some(crate::types::TenantId::new(tenant_id)),
         &identity.username,
         &format!(
             "RLS policy '{}' created on '{}' for {}{}",
@@ -206,41 +226,21 @@ pub fn create_rls_policy(
     Ok(status("CREATE RLS POLICY"))
 }
 
-/// `DROP RLS POLICY <name> ON <collection> [TENANT <id>]`
-///
-/// Token-based `parts` parsing is preserved verbatim from the pgwire handler:
-/// `parts[3]` is the name, `parts[5]` the collection, and an optional `TENANT
-/// <id>` token overrides the tenant.
+/// `DROP RLS POLICY <name> ON <collection> [TENANT <id>]`.
 pub fn drop_rls_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    parts: &[&str],
+    name: &str,
+    collection: &str,
+    if_exists: bool,
+    tenant_id_override: Option<u64>,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    if !identity.is_superuser && !identity.roles.contains(&Role::TenantAdmin) {
-        return Err(DdlError {
-            sqlstate: "42501".to_string(),
-            message: "permission denied".to_string(),
-        });
-    }
-
-    if parts.len() < 6 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: DROP RLS POLICY <name> ON <collection>".to_string(),
-        });
-    }
-
-    let name = parts[3];
-    let collection = parts[5];
-
-    let tenant_id = parts
-        .iter()
-        .position(|p| p.to_uppercase() == "TENANT")
-        .and_then(|i| parts.get(i + 1))
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or_else(|| identity.tenant_id.as_u64());
+    let tenant_id = authorize_rls_scope(identity, tenant_id_override)?;
 
     if !state.rls.policy_exists(tenant_id, collection, name) {
+        if if_exists {
+            return Ok(status("DROP RLS POLICY"));
+        }
         return Err(DdlError {
             sqlstate: "42704".to_string(),
             message: format!("RLS policy '{name}' not found on '{collection}'"),
@@ -273,7 +273,7 @@ pub fn drop_rls_policy(
 
     state.audit_record(
         AuditEvent::AdminAction,
-        Some(identity.tenant_id),
+        Some(crate::types::TenantId::new(tenant_id)),
         &identity.username,
         &format!("RLS policy '{name}' dropped from '{collection}'"),
     );
@@ -281,30 +281,16 @@ pub fn drop_rls_policy(
     Ok(status("DROP RLS POLICY"))
 }
 
-/// `SHOW RLS POLICIES [ON <collection>] [TENANT <id>]`
-///
-/// Token-based `parts` parsing is preserved verbatim from the pgwire handler:
-/// an optional `ON <collection>` token filters by collection and an optional
-/// `TENANT <id>` token overrides the tenant.
+/// `SHOW RLS POLICIES [ON <collection>] [TENANT <id>]`.
 pub fn show_rls_policies(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    parts: &[&str],
+    collection: Option<&str>,
+    tenant_id_override: Option<u64>,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let collection = parts
-        .iter()
-        .position(|p| p.to_uppercase() == "ON")
-        .and_then(|i| parts.get(i + 1))
-        .map(|s| s.to_string());
+    let tenant_id = authorize_rls_scope(identity, tenant_id_override)?;
 
-    let tenant_id = parts
-        .iter()
-        .position(|p| p.to_uppercase() == "TENANT")
-        .and_then(|i| parts.get(i + 1))
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or_else(|| identity.tenant_id.as_u64());
-
-    let policies = if let Some(coll) = &collection {
+    let policies = if let Some(coll) = collection {
         state.rls.all_policies(tenant_id, coll)
     } else {
         state.rls.all_policies_for_tenant(tenant_id)
@@ -358,4 +344,46 @@ pub fn show_rls_policies(
         rows,
         notice: None,
     })])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::security::identity::AuthMethod;
+    use crate::types::TenantId;
+
+    fn identity(tenant_id: u64, roles: Vec<Role>, is_superuser: bool) -> AuthenticatedIdentity {
+        AuthenticatedIdentity {
+            user_id: 1,
+            username: "test".to_string(),
+            tenant_id: TenantId::new(tenant_id),
+            auth_method: AuthMethod::Trust,
+            roles,
+            is_superuser,
+            default_database: None,
+            accessible_databases: AuthenticatedIdentity::default_database_set(is_superuser),
+        }
+    }
+
+    #[test]
+    fn rls_scope_requires_admin_and_reserves_cross_tenant_for_superusers() {
+        let ordinary = identity(7, Vec::new(), false);
+        let admin = identity(7, vec![Role::TenantAdmin], false);
+        let superuser = identity(7, Vec::new(), true);
+
+        assert_eq!(
+            authorize_rls_scope(&ordinary, None).unwrap_err().sqlstate,
+            "42501"
+        );
+        assert_eq!(authorize_rls_scope(&admin, None).expect("own tenant"), 7);
+        assert_eq!(authorize_rls_scope(&admin, Some(7)).expect("own tenant"), 7);
+        assert_eq!(
+            authorize_rls_scope(&admin, Some(8)).unwrap_err().sqlstate,
+            "42501"
+        );
+        assert_eq!(
+            authorize_rls_scope(&superuser, Some(8)).expect("superuser"),
+            8
+        );
+    }
 }

@@ -18,9 +18,11 @@ pub enum PolicyStmt {
         name: String,
         collection: String,
         if_exists: bool,
+        tenant_id_override: Option<u64>,
     },
     ShowRlsPolicies {
         collection: Option<String>,
+        tenant_id_override: Option<u64>,
     },
 
     // ── Retention policy ─────────────────────────────────────────

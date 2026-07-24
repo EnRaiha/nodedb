@@ -1,117 +1,46 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parse CREATE/DROP/SHOW RLS POLICY.
+//! Strict parsing for RLS policy DDL.
 
-use super::helpers::{extract_after_keyword, extract_name_after_if_exists};
 use crate::ddl_ast::statement::{NodedbStatement, PolicyStmt};
 use crate::error::SqlError;
 
 pub(super) fn try_parse(
     upper: &str,
-    parts: &[&str],
+    _parts: &[&str],
     trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
-    (|| -> Result<Option<NodedbStatement>, SqlError> {
-        if upper.starts_with("CREATE RLS POLICY ") {
-            return Ok(Some(parse_create_rls_policy(upper, parts, trimmed)));
-        }
-        if upper.starts_with("DROP RLS POLICY ") {
-            let if_exists = upper.contains("IF EXISTS");
-            let name = match extract_name_after_if_exists(parts, "POLICY") {
-                None => return Ok(None),
-                Some(r) => r?,
-            };
-            let collection = extract_after_keyword(parts, "ON").unwrap_or_default();
-            return Ok(Some(NodedbStatement::Policy(PolicyStmt::DropRlsPolicy {
-                name,
-                collection,
-                if_exists,
-            })));
-        }
-        if upper.starts_with("SHOW RLS POLI") {
-            let collection = parts.get(3).map(|s| s.to_string());
-            return Ok(Some(NodedbStatement::Policy(PolicyStmt::ShowRlsPolicies {
-                collection,
-            })));
-        }
-        Ok(None)
-    })()
-    .transpose()
+    if starts_statement(upper, "CREATE RLS POLICY") {
+        Some(parse_create(trimmed))
+    } else if starts_statement(upper, "DROP RLS POLICY") {
+        Some(parse_drop(trimmed))
+    } else if starts_statement(upper, "SHOW RLS POLICY")
+        || starts_statement(upper, "SHOW RLS POLICIES")
+    {
+        Some(parse_show(trimmed))
+    } else {
+        None
+    }
 }
 
-/// `CREATE RLS POLICY <name> ON <collection> FOR <type> USING (<predicate>)
-///     [RESTRICTIVE] [TENANT <id>] [ON DENY ...]`
-///
-/// Extracts all token-level fields. Predicate compilation (AST parse,
-/// auth-ref validation, ScanFilter serialization) is left to the
-/// handler in `nodedb` which has access to the required security types.
-fn parse_create_rls_policy(upper: &str, parts: &[&str], _trimmed: &str) -> NodedbStatement {
-    // parts: CREATE RLS POLICY <name> ON <collection> FOR <type> USING (<pred>) ...
-    // Indices (0-based):  0      1    2      3         4     5     6     7    8     9+
+fn starts_statement(upper: &str, prefix: &str) -> bool {
+    upper
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
+}
 
-    let name = parts.get(3).unwrap_or(&"").to_lowercase();
-    let collection = parts
-        .iter()
-        .position(|p| p.to_uppercase() == "ON")
-        .and_then(|i| parts.get(i + 1))
-        .map(|s| s.to_lowercase())
-        .unwrap_or_default();
+fn parse_create(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let mut rest = statement_suffix(sql, "CREATE RLS POLICY")?;
+    let (name, after_name) = parse_identifier(rest)?;
+    rest = consume_keyword(after_name, "ON")?;
+    let (collection, after_collection) = parse_identifier(rest)?;
+    rest = consume_keyword(after_collection, "FOR")?;
+    let (policy_type, after_type) = parse_keyword_value(rest, &["READ", "WRITE", "ALL"])?;
+    rest = consume_keyword(after_type, "USING")?;
+    let (predicate_raw, after_predicate) = parse_parenthesized(rest)?;
+    let (is_restrictive, tenant_id_override, on_deny_raw) = parse_create_suffix(after_predicate)?;
 
-    // FOR keyword → next token is the policy type.
-    let policy_type = parts
-        .iter()
-        .position(|p| p.to_uppercase() == "FOR")
-        .and_then(|i| parts.get(i + 1))
-        .map(|s| s.to_uppercase())
-        .unwrap_or_else(|| "ALL".to_string());
-
-    // USING keyword → everything up to the next keyword (RESTRICTIVE/TENANT/ON)
-    // is the predicate (including its outer parentheses which we strip).
-    let predicate_raw =
-        if let Some(using_idx) = parts.iter().position(|p| p.to_uppercase() == "USING") {
-            let end = parts[using_idx + 1..]
-                .iter()
-                .position(|p| {
-                    let u = p.to_uppercase();
-                    u == "RESTRICTIVE" || u == "TENANT" || u == "ON"
-                })
-                .map(|i| using_idx + 1 + i)
-                .unwrap_or(parts.len());
-            strip_outer_parens(&parts[using_idx + 1..end].join(" "))
-        } else {
-            // Fall back: look in the upper string between USING( and ) for simple cases.
-            extract_using_from_upper(upper)
-        };
-
-    let is_restrictive = upper.contains("RESTRICTIVE");
-
-    // ON DENY <...> — everything after "ON DENY" up to RESTRICTIVE/TENANT/end.
-    let on_deny_raw = {
-        // Find "ON" followed by "DENY" in parts (not the "ON <collection>" earlier).
-        let deny_pos = parts
-            .windows(2)
-            .position(|w| w[0].to_uppercase() == "ON" && w[1].to_uppercase() == "DENY");
-        deny_pos.map(|pos| {
-            // Collect tokens after DENY until RESTRICTIVE or TENANT.
-            parts[pos + 2..]
-                .iter()
-                .take_while(|p| {
-                    let u = p.to_uppercase();
-                    u != "RESTRICTIVE" && u != "TENANT"
-                })
-                .copied()
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-    };
-
-    let tenant_id_override = parts
-        .iter()
-        .position(|p| p.to_uppercase() == "TENANT")
-        .and_then(|i| parts.get(i + 1))
-        .and_then(|s| s.parse::<u64>().ok());
-
-    NodedbStatement::Policy(PolicyStmt::CreateRlsPolicy {
+    Ok(NodedbStatement::Policy(PolicyStmt::CreateRlsPolicy {
         name,
         collection,
         policy_type,
@@ -119,61 +48,376 @@ fn parse_create_rls_policy(upper: &str, parts: &[&str], _trimmed: &str) -> Noded
         is_restrictive,
         on_deny_raw,
         tenant_id_override,
-    })
+    }))
 }
 
-/// Strip at most one matched pair of outer parentheses.
-fn strip_outer_parens(s: &str) -> String {
-    let trimmed = s.trim();
-    if trimmed.starts_with('(') && trimmed.ends_with(')') {
-        let inner = &trimmed[1..trimmed.len() - 1];
-        let mut depth = 0i32;
-        let mut balanced = true;
-        for ch in inner.chars() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth < 0 {
-                        balanced = false;
-                        break;
-                    }
-                }
-                _ => {}
-            }
+fn parse_drop(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let mut rest = statement_suffix(sql, "DROP RLS POLICY")?;
+    let mut if_exists = false;
+    if starts_keyword(rest, "IF") {
+        rest = consume_keyword(rest, "IF")?;
+        rest = consume_keyword(rest, "EXISTS")?;
+        if_exists = true;
+    }
+    let (name, after_name) = parse_identifier(rest)?;
+    rest = consume_keyword(after_name, "ON")?;
+    let (collection, after_collection) = parse_identifier(rest)?;
+    rest = after_collection.trim_start();
+    if starts_keyword(rest, "IF") {
+        if if_exists {
+            return Err(parse_error("duplicate IF EXISTS clause"));
         }
-        if balanced && depth == 0 {
-            return inner.trim().to_string();
+        rest = consume_keyword(rest, "IF")?;
+        rest = consume_keyword(rest, "EXISTS")?;
+        if_exists = true;
+    }
+    let tenant_id_override = parse_optional_tenant(rest)?;
+
+    Ok(NodedbStatement::Policy(PolicyStmt::DropRlsPolicy {
+        name,
+        collection,
+        if_exists,
+        tenant_id_override,
+    }))
+}
+
+fn parse_show(sql: &str) -> Result<NodedbStatement, SqlError> {
+    let prefix = if starts_statement(&sql.to_uppercase(), "SHOW RLS POLICIES") {
+        "SHOW RLS POLICIES"
+    } else {
+        "SHOW RLS POLICY"
+    };
+    let mut rest = statement_suffix(sql, prefix)?;
+
+    let mut collection = None;
+    if starts_keyword(rest, "ON") {
+        rest = consume_keyword(rest, "ON")?;
+        let (parsed, after_collection) = parse_identifier(rest)?;
+        collection = Some(parsed);
+        rest = after_collection;
+    }
+    let tenant_id_override = parse_optional_tenant(rest)?;
+
+    Ok(NodedbStatement::Policy(PolicyStmt::ShowRlsPolicies {
+        collection,
+        tenant_id_override,
+    }))
+}
+
+fn parse_create_suffix(input: &str) -> Result<(bool, Option<u64>, Option<String>), SqlError> {
+    let mut rest = input.trim_start();
+    let mut restrictive = false;
+    if starts_keyword(rest, "RESTRICTIVE") {
+        rest = consume_keyword(rest, "RESTRICTIVE")?;
+        restrictive = true;
+    }
+    let (tenant_id_override, after_tenant) = parse_optional_tenant_prefix(rest)?;
+    rest = after_tenant;
+
+    let on_deny_raw = if rest.is_empty() || rest == ";" {
+        None
+    } else {
+        rest = consume_keyword(rest, "ON")?;
+        rest = consume_keyword(rest, "DENY")?;
+        let raw = trim_statement_end(rest)?;
+        if raw.is_empty() {
+            return Err(parse_error("ON DENY requires a mode"));
+        }
+        Some(raw.to_string())
+    };
+    Ok((restrictive, tenant_id_override, on_deny_raw))
+}
+
+fn parse_optional_tenant(input: &str) -> Result<Option<u64>, SqlError> {
+    let (tenant, rest) = parse_optional_tenant_prefix(input)?;
+    ensure_end(rest)?;
+    Ok(tenant)
+}
+
+fn parse_optional_tenant_prefix(input: &str) -> Result<(Option<u64>, &str), SqlError> {
+    let rest = input.trim_start();
+    if !starts_keyword(rest, "TENANT") {
+        return Ok((None, rest));
+    }
+    let after_tenant = consume_keyword(rest, "TENANT")?;
+    let end = after_tenant
+        .char_indices()
+        .find_map(|(index, ch)| (ch.is_whitespace() || ch == ';').then_some(index))
+        .unwrap_or(after_tenant.len());
+    let raw = &after_tenant[..end];
+    if raw.is_empty() {
+        return Err(parse_error("TENANT requires an unsigned integer ID"));
+    }
+    let tenant = raw
+        .parse::<u64>()
+        .map_err(|_| parse_error("TENANT requires an unsigned integer ID"))?;
+    Ok((Some(tenant), &after_tenant[end..]))
+}
+
+fn statement_suffix<'a>(sql: &'a str, prefix: &str) -> Result<&'a str, SqlError> {
+    let sql = sql.trim();
+    let matched = sql
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .ok_or_else(|| parse_error(format!("expected {prefix}")))?;
+    let rest = &sql[matched.len()..];
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return Err(parse_error(format!("expected tokens after {prefix}")));
+    }
+    Ok(rest.trim_start())
+}
+
+fn starts_keyword(input: &str, keyword: &str) -> bool {
+    input
+        .get(..keyword.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
+        && !input[keyword.len()..]
+            .chars()
+            .next()
+            .is_some_and(is_identifier_char)
+}
+
+fn consume_keyword<'a>(input: &'a str, keyword: &str) -> Result<&'a str, SqlError> {
+    let input = input.trim_start();
+    if !starts_keyword(input, keyword) {
+        return Err(parse_error(format!("expected {keyword}")));
+    }
+    Ok(input[keyword.len()..].trim_start())
+}
+
+fn parse_keyword_value<'a>(
+    input: &'a str,
+    allowed: &[&str],
+) -> Result<(String, &'a str), SqlError> {
+    let end = input
+        .char_indices()
+        .find_map(|(index, ch)| (!is_identifier_char(ch)).then_some(index))
+        .unwrap_or(input.len());
+    let value = &input[..end];
+    let normalized = value.to_uppercase();
+    if !allowed.contains(&normalized.as_str()) {
+        return Err(parse_error("expected READ, WRITE, or ALL"));
+    }
+    Ok((normalized, &input[end..]))
+}
+
+fn parse_identifier(input: &str) -> Result<(String, &str), SqlError> {
+    let input = input.trim_start();
+    if let Some(mut rest) = input.strip_prefix('"') {
+        let mut value = String::new();
+        loop {
+            let Some(ch) = rest.chars().next() else {
+                return Err(parse_error("unterminated quoted identifier"));
+            };
+            rest = &rest[ch.len_utf8()..];
+            if ch == '"' {
+                if let Some(next) = rest.strip_prefix('"') {
+                    value.push('"');
+                    rest = next;
+                } else {
+                    if value.is_empty() || value.chars().any(char::is_control) {
+                        return Err(parse_error("invalid quoted identifier"));
+                    }
+                    return Ok((value, rest));
+                }
+            } else {
+                value.push(ch);
+            }
         }
     }
-    trimmed.to_string()
+
+    let end = input
+        .char_indices()
+        .find_map(|(index, ch)| (!is_identifier_char(ch)).then_some(index))
+        .unwrap_or(input.len());
+    let name = &input[..end];
+    if name.is_empty()
+        || !name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
+    {
+        return Err(parse_error("invalid identifier"));
+    }
+    Ok((name.to_lowercase(), &input[end..]))
 }
 
-/// Fallback: extract predicate text from the uppercased SQL string when
-/// USING appears without space-separated parts matching (e.g. `USING(x=1)`).
-fn extract_using_from_upper(upper: &str) -> String {
-    let Some(start) = upper.find("USING") else {
-        return String::new();
-    };
-    let after = &upper[start + 5..].trim_start();
-    if after.starts_with('(') {
-        let mut depth = 0usize;
-        let mut end = 0;
-        for (i, ch) in after.char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i;
-                        break;
-                    }
+fn parse_parenthesized(input: &str) -> Result<(String, &str), SqlError> {
+    let input = input.trim_start();
+    if !input.starts_with('(') {
+        return Err(parse_error("expected '(' after USING"));
+    }
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut index = 0usize;
+    while index < input.len() {
+        let ch = input[index..]
+            .chars()
+            .next()
+            .ok_or_else(|| parse_error("invalid predicate"))?;
+        let next = index + ch.len_utf8();
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                if input[next..].starts_with(delimiter) {
+                    index = next + delimiter.len_utf8();
+                    continue;
                 }
-                _ => {}
+                quote = None;
             }
+            index = next;
+            continue;
         }
-        after[1..end].trim().to_string()
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| parse_error("USING predicate nesting overflow"))?;
+            }
+            ')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| parse_error("unexpected ')' in USING predicate"))?;
+                if depth == 0 {
+                    return Ok((input[1..index].trim().to_string(), &input[next..]));
+                }
+            }
+            _ => {}
+        }
+        index = next;
+    }
+    Err(parse_error(if quote.is_some() {
+        "unterminated quoted predicate"
     } else {
-        String::new()
+        "missing ')' after USING predicate"
+    }))
+}
+
+fn trim_statement_end(input: &str) -> Result<&str, SqlError> {
+    let trimmed = input.trim();
+    let mut quote: Option<char> = None;
+    for (index, ch) in trimmed.char_indices() {
+        if let Some(delimiter) = quote {
+            if ch == delimiter {
+                quote = None;
+            }
+        } else if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch == ';' && index + ch.len_utf8() != trimmed.len() {
+            return Err(parse_error("unexpected statement separator"));
+        }
+    }
+    if quote.is_some() {
+        return Err(parse_error("unterminated ON DENY quoted text"));
+    }
+    Ok(trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end())
+}
+
+fn ensure_end(input: &str) -> Result<(), SqlError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed == ";" {
+        Ok(())
+    } else {
+        Err(parse_error("unexpected trailing tokens in RLS statement"))
+    }
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_alphanumeric()
+}
+
+fn parse_error(detail: impl Into<String>) -> SqlError {
+    SqlError::Parse {
+        detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_preserves_quoted_identifiers_and_balanced_predicate() {
+        let statement = parse_create(
+            "CREATE RLS POLICY \"Read Own\" ON \"Sales Data\" FOR READ USING ((owner = auth.user_id) AND note = 'x) y') RESTRICTIVE TENANT 42 ON DENY SILENT",
+        )
+        .expect("RLS CREATE parses");
+        let NodedbStatement::Policy(PolicyStmt::CreateRlsPolicy {
+            name,
+            collection,
+            predicate_raw,
+            tenant_id_override,
+            ..
+        }) = statement
+        else {
+            panic!("expected create")
+        };
+        assert_eq!(name, "Read Own");
+        assert_eq!(collection, "Sales Data");
+        assert_eq!(predicate_raw, "(owner = auth.user_id) AND note = 'x) y'");
+        assert_eq!(tenant_id_override, Some(42));
+    }
+
+    #[test]
+    fn drop_and_show_preserve_tenant_override_and_quoted_names() {
+        let drop = parse_drop("DROP RLS POLICY IF EXISTS \"Read Own\" ON \"Sales Data\" TENANT 42")
+            .expect("drop parses");
+        let NodedbStatement::Policy(PolicyStmt::DropRlsPolicy {
+            name,
+            collection,
+            tenant_id_override,
+            if_exists,
+        }) = drop
+        else {
+            panic!("expected drop")
+        };
+        assert_eq!(
+            (name, collection, tenant_id_override, if_exists),
+            ("Read Own".into(), "Sales Data".into(), Some(42), true)
+        );
+
+        let trailing_if_exists =
+            parse_drop("DROP RLS POLICY \"Read Own\" ON \"Sales Data\" IF EXISTS TENANT 42")
+                .expect("trailing IF EXISTS parses");
+        let NodedbStatement::Policy(PolicyStmt::DropRlsPolicy {
+            if_exists,
+            tenant_id_override,
+            ..
+        }) = trailing_if_exists
+        else {
+            panic!("expected drop")
+        };
+        assert!(if_exists);
+        assert_eq!(tenant_id_override, Some(42));
+
+        let show =
+            parse_show("SHOW RLS POLICIES ON \"Sales Data\" TENANT 42").expect("show parses");
+        let NodedbStatement::Policy(PolicyStmt::ShowRlsPolicies {
+            collection,
+            tenant_id_override,
+        }) = show
+        else {
+            panic!("expected show")
+        };
+        assert_eq!(collection.as_deref(), Some("Sales Data"));
+        assert_eq!(tenant_id_override, Some(42));
+    }
+
+    #[test]
+    fn parser_rejects_malformed_or_ambiguous_suffixes() {
+        for sql in [
+            "CREATE RLS POLICY p ON c FOR READ USING (x = 1) TENANT",
+            "CREATE RLS POLICY p ON c FOR READ USING (x = 1) TENANT 1 TENANT 2",
+            "DROP RLS POLICY p ON c TENANT nope",
+            "SHOW RLS POLICIES TENANT 1 trailing",
+            "CREATE RLS POLICY p ON c FOR READ USING (x = 1) ON DENY",
+        ] {
+            assert!(
+                try_parse(&sql.to_uppercase(), &[], sql)
+                    .expect("recognized")
+                    .is_err(),
+                "{sql}"
+            );
+        }
     }
 }
