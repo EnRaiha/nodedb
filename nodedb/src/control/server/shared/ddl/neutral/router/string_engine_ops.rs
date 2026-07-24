@@ -171,9 +171,8 @@ pub(super) async fn try_string(
     // before the parse gate, so the prefix recognition and the `parts`-based name
     // extraction stay byte-identical. `CREATE` / `DROP MATERIALIZED VIEW` are
     // handled in the typed match below (they parse into typed StreamView variants).
-    if upper.starts_with("REFRESH MATERIALIZED VIEW ") {
-        let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(materialized_view::refresh_materialized_view(state, identity, &parts).await);
+    if upper.starts_with("REFRESH MATERIALIZED VIEW") {
+        return Some(materialized_view::refresh_materialized_view(state, identity, sql).await);
     }
     if upper.starts_with("SHOW MATERIALIZED VIEW") {
         let parts: Vec<&str> = sql.split_whitespace().collect();

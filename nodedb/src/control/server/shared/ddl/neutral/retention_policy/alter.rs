@@ -31,6 +31,16 @@ fn err(sqlstate: &str, message: String) -> DdlError {
     }
 }
 
+fn parse_auto_tier(value: &str) -> Result<bool, DdlError> {
+    if value.eq_ignore_ascii_case("TRUE") {
+        Ok(true)
+    } else if value.eq_ignore_ascii_case("FALSE") {
+        Ok(false)
+    } else {
+        Err(err("42601", "AUTO_TIER must be TRUE or FALSE".to_string()))
+    }
+}
+
 /// Handle `ALTER RETENTION POLICY <name> ENABLE | DISABLE | SET <key> = <value>`.
 ///
 /// `name`, `action`, `set_key`, and `set_value` come from the typed
@@ -63,7 +73,7 @@ pub fn alter_retention_policy(
             let val = set_value.unwrap_or("");
             match key {
                 "AUTO_TIER" => {
-                    def.auto_tier = val.eq_ignore_ascii_case("TRUE");
+                    def.auto_tier = parse_auto_tier(val)?;
                 }
                 "EVAL_INTERVAL" => {
                     let ms = nodedb_types::kv_parsing::parse_interval_to_ms(val)
@@ -104,4 +114,19 @@ pub fn alter_retention_policy(
         command: "ALTER RETENTION POLICY".to_string(),
         rows_affected: None,
     }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_tier_parser_accepts_only_boolean_keywords() {
+        assert!(parse_auto_tier("TRUE").expect("true parses"));
+        assert!(!parse_auto_tier("false").expect("false parses"));
+        for value in ["", "1", "yes", "TRUE trailing", " false "] {
+            let error = parse_auto_tier(value).expect_err("invalid boolean rejects");
+            assert_eq!(error.sqlstate, "42601", "{value}");
+        }
+    }
 }

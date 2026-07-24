@@ -1,20 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! SQL parsing helpers for retention policy DDL.
-//!
-//! Ported verbatim from the pgwire `ddl::retention_policy::parse` helper; only
-//! the error type changed from pgwire `PgWireError` to the protocol-neutral
-//! [`DdlError`]. Every parse rule, SQLSTATE, and message is preserved.
+mod lex;
 
+use self::lex::{
+    consume_keyword, find_matching_paren, parse_identifier_token, parse_single_quoted_string,
+    split_top_level_commas,
+};
+use super::super::super::result::DdlError;
 use crate::engine::timeseries::continuous_agg::{AggFunction, AggregateExpr};
 use crate::engine::timeseries::retention_policy::types::{
     ArchiveTarget, RetentionPolicyDef, TierDef,
 };
-use nodedb_sql::parser::preprocess::lex::{
-    find_ascii_case_insensitive, find_ascii_case_insensitive_from,
-};
-
-use super::super::super::result::DdlError;
 
 fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError {
@@ -31,38 +27,40 @@ pub(super) struct ParsedRetentionPolicy {
     pub eval_interval_ms: u64,
 }
 
-/// Parse the CREATE RETENTION POLICY SQL.
 pub(super) fn parse_create_retention_policy(sql: &str) -> Result<ParsedRetentionPolicy, DdlError> {
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
-
-    // Extract name: "CREATE RETENTION POLICY <name> ON ..."
-    let prefix = "CREATE RETENTION POLICY ";
-    if !upper.starts_with(prefix) {
-        return Err(err("42601", "expected CREATE RETENTION POLICY".to_string()));
+    let trimmed = sql.trim();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    const PREFIX: &str = "CREATE RETENTION POLICY";
+    let prefix = trimmed
+        .get(..PREFIX.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(PREFIX))
+        .ok_or_else(|| err("42601", "expected CREATE RETENTION POLICY".to_string()))?;
+    if prefix.len() == trimmed.len()
+        || !trimmed[PREFIX.len()..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
+        return Err(err("42601", "expected policy name".to_string()));
     }
-    let after_prefix = &trimmed[prefix.len()..];
-    let name = after_prefix
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| err("42601", "missing policy name".to_string()))?
-        .to_lowercase();
 
-    // Extract collection: "... ON <collection> (...)"
-    let on_pos = find_ascii_case_insensitive_from(trimmed, " ON ", prefix.len())
-        .ok_or_else(|| err("42601", "expected ON <collection>".to_string()))?;
-    let after_on = trimmed[on_pos + 4..].trim_start();
-    let collection = after_on
-        .split(|c: char| c.is_whitespace() || c == '(')
-        .next()
-        .ok_or_else(|| err("42601", "missing collection name".to_string()))?
-        .to_lowercase();
+    let (name, after_name) = parse_identifier_token(trimmed[PREFIX.len()..].trim_start())?;
+    if !after_name.chars().next().is_some_and(char::is_whitespace) {
+        return Err(err("42601", "expected ON <collection>".to_string()));
+    }
+    let after_on = consume_keyword(after_name.trim_start(), "ON")?;
+    let (collection, after_collection) = parse_identifier_token(after_on)?;
+    let after_collection = after_collection.trim_start();
+    if !after_collection.starts_with('(') {
+        return Err(err(
+            "42601",
+            "expected '(' after collection name".to_string(),
+        ));
+    }
 
     // Find the tier body between balanced outer parentheses.
-    let body_start = trimmed
-        .find('(')
-        .ok_or_else(|| err("42601", "expected '(' after collection name".to_string()))?;
-    let body_end = find_matching_paren(trimmed, body_start)
+    let body_start = trimmed.len() - after_collection.len();
+    let body_end = find_matching_paren(trimmed, body_start)?
         .ok_or_else(|| err("42601", "missing closing ')'".to_string()))?;
     if body_end <= body_start {
         return Err(err("42601", "empty tier definition body".to_string()));
@@ -84,7 +82,7 @@ pub(super) fn parse_create_retention_policy(sql: &str) -> Result<ParsedRetention
     let tier_count = tiers.len();
 
     // Parse optional WITH clause after the closing ')'.
-    let eval_interval_ms = parse_with_clause(trimmed, body_end);
+    let eval_interval_ms = parse_with_clause(trimmed, body_end)?;
 
     Ok(ParsedRetentionPolicy {
         name,
@@ -95,204 +93,197 @@ pub(super) fn parse_create_retention_policy(sql: &str) -> Result<ParsedRetention
     })
 }
 
-/// Parse the tier definitions from the body between outer parentheses.
-///
-/// Handles: RAW RETAIN, DOWNSAMPLE TO, ARCHIVE TO.
-/// Splits on top-level commas (respecting nested parentheses).
 fn parse_tiers(body: &str) -> Result<Vec<TierDef>, DdlError> {
-    let clauses = split_top_level_commas(body);
     let mut tiers = Vec::new();
-    let mut tier_index = 0u32;
+    let mut archive_seen = false;
 
-    for clause in &clauses {
+    for clause in split_top_level_commas(body)? {
         let clause = clause.trim();
         if clause.is_empty() {
-            continue;
+            return Err(err("42601", "empty tier clause".to_string()));
         }
-        let upper = clause.to_uppercase();
+        if archive_seen {
+            return Err(err(
+                "42601",
+                "ARCHIVE TO must be the final tier clause".to_string(),
+            ));
+        }
 
-        if upper.starts_with("RAW") {
-            let retain_ms = extract_retain(clause)?;
+        if let Ok(after_raw) = consume_keyword(clause, "RAW") {
+            if !tiers.is_empty() {
+                return Err(err(
+                    "42601",
+                    "RAW must appear exactly once as the first tier".to_string(),
+                ));
+            }
+            let retain_ms = parse_retain_clause(after_raw)?;
             tiers.push(TierDef {
-                tier_index,
+                tier_index: 0,
                 resolution_ms: 0,
                 aggregates: Vec::new(),
                 retain_ms,
                 archive: None,
             });
-            tier_index += 1;
-        } else if upper.starts_with("DOWNSAMPLE") {
-            let resolution_ms = extract_downsample_interval(clause)?;
-            let aggregates = extract_tier_aggregates(clause)?;
-            if aggregates.is_empty() {
+            continue;
+        }
+
+        if let Ok(after_downsample) = consume_keyword(clause, "DOWNSAMPLE") {
+            if tiers.is_empty() {
                 return Err(err(
                     "42601",
-                    "DOWNSAMPLE tier requires at least one AGGREGATE".to_string(),
+                    "DOWNSAMPLE must follow the RAW tier".to_string(),
                 ));
             }
-            let retain_ms = extract_retain(clause)?;
+            let after_to = consume_keyword(after_downsample, "TO")?;
+            let (interval, after_interval) = parse_single_quoted_string(after_to)?;
+            let resolution_ms =
+                nodedb_types::kv_parsing::parse_interval_to_ms(&interval).map_err(|error| {
+                    err(
+                        "42601",
+                        format!("invalid downsample interval '{interval}': {error}"),
+                    )
+                })?;
+            if resolution_ms == 0 {
+                return Err(err(
+                    "42601",
+                    "DOWNSAMPLE resolution must be greater than zero".to_string(),
+                ));
+            }
+            let after_aggregate = consume_keyword(after_interval.trim_start(), "AGGREGATE")?;
+            let (aggregates, after_aggregates) = parse_aggregate_list(after_aggregate)?;
+            let retain_ms = parse_retain_clause(after_aggregates)?;
             tiers.push(TierDef {
-                tier_index,
+                tier_index: tiers.len() as u32,
                 resolution_ms,
                 aggregates,
                 retain_ms,
                 archive: None,
             });
-            tier_index += 1;
-        } else if upper.starts_with("ARCHIVE") {
-            let url = extract_archive_url(clause)?;
-            if let Some(last) = tiers.last_mut() {
-                last.archive = Some(ArchiveTarget::S3 { url });
-            } else {
+            continue;
+        }
+
+        if let Ok(after_archive) = consume_keyword(clause, "ARCHIVE") {
+            let after_to = consume_keyword(after_archive, "TO")?;
+            let (url, trailing) = parse_single_quoted_string(after_to)?;
+            if !trailing.trim().is_empty() {
                 return Err(err(
                     "42601",
-                    "ARCHIVE TO must follow at least one tier".to_string(),
+                    "unexpected tokens after ARCHIVE URL".to_string(),
                 ));
             }
-        } else {
-            return Err(err(
-                "42601",
-                format!(
-                    "unexpected tier clause: {}",
-                    &clause[..clause.len().min(40)]
-                ),
-            ));
+            let last = tiers.last_mut().ok_or_else(|| {
+                err(
+                    "42601",
+                    "ARCHIVE TO must follow at least one tier".to_string(),
+                )
+            })?;
+            if last.archive.is_some() {
+                return Err(err("42601", "duplicate ARCHIVE TO clause".to_string()));
+            }
+            last.archive = Some(ArchiveTarget::S3 { url });
+            archive_seen = true;
+            continue;
         }
+
+        let preview: String = clause.chars().take(40).collect();
+        return Err(err("42601", format!("unexpected tier clause: {preview}")));
     }
 
     Ok(tiers)
 }
 
-/// Split on commas that are NOT inside parentheses.
-fn split_top_level_commas(s: &str) -> Vec<&str> {
-    let mut results = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0;
-
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                results.push(&s[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
+fn parse_retain_clause(input: &str) -> Result<u64, DdlError> {
+    let after_retain = consume_keyword(input.trim_start(), "RETAIN")?;
+    let (value, trailing) = parse_single_quoted_string(after_retain)?;
+    if !trailing.trim().is_empty() {
+        return Err(err(
+            "42601",
+            "unexpected tokens after RETAIN duration".to_string(),
+        ));
     }
-    if start < s.len() {
-        results.push(&s[start..]);
-    }
-    results
-}
-
-/// Extract RETAIN '<duration>' → milliseconds.
-fn extract_retain(clause: &str) -> Result<u64, DdlError> {
-    let pos = find_ascii_case_insensitive(clause, "RETAIN")
-        .ok_or_else(|| err("42601", "missing RETAIN clause".to_string()))?;
-    let after = clause[pos + 6..].trim_start();
-    let val = extract_quoted_string(after)?;
-
-    if val.eq_ignore_ascii_case("forever") {
+    if value.eq_ignore_ascii_case("forever") {
         return Ok(0);
     }
-
-    nodedb_types::kv_parsing::parse_interval_to_ms(&val)
-        .map_err(|e| err("42601", format!("invalid retain duration '{val}': {e}")))
+    nodedb_types::kv_parsing::parse_interval_to_ms(&value).map_err(|error| {
+        err(
+            "42601",
+            format!("invalid retain duration '{value}': {error}"),
+        )
+    })
 }
 
-/// Extract DOWNSAMPLE TO '<interval>' → milliseconds.
-fn extract_downsample_interval(clause: &str) -> Result<u64, DdlError> {
-    let pos = find_ascii_case_insensitive(clause, "TO")
-        .ok_or_else(|| err("42601", "expected DOWNSAMPLE TO '<interval>'".to_string()))?;
-    let after = clause[pos + 2..].trim_start();
-    let val = extract_quoted_string(after)?;
-
-    nodedb_types::kv_parsing::parse_interval_to_ms(&val)
-        .map_err(|e| err("42601", format!("invalid downsample interval '{val}': {e}")))
-}
-
-/// Extract ARCHIVE TO '<url>'.
-fn extract_archive_url(clause: &str) -> Result<String, DdlError> {
-    let pos = find_ascii_case_insensitive(clause, "TO")
-        .ok_or_else(|| err("42601", "expected ARCHIVE TO '<url>'".to_string()))?;
-    let after = clause[pos + 2..].trim_start();
-    extract_quoted_string(after)
-}
-
-/// Extract aggregate expressions from AGGREGATE (...) in a tier clause.
-fn extract_tier_aggregates(clause: &str) -> Result<Vec<AggregateExpr>, DdlError> {
-    let agg_pos = match find_ascii_case_insensitive(clause, "AGGREGATE") {
-        Some(p) => p,
-        None => return Ok(Vec::new()),
-    };
-    let after_agg = &clause[agg_pos + 9..].trim_start();
-
-    let open = after_agg
-        .find('(')
-        .ok_or_else(|| err("42601", "expected '(' after AGGREGATE".to_string()))?;
-
-    let close = find_matching_paren(after_agg, open).ok_or_else(|| {
+fn parse_aggregate_list(input: &str) -> Result<(Vec<AggregateExpr>, &str), DdlError> {
+    let input = input.trim_start();
+    if !input.starts_with('(') {
+        return Err(err("42601", "expected '(' after AGGREGATE".to_string()));
+    }
+    let close = find_matching_paren(input, 0)?.ok_or_else(|| {
         err(
             "42601",
             "missing ')' after AGGREGATE expressions".to_string(),
         )
     })?;
-    if close <= open + 1 {
+    let expressions = &input[1..close];
+    if expressions.trim().is_empty() {
         return Err(err("42601", "empty AGGREGATE expression list".to_string()));
     }
 
-    let inner = &after_agg[open + 1..close];
-    let mut exprs = Vec::new();
-
-    for part in inner.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
+    let mut aggregates = Vec::new();
+    for expression in split_top_level_commas(expressions)? {
+        let expression = expression.trim();
+        if expression.is_empty() {
+            return Err(err("42601", "empty AGGREGATE expression".to_string()));
         }
-        let expr = parse_agg_expr(part)?;
-        exprs.push(expr);
+        aggregates.push(parse_agg_expr(expression)?);
     }
-
-    Ok(exprs)
+    Ok((aggregates, &input[close + 1..]))
 }
 
-/// Find the index of the closing paren that matches the opening paren at `open`.
-fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (i, ch) in s[open..].char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Parse a single aggregate expression: `func(col)` or `func(col) AS alias`.
 pub(super) fn parse_agg_expr(s: &str) -> Result<AggregateExpr, DdlError> {
-    let (func_part, alias) = if let Some(as_pos) = find_ascii_case_insensitive(s, " AS ") {
-        (&s[..as_pos], Some(s[as_pos + 4..].trim().to_lowercase()))
-    } else {
-        (s, None)
-    };
-    let func_part = func_part.trim();
-
-    let open = func_part
+    let expression = s.trim();
+    let open = expression
         .find('(')
         .ok_or_else(|| err("42601", format!("expected func(col): {s}")))?;
-    let close = func_part
-        .rfind(')')
+    let close = find_matching_paren(expression, open)?
         .ok_or_else(|| err("42601", format!("missing ')': {s}")))?;
 
-    let func_name = func_part[..open].trim().to_lowercase();
-    let col_name = func_part[open + 1..close].trim().to_lowercase();
+    let func_name = expression[..open].trim().to_lowercase();
+    if func_name.is_empty()
+        || !func_name
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return Err(err("42601", format!("invalid aggregate function: {s}")));
+    }
+
+    let argument = expression[open + 1..close].trim();
+    let col_name = if argument == "*" {
+        "*".to_string()
+    } else {
+        let (column, trailing) = parse_identifier_token(argument)?;
+        if !trailing.trim().is_empty() {
+            return Err(err(
+                "42601",
+                format!("invalid aggregate column: {argument}"),
+            ));
+        }
+        column
+    };
+
+    let trailing = expression[close + 1..].trim();
+    let alias = if trailing.is_empty() {
+        None
+    } else {
+        let alias_input = consume_keyword(trailing, "AS")?;
+        let (alias, rest) = parse_identifier_token(alias_input)?;
+        if !rest.trim().is_empty() {
+            return Err(err(
+                "42601",
+                "unexpected tokens after aggregate alias".to_string(),
+            ));
+        }
+        Some(alias)
+    };
 
     let function = match func_name.as_str() {
         "sum" => AggFunction::Sum,
@@ -323,48 +314,39 @@ pub(super) fn parse_agg_expr(s: &str) -> Result<AggregateExpr, DdlError> {
     })
 }
 
-/// Extract a single-quoted string value.
-fn extract_quoted_string(s: &str) -> Result<String, DdlError> {
-    let start = s
-        .find('\'')
-        .ok_or_else(|| err("42601", "expected quoted string".to_string()))?;
-    let end = s[start + 1..]
-        .find('\'')
-        .ok_or_else(|| err("42601", "missing closing quote".to_string()))?;
-    Ok(s[start + 1..start + 1 + end].to_string())
-}
-
-/// Parse optional WITH (EVAL_INTERVAL = '<duration>') after closing ')'.
-fn parse_with_clause(sql: &str, body_end: usize) -> u64 {
-    let after_body = &sql[body_end + 1..];
-    let with_pos = match find_ascii_case_insensitive(after_body, "WITH") {
-        Some(p) => p,
-        None => return RetentionPolicyDef::DEFAULT_EVAL_INTERVAL_MS,
-    };
-    let after_with = after_body[with_pos + 4..].trim_start();
-    let inner = match after_with
-        .strip_prefix('(')
-        .and_then(|s| s.split_once(')'))
-        .map(|(inner, _)| inner)
-    {
-        Some(inner) => inner,
-        None => return RetentionPolicyDef::DEFAULT_EVAL_INTERVAL_MS,
-    };
-
-    for pair in inner.split(',') {
-        let pair = pair.trim();
-        if let Some((key, val)) = pair.split_once('=') {
-            let key = key.trim().to_uppercase();
-            let val = val.trim().trim_matches('\'').trim_matches('"');
-            if key == "EVAL_INTERVAL"
-                && let Ok(ms) = nodedb_types::kv_parsing::parse_interval_to_ms(val)
-            {
-                return ms;
-            }
-        }
+fn parse_with_clause(sql: &str, body_end: usize) -> Result<u64, DdlError> {
+    let after_body = sql[body_end + 1..].trim();
+    if after_body.is_empty() {
+        return Ok(RetentionPolicyDef::DEFAULT_EVAL_INTERVAL_MS);
     }
-
-    RetentionPolicyDef::DEFAULT_EVAL_INTERVAL_MS
+    let after_with = consume_keyword(after_body, "WITH")?;
+    let inner = after_with
+        .trim_start()
+        .strip_prefix('(')
+        .ok_or_else(|| err("42601", "expected '(' after WITH".to_string()))?;
+    let after_key = consume_keyword(inner.trim_start(), "EVAL_INTERVAL")?;
+    let after_equals = after_key
+        .trim_start()
+        .strip_prefix('=')
+        .ok_or_else(|| err("42601", "expected '=' after EVAL_INTERVAL".to_string()))?;
+    let (interval, after_interval) = parse_single_quoted_string(after_equals.trim_start())?;
+    let trailing = after_interval.trim_start();
+    let trailing = trailing
+        .strip_prefix(')')
+        .ok_or_else(|| err("42601", "expected ')' after EVAL_INTERVAL".to_string()))?
+        .trim();
+    if !trailing.is_empty() {
+        return Err(err(
+            "42601",
+            "unexpected trailing tokens in WITH clause".to_string(),
+        ));
+    }
+    nodedb_types::kv_parsing::parse_interval_to_ms(&interval).map_err(|error| {
+        err(
+            "42601",
+            format!("invalid EVAL_INTERVAL '{interval}': {error}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -425,6 +407,31 @@ mod tests {
     }
 
     #[test]
+    fn quoted_identifiers_round_trip_and_decode_doubled_quotes() {
+        let parsed = parse_create_retention_policy(
+            "CREATE RETENTION POLICY \"Policy Name\" ON \"Metrics \"\"Primary\"\"\" (RAW RETAIN '7d')",
+        )
+        .expect("quoted identifiers parse");
+        assert_eq!(parsed.name, "Policy Name");
+        assert_eq!(parsed.collection, "Metrics \"Primary\"");
+    }
+
+    #[test]
+    fn malformed_with_clause_never_falls_back_to_default() {
+        for sql in [
+            "CREATE RETENTION POLICY p ON metrics (RAW RETAIN '7d') WITH",
+            "CREATE RETENTION POLICY p ON metrics (RAW RETAIN '7d') WITH (OTHER = '1h')",
+            "CREATE RETENTION POLICY p ON metrics (RAW RETAIN '7d') WITH (EVAL_INTERVAL = 1h)",
+            "CREATE RETENTION POLICY p ON metrics (RAW RETAIN '7d') WITH (EVAL_INTERVAL = 'bogus')",
+            "CREATE RETENTION POLICY p ON metrics (RAW RETAIN '7d') WITH (EVAL_INTERVAL = '1h', OTHER = '2h')",
+            "CREATE RETENTION POLICY p ON metrics (RAW RETAIN '7d') WITH (EVAL_INTERVAL = '1h', EVAL_INTERVAL = '2h')",
+            "CREATE RETENTION POLICY p ON metrics (RAW RETAIN '7d') WITH (EVAL_INTERVAL = '1h') trailing",
+        ] {
+            assert!(parse_create_retention_policy(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
     fn parse_forever_retain() {
         let sql = "CREATE RETENTION POLICY p1 ON metrics (\
                     RAW RETAIN 'forever'\
@@ -465,9 +472,74 @@ mod tests {
     #[test]
     fn split_commas_respects_parens() {
         let input = "RAW RETAIN '7d', DOWNSAMPLE TO '1m' AGGREGATE (AVG(v), MAX(v)) RETAIN '90d'";
-        let parts = split_top_level_commas(input);
+        let parts = split_top_level_commas(input).expect("top-level commas split");
         assert_eq!(parts.len(), 2);
         assert!(parts[0].trim().starts_with("RAW"));
         assert!(parts[1].trim().starts_with("DOWNSAMPLE"));
+    }
+
+    #[test]
+    fn aggregate_list_does_not_split_commas_inside_quoted_identifiers() {
+        let tiers = parse_tiers(
+            "RAW RETAIN '7d', DOWNSAMPLE TO '1m' AGGREGATE (AVG(\"value,secondary\"), MAX(value)) RETAIN '1d'",
+        )
+        .expect("aggregate list parses");
+        let aggregates = &tiers[1].aggregates;
+        assert_eq!(aggregates.len(), 2);
+        assert_eq!(aggregates[0].source_column, "value,secondary");
+        assert_eq!(aggregates[1].source_column, "value");
+
+        let expression = parse_agg_expr("AVG(\"value AS secondary\") AS \"Average Value\"")
+            .expect("quoted column and alias parse");
+        assert_eq!(expression.source_column, "value AS secondary");
+        assert_eq!(expression.output_column, "Average Value");
+    }
+
+    #[test]
+    fn archive_literal_preserves_parenthesis_comma_and_doubled_apostrophe() {
+        let parsed = parse_create_retention_policy(
+            "CREATE RETENTION POLICY p ON metrics (RAW RETAIN '7d', ARCHIVE TO 's3://bucket/a),part/o''reilly')",
+        )
+        .expect("quoted archive URL parses");
+        assert!(matches!(
+            &parsed.tiers[0].archive,
+            Some(ArchiveTarget::S3 { url }) if url == "s3://bucket/a),part/o'reilly"
+        ));
+    }
+
+    #[test]
+    fn malformed_quoted_tier_text_is_rejected() {
+        for sql in [
+            "CREATE RETENTION POLICY p ON metrics (RAW RETAIN '7d)",
+            "CREATE RETENTION POLICY p ON metrics (RAW RETAIN '7d', ARCHIVE TO 's3://bucket/o'reilly')",
+        ] {
+            assert!(parse_create_retention_policy(sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn tiers_enforce_semantic_sequence() {
+        for body in [
+            "DOWNSAMPLE TO '1m' AGGREGATE (AVG(value)) RETAIN '1d'",
+            "RAW RETAIN '7d', RAW RETAIN '1d'",
+            "RAW RETAIN '7d', DOWNSAMPLE TO '0ms' AGGREGATE (AVG(value)) RETAIN '1d'",
+            "RAW RETAIN '7d', ARCHIVE TO 's3://bucket/one', ARCHIVE TO 's3://bucket/two'",
+            "RAW RETAIN '7d', ARCHIVE TO 's3://bucket/path', DOWNSAMPLE TO '1m' AGGREGATE (AVG(value)) RETAIN '1d'",
+        ] {
+            assert!(parse_tiers(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn tiers_reject_keyword_prefixes_and_ignored_junk() {
+        for body in [
+            "RAWX RETAIN '7d'",
+            "DOWNSAMPLEX TO '1m' AGGREGATE (AVG(value)) RETAIN '1d'",
+            "DOWNSAMPLE TO '1m' AGGREGATE (AVG(value)) unexpected RETAIN '1d'",
+            "RAW RETAIN '7d' trailing",
+            "ARCHIVE TO 's3://bucket/path' trailing",
+        ] {
+            assert!(parse_tiers(body).is_err(), "{body}");
+        }
     }
 }

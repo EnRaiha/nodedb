@@ -22,7 +22,7 @@
 //! ) [WITH (EVAL_INTERVAL = '<duration>')]
 //! ```
 
-use nodedb_types::DatabaseId;
+use nodedb_types::{DatabaseId, quote_ident, quote_literal};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -36,6 +36,23 @@ fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError {
         sqlstate: sqlstate.to_string(),
         message,
+    }
+}
+
+fn build_reconstructed_sql(
+    name: &str,
+    collection: &str,
+    body_raw: &str,
+    eval_interval_raw: Option<&str>,
+) -> String {
+    let prefix = format!(
+        "CREATE RETENTION POLICY {} ON {} ({body_raw})",
+        quote_ident(name),
+        quote_ident(collection)
+    );
+    match eval_interval_raw {
+        Some(eval) => format!("{prefix} WITH (EVAL_INTERVAL = {})", quote_literal(eval)),
+        None => prefix,
     }
 }
 
@@ -54,14 +71,10 @@ pub async fn create_retention_policy(
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "create retention policies")?;
 
-    // Reconstruct minimal SQL for the existing complex parser.
-    let reconstructed = if let Some(eval) = eval_interval_raw {
-        format!(
-            "CREATE RETENTION POLICY {name} ON {collection} ({body_raw}) WITH (EVAL_INTERVAL = '{eval}')"
-        )
-    } else {
-        format!("CREATE RETENTION POLICY {name} ON {collection} ({body_raw})")
-    };
+    // Reconstruct minimal SQL for the existing complex parser. The body is
+    // already structured retention-policy grammar; only externally named SQL
+    // tokens are re-emitted here.
+    let reconstructed = build_reconstructed_sql(name, collection, body_raw, eval_interval_raw);
     let parsed = parse_create_retention_policy(&reconstructed)?;
     let tenant_id = identity.tenant_id.as_u64();
 
@@ -193,4 +206,42 @@ pub async fn create_retention_policy(
         command: "CREATE RETENTION POLICY".to_string(),
         rows_affected: None,
     }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconstructed_sql_quotes_identifier_and_interval_inputs() {
+        let sql = build_reconstructed_sql(
+            "policy\"; DROP TABLE audit_log; --",
+            "metrics\"; DELETE FROM audit_log; --",
+            "RAW RETAIN '7d'",
+            Some("1h'; DELETE FROM audit_log; --"),
+        );
+
+        assert_eq!(
+            sql,
+            "CREATE RETENTION POLICY \"policy\"\"; DROP TABLE audit_log; --\" ON \"metrics\"\"; DELETE FROM audit_log; --\" (RAW RETAIN '7d') WITH (EVAL_INTERVAL = '1h''; DELETE FROM audit_log; --')"
+        );
+        assert!(super::parse_create_retention_policy(&sql).is_err());
+    }
+
+    #[test]
+    fn reconstructed_sql_preserves_structured_body_without_eval_interval() {
+        let sql = build_reconstructed_sql(
+            "Policy Name",
+            "Metrics \"Primary\"",
+            "RAW RETAIN '7d'",
+            None,
+        );
+        assert_eq!(
+            sql,
+            "CREATE RETENTION POLICY \"Policy Name\" ON \"Metrics \"\"Primary\"\"\" (RAW RETAIN '7d')"
+        );
+        let parsed = super::parse_create_retention_policy(&sql).expect("reconstructed SQL parses");
+        assert_eq!(parsed.name, "Policy Name");
+        assert_eq!(parsed.collection, "Metrics \"Primary\"");
+    }
 }

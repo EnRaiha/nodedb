@@ -144,14 +144,10 @@ pub(super) async fn try_typed(
 
         NodedbStatement::Policy(PolicyStmt::DropRetentionPolicy { name, if_exists }) => {
             // IF EXISTS short-circuit folded from the pgwire guard: a DROP of a
-            // non-existing retention policy returns the tag before the token
-            // handler runs (and before the tenant-admin gate). The existence
-            // check reads the in-memory `retention_policy_registry` for the
-            // identity tenant scoped to the session database, exactly as the
-            // pgwire guard (`retention_policy_exists`) did. The `if_exists:
-            // false` case and the existing-policy case fall through to
-            // `drop_retention_policy`, which re-derives the name from `parts[3]`
-            // exactly as the pgwire admin string dispatch did.
+            // non-existing retention policy returns the tag before the handler
+            // runs (and before the tenant-admin gate). The existence check reads
+            // the in-memory registry for the identity tenant scoped to the
+            // selected database.
             let tid = identity.tenant_id.as_u64();
             if *if_exists
                 && state
@@ -164,10 +160,7 @@ pub(super) async fn try_typed(
                     rows_affected: None,
                 }]));
             }
-            let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(
-                retention_policy::drop_retention_policy(state, identity, database_id, &parts).await,
-            )
+            Some(retention_policy::drop_retention_policy(state, identity, database_id, name).await)
         }
 
         NodedbStatement::Policy(PolicyStmt::CreateSynonymGroup { name, terms }) => Some(

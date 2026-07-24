@@ -35,18 +35,11 @@ pub async fn drop_retention_policy(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    parts: &[&str],
+    name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop retention policies")?;
 
-    // DROP RETENTION POLICY <name>
-    if parts.len() < 4 {
-        return Err(err(
-            "42601",
-            "syntax: DROP RETENTION POLICY <name>".to_string(),
-        ));
-    }
-    let name = parts[3].to_lowercase();
+    let name = name.to_string();
     let tenant_id = identity.tenant_id.as_u64();
 
     // Verify policy exists and capture definition for cleanup.
