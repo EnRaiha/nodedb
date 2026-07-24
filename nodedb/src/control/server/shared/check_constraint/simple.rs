@@ -81,23 +81,9 @@ pub(super) fn strip_new_prefix(sql: &str) -> String {
     result
 }
 
-/// Convert a `Value` to a SQL literal string for interpolation.
-pub(super) fn value_to_sql_literal(val: &nodedb_types::Value) -> String {
-    match val {
-        nodedb_types::Value::Null => "NULL".to_string(),
-        nodedb_types::Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        nodedb_types::Value::Integer(i) => i.to_string(),
-        nodedb_types::Value::Float(f) => format!("{f}"),
-        nodedb_types::Value::String(s) => {
-            // Escape single quotes for SQL safety.
-            let escaped = s.replace('\'', "''");
-            format!("'{escaped}'")
-        }
-        nodedb_types::Value::DateTime(dt) | nodedb_types::Value::NaiveDateTime(dt) => {
-            format!("'{dt}'")
-        }
-        _ => "NULL".to_string(),
-    }
+/// Convert a `Value` to SQL literal text through the canonical shared implementation.
+pub(super) fn value_to_sql_literal(value: &nodedb_types::Value) -> String {
+    value.to_sql_literal()
 }
 
 #[cfg(test)]
@@ -111,19 +97,11 @@ mod tests {
     }
 
     #[test]
-    fn value_to_sql_literal_types() {
-        assert_eq!(value_to_sql_literal(&nodedb_types::Value::Null), "NULL");
-        assert_eq!(
-            value_to_sql_literal(&nodedb_types::Value::Bool(true)),
-            "TRUE"
-        );
-        assert_eq!(
-            value_to_sql_literal(&nodedb_types::Value::Integer(42)),
-            "42"
-        );
-        assert_eq!(
-            value_to_sql_literal(&nodedb_types::Value::Float(3.5)),
-            "3.5"
-        );
+    fn value_to_sql_literal_delegates_to_shared_implementation() {
+        let value = nodedb_types::Value::Record {
+            table: "ta'ble".into(),
+            id: "id".into(),
+        };
+        assert_eq!(value_to_sql_literal(&value), value.to_sql_literal());
     }
 }
