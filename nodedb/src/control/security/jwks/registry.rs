@@ -216,7 +216,7 @@ impl JwksRegistry {
             return Err(JwtError::MalformedToken);
         }
         let payload_bytes = base64_url_decode(parts[1]).ok_or(JwtError::DecodingError)?;
-        sonic_rs::from_slice(&payload_bytes).map_err(|_| JwtError::InvalidClaims)
+        crate::util::bounded_json::from_slice(&payload_bytes).map_err(|_| JwtError::InvalidClaims)
     }
 
     /// Check if any providers are configured.
@@ -253,8 +253,8 @@ impl JwksRegistry {
         }
 
         let payload_bytes = base64_url_decode(parts[1]).ok_or(JwtError::DecodingError)?;
-        let claims: JwtClaims =
-            sonic_rs::from_slice(&payload_bytes).map_err(|_| JwtError::InvalidClaims)?;
+        let claims: JwtClaims = crate::util::bounded_json::from_slice(&payload_bytes)
+            .map_err(|_| JwtError::InvalidClaims)?;
 
         Ok(DecodedToken {
             parts,
@@ -476,5 +476,5 @@ struct JwtHeader {
 
 fn decode_jwt_header(encoded: &str) -> Result<JwtHeader, JwtError> {
     let bytes = base64_url_decode(encoded).ok_or(JwtError::DecodingError)?;
-    sonic_rs::from_slice(&bytes).map_err(|_| JwtError::InvalidClaims)
+    crate::util::bounded_json::from_slice(&bytes).map_err(|_| JwtError::InvalidClaims)
 }

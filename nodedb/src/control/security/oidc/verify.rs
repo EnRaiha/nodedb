@@ -45,8 +45,9 @@ pub async fn verify_bearer_token(
     }
     let payload_bytes = base64_url_decode(parts[1])
         .ok_or_else(|| jwt_error_to_crate_error(JwtError::DecodingError))?;
-    let claims: crate::control::security::jwt::JwtClaims = sonic_rs::from_slice(&payload_bytes)
-        .map_err(|_| jwt_error_to_crate_error(JwtError::InvalidClaims))?;
+    let claims: crate::control::security::jwt::JwtClaims =
+        crate::util::bounded_json::from_slice(&payload_bytes)
+            .map_err(|_| jwt_error_to_crate_error(JwtError::InvalidClaims))?;
 
     // 2. Route by both unverified issuer and audience. These values only select
     // the verification key; the same constraints are checked again after

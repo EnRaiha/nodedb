@@ -20,10 +20,11 @@ impl Session {
         request_id: RequestId,
         payload: &[u8],
     ) -> crate::Result<Vec<u8>> {
-        // Parse the JSON request body.
         let body: serde_json::Value =
-            sonic_rs::from_slice(payload).map_err(|e| crate::Error::BadRequest {
-                detail: format!("invalid JSON: {e}"),
+            crate::util::bounded_json::from_slice(payload).map_err(|e| {
+                crate::Error::BadRequest {
+                    detail: format!("invalid JSON: {e}"),
+                }
             })?;
 
         let op = body["op"]

@@ -95,7 +95,7 @@ fn derive_surrogates(
 
 fn extract_pks_json(bytes: &[u8]) -> crate::Result<Vec<Vec<u8>>> {
     let value: sonic_rs::Value =
-        sonic_rs::from_slice(bytes).map_err(|e| crate::Error::Serialization {
+        crate::util::bounded_json::from_slice(bytes).map_err(|e| crate::Error::Serialization {
             format: "json".into(),
             detail: format!("columnar bulk decode: {e}"),
         })?;

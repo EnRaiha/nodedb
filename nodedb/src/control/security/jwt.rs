@@ -130,13 +130,13 @@ impl JwtValidator {
 
         // Decode header to determine algorithm.
         let header_bytes = base64_url_decode(parts[0]).ok_or(JwtError::DecodingError)?;
-        let header: JwtHeader =
-            sonic_rs::from_slice(&header_bytes).map_err(|_| JwtError::InvalidClaims)?;
+        let header: JwtHeader = crate::util::bounded_json::from_slice(&header_bytes)
+            .map_err(|_| JwtError::InvalidClaims)?;
 
         // Decode payload (middle part). We verify signature separately.
         let payload_bytes = base64_url_decode(parts[1]).ok_or(JwtError::DecodingError)?;
-        let claims: JwtClaims =
-            sonic_rs::from_slice(&payload_bytes).map_err(|_| JwtError::InvalidClaims)?;
+        let claims: JwtClaims = crate::util::bounded_json::from_slice(&payload_bytes)
+            .map_err(|_| JwtError::InvalidClaims)?;
 
         // Verify signature based on algorithm declared in header.
         let signing_input = format!("{}.{}", parts[0], parts[1]);

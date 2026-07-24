@@ -145,7 +145,7 @@ fn extract_jwt_exp_ms(token: &str) -> Option<u64> {
     let parts: Vec<&str> = token.splitn(3, '.').collect();
     let payload_b64 = parts.get(1)?;
     let bytes = crate::control::security::util::base64_url_decode(payload_b64)?;
-    let claims: serde_json::Value = sonic_rs::from_slice(&bytes).ok()?;
+    let claims: serde_json::Value = crate::util::bounded_json::from_slice(&bytes).ok()?;
     let exp = claims["exp"].as_u64()?;
     if exp == 0 {
         None

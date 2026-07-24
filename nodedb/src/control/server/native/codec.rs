@@ -106,9 +106,11 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 /// Decode a request payload according to the detected format.
 pub fn decode_request(payload: &[u8], format: FrameFormat) -> crate::Result<NativeRequest> {
     match format {
-        FrameFormat::Json => sonic_rs::from_slice(payload).map_err(|e| crate::Error::BadRequest {
-            detail: format!("invalid JSON request: {e}"),
-        }),
+        FrameFormat::Json => {
+            crate::util::bounded_json::from_slice(payload).map_err(|e| crate::Error::BadRequest {
+                detail: format!("invalid JSON request: {e}"),
+            })
+        }
         FrameFormat::MessagePack => {
             zerompk::from_msgpack(payload).map_err(|e| crate::Error::BadRequest {
                 detail: format!("invalid MessagePack request: {e}"),

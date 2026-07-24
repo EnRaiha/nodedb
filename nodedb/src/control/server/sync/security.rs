@@ -23,7 +23,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
-use sonic_rs;
 use tracing::warn;
 
 use super::wire::DeltaPushMsg;
@@ -107,7 +106,7 @@ fn extract_exp_from_token(token: &str) -> Option<u64> {
         return None;
     }
     let payload = base64_url_decode(parts[1])?;
-    let claims: serde_json::Value = sonic_rs::from_slice(&payload).ok()?;
+    let claims: serde_json::Value = crate::util::bounded_json::from_slice(&payload).ok()?;
     claims.get("exp")?.as_u64()
 }
 

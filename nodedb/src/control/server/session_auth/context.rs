@@ -72,8 +72,9 @@ pub fn build_auth_context_with_session(
             // was established — this is a per-transaction override).
             if let Some(payload_b64) = token.split('.').nth(1)
                 && let Some(payload_bytes) = base64_url_decode(payload_b64)
-                && let Ok(claims) =
-                    sonic_rs::from_slice::<crate::control::security::jwt::JwtClaims>(&payload_bytes)
+                && let Ok(claims) = crate::util::bounded_json::from_slice::<
+                    crate::control::security::jwt::JwtClaims,
+                >(&payload_bytes)
             {
                 let mut ctx = AuthContext::from_jwt(&claims, generate_session_id());
                 // Still apply ON DENY override.

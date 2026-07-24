@@ -16,7 +16,7 @@ pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result
         })?;
 
     let geometry: nodedb_types::geometry::Geometry =
-        sonic_rs::from_slice(raw_bytes).map_err(|e| crate::Error::BadRequest {
+        crate::util::bounded_json::from_slice(raw_bytes).map_err(|e| crate::Error::BadRequest {
             detail: format!("invalid query geometry: {e}"),
         })?;
 

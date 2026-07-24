@@ -2,7 +2,6 @@
 
 //! Single WebSocket message processing for the JSON-RPC protocol.
 
-use sonic_rs;
 use tracing::debug;
 
 use crate::control::change_stream::LiveSubscriptionSet;
@@ -53,7 +52,7 @@ pub(super) async fn process_message(
         trace_id,
         live_tx,
     } = context;
-    let req: serde_json::Value = match sonic_rs::from_str(text) {
+    let req: serde_json::Value = match crate::util::bounded_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
             return (

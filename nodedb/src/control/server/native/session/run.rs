@@ -121,7 +121,7 @@ impl NativeSession {
 
             // Auto-detect format on first frame.
             if self.format.is_none() {
-                self.format = Some(FrameFormat::detect(payload[0]));
+                self.format = Some(FrameFormat::detect_payload(&payload));
             }
             let Some(format) = self.format else {
                 return Err(crate::Error::BadRequest {

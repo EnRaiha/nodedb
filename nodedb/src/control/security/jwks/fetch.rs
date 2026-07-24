@@ -149,7 +149,8 @@ async fn fetch_jwks(
         return Err(JwksFetchError::BodyTooLarge);
     }
 
-    let jwks: JwksResponse = sonic_rs::from_slice(&body).map_err(|_| JwksFetchError::JsonParse)?;
+    let jwks: JwksResponse =
+        crate::util::bounded_json::from_slice(&body).map_err(|_| JwksFetchError::JsonParse)?;
 
     let keys: Vec<VerificationKey> = jwks.keys.iter().filter_map(parse_jwk).collect();
 
