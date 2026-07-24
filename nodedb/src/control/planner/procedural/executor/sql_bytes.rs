@@ -12,8 +12,3 @@ pub(super) fn skip_ascii_whitespace(bytes: &[u8], mut i: usize) -> usize {
     }
     i
 }
-
-/// Return `true` if `byte` is an ASCII alphanumeric or underscore character.
-pub(super) fn is_identifier_char(byte: Option<u8>) -> bool {
-    byte.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
-}

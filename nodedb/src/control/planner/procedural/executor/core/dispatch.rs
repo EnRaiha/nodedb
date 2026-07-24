@@ -358,16 +358,29 @@ fn fold_literal_string_concat(sql: &str) -> String {
     let mut i = 0;
 
     while i < bytes.len() {
+        if let Some(end) = opaque_sql_end(sql, i) {
+            result.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
         if bytes[i] != b'\'' {
-            result.push(bytes[i] as char);
-            i += 1;
+            let Some(ch) = sql[i..].chars().next() else {
+                break;
+            };
+            result.push(ch);
+            i += ch.len_utf8();
             continue;
         }
 
         let start = i;
         let Some((mut cursor, mut combined)) = parse_single_quoted_literal(sql, i) else {
-            result.push(bytes[i] as char);
-            i += 1;
+            // An unterminated literal is left unchanged for the SQL parser to
+            // reject; copy one complete UTF-8 character rather than one byte.
+            let Some(ch) = sql[i..].chars().next() else {
+                break;
+            };
+            result.push(ch);
+            i += ch.len_utf8();
             continue;
         };
 
@@ -403,6 +416,85 @@ fn fold_literal_string_concat(sql: &str) -> String {
     result
 }
 
+fn opaque_sql_end(sql: &str, start: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    match bytes[start] {
+        b'"' => Some(consume_quoted_region(sql, start, b'"')),
+        b'-' if bytes.get(start + 1) == Some(&b'-') => Some(
+            sql[start..]
+                .find('\n')
+                .map_or(sql.len(), |offset| start + offset),
+        ),
+        b'/' if bytes.get(start + 1) == Some(&b'*') => {
+            Some(consume_block_comment_region(sql, start))
+        }
+        b'$' => consume_dollar_quote_region(sql, start),
+        _ => None,
+    }
+}
+
+fn consume_quoted_region(sql: &str, start: usize, quote: u8) -> usize {
+    let bytes = sql.as_bytes();
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        if bytes[cursor] == quote {
+            cursor += 1;
+            if bytes.get(cursor) != Some(&quote) {
+                return cursor;
+            }
+            cursor += 1;
+        } else {
+            cursor += sql[cursor..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    sql.len()
+}
+
+fn consume_block_comment_region(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut cursor = start + 2;
+    let mut depth = 1usize;
+    while cursor + 1 < bytes.len() {
+        match (bytes[cursor], bytes[cursor + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                cursor += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                cursor += 2;
+                if depth == 0 {
+                    return cursor;
+                }
+            }
+            _ => cursor += sql[cursor..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    sql.len()
+}
+
+fn consume_dollar_quote_region(sql: &str, start: usize) -> Option<usize> {
+    let rest = &sql[start..];
+    let close = rest[1..].find('$')? + 1;
+    let tag = &rest[..=close];
+    let tag_body = &tag[1..tag.len() - 1];
+    if !tag_body.is_empty()
+        && (!tag_body
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
+            || !tag_body.chars().all(|ch| ch == '_' || ch.is_alphanumeric()))
+    {
+        return None;
+    }
+    let body_start = start + tag.len();
+    Some(
+        sql[body_start..]
+            .find(tag)
+            .map_or(sql.len(), |offset| body_start + offset + tag.len()),
+    )
+}
+
 fn parse_single_quoted_literal(sql: &str, start: usize) -> Option<(usize, String)> {
     let bytes = sql.as_bytes();
     if bytes.get(start) != Some(&b'\'') {
@@ -421,9 +513,10 @@ fn parse_single_quoted_literal(sql: &str, start: usize) -> Option<(usize, String
                     return Some((i + 1, literal));
                 }
             }
-            byte => {
-                literal.push(byte as char);
-                i += 1;
+            _ => {
+                let ch = sql[i..].chars().next()?;
+                literal.push(ch);
+                i += ch.len_utf8();
             }
         }
     }
@@ -448,7 +541,7 @@ fn consume_string_concat_operator(bytes: &[u8], start: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::fold_literal_string_concat;
+    use super::{fold_literal_string_concat, parse_single_quoted_literal};
 
     #[test]
     fn folds_adjacent_string_concat_literals() {
@@ -476,6 +569,25 @@ mod tests {
         let sql = "VALUES ('a', col)";
         let folded = fold_literal_string_concat(sql);
         assert_eq!(folded, sql);
+    }
+
+    #[test]
+    fn leaves_opaque_regions_unfolded() {
+        let sql = "\"'a' || 'b'\" -- 'c' || 'd'\n/* 'e' || 'f' */ $$'g' || 'h'$$, 'i' || 'j'";
+        assert_eq!(
+            fold_literal_string_concat(sql),
+            "\"'a' || 'b'\" -- 'c' || 'd'\n/* 'e' || 'f' */ $$'g' || 'h'$$, 'ij'"
+        );
+    }
+
+    #[test]
+    fn folds_unicode_literals_and_preserves_doubled_quotes() {
+        let sql = "VALUES ('雪''猫' || '犬')";
+        assert_eq!(fold_literal_string_concat(sql), "VALUES ('雪''猫犬')");
+        assert_eq!(
+            parse_single_quoted_literal("'雪''猫'", 0),
+            Some(("'雪''猫'".len(), "雪'猫".to_string()))
+        );
     }
 }
 

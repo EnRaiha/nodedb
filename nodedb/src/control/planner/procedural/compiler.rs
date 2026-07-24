@@ -46,12 +46,7 @@ impl CompileContext {
 
     /// Substitute known variables in a SQL expression.
     fn substitute(&self, sql: &str) -> String {
-        let mut result = sql.to_string();
-        for (name, expr) in &self.variables {
-            // Replace whole-word occurrences of the variable name.
-            result = replace_identifier(&result, name, &format!("({expr})"));
-        }
-        result
+        substitute_identifiers(sql, &self.variables)
     }
 }
 
@@ -82,11 +77,11 @@ fn compile_statements(
                     Some(e) => ctx.substitute(&e.sql),
                     None => "NULL".into(),
                 };
-                ctx.variables.insert(name.clone(), expr);
+                ctx.variables.insert(name.to_lowercase(), expr);
             }
             Statement::Assign { target, expr } => {
                 let substituted = ctx.substitute(&expr.sql);
-                ctx.variables.insert(target.clone(), substituted);
+                ctx.variables.insert(target.to_lowercase(), substituted);
             }
             Statement::If {
                 condition,
@@ -240,7 +235,9 @@ fn compile_for(
     let mut case_parts = Vec::new();
     for val in &iterations {
         let mut iter_ctx = ctx.clone_vars();
-        iter_ctx.variables.insert(var.to_string(), val.to_string());
+        iter_ctx
+            .variables
+            .insert(var.to_lowercase(), val.to_string());
         let body_sql = compile_statements(body, &mut iter_ctx)?;
         // Each iteration becomes a WHEN clause. If the body is unconditional
         // (always returns), it's `WHEN true THEN <body>`. If conditional,
@@ -272,70 +269,125 @@ impl CompileContext {
     }
 }
 
-/// Replace whole-word occurrences of `name` in `sql` with `replacement`.
-///
-/// Only replaces when `name` is surrounded by non-alphanumeric characters
-/// (or at string boundaries). This prevents replacing "x" in "max" or "text".
-fn replace_identifier(sql: &str, name: &str, replacement: &str) -> String {
-    if name.is_empty() || !sql.contains(name) {
-        return sql.to_string();
-    }
-
-    let mut result = String::with_capacity(sql.len());
-    let bytes = sql.as_bytes();
-    let name_bytes = name.as_bytes();
-    let name_len = name_bytes.len();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        // Skip string literals.
-        if bytes[i] == b'\'' {
-            result.push('\'');
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\'' {
-                    result.push('\'');
-                    i += 1;
-                    if i < bytes.len() && bytes[i] == b'\'' {
-                        result.push('\'');
-                        i += 1;
-                    } else {
-                        break;
-                    }
+/// Substitute all known variables in one lexical pass. Replacement text is
+/// copied, never revisited, so binding expansion is deterministic.
+fn substitute_identifiers(sql: &str, variables: &HashMap<String, String>) -> String {
+    let mut output = String::with_capacity(sql.len());
+    let mut cursor = 0;
+    while cursor < sql.len() {
+        let end = opaque_end(sql, cursor);
+        if end > cursor {
+            output.push_str(&sql[cursor..end]);
+            cursor = end;
+        } else if let Some(ch) = sql[cursor..].chars().next() {
+            if is_identifier_start(ch) {
+                let end = consume_identifier(sql, cursor);
+                let token = &sql[cursor..end];
+                if let Some(value) = variables.get(&token.to_lowercase()) {
+                    output.push('(');
+                    output.push_str(value);
+                    output.push(')');
                 } else {
-                    result.push(bytes[i] as char);
-                    i += 1;
+                    output.push_str(token);
+                }
+                cursor = end;
+            } else {
+                output.push(ch);
+                cursor += ch.len_utf8();
+            }
+        }
+    }
+    output
+}
+
+fn opaque_end(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    match bytes[start] {
+        b'\'' | b'"' => consume_quoted(sql, start, bytes[start]),
+        b'-' if bytes.get(start + 1) == Some(&b'-') => sql[start..]
+            .find('\n')
+            .map_or(sql.len(), |offset| start + offset),
+        b'/' if bytes.get(start + 1) == Some(&b'*') => consume_block_comment(sql, start),
+        b'$' => consume_dollar_quote(sql, start).unwrap_or(start),
+        _ => start,
+    }
+}
+
+fn consume_quoted(sql: &str, start: usize, quote: u8) -> usize {
+    let bytes = sql.as_bytes();
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        if bytes[cursor] == quote {
+            cursor += 1;
+            if bytes.get(cursor) != Some(&quote) {
+                return cursor;
+            }
+            cursor += 1;
+        } else {
+            cursor += sql[cursor..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    sql.len()
+}
+
+fn consume_block_comment(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut cursor = start + 2;
+    let mut depth = 1usize;
+    while cursor + 1 < bytes.len() {
+        match (bytes[cursor], bytes[cursor + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                cursor += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                cursor += 2;
+                if depth == 0 {
+                    return cursor;
                 }
             }
-            continue;
-        }
-
-        // Check for whole-word match.
-        if i + name_len <= bytes.len()
-            && sql[i..i + name_len].eq_ignore_ascii_case(name)
-            && !is_ident_char(bytes.get(i.wrapping_sub(1)).copied(), i == 0)
-            && !is_ident_continue(bytes.get(i + name_len).copied())
-        {
-            result.push_str(replacement);
-            i += name_len;
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            _ => cursor += sql[cursor..].chars().next().map_or(1, char::len_utf8),
         }
     }
-
-    result
+    sql.len()
 }
 
-fn is_ident_char(byte: Option<u8>, at_start: bool) -> bool {
-    if at_start {
-        return false;
+fn consume_dollar_quote(sql: &str, start: usize) -> Option<usize> {
+    let rest = &sql[start..];
+    let close = rest[1..].find('$')? + 1;
+    let tag = &rest[..=close];
+    let tag_body = &tag[1..tag.len() - 1];
+    if !tag_body.is_empty()
+        && (!tag_body
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
+            || !tag_body.chars().all(|ch| ch == '_' || ch.is_alphanumeric()))
+    {
+        return None;
     }
-    byte.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+    let body_start = start + tag.len();
+    Some(
+        sql[body_start..]
+            .find(tag)
+            .map_or(sql.len(), |offset| body_start + offset + tag.len()),
+    )
 }
 
-fn is_ident_continue(byte: Option<u8>) -> bool {
-    byte.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || ch.is_alphabetic()
+}
+fn is_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_alphanumeric()
+}
+fn consume_identifier(sql: &str, start: usize) -> usize {
+    sql[start..]
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            (offset > 0 && !is_identifier_continue(ch)).then_some(start + offset)
+        })
+        .unwrap_or(sql.len())
 }
 
 #[cfg(test)]
@@ -472,11 +524,33 @@ mod tests {
     }
 
     #[test]
-    fn replace_whole_word() {
-        assert_eq!(replace_identifier("x + 1", "x", "(5)"), "(5) + 1");
-        assert_eq!(replace_identifier("max(x)", "x", "(5)"), "max((5))");
-        // Should NOT replace "x" inside "text" or "max".
-        assert_eq!(replace_identifier("text", "x", "(5)"), "text");
+    fn replaces_only_whole_identifier_tokens() {
+        let variables = HashMap::from([("x".to_string(), "5".to_string())]);
+        assert_eq!(substitute_identifiers("x + 1", &variables), "(5) + 1");
+        assert_eq!(substitute_identifiers("max(x)", &variables), "max((5))");
+        assert_eq!(substitute_identifiers("text", &variables), "text");
+    }
+
+    #[test]
+    fn replacement_is_one_pass_and_respects_unicode_dollar_boundaries() {
+        let mut variables = HashMap::new();
+        variables.insert("x".into(), "y".into());
+        variables.insert("y".into(), "9".into());
+        variables.insert("é".into(), "11".into());
+        assert_eq!(
+            substitute_identifiers("x y αx xβ x$ É é", &variables),
+            "(y) (9) αx xβ x$ (11) (11)"
+        );
+    }
+
+    #[test]
+    fn replacement_preserves_unicode_and_opaque_sql_regions() {
+        let variables = HashMap::from([("x".to_string(), "5".to_string())]);
+        let sql = "x + '雪x' + \"x\" -- x 雪\n/* outer x /* inner x */ 雪 */ + x";
+        assert_eq!(
+            substitute_identifiers(sql, &variables),
+            "(5) + '雪x' + \"x\" -- x 雪\n/* outer x /* inner x */ 雪 */ + (5)"
+        );
     }
 
     #[test]

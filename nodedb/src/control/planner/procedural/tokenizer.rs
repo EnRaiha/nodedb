@@ -91,11 +91,30 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ProceduralError> {
             continue;
         }
 
-        // Skip SQL comments.
+        // Opaque SQL regions must not surface procedural keywords.
+        if bytes[i] == b'"' {
+            let end = consume_quoted(input, i, b'"');
+            tokens.push(Token::SqlFragment(input[i..end].to_string()));
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'$'
+            && let Some(end) = consume_dollar_quote(input, i)?
+        {
+            tokens.push(Token::SqlFragment(input[i..end].to_string()));
+            i = end;
+            continue;
+        }
         if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
+            let end = input[i..].find('\n').map_or(len, |offset| i + offset + 1);
+            tokens.push(Token::SqlFragment(input[i..end].to_string()));
+            i = end;
+            continue;
+        }
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let end = consume_block_comment(input, i);
+            tokens.push(Token::SqlFragment(input[i..end].to_string()));
+            i = end;
             continue;
         }
 
@@ -148,12 +167,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ProceduralError> {
             continue;
         }
 
-        // Identifier or keyword.
-        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+        // Identifier or keyword. Bare identifiers follow the shared SQL
+        // grammar: Unicode alphabetic/underscore start, then Unicode
+        // alphanumeric/underscore/dollar continuation.
+        if input[i..].chars().next().is_some_and(is_identifier_start) {
             let start = i;
-            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
+            i = consume_identifier(input, i);
             let word = &input[start..i];
             let upper = word.to_uppercase();
 
@@ -214,14 +233,97 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, ProceduralError> {
 
         // Any other character — collect as part of a SQL fragment.
         // This handles operators, parens, etc.
-        tokens.push(Token::Ident(input[i..i + 1].to_string()));
-        i += 1;
+        let Some(ch) = input[i..].chars().next() else {
+            break;
+        };
+        tokens.push(Token::Ident(ch.to_string()));
+        i += ch.len_utf8();
     }
 
     Ok(tokens)
 }
 
 /// Read a single-quoted string literal, handling escaped quotes ('').
+fn consume_quoted(input: &str, start: usize, quote: u8) -> usize {
+    let bytes = input.as_bytes();
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        if bytes[cursor] == quote {
+            cursor += 1;
+            if bytes.get(cursor) != Some(&quote) {
+                return cursor;
+            }
+            cursor += 1;
+        } else {
+            cursor += input[cursor..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    input.len()
+}
+
+fn consume_block_comment(input: &str, start: usize) -> usize {
+    let bytes = input.as_bytes();
+    let mut cursor = start + 2;
+    let mut depth = 1usize;
+    while cursor + 1 < bytes.len() {
+        match (bytes[cursor], bytes[cursor + 1]) {
+            (b'/', b'*') => {
+                depth += 1;
+                cursor += 2;
+            }
+            (b'*', b'/') => {
+                depth -= 1;
+                cursor += 2;
+                if depth == 0 {
+                    return cursor;
+                }
+            }
+            _ => cursor += input[cursor..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    input.len()
+}
+
+fn consume_dollar_quote(input: &str, start: usize) -> Result<Option<usize>, ProceduralError> {
+    let rest = &input[start..];
+    let Some(close) = rest[1..].find('$').map(|offset| offset + 1) else {
+        return Ok(None);
+    };
+    let tag = &rest[..=close];
+    let tag_body = &tag[1..tag.len() - 1];
+    if !tag_body.is_empty()
+        && (!tag_body
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
+            || !tag_body.chars().all(|ch| ch == '_' || ch.is_alphanumeric()))
+    {
+        return Ok(None);
+    }
+    let body_start = start + tag.len();
+    input[body_start..]
+        .find(tag)
+        .map(|offset| Some(body_start + offset + tag.len()))
+        .ok_or_else(|| ProceduralError::tokenize("unterminated dollar-quoted string"))
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || ch.is_alphabetic()
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_alphanumeric()
+}
+
+fn consume_identifier(input: &str, start: usize) -> usize {
+    input[start..]
+        .char_indices()
+        .find_map(|(offset, ch)| {
+            (offset > 0 && !is_identifier_continue(ch)).then_some(start + offset)
+        })
+        .unwrap_or(input.len())
+}
+
 fn read_string_literal(input: &str, start: usize) -> Result<(String, usize), ProceduralError> {
     let bytes = input.as_bytes();
     let mut i = start + 1; // skip opening quote
@@ -238,8 +340,11 @@ fn read_string_literal(input: &str, start: usize) -> Result<(String, usize), Pro
                 return Ok((result, i + 1));
             }
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            let Some(ch) = input[i..].chars().next() else {
+                break;
+            };
+            result.push(ch);
+            i += ch.len_utf8();
         }
     }
     Err(ProceduralError::tokenize("unterminated string literal"))
@@ -326,6 +431,39 @@ mod tests {
     fn tokenize_escaped_string() {
         let tokens = tokenize("RETURN 'it''s';").unwrap();
         assert_eq!(tokens[1], Token::StringLit("it's".into()));
+    }
+
+    #[test]
+    fn opaque_regions_do_not_emit_procedural_keywords() {
+        let tokens = tokenize("\"RETURN END\" $$ IF THEN $$ $tag$ LOOP END $tag$ $雪$ RETURN $雪$ /* outer RETURN /* inner IF */ END */").expect("tokenize");
+        assert!(tokens.iter().all(|token| !matches!(
+            token,
+            Token::Return | Token::End | Token::If | Token::Then | Token::Loop
+        )));
+        assert_eq!(tokens.len(), 5);
+    }
+
+    #[test]
+    fn line_comment_preserves_newline_and_unterminated_dollar_quote_rejects() {
+        let tokens = tokenize("RETURN 1 -- note\n + 2;").expect("tokenize");
+        assert!(tokens.iter().any(|token| {
+            matches!(token, Token::SqlFragment(fragment) if fragment == "-- note\n")
+        }));
+        assert!(tokenize("RETURN $$ unterminated").is_err());
+        assert!(tokenize("RETURN $tag$ unterminated").is_err());
+    }
+
+    #[test]
+    fn tokenize_unicode_escaped_string_literal() {
+        let tokens = tokenize("RETURN '雪''猫';").expect("tokenize");
+        assert_eq!(tokens[1], Token::StringLit("雪'猫".into()));
+    }
+
+    #[test]
+    fn tokenize_unicode_and_dollar_identifier_as_single_tokens() {
+        let tokens = tokenize("RETURN αx + x$y;").expect("tokenize");
+        assert_eq!(tokens[1], Token::Ident("αx".into()));
+        assert_eq!(tokens[3], Token::Ident("x$y".into()));
     }
 
     #[test]
