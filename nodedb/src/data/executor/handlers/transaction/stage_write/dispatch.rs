@@ -169,7 +169,8 @@ impl CoreLoop {
             | PhysicalPlan::Query(_)
             | PhysicalPlan::Meta(_)
             | PhysicalPlan::Array(_)
-            | PhysicalPlan::ClusterArray(_) => return self.stage_not_point_write(task),
+            | PhysicalPlan::ClusterArray(_)
+            | PhysicalPlan::ClusterEvent(_) => return self.stage_not_point_write(task),
         };
 
         match doc_op {

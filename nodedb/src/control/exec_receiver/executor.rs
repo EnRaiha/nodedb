@@ -241,6 +241,80 @@ impl LocalPlanExecutor {
         let tenant_id = crate::types::TenantId::new(req.tenant_id);
         let trace_id = nodedb_types::TraceId(req.trace_id);
 
+        if let PhysicalPlan::ClusterEvent(
+            nodedb_physical::physical_plan::ClusterEventOp::PublishTopic {
+                topic_name,
+                payload,
+            },
+        ) = &plan
+        {
+            return match crate::event::topic::publish::publish_to_topic(
+                &self.state,
+                req.tenant_id,
+                topic_name,
+                payload,
+            ) {
+                Ok(sequence) => match zerompk::to_msgpack_vec(&sequence) {
+                    Ok(payload) => ExecuteResponse::ok(vec![payload], 0, 0),
+                    Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
+                        code: PLAN_DECODE_FAILED,
+                        message: format!("topic response encoding failed: {error}"),
+                    }),
+                },
+                Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
+                    code: PLAN_DECODE_FAILED,
+                    message: error.to_string(),
+                }),
+            };
+        }
+
+        if let PhysicalPlan::ClusterEvent(
+            nodedb_physical::physical_plan::ClusterEventOp::ConsumeStream {
+                stream_name,
+                group_name,
+                partition,
+                limit,
+            },
+        ) = &plan
+        {
+            let limit = match usize::try_from(*limit) {
+                Ok(limit) => limit,
+                Err(_) => {
+                    return ExecuteResponse::err(TypedClusterError::Internal {
+                        code: PLAN_DECODE_FAILED,
+                        message: "CDC consume limit exceeds platform range".into(),
+                    });
+                }
+            };
+            let params = crate::event::cdc::consume::ConsumeParams {
+                tenant_id: req.tenant_id,
+                stream_name,
+                group_name,
+                partition: Some(*partition),
+                limit,
+            };
+            return match crate::event::cdc::consume::consume_local(&self.state, &params) {
+                Ok(result) => {
+                    let events = result
+                        .events
+                        .iter()
+                        .map(|event| event.as_ref().clone())
+                        .collect::<Vec<_>>();
+                    match zerompk::to_msgpack_vec(&events) {
+                        Ok(payload) => ExecuteResponse::ok(vec![payload], 0, 0),
+                        Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
+                            code: PLAN_DECODE_FAILED,
+                            message: format!("CDC response encoding failed: {error}"),
+                        }),
+                    }
+                }
+                Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
+                    code: PLAN_DECODE_FAILED,
+                    message: error.to_string(),
+                }),
+            };
+        }
+
         // ── Replicable write: drive through Raft, NOT local cores ─────────────
         //
         // The gateway forwarded this plan here because THIS node is the leader
@@ -349,6 +423,12 @@ impl LocalPlanExecutor {
 
         if let Err(error) = reject_unadmitted_crdt_apply(&plan) {
             return Some(error);
+        }
+        if matches!(plan, PhysicalPlan::ClusterEvent(_)) {
+            return Some(TypedClusterError::Internal {
+                code: PLAN_DECODE_FAILED,
+                message: "ClusterEvent operations do not support streaming RPC".into(),
+            });
         }
 
         let tenant_id = crate::types::TenantId::new(req.tenant_id);

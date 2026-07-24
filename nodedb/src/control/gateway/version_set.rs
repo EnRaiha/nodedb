@@ -428,7 +428,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
 
         // ClusterArray variants are handled on the Control Plane before reaching
         // the gateway; they carry no collection version set contribution.
-        PhysicalPlan::ClusterArray(_) => {}
+        PhysicalPlan::ClusterArray(_) | PhysicalPlan::ClusterEvent(_) => {}
     }
 
     out

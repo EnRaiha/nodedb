@@ -414,6 +414,7 @@ pub(super) fn extract_write_metadata(
         // directly via `publish_cluster_array_change_events` after a
         // successful execute, so it IS load-bearing there.
         PhysicalPlan::ClusterArray(op) => cluster_array_change_meta(op),
+        PhysicalPlan::ClusterEvent(_) => Vec::new(),
     }
 }
 

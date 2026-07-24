@@ -6,7 +6,7 @@
 //! module (now deleted) except for the result type, which is [`DdlResult`] /
 //! [`DdlError`] throughout instead of pgwire `Response` / `PgWireResult`.
 
-use nodedb_types::{DatabaseId, quote_ident};
+use nodedb_types::DatabaseId;
 use std::path::Path;
 
 use sonic_rs;
@@ -92,7 +92,9 @@ pub async fn copy_to_file(
 /// Build a SELECT SQL string from the source.
 fn build_select_sql(source: &CopyToSource) -> Result<String, DdlError> {
     match source {
-        CopyToSource::Collection(coll) => Ok(format!("SELECT * FROM {}", quote_ident(coll))),
+        CopyToSource::Collection(coll) => {
+            Ok(format!("SELECT * FROM {}", ::nodedb_types::quote_ident(coll)))
+        }
         CopyToSource::Query(q) => Ok(q.clone()),
     }
 }

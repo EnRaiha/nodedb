@@ -92,7 +92,8 @@ fn extract_bulk_predicate_info(plan: &PhysicalPlan) -> (String, Vec<u8>) {
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => (String::new(), vec![]),
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => (String::new(), vec![]),
     }
 }
 
@@ -128,7 +129,8 @@ fn inject_ollp_surrogates(plan: &mut PhysicalPlan, surrogates: Vec<u32>) {
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => {}
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => {}
     }
 }
 
@@ -171,7 +173,8 @@ fn inject_ollp_predicted_edges(plan: &mut PhysicalPlan, mut edges: Vec<OllpPredi
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => {}
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => {}
     }
 }
 
@@ -307,7 +310,8 @@ pub async fn dispatch_dependent_edge_recon(
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => {
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => {
             return Err(Error::Internal {
                 detail: "dependent Calvin task is neither BulkUpdate nor BulkDelete".to_owned(),
             });

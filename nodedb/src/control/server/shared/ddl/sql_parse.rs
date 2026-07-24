@@ -115,6 +115,7 @@ fn try_eval_scalar_function(s: &str) -> Option<nodedb_types::Value> {
     }
     let stmt_sql = format!("SELECT {s}");
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    // reconstructed-sql: parser-only validates one constant-expression AST without execution
     let stmts = sqlparser::parser::Parser::parse_sql(&dialect, &stmt_sql).ok()?;
     let stmt = stmts.into_iter().next()?;
     let sqlparser::ast::Statement::Query(query) = stmt else {

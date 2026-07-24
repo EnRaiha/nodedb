@@ -7,12 +7,15 @@
 //!
 //! **Cluster-wide:** Each topic has a "home node" determined by hashing
 //! the topic name to a vShard. PUBLISH on a non-home node forwards the
-//! request to the home node via the gateway (`ExecuteRequest`). This ensures
+//! request to the home node as a typed operation over authenticated cluster
+//! RPC. This ensures
 //! all messages for a topic live on one node's buffer, maintaining ordering.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nodedb_cluster::rpc_codec::{ExecuteRequest, ExecuteResponse, RaftRpc};
+use nodedb_physical::physical_plan::{ClusterEventOp, PhysicalPlan, wire as plan_wire};
 use sonic_rs;
 use tracing::debug;
 
@@ -134,63 +137,67 @@ fn topic_home_node(state: &SharedState, topic_name: &str) -> Option<u64> {
     routing.leader_for_vshard(vshard_id).ok()
 }
 
-/// Forward a PUBLISH to the topic's home node via the gateway.
-///
-/// Routes the PUBLISH SQL through `gateway.execute_sql`, which plans it
-/// locally and dispatches it as an `ExecuteRequest` over QUIC to the
-/// correct home node. The `leader_node` parameter is accepted for caller
-/// compatibility but is ignored — the gateway handles node selection.
+fn build_publish_plan(topic_name: &str, payload: &str) -> PhysicalPlan {
+    PhysicalPlan::ClusterEvent(ClusterEventOp::PublishTopic {
+        topic_name: topic_name.to_owned(),
+        payload: payload.to_owned(),
+    })
+}
+
+/// Forward a PUBLISH directly to the topic's home node.
 pub async fn publish_remote(
     state: &SharedState,
     tenant_id: u64,
     topic_name: &str,
     payload: &str,
-    _leader_node: u64,
+    leader_node: u64,
 ) -> Result<u64, PublishError> {
-    let gateway = state
-        .gateway
-        .get()
-        .ok_or_else(|| PublishError::RemoteError("gateway not available".into()))?;
-
-    let sql = format!(
-        "PUBLISH TO {} '{}'",
-        topic_name,
-        payload.replace('\'', "''") // Escape single quotes in payload.
-    );
-
-    let gw_ctx = crate::control::gateway::core::QueryContext {
-        tenant_id: crate::types::TenantId::new(tenant_id),
-        trace_id: nodedb_types::TraceId::generate(),
-        database_id: nodedb_types::id::DatabaseId::DEFAULT,
+    let transport = state
+        .cluster_transport
+        .as_ref()
+        .ok_or_else(|| PublishError::RemoteError("cluster transport not available".into()))?;
+    let plan = build_publish_plan(topic_name, payload);
+    let plan_bytes =
+        plan_wire::encode(&plan).map_err(|error| PublishError::RemoteError(error.to_string()))?;
+    let request = RaftRpc::ExecuteRequest(ExecuteRequest {
+        plan_bytes,
+        tenant_id,
+        database_id: nodedb_types::id::DatabaseId::DEFAULT.as_u64(),
+        deadline_remaining_ms: 30_000,
+        trace_id: nodedb_types::TraceId::generate().0,
+        descriptor_versions: Vec::new(),
         txn_id: None,
-    };
-
-    let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-
-    gateway
-        .execute_sql(&gw_ctx, &sql, &[], || {
-            let (tasks, _output_schema) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(query_ctx.plan_sql(
-                    &sql,
-                    crate::types::TenantId::new(tenant_id),
-                    crate::types::DatabaseId::DEFAULT,
-                ))
-            })
-            .map_err(|e| crate::Error::PlanError {
-                detail: e.to_string(),
-            })?;
-            tasks
-                .into_iter()
-                .next()
-                .map(|t| t.plan)
-                .ok_or_else(|| crate::Error::PlanError {
-                    detail: "PUBLISH produced no physical tasks".into(),
-                })
-        })
+    });
+    let response = transport
+        .send_rpc(leader_node, request)
         .await
-        .map_err(|e| PublishError::RemoteError(e.to_string()))?;
-
-    Ok(0) // Sequence not returned by gateway execute; home node assigns it.
+        .map_err(|error| PublishError::RemoteError(error.to_string()))?;
+    let payload = match response {
+        RaftRpc::ExecuteResponse(ExecuteResponse {
+            success: true,
+            payloads,
+            ..
+        }) => payloads.into_iter().next().ok_or_else(|| {
+            PublishError::RemoteError("remote PUBLISH returned no payload".into())
+        })?,
+        RaftRpc::ExecuteResponse(ExecuteResponse {
+            error: Some(error), ..
+        }) => return Err(PublishError::RemoteError(format!("{error:?}"))),
+        RaftRpc::ExecuteResponse(_) => {
+            return Err(PublishError::RemoteError(
+                "remote PUBLISH returned an empty error".into(),
+            ));
+        }
+        _ => {
+            return Err(PublishError::RemoteError(
+                "remote PUBLISH returned an unexpected response".into(),
+            ));
+        }
+    };
+    crate::util::bounded_msgpack::read_value(&payload)
+        .map_err(|error| PublishError::RemoteError(error.to_string()))?;
+    zerompk::from_msgpack::<u64>(&payload)
+        .map_err(|error| PublishError::RemoteError(error.to_string()))
 }
 
 #[derive(Debug)]
@@ -217,5 +224,24 @@ impl std::fmt::Display for PublishError {
             }
             Self::RemoteError(e) => write!(f, "remote publish error: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_publish_plan;
+    use nodedb_physical::physical_plan::{ClusterEventOp, PhysicalPlan};
+
+    #[test]
+    fn remote_publish_preserves_payload_as_typed_data() {
+        let topic = "topic; DROP TOPIC audit";
+        let payload = "' OR true; --";
+        assert_eq!(
+            build_publish_plan(topic, payload),
+            PhysicalPlan::ClusterEvent(ClusterEventOp::PublishTopic {
+                topic_name: topic.into(),
+                payload: payload.into(),
+            })
+        );
     }
 }

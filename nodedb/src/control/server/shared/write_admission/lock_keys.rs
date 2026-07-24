@@ -71,7 +71,8 @@ fn point_lock_key(plan: &PhysicalPlan) -> Option<LockKey> {
         | PhysicalPlan::Text(_)
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
-        | PhysicalPlan::ClusterArray(_) => None,
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => None,
     }
 }
 

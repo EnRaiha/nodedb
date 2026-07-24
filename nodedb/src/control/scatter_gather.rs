@@ -218,6 +218,44 @@ pub struct CrossShardHopParams<'a> {
     pub database_id: DatabaseId,
 }
 
+fn build_graph_traverse_sql(
+    node_id: &str,
+    depth: usize,
+    edge_label: Option<&str>,
+    direction: crate::engine::graph::edge_store::Direction,
+) -> String {
+    let depth = ::nodedb_types::Value::Integer(if depth == 0 { 0 } else { 1 }).to_sql_literal();
+    match (edge_label, direction) {
+        (Some(label), crate::engine::graph::edge_store::Direction::In) => format!(
+            "GRAPH TRAVERSE FROM {} DEPTH {depth} LABEL {} DIRECTION in",
+            ::nodedb_types::quote_literal(node_id),
+            ::nodedb_types::quote_literal(label)
+        ),
+        (Some(label), crate::engine::graph::edge_store::Direction::Out) => format!(
+            "GRAPH TRAVERSE FROM {} DEPTH {depth} LABEL {} DIRECTION out",
+            ::nodedb_types::quote_literal(node_id),
+            ::nodedb_types::quote_literal(label)
+        ),
+        (Some(label), crate::engine::graph::edge_store::Direction::Both) => format!(
+            "GRAPH TRAVERSE FROM {} DEPTH {depth} LABEL {} DIRECTION both",
+            ::nodedb_types::quote_literal(node_id),
+            ::nodedb_types::quote_literal(label)
+        ),
+        (None, crate::engine::graph::edge_store::Direction::In) => format!(
+            "GRAPH TRAVERSE FROM {} DEPTH {depth} DIRECTION in",
+            ::nodedb_types::quote_literal(node_id)
+        ),
+        (None, crate::engine::graph::edge_store::Direction::Out) => format!(
+            "GRAPH TRAVERSE FROM {} DEPTH {depth} DIRECTION out",
+            ::nodedb_types::quote_literal(node_id)
+        ),
+        (None, crate::engine::graph::edge_store::Direction::Both) => format!(
+            "GRAPH TRAVERSE FROM {} DEPTH {depth} DIRECTION both",
+            ::nodedb_types::quote_literal(node_id)
+        ),
+    }
+}
+
 pub async fn coordinate_cross_shard_hop(
     shared: &SharedState,
     tenant_id: TenantId,
@@ -287,16 +325,6 @@ pub async fn coordinate_cross_shard_hop(
         }
     };
 
-    // Build SQL fragments for the label/direction clause (used for every node).
-    let label_clause = match edge_label {
-        Some(lbl) => format!(" LABEL '{lbl}'"),
-        None => String::new(),
-    };
-    let direction_word = match direction {
-        crate::engine::graph::edge_store::Direction::In => "in",
-        crate::engine::graph::edge_store::Direction::Out => "out",
-        crate::engine::graph::edge_store::Direction::Both => "both",
-    };
     // We always traverse exactly 1 depth per scatter batch because the caller
     // drives the outer BFS loop. `remaining_depth` is included for completeness
     // but each forwarded request probes depth 1 so the Control Plane maintains
@@ -329,17 +357,15 @@ pub async fn coordinate_cross_shard_hop(
         let credentials_clone = std::sync::Arc::clone(&shared.credentials);
         let retention_clone = std::sync::Arc::clone(&shared.retention_policy_registry);
         let tenant_id_u64 = tenant_id.as_u64();
-        let label_sql = label_clause.clone();
-        let direction_sql = direction_word.to_string();
+        let edge_label = edge_label.map(str::to_owned);
 
         join_handles.push(tokio::spawn(async move {
             let mut shard_results: Vec<String> = Vec::new();
             let mut any_error = false;
 
             for node_id in batch.node_ids {
-                let sql = format!(
-                    "GRAPH TRAVERSE FROM '{node_id}' DEPTH {hop_depth}{label_sql} DIRECTION {direction_sql}"
-                );
+                let sql =
+                    build_graph_traverse_sql(&node_id, hop_depth, edge_label.as_deref(), direction);
 
                 let gw_ctx = crate::control::gateway::core::QueryContext {
                     tenant_id: crate::types::TenantId::new(tenant_id_u64),
@@ -357,18 +383,15 @@ pub async fn coordinate_cross_shard_hop(
 
                 let sql_for_plan = sql.clone();
                 let plan_result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        plan_ctx.plan_sql(
-                            &sql_for_plan,
-                            crate::types::TenantId::new(tenant_id_u64),
-                            database_id,
-                        ),
-                    )
+                    tokio::runtime::Handle::current().block_on(plan_ctx.plan_sql(
+                        &sql_for_plan,
+                        crate::types::TenantId::new(tenant_id_u64),
+                        database_id,
+                    ))
                 });
 
                 let physical_plan = match plan_result {
-                    Ok((tasks, _output_schema)) => match tasks.into_iter().next().map(|t| t.plan)
-                    {
+                    Ok((tasks, _output_schema)) => match tasks.into_iter().next().map(|t| t.plan) {
                         Some(p) => p,
                         None => continue,
                     },
@@ -464,6 +487,20 @@ pub fn partition_local_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_traverse_sql_quotes_node_and_label_literals() {
+        let sql = build_graph_traverse_sql(
+            "node'; DROP GRAPH audit; --",
+            1,
+            Some("label'; --"),
+            crate::engine::graph::edge_store::Direction::Out,
+        );
+        assert_eq!(
+            sql,
+            "GRAPH TRAVERSE FROM 'node''; DROP GRAPH audit; --' DEPTH 1 LABEL 'label''; --' DIRECTION out"
+        );
+    }
 
     #[test]
     fn scatter_envelope_grouping() {

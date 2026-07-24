@@ -73,13 +73,9 @@ async fn handle_sql_inner(
     // substitution invariant in one place so the DDL router, planner,
     // and transaction buffer all see the same SQL shape regardless of
     // whether the caller sent params or inlined values directly.
-    let substituted: Option<String> = match sql_params {
-        Some(params) if !params.is_empty() => match inline_params(sql, params) {
-            Ok(s) => Some(s),
-            Err(msg) => return resp(NativeResponse::error(seq, "42P02", msg)),
-        },
-        _ => None,
-    };
+    let substituted = sql_params
+        .filter(|params| !params.is_empty())
+        .map(|params| inline_params(sql, params));
     let sql = substituted.as_deref().unwrap_or(sql);
     let sql_trimmed = sql.trim();
     let upper = sql_trimmed.to_uppercase();
@@ -392,46 +388,35 @@ async fn execute_planned(
 // Errors here surface as `42P02` (`undefined_parameter`) so the client
 // gets a typed SQLSTATE rather than a generic `XX000` opaque failure.
 
-/// Substitute `$N` placeholders in `sql` with the rendered SQL literal
-/// form of each value. Returns the new SQL or a typed error message
-/// suitable for `42P02`.
-fn inline_params(sql: &str, params: &[Value]) -> Result<String, String> {
-    // Render every value first so a render failure aborts the whole
-    // substitution rather than partially rewriting placeholders — a
-    // partially-rewritten SQL would re-create the silent-wrong pattern
-    // the trait contract guards against.
-    let literals: Vec<String> = params
-        .iter()
-        .map(value_to_sql_literal)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(crate::control::server::shared::sql::placeholder::rewrite_sql_placeholders(sql, &literals))
-}
-
-/// Render a `nodedb_types::Value` as a SQL literal usable in
-/// expression position.
-///
-/// Strings are single-quote escaped per `standard_conforming_strings=on`;
-/// numeric / boolean / null values are formatted directly. Variants
-/// that have no canonical SQL literal form (objects, arrays, vectors,
-/// binary, datetime) return `Err` rather than producing a malformed
-/// statement — the caller surfaces this as `42P02`.
-fn value_to_sql_literal(v: &Value) -> Result<String, String> {
-    match v {
-        Value::Null => Ok("NULL".into()),
-        Value::Bool(b) => Ok(if *b { "TRUE".into() } else { "FALSE".into() }),
-        Value::Integer(i) => Ok(i.to_string()),
-        Value::Float(f) => Ok(f.to_string()),
-        Value::String(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
-        other => Err(format!(
-            "sql_params value has no SQL literal form: {other:?}"
-        )),
-    }
+/// Substitute `$N` placeholders in `sql` with canonical SQL literals.
+fn inline_params(sql: &str, params: &[Value]) -> String {
+    let literals = params.iter().map(Value::to_sql_literal).collect::<Vec<_>>();
+    crate::control::server::shared::sql::placeholder::rewrite_sql_placeholders(sql, &literals)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::inline_params;
     use crate::bridge::envelope::PhysicalPlan;
     use nodedb_physical::physical_plan::{ColumnarOp, DocumentOp};
+    use nodedb_types::Value;
+
+    #[test]
+    fn native_params_use_canonical_literals_for_scalar_and_nested_values() {
+        let values = [
+            Value::String("x'; --".into()),
+            Value::Array(vec![Value::Integer(1), Value::String("two".into())]),
+        ];
+        let sql = inline_params("SELECT $1, $2", &values);
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT {}, {}",
+                values[0].to_sql_literal(),
+                values[1].to_sql_literal()
+            )
+        );
+    }
 
     #[test]
     fn columnar_scan_is_sharded_source() {

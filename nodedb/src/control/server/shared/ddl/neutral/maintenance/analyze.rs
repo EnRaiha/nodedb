@@ -7,7 +7,7 @@
 //! min/max computation. Results stored in the system catalog for
 //! DataFusion cost-based optimization.
 
-use nodedb_types::{DatabaseId, quote_ident};
+use nodedb_types::DatabaseId;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -54,7 +54,7 @@ pub async fn handle_analyze(
     };
 
     // Dispatch a scan to the Data Plane to collect all rows.
-    let scan_sql = format!("SELECT * FROM {}", quote_ident(&collection));
+    let scan_sql = format!("SELECT * FROM {}", ::nodedb_types::quote_ident(&collection));
     let (tasks, _output_schema) =
         crate::control::server::shared::ddl::neutral::planning::plan_authorized_sql(
             state,

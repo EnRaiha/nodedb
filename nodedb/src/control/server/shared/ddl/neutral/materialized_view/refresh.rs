@@ -24,7 +24,7 @@
 //! pgwire `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
 //! [`DdlError`].
 
-use nodedb_types::{DatabaseId, quote_ident, quote_literal};
+use nodedb_types::DatabaseId;
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -71,7 +71,7 @@ pub async fn refresh_materialized_view(
     dispatch_sql(
         state,
         identity,
-        &format!("DELETE FROM {}", quote_ident(&view.name)),
+        &format!("DELETE FROM {}", ::nodedb_types::quote_ident(&view.name)),
     )
     .await?;
 
@@ -202,17 +202,20 @@ fn build_insert_sql(
             "materialized view SELECT produced an empty row (no columns)".to_string(),
         ));
     }
-    let mut cols: Vec<String> = Vec::with_capacity(row.len());
-    let mut vals: Vec<String> = Vec::with_capacity(row.len());
-    for (k, v) in row {
-        cols.push(quote_ident(k));
-        vals.push(json_value_to_sql_literal(v)?);
-    }
+    let cols = row
+        .keys()
+        .map(String::as_str)
+        .map(::nodedb_types::quote_ident)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let vals = row
+        .values()
+        .map(json_value_to_sql_literal)
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
     Ok(format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        quote_ident(target),
-        cols.join(", "),
-        vals.join(", ")
+        "INSERT INTO {} ({cols}) VALUES ({vals})",
+        ::nodedb_types::quote_ident(target)
     ))
 }
 
@@ -221,11 +224,11 @@ fn json_value_to_sql_literal(v: &serde_json::Value) -> Result<String, DdlError> 
         serde_json::Value::Null => "NULL".into(),
         serde_json::Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
         serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => quote_literal(s),
+        serde_json::Value::String(s) => ::nodedb_types::quote_literal(s),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
             let s = sonic_rs::to_string(v)
                 .map_err(|e| err("XX000", format!("encode nested value: {e}")))?;
-            quote_literal(&s)
+            ::nodedb_types::quote_literal(&s)
         }
     })
 }

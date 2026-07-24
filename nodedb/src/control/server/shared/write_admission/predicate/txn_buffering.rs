@@ -483,6 +483,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         PhysicalPlan::ClusterArray(ClusterArrayOp::Put { .. } | ClusterArrayOp::Delete { .. }) => {
             false
         }
+        PhysicalPlan::ClusterEvent(_) => false,
     }
 }
 

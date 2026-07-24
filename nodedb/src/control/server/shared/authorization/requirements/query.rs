@@ -100,6 +100,7 @@ pub(super) fn collect_query_requirements<'a>(
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => false,
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => false,
     }
 }

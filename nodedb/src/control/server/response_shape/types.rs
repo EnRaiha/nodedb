@@ -191,7 +191,8 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => PlanKind::Execution,
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => PlanKind::Execution,
     }
 }
 

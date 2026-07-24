@@ -176,7 +176,8 @@ fn collect_requirements(plan: &PhysicalPlan, out: &mut Vec<AuthorizationRequirem
             | PhysicalPlan::Crdt(_)
             | PhysicalPlan::Meta(_)
             | PhysicalPlan::Array(_)
-            | PhysicalPlan::ClusterArray(_) => add_general_requirements(plan, out),
+            | PhysicalPlan::ClusterArray(_)
+            | PhysicalPlan::ClusterEvent(_) => add_general_requirements(plan, out),
         }
 
         // A wrapper delegates its resource boundary to its nested plans. Its
@@ -214,7 +215,8 @@ fn requires_tenant_fallback(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => true,
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => true,
     }
 }
 

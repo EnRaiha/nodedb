@@ -258,7 +258,8 @@ pub fn is_write_plan(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Text(_)
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
-        | PhysicalPlan::ClusterArray(_) => false,
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => false,
     }
 }
 

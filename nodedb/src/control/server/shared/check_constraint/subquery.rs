@@ -157,6 +157,7 @@ fn parse_check_wrapper(
     constraint: &CheckConstraintDef,
 ) -> Result<Vec<Statement>, DdlError> {
     let wrapper = format!("SELECT ({check_sql}) AS _check");
+    // reconstructed-sql: parser-only validates and binds the stored CHECK expression AST
     nodedb_sql::parser::statement::parse_sql(&wrapper)
         .map_err(|error| evaluation_error(constraint, &error.to_string()))
 }
@@ -265,6 +266,7 @@ fn is_supported_bound_value(value: &nodedb_types::Value) -> bool {
 
 fn parse_literal_expression(value: &nodedb_types::Value) -> Result<Expr, String> {
     let literal = value_to_sql_literal(value);
+    // reconstructed-sql: parser-only converts one canonical Value literal into an Expr AST
     let statements = nodedb_sql::parser::statement::parse_sql(&format!("SELECT {literal}"))
         .map_err(|error| format!("failed to parse CHECK literal: {error}"))?;
     let [Statement::Query(query)] = statements.as_slice() else {
@@ -351,30 +353,36 @@ fn build_match_query(
         }
     };
 
-    let projection_sql = projection.to_string();
-    let lhs_sql = lhs.to_string();
-    let from_sql = select
-        .from
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
+    let projection_sql = canonical_check_expr_sql(projection);
+    let lhs_sql = canonical_check_expr_sql(lhs);
+    let from_sql = canonical_check_from_sql(&select.from[0]);
     // IN is accepted by CHECK when a row matches or when a NULL row makes the
     // result UNKNOWN. NOT IN is violated only by an actual equal row; a NULL
     // without a match also yields UNKNOWN and therefore passes CHECK.
-    let match_predicate = if negated {
-        format!("({projection_sql}) = ({lhs_sql})")
-    } else {
-        format!("(({projection_sql}) = ({lhs_sql}) OR ({projection_sql}) IS NULL)")
-    };
-    let where_sql = select
-        .selection
-        .as_ref()
-        .map(|where_expr| format!(" AND ({where_expr})"))
-        .unwrap_or_default();
-    Ok(format!(
-        "SELECT COUNT(*) AS cnt FROM {from_sql} WHERE {match_predicate}{where_sql}"
-    ))
+    match (negated, select.selection.as_ref()) {
+        (true, Some(where_expr)) => Ok(format!(
+            "SELECT COUNT(*) AS cnt FROM {from_sql} WHERE ({projection_sql}) = ({lhs_sql}) AND ({})",
+            canonical_check_expr_sql(where_expr)
+        )),
+        (true, None) => Ok(format!(
+            "SELECT COUNT(*) AS cnt FROM {from_sql} WHERE ({projection_sql}) = ({lhs_sql})"
+        )),
+        (false, Some(where_expr)) => Ok(format!(
+            "SELECT COUNT(*) AS cnt FROM {from_sql} WHERE (({projection_sql}) = ({lhs_sql}) OR ({projection_sql}) IS NULL) AND ({})",
+            canonical_check_expr_sql(where_expr)
+        )),
+        (false, None) => Ok(format!(
+            "SELECT COUNT(*) AS cnt FROM {from_sql} WHERE (({projection_sql}) = ({lhs_sql}) OR ({projection_sql}) IS NULL)"
+        )),
+    }
+}
+
+fn canonical_check_expr_sql(expr: &Expr) -> String {
+    expr.to_string()
+}
+
+fn canonical_check_from_sql(from: &sqlparser::ast::TableWithJoins) -> String {
+    from.to_string()
 }
 
 fn validate_subquery_shape(

@@ -64,7 +64,7 @@ pub fn to_replicated_entry(
         PhysicalPlan::ClusterArray(_) => None,
         // Reads / query operators / metadata ops are never replicated writes.
         PhysicalPlan::Query(_) => None,
-        PhysicalPlan::Meta(_) => None,
+        PhysicalPlan::Meta(_) | PhysicalPlan::ClusterEvent(_) => None,
     };
 
     write.map(|write| {

@@ -94,6 +94,7 @@ pub(super) fn plan_contains_exchange(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Crdt(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => false,
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => false,
     }
 }

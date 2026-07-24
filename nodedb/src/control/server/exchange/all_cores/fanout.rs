@@ -114,7 +114,8 @@ pub(super) async fn gather_graph_op_all_cores(
                 | PhysicalPlan::Query(_)
                 | PhysicalPlan::Meta(_)
                 | PhysicalPlan::Array(_)
-                | PhysicalPlan::ClusterArray(_) => {}
+                | PhysicalPlan::ClusterArray(_)
+                | PhysicalPlan::ClusterEvent(_) => {}
             }
             core_plan
         })?;

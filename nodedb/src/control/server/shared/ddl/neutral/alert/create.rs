@@ -280,14 +280,45 @@ fn parse_insert_target(s: &str) -> Result<(String, Vec<String>), DdlError> {
         let paren_end = s
             .rfind(')')
             .ok_or_else(|| err("42601", "missing ')' in INSERT INTO target".to_string()))?;
+        if !s[paren_end + 1..].trim().is_empty() {
+            return Err(err(
+                "42601",
+                "unexpected text after INSERT INTO column list".to_string(),
+            ));
+        }
         let cols: Vec<String> = s[paren_start + 1..paren_end]
             .split(',')
             .map(|c| c.trim().to_lowercase())
             .filter(|c| !c.is_empty())
             .collect();
+        if table.is_empty() || cols.len() != 7 {
+            return Err(err(
+                "42601",
+                "alert INSERT INTO target requires a table and exactly seven columns".to_string(),
+            ));
+        }
         Ok((table, cols))
     } else {
         let table = s.split_whitespace().next().unwrap_or(s).to_lowercase();
+        if table.is_empty() {
+            return Err(err(
+                "42601",
+                "alert INSERT INTO target requires a table".to_string(),
+            ));
+        }
         Ok((table, Vec::new()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_insert_target;
+
+    #[test]
+    fn insert_target_requires_exact_alert_history_arity() {
+        assert!(parse_insert_target("history").is_ok());
+        assert!(parse_insert_target("history (a,b,c,d,e,f,g)").is_ok());
+        assert!(parse_insert_target("history (a,b)").is_err());
+        assert!(parse_insert_target("history (a,b,c,d,e,f,g) trailing").is_err());
     }
 }

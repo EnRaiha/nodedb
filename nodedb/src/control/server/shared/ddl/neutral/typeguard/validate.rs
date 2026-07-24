@@ -11,7 +11,7 @@
 //! preserved verbatim; only the result construction changed from pgwire
 //! `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
 
-use nodedb_types::{DatabaseId, quote_ident};
+use nodedb_types::DatabaseId;
 
 use serde_json::{Map, Value as JsonValue};
 
@@ -64,7 +64,7 @@ pub async fn validate_typeguard(
     let guards = coll.type_guards.clone();
 
     // Scan all documents.
-    let scan_sql = format!("SELECT * FROM {}", quote_ident(&coll_name));
+    let scan_sql = format!("SELECT * FROM {}", ::nodedb_types::quote_ident(&coll_name));
     let (tasks, _output_schema) =
         crate::control::server::shared::ddl::neutral::planning::plan_authorized_sql(
             state,

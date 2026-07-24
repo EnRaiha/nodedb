@@ -83,7 +83,8 @@ pub(super) fn is_calvin_foldable(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => false,
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => false,
     }
 }
 

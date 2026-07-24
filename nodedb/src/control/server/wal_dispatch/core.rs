@@ -172,7 +172,10 @@ pub fn wal_append(req: WalAppendRequest<'_>) -> crate::Result<WalAppendOutcome> 
         // resolved by the coordinator before the SPSC bridge — it fans its cells
         // out to the owning shards, and each owner's apply mints the redo for
         // the cells it actually holds. All produce no durable record here.
-        PhysicalPlan::Meta(_) | PhysicalPlan::Query(_) | PhysicalPlan::ClusterArray(_) => None,
+        PhysicalPlan::Meta(_)
+        | PhysicalPlan::Query(_)
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => None,
     };
     Ok(WalAppendOutcome {
         lsn: appended,

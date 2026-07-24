@@ -64,9 +64,12 @@ pub(super) fn extract_column_pairs(body: &str) -> Result<Vec<(String, String)>, 
 /// Heuristic: does the first token in the paren body look like a WITH-clause
 /// key rather than a column name+type?
 fn is_with_clause_inner(upper_inner: &str) -> bool {
-    let first_tok = upper_inner.split_whitespace().next().unwrap_or("");
+    let first_tok = upper_inner
+        .split(|character: char| character.is_whitespace() || character == '=')
+        .next()
+        .unwrap_or("");
     matches!(
-        first_tok.trim_end_matches(['=', '\'']),
+        first_tok,
         "ENGINE"
             | "PROFILE"
             | "VECTOR_FIELD"
@@ -318,6 +321,15 @@ fn parse_col_token(token: &str) -> Result<Option<(String, String)>, SqlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_clause_without_spaces_is_not_a_column_list() {
+        assert!(
+            extract_column_pairs("WITH (engine='document_schemaless')")
+                .expect("WITH options")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn generated_clause_after_unicode_type_preserves_original_offsets() {

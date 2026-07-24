@@ -103,7 +103,8 @@ impl CoreLoop {
             | PhysicalPlan::Query(_)
             | PhysicalPlan::Meta(_)
             | PhysicalPlan::Array(_)
-            | PhysicalPlan::ClusterArray(_) => {}
+            | PhysicalPlan::ClusterArray(_)
+            | PhysicalPlan::ClusterEvent(_) => {}
         }
     }
 

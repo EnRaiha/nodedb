@@ -194,6 +194,7 @@ fn eval_sql_expr(
 ) -> Option<nodedb_types::Value> {
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
     let full_sql = format!("SELECT {sql_text}");
+    // reconstructed-sql: parser-only evaluates an internal recursive expression AST
     let stmts = sqlparser::parser::Parser::parse_sql(&dialect, &full_sql).ok()?;
     let stmt = stmts.into_iter().next()?;
 

@@ -107,6 +107,7 @@ fn try_eval_constant(sql: &str) -> Option<nodedb_types::Value> {
 
     let dialect = sqlparser::dialect::PostgreSqlDialect {};
     let select_sql = format!("SELECT {expr_str}");
+    // reconstructed-sql: parser-only evaluates one constant-expression AST without dispatch
     let stmts = sqlparser::parser::Parser::parse_sql(&dialect, &select_sql).ok()?;
     let stmt = stmts.first()?;
 

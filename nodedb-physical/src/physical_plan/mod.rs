@@ -8,6 +8,7 @@
 
 pub mod array;
 pub mod cluster_array;
+pub mod cluster_event;
 pub mod columnar;
 pub mod crdt;
 pub mod document;
@@ -26,6 +27,7 @@ pub mod wire;
 
 pub use array::{ArrayBinaryOp, ArrayOp, ArrayReducer};
 pub use cluster_array::ClusterArrayOp;
+pub use cluster_event::ClusterEventOp;
 pub use columnar::{ColumnarInsertIntent, ColumnarOp};
 pub use crdt::CrdtOp;
 pub use document::{
@@ -89,6 +91,9 @@ pub enum PhysicalPlan {
     /// Cluster-mode array operations executed by the coordinator on the
     /// Control Plane. Never sent to the Data Plane.
     ClusterArray(ClusterArrayOp),
+    /// Event-Plane operations executed by a receiving Control Plane.
+    /// Never sent to the Data Plane.
+    ClusterEvent(ClusterEventOp),
 }
 
 impl PhysicalPlan {
@@ -200,6 +205,7 @@ impl PhysicalPlan {
             | PhysicalPlan::Meta(_)
             | PhysicalPlan::Array(_)
             | PhysicalPlan::ClusterArray(_)
+            | PhysicalPlan::ClusterEvent(_)
             | PhysicalPlan::Query(_) => false,
         }
     }
@@ -336,7 +342,8 @@ impl PhysicalPlan {
             | PhysicalPlan::Query(_)
             | PhysicalPlan::Meta(_)
             | PhysicalPlan::Array(_)
-            | PhysicalPlan::ClusterArray(_) => None,
+            | PhysicalPlan::ClusterArray(_)
+            | PhysicalPlan::ClusterEvent(_) => None,
         }
     }
 

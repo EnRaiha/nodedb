@@ -8,7 +8,7 @@ use crate::bridge::envelope::{PhysicalPlan, Response};
 use crate::control::change_stream::ChangeOperation;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
-use nodedb_physical::physical_plan::{ClusterArrayOp, TimeseriesOp};
+use nodedb_physical::physical_plan::ClusterArrayOp;
 
 use super::extract::{cluster_array_change_meta, extract_write_metadata};
 
@@ -58,17 +58,11 @@ fn publish_change_event(
     shared: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
-    is_columnar_collection: bool,
     change_meta: (String, String, ChangeOperation),
     lsn: nodedb_types::Lsn,
 ) {
     let (collection, doc_id, op) = change_meta;
-    let should_publish = if is_columnar_collection {
-        is_timeseries_cdc_enabled(shared, database_id, tenant_id, &collection)
-    } else {
-        true
-    };
-    if !should_publish {
+    if !is_timeseries_cdc_enabled(shared, database_id, tenant_id, &collection) {
         return;
     }
 
@@ -108,10 +102,6 @@ fn publish_change_event(
 /// LSN comes from exists. A caller that still owns its plan at publish time
 /// uses [`publish_origin_change_events`] and never names this type.
 pub(crate) struct WriteChangeSet {
-    /// Whether this plan writes through the columnar storage core. Only those
-    /// collections can be timeseries, so this gates the per-collection
-    /// timeseries CDC opt-in check to the writes that could opt out of it.
-    is_columnar_collection: bool,
     /// One tuple per logical row change — see `extract_write_metadata`.
     metas: Vec<(String, String, ChangeOperation)>,
 }
@@ -121,12 +111,6 @@ pub(crate) struct WriteChangeSet {
 /// call at the one point where the plan is still owned.
 pub(crate) fn extract_write_change_set(plan: &PhysicalPlan, tenant_id: TenantId) -> WriteChangeSet {
     WriteChangeSet {
-        is_columnar_collection: matches!(
-            plan,
-            PhysicalPlan::Columnar(_)
-                | PhysicalPlan::Timeseries(TimeseriesOp::Ingest { .. })
-                | PhysicalPlan::Timeseries(TimeseriesOp::Scan { .. })
-        ),
         metas: extract_write_metadata(plan, tenant_id),
     }
 }
@@ -142,19 +126,9 @@ pub(crate) fn publish_change_set_with_lsn(
     change_set: WriteChangeSet,
     lsn: nodedb_types::Lsn,
 ) {
-    let WriteChangeSet {
-        is_columnar_collection,
-        metas,
-    } = change_set;
+    let WriteChangeSet { metas } = change_set;
     for meta in metas {
-        publish_change_event(
-            shared,
-            tenant_id,
-            database_id,
-            is_columnar_collection,
-            meta,
-            lsn,
-        );
+        publish_change_event(shared, tenant_id, database_id, meta, lsn);
     }
 }
 
@@ -219,7 +193,6 @@ pub(crate) fn publish_cluster_array_change_events(
     lsn: u64,
 ) {
     let change_set = WriteChangeSet {
-        is_columnar_collection: false,
         metas: cluster_array_change_meta(op),
     };
     publish_change_set_with_lsn(

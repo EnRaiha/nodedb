@@ -229,6 +229,10 @@ pub async fn execute_plan_all_local_cores(
             }
         },
 
+        PhysicalPlan::ClusterEvent(_) => Err(crate::Error::Internal {
+            detail: "ClusterEvent plan must execute on the receiving Control Plane".into(),
+        }),
+
         // ── All other PhysicalPlan variants → generic gather ──────────────────
         PhysicalPlan::Vector(_)
         | PhysicalPlan::Document(_)

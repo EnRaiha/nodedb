@@ -115,7 +115,8 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => None,
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => None,
     }
 }
 
@@ -137,6 +138,7 @@ pub(crate) fn plan_engine(plan: &PhysicalPlan) -> EngineTag {
         PhysicalPlan::Meta(_) => EngineTag::Meta,
         PhysicalPlan::Array(_) => EngineTag::Array,
         PhysicalPlan::ClusterArray(_) => EngineTag::ClusterArray,
+        PhysicalPlan::ClusterEvent(_) => EngineTag::Meta,
     }
 }
 
@@ -235,6 +237,7 @@ pub(crate) fn read_key_of(plan: &PhysicalPlan, found: bool) -> ReadKey {
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => ReadKey::Predicate,
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => ReadKey::Predicate,
     }
 }

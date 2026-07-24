@@ -97,7 +97,8 @@ impl CoreLoop {
             | PhysicalPlan::Query(_)
             | PhysicalPlan::Meta(_)
             | PhysicalPlan::Array(_)
-            | PhysicalPlan::ClusterArray(_) => self.exec_tx_passthrough(tid, plan),
+            | PhysicalPlan::ClusterArray(_)
+            | PhysicalPlan::ClusterEvent(_) => self.exec_tx_passthrough(tid, plan),
         }
     }
 

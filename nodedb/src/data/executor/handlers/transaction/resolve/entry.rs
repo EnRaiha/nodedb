@@ -150,9 +150,9 @@ impl CoreLoop {
                 PhysicalPlan::Spatial(op) => spatial::serialize_spatial_op(op, &mut ops)?,
 
                 // Coordinator-only op; never legal on the Data Plane.
-                PhysicalPlan::ClusterArray(_) => {
+                PhysicalPlan::ClusterArray(_) | PhysicalPlan::ClusterEvent(_) => {
                     return Err(crate::Error::Internal {
-                        detail: "cluster-array op reached Data Plane transaction resolve"
+                        detail: "Control-Plane-only op reached Data Plane transaction resolve"
                             .to_string(),
                     });
                 }

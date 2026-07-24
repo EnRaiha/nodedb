@@ -15,6 +15,7 @@ use crate::control::planner::procedural::executor::core::StatementExecutor;
 use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
+use nodedb_types::Value;
 
 use super::hysteresis::HysteresisTransition;
 use super::types::{AlertDef, AlertEvent, NotifyTarget};
@@ -175,6 +176,49 @@ pub async fn notify_webhook_with_client(
     );
 }
 
+fn build_alert_insert_sql(table: &str, columns: &[String], event: &AlertEvent) -> Option<String> {
+    if !columns.is_empty() && columns.len() != 7 {
+        return None;
+    }
+    let default_columns = [
+        "alert_name",
+        "group_key",
+        "severity",
+        "status",
+        "value",
+        "threshold",
+        "timestamp_ms",
+    ];
+    let column_names = if columns.is_empty() {
+        default_columns.to_vec()
+    } else {
+        columns.iter().map(String::as_str).collect::<Vec<_>>()
+    };
+    let col_list = column_names
+        .into_iter()
+        .map(::nodedb_types::quote_ident)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let timestamp_ms = i64::try_from(event.timestamp_ms).ok()?;
+    let values = [
+        Value::String(event.alert_name.clone()),
+        Value::String(event.group_key.clone()),
+        Value::String(event.severity.clone()),
+        Value::String(event.status.clone()),
+        Value::Float(event.value),
+        Value::Float(event.threshold),
+        Value::Integer(timestamp_ms),
+    ]
+    .iter()
+    .map(::nodedb_types::Value::to_sql_literal)
+    .collect::<Vec<_>>()
+    .join(", ");
+    let table = ::nodedb_types::quote_ident(table);
+    Some(format!(
+        "BEGIN INSERT INTO {table} ({col_list}) VALUES ({values}); END"
+    ))
+}
+
 /// INSERT alert event into a history table via StatementExecutor.
 async fn notify_insert(
     state: &SharedState,
@@ -184,25 +228,16 @@ async fn notify_insert(
     columns: &[String],
     event: &AlertEvent,
 ) {
-    // Build INSERT statement.
-    let col_list = if columns.is_empty() {
-        "alert_name, group_key, severity, status, value, threshold, timestamp_ms".to_string()
-    } else {
-        columns.join(", ")
+    let Some(sql) = build_alert_insert_sql(table, columns, event) else {
+        warn!(
+            alert = event.alert_name,
+            table,
+            column_count = columns.len(),
+            timestamp_ms = event.timestamp_ms,
+            "alert history target has invalid column arity or timestamp"
+        );
+        return;
     };
-
-    let values = format!(
-        "'{}', '{}', '{}', '{}', {}, {}, {}",
-        escape_sql(&event.alert_name),
-        escape_sql(&event.group_key),
-        escape_sql(&event.severity),
-        escape_sql(&event.status),
-        event.value,
-        event.threshold,
-        event.timestamp_ms,
-    );
-
-    let sql = format!("BEGIN INSERT INTO {table} ({col_list}) VALUES ({values}); END");
 
     let identity = alert_identity(TenantId::new(tenant_id), owner);
     let block = match crate::control::planner::procedural::parse_block(&sql) {
@@ -252,26 +287,30 @@ fn alert_identity(tenant_id: TenantId, owner: &str) -> AuthenticatedIdentity {
     }
 }
 
-/// SQL string escaping for single-quoted literals.
-///
-/// Escapes single quotes (SQL standard) and backslashes (PostgreSQL extension).
-/// Null bytes are stripped since they are invalid in SQL string literals.
-fn escape_sql(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\'', "''")
-        .replace('\0', "")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn escape_sql_strings() {
-        assert_eq!(escape_sql("it's"), "it''s");
-        assert_eq!(escape_sql("no quotes"), "no quotes");
-        assert_eq!(escape_sql("a'b'c"), "a''b''c");
-        assert_eq!(escape_sql("back\\slash"), "back\\\\slash");
-        assert_eq!(escape_sql("null\0byte"), "nullbyte");
+    fn canonical_alert_sql_quotes_complete_statement_and_enforces_arity() {
+        let event = AlertEvent {
+            alert_name: "cpu'; DROP TABLE users; --".into(),
+            group_key: "group".into(),
+            severity: "high".into(),
+            status: "ACTIVE".into(),
+            value: 1.5,
+            threshold: 1.0,
+            timestamp_ms: 42,
+            collection: "metrics".into(),
+        };
+        let columns = ["a", "b", "c", "d", "e", "f", "g"]
+            .map(str::to_string)
+            .to_vec();
+        let sql = build_alert_insert_sql("history; DROP TABLE audit", &columns, &event)
+            .expect("valid alert SQL");
+        assert!(sql.contains("\"history; DROP TABLE audit\""));
+        assert!(sql.contains("'cpu''; DROP TABLE users; --'"));
+        assert!(sql.contains("(\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\")"));
+        assert!(build_alert_insert_sql("history", &columns[..6], &event).is_none());
     }
 }

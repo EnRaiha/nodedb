@@ -39,7 +39,7 @@ fn err(sqlstate: &str, message: String) -> DdlError {
     }
 }
 
-fn build_reconstructed_sql(
+fn assemble_retention_parser_input(
     name: &str,
     collection: &str,
     body_raw: &str,
@@ -74,7 +74,9 @@ pub async fn create_retention_policy(
     // Reconstruct minimal SQL for the existing complex parser. The body is
     // already structured retention-policy grammar; only externally named SQL
     // tokens are re-emitted here.
-    let reconstructed = build_reconstructed_sql(name, collection, body_raw, eval_interval_raw);
+    let reconstructed =
+        assemble_retention_parser_input(name, collection, body_raw, eval_interval_raw);
+    // reconstructed-sql: parser-only reparses strict retention grammar into typed policy fields
     let parsed = parse_create_retention_policy(&reconstructed)?;
     let tenant_id = identity.tenant_id.as_u64();
 
@@ -214,7 +216,7 @@ mod tests {
 
     #[test]
     fn reconstructed_sql_quotes_identifier_and_interval_inputs() {
-        let sql = build_reconstructed_sql(
+        let sql = assemble_retention_parser_input(
             "policy\"; DROP TABLE audit_log; --",
             "metrics\"; DELETE FROM audit_log; --",
             "RAW RETAIN '7d'",
@@ -230,7 +232,7 @@ mod tests {
 
     #[test]
     fn reconstructed_sql_preserves_structured_body_without_eval_interval() {
-        let sql = build_reconstructed_sql(
+        let sql = assemble_retention_parser_input(
             "Policy Name",
             "Metrics \"Primary\"",
             "RAW RETAIN '7d'",

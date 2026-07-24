@@ -77,7 +77,9 @@ pub(crate) fn plan_vshard_in_database(plan: &PhysicalPlan, database_id: Database
         // Cluster-fanned-out array ops are handled entirely by the
         // Control-Plane `ArrayCoordinator` and never dispatched to the Data
         // Plane (see `data/executor/dispatch/visitor.rs`'s `unreachable!`).
-        PhysicalPlan::ClusterArray(_) => PlanRouting::ControlPlaneOnly,
+        PhysicalPlan::ClusterArray(_) | PhysicalPlan::ClusterEvent(_) => {
+            PlanRouting::ControlPlaneOnly
+        }
         // Reads / query operators / metadata ops: `is_write_plan` already
         // excludes every variant of these four families upstream.
         PhysicalPlan::Text(_) => PlanRouting::NotAWrite,

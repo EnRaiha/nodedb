@@ -11,8 +11,8 @@ use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 use nodedb_physical::PhysicalTaskVisitor;
 use nodedb_physical::physical_plan::{
-    ArrayOp, ClusterArrayOp, ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, MetaOp, QueryOp,
-    SpatialOp, TextOp, TimeseriesOp, VectorOp,
+    ArrayOp, ClusterArrayOp, ClusterEventOp, ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, MetaOp,
+    QueryOp, SpatialOp, TextOp, TimeseriesOp, VectorOp,
 };
 
 /// Adapter that implements [`PhysicalTaskVisitor`] for the Data Plane.
@@ -81,5 +81,9 @@ impl<'a, 'b> PhysicalTaskVisitor for DataPlaneVisitor<'a, 'b> {
 
     fn cluster_array(&mut self, _op: &ClusterArrayOp) -> Result<Response, Self::Error> {
         unreachable!("ClusterArray plans must not be dispatched to the Data Plane")
+    }
+
+    fn cluster_event(&mut self, _op: &ClusterEventOp) -> Result<Response, Self::Error> {
+        unreachable!("ClusterEvent plans must not be dispatched to the Data Plane")
     }
 }

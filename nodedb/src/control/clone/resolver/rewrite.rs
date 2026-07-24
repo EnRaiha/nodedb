@@ -289,7 +289,8 @@ pub fn rewrite_plan_for_source(
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => Ok(None),
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => Ok(None),
     }
 }
 
@@ -322,7 +323,8 @@ pub(super) fn extract_collection_from_plan(plan: &PhysicalPlan) -> Option<&str> 
         | PhysicalPlan::Query(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_) => None,
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => None,
     }
 }
 

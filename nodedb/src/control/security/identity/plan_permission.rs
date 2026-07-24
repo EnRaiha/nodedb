@@ -317,6 +317,7 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             nodedb_physical::physical_plan::ClusterArrayOp::Put { .. }
             | nodedb_physical::physical_plan::ClusterArrayOp::Delete { .. },
         ) => Permission::Write,
+        PhysicalPlan::ClusterEvent(_) => Permission::Read,
 
         // Calvin cross-shard execution batches are write operations dispatched
         // internally by the Calvin scheduler; treat as Write.

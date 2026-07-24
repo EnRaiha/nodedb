@@ -41,7 +41,8 @@ pub fn stamp_minted_lsn(plan: &mut PhysicalPlan, lsn: Lsn) {
         | PhysicalPlan::Spatial(_)
         | PhysicalPlan::Meta(_)
         | PhysicalPlan::Query(_)
-        | PhysicalPlan::ClusterArray(_) => {}
+        | PhysicalPlan::ClusterArray(_)
+        | PhysicalPlan::ClusterEvent(_) => {}
     }
 }
 

@@ -117,6 +117,7 @@ pub fn plan_contains_cluster_partitioned_leaf(plan: &PhysicalPlan) -> bool {
         | PhysicalPlan::Spatial(_)
         | PhysicalPlan::Crdt(_)
         | PhysicalPlan::Meta(_)
+        | PhysicalPlan::ClusterEvent(_)
         | PhysicalPlan::Query(QueryOp::ProviderScan { .. })
         | PhysicalPlan::Query(QueryOp::PartialAggregate { .. })
         | PhysicalPlan::Query(QueryOp::PartialAggregateState { .. })
