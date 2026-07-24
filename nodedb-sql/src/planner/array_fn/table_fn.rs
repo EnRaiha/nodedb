@@ -44,8 +44,14 @@ pub fn try_plan_array_table_fn(
         ast::TableFactor::Table {
             name,
             args: Some(args),
+            alias,
             ..
-        } => (name, args),
+        } => {
+            if let Some(alias) = alias {
+                crate::reserved::check_ast_identifier(&alias.name)?;
+            }
+            (name, args)
+        }
         _ => return Ok(None),
     };
     let fn_name = crate::parser::normalize::normalize_object_name_checked(name)?;

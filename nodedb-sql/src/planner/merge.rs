@@ -44,7 +44,7 @@ pub fn plan_merge(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Vec
 
     // ── Resolve source ──
     let source_plan = plan_merge_source(&merge.source, catalog)?;
-    let source_alias = merge_source_alias(&merge.source, &source_plan);
+    let source_alias = merge_source_alias(&merge.source, &source_plan)?;
 
     // ── Parse ON clause into equi-join columns ──
     let (target_join_col, source_join_col) =
@@ -83,7 +83,10 @@ fn plan_merge_source(factor: &ast::TableFactor, catalog: &dyn SqlCatalog) -> Res
                 .ok_or_else(|| SqlError::UnknownTable {
                     name: source_name.clone(),
                 })?;
-            let alias_str = alias.as_ref().map(|a| normalize_ident(&a.name));
+            let alias_str = alias
+                .as_ref()
+                .map(|alias| crate::reserved::check_ast_identifier(&alias.name))
+                .transpose()?;
             let source_rules = engine_rules::resolve_engine_rules(source_info.engine);
             source_rules.plan_scan(ScanParams {
                 collection: source_name,
@@ -109,7 +112,8 @@ fn plan_merge_source(factor: &ast::TableFactor, catalog: &dyn SqlCatalog) -> Res
             use crate::functions::registry::FunctionRegistry;
             let alias_name = alias
                 .as_ref()
-                .map(|a| normalize_ident(&a.name))
+                .map(|alias| crate::reserved::check_ast_identifier(&alias.name))
+                .transpose()?
                 .unwrap_or_else(|| "source".to_string());
             let functions = FunctionRegistry::new();
             let plan = crate::planner::select::plan_query(
@@ -133,27 +137,29 @@ fn plan_merge_source(factor: &ast::TableFactor, catalog: &dyn SqlCatalog) -> Res
 }
 
 /// Determine the alias used to qualify source-column references in WHEN arms.
-fn merge_source_alias(factor: &ast::TableFactor, source_plan: &SqlPlan) -> String {
+fn merge_source_alias(factor: &ast::TableFactor, source_plan: &SqlPlan) -> Result<String> {
     match factor {
-        ast::TableFactor::Table { name, alias, .. } => alias
-            .as_ref()
-            .map(|a| normalize_ident(&a.name))
-            .unwrap_or_else(|| {
-                normalize_object_name_checked(name).unwrap_or_else(|_| "source".to_string())
-            }),
+        ast::TableFactor::Table { name, alias, .. } => {
+            if let Some(alias) = alias {
+                crate::reserved::check_ast_identifier(&alias.name)
+            } else {
+                normalize_object_name_checked(name)
+            }
+        }
         ast::TableFactor::Derived { alias, .. } => alias
             .as_ref()
-            .map(|a| normalize_ident(&a.name))
-            .unwrap_or_else(|| "source".to_string()),
-        _ => match source_plan {
+            .map(|alias| crate::reserved::check_ast_identifier(&alias.name))
+            .transpose()
+            .map(|alias| alias.unwrap_or_else(|| "source".to_string())),
+        _ => Ok(match source_plan {
             SqlPlan::Scan {
                 collection: _,
-                alias: Some(a),
+                alias: Some(alias),
                 ..
-            } => a.clone(),
+            } => alias.clone(),
             SqlPlan::Scan { collection, .. } => collection.clone(),
             _ => "source".to_string(),
-        },
+        }),
     }
 }
 
@@ -323,7 +329,10 @@ pub(super) fn extract_table_factor_name_alias(
     match factor {
         ast::TableFactor::Table { name, alias, .. } => {
             let table_name = normalize_object_name_checked(name)?;
-            let alias_str = alias.as_ref().map(|a| normalize_ident(&a.name));
+            let alias_str = alias
+                .as_ref()
+                .map(|alias| crate::reserved::check_ast_identifier(&alias.name))
+                .transpose()?;
             Ok((table_name, alias_str))
         }
         other => Err(SqlError::Unsupported {

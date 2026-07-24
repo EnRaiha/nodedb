@@ -7,9 +7,7 @@ use std::collections::HashMap;
 use nodedb_types::DatabaseId;
 
 use crate::error::{Result, SqlError};
-use crate::parser::normalize::{
-    normalize_ident, normalize_object_name_checked, table_name_from_factor,
-};
+use crate::parser::normalize::{normalize_object_name_checked, table_name_from_factor};
 use crate::types::{
     ArrayCatalogView, CollectionInfo, ColumnInfo, EngineType, SqlCatalog, SqlDataType,
 };
@@ -186,7 +184,7 @@ impl TableScope {
             ..
         } = factor
         {
-            let alias_str = normalize_ident(&alias.name);
+            let alias_str = crate::reserved::check_ast_identifier(&alias.name)?;
             self.add(ResolvedTable {
                 name: alias_str.clone(),
                 alias: Some(alias_str.clone()),
@@ -231,7 +229,10 @@ fn resolve_array_tvf(
         } => (
             normalize_object_name_checked(name)?,
             args,
-            alias.as_ref().map(|a| normalize_ident(&a.name)),
+            alias
+                .as_ref()
+                .map(|alias| crate::reserved::check_ast_identifier(&alias.name))
+                .transpose()?,
         ),
         _ => return Ok(None),
     };

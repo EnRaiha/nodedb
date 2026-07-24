@@ -70,6 +70,10 @@ pub enum SqlError {
     #[error("retryable schema change on {descriptor}")]
     RetryableSchemaChanged { descriptor: String },
 
+    /// Identifier violates NodeDB's canonical identifier rules.
+    #[error("invalid identifier '{name}': {reason}")]
+    InvalidIdentifier { name: String, reason: &'static str },
+
     /// Identifier is a NodeDB reserved keyword. Use a quoted identifier to bypass.
     #[error(
         "identifier '{name}' is reserved by NodeDB ({reason}); \

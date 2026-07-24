@@ -31,6 +31,9 @@ pub fn plan_update(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
     }
 
     let table_name = extract_table_name_from_table_with_joins(&update.table)?;
+    // Validate an optional target alias even though the non-FROM update plan
+    // does not retain it.
+    crate::parser::normalize::table_name_from_factor(&update.table.relation)?;
     let info = catalog
         .get_collection(DatabaseId::DEFAULT, &table_name)?
         .ok_or_else(|| SqlError::UnknownTable {
@@ -62,7 +65,10 @@ fn plan_update_from(update: &ast::Update, catalog: &dyn SqlCatalog) -> Result<Ve
 
     // Extract alias for the target table if present.
     let target_alias: Option<String> = match &update.table.relation {
-        ast::TableFactor::Table { alias, .. } => alias.as_ref().map(|a| normalize_ident(&a.name)),
+        ast::TableFactor::Table { alias, .. } => alias
+            .as_ref()
+            .map(|alias| crate::reserved::check_ast_identifier(&alias.name))
+            .transpose()?,
         _ => None,
     };
     let target_ref = target_alias.as_deref().unwrap_or(target_name.as_str());
@@ -113,7 +119,10 @@ fn plan_update_from(update: &ast::Update, catalog: &dyn SqlCatalog) -> Result<Ve
     }
 
     let source_alias: Option<String> = match &from_table.relation {
-        ast::TableFactor::Table { alias, .. } => alias.as_ref().map(|a| normalize_ident(&a.name)),
+        ast::TableFactor::Table { alias, .. } => alias
+            .as_ref()
+            .map(|alias| crate::reserved::check_ast_identifier(&alias.name))
+            .transpose()?,
         _ => None,
     };
     let source_ref = source_alias.as_deref().unwrap_or(source_name.as_str());
@@ -307,12 +316,11 @@ pub fn plan_delete(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
     let from_tables = match &delete.from {
         ast::FromTable::WithFromKeyword(tables) | ast::FromTable::WithoutKeyword(tables) => tables,
     };
-    let table_name =
-        extract_table_name_from_table_with_joins(from_tables.first().ok_or_else(|| {
-            SqlError::Parse {
-                detail: "DELETE requires a FROM table".into(),
-            }
-        })?)?;
+    let from = from_tables.first().ok_or_else(|| SqlError::Parse {
+        detail: "DELETE requires a FROM table".into(),
+    })?;
+    let table_name = extract_table_name_from_table_with_joins(from)?;
+    crate::parser::normalize::table_name_from_factor(&from.relation)?;
     let info = catalog
         .get_collection(DatabaseId::DEFAULT, &table_name)?
         .ok_or_else(|| SqlError::UnknownTable {

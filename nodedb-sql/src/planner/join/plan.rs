@@ -33,7 +33,7 @@ pub fn plan_join_from_select(
             scan_for_relation(&from.relation, scope)?
         };
 
-    let outer_alias = scan_alias_from_relation(&from.relation);
+    let outer_alias = scan_alias_from_relation(&from.relation)?;
 
     let mut current_plan = left_plan;
 
@@ -41,7 +41,7 @@ pub fn plan_join_from_select(
         // Detect LATERAL derived subquery on the right side.
         if is_lateral_derived(&join_item.relation) {
             let lateral_alias =
-                lateral_alias_from_factor(&join_item.relation).ok_or_else(|| {
+                lateral_alias_from_factor(&join_item.relation)?.ok_or_else(|| {
                     SqlError::Unsupported {
                         detail: "LATERAL subquery requires an alias (e.g. LATERAL (...) AS x)"
                             .into(),
@@ -79,7 +79,7 @@ pub fn plan_join_from_select(
         // either order (`ON right.k = left.k`); the physical join builds the
         // hash index on the right key, so a reversed pair would index the wrong
         // side and match zero rows.
-        let right_ids = right_side_identifiers(&join_item.relation);
+        let right_ids = right_side_identifiers(&join_item.relation)?;
         super::constraint::orient_keys_to_sides(&mut on_keys, &right_ids);
 
         current_plan = SqlPlan::Join {
@@ -170,26 +170,21 @@ pub fn plan_join_from_select(
 /// Collect the normalized identifiers (alias and/or table name) by which a
 /// right-side join relation can be referenced in an ON clause. Used to orient
 /// equi-keys so the right-side operand is always `on.1`.
-fn right_side_identifiers(factor: &ast::TableFactor) -> Vec<String> {
+fn right_side_identifiers(factor: &ast::TableFactor) -> Result<Vec<String>> {
     let mut ids = Vec::new();
-    if let Ok(Some((name, alias))) = crate::parser::normalize::table_name_from_factor(factor) {
-        if let Some(a) = alias {
-            ids.push(a);
+    if let Some((name, alias)) = crate::parser::normalize::table_name_from_factor(factor)? {
+        if let Some(alias) = alias {
+            ids.push(alias);
         }
         ids.push(name);
     }
-    ids
+    Ok(ids)
 }
 
 /// Extract an alias (or table name) from a named-table `TableFactor`.
-fn scan_alias_from_relation(factor: &ast::TableFactor) -> Option<String> {
-    match factor {
-        ast::TableFactor::Table { name, alias, .. } => alias
-            .as_ref()
-            .map(|a| crate::parser::normalize::normalize_ident(&a.name))
-            .or_else(|| crate::parser::normalize::normalize_object_name_checked(name).ok()),
-        _ => None,
-    }
+fn scan_alias_from_relation(factor: &ast::TableFactor) -> Result<Option<String>> {
+    crate::parser::normalize::table_name_from_factor(factor)
+        .map(|relation| relation.map(|(name, alias)| alias.unwrap_or(name)))
 }
 
 /// True when the join operator represents a LEFT join variant.

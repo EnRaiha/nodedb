@@ -1,29 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! NodeDB reserved identifier list.
+//! NodeDB reserved identifier list and canonical identifier validation.
 //!
-//! These keywords are intercepted by the DDL dispatcher or DSL rewriter
-//! before the SQL reaches sqlparser. Using them as bare (unquoted)
-//! identifiers would cause silent misdispatch, so they are rejected at
-//! parse time with an actionable error message that includes the quoted
-//! escape form.
+//! The validator is the single boundary for identifier content that survives
+//! into planning. Bare identifiers are canonicalized to lowercase; quoted
+//! identifiers preserve case and may opt into NodeDB-reserved words.
 
 use crate::error::SqlError;
 
 /// Words that NodeDB claims as dispatch or rewrite keywords.
-///
-/// Each entry is stored in UPPER case. All comparisons normalise the
-/// input to upper case before checking containment.
 pub const RESERVED_KEYWORDS: &[&str] = &[
-    "GRAPH",    // graph dispatch keyword
-    "MATCH",    // graph dispatch keyword
-    "OPTIONAL", // graph dispatch keyword
-    "UPSERT",   // preprocess rewrite keyword
-    "UNDROP",   // DDL dispatch keyword
-    "PURGE",    // DROP modifier keyword
-    "CASCADE",  // DROP modifier keyword
-    "SEARCH",   // DSL dispatch keyword
-    "CRDT",     // DSL dispatch keyword
+    "GRAPH", "MATCH", "OPTIONAL", "UPSERT", "UNDROP", "PURGE", "CASCADE", "SEARCH", "CRDT",
 ];
 
 fn reason_for(upper: &str) -> &'static str {
@@ -32,7 +19,8 @@ fn reason_for(upper: &str) -> &'static str {
         "UPSERT" => "preprocess rewrite keyword",
         "UNDROP" => "DDL dispatch keyword",
         "PURGE" | "CASCADE" => "DROP modifier keyword",
-        "SEARCH" | "CRDT" => "DSL dispatch keyword",
+        "SEARCH" => "DSL dispatch keyword",
+        "CRDT" => "DSL dispatch keyword",
         _ => "reserved by NodeDB",
     }
 }
@@ -44,132 +32,205 @@ pub fn is_reserved(name: &str) -> bool {
     RESERVED_KEYWORDS.contains(&upper.as_str())
 }
 
-/// Validate a raw identifier token extracted from SQL.
-///
-/// * If `raw_name` is surrounded by double-quotes (standard SQL quoting),
-///   the quotes are stripped and the inner text is returned unchanged as
-///   `Ok(inner)` — the user has opted in to the reserved word.
-/// * Otherwise, the token is normalised to upper case and compared against
-///   [`RESERVED_KEYWORDS`]. A match returns
-///   `Err(SqlError::ReservedIdentifier { .. })` with an actionable hint.
-/// * A clean identifier is returned as `Ok(name.to_lowercase())` to match
-///   the existing `parse_col_token` behaviour.
-pub fn check_identifier(raw_name: &str) -> Result<String, SqlError> {
-    if raw_name.starts_with('"') && raw_name.ends_with('"') && raw_name.len() >= 2 {
-        // Standard SQL quoted identifier: strip the surrounding quotes.
-        return Ok(raw_name[1..raw_name.len() - 1].to_string());
+fn invalid(name: &str, reason: &'static str) -> SqlError {
+    SqlError::InvalidIdentifier {
+        name: name.to_string(),
+        reason,
     }
+}
 
-    let upper = raw_name.to_uppercase();
+fn validate_quoted_content(value: &str) -> Result<(), SqlError> {
+    if value.is_empty() {
+        return Err(invalid(value, "quoted identifier must not be empty"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(invalid(
+            value,
+            "identifier must not contain control characters",
+        ));
+    }
+    if value.contains('"') {
+        return Err(invalid(value, "identifier must not contain double quotes"));
+    }
+    Ok(())
+}
+
+fn validate_bare_content(value: &str) -> Result<(), SqlError> {
+    if value.is_empty() {
+        return Err(invalid(value, "identifier must not be empty"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(invalid(
+            value,
+            "identifier must not contain control characters",
+        ));
+    }
+    let mut chars = value.chars();
+    let first = chars
+        .next()
+        .ok_or_else(|| invalid(value, "identifier must not be empty"))?;
+    if first != '_' && !first.is_alphabetic() {
+        return Err(invalid(
+            value,
+            "bare identifier must start with a letter or underscore",
+        ));
+    }
+    if !chars.all(|ch| ch == '_' || ch == '$' || ch.is_alphanumeric()) {
+        return Err(invalid(
+            value,
+            "bare identifier may contain only letters, digits, underscores, or dollar signs",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_bare(value: &str) -> Result<String, SqlError> {
+    validate_bare_content(value)?;
+    let normalized = value.to_lowercase();
+    let upper = normalized.to_uppercase();
     if RESERVED_KEYWORDS.contains(&upper.as_str()) {
-        let reason = reason_for(&upper);
         return Err(SqlError::ReservedIdentifier {
-            name: raw_name.to_string(),
-            reason,
+            name: value.to_string(),
+            reason: reason_for(&upper),
         });
     }
+    Ok(normalized)
+}
 
-    Ok(raw_name.to_lowercase())
+/// Validate a raw identifier token extracted from SQL.
+///
+/// Quoted tokens must use SQL doubled-quote escaping. Their decoded content
+/// preserves case and bypasses the reserved-word restriction, but all control
+/// characters and embedded quotes are rejected. Bare tokens must use NodeDB's
+/// canonical ASCII identifier grammar.
+pub fn check_identifier(raw_name: &str) -> Result<String, SqlError> {
+    if raw_name.starts_with('"') {
+        return decode_raw_quoted_identifier(raw_name);
+    }
+    normalize_bare(raw_name)
+}
+
+fn decode_raw_quoted_identifier(raw_name: &str) -> Result<String, SqlError> {
+    let mut rest = raw_name
+        .strip_prefix('"')
+        .ok_or_else(|| invalid(raw_name, "quoted identifier must start with a double quote"))?;
+    let mut decoded = String::new();
+    loop {
+        let Some(ch) = rest.chars().next() else {
+            return Err(invalid(raw_name, "unterminated quoted identifier"));
+        };
+        rest = &rest[ch.len_utf8()..];
+        if ch == '"' {
+            if let Some(after_escape) = rest.strip_prefix('"') {
+                decoded.push('"');
+                rest = after_escape;
+                continue;
+            }
+            if !rest.is_empty() {
+                return Err(invalid(
+                    raw_name,
+                    "unexpected content after quoted identifier",
+                ));
+            }
+            validate_quoted_content(&decoded)?;
+            return Ok(decoded);
+        }
+        decoded.push(ch);
+    }
+}
+
+/// Validate an identifier already decoded by `sqlparser`.
+///
+/// `sqlparser::ast::Ident::value` has SQL quote escaping decoded, so no raw
+/// token reconstruction is needed. Quoted identifiers preserve case; bare
+/// identifiers are canonicalized and checked against reserved words.
+pub fn check_ast_identifier(ident: &sqlparser::ast::Ident) -> Result<String, SqlError> {
+    if ident.quote_style.is_some() {
+        validate_quoted_content(&ident.value)?;
+        Ok(ident.value.clone())
+    } else {
+        normalize_bare(&ident.value)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::SqlError;
-
-    // ── is_reserved ──────────────────────────────────────────────────────────
+    use sqlparser::ast::Ident;
 
     #[test]
-    fn reserved_upper() {
-        assert!(is_reserved("MATCH"));
+    fn bare_identifiers_normalize_and_reserved_words_reject() {
+        assert_eq!(
+            check_identifier("MiXeD_1$Name").expect("bare"),
+            "mixed_1$name"
+        );
+        assert!(matches!(
+            check_identifier("match"),
+            Err(SqlError::ReservedIdentifier { .. })
+        ));
+        assert_eq!(
+            check_identifier("\"MATCH\"").expect("quoted reserved"),
+            "MATCH"
+        );
     }
 
     #[test]
-    fn reserved_lower() {
-        assert!(is_reserved("match"));
+    fn quoted_identifiers_preserve_case_but_reject_unsafe_content() {
+        assert_eq!(
+            check_identifier("\"MiXeD Unicode 雪\"").expect("quoted"),
+            "MiXeD Unicode 雪"
+        );
+        for raw in [
+            "\"\"",
+            "\"a\"\"b\"",
+            "\"a\n\"",
+            "\"unterminated",
+            "\"a\"tail",
+        ] {
+            assert!(
+                matches!(
+                    check_identifier(raw),
+                    Err(SqlError::InvalidIdentifier { .. })
+                ),
+                "{raw}"
+            );
+        }
     }
 
     #[test]
-    fn not_reserved() {
-        assert!(!is_reserved("id"));
-    }
-
-    // ── check_identifier ─────────────────────────────────────────────────────
-
-    #[test]
-    fn bare_reserved_is_err() {
-        let err = check_identifier("match").unwrap_err();
-        assert!(matches!(err, SqlError::ReservedIdentifier { .. }));
-    }
-
-    #[test]
-    fn quoted_lower_is_ok() {
-        assert_eq!(check_identifier("\"match\"").unwrap(), "match");
+    fn bare_identifiers_reject_noncanonical_or_control_content() {
+        for raw in ["", "1name", "na-me", "name;drop", "name\n", "name\""] {
+            assert!(
+                matches!(
+                    check_identifier(raw),
+                    Err(SqlError::InvalidIdentifier { .. })
+                ),
+                "{raw}"
+            );
+        }
+        assert_eq!(check_identifier("雪表").expect("Unicode bare"), "雪表");
     }
 
     #[test]
-    fn quoted_upper_is_ok() {
-        assert_eq!(check_identifier("\"MATCH\"").unwrap(), "MATCH");
-    }
+    fn ast_identifiers_apply_decoded_content_rules() {
+        assert_eq!(
+            check_ast_identifier(&Ident::new("MiXeD")).expect("bare AST"),
+            "mixed"
+        );
+        let mut quoted = Ident::new("MATCH");
+        quoted.quote_style = Some('"');
+        assert_eq!(
+            check_ast_identifier(&quoted).expect("quoted reserved AST"),
+            "MATCH"
+        );
 
-    #[test]
-    fn clean_identifier_is_ok() {
-        assert_eq!(check_identifier("id").unwrap(), "id");
-    }
-
-    // ── one test per reserved word: bare rejected, quoted accepted ────────────
-
-    #[test]
-    fn graph_reserved() {
-        assert!(check_identifier("graph").is_err());
-        assert_eq!(check_identifier("\"graph\"").unwrap(), "graph");
-    }
-
-    #[test]
-    fn match_reserved() {
-        assert!(check_identifier("match").is_err());
-        assert_eq!(check_identifier("\"match\"").unwrap(), "match");
-    }
-
-    #[test]
-    fn optional_reserved() {
-        assert!(check_identifier("optional").is_err());
-        assert_eq!(check_identifier("\"optional\"").unwrap(), "optional");
-    }
-
-    #[test]
-    fn upsert_reserved() {
-        assert!(check_identifier("upsert").is_err());
-        assert_eq!(check_identifier("\"upsert\"").unwrap(), "upsert");
-    }
-
-    #[test]
-    fn undrop_reserved() {
-        assert!(check_identifier("undrop").is_err());
-        assert_eq!(check_identifier("\"undrop\"").unwrap(), "undrop");
-    }
-
-    #[test]
-    fn purge_reserved() {
-        assert!(check_identifier("purge").is_err());
-        assert_eq!(check_identifier("\"purge\"").unwrap(), "purge");
-    }
-
-    #[test]
-    fn cascade_reserved() {
-        assert!(check_identifier("cascade").is_err());
-        assert_eq!(check_identifier("\"cascade\"").unwrap(), "cascade");
-    }
-
-    #[test]
-    fn search_reserved() {
-        assert!(check_identifier("search").is_err());
-        assert_eq!(check_identifier("\"search\"").unwrap(), "search");
-    }
-
-    #[test]
-    fn crdt_reserved() {
-        assert!(check_identifier("crdt").is_err());
-        assert_eq!(check_identifier("\"crdt\"").unwrap(), "crdt");
+        for value in ["", "a\"b", "a\n"] {
+            let mut ident = Ident::new(value);
+            ident.quote_style = Some('"');
+            assert!(matches!(
+                check_ast_identifier(&ident),
+                Err(SqlError::InvalidIdentifier { .. })
+            ));
+        }
     }
 }

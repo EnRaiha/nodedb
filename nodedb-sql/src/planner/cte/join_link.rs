@@ -7,7 +7,7 @@
 use sqlparser::ast::{self, SetExpr};
 
 use crate::error::{Result, SqlError};
-use crate::parser::normalize::{normalize_ident, normalize_object_name_checked};
+use crate::parser::normalize::{normalize_ident, table_name_from_factor};
 use crate::types::*;
 
 /// Extract recursive info from the AST when normal planning fails
@@ -33,28 +33,23 @@ pub(super) fn extract_recursive_info(expr: &SetExpr, cte_name: &str) -> Result<R
     let mut join_on_expr = None;
 
     for from in &select.from {
-        let table_name = extract_table_name(&from.relation);
-        let table_alias = extract_table_alias(&from.relation);
-
-        if let Some(name) = &table_name {
-            if name.eq_ignore_ascii_case(cte_name) {
-                cte_alias = table_alias.or_else(|| Some(name.clone()));
+        if let Some((name, alias, is_unqualified)) = extract_table_reference(&from.relation)? {
+            if is_unqualified && name.eq_ignore_ascii_case(cte_name) {
+                cte_alias = alias.or(Some(name));
             } else {
-                real_table_alias = table_alias.or_else(|| Some(name.clone()));
+                real_table_alias = alias.or(Some(name));
             }
         }
 
         for join in &from.joins {
-            let join_table = extract_table_name(&join.relation);
-            let join_alias = extract_table_alias(&join.relation);
-            if let Some(jt) = &join_table {
-                if jt.eq_ignore_ascii_case(cte_name) {
-                    cte_alias = join_alias.or_else(|| Some(jt.clone()));
+            if let Some((name, alias, is_unqualified)) = extract_table_reference(&join.relation)? {
+                if is_unqualified && name.eq_ignore_ascii_case(cte_name) {
+                    cte_alias = alias.or(Some(name));
                     if let Some(cond) = extract_join_on_condition(&join.join_operator) {
                         join_on_expr = Some(cond.clone());
                     }
                 } else {
-                    real_table_alias = join_alias.or_else(|| Some(jt.clone()));
+                    real_table_alias = alias.or(Some(name));
                     if join_on_expr.is_none()
                         && let Some(cond) = extract_join_on_condition(&join.join_operator)
                     {
@@ -132,18 +127,14 @@ fn extract_qualified_column(expr: &ast::Expr) -> Option<(String, String)> {
     }
 }
 
-fn extract_table_name(relation: &ast::TableFactor) -> Option<String> {
-    match relation {
-        ast::TableFactor::Table { name, .. } => normalize_object_name_checked(name).ok(),
-        _ => None,
-    }
-}
-
-fn extract_table_alias(relation: &ast::TableFactor) -> Option<String> {
-    match relation {
-        ast::TableFactor::Table { alias, .. } => alias.as_ref().map(|a| normalize_ident(&a.name)),
-        _ => None,
-    }
+fn extract_table_reference(
+    relation: &ast::TableFactor,
+) -> Result<Option<(String, Option<String>, bool)>> {
+    let is_unqualified = matches!(
+        relation,
+        ast::TableFactor::Table { name, .. } if name.0.len() == 1
+    );
+    Ok(table_name_from_factor(relation)?.map(|(name, alias)| (name, alias, is_unqualified)))
 }
 
 fn extract_join_on_condition(op: &ast::JoinOperator) -> Option<&ast::Expr> {

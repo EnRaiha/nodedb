@@ -9,6 +9,7 @@ use super::correlation::analyse_lateral_where;
 use crate::coerce::expr_as_usize_literal;
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::normalize_ident;
+use crate::reserved::check_ast_identifier;
 use crate::resolver::expr::convert_expr;
 use crate::temporal::TemporalScope;
 use crate::types::*;
@@ -82,6 +83,7 @@ pub fn plan_lateral_join(args: LateralJoinArgs<'_>) -> Result<SqlPlan> {
             lateral_alias,
             left_join,
             outer_projection,
+            catalog,
         })
     } else if has_equi && analysis.non_equi.is_empty() {
         // Equi-correlated, no LIMIT: rewrite as a regular hash join.
@@ -156,9 +158,9 @@ fn build_inner_scan(
     temporal: TemporalScope,
 ) -> Result<SqlPlan> {
     let inner_collection = extract_inner_collection(select)?;
-    let inner_alias = extract_inner_alias(select);
+    let inner_alias = extract_inner_alias(select)?;
     let inner_info = catalog
-        .get_collection(nodedb_types::DatabaseId::DEFAULT, &inner_collection)?
+        .resolve_relation(nodedb_types::DatabaseId::DEFAULT, &inner_collection)?
         .ok_or_else(|| SqlError::UnknownTable {
             name: inner_collection.clone(),
         })?;
@@ -182,11 +184,16 @@ fn build_inner_scan(
 }
 
 /// Extract the alias of the single-table inner SELECT, if present.
-fn extract_inner_alias(select: &sqlparser::ast::Select) -> Option<String> {
-    let from = select.from.first()?;
+fn extract_inner_alias(select: &sqlparser::ast::Select) -> Result<Option<String>> {
+    let Some(from) = select.from.first() else {
+        return Ok(None);
+    };
     match &from.relation {
-        ast::TableFactor::Table { alias, .. } => alias.as_ref().map(|a| normalize_ident(&a.name)),
-        _ => None,
+        ast::TableFactor::Table { alias, .. } => alias
+            .as_ref()
+            .map(|alias| check_ast_identifier(&alias.name))
+            .transpose(),
+        _ => Ok(None),
     }
 }
 
@@ -201,6 +208,7 @@ struct LateralTopKPlanArgs<'a> {
     lateral_alias: &'a str,
     left_join: bool,
     outer_projection: Vec<Projection>,
+    catalog: &'a dyn SqlCatalog,
 }
 
 /// Plan the `LateralTopK` variant: equi-correlated + ORDER BY + LIMIT k.
@@ -215,10 +223,19 @@ fn plan_lateral_top_k(args: LateralTopKPlanArgs<'_>) -> Result<SqlPlan> {
         lateral_alias,
         left_join,
         outer_projection,
+        catalog,
     } = args;
     // Build a bare inner Scan without correlation filters (those are injected
     // at runtime per outer row).
     let inner_collection = extract_inner_collection(select)?;
+    catalog
+        .resolve_relation(nodedb_types::DatabaseId::DEFAULT, &inner_collection)?
+        .ok_or_else(|| SqlError::UnknownTable {
+            name: inner_collection.clone(),
+        })?;
+    // The Top-K plan does not retain the inner alias, but it must still reject
+    // malformed aliases before expressions referencing them are lowered.
+    let _inner_alias = extract_inner_alias(select)?;
     let inner_filters = inner_non_correlated_filters(select, outer_alias.as_deref().unwrap_or(""))?;
 
     // Extract ORDER BY from the inner subquery.
@@ -267,14 +284,11 @@ fn extract_inner_collection(select: &sqlparser::ast::Select) -> Result<String> {
     let from = select.from.first().ok_or_else(|| SqlError::Unsupported {
         detail: "LATERAL subquery must have a FROM clause".into(),
     })?;
-    match &from.relation {
-        ast::TableFactor::Table { name, .. } => {
-            crate::parser::normalize::normalize_object_name_checked(name)
-        }
-        _ => Err(SqlError::Unsupported {
+    crate::parser::normalize::table_name_from_factor(&from.relation)?
+        .map(|(name, _)| name)
+        .ok_or_else(|| SqlError::Unsupported {
             detail: "LATERAL LateralTopK subquery must reference a plain table".into(),
-        }),
-    }
+        })
 }
 
 /// Extract filters from the inner SELECT that do NOT reference the outer alias.
@@ -349,11 +363,14 @@ fn limit_from_query(query: &ast::Query) -> Option<usize> {
     }
 }
 
-/// Extract a LATERAL alias from a `TableFactor::Derived`.
-pub fn lateral_alias_from_factor(factor: &ast::TableFactor) -> Option<String> {
+/// Extract and validate a LATERAL alias from a `TableFactor::Derived`.
+pub fn lateral_alias_from_factor(factor: &ast::TableFactor) -> Result<Option<String>> {
     match factor {
-        ast::TableFactor::Derived { alias, .. } => alias.as_ref().map(|a| normalize_ident(&a.name)),
-        _ => None,
+        ast::TableFactor::Derived { alias, .. } => alias
+            .as_ref()
+            .map(|alias| check_ast_identifier(&alias.name))
+            .transpose(),
+        _ => Ok(None),
     }
 }
 

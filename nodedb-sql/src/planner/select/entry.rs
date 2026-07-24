@@ -10,7 +10,7 @@ use super::order_by::{apply_order_by, try_hybrid_from_projection};
 use super::select_stmt::plan_select;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
-use crate::parser::normalize::normalize_ident;
+use crate::reserved::check_ast_identifier;
 use crate::temporal::TemporalScope;
 use crate::types::{Projection, SqlExpr, *};
 
@@ -89,7 +89,10 @@ pub fn plan_query(
         let mut definitions = Vec::new();
         let mut cte_names = Vec::new();
         for cte in &with.cte_tables {
-            let name = normalize_ident(&cte.alias.name);
+            let name = check_ast_identifier(&cte.alias.name)?;
+            for column in &cte.alias.columns {
+                check_ast_identifier(&column.name)?;
+            }
             let cte_plan = plan_query(&cte.query, catalog, functions, temporal)?;
             definitions.push((name.clone(), cte_plan));
             cte_names.push(name);

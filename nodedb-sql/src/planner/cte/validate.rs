@@ -71,9 +71,14 @@ pub(super) fn validate_self_ref_count(expr: &SetExpr, cte_name: &str) -> Result<
 
 pub(super) fn table_ref_matches(factor: &ast::TableFactor, cte_name: &str) -> bool {
     match factor {
-        ast::TableFactor::Table { name, .. } => normalize_object_name_checked(name)
-            .map(|n| n.eq_ignore_ascii_case(cte_name))
-            .unwrap_or(false),
+        // A CTE working-table reference is unqualified. Supported system
+        // qualifiers must continue to resolve to catalog relations even when
+        // their final component collides with the CTE name.
+        ast::TableFactor::Table { name, .. } if name.0.len() == 1 => {
+            normalize_object_name_checked(name)
+                .map(|name| name.eq_ignore_ascii_case(cte_name))
+                .unwrap_or(false)
+        }
         _ => false,
     }
 }

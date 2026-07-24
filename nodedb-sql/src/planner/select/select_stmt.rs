@@ -9,7 +9,6 @@ use super::helpers::{convert_projection, convert_where_to_filters};
 use super::where_search::try_extract_where_search;
 use crate::error::{Result, SqlError};
 use crate::functions::registry::FunctionRegistry;
-use crate::parser::normalize::normalize_ident;
 use crate::planner::ast_helpers::strip_single_table_qualifiers;
 use crate::planner::lateral::plan::{
     LateralJoinArgs, is_lateral_derived, lateral_alias_from_factor, plan_lateral_join,
@@ -98,7 +97,7 @@ pub(super) fn plan_select(
         let lateral_twj = &select.from[1];
 
         // Build outer scan plan.
-        let outer_alias = extract_table_alias_from_twj(outer_twj);
+        let outer_alias = extract_table_alias_from_twj(outer_twj)?;
         let outer_collection =
             crate::parser::normalize::table_name_from_factor(&outer_twj.relation)?
                 .map(|(n, _)| n)
@@ -106,7 +105,7 @@ pub(super) fn plan_select(
                     detail: "LATERAL: outer side must be a plain table".into(),
                 })?;
         let outer_info = catalog
-            .get_collection(DatabaseId::DEFAULT, &outer_collection)?
+            .resolve_relation(DatabaseId::DEFAULT, &outer_collection)?
             .ok_or_else(|| SqlError::UnknownTable {
                 name: outer_collection.clone(),
             })?;
@@ -124,7 +123,7 @@ pub(super) fn plan_select(
             temporal,
         };
 
-        let lateral_alias = lateral_alias_from_factor(&lateral_twj.relation).ok_or_else(|| {
+        let lateral_alias = lateral_alias_from_factor(&lateral_twj.relation)?.ok_or_else(|| {
             SqlError::Unsupported {
                 detail: "LATERAL subquery requires an alias (e.g. LATERAL (...) AS x)".into(),
             }
@@ -367,14 +366,9 @@ fn has_column_comparison(expr: &SqlExpr) -> bool {
 }
 
 /// Extract the alias from the first table in a `TableWithJoins`.
-fn extract_table_alias_from_twj(twj: &sqlparser::ast::TableWithJoins) -> Option<String> {
-    match &twj.relation {
-        sqlparser::ast::TableFactor::Table { alias, name, .. } => alias
-            .as_ref()
-            .map(|a| crate::parser::normalize::normalize_ident(&a.name))
-            .or_else(|| crate::parser::normalize::normalize_object_name_checked(name).ok()),
-        _ => None,
-    }
+fn extract_table_alias_from_twj(twj: &sqlparser::ast::TableWithJoins) -> Result<Option<String>> {
+    crate::parser::normalize::table_name_from_factor(&twj.relation)
+        .map(|relation| relation.map(|(name, alias)| alias.unwrap_or(name)))
 }
 
 /// Check if a SELECT has aggregation (GROUP BY or aggregate functions in projection).
@@ -430,7 +424,7 @@ fn try_plan_derived_from(
         _ => return Ok(None),
     };
 
-    let alias_name = normalize_ident(&alias_ident.name);
+    let alias_name = crate::reserved::check_ast_identifier(&alias_ident.name)?;
     let inner_plan = plan_query(subquery, catalog, functions, temporal)?;
 
     // Replan the outer SELECT against a catalog that resolves the alias
@@ -443,7 +437,9 @@ fn try_plan_derived_from(
     };
     let mut outer_select = select.clone();
     outer_select.from[0].relation = ast::TableFactor::Table {
-        name: ast::ObjectName::from(vec![ast::Ident::new(alias_name.clone())]),
+        name: ast::ObjectName(vec![ast::ObjectNamePart::Identifier(
+            alias_ident.name.clone(),
+        )]),
         alias: None,
         args: None,
         with_hints: Vec::new(),
