@@ -20,10 +20,77 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::server::shared::authorization::{
+    AuthorizedTask, authorize_collection, authorize_task_set,
+};
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{AsyncRaftProposer, ReplicatedEntry, to_replicated_entry};
 use crate::event::EventSource;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+
+pub fn authorize_sync_collection(
+    state: &SharedState,
+    identity: Option<&AuthenticatedIdentity>,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    collection: &str,
+) -> crate::Result<()> {
+    let identity = identity.ok_or_else(|| crate::Error::RejectedAuthz {
+        tenant_id,
+        resource: "authenticated sync identity required".into(),
+    })?;
+    let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
+    authorize_collection(
+        identity,
+        database_id,
+        collection,
+        Permission::Write,
+        &state.permissions,
+        &state.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)
+}
+
+pub fn authorize_sync_task(
+    state: &SharedState,
+    identity: Option<&AuthenticatedIdentity>,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    vshard_id: VShardId,
+    plan: PhysicalPlan,
+) -> crate::Result<AuthorizedTask> {
+    let identity = identity.ok_or_else(|| crate::Error::RejectedAuthz {
+        tenant_id,
+        resource: "authenticated sync identity required".into(),
+    })?;
+    let task = PhysicalTask {
+        tenant_id,
+        vshard_id,
+        database_id,
+        plan,
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    };
+    let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
+    authorize_task_set(
+        identity,
+        std::slice::from_ref(&task),
+        &state.permissions,
+        &state.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "sync authorization returned no capability".into(),
+    })
+}
 
 /// Propose a [`ReplicatedEntry`] through Raft and block until the entry is
 /// committed to a quorum and applied on the local node.
@@ -35,7 +102,7 @@ use crate::types::{DatabaseId, Lsn, TenantId, TraceId, VShardId};
 /// Retries transparently up to five times on [`crate::Error::RetryableLeaderChange`]
 /// (leader failover during the propose). Any other error is mapped to
 /// [`crate::Error::Dispatch`].
-pub async fn propose_sync_write(
+pub(crate) async fn propose_sync_write(
     state: &SharedState,
     entry: ReplicatedEntry,
     proposer: &Arc<AsyncRaftProposer>,
@@ -115,20 +182,59 @@ fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> crate::Result<()> {
     Ok(())
 }
 
-pub async fn dispatch_sync_response(
+pub async fn dispatch_authorized_sync_response(
+    state: &SharedState,
+    authorized: AuthorizedTask,
+    trace_id: TraceId,
+    event_source: EventSource,
+) -> crate::Result<Response> {
+    let task = authorized.into_physical_task();
+    dispatch_sync_response_inner(
+        state,
+        task.tenant_id,
+        task.database_id,
+        task.vshard_id,
+        task.plan,
+        trace_id,
+        event_source,
+    )
+    .await
+}
+
+/// Trusted-internal sync-shaped dispatch used by DDL index maintenance.
+pub(crate) async fn dispatch_trusted_internal_sync_response(
     state: &SharedState,
     tenant_id: TenantId,
+    database_id: DatabaseId,
+    vshard_id: VShardId,
+    plan: PhysicalPlan,
+    trace_id: TraceId,
+    event_source: EventSource,
+) -> crate::Result<Response> {
+    dispatch_sync_response_inner(
+        state,
+        tenant_id,
+        database_id,
+        vshard_id,
+        plan,
+        trace_id,
+        event_source,
+    )
+    .await
+}
+
+async fn dispatch_sync_response_inner(
+    state: &SharedState,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
     vshard_id: VShardId,
     plan: PhysicalPlan,
     trace_id: TraceId,
     event_source: EventSource,
 ) -> crate::Result<Response> {
     reject_unadmitted_crdt_apply(&plan)?;
-    // The sync inbound envelope carries no session database yet (see
-    // `dispatch_sync_bytes` below), so this path is scoped to the default
-    // database, same as its local-fallback branch a few lines down.
     if let Some(proposer) = state.async_raft_proposer()
-        && let Some(entry) = to_replicated_entry(tenant_id, DatabaseId::DEFAULT, vshard_id, &plan)
+        && let Some(entry) = to_replicated_entry(tenant_id, database_id, vshard_id, &plan)
     {
         let payload = propose_sync_write(state, entry, proposer).await?;
         let request_id = state.next_request_id();
@@ -149,7 +255,7 @@ pub async fn dispatch_sync_response(
     crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
         state,
         tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         vshard_id,
         plan,
         trace_id,
@@ -158,7 +264,7 @@ pub async fn dispatch_sync_response(
     .await
 }
 
-/// Sync-path convenience over [`dispatch_sync_response`]: dispatches `plan`
+/// Sync-path convenience over authorized sync dispatch: dispatches `plan`
 /// tagged [`EventSource::CrdtSync`] (so AFTER triggers are not re-fired on
 /// synced data) with a zero trace id, and returns just the apply-payload
 /// bytes — which carry the zerompk-encoded [`SyncAckResult`] the per-engine
@@ -168,19 +274,11 @@ pub async fn dispatch_sync_response(
 /// (event source, trace id, payload extraction) lives in exactly one place.
 pub async fn dispatch_sync_payload(
     state: &SharedState,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    plan: PhysicalPlan,
+    authorized: AuthorizedTask,
 ) -> crate::Result<Vec<u8>> {
-    let response = dispatch_sync_response(
-        state,
-        tenant_id,
-        vshard_id,
-        plan,
-        TraceId::ZERO,
-        EventSource::CrdtSync,
-    )
-    .await?;
+    let response =
+        dispatch_authorized_sync_response(state, authorized, TraceId::ZERO, EventSource::CrdtSync)
+            .await?;
     Ok(response.payload.to_vec())
 }
 
@@ -210,9 +308,8 @@ pub fn noop_dispatch_error(op: &str) -> crate::Error {
 /// [`crate::control::server::shared::ddl::sync_dispatch::dispatch_async_with_source`].
 pub async fn dispatch_sync_bytes(
     state: &SharedState,
-    tenant_id: TenantId,
     collection: &str,
-    plan: PhysicalPlan,
+    authorized: AuthorizedTask,
     timeout: Duration,
     event_source: EventSource,
     policy: &dyn crate::control::crdt_admission::CrdtPostImagePolicy,
@@ -220,16 +317,14 @@ pub async fn dispatch_sync_bytes(
     // The sync inbound envelope carries no session database yet, so the Lite
     // sync path is scoped to the default database.
     if matches!(
-        &plan,
+        authorized.plan(),
         PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
     ) {
-        return crate::control::crdt_admission::dispatch_crdt_apply_admitted(
+        return crate::control::crdt_admission::dispatch_authorized_crdt_apply_admitted(
             state,
-            crate::control::crdt_admission::CrdtApplyAdmissionRequest {
-                tenant_id,
-                database_id: DatabaseId::DEFAULT,
+            crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
+                authorized,
                 collection,
-                plan,
                 timeout,
                 event_source,
                 policy,
@@ -237,16 +332,7 @@ pub async fn dispatch_sync_bytes(
         )
         .await;
     }
-    dispatch_write_replicated(
-        state,
-        tenant_id,
-        DatabaseId::DEFAULT,
-        collection,
-        plan,
-        timeout,
-        event_source,
-    )
-    .await
+    dispatch_write_replicated(state, collection, authorized, timeout, event_source).await
 }
 
 /// Dispatch a write so it is quorum-durable when the node is clustered.
@@ -268,15 +354,22 @@ pub async fn dispatch_sync_bytes(
 /// Returns the apply-payload bytes the caller can map to its own success shape.
 pub async fn dispatch_write_replicated(
     state: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
     collection: &str,
-    plan: PhysicalPlan,
+    authorized: AuthorizedTask,
     timeout: Duration,
     event_source: EventSource,
 ) -> crate::Result<Vec<u8>> {
+    let task = authorized.into_physical_task();
+    let tenant_id = task.tenant_id;
+    let database_id = task.database_id;
+    let vshard_id = task.vshard_id;
+    let plan = task.plan;
     reject_unadmitted_crdt_apply(&plan)?;
-    let vshard_id = VShardId::from_collection_in_database(database_id, collection);
+    if vshard_id != VShardId::from_collection_in_database(database_id, collection) {
+        return Err(crate::Error::Internal {
+            detail: "authorized sync task vShard does not match collection".into(),
+        });
+    }
     let local_frontier_mutation = matches!(
         &plan,
         PhysicalPlan::Crdt(op) if crate::control::crdt_admission::changes_crdt_frontier(op)

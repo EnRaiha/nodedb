@@ -72,11 +72,50 @@ pub struct MergeArgs<'a> {
     pub clauses: &'a [MergeClauseOp],
 }
 
+/// Consume an authorized autocommit `MERGE` at the orchestration boundary.
+pub async fn run_authorized_merge(
+    state: &SharedState,
+    authorized: crate::control::server::shared::authorization::AuthorizedTask,
+) -> crate::Result<Response> {
+    let task = authorized.into_physical_task();
+    let PhysicalPlan::Document(DocumentOp::Merge {
+        target_collection,
+        source_collection,
+        source_alias,
+        target_join_col,
+        source_join_col,
+        clauses,
+        resolve_only: false,
+        resolved_inserts: None,
+        source_rows: _,
+        returning: _,
+    }) = task.plan
+    else {
+        return Err(crate::Error::BadRequest {
+            detail: "authorized task is not an unresolved autocommit MERGE".into(),
+        });
+    };
+    run_merge(
+        state,
+        MergeArgs {
+            tenant_id: task.tenant_id,
+            database_id: task.database_id,
+            target_collection: &target_collection,
+            source_collection: &source_collection,
+            source_alias: &source_alias,
+            target_join_col: &target_join_col,
+            source_join_col: &source_join_col,
+            clauses: &clauses,
+        },
+    )
+    .await
+}
+
 /// Drive an autocommit `MERGE` from the Control Plane.
 ///
 /// Returns a `{"affected": N}` response mirroring the shape the Data Plane
 /// merge handler produces, so the dispatch loops render the same command tag.
-pub async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Result<Response> {
+pub(crate) async fn run_merge(state: &SharedState, args: MergeArgs<'_>) -> crate::Result<Response> {
     let catalog = state.credentials.catalog();
     let target_bare = bare_collection_name(args.database_id, args.target_collection);
     let target = catalog

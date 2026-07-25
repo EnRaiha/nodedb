@@ -12,6 +12,7 @@ use crate::control::security::role::RoleStore;
 use crate::control::target_identity::bare_collection_name;
 use crate::types::TenantId;
 
+use super::capability::{AuthorizedCollection, AuthorizedTaskSet};
 use super::error::AuthorizationError;
 use super::requirements::{AuthorizationRequirement, plan_requirements};
 
@@ -62,6 +63,33 @@ pub fn authorize_collection(
     )
 }
 
+/// Mint a collection-scoped capability for a non-physical side effect.
+pub fn authorize_collection_capability(
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    collection: &str,
+    permission: Permission,
+    permissions: &PermissionStore,
+    roles: &RoleStore,
+    emitter: &dyn AuditEmitter,
+) -> Result<AuthorizedCollection, AuthorizationError> {
+    authorize_collection(
+        identity,
+        database_id,
+        collection,
+        permission,
+        permissions,
+        roles,
+        emitter,
+    )?;
+    Ok(AuthorizedCollection::new(
+        identity.tenant_id,
+        database_id,
+        collection,
+        permission,
+    ))
+}
+
 /// Authorize an entire physical task set before any task is dispatched.
 ///
 /// Every task must belong to the authenticated tenant and selected database.
@@ -73,7 +101,7 @@ pub fn authorize_task_set(
     permissions: &PermissionStore,
     roles: &RoleStore,
     emitter: &dyn AuditEmitter,
-) -> Result<(), AuthorizationError> {
+) -> Result<AuthorizedTaskSet, AuthorizationError> {
     for task in tasks {
         if task.tenant_id != identity.tenant_id && !identity.is_superuser {
             return deny(
@@ -128,7 +156,7 @@ pub fn authorize_task_set(
             }
         }
     }
-    Ok(())
+    Ok(AuthorizedTaskSet::new(tasks))
 }
 
 fn authorize_collection_requirement(

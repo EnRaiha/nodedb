@@ -69,7 +69,8 @@ async fn resp_gateway_migration_single_node_set_get() {
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
     });
-    let put_result = gateway.execute(&ctx, put_plan).await;
+    let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
+    let put_result = gateway.execute(&ctx, put_authorized).await;
     assert!(
         put_result.is_ok(),
         "SET via gateway failed: {:?}",
@@ -83,7 +84,8 @@ async fn resp_gateway_migration_single_node_set_get() {
         rls_filters: vec![],
         surrogate_ceiling: None,
     });
-    let get_result = gateway.execute(&ctx, get_plan).await;
+    let get_authorized = common::authorize_gateway_plan(&node.shared, &ctx, get_plan);
+    let get_result = gateway.execute(&ctx, get_authorized).await;
     assert!(
         get_result.is_ok(),
         "GET via gateway failed: {:?}",
@@ -131,8 +133,9 @@ async fn resp_gateway_migration_cross_node_get() {
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
     });
+    let put_authorized = common::authorize_gateway_plan(&cluster.nodes[0].shared, &ctx, put_plan);
     leader_gw
-        .execute(&ctx, put_plan)
+        .execute(&ctx, put_authorized)
         .await
         .expect("seed PUT on leader");
 
@@ -146,7 +149,8 @@ async fn resp_gateway_migration_cross_node_get() {
         rls_filters: vec![],
         surrogate_ceiling: None,
     });
-    let get_result = follower_gw.execute(&ctx, get_plan).await;
+    let get_authorized = common::authorize_gateway_plan(&cluster.nodes[1].shared, &ctx, get_plan);
+    let get_result = follower_gw.execute(&ctx, get_authorized).await;
     assert!(
         get_result.is_ok(),
         "cross-node GET via gateway failed: {:?}",

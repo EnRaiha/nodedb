@@ -86,6 +86,7 @@ impl NodeDbPgHandler {
     pub(super) async fn dispatch_tasks_via_gateway(
         &self,
         tasks: Vec<PhysicalTask>,
+        authorized_tasks: crate::control::server::shared::authorization::AuthorizedTaskSet,
         tenant_id: TenantId,
         database_id: nodedb_types::id::DatabaseId,
         projection: Option<&OutputSchema>,
@@ -107,15 +108,18 @@ impl NodeDbPgHandler {
         };
 
         let mut responses: Vec<Response> = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            let payloads = gateway.execute(&gw_ctx, task.plan).await.map_err(|e| {
-                let (code, msg) = GatewayErrorMap::to_pgwire(&e);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    code.to_owned(),
-                    msg,
-                )))
-            })?;
+        for (_task, authorized_task) in tasks.into_iter().zip(authorized_tasks.into_tasks()) {
+            let payloads = gateway
+                .execute(&gw_ctx, authorized_task)
+                .await
+                .map_err(|e| {
+                    let (code, msg) = GatewayErrorMap::to_pgwire(&e);
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        code.to_owned(),
+                        msg,
+                    )))
+                })?;
 
             if payloads.is_empty() {
                 responses.push(Response::Execution(Tag::new("OK")));

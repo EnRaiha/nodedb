@@ -18,7 +18,7 @@ use nodedb_physical::physical_task::PostSetOp;
 use nodedb_types::protocol::NativeResponse;
 
 use crate::control::gateway::core::QueryContext;
-use crate::control::server::exchange::gather::gather_all_cores_stream;
+use crate::control::server::exchange::gather::gather_all_cores_stream_authorized;
 use crate::control::server::exchange::streamable::streamable_gather_child;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::result_stream::ResultStream;
@@ -101,6 +101,25 @@ pub(crate) async fn try_open_sql_stream(
         return Ok(None);
     };
 
+    let mut child_task = task.clone();
+    child_task.plan = child_plan.clone();
+    let emitter =
+        crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&ctx.state.audit));
+    let authorized_child = crate::control::server::shared::authorization::authorize_task_set(
+        ctx.identity,
+        std::slice::from_ref(&child_task),
+        &ctx.state.permissions,
+        &ctx.state.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "stream authorization returned no capability".into(),
+    })?;
+
     let stream = if let Some(gw) = ctx.state.gateway.get() {
         let gw_ctx = QueryContext {
             tenant_id: task.tenant_id,
@@ -108,15 +127,12 @@ pub(crate) async fn try_open_sql_stream(
             database_id,
             txn_id: task.txn_id,
         };
-        gw.execute_stream(&gw_ctx, child_plan).await?
+        gw.execute_stream(&gw_ctx, authorized_child).await?
     } else {
-        gather_all_cores_stream(
+        gather_all_cores_stream_authorized(
             ctx.state,
-            task.tenant_id,
-            task.database_id,
-            child_plan,
+            authorized_child,
             crate::types::TraceId::ZERO,
-            task.txn_id,
         )?
     };
 

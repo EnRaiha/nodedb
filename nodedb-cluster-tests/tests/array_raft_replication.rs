@@ -79,7 +79,19 @@ fn make_inbound(shared: &Arc<SharedState>) -> OriginArrayInbound {
         engine,
         Arc::clone(&shared.array_sync_schemas),
         Arc::clone(shared),
-        TenantId::new(0),
+        nodedb::control::security::identity::AuthenticatedIdentity {
+            user_id: 0,
+            username: "array-sync-test".into(),
+            tenant_id: TenantId::new(0),
+            auth_method: nodedb::control::security::identity::AuthMethod::Trust,
+            roles: Vec::new(),
+            is_superuser: true,
+            default_database: None,
+            accessible_databases:
+                nodedb::control::security::identity::AuthenticatedIdentity::default_database_set(
+                    true,
+                ),
+        },
     )
 }
 

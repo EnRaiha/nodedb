@@ -92,9 +92,10 @@ pub async fn copy_to_file(
 /// Build a SELECT SQL string from the source.
 fn build_select_sql(source: &CopyToSource) -> Result<String, DdlError> {
     match source {
-        CopyToSource::Collection(coll) => {
-            Ok(format!("SELECT * FROM {}", ::nodedb_types::quote_ident(coll)))
-        }
+        CopyToSource::Collection(coll) => Ok(format!(
+            "SELECT * FROM {}",
+            ::nodedb_types::quote_ident(coll)
+        )),
         CopyToSource::Query(q) => Ok(q.clone()),
     }
 }
@@ -140,13 +141,10 @@ async fn execute_and_collect(
 
     let mut all_rows: Vec<serde_json::Value> = Vec::new();
 
-    for task in tasks {
-        let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+    for task in tasks.into_tasks() {
+        let resp = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
             state,
-            task.tenant_id,
-            task.database_id,
-            task.vshard_id,
-            task.plan,
+            task,
             TraceId::ZERO,
         )
         .await

@@ -75,6 +75,8 @@ pub trait VectorDispatcher: Send + Sync {
 /// data).
 pub struct SharedStateVectorDispatcher<'a> {
     pub shared: &'a crate::control::state::SharedState,
+    pub(crate) identity: Option<&'a crate::control::security::identity::AuthenticatedIdentity>,
+    pub(crate) database_id: DatabaseId,
 }
 
 #[async_trait]
@@ -91,6 +93,14 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
         use nodedb_physical::physical_plan::VectorOp;
 
         let prov = provenance;
+        let database_id = self.database_id;
+        super::raft_dispatch::authorize_sync_collection(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            &params.collection,
+        )?;
 
         // Allocate WAL LSN on the Control Plane before dispatching to the
         // Data Plane. Sync path MUST write to WAL; non-sync path already does
@@ -99,7 +109,7 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
             &self.shared.wal,
             tenant_id,
             vshard,
-            DatabaseId::DEFAULT,
+            database_id,
             VectorPutWalArgs {
                 collection: &params.collection,
                 vector: &params.vector,
@@ -120,7 +130,15 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
             provenance: Some(prov),
         });
 
-        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
+        let authorized = super::raft_dispatch::authorize_sync_task(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            vshard,
+            plan,
+        )?;
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
     }
 
     async fn dispatch_delete(
@@ -139,6 +157,14 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
         use nodedb_physical::physical_plan::VectorOp;
 
         let prov = provenance;
+        let database_id = self.database_id;
+        super::raft_dispatch::authorize_sync_collection(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            &collection,
+        )?;
 
         // Allocate WAL LSN on the Control Plane before dispatching to the
         // Data Plane.
@@ -146,7 +172,7 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
             &self.shared.wal,
             tenant_id,
             vshard,
-            DatabaseId::DEFAULT,
+            database_id,
             VectorDeleteWalArgs {
                 collection: &collection,
                 surrogate,
@@ -162,7 +188,15 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
             provenance: Some(prov),
         });
 
-        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
+        let authorized = super::raft_dispatch::authorize_sync_task(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            vshard,
+            plan,
+        )?;
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
     }
 
     fn assign_surrogate(

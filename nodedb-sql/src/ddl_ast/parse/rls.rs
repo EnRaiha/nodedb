@@ -87,7 +87,14 @@ fn parse_show(sql: &str) -> Result<NodedbStatement, SqlError> {
     } else {
         "SHOW RLS POLICY"
     };
-    let mut rest = statement_suffix(sql, prefix)?;
+    let trimmed = sql.trim();
+    let suffix = trimmed
+        .get(prefix.len()..)
+        .ok_or_else(|| parse_error(format!("expected {prefix}")))?;
+    if !suffix.is_empty() && !suffix.chars().next().is_some_and(char::is_whitespace) {
+        return Err(parse_error(format!("expected {prefix}")));
+    }
+    let mut rest = suffix.trim_start();
 
     let mut collection = None;
     if starts_keyword(rest, "ON") {

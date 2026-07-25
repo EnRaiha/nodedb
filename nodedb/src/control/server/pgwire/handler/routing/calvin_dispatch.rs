@@ -10,8 +10,8 @@ use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::planner::calvin::{
-    TxnDispatchPosition, dispatch_dependent_edge_recon, dispatch_tasks_to_calvin,
-    is_dependent_predicate,
+    TxnDispatchPosition, dispatch_authorized_dependent_edge_recon,
+    dispatch_authorized_tasks_to_calvin, is_dependent_predicate,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::TransactionState;
@@ -32,7 +32,7 @@ impl NodeDbPgHandler {
         &self,
         tasks: Vec<PhysicalTask>,
         tenant_id: TenantId,
-        _identity: &AuthenticatedIdentity,
+        identity: &AuthenticatedIdentity,
         addr: &std::net::SocketAddr,
         result_formats: &[pgwire::api::results::FieldFormat],
     ) -> PgWireResult<Vec<Response>> {
@@ -100,9 +100,10 @@ impl NodeDbPgHandler {
             } else {
                 TxnDispatchPosition::Autocommit
             };
-            let apply_resp = dispatch_tasks_to_calvin(
+            let authorized = self.authorize_tasks(identity, &tasks)?;
+            let apply_resp = dispatch_authorized_tasks_to_calvin(
                 &self.state,
-                &tasks,
+                authorized,
                 tenant_id,
                 cross_shard_mode,
                 position,
@@ -163,9 +164,11 @@ impl NodeDbPgHandler {
         // route from `route_write_to_calvin`), so it stays on the strict
         // multi-vshard dependent `TxClass` builder (`allow_single_vshard:
         // false`).
-        let outcome = dispatch_dependent_edge_recon(
+        let authorized = self.authorize_tasks(identity, &tasks)?;
+        let outcome = dispatch_authorized_dependent_edge_recon(
             &self.state,
-            tasks.clone(),
+            authorized,
+            identity,
             tenant_id,
             database_id,
             false,

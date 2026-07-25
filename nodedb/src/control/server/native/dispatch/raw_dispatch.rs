@@ -3,14 +3,38 @@
 //! Raw native-operation dispatch shared by direct-op handlers.
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
+use std::sync::Arc;
+
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext as GatewayQueryContext;
+use crate::control::server::shared::authorization::AuthorizedTask;
 use crate::types::{Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
 
 use super::super::super::dispatch_utils;
 use super::DispatchCtx;
 
-pub(crate) async fn dispatch_single_task_raw(
+pub(super) fn authorize_single_task(
+    ctx: &DispatchCtx<'_>,
+    task: nodedb_physical::physical_task::PhysicalTask,
+) -> crate::Result<AuthorizedTask> {
+    let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(&ctx.state.audit));
+    crate::control::server::shared::authorization::authorize_task_set(
+        ctx.identity,
+        std::slice::from_ref(&task),
+        &ctx.state.permissions,
+        &ctx.state.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "authorization returned an empty capability set".into(),
+    })
+}
+
+pub(super) async fn dispatch_authorized_single_task(
     ctx: &DispatchCtx<'_>,
     tenant_id: TenantId,
     vshard_id: VShardId,
@@ -23,6 +47,15 @@ pub(crate) async fn dispatch_single_task_raw(
     ) {
         return dispatch_external_crdt_apply(ctx, tenant_id, plan, txn_id).await;
     }
+    let task = nodedb_physical::physical_task::PhysicalTask {
+        tenant_id,
+        vshard_id,
+        database_id: ctx.database_id(),
+        plan,
+        post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+        txn_id,
+    };
+    let authorized = authorize_single_task(ctx, task)?;
     match ctx.state.gateway.get() {
         Some(gateway) => {
             let query = GatewayQueryContext {
@@ -32,7 +65,7 @@ pub(crate) async fn dispatch_single_task_raw(
                 txn_id,
             };
             gateway
-                .execute(&query, plan)
+                .execute(&query, authorized)
                 .await
                 .map(gateway_payloads_to_response)
                 .map_err(|error| {
@@ -40,7 +73,7 @@ pub(crate) async fn dispatch_single_task_raw(
                     crate::Error::Dispatch { detail }
                 })
         }
-        None => dispatch_without_gateway(ctx, tenant_id, vshard_id, plan, txn_id).await,
+        None => dispatch_without_gateway(ctx, authorized).await,
     }
 }
 
@@ -71,6 +104,28 @@ async fn dispatch_external_crdt_apply(
         &audit,
     )
     .map_err(crate::Error::from)?;
+    let task = nodedb_physical::physical_task::PhysicalTask {
+        tenant_id,
+        vshard_id: VShardId::from_collection_in_database(ctx.database_id(), &collection),
+        database_id: ctx.database_id(),
+        plan,
+        post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+        txn_id: None,
+    };
+    let authorized = crate::control::server::shared::authorization::authorize_task_set(
+        ctx.identity,
+        std::slice::from_ref(&task),
+        &ctx.state.permissions,
+        &ctx.state.roles,
+        &audit,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "authorization returned no capability".into(),
+    })?;
     let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
         tenant_id,
         ctx.database_id(),
@@ -80,13 +135,11 @@ async fn dispatch_external_crdt_apply(
         &ctx.state.rls,
         &audit,
     );
-    let outcome = crate::control::crdt_admission::dispatch_crdt_apply_admitted_outcome(
+    let outcome = crate::control::crdt_admission::dispatch_authorized_crdt_apply_admitted_outcome(
         ctx.state,
-        crate::control::crdt_admission::CrdtApplyAdmissionRequest {
-            tenant_id,
-            database_id: ctx.database_id(),
+        crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
+            authorized,
             collection: &collection,
-            plan,
             timeout: std::time::Duration::from_secs(ctx.state.tuning.network.default_deadline_secs),
             event_source: crate::event::EventSource::User,
             policy: &policy,
@@ -109,32 +162,18 @@ async fn dispatch_external_crdt_apply(
 
 pub(super) async fn dispatch_without_gateway(
     ctx: &DispatchCtx<'_>,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    plan: PhysicalPlan,
-    txn_id: Option<TxnId>,
+    authorized: crate::control::server::shared::authorization::AuthorizedTask,
 ) -> crate::Result<Response> {
-    let database_id = ctx.database_id();
-    let frontier_mutation = txn_id.is_none()
+    let vshard_id = authorized.vshard_id();
+    let frontier_mutation = authorized.txn_id().is_none()
         && matches!(
-            &plan,
+            authorized.plan(),
             PhysicalPlan::Crdt(op)
                 if crate::control::crdt_admission::changes_crdt_frontier(op)
         );
     let write = || async move {
-        dispatch_utils::dispatch_autocommit_write(
-            ctx.state,
-            dispatch_utils::AutocommitWrite {
-                tenant_id,
-                database_id,
-                vshard_id,
-                plan,
-                trace_id: TraceId::ZERO,
-                event_source: crate::event::EventSource::User,
-                txn_id,
-            },
-        )
-        .await
+        dispatch_utils::dispatch_authorized_autocommit_write(ctx.state, authorized, TraceId::ZERO)
+            .await
     };
     if frontier_mutation {
         ctx.state

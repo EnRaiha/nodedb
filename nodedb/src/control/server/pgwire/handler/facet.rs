@@ -18,6 +18,7 @@ use crate::types::{DatabaseId, VShardId};
 use nodedb_physical::physical_plan::QueryOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+use super::super::types::error_to_sqlstate;
 use super::core::NodeDbPgHandler;
 use super::plan::multirow_payload_to_response;
 
@@ -58,14 +59,17 @@ pub(super) async fn execute_facet_counts_sql(
         txn_id: None,
     };
 
-    handler.authorize_tasks(identity, std::slice::from_ref(&task))?;
-    let resp = handler.dispatch_task(task, None, None).await.map_err(|e| {
-        PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_owned(),
-            "XX000".to_owned(),
-            e.to_string(),
-        )))
-    })?;
+    let resp = handler
+        .dispatch_authorized_task(task, None, identity)
+        .await
+        .map_err(|error| {
+            let (severity, code, message) = error_to_sqlstate(&error);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            )))
+        })?;
 
     Ok(vec![multirow_payload_to_response(&resp.payload).response])
 }
@@ -118,15 +122,15 @@ pub(super) async fn execute_search_with_facets_sql(
         txn_id: None,
     };
 
-    handler.authorize_tasks(identity, std::slice::from_ref(&facet_task))?;
     let facet_resp = handler
-        .dispatch_task(facet_task, None, None)
+        .dispatch_authorized_task(facet_task, None, identity)
         .await
-        .map_err(|e| {
+        .map_err(|error| {
+            let (severity, code, message) = error_to_sqlstate(&error);
             PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "XX000".to_owned(),
-                e.to_string(),
+                severity.to_owned(),
+                code.to_owned(),
+                message,
             )))
         })?;
 

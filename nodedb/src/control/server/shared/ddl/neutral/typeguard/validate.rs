@@ -76,13 +76,10 @@ pub async fn validate_typeguard(
         .map_err(|error| super::parse::err(&error.sqlstate, &error.message))?;
 
     let mut json_chunks = Vec::new();
-    for task in tasks {
-        let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+    for task in tasks.into_tasks() {
+        let resp = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
             state,
-            tenant_id,
-            task.database_id,
-            task.vshard_id,
-            task.plan,
+            task,
             TraceId::ZERO,
         )
         .await

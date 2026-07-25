@@ -130,7 +130,7 @@ impl NodeDbPgHandler {
                 // Clone resolution adds source-database tasks after the initial
                 // authorization pass. Re-authorize the complete augmented set
                 // before either half can be dispatched.
-                self.authorize_tasks(identity, &tasks)?;
+                let _authorized_tasks = self.authorize_tasks(identity, &tasks)?;
 
                 // Split tasks into target and source halves.
                 let (target_tasks, source_tasks) = tasks.split_at(source_start_idx);
@@ -139,7 +139,7 @@ impl NodeDbPgHandler {
                 let mut responses = Vec::with_capacity(target_tasks.len());
                 for task in target_tasks {
                     let resp = self
-                        .dispatch_task(task.clone(), None, None)
+                        .dispatch_authorized_task(task.clone(), None, identity)
                         .await
                         .map_err(|e| {
                             let (severity, code, message) = error_to_sqlstate(&e);
@@ -194,7 +194,7 @@ impl NodeDbPgHandler {
                 for (source_idx, source_task) in source_tasks.iter().enumerate() {
                     let response_idx = source_idx % target_count;
                     let source_resp = self
-                        .dispatch_task(source_task.clone(), None, None)
+                        .dispatch_authorized_task(source_task.clone(), None, identity)
                         .await
                         .map_err(|e| {
                             let (severity, code, message) = error_to_sqlstate(&e);

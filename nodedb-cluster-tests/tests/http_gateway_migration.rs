@@ -72,7 +72,8 @@ async fn http_gateway_migration_single_node_query() {
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
     });
-    let put_result = gateway.execute(&ctx, put_plan).await;
+    let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
+    let put_result = gateway.execute(&ctx, put_authorized).await;
     assert!(
         put_result.is_ok(),
         "PUT via gateway failed: {:?}",
@@ -86,7 +87,8 @@ async fn http_gateway_migration_single_node_query() {
         rls_filters: vec![],
         surrogate_ceiling: None,
     });
-    let get_result = gateway.execute(&ctx, get_plan).await;
+    let get_authorized = common::authorize_gateway_plan(&node.shared, &ctx, get_plan);
+    let get_result = gateway.execute(&ctx, get_authorized).await;
     assert!(
         get_result.is_ok(),
         "GET via gateway failed: {:?}",
@@ -141,7 +143,8 @@ async fn http_gateway_migration_cross_node_query() {
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
     });
-    let put_result = gateway.execute(&ctx, put_plan).await;
+    let put_authorized = common::authorize_gateway_plan(&follower.shared, &ctx, put_plan);
+    let put_result = gateway.execute(&ctx, put_authorized).await;
     assert!(
         put_result.is_ok(),
         "cross-node PUT via gateway failed: {:?}",
@@ -162,14 +165,26 @@ async fn http_gateway_migration_cross_node_query() {
 
     for i in 0..3u32 {
         let result = gateway
-            .execute_sql(&ctx, get_sql, &[], || {
-                Ok(PhysicalPlan::Kv(KvOp::Get {
-                    collection: "http_gw_cross_node".into(),
-                    key: b"cross-key".to_vec(),
-                    rls_filters: vec![],
-                    surrogate_ceiling: None,
-                }))
-            })
+            .execute_sql(
+                &ctx,
+                get_sql,
+                &[],
+                || {
+                    Ok(PhysicalPlan::Kv(KvOp::Get {
+                        collection: "http_gw_cross_node".into(),
+                        key: b"cross-key".to_vec(),
+                        rls_filters: vec![],
+                        surrogate_ceiling: None,
+                    }))
+                },
+                |plan| {
+                    Ok(common::authorize_gateway_plan(
+                        &follower.shared,
+                        &ctx,
+                        plan.clone(),
+                    ))
+                },
+            )
             .await;
         assert!(
             result.is_ok(),

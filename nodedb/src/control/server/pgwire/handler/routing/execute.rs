@@ -6,9 +6,7 @@
 use pgwire::api::results::{FieldFormat, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
-use crate::control::planner::calvin::{
-    DispatchClass, classify_dispatch, plan_needs_implicit_edge_recon,
-};
+use crate::control::planner::calvin::{DispatchClass, classify_dispatch};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::types::TenantId;
@@ -18,63 +16,12 @@ use super::super::super::types::{error_to_sqlstate, response_status_to_sqlstate,
 use super::super::core::NodeDbPgHandler;
 use super::super::plan::{describe_plan, payload_to_response};
 use super::super::shape_encode;
-use super::planning::consistency_for_tasks;
 use super::result_shaping::ResultShaping;
 use super::set_ops;
 use crate::control::server::response_shape::schema::OutputSchema;
 
 impl NodeDbPgHandler {
-    /// Plan and dispatch SQL after quota and DDL checks have passed.
-    ///
-    /// When in a transaction block (BEGIN..COMMIT), write operations are
-    /// buffered instead of dispatched. Read operations execute immediately.
-    /// The buffer is dispatched atomically on COMMIT.
-    ///
-    /// This is the simple-query entry point (no bound parameters). After
-    /// dispatching, the SELECT projection list is parsed from `sql` and
-    /// each query response is re-encoded with one pgwire field per projected
-    /// column. The extended-query path (`execute_planned_sql_with_params`)
-    /// skips this step because `execute_prepared` applies column projection
-    /// using the richer schema from the Describe phase.
-    pub(in crate::control::server::pgwire::handler) async fn execute_planned_sql(
-        &self,
-        identity: &AuthenticatedIdentity,
-        sql: &str,
-        tenant_id: TenantId,
-        addr: &std::net::SocketAddr,
-    ) -> PgWireResult<Vec<Response>> {
-        // Planner output shapes every SELECT-read response through the neutral core.
-        // Simple query has no Bind message, so no client-requested result
-        // formats: everything renders in text.
-        self.execute_planned_sql_inner(
-            identity,
-            sql,
-            tenant_id,
-            addr,
-            &[],
-            ResultShaping {
-                projection: None,
-                formats: &[],
-            },
-        )
-        .await
-    }
-
-    /// Execute planned SQL with bound parameters (prepared statement path).
-    pub(in crate::control::server::pgwire::handler) async fn execute_planned_sql_with_params(
-        &self,
-        identity: &AuthenticatedIdentity,
-        sql: &str,
-        tenant_id: TenantId,
-        addr: &std::net::SocketAddr,
-        params: &[nodedb_sql::ParamValue],
-        shaping: ResultShaping<'_>,
-    ) -> PgWireResult<Vec<Response>> {
-        self.execute_planned_sql_inner(identity, sql, tenant_id, addr, params, shaping)
-            .await
-    }
-
-    async fn execute_planned_sql_inner(
+    pub(super) async fn execute_planned_sql_inner(
         &self,
         identity: &AuthenticatedIdentity,
         sql: &str,
@@ -123,7 +70,7 @@ impl NodeDbPgHandler {
 
         // The final task set must be authorized before any clone interception,
         // orchestration, staging, or dispatch path can observe it.
-        self.authorize_tasks(identity, &tasks)?;
+        let _authorized_tasks = self.authorize_tasks(identity, &tasks)?;
 
         // Clone CoW read-path interception: for Shadowed/Materializing clones,
         // augment tasks with source-database reads and merge results.
@@ -143,65 +90,27 @@ impl NodeDbPgHandler {
             return Ok(clone_responses);
         }
 
-        // Implicit-edge DELETE/UPDATE routing gate. A dependent predicate
-        // (`BulkDelete`/`BulkUpdate`) on an edge-bearing collection must run
-        // through the OLLP/Calvin coordinator path so the implicit edge-delete
-        // tasks are derived (via the pre-exec recon read) and committed
-        // atomically with the doc write. This MUST preempt gateway-forwarding:
-        // a non-(data-shard)-leader coordinator would otherwise forward the raw
-        // single-shard `BulkDelete` to the shard leader, bypassing edge cleanup
-        // entirely. It also preempts the `classify_dispatch` match below, since a
-        // single-collection delete classifies as `SingleShard`. Deliberately NOT
-        // gated on `cross_shard_txn` mode — this is INTERNAL index/edge
-        // maintenance that must run regardless of the user's cross-shard
-        // preference (unlike the `MultiShard` arm, which gates USER cross-shard
-        // writes on Strict). `dispatch_calvin_multishard` owns the OLLP retry
-        // loop and routes the submit to the sequencer-group leader, so it runs
-        // correctly on a coordinator that is not the data-shard leader.
+        // Implicit-edge dependent predicates must be preempted onto the
+        // OLLP/Calvin path before gateway forwarding or ordinary dispatch.
+        if let Some(responses) = self
+            .maybe_dispatch_implicit_edge_recon(&tasks, tenant_id, identity, addr, shaping.formats)
+            .await?
         {
-            let tx_state = self.sessions.transaction_state(addr);
-            // The not-in-txn-block + registry-available guards are session-state
-            // concerns and stay here (per protocol); the edge-bearing detection
-            // is the protocol-neutral `plan_needs_implicit_edge_recon`. A genuine
-            // catalog READ error propagates (misrouting a delete on a real I/O
-            // fault would silently skip edge cleanup → dangling edges); an absent
-            // catalog or collection row falls through as non-edge-bearing.
-            if tx_state != crate::control::server::shared::session::TransactionState::InBlock
-                && self.state.calvin_completion_registry.get().is_some()
-                && plan_needs_implicit_edge_recon(&self.state, &tasks, tenant_id)
-                    .map_err(|e| {
-                        let (severity, code, message) = error_to_sqlstate(&e);
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            severity.to_owned(),
-                            code.to_owned(),
-                            message,
-                        )))
-                    })?
-                    .is_some()
-            {
-                return self
-                    .dispatch_calvin_multishard(tasks, tenant_id, identity, addr, shaping.formats)
-                    .await;
-            }
+            return Ok(responses);
         }
 
-        let consistency = consistency_for_tasks(&tasks);
-
-        // When all tasks target a remote leader, route through the gateway.
-        if self.should_forward_via_gateway(&tasks, consistency) {
-            let database_id = self
-                .sessions
-                .get_current_database(addr)
-                .unwrap_or(crate::types::DatabaseId::DEFAULT);
-            return self
-                .dispatch_tasks_via_gateway(
-                    tasks,
-                    tenant_id,
-                    database_id,
-                    effective_schema,
-                    shaping.formats,
-                )
-                .await;
+        if let Some(responses) = self
+            .maybe_dispatch_tasks_via_gateway(
+                &tasks,
+                identity,
+                tenant_id,
+                addr,
+                effective_schema,
+                shaping.formats,
+            )
+            .await?
+        {
+            return Ok(responses);
         }
 
         let tx_state = self.sessions.transaction_state(addr);
@@ -286,18 +195,24 @@ impl NodeDbPgHandler {
             // ClusterArray plans are handled entirely on the Control Plane by the
             // ArrayCoordinator — they must never reach the SPSC bridge or
             // trigger/DML machinery. Intercept them here and short-circuit.
-            if let nodedb_physical::physical_plan::PhysicalPlan::ClusterArray(ref cluster_op) =
-                task.plan
-            {
+            if matches!(
+                task.plan,
+                nodedb_physical::physical_plan::PhysicalPlan::ClusterArray(_)
+            ) {
+                let authorized = self
+                    .authorize_tasks(identity, std::slice::from_ref(&task))?
+                    .into_tasks()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "XX000".to_owned(),
+                            "ClusterArray authorization returned no capability".to_owned(),
+                        )))
+                    })?;
                 let response = self
-                    .dispatch_cluster_array_task(
-                        cluster_op,
-                        projection,
-                        result_formats,
-                        addr,
-                        task.tenant_id,
-                        task.database_id,
-                    )
+                    .dispatch_cluster_array_task(authorized, projection, result_formats, addr)
                     .await?;
                 responses.push(response);
                 continue;
@@ -335,8 +250,8 @@ impl NodeDbPgHandler {
                 && let Some(stream_response) = self
                     .maybe_stream_select(
                         &task,
+                        identity,
                         plan_kind,
-                        resp_post_set_op,
                         addr,
                         projection,
                         result_formats,
@@ -374,7 +289,7 @@ impl NodeDbPgHandler {
             let user_id: Option<std::sync::Arc<str>> =
                 Some(std::sync::Arc::from(identity.username.as_str()));
             let (resp, shard_watermarks, distributed_reads) = self
-                .dispatch_task_with_watermarks(task, user_id, Some(identity))
+                .dispatch_authorized_task_with_watermarks(task, user_id, identity)
                 .await
                 .map_err(|e| {
                     let (severity, code, message) = error_to_sqlstate(&e);

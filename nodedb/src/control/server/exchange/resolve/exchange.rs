@@ -222,7 +222,7 @@ async fn resolve_exchange(
                     // `gateway.execute_stream` — cross-node in-transaction
                     // read-your-own-writes is a tracked gap; single-node
                     // (`gather_all_cores_stream` below) is fixed.
-                    gw.execute_stream(&ctx, child).await?
+                    gw.execute_stream_internal(&ctx, child).await?
                 } else {
                     gather_all_cores_stream(state, tenant_id, database_id, child, trace_id, txn_id)?
                 };

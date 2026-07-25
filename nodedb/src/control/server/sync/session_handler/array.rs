@@ -29,8 +29,9 @@ use crate::control::state::SharedState;
 /// a placeholder tenant would misroute every inbound array delta.
 pub(super) fn build_array_inbound(
     shared: &Option<Arc<SharedState>>,
-    tenant_id: crate::types::TenantId,
+    identity: crate::control::security::identity::AuthenticatedIdentity,
 ) -> Option<Arc<crate::control::array_sync::OriginArrayInbound>> {
+    let tenant_id = identity.tenant_id;
     shared.as_ref().map(|s| {
         let engine = Arc::new(crate::control::array_sync::OriginApplyEngine::new(
             Arc::clone(&s.array_sync_schemas),
@@ -49,7 +50,7 @@ pub(super) fn build_array_inbound(
             engine,
             Arc::clone(&s.array_sync_schemas),
             Arc::clone(s),
-            tenant_id,
+            identity,
         )
         .with_observer(fanout);
         Arc::new(inbound)
@@ -168,6 +169,7 @@ mod tests {
     use super::*;
 
     use crate::bridge::dispatch::Dispatcher;
+    use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity};
     use crate::wal::WalManager;
 
     /// Regression guard for the tenant-isolation bug: `build_array_inbound`
@@ -189,7 +191,17 @@ mod tests {
         // A deliberately non-zero, non-default tenant so a placeholder-0
         // regression is unmistakable.
         let tenant = crate::types::TenantId::new(7);
-        let inbound = build_array_inbound(&Some(shared), tenant)
+        let identity = AuthenticatedIdentity {
+            user_id: 7,
+            username: "array-writer".into(),
+            tenant_id: tenant,
+            auth_method: AuthMethod::ApiKey,
+            roles: Vec::new(),
+            is_superuser: false,
+            default_database: None,
+            accessible_databases: AuthenticatedIdentity::default_database_set(false),
+        };
+        let inbound = build_array_inbound(&Some(shared), identity.clone())
             .expect("SharedState present => engine built");
         assert_eq!(
             inbound.tenant_id(),
@@ -198,7 +210,7 @@ mod tests {
         );
 
         // No SharedState (the no-op listener path) => no engine.
-        assert!(build_array_inbound(&None, tenant).is_none());
+        assert!(build_array_inbound(&None, identity).is_none());
 
         drop(dir);
     }

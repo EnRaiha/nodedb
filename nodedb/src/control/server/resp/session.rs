@@ -2,6 +2,7 @@
 
 //! RESP per-connection session state.
 
+use crate::control::security::identity::AuthenticatedIdentity;
 use crate::types::TenantId;
 
 /// Per-connection state for a RESP session.
@@ -17,6 +18,9 @@ pub struct RespSession {
     /// Defaults to tenant 1 (single-tenant mode).
     /// In multi-tenant mode, set after AUTH.
     pub tenant_id: TenantId,
+
+    /// Identity established by RESP AUTH. Data operations fail closed until set.
+    pub identity: Option<AuthenticatedIdentity>,
 }
 
 impl Default for RespSession {
@@ -24,6 +28,7 @@ impl Default for RespSession {
         Self {
             collection: "default".into(),
             tenant_id: TenantId::new(1),
+            identity: None,
         }
     }
 }

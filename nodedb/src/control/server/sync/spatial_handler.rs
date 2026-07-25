@@ -76,6 +76,8 @@ pub trait SpatialDispatcher: Send + Sync {
 /// Production dispatcher: routes spatial ops to the Data Plane via the SPSC bridge.
 pub struct SharedStateSpatialDispatcher<'a> {
     pub shared: &'a crate::control::state::SharedState,
+    pub(crate) identity: Option<&'a crate::control::security::identity::AuthenticatedIdentity>,
+    pub(crate) database_id: DatabaseId,
 }
 
 #[async_trait]
@@ -93,6 +95,7 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
         use nodedb_physical::physical_plan::SpatialOp;
 
         let prov = provenance;
+        let database_id = self.database_id;
         let SpatialInsertTarget {
             collection,
             field,
@@ -100,13 +103,20 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             geometry,
         } = target;
 
+        super::raft_dispatch::authorize_sync_collection(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            &collection,
+        )?;
         let spatial_put_payload =
             encode_spatial_put_payload(&collection, &field, surrogate, &geometry, &prov)?;
         wal_append_spatial_put(
             &self.shared.wal,
             tenant_id,
             vshard,
-            DatabaseId::DEFAULT,
+            database_id,
             &spatial_put_payload,
         )?;
 
@@ -118,7 +128,15 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             provenance: Some(prov),
         });
 
-        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
+        let authorized = super::raft_dispatch::authorize_sync_task(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            vshard,
+            plan,
+        )?;
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
     }
 
     async fn dispatch_delete(
@@ -136,6 +154,14 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
         use nodedb_physical::physical_plan::SpatialOp;
 
         let prov = provenance;
+        let database_id = self.database_id;
+        super::raft_dispatch::authorize_sync_collection(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            &collection,
+        )?;
 
         let spatial_delete_payload =
             encode_spatial_delete_payload(&collection, &field, surrogate, &prov);
@@ -143,7 +169,7 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             &self.shared.wal,
             tenant_id,
             vshard,
-            DatabaseId::DEFAULT,
+            database_id,
             &spatial_delete_payload,
         )?;
 
@@ -154,7 +180,15 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             provenance: Some(prov),
         });
 
-        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
+        let authorized = super::raft_dispatch::authorize_sync_task(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            vshard,
+            plan,
+        )?;
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
     }
 
     fn assign_surrogate(

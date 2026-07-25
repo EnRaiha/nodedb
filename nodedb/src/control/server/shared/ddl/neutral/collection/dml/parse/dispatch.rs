@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::{
-    AuthorizationError, authorize_collection, authorize_task_set,
+    AuthorizationError, AuthorizedTask, AuthorizedTaskSet, authorize_collection, authorize_task_set,
 };
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
@@ -29,27 +29,22 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn dispat
         tenant_id: identity.tenant_id,
         database_id,
         vshard_id,
-        plan: plan.clone(),
+        plan,
         post_set_op: nodedb_physical::physical_task::PostSetOp::None,
         txn_id: None,
     };
-    if let Err(error) = authorize_final_task_set(state, identity, std::slice::from_ref(&task)) {
-        return Some(Err(error));
-    }
+    let authorized = match authorize_final_task(state, identity, &task) {
+        Ok(authorized) => authorized,
+        Err(error) => return Some(Err(error)),
+    };
 
-    if let Err(error) = crate::control::server::dispatch_utils::dispatch_autocommit_write(
-        state,
-        crate::control::server::dispatch_utils::AutocommitWrite {
-            tenant_id: identity.tenant_id,
-            database_id,
-            vshard_id,
-            plan,
-            trace_id: TraceId::ZERO,
-            event_source: crate::event::EventSource::User,
-            txn_id: None,
-        },
-    )
-    .await
+    if let Err(error) =
+        crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
+            state,
+            authorized,
+            TraceId::ZERO,
+        )
+        .await
     {
         return Some(Err(ddl_err("XX000", error.to_string())));
     }
@@ -103,7 +98,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     .await
     .map_err(|error| ddl_err("XX000", error.to_string()))?;
 
-    authorize_final_task_set(state, identity, &tasks)?;
+    let authorized_tasks = authorize_final_task_set(state, identity, &tasks)?;
 
     if state.sequencer_inbox.get().is_some()
         && matches!(
@@ -114,9 +109,9 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             crate::control::planner::calvin::DispatchClass::MultiShard { .. }
         )
     {
-        crate::control::planner::calvin::dispatch_tasks_to_calvin(
+        crate::control::planner::calvin::dispatch_authorized_tasks_to_calvin(
             state,
-            &tasks,
+            authorized_tasks,
             tenant_id,
             crate::control::planner::calvin::CrossShardTxnMode::Strict,
             crate::control::planner::calvin::TxnDispatchPosition::Autocommit,
@@ -128,26 +123,26 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         return Ok(());
     }
 
-    for task in tasks {
-        let task_vshard_id = task.vshard_id;
-        let task_database_id = task.database_id;
-
+    for (task, initial_authorized) in tasks.into_iter().zip(authorized_tasks.into_tasks()) {
         let routed = route_in_tx_write(state, txn_ctx.sessions, txn_ctx.addr, task, |staged| {
-            crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn(
-                state,
-                staged.tenant_id,
-                staged.database_id,
-                staged.vshard_id,
-                staged.plan,
-                TraceId::ZERO,
-                staged.txn_id,
-            )
+            let authorized = authorize_final_task_crate_error(state, identity, &staged);
+            async move {
+                crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+                    state,
+                    authorized?,
+                    TraceId::ZERO,
+                )
+                .await
+            }
         })
         .await;
 
         let task = match routed {
             Ok(InTxnRoute::Read(task)) => *task,
-            Ok(InTxnRoute::Buffered) | Ok(InTxnRoute::Staged(_)) => continue,
+            Ok(InTxnRoute::Buffered) | Ok(InTxnRoute::Staged(_)) => {
+                drop(initial_authorized);
+                continue;
+            }
             Err(StagingGateError::Dispatch(error)) => {
                 return Err(ddl_err("XX000", error.to_string()));
             }
@@ -160,20 +155,16 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             }
         };
 
-        let response = crate::control::server::dispatch_utils::dispatch_autocommit_write(
-            state,
-            crate::control::server::dispatch_utils::AutocommitWrite {
-                tenant_id,
-                database_id: task_database_id,
-                vshard_id: task_vshard_id,
-                plan: task.plan,
-                trace_id: TraceId::ZERO,
-                event_source: crate::event::EventSource::User,
-                txn_id: None,
-            },
-        )
-        .await
-        .map_err(|error| ddl_err("XX000", error.to_string()))?;
+        drop(initial_authorized);
+        let authorized = authorize_final_task(state, identity, &task)?;
+        let response =
+            crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
+                state,
+                authorized,
+                TraceId::ZERO,
+            )
+            .await
+            .map_err(|error| ddl_err("XX000", error.to_string()))?;
 
         if response.status == crate::bridge::envelope::Status::Error {
             let detail = match response.error_code.as_deref() {
@@ -196,10 +187,44 @@ fn authorize_final_task_set(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     tasks: &[nodedb_physical::physical_task::PhysicalTask],
-) -> Result<(), DdlError> {
+) -> Result<AuthorizedTaskSet, DdlError> {
     let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
     authorize_task_set(identity, tasks, &state.permissions, &state.roles, &emitter)
         .map_err(authorization_error_to_ddl)
+}
+
+fn authorize_final_task(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    task: &nodedb_physical::physical_task::PhysicalTask,
+) -> Result<AuthorizedTask, DdlError> {
+    authorize_final_task_set(state, identity, std::slice::from_ref(task))?
+        .into_tasks()
+        .into_iter()
+        .next()
+        .ok_or_else(|| ddl_err("XX000", "authorization returned no task capability"))
+}
+
+fn authorize_final_task_crate_error(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    task: &nodedb_physical::physical_task::PhysicalTask,
+) -> crate::Result<AuthorizedTask> {
+    let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
+    authorize_task_set(
+        identity,
+        std::slice::from_ref(task),
+        &state.permissions,
+        &state.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "authorization returned no task capability".into(),
+    })
 }
 
 fn authorization_error_to_ddl(error: AuthorizationError) -> DdlError {

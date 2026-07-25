@@ -821,7 +821,7 @@ def self_test() -> int:
         ("direct Value constructor is canonical", "fn f() { let t = ::nodedb_types::Value::String(attacker.to_owned()).to_sql_literal(); let sql = format!(\"SELECT {t}\"); plan_sql(&sql); }", 0),
         ("spoofed helper is not canonical", "fn f() { let t = canonical_trigger_template_sql(attacker); let sql = format!(\"SELECT {t}\"); plan_sql(&sql); }", 1),
         ("shadowed quote helper is not canonical", "fn f() { let quote_ident = |value| value; let sql = format!(\"SELECT {}\", quote_ident(attacker)); plan_sql(&sql); }", 1),
-        ("shadowed crate alias is not canonical", "use crate::unsafe_sql as nodedb_types; fn f() { let sql = format!(\"SELECT {}\", nodedb_types::quote_ident(attacker)); plan_sql(&sql); }", 1),
+        ("shadowed crate alias is not canonical", "use crate::unsafe_sql as nodedb_types;\nfn f() { let sql = format!(\"SELECT {}\", nodedb_types::quote_ident(attacker)); plan_sql(&sql); }", 1),
         ("canonical collection", "fn f() { let values = xs.iter().map(::nodedb_types::Value::to_sql_literal).collect::<Vec<_>>().join(\",\"); let sql = format!(\"SELECT {values}\"); plan_sql(&sql); }", 0),
         ("collection suffix append is unsafe", "fn f() { let values = xs.iter().map(::nodedb_types::Value::to_sql_literal).collect::<Vec<_>>().join(\",\") + attacker; let sql = format!(\"SELECT {values}\"); plan_sql(&sql); }", 1),
         ("collection prefix append is unsafe", "fn f() { let values = attacker + &xs.iter().map(::nodedb_types::Value::to_sql_literal).collect::<Vec<_>>().join(\",\"); let sql = format!(\"SELECT {values}\"); plan_sql(&sql); }", 1),

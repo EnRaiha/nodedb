@@ -128,14 +128,13 @@ pub async fn run_preexec_scan(
             database_id,
             txn_id: None,
         };
-        let payloads =
-            gateway
-                .execute(&gw_ctx, scan_plan)
-                .await
-                .map_err(|e| crate::Error::Storage {
-                    engine: "preexec-scan".into(),
-                    detail: format!("pre-execution scan failed: {e}"),
-                })?;
+        let payloads = gateway
+            .execute_internal(&gw_ctx, scan_plan)
+            .await
+            .map_err(|e| crate::Error::Storage {
+                engine: "preexec-scan".into(),
+                detail: format!("pre-execution scan failed: {e}"),
+            })?;
         // A single-collection scan routes to one vshard → one payload. An
         // absent payload means zero matching rows.
         let payload = payloads.into_iter().next().unwrap_or_default();

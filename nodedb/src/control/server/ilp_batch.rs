@@ -9,12 +9,12 @@ use tracing::warn;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::planner::calvin::{
-    TxnDispatchPosition, dispatch_strict_atomic_tasks_to_calvin,
+    TxnDispatchPosition, dispatch_authorized_strict_atomic_tasks_to_calvin,
 };
 use crate::control::security::audit::{ArcAuditEmitter, AuditEmitter};
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::ilp_auth::AuthenticatedIlpContext;
-use crate::control::server::shared::authorization::authorize_collection;
+use crate::control::server::shared::authorization::{authorize_collection, authorize_task_set};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::TimeseriesOp;
@@ -163,8 +163,17 @@ pub(super) async fn flush_ilp_batch(
     context: &AuthenticatedIlpContext,
     batch: &str,
 ) -> crate::Result<u64> {
-    let identity = context.identity();
-    let database_id = context.database_id();
+    flush_authenticated_ilp_batch(state, context.identity(), context.database_id(), batch).await
+}
+
+/// Strictly parse, authorize, and atomically ingest canonical ILP produced by
+/// another authenticated external transport such as OTLP.
+pub(crate) async fn flush_authenticated_ilp_batch(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    batch: &str,
+) -> crate::Result<u64> {
     let audit = ArcAuditEmitter(Arc::clone(&state.audit));
     let groups = preflight_ilp_batch(
         identity,
@@ -184,7 +193,7 @@ pub(super) async fn flush_ilp_batch(
     state.check_tenant_quota(tenant_id)?;
     let _request = TenantRequestAccounting::start(state, tenant_id);
 
-    flush_ilp_batch_inner(state, tenant_id, database_id, groups).await
+    flush_ilp_batch_inner(state, identity, database_id, groups).await
 }
 
 /// Cancellation-safe tenant request accounting for one ILP batch.
@@ -209,19 +218,24 @@ impl Drop for TenantRequestAccounting<'_> {
 /// Inner dispatch logic for ILP batch (separated for clean quota bookkeeping).
 async fn flush_ilp_batch_inner(
     state: &SharedState,
-    tenant_id: TenantId,
+    identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     groups: Vec<IlpMeasurementBatch>,
 ) -> crate::Result<u64> {
+    let tenant_id = identity.tenant_id;
     let total_rows = preflighted_row_count(&groups)?;
     let tasks = build_ilp_calvin_tasks(tenant_id, database_id, &groups)?;
+    let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
+    let authorized =
+        authorize_task_set(identity, &tasks, &state.permissions, &state.roles, &emitter)
+            .map_err(crate::Error::from)?;
 
     // One Calvin submit stages every measurement and makes the TransactionRedo
     // the sole durability record; no per-measurement WAL or direct dispatch may
     // race ahead of a later measurement failure.
-    let _ = dispatch_strict_atomic_tasks_to_calvin(
+    let _ = dispatch_authorized_strict_atomic_tasks_to_calvin(
         state,
-        &tasks,
+        authorized,
         tenant_id,
         TxnDispatchPosition::Autocommit,
         &[],

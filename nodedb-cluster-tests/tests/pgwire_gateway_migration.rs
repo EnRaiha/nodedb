@@ -183,8 +183,9 @@ async fn pgwire_gateway_migration_plan_cache_hits() {
             ttl_ms: 0,
             surrogate: nodedb_types::Surrogate::ZERO,
         });
+        let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
         gateway
-            .execute(&ctx, put_plan)
+            .execute(&ctx, put_authorized)
             .await
             .expect("initial KvPut");
 
@@ -197,20 +198,27 @@ async fn pgwire_gateway_migration_plan_cache_hits() {
                 surrogate_ceiling: None,
             }))
         };
+        let authorize_plan = |plan: &PhysicalPlan| {
+            Ok(common::authorize_gateway_plan(
+                &node.shared,
+                &ctx,
+                plan.clone(),
+            ))
+        };
 
         // Record size before calls.
         let size_before = gateway.plan_cache.len();
 
         gateway
-            .execute_sql(&ctx, sql, &[], make_plan)
+            .execute_sql(&ctx, sql, &[], make_plan, &authorize_plan)
             .await
             .expect("call 1");
         gateway
-            .execute_sql(&ctx, sql, &[], make_plan)
+            .execute_sql(&ctx, sql, &[], make_plan, &authorize_plan)
             .await
             .expect("call 2");
         gateway
-            .execute_sql(&ctx, sql, &[], make_plan)
+            .execute_sql(&ctx, sql, &[], make_plan, &authorize_plan)
             .await
             .expect("call 3");
 

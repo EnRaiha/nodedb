@@ -32,6 +32,7 @@ use crate::types::TenantId;
 
 #[path = "ilp_batch.rs"]
 mod ilp_batch;
+pub(crate) use ilp_batch::flush_authenticated_ilp_batch;
 use ilp_batch::{IlpRateEstimator, flush_ilp_batch};
 
 /// ILP TCP listener.

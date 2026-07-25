@@ -4,14 +4,13 @@
 
 use std::sync::Arc;
 
-use nodedb_physical::physical_task::PhysicalTask;
 use nodedb_types::DatabaseId;
 
 use crate::control::planner::context::{PlanSecurityContext, PlanSqlWithRlsParams, QueryContext};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::schema::OutputSchema;
-use crate::control::server::shared::authorization::authorize_task_set;
+use crate::control::server::shared::authorization::{AuthorizedTaskSet, authorize_task_set};
 use crate::control::server::shared::ddl::result::DdlError;
 use crate::control::state::SharedState;
 
@@ -25,7 +24,7 @@ pub async fn plan_authorized_sql(
     identity: &AuthenticatedIdentity,
     sql: &str,
     database_id: DatabaseId,
-) -> Result<(Vec<PhysicalTask>, OutputSchema), DdlError> {
+) -> Result<(AuthorizedTaskSet, OutputSchema), DdlError> {
     let auth = crate::control::server::session_auth::build_auth_context(identity);
     let permission_cache = state.permission_cache.read().await;
     let sec = PlanSecurityContext {
@@ -51,12 +50,13 @@ pub async fn plan_authorized_sql(
         })?;
 
     let emitter = ArcAuditEmitter(Arc::clone(&state.audit));
-    authorize_task_set(identity, &tasks, &state.permissions, &state.roles, &emitter).map_err(
-        |error| DdlError {
-            sqlstate: nodedb_types::error::sqlstate::INSUFFICIENT_PRIVILEGE.to_string(),
-            message: error.resource().to_string(),
-        },
-    )?;
+    let authorized =
+        authorize_task_set(identity, &tasks, &state.permissions, &state.roles, &emitter).map_err(
+            |error| DdlError {
+                sqlstate: nodedb_types::error::sqlstate::INSUFFICIENT_PRIVILEGE.to_string(),
+                message: error.resource().to_string(),
+            },
+        )?;
 
-    Ok((tasks, output_schema))
+    Ok((authorized, output_schema))
 }

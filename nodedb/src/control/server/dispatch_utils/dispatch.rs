@@ -5,6 +5,7 @@
 //! write admission, the WAL append, the enqueue, and the response collect.
 
 use crate::bridge::envelope::{PhysicalPlan, Response};
+use crate::control::server::shared::authorization::AuthorizedTask;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 
@@ -13,11 +14,87 @@ use super::submit_write::{
 };
 use super::types::{AutocommitWrite, DataPlaneDispatch, WriteDispatch};
 
-/// Dispatch a physical plan to the Data Plane and await the response.
+/// Dispatch a capability-bearing external task to the Data Plane.
+pub async fn dispatch_authorized_to_data_plane(
+    shared: &SharedState,
+    authorized: AuthorizedTask,
+    trace_id: TraceId,
+) -> crate::Result<Response> {
+    let task = authorized.into_physical_task();
+    dispatch_to_data_plane_inner(
+        shared,
+        DataPlaneDispatch {
+            tenant_id: task.tenant_id,
+            database_id: task.database_id,
+            vshard_id: task.vshard_id,
+            plan: task.plan,
+            trace_id,
+            event_source: crate::event::EventSource::User,
+            txn_id: task.txn_id,
+            durability: WalDurability::CallerSupplied {
+                wal_lsn: None,
+                resolved_now_ms: None,
+            },
+        },
+    )
+    .await
+}
+
+/// Dispatch a capability-bearing external task with an explicit event source.
+pub(crate) async fn dispatch_authorized_to_data_plane_with_source(
+    shared: &SharedState,
+    authorized: AuthorizedTask,
+    trace_id: TraceId,
+    event_source: crate::event::EventSource,
+) -> crate::Result<Response> {
+    let task = authorized.into_physical_task();
+    dispatch_to_data_plane_inner(
+        shared,
+        DataPlaneDispatch {
+            tenant_id: task.tenant_id,
+            database_id: task.database_id,
+            vshard_id: task.vshard_id,
+            plan: task.plan,
+            trace_id,
+            event_source,
+            txn_id: task.txn_id,
+            durability: WalDurability::CallerSupplied {
+                wal_lsn: None,
+                resolved_now_ms: None,
+            },
+        },
+    )
+    .await
+}
+
+/// Dispatch a capability-bearing external autocommit write.
+pub async fn dispatch_authorized_autocommit_write(
+    shared: &SharedState,
+    authorized: AuthorizedTask,
+    trace_id: TraceId,
+) -> crate::Result<Response> {
+    let task = authorized.into_physical_task();
+    dispatch_to_data_plane_inner(
+        shared,
+        DataPlaneDispatch {
+            tenant_id: task.tenant_id,
+            database_id: task.database_id,
+            vshard_id: task.vshard_id,
+            plan: task.plan,
+            trace_id,
+            event_source: crate::event::EventSource::User,
+            txn_id: task.txn_id,
+            durability: WalDurability::AppendHere { now_override: None },
+        },
+    )
+    .await
+}
+
+/// Dispatch a trusted internal physical plan to the Data Plane and await the response.
 ///
 /// Creates a request envelope, registers with the tracker for correlation,
 /// dispatches via the SPSC bridge, and awaits the response with a timeout.
-pub async fn dispatch_to_data_plane(
+pub(crate) async fn dispatch_to_data_plane(
     shared: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
@@ -42,7 +119,7 @@ pub async fn dispatch_to_data_plane(
 /// Trigger-generated writes pass `EventSource::Trigger` so the Data Plane
 /// emits WriteEvents with the correct source tag (preventing cascade
 /// re-triggering in the Event Plane).
-pub async fn dispatch_to_data_plane_with_source(
+pub(crate) async fn dispatch_to_data_plane_with_source(
     shared: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
@@ -82,7 +159,7 @@ pub async fn dispatch_to_data_plane_with_source(
 /// `timeseries` `wal=false`). `resolved_now_ms` carries the wall-clock instant
 /// the Control Plane resolved for a TTL-bearing KV write's `expire_at_ms` — see
 /// [`WriteDispatch::resolved_now_ms`].
-pub(crate) async fn dispatch_write_to_data_plane(
+pub(crate) async fn dispatch_trusted_internal_write_to_data_plane(
     shared: &SharedState,
     write: WriteDispatch,
 ) -> crate::Result<Response> {
@@ -166,7 +243,7 @@ pub(crate) async fn dispatch_autocommit_write(
 /// id so the Data Plane can resolve this transaction's staging overlay
 /// (read-your-own-writes) and route `StageWrite`. Used by the native endpoint,
 /// whose in-transaction tasks flow through this shared path.
-pub async fn dispatch_to_data_plane_with_txn(
+pub(crate) async fn dispatch_to_data_plane_with_txn(
     shared: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,

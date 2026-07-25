@@ -163,17 +163,33 @@ pub(crate) async fn apply_delta_and_finalize(
         expected_frontier_digest: None,
     });
 
-    shared.tenant_request_start(tenant_id);
-    let dispatch_result = super::super::raft_dispatch::dispatch_sync_bytes(
-        shared,
-        tenant_id,
+    let vshard_id = crate::types::VShardId::from_collection_in_database(
+        DatabaseId::DEFAULT,
         &delta_msg.collection,
+    );
+    let authorized = super::super::raft_dispatch::authorize_sync_task(
+        shared,
+        Some(identity),
+        tenant_id,
+        DatabaseId::DEFAULT,
+        vshard_id,
         plan,
-        Duration::from_secs(10),
-        crate::event::EventSource::CrdtSync,
-        &policy,
-    )
-    .await;
+    );
+    shared.tenant_request_start(tenant_id);
+    let dispatch_result = match authorized {
+        Ok(authorized) => {
+            super::super::raft_dispatch::dispatch_sync_bytes(
+                shared,
+                &delta_msg.collection,
+                authorized,
+                Duration::from_secs(10),
+                crate::event::EventSource::CrdtSync,
+                &policy,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
     shared.tenant_request_end(tenant_id);
 
     match dispatch_result {

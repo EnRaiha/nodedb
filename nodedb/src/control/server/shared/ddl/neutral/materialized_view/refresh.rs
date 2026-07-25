@@ -129,13 +129,10 @@ async fn execute_select(
         })?;
 
     let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = Vec::new();
-    for task in tasks {
-        let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+    for task in tasks.into_tasks() {
+        let response = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
             state,
-            identity.tenant_id,
-            task.database_id,
-            task.vshard_id,
-            task.plan,
+            task,
             TraceId::ZERO,
         )
         .await
@@ -250,21 +247,18 @@ async fn dispatch_sql(
             sqlstate: error.sqlstate,
             message: format!("plan '{sql}': {}", error.message),
         })?;
-    for task in tasks {
+    for task in tasks.into_tasks() {
         crate::control::server::wal_dispatch::wal_append_if_write(
             &state.wal,
             identity.tenant_id,
-            task.vshard_id,
-            task.database_id,
-            &task.plan,
+            task.vshard_id(),
+            task.database_id(),
+            task.plan(),
         )
         .map_err(|e| err("58030", format!("wal append: {e}")))?;
-        let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+        let response = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
             state,
-            identity.tenant_id,
-            task.database_id,
-            task.vshard_id,
-            task.plan,
+            task,
             TraceId::ZERO,
         )
         .await

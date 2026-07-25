@@ -25,6 +25,7 @@ use std::time::SystemTime;
 use tracing::{Instrument, debug, info_span};
 
 use crate::Error;
+use crate::control::server::shared::authorization::AuthorizedTask;
 use crate::control::state::SharedState;
 use crate::control::trace_export::EmitSpanParams;
 use crate::types::{DatabaseId, Lsn, TenantId, TraceId, TxnId, VShardId};
@@ -33,7 +34,7 @@ use nodedb_physical::physical_plan::PhysicalPlan;
 use super::dispatcher::{DispatchRouteParams, default_deadline_ms, dispatch_route};
 use super::fuser::fuse_payloads;
 use super::key_extractor::UnwiredKeyExtractor;
-use super::plan_cache::{PlanCache, PlanCacheKey, SqlKey, hash_placeholder_types, hash_sql};
+use super::plan_cache::PlanCache;
 use super::retry::retry_not_leader;
 use super::route::TaskRoute;
 use super::router::{resolve_decision, route_plan};
@@ -53,6 +54,22 @@ pub struct QueryContext {
     /// forwarding on remote `ExecuteRequest`. `None` for autocommit and
     /// non-interactive callers.
     pub txn_id: Option<TxnId>,
+}
+
+pub(super) fn authorized_plan_for_context(
+    ctx: &QueryContext,
+    authorized: AuthorizedTask,
+) -> Result<PhysicalPlan, Error> {
+    let task = authorized.into_physical_task();
+    if task.tenant_id != ctx.tenant_id
+        || task.database_id != ctx.database_id
+        || task.txn_id != ctx.txn_id
+    {
+        return Err(Error::Internal {
+            detail: "authorized task scope does not match gateway query context".into(),
+        });
+    }
+    Ok(task.plan)
 }
 
 /// The gateway: routes, dispatches, retries, and caches physical plans.
@@ -118,11 +135,35 @@ impl Gateway {
     pub async fn execute(
         &self,
         ctx: &QueryContext,
-        plan: PhysicalPlan,
+        authorized: AuthorizedTask,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        self.execute_with_watermarks(ctx, plan)
+        self.execute_with_watermarks(ctx, authorized)
             .await
             .map(|(payloads, _watermarks, _read_version)| payloads)
+    }
+
+    /// Execute a trusted Control-Plane plan that has no external caller.
+    ///
+    /// User-facing transports must use [`Gateway::execute`] with a capability
+    /// minted by the shared authorization service. This entry point exists for
+    /// derived fan-out, replay, maintenance, and consensus work whose authority
+    /// comes from an already-admitted internal operation.
+    pub(crate) async fn execute_internal(
+        &self,
+        ctx: &QueryContext,
+        plan: PhysicalPlan,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        self.execute_internal_with_watermarks(ctx, plan)
+            .await
+            .map(|(payloads, _watermarks, _read_version)| payloads)
+    }
+
+    pub(crate) async fn execute_internal_with_watermarks(
+        &self,
+        ctx: &QueryContext,
+        plan: PhysicalPlan,
+    ) -> Result<(Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn), Error> {
+        self.execute_plan_with_watermarks(ctx, plan).await
     }
 
     /// Execute a pre-planned `PhysicalPlan`, returning both the raw payloads and
@@ -134,6 +175,15 @@ impl Gateway {
     /// these into the transaction read-set so a remote-homed read records the
     /// remote's actual LSN instead of the former hardcoded `Lsn::ZERO`.
     pub async fn execute_with_watermarks(
+        &self,
+        ctx: &QueryContext,
+        authorized: AuthorizedTask,
+    ) -> Result<(Vec<Vec<u8>>, Vec<(VShardId, Lsn)>, Lsn), Error> {
+        let plan = authorized_plan_for_context(ctx, authorized)?;
+        self.execute_plan_with_watermarks(ctx, plan).await
+    }
+
+    async fn execute_plan_with_watermarks(
         &self,
         ctx: &QueryContext,
         plan: PhysicalPlan,
@@ -179,99 +229,12 @@ impl Gateway {
         result
     }
 
-    /// SQL-text entry point: checks the plan cache first.
-    ///
-    /// `plan_fn` is called at most once (on cache miss or after a descriptor
-    /// cache-miss recovery that requires re-planning).
-    ///
-    /// ## Two-phase cache lookup (Gap 5 fix)
-    ///
-    /// A `PlanCacheKey` requires a `GatewayVersionSet`, which we cannot build
-    /// from SQL text alone — it requires knowing which collections the plan
-    /// touches. Previously this method used a speculative empty version set,
-    /// meaning the first-call key never matched the post-planning key, giving
-    /// a 0% cache hit rate.
-    ///
-    /// The fix: a side cache maps `(sql_hash, ph_hash)` → stored
-    /// `GatewayVersionSet`. On the second call, we recover the version set
-    /// from the side cache, verify it is still current (DDL may have bumped
-    /// descriptor versions), and — if current — use it to build the full key
-    /// for the plan lookup.
-    pub async fn execute_sql(
-        &self,
-        ctx: &QueryContext,
-        sql: &str,
-        placeholder_types: &[&str],
-        plan_fn: impl FnOnce() -> Result<PhysicalPlan, Error>,
-    ) -> Result<Vec<Vec<u8>>, Error> {
-        let sql_hash = hash_sql(sql);
-        let ph_hash = hash_placeholder_types(placeholder_types);
-        let sql_key = SqlKey {
-            sql_text_hash: sql_hash,
-            placeholder_types_hash: ph_hash,
-        };
-
-        // Phase 1: check the side cache for a previously stored version set.
-        if let Some(stored_vs) = self.plan_cache.lookup_version_set(&sql_key) {
-            // Verify the stored version set is still current by cross-checking
-            // each collection's current descriptor version.
-            let shared = self.shared()?;
-            let catalog = shared.credentials.catalog();
-            let current_vs = stored_vs.reverify(|name| {
-                catalog
-                    .get_collection(ctx.database_id, ctx.tenant_id.as_u64(), name)
-                    .ok()
-                    .flatten()
-                    .map(|col| col.descriptor_version.max(1))
-                    .unwrap_or(0)
-            });
-            if current_vs == stored_vs {
-                // Version set is still current — try the full plan cache.
-                let full_key = PlanCacheKey {
-                    sql_text_hash: sql_hash,
-                    placeholder_types_hash: ph_hash,
-                    version_set: stored_vs.clone(),
-                };
-                if let Some(cached_plan) = self.plan_cache.get(&full_key) {
-                    debug!(sql = %sql, "gateway: plan cache hit (two-phase)");
-                    return self
-                        .execute_with_version_set(ctx, (*cached_plan).clone(), stored_vs)
-                        .await
-                        .map(|(payloads, _watermarks, _read_version)| payloads);
-                }
-            }
-            // Stored version set is stale or plan was evicted — fall through
-            // to re-plan. The stale side-cache entry will be overwritten below.
-        }
-
-        // Cache miss — invoke the planner.
-        let plan = plan_fn()?;
-
-        // Compute the actual version set from the plan (contains the real
-        // collection names and their current descriptor versions).
-        let actual_vs = self.collect_version_set(&plan, ctx.tenant_id.as_u64(), ctx.database_id)?;
-        let actual_key = PlanCacheKey {
-            sql_text_hash: sql_hash,
-            placeholder_types_hash: ph_hash,
-            version_set: actual_vs.clone(),
-        };
-
-        // Populate both caches so the next call hits.
-        self.plan_cache
-            .insert_version_set(sql_key, actual_vs.clone());
-        self.plan_cache.insert(actual_key, Arc::new(plan.clone()));
-
-        self.execute_with_version_set(ctx, plan, actual_vs)
-            .await
-            .map(|(payloads, _watermarks, _read_version)| payloads)
-    }
-
     /// Core execution path: route → dispatch with retry → fuse.
     ///
     /// Returns the fused/collected payloads alongside every route's per-shard
     /// read watermarks (one `(vshard, watermark_lsn)` per participating shard,
     /// accumulated across routes — never collapsed).
-    async fn execute_with_version_set(
+    pub(super) async fn execute_with_version_set(
         &self,
         ctx: &QueryContext,
         plan: PhysicalPlan,
@@ -485,7 +448,7 @@ impl Gateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::gateway::plan_cache::SqlKey;
+    use crate::control::gateway::plan_cache::{PlanCacheKey, SqlKey, hash_sql};
     use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 
     fn kv_get(col: &str) -> PhysicalPlan {

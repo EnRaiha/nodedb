@@ -11,12 +11,11 @@
 use pgwire::api::results::{FieldFormat, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
-use nodedb_physical::physical_plan::ClusterArrayOp;
+use nodedb_physical::physical_plan::{ClusterArrayOp, PhysicalPlan};
 
 use crate::control::server::dispatch_utils::publish_cluster_array_change_events;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::schema::OutputSchema;
-use crate::types::{DatabaseId, TenantId};
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
@@ -36,15 +35,24 @@ impl NodeDbPgHandler {
     /// own doc comment).
     pub(super) async fn dispatch_cluster_array_task(
         &self,
-        cluster_op: &ClusterArrayOp,
+        authorized: crate::control::server::shared::authorization::AuthorizedTask,
         projection: Option<&OutputSchema>,
         result_formats: &[FieldFormat],
         addr: &std::net::SocketAddr,
-        tenant_id: TenantId,
-        database_id: DatabaseId,
     ) -> PgWireResult<Response> {
         use crate::control::cluster::ClusterArrayExecutor;
         use std::sync::Arc;
+
+        let task = authorized.into_physical_task();
+        let tenant_id = task.tenant_id;
+        let database_id = task.database_id;
+        let PhysicalPlan::ClusterArray(cluster_op) = task.plan else {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "XX000".to_owned(),
+                "authorized task is not a ClusterArray operation".to_owned(),
+            ))));
+        };
 
         let transport = self.state.cluster_transport.as_ref().ok_or_else(|| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -66,7 +74,7 @@ impl NodeDbPgHandler {
             self.state.node_id,
             Arc::clone(&self.state),
         );
-        let payload_bytes = executor.execute(cluster_op).await.map_err(|e| {
+        let payload_bytes = executor.execute(&cluster_op).await.map_err(|e| {
             let (severity, code, message) = error_to_sqlstate(&e);
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 severity.to_owned(),
@@ -78,7 +86,7 @@ impl NodeDbPgHandler {
         // are reads and publish nothing; `Put`/`Delete` carry their own
         // Control-Plane-allocated `wal_lsn` since there is no Data-Plane
         // `Response::watermark_lsn` on this coordinator-only path.
-        let write_lsn = match cluster_op {
+        let write_lsn = match &cluster_op {
             ClusterArrayOp::Put { wal_lsn, .. } | ClusterArrayOp::Delete { wal_lsn, .. } => {
                 Some(*wal_lsn)
             }
@@ -89,12 +97,12 @@ impl NodeDbPgHandler {
                 &self.state,
                 tenant_id,
                 database_id,
-                cluster_op,
+                &cluster_op,
                 lsn,
             );
         }
 
-        let cluster_plan_kind = match cluster_op {
+        let cluster_plan_kind = match &cluster_op {
             ClusterArrayOp::Slice { .. } => PlanKind::ArraySlice,
             ClusterArrayOp::Agg { .. }
             | ClusterArrayOp::Put { .. }

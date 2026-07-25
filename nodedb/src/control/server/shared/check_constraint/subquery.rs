@@ -51,18 +51,15 @@ pub(super) async fn enforce_subquery_check(
             "CHECK match query did not produce exactly one task",
         ));
     }
-    let task = tasks.into_iter().next().ok_or_else(|| {
+    let task = tasks.into_tasks().into_iter().next().ok_or_else(|| {
         evaluation_error(
             constraint,
             "CHECK match query did not produce an executable task",
         )
     })?;
-    let response = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+    let response = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
         state,
-        identity.tenant_id,
-        task.database_id,
-        task.vshard_id,
-        task.plan,
+        task,
         TraceId::ZERO,
     )
     .await

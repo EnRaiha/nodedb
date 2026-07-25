@@ -142,6 +142,7 @@ fn handle_auth(cmd: &RespCommand, session: &mut RespSession, state: &SharedState
     ) {
         Some(identity) => {
             session.tenant_id = identity.tenant_id;
+            session.identity = Some(identity);
             state.auth_metrics.record_auth_success("resp_password");
             RespValue::ok()
         }

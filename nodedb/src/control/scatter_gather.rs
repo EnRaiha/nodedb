@@ -406,7 +406,7 @@ pub async fn coordinate_cross_shard_hop(
                     }
                 };
 
-                match gateway_clone.execute(&gw_ctx, physical_plan).await {
+                match gateway_clone.execute_internal(&gw_ctx, physical_plan).await {
                     Ok(payloads) => {
                         for payload in payloads {
                             if let Ok(nodes) = sonic_rs::from_slice::<Vec<String>>(&payload) {

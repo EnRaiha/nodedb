@@ -73,7 +73,9 @@ pub struct DispatchRouteParams<'a> {
 }
 
 /// Dispatch a single route and return the raw payload bytes.
-pub async fn dispatch_route(params: DispatchRouteParams<'_>) -> Result<DispatchOutcome, Error> {
+pub(crate) async fn dispatch_route(
+    params: DispatchRouteParams<'_>,
+) -> Result<DispatchOutcome, Error> {
     let DispatchRouteParams {
         route,
         shared,
@@ -156,7 +158,7 @@ fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> Result<(), Error> {
     Ok(())
 }
 
-pub async fn dispatch_route_stream(
+pub(crate) async fn dispatch_route_stream(
     args: DispatchRouteStreamParams<'_>,
 ) -> Result<ResultStream, Error> {
     let DispatchRouteStreamParams {

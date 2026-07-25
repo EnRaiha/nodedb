@@ -75,7 +75,7 @@ fn purge_removes_all_tenant_data() {
         TENANT_A,
         PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
             collection: "metrics".into(),
-            payload: b"cpu,host=a value=1.0 1000000000\n".to_vec(),
+            payload: b"metrics,host=a value=1.0 1000000000\n".to_vec(),
             format: "ilp".into(),
             wal_lsn: None,
             surrogates: Vec::new(),

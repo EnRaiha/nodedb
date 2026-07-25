@@ -171,8 +171,10 @@ async fn pgwire_not_leader_retry_uses_shared_gateway() {
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
     });
+    let ctx = test_ctx();
+    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway
-        .execute(&test_ctx(), put_plan)
+        .execute(&ctx, authorized)
         .await
         .expect("direct gateway Put must succeed");
 
@@ -229,8 +231,10 @@ async fn http_not_leader_gateway_error_mapping() {
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
     });
+    let ctx = test_ctx();
+    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway
-        .execute(&test_ctx(), put_plan)
+        .execute(&ctx, authorized)
         .await
         .expect("Put via shared.gateway");
 
@@ -293,8 +297,10 @@ async fn resp_not_leader_gateway_error_mapping() {
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
     });
+    let ctx = test_ctx();
+    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway
-        .execute(&test_ctx(), put_plan)
+        .execute(&ctx, authorized)
         .await
         .expect("Put via shared.gateway");
 
@@ -420,8 +426,10 @@ async fn native_not_leader_gateway_error_mapping() {
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
     });
+    let ctx = test_ctx();
+    let authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway
-        .execute(&test_ctx(), put_plan)
+        .execute(&ctx, authorized)
         .await
         .expect("Put via shared.gateway");
 

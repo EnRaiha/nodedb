@@ -184,9 +184,10 @@ pub async fn insert_edge(
         // are single-node), so a single-home Raft write to `vsrc` covers both
         // forward and reverse traversal — EDGES + REVERSE_EDGES land together.
         let plan = PhysicalPlan::Graph(edge_put);
-        crate::control::server::sync::raft_dispatch::dispatch_sync_response(
+        crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
             state,
             tenant_id,
+            database_id,
             vsrc,
             plan,
             TraceId::ZERO,
@@ -354,9 +355,10 @@ pub async fn delete_edge(
         // are single-node), so a single-home write to `vsrc` tombstones both the
         // forward and reverse rows together.
         let plan = PhysicalPlan::Graph(edge_delete);
-        crate::control::server::sync::raft_dispatch::dispatch_sync_response(
+        crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
             state,
             tenant_id,
+            database_id,
             vsrc,
             plan,
             TraceId::ZERO,
@@ -444,9 +446,10 @@ pub async fn set_node_labels(
     )
     .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
-    crate::control::server::sync::raft_dispatch::dispatch_sync_response(
+    crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
         state,
         tenant_id,
+        DatabaseId::DEFAULT,
         vshard_id,
         plan,
         TraceId::ZERO,

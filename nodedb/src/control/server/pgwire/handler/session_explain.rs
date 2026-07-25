@@ -100,7 +100,7 @@ impl NodeDbPgHandler {
                 )))
             })?;
 
-        self.authorize_tasks(identity, &tasks)?;
+        let _authorized_tasks = self.authorize_tasks(identity, &tasks)?;
 
         let schema = Arc::new(vec![text_field("QUERY PLAN")]);
         let mut rows = Vec::new();

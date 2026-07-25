@@ -27,6 +27,7 @@ use common::cluster_harness::{TestCluster, wait::wait_for};
 use std::sync::Arc;
 use std::time::Duration;
 
+use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity};
 use nodedb::control::server::sync::columnar_handler::{
     ColumnarDispatcher, SharedStateColumnarDispatcher,
 };
@@ -184,9 +185,18 @@ async fn dispatch_columnar_seq(
     seq: u64,
     val: &str,
 ) -> Result<AckStatus, String> {
-    let dispatcher = SharedStateColumnarDispatcher {
-        shared: ctx.shared.as_ref(),
+    let identity = AuthenticatedIdentity {
+        user_id: 0,
+        username: "sync-failover-test".into(),
+        tenant_id: ctx.tenant,
+        auth_method: AuthMethod::Trust,
+        roles: Vec::new(),
+        is_superuser: true,
+        default_database: Some(DatabaseId::DEFAULT),
+        accessible_databases: AuthenticatedIdentity::default_database_set(true),
     };
+    let dispatcher =
+        SharedStateColumnarDispatcher::new(ctx.shared.as_ref(), &identity, DatabaseId::DEFAULT);
     let rows = vec![vec![
         Value::Integer(seq as i64),
         Value::String(val.to_string()),

@@ -13,8 +13,8 @@
 //! enum; the implementer pattern-matches as it sees fit.
 
 use crate::physical_plan::{
-    ArrayOp, ClusterArrayOp, ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, MetaOp, PhysicalPlan,
-    QueryOp, SpatialOp, TextOp, TimeseriesOp, VectorOp,
+    ArrayOp, ClusterArrayOp, ClusterEventOp, ColumnarOp, CrdtOp, DocumentOp, GraphOp, KvOp, MetaOp,
+    PhysicalPlan, QueryOp, SpatialOp, TextOp, TimeseriesOp, VectorOp,
 };
 
 /// Per-deployment executor for `PhysicalPlan`.
@@ -41,6 +41,7 @@ pub trait PhysicalTaskVisitor {
     fn meta(&mut self, op: &MetaOp) -> Result<Self::Output, Self::Error>;
     fn array(&mut self, op: &ArrayOp) -> Result<Self::Output, Self::Error>;
     fn cluster_array(&mut self, op: &ClusterArrayOp) -> Result<Self::Output, Self::Error>;
+    fn cluster_event(&mut self, op: &ClusterEventOp) -> Result<Self::Output, Self::Error>;
 }
 
 /// Dispatch `plan` to the matching method on `visitor`.
@@ -64,5 +65,6 @@ pub fn dispatch<V: PhysicalTaskVisitor>(
         PhysicalPlan::Meta(op) => visitor.meta(op),
         PhysicalPlan::Array(op) => visitor.array(op),
         PhysicalPlan::ClusterArray(op) => visitor.cluster_array(op),
+        PhysicalPlan::ClusterEvent(op) => visitor.cluster_event(op),
     }
 }

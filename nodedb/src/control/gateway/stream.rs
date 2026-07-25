@@ -11,9 +11,10 @@ use std::sync::atomic::Ordering;
 
 use crate::Error;
 use crate::control::server::result_stream::ResultStream;
+use crate::control::server::shared::authorization::AuthorizedTask;
 use nodedb_physical::physical_plan::PhysicalPlan;
 
-use super::core::{Gateway, QueryContext};
+use super::core::{Gateway, QueryContext, authorized_plan_for_context};
 use super::dispatcher::{DispatchRouteStreamParams, default_deadline_ms, dispatch_route_stream};
 use super::retry::retry_not_leader;
 use super::route::TaskRoute;
@@ -40,6 +41,15 @@ impl Gateway {
     /// `execute_with_version_set` (which collect a materialized `Vec<Vec<u8>>`);
     /// it frames rows incrementally instead.
     pub async fn execute_stream(
+        &self,
+        ctx: &QueryContext,
+        authorized: AuthorizedTask,
+    ) -> Result<ResultStream, Error> {
+        let plan = authorized_plan_for_context(ctx, authorized)?;
+        self.execute_stream_internal(ctx, plan).await
+    }
+
+    pub(crate) async fn execute_stream_internal(
         &self,
         ctx: &QueryContext,
         plan: PhysicalPlan,

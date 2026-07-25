@@ -8,6 +8,7 @@
 
 mod control_flow;
 mod dispatch;
+pub mod sql_literal_concat;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

@@ -113,7 +113,7 @@ impl NodeDbPgHandler {
         &self,
         identity: &AuthenticatedIdentity,
         tasks: &[PhysicalTask],
-    ) -> PgWireResult<()> {
+    ) -> PgWireResult<crate::control::server::shared::authorization::AuthorizedTaskSet> {
         let emitter = ArcAuditEmitter(Arc::clone(&self.state.audit));
         authorize_task_set(
             identity,

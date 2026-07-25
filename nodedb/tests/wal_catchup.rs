@@ -8,11 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nodedb::bridge::dispatch::Dispatcher;
+use nodedb::control::security::audit::NoopAuditEmitter;
+use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity};
+use nodedb::control::server::shared::authorization::authorize_task_set;
 use nodedb::control::state::SharedState;
 use nodedb::data::executor::core_loop::CoreLoop;
 use nodedb::types::*;
 use nodedb::wal::manager::WalManager;
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 fn ilp_payload(collection: &str, count: usize, start_ts_ns: i64) -> Vec<u8> {
     let mut lines = String::new();
@@ -84,12 +88,40 @@ impl TestStack {
     }
 
     async fn dispatch(&self, plan: PhysicalPlan, collection: &str) -> serde_json::Value {
-        let resp = nodedb::control::server::dispatch_utils::dispatch_to_data_plane(
-            &self.shared,
-            TenantId::new(1),
-            DatabaseId::DEFAULT,
-            VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection),
+        let tenant_id = TenantId::new(1);
+        let task = PhysicalTask {
+            tenant_id,
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection),
             plan,
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        };
+        let identity = AuthenticatedIdentity {
+            user_id: 1,
+            username: "wal-catchup-test".into(),
+            tenant_id,
+            auth_method: AuthMethod::Trust,
+            roles: Vec::new(),
+            is_superuser: true,
+            default_database: None,
+            accessible_databases: AuthenticatedIdentity::default_database_set(true),
+        };
+        let authorized = authorize_task_set(
+            &identity,
+            std::slice::from_ref(&task),
+            &self.shared.permissions,
+            &self.shared.roles,
+            &NoopAuditEmitter,
+        )
+        .expect("authorize test task")
+        .into_tasks()
+        .into_iter()
+        .next()
+        .expect("one authorized task");
+        let resp = nodedb::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+            &self.shared,
+            authorized,
             TraceId::ZERO,
         )
         .await

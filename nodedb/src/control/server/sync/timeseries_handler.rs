@@ -54,6 +54,7 @@ pub trait TimeseriesDispatcher: Send + Sync {
 /// re-fired on synced data.
 pub struct SharedStateTimeseriesDispatcher<'a> {
     pub shared: &'a crate::control::state::SharedState,
+    pub(crate) identity: Option<&'a crate::control::security::identity::AuthenticatedIdentity>,
     pub(crate) database_id: DatabaseId,
 }
 
@@ -80,6 +81,13 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
         let prov = provenance;
         let database_id = self.database_id;
 
+        super::raft_dispatch::authorize_sync_collection(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            &collection,
+        )?;
         let payload_bytes = ilp_payload.into_bytes();
 
         // Allocate a WAL LSN on the Control Plane before dispatching to the
@@ -107,12 +115,18 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             provenance: Some(prov),
         });
 
-        super::raft_dispatch::dispatch_write_replicated(
+        let authorized = super::raft_dispatch::authorize_sync_task(
             self.shared,
+            self.identity,
             tenant_id,
             database_id,
-            &collection,
+            vshard,
             plan,
+        )?;
+        super::raft_dispatch::dispatch_write_replicated(
+            self.shared,
+            &collection,
+            authorized,
             std::time::Duration::from_secs(self.shared.tuning.network.default_deadline_secs),
             crate::event::EventSource::CrdtSync,
         )

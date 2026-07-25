@@ -72,8 +72,9 @@ async fn native_gateway_migration_single_node_select() {
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
     });
+    let put_authorized = common::authorize_gateway_plan(&node.shared, &ctx, put_plan);
     gateway
-        .execute(&ctx, put_plan)
+        .execute(&ctx, put_authorized)
         .await
         .expect("INSERT via gateway");
 
@@ -84,8 +85,9 @@ async fn native_gateway_migration_single_node_select() {
         rls_filters: vec![],
         surrogate_ceiling: None,
     });
+    let get_authorized = common::authorize_gateway_plan(&node.shared, &ctx, get_plan);
     let payloads = gateway
-        .execute(&ctx, get_plan)
+        .execute(&ctx, get_authorized)
         .await
         .expect("SELECT via gateway");
 
@@ -132,8 +134,9 @@ async fn native_gateway_migration_cross_node_select() {
         ttl_ms: 0,
         surrogate: nodedb_types::Surrogate::ZERO,
     });
+    let put_authorized = common::authorize_gateway_plan(&cluster.nodes[0].shared, &ctx, put_plan);
     leader_gw
-        .execute(&ctx, put_plan)
+        .execute(&ctx, put_authorized)
         .await
         .expect("seed PUT on leader");
 
@@ -147,7 +150,8 @@ async fn native_gateway_migration_cross_node_select() {
         rls_filters: vec![],
         surrogate_ceiling: None,
     });
-    let get_result = follower_gw.execute(&ctx, get_plan).await;
+    let get_authorized = common::authorize_gateway_plan(&cluster.nodes[1].shared, &ctx, get_plan);
+    let get_result = follower_gw.execute(&ctx, get_authorized).await;
     assert!(
         get_result.is_ok(),
         "cross-node SELECT via gateway failed: {:?}",

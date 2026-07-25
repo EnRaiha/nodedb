@@ -102,16 +102,6 @@ pub async fn query_ndjson(
         return ApiError::from(error).into_response();
     }
 
-    if let Err(error) = authorize_task_set(
-        &identity,
-        &tasks,
-        &state.shared.permissions,
-        &state.shared.roles,
-        &emitter,
-    ) {
-        return ApiError::from(crate::Error::from(error)).into_response();
-    }
-
     let trace_id = crate::control::trace_context::generate_trace_id();
 
     // Lazy fast path: an eligible single-task, unordered, multi-row SELECT
@@ -122,7 +112,15 @@ pub async fn query_ndjson(
     // bracketed around it — admission was already gated by `check_tenant_quota`
     // above, matching the pgwire lazy path which also does not request-account
     // the streamed `QueryResponse`.
-    match super::super::query_stream::try_open_stream(&state, &tasks, database_id, trace_id).await {
+    match super::super::query_stream::try_open_stream(
+        &state,
+        &tasks,
+        &identity,
+        database_id,
+        trace_id,
+    )
+    .await
+    {
         Ok(Some((stream, limit))) => {
             let body =
                 axum::body::Body::from_stream(super::super::query_stream::ndjson_body_stream(
@@ -140,43 +138,88 @@ pub async fn query_ndjson(
         Ok(None) => {
             // Not streamable — fall through to the materialized path below.
         }
-        Err(e) => {
-            let (_status, msg) = GatewayErrorMap::to_http(&e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
-        }
+        Err(error) => return ApiError::from(error).into_response(),
     }
+
+    let authorized_tasks = match authorize_task_set(
+        &identity,
+        &tasks,
+        &state.shared.permissions,
+        &state.shared.roles,
+        &emitter,
+    ) {
+        Ok(authorized) => authorized.into_tasks(),
+        Err(error) => return ApiError::from(crate::Error::from(error)).into_response(),
+    };
 
     state.shared.tenant_request_start(tenant_id);
 
     let mut ndjson = String::new();
-    for task in tasks {
+    for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
         // Captured before dispatch moves `task.plan` — needed by the
         // protocol-neutral shaping core below.
         let plan_kind = describe_plan(&task.plan);
         let plan_for_shape = task.plan.clone();
 
-        let dispatch_result: crate::Result<Vec<Vec<u8>>> = match state.shared.gateway.get() {
-            Some(gw) => {
-                let gw_ctx = QueryContext {
-                    tenant_id: task.tenant_id,
-                    trace_id,
-                    database_id,
-                    txn_id: None,
-                };
-                gw.execute(&gw_ctx, task.plan).await
-            }
-            None => {
-                // Single-node boot: gateway not yet initialised — dispatch locally.
-                crate::control::server::dispatch_utils::dispatch_to_data_plane(
+        let dispatch_result: crate::Result<Vec<Vec<u8>>> = if matches!(
+            &task.plan,
+            crate::bridge::envelope::PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. }
+            )
+        ) {
+            crate::control::insert_select::run_authorized_insert_select(
+                &state.shared,
+                authorized_task,
+            )
+            .await
+            .map(|response| vec![response.payload.to_vec()])
+        } else if matches!(
+            &task.plan,
+            crate::bridge::envelope::PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::Merge {
+                    resolve_only: false,
+                    resolved_inserts: None,
+                    ..
+                }
+            )
+        ) {
+            crate::control::merge_orchestrator::run_authorized_merge(&state.shared, authorized_task)
+                .await
+                .map(|response| vec![response.payload.to_vec()])
+        } else if matches!(
+            &task.plan,
+            crate::bridge::envelope::PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
+                    resolve_only: false,
+                    source_rows: None,
+                    ..
+                }
+            )
+        ) {
+            crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
+                &state.shared,
+                authorized_task,
+            )
+            .await
+            .map(|response| vec![response.payload.to_vec()])
+        } else {
+            match state.shared.gateway.get() {
+                Some(gw) => {
+                    let gw_ctx = QueryContext {
+                        tenant_id: task.tenant_id,
+                        trace_id,
+                        database_id,
+                        txn_id: None,
+                    };
+                    gw.execute(&gw_ctx, authorized_task).await
+                }
+                None => crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
                     &state.shared,
-                    task.tenant_id,
-                    task.database_id,
-                    task.vshard_id,
-                    task.plan,
+                    authorized_task,
                     trace_id,
                 )
                 .await
-                .map(|r| vec![r.payload.to_vec()])
+                .map(|response| vec![response.payload.to_vec()]),
             }
         };
 

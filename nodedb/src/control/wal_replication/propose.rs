@@ -28,7 +28,7 @@ const BACKOFF_MS: [u64; 5] = [10, 25, 50, 100, 200];
 /// the same write payload is re-proposed against the new leader. The encoded
 /// `ReplicatedEntry` carries enough identity (collection, PK, surrogate) to be
 /// replayable. Other propose errors map to [`crate::Error::Dispatch`].
-pub async fn propose_replicated_entry(
+pub(crate) async fn propose_replicated_entry(
     state: &SharedState,
     proposer: &Arc<AsyncRaftProposer>,
     entry: ReplicatedEntry,

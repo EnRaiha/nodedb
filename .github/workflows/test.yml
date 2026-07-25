@@ -68,6 +68,10 @@ jobs:
         run: |
           python3 scripts/ci/check_reconstructed_sql.py --self-test
           python3 scripts/ci/check_reconstructed_sql.py
+      - name: Authorized-dispatch gate
+        run: |
+          python3 scripts/ci/check_authorized_dispatch.py --self-test
+          python3 scripts/ci/check_authorized_dispatch.py
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:

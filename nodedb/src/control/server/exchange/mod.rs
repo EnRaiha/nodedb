@@ -13,10 +13,13 @@ pub mod full_scan;
 pub mod gather;
 pub mod owning_core;
 pub mod resolve;
+pub mod response;
 pub mod streamable;
 
-pub use all_cores::{NodeLevelResult, execute_plan_all_local_cores};
-pub use gather::{GatherOutcome, finalize_aggregate, gather_all_cores};
+pub use all_cores::NodeLevelResult;
+pub(crate) use all_cores::execute_plan_all_local_cores;
+pub(crate) use gather::gather_all_cores;
+pub use gather::{GatherOutcome, finalize_aggregate};
 pub use resolve::{
     DistributedReadCapture, Resolved, resolve_and_materialize, resolve_exchange_in_plan,
 };

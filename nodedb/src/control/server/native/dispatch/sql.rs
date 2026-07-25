@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::control::planner::calvin::{
     CrossShardTxnMode, DispatchClass, TxnDispatchPosition, classify_dispatch,
-    dispatch_tasks_to_calvin,
+    dispatch_authorized_tasks_to_calvin,
 };
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::shared::authorization::{authorize_database, authorize_task_set};
@@ -271,25 +271,27 @@ async fn execute_planned(
 
     drop(perm_cache);
     let emitter = ArcAuditEmitter(Arc::clone(&ctx.state.audit));
-    if let Err(error) = authorize_task_set(
+    let mut authorized_tasks = match authorize_task_set(
         ctx.identity,
         &tasks,
         &ctx.state.permissions,
         &ctx.state.roles,
         &emitter,
     ) {
-        return resp(error_to_native(seq, &crate::Error::from(error)));
-    }
+        Ok(authorized) => authorized,
+        Err(error) => return resp(error_to_native(seq, &crate::Error::from(error))),
+    };
 
     // Implicit-edge DELETE/UPDATE routing gate (native-protocol parity with
     // pgwire). See `edge_recon_gate` for the full invariant and guard
     // documentation. Returns early when the gate fires, consuming `tasks`.
     {
         use super::edge_recon_gate::{EdgeReconResult, try_edge_recon_dispatch};
-        match try_edge_recon_dispatch(ctx, seq, tasks).await {
+        match try_edge_recon_dispatch(ctx, seq, tasks, authorized_tasks).await {
             EdgeReconResult::Outcome(outcome) => return outcome,
-            EdgeReconResult::NotFired(returned_tasks) => {
+            EdgeReconResult::NotFired(returned_tasks, returned_authorized) => {
                 tasks = returned_tasks;
+                authorized_tasks = returned_authorized;
             }
         }
     }
@@ -319,9 +321,9 @@ async fn execute_planned(
             // so native multi-shard writes route through Calvin by default.
             let cross_shard_mode = ctx.sessions.cross_shard_txn_mode(ctx.peer_addr);
             if cross_shard_mode == CrossShardTxnMode::Strict {
-                return match dispatch_tasks_to_calvin(
+                return match dispatch_authorized_tasks_to_calvin(
                     ctx.state,
-                    &tasks,
+                    authorized_tasks,
                     ctx.tenant_id(),
                     cross_shard_mode,
                     TxnDispatchPosition::Autocommit,

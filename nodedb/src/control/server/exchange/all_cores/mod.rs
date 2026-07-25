@@ -28,4 +28,5 @@ mod fanout;
 mod snapshot;
 mod wcc;
 
-pub use dispatch::{NodeLevelResult, execute_plan_all_local_cores};
+pub use dispatch::NodeLevelResult;
+pub(crate) use dispatch::execute_plan_all_local_cores;

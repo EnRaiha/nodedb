@@ -139,7 +139,7 @@ impl NodeDbQueryParser {
                 error.to_string(),
             )))
         })?;
-        authorize_task_set(
+        let _authorized_tasks = authorize_task_set(
             identity,
             &tasks,
             &self.state.permissions,

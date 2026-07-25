@@ -20,10 +20,10 @@ use prost::Message;
 use tracing::info;
 
 use super::proto;
-use crate::control::server::dispatch_utils::dispatch_to_data_plane;
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::session_auth;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
-use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
+use crate::types::DatabaseId;
 
 /// Configuration for the OTLP receiver.
 #[derive(Debug, Clone)]
@@ -73,6 +73,10 @@ pub async fn receive_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let identity = match authenticate_otel(&headers, &state).await {
+        Ok(identity) => identity,
+        Err(message) => return (StatusCode::UNAUTHORIZED, message),
+    };
     let data = decompress_body(&headers, &body);
     let req = match proto::ExportMetricsServiceRequest::decode(&data[..]) {
         Ok(r) => r,
@@ -91,10 +95,9 @@ pub async fn receive_metrics(
                 if lines.is_empty() {
                     continue;
                 }
-                let collection = metric.name.clone();
                 let payload = lines.join("\n");
 
-                match ingest_ilp(&state, &collection, payload.into_bytes()).await {
+                match ingest_ilp(&state, &identity, &payload).await {
                     Ok(n) => accepted += n,
                     Err(_) => rejected += lines.len() as u64,
                 }
@@ -110,106 +113,107 @@ pub async fn receive_metrics(
 
 /// POST `/v1/traces` — OTLP traces receiver.
 ///
-/// Stores spans as structured documents with trace_id, span_id, timestamps,
+/// Stores spans as timeseries rows with trace_id, span_id, timestamps,
 /// attributes, and status. Enables distributed trace querying via SQL.
 pub async fn receive_traces(
     State(state): State<Arc<SharedState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let identity = match authenticate_otel(&headers, &state).await {
+        Ok(identity) => identity,
+        Err(message) => return (StatusCode::UNAUTHORIZED, message),
+    };
     let data = decompress_body(&headers, &body);
     let req = match proto::ExportTraceServiceRequest::decode(&data[..]) {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("decode error: {e}")),
     };
 
-    let mut span_count = 0u64;
-    for rs in &req.resource_spans {
-        let resource_tags = proto::resource_tags(&rs.resource);
-        for ss in &rs.scope_spans {
-            for span in &ss.spans {
-                let ilp = span_to_ilp(span, &resource_tags);
-                let _ = ingest_ilp(&state, "otel_traces", ilp.into_bytes()).await;
-                span_count += 1;
-            }
-        }
+    match ingest_traces(&state, &identity, &req).await {
+        Ok(span_count) => (StatusCode::OK, format!("{{\"spans\":{span_count}}}")),
+        Err(error) => (StatusCode::FORBIDDEN, error.to_string()),
     }
-
-    (StatusCode::OK, format!("{{\"spans\":{span_count}}}"))
 }
 
 /// POST `/v1/logs` — OTLP logs receiver.
 ///
-/// Stores log records with severity, body, timestamp, trace correlation.
+/// Stores log records as timeseries rows with severity, body, timestamp, and trace correlation.
 pub async fn receive_logs(
     State(state): State<Arc<SharedState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    let identity = match authenticate_otel(&headers, &state).await {
+        Ok(identity) => identity,
+        Err(message) => return (StatusCode::UNAUTHORIZED, message),
+    };
     let data = decompress_body(&headers, &body);
     let req = match proto::ExportLogsServiceRequest::decode(&data[..]) {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("decode error: {e}")),
     };
 
-    let mut log_count = 0u64;
-    for rl in &req.resource_logs {
-        let resource_tags = proto::resource_tags(&rl.resource);
-        for sl in &rl.scope_logs {
-            for record in &sl.log_records {
-                let ilp = log_to_ilp(record, &resource_tags);
-                let _ = ingest_ilp(&state, "otel_logs", ilp.into_bytes()).await;
-                log_count += 1;
-            }
-        }
+    match ingest_logs(&state, &identity, &req).await {
+        Ok(log_count) => (StatusCode::OK, format!("{{\"logs\":{log_count}}}")),
+        Err(error) => (StatusCode::FORBIDDEN, error.to_string()),
     }
-
-    (StatusCode::OK, format!("{{\"logs\":{log_count}}}"))
 }
 
 // ── Core ingest functions (shared by HTTP + gRPC handlers) ───────────────
 
 /// Ingest an OTLP metrics request into the timeseries engine.
-pub async fn ingest_metrics(shared: &Arc<SharedState>, req: &proto::ExportMetricsServiceRequest) {
+pub async fn ingest_metrics(
+    shared: &Arc<SharedState>,
+    identity: &AuthenticatedIdentity,
+    req: &proto::ExportMetricsServiceRequest,
+) -> crate::Result<u64> {
+    let mut lines = Vec::new();
     for rm in &req.resource_metrics {
         let resource_tags = proto::resource_tags(&rm.resource);
         for sm in &rm.scope_metrics {
             for metric in &sm.metrics {
-                let lines = metric_to_ilp(metric, &resource_tags);
-                if !lines.is_empty() {
-                    let collection = metric.name.clone();
-                    let payload = lines.join("\n");
-                    let _ = ingest_ilp(shared, &collection, payload.into_bytes()).await;
-                }
+                lines.extend(metric_to_ilp(metric, &resource_tags));
             }
         }
     }
+    ingest_ilp(shared, identity, &lines.join("\n")).await
 }
 
-/// Ingest an OTLP traces request into the document engine.
-pub async fn ingest_traces(shared: &Arc<SharedState>, req: &proto::ExportTraceServiceRequest) {
+/// Ingest an OTLP traces request into the timeseries engine.
+pub async fn ingest_traces(
+    shared: &Arc<SharedState>,
+    identity: &AuthenticatedIdentity,
+    req: &proto::ExportTraceServiceRequest,
+) -> crate::Result<u64> {
+    let mut lines = Vec::new();
     for rs in &req.resource_spans {
         let resource_tags = proto::resource_tags(&rs.resource);
         for ss in &rs.scope_spans {
             for span in &ss.spans {
-                let ilp = span_to_ilp(span, &resource_tags);
-                let _ = ingest_ilp(shared, "otel_traces", ilp.into_bytes()).await;
+                lines.push(span_to_ilp(span, &resource_tags));
             }
         }
     }
+    ingest_ilp(shared, identity, &lines.join("\n")).await
 }
 
-/// Ingest an OTLP logs request into the document engine.
-pub async fn ingest_logs(shared: &Arc<SharedState>, req: &proto::ExportLogsServiceRequest) {
+/// Ingest an OTLP logs request into the timeseries engine.
+pub async fn ingest_logs(
+    shared: &Arc<SharedState>,
+    identity: &AuthenticatedIdentity,
+    req: &proto::ExportLogsServiceRequest,
+) -> crate::Result<u64> {
+    let mut lines = Vec::new();
     for rl in &req.resource_logs {
         let resource_tags = proto::resource_tags(&rl.resource);
         for sl in &rl.scope_logs {
             for record in &sl.log_records {
-                let ilp = log_to_ilp(record, &resource_tags);
-                let _ = ingest_ilp(shared, "otel_logs", ilp.into_bytes()).await;
+                lines.push(log_to_ilp(record, &resource_tags));
             }
         }
     }
+    ingest_ilp(shared, identity, &lines.join("\n")).await
 }
 
 // ── Conversion helpers ───────────────────────────────────────────────────
@@ -366,29 +370,47 @@ fn escape_ilp_string(s: &str) -> String {
         .replace('\n', "\\n")
 }
 
+pub(super) async fn authenticate_otel(
+    headers: &HeaderMap,
+    shared: &SharedState,
+) -> Result<AuthenticatedIdentity, String> {
+    let header = headers
+        .get("authorization")
+        .ok_or_else(|| "missing Authorization: Bearer <token> header".to_owned())?;
+    let value = header
+        .to_str()
+        .map_err(|_| "invalid authorization header encoding".to_owned())?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| "invalid authorization header".to_owned())?;
+
+    if token.matches('.').count() == 2
+        && let Some(registry) = &shared.jwks_registry
+        && let Ok(identity) = registry.validate(token).await
+    {
+        return Ok(identity);
+    }
+    session_auth::verify_api_key_identity(shared, token, "otlp", "OTLP")
+        .ok_or_else(|| "invalid bearer token".to_owned())
+}
+
 async fn ingest_ilp(
     shared: &Arc<SharedState>,
-    collection: &str,
-    payload: Vec<u8>,
+    identity: &AuthenticatedIdentity,
+    payload: &str,
 ) -> Result<u64, crate::Error> {
-    let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
-        collection: collection.to_string(),
-        payload,
-        format: "ilp".into(),
-        wal_lsn: None,
-        surrogates: Vec::new(),
-        provenance: None,
-    });
-    dispatch_to_data_plane(
+    if payload.is_empty() {
+        return Ok(0);
+    }
+    crate::control::server::ilp_listener::flush_authenticated_ilp_batch(
         shared,
-        TenantId::new(1),
+        identity,
         DatabaseId::DEFAULT,
-        VShardId::new(0),
-        plan,
-        TraceId::ZERO,
+        payload,
     )
-    .await?;
-    Ok(1)
+    .await
 }
 
 fn decompress_body(headers: &HeaderMap, body: &Bytes) -> Vec<u8> {

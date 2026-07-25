@@ -45,8 +45,7 @@ use nodedb_array::sync::op::ArrayOp;
 use nodedb_array::sync::op_codec;
 use nodedb_types::sync::wire::SyncProvenance;
 use nodedb_types::sync::wire::array::{
-    ArrayAckMsg, ArrayCatchupRequestMsg, ArrayDeltaBatchMsg, ArrayDeltaMsg, ArrayRejectMsg,
-    ArrayRejectReason, ArraySchemaSyncMsg,
+    ArrayDeltaBatchMsg, ArrayDeltaMsg, ArrayRejectMsg, ArrayRejectReason, ArraySchemaSyncMsg,
 };
 use tracing::warn;
 
@@ -93,9 +92,10 @@ pub enum InboundOutcome {
 /// and called from the WebSocket listener arm for each array message type.
 pub struct OriginArrayInbound {
     engine: Arc<OriginApplyEngine>,
-    schemas: Arc<OriginSchemaRegistry>,
-    shared: Arc<SharedState>,
+    pub(super) schemas: Arc<OriginSchemaRegistry>,
+    pub(super) shared: Arc<SharedState>,
     tenant_id: TenantId,
+    identity: crate::control::security::identity::AuthenticatedIdentity,
     /// Post-apply observer for fan-out to subscribed Lite peers.
     ///
     /// `None` in configurations where no Lite subscribers are expected
@@ -131,6 +131,39 @@ impl OriginArrayInbound {
         self.tenant_id
     }
 
+    pub(super) fn identity(&self) -> &crate::control::security::identity::AuthenticatedIdentity {
+        &self.identity
+    }
+
+    fn authorize_array_write(
+        &self,
+        array: &str,
+        hlc: Hlc,
+    ) -> Result<
+        crate::control::server::shared::authorization::AuthorizedCollection,
+        Option<ArrayRejectMsg>,
+    > {
+        let emitter =
+            crate::control::security::audit::ArcAuditEmitter(Arc::clone(&self.shared.audit));
+        crate::control::server::shared::authorization::authorize_collection_capability(
+            &self.identity,
+            crate::types::DatabaseId::DEFAULT,
+            array,
+            crate::control::security::identity::Permission::Write,
+            &self.shared.permissions,
+            &self.shared.roles,
+            &emitter,
+        )
+        .map_err(|error| {
+            Some(build_reject(
+                array,
+                hlc,
+                ArrayRejectReason::EngineRejected,
+                error.resource().to_string(),
+            ))
+        })
+    }
+
     pub(super) fn engine(&self) -> &Arc<OriginApplyEngine> {
         &self.engine
     }
@@ -150,13 +183,15 @@ impl OriginArrayInbound {
         engine: Arc<OriginApplyEngine>,
         schemas: Arc<OriginSchemaRegistry>,
         shared: Arc<SharedState>,
-        tenant_id: TenantId,
+        identity: crate::control::security::identity::AuthenticatedIdentity,
     ) -> Self {
+        let tenant_id = identity.tenant_id;
         Self {
             engine,
             schemas,
             shared,
             tenant_id,
+            identity,
             apply_observer: None,
             snapshots: Mutex::new(HashMap::new()),
             session_producer_id: std::sync::atomic::AtomicU64::new(0),
@@ -268,9 +303,11 @@ impl OriginArrayInbound {
     ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
         let hlc_arr: [u8; 18] = msg.schema_hlc_bytes;
         let remote_hlc = Hlc::from_bytes(&hlc_arr);
+        let authorization = self.authorize_array_write(&msg.array, remote_hlc)?;
 
         // In single-node mode (no raft_proposer) fall back to direct import.
         if self.shared.raft_proposer.get().is_none() {
+            let _authorized_scope = authorization.into_scope();
             if let Err(e) =
                 self.schemas
                     .import_snapshot(&msg.array, &msg.snapshot_payload, remote_hlc)
@@ -323,66 +360,14 @@ impl OriginArrayInbound {
             write,
         );
 
-        match self.propose_and_await(entry, &msg.array, remote_hlc).await {
+        match self
+            .propose_and_await(entry, &msg.array, remote_hlc, authorization)
+            .await
+        {
             Ok(()) => Ok(InboundOutcome::SchemaImported),
             Err(Some(r)) => Err(Some(r)),
             Err(None) => Err(None),
         }
-    }
-
-    // ─── Ack ─────────────────────────────────────────────────────────────────
-
-    /// Record a peer ack for GC frontier tracking.
-    ///
-    /// Forwards the ack into the `ArrayAckRegistry` on `SharedState` so the
-    /// GC task can compute the min-ack frontier for each array.
-    pub fn handle_ack(&self, msg: &ArrayAckMsg) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
-        let ack_hlc = Hlc::from_bytes(&msg.ack_hlc_bytes);
-        let replica_id = nodedb_array::sync::replica_id::ReplicaId::new(msg.replica_id);
-        self.shared
-            .array_ack_registry
-            .record(&msg.array, replica_id, ack_hlc);
-        tracing::debug!(
-            array = %msg.array,
-            replica_id = msg.replica_id,
-            ack_hlc = ?ack_hlc,
-            "array_inbound: peer ack recorded"
-        );
-        Ok(InboundOutcome::AckRecorded)
-    }
-
-    // ─── Catchup request ─────────────────────────────────────────────────────
-
-    /// Handle a catch-up request from a Lite peer.
-    ///
-    /// Delegates to [`OriginCatchupServer`] which validates the array, selects
-    /// the op-stream or snapshot delivery path, and enqueues outbound frames.
-    pub fn handle_catchup_request(
-        &self,
-        msg: &ArrayCatchupRequestMsg,
-        session_id: &str,
-    ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
-        use super::catchup::OriginCatchupServer;
-
-        let server = OriginCatchupServer::new(
-            Arc::clone(&self.shared.array_sync_op_log),
-            Arc::clone(&self.schemas),
-            Arc::clone(&self.shared.array_snapshot_store),
-            Arc::clone(&self.shared.array_delivery),
-            Arc::clone(&self.shared.array_subscriber_cursors),
-            Arc::clone(&self.shared.array_ack_registry),
-        );
-
-        if let Err(e) = server.serve(msg, session_id) {
-            warn!(
-                session = %session_id,
-                array = %msg.array,
-                error = %e,
-                "array_inbound: catchup server error"
-            );
-        }
-
-        Ok(InboundOutcome::CatchupRequested)
     }
 
     // ─── Internal helpers ─────────────────────────────────────────────────────
@@ -413,6 +398,8 @@ impl OriginArrayInbound {
             )));
         }
 
+        let authorization = self.authorize_array_write(&op.header.array, op.header.hlc)?;
+
         // 2. Schema HLC gating.
         match self.engine.schema_hlc(&op.header.array) {
             None => {
@@ -439,6 +426,7 @@ impl OriginArrayInbound {
 
         // 3. Fast-path idempotency check (before proposing).
         if self.engine.already_seen(&op.header.array, op.header.hlc) {
+            let _authorized_scope = authorization.into_scope();
             return Ok(InboundOutcome::Idempotent);
         }
 
@@ -447,7 +435,7 @@ impl OriginArrayInbound {
         //    exercised when the cluster stack has not been started (development,
         //    single-node Origin, unit tests without a raft setup).
         if self.shared.raft_proposer.get().is_none() {
-            return self.apply_op_direct(op, provenance).await;
+            return self.apply_op_direct(op, provenance, authorization).await;
         }
 
         // 5. Multi-node path: propose through Raft.
@@ -471,7 +459,7 @@ impl OriginArrayInbound {
         );
 
         match self
-            .propose_and_await(entry, &op.header.array, op.header.hlc)
+            .propose_and_await(entry, &op.header.array, op.header.hlc, authorization)
             .await
         {
             Ok(()) => {

@@ -17,11 +17,34 @@ use tracing::{error, warn};
 
 use crate::control::wal_replication::ReplicatedEntry;
 use crate::types::{DatabaseId, TraceId, VShardId};
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::inbound::{InboundOutcome, OriginArrayInbound};
 use super::reject::build_reject;
 
 impl OriginArrayInbound {
+    fn consume_array_write_authorization(
+        &self,
+        authorization: crate::control::server::shared::authorization::AuthorizedCollection,
+        array: &str,
+        hlc: Hlc,
+    ) -> Result<(), Option<ArrayRejectMsg>> {
+        let (tenant_id, database_id, collection, permission) = authorization.into_scope();
+        if tenant_id != self.tenant_id()
+            || database_id != DatabaseId::DEFAULT
+            || collection != array
+            || permission != crate::control::security::identity::Permission::Write
+        {
+            return Err(Some(build_reject(
+                array,
+                hlc,
+                ArrayRejectReason::EngineRejected,
+                "array authorization scope mismatch".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
     /// Propose a `ReplicatedEntry` to Raft and await its commit + apply.
     ///
     /// Returns `Ok(())` when the entry has been committed and executed by the
@@ -31,7 +54,19 @@ impl OriginArrayInbound {
         entry: ReplicatedEntry,
         array: &str,
         hlc: Hlc,
+        authorization: crate::control::server::shared::authorization::AuthorizedCollection,
     ) -> Result<(), Option<ArrayRejectMsg>> {
+        self.consume_array_write_authorization(authorization, array, hlc)?;
+        if entry.tenant_id != self.tenant_id().as_u64()
+            || entry.database_id != DatabaseId::DEFAULT.as_u64()
+        {
+            return Err(Some(build_reject(
+                array,
+                hlc,
+                ArrayRejectReason::EngineRejected,
+                "array replicated entry scope mismatch".to_string(),
+            )));
+        }
         let vshard_id = entry.vshard_id;
         let idempotency_key = entry.idempotency_key;
         let data = entry.to_bytes();
@@ -130,17 +165,53 @@ impl OriginArrayInbound {
         &self,
         op: ArrayOp,
         provenance: Option<nodedb_types::sync::wire::SyncProvenance>,
+        authorization: crate::control::server::shared::authorization::AuthorizedCollection,
     ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
+        self.consume_array_write_authorization(authorization, &op.header.array, op.header.hlc)?;
         let data_plane_op = self.op_to_data_plane_plan(&op, provenance)?;
         let vshard = self.vshard_for_op(&op);
+        let task = PhysicalTask {
+            tenant_id: self.tenant_id(),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: vshard,
+            plan: data_plane_op,
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        };
+        let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
+            &self.shared().audit,
+        ));
+        let authorized = crate::control::server::shared::authorization::authorize_task_set(
+            self.identity(),
+            std::slice::from_ref(&task),
+            &self.shared().permissions,
+            &self.shared().roles,
+            &emitter,
+        )
+        .map_err(|error| {
+            Some(build_reject(
+                &op.header.array,
+                op.header.hlc,
+                ArrayRejectReason::EngineRejected,
+                error.resource().to_string(),
+            ))
+        })?
+        .into_tasks()
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            Some(build_reject(
+                &op.header.array,
+                op.header.hlc,
+                ArrayRejectReason::EngineRejected,
+                "authorization returned no array task".to_string(),
+            ))
+        })?;
 
         let response =
-            match crate::control::server::dispatch_utils::dispatch_to_data_plane_with_source(
+            match crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane_with_source(
                 self.shared(),
-                self.tenant_id(),
-                DatabaseId::DEFAULT,
-                vshard,
-                data_plane_op,
+                authorized,
                 TraceId::ZERO,
                 crate::event::EventSource::CrdtSync,
             )

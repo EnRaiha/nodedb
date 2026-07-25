@@ -290,24 +290,13 @@ async fn dispatch_task(
     mut task: PhysicalTask,
 ) -> crate::Result<(Response, Vec<(VShardId, Lsn)>, Vec<DistributedReadCapture>)> {
     if let crate::bridge::envelope::PhysicalPlan::Document(
-        nodedb_physical::physical_plan::DocumentOp::InsertSelect {
-            target_collection,
-            source_collection,
-            source_filters,
-            source_limit,
-        },
+        nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. },
     ) = &task.plan
     {
-        let resp = crate::control::insert_select::run_insert_select(
-            ctx.state,
-            task.tenant_id,
-            task.database_id,
-            target_collection,
-            source_collection,
-            source_filters,
-            *source_limit,
-        )
-        .await?;
+        let authorized = super::sql_gateway::authorize_native_task(ctx, &task)?;
+        let resp =
+            crate::control::insert_select::run_authorized_insert_select(ctx.state, authorized)
+                .await?;
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
@@ -316,12 +305,12 @@ async fn dispatch_task(
     // fresh, registered surrogate and all arms apply atomically.
     if let crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::Merge {
-            target_collection,
-            source_collection,
-            source_alias,
-            target_join_col,
-            source_join_col,
-            clauses,
+            target_collection: _,
+            source_collection: _,
+            source_alias: _,
+            target_join_col: _,
+            source_join_col: _,
+            clauses: _,
             returning: _,
             resolve_only: false,
             resolved_inserts: None,
@@ -329,20 +318,9 @@ async fn dispatch_task(
         },
     ) = &task.plan
     {
-        let resp = crate::control::merge_orchestrator::run_merge(
-            ctx.state,
-            crate::control::merge_orchestrator::MergeArgs {
-                tenant_id: task.tenant_id,
-                database_id: task.database_id,
-                target_collection,
-                source_collection,
-                source_alias,
-                target_join_col,
-                source_join_col,
-                clauses,
-            },
-        )
-        .await?;
+        let authorized = super::sql_gateway::authorize_native_task(ctx, &task)?;
+        let resp =
+            crate::control::merge_orchestrator::run_authorized_merge(ctx.state, authorized).await?;
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
@@ -353,33 +331,22 @@ async fn dispatch_task(
     // different core).
     if let crate::bridge::envelope::PhysicalPlan::Document(
         nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
-            target_collection,
-            source_collection,
-            source_alias,
-            target_join_col,
-            source_join_col,
-            updates,
-            target_filters,
-            returning,
+            target_collection: _,
+            source_collection: _,
+            source_alias: _,
+            target_join_col: _,
+            source_join_col: _,
+            updates: _,
+            target_filters: _,
+            returning: _,
             resolve_only: false,
             source_rows: None,
         },
     ) = &task.plan
     {
-        let resp = crate::control::update_from_join_orchestrator::run_update_from_join(
-            ctx.state,
-            crate::control::update_from_join_orchestrator::UpdateFromJoinArgs {
-                tenant_id: task.tenant_id,
-                database_id: task.database_id,
-                target_collection,
-                source_collection,
-                source_alias,
-                target_join_col,
-                source_join_col,
-                updates,
-                target_filters,
-                returning: returning.as_ref(),
-            },
+        let authorized = super::sql_gateway::authorize_native_task(ctx, &task)?;
+        let resp = crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
+            ctx.state, authorized,
         )
         .await?;
         return Ok((resp, Vec::new(), Vec::new()));

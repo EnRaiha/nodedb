@@ -2,6 +2,7 @@
 
 pub mod cross_shard_mode;
 pub mod dependent_recon;
+pub mod dependent_recon_plan;
 pub mod dispatch;
 pub mod dispatch_multi;
 pub mod explain;
@@ -15,14 +16,17 @@ pub mod types;
 pub mod write_class;
 
 pub use cross_shard_mode::CrossShardTxnMode;
+pub(crate) use dependent_recon::dispatch_dependent_edge_recon;
 pub use dependent_recon::{
-    DependentReconOutcome, dispatch_dependent_edge_recon, plan_needs_implicit_edge_recon,
+    DependentReconOutcome, dispatch_authorized_dependent_edge_recon, plan_needs_implicit_edge_recon,
 };
 pub use dispatch::{
-    classify_dispatch, dispatch_calvin_or_fast, is_dependent_predicate, is_write_plan,
-    predicate_class, read_vshards_of,
+    classify_dispatch, is_dependent_predicate, is_write_plan, predicate_class, read_vshards_of,
 };
-pub use dispatch_multi::{dispatch_strict_atomic_tasks_to_calvin, dispatch_tasks_to_calvin};
+pub(crate) use dispatch_multi::dispatch_strict_atomic_tasks_to_calvin;
+pub use dispatch_multi::{
+    dispatch_authorized_strict_atomic_tasks_to_calvin, dispatch_authorized_tasks_to_calvin,
+};
 pub use explain::calvin_explain_preamble;
 pub use predicate::predicate_class_for_filters;
 pub use retry_loop::{DependentRetryArgs, run_dependent_with_retry};

@@ -16,8 +16,9 @@
 use nodedb_types::protocol::NativeResponse;
 
 use crate::control::planner::calvin::{
-    dispatch_dependent_edge_recon, plan_needs_implicit_edge_recon,
+    dispatch_authorized_dependent_edge_recon, plan_needs_implicit_edge_recon,
 };
+use crate::control::server::shared::authorization::AuthorizedTaskSet;
 use crate::control::server::shared::session::TransactionState;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -40,6 +41,7 @@ pub(super) async fn try_edge_recon_dispatch(
     ctx: &DispatchCtx<'_>,
     seq: u64,
     tasks: Vec<PhysicalTask>,
+    authorized: AuthorizedTaskSet,
 ) -> EdgeReconResult {
     // Guard 1: not inside an explicit transaction block.  The native
     // `handle_begin`/`handle_commit`/`handle_rollback` helpers drive the SAME
@@ -49,12 +51,12 @@ pub(super) async fn try_edge_recon_dispatch(
     // limitation as pgwire — buffering a multi-step OLLP inside an explicit txn
     // would require full two-phase commit across the outer txn boundary).
     if ctx.sessions.transaction_state(ctx.peer_addr) == TransactionState::InBlock {
-        return EdgeReconResult::NotFired(tasks);
+        return EdgeReconResult::NotFired(tasks, authorized);
     }
 
     // Guard 2: Calvin completion registry available (sequencer is up).
     if ctx.state.calvin_completion_registry.get().is_none() {
-        return EdgeReconResult::NotFired(tasks);
+        return EdgeReconResult::NotFired(tasks, authorized);
     }
 
     // Guard 3: at least one BulkDelete/BulkUpdate targets an edge-bearing
@@ -63,7 +65,7 @@ pub(super) async fn try_edge_recon_dispatch(
     let (_coll, database_id) =
         match plan_needs_implicit_edge_recon(ctx.state, &tasks, ctx.tenant_id()) {
             Err(e) => return EdgeReconResult::Outcome(resp(error_to_native(seq, &e))),
-            Ok(None) => return EdgeReconResult::NotFired(tasks),
+            Ok(None) => return EdgeReconResult::NotFired(tasks, authorized),
             Ok(Some(pair)) => pair,
         };
 
@@ -84,8 +86,15 @@ pub(super) async fn try_edge_recon_dispatch(
     // normal multi-shard OLLP path (NOT the contended single-shard route from
     // `route_write_to_calvin`), so it stays on the strict multi-vshard
     // dependent `TxClass` builder (`allow_single_vshard: false`).
-    let outcome =
-        dispatch_dependent_edge_recon(ctx.state, tasks, ctx.tenant_id(), database_id, false).await;
+    let outcome = dispatch_authorized_dependent_edge_recon(
+        ctx.state,
+        authorized,
+        ctx.identity,
+        ctx.tenant_id(),
+        database_id,
+        false,
+    )
+    .await;
 
     EdgeReconResult::Outcome(match outcome {
         Ok(recon) => {
@@ -110,7 +119,7 @@ pub(super) async fn try_edge_recon_dispatch(
 pub(super) enum EdgeReconResult {
     /// Gate did not fire; caller receives the task list back and continues
     /// normal dispatch.
-    NotFired(Vec<PhysicalTask>),
+    NotFired(Vec<PhysicalTask>, AuthorizedTaskSet),
     /// Gate fired; caller must return this outcome immediately.
     Outcome(SqlOutcome),
 }

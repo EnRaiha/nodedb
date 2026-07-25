@@ -47,7 +47,7 @@ impl TxnDataPlane for NativeTxnDp<'_> {
     ) -> Pin<Box<dyn Future<Output = crate::Result<Response>> + Send + 'a>> {
         let state = self.state;
         Box::pin(async move {
-            dispatch_utils::dispatch_write_to_data_plane(
+            dispatch_utils::dispatch_trusted_internal_write_to_data_plane(
                 state,
                 dispatch_utils::WriteDispatch {
                     tenant_id: task.tenant_id,

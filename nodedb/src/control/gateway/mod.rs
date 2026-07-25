@@ -13,6 +13,7 @@ pub mod plan_cache;
 pub mod retry;
 pub mod route;
 pub mod router;
+pub mod sql_execute;
 pub mod stream;
 pub mod version_set;
 

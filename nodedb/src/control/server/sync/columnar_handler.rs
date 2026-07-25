@@ -79,7 +79,33 @@ pub trait ColumnarDispatcher: Send + Sync {
 /// bridge using `EventSource::CrdtSync` so that AFTER triggers are not
 /// re-fired on synced data.
 pub struct SharedStateColumnarDispatcher<'a> {
-    pub shared: &'a crate::control::state::SharedState,
+    shared: &'a crate::control::state::SharedState,
+    identity: Option<&'a crate::control::security::identity::AuthenticatedIdentity>,
+    database_id: DatabaseId,
+}
+
+impl<'a> SharedStateColumnarDispatcher<'a> {
+    /// Construct an externally admitted sync dispatcher bound to the
+    /// handshake-authenticated identity and database scope.
+    pub fn new(
+        shared: &'a crate::control::state::SharedState,
+        identity: &'a crate::control::security::identity::AuthenticatedIdentity,
+        database_id: DatabaseId,
+    ) -> Self {
+        Self::from_session(shared, Some(identity), database_id)
+    }
+
+    pub(crate) fn from_session(
+        shared: &'a crate::control::state::SharedState,
+        identity: Option<&'a crate::control::security::identity::AuthenticatedIdentity>,
+        database_id: DatabaseId,
+    ) -> Self {
+        Self {
+            shared,
+            identity,
+            database_id,
+        }
+    }
 }
 
 #[async_trait]
@@ -100,6 +126,14 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
         use std::collections::HashMap;
 
         let prov = provenance;
+        let database_id = self.database_id;
+        super::raft_dispatch::authorize_sync_collection(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            &collection,
+        )?;
 
         // Decode column names from schema_bytes so we can build object rows.
         // The Data Plane columnar insert handler expects rows as
@@ -140,7 +174,7 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
                 surrogates.push(nodedb_types::Surrogate::ZERO);
             } else {
                 surrogates.push(self.shared.surrogate_assigner.assign(
-                    DatabaseId::DEFAULT,
+                    database_id,
                     tenant_id,
                     &collection,
                     &pk,
@@ -162,7 +196,7 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
             &self.shared.wal,
             tenant_id,
             vshard,
-            DatabaseId::DEFAULT,
+            database_id,
             ColumnarWalAppendArgs {
                 collection: &collection,
                 payload: &payload,
@@ -184,7 +218,15 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
             wal_lsn,
         });
 
-        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
+        let authorized = super::raft_dispatch::authorize_sync_task(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            vshard,
+            plan,
+        )?;
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
     }
 }
 

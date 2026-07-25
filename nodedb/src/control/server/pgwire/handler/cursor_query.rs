@@ -57,16 +57,13 @@ impl NodeDbPgHandler {
                 )))
             })?;
 
-        self.authorize_tasks(identity, &tasks)?;
+        let authorized_tasks = self.authorize_tasks(identity, &tasks)?.into_tasks();
 
         let mut rows = Vec::new();
-        for task in tasks {
-            let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+        for authorized in authorized_tasks {
+            let resp = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
                 &self.state,
-                task.tenant_id,
-                task.database_id,
-                task.vshard_id,
-                task.plan,
+                authorized,
                 TraceId::ZERO,
             )
             .await

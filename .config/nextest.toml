@@ -51,6 +51,18 @@ retries = { backoff = "fixed", count = 2, delay = "1s" }
 # default 30s × 4 = 120s ceiling stays in force for unit tests.
 slow-timeout = { period = "30s", terminate-after = 6 }
 
+# Load-sensitive in-process integrations use full Data-Plane runtimes and
+# bounded request deadlines. Running them beside the unrestricted unit-test
+# fan-out can starve their executor threads long enough to turn a healthy local
+# dispatch into DeadlineExceeded. Claim every slot for only these measured
+# heavy cases; this preserves real request deadlines rather than weakening them.
+# The crash-recovery label test is included because its child server otherwise
+# competes with the same in-process graph fan-out during the full suite.
+[[profile.default.overrides]]
+filter = 'binary(graph_cross_core_bfs) | test(query_stream_returns_all_rows_across_chunks) | test(streaming_select_returns_all_rows_across_chunks) | test(graph_node_labels_survive_kill_9) | test(wal_replay_restart_keeps_governor_accounting_sane) | test(alter_add_column_does_not_stall_writes) | test(reindex_vector_concurrent_p99) | test(count_star_sees_flushed_partitions) | test(timeseries_flush_does_not_over_release_engine_budget) | test(timeseries_governor_reflects_resident_memtable_after_flush)'
+test-group = 'load-sensitive'
+threads-required = 'num-test-threads'
+
 # WAL-truncation crash tests wait on real wall-clock server behaviour that the
 # other real-server tests do not: a checkpoint cycle must fire AND actually
 # unlink a sealed segment before the test can crash the server, on top of two
@@ -96,6 +108,7 @@ test-group = 'server-process'
 
 [test-groups]
 cluster = { max-threads = 1 }
+load-sensitive = { max-threads = 1 }
 # Up to 2 real-server tests concurrently. Each picks ephemeral (OS-assigned)
 # ports + a private tempdir, so two running side by side never collide on
 # ports/files; 2 single-core servers fit any CI runner, and CI `retries`

@@ -91,7 +91,7 @@ impl ClusterArrayExecutor {
     /// Execute a `ClusterArrayOp` and return raw response bytes ready to be
     /// returned to the client. The response format mirrors local `ArrayOp`
     /// responses so downstream decode logic is unchanged.
-    pub async fn execute(&self, op: &ClusterArrayOp) -> crate::Result<Vec<u8>> {
+    pub(crate) async fn execute(&self, op: &ClusterArrayOp) -> crate::Result<Vec<u8>> {
         match op {
             ClusterArrayOp::Slice {
                 array_id,

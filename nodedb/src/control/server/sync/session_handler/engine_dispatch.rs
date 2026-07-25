@@ -71,6 +71,12 @@ pub(super) async fn dispatch_engine_frame(
         columnar_handler, fts_handler, spatial_handler, timeseries_handler, vector_handler,
     };
 
+    let dispatcher_identity = session.identity.clone();
+    let dispatcher_database = dispatcher_identity
+        .as_ref()
+        .and_then(|identity| identity.default_database)
+        .unwrap_or(DatabaseId::DEFAULT);
+
     match frame.msg_type {
         SyncMessageType::TimeseriesPush => dispatch!(
             ws,
@@ -81,11 +87,8 @@ pub(super) async fn dispatch_engine_frame(
             handle_timeseries_push,
             |s| timeseries_handler::SharedStateTimeseriesDispatcher {
                 shared: s,
-                database_id: session
-                    .identity
-                    .as_ref()
-                    .and_then(|identity| identity.default_database)
-                    .unwrap_or(DatabaseId::DEFAULT),
+                identity: dispatcher_identity.as_ref(),
+                database_id: dispatcher_database,
             },
             timeseries_handler::NoOpTimeseriesDispatcher
         ),
@@ -96,7 +99,13 @@ pub(super) async fn dispatch_engine_frame(
             shared,
             ColumnarInsertMsg,
             handle_columnar_insert,
-            |s| columnar_handler::SharedStateColumnarDispatcher { shared: s },
+            |shared| {
+                columnar_handler::SharedStateColumnarDispatcher::from_session(
+                    shared,
+                    dispatcher_identity.as_ref(),
+                    dispatcher_database,
+                )
+            },
             columnar_handler::NoOpColumnarDispatcher
         ),
         SyncMessageType::VectorInsert => dispatch!(
@@ -106,7 +115,11 @@ pub(super) async fn dispatch_engine_frame(
             shared,
             VectorInsertMsg,
             handle_vector_insert,
-            |s| vector_handler::SharedStateVectorDispatcher { shared: s },
+            |s| vector_handler::SharedStateVectorDispatcher {
+                shared: s,
+                identity: dispatcher_identity.as_ref(),
+                database_id: dispatcher_database,
+            },
             vector_handler::NoOpVectorDispatcher
         ),
         SyncMessageType::VectorDelete => dispatch!(
@@ -116,7 +129,11 @@ pub(super) async fn dispatch_engine_frame(
             shared,
             VectorDeleteMsg,
             handle_vector_delete,
-            |s| vector_handler::SharedStateVectorDispatcher { shared: s },
+            |s| vector_handler::SharedStateVectorDispatcher {
+                shared: s,
+                identity: dispatcher_identity.as_ref(),
+                database_id: dispatcher_database,
+            },
             vector_handler::NoOpVectorDispatcher
         ),
         SyncMessageType::FtsIndex => dispatch!(
@@ -126,7 +143,11 @@ pub(super) async fn dispatch_engine_frame(
             shared,
             FtsIndexMsg,
             handle_fts_index,
-            |s| fts_handler::SharedStateFtsDispatcher { shared: s },
+            |s| fts_handler::SharedStateFtsDispatcher {
+                shared: s,
+                identity: dispatcher_identity.as_ref(),
+                database_id: dispatcher_database,
+            },
             fts_handler::NoOpFtsDispatcher
         ),
         SyncMessageType::FtsDelete => dispatch!(
@@ -136,7 +157,11 @@ pub(super) async fn dispatch_engine_frame(
             shared,
             FtsDeleteMsg,
             handle_fts_delete,
-            |s| fts_handler::SharedStateFtsDispatcher { shared: s },
+            |s| fts_handler::SharedStateFtsDispatcher {
+                shared: s,
+                identity: dispatcher_identity.as_ref(),
+                database_id: dispatcher_database,
+            },
             fts_handler::NoOpFtsDispatcher
         ),
         SyncMessageType::SpatialInsert => dispatch!(
@@ -146,7 +171,11 @@ pub(super) async fn dispatch_engine_frame(
             shared,
             SpatialInsertMsg,
             handle_spatial_insert,
-            |s| spatial_handler::SharedStateSpatialDispatcher { shared: s },
+            |s| spatial_handler::SharedStateSpatialDispatcher {
+                shared: s,
+                identity: dispatcher_identity.as_ref(),
+                database_id: dispatcher_database,
+            },
             spatial_handler::NoOpSpatialDispatcher
         ),
         SyncMessageType::SpatialDelete => dispatch!(
@@ -156,7 +185,11 @@ pub(super) async fn dispatch_engine_frame(
             shared,
             SpatialDeleteMsg,
             handle_spatial_delete,
-            |s| spatial_handler::SharedStateSpatialDispatcher { shared: s },
+            |s| spatial_handler::SharedStateSpatialDispatcher {
+                shared: s,
+                identity: dispatcher_identity.as_ref(),
+                database_id: dispatcher_database,
+            },
             spatial_handler::NoOpSpatialDispatcher
         ),
         _ => EngineOutcome::NotEngine,

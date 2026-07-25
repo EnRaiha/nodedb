@@ -23,12 +23,31 @@ use crate::control::planner::calvin::{
     CrossShardTxnMode, DispatchClass, TxnDispatchPosition, build_single_vshard_tx_class,
     classify_dispatch, read_vshards_of, submit_calvin_routed,
 };
+use crate::control::server::shared::authorization::AuthorizedTaskSet;
 use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
-/// Submit one strict atomic static Calvin task set.
+/// Submit an externally authorized strict atomic static Calvin task set.
+pub async fn dispatch_authorized_strict_atomic_tasks_to_calvin(
+    state: &SharedState,
+    authorized: AuthorizedTaskSet,
+    tenant_id: TenantId,
+    position: TxnDispatchPosition,
+    reads: &[ReadSetEntry],
+    lock_owner: Option<nodedb_cluster::calvin::types::TxnIdWire>,
+) -> crate::Result<Option<Response>> {
+    let tasks: Vec<PhysicalTask> = authorized
+        .into_tasks()
+        .into_iter()
+        .map(|task| task.into_physical_task())
+        .collect();
+    dispatch_strict_atomic_tasks_to_calvin(state, &tasks, tenant_id, position, reads, lock_owner)
+        .await
+}
+
+/// Submit one trusted internal strict atomic static Calvin task set.
 ///
 /// The task set must be non-empty. Both single- and multi-participant task sets
 /// are admitted only at autocommit or commit flush; a mid-block statement is
@@ -41,7 +60,7 @@ use nodedb_physical::physical_task::PhysicalTask;
 /// On success, `Some(Response)` means the scheduler retained a materialized
 /// applied primary response; `None` means no response was retained. This is not
 /// an affected-row envelope and callers must apply their own operation semantics.
-pub async fn dispatch_strict_atomic_tasks_to_calvin(
+pub(crate) async fn dispatch_strict_atomic_tasks_to_calvin(
     state: &SharedState,
     tasks: &[PhysicalTask],
     tenant_id: TenantId,
@@ -101,13 +120,40 @@ fn admit_legacy_multi_shard_dispatch(
     }
 }
 
-/// Drive the legacy strict Calvin multi-shard path for `tasks`.
+/// Drive the authorized strict Calvin multi-shard path.
+pub async fn dispatch_authorized_tasks_to_calvin(
+    state: &SharedState,
+    authorized: AuthorizedTaskSet,
+    tenant_id: TenantId,
+    cross_shard_mode: CrossShardTxnMode,
+    position: TxnDispatchPosition,
+    reads: &[ReadSetEntry],
+    lock_owner: Option<nodedb_cluster::calvin::types::TxnIdWire>,
+) -> crate::Result<Option<Response>> {
+    let tasks: Vec<PhysicalTask> = authorized
+        .into_tasks()
+        .into_iter()
+        .map(|task| task.into_physical_task())
+        .collect();
+    dispatch_tasks_to_calvin(
+        state,
+        &tasks,
+        tenant_id,
+        cross_shard_mode,
+        position,
+        reads,
+        lock_owner,
+    )
+    .await
+}
+
+/// Drive the legacy trusted-internal strict Calvin multi-shard path for `tasks`.
 ///
 /// This compatibility API preserves its historical multi-shard-only contract.
 /// Its strict branch delegates to [`dispatch_strict_atomic_tasks_to_calvin`],
 /// while best-effort remains rejected because this helper has no non-atomic
 /// dispatch implementation.
-pub async fn dispatch_tasks_to_calvin(
+pub(crate) async fn dispatch_tasks_to_calvin(
     state: &SharedState,
     tasks: &[PhysicalTask],
     tenant_id: TenantId,

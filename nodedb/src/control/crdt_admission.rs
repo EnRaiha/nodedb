@@ -13,6 +13,7 @@ use nodedb_physical::physical_plan::CrdtOp;
 use nodedb_types::CrdtPreviewResult;
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Status};
+use crate::control::server::shared::authorization::AuthorizedTask;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::to_replicated_entry;
 use crate::event::EventSource;
@@ -37,7 +38,16 @@ impl CrdtPostImagePolicy for TrustedInternalCrdtPolicy {
 
 const FRONTIER_RETRY_LIMIT: usize = 8;
 
-/// Inputs for one serialized CRDT delta admission.
+/// Capability-bearing inputs for an externally initiated CRDT apply.
+pub struct AuthorizedCrdtApplyAdmissionRequest<'a> {
+    pub authorized: AuthorizedTask,
+    pub collection: &'a str,
+    pub timeout: Duration,
+    pub event_source: EventSource,
+    pub policy: &'a dyn CrdtPostImagePolicy,
+}
+
+/// Inputs for one trusted-internal serialized CRDT delta admission.
 pub struct CrdtApplyAdmissionRequest<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
@@ -105,8 +115,36 @@ pub fn changes_crdt_frontier(op: &CrdtOp) -> bool {
     }
 }
 
-/// Preview, authorize, fence, and durably apply one CRDT delta atomically.
-pub async fn dispatch_crdt_apply_admitted_outcome(
+/// Preview, authorize, fence, and durably apply one externally authorized delta.
+pub async fn dispatch_authorized_crdt_apply_admitted_outcome(
+    state: &SharedState,
+    request: AuthorizedCrdtApplyAdmissionRequest<'_>,
+) -> crate::Result<CrdtAdmissionOutcome> {
+    let AuthorizedCrdtApplyAdmissionRequest {
+        authorized,
+        collection,
+        timeout,
+        event_source,
+        policy,
+    } = request;
+    let task = authorized.into_physical_task();
+    dispatch_crdt_apply_admitted_outcome(
+        state,
+        CrdtApplyAdmissionRequest {
+            tenant_id: task.tenant_id,
+            database_id: task.database_id,
+            collection,
+            plan: task.plan,
+            timeout,
+            event_source,
+            policy,
+        },
+    )
+    .await
+}
+
+/// Preview, authorize, fence, and durably apply one trusted-internal CRDT delta.
+pub(crate) async fn dispatch_crdt_apply_admitted_outcome(
     state: &SharedState,
     request: CrdtApplyAdmissionRequest<'_>,
 ) -> crate::Result<CrdtAdmissionOutcome> {
@@ -245,8 +283,20 @@ fn stamp_fence(plan: PhysicalPlan, digest: [u8; 32]) -> crate::Result<PhysicalPl
     }
 }
 
-/// Payload-only compatibility wrapper for callers that do not carry an OCC floor.
-pub async fn dispatch_crdt_apply_admitted(
+/// Payload-only wrapper for an externally authorized caller.
+pub async fn dispatch_authorized_crdt_apply_admitted(
+    state: &SharedState,
+    request: AuthorizedCrdtApplyAdmissionRequest<'_>,
+) -> crate::Result<Vec<u8>> {
+    Ok(
+        dispatch_authorized_crdt_apply_admitted_outcome(state, request)
+            .await?
+            .payload,
+    )
+}
+
+/// Payload-only compatibility wrapper for trusted internal callers.
+pub(crate) async fn dispatch_crdt_apply_admitted(
     state: &SharedState,
     request: CrdtApplyAdmissionRequest<'_>,
 ) -> crate::Result<Vec<u8>> {
@@ -258,7 +308,7 @@ pub async fn dispatch_crdt_apply_admitted(
 /// Generate a restore delta and admit it without releasing the vShard slot.
 /// A stale apply fence regenerates the delta from authoritative state before
 /// retrying, so neither historical projection nor policy output is reused.
-pub async fn dispatch_crdt_restore_admitted(
+pub(crate) async fn dispatch_crdt_restore_admitted(
     state: &SharedState,
     request: CrdtRestoreAdmissionRequest<'_>,
 ) -> crate::Result<Option<CrdtAdmissionOutcome>> {
@@ -894,12 +944,44 @@ mod tests {
     #[tokio::test]
     async fn generic_replicated_dispatch_rejects_unadmitted_apply() {
         let (state, _side, _directory) = fixture();
+        let tenant_id = TenantId::new(1);
+        let task = nodedb_physical::physical_task::PhysicalTask {
+            tenant_id,
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, "docs"),
+            plan: apply_plan(),
+            post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+            txn_id: None,
+        };
+        let identity = crate::control::security::identity::AuthenticatedIdentity {
+            user_id: 1,
+            username: "crdt-test".into(),
+            tenant_id,
+            auth_method: crate::control::security::identity::AuthMethod::Trust,
+            roles: Vec::new(),
+            is_superuser: true,
+            default_database: None,
+            accessible_databases:
+                crate::control::security::identity::AuthenticatedIdentity::default_database_set(
+                    true,
+                ),
+        };
+        let authorized = crate::control::server::shared::authorization::authorize_task_set(
+            &identity,
+            std::slice::from_ref(&task),
+            &state.permissions,
+            &state.roles,
+            &crate::control::security::audit::NoopAuditEmitter,
+        )
+        .expect("authorize test task")
+        .into_tasks()
+        .into_iter()
+        .next()
+        .expect("one authorized task");
         let result = crate::control::server::sync::raft_dispatch::dispatch_write_replicated(
             &state,
-            TenantId::new(1),
-            DatabaseId::DEFAULT,
             "docs",
-            apply_plan(),
+            authorized,
             Duration::from_millis(10),
             EventSource::User,
         )

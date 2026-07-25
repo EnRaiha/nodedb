@@ -9,12 +9,15 @@
 //! All helpers return `crate::Result<Response>` so the existing sub-handler
 //! code (`handler_kv`, `handler_hash`, `handler_sorted`) is unchanged.
 
+use std::sync::Arc;
+
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::server::dispatch_utils;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, RequestId, TraceId, VShardId};
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::session::RespSession;
 
@@ -31,6 +34,8 @@ pub(super) async fn dispatch_kv(
     plan: PhysicalPlan,
 ) -> crate::Result<Response> {
     // RESP protocol carries no database selector; all ops target DatabaseId::DEFAULT.
+    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &session.collection);
+    let authorized = authorize_resp_task(state, session, plan, vshard)?;
     match state.gateway.get() {
         Some(gw) => {
             let gw_ctx = QueryContext {
@@ -39,27 +44,16 @@ pub(super) async fn dispatch_kv(
                 database_id: DatabaseId::DEFAULT,
                 txn_id: None,
             };
-            gw.execute(&gw_ctx, plan)
+            gw.execute(&gw_ctx, authorized)
                 .await
                 .map_err(|e| crate::Error::Bridge {
                     detail: GatewayErrorMap::to_resp(&e),
                 })
                 .map(gateway_payloads_to_response)
         }
-        None => {
-            let vshard =
-                VShardId::from_collection_in_database(DatabaseId::DEFAULT, &session.collection);
-            dispatch_utils::dispatch_to_data_plane(
-                state,
-                session.tenant_id,
-                DatabaseId::DEFAULT,
-                vshard,
-                plan,
-                TraceId::ZERO,
-            )
+        None => dispatch_utils::dispatch_authorized_to_data_plane(state, authorized, TraceId::ZERO)
             .await
-            .map_err(map_busy_error)
-        }
+            .map_err(map_busy_error),
     }
 }
 
@@ -76,6 +70,7 @@ pub(super) async fn dispatch_kv_write(
     plan: PhysicalPlan,
 ) -> crate::Result<Response> {
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &session.collection);
+    let authorized = authorize_resp_task(state, session, plan, vshard)?;
     match state.gateway.get() {
         Some(gw) => {
             let gw_ctx = QueryContext {
@@ -84,28 +79,57 @@ pub(super) async fn dispatch_kv_write(
                 database_id: DatabaseId::DEFAULT,
                 txn_id: None,
             };
-            gw.execute(&gw_ctx, plan)
+            gw.execute(&gw_ctx, authorized)
                 .await
                 .map_err(|e| crate::Error::Bridge {
                     detail: GatewayErrorMap::to_resp(&e),
                 })
                 .map(gateway_payloads_to_response)
         }
-        None => dispatch_utils::dispatch_autocommit_write(
-            state,
-            dispatch_utils::AutocommitWrite {
-                tenant_id: session.tenant_id,
-                database_id: DatabaseId::DEFAULT,
-                vshard_id: vshard,
-                plan,
-                trace_id: TraceId::ZERO,
-                event_source: crate::event::EventSource::User,
-                txn_id: None,
-            },
-        )
-        .await
-        .map_err(map_busy_error),
+        None => {
+            dispatch_utils::dispatch_authorized_autocommit_write(state, authorized, TraceId::ZERO)
+                .await
+                .map_err(map_busy_error)
+        }
     }
+}
+
+fn authorize_resp_task(
+    state: &SharedState,
+    session: &RespSession,
+    plan: PhysicalPlan,
+    vshard_id: VShardId,
+) -> crate::Result<crate::control::server::shared::authorization::AuthorizedTask> {
+    let identity = session
+        .identity
+        .as_ref()
+        .ok_or_else(|| crate::Error::RejectedAuthz {
+            tenant_id: session.tenant_id,
+            resource: "RESP AUTH required before data access".into(),
+        })?;
+    let task = PhysicalTask {
+        tenant_id: session.tenant_id,
+        vshard_id,
+        database_id: DatabaseId::DEFAULT,
+        plan,
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    };
+    let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(&state.audit));
+    crate::control::server::shared::authorization::authorize_task_set(
+        identity,
+        std::slice::from_ref(&task),
+        &state.permissions,
+        &state.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "authorization returned an empty capability set".into(),
+    })
 }
 
 /// Convert gateway `Vec<Vec<u8>>` payloads into a synthetic `Response`.

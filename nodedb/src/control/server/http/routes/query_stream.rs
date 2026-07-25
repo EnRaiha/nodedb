@@ -20,11 +20,14 @@ use futures::StreamExt;
 
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
-use crate::control::server::exchange::gather::gather_all_cores_stream;
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::exchange::gather::gather_all_cores_stream_authorized;
 use crate::control::server::exchange::streamable::streamable_gather_child;
 use crate::control::server::response_shape::compose::shape_decoded_rows;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::result_stream::ResultStream;
+use crate::control::server::shared::authorization::authorize_task_set;
 use crate::data::executor::response_codec::decode_payload_to_json;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -43,6 +46,7 @@ use super::super::auth::AppState;
 pub(super) async fn try_open_stream(
     state: &AppState,
     tasks: &[PhysicalTask],
+    identity: &AuthenticatedIdentity,
     database_id: nodedb_types::DatabaseId,
     trace_id: crate::types::TraceId,
 ) -> crate::Result<Option<(ResultStream, usize)>> {
@@ -55,6 +59,23 @@ pub(super) async fn try_open_stream(
     let Some((child_plan, limit)) = streamable_gather_child(&task.plan) else {
         return Ok(None);
     };
+    let mut child_task = task.clone();
+    child_task.plan = child_plan.clone();
+    let emitter = ArcAuditEmitter(std::sync::Arc::clone(&state.shared.audit));
+    let authorized_child = authorize_task_set(
+        identity,
+        std::slice::from_ref(&child_task),
+        &state.shared.permissions,
+        &state.shared.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "stream authorization returned no capability".into(),
+    })?;
 
     let stream = if let Some(gw) = state.shared.gateway.get() {
         let ctx = QueryContext {
@@ -63,16 +84,9 @@ pub(super) async fn try_open_stream(
             database_id,
             txn_id: None,
         };
-        gw.execute_stream(&ctx, child_plan).await
+        gw.execute_stream(&ctx, authorized_child).await
     } else {
-        gather_all_cores_stream(
-            &state.shared,
-            task.tenant_id,
-            task.database_id,
-            child_plan,
-            trace_id,
-            task.txn_id,
-        )
+        gather_all_cores_stream_authorized(&state.shared, authorized_child, trace_id)
     }?;
 
     Ok(Some((stream, limit)))

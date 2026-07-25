@@ -52,12 +52,53 @@ pub struct UpdateFromJoinArgs<'a> {
     pub returning: Option<&'a ReturningSpec>,
 }
 
+/// Consume an authorized autocommit `UPDATE ... FROM` at orchestration.
+pub async fn run_authorized_update_from_join(
+    state: &SharedState,
+    authorized: crate::control::server::shared::authorization::AuthorizedTask,
+) -> crate::Result<Response> {
+    let task = authorized.into_physical_task();
+    let PhysicalPlan::Document(DocumentOp::UpdateFromJoin {
+        target_collection,
+        source_collection,
+        source_alias,
+        target_join_col,
+        source_join_col,
+        updates,
+        target_filters,
+        returning,
+        resolve_only: false,
+        source_rows: _,
+    }) = task.plan
+    else {
+        return Err(crate::Error::BadRequest {
+            detail: "authorized task is not unresolved autocommit UPDATE ... FROM".into(),
+        });
+    };
+    run_update_from_join(
+        state,
+        UpdateFromJoinArgs {
+            tenant_id: task.tenant_id,
+            database_id: task.database_id,
+            target_collection: &target_collection,
+            source_collection: &source_collection,
+            source_alias: &source_alias,
+            target_join_col: &target_join_col,
+            source_join_col: &source_join_col,
+            updates: &updates,
+            target_filters: &target_filters,
+            returning: returning.as_ref(),
+        },
+    )
+    .await
+}
+
 /// Drive an autocommit `UPDATE ... FROM <source>` from the Control Plane.
 ///
 /// Returns the `{"affected": N}` (or RETURNING-rows) response the Data-Plane
 /// handler produces, so the dispatch loops render the same command tag as a
 /// co-resident single-shard update.
-pub async fn run_update_from_join(
+pub(crate) async fn run_update_from_join(
     state: &SharedState,
     args: UpdateFromJoinArgs<'_>,
 ) -> crate::Result<Response> {

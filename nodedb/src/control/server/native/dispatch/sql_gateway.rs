@@ -9,12 +9,35 @@
 //! wired.
 
 use crate::bridge::envelope::{Payload, Response, Status};
+use std::sync::Arc;
+
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext as GatewayQueryContext;
 use crate::types::{Lsn, RequestId, TraceId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::DispatchCtx;
+
+pub(super) fn authorize_native_task(
+    ctx: &DispatchCtx<'_>,
+    task: &PhysicalTask,
+) -> crate::Result<crate::control::server::shared::authorization::AuthorizedTask> {
+    let emitter = crate::control::security::audit::ArcAuditEmitter(Arc::clone(&ctx.state.audit));
+    crate::control::server::shared::authorization::authorize_task_set(
+        ctx.identity,
+        std::slice::from_ref(task),
+        &ctx.state.permissions,
+        &ctx.state.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "authorization returned an empty capability set".into(),
+    })
+}
 
 /// Dispatch a single `PhysicalTask` through the gateway when available,
 /// falling back to the local SPSC path.
@@ -25,12 +48,10 @@ pub(super) async fn dispatch_task_via_gateway(
     ctx: &DispatchCtx<'_>,
     task: PhysicalTask,
 ) -> crate::Result<Response> {
-    // Pre-compute routing identity before plan is moved.
-    let vshard_id = task.vshard_id;
-    let tenant_id = task.tenant_id;
-    let database_id = task.database_id;
-    let txn_id = task.txn_id;
-    let plan = task.plan;
+    let authorized = authorize_native_task(ctx, &task)?;
+    let tenant_id = authorized.tenant_id();
+    let database_id = authorized.database_id();
+    let txn_id = authorized.txn_id();
 
     match ctx.state.gateway.get() {
         Some(gw) => {
@@ -42,7 +63,7 @@ pub(super) async fn dispatch_task_via_gateway(
                 // dispatch resolves the per-txn staging overlay.
                 txn_id,
             };
-            gw.execute(&gw_ctx, plan)
+            gw.execute(&gw_ctx, authorized)
                 .await
                 .map_err(|e| {
                     let (code, msg) = GatewayErrorMap::to_native(&e);
@@ -53,8 +74,12 @@ pub(super) async fn dispatch_task_via_gateway(
                 .map(payloads_to_response)
         }
         None => {
-            super::raw_dispatch::dispatch_without_gateway(ctx, tenant_id, vshard_id, plan, txn_id)
-                .await
+            crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+                ctx.state,
+                authorized,
+                TraceId::generate(),
+            )
+            .await
         }
     }
 }

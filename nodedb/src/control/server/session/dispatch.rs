@@ -4,11 +4,12 @@
 //! `PhysicalPlan` for the requested op, and dispatches it to the Data Plane
 //! (directly via SPSC, or through the Raft proposer gate for CRDT applies).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::bridge::envelope::{PhysicalPlan, Priority, Request, Status};
-use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+use crate::bridge::envelope::{PhysicalPlan, Status};
+use crate::types::{DatabaseId, RequestId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{CrdtOp, DocumentOp, GraphOp, VectorOp};
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 use nodedb_types::vector_distance::DistanceMetric;
 
 use super::Session;
@@ -325,6 +326,28 @@ impl Session {
         let audit = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
             &self.state.audit,
         ));
+        let task = PhysicalTask {
+            tenant_id,
+            database_id,
+            vshard_id: VShardId::from_collection_in_database(database_id, collection),
+            plan,
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        };
+        let authorized = crate::control::server::shared::authorization::authorize_task_set(
+            identity,
+            std::slice::from_ref(&task),
+            &self.state.permissions,
+            &self.state.roles,
+            &audit,
+        )
+        .map_err(crate::Error::from)?
+        .into_tasks()
+        .into_iter()
+        .next()
+        .ok_or_else(|| crate::Error::Internal {
+            detail: "authorization returned no CRDT task".into(),
+        })?;
         let policy =
             crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
                 tenant_id,
@@ -335,13 +358,11 @@ impl Session {
                 &self.state.rls,
                 &audit,
             );
-        let payload = crate::control::crdt_admission::dispatch_crdt_apply_admitted(
+        let payload = crate::control::crdt_admission::dispatch_authorized_crdt_apply_admitted(
             &self.state,
-            crate::control::crdt_admission::CrdtApplyAdmissionRequest {
-                tenant_id,
-                database_id,
+            crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
+                authorized,
                 collection,
-                plan,
                 timeout: Duration::from_secs(self.state.tuning.network.default_deadline_secs),
                 event_source: crate::event::EventSource::User,
                 policy: &policy,
@@ -367,100 +388,46 @@ impl Session {
         vshard_id: VShardId,
         plan: PhysicalPlan,
     ) -> crate::Result<Vec<u8>> {
-        // The sync/native steady-state session builds its own Request and
-        // enqueues directly (it does not flow through the autocommit funnel), so
-        // it passes the write-admission gate here. An uncontended point write
-        // takes the fast path holding its per-vShard deterministic locks (guard
-        // held across enqueue + response); a contended or bulk write is submitted
-        // through the deterministic scheduler and its applied response is
-        // serialized and returned; reads / control ops are `Exempt`.
-        use crate::control::server::shared::write_admission::{
-            WriteAdmission, WriteTarget, admit, bare_ok_response, route_write_to_calvin,
-        };
-        let (admission, _admission_guard, _order_guard) = match admit(
-            &self.state,
-            &WriteTarget {
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| crate::Error::RejectedAuthz {
                 tenant_id,
-                database_id,
-                vshard_id,
-                plan: &plan,
-            },
-        ) {
-            WriteAdmission::ExemptRead => (
-                crate::bridge::envelope::Admission::Exempt(
-                    crate::bridge::envelope::ExemptReason::Read,
-                ),
-                None,
-                None,
-            ),
-            WriteAdmission::FastPath { guard } => {
-                (crate::bridge::envelope::Admission::Admitted, guard, None)
-            }
-            WriteAdmission::FastPathBlocking { key, keyed_lock } => {
-                // Single-node serialization point: acquire the per-key FIFO
-                // order-lock FIRST, before the enqueue below, so concurrent
-                // same-key writers enqueue in arrival order. This path shares the
-                // one global keyed lock with the autocommit cores, so a native
-                // write and an autocommit write to the same key serialize too.
-                // The guard is held to end of function, mirroring the fast-path
-                // admission guard on this path.
-                let order_guard = keyed_lock.lock_owned(key).await;
-                (
-                    crate::bridge::envelope::Admission::Admitted,
-                    None,
-                    Some(order_guard),
-                )
-            }
-            WriteAdmission::RouteToCalvin => {
-                let routed =
-                    route_write_to_calvin(&self.state, tenant_id, database_id, vshard_id, plan)
-                        .await?;
-                let response = routed.unwrap_or_else(|| bare_ok_response(RequestId::new(0)));
-                return Ok(serialize_dispatch_response_json(&response));
-            }
-        };
-        let request = Request {
-            request_id,
+                resource: "authenticated session identity required".into(),
+            })?;
+        let task = PhysicalTask {
             tenant_id,
             database_id,
             vshard_id,
             plan,
-            deadline: Instant::now()
-                + Duration::from_secs(self.state.tuning.network.default_deadline_secs),
-            priority: Priority::Normal,
-            trace_id: TraceId::generate(),
-            consistency: ReadConsistency::Strong,
-            idempotency_key: None,
-            event_source: crate::event::EventSource::User,
-            user_roles: Vec::new(),
-            user_id: None,
-            statement_digest: None,
+            post_set_op: PostSetOp::None,
             txn_id: None,
-            wal_lsn: None,
-            resolved_now_ms: None,
-            admission,
         };
-
-        // Register for response routing before dispatching.
-        let mut rx = self.state.tracker.register(request_id);
-
-        // Dispatch to Data Plane via SPSC.
-        match self.state.dispatcher.lock() {
-            Ok(mut d) => d.dispatch(request)?,
-            Err(poisoned) => poisoned.into_inner().dispatch(request)?,
-        };
-
-        // Await response from Data Plane (routed back via the response poller).
-        let response = tokio::time::timeout(
-            Duration::from_secs(self.state.tuning.network.default_deadline_secs),
-            async { rx.recv().await.ok_or(()) },
+        let audit = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
+            &self.state.audit,
+        ));
+        let authorized = crate::control::server::shared::authorization::authorize_task_set(
+            identity,
+            std::slice::from_ref(&task),
+            &self.state.permissions,
+            &self.state.roles,
+            &audit,
         )
-        .await
-        .map_err(|_| crate::Error::DeadlineExceeded { request_id })?
-        .map_err(|_| crate::Error::Dispatch {
-            detail: "response channel closed".into(),
+        .map_err(crate::Error::from)?
+        .into_tasks()
+        .into_iter()
+        .next()
+        .ok_or_else(|| crate::Error::Internal {
+            detail: "session authorization returned no task capability".into(),
         })?;
-
+        let mut response =
+            crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+                &self.state,
+                authorized,
+                TraceId::generate(),
+            )
+            .await?;
+        response.request_id = request_id;
         Ok(serialize_dispatch_response_json(&response))
     }
 }

@@ -5,6 +5,8 @@
 //! - POST `/obsv/api/v1/write`  — accept snappy-compressed protobuf `WriteRequest`
 //! - POST `/obsv/api/v1/read`   — accept snappy-compressed protobuf `ReadRequest`
 
+use std::sync::Arc;
+
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -21,6 +23,7 @@ use crate::control::promql::{self, types::DEFAULT_LOOKBACK_MS};
 use crate::control::server::http::auth::{AppState, ResolvedIdentity};
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 /// POST `/obsv/api/v1/write` — Prometheus remote write endpoint.
 ///
@@ -82,8 +85,39 @@ pub async fn remote_write(
             provenance: None,
         });
 
+        let task = PhysicalTask {
+            tenant_id,
+            vshard_id: vshard,
+            database_id: DatabaseId::DEFAULT,
+            plan,
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        };
+        let emitter =
+            crate::control::security::audit::ArcAuditEmitter(Arc::clone(&state.shared.audit));
+        let authorized = match crate::control::server::shared::authorization::authorize_task_set(
+            &identity.0,
+            std::slice::from_ref(&task),
+            &state.shared.permissions,
+            &state.shared.roles,
+            &emitter,
+        ) {
+            Ok(set) => match set.into_tasks().into_iter().next() {
+                Some(task) => task,
+                None => {
+                    total_rejected += ts.samples.len() as u64;
+                    continue;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(error = ?error, collection = %collection, "remote write denied");
+                total_rejected += ts.samples.len() as u64;
+                continue;
+            }
+        };
+
         // Route through gateway when available (cluster-aware dispatch);
-        // fall back to direct local SPSC dispatch on single-node boot.
+        // fall back to capability-bearing local dispatch on single-node boot.
         let dispatch_result = match state.shared.gateway.get() {
             Some(gw) => {
                 let gw_ctx = QueryContext {
@@ -92,14 +126,11 @@ pub async fn remote_write(
                     database_id: nodedb_types::id::DatabaseId::DEFAULT,
                     txn_id: None,
                 };
-                gw.execute(&gw_ctx, plan).await
+                gw.execute(&gw_ctx, authorized).await
             }
-            None => crate::control::server::dispatch_utils::dispatch_to_data_plane(
+            None => crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
                 &state.shared,
-                tenant_id,
-                DatabaseId::DEFAULT,
-                vshard,
-                plan,
+                authorized,
                 TraceId::generate(),
             )
             .await

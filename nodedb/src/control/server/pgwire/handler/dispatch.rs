@@ -22,15 +22,33 @@ use super::submit::SubmitArgs;
 struct ReplicatedWrite<'a> {
     entry: crate::control::wal_replication::ReplicatedEntry,
     proposer: &'a Arc<crate::control::wal_replication::AsyncRaftProposer>,
-    tenant_id: crate::types::TenantId,
-    database_id: crate::types::DatabaseId,
-    /// The plan `entry` encodes. The entry does not hand the plan back, and the
-    /// change events must be derived from it after the entry is proposed, so
-    /// the borrow is carried through rather than re-decoded.
-    plan: &'a crate::bridge::envelope::PhysicalPlan,
+    authorized: crate::control::server::shared::authorization::AuthorizedTask,
 }
 
 impl NodeDbPgHandler {
+    fn authorize_for_dispatch(
+        &self,
+        identity: &AuthenticatedIdentity,
+        task: &PhysicalTask,
+    ) -> crate::Result<crate::control::server::shared::authorization::AuthorizedTask> {
+        let emitter =
+            crate::control::security::audit::ArcAuditEmitter(Arc::clone(&self.state.audit));
+        crate::control::server::shared::authorization::authorize_task_set(
+            identity,
+            std::slice::from_ref(task),
+            &self.state.permissions,
+            &self.state.roles,
+            &emitter,
+        )
+        .map_err(crate::Error::from)?
+        .into_tasks()
+        .into_iter()
+        .next()
+        .ok_or_else(|| crate::Error::Internal {
+            detail: "pgwire authorization returned no capability".into(),
+        })
+    }
+
     /// Dispatch a single physical task and wait for the response.
     ///
     /// In cluster mode, write operations are proposed to Raft first and only
@@ -39,14 +57,13 @@ impl NodeDbPgHandler {
     /// `user_id` is forwarded to the `Request` for DML audit attribution.
     /// Pass `None` for system-generated tasks (triggers, maintenance, etc.).
     ///
-    /// `identity` is forwarded to the Exchange resolver for per-request catalog
-    /// materialization (identity-scoped catalog rows). Pass `None` for internal
-    /// sub-tasks where Exchange has already been resolved by an outer call.
-    pub(super) async fn dispatch_task(
+    /// `identity` is forwarded to the Exchange resolver and shared
+    /// authorization service. Every externally derived task must pass it.
+    pub(super) async fn dispatch_authorized_task(
         &self,
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
-        identity: Option<&AuthenticatedIdentity>,
+        identity: &AuthenticatedIdentity,
     ) -> crate::Result<Response> {
         let mut shard_watermarks = Vec::new();
         let mut distributed_reads = Vec::new();
@@ -66,11 +83,11 @@ impl NodeDbPgHandler {
     /// JOIN produced (empty otherwise). Used by the transactional
     /// read-recording seam so a multi-core fan read records one read-set entry
     /// per participating shard, and a shuffle join records one per join side.
-    pub(super) async fn dispatch_task_with_watermarks(
+    pub(super) async fn dispatch_authorized_task_with_watermarks(
         &self,
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
-        identity: Option<&AuthenticatedIdentity>,
+        identity: &AuthenticatedIdentity,
     ) -> crate::Result<(Response, Vec<(VShardId, Lsn)>, Vec<DistributedReadCapture>)> {
         let mut shard_watermarks = Vec::new();
         let mut distributed_reads = Vec::new();
@@ -90,7 +107,7 @@ impl NodeDbPgHandler {
         &self,
         task: PhysicalTask,
         user_id: Option<Arc<str>>,
-        identity: Option<&AuthenticatedIdentity>,
+        identity: &AuthenticatedIdentity,
         shard_watermarks: &mut Vec<(VShardId, Lsn)>,
         distributed_reads: &mut Vec<DistributedReadCapture>,
     ) -> crate::Result<Response> {
@@ -115,7 +132,7 @@ impl NodeDbPgHandler {
         &self,
         mut task: PhysicalTask,
         user_id: Option<Arc<str>>,
-        identity: Option<&AuthenticatedIdentity>,
+        identity: &AuthenticatedIdentity,
         shard_watermarks: &mut Vec<(VShardId, Lsn)>,
         distributed_reads: &mut Vec<DistributedReadCapture>,
     ) -> crate::Result<Response> {
@@ -180,23 +197,16 @@ impl NodeDbPgHandler {
             }
         }
 
-        if let crate::bridge::envelope::PhysicalPlan::Document(
-            nodedb_physical::physical_plan::DocumentOp::InsertSelect {
-                target_collection,
-                source_collection,
-                source_filters,
-                source_limit,
-            },
-        ) = &task.plan
-        {
-            return crate::control::insert_select::run_insert_select(
+        if matches!(
+            &task.plan,
+            crate::bridge::envelope::PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. }
+            )
+        ) {
+            let authorized = self.authorize_for_dispatch(identity, &task)?;
+            return crate::control::insert_select::run_authorized_insert_select(
                 &self.state,
-                task.tenant_id,
-                task.database_id,
-                target_collection,
-                source_collection,
-                source_filters,
-                *source_limit,
+                authorized,
             )
             .await;
         }
@@ -207,33 +217,20 @@ impl NodeDbPgHandler {
         // surrogate, and all arms apply atomically. In-transaction MERGE is
         // buffered for COMMIT replay (`dispatch_task_no_wal`) and never reaches
         // this method, so this intercept fires only for autocommit.
-        if let crate::bridge::envelope::PhysicalPlan::Document(
-            nodedb_physical::physical_plan::DocumentOp::Merge {
-                target_collection,
-                source_collection,
-                source_alias,
-                target_join_col,
-                source_join_col,
-                clauses,
-                returning: _,
-                resolve_only: false,
-                resolved_inserts: None,
-                source_rows: _,
-            },
-        ) = &task.plan
-        {
-            return crate::control::merge_orchestrator::run_merge(
+        if matches!(
+            &task.plan,
+            crate::bridge::envelope::PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::Merge {
+                    resolve_only: false,
+                    resolved_inserts: None,
+                    ..
+                }
+            )
+        ) {
+            let authorized = self.authorize_for_dispatch(identity, &task)?;
+            return crate::control::merge_orchestrator::run_authorized_merge(
                 &self.state,
-                crate::control::merge_orchestrator::MergeArgs {
-                    tenant_id: task.tenant_id,
-                    database_id: task.database_id,
-                    target_collection,
-                    source_collection,
-                    source_alias,
-                    target_join_col,
-                    source_join_col,
-                    clauses,
-                },
+                authorized,
             )
             .await;
         }
@@ -245,35 +242,20 @@ impl NodeDbPgHandler {
         // source's vShard can live on a different core). In-transaction
         // `UPDATE ... FROM` is buffered for COMMIT replay and never reaches this
         // method, so this intercept fires only for autocommit.
-        if let crate::bridge::envelope::PhysicalPlan::Document(
-            nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
-                target_collection,
-                source_collection,
-                source_alias,
-                target_join_col,
-                source_join_col,
-                updates,
-                target_filters,
-                returning,
-                resolve_only: false,
-                source_rows: None,
-            },
-        ) = &task.plan
-        {
-            return crate::control::update_from_join_orchestrator::run_update_from_join(
+        if matches!(
+            &task.plan,
+            crate::bridge::envelope::PhysicalPlan::Document(
+                nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
+                    resolve_only: false,
+                    source_rows: None,
+                    ..
+                }
+            )
+        ) {
+            let authorized = self.authorize_for_dispatch(identity, &task)?;
+            return crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
                 &self.state,
-                crate::control::update_from_join_orchestrator::UpdateFromJoinArgs {
-                    tenant_id: task.tenant_id,
-                    database_id: task.database_id,
-                    target_collection,
-                    source_collection,
-                    source_alias,
-                    target_join_col,
-                    source_join_col,
-                    updates,
-                    target_filters,
-                    returning: returning.as_ref(),
-                },
+                authorized,
             )
             .await;
         }
@@ -298,68 +280,51 @@ impl NodeDbPgHandler {
             .await;
         }
 
-        // Exchange resolution: materialize catalog providers and resolve any
-        // Exchange nodes (Gather/Broadcast) in the plan.  When identity is
-        // available (user-facing SQL paths), per-request catalog materialization
-        // runs first; on internal sub-task paths (identity = None) the plan has
-        // no Exchange nodes left to resolve.
-        if let Some(ident) = identity {
-            match resolve_and_materialize(
-                &self.state,
-                ident,
-                task.database_id,
-                task.tenant_id,
-                task.plan,
-                TraceId::ZERO,
-                task.txn_id,
-            )
-            .await?
-            {
-                Resolved::Gathered(resp, wms, caps) => {
-                    *shard_watermarks = wms;
-                    *distributed_reads = caps;
-                    return Ok(resp);
-                }
-                Resolved::Plan(resolved_plan) => {
-                    task.plan = resolved_plan;
-                }
-                // Real pgwire streaming is handled up-front in
-                // `dispatch_task_loop` (execute.rs), before `dispatch_task` is
-                // ever called: it builds a lazy `QueryResponse` directly from
-                // `gather_all_cores_stream`. A Stream reaching THIS materialize
-                // funnel (e.g. internal pgwire sub-task paths that go through
-                // `dispatch_task` rather than the loop) is collected into a
-                // Response — a safe, behaviour-preserving default.
-                Resolved::Stream(s) => {
-                    return crate::control::server::exchange::gather::stream_to_response(s).await;
-                }
+        // Resolve derived Exchange plans before authorizing the exact task that
+        // will cross the dispatch boundary.
+        match resolve_and_materialize(
+            &self.state,
+            identity,
+            task.database_id,
+            task.tenant_id,
+            task.plan,
+            TraceId::ZERO,
+            task.txn_id,
+        )
+        .await?
+        {
+            Resolved::Gathered(resp, wms, caps) => {
+                *shard_watermarks = wms;
+                *distributed_reads = caps;
+                return Ok(resp);
+            }
+            Resolved::Plan(resolved_plan) => {
+                task.plan = resolved_plan;
+            }
+            Resolved::Stream(stream) => {
+                return crate::control::server::exchange::gather::stream_to_response(stream).await;
             }
         }
 
         reject_unadmitted_crdt_apply(&task.plan)?;
-
+        let authorized = self.authorize_for_dispatch(identity, &task)?;
         if let Some(async_proposer) = self.state.async_raft_proposer()
             && let Some(entry) = crate::control::wal_replication::to_replicated_entry(
-                task.tenant_id,
-                task.database_id,
-                task.vshard_id,
-                &task.plan,
+                authorized.tenant_id(),
+                authorized.database_id(),
+                authorized.vshard_id(),
+                authorized.plan(),
             )
         {
             return self
                 .dispatch_replicated_write(ReplicatedWrite {
                     entry,
                     proposer: async_proposer,
-                    tenant_id: task.tenant_id,
-                    database_id: task.database_id,
-                    // The CDC publish inside needs the plan, which the entry
-                    // encoded but does not hand back; `task` still owns it here.
-                    plan: &task.plan,
+                    authorized,
                 })
                 .await;
         }
-
-        self.dispatch_local(task, user_id).await
+        self.dispatch_local(authorized, user_id).await
     }
 
     /// Dispatch a write through Raft: propose → register waiter → await apply.
@@ -382,10 +347,12 @@ impl NodeDbPgHandler {
         let ReplicatedWrite {
             entry,
             proposer,
-            tenant_id,
-            database_id,
-            plan,
+            authorized,
         } = args;
+        let task = authorized.into_physical_task();
+        let tenant_id = task.tenant_id;
+        let database_id = task.database_id;
+        let plan = task.plan;
         let request_id = self.next_request_id();
 
         // Propose through Raft with transparent leader-change retry. Shared with
@@ -417,7 +384,7 @@ impl NodeDbPgHandler {
 
         // The propose returned, so the entry is committed and this node has
         // applied it. Publish once, here, from the plan the entry encodes.
-        publish_origin_change_events(&self.state, tenant_id, database_id, plan, &response);
+        publish_origin_change_events(&self.state, tenant_id, database_id, &plan, &response);
 
         Ok(response)
     }
@@ -431,21 +398,14 @@ impl NodeDbPgHandler {
     /// helper is a no-op for non-write plans).
     async fn dispatch_local(
         &self,
-        task: PhysicalTask,
+        authorized: crate::control::server::shared::authorization::AuthorizedTask,
         user_id: Option<Arc<str>>,
     ) -> crate::Result<Response> {
-        let txn_id = task.txn_id;
-        self.submit_to_data_plane(SubmitArgs {
-            tenant_id: task.tenant_id,
-            vshard_id: task.vshard_id,
-            database_id: task.database_id,
-            plan: task.plan,
+        self.submit_authorized_to_data_plane(
+            authorized,
             user_id,
-            txn_id,
-            // The funnel mints the LSN under the admission guard just before
-            // enqueue.
-            durability: WalDurability::AppendHere { now_override: None },
-        })
+            WalDurability::AppendHere { now_override: None },
+        )
         .await
     }
 

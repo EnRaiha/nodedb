@@ -47,6 +47,35 @@ use crate::control::maintenance::clone_materializer::{dispatch_local, scan_sourc
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::DocumentOp;
 
+/// Consume an authorized `INSERT ... SELECT` task at the orchestration boundary.
+pub async fn run_authorized_insert_select(
+    state: &SharedState,
+    authorized: crate::control::server::shared::authorization::AuthorizedTask,
+) -> crate::Result<Response> {
+    let task = authorized.into_physical_task();
+    let PhysicalPlan::Document(DocumentOp::InsertSelect {
+        target_collection,
+        source_collection,
+        source_filters,
+        source_limit,
+    }) = task.plan
+    else {
+        return Err(crate::Error::BadRequest {
+            detail: "authorized task is not INSERT ... SELECT".into(),
+        });
+    };
+    run_insert_select(
+        state,
+        task.tenant_id,
+        task.database_id,
+        &target_collection,
+        &source_collection,
+        &source_filters,
+        source_limit,
+    )
+    .await
+}
+
 /// Drive an `INSERT ... SELECT` from `source_collection` into `target_collection`.
 ///
 /// `target_collection` / `source_collection` are the (db-qualified) collection
@@ -56,7 +85,7 @@ use nodedb_physical::physical_plan::DocumentOp;
 ///
 /// Returns a `{"inserted": N}` response mirroring the shape the autocommit
 /// dispatch loops shape as an `INSERT` command tag.
-pub async fn run_insert_select(
+pub(crate) async fn run_insert_select(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,

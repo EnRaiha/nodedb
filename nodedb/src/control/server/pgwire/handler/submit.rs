@@ -28,6 +28,26 @@ pub(super) struct SubmitArgs {
 }
 
 impl NodeDbPgHandler {
+    /// Consume an authorization capability at the local Data Plane boundary.
+    pub(super) async fn submit_authorized_to_data_plane(
+        &self,
+        authorized: crate::control::server::shared::authorization::AuthorizedTask,
+        user_id: Option<Arc<str>>,
+        durability: WalDurability,
+    ) -> crate::Result<Response> {
+        let task = authorized.into_physical_task();
+        self.submit_to_data_plane(SubmitArgs {
+            tenant_id: task.tenant_id,
+            vshard_id: task.vshard_id,
+            database_id: task.database_id,
+            plan: task.plan,
+            user_id,
+            txn_id: task.txn_id,
+            durability,
+        })
+        .await
+    }
+
     /// Submit a plan through the shared Control-Plane write funnel: admit, make
     /// durable, enqueue, collect, and publish. Shared by `dispatch_local` and
     /// `dispatch_task_no_wal`.

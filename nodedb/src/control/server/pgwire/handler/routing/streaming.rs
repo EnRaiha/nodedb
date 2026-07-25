@@ -14,6 +14,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::schema::OutputSchema;
 
 use super::super::super::types::error_to_sqlstate;
@@ -39,13 +40,13 @@ impl NodeDbPgHandler {
     pub(super) async fn maybe_stream_select(
         &self,
         task: &PhysicalTask,
+        identity: &AuthenticatedIdentity,
         plan_kind: PlanKind,
-        post_set_op: PostSetOp,
         addr: &std::net::SocketAddr,
         projection: Option<&OutputSchema>,
         result_formats: &[FieldFormat],
     ) -> PgWireResult<Option<Response>> {
-        if post_set_op != PostSetOp::None
+        if task.post_set_op != PostSetOp::None
             || !matches!(plan_kind, PlanKind::MultiRow)
             || self.sessions.transaction_state(addr)
                 == crate::control::server::shared::session::TransactionState::InBlock
@@ -72,6 +73,20 @@ impl NodeDbPgHandler {
         // Clone the child and owned state so the row stream is `Send + 'static`
         // and does not borrow `self` or `task`.
         let child_plan = (**child).clone();
+        let mut child_task = task.clone();
+        child_task.plan = child_plan.clone();
+        let authorized_child = self
+            .authorize_tasks(identity, std::slice::from_ref(&child_task))?
+            .into_tasks()
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "XX000".to_owned(),
+                    "stream authorization returned no capability".to_owned(),
+                )))
+            })?;
         let state = std::sync::Arc::clone(&self.state);
 
         // Single-node fans to local cores directly; cluster routes the scan to
@@ -84,15 +99,12 @@ impl NodeDbPgHandler {
                 database_id: task.database_id,
                 txn_id: None,
             };
-            gw.execute_stream(&ctx, child_plan).await
+            gw.execute_stream(&ctx, authorized_child).await
         } else {
-            crate::control::server::exchange::gather::gather_all_cores_stream(
+            crate::control::server::exchange::gather::gather_all_cores_stream_authorized(
                 &state,
-                task.tenant_id,
-                task.database_id,
-                child_plan,
+                authorized_child,
                 crate::types::TraceId::ZERO,
-                task.txn_id,
             )
         }
         .map_err(|e| {

@@ -16,14 +16,14 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use prost::Message;
 use tracing::info;
 
 use super::proto;
-use super::receiver::{ingest_logs, ingest_metrics, ingest_traces};
+use super::receiver::{authenticate_otel, ingest_logs, ingest_metrics, ingest_traces};
 use crate::control::state::SharedState;
 
 /// Start the OTLP/gRPC receiver on the given address (default :4317).
@@ -50,31 +50,61 @@ pub async fn run(listen: SocketAddr, shared: Arc<SharedState>) -> std::io::Resul
         .map_err(std::io::Error::other)
 }
 
-async fn grpc_metrics(State(shared): State<Arc<SharedState>>, body: Bytes) -> impl IntoResponse {
+async fn grpc_metrics(
+    State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let identity = match authenticate_otel(&headers, &shared).await {
+        Ok(identity) => identity,
+        Err(message) => return grpc_error(StatusCode::UNAUTHORIZED, &message),
+    };
     let payload = grpc_decode(&body);
     let Ok(req) = proto::ExportMetricsServiceRequest::decode(&payload[..]) else {
         return grpc_error(StatusCode::BAD_REQUEST, "invalid protobuf");
     };
-    ingest_metrics(&shared, &req).await;
-    grpc_response(&proto::ExportMetricsServiceResponse {})
+    match ingest_metrics(&shared, &identity, &req).await {
+        Ok(_) => grpc_response(&proto::ExportMetricsServiceResponse {}),
+        Err(error) => grpc_error(StatusCode::FORBIDDEN, &error.to_string()),
+    }
 }
 
-async fn grpc_traces(State(shared): State<Arc<SharedState>>, body: Bytes) -> impl IntoResponse {
+async fn grpc_traces(
+    State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let identity = match authenticate_otel(&headers, &shared).await {
+        Ok(identity) => identity,
+        Err(message) => return grpc_error(StatusCode::UNAUTHORIZED, &message),
+    };
     let payload = grpc_decode(&body);
     let Ok(req) = proto::ExportTraceServiceRequest::decode(&payload[..]) else {
         return grpc_error(StatusCode::BAD_REQUEST, "invalid protobuf");
     };
-    ingest_traces(&shared, &req).await;
-    grpc_response(&proto::ExportTraceServiceResponse {})
+    match ingest_traces(&shared, &identity, &req).await {
+        Ok(_) => grpc_response(&proto::ExportTraceServiceResponse {}),
+        Err(error) => grpc_error(StatusCode::FORBIDDEN, &error.to_string()),
+    }
 }
 
-async fn grpc_logs(State(shared): State<Arc<SharedState>>, body: Bytes) -> impl IntoResponse {
+async fn grpc_logs(
+    State(shared): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let identity = match authenticate_otel(&headers, &shared).await {
+        Ok(identity) => identity,
+        Err(message) => return grpc_error(StatusCode::UNAUTHORIZED, &message),
+    };
     let payload = grpc_decode(&body);
     let Ok(req) = proto::ExportLogsServiceRequest::decode(&payload[..]) else {
         return grpc_error(StatusCode::BAD_REQUEST, "invalid protobuf");
     };
-    ingest_logs(&shared, &req).await;
-    grpc_response(&proto::ExportLogsServiceResponse {})
+    match ingest_logs(&shared, &identity, &req).await {
+        Ok(_) => grpc_response(&proto::ExportLogsServiceResponse {}),
+        Err(error) => grpc_error(StatusCode::FORBIDDEN, &error.to_string()),
+    }
 }
 
 /// Decode gRPC framing: skip 1-byte compressed flag + 4-byte length prefix.

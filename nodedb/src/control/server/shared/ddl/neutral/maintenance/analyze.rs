@@ -64,13 +64,10 @@ pub async fn handle_analyze(
         )
         .await?;
     let mut rows = Vec::new();
-    for task in tasks {
-        let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
+    for task in tasks.into_tasks() {
+        let resp = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
             state,
-            task.tenant_id,
-            task.database_id,
-            task.vshard_id,
-            task.plan,
+            task,
             TraceId::ZERO,
         )
         .await

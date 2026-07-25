@@ -17,7 +17,74 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::pgwire_harness::TestServer;
+use nodedb::control::gateway::core::QueryContext;
+use nodedb::control::security::audit::NoopAuditEmitter;
+use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity};
 use nodedb::control::server::broadcast::broadcast_call_count;
+use nodedb::control::server::shared::authorization::authorize_task_set;
+use nodedb::types::{DatabaseId, TenantId, TraceId, VShardId};
+use nodedb_physical::physical_plan::{BatchEdge, GraphOp, PhysicalPlan};
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+use nodedb_types::Surrogate;
+
+async fn seed_star(server: &TestServer, collection: &str, leaf_prefix: &str, count: usize) {
+    let tenant_id = TenantId::new(1);
+    let database_id = DatabaseId::DEFAULT;
+    let task = PhysicalTask {
+        tenant_id,
+        vshard_id: VShardId::from_collection_in_database(database_id, collection),
+        database_id,
+        plan: PhysicalPlan::Graph(GraphOp::EdgePutBatch {
+            edges: (0..count)
+                .map(|index| BatchEdge {
+                    collection: collection.to_string(),
+                    src_id: "root".to_string(),
+                    label: "l".to_string(),
+                    dst_id: format!("{leaf_prefix}{index}"),
+                    src_surrogate: Surrogate::ZERO,
+                    dst_surrogate: Surrogate::ZERO,
+                })
+                .collect(),
+        }),
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    };
+    let identity = AuthenticatedIdentity {
+        user_id: 0,
+        username: "graph-bfs-test".into(),
+        tenant_id,
+        auth_method: AuthMethod::Trust,
+        roles: Vec::new(),
+        is_superuser: true,
+        default_database: None,
+        accessible_databases: AuthenticatedIdentity::default_database_set(true),
+    };
+    let authorized = authorize_task_set(
+        &identity,
+        std::slice::from_ref(&task),
+        &server.shared.permissions,
+        &server.shared.roles,
+        &NoopAuditEmitter,
+    )
+    .expect("authorize graph seed batch")
+    .into_tasks()
+    .into_iter()
+    .next()
+    .expect("graph seed authorization capability");
+    let gateway = nodedb::control::gateway::Gateway::new(std::sync::Arc::clone(&server.shared));
+    gateway
+        .execute(
+            &QueryContext {
+                tenant_id,
+                trace_id: TraceId::ZERO,
+                database_id,
+                txn_id: None,
+            },
+            authorized,
+        )
+        .await
+        .expect("dispatch graph seed batch");
+}
 
 /// Spec: a BFS with a wide frontier must complete in time proportional
 /// to the number of hops, not to the product of frontier size × hops.
@@ -44,10 +111,7 @@ async fn cross_core_bfs_does_not_issue_one_rpc_per_frontier_node() {
     // `FANOUT × rpc_latency` exceeds the budget below. A batched
     // implementation is `O(hops)` broadcasts regardless of FANOUT.
     const FANOUT: usize = 2000;
-    for i in 0..FANOUT {
-        let sql = format!("GRAPH INSERT EDGE IN 'bfs_nodes' FROM 'root' TO 'leaf_{i}' TYPE 'l'");
-        server.exec(&sql).await.unwrap();
-    }
+    seed_star(&server, "bfs_nodes", "leaf_", FANOUT).await;
 
     // Snapshot the broadcast-call counter before dispatch so we can
     // assert the exact number of RPCs the traversal issued. Wall-clock
@@ -109,14 +173,7 @@ async fn cross_core_shortest_path_batches_frontier() {
     // Shortest path is root → leaf_500 → target (2 hops). The buggy
     // per-node loop issues `1 + FANOUT` serial broadcasts in hop 1.
     const FANOUT: usize = 2000;
-    for i in 0..FANOUT {
-        server
-            .exec(&format!(
-                "GRAPH INSERT EDGE IN 'sp_nodes' FROM 'root' TO 'leaf_{i}' TYPE 'l'"
-            ))
-            .await
-            .unwrap();
-    }
+    seed_star(&server, "sp_nodes", "leaf_", FANOUT).await;
     server
         .exec("GRAPH INSERT EDGE IN 'sp_nodes' FROM 'leaf_500' TO 'target' TYPE 'l'")
         .await
@@ -168,14 +225,7 @@ async fn cross_core_bfs_respects_max_visited_mid_hop() {
     // blow up the harness. The buggy implementation is still O(F × C)
     // broadcasts inside the hop; the fix is O(1).
     const LEAVES: usize = 3000;
-    for i in 0..LEAVES {
-        server
-            .exec(&format!(
-                "GRAPH INSERT EDGE IN 'bfs_cap' FROM 'root' TO 'n_{i}' TYPE 'l'"
-            ))
-            .await
-            .unwrap();
-    }
+    seed_star(&server, "bfs_cap", "n_", LEAVES).await;
 
     let start = Instant::now();
     let rows = server

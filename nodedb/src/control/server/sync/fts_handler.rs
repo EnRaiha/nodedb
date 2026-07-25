@@ -63,6 +63,8 @@ pub trait FtsDispatcher: Send + Sync {
 /// Production dispatcher: routes FTS ops to the Data Plane via the SPSC bridge.
 pub struct SharedStateFtsDispatcher<'a> {
     pub shared: &'a crate::control::state::SharedState,
+    pub(crate) identity: Option<&'a crate::control::security::identity::AuthenticatedIdentity>,
+    pub(crate) database_id: DatabaseId,
 }
 
 #[async_trait]
@@ -81,6 +83,14 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
         use nodedb_physical::physical_plan::TextOp;
 
         let prov = provenance;
+        let database_id = self.database_id;
+        super::raft_dispatch::authorize_sync_collection(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            &collection,
+        )?;
 
         // Allocate WAL LSN on the Control Plane before dispatching to the
         // Data Plane. The doc_id for WAL purposes is the surrogate hex string
@@ -98,7 +108,7 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
             &self.shared.wal,
             tenant_id,
             vshard,
-            DatabaseId::DEFAULT,
+            database_id,
             &fts_index_payload,
         )?;
 
@@ -109,7 +119,15 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
             provenance: Some(prov),
         });
 
-        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
+        let authorized = super::raft_dispatch::authorize_sync_task(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            vshard,
+            plan,
+        )?;
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
     }
 
     async fn dispatch_delete(
@@ -125,6 +143,14 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
         use nodedb_physical::physical_plan::TextOp;
 
         let prov = provenance;
+        let database_id = self.database_id;
+        super::raft_dispatch::authorize_sync_collection(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            &collection,
+        )?;
 
         let surrogate_hex = crate::engine::document::store::surrogate_to_doc_id(surrogate);
         let fts_delete_payload =
@@ -133,7 +159,7 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
             &self.shared.wal,
             tenant_id,
             vshard,
-            DatabaseId::DEFAULT,
+            database_id,
             &fts_delete_payload,
         )?;
 
@@ -143,7 +169,15 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
             provenance: Some(prov),
         });
 
-        super::raft_dispatch::dispatch_sync_payload(self.shared, tenant_id, vshard, plan).await
+        let authorized = super::raft_dispatch::authorize_sync_task(
+            self.shared,
+            self.identity,
+            tenant_id,
+            database_id,
+            vshard,
+            plan,
+        )?;
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
     }
 
     fn assign_surrogate(

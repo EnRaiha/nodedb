@@ -17,7 +17,7 @@ pub mod types;
 
 pub use decode::from_replicated_entry;
 pub use encode::to_replicated_entry;
-pub use propose::propose_replicated_entry;
+pub(crate) use propose::propose_replicated_entry;
 pub use types::{
     AsyncRaftProposer, ConstraintChangeOp, RaftAppliedIndexSink, RaftCompactor, RaftProposer,
     ReplicatedEntry, ReplicatedWrite,

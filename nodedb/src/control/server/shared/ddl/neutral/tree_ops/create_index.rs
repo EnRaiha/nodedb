@@ -206,9 +206,10 @@ pub async fn create_graph_index(
         )
         .map_err(|e| ddl_err("XX000", format!("edge-insert WAL append failed: {e}")))?;
 
-        match crate::control::server::sync::raft_dispatch::dispatch_sync_response(
+        match crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
             state,
             tenant_id,
+            DatabaseId::DEFAULT,
             shard,
             plan,
             TraceId::ZERO,
@@ -287,9 +288,10 @@ async fn surface_failure(
             }
             (
                 shard,
-                crate::control::server::sync::raft_dispatch::dispatch_sync_response(
+                crate::control::server::sync::raft_dispatch::dispatch_trusted_internal_sync_response(
                     state,
                     tenant_id,
+                    DatabaseId::DEFAULT,
                     shard,
                     plan,
                     TraceId::ZERO,

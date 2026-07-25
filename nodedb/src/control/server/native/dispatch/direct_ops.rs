@@ -7,7 +7,7 @@ use nodedb_types::protocol::{NativeResponse, OpCode, TextFields};
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
 use crate::control::planner::calvin::{
     CrossShardTxnMode, DispatchClass, TxnDispatchPosition, classify_dispatch,
-    dispatch_tasks_to_calvin,
+    dispatch_authorized_tasks_to_calvin,
 };
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::staging_gate::{
@@ -16,7 +16,7 @@ use crate::control::server::shared::session::staging_gate::{
 use crate::types::{Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use super::raw_dispatch::dispatch_single_task_raw;
+use super::raw_dispatch::{authorize_single_task, dispatch_authorized_single_task};
 use super::response::data_plane_response_to_native;
 use super::{DispatchCtx, error_to_native};
 
@@ -70,27 +70,39 @@ pub(crate) async fn handle_direct_op(
         Err(e) => return NativeResponse::error(seq, "42601", e.to_string()),
     };
 
+    // Apply RLS before any special Control-Plane orchestration can observe the plan.
+    if let Err(e) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
+        tenant_id.as_u64(),
+        &mut plan,
+        &ctx.state.rls,
+        ctx.auth_context,
+    ) {
+        return NativeResponse::error(seq, "42501", e.to_string());
+    }
+
     // `INSERT ... SELECT` is orchestrated on the Control Plane (fresh, registered
     // surrogate per target row + atomic `BatchInsert`); it never reaches the
     // Data Plane as a single op.
-    if let PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::InsertSelect {
-        target_collection,
-        source_collection,
-        source_filters,
-        source_limit,
-    }) = &plan
-    {
-        ctx.state.tenant_request_start(tenant_id);
-        let result = crate::control::insert_select::run_insert_select(
-            ctx.state,
+    if matches!(
+        &plan,
+        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. })
+    ) {
+        let task = PhysicalTask {
             tenant_id,
-            ctx.database_id(),
-            target_collection,
-            source_collection,
-            source_filters,
-            *source_limit,
-        )
-        .await;
+            vshard_id,
+            database_id: ctx.database_id(),
+            plan: plan.clone(),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        };
+        let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
+            Ok(authorized) => authorized,
+            Err(error) => return error_to_native(seq, &error),
+        };
+        ctx.state.tenant_request_start(tenant_id);
+        let result =
+            crate::control::insert_select::run_authorized_insert_select(ctx.state, authorized)
+                .await;
         ctx.state.tenant_request_end(tenant_id);
         return match result {
             Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
@@ -101,34 +113,29 @@ pub(crate) async fn handle_direct_op(
     // Autocommit `MERGE` is orchestrated on the Control Plane (fresh, registered
     // surrogate per NOT-MATCHED insert row + atomic apply); it never reaches the
     // Data Plane as a single op.
-    if let PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Merge {
-        target_collection,
-        source_collection,
-        source_alias,
-        target_join_col,
-        source_join_col,
-        clauses,
-        returning: _,
-        resolve_only: false,
-        resolved_inserts: None,
-        source_rows: _,
-    }) = &plan
-    {
+    if matches!(
+        &plan,
+        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Merge {
+            resolve_only: false,
+            resolved_inserts: None,
+            ..
+        })
+    ) {
+        let task = PhysicalTask {
+            tenant_id,
+            vshard_id,
+            database_id: ctx.database_id(),
+            plan: plan.clone(),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        };
+        let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
+            Ok(authorized) => authorized,
+            Err(error) => return error_to_native(seq, &error),
+        };
         ctx.state.tenant_request_start(tenant_id);
-        let result = crate::control::merge_orchestrator::run_merge(
-            ctx.state,
-            crate::control::merge_orchestrator::MergeArgs {
-                tenant_id,
-                database_id: ctx.database_id(),
-                target_collection,
-                source_collection,
-                source_alias,
-                target_join_col,
-                source_join_col,
-                clauses,
-            },
-        )
-        .await;
+        let result =
+            crate::control::merge_orchestrator::run_authorized_merge(ctx.state, authorized).await;
         ctx.state.tenant_request_end(tenant_id);
         return match result {
             Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
@@ -139,51 +146,37 @@ pub(crate) async fn handle_direct_op(
     // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control Plane
     // (source scanned on its own core + shipped into the plan); it never reaches
     // the Data Plane as a single op reading a possibly-non-resident source.
-    if let PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
-        target_collection,
-        source_collection,
-        source_alias,
-        target_join_col,
-        source_join_col,
-        updates,
-        target_filters,
-        returning,
-        resolve_only: false,
-        source_rows: None,
-    }) = &plan
-    {
+    if matches!(
+        &plan,
+        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
+            resolve_only: false,
+            source_rows: None,
+            ..
+        })
+    ) {
+        let task = PhysicalTask {
+            tenant_id,
+            vshard_id,
+            database_id: ctx.database_id(),
+            plan: plan.clone(),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        };
+        let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
+            Ok(authorized) => authorized,
+            Err(error) => return error_to_native(seq, &error),
+        };
         ctx.state.tenant_request_start(tenant_id);
-        let result = crate::control::update_from_join_orchestrator::run_update_from_join(
-            ctx.state,
-            crate::control::update_from_join_orchestrator::UpdateFromJoinArgs {
-                tenant_id,
-                database_id: ctx.database_id(),
-                target_collection,
-                source_collection,
-                source_alias,
-                target_join_col,
-                source_join_col,
-                updates,
-                target_filters,
-                returning: returning.as_ref(),
-            },
-        )
-        .await;
+        let result =
+            crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
+                ctx.state, authorized,
+            )
+            .await;
         ctx.state.tenant_request_end(tenant_id);
         return match result {
             Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
             Err(e) => error_to_native(seq, &e),
         };
-    }
-
-    // Inject RLS filters from auth context (same as pgwire planner).
-    if let Err(e) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
-        tenant_id.as_u64(),
-        &mut plan,
-        &ctx.state.rls,
-        ctx.auth_context,
-    ) {
-        return NativeResponse::error(seq, "42501", e.to_string());
     }
 
     // Stamp the connection's active transaction id (as the SQL path's
@@ -244,9 +237,25 @@ pub(crate) async fn handle_direct_op(
     // Autocommit direct-ops dispatch: no session read-set to widen with.
     let result = match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
         DispatchClass::MultiShard { .. } => {
-            match dispatch_tasks_to_calvin(
-                ctx.state,
+            let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
+                &ctx.state.audit,
+            ));
+            let authorized = match crate::control::server::shared::authorization::authorize_task_set(
+                ctx.identity,
                 &tasks,
+                &ctx.state.permissions,
+                &ctx.state.roles,
+                &emitter,
+            ) {
+                Ok(authorized) => authorized,
+                Err(error) => {
+                    ctx.state.tenant_request_end(tenant_id);
+                    return error_to_native(seq, &crate::Error::from(error));
+                }
+            };
+            match dispatch_authorized_tasks_to_calvin(
+                ctx.state,
+                authorized,
                 tenant_id,
                 CrossShardTxnMode::Strict,
                 TxnDispatchPosition::Autocommit,
@@ -294,109 +303,6 @@ pub(crate) async fn handle_direct_op(
     result
 }
 
-/// Dispatch a native `GraphMatch` op, unwrapping the DP `{rows, frontier}`
-/// envelope into a bare rows array before native conversion.
-///
-/// MATCH responses are enveloped on the DP→CP hop (see
-/// `data::executor::handlers::graph_match`). The native row decoder expects a
-/// bare msgpack array, so this handler unwraps the envelope here. In B1
-/// `cluster_mode` is always `false`, so the frontier is empty and the rows
-/// payload is byte-identical to the prior bare-array native MATCH response.
-/// (B2 will consume the frontier for cross-shard continuation.)
-pub(crate) async fn handle_graph_match(
-    ctx: &DispatchCtx<'_>,
-    seq: u64,
-    fields: &TextFields,
-) -> NativeResponse {
-    let collection = fields
-        .collection
-        .as_deref()
-        .unwrap_or("default")
-        .to_lowercase();
-    let vshard_key = fields.document_id.as_deref().unwrap_or(&collection);
-    let vshard_id = ctx.vshard_for_key(vshard_key);
-    let tenant_id = ctx.tenant_id();
-
-    if let Err(e) = super::limits::check_op_limits(ctx.state, fields) {
-        return NativeResponse::error(seq, "0A000", e.to_string());
-    }
-    if let Err(e) = ctx.state.check_tenant_quota(tenant_id) {
-        return error_to_native(seq, &e);
-    }
-
-    let mut plan =
-        match super::plan_builder::build_plan(ctx, OpCode::GraphMatch, fields, &collection) {
-            Ok(p) => p,
-            Err(e) => return NativeResponse::error(seq, "42601", e.to_string()),
-        };
-    if let Err(e) = crate::control::planner::rls_injection::inject_rls_for_single_plan(
-        tenant_id.as_u64(),
-        &mut plan,
-        &ctx.state.rls,
-        ctx.auth_context,
-    ) {
-        return NativeResponse::error(seq, "42501", e.to_string());
-    }
-
-    // Same rationale as `handle_direct_op`: stamp the active transaction id
-    // (`None` outside a transaction block) so a MATCH issued inside a native
-    // transaction resolves this connection's staging overlay identically to
-    // every other direct-op read.
-    let txn_id = ctx.sessions.tx_id(ctx.peer_addr);
-    let plan_for_response = plan.clone();
-    ctx.state.tenant_request_start(tenant_id);
-    let raw = dispatch_single_task_raw(ctx, tenant_id, vshard_id, plan, txn_id).await;
-    ctx.state.tenant_request_end(tenant_id);
-
-    let resp = match raw {
-        Ok(r) => r,
-        Err(e) => return error_to_native(seq, &e),
-    };
-
-    // A MATCH issued inside a native transaction records a collection-scoped
-    // predicate read at the shard's watermark, identical to every other read
-    // seam. Single-shard direct op → one watermark, one entry.
-    if (resp.status == Status::Ok
-        || resp.error_code.as_deref() == Some(&crate::bridge::envelope::ErrorCode::NotFound))
-        && ctx.sessions.transaction_state(ctx.peer_addr)
-            == crate::control::server::shared::session::TransactionState::InBlock
-    {
-        crate::control::server::shared::session::record_reads_for_response(
-            ctx.state,
-            ctx.sessions,
-            ctx.peer_addr,
-            ctx.tenant_id(),
-            crate::control::server::shared::session::ResponseReads {
-                plan: &plan_for_response,
-                watermarks: &[(vshard_id, resp.watermark_lsn)],
-                read_version_lsn: resp.read_version_lsn,
-                found: resp.status == Status::Ok,
-                distributed_reads: &[],
-                read_lsn_vshard: vshard_id,
-            },
-        )
-        .await;
-    }
-
-    if resp.status == Status::Error {
-        return data_plane_response_to_native(ctx, seq, &plan_for_response, &resp);
-    }
-
-    // Unwrap the `{rows, frontier, resume}` envelope into a bare rows array. The
-    // frontier is discarded here (B2 consumes it for cross-shard dispatch); the
-    // resume cursor is likewise not acted on on this single-shard direct-op
-    // path — the frame's `partial` flag already marks a truncated result.
-    let unwrapped =
-        match crate::control::server::graph_dispatch::unwrap_match_envelope(&resp.payload) {
-            Ok(u) => Response {
-                payload: u.rows_payload,
-                ..resp
-            },
-            Err(e) => return error_to_native(seq, &e),
-        };
-    data_plane_response_to_native(ctx, seq, &plan_for_response, &unwrapped)
-}
-
 /// Dispatch one plan via the gateway (when wired) or the local SPSC path,
 /// converting the Data-Plane response into a `NativeResponse`.
 ///
@@ -432,6 +338,16 @@ async fn dispatch_single_task(
         txn_id,
     };
 
+    // Authorization must precede the staging decision. Non-stageable writes
+    // are buffered without invoking the stage-dispatch closure, so authorizing
+    // only inside that closure would let an ungranted task reach trusted
+    // COMMIT replay. Consuming the exact-task capability here makes every
+    // branch below originate from a successful authorization decision.
+    let task = match authorize_single_task(ctx, task) {
+        Ok(authorized) => authorized.into_staging_task(),
+        Err(error) => return error_to_native(seq, &error),
+    };
+
     // Cloned before `route_in_tx_write` consumes `task`, so a staged write
     // whose outcome carries a real affected-count/computed-value payload
     // (e.g. `KvBatchPut`'s `{"inserted": n}`) can be shaped into the
@@ -439,7 +355,7 @@ async fn dispatch_single_task(
     let plan_for_staged_response = task.plan.clone();
 
     let task = match route_in_tx_write(ctx.state, ctx.sessions, ctx.peer_addr, task, |stage_task| {
-        dispatch_single_task_raw(
+        dispatch_authorized_single_task(
             ctx,
             stage_task.tenant_id,
             stage_task.vshard_id,
@@ -482,8 +398,14 @@ async fn dispatch_single_task(
 
     let plan_for_response = task.plan.clone();
     let task_vshard = task.vshard_id;
-    match dispatch_single_task_raw(ctx, task.tenant_id, task.vshard_id, task.plan, task.txn_id)
-        .await
+    match dispatch_authorized_single_task(
+        ctx,
+        task.tenant_id,
+        task.vshard_id,
+        task.plan,
+        task.txn_id,
+    )
+    .await
     {
         Ok(resp) => {
             // Track direct-op reads, including NotFound phantom observations,

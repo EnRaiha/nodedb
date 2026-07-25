@@ -14,7 +14,7 @@ use crate::types::{DatabaseId, ReadConsistency, TenantId, TraceId, VShardId};
 ///
 /// This is async — it yields the Tokio thread while waiting, so the
 /// response poller can deliver the result without deadlocking.
-pub async fn dispatch_async(
+pub(crate) async fn dispatch_async(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
@@ -39,7 +39,7 @@ pub async fn dispatch_async(
 /// CRDT sync paths pass `EventSource::CrdtSync` so that the Data Plane
 /// emits WriteEvents with the correct source tag — preventing the Event Plane
 /// from firing triggers on replicated deltas.
-pub async fn dispatch_async_with_source(
+pub(crate) async fn dispatch_async_with_source(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,

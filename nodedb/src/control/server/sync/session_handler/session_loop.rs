@@ -209,9 +209,9 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
                         // authentication — and there is no placeholder-tenant
                         // fallback that could misroute writes under tenant 0.
                         if array_inbound.is_none()
-                            && let Some(tenant) = session.tenant_id
+                            && let Some(identity) = session.identity.clone()
                         {
-                            array_inbound = build_array_inbound(&shared, tenant);
+                            array_inbound = build_array_inbound(&shared, identity);
                         }
                         if let Some(inbound) = &array_inbound {
                             // Stamp the session's handshake-assigned identity so

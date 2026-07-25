@@ -114,14 +114,15 @@ pub async fn query(
     .await
     .map_err(ApiError::from)?;
 
-    authorize_task_set(
+    let authorized_tasks = authorize_task_set(
         &identity,
         &tasks,
         &state.shared.permissions,
         &state.shared.roles,
         &emitter,
     )
-    .map_err(crate::Error::from)?;
+    .map_err(crate::Error::from)?
+    .into_tasks();
 
     if tasks.is_empty() {
         return Ok(axum::Json(HttpQueryResponse::ok(vec![])));
@@ -134,31 +135,21 @@ pub async fn query(
     let mut result_rows = Vec::new();
 
     let result = async {
-        for task in tasks {
+        for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
             // `INSERT ... SELECT` is orchestrated on the Control Plane: the
             // source is scanned, each target row gets its OWN fresh, registered
             // surrogate, and the rows are written via an atomic `BatchInsert`.
             // The orchestrator issues its own WAL-backed writes, so the outer
             // per-task WAL append below is skipped for it.
             if let crate::bridge::envelope::PhysicalPlan::Document(
-                nodedb_physical::physical_plan::DocumentOp::InsertSelect {
-                    target_collection,
-                    source_collection,
-                    source_filters,
-                    source_limit,
-                },
+                nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. },
             ) = &task.plan
             {
                 let plan_kind = describe_plan(&task.plan);
                 let plan_for_shape = task.plan.clone();
-                let resp = crate::control::insert_select::run_insert_select(
+                let resp = crate::control::insert_select::run_authorized_insert_select(
                     &state.shared,
-                    task.tenant_id,
-                    task.database_id,
-                    target_collection,
-                    source_collection,
-                    source_filters,
-                    *source_limit,
+                    authorized_task,
                 )
                 .await
                 .map_err(gateway_error)?;
@@ -181,12 +172,12 @@ pub async fn query(
             // writes, so the per-task WAL append below is skipped for it.
             if let crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::Merge {
-                    target_collection,
-                    source_collection,
-                    source_alias,
-                    target_join_col,
-                    source_join_col,
-                    clauses,
+                    target_collection: _,
+                    source_collection: _,
+                    source_alias: _,
+                    target_join_col: _,
+                    source_join_col: _,
+                    clauses: _,
                     returning: _,
                     resolve_only: false,
                     resolved_inserts: None,
@@ -196,18 +187,9 @@ pub async fn query(
             {
                 let plan_kind = describe_plan(&task.plan);
                 let plan_for_shape = task.plan.clone();
-                let resp = crate::control::merge_orchestrator::run_merge(
+                let resp = crate::control::merge_orchestrator::run_authorized_merge(
                     &state.shared,
-                    crate::control::merge_orchestrator::MergeArgs {
-                        tenant_id: task.tenant_id,
-                        database_id: task.database_id,
-                        target_collection,
-                        source_collection,
-                        source_alias,
-                        target_join_col,
-                        source_join_col,
-                        clauses,
-                    },
+                    authorized_task,
                 )
                 .await
                 .map_err(gateway_error)?;
@@ -231,14 +213,14 @@ pub async fn query(
             // per-task WAL append below is skipped for it.
             if let crate::bridge::envelope::PhysicalPlan::Document(
                 nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
-                    target_collection,
-                    source_collection,
-                    source_alias,
-                    target_join_col,
-                    source_join_col,
-                    updates,
-                    target_filters,
-                    returning,
+                    target_collection: _,
+                    source_collection: _,
+                    source_alias: _,
+                    target_join_col: _,
+                    source_join_col: _,
+                    updates: _,
+                    target_filters: _,
+                    returning: _,
                     resolve_only: false,
                     source_rows: None,
                 },
@@ -246,20 +228,9 @@ pub async fn query(
             {
                 let plan_kind = describe_plan(&task.plan);
                 let plan_for_shape = task.plan.clone();
-                let resp = crate::control::update_from_join_orchestrator::run_update_from_join(
+                let resp = crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
                     &state.shared,
-                    crate::control::update_from_join_orchestrator::UpdateFromJoinArgs {
-                        tenant_id: task.tenant_id,
-                        database_id: task.database_id,
-                        target_collection,
-                        source_collection,
-                        source_alias,
-                        target_join_col,
-                        source_join_col,
-                        updates,
-                        target_filters,
-                        returning: returning.as_ref(),
-                    },
+                    authorized_task,
                 )
                 .await
                 .map_err(gateway_error)?;
@@ -295,25 +266,17 @@ pub async fn query(
                         database_id,
                         txn_id: None,
                     };
-                    gw.execute(&gw_ctx, task.plan)
+                    gw.execute(&gw_ctx, authorized_task)
                         .await
                         .map_err(gateway_error)?
                 }
                 None => {
                     // Single-node boot: gateway not yet initialised — dispatch locally.
-                    let response =
-                        crate::control::server::dispatch_utils::dispatch_autocommit_write(
-                            &state.shared,
-                            crate::control::server::dispatch_utils::AutocommitWrite {
-                                tenant_id: task.tenant_id,
-                                database_id: task.database_id,
-                                vshard_id: task.vshard_id,
-                                plan: task.plan,
-                                trace_id,
-                                event_source: crate::event::EventSource::User,
-                                txn_id: None,
-                            },
-                        )
+                    let response = crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write(
+                        &state.shared,
+                        authorized_task,
+                        trace_id,
+                    )
                         .await
                         .map_err(gateway_error)?;
                     if response.status != Status::Ok {

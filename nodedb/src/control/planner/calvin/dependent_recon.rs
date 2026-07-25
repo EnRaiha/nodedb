@@ -35,6 +35,8 @@ use crate::control::state::{CalvinApplyResult, SharedState};
 use crate::types::{DatabaseId, TenantId, TraceId};
 use nodedb_cluster::calvin::sequencer::error::SequencerError;
 use nodedb_physical::physical_plan::{DocumentOp, OllpPredictedEdge, PhysicalPlan};
+
+use super::dependent_recon_plan::{inject_ollp_predicted_edges, inject_ollp_surrogates};
 use nodedb_physical::physical_task::PhysicalTask;
 
 /// The implicit-edge lifecycle a dependent (OLLP) Calvin task drives, derived
@@ -94,87 +96,6 @@ fn extract_bulk_predicate_info(plan: &PhysicalPlan) -> (String, Vec<u8>) {
         | PhysicalPlan::Array(_)
         | PhysicalPlan::ClusterArray(_)
         | PhysicalPlan::ClusterEvent(_) => (String::new(), vec![]),
-    }
-}
-
-/// Inject `ollp_predicted_surrogates` into a `BulkUpdate` or `BulkDelete`
-/// plan in-place.
-///
-/// Other plan variants are left unchanged. Idempotent — calling twice
-/// replaces the previous prediction with the new one.
-fn inject_ollp_surrogates(plan: &mut PhysicalPlan, surrogates: Vec<u32>) {
-    match plan {
-        PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            ollp_predicted_surrogates,
-            ..
-        })
-        | PhysicalPlan::Document(DocumentOp::BulkDelete {
-            ollp_predicted_surrogates,
-            ..
-        }) => {
-            *ollp_predicted_surrogates = Some(surrogates);
-        }
-        // Non-bulk plans are left unchanged. The two bulk arms above take
-        // precedence; these inner wildcards catch every other op. Exhaustive
-        // so a new PhysicalPlan variant forces a decision.
-        PhysicalPlan::Document(_)
-        | PhysicalPlan::Vector(_)
-        | PhysicalPlan::Graph(_)
-        | PhysicalPlan::Kv(_)
-        | PhysicalPlan::Text(_)
-        | PhysicalPlan::Columnar(_)
-        | PhysicalPlan::Timeseries(_)
-        | PhysicalPlan::Spatial(_)
-        | PhysicalPlan::Crdt(_)
-        | PhysicalPlan::Query(_)
-        | PhysicalPlan::Meta(_)
-        | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_)
-        | PhysicalPlan::ClusterEvent(_) => {}
-    }
-}
-
-/// Inject `ollp_predicted_edges` into a `BulkUpdate` or `BulkDelete` plan
-/// in-place.
-///
-/// `edges` is sorted by `(surrogate, from, to, label)` before storing so the
-/// data-plane edge-content comparison is order-independent — mirroring how
-/// `inject_ollp_surrogates` relies on the surrogate set being sorted. Other
-/// plan variants are left unchanged; calling on a non-bulk plan is a no-op.
-/// Edge-content validation currently runs only on the `BulkDelete` path, but
-/// the field is set on whichever bulk variant the plan is for symmetry.
-fn inject_ollp_predicted_edges(plan: &mut PhysicalPlan, mut edges: Vec<OllpPredictedEdge>) {
-    // Canonical `(surrogate, from, to, label)` order via derived `Ord`, matching
-    // the data-plane verifier's sort so the set comparison is well-defined.
-    edges.sort_unstable();
-    match plan {
-        PhysicalPlan::Document(DocumentOp::BulkUpdate {
-            ollp_predicted_edges,
-            ..
-        })
-        | PhysicalPlan::Document(DocumentOp::BulkDelete {
-            ollp_predicted_edges,
-            ..
-        }) => {
-            *ollp_predicted_edges = Some(edges);
-        }
-        // Non-bulk plans are left unchanged. The two bulk arms above take
-        // precedence; these inner wildcards catch every other op. Exhaustive
-        // so a new PhysicalPlan variant forces a decision.
-        PhysicalPlan::Document(_)
-        | PhysicalPlan::Vector(_)
-        | PhysicalPlan::Graph(_)
-        | PhysicalPlan::Kv(_)
-        | PhysicalPlan::Text(_)
-        | PhysicalPlan::Columnar(_)
-        | PhysicalPlan::Timeseries(_)
-        | PhysicalPlan::Spatial(_)
-        | PhysicalPlan::Crdt(_)
-        | PhysicalPlan::Query(_)
-        | PhysicalPlan::Meta(_)
-        | PhysicalPlan::Array(_)
-        | PhysicalPlan::ClusterArray(_)
-        | PhysicalPlan::ClusterEvent(_) => {}
     }
 }
 
@@ -251,9 +172,52 @@ pub fn plan_needs_implicit_edge_recon(
 /// [`build_single_vshard_dependent_tx_class`] so a single-collection
 /// `BulkUpdate`/`BulkDelete` that legitimately resolves to one vshard
 /// sequences through the scheduler instead of being rejected.
-pub async fn dispatch_dependent_edge_recon(
+pub async fn dispatch_authorized_dependent_edge_recon(
+    state: &SharedState,
+    authorized: crate::control::server::shared::authorization::AuthorizedTaskSet,
+    identity: &crate::control::security::identity::AuthenticatedIdentity,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    allow_single_vshard: bool,
+) -> crate::Result<DependentReconOutcome> {
+    let tasks = authorized
+        .into_tasks()
+        .into_iter()
+        .map(|task| task.into_physical_task())
+        .collect();
+    dispatch_dependent_edge_recon_inner(
+        state,
+        tasks,
+        Some(identity),
+        tenant_id,
+        database_id,
+        allow_single_vshard,
+    )
+    .await
+}
+
+pub(crate) async fn dispatch_dependent_edge_recon(
     state: &SharedState,
     tasks: Vec<PhysicalTask>,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    allow_single_vshard: bool,
+) -> crate::Result<DependentReconOutcome> {
+    dispatch_dependent_edge_recon_inner(
+        state,
+        tasks,
+        None,
+        tenant_id,
+        database_id,
+        allow_single_vshard,
+    )
+    .await
+}
+
+async fn dispatch_dependent_edge_recon_inner(
+    state: &SharedState,
+    tasks: Vec<PhysicalTask>,
+    identity: Option<&crate::control::security::identity::AuthenticatedIdentity>,
     tenant_id: TenantId,
     database_id: DatabaseId,
     allow_single_vshard: bool,
@@ -409,11 +373,32 @@ pub async fn dispatch_dependent_edge_recon(
                 }
             }
 
+            let mut submission_tasks: Vec<PhysicalTask> = tasks.to_vec();
+            submission_tasks.extend(edge_tasks);
+            if let Some(identity) = identity {
+                let emitter = crate::control::security::audit::ArcAuditEmitter(
+                    std::sync::Arc::clone(&state.audit),
+                );
+                submission_tasks =
+                    crate::control::server::shared::authorization::authorize_task_set(
+                        identity,
+                        &submission_tasks,
+                        &state.permissions,
+                        &state.roles,
+                        &emitter,
+                    )
+                    .map_err(|_| OllpError::Sequencer(SequencerError::Unavailable))?
+                    .into_tasks()
+                    .into_iter()
+                    .map(|task| task.into_physical_task())
+                    .collect();
+            }
+
             orc.submit_with_retry_via(
                 pred_class,
                 tenant_id,
                 || {
-                    let mut modified_tasks: Vec<PhysicalTask> = tasks
+                    let modified_tasks: Vec<PhysicalTask> = submission_tasks
                         .iter()
                         .map(|t| {
                             let mut t = t.clone();
@@ -428,10 +413,6 @@ pub async fn dispatch_dependent_edge_recon(
                             t
                         })
                         .collect();
-                    // Clone — `submit_with_retry_via`'s tx_builder may be
-                    // invoked more than once, so the edge tasks must survive
-                    // a rebuild.
-                    modified_tasks.extend(edge_tasks.iter().cloned());
                     let built = if allow_single_vshard {
                         build_single_vshard_dependent_tx_class(
                             &modified_tasks,

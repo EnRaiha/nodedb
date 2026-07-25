@@ -36,6 +36,11 @@ fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
 }
 
 fn parse_stream_identifier(token: &str) -> Result<String, DdlError> {
+    if let Some(topic_name) = token.strip_prefix("topic:") {
+        let canonical = nodedb_sql::reserved::check_identifier(topic_name)
+            .map_err(|error| err("42602", error.to_string()))?;
+        return Ok(format!("topic:{canonical}"));
+    }
     nodedb_sql::reserved::check_identifier(token).map_err(|error| err("42602", error.to_string()))
 }
 

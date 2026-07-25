@@ -24,16 +24,26 @@
 //! This is a degraded path relative to AST-level hashing.
 
 use std::collections::BTreeSet;
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use nodedb_cluster::calvin::sequencer::inbox::Inbox;
+#[cfg(test)]
 use nodedb_types::TenantId;
 
+#[cfg(test)]
 use crate::Error;
+#[cfg(test)]
 use crate::control::cluster::calvin::executor::ollp::orchestrator::OllpOrchestrator;
+#[cfg(test)]
 use crate::control::planner::calvin::cross_shard_mode::CrossShardTxnMode;
+#[cfg(test)]
 use crate::control::planner::calvin::tx_class::build_static_tx_class;
-use crate::control::planner::calvin::types::{DispatchClass, DispatchOutcome};
+use crate::control::planner::calvin::types::DispatchClass;
+#[cfg(test)]
+use crate::control::planner::calvin::types::DispatchOutcome;
+#[cfg(test)]
 use crate::control::server::shared::session::TransactionState;
 use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::types::VShardId;
@@ -137,7 +147,8 @@ pub fn classify_dispatch(tasks: &[PhysicalTask], read_vshards: &BTreeSet<u32>) -
 /// The single-shard and best-effort paths are modeled here as outcomes only —
 /// the caller is responsible for the actual Data Plane dispatch, since this
 /// module lives in the Control Plane and has no direct Data Plane handle.
-pub async fn dispatch_calvin_or_fast(
+#[cfg(test)]
+pub(crate) async fn dispatch_calvin_or_fast(
     tasks: &[PhysicalTask],
     mode: CrossShardTxnMode,
     tx_state: TransactionState,

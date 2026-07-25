@@ -374,7 +374,7 @@ fn group_by_not_capped_at_10k() {
     for i in 0..15_000 {
         let ts_ns = 1_700_000_000_000_000_000i64 + i as i64 * 1_000_000;
         lines.push_str(&format!(
-            "dns,qname=host-{i}.example.com elapsed_ms=1.0 {ts_ns}\n"
+            "dns_card,qname=host-{i}.example.com elapsed_ms=1.0 {ts_ns}\n"
         ));
     }
     ingest_ilp(&mut ctx, "dns_card", &lines);
@@ -401,7 +401,7 @@ fn group_by_not_capped_at_10k() {
 #[test]
 fn dedup_only_skips_flushed_partitions() {
     let mut ctx = make_ctx();
-    let payload = b"dns,qname=a.com elapsed_ms=1.0 1700000000000000000\n";
+    let payload = b"dns_dedup,qname=a.com elapsed_ms=1.0 1700000000000000000\n";
 
     // Ingest with wal_lsn — accepted (no flushed partitions yet).
     let resp1 = send_raw(
@@ -483,7 +483,7 @@ fn catchup_replays_gaps_in_lsn_coverage() {
 
     let mk_payload = |i: i64| -> Vec<u8> {
         format!(
-            "dns,qname=host-{i}.test elapsed_ms=1.0 {}\n",
+            "dns_gap,qname=host-{i}.test elapsed_ms=1.0 {}\n",
             1700000000000000000 + i * 1000000
         )
         .into_bytes()
@@ -616,7 +616,9 @@ fn idle_flush_triggers_after_inactivity() {
     let mut lines = String::new();
     for i in 0..5 {
         let ts_ns = 1_700_000_000_000_000_000i64 + i * 1_000_000;
-        lines.push_str(&format!("dns,qname=idle-{i}.test elapsed_ms=1.0 {ts_ns}\n"));
+        lines.push_str(&format!(
+            "dns_idle,qname=idle-{i}.test elapsed_ms=1.0 {ts_ns}\n"
+        ));
     }
     ingest_ilp(&mut ctx, "dns_idle", &lines);
 
@@ -654,7 +656,9 @@ fn idle_flush_triggers_after_inactivity() {
     let mut lines2 = String::new();
     for i in 5..8 {
         let ts_ns = 1_700_000_000_000_000_000i64 + i * 1_000_000;
-        lines2.push_str(&format!("dns,qname=idle-{i}.test elapsed_ms=1.0 {ts_ns}\n"));
+        lines2.push_str(&format!(
+            "dns_idle,qname=idle-{i}.test elapsed_ms=1.0 {ts_ns}\n"
+        ));
     }
     ingest_ilp(&mut ctx, "dns_idle", &lines2);
 
@@ -684,7 +688,7 @@ fn large_group_by_returns_single_valid_json() {
     for i in 0..2_000 {
         let ts_ns = 1_700_000_000_000_000_000i64 + i as i64 * 1_000_000;
         lines.push_str(&format!(
-            "dns,qname=host-{i}.example.com elapsed_ms=1.0 {ts_ns}\n"
+            "dns_large,qname=host-{i}.example.com elapsed_ms=1.0 {ts_ns}\n"
         ));
     }
     ingest_ilp(&mut ctx, "dns_large", &lines);

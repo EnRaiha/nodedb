@@ -61,38 +61,29 @@ pub async fn execute_sql(
         trace_id,
     )
     .await?;
-    authorize_task_set(
+    let authorized_tasks = authorize_task_set(
         identity,
         &tasks,
         &shared.permissions,
         &shared.roles,
         &emitter,
-    )?;
+    )?
+    .into_tasks();
 
     shared.tenant_request_start(tenant_id);
 
     let mut results = Vec::new();
-    for task in tasks {
+    for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
         // `INSERT ... SELECT` is orchestrated on the Control Plane (fresh,
         // registered surrogate per target row + atomic `BatchInsert`), never
         // dispatched to the Data Plane as a single op.
         if let crate::bridge::envelope::PhysicalPlan::Document(
-            nodedb_physical::physical_plan::DocumentOp::InsertSelect {
-                target_collection,
-                source_collection,
-                source_filters,
-                source_limit,
-            },
+            nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. },
         ) = &task.plan
         {
-            match crate::control::insert_select::run_insert_select(
+            match crate::control::insert_select::run_authorized_insert_select(
                 shared,
-                task.tenant_id,
-                task.database_id,
-                target_collection,
-                source_collection,
-                source_filters,
-                *source_limit,
+                authorized_task,
             )
             .await
             {
@@ -120,12 +111,12 @@ pub async fn execute_sql(
         // never dispatched to the Data Plane as a single op.
         if let crate::bridge::envelope::PhysicalPlan::Document(
             nodedb_physical::physical_plan::DocumentOp::Merge {
-                target_collection,
-                source_collection,
-                source_alias,
-                target_join_col,
-                source_join_col,
-                clauses,
+                target_collection: _,
+                source_collection: _,
+                source_alias: _,
+                target_join_col: _,
+                source_join_col: _,
+                clauses: _,
                 returning: _,
                 resolve_only: false,
                 resolved_inserts: None,
@@ -133,20 +124,8 @@ pub async fn execute_sql(
             },
         ) = &task.plan
         {
-            match crate::control::merge_orchestrator::run_merge(
-                shared,
-                crate::control::merge_orchestrator::MergeArgs {
-                    tenant_id: task.tenant_id,
-                    database_id: task.database_id,
-                    target_collection,
-                    source_collection,
-                    source_alias,
-                    target_join_col,
-                    source_join_col,
-                    clauses,
-                },
-            )
-            .await
+            match crate::control::merge_orchestrator::run_authorized_merge(shared, authorized_task)
+                .await
             {
                 Ok(resp) => {
                     let payload = resp.payload.to_vec();
@@ -173,33 +152,22 @@ pub async fn execute_sql(
         // non-resident source.
         if let crate::bridge::envelope::PhysicalPlan::Document(
             nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
-                target_collection,
-                source_collection,
-                source_alias,
-                target_join_col,
-                source_join_col,
-                updates,
-                target_filters,
-                returning,
+                target_collection: _,
+                source_collection: _,
+                source_alias: _,
+                target_join_col: _,
+                source_join_col: _,
+                updates: _,
+                target_filters: _,
+                returning: _,
                 resolve_only: false,
                 source_rows: None,
             },
         ) = &task.plan
         {
-            match crate::control::update_from_join_orchestrator::run_update_from_join(
+            match crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
                 shared,
-                crate::control::update_from_join_orchestrator::UpdateFromJoinArgs {
-                    tenant_id: task.tenant_id,
-                    database_id: task.database_id,
-                    target_collection,
-                    source_collection,
-                    source_alias,
-                    target_join_col,
-                    source_join_col,
-                    updates,
-                    target_filters,
-                    returning: returning.as_ref(),
-                },
+                authorized_task,
             )
             .await
             {
@@ -230,16 +198,13 @@ pub async fn execute_sql(
                     database_id: task.database_id,
                     txn_id: None,
                 };
-                gw.execute(&gw_ctx, task.plan).await
+                gw.execute(&gw_ctx, authorized_task).await
             }
             None => {
                 // Single-node boot: gateway not yet initialised — dispatch locally.
-                crate::control::server::dispatch_utils::dispatch_to_data_plane(
+                crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
                     shared,
-                    task.tenant_id,
-                    task.database_id,
-                    task.vshard_id,
-                    task.plan,
+                    authorized_task,
                     trace_id,
                 )
                 .await

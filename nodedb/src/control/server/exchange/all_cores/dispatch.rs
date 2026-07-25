@@ -51,7 +51,7 @@ pub struct NodeLevelResult {
 /// autocommit / non-transactional path and is byte-identical to before. The
 /// graph-analytics fan-out (BSP / WCC / snapshot / single-blob) is not
 /// session-transaction-scoped, so it does not carry the id.
-pub async fn execute_plan_all_local_cores(
+pub(crate) async fn execute_plan_all_local_cores(
     state: &SharedState,
     tenant_id: TenantId,
     database_id: DatabaseId,
