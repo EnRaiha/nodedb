@@ -30,4 +30,11 @@ pub enum AckStatus {
     /// A gap in the sequence was detected; `expected` is the next seq
     /// the server expected from this producer.
     Gap { expected: u64 },
+    /// The message passed envelope validation and was admitted for
+    /// processing, but has NOT been applied yet.
+    ///
+    /// Emitted by the session boundary before the durable apply runs. A sender
+    /// must keep the message queued until a terminal status arrives — treating
+    /// this as success would retire a write that may still be refused.
+    Accepted,
 }

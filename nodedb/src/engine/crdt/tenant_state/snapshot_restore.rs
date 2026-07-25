@@ -27,7 +27,11 @@ impl TenantCrdtEngine {
         // Do every fallible step before mutating `collections`, so an invalid
         // rollback token cannot discard the current state while reporting an
         // error to the transaction driver.
-        let replacement = CrdtState::new(self.peer_id).map_err(crate::Error::Crdt)?;
+        // Same per-collection derivation as `state_mut`: a rollback must not
+        // hand the collection back a document whose operation identities
+        // collide with a sibling collection's.
+        let replacement = CrdtState::new(Self::collection_peer_id(self.peer_id, collection))
+            .map_err(crate::Error::Crdt)?;
         replacement.import(snapshot).map_err(crate::Error::Crdt)?;
         self.collections.insert(collection.to_owned(), replacement);
         Ok(())

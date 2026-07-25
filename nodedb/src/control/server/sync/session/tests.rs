@@ -375,3 +375,42 @@ fn crc32c_mismatch_rejects_delta() {
     assert_eq!(r2.unwrap().msg_type, SyncMessageType::DeltaReject);
     assert_eq!(session.mutations_rejected, 1);
 }
+
+/// The session emits its `DeltaAck` before the delta has been dispatched to
+/// the Data Plane, and stamps it `AckStatus::Applied`. Nothing has been
+/// applied at that point — the durable apply happens afterwards, and may be
+/// refused. If the connection drops in that window, or the caller forwards the
+/// provisional frame, the client records a write that does not exist.
+///
+/// An acknowledgement must never claim `Applied` before an apply has occurred.
+#[test]
+fn provisional_delta_ack_does_not_claim_applied() {
+    let mut session = make_authenticated_session();
+
+    let data = serde_json::json!({"status": "active"});
+    let msg = DeltaPushMsg {
+        collection: "orders".into(),
+        document_id: "o1".into(),
+        delta: nodedb_types::json_to_msgpack(&data).unwrap(),
+        peer_id: 1,
+        mutation_id: 42,
+        checksum: 0,
+        device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
+    };
+
+    let frame = session
+        .handle_delta_push(&msg, None, None, None)
+        .expect("an accepted push returns a frame");
+    assert_eq!(frame.msg_type, SyncMessageType::DeltaAck);
+
+    let ack: DeltaAckMsg = frame.decode_body().expect("ack body decodes");
+    assert_ne!(
+        ack.status,
+        nodedb_types::sync::wire::AckStatus::Applied,
+        "the session acknowledged a delta as Applied before it was dispatched \
+         to the Data Plane, let alone applied"
+    );
+}

@@ -35,6 +35,16 @@ pub enum ValidatedApplyOutcome {
     /// The delta bytes could not be imported (corrupt / undecodable). Treated
     /// as an idempotent no-op so the stream is not wedged.
     Malformed,
+    /// The delta's causal predecessors are absent from this collection's
+    /// document, so Loro buffered its operations as pending and the applied
+    /// state did not move.
+    ///
+    /// Distinct from [`Self::Malformed`]: malformed bytes can never apply and
+    /// are safely skipped, whereas these operations are well-formed and simply
+    /// arrived without their history. Treating them as a no-op would advance
+    /// the high-water-mark past a write that was never applied — the silent
+    /// data-loss path. The caller must refuse the delta instead.
+    PendingDependencies,
 }
 
 impl TenantCrdtEngine {
@@ -70,8 +80,15 @@ impl TenantCrdtEngine {
                 Err(_) => return ValidatedApplyOutcome::Malformed,
             };
             let before = state.frontier();
-            if state.import(delta).is_err() {
-                return ValidatedApplyOutcome::Malformed;
+            match state.import(delta) {
+                Ok(()) => {}
+                // Well-formed operations that arrived without their causal
+                // history. The state did not move, so this is NOT a no-op the
+                // caller may acknowledge.
+                Err(nodedb_crdt::CrdtError::ImportPendingDependencies) => {
+                    return ValidatedApplyOutcome::PendingDependencies;
+                }
+                Err(_) => return ValidatedApplyOutcome::Malformed,
             }
             match state.write_set_since(&before) {
                 Ok(ws) => ws,
@@ -320,6 +337,156 @@ mod tests {
         // Both rows are reported, including the one the frame did NOT declare.
         assert!(write_set.iter().any(|(c, r)| c == "users" && r == "a"));
         assert!(write_set.iter().any(|(c, r)| c == "users" && r == "b"));
+    }
+
+    /// A peer whose local CRDT document spans several collections exports each
+    /// delta as an incremental slice of ONE shared oplog. Origin keeps one Loro
+    /// document PER COLLECTION, so a delta for collection `probe` can causally
+    /// depend on operations that were routed into a different collection's
+    /// document and are therefore absent here.
+    ///
+    /// Loro accepts such a delta and buffers its operations as causally
+    /// pending: the import returns success, but the applied state never
+    /// advances and the row is never written. That MUST NOT be reported as a
+    /// clean apply — a clean apply means the caller may advance the
+    /// high-water-mark and acknowledge the write as durable, which turns a
+    /// deferred operation into permanent, silent data loss.
+    #[test]
+    fn causally_pending_delta_is_not_clean() {
+        let mut engine = unique_engine();
+
+        // Peer-local document spanning two collections, exporting one
+        // incremental delta per write — the shape every multi-collection
+        // embedded client produces.
+        let peer = CrdtState::new(11).unwrap();
+
+        let v0 = peer.oplog_version_vector();
+        peer.upsert(
+            "users",
+            "u1",
+            &[("email", LoroValue::String("u1@y.com".into()))],
+        )
+        .unwrap();
+        let delta_u1 = peer.export_updates_since(&v0).unwrap();
+
+        let v1 = peer.oplog_version_vector();
+        peer.upsert("signals", "s1", &[("value", LoroValue::String("v".into()))])
+            .unwrap();
+        let _delta_s1 = peer.export_updates_since(&v1).unwrap();
+
+        let v2 = peer.oplog_version_vector();
+        peer.upsert(
+            "users",
+            "u2",
+            &[("email", LoroValue::String("u2@y.com".into()))],
+        )
+        .unwrap();
+        let delta_u2 = peer.export_updates_since(&v2).unwrap();
+
+        // The first `users` delta has no missing predecessor and applies.
+        let first = engine.apply_committed_delta_validated(
+            "users",
+            &delta_u1,
+            nodedb_types::Surrogate::ZERO,
+            "u1",
+            11,
+        );
+        assert!(matches!(first, ValidatedApplyOutcome::Clean { .. }));
+        assert!(engine.row_exists("users", "u1"));
+
+        // The second `users` delta depends on the intervening `signals`
+        // operation, which lives in a different document on this side.
+        let second = engine.apply_committed_delta_validated(
+            "users",
+            &delta_u2,
+            nodedb_types::Surrogate::ZERO,
+            "u2",
+            11,
+        );
+
+        // The load-bearing assertion: an apply that did not actually write the
+        // row must not be indistinguishable from one that did.
+        assert!(
+            !matches!(second, ValidatedApplyOutcome::Clean { .. }),
+            "a delta whose operations stayed causally pending must not report a \
+             clean apply; got {second:?}"
+        );
+
+        // Guard against the specific silent-loss shape: reporting
+        // `Clean { write_set: [] }` passes every downstream contract check
+        // (an empty write-set is a legal no-op delete) while dropping the row.
+        if let ValidatedApplyOutcome::Clean { write_set } = &second {
+            assert!(
+                !write_set.is_empty(),
+                "clean apply with an empty write-set silently drops the row"
+            );
+        }
+    }
+
+    /// A delta must never be reported `Clean` while the row it claimed to
+    /// write is absent. Paired with [`causally_pending_delta_is_not_clean`],
+    /// this pins the observable consequence rather than only the outcome enum:
+    /// whatever remedy the apply path chooses, "reported clean" and "row
+    /// readable" must agree.
+    ///
+    /// This models a peer that keeps ONE document for several collections and
+    /// therefore emits deltas that are not self-contained. Such a delta cannot
+    /// be materialized here — its predecessors live in another document — so
+    /// the correct outcome is a loud refusal, not a clean apply over a missing
+    /// row. A peer that keeps one document per collection emits self-contained
+    /// deltas and is covered end to end on the client side.
+    #[test]
+    fn causally_pending_delta_does_not_lose_its_row() {
+        let mut engine = unique_engine();
+        let peer = CrdtState::new(12).unwrap();
+
+        let v0 = peer.oplog_version_vector();
+        peer.upsert(
+            "users",
+            "a",
+            &[("email", LoroValue::String("a@y.com".into()))],
+        )
+        .unwrap();
+        let delta_a = peer.export_updates_since(&v0).unwrap();
+
+        let v1 = peer.oplog_version_vector();
+        peer.upsert("audit", "e1", &[("op", LoroValue::String("w".into()))])
+            .unwrap();
+
+        let v2 = peer.oplog_version_vector();
+        peer.upsert(
+            "users",
+            "b",
+            &[("email", LoroValue::String("b@y.com".into()))],
+        )
+        .unwrap();
+        let delta_b = peer.export_updates_since(&v2).unwrap();
+        let _ = v1;
+
+        engine.apply_committed_delta_validated(
+            "users",
+            &delta_a,
+            nodedb_types::Surrogate::ZERO,
+            "a",
+            12,
+        );
+        let outcome = engine.apply_committed_delta_validated(
+            "users",
+            &delta_b,
+            nodedb_types::Surrogate::ZERO,
+            "b",
+            12,
+        );
+
+        let reported_clean = matches!(outcome, ValidatedApplyOutcome::Clean { .. });
+        assert_eq!(
+            reported_clean,
+            engine.row_exists("users", "b"),
+            "apply reported clean={reported_clean} but row_exists={}; a clean \
+             apply must leave its row readable and an unreadable row must not \
+             be reported clean",
+            engine.row_exists("users", "b")
+        );
     }
 
     #[test]

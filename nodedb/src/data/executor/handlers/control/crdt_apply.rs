@@ -24,6 +24,13 @@ use crate::engine::crdt::tenant_state::ValidatedApplyOutcome;
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
 
+/// Rejection name for a delta that wrote rows other than its frame target.
+pub(crate) const CRDT_SINGLE_DOCUMENT_DELTA: &str = "crdt_single_document_delta";
+
+/// Rejection name for a delta whose causal predecessors are absent from the
+/// target collection's document, so nothing was applied.
+pub(crate) const CRDT_PENDING_DEPENDENCIES: &str = "crdt_pending_dependencies";
+
 /// Parameters for [`CoreLoop::execute_crdt_apply`].
 pub(in crate::data::executor) struct CrdtApplyParams<'a> {
     pub collection: &'a str,
@@ -166,7 +173,7 @@ impl CoreLoop {
                                     Ok(None)
                                 }
                             }
-                            Err(detail) => Err(detail),
+                            Err(detail) => Err((CRDT_SINGLE_DOCUMENT_DELTA, detail)),
                         }
                     }
                     ValidatedApplyOutcome::Rejected(vt) => {
@@ -177,6 +184,19 @@ impl CoreLoop {
                     ValidatedApplyOutcome::Malformed => {
                         warn!(core = self.core_id, %collection, "crdt apply skipped malformed delta");
                         Ok(None)
+                    }
+                    ValidatedApplyOutcome::PendingDependencies => {
+                        // Nothing was imported: the operations are buffered
+                        // awaiting predecessors this collection's document has
+                        // never seen. Refuse loudly rather than report a write
+                        // that did not happen.
+                        Err((
+                            CRDT_PENDING_DEPENDENCIES,
+                            format!(
+                                "delta for {collection}/{document_id} depends on operations \
+                                 absent from this collection's document; nothing was applied"
+                            ),
+                        ))
                     }
                 }
             };
@@ -208,7 +228,7 @@ impl CoreLoop {
                     self.note_collection_write_lsn(task, collection);
                 }
                 Ok(None) => {}
-                Err(detail) => {
+                Err((constraint, detail)) => {
                     if imported_authoritative {
                         self.note_collection_write_lsn(task, collection);
                     }
@@ -216,13 +236,14 @@ impl CoreLoop {
                         core = self.core_id,
                         %collection,
                         %document_id,
+                        constraint,
                         detail = %detail,
-                        "crdt apply rejected: multi-document delta violates one-document-per-delta contract"
+                        "crdt apply rejected: delta could not be materialized"
                     );
                     return self.response_error(
                         task,
                         ErrorCode::RejectedConstraint {
-                            constraint: "crdt_single_document_delta".to_string(),
+                            constraint: constraint.to_string(),
                             detail,
                         },
                     );
@@ -333,6 +354,12 @@ impl CoreLoop {
                 // engine borrow is dropped here; mark_dirty / sync_commit take
                 // &mut self, and the sparse materialize takes &self.
                 let mut imported_authoritative = false;
+                // A retryable refusal means the delta was NOT applied and the
+                // client is expected to re-push it at the same seq. Advancing
+                // the high-water-mark in that case makes the re-push a
+                // Duplicate and loses the write permanently, so the HWM is held
+                // back for exactly these outcomes.
+                let mut retryable = false;
                 let reject = match outcome {
                     GateOutcome::Pending { installed } => {
                         // Create-race: the constraints this delta was admitted
@@ -350,6 +377,7 @@ impl CoreLoop {
                             installed,
                             "crdt apply fenced: constraint version pending (retryable)"
                         );
+                        retryable = true;
                         Some(ViolationType::ConstraintVersionPending {
                             collection: collection.to_string(),
                             required: constraint_version_required,
@@ -388,6 +416,27 @@ impl CoreLoop {
                         warn!(core = self.core_id, %collection, "crdt apply skipped malformed delta");
                         None
                     }
+                    GateOutcome::Applied(ValidatedApplyOutcome::PendingDependencies) => {
+                        // Well-formed operations that arrived without their
+                        // causal history: Loro buffered them and the applied
+                        // state did not move. Retryable, so the HWM must stay
+                        // put — advancing it would dedup the client's re-send
+                        // and lose the write permanently.
+                        retryable = true;
+                        warn!(
+                            core = self.core_id,
+                            %collection,
+                            %document_id,
+                            "crdt sync apply refused: delta depends on operations absent from \
+                             this collection's document; nothing applied, high-water-mark held"
+                        );
+                        Some(ViolationType::ConstraintViolation {
+                            detail: format!(
+                                "delta for {collection}/{document_id} depends on operations \
+                                 absent from this collection's document; nothing was applied"
+                            ),
+                        })
+                    }
                 };
                 // Materialize the merged document into the sparse store so
                 // DocumentScan / ShapeSnapshot see the synced write. `materialized`
@@ -408,10 +457,22 @@ impl CoreLoop {
                 if imported_authoritative {
                     self.note_collection_write_lsn(task, collection);
                 }
-                // Advance the HWM unconditionally after apply — a rejected,
-                // fenced, or malformed delta must not wedge the sync stream.
-                self.sync_commit(prov);
-                (AckStatus::Applied, prov.seq, reject)
+                // Advance the HWM after apply so a permanently-refused
+                // (DLQ'd constraint violation) or malformed delta cannot wedge
+                // the sync stream — those will never succeed on a re-push, so
+                // holding the stream for them buys nothing.
+                //
+                // A RETRYABLE refusal is the exception: nothing was applied and
+                // the client is expected to re-push the same seq. Committing
+                // here would turn that re-push into a Duplicate and drop the
+                // write, which is the silent-loss pattern this guard exists to
+                // prevent. Report the unchanged high-water-mark instead.
+                if retryable {
+                    (AckStatus::Gap { expected: prov.seq }, current_hwm, reject)
+                } else {
+                    self.sync_commit(prov);
+                    (AckStatus::Applied, prov.seq, reject)
+                }
             }
             SyncAdmit::Duplicate => (AckStatus::Duplicate, current_hwm, None),
             SyncAdmit::Fenced => (AckStatus::Fenced, current_hwm, None),

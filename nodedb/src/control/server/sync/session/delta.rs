@@ -165,14 +165,51 @@ impl SyncSession {
             );
         }
 
+        // Provisional: the delta has passed envelope validation and been
+        // admitted, but the durable apply has not run yet and may still refuse
+        // it. Claiming `Applied` here would let a sender retire a write that
+        // never landed, so this reports `Accepted` and the caller overwrites
+        // the status with the real outcome once the Data Plane replies.
         let ack = DeltaAckMsg {
             mutation_id: msg.mutation_id,
             lsn: 0,
             clock_skew_warning_ms,
             applied_seq: 0,
-            status: nodedb_types::sync::wire::AckStatus::Applied,
+            status: nodedb_types::sync::wire::AckStatus::Accepted,
         };
         SyncFrame::try_encode(SyncMessageType::DeltaAck, &ack)
+    }
+}
+
+impl SyncSession {
+    /// Record the terminal outcome of a delta whose refusal or success was
+    /// decided downstream of [`Self::handle_delta_push`].
+    ///
+    /// The durable apply runs outside the session, so without this the session
+    /// counters can only ever see admission — which is how a session that
+    /// applied one write out of hundreds still closed reporting
+    /// `rejected=0`. Every terminal frame returned to the client is routed
+    /// through here so the close line reflects what actually happened.
+    pub fn record_delta_outcome(&mut self, frame: &SyncFrame) {
+        match frame.msg_type {
+            SyncMessageType::DeltaReject => {
+                self.mutations_rejected += 1;
+            }
+            SyncMessageType::DeltaAck => {
+                let Some(ack) = frame.decode_body::<DeltaAckMsg>() else {
+                    // An ack we cannot read is not evidence of an apply.
+                    self.mutations_not_applied += 1;
+                    return;
+                };
+                match ack.status {
+                    AckStatus::Applied | AckStatus::Duplicate => self.mutations_applied += 1,
+                    AckStatus::Accepted | AckStatus::Fenced | AckStatus::Gap { .. } => {
+                        self.mutations_not_applied += 1
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 

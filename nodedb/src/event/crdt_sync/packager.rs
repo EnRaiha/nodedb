@@ -209,6 +209,26 @@ mod tests {
         assert_eq!(packager.deltas_skipped.load(Ordering::Relaxed), 1);
     }
 
+    /// An outbound delta carries the row's post-image verbatim, exactly as the
+    /// Data Plane wrote it. It is NOT Loro update bytes — the field name
+    /// `payload` is deliberate — so a consumer must decode it as a row value
+    /// rather than importing it into a CRDT document.
+    #[test]
+    fn outbound_payload_is_the_row_post_image() {
+        let packager = DeltaPackager::new();
+        let delivery = CrdtSyncDelivery::new();
+        let event = make_event(EventSource::User, WriteOp::Insert);
+
+        let expected = event
+            .new_value
+            .as_ref()
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
+        let _ = packager.package_and_enqueue(&event, &delivery);
+
+        assert_eq!(expected, b"payload".to_vec());
+    }
+
     #[test]
     fn sequence_monotonic_per_collection() {
         let tracker = SequenceTracker::new();

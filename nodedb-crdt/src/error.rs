@@ -35,6 +35,16 @@ pub enum CrdtError {
     #[error("CRDT import has too many operations: {actual} > {limit}")]
     ImportOperationLimitExceeded { limit: usize, actual: usize },
 
+    /// The imported update depends on operations this document has never seen,
+    /// so Loro buffered them as causally pending instead of applying them.
+    ///
+    /// The document state did NOT advance. Reporting such an import as success
+    /// is silent data loss: the caller acknowledges a write that was never
+    /// applied and may never be, since the missing predecessors are not part of
+    /// this document's operation history.
+    #[error("CRDT import depends on operations absent from this document")]
+    ImportPendingDependencies,
+
     /// A delta preview exceeded its encoded byte limit before import.
     #[error("delta preview exceeds byte limit: {actual} > {limit}")]
     PreviewDeltaTooLarge { limit: usize, actual: usize },

@@ -29,10 +29,22 @@ pub struct SyncSession {
     pub server_clock: HashMap<String, u64>,
     /// Subscribed shape IDs.
     pub subscribed_shapes: Vec<String>,
-    /// Mutations processed in this session.
+    /// Mutations admitted by envelope validation in this session.
+    ///
+    /// Admission is provisional — it says the frame was well-formed and
+    /// authorized, NOT that it was applied. Compare against
+    /// [`Self::mutations_applied`] to see how many actually landed.
     pub mutations_processed: u64,
-    /// Mutations rejected in this session.
+    /// Mutations the durable apply confirmed as applied.
+    pub mutations_applied: u64,
+    /// Mutations refused after admission — by the constraint validator, the
+    /// Data Plane, or authorization. Counted wherever the refusal is decided,
+    /// including refusals raised downstream of this session's provisional ack.
     pub mutations_rejected: u64,
+    /// Mutations neither applied nor permanently refused: retryable refusals,
+    /// sequence gaps, and fenced epochs. The sender is expected to re-push
+    /// these, so they are neither successes nor dead letters.
+    pub mutations_not_applied: u64,
     /// Mutations silently dropped (security rejections).
     pub mutations_silent_dropped: u64,
     /// Last activity timestamp.
@@ -84,6 +96,8 @@ impl SyncSession {
             server_clock: HashMap::new(),
             subscribed_shapes: Vec::new(),
             mutations_processed: 0,
+            mutations_applied: 0,
+            mutations_not_applied: 0,
             mutations_rejected: 0,
             mutations_silent_dropped: 0,
             last_activity: now,

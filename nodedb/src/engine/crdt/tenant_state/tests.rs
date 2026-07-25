@@ -505,3 +505,144 @@ fn purge_clears_constraints_and_resets_version_fence() {
     assert_eq!(installed.len(), 1);
     assert_eq!(installed[0].name, "new_rule");
 }
+
+// ── an apply that did not apply must not report success ──────────────────────
+
+/// Build a peer document spanning two collections and export one incremental
+/// delta per write, mirroring how an embedded client that keeps a single Loro
+/// document for the whole database produces its deltas.
+///
+/// Returns `(first_delta_for_target, later_delta_for_target)` where the later
+/// delta causally depends on an intervening write to the *other* collection.
+fn interleaved_collection_deltas(peer: u64, target: &str, other: &str) -> (Vec<u8>, Vec<u8>) {
+    let state = nodedb_crdt::state::CrdtState::new(peer).unwrap();
+
+    let v0 = state.oplog_version_vector();
+    state
+        .upsert(target, "first", &[("v", LoroValue::I64(1))])
+        .unwrap();
+    let first = state.export_updates_since(&v0).unwrap();
+
+    state
+        .upsert(other, "aside", &[("v", LoroValue::I64(2))])
+        .unwrap();
+
+    let v2 = state.oplog_version_vector();
+    state
+        .upsert(target, "later", &[("v", LoroValue::I64(3))])
+        .unwrap();
+    let later = state.export_updates_since(&v2).unwrap();
+
+    (first, later)
+}
+
+/// `apply_committed_delta` runs AFTER Raft consensus: the entry is already in
+/// the log on every replica. If the import leaves its operations causally
+/// pending, this replica's state silently diverges from a committed log entry
+/// while returning `Ok` — the divergence is undetectable and permanent.
+#[test]
+fn raft_committed_apply_does_not_report_success_without_applying() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+    let (first, later) = interleaved_collection_deltas(31, "users", "signals");
+
+    engine.apply_committed_delta("users", &first).unwrap();
+    assert!(engine.row_exists("users", "first"));
+
+    let result = engine.apply_committed_delta("users", &later);
+
+    assert!(
+        result.is_err() || engine.row_exists("users", "later"),
+        "a Raft-committed apply reported success while its operations stayed \
+         causally pending — this replica has silently diverged from the log"
+    );
+}
+
+/// Snapshot restore must not report a completed restore when the blob's
+/// operations could not be applied: the collection would come back partially
+/// populated and be indistinguishable from a correct restore.
+#[test]
+fn snapshot_import_does_not_report_success_without_applying() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+    let (first, later) = interleaved_collection_deltas(32, "users", "signals");
+
+    engine.import_snapshot_bytes("users", &first).unwrap();
+    assert!(engine.row_exists("users", "first"));
+
+    let result = engine.import_snapshot_bytes("users", &later);
+
+    assert!(
+        result.is_err() || engine.row_exists("users", "later"),
+        "snapshot import reported a completed restore while its operations \
+         stayed causally pending"
+    );
+}
+
+/// Transaction rollback replaces a collection with an exact pre-image. If the
+/// pre-image import leaves operations pending, rollback installs an incomplete
+/// state and tells the transaction driver it succeeded.
+#[test]
+fn rollback_pre_image_does_not_report_success_without_applying() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+    let (first, later) = interleaved_collection_deltas(33, "users", "signals");
+
+    engine
+        .restore_collection_snapshot("users", Some(&first))
+        .unwrap();
+    assert!(engine.row_exists("users", "first"));
+
+    let result = engine.restore_collection_snapshot("users", Some(&later));
+
+    assert!(
+        result.is_err() || engine.row_exists("users", "later"),
+        "rollback reported success while the pre-image's operations stayed \
+         causally pending — the transaction driver believes state was restored"
+    );
+}
+
+/// Every collection's document is constructed with the same peer id, so Loro
+/// operation ids are unique only *within* a collection. Two collections'
+/// snapshots therefore carry colliding `(peer, counter)` identities, and a
+/// consumer that merges them into one document — which is exactly how an
+/// embedded client stores them — silently loses one side of the collision.
+#[test]
+fn collection_snapshots_carry_distinct_operation_identities() {
+    let mut engine = TenantCrdtEngine::new(TenantId::new(1), 0, ConstraintSet::new()).unwrap();
+
+    engine
+        .doc_upsert(
+            "users",
+            "u1",
+            &[("name", LoroValue::String("Alice".into()))],
+        )
+        .unwrap();
+    engine
+        .doc_upsert(
+            "orders",
+            "o1",
+            &[("item", LoroValue::String("book".into()))],
+        )
+        .unwrap();
+
+    let users = engine
+        .export_snapshot_bytes("users")
+        .unwrap()
+        .expect("users snapshot");
+    let orders = engine
+        .export_snapshot_bytes("orders")
+        .unwrap()
+        .expect("orders snapshot");
+
+    // A single document holding both collections — the embedded-client shape.
+    let merged = nodedb_crdt::state::CrdtState::new(99).unwrap();
+    merged.import(&users).expect("import users snapshot");
+    merged.import(&orders).expect("import orders snapshot");
+
+    assert!(
+        merged.row_exists("users", "u1"),
+        "the users row was lost when both collections merged into one document"
+    );
+    assert!(
+        merged.row_exists("orders", "o1"),
+        "the orders row was lost when both collections merged into one document"
+    );
+}

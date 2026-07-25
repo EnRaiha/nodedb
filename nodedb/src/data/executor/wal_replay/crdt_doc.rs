@@ -281,7 +281,14 @@ mod tests {
         )
         .expect("append earlier doc intent");
 
-        let source = nodedb_crdt::CrdtState::new(999).expect("snapshot source");
+        // The intent and this snapshot are causally CONCURRENT — the source doc
+        // never saw the intent — so Loro breaks the tie by peer id, not by WAL
+        // order. Pin the source to the highest legal peer id so the tie-break
+        // is deterministic and this test measures what it is about (replay
+        // ordering across record classes) rather than incidental peer-id
+        // ordering against whatever id the engine derives for the collection.
+        const HIGHEST_PEER_ID: u64 = (1 << 63) - 1;
+        let source = nodedb_crdt::CrdtState::new(HIGHEST_PEER_ID).expect("snapshot source");
         for index in 0..16 {
             source
                 .upsert(

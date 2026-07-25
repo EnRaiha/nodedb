@@ -198,21 +198,34 @@ pub(crate) async fn apply_delta_and_finalize(
             // On success, rebuild the DeltaAck with the correct applied_seq and status.
             // The original ack_frame carries mutation_id and clock_skew_warning_ms which
             // we preserve; applied_seq and status come from the gate result.
-            let gate_result = match zerompk::from_msgpack::<nodedb_types::sync::wire::SyncAckResult>(
-                &payload,
-            ) {
-                Ok(r) => r,
-                Err(err) => {
-                    // Payload decode failed: fall back to the original ack frame so
-                    // the client still gets an ack (the delta was applied).
-                    warn!(
-                        collection = %delta_msg.collection,
-                        error = %err,
-                        "sync: failed to decode SyncAckResult from Data Plane; using default ack"
-                    );
-                    return Some(ack_frame);
-                }
-            };
+            let gate_result =
+                match zerompk::from_msgpack::<nodedb_types::sync::wire::SyncAckResult>(&payload) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        // The Data Plane's outcome is unreadable, so whether the
+                        // delta applied is unknown. Returning the provisional ack
+                        // would assert success we cannot verify and let the client
+                        // retire the write. Refuse retryably instead: a re-push is
+                        // idempotent (the gate dedups by seq), whereas a wrongly
+                        // acked write is lost.
+                        warn!(
+                            collection = %delta_msg.collection,
+                            doc = %delta_msg.document_id,
+                            error = %err,
+                            "sync: failed to decode SyncAckResult from Data Plane; \
+                             refusing the delta rather than acking an unverified apply"
+                        );
+                        let reject = DeltaRejectMsg {
+                            mutation_id: delta_msg.mutation_id,
+                            reason: format!("apply outcome undecodable: {err}"),
+                            compensation: Some(CompensationHint::Custom {
+                                constraint: "apply_outcome_unreadable".into(),
+                                detail: "retry: the apply result could not be read".into(),
+                            }),
+                        };
+                        return SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject);
+                    }
+                };
 
             // Applied-then-rejected: the delta committed and imported, but the
             // post-import validator flagged a constraint violation and enqueued a

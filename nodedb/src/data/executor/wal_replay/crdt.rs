@@ -46,7 +46,7 @@ impl CoreLoop {
         tombstones: &nodedb_wal::TombstoneSet,
     ) {
         use nodedb_wal::record::RecordType;
-        use tracing::warn;
+        use tracing::{error, warn};
 
         let mut replayed = 0usize;
 
@@ -194,6 +194,24 @@ impl CoreLoop {
                         }
                         crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Malformed => {
                             warn!(core = self.core_id, tenant = tid.as_u64(), %collection, "CRDT WAL delta malformed during replay");
+                            continue;
+                        }
+                        crate::engine::crdt::tenant_state::ValidatedApplyOutcome::PendingDependencies => {
+                            // Records replay in LSN order, so a delta whose
+                            // causal predecessors are missing means the log is
+                            // inconsistent with this collection's document —
+                            // not a routine skip. Recovery continues so the
+                            // node still starts, but this is an error-level
+                            // event: the row it carried is NOT present.
+                            error!(
+                                core = self.core_id,
+                                tenant = tid.as_u64(),
+                                %collection,
+                                %document_id,
+                                lsn = record.header.lsn,
+                                "CRDT WAL delta depends on operations absent from this \
+                                 collection's document; row not recovered"
+                            );
                             continue;
                         }
                     }

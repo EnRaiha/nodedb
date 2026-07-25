@@ -26,11 +26,22 @@ impl CrdtState {
     ///
     /// The limits are checked before Loro can import the blob, so rejected
     /// bytes never mutate this document or allocate an import graph.
+    ///
+    /// An update whose causal predecessors are absent from this document is
+    /// buffered by Loro as *pending* and leaves the applied state untouched.
+    /// That is reported as [`CrdtError::ImportPendingDependencies`], never as
+    /// success: a caller that took `Ok` here would acknowledge a write that
+    /// was never applied. The buffered operations remain queued inside Loro,
+    /// so a later import carrying the missing predecessors still converges.
     pub fn import_with_limits(&self, data: &[u8], limits: CrdtImportLimits) -> Result<()> {
         admit_import(data, &self.doc.oplog_vv(), limits)?;
-        self.doc
+        let status = self
+            .doc
             .import(data)
             .map_err(|e| CrdtError::DeltaApplyFailed(e.to_string()))?;
+        if status.pending.is_some() {
+            return Err(CrdtError::ImportPendingDependencies);
+        }
         Ok(())
     }
 
@@ -195,6 +206,90 @@ mod tests {
         let before = receiver.frontier();
         receiver.import(&stale).expect("stale replay is idempotent");
         assert_eq!(receiver.frontier(), before);
+    }
+
+    /// Loro accepts a delta whose causal predecessors are missing and buffers
+    /// its operations as *pending*: the import call succeeds, but the applied
+    /// state never advances and the row is never written.
+    ///
+    /// Reporting that as a plain success is what makes the loss silent — the
+    /// caller advances its high-water-mark and acknowledges a write that does
+    /// not exist. An import must never report success while leaving the row it
+    /// carried unwritten.
+    #[test]
+    fn import_does_not_report_success_while_operations_stay_pending() {
+        // One source document, three writes, each exported as an incremental
+        // delta. The middle delta is withheld, so the third depends on
+        // operations the receiver never sees.
+        let source = CrdtState::new(9).expect("source");
+
+        let v0 = source.oplog_version_vector();
+        source
+            .upsert("docs", "first", &[("value", LoroValue::I64(1))])
+            .expect("first write");
+        let delta_first = source.export_updates_since(&v0).expect("first delta");
+
+        source
+            .upsert("docs", "withheld", &[("value", LoroValue::I64(2))])
+            .expect("withheld write");
+
+        let v2 = source.oplog_version_vector();
+        source
+            .upsert("docs", "third", &[("value", LoroValue::I64(3))])
+            .expect("third write");
+        let delta_third = source.export_updates_since(&v2).expect("third delta");
+
+        let receiver = CrdtState::new(1).expect("receiver");
+        receiver.import(&delta_first).expect("first delta applies");
+        assert!(receiver.row_exists("docs", "first"));
+
+        let result = receiver.import(&delta_third);
+
+        // Fix-shape agnostic: the import may refuse the delta outright, or it
+        // may report success — but it MUST NOT do the latter while the row it
+        // carried is absent.
+        assert!(
+            result.is_err() || receiver.row_exists("docs", "third"),
+            "import reported success while its operations stayed causally \
+             pending and the row was never written"
+        );
+    }
+
+    /// The pending-operation buffer must not be observable as a silent
+    /// frontier stall either: if an import reports success, the applied state
+    /// must have advanced past the pre-import frontier.
+    #[test]
+    fn successful_import_advances_the_applied_frontier() {
+        let source = CrdtState::new(21).expect("source");
+
+        let v0 = source.oplog_version_vector();
+        source
+            .upsert("docs", "a", &[("value", LoroValue::I64(1))])
+            .expect("first write");
+        let delta_a = source.export_updates_since(&v0).expect("delta a");
+
+        source
+            .upsert("docs", "gap", &[("value", LoroValue::I64(2))])
+            .expect("withheld write");
+
+        let v2 = source.oplog_version_vector();
+        source
+            .upsert("docs", "b", &[("value", LoroValue::I64(3))])
+            .expect("second write");
+        let delta_b = source.export_updates_since(&v2).expect("delta b");
+
+        let receiver = CrdtState::new(2).expect("receiver");
+        receiver.import(&delta_a).expect("delta a applies");
+        let before = receiver.frontier();
+
+        if receiver.import(&delta_b).is_ok() {
+            assert_ne!(
+                receiver.frontier(),
+                before,
+                "a successful import left the applied frontier unchanged — its \
+                 operations were buffered as pending, not applied"
+            );
+        }
     }
 
     #[test]
