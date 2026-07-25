@@ -23,11 +23,10 @@ use std::sync::Arc;
 use common::array_sync::build_schema_snapshot;
 use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::control::array_sync::{OriginApplyEngine, OriginArrayInbound};
-use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity, DatabaseSet};
+use nodedb::control::security::identity::AuthenticatedIdentity;
 use nodedb::control::server::shared::ddl::neutral::collection::show_collections;
 use nodedb::control::server::shared::ddl::result::DdlResult;
 use nodedb::control::state::SharedState;
-use nodedb::types::TenantId;
 use nodedb::wal::WalManager;
 use nodedb_types::DatabaseId;
 
@@ -42,16 +41,7 @@ fn build_test_state() -> Arc<SharedState> {
 }
 
 fn superuser_identity() -> AuthenticatedIdentity {
-    AuthenticatedIdentity {
-        user_id: 1,
-        username: "test".into(),
-        tenant_id: TenantId::new(0),
-        auth_method: AuthMethod::Trust,
-        roles: vec![],
-        is_superuser: true,
-        default_database: None,
-        accessible_databases: DatabaseSet::All,
-    }
+    nodedb_test_support::pgwire_auth_helpers::superuser()
 }
 
 /// Extract the `name` column values from a `SHOW COLLECTIONS` result.
@@ -85,19 +75,7 @@ async fn synced_array_schema_is_visible_in_system_catalog_single_node() {
         engine,
         Arc::clone(&shared.array_sync_schemas),
         Arc::clone(&shared),
-        nodedb::control::security::identity::AuthenticatedIdentity {
-            user_id: 0,
-            username: "array-sync-test".into(),
-            tenant_id: TenantId::new(0),
-            auth_method: nodedb::control::security::identity::AuthMethod::Trust,
-            roles: Vec::new(),
-            is_superuser: true,
-            default_database: None,
-            accessible_databases:
-                nodedb::control::security::identity::AuthenticatedIdentity::default_database_set(
-                    true,
-                ),
-        },
+        nodedb_test_support::pgwire_auth_helpers::superuser(),
     );
 
     let array_name = "genome_tiles";

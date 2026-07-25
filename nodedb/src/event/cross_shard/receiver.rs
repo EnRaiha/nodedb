@@ -18,7 +18,7 @@ use nodedb_cluster::wire::{VShardEnvelope, VShardMessageType, WIRE_VERSION};
 use super::dedup::HwmStore;
 use super::metrics::CrossShardMetrics;
 use super::types::{CrossShardWriteRequest, CrossShardWriteResponse};
-use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, Role};
+use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
@@ -228,16 +228,15 @@ impl CrossShardReceiver {
 
 /// Build a system identity for cross-shard execution (SECURITY DEFINER).
 fn cross_shard_identity(tenant_id: TenantId) -> AuthenticatedIdentity {
-    AuthenticatedIdentity {
-        user_id: 0,
-        username: "_system_cross_shard".into(),
+    AuthenticatedIdentity::new_internal_service(
+        0,
+        "_system_cross_shard",
         tenant_id,
-        auth_method: AuthMethod::Trust,
-        roles: vec![Role::Superuser],
-        is_superuser: true,
-        default_database: None,
-        accessible_databases: crate::control::security::identity::DatabaseSet::All,
-    }
+        vec![Role::Superuser],
+        true,
+        None,
+        crate::control::security::identity::DatabaseSet::All,
+    )
 }
 
 #[cfg(test)]
@@ -247,7 +246,7 @@ mod tests {
     #[test]
     fn cross_shard_identity_is_superuser() {
         let id = cross_shard_identity(TenantId::new(5));
-        assert!(id.is_superuser);
+        assert!(id.is_superuser());
         assert_eq!(id.tenant_id, TenantId::new(5));
         assert_eq!(id.username, "_system_cross_shard");
     }

@@ -185,18 +185,17 @@ mod tests {
     fn new_ip_triggers() {
         let scorer = RiskScorer::default();
         let auth = crate::control::security::auth_context::AuthContext::from_identity(
-            &crate::control::security::identity::AuthenticatedIdentity {
-                user_id: 1,
-                username: "alice".into(),
-                tenant_id: crate::types::TenantId::new(1),
-                auth_method: crate::control::security::identity::AuthMethod::ApiKey,
-                roles: vec![crate::control::security::identity::Role::ReadWrite],
-                is_superuser: false,
-                default_database: None,
-                accessible_databases: crate::control::security::identity::DatabaseSet::Some(
-                    smallvec::smallvec![nodedb_types::id::DatabaseId::DEFAULT],
-                ),
-            },
+            &crate::control::security::identity::AuthenticatedIdentity::new_regular(
+                1,
+                "alice",
+                crate::types::TenantId::new(1),
+                crate::control::security::identity::AuthMethod::ApiKey,
+                vec![crate::control::security::identity::Role::ReadWrite],
+                None,
+                crate::control::security::identity::DatabaseSet::Some(smallvec::smallvec![
+                    nodedb_types::id::DatabaseId::DEFAULT,
+                ]),
+            ),
             "test".into(),
         );
 
@@ -213,16 +212,15 @@ mod tests {
     fn high_privilege_triggers() {
         let scorer = RiskScorer::default();
         let auth = crate::control::security::auth_context::AuthContext::from_identity(
-            &crate::control::security::identity::AuthenticatedIdentity {
-                user_id: 1,
-                username: "admin".into(),
-                tenant_id: crate::types::TenantId::new(1),
-                auth_method: crate::control::security::identity::AuthMethod::ApiKey,
-                roles: vec![crate::control::security::identity::Role::Superuser],
-                is_superuser: true,
-                default_database: None,
-                accessible_databases: crate::control::security::identity::DatabaseSet::All,
-            },
+            &crate::control::security::identity::AuthenticatedIdentity::new_internal_service(
+                1,
+                "admin",
+                crate::types::TenantId::new(1),
+                vec![crate::control::security::identity::Role::Superuser],
+                true,
+                None,
+                crate::control::security::identity::DatabaseSet::All,
+            ),
             "test".into(),
         );
 
@@ -239,18 +237,17 @@ mod tests {
         };
         let scorer = RiskScorer::new(config);
         let auth = crate::control::security::auth_context::AuthContext::from_identity(
-            &crate::control::security::identity::AuthenticatedIdentity {
-                user_id: 1,
-                username: "test".into(),
-                tenant_id: crate::types::TenantId::new(1),
-                auth_method: crate::control::security::identity::AuthMethod::ApiKey,
-                roles: vec![],
-                is_superuser: false,
-                default_database: None,
-                accessible_databases: crate::control::security::identity::DatabaseSet::Some(
-                    smallvec::smallvec![nodedb_types::id::DatabaseId::DEFAULT],
-                ),
-            },
+            &crate::control::security::identity::AuthenticatedIdentity::new_regular(
+                1,
+                "test",
+                crate::types::TenantId::new(1),
+                crate::control::security::identity::AuthMethod::ApiKey,
+                vec![],
+                None,
+                crate::control::security::identity::DatabaseSet::Some(smallvec::smallvec![
+                    nodedb_types::id::DatabaseId::DEFAULT,
+                ]),
+            ),
             "test".into(),
         );
 

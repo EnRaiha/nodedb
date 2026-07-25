@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::planner::procedural::executor::core::StatementExecutor;
-use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, Role};
+use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 use nodedb_types::Value;
@@ -275,16 +275,15 @@ async fn notify_insert(
 
 /// Create a system identity for alert notification execution.
 fn alert_identity(tenant_id: TenantId, owner: &str) -> AuthenticatedIdentity {
-    AuthenticatedIdentity {
-        user_id: 0,
-        username: owner.to_string(),
+    AuthenticatedIdentity::new_internal_service(
+        0,
+        owner,
         tenant_id,
-        auth_method: AuthMethod::Trust,
-        roles: vec![Role::Superuser],
-        is_superuser: true,
-        default_database: None,
-        accessible_databases: crate::control::security::identity::DatabaseSet::All,
-    }
+        vec![Role::Superuser],
+        true,
+        None,
+        crate::control::security::identity::DatabaseSet::All,
+    )
 }
 
 #[cfg(test)]

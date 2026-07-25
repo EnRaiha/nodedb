@@ -411,16 +411,15 @@ mod tests {
     use nodedb_types::sync::wire::{DeltaPushMsg, DeltaRejectMsg, SyncMessageType};
 
     fn identity() -> AuthenticatedIdentity {
-        AuthenticatedIdentity {
-            user_id: 7,
-            username: "writer".into(),
-            tenant_id: TenantId::new(9),
-            auth_method: AuthMethod::ApiKey,
-            roles: Vec::new(),
-            is_superuser: false,
-            default_database: None,
-            accessible_databases: AuthenticatedIdentity::default_database_set(false),
-        }
+        AuthenticatedIdentity::new_regular(
+            7,
+            "writer",
+            TenantId::new(9),
+            AuthMethod::ApiKey,
+            Vec::new(),
+            None,
+            AuthenticatedIdentity::default_database_set(false),
+        )
     }
 
     fn delta() -> DeltaPushMsg {

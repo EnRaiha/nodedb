@@ -413,16 +413,15 @@ mod tests {
     use nodedb_types::id::DatabaseId;
 
     fn test_identity() -> AuthenticatedIdentity {
-        AuthenticatedIdentity {
-            user_id: 42,
-            username: "alice".into(),
-            tenant_id: TenantId::new(1),
-            auth_method: AuthMethod::ScramSha256,
-            roles: vec![Role::ReadWrite],
-            is_superuser: false,
-            default_database: None,
-            accessible_databases: DatabaseSet::Some(smallvec::smallvec![DatabaseId::DEFAULT]),
-        }
+        AuthenticatedIdentity::new_regular(
+            42,
+            "alice",
+            TenantId::new(1),
+            AuthMethod::ScramSha256,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::Some(smallvec::smallvec![DatabaseId::DEFAULT]),
+        )
     }
 
     fn auth_with_database(db_id: DatabaseId) -> AuthContext {

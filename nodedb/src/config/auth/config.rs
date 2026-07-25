@@ -119,9 +119,13 @@ pub struct JwtAuthConfig {
     #[serde(default = "default_allowed_algorithms")]
     pub allowed_algorithms: Vec<String>,
 
-    /// Clock skew tolerance in seconds for `exp`/`nbf` validation.
+    /// Clock skew tolerance in seconds for `exp`/`nbf`/`iat` validation.
     #[serde(default = "default_clock_skew")]
     pub clock_skew_secs: u64,
+
+    /// Maximum accepted JWT lifetime (`exp - iat`) in seconds.
+    #[serde(default = "default_max_token_lifetime")]
+    pub max_token_lifetime_secs: u64,
 
     /// Path to cache JWKS on disk for offline fallback.
     /// If set, JWKS responses are persisted and used when providers are unreachable.
@@ -252,6 +256,11 @@ impl JwtAuthConfig {
     /// Validate all providers. Called by the server-config loader and JWKS
     /// registry construction so misconfiguration fails before authentication.
     pub fn validate(&self) -> crate::Result<()> {
+        if self.max_token_lifetime_secs == 0 {
+            return Err(crate::Error::Config {
+                detail: "auth.jwt max_token_lifetime_secs must be greater than zero".into(),
+            });
+        }
         let policy = self.jwks_policy().map_err(|e| crate::Error::Config {
             detail: format!("auth.jwt allow-list is invalid: {e}"),
         })?;
@@ -307,6 +316,9 @@ fn default_jwks_min_refetch() -> u64 {
 fn default_clock_skew() -> u64 {
     60
 }
+fn default_max_token_lifetime() -> u64 {
+    86_400
+}
 fn default_allowed_algorithms() -> Vec<String> {
     vec!["RS256".into(), "ES256".into()]
 }
@@ -321,6 +333,7 @@ impl Default for JwtAuthConfig {
             jwks_min_refetch_secs: default_jwks_min_refetch(),
             allowed_algorithms: default_allowed_algorithms(),
             clock_skew_secs: default_clock_skew(),
+            max_token_lifetime_secs: default_max_token_lifetime(),
             jwks_cache_path: None,
             providers: Vec::new(),
             jit_provisioning: false,

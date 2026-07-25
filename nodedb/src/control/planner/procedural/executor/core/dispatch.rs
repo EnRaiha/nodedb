@@ -378,7 +378,7 @@ mod cross_shard_origination_tests {
     use crate::control::planner::procedural::executor::core::{
         CrossShardOrigin, StatementExecutor,
     };
-    use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity};
+    use crate::control::security::identity::AuthenticatedIdentity;
     use crate::control::server::shared::ddl::neutral::collection::create::handler::create_collection;
     use crate::control::server::shared::ddl::neutral::collection::create::request::CreateCollectionRequest;
     use crate::control::state::SharedState;
@@ -392,16 +392,15 @@ mod cross_shard_origination_tests {
     const REMOTE_NODE: u64 = 2;
 
     fn test_identity() -> AuthenticatedIdentity {
-        AuthenticatedIdentity {
-            user_id: 1,
-            username: "cross_shard_origin_test".into(),
-            tenant_id: TenantId::new(1),
-            auth_method: AuthMethod::Trust,
-            roles: vec![],
-            is_superuser: true,
-            default_database: None,
-            accessible_databases: AuthenticatedIdentity::default_database_set(true),
-        }
+        AuthenticatedIdentity::new_internal_service(
+            1,
+            "cross_shard_origin_test",
+            TenantId::new(1),
+            vec![],
+            true,
+            None,
+            AuthenticatedIdentity::default_database_set(true),
+        )
     }
 
     /// Build a `SharedState` wired for cross-shard trigger origination: a

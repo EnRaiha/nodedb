@@ -189,7 +189,7 @@ use std::pin::Pin;
 use std::sync::Mutex;
 
 use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
-use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, DatabaseSet};
+use crate::control::security::identity::{AuthenticatedIdentity, DatabaseSet};
 use crate::control::server::shared::session::outcome::TxnDataPlane;
 use crate::control::server::shared::session::savepoint_ops;
 use crate::types::{DatabaseId, Lsn, RequestId, TenantId, VShardId};
@@ -261,16 +261,15 @@ fn staged_task(vshard: u32) -> PhysicalTask {
 }
 
 fn test_identity() -> AuthenticatedIdentity {
-    AuthenticatedIdentity {
-        user_id: 1,
-        username: "tester".into(),
-        tenant_id: TenantId::new(1),
-        auth_method: AuthMethod::Trust,
-        roles: Vec::new(),
-        is_superuser: true,
-        default_database: None,
-        accessible_databases: DatabaseSet::All,
-    }
+    AuthenticatedIdentity::new_internal_service(
+        1,
+        "tester",
+        TenantId::new(1),
+        Vec::new(),
+        true,
+        None,
+        DatabaseSet::All,
+    )
 }
 
 /// ROLLBACK of a transaction that staged writes to TWO vShards must drop the

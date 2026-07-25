@@ -338,16 +338,15 @@ mod tests {
     use nodedb_types::Surrogate;
 
     fn identity(database_id: DatabaseId) -> AuthenticatedIdentity {
-        AuthenticatedIdentity {
-            user_id: 7,
-            username: "ingester".into(),
-            tenant_id: TenantId::new(9),
-            auth_method: AuthMethod::ApiKey,
-            roles: Vec::new(),
-            is_superuser: false,
-            default_database: Some(database_id),
-            accessible_databases: DatabaseSet::Some(smallvec::smallvec![database_id]),
-        }
+        AuthenticatedIdentity::new_regular(
+            7,
+            "ingester",
+            TenantId::new(9),
+            AuthMethod::ApiKey,
+            Vec::new(),
+            Some(database_id),
+            DatabaseSet::Some(smallvec::smallvec![database_id]),
+        )
     }
 
     fn grant_write(permissions: &PermissionStore, collection: &str) {

@@ -49,32 +49,27 @@ pub fn make_state_with_catalog() -> Arc<SharedState> {
 
 /// Superuser identity for DDL tests.
 pub fn superuser() -> AuthenticatedIdentity {
-    AuthenticatedIdentity {
-        user_id: 0,
-        username: "nodedb".into(),
-        tenant_id: TenantId::new(0),
-        auth_method: AuthMethod::Trust,
-        roles: vec![Role::Superuser],
-        is_superuser: true,
-        default_database: None,
-        accessible_databases: DatabaseSet::All,
-    }
+    let store = nodedb::control::security::credential::store::CredentialStore::new()
+        .expect("create test credential store");
+    store
+        .bootstrap_superuser("nodedb", "test-only-password")
+        .expect("bootstrap test superuser");
+    store
+        .to_identity("nodedb", AuthMethod::Trust)
+        .expect("build catalog-authenticated test superuser")
 }
 
 /// Readonly identity for permission tests.
 pub fn readonly_user() -> AuthenticatedIdentity {
-    AuthenticatedIdentity {
-        user_id: 99,
-        username: "viewer".into(),
-        tenant_id: TenantId::new(1),
-        auth_method: AuthMethod::Trust,
-        roles: vec![Role::ReadOnly],
-        is_superuser: false,
-        default_database: None,
-        accessible_databases: DatabaseSet::Some(smallvec::smallvec![
-            nodedb_types::id::DatabaseId::DEFAULT
-        ]),
-    }
+    AuthenticatedIdentity::new_regular(
+        99,
+        "viewer",
+        TenantId::new(1),
+        AuthMethod::Trust,
+        vec![Role::ReadOnly],
+        None,
+        DatabaseSet::Some(smallvec::smallvec![nodedb_types::id::DatabaseId::DEFAULT,]),
+    )
 }
 
 /// Run DDL, expect success.
@@ -144,32 +139,28 @@ pub async fn assert_readonly_denied(state: &SharedState, sql: &str) {
 
 /// Cluster-admin identity (no implicit RLS bypass, no cross-DB data access).
 pub fn cluster_admin_user() -> AuthenticatedIdentity {
-    AuthenticatedIdentity {
-        user_id: 100,
-        username: "cluster_admin".into(),
-        tenant_id: nodedb::types::TenantId::new(1),
-        auth_method: AuthMethod::Trust,
-        roles: vec![Role::ClusterAdmin],
-        is_superuser: false,
-        default_database: None,
-        accessible_databases: DatabaseSet::Some(smallvec::smallvec![
-            nodedb_types::id::DatabaseId::DEFAULT
-        ]),
-    }
+    AuthenticatedIdentity::new_regular(
+        100,
+        "cluster_admin",
+        nodedb::types::TenantId::new(1),
+        AuthMethod::Trust,
+        vec![Role::ClusterAdmin],
+        None,
+        DatabaseSet::Some(smallvec::smallvec![nodedb_types::id::DatabaseId::DEFAULT,]),
+    )
 }
 
 /// Database-owner identity for `db_id`.
 pub fn database_owner_user(db_id: nodedb_types::id::DatabaseId) -> AuthenticatedIdentity {
-    AuthenticatedIdentity {
-        user_id: 101,
-        username: "db_owner".into(),
-        tenant_id: nodedb::types::TenantId::new(1),
-        auth_method: AuthMethod::Trust,
-        roles: vec![Role::DatabaseOwner(db_id)],
-        is_superuser: false,
-        default_database: None,
-        accessible_databases: DatabaseSet::Some(smallvec::smallvec![db_id]),
-    }
+    AuthenticatedIdentity::new_regular(
+        101,
+        "db_owner",
+        nodedb::types::TenantId::new(1),
+        AuthMethod::Trust,
+        vec![Role::DatabaseOwner(db_id)],
+        None,
+        DatabaseSet::Some(smallvec::smallvec![db_id]),
+    )
 }
 
 /// Assert that the audit log contains at least one entry with `event` and `db_id`.

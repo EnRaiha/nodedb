@@ -58,9 +58,14 @@ fn signed_jwt_fixture(roles: &[&str], is_superuser: bool) -> (String, String) {
         .collect::<Vec<_>>()
         .join(",");
     let header = encode(br#"{"alg":"RS256","kid":"oidc-role-boundary"}"#);
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("fixture clock must be after epoch")
+        .as_secs();
+    let expires_at = issued_at + 3_600;
     let payload = encode(
         format!(
-            r#"{{"iss":"https://catalog-idp.example/","aud":"nodedb-api","sub":"alice","tenant_id":999,"roles":[{roles}],"is_superuser":{is_superuser},"exp":9999999999,"user_id":42}}"#
+            r#"{{"iss":"https://catalog-idp.example/","aud":"nodedb-api","sub":"alice","tenant_id":999,"roles":[{roles}],"is_superuser":{is_superuser},"iat":{issued_at},"exp":{expires_at},"user_id":42}}"#
         )
         .as_bytes(),
     );

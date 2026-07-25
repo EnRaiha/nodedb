@@ -26,16 +26,15 @@ fn arb_auth_context() -> impl Strategy<Value = AuthContext> {
         proptest::collection::vec("[a-z]{3,8}".prop_map(String::from), 0..3), // groups
     )
         .prop_map(|(id, username, email, tid, roles, groups)| {
-            let identity = AuthenticatedIdentity {
-                user_id: 1,
-                username: username.clone(),
-                tenant_id: TenantId::new(tid),
-                auth_method: AuthMethod::Trust,
-                roles: vec![Role::ReadWrite],
-                is_superuser: false,
-                default_database: None,
-                accessible_databases: AuthenticatedIdentity::default_database_set(false),
-            };
+            let identity = AuthenticatedIdentity::new_regular(
+                1,
+                username.clone(),
+                TenantId::new(tid),
+                AuthMethod::Trust,
+                vec![Role::ReadWrite],
+                None,
+                AuthenticatedIdentity::default_database_set(false),
+            );
             let mut ctx = AuthContext::from_identity(&identity, "fuzz".into());
             ctx.id = id;
             ctx.username = username;

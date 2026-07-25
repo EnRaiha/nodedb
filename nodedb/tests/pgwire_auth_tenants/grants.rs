@@ -22,16 +22,15 @@ use nodedb::control::security::permission::tenant_target;
 use nodedb::types::TenantId;
 
 fn ops_user_in_tenant(tenant_id: u64) -> AuthenticatedIdentity {
-    AuthenticatedIdentity {
-        user_id: 200,
-        username: "ops_user".into(),
-        tenant_id: TenantId::new(tenant_id),
-        auth_method: AuthMethod::Trust,
-        roles: vec![Role::ReadOnly],
-        is_superuser: false,
-        default_database: None,
-        accessible_databases: AuthenticatedIdentity::default_database_set(false),
-    }
+    AuthenticatedIdentity::new_regular(
+        200,
+        "ops_user",
+        TenantId::new(tenant_id),
+        AuthMethod::Trust,
+        vec![Role::ReadOnly],
+        None,
+        AuthenticatedIdentity::default_database_set(false),
+    )
 }
 
 /// `GRANT BACKUP ON TENANT <name> TO <user>` stores a grant whose target
@@ -214,16 +213,15 @@ async fn check_tenant_without_grant_is_denied() {
 #[tokio::test]
 async fn grant_on_tenant_cross_tenant_requires_superuser() {
     let state = make_state();
-    let tenant_a_admin = AuthenticatedIdentity {
-        user_id: 300,
-        username: "ta".into(),
-        tenant_id: TenantId::new(1),
-        auth_method: AuthMethod::Trust,
-        roles: vec![Role::TenantAdmin],
-        is_superuser: false,
-        default_database: None,
-        accessible_databases: AuthenticatedIdentity::default_database_set(false),
-    };
+    let tenant_a_admin = AuthenticatedIdentity::new_regular(
+        300,
+        "ta",
+        TenantId::new(1),
+        AuthMethod::Trust,
+        vec![Role::TenantAdmin],
+        None,
+        AuthenticatedIdentity::default_database_set(false),
+    );
 
     let err = ddl_err(
         &state,

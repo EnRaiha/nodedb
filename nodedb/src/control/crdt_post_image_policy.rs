@@ -114,27 +114,26 @@ impl CrdtPostImagePolicy for ExternalCrdtPostImagePolicy<'_> {
 mod tests {
     use super::*;
     use crate::control::security::audit::NoopAuditEmitter;
-    use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, Role};
+    use crate::control::security::identity::{AuthenticatedIdentity, Role};
     use crate::control::security::predicate::{
         CompareOp, PolicyMode, PredicateValue, RlsPredicate,
     };
     use crate::control::security::rls::{PolicyType, RlsPolicy};
 
     fn identity(superuser: bool) -> AuthenticatedIdentity {
-        AuthenticatedIdentity {
-            user_id: 42,
-            username: "alice".into(),
-            tenant_id: TenantId::new(1),
-            auth_method: AuthMethod::ApiKey,
-            roles: if superuser {
+        AuthenticatedIdentity::new_internal_service(
+            42,
+            "alice",
+            TenantId::new(1),
+            if superuser {
                 vec![Role::Superuser]
             } else {
                 vec![Role::ReadWrite]
             },
-            is_superuser: superuser,
-            default_database: None,
-            accessible_databases: AuthenticatedIdentity::default_database_set(superuser),
-        }
+            superuser,
+            None,
+            AuthenticatedIdentity::default_database_set(superuser),
+        )
     }
 
     fn store_with(predicate: Option<RlsPredicate>) -> RlsPolicyStore {

@@ -318,16 +318,18 @@ impl CredentialStore {
     pub fn to_identity(&self, username: &str, method: AuthMethod) -> Option<AuthenticatedIdentity> {
         self.get_user(username).map(|record| {
             let is_su = record.is_superuser;
-            AuthenticatedIdentity {
-                user_id: record.user_id,
-                username: record.username,
-                tenant_id: record.tenant_id,
-                auth_method: method,
-                roles: record.roles,
-                is_superuser: is_su,
-                default_database: None,
-                accessible_databases: AuthenticatedIdentity::default_database_set(is_su),
-            }
+            AuthenticatedIdentity::from_catalog_principal(
+                crate::control::security::identity::CatalogPrincipal {
+                    user_id: record.user_id,
+                    username: record.username,
+                    tenant_id: record.tenant_id,
+                    auth_method: method,
+                    roles: record.roles,
+                    is_superuser: is_su,
+                    default_database: None,
+                    accessible_databases: AuthenticatedIdentity::default_database_set(is_su),
+                },
+            )
         })
     }
 }

@@ -258,32 +258,24 @@ fn parse_hour(s: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
     fn test_auth() -> AuthContext {
-        AuthContext {
-            id: "42".into(),
-            username: "alice".into(),
-            email: None,
-            tenant_id: crate::types::TenantId::new(1),
-            org_id: None,
-            org_ids: Vec::new(),
-            roles: vec!["readwrite".into()],
-            groups: Vec::new(),
-            permissions: Vec::new(),
-            status: super::super::auth_context::AuthStatus::Active,
-            metadata: HashMap::new(),
-            auth_method: super::super::identity::AuthMethod::ApiKey,
-            auth_time: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            ),
-            session_id: "test".into(),
-            on_deny_override: None,
-            database_id: None,
-        }
+        let identity = super::super::identity::AuthenticatedIdentity::new_regular(
+            42,
+            "alice",
+            crate::types::TenantId::new(1),
+            super::super::identity::AuthMethod::ApiKey,
+            vec![super::super::identity::Role::ReadWrite],
+            None,
+            super::super::identity::AuthenticatedIdentity::default_database_set(false),
+        );
+        let mut auth = AuthContext::from_identity(&identity, "test".into());
+        auth.auth_time = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+        auth
     }
 
     #[test]

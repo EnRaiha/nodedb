@@ -59,7 +59,7 @@ slow-timeout = { period = "30s", terminate-after = 6 }
 # The crash-recovery label test is included because its child server otherwise
 # competes with the same in-process graph fan-out during the full suite.
 [[profile.default.overrides]]
-filter = 'binary(graph_cross_core_bfs) | test(query_stream_returns_all_rows_across_chunks) | test(streaming_select_returns_all_rows_across_chunks) | test(graph_node_labels_survive_kill_9) | test(wal_replay_restart_keeps_governor_accounting_sane) | test(alter_add_column_does_not_stall_writes) | test(reindex_vector_concurrent_p99) | test(count_star_sees_flushed_partitions) | test(timeseries_flush_does_not_over_release_engine_budget) | test(timeseries_governor_reflects_resident_memtable_after_flush)'
+filter = 'binary(graph_cross_core_bfs) | test(query_stream_returns_all_rows_across_chunks) | test(streaming_select_returns_all_rows_across_chunks) | test(graph_node_labels_survive_kill_9) | test(spatial_document_geometry_survives_kill_9) | test(wal_replay_restart_keeps_governor_accounting_sane) | test(alter_add_column_does_not_stall_writes) | test(reindex_vector_concurrent_p99) | test(count_star_sees_flushed_partitions) | test(timeseries_flush_does_not_over_release_engine_budget) | test(timeseries_governor_reflects_resident_memtable_after_flush)'
 test-group = 'load-sensitive'
 threads-required = 'num-test-threads'
 

@@ -7,8 +7,8 @@
 //!
 //! - HS256 (HMAC-SHA256) for shared-secret deployments
 //! - RS256 (RSA-SHA256) for public-key deployments
-//! - Token expiration (`exp` claim)
-//! - Tenant isolation (`tenant_id` claim)
+//! - Required, bounded token lifetime (`iat` + `exp` claims)
+//! - Tenant isolation (server-owned provider binding)
 //! - Role mapping (`roles` claim → NodeDB roles)
 //!
 //! The JWT secret/public key is configured per cluster. Tokens are
@@ -21,11 +21,31 @@ use tracing::debug;
 use crate::control::security::util::base64_url_decode;
 use crate::types::TenantId;
 
-use super::identity::{AuthMethod, AuthenticatedIdentity, Role, roles_from_external_claims};
+use super::identity::{
+    AuthenticatedIdentity, ExternalClaims, ExternalProviderBinding, identity_from_external_claims,
+};
+
+/// Signature algorithm pinned by a static JWT provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JwtAlgorithm {
+    Hs256,
+    Rs256,
+}
+
+impl JwtAlgorithm {
+    fn header_name(self) -> &'static str {
+        match self {
+            Self::Hs256 => "HS256",
+            Self::Rs256 => "RS256",
+        }
+    }
+}
 
 /// JWT validation configuration.
 #[derive(Debug, Clone)]
 pub struct JwtConfig {
+    /// The one accepted algorithm for this provider. Required when enabled.
+    pub algorithm: Option<JwtAlgorithm>,
     /// HMAC secret for HS256 verification (raw bytes).
     /// If empty, HS256 is disabled.
     pub hmac_secret: Vec<u8>,
@@ -38,16 +58,24 @@ pub struct JwtConfig {
     pub expected_audience: String,
     /// Clock skew tolerance in seconds for `exp`/`nbf` validation.
     pub clock_skew_seconds: u64,
+    /// Server-owned tenant binding for this static JWT provider.
+    /// Tokens are rejected when this is absent; `claims.tenant_id` is never authoritative.
+    pub tenant_id: Option<u64>,
+    /// Maximum accepted `exp - iat` lifetime in seconds.
+    pub max_token_lifetime_seconds: u64,
 }
 
 impl Default for JwtConfig {
     fn default() -> Self {
         Self {
+            algorithm: None,
             hmac_secret: Vec::new(),
             rsa_public_key_der: Vec::new(),
             expected_issuer: String::new(),
             expected_audience: String::new(),
             clock_skew_seconds: 60,
+            tenant_id: None,
+            max_token_lifetime_seconds: 86_400,
         }
     }
 }
@@ -64,7 +92,7 @@ struct JwtHeader {
 pub struct JwtClaims {
     /// Subject: typically user_id or username.
     pub sub: String,
-    /// Tenant ID.
+    /// Legacy tenant assertion. Parsed but never authoritative.
     #[serde(default)]
     pub tenant_id: u64,
     /// Roles as string array.
@@ -97,9 +125,9 @@ pub struct JwtClaims {
     /// Extended claims not covered by the standard fields above.
     ///
     /// Captures provider-specific claims (email, org_id, groups, permissions,
-    /// status, metadata) that `AuthContext::from_jwt()` maps to session
-    /// variables. Different providers use different claim names — the
-    /// `[auth.jwt.claims]` config section remaps them.
+    /// status, metadata) that verified JWT context construction maps to
+    /// session variables. Different providers use different claim names — the
+    /// `[auth.jwt.claims]` config section remaps them after verification.
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
@@ -142,8 +170,12 @@ impl JwtValidator {
         let signing_input = format!("{}.{}", parts[0], parts[1]);
         let signature_bytes = base64_url_decode(parts[2]).ok_or(JwtError::DecodingError)?;
 
-        match header.alg.as_str() {
-            "HS256" => {
+        let algorithm = self.config.algorithm.ok_or(JwtError::UnboundAlgorithm)?;
+        if header.alg != algorithm.header_name() {
+            return Err(JwtError::UnsupportedAlgorithm);
+        }
+        match algorithm {
+            JwtAlgorithm::Hs256 => {
                 if self.config.hmac_secret.is_empty() {
                     return Err(JwtError::UnsupportedAlgorithm);
                 }
@@ -155,7 +187,7 @@ impl JwtValidator {
                     return Err(JwtError::InvalidSignature);
                 }
             }
-            "RS256" => {
+            JwtAlgorithm::Rs256 => {
                 if self.config.rsa_public_key_der.is_empty() {
                     return Err(JwtError::UnsupportedAlgorithm);
                 }
@@ -167,7 +199,6 @@ impl JwtValidator {
                     return Err(JwtError::InvalidSignature);
                 }
             }
-            _ => return Err(JwtError::UnsupportedAlgorithm),
         }
 
         // Check expiration.
@@ -176,12 +207,12 @@ impl JwtValidator {
             .unwrap_or_default()
             .as_secs();
 
-        if claims.exp > 0 && now > claims.exp + self.config.clock_skew_seconds {
-            return Err(JwtError::Expired);
-        }
-        if claims.nbf > 0 && now + self.config.clock_skew_seconds < claims.nbf {
-            return Err(JwtError::NotYetValid);
-        }
+        validate_time_claims(
+            &claims,
+            now,
+            self.config.clock_skew_seconds,
+            self.config.max_token_lifetime_seconds,
+        )?;
 
         // Validate issuer.
         if !self.config.expected_issuer.is_empty() && claims.iss != self.config.expected_issuer {
@@ -194,39 +225,63 @@ impl JwtValidator {
             return Err(JwtError::InvalidAudience);
         }
 
-        // External tokens may supply ordinary roles, but NodeDB owns the
-        // non-assertable superuser privilege boundary.
-        let roles: Vec<Role> = roles_from_external_claims(&claims.roles, claims.is_superuser);
-
-        let username = if claims.sub.is_empty() {
-            format!("jwt_user_{}", claims.user_id)
-        } else {
-            claims.sub.clone()
-        };
+        let tenant_id = self.config.tenant_id.ok_or(JwtError::UnboundProvider)?;
+        let identity = identity_from_external_claims(
+            ExternalClaims {
+                user_id: claims.user_id,
+                subject: &claims.sub,
+                role_names: &claims.roles,
+                asserted_superuser: claims.is_superuser,
+            },
+            ExternalProviderBinding::default_database(TenantId::new(tenant_id)),
+        );
 
         debug!(
-            username = %username,
-            tenant_id = claims.tenant_id,
-            roles = ?roles,
+            username = %identity.username,
+            tenant_id,
+            roles = ?identity.roles,
             "JWT validated"
         );
 
-        Ok(AuthenticatedIdentity {
-            user_id: claims.user_id,
-            username,
-            tenant_id: TenantId::new(claims.tenant_id),
-            auth_method: AuthMethod::OidcBearer,
-            roles,
-            is_superuser: false,
-            default_database: None,
-            accessible_databases: AuthenticatedIdentity::default_database_set(false),
-        })
+        Ok(identity)
     }
 
     /// Check if JWT authentication is configured (has a secret or public key).
     pub fn is_configured(&self) -> bool {
-        !self.config.hmac_secret.is_empty() || !self.config.rsa_public_key_der.is_empty()
+        self.config.algorithm.is_some()
+            && self.config.tenant_id.is_some()
+            && (!self.config.hmac_secret.is_empty() || !self.config.rsa_public_key_der.is_empty())
     }
+}
+
+pub(crate) fn validate_time_claims(
+    claims: &JwtClaims,
+    now: u64,
+    clock_skew_seconds: u64,
+    max_token_lifetime_seconds: u64,
+) -> Result<(), JwtError> {
+    if claims.exp == 0 {
+        return Err(JwtError::MissingExpiration);
+    }
+    if claims.iat == 0 {
+        return Err(JwtError::MissingIssuedAt);
+    }
+    if claims.exp < claims.iat {
+        return Err(JwtError::InvalidIssuedAt);
+    }
+    if claims.exp.saturating_sub(claims.iat) > max_token_lifetime_seconds {
+        return Err(JwtError::TokenLifetimeExceeded);
+    }
+    if now > claims.exp.saturating_add(clock_skew_seconds) {
+        return Err(JwtError::Expired);
+    }
+    if claims.iat > now.saturating_add(clock_skew_seconds) {
+        return Err(JwtError::InvalidIssuedAt);
+    }
+    if claims.nbf > 0 && now.saturating_add(clock_skew_seconds) < claims.nbf {
+        return Err(JwtError::NotYetValid);
+    }
+    Ok(())
 }
 
 /// JWT validation errors.
@@ -246,6 +301,18 @@ pub enum JwtError {
     InvalidIssuer,
     #[error("JWT audience mismatch")]
     InvalidAudience,
+    #[error("JWT provider has no server-side tenant binding")]
+    UnboundProvider,
+    #[error("JWT provider has no pinned signature algorithm")]
+    UnboundAlgorithm,
+    #[error("JWT token is missing exp")]
+    MissingExpiration,
+    #[error("JWT token is missing iat")]
+    MissingIssuedAt,
+    #[error("JWT iat/exp claims are inconsistent")]
+    InvalidIssuedAt,
+    #[error("JWT token lifetime exceeds provider maximum")]
+    TokenLifetimeExceeded,
     #[error("JWT base64 decoding error")]
     DecodingError,
     #[error("JWT algorithm not supported or not configured")]
@@ -311,6 +378,7 @@ pub fn load_rsa_public_key_pem(pem_path: &std::path::Path) -> Result<Vec<u8>, Jw
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::security::identity::Role;
 
     #[test]
     fn decode_claims() {
@@ -372,7 +440,10 @@ mod tests {
             base64_url_encode(&signature.to_bytes())
         );
         let validator = JwtValidator::new(JwtConfig {
+            algorithm: Some(JwtAlgorithm::Rs256),
             rsa_public_key_der: pub_der,
+            tenant_id: Some(2),
+            max_token_lifetime_seconds: u64::MAX,
             ..Default::default()
         });
         validator.validate(&token).unwrap()
@@ -381,10 +452,10 @@ mod tests {
     #[test]
     fn externally_asserted_superuser_flag_does_not_grant_superuser() {
         let identity = validate_rs256_payload(
-            r#"{"sub":"alice","tenant_id":2,"roles":["readwrite"],"is_superuser":true,"exp":9999999999,"user_id":99}"#,
+            r#"{"sub":"alice","tenant_id":999,"roles":["readwrite"],"is_superuser":true,"iat":1,"exp":9999999999,"user_id":99}"#,
         );
 
-        assert!(!identity.is_superuser);
+        assert!(!identity.is_superuser());
         assert!(!identity.roles.contains(&Role::Superuser));
         assert!(identity.roles.contains(&Role::ReadWrite));
         assert!(!identity.can_access_database(nodedb_types::id::DatabaseId::new(9_999)));
@@ -393,10 +464,10 @@ mod tests {
     #[test]
     fn externally_asserted_superuser_role_does_not_grant_superuser() {
         let identity = validate_rs256_payload(
-            r#"{"sub":"alice","tenant_id":2,"roles":["superuser","readonly"],"is_superuser":false,"exp":9999999999,"user_id":99}"#,
+            r#"{"sub":"alice","tenant_id":999,"roles":["superuser","readonly"],"is_superuser":false,"iat":1,"exp":9999999999,"user_id":99}"#,
         );
 
-        assert!(!identity.is_superuser);
+        assert!(!identity.is_superuser());
         assert!(!identity.roles.contains(&Role::Superuser));
         assert!(identity.roles.contains(&Role::ReadOnly));
     }
@@ -419,8 +490,7 @@ mod tests {
 
         // Build JWT manually.
         let header = base64_url_encode(br#"{"alg":"RS256","typ":"JWT"}"#);
-        let payload_json =
-            r#"{"sub":"bob","tenant_id":2,"roles":["admin"],"exp":9999999999,"user_id":99}"#;
+        let payload_json = r#"{"sub":"bob","tenant_id":999,"roles":["admin"],"iat":1,"exp":9999999999,"user_id":99}"#;
         let payload = base64_url_encode(payload_json.as_bytes());
         let signing_input = format!("{header}.{payload}");
 
@@ -433,7 +503,10 @@ mod tests {
 
         // Validate.
         let config = JwtConfig {
+            algorithm: Some(JwtAlgorithm::Rs256),
             rsa_public_key_der: pub_der,
+            tenant_id: Some(2),
+            max_token_lifetime_seconds: u64::MAX,
             ..Default::default()
         };
         let validator = JwtValidator::new(config);
@@ -470,7 +543,10 @@ mod tests {
 
         // Verify with key2 — should fail.
         let config = JwtConfig {
+            algorithm: Some(JwtAlgorithm::Rs256),
             rsa_public_key_der: pub2_der,
+            tenant_id: Some(1),
+            max_token_lifetime_seconds: u64::MAX,
             ..Default::default()
         };
         let validator = JwtValidator::new(config);
@@ -480,6 +556,47 @@ mod tests {
         );
     }
 
+    fn time_claims(iat: u64, exp: u64) -> JwtClaims {
+        JwtClaims {
+            sub: "alice".into(),
+            tenant_id: 999,
+            roles: Vec::new(),
+            exp,
+            nbf: 0,
+            iat,
+            iss: String::new(),
+            aud: String::new(),
+            user_id: 1,
+            is_superuser: false,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn time_claims_require_exp_iat_and_bounded_lifetime() {
+        assert_eq!(
+            validate_time_claims(&time_claims(10, 0), 10, 0, 100),
+            Err(JwtError::MissingExpiration)
+        );
+        assert_eq!(
+            validate_time_claims(&time_claims(0, 20), 10, 0, 100),
+            Err(JwtError::MissingIssuedAt)
+        );
+        assert_eq!(
+            validate_time_claims(&time_claims(20, 10), 10, 0, 100),
+            Err(JwtError::InvalidIssuedAt)
+        );
+        assert_eq!(
+            validate_time_claims(&time_claims(10, 111), 10, 0, 100),
+            Err(JwtError::TokenLifetimeExceeded)
+        );
+        assert_eq!(
+            validate_time_claims(&time_claims(20, 30), 10, 0, 100),
+            Err(JwtError::InvalidIssuedAt)
+        );
+        assert!(validate_time_claims(&time_claims(10, 30), 20, 0, 100).is_ok());
+    }
+
     #[test]
     fn unsupported_algorithm_rejected() {
         let header = base64_url_encode(br#"{"alg":"ES256"}"#);
@@ -487,7 +604,55 @@ mod tests {
         let sig = base64_url_encode(b"fakesig");
         let token = format!("{header}.{payload}.{sig}");
 
-        let validator = JwtValidator::new(JwtConfig::default());
+        let validator = JwtValidator::new(JwtConfig {
+            algorithm: Some(JwtAlgorithm::Rs256),
+            tenant_id: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(
+            validator.validate(&token).err(),
+            Some(JwtError::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn configured_algorithm_cannot_be_overridden_by_header() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let secret = b"shared-secret";
+        let header = base64_url_encode(br#"{"alg":"HS256"}"#);
+        let payload = base64_url_encode(br#"{"sub":"x","iat":1,"exp":2}"#);
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("valid HMAC fixture key");
+        mac.update(signing_input.as_bytes());
+        let token = format!(
+            "{signing_input}.{}",
+            base64_url_encode(&mac.finalize().into_bytes())
+        );
+        let validator = JwtValidator::new(JwtConfig {
+            algorithm: Some(JwtAlgorithm::Rs256),
+            hmac_secret: secret.to_vec(),
+            rsa_public_key_der: vec![1],
+            tenant_id: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(
+            validator.validate(&token).err(),
+            Some(JwtError::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
+    fn none_algorithm_rejected() {
+        let header = base64_url_encode(br#"{"alg":"none"}"#);
+        let payload = base64_url_encode(br#"{"sub":"x","iat":1,"exp":2}"#);
+        let token = format!("{header}.{payload}.");
+        let validator = JwtValidator::new(JwtConfig {
+            algorithm: Some(JwtAlgorithm::Rs256),
+            tenant_id: Some(1),
+            ..Default::default()
+        });
         assert_eq!(
             validator.validate(&token).err(),
             Some(JwtError::UnsupportedAlgorithm)

@@ -13,7 +13,7 @@ use crate::control::planner::procedural::executor::core::{
     CrossShardOrigin, MAX_CASCADE_DEPTH, StatementExecutor,
 };
 use crate::control::security::catalog::trigger_types::{StoredTrigger, TriggerSecurity};
-use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, Role};
+use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
@@ -146,16 +146,15 @@ pub(crate) fn resolve_trigger_identity(
         TriggerSecurity::Definer => {
             // Create a synthetic identity for the trigger owner.
             // The owner is a superuser within the trigger's tenant scope.
-            AuthenticatedIdentity {
-                user_id: 0, // System-generated; not a real user ID
-                username: trigger.owner.clone(),
+            AuthenticatedIdentity::new_internal_service(
+                0,
+                trigger.owner.clone(),
                 tenant_id,
-                auth_method: AuthMethod::Trust,
-                roles: vec![Role::TenantAdmin],
-                is_superuser: true,
-                default_database: None,
-                accessible_databases: crate::control::security::identity::DatabaseSet::All,
-            }
+                vec![Role::TenantAdmin],
+                true,
+                None,
+                crate::control::security::identity::DatabaseSet::All,
+            )
         }
     }
 }

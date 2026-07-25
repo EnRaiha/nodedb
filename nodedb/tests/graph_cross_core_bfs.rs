@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 use common::pgwire_harness::TestServer;
 use nodedb::control::gateway::core::QueryContext;
 use nodedb::control::security::audit::NoopAuditEmitter;
-use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity};
 use nodedb::control::server::broadcast::broadcast_call_count;
 use nodedb::control::server::shared::authorization::authorize_task_set;
 use nodedb::types::{DatabaseId, TenantId, TraceId, VShardId};
@@ -49,16 +48,7 @@ async fn seed_star(server: &TestServer, collection: &str, leaf_prefix: &str, cou
         post_set_op: PostSetOp::None,
         txn_id: None,
     };
-    let identity = AuthenticatedIdentity {
-        user_id: 0,
-        username: "graph-bfs-test".into(),
-        tenant_id,
-        auth_method: AuthMethod::Trust,
-        roles: Vec::new(),
-        is_superuser: true,
-        default_database: None,
-        accessible_databases: AuthenticatedIdentity::default_database_set(true),
-    };
+    let identity = nodedb_test_support::pgwire_auth_helpers::superuser();
     let authorized = authorize_task_set(
         &identity,
         std::slice::from_ref(&task),

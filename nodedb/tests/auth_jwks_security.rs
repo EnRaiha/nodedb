@@ -95,9 +95,14 @@ fn signed_jwt_fixture(issuer: &str, audience: &str, claimed_tenant_id: u64) -> (
         b64(&public_key.e().to_bytes_be()),
     );
     let header = b64(br#"{"alg":"RS256","kid":"tenant-binding"}"#);
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("fixture clock must be after epoch")
+        .as_secs();
+    let expires_at = issued_at + 3_600;
     let payload = b64(
         format!(
-            r#"{{"iss":"{issuer}","aud":"{audience}","sub":"alice","tenant_id":{claimed_tenant_id},"roles":["readwrite"],"exp":9999999999,"user_id":42}}"#
+            r#"{{"iss":"{issuer}","aud":"{audience}","sub":"alice","tenant_id":{claimed_tenant_id},"roles":["readwrite"],"iat":{issued_at},"exp":{expires_at},"user_id":42}}"#
         )
         .as_bytes(),
     );

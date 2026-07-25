@@ -388,19 +388,19 @@ mod tests {
 
     fn authenticate(session: &mut SyncSession) {
         session.authenticated = true;
-        session.identity = Some(crate::control::security::identity::AuthenticatedIdentity {
-            user_id: 1,
-            username: "test".into(),
-            tenant_id: TenantId::new(1),
-            auth_method: crate::control::security::identity::AuthMethod::ApiKey,
-            roles: Vec::new(),
-            is_superuser: false,
-            default_database: None,
-            accessible_databases:
+        session.identity = Some(
+            crate::control::security::identity::AuthenticatedIdentity::new_regular(
+                1,
+                "test",
+                TenantId::new(1),
+                crate::control::security::identity::AuthMethod::ApiKey,
+                Vec::new(),
+                None,
                 crate::control::security::identity::AuthenticatedIdentity::default_database_set(
                     false,
                 ),
-        });
+            ),
+        );
     }
 
     /// Build a minimal `TimeseriesPushMsg` with valid Gorilla-encoded blocks
@@ -474,10 +474,15 @@ mod tests {
         authenticate(&mut session);
         let database_id = DatabaseId::new(8);
         let identity = session.identity.as_mut().expect("authenticated identity");
-        identity.default_database = Some(database_id);
-        identity.is_superuser = true;
-        identity.accessible_databases =
-            crate::control::security::identity::AuthenticatedIdentity::default_database_set(true);
+        *identity = crate::control::security::identity::AuthenticatedIdentity::new_regular(
+            1,
+            "test",
+            TenantId::new(1),
+            crate::control::security::identity::AuthMethod::ApiKey,
+            Vec::new(),
+            Some(database_id),
+            crate::control::security::identity::DatabaseSet::Some(smallvec::smallvec![database_id]),
+        );
         let (mut mock, calls) = MockDispatcher::ok();
         mock.database_id = database_id;
         let msg = make_push_msg("metrics");

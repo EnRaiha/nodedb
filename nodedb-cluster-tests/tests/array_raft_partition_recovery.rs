@@ -21,7 +21,6 @@ use nodedb_array::sync::op::{ArrayOp, ArrayOpHeader, ArrayOpKind};
 use nodedb_array::sync::op_codec;
 use nodedb_array::types::cell_value::value::CellValue;
 use nodedb_array::types::coord::value::CoordValue;
-use nodedb_types::TenantId;
 use nodedb_types::sync::wire::array::ArrayDeltaMsg;
 
 use common::array_sync::{hlc, register_schema_on_all};
@@ -70,19 +69,7 @@ fn make_inbound(shared: &Arc<SharedState>) -> OriginArrayInbound {
         engine,
         Arc::clone(&shared.array_sync_schemas),
         Arc::clone(shared),
-        nodedb::control::security::identity::AuthenticatedIdentity {
-            user_id: 0,
-            username: "array-sync-test".into(),
-            tenant_id: TenantId::new(0),
-            auth_method: nodedb::control::security::identity::AuthMethod::Trust,
-            roles: Vec::new(),
-            is_superuser: true,
-            default_database: None,
-            accessible_databases:
-                nodedb::control::security::identity::AuthenticatedIdentity::default_database_set(
-                    true,
-                ),
-        },
+        nodedb_test_support::pgwire_auth_helpers::superuser(),
     )
 }
 

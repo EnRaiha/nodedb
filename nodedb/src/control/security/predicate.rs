@@ -211,18 +211,17 @@ mod tests {
     use crate::types::TenantId;
 
     fn make_auth() -> AuthContext {
-        let identity = AuthenticatedIdentity {
-            user_id: 123,
-            username: "alice".into(),
-            tenant_id: TenantId::new(1),
-            roles: vec![Role::ReadWrite],
-            auth_method: AuthMethod::ApiKey,
-            is_superuser: false,
-            default_database: None,
-            accessible_databases: crate::control::security::identity::DatabaseSet::Some(
-                smallvec::smallvec![nodedb_types::id::DatabaseId::DEFAULT],
-            ),
-        };
+        let identity = AuthenticatedIdentity::new_regular(
+            123,
+            "alice",
+            TenantId::new(1),
+            AuthMethod::ApiKey,
+            vec![Role::ReadWrite],
+            None,
+            crate::control::security::identity::DatabaseSet::Some(smallvec::smallvec![
+                nodedb_types::id::DatabaseId::DEFAULT,
+            ]),
+        );
         AuthContext::from_identity(&identity, "test-session".into())
     }
 

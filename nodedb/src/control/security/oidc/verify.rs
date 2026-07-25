@@ -16,7 +16,7 @@ use tracing::debug;
 use crate::control::security::catalog::StoredOidcProvider;
 use crate::control::security::identity::database_set::DatabaseSet;
 use crate::control::security::identity::{
-    AuthMethod, AuthenticatedIdentity, Role, roles_from_external_claims,
+    AuthenticatedIdentity, ExternalClaims, ExternalProviderBinding, identity_from_external_claims,
 };
 use crate::control::security::jwt::JwtError;
 use crate::control::security::util::base64_url_decode;
@@ -67,13 +67,14 @@ pub async fn verify_bearer_token(
         .jwks_registry
         .as_ref()
         .ok_or_else(|| jwt_error_to_crate_error(JwtError::UnsupportedAlgorithm))?;
-    let verified_claims = jwks
+    let verified = jwks
         .validate_with_catalog_provider(&provider.provider_name, &provider.jwks_uri, token)
         .await
         .map_err(jwt_error_to_crate_error)?;
+    let verified_claims = verified.claims();
 
     // 4. Re-check the verified claims against the provider selected above.
-    validate_selected_provider_claims(&provider, &verified_claims)
+    validate_selected_provider_claims(&provider, verified_claims)
         .map_err(jwt_error_to_crate_error)?;
 
     // Legacy records without a tenant binding must not reveal catalog metadata
@@ -94,7 +95,7 @@ pub async fn verify_bearer_token(
     }
 
     // 5. Apply claim mapping.
-    let mapping = apply_claim_mapping(&verified_claims, &provider.claim_mapping);
+    let mapping = apply_claim_mapping(verified_claims, &provider.claim_mapping);
 
     // Build the accessible-database set. The default database MUST be set
     // by a matching claim-mapping rule — there is no silent fallback to
@@ -116,16 +117,6 @@ pub async fn verify_bearer_token(
         }
     }
 
-    // Claim-mapping conditions depend on external assertions, so their
-    // resulting roles remain below NodeDB's database-owned superuser ceiling.
-    let roles: Vec<Role> = roles_from_external_claims(&mapping.roles, false);
-
-    let username = if verified_claims.sub.is_empty() {
-        format!("oidc_{}", verified_claims.user_id)
-    } else {
-        verified_claims.sub.clone()
-    };
-
     debug!(
         provider = %provider.provider_name,
         sub = %verified_claims.sub,
@@ -134,19 +125,19 @@ pub async fn verify_bearer_token(
         "OIDC login succeeded"
     );
 
-    Ok(AuthenticatedIdentity {
-        // Use a sentinel range for OIDC ephemeral identities to avoid colliding
-        // with trust-mode user_id == 0 checks. The real user record, if any,
-        // is identified by the `sub` claim's username.
-        user_id: verified_claims.user_id,
-        username,
-        tenant_id: TenantId::new(tenant_id),
-        auth_method: AuthMethod::OidcBearer,
-        roles,
-        is_superuser: false,
-        default_database: Some(default_db),
-        accessible_databases: DatabaseSet::Some(accessible),
-    })
+    Ok(identity_from_external_claims(
+        ExternalClaims {
+            user_id: verified_claims.user_id,
+            subject: &verified_claims.sub,
+            role_names: &mapping.roles,
+            asserted_superuser: false,
+        },
+        ExternalProviderBinding::mapped_databases(
+            TenantId::new(tenant_id),
+            default_db,
+            DatabaseSet::Some(accessible),
+        ),
+    ))
 }
 
 /// Select one catalog provider for the token's unverified issuer and audience.

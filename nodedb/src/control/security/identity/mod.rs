@@ -24,9 +24,12 @@ pub mod permission;
 pub mod plan_permission;
 pub mod role;
 
+pub(crate) use authenticated::CatalogPrincipal;
 pub use authenticated::{AuthMethod, AuthenticatedIdentity};
 pub use database_set::DatabaseSet;
-pub use external_authority::roles_from_external_claims;
+pub(crate) use external_authority::{
+    ExternalClaims, ExternalProviderBinding, identity_from_external_claims,
+};
 pub use permission::{Permission, PermissionTarget, role_grants_permission};
 pub use plan_permission::required_permission;
 pub use role::Role;

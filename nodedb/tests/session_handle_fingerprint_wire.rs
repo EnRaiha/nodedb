@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use nodedb::control::security::audit::AuditEvent;
 use nodedb::control::security::auth_context::{AuthContext, generate_session_id};
-use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity, Role};
 use nodedb::control::security::session_handle::ClientFingerprint;
 use nodedb::types::TenantId;
 
@@ -34,16 +33,7 @@ use common::pgwire_harness::TestServer;
 fn nodedb_auth_ctx() -> AuthContext {
     // Matches the harness-provisioned `nodedb` superuser (tenant 1) so the
     // resolver can hand back a context the query path will accept.
-    let identity = AuthenticatedIdentity {
-        user_id: 1,
-        username: "nodedb".into(),
-        tenant_id: TenantId::new(1),
-        auth_method: AuthMethod::Trust,
-        roles: vec![Role::Superuser],
-        is_superuser: true,
-        default_database: None,
-        accessible_databases: AuthenticatedIdentity::default_database_set(true),
-    };
+    let identity = nodedb_test_support::pgwire_auth_helpers::superuser();
     AuthContext::from_identity(&identity, generate_session_id())
 }
 

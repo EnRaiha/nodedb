@@ -51,16 +51,15 @@ async fn grant_superuser_requires_superuser() {
     let su = superuser();
     ddl_ok(&state, &su, "CREATE USER ivan WITH PASSWORD 'pass'").await;
 
-    let admin = AuthenticatedIdentity {
-        user_id: 50,
-        username: "ta".into(),
-        tenant_id: TenantId::new(1),
-        auth_method: AuthMethod::Trust,
-        roles: vec![Role::TenantAdmin],
-        is_superuser: false,
-        default_database: None,
-        accessible_databases: AuthenticatedIdentity::default_database_set(false),
-    };
+    let admin = AuthenticatedIdentity::new_regular(
+        50,
+        "ta",
+        TenantId::new(1),
+        AuthMethod::Trust,
+        vec![Role::TenantAdmin],
+        None,
+        AuthenticatedIdentity::default_database_set(false),
+    );
     let err = ddl_err(&state, &admin, "GRANT ROLE superuser TO ivan").await;
     assert!(err.contains("only superuser"), "{err}");
 }

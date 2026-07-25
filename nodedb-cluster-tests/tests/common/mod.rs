@@ -19,20 +19,10 @@ pub fn authorize_gateway_plan(
     plan: nodedb_physical::physical_plan::PhysicalPlan,
 ) -> nodedb::control::server::shared::authorization::AuthorizedTask {
     use nodedb::control::security::audit::NoopAuditEmitter;
-    use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity};
     use nodedb::control::server::shared::authorization::authorize_task_set;
     use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-    let identity = AuthenticatedIdentity {
-        user_id: 0,
-        username: "cluster-gateway-test".into(),
-        tenant_id: ctx.tenant_id,
-        auth_method: AuthMethod::Trust,
-        roles: Vec::new(),
-        is_superuser: true,
-        default_database: Some(ctx.database_id),
-        accessible_databases: AuthenticatedIdentity::default_database_set(true),
-    };
+    let identity = nodedb_test_support::pgwire_auth_helpers::superuser();
     let task = PhysicalTask {
         tenant_id: ctx.tenant_id,
         vshard_id: nodedb::types::VShardId::new(0),

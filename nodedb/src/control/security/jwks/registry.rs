@@ -18,9 +18,9 @@ use tracing::{debug, warn};
 
 use crate::config::auth::{JwtAuthConfig, JwtProviderConfig};
 use crate::control::security::identity::{
-    AuthMethod, AuthenticatedIdentity, roles_from_external_claims,
+    AuthenticatedIdentity, ExternalClaims, ExternalProviderBinding, identity_from_external_claims,
 };
-use crate::control::security::jwt::{JwtClaims, JwtError};
+use crate::control::security::jwt::{JwtClaims, JwtError, validate_time_claims};
 use crate::control::security::util::base64_url_decode;
 use crate::types::TenantId;
 
@@ -50,6 +50,15 @@ struct DecodedToken<'a> {
     parts: [&'a str; 3],
     header: JwtHeader,
     claims: JwtClaims,
+}
+
+/// Opaque proof that claims passed JWKS signature, route, and time validation.
+pub struct VerifiedJwtClaims(JwtClaims);
+
+impl VerifiedJwtClaims {
+    pub(crate) fn claims(&self) -> &JwtClaims {
+        &self.0
+    }
 }
 
 impl JwksRegistry {
@@ -126,6 +135,16 @@ impl JwksRegistry {
     /// 5. Validate `iss`, `aud` against the matched provider.
     /// 6. Build and return an `AuthenticatedIdentity` bound to that provider's tenant.
     pub async fn validate(&self, token: &str) -> Result<AuthenticatedIdentity, JwtError> {
+        self.validate_with_claims(token)
+            .await
+            .map(|(identity, _)| identity)
+    }
+
+    /// Validate a JWT and retain an opaque proof for rich session claims.
+    pub(crate) async fn validate_with_claims(
+        &self,
+        token: &str,
+    ) -> Result<(AuthenticatedIdentity, VerifiedJwtClaims), JwtError> {
         let decoded = self.decode_unverified(token)?;
         let provider = self.find_provider(&decoded.claims.iss, &decoded.claims.aud)?;
         let key = self.resolve_key(provider, &decoded).await?;
@@ -144,36 +163,7 @@ impl JwksRegistry {
             "JWKS JWT validated"
         );
 
-        Ok(identity)
-    }
-
-    /// Validate a JWT token using a specific named static provider.
-    ///
-    /// Like `validate`, but skips the `iss`-based provider lookup — the caller
-    /// supplies the resolved provider name (from the OIDC provider catalog).
-    /// Returns the decoded, verified claims on success.
-    pub async fn validate_with_provider(
-        &self,
-        provider_name: &str,
-        token: &str,
-    ) -> Result<JwtClaims, JwtError> {
-        let decoded = self.decode_unverified(token)?;
-        let provider = self
-            .providers
-            .iter()
-            .find(|p| p.name == provider_name)
-            .ok_or(JwtError::InvalidIssuer)?;
-        let key = self.resolve_key(provider, &decoded).await?;
-        self.verify_signature_and_time(&decoded, &key, provider_name)?;
-        validate_provider_claims(provider, &decoded.claims)?;
-
-        debug!(
-            provider = %provider_name,
-            kid = %decoded.header.kid.as_deref().unwrap_or(""),
-            sub = %decoded.claims.sub,
-            "JWKS JWT validated via validate_with_provider"
-        );
-        Ok(decoded.claims)
+        Ok((identity, VerifiedJwtClaims(claims)))
     }
 
     /// Validate a JWT using a named catalog provider whose JWKS endpoint is
@@ -187,7 +177,7 @@ impl JwksRegistry {
         provider_name: &str,
         jwks_uri: &str,
         token: &str,
-    ) -> Result<JwtClaims, JwtError> {
+    ) -> Result<VerifiedJwtClaims, JwtError> {
         let decoded = self.decode_unverified(token)?;
         let kid = decoded.header.kid.as_deref().unwrap_or("");
         let cache_identity = catalog_cache_identity(provider_name, jwks_uri);
@@ -206,17 +196,7 @@ impl JwksRegistry {
             sub = %decoded.claims.sub,
             "JWKS JWT validated via catalog provider"
         );
-        Ok(decoded.claims)
-    }
-
-    /// Decode JWT claims without signature verification (for AuthContext building).
-    pub fn decode_claims(&self, token: &str) -> Result<JwtClaims, JwtError> {
-        let parts: Vec<&str> = token.split('.').collect();
-        if parts.len() != 3 {
-            return Err(JwtError::MalformedToken);
-        }
-        let payload_bytes = base64_url_decode(parts[1]).ok_or(JwtError::DecodingError)?;
-        crate::util::bounded_json::from_slice(&payload_bytes).map_err(|_| JwtError::InvalidClaims)
+        Ok(VerifiedJwtClaims(decoded.claims))
     }
 
     /// Check if any providers are configured.
@@ -295,13 +275,12 @@ impl JwksRegistry {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if decoded.claims.exp > 0 && now > decoded.claims.exp + self.config.clock_skew_secs {
-            return Err(JwtError::Expired);
-        }
-        if decoded.claims.nbf > 0 && now + self.config.clock_skew_secs < decoded.claims.nbf {
-            return Err(JwtError::NotYetValid);
-        }
-        Ok(())
+        validate_time_claims(
+            &decoded.claims,
+            now,
+            self.config.clock_skew_secs,
+            self.config.max_token_lifetime_secs,
+        )
     }
 
     /// Resolve the verification key for a static-config provider, refetching
@@ -447,22 +426,15 @@ fn validate_provider_claims(
 /// [`crate::control::security::oidc`] instead, which applies stored
 /// claim-mapping rules.
 fn build_identity(claims: &JwtClaims, tenant_id: u64) -> AuthenticatedIdentity {
-    let roles = roles_from_external_claims(&claims.roles, claims.is_superuser);
-    let username = if claims.sub.is_empty() {
-        format!("jwt_user_{}", claims.user_id)
-    } else {
-        claims.sub.clone()
-    };
-    AuthenticatedIdentity {
-        user_id: claims.user_id,
-        username,
-        tenant_id: TenantId::new(tenant_id),
-        auth_method: AuthMethod::OidcBearer,
-        roles,
-        is_superuser: false,
-        default_database: None,
-        accessible_databases: AuthenticatedIdentity::default_database_set(false),
-    }
+    identity_from_external_claims(
+        ExternalClaims {
+            user_id: claims.user_id,
+            subject: &claims.sub,
+            role_names: &claims.roles,
+            asserted_superuser: claims.is_superuser,
+        },
+        ExternalProviderBinding::default_database(TenantId::new(tenant_id)),
+    )
 }
 
 // ── JWT Header Parsing ──────────────────────────────────────────────────

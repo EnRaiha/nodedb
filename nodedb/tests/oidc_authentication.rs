@@ -81,7 +81,11 @@ fn assert_generic_oidc_authentication_failure(error: impl std::fmt::Display) -> 
 }
 
 fn signed_jwt_fixture(issuer: &str, audience: &str, tenant_id: u64) -> (String, String) {
-    signed_jwt_fixture_with_expiry(issuer, audience, tenant_id, 9_999_999_999)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("fixture clock must be after epoch")
+        .as_secs();
+    signed_jwt_fixture_with_expiry(issuer, audience, tenant_id, now + 3_600)
 }
 
 fn signed_jwt_fixture_with_expiry(
@@ -105,9 +109,18 @@ fn signed_jwt_fixture_with_expiry(
         encode(&public_key.e().to_bytes_be()),
     );
     let header = encode(br#"{"alg":"RS256","kid":"catalog-tenant-binding"}"#);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("fixture clock must be after epoch")
+        .as_secs();
+    let issued_at = if exp > now {
+        now
+    } else {
+        exp.saturating_sub(1).max(1)
+    };
     let payload = encode(
         format!(
-            r#"{{"iss":"{issuer}","aud":"{audience}","sub":"alice","tenant_id":{tenant_id},"exp":{exp},"user_id":42}}"#
+            r#"{{"iss":"{issuer}","aud":"{audience}","sub":"alice","tenant_id":{tenant_id},"iat":{issued_at},"exp":{exp},"user_id":42}}"#
         )
         .as_bytes(),
     );

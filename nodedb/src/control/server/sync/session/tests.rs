@@ -22,16 +22,15 @@ fn make_authenticated_session() -> SyncSession {
     session.authenticated = true;
     session.tenant_id = Some(TenantId::new(1));
     session.username = Some("alice".into());
-    session.identity = Some(AuthenticatedIdentity {
-        user_id: 1,
-        username: "alice".into(),
-        tenant_id: TenantId::new(1),
-        auth_method: crate::control::security::identity::AuthMethod::ApiKey,
-        roles: vec![crate::control::security::identity::Role::ReadWrite],
-        is_superuser: false,
-        default_database: None,
-        accessible_databases: AuthenticatedIdentity::default_database_set(false),
-    });
+    session.identity = Some(AuthenticatedIdentity::new_regular(
+        1,
+        "alice",
+        TenantId::new(1),
+        crate::control::security::identity::AuthMethod::ApiKey,
+        vec![crate::control::security::identity::Role::ReadWrite],
+        None,
+        AuthenticatedIdentity::default_database_set(false),
+    ));
     session
 }
 
@@ -211,16 +210,15 @@ fn delta_push_rate_limited_silent_drop() {
     session.authenticated = true;
     session.tenant_id = Some(TenantId::new(1));
     session.username = Some("bob".into());
-    session.identity = Some(AuthenticatedIdentity {
-        user_id: 2,
-        username: "bob".into(),
-        tenant_id: TenantId::new(1),
-        auth_method: crate::control::security::identity::AuthMethod::ApiKey,
-        roles: vec![crate::control::security::identity::Role::ReadWrite],
-        is_superuser: false,
-        default_database: None,
-        accessible_databases: AuthenticatedIdentity::default_database_set(false),
-    });
+    session.identity = Some(AuthenticatedIdentity::new_regular(
+        2,
+        "bob",
+        TenantId::new(1),
+        crate::control::security::identity::AuthMethod::ApiKey,
+        vec![crate::control::security::identity::Role::ReadWrite],
+        None,
+        AuthenticatedIdentity::default_database_set(false),
+    ));
 
     let data = serde_json::json!({"key": "value"});
     let msg = DeltaPushMsg {

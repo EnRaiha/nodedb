@@ -16,16 +16,15 @@ use nodedb_types::TenantId;
 const NOOP: &NoopAuditEmitter = &NoopAuditEmitter;
 
 fn make_auth(tenant_id: u64) -> AuthContext {
-    let identity = AuthenticatedIdentity {
-        user_id: 1,
-        username: "user1".into(),
-        tenant_id: TenantId::new(tenant_id),
-        auth_method: AuthMethod::ApiKey,
-        roles: vec![Role::ReadWrite],
-        is_superuser: false,
-        default_database: None,
-        accessible_databases: AuthenticatedIdentity::default_database_set(false),
-    };
+    let identity = AuthenticatedIdentity::new_regular(
+        1,
+        "user1",
+        TenantId::new(tenant_id),
+        AuthMethod::ApiKey,
+        vec![Role::ReadWrite],
+        None,
+        AuthenticatedIdentity::default_database_set(false),
+    );
     AuthContext::from_identity(&identity, "test".into())
 }
 

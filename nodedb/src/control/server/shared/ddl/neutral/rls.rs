@@ -349,20 +349,18 @@ pub fn show_rls_policies(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::security::identity::AuthMethod;
     use crate::types::TenantId;
 
     fn identity(tenant_id: u64, roles: Vec<Role>, is_superuser: bool) -> AuthenticatedIdentity {
-        AuthenticatedIdentity {
-            user_id: 1,
-            username: "test".to_string(),
-            tenant_id: TenantId::new(tenant_id),
-            auth_method: AuthMethod::Trust,
+        AuthenticatedIdentity::new_internal_service(
+            1,
+            "test",
+            TenantId::new(tenant_id),
             roles,
             is_superuser,
-            default_database: None,
-            accessible_databases: AuthenticatedIdentity::default_database_set(is_superuser),
-        }
+            None,
+            AuthenticatedIdentity::default_database_set(is_superuser),
+        )
     }
 
     #[test]

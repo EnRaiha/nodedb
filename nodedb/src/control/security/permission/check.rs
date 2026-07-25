@@ -279,27 +279,26 @@ impl PermissionStore {
 mod tests {
     use super::*;
     use crate::control::security::audit::NoopAuditEmitter;
-    use crate::control::security::identity::{AuthMethod, Role};
+    use crate::control::security::identity::Role;
     use crate::types::TenantId;
 
     const NOOP: &NoopAuditEmitter = &NoopAuditEmitter;
 
     fn identity(username: &str, roles: Vec<Role>, superuser: bool) -> AuthenticatedIdentity {
         use crate::control::security::identity::DatabaseSet;
-        AuthenticatedIdentity {
-            user_id: 1,
-            username: username.into(),
-            tenant_id: TenantId::new(1),
-            auth_method: AuthMethod::Trust,
+        AuthenticatedIdentity::new_internal_service(
+            1,
+            username,
+            TenantId::new(1),
             roles,
-            is_superuser: superuser,
-            default_database: None,
-            accessible_databases: if superuser {
+            superuser,
+            None,
+            if superuser {
                 DatabaseSet::All
             } else {
                 DatabaseSet::Some(smallvec::smallvec![nodedb_types::id::DatabaseId::DEFAULT])
             },
-        }
+        )
     }
 
     #[test]

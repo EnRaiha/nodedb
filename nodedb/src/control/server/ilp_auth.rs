@@ -338,16 +338,15 @@ mod tests {
 
     #[test]
     fn default_database_prefers_identity_default() {
-        let identity = AuthenticatedIdentity {
-            user_id: 1,
-            username: "ingest".into(),
-            tenant_id: crate::types::TenantId::new(4),
-            auth_method: crate::control::security::identity::AuthMethod::ApiKey,
-            roles: Vec::new(),
-            is_superuser: false,
-            default_database: Some(DatabaseId::new(8)),
-            accessible_databases: AuthenticatedIdentity::default_database_set(false),
-        };
+        let identity = AuthenticatedIdentity::new_regular(
+            1,
+            "ingest",
+            crate::types::TenantId::new(4),
+            crate::control::security::identity::AuthMethod::ApiKey,
+            Vec::new(),
+            Some(DatabaseId::new(8)),
+            AuthenticatedIdentity::default_database_set(false),
+        );
         assert_eq!(default_database(&identity), DatabaseId::new(8));
         assert!(authorize_database(&identity, DatabaseId::new(8), &NoopAuditEmitter).is_err());
     }

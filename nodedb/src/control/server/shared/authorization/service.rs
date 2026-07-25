@@ -288,16 +288,15 @@ mod tests {
     use nodedb_physical::physical_plan::KvOp;
 
     fn identity(roles: Vec<Role>, databases: DatabaseSet) -> AuthenticatedIdentity {
-        AuthenticatedIdentity {
-            user_id: 7,
-            username: "reader".into(),
-            tenant_id: TenantId::new(9),
-            auth_method: AuthMethod::Trust,
+        AuthenticatedIdentity::new_regular(
+            7,
+            "reader",
+            TenantId::new(9),
+            AuthMethod::Trust,
             roles,
-            is_superuser: false,
-            default_database: None,
-            accessible_databases: databases,
-        }
+            None,
+            databases,
+        )
     }
 
     fn read_task() -> PhysicalTask {

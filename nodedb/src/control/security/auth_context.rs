@@ -16,7 +16,8 @@ use nodedb_types::DatabaseId;
 
 use crate::types::TenantId;
 
-use super::identity::{AuthMethod, AuthenticatedIdentity, roles_from_external_claims};
+use super::identity::{AuthMethod, AuthenticatedIdentity};
+use super::jwks::registry::VerifiedJwtClaims;
 use super::jwt::JwtClaims;
 
 /// Account status for access-control decisions.
@@ -84,6 +85,9 @@ pub struct AuthContext {
     pub org_id: Option<String>,
     /// All organization memberships (from JWT `org_ids` array claim).
     pub org_ids: Vec<String>,
+    /// Server-issued superuser authority. This is not derived from role-name
+    /// strings and cannot be mutated by claim enrichment.
+    is_superuser: bool,
     /// Role names as strings (for RLS predicate matching).
     pub roles: Vec<String>,
     /// Group memberships (from JWT `groups` claim).
@@ -113,17 +117,12 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
-    /// Build `AuthContext` from validated JWT claims.
-    ///
-    /// Maps standard and NodeDB-specific claims to context fields.
-    /// Missing optional claims default to empty/None (deny by default in RLS).
-    pub fn from_jwt(claims: &JwtClaims, session_id: String) -> Self {
-        let username = if claims.sub.is_empty() {
-            format!("jwt_user_{}", claims.user_id)
-        } else {
-            claims.sub.clone()
-        };
-
+    /// Build claim-enriched context after JWT verification and provider binding.
+    fn from_verified_claims(
+        claims: &JwtClaims,
+        identity: &AuthenticatedIdentity,
+        session_id: String,
+    ) -> Self {
         // Extract extended claims from the `extra` map if present.
         let email = claims
             .extra
@@ -171,25 +170,23 @@ impl AuthContext {
         }
 
         Self {
-            id: if claims.user_id != 0 {
-                claims.user_id.to_string()
-            } else {
+            id: if identity.user_id == 0 {
                 claims.sub.clone()
+            } else {
+                identity.user_id.to_string()
             },
-            username,
+            username: identity.username.clone(),
             email,
-            tenant_id: TenantId::new(claims.tenant_id),
+            tenant_id: identity.tenant_id,
             org_id,
             org_ids,
-            roles: roles_from_external_claims(&claims.roles, claims.is_superuser)
-                .into_iter()
-                .map(|role| role.to_string())
-                .collect(),
+            is_superuser: identity.is_superuser(),
+            roles: identity.roles.iter().map(ToString::to_string).collect(),
             groups,
             permissions,
             status,
             metadata,
-            auth_method: AuthMethod::ApiKey, // JWT is bearer-token variant
+            auth_method: identity.auth_method.clone(),
             auth_time: if claims.iat > 0 {
                 Some(claims.iat)
             } else {
@@ -207,20 +204,12 @@ impl AuthContext {
     /// group, permission, and metadata fields. Identity fields that control
     /// authorization are taken from the verified identity, whose tenant and
     /// roles may be provider-bound rather than token-claim-derived.
-    pub fn from_verified_jwt(
-        claims: &JwtClaims,
+    pub(crate) fn from_verified_jwt(
+        verified_claims: &VerifiedJwtClaims,
         identity: &AuthenticatedIdentity,
         session_id: String,
     ) -> Self {
-        let mut context = Self::from_jwt(claims, session_id);
-        if identity.user_id != 0 {
-            context.id = identity.user_id.to_string();
-        }
-        context.username = identity.username.clone();
-        context.tenant_id = identity.tenant_id;
-        context.roles = identity.roles.iter().map(ToString::to_string).collect();
-        context.auth_method = identity.auth_method.clone();
-        context
+        Self::from_verified_claims(verified_claims.claims(), identity, session_id)
     }
 
     /// Build `AuthContext` from a DB-authenticated identity (SCRAM, password, API key).
@@ -237,6 +226,7 @@ impl AuthContext {
             tenant_id: identity.tenant_id,
             org_id: None,
             org_ids: Vec::new(),
+            is_superuser: identity.is_superuser(),
             roles: identity.roles.iter().map(|r| r.to_string()).collect(),
             groups: Vec::new(),
             permissions: Vec::new(),
@@ -330,7 +320,7 @@ impl AuthContext {
 
     /// Whether this context represents a superuser.
     pub fn is_superuser(&self) -> bool {
-        self.roles.iter().any(|r| r == "superuser")
+        self.is_superuser
     }
 }
 
@@ -361,18 +351,15 @@ mod tests {
 
     fn test_identity() -> AuthenticatedIdentity {
         use crate::control::security::identity::DatabaseSet;
-        AuthenticatedIdentity {
-            user_id: 42,
-            username: "alice".into(),
-            tenant_id: TenantId::new(1),
-            auth_method: AuthMethod::ScramSha256,
-            roles: vec![Role::ReadWrite],
-            is_superuser: false,
-            default_database: None,
-            accessible_databases: DatabaseSet::Some(smallvec::smallvec![
-                nodedb_types::id::DatabaseId::DEFAULT
-            ]),
-        }
+        AuthenticatedIdentity::new_regular(
+            42,
+            "alice",
+            TenantId::new(1),
+            AuthMethod::ScramSha256,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::Some(smallvec::smallvec![nodedb_types::id::DatabaseId::DEFAULT,]),
+        )
     }
 
     #[test]
@@ -541,7 +528,7 @@ mod tests {
         identity.auth_method = AuthMethod::OidcBearer;
         identity.roles = vec![Role::TenantAdmin];
 
-        let ctx = AuthContext::from_verified_jwt(&claims, &identity, "s_jwt_bound".into());
+        let ctx = AuthContext::from_verified_claims(&claims, &identity, "s_jwt_bound".into());
 
         assert_eq!(ctx.id, "42");
         assert_eq!(ctx.username, "provider-user");
@@ -574,8 +561,9 @@ mod tests {
         identity.user_id = 0;
         identity.auth_method = AuthMethod::OidcBearer;
 
-        let first = AuthContext::from_verified_jwt(&first_claims, &identity, "s_oidc_1".into());
-        let second = AuthContext::from_verified_jwt(&second_claims, &identity, "s_oidc_2".into());
+        let first = AuthContext::from_verified_claims(&first_claims, &identity, "s_oidc_1".into());
+        let second =
+            AuthContext::from_verified_claims(&second_claims, &identity, "s_oidc_2".into());
 
         assert_eq!(first.id, first_claims.sub);
         assert_eq!(second.id, second_claims.sub);
@@ -603,7 +591,8 @@ mod tests {
             extra: HashMap::new(),
         };
 
-        let context = AuthContext::from_jwt(&claims, "s_jwt_roles".into());
+        let context =
+            AuthContext::from_verified_claims(&claims, &test_identity(), "s_jwt_roles".into());
 
         assert!(!context.is_superuser());
         assert_eq!(context.roles, vec!["readwrite"]);
@@ -643,7 +632,7 @@ mod tests {
             extra,
         };
 
-        let ctx = AuthContext::from_jwt(&claims, "s_jwt_001".into());
+        let ctx = AuthContext::from_verified_claims(&claims, &test_identity(), "s_jwt_001".into());
 
         assert_eq!(ctx.id, "42");
         assert_eq!(ctx.username, "alice");

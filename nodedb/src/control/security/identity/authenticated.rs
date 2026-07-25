@@ -31,8 +31,9 @@ pub struct AuthenticatedIdentity {
     pub auth_method: AuthMethod,
     /// Assigned roles.
     pub roles: Vec<Role>,
-    /// Whether this user is a superuser (bypasses all permission checks).
-    pub is_superuser: bool,
+    /// Server-issued privilege authority. Private so external claims and
+    /// transport code cannot assert or mutate superuser state.
+    authority: IdentityAuthority,
     /// Per-user default database. `None` means fall through to tenant default,
     /// then `DatabaseId::DEFAULT`.
     ///
@@ -48,25 +49,125 @@ pub struct AuthenticatedIdentity {
     pub accessible_databases: DatabaseSet,
 }
 
+/// Read-only privilege view exposed through `Deref` for compatibility with
+/// authorization checks. There is deliberately no `DerefMut` implementation.
+#[derive(Debug, Clone)]
+pub struct IdentityAuthority {
+    pub is_superuser: bool,
+}
+
+impl std::ops::Deref for AuthenticatedIdentity {
+    type Target = IdentityAuthority;
+
+    fn deref(&self) -> &Self::Target {
+        &self.authority
+    }
+}
+
+/// Server-owned principal material loaded from the credential catalog.
+pub(crate) struct CatalogPrincipal {
+    pub(crate) user_id: u64,
+    pub(crate) username: String,
+    pub(crate) tenant_id: TenantId,
+    pub(crate) auth_method: AuthMethod,
+    pub(crate) roles: Vec<Role>,
+    pub(crate) is_superuser: bool,
+    pub(crate) default_database: Option<DatabaseId>,
+    pub(crate) accessible_databases: DatabaseSet,
+}
+
 impl AuthenticatedIdentity {
+    /// Construct a regular identity. Superuser role strings are discarded;
+    /// only the credential catalog or a named internal-service constructor may
+    /// create superuser authority.
+    pub fn new_regular(
+        user_id: u64,
+        username: impl Into<String>,
+        tenant_id: TenantId,
+        auth_method: AuthMethod,
+        mut roles: Vec<Role>,
+        default_database: Option<DatabaseId>,
+        accessible_databases: DatabaseSet,
+    ) -> Self {
+        roles.retain(|role| !matches!(role, Role::Superuser));
+        Self {
+            user_id,
+            username: username.into(),
+            tenant_id,
+            auth_method,
+            roles,
+            authority: IdentityAuthority {
+                is_superuser: false,
+            },
+            default_database,
+            accessible_databases,
+        }
+    }
+
+    /// Construct an identity from a NodeDB credential-catalog record.
+    pub(crate) fn from_catalog_principal(principal: CatalogPrincipal) -> Self {
+        Self {
+            user_id: principal.user_id,
+            username: principal.username,
+            tenant_id: principal.tenant_id,
+            auth_method: principal.auth_method,
+            roles: principal.roles,
+            authority: IdentityAuthority {
+                is_superuser: principal.is_superuser,
+            },
+            default_database: principal.default_database,
+            accessible_databases: principal.accessible_databases,
+        }
+    }
+
+    /// Construct a trusted internal service identity.
+    ///
+    /// This crate-private path is reserved for replay, triggers, schedulers,
+    /// and other server-owned work that has no external claims.
+    pub(crate) fn new_internal_service(
+        user_id: u64,
+        username: impl Into<String>,
+        tenant_id: TenantId,
+        roles: Vec<Role>,
+        is_superuser: bool,
+        default_database: Option<DatabaseId>,
+        accessible_databases: DatabaseSet,
+    ) -> Self {
+        Self {
+            user_id,
+            username: username.into(),
+            tenant_id,
+            auth_method: AuthMethod::Trust,
+            roles,
+            authority: IdentityAuthority { is_superuser },
+            default_database,
+            accessible_databases,
+        }
+    }
+
+    /// Whether this server-issued identity has catalog/internal superuser authority.
+    pub fn is_superuser(&self) -> bool {
+        self.authority.is_superuser
+    }
+
     /// Check if this identity has a specific role.
     pub fn has_role(&self, role: &Role) -> bool {
-        self.is_superuser || self.roles.contains(role)
+        self.authority.is_superuser || self.roles.contains(role)
     }
 
     /// Check if this identity has any of the specified roles.
     pub fn has_any_role(&self, roles: &[Role]) -> bool {
-        self.is_superuser || roles.iter().any(|r| self.roles.contains(r))
+        self.authority.is_superuser || roles.iter().any(|r| self.roles.contains(r))
     }
 
     /// Returns `true` if this identity is Superuser or carries `Role::ClusterAdmin`.
     pub fn has_cluster_admin(&self) -> bool {
-        self.is_superuser || self.roles.iter().any(|r| matches!(r, Role::ClusterAdmin))
+        self.authority.is_superuser || self.roles.iter().any(|r| matches!(r, Role::ClusterAdmin))
     }
 
     /// Returns `true` if this identity is the owner of `db` (or is Superuser).
     pub fn is_database_owner(&self, db: DatabaseId) -> bool {
-        self.is_superuser
+        self.authority.is_superuser
             || self
                 .roles
                 .iter()
@@ -80,7 +181,7 @@ impl AuthenticatedIdentity {
     /// bind — the session is rejected with `ACCESS_DENIED` if the resolved
     /// `current_database` fails this check.
     pub fn can_access_database(&self, db: DatabaseId) -> bool {
-        self.is_superuser || self.accessible_databases.contains(db)
+        self.authority.is_superuser || self.accessible_databases.contains(db)
     }
 
     /// Derive the appropriate `DatabaseSet` for a superuser identity.
@@ -118,16 +219,15 @@ mod tests {
     use super::*;
 
     fn test_identity(roles: Vec<Role>, superuser: bool) -> AuthenticatedIdentity {
-        AuthenticatedIdentity {
-            user_id: 1,
-            username: "test".into(),
-            tenant_id: TenantId::new(1),
-            auth_method: AuthMethod::Trust,
+        AuthenticatedIdentity::new_internal_service(
+            1,
+            "test",
+            TenantId::new(1),
             roles,
-            is_superuser: superuser,
-            default_database: None,
-            accessible_databases: AuthenticatedIdentity::default_database_set(superuser),
-        }
+            superuser,
+            None,
+            AuthenticatedIdentity::default_database_set(superuser),
+        )
     }
 
     #[test]

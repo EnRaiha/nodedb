@@ -953,19 +953,18 @@ mod tests {
             post_set_op: nodedb_physical::physical_task::PostSetOp::None,
             txn_id: None,
         };
-        let identity = crate::control::security::identity::AuthenticatedIdentity {
-            user_id: 1,
-            username: "crdt-test".into(),
-            tenant_id,
-            auth_method: crate::control::security::identity::AuthMethod::Trust,
-            roles: Vec::new(),
-            is_superuser: true,
-            default_database: None,
-            accessible_databases:
+        let identity =
+            crate::control::security::identity::AuthenticatedIdentity::new_internal_service(
+                1,
+                "crdt-test",
+                tenant_id,
+                Vec::new(),
+                true,
+                None,
                 crate::control::security::identity::AuthenticatedIdentity::default_database_set(
                     true,
                 ),
-        };
+            );
         let authorized = crate::control::server::shared::authorization::authorize_task_set(
             &identity,
             std::slice::from_ref(&task),

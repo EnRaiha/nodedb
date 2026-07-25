@@ -275,18 +275,17 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn ctx(tenant: u64, user: &str) -> AuthContext {
-        let identity = AuthenticatedIdentity {
-            user_id: 1,
-            username: user.into(),
-            tenant_id: TenantId::new(tenant),
-            auth_method: AuthMethod::ApiKey,
-            roles: vec![Role::ReadWrite],
-            is_superuser: false,
-            default_database: None,
-            accessible_databases: crate::control::security::identity::DatabaseSet::Some(
-                smallvec::smallvec![nodedb_types::id::DatabaseId::DEFAULT],
-            ),
-        };
+        let identity = AuthenticatedIdentity::new_regular(
+            1,
+            user,
+            TenantId::new(tenant),
+            AuthMethod::ApiKey,
+            vec![Role::ReadWrite],
+            None,
+            crate::control::security::identity::DatabaseSet::Some(smallvec::smallvec![
+                nodedb_types::id::DatabaseId::DEFAULT,
+            ]),
+        );
         AuthContext::from_identity(&identity, generate_session_id())
     }
 

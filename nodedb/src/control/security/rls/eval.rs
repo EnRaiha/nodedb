@@ -196,18 +196,17 @@ mod tests {
     fn nonsuper_auth() -> AuthContext {
         use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, Role};
         use crate::types::TenantId;
-        let identity = AuthenticatedIdentity {
-            user_id: 42,
-            username: "alice".into(),
-            tenant_id: TenantId::new(1),
-            auth_method: AuthMethod::ScramSha256,
-            roles: vec![Role::ReadWrite],
-            is_superuser: false,
-            default_database: None,
-            accessible_databases: crate::control::security::identity::DatabaseSet::Some(
-                smallvec::smallvec![nodedb_types::id::DatabaseId::DEFAULT],
-            ),
-        };
+        let identity = AuthenticatedIdentity::new_regular(
+            42,
+            "alice",
+            TenantId::new(1),
+            AuthMethod::ScramSha256,
+            vec![Role::ReadWrite],
+            None,
+            crate::control::security::identity::DatabaseSet::Some(smallvec::smallvec![
+                nodedb_types::id::DatabaseId::DEFAULT,
+            ]),
+        );
         AuthContext::from_identity(&identity, "s_test".into())
     }
 

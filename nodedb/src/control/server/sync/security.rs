@@ -195,16 +195,15 @@ mod tests {
     use crate::types::TenantId;
 
     fn test_identity(tenant: u64, username: &str) -> AuthenticatedIdentity {
-        AuthenticatedIdentity {
-            user_id: 1,
-            username: username.into(),
-            tenant_id: TenantId::new(tenant),
-            auth_method: crate::control::security::identity::AuthMethod::ApiKey,
-            roles: vec![crate::control::security::identity::Role::ReadWrite],
-            is_superuser: false,
-            default_database: None,
-            accessible_databases: AuthenticatedIdentity::default_database_set(false),
-        }
+        AuthenticatedIdentity::new_regular(
+            1,
+            username,
+            TenantId::new(tenant),
+            crate::control::security::identity::AuthMethod::ApiKey,
+            vec![crate::control::security::identity::Role::ReadWrite],
+            None,
+            AuthenticatedIdentity::default_database_set(false),
+        )
     }
 
     fn make_delta(collection: &str, doc_id: &str, data: &serde_json::Value) -> DeltaPushMsg {

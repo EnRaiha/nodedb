@@ -191,16 +191,15 @@ mod tests {
         // A deliberately non-zero, non-default tenant so a placeholder-0
         // regression is unmistakable.
         let tenant = crate::types::TenantId::new(7);
-        let identity = AuthenticatedIdentity {
-            user_id: 7,
-            username: "array-writer".into(),
-            tenant_id: tenant,
-            auth_method: AuthMethod::ApiKey,
-            roles: Vec::new(),
-            is_superuser: false,
-            default_database: None,
-            accessible_databases: AuthenticatedIdentity::default_database_set(false),
-        };
+        let identity = AuthenticatedIdentity::new_regular(
+            7,
+            "array-writer",
+            tenant,
+            AuthMethod::ApiKey,
+            Vec::new(),
+            None,
+            AuthenticatedIdentity::default_database_set(false),
+        );
         let inbound = build_array_inbound(&Some(shared), identity.clone())
             .expect("SharedState present => engine built");
         assert_eq!(

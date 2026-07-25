@@ -154,23 +154,25 @@ impl ApiKeyStore {
     /// Build an AuthenticatedIdentity from a verified API key.
     /// The caller must compute and pass the effective `accessible_databases`
     /// (owner_set ∩ key_set) rather than letting this method guess.
-    pub fn to_identity(
+    pub(crate) fn to_identity(
         &self,
         record: &ApiKeyRecord,
         roles: Vec<Role>,
         is_superuser: bool,
         accessible_databases: DatabaseSet,
     ) -> AuthenticatedIdentity {
-        AuthenticatedIdentity {
-            user_id: record.user_id,
-            username: record.username.clone(),
-            tenant_id: record.tenant_id,
-            auth_method: AuthMethod::ApiKey,
-            roles,
-            is_superuser,
-            default_database: None,
-            accessible_databases,
-        }
+        AuthenticatedIdentity::from_catalog_principal(
+            crate::control::security::identity::CatalogPrincipal {
+                user_id: record.user_id,
+                username: record.username.clone(),
+                tenant_id: record.tenant_id,
+                auth_method: AuthMethod::ApiKey,
+                roles,
+                is_superuser,
+                default_database: None,
+                accessible_databases,
+            },
+        )
     }
 
     /// Build a `StoredApiKey` ready for replication + return the

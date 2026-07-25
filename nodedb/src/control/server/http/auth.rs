@@ -30,12 +30,19 @@ pub struct AppState {
 ///
 /// Returns `Some(identity)` if the token is a valid JWT with 2 dots and
 /// the registry verifies the signature. Returns `None` otherwise.
-fn try_validate_jwt(state: &AppState, token: &str) -> Option<AuthenticatedIdentity> {
+fn try_validate_jwt(
+    state: &AppState,
+    token: &str,
+) -> Option<(
+    AuthenticatedIdentity,
+    crate::control::security::jwks::registry::VerifiedJwtClaims,
+)> {
     if token.matches('.').count() == 2
         && let Some(ref registry) = state.shared.jwks_registry
-        && let Ok(identity) = tokio::runtime::Handle::current().block_on(registry.validate(token))
+        && let Ok(verified) =
+            tokio::runtime::Handle::current().block_on(registry.validate_with_claims(token))
     {
-        Some(identity)
+        Some(verified)
     } else {
         None
     }
@@ -61,7 +68,7 @@ pub fn resolve_identity(
             let token = token.trim();
 
             // Try JWT first (token has 2 dots = JWT format).
-            if let Some(identity) = try_validate_jwt(state, token) {
+            if let Some((identity, _)) = try_validate_jwt(state, token) {
                 return Ok(identity);
             }
 
@@ -111,15 +118,9 @@ pub fn resolve_auth(
         && let Some(token) = auth_str.strip_prefix("Bearer ")
     {
         let token = token.trim();
-        if let Some(identity) = try_validate_jwt(state, token) {
-            let auth_ctx = if let Some(ref registry) = state.shared.jwks_registry
-                && let Ok(claims) = registry.decode_claims(token)
-            {
-                AuthContext::from_verified_jwt(&claims, &identity, generate_session_id())
-            } else {
-                tracing::trace!("JWT claims decode unavailable, using basic auth context");
-                session_auth::build_auth_context(&identity)
-            };
+        if let Some((identity, verified_claims)) = try_validate_jwt(state, token) {
+            let auth_ctx =
+                AuthContext::from_verified_jwt(&verified_claims, &identity, generate_session_id());
             let auth_ctx = apply_on_deny_header(headers, auth_ctx);
             return Ok((identity, auth_ctx));
         }

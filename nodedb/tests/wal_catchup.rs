@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::control::security::audit::NoopAuditEmitter;
-use nodedb::control::security::identity::{AuthMethod, AuthenticatedIdentity};
 use nodedb::control::server::shared::authorization::authorize_task_set;
 use nodedb::control::state::SharedState;
 use nodedb::data::executor::core_loop::CoreLoop;
@@ -97,16 +96,7 @@ impl TestStack {
             post_set_op: PostSetOp::None,
             txn_id: None,
         };
-        let identity = AuthenticatedIdentity {
-            user_id: 1,
-            username: "wal-catchup-test".into(),
-            tenant_id,
-            auth_method: AuthMethod::Trust,
-            roles: Vec::new(),
-            is_superuser: true,
-            default_database: None,
-            accessible_databases: AuthenticatedIdentity::default_database_set(true),
-        };
+        let identity = nodedb_test_support::pgwire_auth_helpers::superuser();
         let authorized = authorize_task_set(
             &identity,
             std::slice::from_ref(&task),
