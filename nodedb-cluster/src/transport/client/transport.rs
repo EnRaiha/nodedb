@@ -155,6 +155,15 @@ impl NexarTransport {
         creds: TransportCredentials,
         identity_store: Arc<dyn PeerIdentityStore>,
     ) -> Result<Self> {
+        if creds.is_insecure() && !credentials::insecure_transport_bind_allowed(listen_addr) {
+            return Err(ClusterError::Config {
+                detail: format!(
+                    "insecure cluster transport requires a loopback or private bind address; \
+                     {listen_addr} is unspecified or publicly routable"
+                ),
+            });
+        }
+
         let (server_config, client_config) = match &creds {
             TransportCredentials::Mtls(tls) => (
                 config::make_raft_server_config_mtls(tls, tuning, Arc::clone(&identity_store))?,

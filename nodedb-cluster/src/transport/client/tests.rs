@@ -171,6 +171,24 @@ impl RaftRpcHandler for EchoHandler {
     async fn on_timeout_now(&self, _req: TimeoutNowRequest) {}
 }
 
+#[test]
+fn insecure_transport_rejects_non_private_bind_before_observability_increment() {
+    let before = crate::transport::credentials::insecure_transport_count();
+    let error = match NexarTransport::new(
+        1,
+        "0.0.0.0:0".parse().unwrap(),
+        TransportCredentials::Insecure,
+    ) {
+        Ok(_) => panic!("unspecified insecure bind must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ClusterError::Config { .. }));
+    assert_eq!(
+        crate::transport::credentials::insecure_transport_count(),
+        before
+    );
+}
+
 fn make_transport(node_id: u64) -> NexarTransport {
     NexarTransport::new(
         node_id,

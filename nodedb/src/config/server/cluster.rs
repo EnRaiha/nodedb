@@ -175,6 +175,16 @@ impl ClusterSettings {
                 detail: "cluster.replication_factor must be at least 1".into(),
             });
         }
+        if self.insecure_transport && !nodedb_cluster::insecure_transport_bind_allowed(self.listen)
+        {
+            return Err(crate::Error::Config {
+                detail: format!(
+                    "cluster.insecure_transport requires cluster.listen to use a loopback or \
+                     private address; {} is unspecified or publicly routable",
+                    self.listen
+                ),
+            });
+        }
         if self.force_bootstrap && !self.seed_nodes.contains(&self.listen) {
             return Err(crate::Error::Config {
                 detail: "cluster.force_bootstrap requires cluster.listen to be present in \
@@ -183,5 +193,42 @@ impl ClusterSettings {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn insecure_settings(listen: &str) -> ClusterSettings {
+        let listen = listen.parse().unwrap();
+        ClusterSettings {
+            node_id: 1,
+            listen,
+            seed_nodes: vec![listen],
+            num_groups: 1,
+            replication_factor: 1,
+            force_bootstrap: false,
+            tls: None,
+            max_active_sessions: 0,
+            login_attempts_per_ip_per_min: 30,
+            login_attempts_per_user_per_min: 10,
+            insecure_transport: true,
+            log_compaction_threshold: None,
+        }
+    }
+
+    #[test]
+    fn insecure_transport_rejects_public_and_unspecified_binds() {
+        for listen in ["0.0.0.0:9400", "8.8.8.8:9400", "[::]:9400"] {
+            assert!(insecure_settings(listen).validate().is_err(), "{listen}");
+        }
+    }
+
+    #[test]
+    fn insecure_transport_allows_private_binds() {
+        for listen in ["127.0.0.1:9400", "10.0.0.1:9400", "[fd00::1]:9400"] {
+            assert!(insecure_settings(listen).validate().is_ok(), "{listen}");
+        }
     }
 }

@@ -30,7 +30,9 @@ pub mod pki_types {
         CertificateDer, CertificateRevocationListDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime,
     };
 }
-pub use credentials::{TransportCredentials, insecure_transport_count};
+pub use credentials::{
+    TransportCredentials, insecure_transport_bind_allowed, insecure_transport_count,
+};
 pub use peer_identity_store::{NoopIdentityStore, PeerIdentityStore};
 pub use peer_identity_verifier::{
     IDENTITY_MISMATCH_QUIC_ERROR, VerifyMethod, VerifyOutcome, spki_pin_from_cert_der,

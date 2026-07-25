@@ -13,6 +13,7 @@
 //! [`NexarTransport`]: super::client::NexarTransport
 //! [`insecure_transport_count`]: self::insecure_transport_count
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::warn;
@@ -63,6 +64,18 @@ impl std::fmt::Debug for TransportCredentials {
 
 static INSECURE_TRANSPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Whether an unauthenticated cluster listener is confined to a loopback or
+/// private-network bind address.
+///
+/// Unspecified and globally routable addresses are deliberately rejected.
+/// IPv4 permits loopback and RFC 1918 space; IPv6 permits loopback and ULA.
+pub fn insecure_transport_bind_allowed(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+    }
+}
+
 /// Number of [`NexarTransport`] instances constructed in `Insecure` mode
 /// since process start. Exposed for operational dashboards — any non-zero
 /// value in a production deployment is a misconfiguration.
@@ -92,6 +105,38 @@ mod tests {
     #[test]
     fn insecure_flag() {
         assert!(TransportCredentials::Insecure.is_insecure());
+    }
+
+    #[test]
+    fn insecure_bind_policy_rejects_public_and_unspecified_addresses() {
+        for addr in [
+            "0.0.0.0:9400",
+            "8.8.8.8:9400",
+            "[::]:9400",
+            "[2001:4860:4860::8888]:9400",
+        ] {
+            assert!(
+                !insecure_transport_bind_allowed(addr.parse().unwrap()),
+                "{addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn insecure_bind_policy_allows_loopback_and_private_addresses() {
+        for addr in [
+            "127.0.0.1:9400",
+            "10.0.0.1:9400",
+            "172.16.0.1:9400",
+            "192.168.0.1:9400",
+            "[::1]:9400",
+            "[fd00::1]:9400",
+        ] {
+            assert!(
+                insecure_transport_bind_allowed(addr.parse().unwrap()),
+                "{addr}"
+            );
+        }
     }
 
     #[test]

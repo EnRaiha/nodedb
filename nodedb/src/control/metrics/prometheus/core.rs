@@ -74,6 +74,12 @@ impl SystemMetrics {
             "Active vShard migrations",
             self.vshard_migrations_active.load(Ordering::Relaxed),
         );
+        gauge(
+            out,
+            "nodedb_cluster_insecure_transports",
+            "Insecure cluster transports created; alert whenever this is greater than zero",
+            nodedb_cluster::insecure_transport_count(),
+        );
 
         // ── Bridge ──
         gauge_f64(
