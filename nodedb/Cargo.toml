@@ -26,7 +26,7 @@ nodedb-types = { workspace = true }
 nodedb-columnar = { workspace = true }
 nodedb-bridge = { workspace = true }
 nodedb-physical = { workspace = true }
-rust_decimal = { workspace = true }
+rust_decimal = { workspace = true, features = ["db-postgres"] }
 nodedb-cluster = { workspace = true }
 nodedb-raft = { workspace = true }
 nodedb-wal = { workspace = true }
