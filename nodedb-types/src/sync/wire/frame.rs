@@ -36,6 +36,14 @@ pub enum SyncMessageType {
     /// must drop local Loro state and remove the collection's redb
     /// record; future deltas for the collection are not sync-eligible.
     CollectionPurged = 0x14,
+    /// Row post-image push (server → client, 0x15).
+    ///
+    /// Carries a row's full post-image as MessagePack, NOT Loro update
+    /// bytes — distinct from [`Self::DeltaPush`], which is client → server
+    /// and carries a CRDT delta. Origin fans these out for writes that
+    /// originated on the server (SQL DML, DDL-managed system rows), where no
+    /// client-authored CRDT operation exists to replicate.
+    RowPush = 0x15,
     ShapeSubscribe = 0x20,
     ShapeSnapshot = 0x21,
     ShapeDelta = 0x22,
@@ -121,6 +129,7 @@ impl SyncMessageType {
             0x12 => Some(Self::DeltaReject),
             0x13 => Some(Self::CollectionSchema),
             0x14 => Some(Self::CollectionPurged),
+            0x15 => Some(Self::RowPush),
             0x20 => Some(Self::ShapeSubscribe),
             0x21 => Some(Self::ShapeSnapshot),
             0x22 => Some(Self::ShapeDelta),

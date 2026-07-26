@@ -80,7 +80,9 @@ pub use array::{
 };
 pub use collection_schema::{CollectionDescriptor, CollectionSchemaSyncMsg};
 pub use columnar::{ColumnarInsertAckMsg, ColumnarInsertMsg};
-pub use delta::{CollectionPurgedMsg, DeltaAckMsg, DeltaPushMsg, DeltaRejectMsg};
+pub use delta::{
+    CollectionPurgedMsg, DeltaAckMsg, DeltaPushMsg, DeltaRejectMsg, RowOp, RowPushMsg,
+};
 pub use frame::{SyncFrame, SyncMessageType};
 pub use fts::{FtsDeleteAckMsg, FtsDeleteMsg, FtsIndexAckMsg, FtsIndexMsg};
 pub use presence::{PeerPresence, PresenceBroadcastMsg, PresenceLeaveMsg, PresenceUpdateMsg};

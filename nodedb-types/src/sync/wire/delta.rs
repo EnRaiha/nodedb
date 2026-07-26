@@ -113,3 +113,59 @@ pub struct CollectionPurgedMsg {
     /// Origin WAL LSN at which the hard-delete was committed.
     pub purge_lsn: u64,
 }
+
+/// Row-level operation carried by a [`RowPushMsg`].
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    zerompk::ToMessagePack,
+    zerompk::FromMessagePack,
+)]
+pub enum RowOp {
+    /// The row was created or updated; `payload` is its post-image.
+    #[default]
+    Upsert,
+    /// The row was removed; `payload` is empty.
+    Delete,
+}
+
+/// Row post-image push (server → client, 0x15).
+///
+/// Origin sends this for writes that originated on the server — SQL DML, or
+/// DDL-managed system rows such as retention policies and alerts — where there
+/// is no client-authored CRDT operation to replicate. The peer applies it as a
+/// row upsert or delete against its local state.
+///
+/// Deliberately NOT [`DeltaPushMsg`]: that message is client → server and its
+/// `delta` field is Loro update bytes. Carrying a MessagePack post-image in it
+/// would leave the receiver unable to tell the two encodings apart, and the
+/// operation (upsert vs delete) would have to be inferred from an empty
+/// payload rather than stated.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
+)]
+pub struct RowPushMsg {
+    /// Collection the row belongs to.
+    pub collection: String,
+    /// Row / document ID.
+    pub document_id: String,
+    /// MessagePack-encoded row post-image. Empty for [`RowOp::Delete`].
+    pub payload: Vec<u8>,
+    /// Whether the row was written or removed.
+    pub op: RowOp,
+    /// Origin-assigned WAL LSN for the write, when known (`0` otherwise).
+    #[serde(default)]
+    pub lsn: u64,
+    /// Originating peer / node ID.
+    #[serde(default)]
+    pub peer_id: u64,
+    /// Per-collection monotonic sequence, for ordering diagnostics.
+    #[serde(default)]
+    pub sequence: u64,
+}

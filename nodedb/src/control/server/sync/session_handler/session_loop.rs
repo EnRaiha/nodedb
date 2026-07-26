@@ -439,20 +439,28 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
                         .insert(delta.collection.clone());
                 }
 
-                let push_msg = nodedb_types::sync::wire::DeltaPushMsg {
+                // A row post-image, not a Loro delta — so this goes out as
+                // `RowPush`, never `DeltaPush`. The two carry different
+                // encodings, and the peer cannot tell them apart from the
+                // bytes alone.
+                let push_msg = nodedb_types::sync::wire::RowPushMsg {
                     collection: delta.collection,
                     document_id: delta.document_id,
-                    delta: delta.payload,
+                    payload: delta.payload,
+                    op: match delta.op {
+                        crate::event::crdt_sync::types::DeltaOp::Upsert => {
+                            nodedb_types::sync::wire::RowOp::Upsert
+                        }
+                        crate::event::crdt_sync::types::DeltaOp::Delete => {
+                            nodedb_types::sync::wire::RowOp::Delete
+                        }
+                    },
+                    lsn: delta.lsn,
                     peer_id: delta.peer_id,
-                    mutation_id: delta.sequence,
-                    checksum: 0,
-                    device_valid_time_ms: None,
-                    producer_id: 0,
-                    epoch: 0,
-                    seq: 0,
+                    sequence: delta.sequence,
                 };
                 if let Some(frame) = nodedb_types::sync::wire::SyncFrame::new_msgpack(
-                    nodedb_types::sync::wire::SyncMessageType::DeltaPush,
+                    nodedb_types::sync::wire::SyncMessageType::RowPush,
                     &push_msg,
                 ) && ws
                     .send(Message::Binary(frame.to_bytes().into()))
