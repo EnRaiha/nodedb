@@ -56,6 +56,40 @@ impl CrdtState {
             .map_err(|e| CrdtError::Loro(format!("delta export: {e}")))
     }
 
+    /// Next op counter this document's own peer will author.
+    ///
+    /// Equivalently, how many ops this peer has authored so far. Looked up
+    /// directly in the oplog version vector rather than tracked separately,
+    /// so it can never drift from what `doc.oplog_vv()` actually reports.
+    pub fn local_op_counter(&self) -> i32 {
+        self.doc.oplog_vv().get(&self.peer_id).copied().unwrap_or(0)
+    }
+
+    /// Export exactly the ops this document's own peer authored in
+    /// `[from_counter, to_counter)`.
+    ///
+    /// A deferred batch of local writes must be split into one
+    /// self-contained delta per row so each can be committed independently
+    /// downstream. Because each row's ops occupy a contiguous range in this
+    /// peer's own op sequence (interleaving never happens within a single
+    /// author), a bounded range export over that peer's `IdSpan` yields
+    /// exactly that row's operations — nothing from before, nothing from
+    /// after, and nothing from any other peer. Unlike `export_updates_since`,
+    /// whose cost is proportional to everything after a version, this is
+    /// bounded by the width of the requested span.
+    ///
+    /// An empty or inverted range (`to_counter <= from_counter`) is not an
+    /// error — it simply exports nothing.
+    pub fn export_local_range(&self, from_counter: i32, to_counter: i32) -> Result<Vec<u8>> {
+        if to_counter <= from_counter {
+            return Ok(Vec::new());
+        }
+        let span = loro::IdSpan::new(self.peer_id, from_counter, to_counter);
+        self.doc
+            .export(loro::ExportMode::updates_in_range(vec![span]))
+            .map_err(|e| CrdtError::Loro(format!("bounded range export failed: {e}")))
+    }
+
     /// Compact history at a specific version (not just current frontiers).
     ///
     /// Discards oplog entries before the target version. Current state and
@@ -302,5 +336,74 @@ mod tests {
                 .expect("preview")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn local_op_counter_starts_at_zero_and_advances() {
+        let state = CrdtState::new(1).expect("state");
+        assert_eq!(state.local_op_counter(), 0);
+
+        state
+            .upsert("docs", "a", &[("v", LoroValue::I64(1))])
+            .expect("write a");
+        state.doc.commit();
+        let after_a = state.local_op_counter();
+        assert!(after_a > 0);
+
+        state
+            .upsert("docs", "b", &[("v", LoroValue::I64(2))])
+            .expect("write b");
+        state.doc.commit();
+        let after_b = state.local_op_counter();
+        assert!(after_b > after_a);
+    }
+
+    #[test]
+    fn export_local_range_round_trips_one_row() {
+        let state = CrdtState::new(1).expect("state");
+
+        let start_a = state.local_op_counter();
+        state
+            .upsert("docs", "a", &[("v", LoroValue::I64(1))])
+            .expect("write a");
+        state.doc.commit();
+        let end_a = state.local_op_counter();
+
+        state
+            .upsert("docs", "b", &[("v", LoroValue::I64(2))])
+            .expect("write b");
+        state.doc.commit();
+
+        let row_a_delta = state
+            .export_local_range(start_a, end_a)
+            .expect("export row a range");
+
+        let target = CrdtState::new(2).expect("target state");
+        target.import(&row_a_delta).expect("import row a delta");
+
+        assert!(target.row_exists("docs", "a"));
+        assert!(!target.row_exists("docs", "b"));
+    }
+
+    #[test]
+    fn empty_range_exports_nothing() {
+        let state = CrdtState::new(1).expect("state");
+        state
+            .upsert("docs", "a", &[("v", LoroValue::I64(1))])
+            .expect("write a");
+        state.doc.commit();
+
+        let delta = state.export_local_range(5, 5).expect("empty range export");
+        assert!(delta.is_empty());
+
+        // An empty range yields no bytes at all — there is nothing to send, and
+        // an empty blob is NOT importable (it carries no header). Callers must
+        // skip an empty export rather than enqueue or import it.
+        let target = CrdtState::new(2).expect("target state");
+        assert!(
+            target.import(&delta).is_err(),
+            "an empty export is not a valid delta; callers must skip it"
+        );
+        assert!(!target.row_exists("docs", "a"));
     }
 }
