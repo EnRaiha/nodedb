@@ -68,6 +68,12 @@ impl DescriptorDrainTracker {
     /// Called by the metadata applier on every node when a
     /// `DescriptorDrainStart` raft entry commits.
     pub fn install_start(&self, id: DescriptorId, up_to_version: u64, expires_at: Hlc) {
+        tracing::debug!(
+            ?id,
+            up_to_version,
+            expires_wall_ns = expires_at.wall_ns,
+            "drain: install_start"
+        );
         let mut map = self.active.write().unwrap_or_else(|p| p.into_inner());
         map.insert(
             id,
@@ -83,6 +89,7 @@ impl DescriptorDrainTracker {
     /// raft entries AND on the implicit clear path that runs
     /// after a successful `Put*` apply.
     pub fn install_end(&self, id: &DescriptorId) {
+        tracing::debug!(?id, "drain: install_end");
         let mut map = self.active.write().unwrap_or_else(|p| p.into_inner());
         map.remove(id);
     }

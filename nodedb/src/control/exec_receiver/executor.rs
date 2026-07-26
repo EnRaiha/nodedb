@@ -146,6 +146,12 @@ impl LocalPlanExecutor {
                             stored.descriptor_version
                         };
                         if actual != entry.version {
+                            tracing::debug!(
+                                collection = %entry.collection,
+                                expected_version = entry.version,
+                                actual_version = actual,
+                                "exec receiver: descriptor version mismatch"
+                            );
                             return Err(TypedClusterError::DescriptorMismatch {
                                 collection: entry.collection.clone(),
                                 expected_version: entry.version,

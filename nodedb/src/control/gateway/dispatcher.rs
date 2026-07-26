@@ -321,9 +321,26 @@ pub(super) fn map_typed_cluster_error(err: TypedClusterError, vshard_id: u64) ->
             leader_node: leader_node_id.unwrap_or(0),
             leader_addr: leader_addr.unwrap_or_default(),
         },
-        TypedClusterError::DescriptorMismatch { collection, .. } => Error::RetryableSchemaChanged {
-            descriptor: collection,
-        },
+        TypedClusterError::DescriptorMismatch {
+            collection,
+            expected_version,
+            actual_version,
+        } => {
+            // The versions are the whole diagnosis for this error: a mismatch
+            // that keeps repeating means the planner and the leaseholder
+            // disagree persistently, which is a bug rather than the transient
+            // race the retry assumes. Dropping them leaves "retryable schema
+            // change" with nothing to act on.
+            tracing::debug!(
+                %collection,
+                expected_version,
+                actual_version,
+                "gateway: descriptor version mismatch at leaseholder"
+            );
+            Error::RetryableSchemaChanged {
+                descriptor: collection,
+            }
+        }
         TypedClusterError::DeadlineExceeded { .. } => Error::DeadlineExceeded {
             request_id: crate::types::RequestId::new(0),
         },
