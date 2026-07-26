@@ -121,7 +121,16 @@ impl FromStr for ColumnType {
         }
 
         match upper.as_str() {
-            "BIGINT" | "INT64" | "INTEGER" | "INT" => Ok(Self::Int64),
+            // `INT4`/`INT8`/`SMALLINT`/`INT2` are PostgreSQL wire-width integer
+            // keywords (issue #223: strict/kv `CREATE COLLECTION` rejected
+            // them as unknown types even though they're valid aliases). They
+            // all collapse to the same `Int64` storage variant as
+            // `BIGINT`/`INTEGER`/`INT` — nodedb always stores integers as a
+            // full i64; the declared width only narrows the advertised wire
+            // OID (see `response_shape::schema::sql_data_type_to_ddl_col_type_with_raw`).
+            "BIGINT" | "INT64" | "INTEGER" | "INT" | "INT4" | "INT8" | "SMALLINT" | "INT2" => {
+                Ok(Self::Int64)
+            }
             "FLOAT64" | "DOUBLE" | "REAL" | "FLOAT" => Ok(Self::Float64),
             "TEXT" | "STRING" | "VARCHAR" => Ok(Self::String),
             "BOOL" | "BOOLEAN" => Ok(Self::Bool),
