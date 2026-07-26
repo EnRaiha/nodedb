@@ -18,6 +18,10 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use super::connection::NativeConnection;
 
 /// Configuration for the connection pool.
+///
+/// There is no `Default` impl — construct via [`PoolConfig::new`], which
+/// requires an explicit `auth` identity. See that constructor's doc comment
+/// for why a defaulted identity is unsafe.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     /// Server address (host:port).
@@ -28,7 +32,8 @@ pub struct PoolConfig {
     pub connect_timeout: Duration,
     /// Idle connection timeout (connections idle longer than this are dropped).
     pub idle_timeout: Duration,
-    /// Authentication method.
+    /// Authentication method. Required — no default identity (see
+    /// [`PoolConfig::new`]).
     pub auth: AuthMethod,
     /// Target database name sent in the auth handshake frame.
     ///
@@ -38,16 +43,40 @@ pub struct PoolConfig {
     pub tls: super::connection::TlsConfig,
 }
 
-impl Default for PoolConfig {
-    fn default() -> Self {
+impl PoolConfig {
+    /// Construct a pool configuration with an explicit connection address and
+    /// authentication identity.
+    ///
+    /// There is intentionally no `Default` impl for `PoolConfig`: trust
+    /// authentication is passwordless, so a server configured for trust auth
+    /// grants full privileges to whatever username the client claims. A
+    /// default identity (e.g. a hardcoded `admin`) would let a caller connect
+    /// as the server's most privileged account simply by forgetting to
+    /// configure auth — privilege escalation by omission. Every caller must
+    /// state who they are connecting as.
+    ///
+    /// Every other tuning field keeps its previous default and can still be
+    /// overridden via struct-update syntax:
+    ///
+    /// ```rust,ignore
+    /// use nodedb_client::native::pool::PoolConfig;
+    /// use nodedb_types::protocol::AuthMethod;
+    ///
+    /// let auth = AuthMethod::Trust {
+    ///     username: "alice".into(),
+    /// };
+    /// let config = PoolConfig {
+    ///     max_size: 2,
+    ///     ..PoolConfig::new("127.0.0.1:6433", auth)
+    /// };
+    /// ```
+    pub fn new(addr: impl Into<String>, auth: AuthMethod) -> Self {
         Self {
-            addr: "127.0.0.1:6433".into(),
+            addr: addr.into(),
             max_size: 10,
             connect_timeout: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(300),
-            auth: AuthMethod::Trust {
-                username: "admin".into(),
-            },
+            auth,
             database: None,
             tls: Default::default(),
         }
@@ -222,19 +251,37 @@ impl Drop for PooledConnection<'_> {
 mod tests {
     use super::*;
 
+    fn trust(username: &str) -> AuthMethod {
+        AuthMethod::Trust {
+            username: username.to_string(),
+        }
+    }
+
     #[test]
-    fn pool_config_defaults() {
-        let cfg = PoolConfig::default();
+    fn pool_config_new_sets_tuning_defaults() {
+        let cfg = PoolConfig::new("127.0.0.1:6433", trust("alice"));
         assert_eq!(cfg.addr, "127.0.0.1:6433");
         assert_eq!(cfg.max_size, 10);
         assert_eq!(cfg.connect_timeout, Duration::from_secs(5));
+    }
+
+    /// `PoolConfig::new` must carry the caller's identity through to the
+    /// built config unchanged — asserted explicitly so a future refactor
+    /// cannot quietly reintroduce a hardcoded default identity.
+    #[test]
+    fn pool_config_new_carries_caller_identity() {
+        let cfg = PoolConfig::new("127.0.0.1:6433", trust("alice"));
+        match cfg.auth {
+            AuthMethod::Trust { username } => assert_eq!(username, "alice"),
+            other => panic!("expected AuthMethod::Trust, got {other:?}"),
+        }
     }
 
     #[test]
     fn pool_creates_semaphore() {
         let pool = Pool::new(PoolConfig {
             max_size: 5,
-            ..Default::default()
+            ..PoolConfig::new("127.0.0.1:6433", trust("alice"))
         });
         assert_eq!(pool.semaphore.available_permits(), 5);
     }

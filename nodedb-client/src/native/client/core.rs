@@ -3,6 +3,7 @@
 //! `NativeClient` struct definition and connection/session helpers.
 
 use nodedb_types::error::{ErrorDetails, NodeDbError, NodeDbResult};
+use nodedb_types::protocol::AuthMethod;
 use nodedb_types::result::QueryResult;
 
 use super::super::pool::{Pool, PoolConfig};
@@ -23,12 +24,16 @@ impl NativeClient {
         }
     }
 
-    /// Connect to a NodeDB server with default settings.
-    pub fn connect(addr: &str) -> Self {
-        Self::new(PoolConfig {
-            addr: addr.to_string(),
-            ..Default::default()
-        })
+    /// Connect to a NodeDB server, authenticating as `auth`.
+    ///
+    /// The identity is a required argument, not a default: trust
+    /// authentication is passwordless, so a default identity would let a
+    /// caller who forgot to configure auth connect as whatever account the
+    /// default names — privilege escalation by omission. Use
+    /// [`PoolConfig::new`] plus [`NativeClient::new`] directly if other pool
+    /// tuning (max size, timeouts, TLS, database) needs to be non-default too.
+    pub fn connect_as(addr: &str, auth: AuthMethod) -> Self {
+        Self::new(PoolConfig::new(addr, auth))
     }
 
     /// Execute a SQL query and return structured results.

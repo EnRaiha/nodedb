@@ -18,7 +18,7 @@ use nodedb_types::protocol::{
 ///
 /// # Example
 /// ```no_run
-/// # use nodedb_client::native::capabilities::Capabilities;
+/// # use nodedb_client::capabilities::Capabilities;
 /// let caps = Capabilities::from_raw(0x07); // streaming + graphrag + fts
 /// assert!(caps.supports_streaming());
 /// assert!(caps.supports_graphrag());

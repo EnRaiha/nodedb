@@ -36,7 +36,8 @@ pub struct TestClusterNode {
     pub listen_addr: SocketAddr,
     pub pg_addr: SocketAddr,
     /// Native (MessagePack) protocol listener port. Bound on an ephemeral port
-    /// so `NativeClient::connect("127.0.0.1:<native_port>")` works in tests.
+    /// so `TestClusterNode::native_client` / `native_client_with` (which build
+    /// a `NativeClient` authenticated as the harness superuser) work in tests.
     pub native_port: u16,
     pub client: ClusterTestClient,
     pub shared: Arc<SharedState>,

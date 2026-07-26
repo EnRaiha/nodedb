@@ -89,14 +89,13 @@ fn is_serialization_abort(e: &NodeDbError) -> bool {
 /// the SAME socket and server session, so `BEGIN → read → writes → COMMIT` all
 /// share one transaction context.
 fn pinned_native_client(node: &TestClusterNode) -> NativeClient {
-    // `native_client_with` overrides `addr`/`auth` to the harness's
-    // bootstrapped superuser (see its doc comment for why the `PoolConfig`
-    // default of trust user `admin` never works against this harness); the
-    // `max_size: 1` pinning is this test's own requirement, preserved
-    // explicitly through the caller-supplied base config.
-    node.native_client_with(PoolConfig {
+    // `native_client_with` seeds `addr`/`auth` from the harness's bootstrapped
+    // superuser (see its doc comment for why `PoolConfig` has no identity
+    // default); the `max_size: 1` pinning is this test's own requirement,
+    // applied on top of that base.
+    node.native_client_with(|base| PoolConfig {
         max_size: 1,
-        ..Default::default()
+        ..base
     })
 }
 

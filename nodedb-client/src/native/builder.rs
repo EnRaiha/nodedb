@@ -8,11 +8,13 @@
 //!     .password("s3cr3t")
 //!     .database("analytics")
 //!     .max_connections(20)
-//!     .build();
+//!     .build()?;
+//! # Ok::<(), nodedb_types::error::NodeDbError>(())
 //! ```
 
 use std::time::Duration;
 
+use nodedb_types::error::{NodeDbError, NodeDbResult};
 use nodedb_types::protocol::AuthMethod;
 
 use super::client::NativeClient;
@@ -99,25 +101,29 @@ impl ConnectionBuilder {
 
     /// Build the `NativeClient`.
     ///
-    /// Falls back to sensible defaults for any unset option.
-    pub fn build(self) -> NativeClient {
+    /// The connection address falls back to `127.0.0.1:6433` when unset —
+    /// that is a convenience default, not a security decision. Identity is
+    /// the one option with no default: trust auth is passwordless, so a
+    /// defaulted username would silently authenticate as whatever that
+    /// default happened to be (privilege escalation by omission). Callers
+    /// must supply either [`api_key`](Self::api_key) (which carries its own
+    /// identity via the token) or [`username`](Self::username) — do not
+    /// reintroduce a fallback for either. Never add a default for `addr`
+    /// beyond the existing one either; keep the two concerns separate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither `api_key` nor `username` was set.
+    pub fn build(self) -> NodeDbResult<NativeClient> {
         let addr = self.addr.unwrap_or_else(|| "127.0.0.1:6433".to_string());
+        let auth = resolve_auth(self.username, self.password, self.api_key)?;
 
-        let auth = if let Some(token) = self.api_key {
-            AuthMethod::ApiKey { token }
-        } else if let Some(password) = self.password {
-            let username = self.username.unwrap_or_else(|| "admin".to_string());
-            AuthMethod::Password { username, password }
-        } else {
-            let username = self.username.unwrap_or_else(|| "admin".to_string());
-            AuthMethod::Trust { username }
-        };
-
-        let default_config = PoolConfig::default();
+        // `PoolConfig::new` already carries the identity (`auth`, always
+        // built above — never omitted) plus this crate's tuning defaults;
+        // only override the tuning fields the caller actually set.
+        let default_config = PoolConfig::new(addr, auth);
 
         let config = PoolConfig {
-            addr,
-            auth,
             database: self.database,
             max_size: self.max_connections.unwrap_or(default_config.max_size),
             connect_timeout: self
@@ -125,10 +131,37 @@ impl ConnectionBuilder {
                 .unwrap_or(default_config.connect_timeout),
             idle_timeout: self.idle_timeout.unwrap_or(default_config.idle_timeout),
             tls: self.tls.unwrap_or_default(),
+            ..default_config
         };
 
-        NativeClient::new(config)
+        Ok(NativeClient::new(config))
     }
+}
+
+/// Resolve the builder's optional identity fields into a required
+/// [`AuthMethod`].
+///
+/// This is a disjunction, not three independent defaults: an `api_key`
+/// carries its own identity via the token, so it alone is sufficient. The
+/// trust and password branches have no such built-in identity, so they
+/// require an explicit `username` — there is no fallback for either.
+fn resolve_auth(
+    username: Option<String>,
+    password: Option<String>,
+    api_key: Option<String>,
+) -> NodeDbResult<AuthMethod> {
+    if let Some(token) = api_key {
+        return Ok(AuthMethod::ApiKey { token });
+    }
+    let username = username.ok_or_else(|| {
+        NodeDbError::config(
+            "no authentication identity configured: call .username(...) or .api_key(...)",
+        )
+    })?;
+    Ok(match password {
+        Some(password) => AuthMethod::Password { username, password },
+        None => AuthMethod::Trust { username },
+    })
 }
 
 #[cfg(test)]
@@ -136,18 +169,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builder_defaults() {
-        let client = ConnectionBuilder::new("127.0.0.1:6433").build();
-        let _ = client; // just verify it compiles
+    fn resolve_auth_with_username_carries_it_into_trust() {
+        let auth = resolve_auth(Some("alice".to_string()), None, None).expect("username given");
+        match auth {
+            AuthMethod::Trust { username } => assert_eq!(username, "alice"),
+            other => panic!("expected AuthMethod::Trust, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_auth_with_username_and_password_carries_it_into_password() {
+        let auth = resolve_auth(Some("bob".to_string()), Some("secret".to_string()), None)
+            .expect("username given");
+        match auth {
+            AuthMethod::Password { username, password } => {
+                assert_eq!(username, "bob");
+                assert_eq!(password, "secret");
+            }
+            other => panic!("expected AuthMethod::Password, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_auth_with_api_key_succeeds_without_username() {
+        let auth = resolve_auth(None, None, Some("token-123".to_string())).expect("api_key given");
+        assert!(matches!(auth, AuthMethod::ApiKey { token } if token == "token-123"));
+    }
+
+    #[test]
+    fn resolve_auth_with_no_identity_errors() {
+        // Regression lock: no username, no api_key — must fail, never
+        // silently authenticate as some default identity.
+        let err = resolve_auth(None, None, None).expect_err("must reject a missing identity");
+        assert!(err.message().contains("authentication identity"));
+    }
+
+    #[test]
+    fn resolve_auth_with_password_but_no_username_errors() {
+        let err = resolve_auth(None, Some("secret".to_string()), None)
+            .expect_err("must reject password auth without a username");
+        assert!(err.message().contains("authentication identity"));
+    }
+
+    #[test]
+    fn builder_with_username_succeeds() {
+        let client = ConnectionBuilder::new("127.0.0.1:6433")
+            .username("alice")
+            .build();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn builder_with_api_key_succeeds_without_username() {
+        let client = ConnectionBuilder::new("127.0.0.1:6433")
+            .api_key("token-123")
+            .build();
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn builder_with_no_identity_errors() {
+        // Regression lock: no username, no api_key — must fail, never
+        // silently authenticate as some default identity.
+        // `NativeClient` is not `Debug` (it owns a live connection pool), so
+        // the Ok payload is discarded before `expect_err`.
+        let err = ConnectionBuilder::new("127.0.0.1:6433")
+            .build()
+            .map(|_| ())
+            .expect_err("build() must reject a missing identity");
+        assert!(err.message().contains("authentication identity"));
+    }
+
+    #[test]
+    fn builder_password_without_username_errors() {
+        let err = ConnectionBuilder::new("127.0.0.1:6433")
+            .password("secret")
+            .build()
+            .map(|_| ())
+            .expect_err("build() must reject password auth without a username");
+        assert!(err.message().contains("authentication identity"));
     }
 
     #[test]
     fn builder_with_database() {
-        // Smoke test: verify the builder accepts a database name without panic.
         let _client = ConnectionBuilder::new("127.0.0.1:6433")
             .username("alice")
             .database("analytics")
-            .build();
+            .build()
+            .expect("username was supplied, build() must succeed");
     }
 
     #[test]
@@ -156,6 +265,7 @@ mod tests {
             .username("bob")
             .password("secret")
             .database("prod")
-            .build();
+            .build()
+            .expect("username was supplied, build() must succeed");
     }
 }

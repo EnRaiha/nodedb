@@ -18,18 +18,14 @@ use nodedb_test_support::pgwire_harness::TestServer;
 async fn native_execute_sql_with_bound_params_round_trips() {
     let server = TestServer::start().await;
 
-    let pool = PoolConfig {
-        addr: format!("127.0.0.1:{}", server.native_port),
-        ..Default::default()
-    };
-    // The harness provisions superuser `nodedb`; override the default
-    // PoolConfig auth username from `admin`.
-    let pool = PoolConfig {
-        auth: nodedb_types::protocol::AuthMethod::Trust {
+    // The harness provisions superuser `nodedb`; `PoolConfig` has no default
+    // identity (see `PoolConfig::new`'s doc comment), so state it explicitly.
+    let pool = PoolConfig::new(
+        format!("127.0.0.1:{}", server.native_port),
+        nodedb_types::protocol::AuthMethod::Trust {
             username: "nodedb".into(),
         },
-        ..pool
-    };
+    );
     let native = NativeClient::new(pool);
 
     // Spec: a bound parameter binds to `$1` and the server returns a
