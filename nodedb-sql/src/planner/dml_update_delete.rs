@@ -9,8 +9,8 @@ use super::super::ast_helpers::{
     flatten_and_expr, qualified_ident_pair, strip_and_convert_filters,
 };
 use super::super::dml_helpers::{
-    check_declared_int_ranges_in_assignments, extract_point_keys,
-    extract_table_name_from_table_with_joins,
+    check_declared_float_ranges_in_assignments, check_declared_int_ranges_in_assignments,
+    extract_point_keys, extract_table_name_from_table_with_joins,
 };
 use crate::engine_rules::{self, DeleteParams, UpdateFromParams, UpdateParams};
 use crate::error::{Result, SqlError};
@@ -54,6 +54,7 @@ pub fn plan_update(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
     // an `INSERT` that does (see `declared_type_coerce`).
     coerce_assignments_to_declared_types(&info.columns, &mut assigns, info.primary_key.as_deref())?;
     check_declared_int_ranges_in_assignments(&info.columns, &assigns)?;
+    check_declared_float_ranges_in_assignments(&info.columns, &assigns)?;
 
     let filters = match &update.selection {
         Some(expr) => super::super::select::convert_where_to_filters(expr)?,

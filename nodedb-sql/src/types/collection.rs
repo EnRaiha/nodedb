@@ -91,10 +91,13 @@ pub struct ColumnInfo {
     /// for float columns whose declared type the catalog never recorded.
     ///
     /// The float analogue of [`ColumnInfo::int_width`], and resolved from the
-    /// same source, but read on the read path only: it selects the
-    /// `RowDescription` OID (700 vs 701) and the binary payload width (4 vs 8
-    /// bytes). There is no write-path counterpart because narrowing a float
-    /// rounds rather than wraps — PostgreSQL accepts-and-rounds a `double`
-    /// literal into a `real` column, and so does nodedb.
+    /// same source. Read on the read path to select the `RowDescription` OID
+    /// (700 vs 701) and the binary payload width (4 vs 8 bytes), and read on
+    /// the write path by `check_declared_float_ranges` — but only for the
+    /// narrower failure mode a float has: narrowing an `f64` to `f32` rounds
+    /// rather than wraps (PostgreSQL accepts-and-rounds a `double` literal
+    /// into a `real` column, and so does nodedb), so only a finite value
+    /// that would overflow to infinity is rejected, not the full out-of-range
+    /// check `int_width` gets.
     pub float_width: Option<nodedb_types::columnar::FloatWidth>,
 }

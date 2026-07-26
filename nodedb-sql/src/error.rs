@@ -35,6 +35,22 @@ pub enum SqlError {
         declared_type: &'static str,
     },
 
+    /// A write supplied a finite float that overflows to infinity when
+    /// narrowed to the column's declared `REAL` width.
+    ///
+    /// Narrowing an `f64` to `f32` normally rounds — `1.1` becoming
+    /// `1.10000002` is correct PostgreSQL `real` behaviour, never an error —
+    /// so this is not the float mirror of [`SqlError::IntegerOutOfRange`]'s
+    /// full-range check. The single case rejected is a finite value beyond
+    /// `f32`'s range, which would otherwise silently become `Infinity`.
+    /// PostgreSQL rejects the same write with the same message.
+    #[error("value {value} is out of range for column '{column}' of type {declared_type}")]
+    FloatOutOfRange {
+        column: String,
+        value: f64,
+        declared_type: &'static str,
+    },
+
     #[error("unsupported: {detail}")]
     Unsupported { detail: String },
 

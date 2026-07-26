@@ -13,16 +13,20 @@
 //!
 //! # How this differs from [`IntWidth`](super::IntWidth)
 //!
-//! The integer analogue also bounds *writes*: narrowing an out-of-range `i64`
-//! wraps, so a value that does not fit a declared `INTEGER` is rejected at
-//! write time exactly as PostgreSQL rejects it. Floats have no such rule.
-//! Narrowing an `f64` to an `f32` **rounds** — `1.1` becoming `1.10000002` is
-//! correct PostgreSQL `real` behaviour, not an error — and PostgreSQL itself
-//! accepts-and-rounds on write. There is deliberately no float counterpart to
-//! `check_declared_int_ranges`. The single failure mode is *overflow to
-//! infinity*: a finite `f64` beyond `f32`'s range becomes `inf`, which
-//! PostgreSQL raises `value out of range: overflow` for, and which the wire
-//! encoder guards against at narrowing time.
+//! The integer analogue bounds writes by *full range*: narrowing an
+//! out-of-range `i64` wraps, so any value that does not fit a declared
+//! `INTEGER` is rejected at write time exactly as PostgreSQL rejects it.
+//! Floats are bounded differently. Narrowing an `f64` to an `f32` **rounds** —
+//! `1.1` becoming `1.10000002` is correct PostgreSQL `real` behaviour, not an
+//! error — so `check_declared_float_ranges` (the float counterpart of
+//! `check_declared_int_ranges`) never rejects on rounding. The single failure
+//! mode it does reject is *overflow to infinity*: a finite `f64` beyond
+//! `f32`'s range becomes `inf`, which PostgreSQL raises `value out of range:
+//! overflow` for. That check runs at write time in the planner, mirroring the
+//! read-side guard the wire encoder applies at narrowing time — the two are
+//! deliberately layered, not redundant: the write-time check is bypassed by
+//! rows written before the column's width was declared or via non-SQL
+//! ingest, so the read-side guard remains the backstop.
 //!
 //! Because the keyword set is shared by catalog introspection OIDs and
 //! `RowDescription` OIDs alike, [`FloatWidth::from_declared_type`] is the

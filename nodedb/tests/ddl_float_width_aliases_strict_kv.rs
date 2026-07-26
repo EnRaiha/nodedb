@@ -26,11 +26,13 @@
 //! * Bare `FLOAT` is **double** precision (OID 701), matching PostgreSQL and
 //!   the SQL standard. `FLOAT` is not a synonym for `REAL`.
 //!
-//! Unlike integers there is no write-side range constraint: narrowing a float
-//! rounds rather than wraps, and PostgreSQL accepts-and-rounds too. The one
-//! failure mode — a finite `f64` beyond `f32`'s range overflowing to infinity
-//! on the wire — is refused at encode time with SQLSTATE `22003`, covered by
-//! the last test here.
+//! Unlike an out-of-range integer, narrowing a float rounds rather than
+//! wraps, and PostgreSQL accepts-and-rounds too — so there is no full
+//! write-side range constraint. The one failure mode — a finite `f64` beyond
+//! `f32`'s range overflowing to infinity — is refused at write time by the
+//! planner (mirroring the declared-width integer check), with the pgwire
+//! encoder's SQLSTATE `22003` guard layered underneath as the backstop for
+//! rows that reach it some other way. Covered by the last test here.
 
 mod common;
 
@@ -305,14 +307,18 @@ async fn real_column_rounds_rather_than_rejecting() {
     );
 }
 
-/// The one float narrowing that is not value-preserving: a finite `f64` beyond
-/// `f32`'s range would reach the client as `Infinity`, silently replacing a
-/// real stored number. Nothing range-checks floats on write (narrowing rounds
-/// rather than wraps, so there is nothing to check), which is exactly why the
-/// encoder must refuse it — under SQLSTATE `22003`, as PostgreSQL does for the
-/// same conversion.
+/// The one float narrowing that is not value-preserving: a finite `f64`
+/// beyond `f32`'s range would reach the client as `Infinity`, silently
+/// replacing a real stored number. That is now caught at write time, in the
+/// planner (`check_declared_float_ranges`), exactly as the declared-width
+/// integer check rejects an out-of-range integer literal — so the bad row
+/// never lands and the error surfaces immediately to the writer, not later to
+/// whoever happens to read it. The read-side guard in the pgwire encoder
+/// (`checked_narrow_f32`, SQLSTATE `22003`) still exists underneath as the
+/// backstop for rows written before the column's width was declared, or via
+/// non-SQL ingest — see its module docs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_column_overflow_errors_instead_of_returning_infinity() {
+async fn real_column_overflow_is_rejected_at_write_time() {
     let server = TestServer::start().await;
 
     server
@@ -326,39 +332,42 @@ async fn real_column_overflow_errors_instead_of_returning_infinity() {
         .await
         .expect("CREATE COLLECTION real_overflow must succeed");
 
-    // Accepted on write — floats carry no declared-range constraint.
-    server
+    // Rejected on write — a finite value beyond f32 range would otherwise
+    // silently become Infinity.
+    let err = server
         .exec("INSERT INTO real_overflow (id, r, d) VALUES ('r1', 1e300, 1e300)")
         .await
-        .expect("a float beyond f32 range must still be accepted on write");
-
-    let stmt = server
-        .client
-        .prepare_typed(
-            "SELECT r FROM real_overflow WHERE id = $1",
-            &[tokio_postgres::types::Type::TEXT],
-        )
-        .await
-        .expect("prepare real_overflow select");
-    let err = server
-        .client
-        .query(&stmt, &[&"r1"])
-        .await
-        .expect_err("reading an out-of-range value through a REAL column must error");
-    let db = err
-        .as_db_error()
-        .unwrap_or_else(|| panic!("expected a server-side error, got: {err}"));
-    assert_eq!(
-        db.code(),
-        &tokio_postgres::error::SqlState::NUMERIC_VALUE_OUT_OF_RANGE,
-        "float overflow must report SQLSTATE 22003, got {}: {}",
-        db.code().code(),
-        db.message()
+        .expect_err(
+            "a float beyond the declared REAL column's f32 range must be \
+             rejected at write time, not silently stored and surfaced later \
+             on read",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("out of range"),
+        "rejection must say the value is out of range; got: {msg}"
     );
 
-    // The same value read through the `DOUBLE` column is in range and comes
-    // back intact — proving the error above is the narrowing guard and not a
+    // Nothing from the rejected statement may have landed.
+    let rows = server
+        .client
+        .query("SELECT id FROM real_overflow", &[])
+        .await
+        .expect("scan real_overflow");
+    assert!(
+        rows.is_empty(),
+        "no rejected row may be stored; found {} row(s)",
+        rows.len()
+    );
+
+    // The same value into a DOUBLE column is in range and is accepted —
+    // proving the rejection above is the declared-REAL-width guard and not a
     // blanket rejection of large floats.
+    server
+        .exec("INSERT INTO real_overflow (id, d) VALUES ('r2', 1e300)")
+        .await
+        .expect("a float within f64 range must be accepted into a DOUBLE column");
+
     let stmt_wide = server
         .client
         .prepare_typed(
@@ -369,7 +378,7 @@ async fn real_column_overflow_errors_instead_of_returning_infinity() {
         .expect("prepare real_overflow wide select");
     let rows = server
         .client
-        .query(&stmt_wide, &[&"r1"])
+        .query(&stmt_wide, &[&"r2"])
         .await
         .expect("a double precision column holds the same value without error");
     assert_eq!(rows.len(), 1, "expected 1 row back from real_overflow");

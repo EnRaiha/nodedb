@@ -5,7 +5,10 @@
 
 use sqlparser::ast;
 
-use super::range_check::check_declared_int_ranges;
+use super::range_check::{
+    check_declared_float_ranges, check_declared_float_ranges_in_assignments,
+    check_declared_int_ranges, check_declared_int_ranges_in_assignments,
+};
 use super::value_convert::expr_to_sql_value;
 use crate::error::{Result, SqlError};
 use crate::planner::declared_type_coerce::{
@@ -91,6 +94,7 @@ pub(crate) fn build_kv_insert_plan(
     // values so a literal that only becomes an integer through coercion is
     // still range-checked against its declared width.
     check_declared_int_ranges(declared_columns, &coerced_rows)?;
+    check_declared_float_ranges(declared_columns, &coerced_rows)?;
     // `ON CONFLICT DO UPDATE SET col = <literal>` writes through the same
     // untyped KV path as the inserted row, so its literals need the same
     // declared-type coercion.
@@ -99,6 +103,8 @@ pub(crate) fn build_kv_insert_plan(
         &mut on_conflict_updates,
         Some(key_col_name),
     )?;
+    check_declared_int_ranges_in_assignments(declared_columns, &on_conflict_updates)?;
+    check_declared_float_ranges_in_assignments(declared_columns, &on_conflict_updates)?;
 
     let mut entries = Vec::with_capacity(coerced_rows.len());
     let mut ttl_secs: u64 = 0;
@@ -129,4 +135,110 @@ pub(crate) fn build_kv_insert_plan(
         intent,
         on_conflict_updates,
     }])
+}
+
+#[cfg(test)]
+mod kv_on_conflict_range_tests {
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+    use sqlparser::tokenizer::Span;
+
+    use super::*;
+    use nodedb_types::columnar::{FloatWidth, IntWidth};
+
+    fn string_column(name: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: SqlDataType::String,
+            nullable: true,
+            is_primary_key: false,
+            default: None,
+            raw_type: None,
+            int_width: None,
+            float_width: None,
+        }
+    }
+
+    fn int_column(name: &str, width: Option<IntWidth>) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: SqlDataType::Int64,
+            nullable: true,
+            is_primary_key: false,
+            default: None,
+            raw_type: None,
+            int_width: width,
+            float_width: None,
+        }
+    }
+
+    fn float_column(name: &str, width: Option<FloatWidth>) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: SqlDataType::Float64,
+            nullable: true,
+            is_primary_key: false,
+            default: None,
+            raw_type: None,
+            int_width: None,
+            float_width: width,
+        }
+    }
+
+    fn key_value_expr(key: &str) -> Expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(key.to_string()),
+            span: Span::empty(),
+        })
+    }
+
+    /// Build a single-row `INSERT ... ON CONFLICT (key) DO UPDATE SET ...`
+    /// plan against a `key TEXT PRIMARY KEY` collection with `n INT` and
+    /// `r REAL` columns, and return the result of range-checking `updates`.
+    fn plan_with_on_conflict(updates: Vec<(String, SqlExpr)>) -> Result<Vec<SqlPlan>> {
+        let declared = [
+            string_column("key"),
+            int_column("n", Some(IntWidth::I32)),
+            float_column("r", Some(FloatWidth::F32)),
+        ];
+        build_kv_insert_plan(
+            "t".to_string(),
+            &["key".to_string()],
+            &[vec![key_value_expr("a")]],
+            KvInsertIntent::Put,
+            updates,
+            Some("key"),
+            &declared,
+        )
+    }
+
+    #[test]
+    fn on_conflict_int_beyond_declared_width_is_rejected() {
+        let updates = vec![(
+            "n".to_string(),
+            SqlExpr::Literal(SqlValue::Int(9_876_543_210)),
+        )];
+        let err = plan_with_on_conflict(updates).expect_err("i32 column must reject overflow");
+        assert!(matches!(err, SqlError::IntegerOutOfRange { .. }));
+    }
+
+    #[test]
+    fn on_conflict_int_in_range_is_accepted() {
+        let updates = vec![("n".to_string(), SqlExpr::Literal(SqlValue::Int(42)))];
+        plan_with_on_conflict(updates).expect("in-range i32 literal must be accepted");
+    }
+
+    #[test]
+    fn on_conflict_float_beyond_f32_range_is_rejected() {
+        let updates = vec![("r".to_string(), SqlExpr::Literal(SqlValue::Float(1e300)))];
+        let err = plan_with_on_conflict(updates).expect_err("real column must reject f32 overflow");
+        assert!(matches!(err, SqlError::FloatOutOfRange { .. }));
+    }
+
+    #[test]
+    fn on_conflict_float_rounding_is_accepted() {
+        // Pinned per `check_declared_float_ranges`: narrowing to f32 rounds,
+        // it does not reject, so a future change must not tighten this.
+        let updates = vec![("r".to_string(), SqlExpr::Literal(SqlValue::Float(1.1)))];
+        plan_with_on_conflict(updates).expect("rounding into f32 must not be rejected");
+    }
 }

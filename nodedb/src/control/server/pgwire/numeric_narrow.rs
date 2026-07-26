@@ -19,10 +19,12 @@
 //!   a last line of defence, writes are range-checked up front
 //!   (`nodedb_sql::planner::dml_helpers::check_declared_int_ranges`).
 //! * **Floats round.** `1.1` read back from a `REAL` column as `1.10000002` is
-//!   exactly what PostgreSQL does, so there is deliberately no write-time
-//!   float range check and no error here. The single non-value-preserving case
-//!   is overflow: a finite `f64` beyond `f32`'s range narrows to an infinity,
-//!   replacing a real number with `Infinity` and signalling nothing.
+//!   exactly what PostgreSQL does, so rounding is never an error here. The
+//!   single non-value-preserving case is overflow: a finite `f64` beyond
+//!   `f32`'s range narrows to an infinity, replacing a real number with
+//!   `Infinity` and signalling nothing — writes are range-checked for exactly
+//!   this case up front
+//!   (`nodedb_sql::planner::dml_helpers::check_declared_float_ranges`).
 
 use nodedb_types::columnar::{FloatWidth, IntWidth};
 use pgwire::error::PgWireResult;
@@ -74,6 +76,13 @@ pub(in crate::control::server::pgwire) fn checked_narrow(
 /// SQLSTATE `22003` PostgreSQL raises for the identical conversion. A source
 /// value that is *already* infinite or NaN passes through untouched: those are
 /// representable in both widths and are not an overflow.
+///
+/// Writes through SQL are range-checked at plan time
+/// (`nodedb_sql::planner::dml_helpers::check_declared_float_ranges`), which
+/// makes this unreachable for data nodedb accepted itself. It still has to
+/// exist, layered underneath rather than replaced by it: rows written before a
+/// column's width was declared, and rows arriving over non-SQL ingest paths,
+/// are not covered by that check.
 pub(in crate::control::server::pgwire) fn checked_narrow_f32(
     v: &serde_json::Value,
 ) -> PgWireResult<Option<f32>> {

@@ -6,8 +6,9 @@ use nodedb_types::DatabaseId;
 use sqlparser::ast::{self};
 
 use super::dml_helpers::{
-    build_kv_insert_plan, build_vector_primary_insert_plan, coerce_and_check_rows,
-    convert_value_rows, resolve_insert_columns,
+    build_kv_insert_plan, build_vector_primary_insert_plan,
+    check_declared_float_ranges_in_assignments, check_declared_int_ranges_in_assignments,
+    coerce_and_check_rows, convert_value_rows, resolve_insert_columns,
 };
 use crate::engine_rules::{self, InsertParams};
 use crate::error::{Result, SqlError};
@@ -317,6 +318,8 @@ fn plan_upsert_with_on_conflict(
         &mut on_conflict_updates,
         info.primary_key.as_deref(),
     )?;
+    check_declared_int_ranges_in_assignments(&info.columns, &on_conflict_updates)?;
+    check_declared_float_ranges_in_assignments(&info.columns, &on_conflict_updates)?;
     let column_defaults: Vec<(String, String)> = info
         .columns
         .iter()

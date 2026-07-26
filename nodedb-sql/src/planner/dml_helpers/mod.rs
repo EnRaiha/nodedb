@@ -19,6 +19,9 @@ pub use ast_extract::extract_point_keys;
 pub(super) use ast_extract::extract_table_name_from_table_with_joins;
 pub(super) use insert_columns::resolve_insert_columns;
 pub(super) use kv_insert::build_kv_insert_plan;
-pub(super) use range_check::{check_declared_int_ranges_in_assignments, coerce_and_check_rows};
+pub(super) use range_check::{
+    check_declared_float_ranges_in_assignments, check_declared_int_ranges_in_assignments,
+    coerce_and_check_rows,
+};
 pub(super) use value_convert::{convert_value_rows, expr_to_sql_value};
 pub(super) use vector_primary_insert::build_vector_primary_insert_plan;
