@@ -4170,6 +4170,7 @@ dependencies = [
  "parquet",
  "pem",
  "pgwire",
+ "postgres-types",
  "proptest",
  "prost",
  "rand 0.9.4",

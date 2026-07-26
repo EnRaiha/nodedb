@@ -142,14 +142,15 @@ async fn boundary_values_are_accepted_and_round_trip() {
 ///
 /// This is the case the planner check exists for. An inline literal could in
 /// principle be rejected by the parser; a parameter arrives as an `int8` on
-/// the wire and is bound into the AST *before* planning, so the only thing
-/// standing between it and storage is the range check.
+/// the wire, is decoded from its binary form, and is bound into the AST
+/// *before* planning, so the planner's declared-width range check is the only
+/// thing standing between it and storage.
 ///
-/// The parameter is declared `TEXT` with an explicit `::INT` cast rather than
-/// `INT8`: inference for an `INSERT ... VALUES ($1)` placeholder reports
-/// `Unknown` (which no driver will serialize an integer into), and the bind
-/// layer decodes parameters from their text form, so a `TEXT` parameter is the
-/// shape that reaches the planner as a bound integer.
+/// The parameter is declared `INT8` (via `prepare_typed`) rather than left as
+/// a bare `INSERT ... VALUES ($1)` placeholder: inference for a bare
+/// placeholder reports `Unknown`, which no driver will serialize an integer
+/// into, so an explicit `INT8` type is the shape that reaches the planner as
+/// a bound integer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bound_parameter_beyond_declared_width_is_rejected() {
     let server = server_with_widths("width_param", "").await;
@@ -157,14 +158,14 @@ async fn bound_parameter_beyond_declared_width_is_rejected() {
     let stmt = server
         .client
         .prepare_typed(
-            "INSERT INTO width_param (id, med) VALUES ('p1', $1::INT)",
-            &[tokio_postgres::types::Type::TEXT],
+            "INSERT INTO width_param (id, med) VALUES ('p1', $1)",
+            &[tokio_postgres::types::Type::INT8],
         )
         .await
         .expect("prepare width_param insert");
     let err = server
         .client
-        .execute(&stmt, &[&OVER_I32.to_string()])
+        .execute(&stmt, &[&OVER_I32])
         .await
         .expect_err("a bound parameter past the declared width must be rejected");
     // `tokio_postgres::Error`'s Display is just "db error"; the server's
@@ -184,14 +185,14 @@ async fn bound_parameter_beyond_declared_width_is_rejected() {
     let stmt_ok = server
         .client
         .prepare_typed(
-            "INSERT INTO width_param (id, med) VALUES ('p2', $1::INT)",
-            &[tokio_postgres::types::Type::TEXT],
+            "INSERT INTO width_param (id, med) VALUES ('p2', $1)",
+            &[tokio_postgres::types::Type::INT8],
         )
         .await
         .expect("prepare in-range width_param insert");
     server
         .client
-        .execute(&stmt_ok, &[&i32::MAX.to_string()])
+        .execute(&stmt_ok, &[&(i32::MAX as i64)])
         .await
         .expect("an in-range bound parameter must be accepted");
 

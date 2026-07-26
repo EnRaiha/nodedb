@@ -125,6 +125,7 @@ reqwest = { workspace = true }
 
 # PostgreSQL wire protocol
 pgwire = { workspace = true }
+postgres-types = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
 

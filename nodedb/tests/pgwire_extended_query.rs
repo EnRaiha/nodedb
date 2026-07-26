@@ -600,3 +600,203 @@ async fn extended_query_timestamp_text_fallback_with_binary_sibling() {
         text_rows[0]
     );
 }
+
+/// Regression lock: when the client declares a parameter's type (via
+/// `prepare_typed`), `tokio-postgres` transmits that parameter in
+/// PostgreSQL *binary* format. Before this fix, the bind layer decoded
+/// every parameter as UTF-8 text regardless of wire format, so a binary
+/// `INT8` payload was rejected with SQLSTATE 22021 ("invalid UTF-8 in
+/// parameter $1"). Now binary BOOL/INT2/INT4/INT8/FLOAT4/FLOAT8 are decoded
+/// via their `postgres_types::FromSql` binary encodings instead.
+///
+/// Note: this test (and its siblings below) use `prepare_typed` with an
+/// explicit type rather than a bare `$1` placeholder because this server
+/// does not infer parameter types from the catalog — an untyped `$1` still
+/// reports `Unknown` back to the client, and `tokio-postgres` refuses to
+/// serialize a Rust value against an `Unknown` OID. That gap is a separate,
+/// out-of-scope limitation; declaring the type is how a real client reaches
+/// the binary-format path this test locks in.
+#[tokio::test]
+async fn extended_query_binary_i64_param_in_where_is_decoded() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION t (id STRING PRIMARY KEY, n BIGINT) WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO t (id, n) VALUES ('a', 1), ('b', 42), ('c', 100)")
+        .await
+        .unwrap();
+
+    let stmt = server
+        .client
+        .prepare_typed("SELECT id FROM t WHERE n = $1", &[Type::INT8])
+        .await
+        .expect("prepare_typed should succeed");
+    let rows = server
+        .client
+        .query(&stmt, &[&42i64])
+        .await
+        .expect("binary-format i64 parameter must decode and match");
+
+    assert_eq!(rows.len(), 1, "expected exactly one matching row");
+    let id: &str = rows[0].get("id");
+    assert_eq!(id, "b");
+}
+
+/// Every declared-width binary scalar type (`i32`, `i16`, `f64`, `f32`,
+/// `bool`) must decode correctly when bound as a `tokio-postgres` typed
+/// parameter — not just `i64`. Each is used in a `WHERE` predicate so the
+/// bound value must be decoded to the correct value, not merely accepted.
+#[tokio::test]
+async fn extended_query_binary_scalar_params_decode_in_where() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION s (id STRING PRIMARY KEY, i32_col INT, i16_col SMALLINT, \
+             f64_col DOUBLE, f32_col FLOAT, bool_col BOOL) WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    server
+        .exec(
+            "INSERT INTO s (id, i32_col, i16_col, f64_col, f32_col, bool_col) \
+             VALUES ('a', 1000, 10, 1.5, 1.5, false)",
+        )
+        .await
+        .unwrap();
+    server
+        .exec(
+            "INSERT INTO s (id, i32_col, i16_col, f64_col, f32_col, bool_col) \
+             VALUES ('b', 70000, 300, 2.5, 2.5, true)",
+        )
+        .await
+        .unwrap();
+
+    let stmt = server
+        .client
+        .prepare_typed("SELECT id FROM s WHERE i32_col = $1", &[Type::INT4])
+        .await
+        .expect("prepare_typed should succeed");
+    let rows = server
+        .client
+        .query(&stmt, &[&70000i32])
+        .await
+        .expect("binary-format i32 parameter must decode and match");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("id"), "b");
+
+    let stmt = server
+        .client
+        .prepare_typed("SELECT id FROM s WHERE i16_col = $1", &[Type::INT2])
+        .await
+        .expect("prepare_typed should succeed");
+    let rows = server
+        .client
+        .query(&stmt, &[&10i16])
+        .await
+        .expect("binary-format i16 parameter must decode and match");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("id"), "a");
+
+    let stmt = server
+        .client
+        .prepare_typed("SELECT id FROM s WHERE f64_col = $1", &[Type::FLOAT8])
+        .await
+        .expect("prepare_typed should succeed");
+    let rows = server
+        .client
+        .query(&stmt, &[&2.5f64])
+        .await
+        .expect("binary-format f64 parameter must decode and match");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("id"), "b");
+
+    let stmt = server
+        .client
+        .prepare_typed("SELECT id FROM s WHERE f32_col = $1", &[Type::FLOAT4])
+        .await
+        .expect("prepare_typed should succeed");
+    let rows = server
+        .client
+        .query(&stmt, &[&1.5f32])
+        .await
+        .expect("binary-format f32 parameter must decode and match");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("id"), "a");
+
+    let stmt = server
+        .client
+        .prepare_typed("SELECT id FROM s WHERE bool_col = $1", &[Type::BOOL])
+        .await
+        .expect("prepare_typed should succeed");
+    let rows = server
+        .client
+        .query(&stmt, &[&true])
+        .await
+        .expect("binary-format bool parameter must decode and match");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("id"), "b");
+}
+
+/// The same binary scalar types bound as INSERT values, not just WHERE
+/// predicates — the decoded value must be the one actually stored, verified
+/// by reading it back.
+#[tokio::test]
+async fn extended_query_binary_scalar_params_insert_and_round_trip() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION w (id STRING PRIMARY KEY, i32_col INT, i16_col SMALLINT, \
+             f64_col DOUBLE, f32_col FLOAT, bool_col BOOL) WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+
+    let stmt = server
+        .client
+        .prepare_typed(
+            "INSERT INTO w (id, i32_col, i16_col, f64_col, f32_col, bool_col) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[
+                Type::TEXT,
+                Type::INT4,
+                Type::INT2,
+                Type::FLOAT8,
+                Type::FLOAT4,
+                Type::BOOL,
+            ],
+        )
+        .await
+        .expect("prepare_typed insert should succeed");
+    server
+        .client
+        .execute(
+            &stmt,
+            &[&"row1", &123456i32, &(-7i16), &1234.5f64, &1.25f32, &true],
+        )
+        .await
+        .expect("binary-format scalar insert should succeed");
+
+    let rows = server
+        .client
+        .query(
+            "SELECT i32_col, i16_col, f64_col, f32_col, bool_col FROM w WHERE id = $1",
+            &[&"row1"],
+        )
+        .await
+        .expect("select back the inserted row");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>("i32_col"), 123456);
+    assert_eq!(rows[0].get::<_, i16>("i16_col"), -7);
+    assert!((rows[0].get::<_, f64>("f64_col") - 1234.5).abs() < 1e-9);
+    // `f32_col` is declared FLOAT, which the catalog always advertises as
+    // float8 (only integer widths are narrowed on the wire — see
+    // `sql_data_type_to_ddl_col_type_with_width`), so the stored value is
+    // fetched via the f64 getter; what's under test is that the bound f32
+    // *parameter* was decoded to the right value on the way in.
+    assert!((rows[0].get::<_, f64>("f32_col") - 1.25).abs() < 1e-6);
+    assert!(rows[0].get::<_, bool>("bool_col"));
+}
