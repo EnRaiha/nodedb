@@ -20,11 +20,11 @@ pub(in crate::data::executor) fn apply_projection(
     data: serde_json::Value,
     computed_cols: &[ComputedColumn],
     projection: &[String],
-) -> serde_json::Value {
-    match data {
+) -> crate::Result<serde_json::Value> {
+    Ok(match data {
         serde_json::Value::Object(obj) => {
             if computed_cols.is_empty() && projection.is_empty() {
-                return serde_json::Value::Object(obj);
+                return Ok(serde_json::Value::Object(obj));
             }
 
             let doc_val = nodedb_types::Value::from(serde_json::Value::Object(obj.clone()));
@@ -45,16 +45,17 @@ pub(in crate::data::executor) fn apply_projection(
                 if matches!(existing, Some(v) if !v.is_null()) {
                     continue;
                 }
-                out.insert(
-                    cc.alias.clone(),
-                    serde_json::Value::from(cc.expr.eval(&doc_val)),
-                );
+                // A computed column is projection-shaped (nodedb issue
+                // #216): a division/modulo-by-zero fails the whole query
+                // instead of silently materializing NULL into the response.
+                let v = cc.expr.eval(&doc_val)?;
+                out.insert(cc.alias.clone(), serde_json::Value::from(v));
             }
 
             serde_json::Value::Object(out)
         }
         other => other,
-    }
+    })
 }
 
 /// Apply projection and computed columns on raw msgpack bytes.
@@ -65,9 +66,9 @@ pub(in crate::data::executor) fn apply_projection_msgpack(
     data: &[u8],
     computed_cols: &[ComputedColumn],
     projection: &[String],
-) -> Vec<u8> {
+) -> crate::Result<Vec<u8>> {
     if computed_cols.is_empty() && projection.is_empty() {
-        return data.to_vec();
+        return Ok(data.to_vec());
     }
 
     let field_count = if projection.is_empty() {
@@ -98,7 +99,10 @@ pub(in crate::data::executor) fn apply_projection_msgpack(
                 continue;
             }
             nodedb_query::msgpack_scan::write_str(&mut buf, &cc.alias);
-            let result = cc.expr.eval(&doc_val);
+            // A computed column is projection-shaped (nodedb issue #216): a
+            // division/modulo-by-zero fails the whole query instead of
+            // silently materializing NULL into the response.
+            let result = cc.expr.eval(&doc_val)?;
             if let Ok(mp) = nodedb_types::value_to_msgpack(&result) {
                 buf.extend_from_slice(&mp);
             } else {
@@ -107,7 +111,7 @@ pub(in crate::data::executor) fn apply_projection_msgpack(
         }
     }
 
-    buf
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -128,7 +132,7 @@ mod tests {
         }];
         let projection = vec!["name".to_string(), "age".to_string()];
 
-        let projected = apply_projection(data, &computed, &projection);
+        let projected = apply_projection(data, &computed, &projection).unwrap();
 
         assert_eq!(
             projected,
@@ -156,7 +160,7 @@ mod tests {
         }];
         let projection = vec!["name".to_string(), "age".to_string(), "rn".to_string()];
 
-        let projected = apply_projection(data, &computed, &projection);
+        let projected = apply_projection(data, &computed, &projection).unwrap();
 
         assert_eq!(
             projected,
@@ -180,7 +184,7 @@ mod tests {
             "pr_score".to_string(),
         ];
 
-        let projected = apply_projection(data, &[], &projection);
+        let projected = apply_projection(data, &[], &projection).unwrap();
 
         assert_eq!(
             projected,
@@ -190,5 +194,23 @@ mod tests {
                 "pr_score": serde_json::Value::Null,
             })
         );
+    }
+
+    /// nodedb issue #216: a computed column that divides by zero fails the
+    /// projection instead of silently materializing `NULL`.
+    #[test]
+    fn apply_projection_computed_column_division_by_zero_errors() {
+        use crate::bridge::expr_eval::BinaryOp;
+        let data = serde_json::json!({"denom": 0});
+        let computed = vec![ComputedColumn {
+            alias: "bad".into(),
+            expr: SqlExpr::BinaryOp {
+                left: Box::new(SqlExpr::Literal(nodedb_types::Value::Integer(10))),
+                op: BinaryOp::Div,
+                right: Box::new(SqlExpr::Column("denom".into())),
+            },
+        }];
+        let err = apply_projection(data, &computed, &[]).unwrap_err();
+        assert!(matches!(err, crate::Error::DivisionByZero), "got {err:?}");
     }
 }

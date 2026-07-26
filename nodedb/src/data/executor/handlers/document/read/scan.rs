@@ -158,17 +158,32 @@ impl CoreLoop {
                         crate::types::TenantId::new(tid),
                         collection.to_string(),
                     );
+                    // `merge_overlay_into_scan` takes an infallible
+                    // `Fn(&[u8]) -> bool` predicate, so a division/modulo-by-
+                    // zero (nodedb issue #216) is captured via this `Cell`
+                    // side-channel and checked once the merge returns.
+                    let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
+                        std::cell::Cell::new(None);
                     let matches = |value: &[u8]| -> bool {
                         if filter_predicates.is_empty() {
                             return true;
                         }
-                        crate::data::executor::core_loop::filter_match::matches_with_resolved_schema(
+                        match crate::data::executor::core_loop::filter_match::matches_with_resolved_schema(
                             effective_schema.as_ref(),
                             &filter_predicates,
                             value,
-                        )
+                        ) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                predicate_err.set(Some(e));
+                                false
+                            }
+                        }
                     };
                     self.merge_overlay_into_scan(txn_id, &coll_key, &mut filtered, &matches);
+                    if predicate_err.take().is_some() {
+                        return self.response_error(task, ErrorCode::DivisionByZero);
+                    }
                 }
 
                 // Bound an unbounded (no-LIMIT) scan by the memory budget. If
@@ -253,15 +268,19 @@ impl CoreLoop {
                     // with the same `category` but different ids/payload are
                     // distinct as documents but the same under
                     // `SELECT DISTINCT category`. Project first, then dedupe.
-                    let projected_rows: Vec<_> = sorted
+                    let projected_rows: Vec<_> = match sorted
                         .into_iter()
                         .map(|(doc_id, val)| {
                             let mp = decode_scanned_document_msgpack(&val, Some(schema));
                             let projected =
-                                apply_projection_msgpack(&mp, &computed_cols, projection);
-                            (doc_id, projected)
+                                apply_projection_msgpack(&mp, &computed_cols, projection)?;
+                            Ok((doc_id, projected))
                         })
-                        .collect();
+                        .collect::<crate::Result<Vec<_>>>()
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => return self.response_error(task, e),
+                    };
                     let deduped = if distinct {
                         let mut seen = std::collections::HashSet::new();
                         projected_rows
@@ -290,16 +309,20 @@ impl CoreLoop {
 
                     // Project first, then dedupe on the projected JSON value
                     // so `SELECT DISTINCT col` honours SQL semantics.
-                    let projected_rows: Vec<_> = decoded_rows
+                    let projected_rows: Vec<_> = match decoded_rows
                         .into_iter()
                         .map(|(doc_id, data)| {
-                            let projected = apply_projection(data, &computed_cols, projection);
-                            DocumentRow {
+                            let projected = apply_projection(data, &computed_cols, projection)?;
+                            Ok(DocumentRow {
                                 id: doc_id,
                                 data: projected,
-                            }
+                            })
                         })
-                        .collect();
+                        .collect::<crate::Result<Vec<_>>>()
+                    {
+                        Ok(rows) => rows,
+                        Err(e) => return self.response_error(task, e),
+                    };
 
                     let deduped: Vec<_> = if distinct {
                         let mut seen = std::collections::HashSet::new();
@@ -319,15 +342,19 @@ impl CoreLoop {
                     if needs_transform {
                         // Project first so DISTINCT acts on the projected
                         // row, not the raw document.
-                        let projected_rows: Vec<_> = sorted
+                        let projected_rows: Vec<_> = match sorted
                             .into_iter()
                             .map(|(doc_id, value)| {
                                 let mp = doc_format::json_to_msgpack(&value);
                                 let projected =
-                                    apply_projection_msgpack(&mp, &computed_cols, projection);
-                                (doc_id, projected)
+                                    apply_projection_msgpack(&mp, &computed_cols, projection)?;
+                                Ok((doc_id, projected))
                             })
-                            .collect();
+                            .collect::<crate::Result<Vec<_>>>()
+                        {
+                            Ok(rows) => rows,
+                            Err(e) => return self.response_error(task, e),
+                        };
                         let deduped = if distinct {
                             let mut seen = std::collections::HashSet::new();
                             projected_rows
@@ -357,12 +384,7 @@ impl CoreLoop {
                     }
                 }
             }
-            Err(e) => self.response_error(
-                task,
-                ErrorCode::Internal {
-                    detail: e.to_string(),
-                },
-            ),
+            Err(e) => self.response_error(task, e),
         }
     }
 }

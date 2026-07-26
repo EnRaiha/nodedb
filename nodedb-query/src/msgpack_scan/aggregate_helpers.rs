@@ -17,10 +17,26 @@ use crate::value_ops;
 
 // ── Expression evaluator ───────────────────────────────────────────────────
 
+/// Evaluate `expr` against a decoded document.
+///
+/// These helpers feed `AggAccum::feed` (`nodedb/.../handlers/accum/feed.rs`),
+/// the per-document hot path shared by every streaming aggregate
+/// (`SUM`/`AVG`/`MIN`/`MAX`/`COUNT`/... over an expression argument), which
+/// is itself infallible (`fn feed(&mut self, ..)`) and is called from
+/// several independent aggregation pipelines (columnar, spill-to-disk
+/// group-by, grouping sets, shuffle-merge). Threading a `Result` up through
+/// `feed` and all of those call sites is a substantially larger, separate
+/// change; for now a division/modulo-by-zero (nodedb issue #216) in an
+/// aggregate argument folds to `None` here, matching the pre-existing
+/// "value can't be produced for this row" handling every caller already
+/// has (the row is simply excluded from the aggregate) rather than
+/// silently coercing to a wrong answer. See the unit-2 completion report
+/// for the follow-up needed to give aggregate arguments the same `22012`
+/// treatment as WHERE/projection expressions.
 #[inline]
 fn eval_expr(doc: &[u8], expr: &SqlExpr) -> Option<Value> {
     let doc_val = nodedb_types::json_msgpack::value_from_msgpack(doc).ok()?;
-    Some(expr.eval(&doc_val))
+    expr.eval(&doc_val).ok()
 }
 
 // ── Public extraction helpers ──────────────────────────────────────────────

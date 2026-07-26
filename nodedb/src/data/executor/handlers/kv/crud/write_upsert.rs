@@ -74,11 +74,15 @@ impl CoreLoop {
                         );
                     }
                 };
-                let merged = crate::data::executor::handlers::upsert::apply_on_conflict_updates(
-                    existing_val,
-                    &excluded_val,
-                    updates,
-                );
+                let merged =
+                    match crate::data::executor::handlers::upsert::apply_on_conflict_updates(
+                        existing_val,
+                        &excluded_val,
+                        updates,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => return self.response_error(task, e),
+                    };
                 match nodedb_types::value_to_msgpack(&merged) {
                     Ok(b) => b,
                     Err(_) => {

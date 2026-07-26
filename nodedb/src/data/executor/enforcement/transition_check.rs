@@ -25,7 +25,17 @@ pub fn check_transition_predicates(
     let old_val = nodedb_types::Value::from(old_doc.clone());
     let new_val = nodedb_types::Value::from(new_doc.clone());
     for check in checks {
-        let result = check.predicate.eval_with_old(&new_val, &old_val);
+        // A division/modulo-by-zero (nodedb issue #216) inside the predicate
+        // is neither a PASS nor an ordinary FAIL — it's an evaluation error,
+        // surfaced via `detail` rather than folded into the plain "predicate
+        // returned false" case below.
+        let result = check
+            .predicate
+            .eval_with_old(&new_val, &old_val)
+            .map_err(|e| ErrorCode::TransitionCheckViolation {
+                collection: collection.to_string(),
+                detail: format!("transition check '{}' failed to evaluate: {e}", check.name),
+            })?;
         let passed = match result {
             nodedb_types::Value::Bool(b) => b,
             nodedb_types::Value::Null => false, // NULL treated as FALSE for constraint purposes.
@@ -34,6 +44,7 @@ pub fn check_transition_predicates(
         if !passed {
             return Err(ErrorCode::TransitionCheckViolation {
                 collection: collection.to_string(),
+                detail: format!("transition check '{}' predicate failed", check.name),
             });
         }
     }

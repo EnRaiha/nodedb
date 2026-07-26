@@ -129,14 +129,22 @@ fn append_field_value_range(buf: &mut String, doc: &[u8], range: Option<(usize, 
 /// Append a computed key's value: evaluate `expr` against the whole document
 /// and encode the result the same way a field value is encoded, so a computed
 /// slot is byte-identical wherever the same expression meets the same document.
-/// A document that cannot be decoded, or a value that cannot be re-encoded,
-/// contributes `null` — mirroring the missing-field handling above.
+/// A document that cannot be decoded, a value that cannot be re-encoded, or
+/// an expression that fails to evaluate (e.g. division/modulo by zero,
+/// nodedb issue #216) contributes `null` — mirroring the missing-field
+/// handling above. `build_group_key`/`build_group_key_indexed` are called
+/// per document from several independent GROUP BY execution paths
+/// (columnar aggregation, spill-to-disk group-by, grouping sets); giving a
+/// computed GROUP BY key expression the same `22012` statement-failure
+/// treatment as WHERE/projection expressions would mean threading a
+/// `Result` through all of those, which is a substantially larger, separate
+/// change — see the unit-2 completion report.
 fn append_computed_value(buf: &mut String, doc: &[u8], expr: &SqlExpr) {
     let Ok(doc_val) = nodedb_types::json_msgpack::value_from_msgpack(doc) else {
         buf.push_str("null");
         return;
     };
-    let val = expr.eval(&doc_val);
+    let val = expr.eval(&doc_val).unwrap_or(nodedb_types::Value::Null);
     match nodedb_types::json_msgpack::value_to_msgpack(&val) {
         Ok(vb) => append_value_at(buf, &vb, 0, vb.len()),
         Err(_) => buf.push_str("null"),

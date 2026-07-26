@@ -9,6 +9,7 @@
 
 use std::cmp::Ordering;
 
+use crate::expr::EvalError;
 use crate::msgpack_scan::field::extract_field;
 use crate::msgpack_scan::index::FieldIndex;
 use crate::msgpack_scan::reader::{
@@ -18,22 +19,64 @@ use crate::scan_filter::like::sql_like_match;
 use crate::scan_filter::{FilterOp, ScanFilter};
 
 impl ScanFilter {
+    /// Evaluate an AND-group of filters, short-circuiting on the first
+    /// `false` or the first evaluation error — same semantics as
+    /// `group.iter().all(|f| f.matches_binary(doc))` had before filter
+    /// evaluation could fail (nodedb issue #216). A `pub` associated
+    /// function (rather than a private free function) so the many call
+    /// sites across the `nodedb` crate that used to write
+    /// `filters.iter().all(|f| f.matches_binary(doc))` have a single
+    /// drop-in replacement instead of each hand-rolling the same
+    /// short-circuit loop.
+    pub fn all_match_binary(group: &[ScanFilter], doc: &[u8]) -> Result<bool, EvalError> {
+        for f in group {
+            if !f.matches_binary(doc)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Indexed counterpart of [`ScanFilter::all_match_binary`].
+    pub fn all_match_binary_indexed(
+        group: &[ScanFilter],
+        doc: &[u8],
+        idx: &FieldIndex,
+    ) -> Result<bool, EvalError> {
+        for f in group {
+            if !f.matches_binary_indexed(doc, idx)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl ScanFilter {
     /// Evaluate this filter against a raw MessagePack document.
     ///
     /// Zero deserialization — extracts only the needed field bytes.
-    pub fn matches_binary(&self, doc: &[u8]) -> bool {
+    ///
+    /// Returns `Err(EvalError::DivisionByZero)` when this is (or contains,
+    /// via an `OR` group) a `FilterOp::Expr` predicate that divides or
+    /// takes a modulus by zero (nodedb issue #216) — see
+    /// `scan_filter::ScanFilter::matches_value` for the WHERE-clause
+    /// behavior-flip rationale, which applies identically here.
+    pub fn matches_binary(&self, doc: &[u8]) -> Result<bool, EvalError> {
         match self.op {
-            FilterOp::MatchAll | FilterOp::Exists | FilterOp::NotExists => return true,
+            FilterOp::MatchAll | FilterOp::Exists | FilterOp::NotExists => return Ok(true),
             FilterOp::Or => {
-                return self
-                    .clauses
-                    .iter()
-                    .any(|clause| clause.iter().all(|f| f.matches_binary(doc)));
+                for clause in &self.clauses {
+                    if Self::all_match_binary(clause, doc)? {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
             }
             FilterOp::Expr => {
                 return match (self.expr.as_ref(), nodedb_types::value_from_msgpack(doc)) {
-                    (Some(expr), Ok(value)) => crate::value_ops::is_truthy(&expr.eval(&value)),
-                    _ => false,
+                    (Some(expr), Ok(value)) => Ok(crate::value_ops::is_truthy(&expr.eval(&value)?)),
+                    _ => Ok(false),
                 };
             }
             _ => {}
@@ -46,30 +89,32 @@ impl ScanFilter {
                 let suffix = format!(".{}", self.field);
                 match find_field_by_suffix(doc, &suffix) {
                     Some(r) => r,
-                    None => return self.op == FilterOp::IsNull,
+                    None => return Ok(self.op == FilterOp::IsNull),
                 }
             }
         };
 
-        eval_op(self, doc, start, end)
+        Ok(eval_op(self, doc, start, end))
     }
 
     /// Evaluate using a pre-built `FieldIndex` for O(1) field lookup.
     ///
     /// Use when evaluating multiple predicates on the same document.
-    pub fn matches_binary_indexed(&self, doc: &[u8], idx: &FieldIndex) -> bool {
+    pub fn matches_binary_indexed(&self, doc: &[u8], idx: &FieldIndex) -> Result<bool, EvalError> {
         match self.op {
-            FilterOp::MatchAll | FilterOp::Exists | FilterOp::NotExists => return true,
+            FilterOp::MatchAll | FilterOp::Exists | FilterOp::NotExists => return Ok(true),
             FilterOp::Or => {
-                return self
-                    .clauses
-                    .iter()
-                    .any(|clause| clause.iter().all(|f| f.matches_binary_indexed(doc, idx)));
+                for clause in &self.clauses {
+                    if Self::all_match_binary_indexed(clause, doc, idx)? {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
             }
             FilterOp::Expr => {
                 return match (self.expr.as_ref(), nodedb_types::value_from_msgpack(doc)) {
-                    (Some(expr), Ok(value)) => crate::value_ops::is_truthy(&expr.eval(&value)),
-                    _ => false,
+                    (Some(expr), Ok(value)) => Ok(crate::value_ops::is_truthy(&expr.eval(&value)?)),
+                    _ => Ok(false),
                 };
             }
             _ => {}
@@ -77,10 +122,10 @@ impl ScanFilter {
 
         let (start, end) = match idx.get(&self.field) {
             Some(r) => r,
-            None => return self.op == FilterOp::IsNull,
+            None => return Ok(self.op == FilterOp::IsNull),
         };
 
-        eval_op(self, doc, start, end)
+        Ok(eval_op(self, doc, start, end))
     }
 }
 
@@ -284,79 +329,161 @@ mod tests {
     #[test]
     fn eq_integer() {
         let doc = encode(&json!({"age": 25}));
-        assert!(filter("age", "eq", nodedb_types::Value::Integer(25)).matches_binary(&doc));
-        assert!(!filter("age", "eq", nodedb_types::Value::Integer(30)).matches_binary(&doc));
+        assert!(
+            filter("age", "eq", nodedb_types::Value::Integer(25))
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            !filter("age", "eq", nodedb_types::Value::Integer(30))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn eq_coerces_string_to_integer() {
         let doc = encode(&json!({"age": 25}));
-        assert!(filter("age", "eq", nodedb_types::Value::String("25".into())).matches_binary(&doc));
+        assert!(
+            filter("age", "eq", nodedb_types::Value::String("25".into()))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn gt_coerces_string_to_integer() {
         let doc = encode(&json!({"score": "90"}));
-        assert!(filter("score", "gt", nodedb_types::Value::Integer(80)).matches_binary(&doc));
+        assert!(
+            filter("score", "gt", nodedb_types::Value::Integer(80))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn eq_string() {
         let doc = encode(&json!({"name": "alice"}));
         assert!(
-            filter("name", "eq", nodedb_types::Value::String("alice".into())).matches_binary(&doc)
+            filter("name", "eq", nodedb_types::Value::String("alice".into()))
+                .matches_binary(&doc)
+                .unwrap()
         );
     }
 
     #[test]
     fn eq_coercion_int_vs_string() {
         let doc = encode(&json!({"age": 25}));
-        assert!(filter("age", "eq", nodedb_types::Value::String("25".into())).matches_binary(&doc));
+        assert!(
+            filter("age", "eq", nodedb_types::Value::String("25".into()))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn eq_coercion_string_vs_int() {
         let doc = encode(&json!({"score": "90"}));
-        assert!(filter("score", "eq", nodedb_types::Value::Integer(90)).matches_binary(&doc));
+        assert!(
+            filter("score", "eq", nodedb_types::Value::Integer(90))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn ne() {
         let doc = encode(&json!({"x": 1}));
-        assert!(filter("x", "ne", nodedb_types::Value::Integer(2)).matches_binary(&doc));
-        assert!(!filter("x", "ne", nodedb_types::Value::Integer(1)).matches_binary(&doc));
+        assert!(
+            filter("x", "ne", nodedb_types::Value::Integer(2))
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            !filter("x", "ne", nodedb_types::Value::Integer(1))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn gt_lt() {
         let doc = encode(&json!({"v": 10}));
-        assert!(filter("v", "gt", nodedb_types::Value::Integer(5)).matches_binary(&doc));
-        assert!(!filter("v", "gt", nodedb_types::Value::Integer(15)).matches_binary(&doc));
-        assert!(filter("v", "lt", nodedb_types::Value::Integer(15)).matches_binary(&doc));
-        assert!(!filter("v", "lt", nodedb_types::Value::Integer(5)).matches_binary(&doc));
+        assert!(
+            filter("v", "gt", nodedb_types::Value::Integer(5))
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            !filter("v", "gt", nodedb_types::Value::Integer(15))
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            filter("v", "lt", nodedb_types::Value::Integer(15))
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            !filter("v", "lt", nodedb_types::Value::Integer(5))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn gte_lte() {
         let doc = encode(&json!({"v": 10}));
-        assert!(filter("v", "gte", nodedb_types::Value::Integer(10)).matches_binary(&doc));
-        assert!(filter("v", "gte", nodedb_types::Value::Integer(5)).matches_binary(&doc));
-        assert!(!filter("v", "gte", nodedb_types::Value::Integer(15)).matches_binary(&doc));
-        assert!(filter("v", "lte", nodedb_types::Value::Integer(10)).matches_binary(&doc));
+        assert!(
+            filter("v", "gte", nodedb_types::Value::Integer(10))
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            filter("v", "gte", nodedb_types::Value::Integer(5))
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            !filter("v", "gte", nodedb_types::Value::Integer(15))
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            filter("v", "lte", nodedb_types::Value::Integer(10))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn is_null_not_null() {
         let doc = encode(&json!({"a": null, "b": 1}));
-        assert!(filter("a", "is_null", nodedb_types::Value::Null).matches_binary(&doc));
-        assert!(!filter("b", "is_null", nodedb_types::Value::Null).matches_binary(&doc));
-        assert!(filter("b", "is_not_null", nodedb_types::Value::Null).matches_binary(&doc));
+        assert!(
+            filter("a", "is_null", nodedb_types::Value::Null)
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            !filter("b", "is_null", nodedb_types::Value::Null)
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            filter("b", "is_not_null", nodedb_types::Value::Null)
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn missing_field_is_null() {
         let doc = encode(&json!({"x": 1}));
-        assert!(filter("missing", "is_null", nodedb_types::Value::Null).matches_binary(&doc));
+        assert!(
+            filter("missing", "is_null", nodedb_types::Value::Null)
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -369,6 +496,7 @@ mod tests {
                 nodedb_types::Value::String("world".into())
             )
             .matches_binary(&doc)
+            .unwrap()
         );
     }
 
@@ -376,15 +504,19 @@ mod tests {
     fn like_ilike() {
         let doc = encode(&json!({"name": "Alice"}));
         assert!(
-            filter("name", "like", nodedb_types::Value::String("Ali%".into())).matches_binary(&doc)
+            filter("name", "like", nodedb_types::Value::String("Ali%".into()))
+                .matches_binary(&doc)
+                .unwrap()
         );
         assert!(
             !filter("name", "like", nodedb_types::Value::String("ali%".into()))
                 .matches_binary(&doc)
+                .unwrap()
         );
         assert!(
             filter("name", "ilike", nodedb_types::Value::String("ali%".into()))
                 .matches_binary(&doc)
+                .unwrap()
         );
         assert!(
             filter(
@@ -393,6 +525,7 @@ mod tests {
                 nodedb_types::Value::String("Bob%".into())
             )
             .matches_binary(&doc)
+            .unwrap()
         );
     }
 
@@ -412,6 +545,7 @@ mod tests {
                 expr: None
             }
             .matches_binary(&doc)
+            .unwrap()
         );
 
         let doc2 = encode(&json!({"status": "deleted"}));
@@ -424,6 +558,7 @@ mod tests {
                 expr: None
             }
             .matches_binary(&doc2)
+            .unwrap()
         );
     }
 
@@ -437,6 +572,7 @@ mod tests {
                 nodedb_types::Value::String("rust".into())
             )
             .matches_binary(&doc)
+            .unwrap()
         );
         assert!(
             !filter(
@@ -445,6 +581,7 @@ mod tests {
                 nodedb_types::Value::String("slow".into())
             )
             .matches_binary(&doc)
+            .unwrap()
         );
     }
 
@@ -464,6 +601,7 @@ mod tests {
                 expr: None
             }
             .matches_binary(&doc)
+            .unwrap()
         );
     }
 
@@ -483,6 +621,7 @@ mod tests {
                 expr: None
             }
             .matches_binary(&doc)
+            .unwrap()
         );
     }
 
@@ -499,33 +638,57 @@ mod tests {
             ],
             expr: None,
         };
-        assert!(f.matches_binary(&doc));
+        assert!(f.matches_binary(&doc).unwrap());
     }
 
     #[test]
     fn match_all() {
         let doc = encode(&json!({"any": "thing"}));
-        assert!(filter("", "match_all", nodedb_types::Value::Null).matches_binary(&doc));
+        assert!(
+            filter("", "match_all", nodedb_types::Value::Null)
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn float_comparison() {
         let doc = encode(&json!({"temp": 36.6}));
-        assert!(filter("temp", "gt", nodedb_types::Value::Float(30.0)).matches_binary(&doc));
-        assert!(filter("temp", "lt", nodedb_types::Value::Float(40.0)).matches_binary(&doc));
+        assert!(
+            filter("temp", "gt", nodedb_types::Value::Float(30.0))
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            filter("temp", "lt", nodedb_types::Value::Float(40.0))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn bool_eq() {
         let doc = encode(&json!({"active": true}));
-        assert!(filter("active", "eq", nodedb_types::Value::Bool(true)).matches_binary(&doc));
-        assert!(!filter("active", "eq", nodedb_types::Value::Bool(false)).matches_binary(&doc));
+        assert!(
+            filter("active", "eq", nodedb_types::Value::Bool(true))
+                .matches_binary(&doc)
+                .unwrap()
+        );
+        assert!(
+            !filter("active", "eq", nodedb_types::Value::Bool(false))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
     fn gt_coercion_string_field() {
         let doc = encode(&json!({"score": "90"}));
-        assert!(filter("score", "gt", nodedb_types::Value::Integer(80)).matches_binary(&doc));
+        assert!(
+            filter("score", "gt", nodedb_types::Value::Integer(80))
+                .matches_binary(&doc)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -538,6 +701,7 @@ mod tests {
                 nodedb_types::Value::String("2026-07-02 14:00:00".into())
             )
             .matches_binary(&doc)
+            .unwrap()
         );
         assert!(
             filter(
@@ -546,6 +710,7 @@ mod tests {
                 nodedb_types::Value::String("2026-07-02 14:00:00".into())
             )
             .matches_binary(&doc)
+            .unwrap()
         );
         assert!(
             filter(
@@ -554,6 +719,7 @@ mod tests {
                 nodedb_types::Value::String("2026-07-02 12:00:00".into())
             )
             .matches_binary(&doc)
+            .unwrap()
         );
         assert!(
             filter(
@@ -562,6 +728,7 @@ mod tests {
                 nodedb_types::Value::String("2026-07-02 13:00:00".into())
             )
             .matches_binary(&doc)
+            .unwrap()
         );
     }
 
@@ -582,8 +749,8 @@ mod tests {
 
         for f in &filters {
             assert_eq!(
-                f.matches_binary(&doc),
-                f.matches_binary_indexed(&doc, &idx),
+                f.matches_binary(&doc).unwrap(),
+                f.matches_binary_indexed(&doc, &idx).unwrap(),
                 "mismatch for field={} op={:?}",
                 f.field,
                 f.op

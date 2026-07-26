@@ -140,11 +140,16 @@ impl CoreLoop {
                         Some(prior) => {
                             let existing_val = row_values_to_object(schema, &prior);
                             let excluded_val = row_values_to_object(schema, &values);
-                            let merged = apply_on_conflict_updates(
+                            let merged = match apply_on_conflict_updates(
                                 existing_val,
                                 &excluded_val,
                                 on_conflict_updates,
-                            );
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    return Err(self.response_error(task, e));
+                                }
+                            };
                             let merged_obj = match merged {
                                 nodedb_types::Value::Object(m) => m,
                                 _ => {

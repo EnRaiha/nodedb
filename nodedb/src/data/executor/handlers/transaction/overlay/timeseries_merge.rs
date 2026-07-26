@@ -108,7 +108,7 @@ impl CoreLoop {
         &self,
         params: TimeseriesOverlayMergeParams<'_>,
         results: &mut Vec<rmpv::Value>,
-    ) {
+    ) -> crate::Result<()> {
         let TimeseriesOverlayMergeParams {
             txn_id,
             coll_key,
@@ -121,7 +121,7 @@ impl CoreLoop {
         // Read-your-own-writes refreshes the lease (see the reaper).
         self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
-            return;
+            return Ok(());
         };
 
         for (_surrogate, staged) in overlay.iter_for_collection(coll_key) {
@@ -148,11 +148,12 @@ impl CoreLoop {
             // Re-apply the scan's WHERE predicate on the staged body (already
             // msgpack), exactly like the raw scan's `need_json_filter` path
             // does per base row.
-            if has_filters && !filter_predicates.iter().all(|f| f.matches_binary(body)) {
+            if has_filters && !ScanFilter::all_match_binary(filter_predicates, body)? {
                 continue;
             }
 
             results.push(staged_row_to_rmpv(&row));
         }
+        Ok(())
     }
 }

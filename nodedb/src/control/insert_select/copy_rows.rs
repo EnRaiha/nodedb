@@ -129,7 +129,9 @@ pub(crate) fn assign_page_rows(
             Some(schema) => binary_tuple_to_msgpack(&raw, schema).unwrap_or(raw),
             None => raw,
         };
-        if !spec.filters.is_empty() && !spec.filters.iter().all(|f| f.matches_binary(&value)) {
+        if !spec.filters.is_empty()
+            && !crate::bridge::scan_filter::ScanFilter::all_match_binary(&spec.filters, &value)?
+        {
             continue;
         }
         let surrogate = assign_target_surrogate(

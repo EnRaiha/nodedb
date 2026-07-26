@@ -110,17 +110,20 @@ pub(super) fn extract_timestamp(row: &rmpv::Value) -> i64 {
 pub(super) fn apply_computed_columns_rmpv(
     row: rmpv::Value,
     computed_cols: &[crate::bridge::expr_eval::ComputedColumn],
-) -> rmpv::Value {
+) -> crate::Result<rmpv::Value> {
     let doc = rmpv_to_nodedb_value(&row);
     let mut fields: Vec<(rmpv::Value, rmpv::Value)> = Vec::with_capacity(computed_cols.len());
     for cc in computed_cols {
-        let result = cc.expr.eval(&doc);
+        // A computed column is projection-shaped (nodedb issue #216): a
+        // division/modulo-by-zero fails the whole scan instead of silently
+        // materializing NULL into the response.
+        let result = cc.expr.eval(&doc)?;
         fields.push((
             rmpv::Value::String(cc.alias.as_str().into()),
             nodedb_value_to_rmpv(&result),
         ));
     }
-    rmpv::Value::Map(fields)
+    Ok(rmpv::Value::Map(fields))
 }
 
 /// Convert rmpv row to nodedb_types::Value for expression evaluation.

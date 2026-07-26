@@ -60,19 +60,29 @@ pub(in crate::data::executor) struct SpatialOverlayMergeParams<'a> {
 
 /// Decode a staged spatial-collection overlay body into a full (unprojected)
 /// `Value::Object`, handling both possible staged shapes (see module doc).
-/// Returns `None` for a body that fails to decode, or a `Value::Array`
+/// Returns `Ok(None)` for a body that fails to decode, or a `Value::Array`
 /// staged row whose collection has no known columnar schema (defensively
-/// treated as "does not match" rather than surfacing a panic).
-fn decode_staged_spatial_row(body: &[u8], schema: Option<&ColumnarSchema>) -> Option<Value> {
-    match nodedb_types::value_from_msgpack(body).ok()? {
-        Value::Array(row) => {
-            let schema = schema?;
-            let json = row_to_projected_json(&row, schema, &[], &[], false);
-            Some(Value::from(json))
-        }
-        obj @ Value::Object(_) => Some(obj),
+/// treated as "does not match" rather than surfacing a panic). Returns
+/// `Err` only when the row *does* decode but its computed-column projection
+/// hits a division/modulo-by-zero (nodedb issue #216) — `row_to_projected_json`
+/// is called with no computed columns here (`&[]`), so this is currently
+/// unreachable, but the `Result` return keeps the signature honest about
+/// what `row_to_projected_json` can do.
+fn decode_staged_spatial_row(
+    body: &[u8],
+    schema: Option<&ColumnarSchema>,
+) -> crate::Result<Option<Value>> {
+    Ok(match nodedb_types::value_from_msgpack(body).ok() {
+        Some(Value::Array(row)) => match schema {
+            Some(schema) => {
+                let json = row_to_projected_json(&row, schema, &[], &[], false)?;
+                Some(Value::from(json))
+            }
+            None => None,
+        },
+        Some(obj @ Value::Object(_)) => Some(obj),
         _ => None,
-    }
+    })
 }
 
 /// Extract the hex-surrogate identity from a projected spatial result row
@@ -95,7 +105,7 @@ impl CoreLoop {
         &self,
         params: SpatialOverlayMergeParams<'_>,
         results: &mut Vec<Value>,
-    ) {
+    ) -> crate::Result<()> {
         let SpatialOverlayMergeParams {
             txn_id,
             coll_key,
@@ -111,7 +121,7 @@ impl CoreLoop {
         // Read-your-own-writes refreshes the lease (see the reaper).
         self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
-            return;
+            return Ok(());
         };
 
         // A staged columnar-row body needs the collection's columnar schema
@@ -120,15 +130,18 @@ impl CoreLoop {
         // via `ensure_columnar_engine_schema` at insert time.
         let schema = self.columnar_engines.get(coll_key).map(|e| e.schema());
 
-        let row_matches = |doc: &Value| -> bool {
+        // A division/modulo-by-zero (nodedb issue #216) in an attribute or
+        // row-level filter is WHERE-shaped: it fails the whole scan, same
+        // as `handlers::spatial`'s direct `matches_value` calls.
+        let row_matches = |doc: &Value| -> crate::Result<bool> {
             let Some(doc_geom) = extract_geometry(doc, field) else {
-                return false;
+                return Ok(false);
             };
             if !apply_predicate(predicate, query_geom, &doc_geom, distance_meters) {
-                return false;
+                return Ok(false);
             }
-            attr_filters.iter().all(|f| f.matches_value(doc))
-                && row_level_filters.iter().all(|f| f.matches_value(doc))
+            Ok(ScanFilter::all_match_value(attr_filters, doc)?
+                && ScanFilter::all_match_value(row_level_filters, doc)?)
         };
 
         // Surrogates already represented in the base result.
@@ -140,28 +153,50 @@ impl CoreLoop {
         // the geometry out of the query region). A row with no resolvable
         // surrogate identity has no overlay identity to resolve and is left
         // untouched.
+        //
+        // `Vec::retain_mut`'s closure must return `bool`, so an evaluation
+        // error is captured in `first_err` and checked once the retain pass
+        // finishes, aborting the merge before the overlay-addition pass runs.
+        let mut first_err: Option<crate::Error> = None;
         results.retain_mut(|row| {
+            if first_err.is_some() {
+                return true;
+            }
             let Some(raw) = row_surrogate(row) else {
                 return true;
             };
             match overlay.get(coll_key, raw) {
                 Some(Staged::Tombstone) => false,
-                Some(Staged::Put(body)) => match decode_staged_spatial_row(body, schema) {
-                    Some(doc) => {
-                        if !row_matches(&doc) {
-                            return false;
+                Some(Staged::Put(body)) => {
+                    let doc = match decode_staged_spatial_row(body, schema) {
+                        Ok(Some(doc)) => doc,
+                        // A staged body that fails to decode carries no
+                        // usable row: drop it rather than surface stale
+                        // base data.
+                        Ok(None) => return false,
+                        Err(e) => {
+                            first_err = Some(e);
+                            return true;
                         }
-                        let doc_id = surrogate_to_doc_id(Surrogate(raw));
-                        *row = project_doc(&doc, &doc_id, projection);
-                        true
+                    };
+                    match row_matches(&doc) {
+                        Ok(true) => {}
+                        Ok(false) => return false,
+                        Err(e) => {
+                            first_err = Some(e);
+                            return true;
+                        }
                     }
-                    // A staged body that fails to decode carries no usable
-                    // row: drop it rather than surface stale base data.
-                    None => false,
-                },
+                    let doc_id = surrogate_to_doc_id(Surrogate(raw));
+                    *row = project_doc(&doc, &doc_id, projection);
+                    true
+                }
                 None => true,
             }
         });
+        if let Some(e) = first_err {
+            return Err(e);
+        }
 
         // Overlay additions: staged puts for surrogates the base scan did
         // not return, appended when the decoded geometry satisfies the
@@ -174,15 +209,16 @@ impl CoreLoop {
             let Staged::Put(body) = staged else {
                 continue;
             };
-            let Some(doc) = decode_staged_spatial_row(body, schema) else {
+            let Some(doc) = decode_staged_spatial_row(body, schema)? else {
                 continue;
             };
-            if !row_matches(&doc) {
+            if !row_matches(&doc)? {
                 continue;
             }
             let doc_id = surrogate_to_doc_id(Surrogate(surrogate));
             results.push(project_doc(&doc, &doc_id, projection));
             seen.insert(surrogate);
         }
+        Ok(())
     }
 }

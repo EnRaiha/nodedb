@@ -511,7 +511,7 @@ mod tests {
         let (expr, deps) = parse_ok("price * (1 + tax_rate)");
         assert_eq!(deps, vec!["price", "tax_rate"]);
         let doc = Value::from(serde_json::json!({"price": 100.0, "tax_rate": 0.08}));
-        let result = expr.eval(&doc);
+        let result = expr.eval(&doc).unwrap();
         assert_eq!(result.as_f64(), Some(108.0));
     }
 
@@ -520,7 +520,7 @@ mod tests {
         let (expr, deps) = parse_ok("ROUND(price * (1 + tax_rate), 2)");
         assert_eq!(deps, vec!["price", "tax_rate"]);
         let doc = Value::from(serde_json::json!({"price": 99.99, "tax_rate": 0.08}));
-        let result = expr.eval(&doc);
+        let result = expr.eval(&doc).unwrap();
         assert_eq!(result, Value::Float(107.99));
     }
 
@@ -529,14 +529,14 @@ mod tests {
         let (expr, deps) = parse_ok("CONCAT(name, ' ', brand)");
         assert_eq!(deps, vec!["brand", "name"]);
         let doc = Value::from(serde_json::json!({"name": "Shoe", "brand": "Nike"}));
-        assert_eq!(expr.eval(&doc), Value::String("Shoe Nike".into()));
+        assert_eq!(expr.eval(&doc).unwrap(), Value::String("Shoe Nike".into()));
     }
 
     #[test]
     fn coalesce() {
         let (expr, _) = parse_ok("COALESCE(description, '')");
         let doc = Value::from(serde_json::json!({"description": null}));
-        assert_eq!(expr.eval(&doc), Value::String("".into()));
+        assert_eq!(expr.eval(&doc).unwrap(), Value::String("".into()));
     }
 
     #[test]
@@ -547,10 +547,10 @@ mod tests {
         assert!(deps.contains(&"price".to_string()));
 
         let doc = Value::from(serde_json::json!({"price": 100.0, "discount": 0.2}));
-        assert_eq!(expr.eval(&doc).as_f64(), Some(80.0));
+        assert_eq!(expr.eval(&doc).unwrap().as_f64(), Some(80.0));
 
         let doc2 = Value::from(serde_json::json!({"price": 100.0, "discount": 0}));
-        assert_eq!(expr.eval(&doc2).as_f64(), Some(100.0));
+        assert_eq!(expr.eval(&doc2).unwrap().as_f64(), Some(100.0));
     }
 
     #[test]
@@ -572,21 +572,24 @@ mod tests {
     fn string_literal() {
         let (expr, _) = parse_ok("CONCAT(name, ' - ', 'default')");
         let doc = Value::from(serde_json::json!({"name": "Product"}));
-        assert_eq!(expr.eval(&doc), Value::String("Product - default".into()));
+        assert_eq!(
+            expr.eval(&doc).unwrap(),
+            Value::String("Product - default".into())
+        );
     }
 
     #[test]
     fn null_literal() {
         let (expr, _) = parse_ok("COALESCE(x, NULL, 0)");
         let doc = Value::from(serde_json::json!({"x": null}));
-        assert_eq!(expr.eval(&doc), Value::Integer(0));
+        assert_eq!(expr.eval(&doc).unwrap(), Value::Integer(0));
     }
 
     #[test]
     fn nested_functions() {
         let (expr, _) = parse_ok("ROUND(price * (1 - COALESCE(discount, 0)), 2)");
         let doc = Value::from(serde_json::json!({"price": 49.99}));
-        assert_eq!(expr.eval(&doc), Value::Float(49.99));
+        assert_eq!(expr.eval(&doc).unwrap(), Value::Float(49.99));
     }
 
     #[test]
@@ -604,7 +607,7 @@ mod tests {
     fn cjk_string_in_concat() {
         let (expr, _) = parse_ok("CONCAT('你好', name)");
         let doc = Value::from(serde_json::json!({"name": "world"}));
-        assert_eq!(expr.eval(&doc), Value::String("你好world".into()));
+        assert_eq!(expr.eval(&doc).unwrap(), Value::String("你好world".into()));
     }
 
     #[test]
@@ -612,6 +615,6 @@ mod tests {
         let (expr, deps) = parse_ok("name != '禁止'");
         assert_eq!(deps, vec!["name"]);
         let doc = Value::from(serde_json::json!({"name": "allowed"}));
-        assert_eq!(expr.eval(&doc), Value::Bool(true));
+        assert_eq!(expr.eval(&doc).unwrap(), Value::Bool(true));
     }
 }

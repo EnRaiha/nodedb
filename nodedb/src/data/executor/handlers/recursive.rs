@@ -156,8 +156,12 @@ impl CoreLoop {
                     continue;
                 }
             };
-            if !base_preds.iter().all(|f| f.matches_binary(&mp)) {
-                continue;
+            match ScanFilter::all_match_binary(&base_preds, &mp) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_e) => {
+                    return self.response_error(task, ErrorCode::DivisionByZero);
+                }
             }
             let key = if distinct {
                 nodedb_types::msgpack_to_json_string(&mp).unwrap_or_default()
@@ -209,8 +213,12 @@ impl CoreLoop {
                     };
 
                     // Apply recursive filters (WHERE clause from recursive branch).
-                    if !recursive_preds.iter().all(|f| f.matches_binary(&mp)) {
-                        continue;
+                    match ScanFilter::all_match_binary(&recursive_preds, &mp) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_e) => {
+                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        }
                     }
 
                     // Check join link: collection_field value must be in frontier.
@@ -264,8 +272,12 @@ impl CoreLoop {
                         Some(m) => m,
                         None => continue,
                     };
-                    if !recursive_preds.iter().all(|f| f.matches_binary(&mp)) {
-                        continue;
+                    match ScanFilter::all_match_binary(&recursive_preds, &mp) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_e) => {
+                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        }
                     }
                     let key = if distinct {
                         nodedb_types::msgpack_to_json_string(&mp).unwrap_or_default()

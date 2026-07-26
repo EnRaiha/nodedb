@@ -113,19 +113,29 @@ impl CoreLoop {
                 break;
             }
             for (_, value) in chunk {
+                // WHERE-filter evaluation is fatal to the whole accumulation
+                // on a division/modulo-by-zero (nodedb issue #216), exactly
+                // like a spill error below — both break out via `spill_err`.
                 let outer_key = if use_field_index {
                     let idx = msgpack_scan::FieldIndex::build(value, 0)
                         .unwrap_or_else(msgpack_scan::FieldIndex::empty);
-                    if !filter_predicates
-                        .iter()
-                        .all(|f| f.matches_binary_indexed(value, &idx))
-                    {
-                        continue;
+                    match ScanFilter::all_match_binary_indexed(&filter_predicates, value, &idx) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            spill_err = Some(crate::Error::from(e));
+                            break;
+                        }
                     }
                     msgpack_scan::group_key::build_group_key_indexed(value, group_by, &idx)
                 } else {
-                    if !filter_predicates.iter().all(|f| f.matches_binary(value)) {
-                        continue;
+                    match ScanFilter::all_match_binary(&filter_predicates, value) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            spill_err = Some(crate::Error::from(e));
+                            break;
+                        }
                     }
                     msgpack_scan::build_group_key(value, group_by)
                 };

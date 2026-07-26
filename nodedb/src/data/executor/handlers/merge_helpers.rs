@@ -12,23 +12,38 @@ use nodedb_physical::physical_plan::document::merge_types::{
 
 /// Find the first clause of the given kind whose extra_predicate is satisfied
 /// against `context_doc`.
+///
+/// A MERGE clause's `AND <condition>` extra predicate is WHERE-shaped, so a
+/// division/modulo-by-zero inside it (nodedb issue #216) fails the whole
+/// statement — the same behavior-flip rule 4 applies to WHERE/projection —
+/// rather than silently skipping to the next clause.
 pub(super) fn find_arm<'a>(
     clauses: &'a [MergeClauseOp],
     kind: MergeClauseKindOp,
     context_doc: &serde_json::Value,
-) -> Option<&'a MergeClauseOp> {
+) -> crate::Result<Option<&'a MergeClauseOp>> {
     let context_bytes = doc_format::encode_to_msgpack(context_doc);
-    clauses.iter().find(|c| {
+    for c in clauses {
         if c.kind != kind {
-            return false;
+            continue;
         }
         if c.extra_predicate.is_empty() {
-            return true;
+            return Ok(Some(c));
         }
         let filters: Vec<ScanFilter> =
             zerompk::from_msgpack(&c.extra_predicate).unwrap_or_default();
-        filters.iter().all(|f| f.matches_binary(&context_bytes))
-    })
+        let mut all_match = true;
+        for f in &filters {
+            if !f.matches_binary(&context_bytes)? {
+                all_match = false;
+                break;
+            }
+        }
+        if all_match {
+            return Ok(Some(c));
+        }
+    }
+    Ok(None)
 }
 
 /// Parameters for [`apply_action`].
@@ -85,7 +100,7 @@ pub(super) fn apply_action(
             Ok(true)
         }
         MergeActionOp::Update { updates } => {
-            let updated = build_update_doc(target_doc, source_doc, source_alias, updates);
+            let updated = build_update_doc(target_doc, source_doc, source_alias, updates)?;
 
             let updated_bytes = if let Some(schema) = strict_schema {
                 let ndb_val: nodedb_types::Value = updated.clone().into();
@@ -168,7 +183,7 @@ pub(super) fn apply_insert_action(
             Ok(false)
         }
         MergeActionOp::Insert { columns, values } => {
-            let json_doc = build_insert_doc(columns, values, source_doc, source_alias);
+            let json_doc = build_insert_doc(columns, values, source_doc, source_alias)?;
             let doc_id = json_doc
                 .get("id")
                 .map(json_to_str)
@@ -210,7 +225,7 @@ pub(in crate::data::executor) fn build_insert_doc(
     values: &[UpdateValue],
     source_doc: &serde_json::Value,
     source_alias: &str,
-) -> serde_json::Value {
+) -> crate::Result<serde_json::Value> {
     let mut new_doc = serde_json::Map::new();
     if columns.is_empty() {
         if let Some(obj) = source_doc.as_object() {
@@ -228,10 +243,10 @@ pub(in crate::data::executor) fn build_insert_doc(
         );
         let merged_ndb: nodedb_types::Value = merged.into();
         for (col, val) in columns.iter().zip(values.iter()) {
-            new_doc.insert(col.clone(), resolve_update_value(val, &merged_ndb));
+            new_doc.insert(col.clone(), resolve_update_value(val, &merged_ndb)?);
         }
     }
-    serde_json::Value::Object(new_doc)
+    Ok(serde_json::Value::Object(new_doc))
 }
 
 /// Build the post-update JSON document a MATCHED / NOT-MATCHED-BY-SOURCE
@@ -244,28 +259,36 @@ pub(in crate::data::executor) fn build_update_doc(
     source_doc: &serde_json::Value,
     source_alias: &str,
     updates: &[(String, UpdateValue)],
-) -> serde_json::Value {
+) -> crate::Result<serde_json::Value> {
     let merged = build_merged(target_doc, source_doc, source_alias);
     let merged_ndb: nodedb_types::Value = merged.into();
     let mut updated = target_doc.clone();
     if let Some(obj) = updated.as_object_mut() {
         for (field, update_val) in updates {
-            obj.insert(field.clone(), resolve_update_value(update_val, &merged_ndb));
+            obj.insert(
+                field.clone(),
+                resolve_update_value(update_val, &merged_ndb)?,
+            );
         }
     }
-    updated
+    Ok(updated)
 }
 
 /// Resolve one `UpdateValue` to JSON: a literal decodes directly from its
 /// msgpack encoding, an expression evaluates against the merged document.
-/// Shared by [`build_insert_doc`] and [`build_update_doc`].
-fn resolve_update_value(val: &UpdateValue, merged_ndb: &nodedb_types::Value) -> serde_json::Value {
-    match val {
+/// Shared by [`build_insert_doc`] and [`build_update_doc`]. An assignment
+/// expression is write-path-shaped (nodedb issue #216), so a division/
+/// modulo-by-zero fails the whole MERGE statement.
+fn resolve_update_value(
+    val: &UpdateValue,
+    merged_ndb: &nodedb_types::Value,
+) -> crate::Result<serde_json::Value> {
+    Ok(match val {
         UpdateValue::Literal(bytes) => {
             nodedb_types::json_from_msgpack(bytes).unwrap_or(serde_json::Value::Null)
         }
-        UpdateValue::Expr(expr) => expr.eval(merged_ndb).into(),
-    }
+        UpdateValue::Expr(expr) => expr.eval(merged_ndb)?.into(),
+    })
 }
 
 /// Build merged document: target fields at top level, source fields as

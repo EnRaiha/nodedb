@@ -240,10 +240,18 @@ pub fn compute_aggregate_binary(
 
 /// Decode a msgpack document directly to `nodedb_types::Value` and evaluate
 /// the expression. No JSON intermediate — msgpack → Value → eval → Value.
+///
+/// `compute_aggregate_binary` (this module's only public entry point) has
+/// no caller anywhere in the workspace — the live aggregate pipeline goes
+/// through `nodedb/src/data/executor/handlers/accum` instead. A
+/// division/modulo-by-zero (nodedb issue #216) here folds to `None`
+/// exactly like the pre-existing msgpack-decode-failure case on the line
+/// above, rather than threading a `Result` through an otherwise-dead
+/// `Option`-shaped API.
 #[inline]
 fn eval_expr_on_doc(doc: &[u8], expr: &crate::expr::SqlExpr) -> Option<Value> {
     let doc_val = nodedb_types::json_msgpack::value_from_msgpack(doc).ok()?;
-    Some(expr.eval(&doc_val))
+    expr.eval(&doc_val).ok()
 }
 
 /// Extract a numeric value from a field or expression result.

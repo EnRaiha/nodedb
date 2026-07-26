@@ -225,28 +225,38 @@ impl CoreLoop {
         // shared `ColumnarMatchedRow` tuple the overlay merge consumes. A
         // missing engine means the only affected rows are overlay-only staged
         // inserts, which the merge appends below.
-        let mut matched: Vec<(Option<Surrogate>, Vec<Value>, serde_json::Value)> =
-            match self.columnar_engines.get(&coll_key) {
-                Some(engine) => engine
-                    .scan_memtable_rows_with_surrogates()
-                    .filter(|(_, row)| {
-                        filter_predicates.is_empty()
-                            || row_matches_filters(row, &schema, &filter_predicates)
-                    })
-                    .map(|(surrogate, row)| {
-                        let json = row_to_projected_json(&row, &schema, &[], &[], false);
-                        (surrogate, row, json)
-                    })
-                    .collect(),
-                None => Vec::new(),
-            };
+        let mut matched: Vec<(Option<Surrogate>, Vec<Value>, serde_json::Value)> = Vec::new();
+        if let Some(engine) = self.columnar_engines.get(&coll_key) {
+            for (surrogate, row) in engine.scan_memtable_rows_with_surrogates() {
+                if !filter_predicates.is_empty() {
+                    match row_matches_filters(&row, &schema, &filter_predicates) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_e) => {
+                            return Err(self.response_error(task, ErrorCode::DivisionByZero));
+                        }
+                    }
+                }
+                // No computed columns on this path (`&[]` below), so this
+                // can never actually raise `DivisionByZero` today — handled
+                // uniformly with every other `row_to_projected_json` caller
+                // instead of assuming that invariant with an `unwrap`.
+                let json = match row_to_projected_json(&row, &schema, &[], &[], false) {
+                    Ok(v) => v,
+                    Err(_e) => {
+                        return Err(self.response_error(task, ErrorCode::DivisionByZero));
+                    }
+                };
+                matched.push((surrogate, row, json));
+            }
+        }
 
         // Fold the transaction's own staged writes into the base set: drops
         // tombstoned surrogates, re-checks staged puts against the predicate,
         // and appends overlay-only staged inserts that now match — so a row
         // this txn just inserted (or an earlier staged update moved into the
         // predicate) is affected too.
-        self.merge_overlay_into_columnar_scan(
+        if let Err(e) = self.merge_overlay_into_columnar_scan(
             ColumnarOverlayMergeParams {
                 txn_id,
                 coll_key: &coll_key,
@@ -257,7 +267,9 @@ impl CoreLoop {
                 all_versions: false,
             },
             &mut matched,
-        );
+        ) {
+            return Err(self.response_error(task, e));
+        }
 
         Ok(matched
             .into_iter()

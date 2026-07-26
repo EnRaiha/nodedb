@@ -42,7 +42,7 @@ impl CoreLoop {
             for entry in range.flatten() {
                 let key = entry.0.value();
                 let value_bytes = entry.1.value();
-                if matches(value_bytes)
+                if matches(value_bytes)?
                     && let Some(doc_id) = key.strip_prefix(&prefix)
                 {
                     ids.push(doc_id.to_string());

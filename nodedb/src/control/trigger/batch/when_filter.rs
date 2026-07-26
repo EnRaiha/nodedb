@@ -53,7 +53,29 @@ pub fn filter_batch_by_when(
                     WhenTarget::Old => row.old_raw(),
                 };
                 match raw {
-                    Some(bytes) => filters.iter().all(|f| f.matches_binary(bytes)),
+                    // A division/modulo-by-zero (nodedb issue #216) in a
+                    // trigger's WHEN predicate folds to "does not fire" for
+                    // this row rather than failing the batch.
+                    // `filter_batch_by_when` stays infallible here — not
+                    // because a caller structurally can't propagate a typed
+                    // error (one of its two callers,
+                    // `before.rs::execute_before_batch`, already returns
+                    // `crate::Result<..>` and carries a full per-row
+                    // `ErrorAccumulator`), but because NEITHER caller is
+                    // wired into the production trigger dispatch path yet:
+                    // `event::consumer::process_normal_batch` /
+                    // `dispatch_triggers` in `single.rs` is the sole live
+                    // AFTER-ROW path today (see both callers' own module
+                    // docs — `execute_before_batch` currently has zero
+                    // callers anywhere in the tree). The Result-ification of
+                    // this batch-eval path is deferred alongside the other
+                    // unwired batch-eval paths in this diff rather than done
+                    // in isolation for a dead code path; wiring it up is
+                    // tracked in the unit-2 completion report.
+                    Some(bytes) => {
+                        crate::bridge::scan_filter::ScanFilter::all_match_binary(&filters, bytes)
+                            .unwrap_or(false)
+                    }
                     // No raw bytes (test rows from from_decoded) — fall back to
                     // the decode + substitute path for this row.
                     None => {

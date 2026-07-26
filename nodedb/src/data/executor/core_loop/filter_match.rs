@@ -13,6 +13,7 @@
 //! step so the staging handlers (and, ideally, the two base-scan call sites)
 //! evaluate strict predicates identically.
 
+use nodedb_query::EvalError;
 use nodedb_types::columnar::StrictSchema;
 
 use crate::bridge::scan_filter::ScanFilter;
@@ -29,20 +30,24 @@ use super::CoreLoop;
 /// [`CoreLoop::strict_aware_matcher`] — this function does no lookup itself,
 /// so it never re-pays the `doc_configs` hash lookup per row.
 ///
-/// Returns `false` for a strict body that fails to decode against its own
-/// schema (a malformed or stale Binary Tuple never matches, mirroring the
-/// base scan's behavior).
+/// Returns `Ok(false)` for a strict body that fails to decode against its
+/// own schema (a malformed or stale Binary Tuple never matches, mirroring
+/// the base scan's behavior). Returns `Err(EvalError::DivisionByZero)`
+/// (nodedb issue #216) when `filters` contains a `FilterOp::Expr` predicate
+/// that divides or takes a modulus by zero — this is the base document
+/// scan's WHERE predicate, so the behavior-flip rule applies: the query
+/// fails instead of the row being silently excluded.
 pub(in crate::data::executor) fn matches_with_resolved_schema(
     strict_schema: Option<&StrictSchema>,
     filters: &[ScanFilter],
     body: &[u8],
-) -> bool {
+) -> Result<bool, EvalError> {
     match strict_schema {
         Some(schema) => match strict_format::binary_tuple_to_msgpack(body, schema) {
-            Some(msgpack) => filters.iter().all(|f| f.matches_binary(&msgpack)),
-            None => false,
+            Some(msgpack) => ScanFilter::all_match_binary(filters, &msgpack),
+            None => Ok(false),
         },
-        None => filters.iter().all(|f| f.matches_binary(body)),
+        None => ScanFilter::all_match_binary(filters, body),
     }
 }
 
@@ -73,19 +78,26 @@ impl CoreLoop {
         })
     }
 
-    /// Build a reusable `Fn(&[u8]) -> bool` closure evaluating `filters`
-    /// against a stored row body, resolving `collection`'s strict schema
-    /// ONCE up front (not per row) and capturing it in the closure. Suitable
-    /// for passing as the `&dyn Fn(&[u8]) -> bool` predicate
-    /// [`CoreLoop::merge_overlay_into_scan`] expects, or for a hot per-row
-    /// scan loop.
+    /// Build a reusable `Fn(&[u8]) -> Result<bool, EvalError>` closure
+    /// evaluating `filters` against a stored row body, resolving
+    /// `collection`'s strict schema ONCE up front (not per row) and
+    /// capturing it in the closure. Suitable for a hot per-row scan loop
+    /// directly, or as the fallible half of a Cell-wrapping call pattern —
+    /// [`CoreLoop::merge_overlay_into_scan`] actually expects an
+    /// *infallible* `&dyn Fn(&[u8]) -> bool`, not this function's own
+    /// `Result`-returning output, so callers that feed it into that merge
+    /// wrap the closure this function returns in a second, infallible one
+    /// that stashes any `Err` into a local `Cell<Option<EvalError>>` and
+    /// checks it once the merge call returns (nodedb issue #216) — see
+    /// `stage_bulk_delete.rs`/`stage_bulk_update.rs`'s `raw_matches` /
+    /// `matches` pair for the exact pattern.
     pub(in crate::data::executor) fn strict_aware_matcher<'a>(
         &self,
         database_id: u64,
         tid: u64,
         collection: &str,
         filters: &'a [ScanFilter],
-    ) -> impl Fn(&[u8]) -> bool + 'a {
+    ) -> impl Fn(&[u8]) -> Result<bool, EvalError> + 'a {
         let strict_schema = self.resolve_strict_schema(database_id, tid, collection);
         move |body: &[u8]| matches_with_resolved_schema(strict_schema.as_ref(), filters, body)
     }

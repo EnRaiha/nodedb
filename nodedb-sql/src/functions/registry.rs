@@ -275,4 +275,198 @@ mod tests {
             "lower must return String"
         );
     }
+
+    /// nodedb issue #216 INVARIANT: every name the runtime evaluator
+    /// (`nodedb_query::functions::*::try_eval`) actually dispatches on MUST
+    /// resolve through `FunctionRegistry::lookup`, or `resolver::expr::
+    /// functions::convert_function_depth`'s plan-time existence gate rejects
+    /// a call the evaluator would otherwise happily run — the exact bug
+    /// class this whole registry audit exists to close.
+    ///
+    /// Each list below is a literal transcription of one
+    /// `nodedb-query/src/functions/<module>.rs` `try_eval` match arm's
+    /// name set (including every `|`-joined alias), NOT derived from this
+    /// registry — a name added to a `try_eval` match arm without a matching
+    /// registry entry must fail this test, not silently pass because both
+    /// sides drifted together. When either side changes, update the other.
+    #[test]
+    fn runtime_match_arms_are_all_registered() {
+        let reg = FunctionRegistry::new();
+        let assert_all = |module: &str, names: &[&str]| {
+            for name in names {
+                assert!(
+                    reg.lookup(name).is_some(),
+                    "nodedb_query::functions::{module}::try_eval handles '{name}' \
+                     but FunctionRegistry has no entry for it — nodedb issue #216's \
+                     plan-time gate would reject a call the runtime evaluator supports"
+                );
+            }
+        };
+
+        // `nodedb_query::functions::math::try_eval`.
+        assert_all(
+            "math",
+            &[
+                "abs", "round", "ceil", "ceiling", "floor", "power", "pow", "sqrt", "mod", "sign",
+                "log", "ln", "log10", "log2", "exp",
+            ],
+        );
+
+        // `nodedb_query::functions::string::try_eval`.
+        assert_all(
+            "string",
+            &[
+                "upper",
+                "lower",
+                "trim",
+                "ltrim",
+                "rtrim",
+                "length",
+                "char_length",
+                "character_length",
+                "substr",
+                "substring",
+                "concat",
+                "replace",
+                "reverse",
+            ],
+        );
+
+        // `nodedb_query::functions::conditional::try_eval`.
+        assert_all("conditional", &["coalesce", "nullif", "greatest", "least"]);
+
+        // `nodedb_query::functions::id::try_eval`.
+        assert_all(
+            "id",
+            &[
+                "uuid",
+                "uuid_v4",
+                "gen_random_uuid",
+                "uuid_v7",
+                "ulid",
+                "cuid2",
+                "nanoid",
+                "is_uuid",
+                "is_ulid",
+                "is_cuid2",
+                "is_nanoid",
+                "id_type",
+                "uuid_version",
+                "ulid_timestamp",
+            ],
+        );
+
+        // `nodedb_query::functions::datetime::try_eval`. Individual date
+        // parts (`year`, `month`, `day`, `hour`, `minute`, `second`,
+        // `dow`/`dayofweek`, `epoch`) are string literals consumed by
+        // `extract`/`date_part`/`date_trunc`, not standalone function
+        // names, so they are deliberately absent from this list.
+        assert_all(
+            "datetime",
+            &[
+                "now",
+                "current_timestamp",
+                "datetime",
+                "to_datetime",
+                "unix_secs",
+                "epoch_secs",
+                "unix_millis",
+                "epoch_millis",
+                "extract",
+                "date_part",
+                "date_trunc",
+                "datetrunc",
+                "date_add",
+                "datetime_add",
+                "date_sub",
+                "datetime_sub",
+                "date_diff",
+                "datediff",
+                "duration",
+                "to_duration",
+                "decimal",
+                "to_decimal",
+                "time_bucket",
+            ],
+        );
+
+        // `nodedb_query::functions::json::{mod,legacy}::try_eval`.
+        assert_all(
+            "json",
+            &[
+                "pg_json_get",
+                "pg_json_get_text",
+                "pg_json_path_get",
+                "pg_json_path_get_text",
+                "pg_json_contains",
+                "pg_json_contained_by",
+                "pg_json_has_key",
+                "pg_json_has_all_keys",
+                "pg_json_has_any_key",
+                "json_value",
+                "json_query",
+                "json_exists",
+                "json_extract",
+                "json_get",
+                "json_set",
+                "json_remove",
+                "json_keys",
+                "json_values",
+                "json_length",
+                "json_len",
+                "json_type",
+                "json_array",
+                "json_object",
+                "json_contains",
+                "json_merge",
+                "json_patch",
+            ],
+        );
+
+        // `nodedb_query::functions::types::try_eval`.
+        assert_all("types", &["typeof", "type_of"]);
+
+        // `nodedb_query::functions::array::try_eval`. Distinct from the
+        // "Array engine" table-valued functions (`array_slice`/
+        // `array_project`/`array_agg`/`array_elementwise`/`array_flush`/
+        // `array_compact`), which are covered by
+        // `all_builtins_arg_counts_consistent` via their own registrations.
+        assert_all(
+            "array",
+            &[
+                "array_length",
+                "cardinality",
+                "array_append",
+                "array_prepend",
+                "array_remove",
+                "array_concat",
+                "array_cat",
+                "array_distinct",
+                "array_contains",
+                "array_position",
+                "array_reverse",
+            ],
+        );
+
+        // `nodedb_query::functions::fts::pg_fts_exec::try_eval_fts`.
+        assert_all(
+            "fts",
+            &[
+                "pg_fts_match",
+                "pg_to_tsquery",
+                "pg_plainto_tsquery",
+                "pg_websearch_to_tsquery",
+                "pg_phraseto_tsquery",
+                "pg_to_tsvector",
+                "pg_ts_rank",
+                "pg_ts_headline",
+            ],
+        );
+
+        // `nodedb_query::functions::system::try_eval`.
+        assert_all(
+            "system",
+            &["version", "format_type", "pg_get_expr", "col_description"],
+        );
+    }
 }

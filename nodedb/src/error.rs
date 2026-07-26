@@ -194,6 +194,18 @@ pub enum Error {
     #[error("query plan error: {detail}")]
     PlanError { detail: String },
 
+    /// A function call in a query names no registered scalar, aggregate, or
+    /// window function. Propagated from `SqlError::UndefinedFunction`; the
+    /// pgwire layer renders this as SQLSTATE `42883` (undefined_function).
+    #[error("function {name}(...) does not exist")]
+    UndefinedFunction { name: String },
+
+    /// Expression evaluation divided or took a modulus by zero. Propagated
+    /// from `nodedb_query::EvalError::DivisionByZero` (nodedb issue #216);
+    /// the pgwire layer renders this as SQLSTATE `22012` (division_by_zero).
+    #[error("division by zero")]
+    DivisionByZero,
+
     /// Descriptor lease conflict; pgwire retries within `PLAN_RETRY_BUDGET`.
     #[error("retryable schema change on {descriptor}")]
     RetryableSchemaChanged { descriptor: String },

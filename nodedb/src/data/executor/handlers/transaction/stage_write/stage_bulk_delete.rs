@@ -80,9 +80,25 @@ impl CoreLoop {
         };
 
         {
-            let matches =
+            // `merge_overlay_into_scan` takes an infallible
+            // `Fn(&[u8]) -> bool` predicate, so a division/modulo-by-zero
+            // (nodedb issue #216) is captured via this `Cell` side-channel
+            // and checked once the merge returns.
+            let raw_matches =
                 self.strict_aware_matcher(database_id.as_u64(), tid, collection, &filters);
+            let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
+                std::cell::Cell::new(None);
+            let matches = |body: &[u8]| match raw_matches(body) {
+                Ok(b) => b,
+                Err(e) => {
+                    predicate_err.set(Some(e));
+                    false
+                }
+            };
             self.merge_overlay_into_scan(txn_id, &coll_key, &mut rows, &matches);
+            if predicate_err.take().is_some() {
+                return self.response_error(task, ErrorCode::DivisionByZero);
+            }
         }
 
         let mut affected = 0u64;

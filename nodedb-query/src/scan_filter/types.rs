@@ -3,7 +3,7 @@
 //! `ScanFilter` record, its wire codec, and per-row evaluation against a
 //! `nodedb_types::Value` document.
 
-use crate::expr::SqlExpr;
+use crate::expr::{EvalError, SqlExpr};
 
 use super::like;
 use super::op::FilterOp;
@@ -69,23 +69,52 @@ impl<'a> zerompk::FromMessagePack<'a> for ScanFilter {
 }
 
 impl ScanFilter {
+    /// Evaluate an AND-group of filters, short-circuiting on the first
+    /// `false` or the first evaluation error — same semantics as
+    /// `group.iter().all(|f| f.matches_value(doc))` had before filter
+    /// evaluation could fail (nodedb issue #216). `pub` so the many call
+    /// sites across the `nodedb` crate that used to write
+    /// `filters.iter().all(|f| f.matches_value(doc))` have a drop-in
+    /// replacement instead of each hand-rolling the same short-circuit loop.
+    pub fn all_match_value(
+        group: &[ScanFilter],
+        doc: &nodedb_types::Value,
+    ) -> Result<bool, EvalError> {
+        for f in group {
+            if !f.matches_value(doc)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Evaluate this filter against a `nodedb_types::Value` document.
     ///
     /// Same semantics as `matches()` but operates on the native Value type
     /// instead of serde_json::Value, avoiding lossy JSON roundtrips.
-    pub fn matches_value(&self, doc: &nodedb_types::Value) -> bool {
+    ///
+    /// Returns `Err(EvalError::DivisionByZero)` when the filter is (or
+    /// contains, via an `OR` group) a `FilterOp::Expr` predicate whose
+    /// expression divides or takes a modulus by zero (nodedb issue #216).
+    /// This is the deliberate WHERE-clause behavior flip: a predicate like
+    /// `10 / denom > 1` used to evaluate to `Value::Null`/`false` (silently
+    /// filtering the row out) when `denom` was `0`; it now fails the whole
+    /// query with SQLSTATE `22012`, matching Postgres.
+    pub fn matches_value(&self, doc: &nodedb_types::Value) -> Result<bool, EvalError> {
         match self.op {
-            FilterOp::MatchAll | FilterOp::Exists | FilterOp::NotExists => return true,
+            FilterOp::MatchAll | FilterOp::Exists | FilterOp::NotExists => return Ok(true),
             FilterOp::Or => {
-                return self
-                    .clauses
-                    .iter()
-                    .any(|clause| clause.iter().all(|f| f.matches_value(doc)));
+                for clause in &self.clauses {
+                    if Self::all_match_value(clause, doc)? {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
             }
             FilterOp::Expr => {
                 return match &self.expr {
-                    Some(expr) => crate::value_ops::is_truthy(&expr.eval(doc)),
-                    None => false,
+                    Some(expr) => Ok(crate::value_ops::is_truthy(&expr.eval(doc)?)),
+                    None => Ok(false),
                 };
             }
             _ => {}
@@ -93,10 +122,10 @@ impl ScanFilter {
 
         let field_val = match doc.get(&self.field) {
             Some(v) => v,
-            None => return self.op == FilterOp::IsNull,
+            None => return Ok(self.op == FilterOp::IsNull),
         };
 
-        match self.op {
+        Ok(match self.op {
             FilterOp::Eq => self.value.eq_coerced(field_val),
             FilterOp::Ne => !self.value.eq_coerced(field_val),
             FilterOp::Gt => self.value.cmp_coerced(field_val) == std::cmp::Ordering::Less,
@@ -193,11 +222,11 @@ impl ScanFilter {
             | FilterOp::NeColumn => {
                 let other_col = match &self.value {
                     nodedb_types::Value::String(s) => s.as_str(),
-                    _ => return false,
+                    _ => return Ok(false),
                 };
                 let other_val = match doc.get(other_col) {
                     Some(v) => v,
-                    None => return false,
+                    None => return Ok(false),
                 };
                 match self.op {
                     FilterOp::GtColumn => {
@@ -218,6 +247,6 @@ impl ScanFilter {
                 }
             }
             _ => false,
-        }
+        })
     }
 }

@@ -142,7 +142,13 @@ pub(super) fn probe_hash_index(p: &ProbeParams<'_>) -> Vec<Vec<u8>> {
                     p.probe_collection,
                     p.index_collection,
                 );
-                if p.join_filters.is_empty() || binary_row_matches_filters(&merged, p.join_filters)
+                // A division/modulo-by-zero (nodedb issue #216) in a join's
+                // residual ON predicate folds to "no match" here rather than
+                // erroring — `probe_hash_index` is infallible and part of the
+                // grace-hash spill/streaming family (see
+                // `binary_row_matches_filters`'s doc comment).
+                if p.join_filters.is_empty()
+                    || binary_row_matches_filters(&merged, p.join_filters).unwrap_or(false)
                 {
                     results.push(merged);
                 }
@@ -218,7 +224,8 @@ pub(super) fn probe_rows_into(
                     p.probe_collection,
                     p.index_collection,
                 );
-                binary_row_matches_filters(&merged, p.join_filters)
+                // See the fold rationale at the cross-join call site above.
+                binary_row_matches_filters(&merged, p.join_filters).unwrap_or(false)
             })
             .collect::<Vec<_>>();
 

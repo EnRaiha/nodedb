@@ -45,13 +45,28 @@ pub(super) fn get_field(doc: &serde_json::Value, field: &str) -> serde_json::Val
 }
 
 /// Evaluate a `SqlExpr` against a serde_json document, returning a serde_json value.
+///
+/// `build_partitions`/`order_keys_equal` (this function's only callers) feed
+/// `evaluate_window_functions`, which is itself infallible (`fn(..)`) and is
+/// reached, in the live server path, through
+/// `nodedb/.../document/read/scan.rs`'s `CoreLoop::execute_document_scan`,
+/// which returns the bridge `Response` envelope rather than `crate::Result`.
+/// Giving a PARTITION BY / ORDER BY expression the same `22012`
+/// statement-failure treatment as WHERE/projection expressions (nodedb
+/// issue #216) would mean threading a `Result` through the window
+/// subsystem's several still-infallible function implementations
+/// (`row_number`/`rank`/`dense_rank`/`percent_rank`/`cume_dist`/aggregate
+/// window functions) and extending `Response`/`ErrorCode` to carry it —
+/// a substantially larger, separate change. For now a division/modulo-by-
+/// zero here folds to `NULL`, matching prior behavior; see the unit-2
+/// completion report.
 pub(super) fn eval_expr_on_json(expr: &SqlExpr, doc: &serde_json::Value) -> serde_json::Value {
     match expr {
         SqlExpr::Column(name) => get_field(doc, name),
         SqlExpr::Literal(v) => serde_json::Value::from(v.clone()),
         other => {
             let ndb_doc = nodedb_types::Value::from(doc.clone());
-            let result = other.eval(&ndb_doc);
+            let result = other.eval(&ndb_doc).unwrap_or(nodedb_types::Value::Null);
             serde_json::Value::from(result)
         }
     }

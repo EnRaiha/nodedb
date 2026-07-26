@@ -39,7 +39,14 @@ pub fn inject_defaults(
                     }
                 })?;
             let doc = nodedb_types::Value::Object(fields.clone());
-            fields.insert(guard.field.clone(), expr.eval(&doc));
+            let val = expr.eval(&doc).map_err(|e| ErrorCode::TypeGuardViolation {
+                collection: String::new(),
+                detail: format!(
+                    "field '{}': VALUE expression '{}' failed to evaluate: {e}",
+                    guard.field, expr_str
+                ),
+            })?;
+            fields.insert(guard.field.clone(), val);
         }
         // DEFAULT: inject only if absent or null.
         else if let Some(ref expr_str) = guard.default_expr {
@@ -56,7 +63,14 @@ pub fn inject_defaults(
                         ),
                     })?;
                 let doc = nodedb_types::Value::Object(fields.clone());
-                fields.insert(guard.field.clone(), expr.eval(&doc));
+                let val = expr.eval(&doc).map_err(|e| ErrorCode::TypeGuardViolation {
+                    collection: String::new(),
+                    detail: format!(
+                        "field '{}': DEFAULT expression '{}' failed to evaluate: {e}",
+                        guard.field, expr_str
+                    ),
+                })?;
+                fields.insert(guard.field.clone(), val);
             }
         }
     }
@@ -174,7 +188,15 @@ pub fn check_type_guards(
                         guard.field, check_str
                     ),
                 })?;
-            let result = check_expr.eval(doc);
+            let result = check_expr
+                .eval(doc)
+                .map_err(|e| ErrorCode::TypeGuardViolation {
+                    collection: collection.to_string(),
+                    detail: format!(
+                        "field '{}': CHECK expression '{}' failed to evaluate: {e}",
+                        guard.field, check_str
+                    ),
+                })?;
             match result {
                 nodedb_types::Value::Bool(true) => {} // CHECK passed
                 nodedb_types::Value::Null => {}       // NULL passes CHECK (SQL semantics)

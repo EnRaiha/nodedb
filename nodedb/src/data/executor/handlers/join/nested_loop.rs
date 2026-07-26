@@ -162,7 +162,15 @@ impl CoreLoop {
                         left_collection,
                         right_collection,
                     );
-                    predicates.iter().all(|p| p.matches_binary(&merged))
+                    match crate::bridge::scan_filter::ScanFilter::all_match_binary(
+                        &predicates,
+                        &merged,
+                    ) {
+                        Ok(b) => b,
+                        Err(_e) => {
+                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        }
+                    }
                 };
 
                 if passes {

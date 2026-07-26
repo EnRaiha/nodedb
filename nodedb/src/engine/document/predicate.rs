@@ -43,10 +43,15 @@ impl IndexPredicate {
 
     /// Evaluate the predicate against a document value. Returns `true`
     /// only when the expression evaluates to `Bool(true)` — `NULL`,
-    /// `Bool(false)`, and any non-boolean result exclude the row from
-    /// the index (matching Postgres partial-index semantics).
+    /// `Bool(false)`, any non-boolean result, and (nodedb issue #216) a
+    /// division/modulo-by-zero evaluation error all exclude the row from
+    /// the index. This mirrors the existing "anything but exactly `true`
+    /// excludes" partial-index philosophy already documented above (which
+    /// already fails closed rather than defaulting to "index everything");
+    /// an eval error gets the same fail-closed treatment as an ordinary
+    /// `false`/`NULL` result, not a distinct outcome.
     pub fn evaluate(&self, doc: &Value) -> bool {
-        matches!(self.expr.eval(doc), Value::Bool(true))
+        matches!(self.expr.eval(doc), Ok(Value::Bool(true)))
     }
 
     /// Convenience overload for the document write path, which holds

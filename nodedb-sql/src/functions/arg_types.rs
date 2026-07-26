@@ -35,6 +35,8 @@ const GEOMETRY_ONLY: &[ColumnType] = &[ColumnType::Geometry];
 
 const TIMESTAMP_TYPES: &[ColumnType] = &[ColumnType::Timestamp, ColumnType::Timestamptz];
 
+const ARRAY_ONLY: &[ColumnType] = &[ColumnType::Array];
+
 // ── Helper constructors ──────────────────────────────────────────────────────
 
 pub(super) const fn any(name: &'static str) -> ArgTypeSpec {
@@ -186,6 +188,40 @@ pub static H3_LATLNGTOCELL_ARGS: &[ArgTypeSpec] = &[
 
 pub static H3_CELLTOLATLNG_ARGS: &[ArgTypeSpec] = &[typed("h3_index", TEXT)];
 
+/// `geo_distance`/`haversine_distance`/`geo_bearing`/`haversine_bearing`
+/// (lng1, lat1, lng2, lat2).
+pub static HAVERSINE_ARGS: &[ArgTypeSpec] = &[
+    typed("lng1", FLOAT64_ONLY),
+    typed("lat1", FLOAT64_ONLY),
+    typed("lng2", FLOAT64_ONLY),
+    typed("lat2", FLOAT64_ONLY),
+];
+
+/// `geo_circle(lng, lat, radius_m, segments?)`.
+pub static GEO_CIRCLE_ARGS: &[ArgTypeSpec] = &[
+    typed("lng", FLOAT64_ONLY),
+    typed("lat", FLOAT64_ONLY),
+    typed("radius_m", FLOAT64_ONLY),
+    typed("segments", INT64_ONLY),
+];
+
+/// `geo_bbox(min_lng, min_lat, max_lng, max_lat)`.
+pub static GEO_BBOX_ARGS: &[ArgTypeSpec] = &[
+    typed("min_lng", FLOAT64_ONLY),
+    typed("min_lat", FLOAT64_ONLY),
+    typed("max_lng", FLOAT64_ONLY),
+    typed("max_lat", FLOAT64_ONLY),
+];
+
+/// `geo_line(point1, point2, ...)` — at least 2 Point geometries.
+pub static GEO_LINE_ARGS: &[ArgTypeSpec] = &[
+    typed("point1", GEOMETRY_ONLY),
+    typed_variadic("point2", GEOMETRY_ONLY),
+];
+
+/// `geo_polygon(ring1, ring2, ...)` — each ring an array of `[lng, lat]` pairs.
+pub static GEO_POLYGON_ARGS: &[ArgTypeSpec] = &[any_variadic("ring")];
+
 // ── Timeseries ────────────────────────────────────────────────────────────────
 
 pub static TIME_BUCKET_ARGS: &[ArgTypeSpec] = &[any("interval"), typed("ts", TIMESTAMP_TYPES)];
@@ -248,7 +284,18 @@ pub static NULLIF_ARGS: &[ArgTypeSpec] = &[any("expr1"), any("expr2")];
 
 pub static MATH_1_ARGS: &[ArgTypeSpec] = &[typed("expr", NUMERIC)];
 
+/// `mod(a, b)` / `power(base, exp)` / `pow(base, exp)` — two required
+/// numeric arguments.
+pub static MATH_2_ARGS: &[ArgTypeSpec] = &[typed("left", NUMERIC), typed("right", NUMERIC)];
+
 pub static ROUND_ARGS: &[ArgTypeSpec] = &[typed("expr", NUMERIC), typed("scale", INT64_ONLY)];
+
+/// `greatest(expr, ...)` / `least(expr, ...)` — one or more arguments of any
+/// (comparable) type.
+pub static GREATEST_LEAST_ARGS: &[ArgTypeSpec] = &[any_variadic("expr")];
+
+/// `typeof(expr)` / `type_of(expr)` — accepts any value, including NULL.
+pub static TYPEOF_ARGS: &[ArgTypeSpec] = &[any("expr")];
 
 pub static STRING_1_ARGS: &[ArgTypeSpec] = &[typed("expr", TEXT)];
 
@@ -331,3 +378,89 @@ pub static ARRAY_ELEMENTWISE_ARGS: &[ArgTypeSpec] = &[
 ];
 
 pub static ARRAY_MAINT_ARGS: &[ArgTypeSpec] = &[typed("name", TEXT)];
+
+// ── ID generation / detection (nodedb-query's `functions/id.rs`) ──────────────
+
+/// `is_uuid(value)` / `is_ulid(value)` / `is_cuid2(value)` / `is_nanoid(value)`
+/// / `id_type(value)` / `uuid_version(value)` / `ulid_timestamp(value)` — a
+/// single text value to classify. Shared shape across all detector functions.
+pub static ID_CHECK_ARGS: &[ArgTypeSpec] = &[typed("value", TEXT)];
+
+/// `nanoid(length?)` — optional custom length, defaults to the standard
+/// 21-character id when omitted.
+pub static NANOID_ARGS: &[ArgTypeSpec] = &[typed("length", INT64_ONLY)];
+
+// ── Array element functions (nodedb-query's `functions/array.rs`) ─────────────
+//
+// Distinct from the "Array engine" table-valued functions above
+// (`array_slice`/`array_project`/...): these operate on an in-row `Array`
+// value, mirroring the match arms in `nodedb_query::functions::array::try_eval`.
+
+/// `array_length(arr)` / `cardinality(arr)` / `array_distinct(arr)` /
+/// `array_reverse(arr)` — a single array argument.
+pub static ARRAY_1_ARGS: &[ArgTypeSpec] = &[typed("arr", ARRAY_ONLY)];
+
+/// `array_append(arr, value)` / `array_remove(arr, value)` /
+/// `array_contains(arr, value)` / `array_position(arr, value)` — an array
+/// plus an element of any type.
+pub static ARRAY_ELEM_ARGS: &[ArgTypeSpec] = &[typed("arr", ARRAY_ONLY), any("value")];
+
+/// `array_prepend(value, arr)` — value-first argument order, matching
+/// `nodedb_query::functions::array::try_eval`'s `"array_prepend"` arm.
+pub static ARRAY_PREPEND_ARGS: &[ArgTypeSpec] = &[any("value"), typed("arr", ARRAY_ONLY)];
+
+/// `array_concat(arr1, arr2)` / `array_cat(arr1, arr2)`.
+pub static ARRAY_CAT_ARGS: &[ArgTypeSpec] = &[typed("arr1", ARRAY_ONLY), typed("arr2", ARRAY_ONLY)];
+
+// ── DateTime / duration (nodedb-query's `functions/datetime.rs`) ──────────────
+
+/// `datetime(value)` / `to_datetime(value)` / `unix_secs(value)` /
+/// `epoch_secs(value)` / `unix_millis(value)` / `epoch_millis(value)` /
+/// `duration(value)` / `to_duration(value)` / `decimal(value)` /
+/// `to_decimal(value)` — a single value whose accepted shape (string,
+/// integer micros, or an existing timestamp/duration) varies by function, so
+/// the position is left untyped (`any`) rather than over-constrained.
+pub static DATETIME_1_ARGS: &[ArgTypeSpec] = &[any("value")];
+
+/// `extract(part, ts)` / `date_part(part, ts)` / `date_trunc(part, ts)` /
+/// `datetrunc(part, ts)` — a text field-name selector plus the
+/// timestamp-like value to read it from.
+pub static DATE_PART_ARGS: &[ArgTypeSpec] = &[typed("part", TEXT), any("ts")];
+
+/// `date_add(ts, duration)` / `datetime_add(ts, duration)` /
+/// `date_sub(ts, duration)` / `datetime_sub(ts, duration)`.
+pub static DATE_ARITH_ARGS: &[ArgTypeSpec] = &[any("ts"), typed("duration", TEXT)];
+
+/// `date_diff(ts1, ts2)` / `datediff(ts1, ts2)`.
+pub static DATE_DIFF_ARGS: &[ArgTypeSpec] = &[any("ts1"), any("ts2")];
+
+// ── Legacy JSON manipulation (nodedb-query's `functions/json/legacy.rs`) ──────
+//
+// Distinct from the PostgreSQL JSON operators and SQL/JSON standard
+// functions above: these are the pre-existing `json_*` document-helper
+// functions.
+
+/// `json_extract(json, path)` / `json_get(json, path)`.
+pub static JSON_EXTRACT_ARGS: &[ArgTypeSpec] = &[any("json"), typed("path", TEXT)];
+
+/// `json_set(json, key, value)`.
+pub static JSON_SET_ARGS: &[ArgTypeSpec] = &[any("json"), typed("key", TEXT), any("value")];
+
+/// `json_remove(json, key)`.
+pub static JSON_REMOVE_ARGS: &[ArgTypeSpec] = &[any("json"), typed("key", TEXT)];
+
+/// `json_keys(json)` / `json_values(json)` / `json_length(json)` /
+/// `json_len(json)` / `json_type(json)` — a single JSON-shaped value.
+pub static JSON_1_ARGS: &[ArgTypeSpec] = &[any("json")];
+
+/// `json_array(value, ...)` — zero or more values of any type.
+pub static JSON_ARRAY_ARGS: &[ArgTypeSpec] = &[any_variadic("value")];
+
+/// `json_object(key, value, ...)` — a flat, variadic key/value list.
+pub static JSON_OBJECT_ARGS: &[ArgTypeSpec] = &[any_variadic("kv")];
+
+/// `json_contains(container, needle)`.
+pub static JSON_CONTAINS_ARGS: &[ArgTypeSpec] = &[any("container"), any("needle")];
+
+/// `json_merge(base, overlay)` / `json_patch(base, overlay)`.
+pub static JSON_MERGE_ARGS: &[ArgTypeSpec] = &[any("base"), any("overlay")];

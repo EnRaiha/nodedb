@@ -16,6 +16,18 @@ impl From<nodedb_query::expr_parse::ExprParseError> for Error {
     }
 }
 
+/// `EvalError` has exactly one variant today (`DivisionByZero`, nodedb
+/// issue #216); the `match` is exhaustive rather than a `_ =>` fallback so
+/// a future evaluator error is forced to pick its own `crate::Error`
+/// mapping instead of silently inheriting this one.
+impl From<nodedb_query::EvalError> for Error {
+    fn from(e: nodedb_query::EvalError) -> Self {
+        match e {
+            nodedb_query::EvalError::DivisionByZero => Self::DivisionByZero,
+        }
+    }
+}
+
 impl From<crate::control::pubsub::TopicError> for Error {
     fn from(e: crate::control::pubsub::TopicError) -> Self {
         Self::BadRequest {
@@ -224,6 +236,8 @@ impl From<Error> for NodeDbError {
                 NodeDbError::quota_overcommit(field, detail)
             }
             Error::PlanError { detail } => NodeDbError::plan_error(detail),
+            Error::UndefinedFunction { name } => NodeDbError::undefined_function(name),
+            Error::DivisionByZero => NodeDbError::division_by_zero(),
             Error::RetryableSchemaChanged { descriptor } => {
                 NodeDbError::plan_error(format!("retryable schema change on {descriptor}"))
             }

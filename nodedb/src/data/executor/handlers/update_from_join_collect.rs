@@ -144,7 +144,14 @@ impl CoreLoop {
                             Ok(v) => v,
                             Err(_) => continue,
                         },
-                        UpdateValue::Expr(expr) => expr.eval(&merged_ndb).into(),
+                        // nodedb issue #216: division/modulo by zero fails
+                        // the statement, same as the literal decode-failure
+                        // arm above would if it propagated instead of
+                        // skipping (kept as-is; only the newly-fallible
+                        // expr path is threaded here).
+                        UpdateValue::Expr(expr) => {
+                            expr.eval(&merged_ndb).map_err(crate::Error::from)?.into()
+                        }
                     };
                     target_obj.insert(field.clone(), val);
                 }
@@ -252,12 +259,12 @@ impl CoreLoop {
                     match super::super::strict_format::binary_tuple_to_json(value_bytes, schema) {
                         Some(doc) => {
                             let msgpack = doc_format::encode_to_msgpack(&doc);
-                            target_filters.iter().all(|f| f.matches_binary(&msgpack))
+                            ScanFilter::all_match_binary(target_filters, &msgpack)?
                         }
                         None => false,
                     }
                 } else {
-                    target_filters.iter().all(|f| f.matches_binary(value_bytes))
+                    ScanFilter::all_match_binary(target_filters, value_bytes)?
                 };
                 if matches && let Some(doc_id) = key.strip_prefix(&prefix) {
                     rows.push((doc_id.to_string(), value_bytes.to_vec()));
@@ -272,9 +279,25 @@ impl CoreLoop {
         // that satisfies the predicate is surfaced, one that no longer does is
         // dropped, exactly as for a base row.
         if let Some(txn_id) = txn_id {
-            let matches =
+            // `merge_overlay_into_scan` takes an infallible
+            // `Fn(&[u8]) -> bool` predicate, so a division/modulo-by-zero
+            // (nodedb issue #216) is captured via this `Cell` side-channel
+            // and checked once the merge returns.
+            let raw_matches =
                 self.strict_aware_matcher(database_id, tid, target_collection, target_filters);
+            let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
+                std::cell::Cell::new(None);
+            let matches = |body: &[u8]| match raw_matches(body) {
+                Ok(b) => b,
+                Err(e) => {
+                    predicate_err.set(Some(e));
+                    false
+                }
+            };
             self.merge_overlay_into_scan(txn_id, target_coll_key, &mut rows, &matches);
+            if let Some(e) = predicate_err.take() {
+                return Err(crate::Error::from(e));
+            }
         }
         Ok(rows)
     }

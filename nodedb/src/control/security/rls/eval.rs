@@ -133,7 +133,7 @@ fn check_compiled_write(
     };
 
     let doc_mp = nodedb_types::json_to_msgpack_or_empty(document);
-    if !filters.iter().all(|f| f.matches_binary(&doc_mp)) {
+    if !crate::bridge::scan_filter::ScanFilter::all_match_binary(&filters, &doc_mp)? {
         info!(
             policy = %policy.name,
             username = %auth.username,

@@ -381,8 +381,9 @@ pub enum ErrorCode {
     LegalHoldActive { collection: String },
     /// State transition not in allowed list.
     StateTransitionViolation { collection: String, detail: String },
-    /// Transition check predicate returned false.
-    TransitionCheckViolation { collection: String },
+    /// Transition check predicate returned false, or (nodedb issue #216)
+    /// failed to evaluate — `detail` distinguishes the two.
+    TransitionCheckViolation { collection: String, detail: String },
     /// Type guard violation: field type mismatch or REQUIRED absent.
     TypeGuardViolation { collection: String, detail: String },
     /// Value type does not match expected type for operation (e.g. INCR on a string).
@@ -426,6 +427,13 @@ pub enum ErrorCode {
     /// transaction is too large to stage rather than that it hit an internal
     /// fault.
     TxnOverlayMemoryExceeded { limit: usize },
+    /// Expression evaluation divided or took a modulus by zero (nodedb
+    /// issue #216). Distinct from `Internal` so it survives the Data Plane
+    /// → pgwire boundary (including `result_stream::stream_response_channel`,
+    /// which special-cases this variant the same way it already
+    /// special-cases `NotFound`) and reaches the client as SQLSTATE `22012`
+    /// rather than the generic `XX000` every `Internal` maps to.
+    DivisionByZero,
 }
 
 impl From<crate::Error> for ErrorCode {
@@ -462,8 +470,8 @@ impl From<crate::Error> for ErrorCode {
             crate::Error::StateTransitionViolation {
                 collection, detail, ..
             } => Self::StateTransitionViolation { collection, detail },
-            crate::Error::TransitionCheckViolation { collection, .. } => {
-                Self::TransitionCheckViolation { collection }
+            crate::Error::TransitionCheckViolation { collection, detail } => {
+                Self::TransitionCheckViolation { collection, detail }
             }
             crate::Error::TypeGuardViolation {
                 collection, detail, ..
@@ -486,6 +494,7 @@ impl From<crate::Error> for ErrorCode {
             crate::Error::TxnOverlayMemoryExceeded { limit } => {
                 Self::TxnOverlayMemoryExceeded { limit }
             }
+            crate::Error::DivisionByZero => Self::DivisionByZero,
             other => Self::Internal {
                 detail: other.to_string(),
             },

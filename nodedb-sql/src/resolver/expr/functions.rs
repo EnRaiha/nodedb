@@ -1,12 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::LazyLock;
+
 use sqlparser::ast;
 
 use crate::error::{Result, SqlError};
+use crate::functions::registry::FunctionRegistry;
 use crate::parser::normalize::{SCHEMA_QUALIFIED_MSG, normalize_ident};
 use crate::types::*;
 
 use super::convert::convert_expr_depth;
+
+/// Process-wide function registry backing the undefined-function gate in
+/// [`convert_function_depth`]. `FunctionRegistry::new()` rebuilds the full
+/// builtin table (aggregates + scalars) from scratch, so a fresh instance
+/// per function-call site would redo that work on every call in every
+/// statement; a lazily-initialized singleton amortizes it, mirroring
+/// `planner::const_fold::DEFAULT_REGISTRY`.
+static FUNCTION_REGISTRY: LazyLock<FunctionRegistry> = LazyLock::new(FunctionRegistry::new);
 
 pub(super) fn convert_function_depth(func: &ast::Function, depth: &mut usize) -> Result<SqlExpr> {
     // Intercept PG FTS surface functions and lower them to pg_* internal names
@@ -54,6 +65,20 @@ pub(super) fn convert_function_depth(func: &ast::Function, depth: &mut usize) ->
         && let Some(expr) = intercept_catalog_function(&name, func, depth)?
     {
         return Ok(expr);
+    }
+
+    // Plan-time existence gate (nodedb issue #216): every special-form
+    // interception above (FTS surface functions, catalog functions) has
+    // already had its shot at `name` and returned early. Anything reaching
+    // this point is a plain scalar/aggregate/window call that must be a
+    // known builtin — `FunctionRegistry` is the single source of truth used
+    // by aggregate/window classification and constant folding elsewhere in
+    // this crate, so an unknown name here would otherwise flow through to
+    // `SqlExpr::Function` and silently evaluate to `NULL` for every row at
+    // runtime (`nodedb_query::functions::eval_function`'s fallback). Reject
+    // it here instead, so the whole statement fails at plan time.
+    if FUNCTION_REGISTRY.lookup(&name).is_none() {
+        return Err(SqlError::UndefinedFunction { name });
     }
 
     let args = match &func.args {
@@ -196,5 +221,80 @@ fn collect_function_args(func: &ast::Function, depth: &mut usize) -> Result<Vec<
                 _ => None,
             })
             .collect::<Result<Vec<_>>>(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    use super::*;
+
+    /// Parse `SELECT <expr>` and return the sole projection expression.
+    fn parse_expr(sql: &str) -> ast::Expr {
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        match stmts.into_iter().next().unwrap() {
+            ast::Statement::Query(q) => match *q.body {
+                ast::SetExpr::Select(s) => match s.projection.into_iter().next().unwrap() {
+                    ast::SelectItem::UnnamedExpr(e) => e,
+                    ast::SelectItem::ExprWithAlias { expr, .. } => expr,
+                    other => panic!("expected a bare/aliased expr projection, got {other:?}"),
+                },
+                _ => panic!("expected SELECT"),
+            },
+            _ => panic!("expected query"),
+        }
+    }
+
+    /// Parse `SELECT <call>` and return the function-call AST node.
+    fn function_ast(sql: &str) -> ast::Function {
+        match parse_expr(sql) {
+            ast::Expr::Function(f) => f,
+            other => panic!("expected a function call expr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_function_name_is_rejected() {
+        let func = function_ast("SELECT totally_bogus_fn(1, 2)");
+        let mut depth = 0;
+        let err = convert_function_depth(&func, &mut depth).unwrap_err();
+        match err {
+            SqlError::UndefinedFunction { name } => assert_eq!(name, "totally_bogus_fn"),
+            other => panic!("expected SqlError::UndefinedFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn known_scalar_function_name_resolves() {
+        let func = function_ast("SELECT upper('x')");
+        let mut depth = 0;
+        let expr = convert_function_depth(&func, &mut depth).unwrap();
+        match expr {
+            SqlExpr::Function { name, .. } => assert_eq!(name, "upper"),
+            other => panic!("expected SqlExpr::Function, got {other:?}"),
+        }
+    }
+
+    /// `func.name` is only lower-cased upstream (`normalize_ident`) for
+    /// *unquoted* identifiers, so a quoted `"UPPER"` reaches the registry
+    /// gate with its original case intact. The gate must still resolve it —
+    /// `FunctionRegistry::lookup` case-folds internally — proving the
+    /// existence check itself is case-insensitive, not merely riding on
+    /// upstream normalization.
+    #[test]
+    fn function_lookup_is_case_insensitive() {
+        let mut depth = 0;
+        let lower = function_ast("SELECT upper('x')");
+        let upper_quoted = function_ast(r#"SELECT "UPPER"('x')"#);
+        assert!(
+            convert_function_depth(&lower, &mut depth).is_ok(),
+            "lowercase 'upper' must resolve"
+        );
+        assert!(
+            convert_function_depth(&upper_quoted, &mut depth).is_ok(),
+            "quoted 'UPPER' must still resolve via case-insensitive registry lookup"
+        );
     }
 }

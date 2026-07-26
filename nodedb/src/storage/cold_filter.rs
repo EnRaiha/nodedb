@@ -17,6 +17,8 @@
 //! Called from `read_parquet_filtered()` which replaces `read_parquet_with_predicate`
 //! for queries that have filter predicates.
 
+use std::sync::{Arc, Mutex};
+
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 use bytes::Bytes;
@@ -83,6 +85,21 @@ pub fn read_parquet_filtered(
     };
 
     // Step 3: Apply row-level filter if predicates exist.
+    //
+    // Side-channel: a division/modulo-by-zero in a pushed-down WHERE
+    // predicate (nodedb issue #216) is captured here rather than propagated
+    // through `ArrowPredicateFn`'s `Result<BooleanArray, ArrowError>` return
+    // type, which cannot carry an `EvalError` — the previous code converted
+    // it to `arrow::error::ArrowError::DivideByZero`, and `reader.collect()`
+    // below then turned THAT into a generic `crate::Error::ColdStorage`
+    // (`XX000`), losing the typed error entirely. `Arc<Mutex<..>>` rather
+    // than the plain `Cell<Option<EvalError>>` side-channel used elsewhere
+    // in this diff (e.g. `document/read/scan.rs`'s `merge_overlay_into_scan`
+    // predicate) because `ArrowPredicateFn::new` requires its closure be
+    // `Send + 'static` (`parquet::arrow::arrow_reader::filter::
+    // ArrowPredicateFn`), and `Cell` is neither `Send` nor `Sync`.
+    let predicate_err: Arc<Mutex<Option<nodedb_query::EvalError>>> = Arc::new(Mutex::new(None));
+
     let reader = if filters.is_empty() {
         reader_builder
             .build()
@@ -92,6 +109,7 @@ pub fn read_parquet_filtered(
     } else {
         let filter_schema = schema.clone();
         let filters_owned: Vec<ScanFilter> = filters.to_vec();
+        let predicate_err = predicate_err.clone();
 
         let predicate = ArrowPredicateFn::new(ProjectionMask::all(), move |batch: RecordBatch| {
             let num_rows = batch.num_rows();
@@ -99,7 +117,24 @@ pub fn read_parquet_filtered(
                 .map(|row_idx| {
                     let doc = record_batch_row_to_json(&batch, row_idx, &filter_schema);
                     let msgpack = nodedb_types::json_msgpack::json_to_msgpack_or_empty(&doc);
-                    filters_owned.iter().all(|f| f.matches_binary(&msgpack))
+                    let mut row_matches = true;
+                    for f in &filters_owned {
+                        match f.matches_binary(&msgpack) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                row_matches = false;
+                                break;
+                            }
+                            Err(e) => {
+                                if let Ok(mut slot) = predicate_err.lock() {
+                                    *slot = Some(e);
+                                }
+                                row_matches = false;
+                                break;
+                            }
+                        }
+                    }
+                    row_matches
                 })
                 .collect();
 
@@ -121,6 +156,20 @@ pub fn read_parquet_filtered(
             .map_err(|e| crate::Error::ColdStorage {
                 detail: format!("read batches: {e}"),
             })?;
+
+    // Check the side-channel AFTER the reader finishes: a division/modulo-
+    // by-zero row was already excluded from every batch's mask above (never
+    // surfaced as a mis-filtered result), so `reader.collect()` succeeding
+    // does not mean the read was clean — it means the predicate closure
+    // never got a chance to return an `Err` at all. This is the typed
+    // `crate::Error::DivisionByZero` the pre-fix `ArrowError` conversion
+    // above lost.
+    if let Ok(mut slot) = predicate_err.lock()
+        && slot.take().is_some()
+    {
+        return Err(crate::Error::DivisionByZero);
+    }
+
     Ok(batches)
 }
 
@@ -379,7 +428,6 @@ mod tests {
     use super::*;
     use arrow::array::ArrayRef;
     use arrow::datatypes::{Field, Schema};
-    use std::sync::Arc;
 
     fn make_test_parquet(rows: &[(&str, i64, &str)]) -> Vec<u8> {
         let schema = Arc::new(Schema::new(vec![
@@ -445,6 +493,69 @@ mod tests {
         // Only bob (age=30) should match age > 25.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "d2");
+    }
+
+    /// nodedb issue #216: a `FilterOp::Expr` predicate that divides by a
+    /// zero-valued column must fail the whole cold-storage read with the
+    /// typed `crate::Error::DivisionByZero`, not the generic `ColdStorage`
+    /// the pre-fix `ArrowError` conversion collapsed it to (verified at the
+    /// SQL/pgwire layer as `XX000` vs `22012` — this is the storage-layer
+    /// unit underneath that behavior).
+    #[test]
+    fn expr_predicate_division_by_zero_returns_typed_error() {
+        use nodedb_query::expr::{BinaryOp, SqlExpr};
+
+        let parquet = make_test_parquet(&[("d1", 0, "alice"), ("d2", 30, "bob")]);
+
+        let filters = vec![ScanFilter {
+            field: String::new(),
+            op: "expr".into(),
+            value: nodedb_types::Value::Null,
+            clauses: vec![],
+            expr: Some(SqlExpr::BinaryOp {
+                left: Box::new(SqlExpr::Literal(nodedb_types::Value::Integer(10))),
+                op: BinaryOp::Div,
+                right: Box::new(SqlExpr::Column("age".into())),
+            }),
+        }];
+
+        let err = read_parquet_filtered(&parquet, &filters, &[]).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::DivisionByZero),
+            "expected crate::Error::DivisionByZero, got: {err:?}"
+        );
+    }
+
+    /// Control: the same expression predicate over rows that never divide
+    /// by zero still filters correctly — the fix must not turn every
+    /// `FilterOp::Expr` predicate into an error.
+    #[test]
+    fn expr_predicate_valid_division_still_filters() {
+        use nodedb_query::expr::{BinaryOp, SqlExpr};
+
+        let parquet = make_test_parquet(&[("d1", 2, "alice"), ("d2", 30, "bob")]);
+
+        // `10 / age > 1` is true only for d1 (10/2 = 5 > 1); d2 (10/30 = 0) fails.
+        let filters = vec![ScanFilter {
+            field: String::new(),
+            op: "expr".into(),
+            value: nodedb_types::Value::Null,
+            clauses: vec![],
+            expr: Some(SqlExpr::BinaryOp {
+                left: Box::new(SqlExpr::BinaryOp {
+                    left: Box::new(SqlExpr::Literal(nodedb_types::Value::Integer(10))),
+                    op: BinaryOp::Div,
+                    right: Box::new(SqlExpr::Column("age".into())),
+                }),
+                op: BinaryOp::Gt,
+                right: Box::new(SqlExpr::Literal(nodedb_types::Value::Integer(1))),
+            }),
+        }];
+
+        let batches = read_parquet_filtered(&parquet, &filters, &[]).unwrap();
+        let rows = batches_to_document_rows(&batches);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "d1");
     }
 
     #[test]

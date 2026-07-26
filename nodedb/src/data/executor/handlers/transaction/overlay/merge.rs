@@ -251,7 +251,7 @@ impl CoreLoop {
         params: IndexOverlayMergeParams<'_>,
         doc_ids: &mut Vec<String>,
         decode: &dyn Fn(&[u8]) -> Option<serde_json::Value>,
-    ) {
+    ) -> crate::Result<()> {
         let IndexOverlayMergeParams {
             txn_id,
             coll_key,
@@ -265,7 +265,7 @@ impl CoreLoop {
         // Read-your-own-writes refreshes the lease (see the reaper).
         self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
-            return;
+            return Ok(());
         };
 
         let normalize = |s: String| -> String {
@@ -290,8 +290,23 @@ impl CoreLoop {
         // overlay merge uses, so a staged Put that satisfies the indexed term
         // but not the residual is excluded exactly like it would be from a
         // base scan result.
+        // `residual_matches` feeds `Vec::retain`/a plain `for` loop below, both
+        // of which need a `bool`, so a division/modulo-by-zero (nodedb issue
+        // #216) is captured via this `Cell` side-channel and checked once
+        // both passes finish.
+        let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
+            std::cell::Cell::new(None);
         let residual_matches = |body: &[u8]| -> bool {
-            residual.is_empty() || matches_with_resolved_schema(strict_schema, residual, body)
+            if residual.is_empty() {
+                return true;
+            }
+            match matches_with_resolved_schema(strict_schema, residual, body) {
+                Ok(b) => b,
+                Err(e) => {
+                    predicate_err.set(Some(e));
+                    false
+                }
+            }
         };
 
         // Base doc IDs are hex surrogates; track their surrogates so additions
@@ -335,6 +350,10 @@ impl CoreLoop {
                 Staged::Tombstone => {}
             }
         }
+        if let Some(e) = predicate_err.take() {
+            return Err(crate::Error::from(e));
+        }
+        Ok(())
     }
 
     /// Resolve the current body for a hex-surrogate `doc_id` in `coll_key`,

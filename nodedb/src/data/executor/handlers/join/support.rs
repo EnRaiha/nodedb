@@ -3,6 +3,7 @@
 //! Shared binary-msgpack helpers used by the join execution handlers:
 //! row merging, map-header writing, field filtering, and projection.
 
+use nodedb_query::EvalError;
 use nodedb_query::msgpack_scan;
 
 use crate::data::executor::msgpack_utils::write_str;
@@ -134,25 +135,34 @@ pub(super) fn compare_preextracted(
 /// ScanFilter field names may be unqualified ("amount") while the merged
 /// join row has qualified keys ("orders.amount"). We try the field name
 /// as-is first, then fall back to suffix matching.
+///
+/// Returns `Err(EvalError::DivisionByZero)` when a `FilterOp::Expr`
+/// predicate divides or takes a modulus by zero (nodedb issue #216). Callers
+/// on the WHERE-shaped post-filter path (`join::params::filter_and_project`)
+/// propagate this as a genuine statement error; callers on the hash-join
+/// probe hot path (`join::hash`, part of the grace-hash spill/streaming
+/// family spanning several files) fold it to "no match" for now — see the
+/// unit-2 completion report for the follow-up needed to give a join's
+/// residual ON-predicate the same treatment.
 pub(super) fn binary_row_matches_filters(
     row: &[u8],
     filters: &[crate::bridge::scan_filter::ScanFilter],
-) -> bool {
+) -> Result<bool, EvalError> {
     use crate::bridge::scan_filter::FilterOp;
 
-    filters.iter().all(|f| {
+    for f in filters {
         if f.op == FilterOp::MatchAll {
-            return true;
+            continue;
         }
         // Try exact field name first.
-        if f.matches_binary(row) {
-            return true;
+        if f.matches_binary(row)? {
+            continue;
         }
         // Qualified-name fallback: field "amount" may be stored as "orders.amount".
         // Build a mini map with unqualified names for the fields this filter needs,
         // so matches_binary can find them.
         let Some((count, mut pos)) = msgpack_scan::map_header(row, 0) else {
-            return false;
+            return Ok(false);
         };
 
         // Collect all fields the filter needs (left field + right column for ColumnCompare).
@@ -178,12 +188,12 @@ pub(super) fn binary_row_matches_filters(
             let key = msgpack_scan::read_str(row, pos);
             let key_end = match msgpack_scan::skip_value(row, pos) {
                 Some(p) => p,
-                None => return false,
+                None => return Ok(false),
             };
             let val_start = key_end;
             let val_end = match msgpack_scan::skip_value(row, val_start) {
                 Some(p) => p,
-                None => return false,
+                None => return Ok(false),
             };
             if let Some(k) = key {
                 for &need in &needed {
@@ -197,7 +207,7 @@ pub(super) fn binary_row_matches_filters(
         }
 
         if found.is_empty() {
-            return false;
+            return Ok(false);
         }
 
         // Build a mini map with unqualified names.
@@ -207,8 +217,11 @@ pub(super) fn binary_row_matches_filters(
             write_str(&mut mini, name);
             mini.extend_from_slice(&row[*vs..*ve]);
         }
-        f.matches_binary(&mini)
-    })
+        if !f.matches_binary(&mini)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Apply projection to a binary msgpack row, keeping only requested columns.
@@ -303,7 +316,7 @@ mod tests {
             expr: None,
         }];
 
-        assert!(binary_row_matches_filters(&merged, &filters));
+        assert!(binary_row_matches_filters(&merged, &filters).unwrap());
     }
 
     #[test]

@@ -149,7 +149,10 @@ impl CoreLoop {
                 let merged = if on_conflict_updates.is_empty() {
                     merge_values(existing_val, new_val)
                 } else {
-                    apply_on_conflict_updates(existing_val, &new_val, on_conflict_updates)
+                    match apply_on_conflict_updates(existing_val, &new_val, on_conflict_updates) {
+                        Ok(v) => v,
+                        Err(e) => return self.response_error(task, e),
+                    }
                 };
 
                 let sys_from_ms = if bitemporal {
@@ -376,7 +379,7 @@ pub(in crate::data::executor) fn apply_on_conflict_updates(
     existing: nodedb_types::Value,
     excluded: &nodedb_types::Value,
     updates: &[(String, nodedb_physical::physical_plan::UpdateValue)],
-) -> nodedb_types::Value {
+) -> crate::Result<nodedb_types::Value> {
     let mut obj = match existing {
         nodedb_types::Value::Object(map) => map,
         // If the existing row isn't an object (shouldn't happen for
@@ -396,13 +399,16 @@ pub(in crate::data::executor) fn apply_on_conflict_updates(
                     Err(_) => continue,
                 }
             }
+            // `ON CONFLICT DO UPDATE SET` is write-path-shaped (nodedb
+            // issue #216): a division/modulo-by-zero fails the statement
+            // instead of silently writing NULL.
             nodedb_physical::physical_plan::UpdateValue::Expr(expr) => {
-                expr.eval_with_excluded(&snapshot, excluded)
+                expr.eval_with_excluded(&snapshot, excluded)?
             }
         };
         obj.insert(field.clone(), new_val);
     }
-    nodedb_types::Value::Object(obj)
+    Ok(nodedb_types::Value::Object(obj))
 }
 
 /// Merge two `nodedb_types::Value` objects: overlay `new` fields onto `existing`.

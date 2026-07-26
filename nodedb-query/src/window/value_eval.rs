@@ -158,6 +158,14 @@ pub(super) fn order_keys_equal_v(
 
 // ── Argument evaluation (pub(super) for value_agg) ────────────────────────────
 
+/// Evaluate a window-function argument expression against one row.
+///
+/// This is the Value-native counterpart of `window::helpers::eval_expr_on_json`
+/// and shares its scoping rationale: it's called from ranking/offset/
+/// aggregate window-function implementations that are still infallible, so
+/// a division/modulo-by-zero (nodedb issue #216) here folds to `NULL`
+/// rather than threading a `Result` through the rest of the value-mode
+/// window evaluator — see the unit-2 completion report.
 pub(super) fn eval_arg_for_row(
     expr: &SqlExpr,
     row: &[Value],
@@ -172,7 +180,7 @@ pub(super) fn eval_arg_for_row(
         SqlExpr::Literal(v) => v.clone(),
         other => {
             let doc = row_to_obj(row, column_index);
-            other.eval(&doc)
+            other.eval(&doc).unwrap_or(Value::Null)
         }
     }
 }
