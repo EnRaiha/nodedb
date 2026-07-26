@@ -7,16 +7,29 @@ use tracing::{debug, warn};
 
 use super::types::MetadataCommitApplier;
 
+pub(super) struct SyncProducerRegistrationApply<'a> {
+    pub(super) lite_id: &'a str,
+    pub(super) producer_id: u64,
+    pub(super) tenant_id: u64,
+    pub(super) user_id: u64,
+    pub(super) epoch: u64,
+    pub(super) created_ms: i64,
+}
+
 impl MetadataCommitApplier {
     pub(super) fn apply_sync_producer_register(
         &self,
-        lite_id: &str,
-        producer_id: u64,
-        tenant_id: u64,
-        epoch: u64,
-        created_ms: i64,
+        registration: SyncProducerRegistrationApply<'_>,
         raft_index: u64,
     ) -> Result<(), crate::Error> {
+        let SyncProducerRegistrationApply {
+            lite_id,
+            producer_id,
+            tenant_id,
+            user_id,
+            epoch,
+            created_ms,
+        } = registration;
         if let Some(weak) = self.shared.get()
             && let Some(shared) = weak.upgrade()
         {
@@ -27,7 +40,7 @@ impl MetadataCommitApplier {
             // failure must not advance the watermark — Raft re-delivers
             // and `apply_register` is idempotent, so the retry is safe.
             if let Err(e) =
-                registry.apply_register(lite_id, producer_id, tenant_id, epoch, created_ms)
+                registry.apply_register(lite_id, producer_id, tenant_id, user_id, epoch, created_ms)
             {
                 warn!(
                     lite_id = %lite_id,

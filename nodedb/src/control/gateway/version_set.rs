@@ -325,6 +325,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 Read { collection, .. }
                 | PreviewApply { collection, .. }
                 | Apply { collection, .. }
+                | ApplyAuthenticated { collection, .. }
                 | SetPolicy { collection, .. }
                 | GetPolicy { collection, .. }
                 | ReadAtVersion { collection, .. }

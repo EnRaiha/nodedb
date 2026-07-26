@@ -22,7 +22,7 @@
 //! invoked by `MetadataCommitApplier` on every node (including the leader)
 //! when those Raft entries commit.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::control::security::catalog::SystemCatalog;
 use crate::control::security::catalog::sync_producer::StoredProducerRegistration;
@@ -41,6 +41,8 @@ pub struct ProducerRegistration {
     pub current_epoch: u64,
     /// Tenant that owns this registration.
     pub tenant_id: u64,
+    /// Immutable authenticated user that owns this registration.
+    pub user_id: u64,
     /// Unix-millisecond timestamp when the registration was created.
     pub created_ms: i64,
 }
@@ -51,6 +53,7 @@ impl From<StoredProducerRegistration> for ProducerRegistration {
             producer_id: s.producer_id,
             current_epoch: s.current_epoch,
             tenant_id: s.tenant_id,
+            user_id: s.user_id,
             created_ms: s.created_ms,
         }
     }
@@ -62,6 +65,7 @@ impl From<&ProducerRegistration> for StoredProducerRegistration {
             producer_id: r.producer_id,
             current_epoch: r.current_epoch,
             tenant_id: r.tenant_id,
+            user_id: r.user_id,
             created_ms: r.created_ms,
         }
     }
@@ -73,6 +77,7 @@ impl From<&ProducerRegistration> for StoredProducerRegistration {
 pub struct SyncProducerRegistry {
     catalog: Arc<SystemCatalog>,
     alloc: ProducerIdAllocator,
+    registration_lock: Mutex<()>,
 }
 
 impl SyncProducerRegistry {
@@ -82,7 +87,11 @@ impl SyncProducerRegistry {
     pub fn open(catalog: Arc<SystemCatalog>) -> crate::Result<Self> {
         let hwm = catalog.get_producer_hwm()?;
         let alloc = ProducerIdAllocator::from_persisted_hwm(hwm);
-        Ok(Self { catalog, alloc })
+        Ok(Self {
+            catalog,
+            alloc,
+            registration_lock: Mutex::new(()),
+        })
     }
 
     /// Look up the registration for `lite_id`.  Returns `None` if the Lite
@@ -94,31 +103,35 @@ impl SyncProducerRegistry {
             .map(ProducerRegistration::from))
     }
 
-    /// Register a Lite client, allocating a new monotonic `producer_id` and
-    /// persisting the row.
+    /// Atomically load or create a Lite producer registration.
     ///
-    /// If `lite_id` already has a registration this call replaces it with a
-    /// fresh `producer_id` and resets `current_epoch` to `epoch`.  Callers
-    /// that want idempotent re-registration must call `get` first and
-    /// short-circuit if a row already exists.
-    ///
-    /// `now_ms` is the caller-supplied Unix timestamp in milliseconds (passed
-    /// explicitly so the registry is testable without system-clock access).
-    pub fn register(
+    /// The returned boolean is `true` only when this call created the durable
+    /// row. Existing ownership is immutable: a different authenticated tenant
+    /// or user receives a typed error rather than replacing the registration.
+    pub fn get_or_register(
         &self,
         lite_id: &str,
         tenant_id: u64,
+        user_id: u64,
         epoch: u64,
         now_ms: i64,
-    ) -> crate::Result<ProducerRegistration> {
-        let producer_id = self.alloc.alloc_one().map_err(crate::Error::from)?;
+    ) -> crate::Result<(ProducerRegistration, bool)> {
+        let _guard = self
+            .registration_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = self.catalog.get_producer_registration(lite_id)? {
+            if existing.tenant_id != tenant_id || existing.user_id != user_id {
+                return Err(crate::Error::BadRequest {
+                    detail: format!(
+                        "lite_id '{lite_id}' is already owned by another authenticated principal"
+                    ),
+                });
+            }
+            return Ok((ProducerRegistration::from(existing), false));
+        }
 
-        // Flush the allocator hwm eagerly after every allocation so a crash
-        // between `alloc_one` and the registration row persist cannot produce
-        // a duplicate id on recovery.  The allocator's own periodic thresholds
-        // apply on top for bulk scenarios; here we always flush after a
-        // registration because registrations are infrequent enough that the
-        // extra redb write is negligible.
+        let producer_id = self.alloc.alloc_one().map_err(crate::Error::from)?;
         let hwm_persist = SystemCatalogProducerHwm::new(self.catalog.clone());
         if self.alloc.should_flush() {
             self.alloc.flush(&hwm_persist).map_err(crate::Error::from)?;
@@ -126,15 +139,29 @@ impl SyncProducerRegistry {
             hwm_persist.checkpoint(self.alloc.current_hwm())?;
         }
 
-        let reg = ProducerRegistration {
+        let registration = ProducerRegistration {
             producer_id,
             current_epoch: epoch,
             tenant_id,
+            user_id,
             created_ms: now_ms,
         };
         self.catalog
-            .put_producer_registration(lite_id, &StoredProducerRegistration::from(&reg))?;
-        Ok(reg)
+            .put_producer_registration(lite_id, &StoredProducerRegistration::from(&registration))?;
+        Ok((registration, true))
+    }
+
+    /// Register a Lite client or return its immutable existing registration.
+    pub fn register(
+        &self,
+        lite_id: &str,
+        tenant_id: u64,
+        user_id: u64,
+        epoch: u64,
+        now_ms: i64,
+    ) -> crate::Result<ProducerRegistration> {
+        self.get_or_register(lite_id, tenant_id, user_id, epoch, now_ms)
+            .map(|(registration, _created)| registration)
     }
 
     /// Advance the fencing epoch for an existing registration.
@@ -169,9 +196,14 @@ impl SyncProducerRegistry {
         lite_id: &str,
         producer_id: u64,
         tenant_id: u64,
+        user_id: u64,
         epoch: u64,
         created_ms: i64,
     ) -> crate::Result<()> {
+        let _guard = self
+            .registration_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.alloc
             .restore_hwm(producer_id)
             .map_err(crate::Error::from)?;
@@ -183,8 +215,21 @@ impl SyncProducerRegistry {
             producer_id,
             current_epoch: epoch,
             tenant_id,
+            user_id,
             created_ms,
         };
+        if let Some(existing) = self.catalog.get_producer_registration(lite_id)? {
+            let is_identical = existing.producer_id == producer_id
+                && existing.tenant_id == tenant_id
+                && existing.user_id == user_id
+                && existing.created_ms == created_ms;
+            if !is_identical {
+                return Err(crate::Error::BadRequest {
+                    detail: format!("conflicting replicated registration for lite_id '{lite_id}'"),
+                });
+            }
+            return Ok(());
+        }
         self.catalog.put_producer_registration(lite_id, &row)
     }
 
@@ -223,14 +268,18 @@ mod tests {
     #[test]
     fn register_returns_nonzero_producer_id() {
         let (_dir, reg) = open_registry();
-        let r = reg.register("device-1", 42, 0, 1_700_000_000_000).unwrap();
+        let r = reg
+            .register("device-1", 42, 99, 0, 1_700_000_000_000)
+            .unwrap();
         assert!(r.producer_id > 0, "producer_id must be > 0");
     }
 
     #[test]
     fn get_after_register_returns_same_record() {
         let (_dir, reg) = open_registry();
-        let created = reg.register("device-1", 42, 0, 1_700_000_000_000).unwrap();
+        let created = reg
+            .register("device-1", 42, 99, 0, 1_700_000_000_000)
+            .unwrap();
         let loaded = reg.get("device-1").unwrap().unwrap();
         assert_eq!(loaded.producer_id, created.producer_id);
         assert_eq!(loaded.tenant_id, 42);
@@ -247,8 +296,8 @@ mod tests {
     #[test]
     fn distinct_lite_ids_get_distinct_producer_ids() {
         let (_dir, reg) = open_registry();
-        let a = reg.register("device-a", 1, 0, 0).unwrap();
-        let b = reg.register("device-b", 1, 0, 0).unwrap();
+        let a = reg.register("device-a", 1, 99, 0, 0).unwrap();
+        let b = reg.register("device-b", 1, 99, 0, 0).unwrap();
         assert_ne!(
             a.producer_id, b.producer_id,
             "each lite_id must get a unique producer_id"
@@ -260,7 +309,7 @@ mod tests {
         let (_dir, reg) = open_registry();
         let ids: Vec<u64> = (0..20)
             .map(|i| {
-                reg.register(&format!("device-{i}"), 1, 0, 0)
+                reg.register(&format!("device-{i}"), 1, 99, 0, 0)
                     .unwrap()
                     .producer_id
             })
@@ -273,7 +322,7 @@ mod tests {
     #[test]
     fn fence_advances_epoch() {
         let (_dir, reg) = open_registry();
-        reg.register("device-1", 1, 0, 0).unwrap();
+        reg.register("device-1", 1, 99, 0, 0).unwrap();
         reg.fence("device-1", 5).unwrap();
         let loaded = reg.get("device-1").unwrap().unwrap();
         assert_eq!(loaded.current_epoch, 5);
@@ -297,7 +346,7 @@ mod tests {
         let producer_id = {
             let catalog = Arc::new(SystemCatalog::open(&path).unwrap());
             let reg = SyncProducerRegistry::open(catalog).unwrap();
-            let r = reg.register("device-1", 7, 0, 12345).unwrap();
+            let r = reg.register("device-1", 7, 99, 0, 12345).unwrap();
             reg.fence("device-1", 3).unwrap();
             r.producer_id
         };
@@ -318,15 +367,15 @@ mod tests {
         {
             let catalog = Arc::new(SystemCatalog::open(&path).unwrap());
             let reg = SyncProducerRegistry::open(catalog).unwrap();
-            reg.register("d1", 1, 0, 0).unwrap();
-            reg.register("d2", 1, 0, 0).unwrap();
+            reg.register("d1", 1, 99, 0, 0).unwrap();
+            reg.register("d2", 1, 99, 0, 0).unwrap();
         }
 
         // On reopen the allocator must start above the previous hwm so ids
         // from the new session never collide with ids from the first session.
         let catalog = Arc::new(SystemCatalog::open(&path).unwrap());
         let reg = SyncProducerRegistry::open(catalog).unwrap();
-        let r = reg.register("d3", 1, 0, 0).unwrap();
+        let r = reg.register("d3", 1, 99, 0, 0).unwrap();
         assert!(
             r.producer_id > 2,
             "post-restart ids must be above pre-crash hwm"
@@ -339,7 +388,7 @@ mod tests {
         // written verbatim (leader-assigned producer_id), and the allocator
         // hwm advances so a future local allocation never reissues the id.
         let (_dir, reg) = open_registry();
-        reg.apply_register("device-x", 42, 7, 3, 1_700_000_000_000)
+        reg.apply_register("device-x", 42, 7, 99, 3, 1_700_000_000_000)
             .unwrap();
 
         let loaded = reg.get("device-x").unwrap().unwrap();
@@ -348,7 +397,7 @@ mod tests {
         assert_eq!(loaded.tenant_id, 7);
 
         // A subsequent local allocation must be strictly above the applied id.
-        let next = reg.register("device-y", 7, 0, 0).unwrap();
+        let next = reg.register("device-y", 7, 99, 0, 0).unwrap();
         assert!(
             next.producer_id > 42,
             "local allocation must not reissue an applied producer_id"
@@ -356,20 +405,109 @@ mod tests {
     }
 
     #[test]
+    fn apply_register_rejects_conflicting_owner_and_preserves_first_row() {
+        let (_dir, reg) = open_registry();
+        reg.apply_register("device-x", 42, 7, 99, 3, 100).unwrap();
+        let error = reg
+            .apply_register("device-x", 43, 8, 100, 3, 101)
+            .unwrap_err();
+        assert!(matches!(error, crate::Error::BadRequest { .. }));
+        let loaded = reg.get("device-x").unwrap().unwrap();
+        assert_eq!(loaded.producer_id, 42);
+        assert_eq!(loaded.tenant_id, 7);
+        assert_eq!(loaded.user_id, 99);
+    }
+
+    #[test]
+    fn atomic_registration_rejects_cross_principal_reuse() {
+        let (_dir, reg) = open_registry();
+        let (first, created) = reg.get_or_register("device-x", 7, 99, 3, 100).unwrap();
+        assert!(created);
+        let error = reg.get_or_register("device-x", 8, 100, 3, 101).unwrap_err();
+        assert!(matches!(error, crate::Error::BadRequest { .. }));
+        assert_eq!(reg.get("device-x").unwrap().unwrap(), first);
+    }
+
+    #[test]
+    fn local_registration_and_raft_apply_cannot_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(SystemCatalog::open(&dir.path().join("system.redb")).unwrap());
+        let reg = Arc::new(SyncProducerRegistry::open(catalog).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let local = {
+            let reg = Arc::clone(&reg);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                reg.get_or_register("raced-device", 7, 70, 1, 100)
+            })
+        };
+        let replicated = {
+            let reg = Arc::clone(&reg);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                reg.apply_register("raced-device", 900, 8, 80, 1, 101)
+            })
+        };
+        barrier.wait();
+        let local = local.join().unwrap();
+        let replicated = replicated.join().unwrap();
+        assert_ne!(local.is_ok(), replicated.is_ok());
+
+        let stored = reg.get("raced-device").unwrap().unwrap();
+        if local.is_ok() {
+            assert_eq!((stored.tenant_id, stored.user_id), (7, 70));
+        } else {
+            assert_eq!((stored.tenant_id, stored.user_id), (8, 80));
+            assert_eq!(stored.producer_id, 900);
+        }
+    }
+
+    #[test]
     fn apply_register_is_idempotent() {
         let (_dir, reg) = open_registry();
-        reg.apply_register("device-x", 42, 7, 3, 100).unwrap();
+        reg.apply_register("device-x", 42, 7, 99, 3, 100).unwrap();
         // Duplicate / reordered delivery re-applies identical state.
-        reg.apply_register("device-x", 42, 7, 3, 100).unwrap();
+        reg.apply_register("device-x", 42, 7, 99, 3, 100).unwrap();
         let loaded = reg.get("device-x").unwrap().unwrap();
         assert_eq!(loaded.producer_id, 42);
         assert_eq!(loaded.current_epoch, 3);
     }
 
     #[test]
+    fn failed_fence_retry_converges_follower_before_failover() {
+        let (_leader_dir, leader) = open_registry();
+        let (_follower_dir, follower) = open_registry();
+
+        leader
+            .apply_register("device-x", 42, 7, 99, 3, 100)
+            .unwrap();
+        follower
+            .apply_register("device-x", 42, 7, 99, 3, 100)
+            .unwrap();
+
+        // The leader persisted epoch 9 locally, but its first fence proposal
+        // failed before reaching the follower.
+        leader.fence("device-x", 9).unwrap();
+        assert_eq!(leader.get("device-x").unwrap().unwrap().current_epoch, 9);
+        assert_eq!(follower.get("device-x").unwrap().unwrap().current_epoch, 3);
+
+        // A retry replays the identical registration and then the max-wins
+        // fence. The follower is safe to become leader only after both apply.
+        follower
+            .apply_register("device-x", 42, 7, 99, 9, 100)
+            .unwrap();
+        assert_eq!(follower.get("device-x").unwrap().unwrap().current_epoch, 3);
+        follower.apply_fence("device-x", 9).unwrap();
+        assert_eq!(follower.get("device-x").unwrap().unwrap().current_epoch, 9);
+    }
+
+    #[test]
     fn apply_fence_is_max_wins() {
         let (_dir, reg) = open_registry();
-        reg.apply_register("device-x", 42, 7, 5, 100).unwrap();
+        reg.apply_register("device-x", 42, 7, 99, 5, 100).unwrap();
 
         // A lower epoch is ignored (out-of-order delivery cannot regress).
         reg.apply_fence("device-x", 3).unwrap();

@@ -2,7 +2,10 @@
 
 //! Topology-decoupled lookup for per-node identity pins.
 
-use crate::topology::NodeInfo;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
+use crate::topology::{ClusterTopology, NodeInfo};
 
 /// Topology-decoupled lookup for per-node identity pins.
 ///
@@ -40,9 +43,44 @@ pub trait PeerIdentityStore: Send + Sync + 'static {
     ///
     /// Used by the TLS-layer verifiers during the handshake.
     fn find_by_spiffe(&self, spiffe_id: &str) -> Option<NodeInfo>;
+
+    /// Attach the authoritative topology after bootstrap/join/restart.
+    /// Implementations that are not topology-backed may ignore this hook.
+    fn install_topology(&self, _topology: Arc<RwLock<ClusterTopology>>) {}
+
+    /// Whether the application layer must reject identities not yet present
+    /// in the topology except for the narrowly validated join enrollment RPC.
+    fn enforces_peer_identity(&self) -> bool {
+        false
+    }
+
+    /// Whether initial seed discovery is still allowed before an
+    /// authoritative topology has been installed.
+    fn bootstrap_window_open(&self) -> bool {
+        false
+    }
+
+    /// Whether a CA-verified leaf pin was explicitly issued for enrollment.
+    fn is_preauthorized(&self, _spki: &[u8; 32]) -> bool {
+        false
+    }
+
+    /// Preauthorize a freshly issued joiner leaf until the bounded deadline.
+    /// Returns false when the bounded enrollment set is full.
+    fn preauthorize(&self, _spki: [u8; 32], _expires_at: Instant) -> bool {
+        false
+    }
+
+    /// Whether a bounded enrollment credential was explicitly revoked.
+    fn is_enrollment_revoked(&self, _spki: &[u8; 32]) -> bool {
+        false
+    }
+
+    /// Revoke an enrollment pin until its certificate enrollment deadline.
+    fn revoke_preauthorization(&self, _spki: &[u8; 32], _expires_at: Instant) {}
 }
 
-/// Always returns `None`, accepting every peer as a bootstrap window.
+/// Always returns `None` and disables application-layer pin enforcement.
 ///
 /// Used when mTLS is disabled (insecure transport) or in unit tests
 /// that focus on HMAC / codec layers rather than identity binding.
@@ -59,5 +97,9 @@ impl PeerIdentityStore for NoopIdentityStore {
 
     fn find_by_spiffe(&self, _spiffe_id: &str) -> Option<NodeInfo> {
         None
+    }
+
+    fn bootstrap_window_open(&self) -> bool {
+        true
     }
 }

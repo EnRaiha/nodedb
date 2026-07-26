@@ -55,6 +55,7 @@ async fn cluster_sync_producer_fence_survives_failover() {
 
     const LITE_ID: &str = "device-failover-7x9";
     const TENANT: u64 = 0;
+    const USER: u64 = 7;
     const CREATED_MS: i64 = 1_700_000_000_000;
 
     // Mirror the handshake exactly: allocate + write locally on the leader,
@@ -66,13 +67,14 @@ async fn cluster_sync_producer_fence_survives_failover() {
             .as_ref()
             .expect("producer_registry present on leader");
         let registration = reg
-            .register(LITE_ID, TENANT, 1, CREATED_MS)
+            .register(LITE_ID, TENANT, USER, 1, CREATED_MS)
             .expect("local register");
         nodedb::control::metadata_proposer::propose_sync_producer_register(
             &cluster.nodes[leader_idx].shared,
             LITE_ID,
             registration.producer_id,
             TENANT,
+            USER,
             registration.current_epoch,
             CREATED_MS,
         )

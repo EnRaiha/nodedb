@@ -175,7 +175,11 @@ pub(crate) async fn propose_sync_write(
 fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> crate::Result<()> {
     if matches!(
         plan,
-        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
+        PhysicalPlan::Crdt(
+            nodedb_physical::physical_plan::CrdtOp::Apply { .. }
+                | nodedb_physical::physical_plan::CrdtOp::ApplyAuthenticated { .. }
+                | nodedb_physical::physical_plan::CrdtOp::ImportSnapshot { .. }
+        )
     ) {
         return Err(crate::Error::CrdtApplyRequiresAdmission);
     }
@@ -318,7 +322,10 @@ pub async fn dispatch_sync_bytes(
     // sync path is scoped to the default database.
     if matches!(
         authorized.plan(),
-        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
+        PhysicalPlan::Crdt(
+            nodedb_physical::physical_plan::CrdtOp::Apply { .. }
+                | nodedb_physical::physical_plan::CrdtOp::ApplyAuthenticated { .. }
+        )
     ) {
         return crate::control::crdt_admission::dispatch_authorized_crdt_apply_admitted(
             state,

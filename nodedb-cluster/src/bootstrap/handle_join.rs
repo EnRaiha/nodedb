@@ -70,6 +70,16 @@ pub fn handle_join_request(
         }
     };
 
+    let spki_pin: Option<[u8; 32]> = match req.spki_pin.as_deref() {
+        Some(bytes) if bytes.len() == 32 => {
+            let mut pin = [0u8; 32];
+            pin.copy_from_slice(bytes);
+            Some(pin)
+        }
+        Some(_) => return reject("spki_pin must contain exactly 32 bytes".into()),
+        None => None,
+    };
+
     // Collision / idempotency check — both require reading the existing entry.
     if let Some(existing) = topology.get_node(req.node_id) {
         let existing_addr = existing.addr.clone();
@@ -80,10 +90,14 @@ pub fn handle_join_request(
                 req.node_id, existing_addr, req.listen_addr
             ));
         }
-        // Same id, same address. If already Active we short-circuit —
-        // no topology mutation at all, just rebuild the wire response. If the
-        // node was in a non-Active state (Joining/Draining), normalize to
-        // Active now because it's clearly back online.
+        if existing.spki_pin != spki_pin {
+            return reject(format!(
+                "node_id {} is already registered with a different SPKI pin",
+                req.node_id
+            ));
+        }
+        // Same id, same address, same identity. If already Active we
+        // short-circuit; otherwise normalize it to Active.
         if existing.state != NodeState::Active
             && let Some(entry) = topology.get_node_mut(req.node_id)
         {
@@ -92,19 +106,21 @@ pub fn handle_join_request(
         return build_response(topology, routing, cluster_id);
     }
 
+    if let Some(pin) = spki_pin
+        && let Some(owner) = topology
+            .all_nodes()
+            .find(|node| node.spki_pin == Some(pin) && node.node_id != req.node_id)
+    {
+        return reject(format!(
+            "SPKI pin is already registered to node_id {}",
+            owner.node_id
+        ));
+    }
+
     // Brand new node — admit as Active. Stamp the joiner's own
     // wire version and identity fields onto its NodeInfo so every
     // peer that replays this topology has the correct version and
     // identity pins.
-    let spki_pin: Option<[u8; 32]> = req.spki_pin.as_deref().and_then(|b| {
-        if b.len() == 32 {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(b);
-            Some(arr)
-        } else {
-            None
-        }
-    });
     topology.add_node(
         NodeInfo::new(req.node_id, addr, NodeState::Active)
             .with_wire_version(req.wire_version)
@@ -297,6 +313,26 @@ mod tests {
         assert_eq!(topology.node_count(), 2);
         let n2 = topology.get_node(2).unwrap();
         assert_eq!(n2.addr, "10.0.0.2:9400");
+    }
+
+    #[test]
+    fn handle_join_rejects_spki_owned_by_another_node() {
+        let pin = [0x5a; 32];
+        let mut topology = topo_with_one_node();
+        topology.get_node_mut(1).unwrap().spki_pin = Some(pin);
+        let routing = RoutingTable::uniform(1, &[1], 1);
+        let request = JoinRequest {
+            node_id: 2,
+            listen_addr: "10.0.0.2:9400".into(),
+            wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            spiffe_id: Some("spiffe://nodedb/node/2".into()),
+            spki_pin: Some(pin.to_vec()),
+        };
+
+        let response = handle_join_request(&request, &mut topology, &routing, 11);
+        assert!(!response.success);
+        assert!(response.error.contains("already registered to node_id 1"));
+        assert!(!topology.contains(2));
     }
 
     #[test]

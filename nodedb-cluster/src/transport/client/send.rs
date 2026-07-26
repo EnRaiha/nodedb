@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::Stream;
+use rustls::pki_types::CertificateDer;
 use tracing::debug;
 
 use std::sync::Arc;
@@ -25,6 +26,9 @@ use crate::rpc_codec::{
 };
 use crate::transport::auth_context::AuthContext;
 use crate::transport::config::SNI_HOSTNAME;
+use crate::transport::peer_identity_verifier::{
+    VerifyOutcome, spki_pin_from_cert_der, verify_peer_identity,
+};
 use crate::transport::server;
 use crate::wire_version::handshake_io::perform_version_handshake_client;
 
@@ -39,14 +43,41 @@ impl NexarTransport {
     /// `from_node_id` is consulted for the inbound replay window only
     /// after MAC verification.
     pub async fn send_rpc_to_addr(&self, addr: SocketAddr, rpc: RaftRpc) -> Result<RaftRpc> {
-        tokio::time::timeout(self.rpc_timeout, self.send_rpc_to_addr_inner(addr, rpc))
-            .await
-            .map_err(|_| ClusterError::Transport {
-                detail: format!("RPC timeout ({}ms) to {addr}", self.rpc_timeout.as_millis()),
-            })?
+        tokio::time::timeout(
+            self.rpc_timeout,
+            self.send_rpc_to_addr_inner(addr, rpc, true),
+        )
+        .await
+        .map_err(|_| ClusterError::Transport {
+            detail: format!("RPC timeout ({}ms) to {addr}", self.rpc_timeout.as_millis()),
+        })?
     }
 
-    async fn send_rpc_to_addr_inner(&self, addr: SocketAddr, rpc: RaftRpc) -> Result<RaftRpc> {
+    /// Send to an address supplied by a response from the pinned bootstrap
+    /// issuer. The redirect is already authenticated by the issuer envelope,
+    /// so the redirected peer is authenticated by cluster CA + envelope MAC
+    /// rather than by the issuer's leaf pin.
+    pub(crate) async fn send_rpc_to_authenticated_redirect(
+        &self,
+        addr: SocketAddr,
+        rpc: RaftRpc,
+    ) -> Result<RaftRpc> {
+        tokio::time::timeout(
+            self.rpc_timeout,
+            self.send_rpc_to_addr_inner(addr, rpc, false),
+        )
+        .await
+        .map_err(|_| ClusterError::Transport {
+            detail: format!("RPC timeout ({}ms) to {addr}", self.rpc_timeout.as_millis()),
+        })?
+    }
+
+    async fn send_rpc_to_addr_inner(
+        &self,
+        addr: SocketAddr,
+        rpc: RaftRpc,
+        enforce_bootstrap_pin: bool,
+    ) -> Result<RaftRpc> {
         let envelope = self.wrap_outbound(&rpc)?;
 
         let conn = self
@@ -60,6 +91,26 @@ impl NexarTransport {
             .map_err(|e| ClusterError::Transport {
                 detail: format!("handshake with {addr}: {e}"),
             })?;
+
+        if enforce_bootstrap_pin && let Some(expected_spki) = self.bootstrap_peer_spki {
+            let peer_cert = conn
+                .peer_identity()
+                .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
+                .and_then(|chain| chain.first().cloned())
+                .ok_or_else(|| ClusterError::Transport {
+                    detail: format!("bootstrap peer {addr} supplied no leaf certificate"),
+                })?;
+            let actual_spki = spki_pin_from_cert_der(peer_cert.as_ref()).map_err(|error| {
+                ClusterError::Transport {
+                    detail: format!("bootstrap peer {addr} has invalid leaf: {error}"),
+                }
+            })?;
+            if actual_spki != expected_spki {
+                return Err(ClusterError::Transport {
+                    detail: format!("bootstrap peer {addr} does not match join-token issuer"),
+                });
+            }
+        }
 
         // Perform the wire-version handshake on the first bidi stream.
         {
@@ -85,7 +136,7 @@ impl NexarTransport {
         })?;
 
         let response_envelope = server::read_envelope(&mut recv).await?;
-        self.parse_inbound(&response_envelope)
+        self.parse_inbound(&response_envelope, None)
     }
 
     /// Send an RPC to a peer with retry and circuit breaker.
@@ -162,6 +213,7 @@ impl NexarTransport {
     pub async fn send_rpc_oneway(&self, target: u64, rpc: RaftRpc) -> Result<()> {
         let envelope = self.wrap_outbound(&rpc)?;
         let conn = self.get_or_connect(target).await?;
+        self.verify_connection_target(&conn, target)?;
         let (mut send, _recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
             detail: format!("oneway open_bi to node {target}: {e}"),
         })?;
@@ -201,6 +253,7 @@ impl NexarTransport {
     ) -> Result<impl Stream<Item = Result<(Vec<u8>, u64)>> + Send + use<>> {
         let envelope = self.wrap_outbound(&rpc)?;
         let conn = self.get_or_connect(target).await?;
+        self.verify_connection_target(&conn, target)?;
 
         let (mut send, mut recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
             detail: format!("open_bi (stream) to node {target}: {e}"),
@@ -228,6 +281,14 @@ impl NexarTransport {
                 let envelope = server::read_envelope(&mut recv).await?;
                 let (fields, inner_frame) =
                     auth_envelope::parse_envelope(&envelope, &auth.mac_key)?;
+                if fields.from_node_id != target {
+                    Err(ClusterError::Transport {
+                        detail: format!(
+                            "streaming response identity mismatch: expected node {target}, got {}",
+                            fields.from_node_id
+                        ),
+                    })?;
+                }
                 // Replay-window check, skipping self-addressed frames (same
                 // reasoning as `parse_inbound`).
                 if fields.from_node_id != local_node_id {
@@ -310,6 +371,7 @@ impl NexarTransport {
         read_timeout: Duration,
     ) -> std::result::Result<Result<RaftRpc>, ClusterError> {
         let conn = self.get_or_connect(target).await?;
+        self.verify_connection_target(&conn, target)?;
 
         let (mut send, mut recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
             detail: format!("open_bi to node {target}: {e}"),
@@ -337,7 +399,7 @@ impl NexarTransport {
         // Envelope / MAC / replay-window / codec errors are not transport
         // errors — return them wrapped in Ok so retry logic doesn't retry
         // a failed MAC as if it were a flaky network.
-        Ok(self.parse_inbound(&response_envelope))
+        Ok(self.parse_inbound(&response_envelope, Some(target)))
     }
 
     /// Encode and wrap an RPC in an authenticated envelope.
@@ -371,8 +433,51 @@ impl NexarTransport {
     /// guard the second accept trips on its own first — the envelope
     /// was never replayed, the same window simply saw traffic from both
     /// directions for `peer_id == local_node_id`.
-    fn parse_inbound(&self, envelope: &[u8]) -> Result<RaftRpc> {
+    fn verify_connection_target(&self, conn: &quinn::Connection, target: u64) -> Result<()> {
+        if !self.identity_store.enforces_peer_identity()
+            || self.identity_store.bootstrap_window_open()
+        {
+            return Ok(());
+        }
+        let expected =
+            self.identity_store
+                .get_node_info(target)
+                .ok_or_else(|| ClusterError::Transport {
+                    detail: format!("target node {target} has no pinned topology identity"),
+                })?;
+        let identity = conn
+            .peer_identity()
+            .ok_or_else(|| ClusterError::Transport {
+                detail: format!("target node {target} did not present a TLS identity"),
+            })?;
+        let certs: &Vec<rustls::pki_types::CertificateDer<'static>> = identity
+            .downcast_ref()
+            .ok_or_else(|| ClusterError::Transport {
+                detail: format!("target node {target} presented an unsupported TLS identity"),
+            })?;
+        let cert = certs.first().ok_or_else(|| ClusterError::Transport {
+            detail: format!("target node {target} presented no leaf certificate"),
+        })?;
+        match verify_peer_identity(&expected, cert.as_ref()) {
+            VerifyOutcome::Accepted { .. } => Ok(()),
+            VerifyOutcome::Rejected => Err(ClusterError::Transport {
+                detail: format!("TLS identity does not match target node {target}"),
+            }),
+        }
+    }
+
+    fn parse_inbound(&self, envelope: &[u8], expected_node_id: Option<u64>) -> Result<RaftRpc> {
         let (fields, inner_frame) = auth_envelope::parse_envelope(envelope, &self.auth.mac_key)?;
+        if let Some(expected) = expected_node_id
+            && fields.from_node_id != expected
+        {
+            return Err(ClusterError::Transport {
+                detail: format!(
+                    "response identity mismatch: expected node {expected}, got {}",
+                    fields.from_node_id
+                ),
+            });
+        }
         if fields.from_node_id != self.auth.local_node_id {
             self.auth
                 .peer_seq_in
@@ -412,6 +517,7 @@ impl ShufflePushStream {
         req: ShufflePushRequest,
     ) -> Result<Self> {
         let conn = transport.get_or_connect(target).await?;
+        transport.verify_connection_target(&conn, target)?;
         let (mut send, _recv) = conn.open_bi().await.map_err(|e| ClusterError::Transport {
             detail: format!("open_bi (shuffle push) to node {target}: {e}"),
         })?;

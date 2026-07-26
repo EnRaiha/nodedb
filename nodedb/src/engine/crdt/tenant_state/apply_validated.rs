@@ -3,18 +3,27 @@
 //! Apply-and-validate a peer delta on the sync path.
 //!
 //! Unlike the bare [`TenantCrdtEngine::apply_committed_delta`] import, this
-//! path re-reads the rows the delta *actually* wrote and validates each against
-//! the constraints installed for its collection. A violation is routed to the
-//! dead-letter queue and surfaced as a deterministic [`ViolationType`] the
-//! caller can carry back to the client — while the import itself is always
-//! kept (the sync high-water-mark must advance regardless, so a rejected or
-//! malformed delta never wedges the stream).
+//! path applies into a detached candidate, re-reads the rows the delta
+//! *actually* wrote, and validates each against installed constraints. Only a
+//! clean candidate replaces authoritative state. A violation is routed to the
+//! dead-letter queue and surfaced as a deterministic [`ViolationType`].
 
+use nodedb_crdt::state::CrdtState;
 use nodedb_crdt::validator::{ValidationOutcome, Violation};
 use nodedb_types::Surrogate;
 use nodedb_types::sync::violation::ViolationType;
 
 use super::core::TenantCrdtEngine;
+
+/// Server-derived signing context for an externally synchronized delta.
+pub struct DeltaSigningAdmission {
+    pub auth: nodedb_crdt::CrdtAuthContext,
+    pub required: bool,
+    /// The Control Plane verified this signature against the authenticated
+    /// session's catalog-backed key before constructing the authenticated
+    /// physical-plan variant. WAL/Raft replay preserves that admission result.
+    pub preverified: bool,
+}
 
 /// Outcome of applying and validating one peer delta.
 #[derive(Debug)]
@@ -29,8 +38,8 @@ pub enum ValidatedApplyOutcome {
     /// client that coalesced N upserts into one delta) must be rejected
     /// loudly — materializing just one row would silently drop the rest.
     Clean { write_set: Vec<(String, String)> },
-    /// The delta imported but a row violated a constraint. The violation has
-    /// been enqueued to the DLQ; the translated type is carried for the caller.
+    /// The candidate violated a constraint and was discarded. The violation
+    /// has been enqueued to the DLQ and translated for the caller.
     Rejected(ViolationType),
     /// The delta bytes could not be imported (corrupt / undecodable). Treated
     /// as an idempotent no-op so the stream is not wedged.
@@ -41,11 +50,9 @@ impl TenantCrdtEngine {
     /// Import a peer delta, then validate the rows it wrote against installed
     /// constraints.
     ///
-    /// The import is always retained: a violating row is routed to the DLQ and
-    /// its violation returned as [`ValidatedApplyOutcome::Rejected`], and a
-    /// corrupt blob returns [`ValidatedApplyOutcome::Malformed`] rather than
-    /// propagating an error. Neither wedges the sync stream — the caller still
-    /// advances the high-water-mark.
+    /// Import and validation occur on a detached candidate. A violating row is
+    /// routed to the DLQ without mutating authoritative state, and a corrupt
+    /// blob returns [`ValidatedApplyOutcome::Malformed`].
     ///
     /// `surrogate` / `document_id` bind the sender's claimed target row so its
     /// UNIQUE / FK probes reference the correct cross-engine identity; other
@@ -58,27 +65,71 @@ impl TenantCrdtEngine {
         document_id: &str,
         peer_id: u64,
     ) -> ValidatedApplyOutcome {
-        // Import inside a scoped borrow of the per-collection state, diffing the
-        // frontier to learn exactly which rows the delta wrote. The `&mut`
-        // borrow is dropped before validation / DLQ enqueue below take other
-        // fields of `self`.
-        let write_set = {
-            let state = match self.state_mut(collection) {
-                Ok(s) => s,
-                // Engine construction failure is not a delta-content problem;
-                // treat as a no-op so the stream still advances.
+        self.apply_committed_delta_authenticated(
+            collection,
+            delta,
+            surrogate,
+            document_id,
+            peer_id,
+            DeltaSigningAdmission {
+                auth: nodedb_crdt::CrdtAuthContext::default(),
+                required: false,
+                preverified: false,
+            },
+        )
+    }
+
+    /// Apply a sync delta after enforcing the catalog-owned signing policy.
+    pub fn apply_committed_delta_authenticated(
+        &mut self,
+        collection: &str,
+        delta: &[u8],
+        surrogate: Surrogate,
+        document_id: &str,
+        peer_id: u64,
+        admission: DeltaSigningAdmission,
+    ) -> ValidatedApplyOutcome {
+        if admission.required && admission.auth.delta_signature == [0; 32] {
+            return ValidatedApplyOutcome::Malformed;
+        }
+        if !admission.preverified
+            && self
+                .validator
+                .verify_delta_auth(collection, &admission.auth, delta)
+                .is_err()
+        {
+            return ValidatedApplyOutcome::Malformed;
+        }
+        let candidate = match CrdtState::new(self.peer_id) {
+            Ok(state) => state,
+            Err(_) => return ValidatedApplyOutcome::Malformed,
+        };
+        if let Some(current) = self.collections.get(collection) {
+            let snapshot = match current.export_snapshot() {
+                Ok(snapshot) => snapshot,
                 Err(_) => return ValidatedApplyOutcome::Malformed,
             };
-            let before = state.frontier();
-            if state.import(delta).is_err() {
+            if candidate.import(&snapshot).is_err() {
                 return ValidatedApplyOutcome::Malformed;
             }
-            match state.write_set_since(&before) {
-                Ok(ws) => ws,
-                Err(_) => return ValidatedApplyOutcome::Malformed,
-            }
+        }
+        let before = candidate.frontier();
+        if candidate.import(delta).is_err() {
+            return ValidatedApplyOutcome::Malformed;
+        }
+        let write_set = match candidate.write_set_since(&before) {
+            Ok(write_set) => write_set,
+            Err(_) => return ValidatedApplyOutcome::Malformed,
         };
+        if write_set.iter().any(|(written, row)| {
+            written != collection || (!document_id.is_empty() && row != document_id)
+        }) {
+            return ValidatedApplyOutcome::Malformed;
+        }
 
+        // Install the candidate only while validation reads it. Keep the exact
+        // previous state available for a no-fail rollback on rejection.
+        let previous = self.collections.insert(collection.to_owned(), candidate);
         for (coll, row) in &write_set {
             let sg = if row.as_str() == document_id {
                 surrogate
@@ -93,9 +144,16 @@ impl TenantCrdtEngine {
             let Some(violation) = violations.into_iter().next() else {
                 continue;
             };
-            return ValidatedApplyOutcome::Rejected(
-                self.dlq_and_translate(coll, delta, peer_id, violation),
-            );
+            let violation = self.dlq_and_translate(coll, delta, peer_id, violation);
+            match previous {
+                Some(previous) => {
+                    self.collections.insert(collection.to_owned(), previous);
+                }
+                None => {
+                    self.collections.remove(collection);
+                }
+            }
+            return ValidatedApplyOutcome::Rejected(violation);
         }
 
         ValidatedApplyOutcome::Clean { write_set }
@@ -279,14 +337,10 @@ mod tests {
         assert_eq!(engine.dlq_len(), 0);
     }
 
-    /// A delta that wrote more than the one frame-declared row surfaces every
-    /// written `(collection, row_id)` in the `Clean` write-set, so the sync
-    /// handler can detect the one-document-per-delta contract violation
-    /// instead of silently materializing a single row (regression for the
-    /// batch-coalesced-delta data-loss bug: N upserts merged into one delta
-    /// tagged with a synthetic frame id materialized zero or one of N rows).
+    /// A multi-row frame is rejected before its detached candidate can replace
+    /// authoritative state.
     #[test]
-    fn multi_doc_delta_reports_full_write_set() {
+    fn multi_doc_delta_does_not_mutate_authoritative_state() {
         let mut engine = unique_engine();
         // One Loro delta that writes two distinct rows.
         let state = CrdtState::new(7).unwrap();
@@ -314,12 +368,9 @@ mod tests {
             "a",
             7,
         );
-        let ValidatedApplyOutcome::Clean { write_set } = outcome else {
-            panic!("expected Clean with a populated write-set");
-        };
-        // Both rows are reported, including the one the frame did NOT declare.
-        assert!(write_set.iter().any(|(c, r)| c == "users" && r == "a"));
-        assert!(write_set.iter().any(|(c, r)| c == "users" && r == "b"));
+        assert!(matches!(outcome, ValidatedApplyOutcome::Malformed));
+        assert!(!engine.row_exists("users", "a"));
+        assert!(!engine.row_exists("users", "b"));
     }
 
     #[test]
@@ -353,6 +404,10 @@ mod tests {
             other => panic!("expected UniqueViolation, got {other:?}"),
         }
         assert_eq!(engine.dlq_len(), 1);
+        assert!(
+            engine.read_row("users", "b").is_none(),
+            "constraint-rejected delta must not mutate authoritative state"
+        );
     }
 
     #[test]

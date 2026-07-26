@@ -16,6 +16,7 @@ use crate::transport::auth_context::AuthContext;
 use crate::transport::config;
 use crate::transport::credentials::{self, TransportCredentials};
 use crate::transport::peer_identity_store::{NoopIdentityStore, PeerIdentityStore};
+use crate::transport::topology_identity_store::TopologyIdentityStore;
 
 /// QUIC-based Raft transport with retry and circuit breaker.
 ///
@@ -43,10 +44,14 @@ pub struct NexarTransport {
     /// MAC key + per-peer sequence trackers. Shared with every spawned
     /// per-connection / per-stream task via `Arc::clone`.
     pub(super) auth: Arc<AuthContext>,
+    /// Shared by TLS verification and the post-envelope node-id check.
+    pub(super) identity_store: Arc<dyn PeerIdentityStore>,
     /// SPKI pin for this node's own TLS leaf certificate.  `None` when
     /// running in insecure transport mode.  Transmitted in `JoinRequest`
     /// so remote peers can pin our identity.
     local_spki_pin: Option<[u8; 32]>,
+    /// Token-bound issuer identity for initial address-only join RPCs.
+    pub(super) bootstrap_peer_spki: Option<[u8; 32]>,
     /// Agreed wire version per connection, keyed on `conn.stable_id()`.
     /// Populated by `perform_version_handshake_client` after the
     /// per-connection handshake completes; evicted on connection drop.
@@ -55,6 +60,13 @@ pub struct NexarTransport {
     /// inside the cluster transport and never crosses the SPSC bridge
     /// into the Data Plane.
     pub(super) agreed_versions: RwLock<HashMap<usize, crate::wire_version::WireVersion>>,
+}
+
+fn default_identity_store(creds: &TransportCredentials) -> Arc<dyn PeerIdentityStore> {
+    match creds {
+        TransportCredentials::Mtls(_) => Arc::new(TopologyIdentityStore::new()),
+        TransportCredentials::Insecure => Arc::new(NoopIdentityStore),
+    }
 }
 
 impl NexarTransport {
@@ -84,13 +96,14 @@ impl NexarTransport {
         creds: TransportCredentials,
     ) -> Result<Self> {
         let defaults = ClusterTransportTuning::default();
+        let identity_store = default_identity_store(&creds);
         Self::build(
             node_id,
             listen_addr,
             rpc_timeout,
             &defaults,
             creds,
-            Arc::new(NoopIdentityStore),
+            identity_store,
         )
     }
 
@@ -110,13 +123,14 @@ impl NexarTransport {
         creds: TransportCredentials,
     ) -> Result<Self> {
         let rpc_timeout = Duration::from_secs(tuning.rpc_timeout_secs);
+        let identity_store = default_identity_store(&creds);
         Self::build(
             node_id,
             listen_addr,
             rpc_timeout,
             tuning,
             creds,
-            Arc::new(NoopIdentityStore),
+            identity_store,
         )
     }
 
@@ -178,9 +192,9 @@ impl NexarTransport {
             }
         };
 
-        let local_spki_pin = match &creds {
-            TransportCredentials::Mtls(tls) => Some(tls.spki_pin),
-            TransportCredentials::Insecure => None,
+        let (local_spki_pin, bootstrap_peer_spki) = match &creds {
+            TransportCredentials::Mtls(tls) => (Some(tls.spki_pin), tls.bootstrap_peer_spki),
+            TransportCredentials::Insecure => (None, None),
         };
 
         let auth = Arc::new(AuthContext::from_credentials(node_id, &creds));
@@ -208,7 +222,9 @@ impl NexarTransport {
             circuit_breaker: Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
             retry_policy: RetryPolicy::default(),
             auth,
+            identity_store,
             local_spki_pin,
+            bootstrap_peer_spki,
             agreed_versions: RwLock::new(HashMap::new()),
         })
     }
@@ -228,6 +244,32 @@ impl NexarTransport {
     /// The local address this transport is listening on.
     pub fn local_addr(&self) -> SocketAddr {
         self.listener.local_addr()
+    }
+
+    /// Permit a freshly issued CA-signed leaf until its bounded enrollment
+    /// deadline. Returns false when the bounded preauthorization set is full.
+    pub fn preauthorize_peer_identity(&self, spki: [u8; 32], ttl: Duration) -> bool {
+        let Some(expires_at) = std::time::Instant::now().checked_add(ttl) else {
+            return false;
+        };
+        self.identity_store.preauthorize(spki, expires_at)
+    }
+
+    /// Close an enrollment exception after an issuance-state failure.
+    pub fn revoke_peer_preauthorization(&self, spki: &[u8; 32], ttl: Duration) {
+        if let Some(expires_at) = std::time::Instant::now().checked_add(ttl) {
+            self.identity_store
+                .revoke_preauthorization(spki, expires_at);
+        }
+    }
+
+    /// Attach the authoritative shared topology to the transport identity
+    /// verifier before the inbound RPC server starts.
+    pub fn install_identity_topology(
+        &self,
+        topology: Arc<RwLock<crate::topology::ClusterTopology>>,
+    ) {
+        self.identity_store.install_topology(topology);
     }
 
     /// This node's ID.

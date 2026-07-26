@@ -29,14 +29,27 @@ fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn mint_token(secret: &[u8; 32], for_node: u64, ttl_secs: u64) -> String {
+fn mint_token(
+    secret: &[u8; 32],
+    for_node: u64,
+    ttl_secs: u64,
+    bootstrap_issuer_spki: [u8; 32],
+    bootstrap_ca_der: &[u8],
+) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let expiry = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
         + ttl_secs;
-    tok::issue_token(secret, for_node, expiry).unwrap()
+    tok::issue_token(
+        secret,
+        for_node,
+        expiry,
+        bootstrap_issuer_spki,
+        bootstrap_ca_der,
+    )
+    .unwrap()
 }
 
 /// A `BootstrapHandler` that wires token state machine + audit writer
@@ -72,12 +85,12 @@ impl<B: TokenStateBackend, A: AuditWriter> BootstrapHandler for StatefulBootstra
     fn handle<'a>(
         &'a self,
         req: BootstrapCredsRequest,
+        remote_addr: SocketAddr,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BootstrapCredsResponse> + Send + 'a>>
     {
         Box::pin(async move {
             // Step 1: constant-time HMAC verification.
-            let (token_node, expiry_secs) = match verify_token(&req.token_hex, &self.cluster_secret)
-            {
+            let verified = match verify_token(&req.token_hex, &self.cluster_secret) {
                 Ok(v) => v,
                 Err(e) => {
                     // PERSIST audit before responding (acquire-log-then-respond).
@@ -95,7 +108,7 @@ impl<B: TokenStateBackend, A: AuditWriter> BootstrapHandler for StatefulBootstra
                 }
             };
 
-            if token_node != req.node_id {
+            if verified.for_node != req.node_id {
                 let th = tok::token_hash(&req.token_hex).unwrap_or([0u8; 32]);
                 self.audit
                     .append(nodedb_cluster::auth::audit::AuditEvent::new(
@@ -107,8 +120,8 @@ impl<B: TokenStateBackend, A: AuditWriter> BootstrapHandler for StatefulBootstra
                         },
                     ));
                 return BootstrapCredsResponse::error(format!(
-                    "node id mismatch: token bound to {token_node}, request claims {}",
-                    req.node_id
+                    "node id mismatch: token bound to {}, request claims {}",
+                    verified.for_node, req.node_id
                 ));
             }
 
@@ -119,15 +132,18 @@ impl<B: TokenStateBackend, A: AuditWriter> BootstrapHandler for StatefulBootstra
                 }
             };
 
-            // Step 2: check token state machine.
-            // Use a dummy addr since we don't have the remote addr here.
-            let dummy_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-            match self
+            if verified.bootstrap_ca_der.as_slice() != self.ca.cert_der().as_ref() {
+                return BootstrapCredsResponse::error("token CA mismatch");
+            }
+            let expiry_secs = verified.expiry_unix_secs;
+
+            // Step 2: check token state machine, bound to the actual peer.
+            let lease = match self
                 .token_store
-                .begin_inflight(&token_hash, dummy_addr)
+                .begin_inflight(&token_hash, remote_addr)
                 .await
             {
-                Ok(()) => {}
+                Ok(lease) => lease,
                 Err(TokenStateError::AlreadyConsumed) => {
                     self.audit
                         .append(nodedb_cluster::auth::audit::AuditEvent::new(
@@ -160,24 +176,27 @@ impl<B: TokenStateBackend, A: AuditWriter> BootstrapHandler for StatefulBootstra
                             attempt: 0,
                         })
                         .await;
-                    if self
+                    match self
                         .token_store
-                        .begin_inflight(&token_hash, dummy_addr)
+                        .begin_inflight(&token_hash, remote_addr)
                         .await
-                        .is_err()
                     {
-                        return BootstrapCredsResponse::error("token state conflict");
+                        Ok(lease) => lease,
+                        Err(_) => {
+                            return BootstrapCredsResponse::error("token state conflict");
+                        }
                     }
                 }
                 Err(e) => {
                     return BootstrapCredsResponse::error(format!("token state: {e}"));
                 }
-            }
+            };
 
             // Spawn the dead-man timer.
             nodedb_cluster::auth::token_state::spawn_inflight_timeout(
                 Arc::clone(&self.token_store),
                 token_hash,
+                lease,
                 self.inflight_timeout,
             );
 
@@ -185,7 +204,7 @@ impl<B: TokenStateBackend, A: AuditWriter> BootstrapHandler for StatefulBootstra
             let resp = match self.issue(req.node_id) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = self.token_store.revert_inflight(&token_hash).await;
+                    let _ = self.token_store.revert_inflight(&token_hash, lease).await;
                     return BootstrapCredsResponse::error(e);
                 }
             };
@@ -193,7 +212,7 @@ impl<B: TokenStateBackend, A: AuditWriter> BootstrapHandler for StatefulBootstra
             // Step 4: transition to Consumed — persist audit BEFORE returning.
             let _ = self
                 .token_store
-                .mark_consumed(&token_hash, dummy_addr, epoch_ms())
+                .mark_consumed(&token_hash, remote_addr, lease, epoch_ms(), Vec::new())
                 .await;
             self.audit
                 .append(nodedb_cluster::auth::audit::AuditEvent::new(
@@ -227,18 +246,38 @@ fn make_handler(
     (h, audit)
 }
 
+fn spawn_test_listener<H: BootstrapHandler>(
+    ca: &nexar::transport::tls::ClusterCa,
+    handler: Arc<H>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> (SocketAddr, tokio::task::JoinHandle<()>, [u8; 32]) {
+    let credentials =
+        issue_leaf_for_sans(ca, &[nodedb_cluster::transport::config::SNI_HOSTNAME]).unwrap();
+    let issuer_spki = credentials.spki_pin;
+    let (addr, task) = spawn_listener(
+        "127.0.0.1:0".parse().unwrap(),
+        credentials.cert,
+        credentials.key,
+        handler,
+        shutdown,
+    )
+    .unwrap();
+    (addr, task, issuer_spki)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn valid_token_accepted_and_audit_logged() {
     let secret = [0x11u8; 32];
     let (handler, audit) = make_handler(secret);
+    let ca = Arc::clone(&handler.ca);
 
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let (local, _join) = spawn_listener("127.0.0.1:0".parse().unwrap(), handler, rx).unwrap();
+    let (local, _join, issuer_spki) = spawn_test_listener(&ca, handler, rx);
     tokio::time::sleep(Duration::from_millis(30)).await;
 
-    let token = mint_token(&secret, 5, 60);
+    let token = mint_token(&secret, 5, 60, issuer_spki, ca.cert_der().as_ref());
     let resp =
         nodedb_cluster::bootstrap_listener::fetch_creds(local, &token, 5, Duration::from_secs(3))
             .await
@@ -263,16 +302,71 @@ async fn valid_token_accepted_and_audit_logged() {
 }
 
 #[tokio::test]
+async fn token_bound_to_wrong_ca_is_rejected_before_bootstrap_request() {
+    let secret = [0x12u8; 32];
+    let (handler, audit) = make_handler(secret);
+    let server_ca = Arc::clone(&handler.ca);
+    let (other_ca, other_creds) = generate_node_credentials_multi_san(&["other-ca"]).unwrap();
+    let token = mint_token(
+        &secret,
+        6,
+        60,
+        other_creds.spki_pin,
+        other_ca.cert_der().as_ref(),
+    );
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let (local, _join, _) = spawn_test_listener(&server_ca, handler, rx);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let error =
+        nodedb_cluster::bootstrap_listener::fetch_creds(local, &token, 6, Duration::from_secs(3))
+            .await
+            .unwrap_err();
+    assert!(error.to_string().contains("bootstrap connect"));
+    assert!(
+        audit.snapshot().is_empty(),
+        "server handler must not see the token"
+    );
+    tx.send(true).unwrap();
+}
+
+#[tokio::test]
+async fn token_bound_to_same_ca_nonissuer_is_rejected_before_request() {
+    let secret = [0x13u8; 32];
+    let (handler, audit) = make_handler(secret);
+    let ca = Arc::clone(&handler.ca);
+    let nonissuer = issue_leaf_for_sans(&ca, &["nonissuer"]).unwrap();
+    let token = mint_token(&secret, 6, 60, nonissuer.spki_pin, ca.cert_der().as_ref());
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let (local, _join, _) = spawn_test_listener(&ca, handler, rx);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let error =
+        nodedb_cluster::bootstrap_listener::fetch_creds(local, &token, 6, Duration::from_secs(3))
+            .await
+            .unwrap_err();
+    assert!(error.to_string().contains("issuer identity mismatch"));
+    assert!(
+        audit.snapshot().is_empty(),
+        "handler must not see bearer token"
+    );
+    tx.send(true).unwrap();
+}
+
+#[tokio::test]
 async fn invalid_hmac_rejected_audit_logged() {
     let secret = [0x22u8; 32];
     let (handler, audit) = make_handler(secret);
+    let ca = Arc::clone(&handler.ca);
 
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let (local, _join) = spawn_listener("127.0.0.1:0".parse().unwrap(), handler, rx).unwrap();
+    let (local, _join, issuer_spki) = spawn_test_listener(&ca, handler, rx);
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     // Token issued under a different secret.
-    let bad_token = mint_token(&[0xFFu8; 32], 2, 60);
+    let bad_token = mint_token(&[0xFFu8; 32], 2, 60, issuer_spki, ca.cert_der().as_ref());
     let err = nodedb_cluster::bootstrap_listener::fetch_creds(
         local,
         &bad_token,
@@ -301,12 +395,13 @@ async fn invalid_hmac_rejected_audit_logged() {
 async fn replayed_token_rejected() {
     let secret = [0x33u8; 32];
     let (handler, audit) = make_handler(secret);
+    let ca = Arc::clone(&handler.ca);
 
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let (local, _join) = spawn_listener("127.0.0.1:0".parse().unwrap(), handler, rx).unwrap();
+    let (local, _join, issuer_spki) = spawn_test_listener(&ca, handler, rx);
     tokio::time::sleep(Duration::from_millis(30)).await;
 
-    let token = mint_token(&secret, 7, 60);
+    let token = mint_token(&secret, 7, 60, issuer_spki, ca.cert_der().as_ref());
 
     // First use: should succeed.
     let resp1 =
@@ -343,13 +438,15 @@ async fn replayed_token_rejected() {
 async fn expired_token_rejected_audit_logged() {
     let secret = [0x44u8; 32];
     let (handler, audit) = make_handler(secret);
+    let ca = Arc::clone(&handler.ca);
 
     let (tx, rx) = tokio::sync::watch::channel(false);
-    let (local, _join) = spawn_listener("127.0.0.1:0".parse().unwrap(), handler, rx).unwrap();
+    let (local, _join, issuer_spki) = spawn_test_listener(&ca, handler, rx);
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     // Issue a token that is already expired (expiry = 1 second past unix epoch).
-    let expired_token = tok::issue_token(&secret, 3, 1).unwrap();
+    let expired_token =
+        tok::issue_token(&secret, 3, 1, issuer_spki, ca.cert_der().as_ref()).unwrap();
     let err = nodedb_cluster::bootstrap_listener::fetch_creds(
         local,
         &expired_token,
@@ -432,8 +529,11 @@ async fn token_state_issued_to_consumed() {
             attempt: 0,
         })
         .await;
-    store.begin_inflight(&hash, addr).await.unwrap();
-    store.mark_consumed(&hash, addr, epoch_ms()).await.unwrap();
+    let lease = store.begin_inflight(&hash, addr).await.unwrap();
+    store
+        .mark_consumed(&hash, addr, lease, epoch_ms(), Vec::new())
+        .await
+        .unwrap();
     let s = store.get(&hash).unwrap();
     assert!(matches!(s.lifecycle, JoinTokenLifecycle::Consumed { .. }));
 }
@@ -452,8 +552,11 @@ async fn token_state_replay_on_consumed_returns_error() {
             attempt: 0,
         })
         .await;
-    store.begin_inflight(&hash, addr).await.unwrap();
-    store.mark_consumed(&hash, addr, epoch_ms()).await.unwrap();
+    let lease = store.begin_inflight(&hash, addr).await.unwrap();
+    store
+        .mark_consumed(&hash, addr, lease, epoch_ms(), Vec::new())
+        .await
+        .unwrap();
     assert_eq!(
         store.begin_inflight(&hash, addr).await.unwrap_err(),
         TokenStateError::AlreadyConsumed
@@ -494,8 +597,8 @@ async fn token_state_inflight_reverts_on_timeout() {
             attempt: 0,
         })
         .await;
-    store.begin_inflight(&hash, addr).await.unwrap();
-    store.revert_inflight(&hash).await.unwrap();
+    let lease = store.begin_inflight(&hash, addr).await.unwrap();
+    store.revert_inflight(&hash, lease).await.unwrap();
     let s = store.get(&hash).unwrap();
     assert_eq!(s.lifecycle, JoinTokenLifecycle::Issued);
     assert_eq!(s.attempt, 1);

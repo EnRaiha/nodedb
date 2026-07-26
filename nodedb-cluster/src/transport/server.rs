@@ -43,6 +43,7 @@ use crate::rpc_codec::{
     self, ExecuteStreamChunk, ExecuteStreamEnd, MAX_RPC_PAYLOAD_SIZE, RaftRpc, auth_envelope,
 };
 use crate::transport::auth_context::AuthContext;
+use crate::transport::identity_admission::enrollment_matches;
 use crate::transport::peer_identity_store::PeerIdentityStore;
 use crate::transport::peer_identity_verifier::{
     IDENTITY_MISMATCH_QUIC_ERROR, VerifyOutcome, verify_peer_identity,
@@ -111,7 +112,7 @@ fn peer_leaf_cert_der(conn: &quinn::Connection) -> Option<Vec<u8>> {
 ///
 /// Exits cleanly (Ok) on shutdown, on normal connection close,
 /// or on unrecoverable transport error.
-pub(crate) async fn handle_connection<H: RaftRpcHandler, S: PeerIdentityStore>(
+pub(crate) async fn handle_connection<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
     conn: quinn::Connection,
     handler: Arc<H>,
     auth: Arc<AuthContext>,
@@ -218,7 +219,7 @@ pub(crate) async fn handle_connection<H: RaftRpcHandler, S: PeerIdentityStore>(
 /// Bundles the shared, connection-scoped handles so [`handle_stream`] stays
 /// under the `too_many_arguments` threshold while remaining generic over
 /// handler and identity-store types.
-struct StreamContext<H: RaftRpcHandler, S: PeerIdentityStore> {
+struct StreamContext<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized> {
     handler: Arc<H>,
     auth: Arc<AuthContext>,
     identity_store: Arc<S>,
@@ -227,11 +228,19 @@ struct StreamContext<H: RaftRpcHandler, S: PeerIdentityStore> {
     shutdown: watch::Receiver<bool>,
 }
 
+fn reject_peer_identity(conn: &quinn::Connection, node_id: u64) -> Result<()> {
+    warn!(node_id, "peer identity mismatch — closing connection");
+    conn.close(IDENTITY_MISMATCH_QUIC_ERROR, b"peer identity mismatch");
+    Err(ClusterError::Transport {
+        detail: format!("peer identity mismatch for node {node_id}"),
+    })
+}
+
 /// Handle a single bidi stream: read request → dispatch → write response.
 ///
 /// Every long-lived await is racing a shutdown signal — see the
 /// module docstring for the rationale.
-async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
+async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
     ctx: StreamContext<H, S>,
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -262,14 +271,22 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
             auth.peer_seq_in.accept(fields.from_node_id, fields.seq)?;
         }
 
-        // 3b. Peer identity check — binds the MAC-verified node_id to the
-        //     TLS certificate.  Self-addressed frames skip the check by the
-        //     same reasoning as the replay window above.
-        if fields.from_node_id != auth.local_node_id
-            && let Some(cert_der) = &peer_cert_der
-        {
-            let node_info = identity_store.get_node_info(fields.from_node_id);
-            match node_info {
+        // 3. Decode before the identity decision so an unknown, CA-verified
+        // peer can be restricted to exactly one enrollment operation.
+        let request = rpc_codec::decode(inner_frame)?;
+        validate_join_sender(&request, fields.from_node_id)?;
+
+        // 3b. Bind the MAC-authenticated node id to the mTLS leaf identity.
+        // Unknown identities may submit only a JoinRequest whose node id and
+        // advertised pins exactly match that leaf. Every other RPC fails
+        // closed until the successful join is visible in topology.
+        if fields.from_node_id != auth.local_node_id && identity_store.enforces_peer_identity() {
+            let cert_der = peer_cert_der
+                .as_deref()
+                .ok_or_else(|| ClusterError::Transport {
+                    detail: "authenticated cluster peer did not present a leaf certificate".into(),
+                })?;
+            match identity_store.get_node_info(fields.from_node_id) {
                 Some(ref info) => match verify_peer_identity(info, cert_der) {
                     VerifyOutcome::Accepted { method } => {
                         debug!(
@@ -278,38 +295,27 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
                             "peer identity verified"
                         );
                     }
-                    VerifyOutcome::BootstrapAccepted => {
-                        warn!(
-                            node_id = fields.from_node_id,
-                            "peer identity not pinned — bootstrap window accepted"
-                        );
-                    }
                     VerifyOutcome::Rejected => {
-                        warn!(
-                            node_id = fields.from_node_id,
-                            "peer identity mismatch — closing connection"
-                        );
-                        conn.close(IDENTITY_MISMATCH_QUIC_ERROR, b"peer identity mismatch");
-                        return Err(ClusterError::Transport {
-                            detail: format!(
-                                "peer identity mismatch for node {}",
-                                fields.from_node_id
-                            ),
-                        });
+                        reject_peer_identity(&conn, fields.from_node_id)?;
                     }
                 },
-                None => {
-                    // Node not yet in topology — bootstrap window.
-                    warn!(
+                None if enrollment_matches(
+                    &request,
+                    fields.from_node_id,
+                    cert_der,
+                    &*identity_store,
+                ) =>
+                {
+                    debug!(
                         node_id = fields.from_node_id,
-                        "node not in topology — bootstrap window accepted"
+                        "accepted identity-bound cluster join enrollment"
                     );
+                }
+                None => {
+                    reject_peer_identity(&conn, fields.from_node_id)?;
                 }
             }
         }
-
-        // 4. Decode inner RPC and hand to handler.
-        let request = rpc_codec::decode(inner_frame)?;
 
         // 4b. Streaming path: an `ExecuteStreamRequest` produces a multi-frame
         //     response — N `RPC_EXECUTE_STREAM_CHUNK` envelopes (each written
@@ -374,6 +380,9 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
                 };
                 let (frame_fields, frame_inner) =
                     auth_envelope::parse_envelope(&frame_envelope, &auth.mac_key)?;
+                if frame_fields.from_node_id != fields.from_node_id {
+                    reject_peer_identity(&conn, frame_fields.from_node_id)?;
+                }
                 if frame_fields.from_node_id != auth.local_node_id {
                     auth.peer_seq_in
                         .accept(frame_fields.from_node_id, frame_fields.seq)?;
@@ -445,6 +454,20 @@ async fn handle_stream<H: RaftRpcHandler, S: PeerIdentityStore>(
     }
 }
 
+fn validate_join_sender(request: &RaftRpc, authenticated_node_id: u64) -> Result<()> {
+    if let RaftRpc::JoinRequest(join) = request
+        && join.node_id != authenticated_node_id
+    {
+        return Err(ClusterError::Transport {
+            detail: format!(
+                "join request node_id {} does not match authenticated sender {}",
+                join.node_id, authenticated_node_id
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Read a complete authenticated envelope from a QUIC receive stream.
 ///
 /// Reads the fixed envelope pre-header (version + from_node_id + seq +
@@ -482,4 +505,28 @@ pub(crate) async fn read_envelope(recv: &mut quinn::RecvStream) -> Result<Vec<u8
     }
 
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc_codec::JoinRequest;
+
+    #[test]
+    fn join_request_must_match_authenticated_sender() {
+        let request = RaftRpc::JoinRequest(JoinRequest {
+            node_id: 9,
+            listen_addr: "127.0.0.1:9400".into(),
+            wire_version: crate::topology::CLUSTER_WIRE_FORMAT_VERSION,
+            spiffe_id: None,
+            spki_pin: Some(vec![1; 32]),
+        });
+        assert!(validate_join_sender(&request, 9).is_ok());
+        let error = validate_join_sender(&request, 8).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match authenticated sender 8")
+        );
+    }
 }

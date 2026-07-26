@@ -56,6 +56,11 @@ pub struct HandshakeAckMsg {
     /// Server's current accepted epoch for this producer. 0 if not yet tracked.
     #[serde(default)]
     pub accepted_epoch: u64,
+    /// Stable per-user key for signing queued CRDT deltas. Issued only after
+    /// successful authentication over the protected sync transport. All zeros
+    /// means signing is unavailable for this session.
+    #[serde(default)]
+    pub delta_signing_key: [u8; 32],
 }
 
 /// Token refresh request (client → server, 0x60).

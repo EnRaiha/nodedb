@@ -97,6 +97,22 @@ impl CoreLoop {
             }
 
             let database_id = crate::types::DatabaseId::new(record.header.database_id);
+            if let Some(signing) = payload.signing {
+                let Some(provenance) = payload.provenance.as_ref() else {
+                    warn!(core = self.core_id, tenant = tid.as_u64(), %collection, "authenticated CRDT WAL record has no provenance");
+                    continue;
+                };
+                if signing.auth_user_id == 0
+                    || signing.auth_device_id == 0
+                    || signing.auth_seq_no == 0
+                    || provenance.producer_id != signing.auth_device_id
+                    || provenance.seq != signing.auth_seq_no
+                    || (signing.required && signing.delta_signature == [0; 32])
+                {
+                    warn!(core = self.core_id, tenant = tid.as_u64(), %collection, "authenticated CRDT WAL admission metadata is inconsistent");
+                    continue;
+                }
+            }
             if let Some(expected) = payload.expected_frontier_digest {
                 let actual = self
                     .crdt_engines
@@ -111,6 +127,11 @@ impl CoreLoop {
                         )
                     });
                 if actual != expected {
+                    if payload.signing.is_some()
+                        && let Some(provenance) = payload.provenance.as_ref()
+                    {
+                        self.sync_commit(provenance);
+                    }
                     warn!(
                         core = self.core_id,
                         tenant = tid.as_u64(),
@@ -124,13 +145,33 @@ impl CoreLoop {
             let projection = match (&payload.document_id, payload.surrogate) {
                 (Some(document_id), Some(surrogate)) => {
                     let applied = match self.get_crdt_engine(database_id, tid) {
-                        Ok(engine) => engine.apply_committed_delta_validated(
-                            collection,
-                            &payload.bytes,
-                            nodedb_types::Surrogate::new(surrogate),
-                            document_id,
-                            0,
-                        ),
+                        Ok(engine) => match payload.signing {
+                            Some(signing) => engine.apply_committed_delta_authenticated(
+                                collection,
+                                &payload.bytes,
+                                nodedb_types::Surrogate::new(surrogate),
+                                document_id,
+                                0,
+                                crate::engine::crdt::tenant_state::DeltaSigningAdmission {
+                                    auth: nodedb_crdt::CrdtAuthContext {
+                                        user_id: signing.auth_user_id,
+                                        device_id: signing.auth_device_id,
+                                        seq_no: signing.auth_seq_no,
+                                        delta_signature: signing.delta_signature,
+                                        ..nodedb_crdt::CrdtAuthContext::default()
+                                    },
+                                    required: signing.required,
+                                    preverified: true,
+                                },
+                            ),
+                            None => engine.apply_committed_delta_validated(
+                                collection,
+                                &payload.bytes,
+                                nodedb_types::Surrogate::new(surrogate),
+                                document_id,
+                                0,
+                            ),
+                        },
                         Err(e) => {
                             warn!(
                                 core = self.core_id,
@@ -185,14 +226,16 @@ impl CoreLoop {
                         crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Rejected(
                             reason,
                         ) => {
-                            // Validated apply deliberately retains a violating
-                            // Loro import for sync/DLQ convergence. It has no
-                            // sparse projection, but remains an authoritative
-                            // durable mutation whose collection floor advances.
+                            // The detached candidate was rejected and discarded.
+                            // The committed record remains a deterministic no-op
+                            // whose collection floor advances on every replica.
                             warn!(core = self.core_id, tenant = tid.as_u64(), %collection, %reason, "CRDT WAL delta rejected during replay");
                             None
                         }
                         crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Malformed => {
+                            if let Some(provenance) = payload.provenance.as_ref() {
+                                self.sync_commit(provenance);
+                            }
                             warn!(core = self.core_id, tenant = tid.as_u64(), %collection, "CRDT WAL delta malformed during replay");
                             continue;
                         }
@@ -203,14 +246,30 @@ impl CoreLoop {
                     // established Loro-only replay behavior rather than guessing
                     // a sparse key from attacker-controlled delta contents.
                     match self.get_crdt_engine(database_id, tid) {
-                        Ok(engine) => {
-                            if let Err(e) = engine.apply_committed_delta(collection, &payload.bytes)
-                            {
-                                warn!(core = self.core_id, tenant = tid.as_u64(), error = %e, "CRDT WAL delta import failed during replay");
+                        Ok(engine) => match engine.apply_committed_delta_validated(
+                            collection,
+                            &payload.bytes,
+                            nodedb_types::Surrogate::ZERO,
+                            "",
+                            0,
+                        ) {
+                            crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Clean {
+                                ..
+                            } => None,
+                            crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Rejected(
+                                reason,
+                            ) => {
+                                warn!(core = self.core_id, tenant = tid.as_u64(), %collection, %reason, "legacy CRDT WAL delta rejected during replay");
+                                None
+                            }
+                            crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Malformed => {
+                                if let Some(provenance) = payload.provenance.as_ref() {
+                                    self.sync_commit(provenance);
+                                }
+                                warn!(core = self.core_id, tenant = tid.as_u64(), %collection, "legacy CRDT WAL delta malformed during replay");
                                 continue;
                             }
-                            None
-                        }
+                        },
                         Err(e) => {
                             warn!(core = self.core_id, tenant = tid.as_u64(), error = %e, "failed to create CRDT engine during WAL replay");
                             continue;
@@ -240,6 +299,9 @@ impl CoreLoop {
                     surrogate,
                     &bytes,
                 );
+            }
+            if let Some(provenance) = payload.provenance.as_ref() {
+                self.sync_commit(provenance);
             }
             // Every successfully imported payload changed authoritative Loro
             // state, including historical payloads that predate sparse-row
@@ -371,6 +433,59 @@ mod crdt_replay_tests {
             engine.row_exists("notes", "row1"),
             "CRDT row must be restored from WAL replay"
         );
+    }
+
+    #[test]
+    fn replay_stale_v4_restores_authenticated_sequence_watermark() {
+        let tid = TenantId::new(9);
+        let provenance = nodedb_types::sync::wire::SyncProvenance {
+            producer_id: 77,
+            epoch: 3,
+            stream_id: 5,
+            seq: 11,
+        };
+        let state = nodedb_crdt::state::CrdtState::new(77).expect("state");
+        state
+            .upsert(
+                "secure_notes",
+                "doc",
+                &[("body", LoroValue::String("signed".into()))],
+            )
+            .expect("upsert");
+        let payload = crate::wal::CrdtDeltaWalPayload::new(
+            state.export_snapshot().expect("snapshot"),
+            Some("secure_notes".into()),
+            Some(provenance.clone()),
+            Some([0xee; 32]),
+            Some("doc".into()),
+            Some(1),
+        )
+        .with_signing(crate::wal::CrdtDeltaSigning {
+            auth_user_id: 42,
+            auth_device_id: provenance.producer_id,
+            auth_seq_no: provenance.seq,
+            delta_signature: [7; 32],
+            required: true,
+        });
+        let record = nodedb_wal::WalRecord::new(nodedb_wal::WalRecordArgs {
+            record_type: RecordType::CrdtDelta as u32,
+            lsn: 10,
+            tenant_id: tid.as_u64(),
+            vshard_id: 0,
+            database_id: DatabaseId::DEFAULT.as_u64(),
+            payload: payload.encode().expect("encode"),
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("record");
+
+        let mut h = make_core(0);
+        h.core
+            .replay_crdt_wal(&[record], 1, &nodedb_wal::TombstoneSet::new());
+        assert!(matches!(
+            h.core.sync_admit(&provenance),
+            crate::data::executor::sync_gate::SyncAdmit::Duplicate
+        ));
     }
 
     #[test]

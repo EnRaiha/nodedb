@@ -174,6 +174,7 @@ pub enum MetadataEntry {
         lite_id: String,
         producer_id: u64,
         tenant_id: u64,
+        user_id: u64,
         epoch: u64,
         created_ms: i64,
     },
@@ -271,6 +272,18 @@ pub enum MetadataEntry {
         reason: String,
         compensations: Vec<Compensation>,
     },
+
+    /// Bounded CA-issued enrollment identity accepted by every join endpoint
+    /// until topology commit or expiry.
+    EnrollmentPreauthorization {
+        spki: [u8; 32],
+        expires_at_ms: u64,
+    },
+    /// Explicitly close an enrollment exception after a failed issuance.
+    EnrollmentPreauthorizationRevoke {
+        spki: [u8; 32],
+        expires_at_ms: u64,
+    },
 }
 
 /// The direction of a join-token lifecycle transition.
@@ -289,11 +302,18 @@ pub enum JoinTokenTransitionKind {
     /// can enforce the TTL independently.
     Register { expires_at_ms: u64 },
     /// Joiner presented the token; transitioning Issued → InFlight.
-    BeginInFlight { node_addr: String },
+    BeginInFlight {
+        node_addr: String,
+        lease_id: [u8; 16],
+    },
     /// Bundle delivered; transitioning InFlight → Consumed.
-    MarkConsumed { node_addr: String },
+    MarkConsumed {
+        node_addr: String,
+        lease_id: [u8; 16],
+        recovery_bundle: Vec<u8>,
+    },
     /// Dead-man timer fired; transitioning InFlight → Issued.
-    RevertInFlight,
+    RevertInFlight { lease_id: [u8; 16] },
     /// Token TTL elapsed without consumption.
     MarkExpired,
     /// Explicitly invalidated by an operator.

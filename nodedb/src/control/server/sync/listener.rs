@@ -2,8 +2,9 @@
 
 //! WebSocket listener for NodeDB-Lite sync connections.
 //!
-//! Accepts `ws://` connections on the Tokio Control Plane. Each connection
-//! spawns a sync session with full RLS, audit, DLQ, and rate limiting.
+//! Accepts loopback-only `ws://` connections on the Tokio Control Plane for a
+//! local TLS-terminating proxy. Each connection spawns a sync session with full
+//! RLS, audit, DLQ, and rate limiting. Public plaintext binds are rejected.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ pub struct SyncListenerConfig {
 impl Default for SyncListenerConfig {
     fn default() -> Self {
         Self {
-            listen_addr: std::net::SocketAddr::from(([0, 0, 0, 0], 9090)),
+            listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 9090)),
             max_sessions: 1024,
             idle_timeout_secs: 300,
             jwt_config: JwtConfig::default(),
@@ -81,6 +82,14 @@ pub async fn start_sync_listener(
     config: SyncListenerConfig,
     shared: Option<Arc<SharedState>>,
 ) -> crate::Result<Arc<SyncListenerState>> {
+    if !config.listen_addr.ip().is_loopback() {
+        return Err(crate::Error::Config {
+            detail: format!(
+                "plaintext sync listener {} must bind to loopback behind a TLS-terminating proxy",
+                config.listen_addr
+            ),
+        });
+    }
     let listener =
         TcpListener::bind(&config.listen_addr)
             .await
@@ -161,5 +170,28 @@ async fn accept_loop(
                 warn!(error = %e, "sync: accept failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_plaintext_sync_listener_is_loopback_only() {
+        assert!(SyncListenerConfig::default().listen_addr.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn public_plaintext_sync_bind_is_rejected() {
+        let config = SyncListenerConfig {
+            listen_addr: "0.0.0.0:9090".parse().unwrap(),
+            ..SyncListenerConfig::default()
+        };
+        let error = match start_sync_listener(config, None).await {
+            Ok(_) => panic!("public plaintext listener unexpectedly started"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("TLS-terminating proxy"));
     }
 }

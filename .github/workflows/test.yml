@@ -64,6 +64,8 @@ jobs:
         run: bash scripts/ci/check_calvin_determinism.sh
       - name: Plane-separation gate
         run: bash scripts/ci/check_plane_separation.sh
+      - name: Raft transport-boundary gate
+        run: python3 scripts/ci/check_raft_transport_boundary.py
       - name: Reconstructed-SQL gate
         run: |
           python3 scripts/ci/check_reconstructed_sql.py --self-test

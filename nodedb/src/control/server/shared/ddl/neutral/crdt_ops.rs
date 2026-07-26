@@ -17,11 +17,12 @@ use crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
-use crate::control::server::shared::authorization::authorize_collection;
+use crate::control::server::shared::authorization::{authorize_collection, authorize_task_set};
 use crate::control::server::shared::ddl::sql_parse::hex_decode;
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::result::{DdlError, DdlResult};
 
@@ -185,6 +186,32 @@ pub async fn crdt_apply(
         constraint_version_required: 0,
         expected_frontier_digest: None,
     });
+    let task = PhysicalTask {
+        tenant_id,
+        vshard_id: crate::types::VShardId::from_collection_in_database(database_id, collection),
+        database_id,
+        plan,
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    };
+    let authorized = authorize_task_set(
+        identity,
+        std::slice::from_ref(&task),
+        &state.permissions,
+        &state.roles,
+        &audit,
+    )
+    .map_err(|error| DdlError {
+        sqlstate: "42501".into(),
+        message: format!("permission denied: {}", error.resource()),
+    })?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| DdlError {
+        sqlstate: "XX000".into(),
+        message: "authorization returned no capability".into(),
+    })?;
 
     // Route through the Raft proposer gate so the delta is quorum-durable under
     // replication. A local-only dispatch would land the delta on the receiving
@@ -198,13 +225,11 @@ pub async fn crdt_apply(
         &state.rls,
         &audit,
     );
-    crate::control::crdt_admission::dispatch_crdt_apply_admitted(
+    crate::control::crdt_admission::dispatch_authorized_crdt_apply_admitted(
         state,
-        crate::control::crdt_admission::CrdtApplyAdmissionRequest {
-            tenant_id,
-            database_id,
+        crate::control::crdt_admission::AuthorizedCrdtApplyAdmissionRequest {
+            authorized,
             collection,
-            plan,
             timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
             event_source: crate::event::EventSource::User,
             policy: &policy,

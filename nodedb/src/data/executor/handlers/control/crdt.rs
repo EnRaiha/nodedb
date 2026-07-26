@@ -230,18 +230,33 @@ impl CoreLoop {
                 );
             }
         };
-        match engine.import_snapshot_bytes(collection, bytes) {
-            Ok(()) => {
+        match engine.apply_committed_delta_validated(
+            collection,
+            bytes,
+            nodedb_types::Surrogate::ZERO,
+            "",
+            0,
+        ) {
+            crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Clean { .. } => {
                 self.checkpoint_coordinator.mark_dirty("crdt", 1);
                 self.note_collection_write_lsn(task, collection);
                 self.response_ok(task)
             }
-            Err(e) => {
-                warn!(core = self.core_id, error = %e, "crdt import snapshot failed");
+            crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Rejected(reason) => {
+                warn!(core = self.core_id, %reason, "crdt snapshot rejected by constraints");
                 self.response_error(
                     task,
                     ErrorCode::Internal {
-                        detail: e.to_string(),
+                        detail: format!("CRDT snapshot violates constraints: {reason}"),
+                    },
+                )
+            }
+            crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Malformed => {
+                warn!(core = self.core_id, "crdt snapshot import was malformed");
+                self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: "malformed CRDT snapshot".into(),
                     },
                 )
             }

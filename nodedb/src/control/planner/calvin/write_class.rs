@@ -195,7 +195,7 @@ fn columnar_is_write(op: &ColumnarOp) -> bool {
 
 fn crdt_is_write(op: &CrdtOp) -> bool {
     match op {
-        CrdtOp::Apply { .. }
+        CrdtOp::Apply { .. } | CrdtOp::ApplyAuthenticated { .. }
         | CrdtOp::ListInsert { .. }
         | CrdtOp::ListDelete { .. }
         | CrdtOp::ListMove { .. }

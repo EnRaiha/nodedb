@@ -18,7 +18,8 @@ use tracing::{debug, info, warn};
 use crate::error::{ClusterError, Result};
 
 use super::protocol::{
-    BootstrapCredsRequest, BootstrapCredsResponse, MAX_FRAME_BYTES, decode_request, encode_response,
+    BootstrapCredsRequest, BootstrapCredsResponse, DELIVERY_ACK, MAX_FRAME_BYTES, decode_request,
+    encode_response,
 };
 
 /// Host-side handler called for every validated `BootstrapCredsRequest`.
@@ -31,20 +32,41 @@ pub trait BootstrapHandler: Send + Sync + 'static {
     fn handle<'a>(
         &'a self,
         req: BootstrapCredsRequest,
+        remote_addr: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = BootstrapCredsResponse> + Send + 'a>>;
+
+    fn confirm_delivery<'a>(
+        &'a self,
+        _req: &'a BootstrapCredsRequest,
+        _response: &'a BootstrapCredsResponse,
+        _remote_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn abort_delivery<'a>(
+        &'a self,
+        _req: &'a BootstrapCredsRequest,
+        _response: &'a BootstrapCredsResponse,
+        _remote_addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
 }
 
 /// Spawn a tokio task that accepts QUIC connections on `listen_addr`
 /// and dispatches each to `handler`.
 ///
-/// Uses a fresh self-signed server cert per listener lifetime. The
-/// channel provides confidentiality but not authentication —
-/// authentication happens inside the handler via the token check.
+/// Uses the issuer node's existing cluster certificate. Each join token binds
+/// that certificate's SPKI, so the joiner authenticates the specific issuer
+/// before transmitting the bearer token.
 ///
 /// The listener runs until `shutdown` fires. The returned `JoinHandle`
 /// completes once the loop has drained.
 pub fn spawn_listener<H: BootstrapHandler>(
     listen_addr: SocketAddr,
+    issuer_cert: rustls::pki_types::CertificateDer<'static>,
+    issuer_key: rustls::pki_types::PrivateKeyDer<'static>,
     handler: Arc<H>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
@@ -56,16 +78,10 @@ pub fn spawn_listener<H: BootstrapHandler>(
     // care which wins — any provider is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let (cert, key) = nexar::transport::tls::generate_self_signed_cert().map_err(|e| {
-        ClusterError::Transport {
-            detail: format!("bootstrap listener self-signed cert: {e}"),
-        }
-    })?;
-    let server_config = nexar::transport::tls::make_server_config(cert, key).map_err(|e| {
-        ClusterError::Transport {
+    let server_config = nexar::transport::tls::make_server_config(issuer_cert, issuer_key)
+        .map_err(|e| ClusterError::Transport {
             detail: format!("bootstrap listener server config: {e}"),
-        }
-    })?;
+        })?;
 
     let listener =
         nexar::TransportListener::bind_with_config(listen_addr, server_config).map_err(|e| {
@@ -112,6 +128,7 @@ async fn handle_connection<H: BootstrapHandler>(
     conn: quinn::Connection,
     handler: Arc<H>,
 ) -> Result<()> {
+    let remote_addr = conn.remote_address();
     // We accept exactly one bidi stream per connection. The joiner
     // closes the connection after receiving the response.
     let (mut send, mut recv) = conn
@@ -128,9 +145,33 @@ async fn handle_connection<H: BootstrapHandler>(
         "bootstrap-listener: handling request"
     );
 
-    let resp = handler.handle(req).await;
+    let resp = handler.handle(req.clone(), remote_addr).await;
     let resp_bytes = encode_response(&resp)?;
-    write_frame(&mut send, &resp_bytes).await?;
+    if let Err(error) = write_frame(&mut send, &resp_bytes).await {
+        if resp.ok {
+            handler.abort_delivery(&req, &resp, remote_addr).await;
+        }
+        return Err(error);
+    }
+    if resp.ok {
+        let ack = match read_frame(&mut recv).await {
+            Ok(ack) => ack,
+            Err(error) => {
+                handler.abort_delivery(&req, &resp, remote_addr).await;
+                return Err(error);
+            }
+        };
+        if ack.as_slice() != DELIVERY_ACK {
+            handler.abort_delivery(&req, &resp, remote_addr).await;
+            return Err(ClusterError::Transport {
+                detail: "bootstrap credential delivery acknowledgement mismatch".into(),
+            });
+        }
+        if let Err(error) = handler.confirm_delivery(&req, &resp, remote_addr).await {
+            handler.abort_delivery(&req, &resp, remote_addr).await;
+            return Err(error);
+        }
+    }
     send.finish().map_err(|e| ClusterError::Transport {
         detail: format!("finish stream: {e}"),
     })?;

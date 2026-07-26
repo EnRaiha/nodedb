@@ -19,18 +19,10 @@
 //!    DER blob (the public-key algorithm + key material, minus the cert
 //!    metadata).  Compared against the 32-byte pin stored in `NodeInfo`.
 //!
-//! A connection is accepted only when at least one mechanism matches.  If the
-//! `NodeInfo` carries *neither* a SPIFFE id nor an SPKI pin (e.g. the first
-//! peer in a newly-bootstrapped cluster, before the allowlist is seeded), the
-//! connection is accepted with a warning — this is the single-node bootstrap
-//! window described below.
-//!
-//! # Bootstrap window
-//!
-//! The very first single-node cluster has no peers, so there is nothing to
-//! pin.  Once the first `JoinRequest` is accepted and the joining node's
-//! identity is written into `NodeInfo`, the allowlist becomes non-empty and
-//! strict enforcement kicks in automatically.
+//! A topology peer is accepted only when at least one mechanism matches.
+//! Legacy `NodeInfo` rows carrying neither identity are rejected. Initial seed
+//! discovery and newly issued joiner enrollment are separately bounded by the
+//! TLS verifier and the identity-bound JoinRequest admission path.
 //!
 //! # Key-rotation SPKI overlap (known gap)
 //!
@@ -65,8 +57,6 @@ pub const IDENTITY_MISMATCH_QUIC_ERROR: quinn::VarInt = quinn::VarInt::from_u32(
 pub enum VerifyOutcome {
     /// The peer's certificate matched the pinned identity via the given method.
     Accepted { method: VerifyMethod },
-    /// No pin was recorded for this node — accepted in bootstrap-window mode.
-    BootstrapAccepted,
     /// The peer's identity did not match any pinned value.
     Rejected,
 }
@@ -96,6 +86,28 @@ pub fn spki_pin_from_cert_der(cert_der: &[u8]) -> Result<[u8; 32]> {
 ///
 /// Returns `None` when the cert carries no URI SAN or when none of the URI
 /// SANs use the `spiffe://` scheme.
+pub fn enrollment_identity_from_cert_der(cert_der: &[u8]) -> Option<(u64, u64)> {
+    let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
+    for san in cert
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .map(|ext| &ext.value.general_names)
+        .into_iter()
+        .flatten()
+    {
+        let GeneralName::DNSName(name) = san else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix("nodedb-enrollment-") else {
+            continue;
+        };
+        let (node_id, expires_at_ms) = rest.split_once('-')?;
+        return Some((node_id.parse().ok()?, expires_at_ms.parse().ok()?));
+    }
+    None
+}
+
 pub fn spiffe_id_from_cert_der(cert_der: &[u8]) -> Option<String> {
     let (_, cert) = X509Certificate::from_der(cert_der).ok()?;
     for san in cert
@@ -127,21 +139,17 @@ pub fn spiffe_id_from_cert_der(cert_der: &[u8]) -> Option<String> {
 /// * `peer_cert_der` — the peer's leaf certificate in DER form, extracted
 ///   from the TLS connection after the handshake.
 ///
-/// Returns [`VerifyOutcome::Accepted`] on success, [`VerifyOutcome::Rejected`]
-/// on mismatch, or [`VerifyOutcome::BootstrapAccepted`] when the `NodeInfo`
-/// carries no pins at all.
+/// Returns [`VerifyOutcome::Accepted`] on success and
+/// [`VerifyOutcome::Rejected`] on mismatch or a legacy unpinned topology row.
 pub fn verify_peer_identity(info: &NodeInfo, peer_cert_der: &[u8]) -> VerifyOutcome {
     let has_any_pin = info.spiffe_id.is_some() || info.spki_pin.is_some();
 
     if !has_any_pin {
-        // Bootstrap window: first peer in a single-node cluster.  Accept with
-        // a warning so operators know the window is open.
         warn!(
             node_id = info.node_id,
-            "accepting peer with no pinned identity (bootstrap window — pin will be recorded \
-             once the first JoinRequest is processed)"
+            "rejecting topology peer with no pinned identity"
         );
-        return VerifyOutcome::BootstrapAccepted;
+        return VerifyOutcome::Rejected;
     }
 
     // --- SPIFFE first ---
@@ -249,10 +257,10 @@ mod tests {
     }
 
     #[test]
-    fn no_pin_bootstrap_accepted() {
+    fn topology_peer_without_pins_is_rejected() {
         let node = make_node_no_pin(1);
         let outcome = verify_peer_identity(&node, &[]);
-        assert_eq!(outcome, VerifyOutcome::BootstrapAccepted);
+        assert_eq!(outcome, VerifyOutcome::Rejected);
     }
 
     #[test]

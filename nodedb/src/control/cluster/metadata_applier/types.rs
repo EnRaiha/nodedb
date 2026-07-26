@@ -27,6 +27,8 @@ pub struct MetadataCommitApplier {
     pub(super) cache: Arc<RwLock<MetadataCache>>,
     pub(super) catalog_change_tx: broadcast::Sender<CatalogChangeEvent>,
     pub(super) credentials: Arc<CredentialStore>,
+    pub(super) token_state: nodedb_cluster::SharedTokenStateMirror,
+    pub(super) transport: OnceLock<Arc<nodedb_cluster::NexarTransport>>,
     /// Weak handle to `SharedState`. Installed by `start_raft` after
     /// construction so the applier can spawn async post-apply side
     /// effects (Data Plane register on `PutCollection`,
@@ -41,13 +43,20 @@ impl MetadataCommitApplier {
         cache: Arc<RwLock<MetadataCache>>,
         catalog_change_tx: broadcast::Sender<CatalogChangeEvent>,
         credentials: Arc<CredentialStore>,
+        token_state: nodedb_cluster::SharedTokenStateMirror,
     ) -> Self {
         Self {
             cache,
             catalog_change_tx,
             credentials,
+            token_state,
+            transport: OnceLock::new(),
             shared: OnceLock::new(),
         }
+    }
+
+    pub fn install_transport(&self, transport: Arc<nodedb_cluster::NexarTransport>) {
+        let _ = self.transport.set(transport);
     }
 
     /// Install a weak handle to `SharedState` so the applier can

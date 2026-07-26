@@ -13,7 +13,7 @@ pub mod replay;
 pub use audit_segment::AuditWalSegment;
 pub(crate) use crdt_doc_payload::CrdtDocOpWalRecord;
 pub(crate) use crdt_list_payload::CrdtListOpWalRecord;
-pub(crate) use crdt_payload::CrdtDeltaWalPayload;
+pub(crate) use crdt_payload::{CrdtDeltaSigning, CrdtDeltaWalPayload};
 pub use manager::WalManager;
 pub use redo::{CalvinStamp, EdgeDeleteRedo, EdgePutRedo, RedoRecord, RedoSubRecord};
 pub use replay::SyncHwmReplayMaps;

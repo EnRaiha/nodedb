@@ -509,6 +509,7 @@ pub fn propose_sync_producer_register(
     lite_id: &str,
     producer_id: u64,
     tenant_id: u64,
+    user_id: u64,
     epoch: u64,
     created_ms: i64,
 ) -> Result<u64, Error> {
@@ -520,6 +521,7 @@ pub fn propose_sync_producer_register(
         lite_id: lite_id.to_owned(),
         producer_id,
         tenant_id,
+        user_id,
         epoch,
         created_ms,
     };

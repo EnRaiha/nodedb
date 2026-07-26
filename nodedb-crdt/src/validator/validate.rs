@@ -35,6 +35,45 @@ fn first_violation_err(
 }
 
 impl Validator {
+    /// Verify signing policy and replay sequence before candidate import.
+    pub fn verify_delta_auth(
+        &self,
+        collection: &str,
+        auth: &CrdtAuthContext,
+        delta_bytes: &[u8],
+    ) -> Result<()> {
+        let is_signed = auth.delta_signature != [0u8; 32];
+        if self.delta_signing_required(collection) && !is_signed {
+            return Err(CrdtError::InvalidSignature {
+                user_id: auth.user_id,
+                detail: format!("collection `{collection}` requires signed deltas"),
+            });
+        }
+        if !is_signed {
+            return Ok(());
+        }
+        let verifier = self
+            .delta_verifier
+            .as_ref()
+            .ok_or_else(|| CrdtError::InvalidSignature {
+                user_id: auth.user_id,
+                detail: "no delta verifier is configured".into(),
+            })?;
+        verifier
+            .registry()
+            .check_seq(auth.user_id, auth.device_id, auth.seq_no)?;
+        verifier.verify(
+            auth.user_id,
+            auth.device_id,
+            auth.seq_no,
+            delta_bytes,
+            &auth.delta_signature,
+        )?;
+        verifier
+            .registry()
+            .commit_seq(auth.user_id, auth.device_id, auth.seq_no)
+    }
+
     /// Validate a proposed change against all applicable constraints.
     ///
     /// Returns `Accepted` if all constraints pass, or `Rejected` with
@@ -95,33 +134,7 @@ impl Validator {
             }
         }
 
-        // Replay protection + signature verification (signed path only).
-        //
-        // The unsigned path (all-zeros signature) bypasses replay protection.
-        // Old clients that send device_id=0 / seq_no=0 with a non-zero
-        // signature will be rejected by the seq_no check (0 is never > 0).
-        if auth.delta_signature != [0u8; 32]
-            && let Some(ref verifier) = self.delta_verifier
-        {
-            // Step 1: cheap seq_no check before any HMAC computation.
-            verifier
-                .registry()
-                .check_seq(auth.user_id, auth.device_id, auth.seq_no)?;
-
-            // Step 2: constant-time HMAC verification.
-            verifier.verify(
-                auth.user_id,
-                auth.device_id,
-                auth.seq_no,
-                &delta_bytes,
-                &auth.delta_signature,
-            )?;
-
-            // Step 3: advance last_seen atomically on success.
-            verifier
-                .registry()
-                .commit_seq(auth.user_id, auth.device_id, auth.seq_no)?;
-        }
+        self.verify_delta_auth(&change.collection, &auth, &delta_bytes)?;
 
         let hlc_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -144,5 +157,56 @@ impl Validator {
                 first_violation_err(violations, &change.collection, None)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod signing_tests {
+    use loro::LoroValue;
+
+    use super::*;
+    use crate::constraint::ConstraintSet;
+    use crate::state::CrdtState;
+
+    fn change() -> ProposedChange {
+        ProposedChange {
+            collection: "secure_docs".into(),
+            row_id: "row-1".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            fields: vec![("value".into(), LoroValue::I64(1))],
+        }
+    }
+
+    #[test]
+    fn required_signing_rejects_unsigned_delta() {
+        let state = CrdtState::new(1).unwrap();
+        let mut validator = Validator::new(ConstraintSet::new(), 8);
+        validator.require_delta_signing("secure_docs");
+
+        let error = validator
+            .validate_or_reject(
+                &state,
+                2,
+                CrdtAuthContext::default(),
+                &change(),
+                b"delta".to_vec(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, CrdtError::InvalidSignature { .. }));
+    }
+
+    #[test]
+    fn signed_delta_without_verifier_fails_closed() {
+        let state = CrdtState::new(1).unwrap();
+        let mut validator = Validator::new(ConstraintSet::new(), 8);
+        let auth = CrdtAuthContext {
+            delta_signature: [7; 32],
+            ..CrdtAuthContext::default()
+        };
+
+        let error = validator
+            .validate_or_reject(&state, 2, auth, &change(), b"delta".to_vec())
+            .unwrap_err();
+        assert!(matches!(error, CrdtError::InvalidSignature { .. }));
     }
 }

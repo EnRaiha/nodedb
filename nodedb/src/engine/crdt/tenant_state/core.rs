@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! TenantCrdtEngine core: construction, per-collection state access, delta
-//! apply, DLQ, row purge.
-//!
-//! Each `(tenant, collection)` owns its own `LoroDoc` (one [`CrdtState`] per
-//! collection). The validator, dead-letter queue and the cross-engine array
-//! surrogate registry stay tenant-wide because UNIQUE / FK constraints are
-//! cross-collection (and FK referents may be array-engine rows).
+//! Per-tenant, per-collection CRDT state and cross-collection validation.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -23,12 +17,7 @@ use nodedb_crdt::validator::{ProposedChange, Validator};
 
 use crate::types::TenantId;
 
-/// Tenant-wide row/field lookup view passed to the constraint validator.
-///
-/// Row existence (FK / BiTemporalFK) is satisfied by ANY collection's doc OR
-/// by the tenant's array-surrogate registry (cross-engine FK referents).
-/// Field-value uniqueness probes are per-collection only — array surrogates are
-/// not document rows and never participate in UNIQUE checks.
+/// Tenant-wide row/field lookup used for cross-collection constraints.
 pub(super) struct TenantRowLookup<'a> {
     pub(super) collections: &'a HashMap<String, CrdtState>,
     pub(super) array_surrogate_ids: &'a HashSet<String>,
@@ -188,18 +177,47 @@ impl TenantCrdtEngine {
         pre_validate::pre_validate(&self.validator, &view, change)
     }
 
-    /// Import a full CRDT snapshot for a single collection (snapshot restore).
-    pub fn import_snapshot_bytes(&mut self, collection: &str, bytes: &[u8]) -> crate::Result<()> {
-        self.state_mut(collection)?
-            .import(bytes)
-            .map_err(crate::Error::Crdt)
+    /// Require signed, replay-protected peer deltas for this tenant's
+    /// collection. The caller must also install a tenant signing verifier.
+    pub fn require_delta_signing(&mut self, collection: impl Into<String>) {
+        self.validator.require_delta_signing(collection);
     }
 
-    /// Apply a validated delta for a collection from Raft commit.
-    ///
-    /// This is called AFTER Raft consensus — the delta has been committed
-    /// to the Raft log and now needs to be applied to the local state.
-    pub fn apply_committed_delta(&mut self, collection: &str, delta: &[u8]) -> crate::Result<()> {
+    /// Install the tenant's registered user/device signing keys.
+    pub fn set_delta_verifier(&mut self, verifier: nodedb_crdt::DeltaSigner) {
+        self.validator.set_delta_verifier(verifier);
+    }
+
+    /// Import a full CRDT snapshot for a single collection (snapshot restore).
+    pub fn import_snapshot_bytes(&mut self, collection: &str, bytes: &[u8]) -> crate::Result<()> {
+        match self.apply_committed_delta_validated(
+            collection,
+            bytes,
+            nodedb_types::Surrogate::ZERO,
+            "",
+            0,
+        ) {
+            super::ValidatedApplyOutcome::Clean { .. } => Ok(()),
+            super::ValidatedApplyOutcome::Rejected(reason) => Err(crate::Error::Crdt(
+                nodedb_crdt::CrdtError::ConstraintViolation {
+                    constraint: "snapshot import".into(),
+                    collection: collection.into(),
+                    detail: reason.to_string(),
+                },
+            )),
+            super::ValidatedApplyOutcome::Malformed => Err(crate::Error::Crdt(
+                nodedb_crdt::CrdtError::DeltaApplyFailed("malformed snapshot".into()),
+            )),
+        }
+    }
+
+    /// Test-only raw import used to seed transaction rollback fixtures.
+    #[cfg(test)]
+    pub(crate) fn apply_committed_delta(
+        &mut self,
+        collection: &str,
+        delta: &[u8],
+    ) -> crate::Result<()> {
         self.state_mut(collection)?
             .import(delta)
             .map_err(crate::Error::Crdt)

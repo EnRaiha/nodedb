@@ -60,7 +60,41 @@ pub const CA_TRUST_DIR: &str = "ca.d";
 /// Cluster-wide HMAC key used by the authenticated Raft frame envelope.
 /// Persisted as raw 32 bytes (no PEM framing) with 0600 perms.
 const CLUSTER_SECRET_FILE: &str = "cluster_secret.bin";
+const BOOTSTRAP_PEER_SPKI_FILE: &str = "bootstrap_peer_spki.bin";
 const CLUSTER_SECRET_LEN: usize = 32;
+
+pub(crate) struct BootstrapIssuerMaterial {
+    pub(crate) ca_cert: CertificateDer<'static>,
+    pub(crate) ca_key_der: Vec<u8>,
+    pub(crate) node_cert: CertificateDer<'static>,
+    pub(crate) node_key_der: Vec<u8>,
+    pub(crate) cluster_secret: [u8; 32],
+}
+
+/// Load the local CA issuer material needed by the authenticated bootstrap
+/// listener. Nodes without the CA private key cannot issue enrollment
+/// certificates and therefore do not start an issuer listener.
+pub(crate) fn load_bootstrap_issuer_material(
+    data_dir: &Path,
+) -> crate::Result<Option<BootstrapIssuerMaterial>> {
+    let tls_dir = data_dir.join(TLS_SUBDIR);
+    let ca_key_path = tls_dir.join(CA_KEY_FILE);
+    if !ca_key_path.exists() {
+        return Ok(None);
+    }
+    let ca_cert = read_single_cert(&tls_dir.join(CA_CERT_FILE))?;
+    let ca_key = read_private_key(&ca_key_path)?;
+    let node_cert = read_single_cert(&tls_dir.join(NODE_CERT_FILE))?;
+    let node_key = read_private_key(&tls_dir.join(NODE_KEY_FILE))?;
+    let cluster_secret = read_cluster_secret(&tls_dir.join(CLUSTER_SECRET_FILE))?;
+    Ok(Some(BootstrapIssuerMaterial {
+        ca_cert,
+        ca_key_der: ca_key.secret_der().to_vec(),
+        node_cert,
+        node_key_der: node_key.secret_der().to_vec(),
+        cluster_secret,
+    }))
+}
 
 /// Resolve [`TransportCredentials`] for this node from operator settings
 /// and on-disk state. See module docs for resolution order.
@@ -182,6 +216,7 @@ fn load_from_paths(paths: &TlsPaths, tls_dir: &Path) -> crate::Result<TlsCredent
         crls,
         cluster_secret,
         spki_pin,
+        bootstrap_peer_spki: None,
     })
 }
 
@@ -193,6 +228,12 @@ fn load_from_data_dir(tls_dir: &Path) -> crate::Result<TlsCredentials> {
     let additional_ca_certs = load_extra_cas(tls_dir)?;
     let spki_pin =
         nodedb_cluster::transport::spki_pin_from_cert_der(cert.as_ref()).unwrap_or([0u8; 32]);
+    let bootstrap_peer_spki_path = tls_dir.join(BOOTSTRAP_PEER_SPKI_FILE);
+    let bootstrap_peer_spki = if bootstrap_peer_spki_path.exists() {
+        Some(read_cluster_secret(&bootstrap_peer_spki_path)?)
+    } else {
+        None
+    };
     Ok(TlsCredentials {
         cert,
         key,
@@ -201,6 +242,7 @@ fn load_from_data_dir(tls_dir: &Path) -> crate::Result<TlsCredentials> {
         crls: Vec::new(),
         cluster_secret,
         spki_pin,
+        bootstrap_peer_spki,
     })
 }
 
@@ -306,8 +348,18 @@ fn fetch_creds_via_bootstrap(
     let mut secret = [0u8; CLUSTER_SECRET_LEN];
     secret.copy_from_slice(&resp.cluster_secret);
     write_cluster_secret(&tls_dir.join(CLUSTER_SECRET_FILE), &secret)?;
+    let bootstrap_peer_spki = nodedb_cluster::auth::join_token::bootstrap_issuer_spki(token_hex)
+        .map_err(|e| crate::Error::Config {
+            detail: format!("bootstrap token issuer SPKI: {e}"),
+        })?;
+    write_cluster_secret(
+        &tls_dir.join(BOOTSTRAP_PEER_SPKI_FILE),
+        &bootstrap_peer_spki,
+    )?;
 
-    load_from_data_dir(tls_dir)
+    let mut credentials = load_from_data_dir(tls_dir)?;
+    credentials.bootstrap_peer_spki = Some(bootstrap_peer_spki);
+    Ok(credentials)
 }
 
 fn bootstrap_credentials(
@@ -414,7 +466,7 @@ fn read_crls(path: &Path) -> crate::Result<Vec<CertificateRevocationListDer<'sta
     })
 }
 
-fn write_pem_cert(path: &Path, der: &[u8]) -> crate::Result<()> {
+pub(crate) fn write_pem_cert(path: &Path, der: &[u8]) -> crate::Result<()> {
     super::pem_io::write_pem_cert(path, der).map_err(|e| crate::Error::Config {
         detail: format!("write {}: {e}", path.display()),
     })

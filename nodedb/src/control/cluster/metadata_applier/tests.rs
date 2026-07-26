@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::broadcast;
 
@@ -25,7 +25,8 @@ fn make_applier() -> (
         Arc::new(CredentialStore::open(&tmp.path().join("system.redb")).expect("open"));
     let cache = Arc::new(RwLock::new(MetadataCache::new()));
     let (tx, _rx) = broadcast::channel(16);
-    let applier = MetadataCommitApplier::new(cache.clone(), tx, credentials.clone());
+    let token_state = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let applier = MetadataCommitApplier::new(cache.clone(), tx, credentials.clone(), token_state);
     (applier, cache, credentials, tmp)
 }
 
@@ -80,6 +81,56 @@ fn apply_deactivate_preserves_record() {
         .unwrap()
         .expect("preserved");
     assert!(!loaded.is_active);
+}
+
+#[test]
+fn join_token_transition_updates_and_persists_shared_mirror() {
+    let (applier, _cache, credentials, _tmp) = make_applier();
+    let hash = [0x44; 32];
+    let entries = [
+        MetadataEntry::JoinTokenTransition {
+            token_hash: hash,
+            transition: nodedb_cluster::JoinTokenTransitionKind::Register {
+                expires_at_ms: 10_000,
+            },
+            ts_ms: 1,
+        },
+        MetadataEntry::JoinTokenTransition {
+            token_hash: hash,
+            transition: nodedb_cluster::JoinTokenTransitionKind::BeginInFlight {
+                node_addr: "127.0.0.1:9000".into(),
+                lease_id: [0x55; 16],
+            },
+            ts_ms: 2,
+        },
+        MetadataEntry::JoinTokenTransition {
+            token_hash: hash,
+            transition: nodedb_cluster::JoinTokenTransitionKind::MarkConsumed {
+                node_addr: "127.0.0.1:9000".into(),
+                lease_id: [0x55; 16],
+                recovery_bundle: vec![1, 2, 3],
+            },
+            ts_ms: 3,
+        },
+    ];
+    for (offset, entry) in entries.iter().enumerate() {
+        let index = offset as u64 + 1;
+        assert_eq!(
+            applier.apply(&[(index, encode_entry(entry).expect("encode"))]),
+            index
+        );
+    }
+    let persisted = credentials
+        .catalog()
+        .list_join_token_states()
+        .expect("load token state");
+    assert!(matches!(
+        persisted.as_slice(),
+        [nodedb_cluster::JoinTokenState {
+            lifecycle: nodedb_cluster::JoinTokenLifecycle::Consumed { ts_ms: 3, .. },
+            ..
+        }]
+    ));
 }
 
 #[test]

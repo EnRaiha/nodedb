@@ -50,6 +50,22 @@ impl SyncSession {
                     };
                     return SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack);
                 }
+                if let Some(current) = self.identity.as_ref()
+                    && new_identity.user_id != current.user_id
+                {
+                    warn!(
+                        session = %self.session_id,
+                        current_user_id = current.user_id,
+                        new_user_id = new_identity.user_id,
+                        "token refresh rejected: user mismatch"
+                    );
+                    let ack = TokenRefreshAckMsg {
+                        success: false,
+                        error: Some("user mismatch".into()),
+                        expires_in_secs: 0,
+                    };
+                    return SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack);
+                }
                 self.username = Some(new_identity.username.clone());
                 self.identity = Some(new_identity);
                 info!(

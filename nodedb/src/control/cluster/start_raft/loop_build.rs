@@ -49,6 +49,7 @@ pub(super) struct LoopBuild {
     pub(super) apply_rx: mpsc::Receiver<ApplyBatch>,
     pub(super) calvin_read_result_senders: Arc<Mutex<BTreeMap<u32, Sender<ReadResultEvent>>>>,
     pub(super) calvin_completion_registry: Arc<CalvinCompletionRegistry>,
+    pub(super) token_state: nodedb_cluster::SharedTokenStateMirror,
     /// Shared with the compactor wiring so sequencer-group log compaction can
     /// be held down below any armed scheduler catch-up index.
     pub(super) sequencer_state_machine: Arc<Mutex<SequencerStateMachine>>,
@@ -74,6 +75,7 @@ pub(super) fn build_raft_loop(
         sequencer_state_machine,
         calvin_read_result_senders,
         metadata_applier,
+        token_state,
         plan_executor,
         vshard_handler,
         tick_interval,
@@ -187,6 +189,7 @@ pub(super) fn build_raft_loop(
         apply_rx,
         calvin_read_result_senders,
         calvin_completion_registry,
+        token_state,
         sequencer_state_machine,
     })
 }

@@ -7,24 +7,21 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::error::Result;
-use crate::transport::peer_identity_store::{NoopIdentityStore, PeerIdentityStore};
+use crate::transport::peer_identity_store::PeerIdentityStore;
 use crate::transport::rpc_handler::RaftRpcHandler;
 use crate::transport::server;
 
 use super::transport::NexarTransport;
 
 impl NexarTransport {
-    /// Run the inbound RPC accept loop until shutdown using `NoopIdentityStore`.
-    ///
-    /// Convenience wrapper for insecure transport / tests.  For mTLS
-    /// deployments that enforce per-node identity, use
-    /// [`serve_with_identity`].
+    /// Run the inbound RPC accept loop using the same identity store installed
+    /// into the TLS verifiers at transport construction.
     pub async fn serve<H: RaftRpcHandler>(
         &self,
         handler: Arc<H>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
-        self.serve_with_identity(handler, Arc::new(NoopIdentityStore), shutdown)
+        self.serve_with_identity(handler, Arc::clone(&self.identity_store), shutdown)
             .await
     }
 
@@ -40,7 +37,7 @@ impl NexarTransport {
     /// `quinn::Connection::accept_bi` / `quinn::RecvStream::read_exact`,
     /// pinning the handler Arc (and any redb file handles it holds) for the
     /// lifetime of the runtime.
-    pub async fn serve_with_identity<H: RaftRpcHandler, S: PeerIdentityStore>(
+    pub async fn serve_with_identity<H: RaftRpcHandler, S: PeerIdentityStore + ?Sized>(
         &self,
         handler: Arc<H>,
         identity_store: Arc<S>,

@@ -62,6 +62,7 @@ mod tests {
             crls: Vec::new(),
             cluster_secret: secret,
             spki_pin: [0u8; 32],
+            bootstrap_peer_spki: None,
         }
     }
 

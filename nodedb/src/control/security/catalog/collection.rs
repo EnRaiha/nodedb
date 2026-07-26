@@ -81,6 +81,10 @@ pub struct StoredCollection {
     /// transiently rejects in-flight deltas.
     #[msgpack(default)]
     pub constraint_version: u64,
+    /// Whether externally synchronized CRDT deltas require an HMAC signature
+    /// and monotonic device sequence.
+    #[msgpack(default)]
+    pub crdt_signing_required: bool,
     /// Hybrid Logical Clock timestamp assigned by the metadata
     /// applier at commit time. Strictly monotonic per descriptor.
     #[msgpack(default)]
@@ -277,6 +281,7 @@ impl StoredCollection {
             created_at: now,
             descriptor_version: 0,
             constraint_version: 0,
+            crdt_signing_required: false,
             modification_hlc: Hlc::ZERO,
             fields: Vec::new(),
             field_defs: Vec::new(),

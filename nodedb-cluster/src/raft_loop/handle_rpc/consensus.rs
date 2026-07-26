@@ -32,6 +32,9 @@ impl<A: CommitApplier, P: PlanExecutor> RaftLoop<A, P> {
         Ok(RaftRpc::RequestVoteResponse(resp))
     }
 
+    /// Apply snapshot bytes only after the cluster transport has authenticated
+    /// the sender's mTLS identity, HMAC envelope, and replay sequence. CRC and
+    /// chunk framing below detect corruption; they are not authenticity checks.
     pub(super) async fn handle_install_snapshot_rpc(
         &self,
         mut req: InstallSnapshotRequest,

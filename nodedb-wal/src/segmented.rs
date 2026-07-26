@@ -143,9 +143,26 @@ impl SegmentedWal {
         Ok(())
     }
 
+    /// Configure encryption for a newly created WAL or roll an already-open
+    /// active segment before switching keys on restart.
+    pub fn configure_encryption_ring(&mut self, ring: crate::crypto::KeyRing) -> Result<()> {
+        if self.writer.can_set_encryption_ring() {
+            self.set_encryption_ring(ring)
+        } else {
+            self.rotate_encryption_ring(ring)
+        }
+    }
+
     /// Get the encryption key ring (for replay decryption).
     pub fn encryption_ring(&self) -> Option<&crate::crypto::KeyRing> {
         self.encryption_ring.as_ref()
+    }
+
+    /// Seal the active segment and start a new segment under `ring`.
+    /// This is the only safe runtime key-rotation boundary because a segment's
+    /// encryption epoch and key are fixed by its preamble.
+    pub fn rotate_encryption_ring(&mut self, ring: crate::crypto::KeyRing) -> Result<()> {
+        self.roll_segment_with_ring(Some(ring))
     }
 
     /// Append a record to the WAL. Returns the assigned LSN.
@@ -243,33 +260,31 @@ impl SegmentedWal {
 
     /// Roll to a new segment: seal the current writer and create a new one.
     fn roll_segment(&mut self) -> Result<()> {
-        // Flush and seal the current segment.
-        self.writer.seal()?;
+        let next_ring = self
+            .encryption_ring
+            .as_ref()
+            .map(|ring| {
+                ring.current()
+                    .with_fresh_epoch()
+                    .map(crate::crypto::KeyRing::new)
+            })
+            .transpose()?;
+        self.roll_segment_with_ring(next_ring)
+    }
 
-        // The new segment starts at the next LSN.
+    fn roll_segment_with_ring(&mut self, next_ring: Option<crate::crypto::KeyRing>) -> Result<()> {
+        self.writer.seal()?;
         let new_first_lsn = self.writer.next_lsn();
         let new_path = segment_path(&self.wal_dir, new_first_lsn);
-
         let mut new_writer =
             WalWriter::open_with_start_lsn(&new_path, self.writer_config.clone(), new_first_lsn)?;
 
-        // Propagate encryption to the new writer with a fresh epoch.
-        // Each segment gets a new random epoch so the per-segment nonce space
-        // is independent. The ring's key material is preserved; only the epoch
-        // changes. The new preamble is written at the head of the new segment.
-        if let Some(ref ring) = self.encryption_ring {
-            let fresh_key = ring.current().with_fresh_epoch()?;
-            let new_ring = crate::crypto::KeyRing::new(fresh_key);
-            new_writer.set_encryption_ring(new_ring.clone())?;
-            self.encryption_ring = Some(new_ring);
+        if let Some(ref ring) = next_ring {
+            new_writer.set_encryption_ring(ring.clone())?;
         }
-
+        self.encryption_ring = next_ring;
         self.writer = new_writer;
         self.active_first_lsn = new_first_lsn;
-
-        // Fsync the WAL directory to ensure the new segment's directory
-        // entry is durable. Without this, a power loss could cause the
-        // new segment file to "disappear" on ext4/XFS.
         let _ = crate::segment::fsync_directory(&self.wal_dir);
 
         info!(
@@ -277,7 +292,6 @@ impl SegmentedWal {
             first_lsn = new_first_lsn,
             "rolled to new WAL segment"
         );
-
         Ok(())
     }
 }

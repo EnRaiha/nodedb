@@ -28,6 +28,9 @@ pub struct Validator {
     /// Optional delta signature verifier. When set, signed deltas are
     /// verified before constraint validation.
     pub(super) delta_verifier: Option<DeltaSigner>,
+    /// Collections whose externally submitted deltas must carry a valid
+    /// signature and monotonic device sequence.
+    pub(super) signing_required_collections: HashSet<String>,
     /// Collections known to be bitemporal. UNIQUE checks for rows in these
     /// collections scope to currently-live rows (open `_ts_valid_until`)
     /// so superseded versions don't falsely collide with live writes.
@@ -54,6 +57,7 @@ impl Validator {
             deferred: DeferredQueue::new(deferred_capacity),
             suffix_counter: HashMap::new(),
             delta_verifier: None,
+            signing_required_collections: HashSet::new(),
             bitemporal_collections: HashSet::new(),
         }
     }
@@ -115,8 +119,24 @@ impl Validator {
         &mut self.deferred
     }
 
-    /// Set the delta signature verifier. When set, deltas with non-zero
-    /// signatures in their CrdtAuthContext will be verified before validation.
+    /// Require signed, replay-protected deltas for a collection. A tenant owns
+    /// its own `Validator`, so this setting is tenant-and-collection scoped.
+    pub fn require_delta_signing(&mut self, collection: impl Into<String>) {
+        self.signing_required_collections.insert(collection.into());
+    }
+
+    /// Stop requiring signed deltas for a collection.
+    pub fn allow_unsigned_deltas(&mut self, collection: &str) {
+        self.signing_required_collections.remove(collection);
+    }
+
+    /// Whether signed deltas are mandatory for a collection.
+    pub fn delta_signing_required(&self, collection: &str) -> bool {
+        self.signing_required_collections.contains(collection)
+    }
+
+    /// Set the delta signature verifier. Every non-zero signature is verified;
+    /// signed input fails closed when no verifier is installed.
     pub fn set_delta_verifier(&mut self, verifier: DeltaSigner) {
         self.delta_verifier = Some(verifier);
     }

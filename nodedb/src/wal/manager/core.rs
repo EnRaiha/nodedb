@@ -28,6 +28,8 @@ pub struct WalManager {
     pub(super) wal_dir: PathBuf,
     /// Encryption key ring (if configured). Supports dual-key reads during rotation.
     pub(super) encryption_ring: Option<nodedb_wal::crypto::KeyRing>,
+    /// Stable CRDT signing root, persisted only as WAL-key-wrapped ciphertext.
+    pub(super) crdt_signing_root: Option<[u8; 32]>,
     /// Dedicated audit WAL segment. When present, audit entries are written
     /// atomically alongside data writes. Append-only, never compacted.
     pub(super) audit_wal: Option<crate::wal::AuditWalSegment>,
@@ -46,6 +48,20 @@ pub struct WalManager {
 }
 
 impl WalManager {
+    /// Whether every appended payload is protected by an AEAD key ring.
+    pub fn payloads_authenticated(&self) -> bool {
+        self.encryption_ring.is_some()
+    }
+
+    /// Return the stable in-memory root for per-user CRDT signing keys.
+    /// The root is persisted only as WAL-key-wrapped ciphertext and is
+    /// rewrapped on rotation, so offline signatures survive chained key
+    /// rotations and restarts. No root exists when WAL encryption is disabled,
+    /// which prevents `SIGNED_DELTAS` from being enabled.
+    pub fn crdt_signing_root(&self) -> crate::Result<Option<[u8; 32]>> {
+        Ok(self.crdt_signing_root)
+    }
+
     /// Open or create a segmented WAL at the given path.
     ///
     /// The `path` argument is the WAL directory for the segmented format.
@@ -137,6 +153,7 @@ impl WalManager {
             wal: Arc::new(Mutex::new(wal)),
             wal_dir,
             encryption_ring: None,
+            crdt_signing_root: None,
             audit_wal,
             durable_lsn: AtomicU64::new(0),
             commit_lock: tokio::sync::Mutex::new(()),

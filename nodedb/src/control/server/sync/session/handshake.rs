@@ -33,6 +33,15 @@ enum FencingDecision {
     RejectTransient,
 }
 
+#[cfg(test)]
+fn producer_owner_matches(
+    registration: &crate::control::sync_producer::ProducerRegistration,
+    tenant_id: u64,
+    user_id: u64,
+) -> bool {
+    registration.tenant_id == tenant_id && registration.user_id == user_id
+}
+
 impl SyncSession {
     /// Process a handshake message: validate JWT, store client clock, detect forks.
     ///
@@ -70,6 +79,7 @@ impl SyncSession {
                 server_wire_version: crate::version::WIRE_FORMAT_VERSION,
                 producer_id: 0,
                 accepted_epoch: 0,
+                delta_signing_key: [0; 32],
             };
             return SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack);
         }
@@ -89,11 +99,13 @@ impl SyncSession {
                     server_wire_version: crate::version::WIRE_FORMAT_VERSION,
                     producer_id: 0,
                     accepted_epoch: 0,
+                    delta_signing_key: [0; 32],
                 };
                 return SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack);
             };
             self.tenant_id = Some(identity.tenant_id);
             self.username = Some(identity.username.clone());
+            let user_id = identity.user_id;
             self.identity = Some(identity);
             self.authenticated = true;
             self.client_clock = msg.vector_clock.clone();
@@ -112,7 +124,7 @@ impl SyncSession {
             };
 
             let tenant_id = self.tenant_id.map(|t| t.as_u64()).unwrap_or(0);
-            match self.durable_fencing_decision(msg, shared, tenant_id) {
+            match self.durable_fencing_decision(msg, shared, tenant_id, user_id) {
                 Some(FencingDecision::Reject) => {
                     return self.fork_reject_frame(
                         &current_server_clock,
@@ -146,6 +158,7 @@ impl SyncSession {
                 server_wire_version: crate::version::WIRE_FORMAT_VERSION,
                 producer_id: self.producer_id,
                 accepted_epoch: self.accepted_epoch,
+                delta_signing_key: [0; 32],
             };
             return SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack);
         }
@@ -173,7 +186,7 @@ impl SyncSession {
                 };
 
                 let tenant_id = identity.tenant_id.as_u64();
-                match self.durable_fencing_decision(msg, shared, tenant_id) {
+                match self.durable_fencing_decision(msg, shared, tenant_id, identity.user_id) {
                     Some(FencingDecision::Reject) => {
                         return self.fork_reject_frame(
                             &current_server_clock,
@@ -196,6 +209,25 @@ impl SyncSession {
                     None => {}
                 }
 
+                self.delta_signing_key = match shared {
+                    Some(state) if state.wal.payloads_authenticated() => {
+                        match state.credentials.catalog().get_or_create_crdt_signing_key(
+                            identity.tenant_id.as_u64(),
+                            identity.user_id,
+                        ) {
+                            Ok(key) => Some(key),
+                            Err(error) => {
+                                warn!(session = %self.session_id, %error, "sync signing key unavailable");
+                                return self.transient_reject_frame(
+                                    &current_server_clock,
+                                    "SYNC_UNAVAILABLE: signing key persistence failed",
+                                );
+                            }
+                        }
+                    }
+                    Some(_) | None => None,
+                };
+
                 info!(
                     session = %self.session_id,
                     user = %identity.username,
@@ -213,6 +245,7 @@ impl SyncSession {
                     server_wire_version: crate::version::WIRE_FORMAT_VERSION,
                     producer_id: self.producer_id,
                     accepted_epoch: self.accepted_epoch,
+                    delta_signing_key: self.delta_signing_key.unwrap_or([0; 32]),
                 };
                 SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack)
             }
@@ -231,6 +264,7 @@ impl SyncSession {
                     server_wire_version: crate::version::WIRE_FORMAT_VERSION,
                     producer_id: 0,
                     accepted_epoch: 0,
+                    delta_signing_key: [0; 32],
                 };
                 SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack)
             }
@@ -256,6 +290,7 @@ impl SyncSession {
             server_wire_version: crate::version::WIRE_FORMAT_VERSION,
             producer_id: 0,
             accepted_epoch: 0,
+            delta_signing_key: [0; 32],
         };
         SyncFrame::try_encode(SyncMessageType::HandshakeAck, &ack)
     }
@@ -310,6 +345,7 @@ impl SyncSession {
         msg: &HandshakeMsg,
         shared: Option<&Arc<SharedState>>,
         tenant_id: u64,
+        user_id: u64,
     ) -> Option<FencingDecision> {
         if msg.lite_id.is_empty() || msg.epoch == 0 {
             return None;
@@ -329,117 +365,101 @@ impl SyncSession {
                     .unwrap_or_default()
                     .as_millis() as i64;
 
-                match reg.get(&msg.lite_id) {
+                let existing = match reg.get_or_register(
+                    &msg.lite_id,
+                    tenant_id,
+                    user_id,
+                    msg.epoch,
+                    now_ms,
+                ) {
+                    Ok((registration, _created)) => registration,
+                    Err(crate::Error::BadRequest { .. }) => {
+                        warn!(
+                            session = %self.session_id,
+                            lite_id = %msg.lite_id,
+                            authenticated_tenant = tenant_id,
+                            authenticated_user = user_id,
+                            "sync producer owner mismatch"
+                        );
+                        return Some(FencingDecision::Reject);
+                    }
                     Err(e) => {
                         warn!(
                             session = %self.session_id,
                             lite_id = %msg.lite_id,
                             error = %e,
-                            "sync handshake: registry.get failed; rejecting as retryable"
+                            "sync handshake: atomic producer registration failed; rejecting as retryable"
                         );
-                        Some(FencingDecision::RejectTransient)
+                        return Some(FencingDecision::RejectTransient);
                     }
-                    Ok(None) => {
-                        // First time we see this lite_id: register and accept.
-                        // The local write keeps single-node correct; the Raft
-                        // propose replicates the producer_id+epoch to all
-                        // followers so state survives leader failover.
-                        match reg.register(&msg.lite_id, tenant_id, msg.epoch, now_ms) {
-                            Ok(registration) => {
-                                if let Err(e) =
-                                    crate::control::metadata_proposer::propose_sync_producer_register(
-                                        shared_ref.as_ref(),
-                                        &msg.lite_id,
-                                        registration.producer_id,
-                                        tenant_id,
-                                        registration.current_epoch,
-                                        now_ms,
-                                    )
-                                {
-                                    warn!(
-                                        session = %self.session_id,
-                                        lite_id = %msg.lite_id,
-                                        error = %e,
-                                        "sync handshake: propose_sync_producer_register failed; \
-                                         rejecting as retryable"
-                                    );
-                                    return Some(FencingDecision::RejectTransient);
-                                }
-                                Some(FencingDecision::Accept {
-                                    producer_id: registration.producer_id,
-                                    accepted_epoch: registration.current_epoch,
-                                })
-                            }
-                            Err(e) => {
-                                warn!(
-                                    session = %self.session_id,
-                                    lite_id = %msg.lite_id,
-                                    error = %e,
-                                    "sync handshake: registry.register failed; rejecting as retryable"
-                                );
-                                Some(FencingDecision::RejectTransient)
-                            }
-                        }
-                    }
-                    Ok(Some(existing)) => {
-                        if msg.epoch > existing.current_epoch {
-                            // Epoch advanced: fence the old epoch and accept the new one.
-                            // The local write keeps single-node correct; the Raft
-                            // propose replicates the epoch advance cluster-wide.
-                            match reg.fence(&msg.lite_id, msg.epoch) {
-                                Ok(()) => {
-                                    if let Err(e) =
-                                        crate::control::metadata_proposer::propose_sync_producer_fence(
-                                            shared_ref.as_ref(),
-                                            &msg.lite_id,
-                                            msg.epoch,
-                                        )
-                                    {
-                                        warn!(
-                                            session = %self.session_id,
-                                            lite_id = %msg.lite_id,
-                                            error = %e,
-                                            "sync handshake: propose_sync_producer_fence failed; \
-                                             rejecting as retryable"
-                                        );
-                                        return Some(FencingDecision::RejectTransient);
-                                    }
-                                    Some(FencingDecision::Accept {
-                                        producer_id: existing.producer_id,
-                                        accepted_epoch: msg.epoch,
-                                    })
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        session = %self.session_id,
-                                        lite_id = %msg.lite_id,
-                                        error = %e,
-                                        "sync handshake: registry.fence failed; rejecting as retryable"
-                                    );
-                                    Some(FencingDecision::RejectTransient)
-                                }
-                            }
-                        } else if msg.epoch == existing.current_epoch {
-                            // Same epoch: idempotent re-connect (at-least-once redelivery).
-                            // No state change — no propose needed.
-                            Some(FencingDecision::Accept {
-                                producer_id: existing.producer_id,
-                                accepted_epoch: existing.current_epoch,
-                            })
-                        } else {
-                            // msg.epoch < existing.current_epoch: stale/forked device.
-                            // No state change — no propose needed.
-                            warn!(
-                                session = %self.session_id,
-                                lite_id = %msg.lite_id,
-                                client_epoch = msg.epoch,
-                                current_epoch = existing.current_epoch,
-                                "FORK DETECTED: client epoch is behind persisted epoch"
-                            );
-                            Some(FencingDecision::Reject)
-                        }
-                    }
+                };
+
+                // Propose on both creation and retry. This closes the crash/error
+                // window between the local durable row and Raft replication;
+                // duplicate identical registrations are apply-idempotent.
+                if let Err(e) = crate::control::metadata_proposer::propose_sync_producer_register(
+                    shared_ref.as_ref(),
+                    &msg.lite_id,
+                    existing.producer_id,
+                    existing.tenant_id,
+                    existing.user_id,
+                    existing.current_epoch,
+                    existing.created_ms,
+                ) {
+                    warn!(
+                        session = %self.session_id,
+                        lite_id = %msg.lite_id,
+                        error = %e,
+                        "sync handshake: propose_sync_producer_register failed; rejecting as retryable"
+                    );
+                    return Some(FencingDecision::RejectTransient);
                 }
+
+                if msg.epoch < existing.current_epoch {
+                    warn!(
+                        session = %self.session_id,
+                        lite_id = %msg.lite_id,
+                        client_epoch = msg.epoch,
+                        current_epoch = existing.current_epoch,
+                        "FORK DETECTED: client epoch is behind persisted epoch"
+                    );
+                    return Some(FencingDecision::Reject);
+                }
+
+                if msg.epoch > existing.current_epoch
+                    && let Err(e) = reg.fence(&msg.lite_id, msg.epoch)
+                {
+                    warn!(
+                        session = %self.session_id,
+                        lite_id = %msg.lite_id,
+                        error = %e,
+                        "sync handshake: registry.fence failed; rejecting as retryable"
+                    );
+                    return Some(FencingDecision::RejectTransient);
+                }
+
+                // Re-propose even when the requested epoch already matches the
+                // local row. A prior proposal may have failed after the local
+                // fence was persisted; the idempotent max-wins Raft entry must
+                // reach followers before this node accepts the retry.
+                if let Err(e) = crate::control::metadata_proposer::propose_sync_producer_fence(
+                    shared_ref.as_ref(),
+                    &msg.lite_id,
+                    msg.epoch,
+                ) {
+                    warn!(
+                        session = %self.session_id,
+                        lite_id = %msg.lite_id,
+                        error = %e,
+                        "sync handshake: propose_sync_producer_fence failed; rejecting as retryable"
+                    );
+                    return Some(FencingDecision::RejectTransient);
+                }
+
+                Some(FencingDecision::Accept {
+                    producer_id: existing.producer_id,
+                    accepted_epoch: msg.epoch,
+                })
             }
             // No registry available: no fencing decision — handshake proceeds.
             None => None,
@@ -449,6 +469,7 @@ impl SyncSession {
 
 #[cfg(test)]
 mod tests {
+    use super::producer_owner_matches;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -558,9 +579,20 @@ mod tests {
         let reg = open_registry(dir.path());
 
         // Simulate what durable_fencing_decision does for a new lite_id.
-        let r = reg.register("device-a", 1, 10, 0).unwrap();
+        let r = reg.register("device-a", 1, 99, 10, 0).unwrap();
         assert!(r.producer_id > 0);
         assert_eq!(r.current_epoch, 10);
+    }
+
+    #[test]
+    fn producer_owner_binding_rejects_cross_tenant_and_cross_user_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = open_registry(dir.path());
+        let registration = reg.register("owned-device", 7, 11, 1, 0).unwrap();
+
+        assert!(producer_owner_matches(&registration, 7, 11));
+        assert!(!producer_owner_matches(&registration, 8, 11));
+        assert!(!producer_owner_matches(&registration, 7, 12));
     }
 
     #[test]
@@ -568,7 +600,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reg = open_registry(dir.path());
 
-        let first = reg.register("device-b", 1, 5, 0).unwrap();
+        let first = reg.register("device-b", 1, 99, 5, 0).unwrap();
         let loaded = reg.get("device-b").unwrap().unwrap();
         assert_eq!(loaded.producer_id, first.producer_id);
         assert_eq!(loaded.current_epoch, 5);
@@ -579,7 +611,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reg = open_registry(dir.path());
 
-        let first = reg.register("device-c", 1, 3, 0).unwrap();
+        let first = reg.register("device-c", 1, 99, 3, 0).unwrap();
         reg.fence("device-c", 7).unwrap();
         let loaded = reg.get("device-c").unwrap().unwrap();
         assert_eq!(loaded.producer_id, first.producer_id);
@@ -591,7 +623,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reg = open_registry(dir.path());
 
-        reg.register("device-d", 1, 9, 0).unwrap();
+        reg.register("device-d", 1, 99, 9, 0).unwrap();
         let loaded = reg.get("device-d").unwrap().unwrap();
         // A client presenting epoch < current_epoch (9) must be rejected.
         assert!(

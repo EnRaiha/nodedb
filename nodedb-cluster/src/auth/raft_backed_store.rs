@@ -41,7 +41,8 @@ use async_trait::async_trait;
 use tracing::{error, warn};
 
 use crate::auth::token_state::{
-    JoinTokenLifecycle, JoinTokenState, SharedTokenStateMirror, TokenStateBackend, TokenStateError,
+    INFLIGHT_LEASE_DURATION_MS, InflightLease, JoinTokenLifecycle, JoinTokenState,
+    SharedTokenStateMirror, TokenStateBackend, TokenStateError,
 };
 use crate::decommission::coordinator::MetadataProposer;
 use crate::metadata_group::entry::{JoinTokenTransitionKind, MetadataEntry};
@@ -131,7 +132,8 @@ impl TokenStateBackend for RaftBackedTokenStore {
         &self,
         token_hash: &[u8; 32],
         node_addr: SocketAddr,
-    ) -> Result<(), TokenStateError> {
+    ) -> Result<InflightLease, TokenStateError> {
+        let lease = InflightLease::generate()?;
         // Pre-flight: check for terminal states before round-tripping Raft.
         if let Some(current) = self.read_state(token_hash) {
             match &current.lifecycle {
@@ -149,6 +151,7 @@ impl TokenStateBackend for RaftBackedTokenStore {
             *token_hash,
             JoinTokenTransitionKind::BeginInFlight {
                 node_addr: addr_str.clone(),
+                lease_id: lease.id,
             },
         )
         .await?;
@@ -159,9 +162,13 @@ impl TokenStateBackend for RaftBackedTokenStore {
         match self.read_state(token_hash) {
             None => Err(TokenStateError::NotFound),
             Some(s) => match &s.lifecycle {
-                JoinTokenLifecycle::InFlight { node_addr: winner } => {
-                    if *winner == node_addr {
-                        Ok(())
+                JoinTokenLifecycle::InFlight {
+                    node_addr: winner,
+                    lease_id,
+                    ..
+                } => {
+                    if *winner == node_addr && *lease_id == lease.id {
+                        Ok(lease)
                     } else {
                         Err(TokenStateError::InFlightConflict)
                     }
@@ -186,13 +193,17 @@ impl TokenStateBackend for RaftBackedTokenStore {
         &self,
         token_hash: &[u8; 32],
         node_addr: SocketAddr,
+        lease: InflightLease,
         _ts_ms: u64,
+        recovery_bundle: Vec<u8>,
     ) -> Result<(), TokenStateError> {
         let addr_str = node_addr.to_string();
         self.propose(
             *token_hash,
             JoinTokenTransitionKind::MarkConsumed {
                 node_addr: addr_str,
+                lease_id: lease.id,
+                recovery_bundle,
             },
         )
         .await?;
@@ -200,15 +211,27 @@ impl TokenStateBackend for RaftBackedTokenStore {
         match self.read_state(token_hash) {
             None => Err(TokenStateError::NotFound),
             Some(s) => match &s.lifecycle {
-                JoinTokenLifecycle::Consumed { .. } => Ok(()),
+                JoinTokenLifecycle::Consumed {
+                    node_addr: consumed_addr,
+                    lease_id,
+                    ..
+                } if *consumed_addr == node_addr && *lease_id == lease.id => Ok(()),
+                JoinTokenLifecycle::Consumed { .. } => Err(TokenStateError::AlreadyConsumed),
                 _ => Err(TokenStateError::InvalidTransition),
             },
         }
     }
 
-    async fn revert_inflight(&self, token_hash: &[u8; 32]) -> Result<(), TokenStateError> {
-        self.propose(*token_hash, JoinTokenTransitionKind::RevertInFlight)
-            .await?;
+    async fn revert_inflight(
+        &self,
+        token_hash: &[u8; 32],
+        lease: InflightLease,
+    ) -> Result<(), TokenStateError> {
+        self.propose(
+            *token_hash,
+            JoinTokenTransitionKind::RevertInFlight { lease_id: lease.id },
+        )
+        .await?;
 
         match self.read_state(token_hash) {
             None => Err(TokenStateError::NotFound),
@@ -254,7 +277,10 @@ pub fn apply_token_transition_to_mirror(
             });
         }
 
-        JoinTokenTransitionKind::BeginInFlight { node_addr } => {
+        JoinTokenTransitionKind::BeginInFlight {
+            node_addr,
+            lease_id,
+        } => {
             let Ok(parsed_addr) = node_addr.parse::<SocketAddr>() else {
                 error!(
                     token_hash = ?token_hash,
@@ -265,22 +291,45 @@ pub fn apply_token_transition_to_mirror(
             };
             if let Some(entry) = map.get_mut(&token_hash) {
                 match &entry.lifecycle {
+                    JoinTokenLifecycle::Issued if ts_ms > entry.expires_at_ms => {
+                        entry.lifecycle = JoinTokenLifecycle::Expired;
+                    }
                     JoinTokenLifecycle::Issued => {
                         entry.lifecycle = JoinTokenLifecycle::InFlight {
                             node_addr: parsed_addr,
+                            lease_id: *lease_id,
+                            lease_expires_at_ms: ts_ms.saturating_add(INFLIGHT_LEASE_DURATION_MS),
                         };
                         entry.attempt += 1;
                     }
                     JoinTokenLifecycle::InFlight {
                         node_addr: existing,
-                    } if *existing == parsed_addr => {
-                        // Idempotent: same node re-proposing.
+                        lease_id: existing_lease,
+                        ..
+                    } if *existing == parsed_addr && *existing_lease == *lease_id => {
+                        // Idempotent replay of the same committed proposal.
+                    }
+                    JoinTokenLifecycle::InFlight {
+                        lease_expires_at_ms,
+                        ..
+                    } if ts_ms >= *lease_expires_at_ms => {
+                        if ts_ms > entry.expires_at_ms {
+                            entry.lifecycle = JoinTokenLifecycle::Expired;
+                        } else {
+                            entry.lifecycle = JoinTokenLifecycle::InFlight {
+                                node_addr: parsed_addr,
+                                lease_id: *lease_id,
+                                lease_expires_at_ms: ts_ms
+                                    .saturating_add(INFLIGHT_LEASE_DURATION_MS),
+                            };
+                            entry.attempt += 1;
+                        }
                     }
                     other => {
                         error!(
                             token_hash = ?token_hash,
                             ?other,
-                            "apply BeginInFlight: unexpected lifecycle — log corruption?"
+                            "apply BeginInFlight: active or terminal lifecycle rejected"
                         );
                     }
                 }
@@ -292,7 +341,11 @@ pub fn apply_token_transition_to_mirror(
             }
         }
 
-        JoinTokenTransitionKind::MarkConsumed { node_addr } => {
+        JoinTokenTransitionKind::MarkConsumed {
+            node_addr,
+            lease_id,
+            recovery_bundle,
+        } => {
             let Ok(parsed_addr) = node_addr.parse::<SocketAddr>() else {
                 error!(
                     token_hash = ?token_hash,
@@ -303,10 +356,15 @@ pub fn apply_token_transition_to_mirror(
             };
             if let Some(entry) = map.get_mut(&token_hash) {
                 match &entry.lifecycle {
-                    JoinTokenLifecycle::InFlight { .. } => {
+                    JoinTokenLifecycle::InFlight {
+                        lease_id: active_lease,
+                        ..
+                    } if *active_lease == *lease_id => {
                         entry.lifecycle = JoinTokenLifecycle::Consumed {
                             node_addr: parsed_addr,
+                            lease_id: *lease_id,
                             ts_ms,
+                            recovery_bundle: recovery_bundle.clone(),
                         };
                     }
                     JoinTokenLifecycle::Consumed { .. } => {
@@ -325,10 +383,13 @@ pub fn apply_token_transition_to_mirror(
             }
         }
 
-        JoinTokenTransitionKind::RevertInFlight => {
+        JoinTokenTransitionKind::RevertInFlight { lease_id } => {
             if let Some(entry) = map.get_mut(&token_hash) {
                 match &entry.lifecycle {
-                    JoinTokenLifecycle::InFlight { .. } => {
+                    JoinTokenLifecycle::InFlight {
+                        lease_id: active_lease,
+                        ..
+                    } if *active_lease == *lease_id => {
                         entry.lifecycle = JoinTokenLifecycle::Issued;
                     }
                     JoinTokenLifecycle::Issued => {
@@ -448,8 +509,11 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9100".parse().unwrap();
 
         store.register(issued_state(hash, far_future_ms())).await;
-        store.begin_inflight(&hash, addr).await.unwrap();
-        store.mark_consumed(&hash, addr, epoch_ms()).await.unwrap();
+        let lease = store.begin_inflight(&hash, addr).await.unwrap();
+        store
+            .mark_consumed(&hash, addr, lease, epoch_ms(), vec![1])
+            .await
+            .unwrap();
 
         let s = store.get(&hash).unwrap();
         assert!(matches!(s.lifecycle, JoinTokenLifecycle::Consumed { .. }));
@@ -462,13 +526,78 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9101".parse().unwrap();
 
         store.register(issued_state(hash, far_future_ms())).await;
-        store.begin_inflight(&hash, addr).await.unwrap();
-        store.mark_consumed(&hash, addr, epoch_ms()).await.unwrap();
+        let lease = store.begin_inflight(&hash, addr).await.unwrap();
+        store
+            .mark_consumed(&hash, addr, lease, epoch_ms(), Vec::new())
+            .await
+            .unwrap();
 
         assert_eq!(
             store.begin_inflight(&hash, addr).await.unwrap_err(),
             TokenStateError::AlreadyConsumed
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_address_acquisition_has_one_owner() {
+        let (store, _mirror) = make_store();
+        let hash = [0xA7u8; 32];
+        let addr: SocketAddr = "127.0.0.1:9107".parse().unwrap();
+        store.register(issued_state(hash, far_future_ms())).await;
+
+        let (first, second) = tokio::join!(
+            store.begin_inflight(&hash, addr),
+            store.begin_inflight(&hash, addr)
+        );
+        let successes = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        assert_eq!(successes, 1, "exactly one issuance attempt owns the token");
+        let failure = first.err().or_else(|| second.err()).unwrap();
+        assert_eq!(failure, TokenStateError::InFlightConflict);
+    }
+
+    #[test]
+    fn expired_committed_inflight_lease_is_replaced_after_restart() {
+        let mirror: SharedTokenStateMirror = Arc::new(Mutex::new(HashMap::new()));
+        let hash = [0xA8; 32];
+        let first_lease = [0x11; 16];
+        let replacement_lease = [0x22; 16];
+        apply_token_transition_to_mirror(
+            &mirror,
+            hash,
+            &JoinTokenTransitionKind::Register {
+                expires_at_ms: 1_000_000,
+            },
+            100,
+        );
+        apply_token_transition_to_mirror(
+            &mirror,
+            hash,
+            &JoinTokenTransitionKind::BeginInFlight {
+                node_addr: "127.0.0.1:9108".into(),
+                lease_id: first_lease,
+            },
+            100,
+        );
+        apply_token_transition_to_mirror(
+            &mirror,
+            hash,
+            &JoinTokenTransitionKind::BeginInFlight {
+                node_addr: "127.0.0.1:9109".into(),
+                lease_id: replacement_lease,
+            },
+            100 + INFLIGHT_LEASE_DURATION_MS,
+        );
+
+        let state = mirror.lock().unwrap().get(&hash).cloned().unwrap();
+        assert!(matches!(
+            state.lifecycle,
+            JoinTokenLifecycle::InFlight {
+                node_addr,
+                lease_id,
+                ..
+            } if node_addr == "127.0.0.1:9109".parse::<SocketAddr>().unwrap() && lease_id == replacement_lease
+        ));
+        assert_eq!(state.attempt, 2);
     }
 
     #[tokio::test]
@@ -478,8 +607,8 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:9102".parse().unwrap();
 
         store.register(issued_state(hash, far_future_ms())).await;
-        store.begin_inflight(&hash, addr).await.unwrap();
-        store.revert_inflight(&hash).await.unwrap();
+        let lease = store.begin_inflight(&hash, addr).await.unwrap();
+        store.revert_inflight(&hash, lease).await.unwrap();
 
         let s = store.get(&hash).unwrap();
         assert_eq!(s.lifecycle, JoinTokenLifecycle::Issued);
@@ -501,9 +630,9 @@ mod tests {
         let proposer_a = MirroringProposer::new(mirror.clone());
         let store_a = RaftBackedTokenStore::new(proposer_a, mirror.clone());
         store_a.register(issued_state(hash, far_future_ms())).await;
-        store_a.begin_inflight(&hash, addr_a).await.unwrap();
+        let lease = store_a.begin_inflight(&hash, addr_a).await.unwrap();
         store_a
-            .mark_consumed(&hash, addr_a, epoch_ms())
+            .mark_consumed(&hash, addr_a, lease, epoch_ms(), Vec::new())
             .await
             .unwrap();
 
@@ -528,13 +657,17 @@ mod tests {
         let proposer = MirroringProposer::new(mirror.clone());
         let store = RaftBackedTokenStore::new(proposer, mirror.clone());
         store.register(issued_state(hash, far_future_ms())).await;
-        store.begin_inflight(&hash, addr).await.unwrap();
-        store.mark_consumed(&hash, addr, epoch_ms()).await.unwrap();
+        let lease = store.begin_inflight(&hash, addr).await.unwrap();
+        store
+            .mark_consumed(&hash, addr, lease, epoch_ms(), vec![7, 8])
+            .await
+            .unwrap();
 
         // "Crash": create a fresh mirror and replay the committed log entries.
         let fresh_mirror: SharedTokenStateMirror = Arc::new(Mutex::new(HashMap::new()));
         // Simulate log replay: Register → BeginInFlight → MarkConsumed.
         let ts = epoch_ms();
+        let replay_lease = [0x5a; 16];
         apply_token_transition_to_mirror(
             &fresh_mirror,
             hash,
@@ -548,6 +681,7 @@ mod tests {
             hash,
             &JoinTokenTransitionKind::BeginInFlight {
                 node_addr: addr.to_string(),
+                lease_id: replay_lease,
             },
             ts,
         );
@@ -556,6 +690,8 @@ mod tests {
             hash,
             &JoinTokenTransitionKind::MarkConsumed {
                 node_addr: addr.to_string(),
+                lease_id: replay_lease,
+                recovery_bundle: vec![7, 8],
             },
             ts,
         );
@@ -584,8 +720,11 @@ mod tests {
                 attempt: 0,
             })
             .await;
-        store.begin_inflight(&hash, addr).await.unwrap();
-        store.mark_consumed(&hash, addr, epoch_ms()).await.unwrap();
+        let lease = store.begin_inflight(&hash, addr).await.unwrap();
+        store
+            .mark_consumed(&hash, addr, lease, epoch_ms(), Vec::new())
+            .await
+            .unwrap();
         assert!(matches!(
             store.get(&hash).unwrap().lifecycle,
             JoinTokenLifecycle::Consumed { .. }

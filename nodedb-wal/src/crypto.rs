@@ -223,6 +223,21 @@ impl WalEncryptionKey {
         self.key.as_bytes()
     }
 
+    /// Derive a domain-separated application subkey without exposing the WAL
+    /// encryption key itself. The result is stable across process lifetimes
+    /// for the same configured key and deliberately excludes the random WAL
+    /// nonce epoch.
+    pub fn derive_subkey(&self, domain: &[u8]) -> Result<[u8; 32]> {
+        let hkdf =
+            hkdf::Hkdf::<sha2::Sha256>::new(Some(b"nodedb-wal-subkey-v1"), self.key.as_bytes());
+        let mut output = [0u8; 32];
+        hkdf.expand(domain, &mut output)
+            .map_err(|_| WalError::EncryptionError {
+                detail: "WAL subkey derivation failed".into(),
+            })?;
+        Ok(output)
+    }
+
     /// Decrypt a payload. Input is ciphertext + auth_tag (16 bytes at end).
     ///
     /// - `epoch`: must be the epoch that was used during encryption, read from
@@ -343,6 +358,11 @@ impl KeyRing {
     /// Get the current key (for encryption operations).
     pub fn current(&self) -> &WalEncryptionKey {
         &self.current
+    }
+
+    /// Previous key retained during an in-progress rotation.
+    pub fn previous(&self) -> Option<&WalEncryptionKey> {
+        self.previous.as_ref()
     }
 
     /// Whether a previous key is present (rotation in progress).

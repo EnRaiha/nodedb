@@ -224,6 +224,7 @@ fn creds_signed_by(
         crls: Vec::new(),
         cluster_secret,
         spki_pin,
+        bootstrap_peer_spki: None,
     }
 }
 
@@ -363,6 +364,7 @@ async fn l2_mismatched_mac_key_rejects_rpcs() {
         crls: Vec::new(),
         cluster_secret: [0xAAu8; 32],
         spki_pin: client_spki_pin,
+        bootstrap_peer_spki: None,
     };
     // Deliberately mismatched cluster secrets.
     server_creds.cluster_secret = [0x55u8; 32];
@@ -501,6 +503,7 @@ fn debug_on_transport_credentials_redacts() {
         crls: Vec::new(),
         cluster_secret: [0xAB; 32],
         spki_pin: [0u8; 32],
+        bootstrap_peer_spki: None,
     };
     let tc = TransportCredentials::Mtls(creds);
     let s = format!("{tc:?}");

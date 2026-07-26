@@ -4,13 +4,10 @@
 //!
 //! ## What this guards
 //!
-//! Loro CRDT deltas are commutative: once a delta from a peer is imported
-//! into the tenant document, it cannot be un-imported — the merge already
-//! happened. Constraint enforcement therefore runs *after* import, as a
-//! post-hoc validation pass, and a violation cannot roll back the merge.
-//! What it CAN do is tell the client precisely what went wrong so the edge
-//! can compensate (regenerate the value, prompt the user, etc.) and make
-//! sure the offending row is quarantined rather than silently accepted.
+//! Peer deltas are imported into a detached candidate and constraint-checked
+//! before that candidate can replace authoritative state. A violation must
+//! leave the existing state untouched while telling the edge precisely how to
+//! compensate (regenerate the value, prompt the user, etc.).
 //!
 //! This test drives the sync WebSocket end-to-end: a delta that violates a
 //! UNIQUE(email) constraint must come back as a `DeltaReject` carrying a
