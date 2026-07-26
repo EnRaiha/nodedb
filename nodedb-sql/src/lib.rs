@@ -40,7 +40,7 @@ pub use visitor::plan_visitor::args::*;
 pub use catalog::{SqlCatalog, SqlCatalogError};
 pub use error::{Result, SqlError};
 pub use params::ParamValue;
-pub use placeholder_types::infer_placeholder_types;
+pub use placeholder_types::{InferredParamType, infer_placeholder_types};
 pub use types::*;
 
 /// Parse a standalone SQL expression string into an `SqlExpr`.

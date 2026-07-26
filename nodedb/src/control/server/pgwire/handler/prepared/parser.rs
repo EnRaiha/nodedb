@@ -60,10 +60,11 @@ fn ddl_col_type_to_pg(ty: &DdlColType) -> Type {
 /// in `ParameterDescription`, or `None` when no faithful wire type exists.
 ///
 /// Reuses the two established hops — `sql_data_type_to_ddl_col_type_with_width`
-/// then [`ddl_col_type_to_pg`] — rather than introducing a third mapping.
-/// `None` is passed for the integer width because a placeholder has no
-/// catalog column behind it in this pass; a follow-up that resolves
-/// column-backed positions supplies the column's declared `IntWidth` here.
+/// then [`ddl_col_type_to_pg`] — rather than introducing a third mapping. The
+/// declared integer width travels with the inferred type so a column declared
+/// `INT` is advertised as int4 (oid 23), not int8: the client encodes its bind
+/// value at exactly the width described, and a 4-byte column behind an 8-byte
+/// promise is a decode failure.
 ///
 /// # Why some variants are refused
 ///
@@ -75,11 +76,11 @@ fn ddl_col_type_to_pg(ty: &DdlColType) -> Type {
 /// `Decimal`/`Uuid` that the server wants TEXT — a client-side `WrongType`
 /// failure where `Unknown` would have worked. They stay unresolved until
 /// each has a real wire type.
-fn inferred_param_type(ty: &nodedb_sql::types_expr::SqlDataType) -> Option<Type> {
+fn inferred_param_type(inferred: &nodedb_sql::InferredParamType) -> Option<Type> {
     use crate::control::server::response_shape::schema::sql_data_type_to_ddl_col_type_with_width;
     use nodedb_sql::types_expr::SqlDataType;
 
-    match ty {
+    match &inferred.data_type {
         SqlDataType::Int64
         | SqlDataType::Float64
         | SqlDataType::String
@@ -87,7 +88,7 @@ fn inferred_param_type(ty: &nodedb_sql::types_expr::SqlDataType) -> Option<Type>
         | SqlDataType::Bytes
         | SqlDataType::Timestamp
         | SqlDataType::Timestamptz => Some(ddl_col_type_to_pg(
-            &sql_data_type_to_ddl_col_type_with_width(ty, None),
+            &sql_data_type_to_ddl_col_type_with_width(&inferred.data_type, inferred.int_width),
         )),
         SqlDataType::Decimal
         | SqlDataType::Uuid
@@ -134,9 +135,13 @@ impl NodeDbQueryParser {
     /// for SQL the planner cannot plan — because inference reads only the SQL
     /// text: whether planning succeeded has no bearing on it, and letting the
     /// advertised parameter types depend on that would be arbitrary.
-    fn param_types_with_inference(sql: &str, client_types: &[Option<Type>]) -> Vec<Option<Type>> {
+    fn param_types_with_inference(
+        sql: &str,
+        client_types: &[Option<Type>],
+        catalog: &dyn nodedb_sql::SqlCatalog,
+    ) -> Vec<Option<Type>> {
         let mut param_types = Self::placeholder_types(sql, client_types);
-        Self::fill_inferred_param_types(sql, &mut param_types);
+        Self::fill_inferred_param_types(sql, catalog, &mut param_types);
         param_types
     }
 
@@ -151,8 +156,12 @@ impl NodeDbQueryParser {
     /// below rewrites `$N` to `NULL` before planning (the resolver cannot
     /// typecheck a bare placeholder), which erases the position → type link,
     /// so this must happen before that rewrite and independently of it.
-    fn fill_inferred_param_types(sql: &str, param_types: &mut Vec<Option<Type>>) {
-        let inferred = nodedb_sql::infer_placeholder_types(sql);
+    fn fill_inferred_param_types(
+        sql: &str,
+        catalog: &dyn nodedb_sql::SqlCatalog,
+        param_types: &mut Vec<Option<Type>>,
+    ) {
+        let inferred = nodedb_sql::infer_placeholder_types(sql, catalog);
         if inferred.len() > param_types.len() {
             param_types.resize(inferred.len(), None);
         }
@@ -228,30 +237,40 @@ impl NodeDbQueryParser {
         Ok(true)
     }
 
-    /// Infer parameter and result types using nodedb-sql catalog, scoped to
-    /// the connecting user's tenant so a tenant-N user's Parse message
-    /// resolves against tenant-N's catalog (not tenant 1).
-    fn try_infer_types(
+    /// The tenant-scoped catalog a single Parse message resolves against, so a
+    /// tenant-N user's statement sees tenant-N's collections (not tenant 1).
+    ///
+    /// Built once per Parse and shared by both consumers — parameter-type
+    /// inference and schema planning — so the two can never disagree about
+    /// what a name resolves to.
+    fn build_catalog(
         &self,
-        sql: &str,
-        client_types: &[Option<Type>],
         tenant_id: u64,
         database_id: crate::types::DatabaseId,
-    ) -> (Vec<Option<Type>>, Vec<FieldInfo>) {
-        let catalog = crate::control::planner::catalog_adapter::OriginCatalog::new(
+    ) -> crate::control::planner::catalog_adapter::OriginCatalog {
+        crate::control::planner::catalog_adapter::OriginCatalog::new(
             Arc::clone(&self.state.credentials),
             tenant_id,
             database_id,
             Some(Arc::clone(&self.state.retention_policy_registry)),
-        );
+        )
+    }
 
+    /// Infer parameter and result types using the nodedb-sql catalog.
+    fn try_infer_types(
+        &self,
+        sql: &str,
+        client_types: &[Option<Type>],
+        catalog: &crate::control::planner::catalog_adapter::OriginCatalog,
+        database_id: crate::types::DatabaseId,
+    ) -> (Vec<Option<Type>>, Vec<FieldInfo>) {
         // Placeholder *counting* runs unconditionally so an unplannable SQL
         // string (e.g. `WHERE id = $1` where the planner needs bound params
         // to typecheck) still reports the right number of parameter slots in
         // Describe. Type inference then fills the slots the client left
         // undeclared, from the SQL alone — it is independent of the planning
         // pass below and survives that pass failing.
-        let param_types = Self::param_types_with_inference(sql, client_types);
+        let param_types = Self::param_types_with_inference(sql, client_types, catalog);
 
         // Strip RETURNING from DML before passing to DataFusion. Retain the
         // parsed spec so we can build result fields for Describe.
@@ -270,7 +289,7 @@ impl NodeDbQueryParser {
         // for this planning pass. Execution re-plans with real bound
         // values.
         let sql_for_inference = substitute_placeholders_with_null(&sql_stripped);
-        let plans = match nodedb_sql::plan_sql(&sql_for_inference, &catalog) {
+        let plans = match nodedb_sql::plan_sql(&sql_for_inference, catalog) {
             Ok(p) => p,
             Err(_) => return (param_types, Vec::new()),
         };
@@ -278,7 +297,7 @@ impl NodeDbQueryParser {
         // When the original SQL had a RETURNING clause on a DML statement,
         // build result fields from the collection schema and the RETURNING spec.
         if let Some(spec) = returning_spec
-            && let Some(fields) = result_fields_for_returning(&spec, plans.first(), &catalog)
+            && let Some(fields) = result_fields_for_returning(&spec, plans.first(), catalog)
         {
             return (param_types, fields);
         }
@@ -292,7 +311,7 @@ impl NodeDbQueryParser {
         let output_schema =
             crate::control::planner::sql_plan_convert::output_schema::build_output_schema(
                 &plans,
-                &catalog,
+                catalog,
                 database_id,
             );
         let result_fields: Vec<FieldInfo> = output_schema
@@ -356,10 +375,18 @@ impl QueryParser for NodeDbQueryParser {
         let can_infer_schema = self
             .authorize_plannable_sql(sql, &identity, database_id, &emitter)
             .await?;
+        // One catalog per Parse, shared by parameter-type inference and schema
+        // planning. The unplannable branch still needs it: inference resolves
+        // `WHERE col = $1` from the catalog whether or not the statement as a
+        // whole could be planned.
+        let catalog = self.build_catalog(identity.tenant_id.as_u64(), database_id);
         let (param_types, result_fields) = if can_infer_schema {
-            self.try_infer_types(sql, types, identity.tenant_id.as_u64(), database_id)
+            self.try_infer_types(sql, types, &catalog, database_id)
         } else {
-            (Self::param_types_with_inference(sql, types), Vec::new())
+            (
+                Self::param_types_with_inference(sql, types, &catalog),
+                Vec::new(),
+            )
         };
 
         // If type inference produced no result fields and the SQL matches a

@@ -193,3 +193,30 @@ pub(super) fn result_fields_for_returning(
     };
     Some(fields)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_placeholders_basic() {
+        assert_eq!(count_placeholders("SELECT $1, $2, $3"), 3);
+        assert_eq!(count_placeholders("SELECT 1"), 0);
+        assert_eq!(count_placeholders("WHERE id = $1 AND name = $1"), 1);
+    }
+
+    #[test]
+    fn count_placeholders_malformed_body_unaffected() {
+        assert_eq!(count_placeholders("SELECT $"), 0);
+        assert_eq!(count_placeholders("SELECT $abc"), 0);
+    }
+
+    #[test]
+    fn count_placeholders_bounded_against_absurd_index() {
+        // Must not attempt a `Vec` sized off an attacker-controlled index
+        // downstream — the shared scanner refuses to track it at all.
+        assert_eq!(count_placeholders("SELECT $99999999999999"), 0);
+        assert_eq!(count_placeholders("SELECT $65536"), 0);
+        assert_eq!(count_placeholders("SELECT $65535"), 65535);
+    }
+}

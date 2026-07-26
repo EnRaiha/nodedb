@@ -940,31 +940,144 @@ async fn extended_query_client_declared_param_type_wins_over_inference() {
     assert_eq!(rows.len(), 2);
 }
 
-/// Under-inference boundary: a column-backed position (`WHERE col = $1`)
-/// needs a catalog lookup this pass deliberately does not perform, so it must
-/// still be described as unknown — never guessed. Reporting a wrong concrete
-/// oid would make the client commit to a binary encoding the server cannot
-/// decode; unknown degrades to text format, which already works.
+/// **The headline regression lock.** A plain `client.query` with a bound
+/// `i64` and NO `prepare_typed`, NO cast — the exact call that used to fail
+/// client-side with `WrongType { postgres: Unknown, rust: "i64" }` because
+/// Describe answered oid 0 for the column-backed `$1`.
+///
+/// `tokio-postgres` refuses to serialize an `i64` against an unknown oid, so
+/// this fails before a byte reaches the server unless the parameter is
+/// resolved from the catalog column behind `big`.
 #[tokio::test]
-async fn extended_query_column_backed_param_stays_unknown() {
+async fn extended_query_plain_parameterised_select_binds_i64() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION t (id STRING PRIMARY KEY, big BIGINT) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    for (id, big) in [("a", 41), ("b", 42), ("c", 43)] {
+        server
+            .exec(&format!("INSERT INTO t (id, big) VALUES ('{id}', {big})"))
+            .await
+            .unwrap();
+    }
+
+    let rows = server
+        .client
+        .query("SELECT id FROM t WHERE big = $1", &[&42i64])
+        .await
+        .expect("a bare parameterised query with an i64 bind must succeed");
+
+    assert_eq!(rows.len(), 1, "expected exactly the row with big = 42");
+    assert_eq!(rows[0].get::<_, &str>("id"), "b");
+}
+
+/// Width fidelity: a column declared `INT` must be described as `int4`
+/// (oid 23), not `int8` (oid 20). The client encodes the bind value at
+/// exactly the described width, so collapsing every integer column to int8
+/// would put a 4-byte column behind an 8-byte promise.
+#[tokio::test]
+async fn extended_query_int_column_param_reports_int4() {
     let server = TestServer::start().await;
     server
         .exec("CREATE COLLECTION t (id STRING PRIMARY KEY, n INT) WITH (engine='document_strict')")
         .await
         .unwrap();
-    server
-        .exec("INSERT INTO t (id, n) VALUES ('a', 1)")
-        .await
-        .unwrap();
+    for (id, n) in [("a", 1), ("b", 2), ("c", 3)] {
+        server
+            .exec(&format!("INSERT INTO t (id, n) VALUES ('{id}', {n})"))
+            .await
+            .unwrap();
+    }
 
     let stmt = server
         .client
         .prepare("SELECT id FROM t WHERE n = $1")
         .await
+        .expect("prepare without declared param types should succeed");
+    assert_eq!(
+        stmt.params(),
+        &[Type::INT4],
+        "an INT column's parameter must report int4, got {:?}",
+        stmt.params()
+    );
+
+    let rows = server
+        .client
+        .query(&stmt, &[&2i32])
+        .await
+        .expect("an i32 must be bindable against the inferred int4 parameter");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("id"), "b");
+}
+
+/// A client-declared type is the client's contract and outranks the
+/// catalog-backed inference too: declaring `int8` for a position inference
+/// would have called `int4` keeps `int8` in the ParameterDescription.
+#[tokio::test]
+async fn extended_query_client_declared_type_wins_over_column_inference() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION t (id STRING PRIMARY KEY, n INT) WITH (engine='document_strict')")
+        .await
+        .unwrap();
+    for (id, n) in [("a", 1), ("b", 2), ("c", 3)] {
+        server
+            .exec(&format!("INSERT INTO t (id, n) VALUES ('{id}', {n})"))
+            .await
+            .unwrap();
+    }
+
+    let stmt = server
+        .client
+        .prepare_typed("SELECT id FROM t WHERE n = $1", &[Type::INT8])
+        .await
+        .expect("prepare_typed should succeed");
+    assert_eq!(
+        stmt.params(),
+        &[Type::INT8],
+        "client-declared int8 must not be overwritten by the inferred int4"
+    );
+
+    let rows = server
+        .client
+        .query(&stmt, &[&2i64])
+        .await
+        .expect("binary i64 must decode against the declared int8 parameter");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("id"), "b");
+}
+
+/// Under-inference boundary: a position no listed form types — here a bare
+/// projection `$1`, which has no column behind it — must still be described
+/// as unknown rather than guessed, and must still work over the text format
+/// the client falls back to. Reporting a wrong concrete oid would make the
+/// client commit to a binary encoding the server cannot decode; unknown
+/// degrades gracefully.
+#[tokio::test]
+async fn extended_query_unresolvable_param_stays_unknown_and_still_works() {
+    let server = TestServer::start().await;
+
+    let stmt = server
+        .client
+        .prepare("SELECT $1 AS v")
+        .await
         .expect("prepare should succeed");
     assert_eq!(
         stmt.params(),
         &[Type::UNKNOWN],
-        "column-backed parameter must stay unknown until catalog-backed inference lands"
+        "a projection position is not a form inference types, got {:?}",
+        stmt.params()
     );
+
+    let rows = server
+        .client
+        .query(&stmt, &[&"passthrough"])
+        .await
+        .expect("an unknown parameter must still bind in text format");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("v"), "passthrough");
 }

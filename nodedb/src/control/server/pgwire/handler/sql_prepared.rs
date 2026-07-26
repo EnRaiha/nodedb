@@ -363,6 +363,17 @@ mod tests {
     }
 
     #[test]
+    fn count_placeholders_bounded_against_absurd_index() {
+        // A hostile index parses fine as a usize but must never be reported
+        // as a real parameter count — the caller sizes a Vec off this value.
+        assert_eq!(count_placeholders("SELECT $99999999999999"), 0);
+        // Just above the pgwire Int16 parameter-count ceiling.
+        assert_eq!(count_placeholders("SELECT $65536"), 0);
+        // The boundary itself is still a legitimate placeholder.
+        assert_eq!(count_placeholders("SELECT $65535"), 65535);
+    }
+
+    #[test]
     fn substitute_params() {
         let sql = "SELECT * FROM users WHERE id = $1 AND name = $2";
         let values = vec!["42".to_string(), "alice".to_string()];
