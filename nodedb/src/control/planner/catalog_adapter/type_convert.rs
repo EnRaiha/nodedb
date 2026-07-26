@@ -61,7 +61,12 @@ pub(super) fn convert_collection_type(
                     nullable: true,
                     is_primary_key: false,
                     default: None,
-                    raw_type: None,
+                    // Mirrors the columnar branch below: the raw declared
+                    // type string is the only place the wire-width refiner
+                    // (`sql_data_type_to_ddl_col_type_with_raw`) can recover
+                    // `SMALLINT`/`INT4` vs `BIGINT` — `parse_type_str`
+                    // collapses all of them to the same `SqlDataType::Int64`.
+                    raw_type: Some(type_str.clone()),
                 });
             }
             (EngineType::DocumentSchemaless, columns, Some(pk_name))
@@ -180,7 +185,7 @@ fn parse_type_str(s: &str) -> SqlDataType {
         return SqlDataType::Decimal;
     }
     match upper.as_str() {
-        "INT" | "INTEGER" | "INT4" | "INT8" | "BIGINT" => SqlDataType::Int64,
+        "INT" | "INTEGER" | "INT4" | "INT8" | "BIGINT" | "SMALLINT" | "INT2" => SqlDataType::Int64,
         "FLOAT" | "FLOAT4" | "FLOAT8" | "FLOAT64" | "DOUBLE" | "REAL" => SqlDataType::Float64,
         "BOOL" | "BOOLEAN" => SqlDataType::Bool,
         "BYTES" | "BYTEA" | "BLOB" => SqlDataType::Bytes,
@@ -193,8 +198,22 @@ fn parse_type_str(s: &str) -> SqlDataType {
 mod tests {
     use nodedb_types::CollectionType;
 
-    use super::{SqlDataType, convert_collection_type};
+    use super::{SqlDataType, convert_collection_type, parse_type_str};
     use crate::control::security::catalog::StoredCollection;
+
+    /// `SMALLINT`/`INT2` are valid PostgreSQL wire-width integer keywords
+    /// (issue #217) that must resolve to the same `SqlDataType::Int64` arm as
+    /// `INT`/`INTEGER`/`INT4`/`INT8`/`BIGINT` — previously they were unlisted
+    /// and fell through to the `_ => SqlDataType::String` default, which is
+    /// what produced the wire OID 25 (text) bug for `SMALLINT` columns.
+    #[test]
+    fn parse_type_str_smallint_and_int2_map_to_int64() {
+        assert_eq!(parse_type_str("SMALLINT"), SqlDataType::Int64);
+        assert_eq!(parse_type_str("INT2"), SqlDataType::Int64);
+        // Case-insensitivity, matching every other arm in this function.
+        assert_eq!(parse_type_str("smallint"), SqlDataType::Int64);
+        assert_eq!(parse_type_str("int2"), SqlDataType::Int64);
+    }
 
     /// A columnar (or spatial, which shares the same non-timeseries
     /// synthetic-PK path) collection whose DDL declares an explicit

@@ -20,7 +20,7 @@ use nodedb_sql::types_expr::SqlExpr;
 use super::lateral::collection_name_from_plan;
 use super::output_schema_types::{infer_aggregate_type, infer_computed_expr_type};
 use crate::control::server::response_shape::schema::{
-    OutputColumn, OutputSchema, sql_data_type_to_ddl_col_type,
+    OutputColumn, OutputSchema, sql_data_type_to_ddl_col_type_with_raw,
 };
 use crate::control::server::response_shape::types::DdlColType;
 
@@ -94,7 +94,12 @@ fn column_types_for<C: SqlCatalog>(
         Ok(Some(info)) => info
             .columns
             .iter()
-            .map(|c| (c.name.clone(), sql_data_type_to_ddl_col_type(&c.data_type)))
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    sql_data_type_to_ddl_col_type_with_raw(&c.data_type, c.raw_type.as_deref()),
+                )
+            })
             .collect(),
         _ => HashMap::new(),
     }
@@ -173,7 +178,7 @@ fn ordered_columns_for<C: SqlCatalog>(
             .map(|c| OutputColumn {
                 display_name: c.name.clone(),
                 lookup_key: c.name.clone(),
-                ty: sql_data_type_to_ddl_col_type(&c.data_type),
+                ty: sql_data_type_to_ddl_col_type_with_raw(&c.data_type, c.raw_type.as_deref()),
             })
             .collect(),
         _ => Vec::new(),

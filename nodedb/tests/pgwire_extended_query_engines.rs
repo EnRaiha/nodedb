@@ -194,10 +194,13 @@ async fn extended_query_columnar_typed_scan() {
     let id: &str = rows[0].get("id");
     assert_eq!(id, "r1");
 
-    // RowDescription: id→TEXT(25), n→INT8(20), score→FLOAT8(701), flag→BOOL(16), label→TEXT(25).
+    // RowDescription: id→TEXT(25), n→INT4(23), score→FLOAT8(701), flag→BOOL(16), label→TEXT(25).
+    // `n` is declared `INT` in the DDL above, which is the INT4 alias — issue
+    // #217 fixed this column advertising OID 20 (int8) for every declared
+    // integer width; it now correctly narrows to OID 23 (int4).
     let expected: &[(&str, u32)] = &[
         ("id", 25),
-        ("n", 20),
+        ("n", 23),
         ("score", 701),
         ("flag", 16),
         ("label", 25),

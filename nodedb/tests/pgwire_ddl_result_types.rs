@@ -27,6 +27,8 @@ use tokio::net::TcpStream;
 /// PostgreSQL built-in type OIDs (stable, wire-level constants).
 const OID_TEXT: u32 = 25;
 const OID_INT8: u32 = 20;
+const OID_INT4: u32 = 23;
+const OID_INT2: u32 = 21;
 
 /// A decoded simple-query result: the `RowDescription` columns as
 /// `(name, type_oid)` pairs, plus each `DataRow`'s fields as raw text
@@ -260,5 +262,85 @@ async fn show_collections_row_description_preserves_int8_column() {
     assert!(
         created_at.parse::<i64>().is_ok(),
         "created_at INT8 value must round-trip as a decimal integer, got {created_at:?}"
+    );
+}
+
+/// Upstream issue #217 repro: integer OID wire fidelity. A schemaless
+/// `CREATE COLLECTION` (no `WITH (engine=...)` clause) declaring every
+/// PostgreSQL integer width — `INT`, `INTEGER`, `INT4`, `BIGINT`, `INT8`,
+/// `SMALLINT`, `INT2` — must advertise each column's *own* wire OID in
+/// `RowDescription`: 23 (int4) for the 4-byte aliases, 20 (int8) for the
+/// 8-byte aliases, 21 (int2) for the 2-byte aliases. Before the fix, every
+/// declared width collapsed to `SqlDataType::Int64`'s single wire mapping —
+/// `INT`/`INTEGER`/`INT4`/`BIGINT`/`INT8` all rendered as OID 20 (int8), and
+/// `SMALLINT`/`INT2` (unlisted in the type-string parser) fell through to
+/// the `String` default and rendered as OID 25 (text) instead of an integer
+/// OID at all.
+#[tokio::test]
+async fn create_collection_int_widths_preserve_wire_oids() {
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION fixprobe_ints (\
+                id TEXT PRIMARY KEY, \
+                a INT, \
+                b INTEGER, \
+                c INT4, \
+                d BIGINT, \
+                e INT8, \
+                f SMALLINT, \
+                g INT2\
+             )",
+        )
+        .await
+        .expect("CREATE COLLECTION fixprobe_ints must succeed");
+    server
+        .exec(
+            "INSERT INTO fixprobe_ints (id, a, b, c, d, e, f, g) \
+             VALUES ('r1', 1, 2, 3, 4, 5, 6, 7)",
+        )
+        .await
+        .expect("INSERT fixprobe_ints must succeed");
+
+    let res = raw_simple_query(
+        server.pg_port,
+        "SELECT id, a, b, c, d, e, f, g FROM fixprobe_ints",
+    )
+    .await;
+
+    let expected = vec![
+        ("id".to_string(), OID_TEXT),
+        ("a".to_string(), OID_INT4),
+        ("b".to_string(), OID_INT4),
+        ("c".to_string(), OID_INT4),
+        ("d".to_string(), OID_INT8),
+        ("e".to_string(), OID_INT8),
+        ("f".to_string(), OID_INT2),
+        ("g".to_string(), OID_INT2),
+    ];
+    assert_eq!(
+        res.columns, expected,
+        "fixprobe_ints RowDescription (name, OID) must preserve each declared \
+         integer width — INT/INTEGER/INT4 -> int4 (23), BIGINT/INT8 -> int8 (20), \
+         SMALLINT/INT2 -> int2 (21)"
+    );
+
+    let row = res
+        .rows
+        .first()
+        .unwrap_or_else(|| panic!("expected 1 row, got: {:?}", res.rows));
+    assert_eq!(
+        row,
+        &vec![
+            Some("r1".to_string()),
+            Some("1".to_string()),
+            Some("2".to_string()),
+            Some("3".to_string()),
+            Some("4".to_string()),
+            Some("5".to_string()),
+            Some("6".to_string()),
+            Some("7".to_string()),
+        ],
+        "fixprobe_ints row values must round-trip unchanged"
     );
 }
