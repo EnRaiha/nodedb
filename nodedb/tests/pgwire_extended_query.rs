@@ -544,8 +544,10 @@ async fn extended_query_binary_typed_columns_decode() {
         .expect("prepared typed query should succeed");
     assert_eq!(rows.len(), 1);
 
-    // int8 -> i64, float8 -> f64, bool -> bool, text -> String.
-    let n: i64 = rows[0].get("n");
+    // `n` is declared INT (the INT4 alias), so it advertises OID 23 and
+    // decodes as i32 — issue #217; before the fix every declared integer
+    // width collapsed to int8. float8 -> f64, bool -> bool, text -> String.
+    let n: i32 = rows[0].get("n");
     let amt: f64 = rows[0].get("amt");
     let flag: bool = rows[0].get("flag");
     let name: &str = rows[0].get("name");
@@ -575,14 +577,15 @@ async fn extended_query_timestamp_text_fallback_with_binary_sibling() {
         .unwrap();
 
     // Extended path: the query carrying a timestamp column must succeed, and
-    // the int8 sibling decodes from binary.
+    // the integer sibling decodes from binary. `n` is declared INT, so it
+    // advertises OID 23 and decodes as i32 (issue #217).
     let rows = server
         .client
         .query("SELECT n, ts FROM ev WHERE id = $1", &[&"a"])
         .await
         .expect("query with a timestamp column should succeed");
     assert_eq!(rows.len(), 1);
-    let n: i64 = rows[0].get("n");
+    let n: i32 = rows[0].get("n");
     assert_eq!(n, 7);
 
     // Simple-query path returns every column as text, including the timestamp.

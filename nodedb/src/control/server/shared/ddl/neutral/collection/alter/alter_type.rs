@@ -16,7 +16,9 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::strict_schema::{load_strict_collection, persist_schema_change, write_schema_back};
+use super::strict_schema::{
+    load_strict_collection, persist_schema_change, retype_field, write_schema_back,
+};
 use super::support::{err, status};
 
 /// ALTER COLLECTION <name> ALTER COLUMN <column_name> TYPE <new_type>
@@ -62,6 +64,9 @@ pub(super) async fn alter_collection_alter_column_type(
 
     let mut updated = coll;
     write_schema_back(&mut updated, schema);
+    // The declared spelling, not the resolved `ColumnType`, is what carries
+    // the integer width — see `retype_field`.
+    retype_field(&mut updated, column_name, new_type_str);
     persist_schema_change(state, &updated).await?;
 
     state.audit_record(

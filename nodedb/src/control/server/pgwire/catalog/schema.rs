@@ -219,6 +219,7 @@ pub fn catalog_collection_info(name: &str) -> Option<CollectionInfo> {
             is_primary_key: false,
             default: None,
             raw_type: None,
+            int_width: None,
         })
         .collect();
     Some(CollectionInfo {

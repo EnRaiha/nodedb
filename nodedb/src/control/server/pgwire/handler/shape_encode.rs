@@ -22,6 +22,7 @@ use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
 use nodedb_types::NdbDateTime;
+use nodedb_types::columnar::IntWidth;
 
 use crate::control::server::response_shape::project::json_value_to_text;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
@@ -89,8 +90,29 @@ fn encode_typed_cell(
     if format == FieldFormat::Binary {
         match ct {
             DdlColType::Int8 => return encoder.encode_field(&v.as_i64()),
-            DdlColType::Int4 => return encoder.encode_field(&v.as_i64().map(|n| n as i32)),
-            DdlColType::Int2 => return encoder.encode_field(&v.as_i64().map(|n| n as i16)),
+            // Narrowing casts are fallible, so they are `try_from`, not `as`.
+            // A stored value wider than the column's declared width cannot be
+            // transmitted under a narrowed OID: the client reads exactly 2 or 4
+            // bytes and would silently decode a wrapped number. Writes are
+            // range-checked (`nodedb_sql::planner::dml`), so this is
+            // unreachable for data written through SQL — but rows predating the
+            // declared width, or arriving via a non-SQL ingest path, can still
+            // be out of range, and those must surface as an error rather than
+            // corrupt a value in flight.
+            DdlColType::Int4 => {
+                // `as i32` is lossless here: `checked_narrow` has already
+                // proved the value is inside `IntWidth::I32`.
+                return match checked_narrow(v, IntWidth::I32)? {
+                    Some(n) => encoder.encode_field(&(n as i32)),
+                    None => encoder.encode_field(&None::<i32>),
+                };
+            }
+            DdlColType::Int2 => {
+                return match checked_narrow(v, IntWidth::I16)? {
+                    Some(n) => encoder.encode_field(&(n as i16)),
+                    None => encoder.encode_field(&None::<i16>),
+                };
+            }
             DdlColType::Float8 => return encoder.encode_field(&v.as_f64()),
             DdlColType::Float4 => return encoder.encode_field(&v.as_f64().map(|f| f as f32)),
             DdlColType::Bool => return encoder.encode_field(&v.as_bool()),
@@ -133,6 +155,44 @@ fn encode_typed_cell(
         },
         _ => encoder.encode_field(&json_value_to_text(v)),
     }
+}
+
+/// Range-check an integer cell against the width its column advertises,
+/// before it is narrowed for binary transmission.
+///
+/// `Ok(None)` means the cell is absent or not an integer and encodes as SQL
+/// NULL, matching the wider `Int8` arm. `Ok(Some(n))` guarantees `n` fits
+/// `width`, so the caller's narrowing cast is lossless by construction.
+///
+/// An out-of-range value is a hard error rather than a truncation: the
+/// column's `RowDescription` already told the client to read two or four
+/// bytes, so no encoding of the true value is available here, and a wrapped
+/// one is undetectable at the far end. SQLSTATE `22003`
+/// (`numeric_value_out_of_range`) is what PostgreSQL raises for the same
+/// condition, so drivers already classify it as a data error.
+///
+/// Writes through SQL are range-checked at plan time
+/// (`nodedb_sql::planner::dml_helpers::check_declared_int_ranges`), which
+/// makes this unreachable for data nodedb accepted itself. It still has to
+/// exist: rows written before a column's width was declared, and rows
+/// arriving over non-SQL ingest paths, are not covered by that check.
+fn checked_narrow(v: &serde_json::Value, width: IntWidth) -> PgWireResult<Option<i64>> {
+    let Some(n) = v.as_i64() else {
+        return Ok(None);
+    };
+    if width.contains(n) {
+        return Ok(Some(n));
+    }
+    Err(pgwire::error::PgWireError::UserError(Box::new(
+        pgwire::error::ErrorInfo::new(
+            "ERROR".into(),
+            "22003".into(),
+            format!(
+                "value {n} is out of range for type {}",
+                width.pg_type_name()
+            ),
+        ),
+    )))
 }
 
 /// Build a `Response::Query` from a protocol-neutral [`ShapedRows`], plus its

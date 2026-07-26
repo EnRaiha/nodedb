@@ -126,8 +126,9 @@ impl FromStr for ColumnType {
             // them as unknown types even though they're valid aliases). They
             // all collapse to the same `Int64` storage variant as
             // `BIGINT`/`INTEGER`/`INT` — nodedb always stores integers as a
-            // full i64; the declared width only narrows the advertised wire
-            // OID (see `response_shape::schema::sql_data_type_to_ddl_col_type_with_raw`).
+            // full i64. The declared width is carried separately as an
+            // [`super::IntWidth`], which is what bounds writes and narrows the
+            // advertised wire OID; it is deliberately not a storage variant.
             "BIGINT" | "INT64" | "INTEGER" | "INT" | "INT4" | "INT8" | "SMALLINT" | "INT2" => {
                 Ok(Self::Int64)
             }

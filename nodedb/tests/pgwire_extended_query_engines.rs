@@ -76,10 +76,14 @@ async fn extended_query_kv_integer_value() {
         .iter()
         .find(|c| c.name() == "score")
         .expect("score column must appear in RowDescription");
+    // `score` is declared `INT`, the INT4 alias — issue #217 fixed this column
+    // advertising OID 20 (int8) for every declared integer width. KV resolves
+    // declared widths through the same catalog path as every other engine, so
+    // it now correctly narrows to OID 23 (int4).
     assert_eq!(
         col_score.type_().oid(),
-        20,
-        "KV INT column 'score' must have OID 20 (int8), got {}",
+        23,
+        "KV INT column 'score' must have OID 23 (int4), got {}",
         col_score.type_().oid()
     );
 

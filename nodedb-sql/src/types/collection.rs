@@ -76,4 +76,14 @@ pub struct ColumnInfo {
     /// Columnar INSERT converters use this to reconstruct the exact `ColumnType`
     /// so JSON / Geometry / UUID columns are not incorrectly inferred as String.
     pub raw_type: Option<String>,
+    /// Declared width of an integer column, resolved once from the catalog at
+    /// adapter-construction time. `None` for non-integer columns and for
+    /// integer columns whose declared type carried no width.
+    ///
+    /// This is deliberately a resolved [`IntWidth`] rather than another raw
+    /// string: it is read on both the write path (range validation) and the
+    /// read path (`RowDescription` OID and binary payload width), and those
+    /// two must agree exactly. Resolving once at the catalog boundary is what
+    /// makes disagreement unrepresentable.
+    pub int_width: Option<nodedb_types::columnar::IntWidth>,
 }

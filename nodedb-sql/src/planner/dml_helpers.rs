@@ -25,6 +25,85 @@ pub(super) fn convert_value_rows(
         .collect()
 }
 
+/// Reject any integer value that does not fit its column's declared width.
+///
+/// nodedb stores every integer as an `i64`, so this is not a storage limit.
+/// It is the constraint that makes the column's advertised wire type honest:
+/// a column declared `INTEGER` reports OID 23 in `RowDescription`, and a
+/// pgwire client reading it in binary format decodes exactly four bytes.
+/// Accepting a wider value would force a later choice between truncating it on
+/// read and lying about the column's type — so the value is refused at the
+/// point it enters, exactly as PostgreSQL refuses it.
+///
+/// This runs in the planner rather than in each engine because the declared
+/// width is engine-independent (the same `IntWidth` drives the wire type for
+/// schemaless, columnar, strict, and kv alike), and because parameters are
+/// bound into the AST before planning — so one check here covers both literal
+/// `VALUES` and `$1` placeholders, for every engine, on every DML path.
+///
+/// Non-integer values and columns with no declared width pass through: this
+/// checks range only, never type.
+pub(super) fn check_declared_int_ranges(
+    columns: &[ColumnInfo],
+    rows: &[Vec<(String, SqlValue)>],
+) -> Result<()> {
+    // Overwhelmingly the common case — skip the per-cell name lookup entirely
+    // when the collection declares no narrowed integer column.
+    if !columns.iter().any(|c| {
+        matches!(
+            c.int_width,
+            Some(nodedb_types::columnar::IntWidth::I16 | nodedb_types::columnar::IntWidth::I32)
+        )
+    }) {
+        return Ok(());
+    }
+
+    for row in rows {
+        for (name, value) in row {
+            let SqlValue::Int(v) = value else { continue };
+            let Some(width) = columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))
+                .and_then(|c| c.int_width)
+            else {
+                continue;
+            };
+            if !width.contains(*v) {
+                return Err(SqlError::IntegerOutOfRange {
+                    column: name.clone(),
+                    value: *v,
+                    declared_type: width.pg_type_name(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`check_declared_int_ranges`] for `UPDATE ... SET col = <literal>`.
+///
+/// Only literal assignments are checkable at plan time; a computed assignment
+/// (`SET n = n + 1`) has no value until the Data Plane evaluates it. Those are
+/// caught on the read path instead, where the encoder refuses to transmit a
+/// value that does not fit the column's advertised width — so an out-of-range
+/// value can never reach a client silently by either route.
+pub(super) fn check_declared_int_ranges_in_assignments(
+    columns: &[ColumnInfo],
+    assignments: &[(String, SqlExpr)],
+) -> Result<()> {
+    let literals: Vec<(String, SqlValue)> = assignments
+        .iter()
+        .filter_map(|(col, expr)| match expr {
+            SqlExpr::Literal(v @ SqlValue::Int(_)) => Some((col.clone(), v.clone())),
+            _ => None,
+        })
+        .collect();
+    if literals.is_empty() {
+        return Ok(());
+    }
+    check_declared_int_ranges(columns, std::slice::from_ref(&literals))
+}
+
 /// Resolve the effective column list for a `VALUES`-clause INSERT/UPSERT.
 ///
 /// A *positional* insert — `INSERT INTO t VALUES (...)` with no explicit
@@ -277,6 +356,7 @@ pub(super) fn build_kv_insert_plan(
     intent: KvInsertIntent,
     on_conflict_updates: Vec<(String, SqlExpr)>,
     pk_col: Option<&str>,
+    declared_columns: &[ColumnInfo],
 ) -> Result<Vec<SqlPlan>> {
     // Positional KV insert (no column list): the key/value split below is
     // driven entirely by matching column *names* against `key_col_name`/
@@ -288,6 +368,10 @@ pub(super) fn build_kv_insert_plan(
             collection: table_name,
         });
     }
+    // KV returns early from every INSERT/UPSERT entry point, so the declared
+    // width check lives here rather than at the call sites — otherwise a
+    // fourth KV entry point could be added without it.
+    check_declared_int_ranges(declared_columns, &convert_value_rows(columns, rows_ast)?)?;
     let key_col_name = pk_col.unwrap_or("key");
     let key_idx = columns.iter().position(|c| c == key_col_name);
     let ttl_idx = columns.iter().position(|c| c == "ttl");

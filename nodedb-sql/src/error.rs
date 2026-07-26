@@ -20,6 +20,21 @@ pub enum SqlError {
     #[error("type mismatch: {detail}")]
     TypeMismatch { detail: String },
 
+    /// A write supplied an integer wider than the column's declared type.
+    ///
+    /// nodedb stores every integer as an `i64`, so this is not a storage
+    /// limit — it is the constraint that makes the column's advertised wire
+    /// type honest. A column declared `INTEGER` reports OID 23, and a pgwire
+    /// client reading it in binary format decodes exactly four bytes; letting
+    /// a wider value in would mean either truncating it on read or lying about
+    /// the type. PostgreSQL rejects the same write with the same message.
+    #[error("value {value} is out of range for column '{column}' of type {declared_type}")]
+    IntegerOutOfRange {
+        column: String,
+        value: i64,
+        declared_type: &'static str,
+    },
+
     #[error("unsupported: {detail}")]
     Unsupported { detail: String },
 

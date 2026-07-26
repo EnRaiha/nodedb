@@ -8,7 +8,10 @@ use sqlparser::ast;
 use super::super::ast_helpers::{
     flatten_and_expr, qualified_ident_pair, strip_and_convert_filters,
 };
-use super::super::dml_helpers::{extract_point_keys, extract_table_name_from_table_with_joins};
+use super::super::dml_helpers::{
+    check_declared_int_ranges_in_assignments, extract_point_keys,
+    extract_table_name_from_table_with_joins,
+};
 use crate::engine_rules::{self, DeleteParams, UpdateFromParams, UpdateParams};
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::{
@@ -41,6 +44,7 @@ pub fn plan_update(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
         })?;
 
     let assigns = convert_assignments(&update.assignments)?;
+    check_declared_int_ranges_in_assignments(&info.columns, &assigns)?;
 
     let filters = match &update.selection {
         Some(expr) => super::super::select::convert_where_to_filters(expr)?,

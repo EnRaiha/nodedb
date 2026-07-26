@@ -6,8 +6,8 @@ use nodedb_types::DatabaseId;
 use sqlparser::ast::{self};
 
 use super::dml_helpers::{
-    build_kv_insert_plan, build_vector_primary_insert_plan, convert_value_rows,
-    resolve_insert_columns,
+    build_kv_insert_plan, build_vector_primary_insert_plan, check_declared_int_ranges,
+    convert_value_rows, resolve_insert_columns,
 };
 use crate::engine_rules::{self, InsertParams};
 use crate::error::{Result, SqlError};
@@ -135,6 +135,7 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
             intent,
             Vec::new(),
             info.primary_key.as_deref(),
+            &info.columns,
         );
     }
 
@@ -148,11 +149,13 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
         && let Some(ref vpc) = info.vector_primary
     {
         let rows_parsed = convert_value_rows(&columns, rows_ast)?;
+        check_declared_int_ranges(&info.columns, &rows_parsed)?;
         return build_vector_primary_insert_plan(&table_name, vpc, &columns, rows_parsed);
     }
 
     // All other engines: delegate to engine rules.
     let rows = convert_value_rows(&columns, rows_ast)?;
+    check_declared_int_ranges(&info.columns, &rows)?;
     let column_defaults: Vec<(String, String)> = info
         .columns
         .iter()
@@ -218,6 +221,7 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
             KvInsertIntent::Put,
             Vec::new(),
             info.primary_key.as_deref(),
+            &info.columns,
         );
     }
 
@@ -226,6 +230,7 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
     let columns = resolve_insert_columns(columns, &info, rows_ast)?;
 
     let rows = convert_value_rows(&columns, rows_ast)?;
+    check_declared_int_ranges(&info.columns, &rows)?;
     let column_defaults: Vec<(String, String)> = info
         .columns
         .iter()
@@ -294,6 +299,7 @@ fn plan_upsert_with_on_conflict(
             KvInsertIntent::Put,
             on_conflict_updates,
             info.primary_key.as_deref(),
+            &info.columns,
         );
     }
 
@@ -302,6 +308,7 @@ fn plan_upsert_with_on_conflict(
     let columns = resolve_insert_columns(columns, &info, rows_ast)?;
 
     let rows = convert_value_rows(&columns, rows_ast)?;
+    check_declared_int_ranges(&info.columns, &rows)?;
     let column_defaults: Vec<(String, String)> = info
         .columns
         .iter()

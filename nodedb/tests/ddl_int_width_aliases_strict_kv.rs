@@ -1,31 +1,65 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Upstream issue #223 regression: `document_strict` and `kv` engines must
-//! accept `INT4`/`SMALLINT` (and the other PostgreSQL integer-width
-//! keywords) as valid column types. Both engines validate declared column
-//! types via `nodedb_types::columnar::ColumnType::from_str`
-//! (`nodedb-sql/src/ddl_ast/collection_type.rs`'s `build_strict_schema` /
-//! `build_kv_collection_type`), which previously only recognized
-//! `BIGINT`/`INT64`/`INTEGER`/`INT` — `INT4`, `INT8`, `SMALLINT`, and `INT2`
-//! were rejected with "unknown column type", even though they're valid
-//! PostgreSQL integer aliases.
+//! Upstream issue #223: `document_strict` and `kv` collections must accept
+//! every PostgreSQL integer-width keyword in DDL *and* report each column's
+//! declared width faithfully on the wire.
 //!
-//! This is a DDL-acceptance smoke test only: for these engines the wire OID
-//! stays `INT8` (20) regardless of declared width — `raw_type` refinement
-//! (issue #217) is schemaless/columnar-only by design, since strict/kv
-//! columns are typed authoritatively by the resolved `ColumnType`, not a
-//! separately-tracked raw string. See `pgwire_ddl_result_types.rs`'s
-//! `create_collection_int_widths_preserve_wire_oids` for the schemaless OID
-//! fidelity coverage.
+//! Both engines validate declared column types via
+//! `nodedb_types::columnar::ColumnType::from_str`
+//! (`nodedb-sql/src/ddl_ast/collection_type.rs`'s `build_strict_schema` /
+//! `build_kv_collection_type`), which previously recognized only
+//! `BIGINT`/`INT64`/`INTEGER`/`INT` — `INT4`, `INT8`, `SMALLINT`, and `INT2`
+//! were rejected as "unknown column type".
+//!
+//! Accepting those spellings is only half the fix. `ColumnType` deliberately
+//! has one `Int64` variant for every declared width (nodedb stores all
+//! integers as a full i64), so a strict/kv column's resolved type cannot say
+//! how wide the author declared it. The declared width is recovered from the
+//! catalog's raw `fields` entries — populated for strict and kv exactly as for
+//! schemaless and columnar — and resolved to an `IntWidth` at the catalog
+//! boundary. Without that, `CREATE ... (a SMALLINT)` would succeed and then
+//! report OID 20, trading a loud DDL error for a silent width mismatch.
+//!
+//! Companion coverage: `pgwire_ddl_result_types.rs` for schemaless OID
+//! fidelity, and `pgwire_int_width_range_enforcement.rs` for the write-side
+//! range constraint that makes these narrowed OIDs honest.
 
 mod common;
 
 use common::pgwire_harness::TestServer;
 
-/// `document_strict` `CREATE COLLECTION` with `INT4`/`SMALLINT` columns must
-/// succeed (previously errored with "unknown column type: 'INT4'").
+/// Assert the exact `RowDescription` OID of each named column, failing loudly
+/// if a column is missing entirely.
+///
+/// Deliberately not `if let Some(col)` — a lookup that silently skips turns
+/// this into a test that passes when the columns vanish, which is precisely
+/// the regression it exists to catch.
+fn assert_column_oids(row: &tokio_postgres::Row, expected: &[(&str, u32)]) {
+    for (col_name, expected_oid) in expected {
+        let col = row
+            .columns()
+            .iter()
+            .find(|c| c.name() == *col_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "column '{col_name}' must appear in RowDescription; got {:?}",
+                    row.columns().iter().map(|c| c.name()).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            col.type_().oid(),
+            *expected_oid,
+            "column '{col_name}' must advertise OID {expected_oid}, got {}",
+            col.type_().oid()
+        );
+    }
+}
+
+/// `document_strict` `CREATE COLLECTION` with every integer-width spelling
+/// must succeed (previously "unknown column type: 'INT4'") and each column
+/// must advertise its own declared width.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn strict_create_collection_accepts_int_width_aliases() {
+async fn strict_create_collection_preserves_declared_int_widths() {
     let server = TestServer::start().await;
 
     server
@@ -61,27 +95,23 @@ async fn strict_create_collection_accepts_int_width_aliases() {
         .expect("execute strict_int_widths select");
     assert_eq!(rows.len(), 1, "expected 1 row back from strict_int_widths");
 
-    // Load-bearing: document_strict stays INT8 (20) regardless of declared
-    // width — strict columns carry no `raw_type` (they're already typed
-    // authoritatively by `ColumnType`), so the issue #217 refinement never
-    // applies here. Width narrowing is schemaless/columnar-only by design.
-    for col_name in ["a", "b", "c", "d"] {
-        if let Some(col) = rows[0].columns().iter().find(|c| c.name() == col_name) {
-            assert_eq!(
-                col.type_().oid(),
-                20,
-                "strict column '{col_name}' OID must stay INT8 (20), got {}",
-                col.type_().oid()
-            );
-        }
-    }
+    assert_column_oids(
+        &rows[0],
+        &[("a", 23), ("b", 21), ("c", 21), ("d", 20), ("id", 25)],
+    );
+
+    // Typed getters matching the advertised widths: a wrong OID or a
+    // wrong-width binary payload panics inside `get` before the comparison.
+    assert_eq!(rows[0].get::<_, i32>("a"), 1);
+    assert_eq!(rows[0].get::<_, i16>("b"), 2);
+    assert_eq!(rows[0].get::<_, i16>("c"), 3);
+    assert_eq!(rows[0].get::<_, i64>("d"), 4);
 }
 
-/// `kv` `CREATE COLLECTION` with `INT4`/`SMALLINT` columns must succeed
-/// (previously errored with "unknown column type: 'INT4'"). The kv OID
-/// stays INT8 (20) — do not assert a narrowed OID here.
+/// `kv` `CREATE COLLECTION` with `INT4`/`SMALLINT` columns must succeed and
+/// report each declared width, exactly as strict does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kv_create_collection_accepts_int_width_aliases() {
+async fn kv_create_collection_preserves_declared_int_widths() {
     let server = TestServer::start().await;
 
     server
@@ -115,16 +145,68 @@ async fn kv_create_collection_accepts_int_width_aliases() {
         .expect("execute kv_int_widths select");
     assert_eq!(rows.len(), 1, "expected 1 row back from kv_int_widths");
 
-    // Load-bearing: kv stays INT8 (20) — the fix does not widen/narrow kv's
-    // wire type, only schemaless/columnar's.
-    for col_name in ["a", "b"] {
-        if let Some(col) = rows[0].columns().iter().find(|c| c.name() == col_name) {
-            assert_eq!(
-                col.type_().oid(),
-                20,
-                "kv column '{col_name}' OID must stay INT8 (20), got {}",
-                col.type_().oid()
-            );
-        }
-    }
+    assert_column_oids(&rows[0], &[("a", 23), ("b", 21)]);
+    assert_eq!(rows[0].get::<_, i32>("a"), 1);
+    assert_eq!(rows[0].get::<_, i16>("b"), 2);
+}
+
+/// A column whose declared type carries no width (`BIGINT`) stays at OID 20,
+/// and a non-integer column is untouched by width resolution — the narrowing
+/// must apply to declared narrow integers only, never by default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn undeclared_and_non_integer_widths_are_untouched() {
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION strict_mixed_widths (\
+                id TEXT PRIMARY KEY, \
+                big BIGINT, \
+                label TEXT, \
+                ratio DOUBLE, \
+                flag BOOL\
+             ) WITH (engine='document_strict')",
+        )
+        .await
+        .expect("CREATE COLLECTION strict_mixed_widths must succeed");
+
+    server
+        .exec(
+            "INSERT INTO strict_mixed_widths (id, big, label, ratio, flag) \
+             VALUES ('r1', 9876543210, 'x', 1.5, true)",
+        )
+        .await
+        .expect("INSERT into strict_mixed_widths must succeed");
+
+    let stmt = server
+        .client
+        .prepare_typed(
+            "SELECT id, big, label, ratio, flag FROM strict_mixed_widths WHERE id = $1",
+            &[tokio_postgres::types::Type::TEXT],
+        )
+        .await
+        .expect("prepare strict_mixed_widths select");
+    let rows = server
+        .client
+        .query(&stmt, &[&"r1"])
+        .await
+        .expect("execute strict_mixed_widths select");
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected 1 row back from strict_mixed_widths"
+    );
+
+    assert_column_oids(
+        &rows[0],
+        &[
+            ("big", 20),
+            ("label", 25),
+            ("ratio", 701),
+            ("flag", 16),
+            ("id", 25),
+        ],
+    );
+    // A BIGINT column must still carry values no narrower type could hold.
+    assert_eq!(rows[0].get::<_, i64>("big"), 9876543210);
 }

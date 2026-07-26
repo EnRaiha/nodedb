@@ -31,6 +31,15 @@ pub(super) async fn alter_table_add_column(
 
     let column = parse_origin_column_def(col_def_str).map_err(|e| err("42601", e.to_string()))?;
     let column_name = column.name.clone();
+    // The declared type as written, e.g. `SMALLINT` from `age SMALLINT NOT
+    // NULL`. `ColumnDef::column_type` cannot supply this: it has one `Int64`
+    // variant for every integer width. Falls back to the resolved type's own
+    // name when the definition has no separate type token to quote.
+    let declared_type = col_def_str
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+        .unwrap_or_else(|| column.column_type.to_string());
 
     // Validate: new column must be nullable or have a default.
     if !column.nullable && column.default.is_none() {
@@ -67,6 +76,16 @@ pub(super) async fn alter_table_add_column(
                     let mut updated = coll;
                     updated.collection_type = nodedb_types::CollectionType::strict(schema.clone());
                     updated.timeseries_config = sonic_rs::to_string(&schema).ok();
+                    // Record the column's *declared* type alongside the
+                    // resolved one — see `strict_schema::retype_field`. Without
+                    // this the added column has no declared width and falls
+                    // back to `BIGINT` on the wire, unlike an identical column
+                    // declared at CREATE time.
+                    super::strict_schema::add_field(
+                        &mut updated,
+                        &column_name,
+                        declared_type.as_str(),
+                    );
                     let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(
                         Box::new(updated.clone()),
                     );

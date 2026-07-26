@@ -14,7 +14,9 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::strict_schema::{load_strict_collection, persist_schema_change, write_schema_back};
+use super::strict_schema::{
+    load_strict_collection, persist_schema_change, remove_field, write_schema_back,
+};
 use super::support::{err, status};
 
 /// ALTER COLLECTION <name> DROP COLUMN <column_name>
@@ -60,6 +62,7 @@ pub(super) async fn alter_collection_drop_column(
 
     let mut updated = coll;
     write_schema_back(&mut updated, schema);
+    remove_field(&mut updated, column_name);
     persist_schema_change(state, &updated).await?;
 
     state.audit_record(

@@ -63,68 +63,51 @@ pub fn sql_data_type_to_ddl_col_type(
     }
 }
 
-/// Like [`sql_data_type_to_ddl_col_type`], but refines an `Int8` result using
-/// the catalog's declared raw type string (`ColumnInfo::raw_type`), when
-/// present.
+/// Like [`sql_data_type_to_ddl_col_type`], but narrows an `Int8` result to the
+/// column's declared integer width (`ColumnInfo::int_width`) when the catalog
+/// recorded one.
 ///
-/// # Why only `Int8` is refined
+/// # Why only `Int8` is narrowed
 ///
 /// `SqlDataType::Int64` is the single planner-facing type for every integer
-/// width — `SMALLINT`/`INT2`, `INTEGER`/`INT4`, and `BIGINT`/`INT8` all parse
+/// width — `SMALLINT`/`INT2`, `INTEGER`/`INT4`, and `BIGINT`/`INT8` all resolve
 /// to it (see `catalog_adapter::type_convert::parse_type_str` and
-/// `nodedb_types::columnar::ColumnType::from_str`), because nodedb's
-/// storage — columnar, strict, and kv alike — always keeps integers as a
-/// full `i64`. The declared width therefore carries no storage or
-/// computation meaning; it is authoritative for exactly one thing: the wire
-/// type a pgwire client expects in `RowDescription`. A client that declared
-/// `SMALLINT` expects OID 21 (and, for binary-format results, a 2-byte
-/// value) — silently widening every integer to `BIGINT`'s OID 20 breaks ORMs
-/// and typed client libraries that trust the advertised OID (nodedb upstream
-/// issue #217). So this function narrows *display width only*, strictly
-/// downstream of `sql_data_type_to_ddl_col_type`'s own type mapping: every
-/// other `SqlDataType` variant (`String`, `Float64`, `Bool`, ...) passes
-/// through unchanged, with `raw` ignored, because there is no other
-/// wire-ambiguous case to resolve.
+/// `nodedb_types::columnar::ColumnType::from_str`), because nodedb's storage —
+/// columnar, strict, and kv alike — always keeps integers as a full `i64`. The
+/// declared width therefore carries no storage meaning; it is authoritative for
+/// the wire contract: a client that declared `SMALLINT` expects OID 21 and, in
+/// binary format, exactly two bytes. Silently widening every integer to
+/// `BIGINT`'s OID 20 breaks ORMs and typed client libraries that trust the
+/// advertised OID (issue #217). Every other `SqlDataType` variant passes
+/// through unchanged with `width` ignored — there is no other wire-ambiguous
+/// case to resolve.
 ///
-/// # Matching
+/// # Why this takes a resolved width rather than a type string
 ///
-/// `raw` is matched case-insensitively by keyword, using the same
-/// prefix-with-boundary logic as
-/// `pgwire::catalog::tables::collections::field_type_to_oid` (the
-/// already-correct reference implementation this mirrors): `BIGINT`/`INT8`
-/// are checked *first* to mirror that reference implementation's ordering,
-/// but the order isn't load-bearing — the boundary check itself already
-/// rejects `int` as a prefix match of `int8`, since the next character
-/// (`8`) is neither `(` nor whitespace. An unrecognized or absent `raw`
-/// leaves the base `Int8` untouched — refinement is best-effort, never a
-/// hard error.
-pub fn sql_data_type_to_ddl_col_type_with_raw(
+/// The declared width is also enforced on the write path, and the two must
+/// agree exactly or the narrowing here would be advertising a contract writes
+/// do not honour. Both sides read the same
+/// [`IntWidth`](nodedb_types::columnar::IntWidth), resolved once at the catalog
+/// boundary by `catalog_adapter::type_convert`, so disagreement is not
+/// representable. A `None` width means the catalog has no record of the
+/// declared type (for example a planner-synthesized column) and leaves the base
+/// `Int8` — the widest, and so the only lossless, fallback.
+pub fn sql_data_type_to_ddl_col_type_with_width(
     ty: &nodedb_sql::types_expr::SqlDataType,
-    raw: Option<&str>,
+    width: Option<nodedb_types::columnar::IntWidth>,
 ) -> super::types::DdlColType {
     use super::types::DdlColType;
+    use nodedb_types::columnar::IntWidth;
 
     let base = sql_data_type_to_ddl_col_type(ty);
-    let (DdlColType::Int8, Some(raw)) = (base, raw) else {
+    let (DdlColType::Int8, Some(width)) = (base, width) else {
         return base;
     };
 
-    let normalized = raw.trim().to_ascii_lowercase();
-    let starts_with_type = |name: &str| {
-        normalized == name
-            || normalized.strip_prefix(name).is_some_and(|rest| {
-                rest.starts_with('(') || rest.chars().next().is_some_and(char::is_whitespace)
-            })
-    };
-
-    if starts_with_type("bigint") || starts_with_type("int8") {
-        DdlColType::Int8
-    } else if starts_with_type("smallint") || starts_with_type("int2") {
-        DdlColType::Int2
-    } else if starts_with_type("integer") || starts_with_type("int4") || starts_with_type("int") {
-        DdlColType::Int4
-    } else {
-        DdlColType::Int8
+    match width {
+        IntWidth::I16 => DdlColType::Int2,
+        IntWidth::I32 => DdlColType::Int4,
+        IntWidth::I64 => DdlColType::Int8,
     }
 }
 
@@ -133,76 +116,62 @@ mod tests {
     use super::super::types::DdlColType;
     use super::*;
     use nodedb_sql::types_expr::SqlDataType;
+    use nodedb_types::columnar::IntWidth;
 
-    /// `sql_data_type_to_ddl_col_type_with_raw` must narrow an `Int64`
-    /// (base `Int8`) column to `Int4`/`Int2` when the catalog's declared raw
-    /// type string says the DDL author wrote a narrower integer keyword.
-    /// `BIGINT`/`INT8` stay `Int8`. Case-insensitive, matching every other
-    /// raw-type match in this codebase (e.g. `field_type_to_oid`).
+    /// Each declared width narrows the `Int8` base to its own wire type, and
+    /// the mapping matches the OIDs `IntWidth` itself advertises — locking the
+    /// two representations of "how wide is this column" against drift.
     #[test]
-    fn refine_narrows_int8_by_raw_integer_keyword() {
-        let cases: &[(&str, DdlColType)] = &[
-            ("BIGINT", DdlColType::Int8),
-            ("INT8", DdlColType::Int8),
-            ("INTEGER", DdlColType::Int4),
-            ("INT", DdlColType::Int4),
-            ("INT4", DdlColType::Int4),
-            ("SMALLINT", DdlColType::Int2),
-            ("INT2", DdlColType::Int2),
+    fn narrows_int8_to_each_declared_width() {
+        let cases: &[(IntWidth, DdlColType, u32)] = &[
+            (IntWidth::I16, DdlColType::Int2, 21),
+            (IntWidth::I32, DdlColType::Int4, 23),
+            (IntWidth::I64, DdlColType::Int8, 20),
         ];
-        for (raw, expected) in cases {
+        for (width, expected, expected_oid) in cases {
             assert_eq!(
-                sql_data_type_to_ddl_col_type_with_raw(&SqlDataType::Int64, Some(raw)),
+                sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Int64, Some(*width)),
                 *expected,
-                "raw type {raw:?} must refine to {expected:?}"
+                "declared width {width:?} must narrow to {expected:?}"
             );
-            // Case-insensitivity.
             assert_eq!(
-                sql_data_type_to_ddl_col_type_with_raw(
-                    &SqlDataType::Int64,
-                    Some(&raw.to_lowercase())
-                ),
-                *expected,
-                "lowercase raw type {raw:?} must refine to {expected:?}"
+                width.pg_oid(),
+                *expected_oid,
+                "declared width {width:?} must advertise OID {expected_oid}"
             );
         }
     }
 
-    /// A raw string that isn't a recognized integer keyword leaves the base
-    /// `Int8` untouched — the refinement is best-effort, never a hard error.
+    /// `width = None` — a planner-synthesized column, or one whose declared
+    /// type the catalog never recorded — stays at the base `Int8`. `BIGINT` is
+    /// the widest integer wire type, so it is the only fallback that cannot
+    /// truncate a stored value.
     #[test]
-    fn refine_unrecognized_raw_keyword_stays_int8() {
+    fn no_declared_width_stays_int8() {
         assert_eq!(
-            sql_data_type_to_ddl_col_type_with_raw(&SqlDataType::Int64, Some("NOT_A_TYPE")),
+            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Int64, None),
             DdlColType::Int8
         );
     }
 
-    /// `raw = None` (planner-synthesized columns, e.g. an auto-injected
-    /// `id`, carry no raw type) passes through to the unrefined base type.
-    #[test]
-    fn refine_with_no_raw_type_stays_base() {
-        assert_eq!(
-            sql_data_type_to_ddl_col_type_with_raw(&SqlDataType::Int64, None),
-            DdlColType::Int8
-        );
-    }
-
-    /// Only an `Int8` base is eligible for refinement — every other
+    /// Only an `Int8` base is eligible for narrowing — every other
     /// `SqlDataType` passes through `sql_data_type_to_ddl_col_type` exactly,
-    /// with `raw` ignored even when it names an integer keyword (a raw type
-    /// string can never disagree with the planner's own resolved
-    /// `SqlDataType`, but this proves the fn doesn't misapply integer
-    /// narrowing to non-integer columns regardless).
+    /// with `width` ignored even when one is supplied. A width can never
+    /// disagree with the planner's resolved `SqlDataType` in practice, but
+    /// this proves narrowing is never misapplied to a non-integer column.
     #[test]
-    fn refine_passes_through_non_int8_types_untouched() {
+    fn passes_through_non_int8_types_untouched() {
         assert_eq!(
-            sql_data_type_to_ddl_col_type_with_raw(&SqlDataType::String, Some("SMALLINT")),
+            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::String, Some(IntWidth::I16)),
             DdlColType::Text
         );
         assert_eq!(
-            sql_data_type_to_ddl_col_type_with_raw(&SqlDataType::Float64, None),
+            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Float64, Some(IntWidth::I32)),
             DdlColType::Float8
+        );
+        assert_eq!(
+            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Bool, None),
+            DdlColType::Bool
         );
     }
 

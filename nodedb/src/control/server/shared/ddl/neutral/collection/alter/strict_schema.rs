@@ -69,6 +69,48 @@ pub(super) fn write_schema_back(
     coll.timeseries_config = sonic_rs::to_string(&schema).ok();
 }
 
+/// Retype a column's entry in `coll.fields`, the catalog's record of the
+/// *declared* type string each column was created with.
+///
+/// `fields` is not redundant with the strict schema: `ColumnType` collapses
+/// every integer width onto one `Int64` variant, so the declared spelling is
+/// the only surviving record of how wide the author said the column was. That
+/// spelling drives the column's advertised wire OID and the range accepted on
+/// write, which is exactly why `ALTER COLUMN TYPE` — whose only supported use
+/// *is* an alias change such as `INT` → `BIGINT` — has to update it. Leaving
+/// it stale would make the alter a silent no-op for the case it exists to
+/// serve, and would keep rejecting writes the new type allows.
+pub(super) fn retype_field(coll: &mut StoredCollection, column: &str, new_type: &str) {
+    for (name, type_str) in coll.fields.iter_mut() {
+        if name.eq_ignore_ascii_case(column) {
+            *type_str = new_type.to_string();
+        }
+    }
+}
+
+/// Rename a column's entry in `coll.fields`, keeping its declared type.
+pub(super) fn rename_field(coll: &mut StoredCollection, old_name: &str, new_name: &str) {
+    for (name, _) in coll.fields.iter_mut() {
+        if name.eq_ignore_ascii_case(old_name) {
+            *name = new_name.to_string();
+        }
+    }
+}
+
+/// Remove a column's entry from `coll.fields`.
+pub(super) fn remove_field(coll: &mut StoredCollection, column: &str) {
+    coll.fields
+        .retain(|(name, _)| !name.eq_ignore_ascii_case(column));
+}
+
+/// Append a column's declared type to `coll.fields`, replacing any existing
+/// entry of the same name.
+pub(super) fn add_field(coll: &mut StoredCollection, column: &str, declared_type: &str) {
+    remove_field(coll, column);
+    coll.fields
+        .push((column.to_string(), declared_type.to_string()));
+}
+
 /// Replicate the mutated collection through the metadata raft group,
 /// refresh this node's Data Plane register so the in-memory shape
 /// catches up with the new schema, then bump `schema_version`.
