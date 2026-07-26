@@ -92,10 +92,12 @@ pub fn sql_data_type_to_ddl_col_type(
 /// prefix-with-boundary logic as
 /// `pgwire::catalog::tables::collections::field_type_to_oid` (the
 /// already-correct reference implementation this mirrors): `BIGINT`/`INT8`
-/// are checked *first* so a plain `INT` prefix check can't accidentally
-/// swallow `INT8` (there is no separator between `INT` and `8` for the
-/// boundary check to reject). An unrecognized or absent `raw` leaves the
-/// base `Int8` untouched — refinement is best-effort, never a hard error.
+/// are checked *first* to mirror that reference implementation's ordering,
+/// but the order isn't load-bearing — the boundary check itself already
+/// rejects `int` as a prefix match of `int8`, since the next character
+/// (`8`) is neither `(` nor whitespace. An unrecognized or absent `raw`
+/// leaves the base `Int8` untouched — refinement is best-effort, never a
+/// hard error.
 pub fn sql_data_type_to_ddl_col_type_with_raw(
     ty: &nodedb_sql::types_expr::SqlDataType,
     raw: Option<&str>,
