@@ -468,5 +468,59 @@ mod tests {
             "system",
             &["version", "format_type", "pg_get_expr", "col_description"],
         );
+
+        // `nodedb_query::geo_functions::eval_geo_function`. Distinct from
+        // the other modules above: this one lives in `nodedb-query`'s
+        // top-level `geo_functions` module (not `functions::<name>`), and
+        // is dispatched into from `functions::eval_function` for any
+        // geo-prefixed/ST_-prefixed name — every `|`-joined alias on its
+        // match arms is flattened into this one list, same as `math`'s
+        // `ceil`/`ceiling` pairing above.
+        assert_all(
+            "geo_functions",
+            &[
+                "geo_distance",
+                "haversine_distance",
+                "geo_bearing",
+                "haversine_bearing",
+                "geo_point",
+                "st_point",
+                "geo_geohash",
+                "geo_geohash_decode",
+                "geo_geohash_neighbors",
+                "st_contains",
+                "st_intersects",
+                "st_within",
+                "st_disjoint",
+                "st_dwithin",
+                "st_distance",
+                "st_buffer",
+                "st_envelope",
+                "st_union",
+                "geo_length",
+                "geo_perimeter",
+                "geo_line",
+                "geo_polygon",
+                "geo_circle",
+                "geo_bbox",
+                "geo_as_geojson",
+                "geo_from_geojson",
+                "geo_as_wkt",
+                "geo_from_wkt",
+                "geo_x",
+                "geo_y",
+                "geo_num_points",
+                "geo_type",
+                "geo_is_valid",
+                "geo_h3",
+                "geo_h3_to_boundary",
+                "geo_h3_resolution",
+                "st_geohash",
+                "st_geohashdecode",
+                "h3_latlngtocell",
+                "h3_celltolatlng",
+                "st_intersection",
+            ],
+        );
     }
 }

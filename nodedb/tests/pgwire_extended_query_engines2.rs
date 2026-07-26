@@ -306,3 +306,106 @@ async fn extended_query_oid_mismatch_text_for_int_errors_or_coerces() {
         }
     }
 }
+
+// ── Cross-engine: issue #216 SQLSTATEs through the extended protocol ────────
+
+/// Undefined-function rejection (issue #216, SQLSTATE `42883`) through the
+/// extended-query path. `sql_undefined_function.rs` proves this fires at
+/// PLAN time over simple-query (where Parse+Bind+Execute collapse into one
+/// round trip). Naively, `pgwire_database_authorization.rs`'s
+/// `prepared_parse_denies_*` tests suggest Parse/Describe is where this
+/// server plans a statement (authorization and undefined-table checks both
+/// reject there) — but confirmed empirically here, `.prepare()` for this
+/// statement actually *succeeds*: the function-registry existence gate is
+/// not consulted during Parse/Describe (no columns/params to resolve for
+/// this shape rules it out early), so the error is only raised once
+/// `.query()` drives Bind+Execute and the plan is actually built. Asserting
+/// on the real surfacing point, not the naive assumption.
+#[tokio::test]
+async fn extended_query_unknown_function_errors_42883() {
+    let srv = TestServer::start().await;
+
+    let stmt = srv
+        .client
+        .prepare("SELECT some_function_that_does_not_exist_216(1, 2)")
+        .await
+        .expect(
+            "Parse/Describe succeeds for this statement shape — the \
+             undefined-function gate is not consulted until Bind/Execute",
+        );
+
+    let err = srv
+        .client
+        .query(&stmt, &[])
+        .await
+        .expect_err("Execute must reject a call to an unregistered scalar function");
+    let db_err = err
+        .as_db_error()
+        .expect("server must return a typed SQLSTATE for the unknown function");
+    assert_eq!(
+        db_err.code().code(),
+        "42883",
+        "unknown-function rejection must carry SQLSTATE 42883, got {}",
+        db_err.code().code()
+    );
+}
+
+/// Division-by-zero rejection (issue #216, SQLSTATE `22012`) through the
+/// extended-query path. Unlike the undefined-function gate above, `10 / d`
+/// is a well-typed expression regardless of `d`'s runtime value, so
+/// Parse/Describe must succeed — the zero divisor can only be discovered
+/// once a bound row is actually evaluated, i.e. at Bind/Execute
+/// (`.query()`) time. Mirrors `sql_division_by_zero.rs`'s simple-query
+/// coverage of the same fix, through Parse/Bind/Execute instead.
+#[tokio::test]
+async fn extended_query_division_by_zero_errors_22012_at_execute() {
+    let srv = TestServer::start().await;
+    srv.exec(
+        "CREATE COLLECTION ext_divzero_216 (id STRING PRIMARY KEY, d INT) \
+         WITH (engine='document_strict')",
+    )
+    .await
+    .expect("CREATE ext_divzero_216");
+    srv.exec("INSERT INTO ext_divzero_216 (id, d) VALUES ('nonzero', 2)")
+        .await
+        .expect("INSERT nonzero row");
+    srv.exec("INSERT INTO ext_divzero_216 (id, d) VALUES ('zero', 0)")
+        .await
+        .expect("INSERT zero-divisor row");
+
+    let stmt = srv
+        .client
+        .prepare_typed(
+            "SELECT 10 / d AS ratio FROM ext_divzero_216 WHERE id = $1",
+            &[Type::TEXT],
+        )
+        .await
+        .expect(
+            "Parse must succeed — `10 / d` is well-typed independent of d's runtime value",
+        );
+
+    let err = srv
+        .client
+        .query(&stmt, &[&"zero"])
+        .await
+        .expect_err("Execute over the zero-divisor row must fail the statement");
+    let db_err = err
+        .as_db_error()
+        .expect("server must return a typed SQLSTATE for division by zero");
+    assert_eq!(
+        db_err.code().code(),
+        "22012",
+        "zero-divisor Execute-time rejection must carry SQLSTATE 22012, got {}",
+        db_err.code().code()
+    );
+
+    // Control: the identical prepared statement, bound against the
+    // non-zero row, must still succeed — the fix must not turn division
+    // itself into a blanket error on this path.
+    let rows = srv
+        .client
+        .query(&stmt, &[&"nonzero"])
+        .await
+        .expect("Execute over the non-zero-divisor row must still succeed");
+    assert_eq!(rows.len(), 1, "expected exactly 1 row for the nonzero id");
+}
