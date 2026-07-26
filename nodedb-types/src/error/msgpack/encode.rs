@@ -153,6 +153,10 @@ impl ToMessagePack for ErrorDetails {
                 limit,
             } => write2(writer, TAG_FAN_OUT_EXCEEDED, shards_touched, limit),
             ErrorDetails::SqlNotEnabled => write_unit(writer, TAG_SQL_NOT_ENABLED),
+            ErrorDetails::UndefinedFunction { name } => {
+                write1(writer, TAG_UNDEFINED_FUNCTION, name)
+            }
+            ErrorDetails::DivisionByZero => write_unit(writer, TAG_DIVISION_BY_ZERO),
             ErrorDetails::AuthorizationDenied { resource } => {
                 write1(writer, TAG_AUTHORIZATION_DENIED, resource)
             }

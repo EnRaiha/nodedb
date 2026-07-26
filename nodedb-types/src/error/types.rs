@@ -98,6 +98,8 @@ impl NodeDbError {
                 | ErrorDetails::AuthExpired
                 | ErrorDetails::Config
                 | ErrorDetails::SqlNotEnabled
+                | ErrorDetails::UndefinedFunction { .. }
+                | ErrorDetails::DivisionByZero
         )
     }
 }

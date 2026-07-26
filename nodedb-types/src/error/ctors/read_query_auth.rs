@@ -120,6 +120,33 @@ impl NodeDbError {
         }
     }
 
+    /// A function call in a query names no registered scalar, aggregate, or
+    /// window function. Distinct from `plan_error` so clients can match on
+    /// the specific code (SQLSTATE `42883`, `undefined_function`) rather
+    /// than parsing the message.
+    pub fn undefined_function(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            code: ErrorCode::UNDEFINED_FUNCTION,
+            message: format!("function {name}(...) does not exist"),
+            details: ErrorDetails::UndefinedFunction { name },
+            cause: None,
+        }
+    }
+
+    /// Expression evaluation divided or took a modulus by zero. Distinct
+    /// from `plan_error` so clients can match on the specific code
+    /// (SQLSTATE `22012`, `division_by_zero`) rather than parsing the
+    /// message (nodedb issue #216).
+    pub fn division_by_zero() -> Self {
+        Self {
+            code: ErrorCode::DIVISION_BY_ZERO,
+            message: "division by zero".to_string(),
+            details: ErrorDetails::DivisionByZero,
+            cause: None,
+        }
+    }
+
     pub fn authorization_denied(resource: impl Into<String>) -> Self {
         let resource = resource.into();
         Self {

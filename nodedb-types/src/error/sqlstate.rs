@@ -40,6 +40,10 @@ pub const CANNOT_DROP_DEFAULT_DATABASE: &str = "0A000";
 /// `22003` — `numeric_value_out_of_range`
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 
+/// `22012` — `division_by_zero` (`/` or `%` with a zero divisor; nodedb
+/// issue #216 — raised at runtime instead of evaluating to `NULL`)
+pub const DIVISION_BY_ZERO: &str = "22012";
+
 // ── Class 23 — Integrity Constraint Violation ────────────────────────────────
 
 /// `23000` — `integrity_constraint_violation` (generic)
@@ -104,6 +108,10 @@ pub const CANNOT_COERCE: &str = "42846";
 
 /// `42P01` — `undefined_table` (collection not found)
 pub const UNDEFINED_TABLE: &str = "42P01";
+
+/// `42883` — `undefined_function` (no scalar/aggregate/window function
+/// registered under the called name)
+pub const UNDEFINED_FUNCTION: &str = "42883";
 
 // ── Class 53 — Insufficient Resources ────────────────────────────────────────
 
@@ -237,6 +245,7 @@ mod tests {
             NO_DATA,
             FEATURE_NOT_SUPPORTED,
             NUMERIC_VALUE_OUT_OF_RANGE,
+            DIVISION_BY_ZERO,
             INTEGRITY_CONSTRAINT_VIOLATION,
             NOT_NULL_VIOLATION,
             FOREIGN_KEY_VIOLATION,
@@ -256,6 +265,7 @@ mod tests {
             SYNTAX_ERROR,
             CANNOT_COERCE,
             UNDEFINED_TABLE,
+            UNDEFINED_FUNCTION,
             OUT_OF_MEMORY,
             TOO_MANY_CONNECTIONS,
             CONFIGURATION_LIMIT_EXCEEDED,

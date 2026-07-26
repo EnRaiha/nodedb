@@ -123,6 +123,14 @@ impl<'a> FromMessagePack<'a> for ErrorDetails {
                 skip_fields(reader, field_count)?;
                 Ok(ErrorDetails::SqlNotEnabled)
             }
+            TAG_UNDEFINED_FUNCTION => {
+                let (name,) = read1_str(reader, field_count)?;
+                Ok(ErrorDetails::UndefinedFunction { name })
+            }
+            TAG_DIVISION_BY_ZERO => {
+                skip_fields(reader, field_count)?;
+                Ok(ErrorDetails::DivisionByZero)
+            }
             TAG_AUTHORIZATION_DENIED => {
                 let (resource,) = read1_str(reader, field_count)?;
                 Ok(ErrorDetails::AuthorizationDenied { resource })
@@ -346,6 +354,7 @@ mod tests {
         for v in [
             ErrorDetails::DeadlineExceeded,
             ErrorDetails::SqlNotEnabled,
+            ErrorDetails::DivisionByZero,
             ErrorDetails::AuthExpired,
             ErrorDetails::SyncConnectionFailed,
             ErrorDetails::Config,
