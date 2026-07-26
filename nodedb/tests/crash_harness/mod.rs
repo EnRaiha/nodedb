@@ -72,6 +72,11 @@ pub struct CrashHarness {
     pub http_port: u16,
     pub pgwire_port: u16,
     pub native_port: u16,
+    /// The sync WebSocket port. Unused by the tests themselves, but it must
+    /// be unique per harness: every protocol bind is boot-fatal, so two
+    /// concurrent harnesses left on the default sync port would collide and
+    /// one server would refuse to boot.
+    pub sync_port: u16,
     child: Option<std::process::Child>,
     /// Extra server env applied on EVERY spawn, including `reopen`. A test that
     /// tunes the server (short checkpoint interval, small WAL segments) needs
@@ -90,6 +95,7 @@ impl CrashHarness {
             http_port: free_port(),
             pgwire_port: free_port(),
             native_port: free_port(),
+            sync_port: free_port(),
             child: None,
             extra_env: Vec::new(),
         }
@@ -141,6 +147,7 @@ impl CrashHarness {
             .env("NODEDB_PORT_HTTP", self.http_port.to_string())
             .env("NODEDB_PORT_PGWIRE", self.pgwire_port.to_string())
             .env("NODEDB_PORT_NATIVE", self.native_port.to_string())
+            .env("NODEDB_PORT_SYNC", self.sync_port.to_string())
             // Pin the superuser password so the test can authenticate. Without
             // this the binary auto-generates a random password into
             // `<data_dir>/.superuser_password` (default auth mode is Password),

@@ -63,6 +63,9 @@ fn offender_task_aborted_at_500ms_budget() {
     let http_port = free_port();
     let pgwire_port = free_port();
     let native_port = free_port();
+    // Unique too: the sync bind is boot-fatal, so concurrent server
+    // processes must not share the default sync port.
+    let sync_port = free_port();
 
     let child = std::process::Command::new(bin)
         .env("NODEDB_DATA_DIR", dir.path())
@@ -70,6 +73,7 @@ fn offender_task_aborted_at_500ms_budget() {
         .env("NODEDB_PORT_HTTP", http_port.to_string())
         .env("NODEDB_PORT_PGWIRE", pgwire_port.to_string())
         .env("NODEDB_PORT_NATIVE", native_port.to_string())
+        .env("NODEDB_PORT_SYNC", sync_port.to_string())
         // Inject a slow drain task that will be detected as an offender.
         .env("NODEDB_TEST_SLOW_DRAIN_TASK", "1")
         // Use warn level so the shutdown offender ERROR log is captured.

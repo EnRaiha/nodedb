@@ -4,6 +4,8 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
+use tokio::net::TcpListener;
 use tracing::info;
 
 use crate::ServerConfig;
@@ -16,9 +18,14 @@ use crate::control::shutdown::ShutdownBus;
 use crate::control::startup::StartupGate;
 use crate::control::state::SharedState;
 
-/// The three protocol listeners passed to [`spawn_protocol_listeners`].
+/// The pre-bound protocol listeners passed to [`spawn_protocol_listeners`].
+///
+/// Every socket here is already bound by [`bind_listeners`], so spawning
+/// cannot fail on a port conflict.
 pub struct ProtocolListeners {
     pub pg_listener: PgListener,
+    pub http_listener: TcpListener,
+    pub sync_listener: TcpListener,
     pub ilp_listener: Option<IlpListener>,
     pub resp_listener: Option<RespListener>,
 }
@@ -34,6 +41,10 @@ pub struct ListenerInfra {
 ///
 /// The native listener is not spawned here — it is run on the main task
 /// by the caller after this returns.
+///
+/// Infallible by construction: every socket was bound by [`bind_listeners`]
+/// before this point, so a port conflict has already aborted boot while
+/// nothing was exposed. Nothing here may silently swallow a bind failure.
 pub async fn spawn_protocol_listeners(
     listeners: ProtocolListeners,
     shared: Arc<SharedState>,
@@ -44,6 +55,8 @@ pub async fn spawn_protocol_listeners(
 ) {
     let ProtocolListeners {
         pg_listener,
+        http_listener,
+        sync_listener,
         ilp_listener,
         resp_listener,
     } = listeners;
@@ -84,10 +97,9 @@ pub async fn spawn_protocol_listeners(
         }
     });
 
-    // HTTP API server.
+    // HTTP API server (on the socket bound by `bind_listeners`).
     let shared_http = Arc::clone(&shared);
     let http_auth_mode = config.auth.mode.clone();
-    let http_listen = config.http_addr();
     let http_tls = if http_tls_enabled {
         config.server.tls.clone()
     } else {
@@ -96,7 +108,7 @@ pub async fn spawn_protocol_listeners(
     let bus_http = shutdown_bus.clone();
     tokio::spawn(async move {
         if let Err(e) = crate::control::server::http::server::run(
-            http_listen,
+            http_listener,
             shared_http,
             http_auth_mode,
             http_tls.as_ref(),
@@ -156,25 +168,22 @@ pub async fn spawn_protocol_listeners(
         });
     }
 
-    // Sync WebSocket listener for NodeDB-Lite clients.
-    let sync_config = crate::control::server::sync::listener::SyncListenerConfig::default();
-    match crate::control::server::sync::listener::start_sync_listener(
+    // Sync WebSocket listener for NodeDB-Lite clients (socket already bound).
+    let sync_config = crate::control::server::sync::listener::SyncListenerConfig {
+        listen_addr: config.sync_addr(),
+        ..Default::default()
+    };
+    let sync_state = crate::control::server::sync::listener::serve_sync_listener(
+        sync_listener,
         sync_config,
         Some(Arc::clone(&shared)),
     )
-    .await
-    {
-        Ok(sync_state) => {
-            info!(
-                addr = %sync_state.config.listen_addr,
-                max_sessions = sync_state.config.max_sessions,
-                "sync WebSocket listener started"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "sync listener failed to start (non-fatal)");
-        }
-    }
+    .await;
+    info!(
+        addr = %sync_state.config.listen_addr,
+        max_sessions = sync_state.config.max_sessions,
+        "sync WebSocket listener started"
+    );
 
     // Signal readiness to systemd and cluster lifecycle.
     if let Some(handle) = cluster_handle {
@@ -184,18 +193,34 @@ pub async fn spawn_protocol_listeners(
     nodedb_cluster::readiness::notify_ready();
 }
 
+/// Every protocol socket, bound before any accept loop starts.
+pub struct BoundListeners {
+    pub native: Listener,
+    pub pgwire: PgListener,
+    pub http: TcpListener,
+    pub sync: TcpListener,
+    pub ilp: Option<IlpListener>,
+    pub resp: Option<RespListener>,
+}
+
 /// Bind all protocol listeners to their configured addresses.
-pub async fn bind_listeners(
-    config: &ServerConfig,
-) -> anyhow::Result<(
-    Listener,
-    PgListener,
-    Option<IlpListener>,
-    Option<RespListener>,
-)> {
+///
+/// This is the single fail-fast point for listener setup: it runs before the
+/// node waits on cluster readiness and before any accept loop is spawned, so
+/// a port conflict on *any* protocol — including HTTP and sync, which serve
+/// from detached tasks — aborts boot while nothing is exposed yet. Never
+/// move a bind out of here into a spawned task; that is how a server ends up
+/// running for days missing a listener behind one warning line.
+pub async fn bind_listeners(config: &ServerConfig) -> anyhow::Result<BoundListeners> {
     let native = crate::control::server::listener::Listener::bind(config.native_addr()).await?;
     let pgwire =
         crate::control::server::pgwire::listener::PgListener::bind(config.pgwire_addr()).await?;
+    let http = TcpListener::bind(config.http_addr())
+        .await
+        .with_context(|| format!("bind HTTP API listener to {}", config.http_addr()))?;
+    let sync = crate::control::server::sync::listener::bind_sync_listener(config.sync_addr())
+        .await
+        .context("sync listener failed to bind")?;
     let ilp = if let Some(ilp_addr) = config.ilp_addr() {
         Some(crate::control::server::ilp_listener::IlpListener::bind(ilp_addr).await?)
     } else {
@@ -206,5 +231,12 @@ pub async fn bind_listeners(
     } else {
         None
     };
-    Ok((native, pgwire, ilp, resp))
+    Ok(BoundListeners {
+        native,
+        pgwire,
+        http,
+        sync,
+        ilp,
+        resp,
+    })
 }

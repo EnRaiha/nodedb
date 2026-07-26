@@ -37,7 +37,6 @@
 //! middleware (auth, startup-gate, tracing) must apply uniformly across
 //! versions.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -213,8 +212,8 @@ async fn startup_gate_middleware(
 
 /// Start the HTTP API server from an already-bound [`tokio::net::TcpListener`].
 ///
-/// Useful in tests where an ephemeral-port listener is bound before the server
-/// task is spawned, making the port available to the test without a race.
+/// Alias of [`run`], kept for call sites (tests, harnesses) that bind an
+/// ephemeral-port listener first so the port is known without a race.
 pub async fn run_with_listener(
     listener: tokio::net::TcpListener,
     shared: Arc<SharedState>,
@@ -222,11 +221,22 @@ pub async fn run_with_listener(
     tls_settings: Option<&crate::config::server::TlsSettings>,
     bus: crate::control::shutdown::ShutdownBus,
 ) -> crate::Result<()> {
-    if tls_settings.is_some() {
-        return Err(crate::Error::Config {
-            detail: "run_with_listener does not support TLS; use run() instead".into(),
-        });
-    }
+    run(listener, shared, auth_mode, tls_settings, bus).await
+}
+
+/// Start the HTTP API server (plain HTTP or HTTPS) on a pre-bound listener.
+///
+/// The socket is bound by `bootstrap::listeners::bind_listeners` before any
+/// accept loop starts, so a port conflict is boot-fatal rather than an error
+/// logged from inside an already-detached task. If `tls_settings` is provided,
+/// serves HTTPS via axum-server + rustls; otherwise plain HTTP via axum::serve.
+pub async fn run(
+    listener: tokio::net::TcpListener,
+    shared: Arc<SharedState>,
+    auth_mode: AuthMode,
+    tls_settings: Option<&crate::config::server::TlsSettings>,
+    bus: crate::control::shutdown::ShutdownBus,
+) -> crate::Result<()> {
     let drain_guard = bus.register_task(
         crate::control::shutdown::ShutdownPhase::DrainingListeners,
         "http",
@@ -244,54 +254,9 @@ pub async fn run_with_listener(
     };
     let router = build_router(state);
     let local_addr = listener.local_addr()?;
-    info!(%local_addr, "HTTP API server listening (pre-bound listener)");
-    // `with_connect_info` is required so routes that take
-    // `ConnectInfo<SocketAddr>` (e.g. `/api/auth/session` for the
-    // fingerprint-bound session handle path) resolve the peer address.
-    // Without it, axum rejects those requests with 500.
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_rx.changed().await;
-    })
-    .await
-    .map_err(crate::Error::Io)?;
-    drain_guard.report_drained();
-    Ok(())
-}
-
-/// Start the HTTP API server (plain HTTP or HTTPS).
-///
-/// If `tls_settings` is provided, serves HTTPS via axum-server + rustls.
-/// Otherwise serves plain HTTP via axum::serve.
-pub async fn run(
-    listen: SocketAddr,
-    shared: Arc<SharedState>,
-    auth_mode: AuthMode,
-    tls_settings: Option<&crate::config::server::TlsSettings>,
-    bus: crate::control::shutdown::ShutdownBus,
-) -> crate::Result<()> {
-    let drain_guard = bus.register_task(
-        crate::control::shutdown::ShutdownPhase::DrainingListeners,
-        "http",
-        None,
-    );
-    let mut shutdown_rx = bus.handle().flat_watch().raw_receiver();
-
-    let query_ctx = Arc::new(crate::control::planner::context::QueryContext::for_state(
-        &shared,
-    ));
-    let state = AppState {
-        shared,
-        auth_mode,
-        query_ctx,
-    };
-    let router = build_router(state);
 
     if let Some(tls) = tls_settings {
-        // HTTPS via axum-server + rustls.
+        // HTTPS via axum-server + rustls, on the pre-bound socket.
         let rustls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
                 .await
@@ -299,7 +264,7 @@ pub async fn run(
                     detail: format!("HTTP TLS config error: {e}"),
                 })?;
 
-        info!(%listen, tls = true, "HTTPS API server listening");
+        info!(%local_addr, tls = true, "HTTPS API server listening");
 
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
@@ -308,17 +273,22 @@ pub async fn run(
             shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
         });
 
-        axum_server::bind_rustls(listen, rustls_config)
+        // `into_std` keeps the socket in nonblocking mode, which is what
+        // axum-server needs to hand it back to Tokio.
+        axum_server::from_tcp_rustls(listener.into_std()?, rustls_config)
+            .map_err(crate::Error::Io)?
             .handle(handle)
             .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .map_err(crate::Error::Io)?;
     } else {
         // Plain HTTP.
-        let listener = tokio::net::TcpListener::bind(listen).await?;
-        let local_addr = listener.local_addr()?;
         info!(%local_addr, "HTTP API server listening");
 
+        // `with_connect_info` is required so routes that take
+        // `ConnectInfo<SocketAddr>` (e.g. `/api/auth/session` for the
+        // fingerprint-bound session handle path) resolve the peer address.
+        // Without it, axum rejects those requests with 500.
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),

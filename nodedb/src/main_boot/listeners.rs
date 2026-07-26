@@ -25,6 +25,8 @@ pub(crate) struct ListenerSetup {
     pub(crate) admission_registry: Arc<nodedb::control::server::admission::AdmissionRegistry>,
     pub(crate) listener: Listener,
     pub(crate) pg_listener: PgListener,
+    pub(crate) http_listener: tokio::net::TcpListener,
+    pub(crate) sync_listener: tokio::net::TcpListener,
     pub(crate) ilp_listener: Option<IlpListener>,
     pub(crate) resp_listener: Option<RespListener>,
     pub(crate) base_acceptor: Option<tokio_rustls::TlsAcceptor>,
@@ -54,9 +56,17 @@ pub(crate) async fn setup(
         "connection limit configured"
     );
 
-    // Bind all listeners before starting accept loops.
-    let (listener, pg_listener, ilp_listener, resp_listener) =
-        bootstrap::listeners::bind_listeners(config).await?;
+    // Bind all listeners — every protocol, including HTTP and sync — before
+    // starting any accept loop, so a port conflict fails boot here rather
+    // than after the node is already serving other protocols.
+    let bootstrap::listeners::BoundListeners {
+        native: listener,
+        pgwire: pg_listener,
+        http: http_listener,
+        sync: sync_listener,
+        ilp: ilp_listener,
+        resp: resp_listener,
+    } = bootstrap::listeners::bind_listeners(config).await?;
 
     // Startup banner (and trust-mode warning if applicable).
     bootstrap::credentials::print_startup_banner(config, cluster_mode_str);
@@ -99,6 +109,8 @@ pub(crate) async fn setup(
         admission_registry,
         listener,
         pg_listener,
+        http_listener,
+        sync_listener,
         ilp_listener,
         resp_listener,
         base_acceptor,

@@ -39,6 +39,7 @@ use crate::config::EngineConfig;
 /// pgwire = 6432
 /// native = 6433
 /// http   = 6480
+/// sync   = 9090
 ///
 /// [auth]
 /// # ...
@@ -161,6 +162,11 @@ impl ServerConfig {
         self.addr(self.server.ports.http)
     }
 
+    /// Sync WebSocket listen address (NodeDB-Lite clients).
+    pub fn sync_addr(&self) -> SocketAddr {
+        self.addr(self.server.ports.sync)
+    }
+
     /// RESP listen address (None if disabled).
     pub fn resp_addr(&self) -> Option<SocketAddr> {
         self.server.ports.resp.map(|p| self.addr(p))
@@ -200,6 +206,7 @@ mod tests {
         assert_eq!(cfg.server.ports.native, 6433);
         assert_eq!(cfg.server.ports.pgwire, 6432);
         assert_eq!(cfg.server.ports.http, 6480);
+        assert_eq!(cfg.server.ports.sync, 9090);
         assert!(cfg.server.ports.resp.is_none());
         assert!(cfg.server.ports.ilp.is_none());
         assert!(cfg.server.data_plane_cores >= 1);

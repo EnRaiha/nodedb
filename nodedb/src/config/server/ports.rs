@@ -4,6 +4,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Default sync WebSocket port.
+///
+/// Exported because the sync listener's own `SyncListenerConfig::default()`
+/// must agree with the config default — one constant, not two literals that
+/// can drift apart.
+pub const DEFAULT_SYNC_PORT: u16 = 9090;
+
 /// Port configuration for all protocol listeners.
 ///
 /// Always-on protocols have a default port. Optional protocols (RESP, ILP)
@@ -20,6 +27,9 @@ pub struct PortsConfig {
     /// HTTP API port (REST, SSE, WebSocket). Default: 6480.
     #[serde(default = "default_http_port")]
     pub http: u16,
+    /// Sync WebSocket port (NodeDB-Lite clients). Default: 9090.
+    #[serde(default = "default_sync_port")]
+    pub sync: u16,
     /// RESP (Redis-compatible) port. Disabled by default. Set to enable.
     #[serde(default)]
     pub resp: Option<u16>,
@@ -34,6 +44,7 @@ impl Default for PortsConfig {
             native: default_native_port(),
             pgwire: default_pgwire_port(),
             http: default_http_port(),
+            sync: default_sync_port(),
             resp: None,
             ilp: None,
         }
@@ -49,6 +60,9 @@ fn default_pgwire_port() -> u16 {
 fn default_http_port() -> u16 {
     6480
 }
+fn default_sync_port() -> u16 {
+    DEFAULT_SYNC_PORT
+}
 
 #[cfg(test)]
 mod tests {
@@ -60,6 +74,7 @@ mod tests {
         assert_eq!(p.native, 6433);
         assert_eq!(p.pgwire, 6432);
         assert_eq!(p.http, 6480);
+        assert_eq!(p.sync, 9090);
         assert!(p.resp.is_none());
         assert!(p.ilp.is_none());
     }

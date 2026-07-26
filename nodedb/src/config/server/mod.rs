@@ -25,7 +25,7 @@ pub use observability::{
     ObservabilityConfig, OtlpConfig, OtlpExportConfig, OtlpReceiverConfig, PromqlConfig,
     apply_observability_env, validate_feature_availability,
 };
-pub use ports::PortsConfig;
+pub use ports::{DEFAULT_SYNC_PORT, PortsConfig};
 pub use retention::RetentionSettings;
 pub use scheduler::{CronTimezone, SchedulerConfig};
 pub use section::ServerSection;

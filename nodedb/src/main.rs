@@ -171,6 +171,8 @@ async fn main() -> anyhow::Result<()> {
         admission_registry,
         listener,
         pg_listener,
+        http_listener,
+        sync_listener,
         ilp_listener,
         resp_listener,
         base_acceptor,
@@ -211,6 +213,8 @@ async fn main() -> anyhow::Result<()> {
     nodedb::bootstrap::listeners::spawn_protocol_listeners(
         nodedb::bootstrap::listeners::ProtocolListeners {
             pg_listener,
+            http_listener,
+            sync_listener,
             ilp_listener,
             resp_listener,
         },

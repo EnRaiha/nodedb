@@ -223,6 +223,7 @@ log_format = "text"               # "text" or "json"
 native = 6433                     # Always-on protocols have defaults
 pgwire = 6432
 http = 6480
+sync = 9090                       # Always on
 resp = 6381                       # Optional: set to enable, omit to disable
 ilp = 8086                        # Optional: set to enable, omit to disable
 
@@ -236,6 +237,10 @@ resp = true
 ilp = false                       # Example: disable TLS for ILP ingest
 ```
 
+Every listener binds during startup, before the server accepts any
+connection. If a configured port is already in use, startup fails with that
+port named — the server never comes up missing a protocol.
+
 **Server settings:**
 
 | Config field       | Environment variable      | Default                                               |
@@ -244,6 +249,7 @@ ilp = false                       # Example: disable TLS for ILP ingest
 | `ports.native`     | `NODEDB_PORT_NATIVE`      | `6433`                                                |
 | `ports.pgwire`     | `NODEDB_PORT_PGWIRE`      | `6432`                                                |
 | `ports.http`       | `NODEDB_PORT_HTTP`        | `6480`                                                |
+| `ports.sync`       | `NODEDB_PORT_SYNC`        | `9090`                                                |
 | `ports.resp`       | `NODEDB_PORT_RESP`        | disabled                                              |
 | `ports.ilp`        | `NODEDB_PORT_ILP`         | disabled                                              |
 | `data_dir`         | `NODEDB_DATA_DIR`         | `~/.nodedb/data` (binary), `/var/lib/nodedb` (Docker) |

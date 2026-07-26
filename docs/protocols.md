@@ -223,7 +223,7 @@ SELECT * FROM cpu WHERE ts > now() - INTERVAL '1 hour';
 
 CRDT sync protocol for NodeDB-Lite clients (mobile, WASM, desktop). Bidirectional delta exchange over WebSocket.
 
-**Port:** 9090 (default)
+**Port:** 9090 (default). Configurable via `[server.ports] sync` or `NODEDB_PORT_SYNC`.
 
 **Flow:**
 
@@ -256,6 +256,7 @@ host = "127.0.0.1"
 pgwire = 6432       # Always on
 native = 6433       # Always on
 http = 6480         # Always on
+sync = 9090         # Always on
 resp = 6381         # Set to enable (omit to disable)
 ilp = 8086          # Set to enable (omit to disable)
 
@@ -269,7 +270,7 @@ resp = true
 ilp = false         # Example: disable TLS for ILP ingest
 ```
 
-Environment variables override config: `NODEDB_PORT_PGWIRE`, `NODEDB_PORT_NATIVE`, `NODEDB_PORT_HTTP`, `NODEDB_PORT_RESP`, `NODEDB_PORT_ILP`.
+Environment variables override config: `NODEDB_PORT_PGWIRE`, `NODEDB_PORT_NATIVE`, `NODEDB_PORT_HTTP`, `NODEDB_PORT_SYNC`, `NODEDB_PORT_RESP`, `NODEDB_PORT_ILP`.
 
 ## Native Protocol Opcodes (SDK Reference)
 

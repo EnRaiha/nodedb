@@ -180,6 +180,7 @@ fn apply_bool_env(var: &str, target: &mut bool) {
 /// - `NODEDB_PORT_NATIVE`      — overrides `config.ports.native` (default 6433)
 /// - `NODEDB_PORT_PGWIRE`      — overrides `config.ports.pgwire` (default 6432)
 /// - `NODEDB_PORT_HTTP`        — overrides `config.ports.http` (default 6480)
+/// - `NODEDB_PORT_SYNC`        — overrides `config.ports.sync` (default 9090)
 /// - `NODEDB_PORT_RESP`        — overrides `config.ports.resp` (set to enable RESP)
 /// - `NODEDB_PORT_ILP`         — overrides `config.ports.ilp` (set to enable ILP)
 /// - `NODEDB_DATA_DIR`         — overrides `config.data_dir`
@@ -235,6 +236,7 @@ pub fn apply_env_overrides(config: &mut ServerConfig) {
     apply_port_env("NODEDB_PORT_NATIVE", &mut config.server.ports.native);
     apply_port_env("NODEDB_PORT_PGWIRE", &mut config.server.ports.pgwire);
     apply_port_env("NODEDB_PORT_HTTP", &mut config.server.ports.http);
+    apply_port_env("NODEDB_PORT_SYNC", &mut config.server.ports.sync);
     apply_optional_port_env("NODEDB_PORT_RESP", &mut config.server.ports.resp);
     apply_optional_port_env("NODEDB_PORT_ILP", &mut config.server.ports.ilp);
 
@@ -677,6 +679,29 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("NODEDB_MEMORY_LIMIT") };
+    }
+
+    /// Tests valid and malformed `NODEDB_PORT_SYNC` sequentially to avoid
+    /// env-var races (env vars are process-global, Rust tests run in parallel).
+    #[test]
+    fn env_sync_port_overrides() {
+        // ── Valid value → overrides ports.sync ──
+        unsafe { std::env::set_var("NODEDB_PORT_SYNC", "19090") };
+        let mut cfg = ServerConfig::default();
+        apply_env_overrides(&mut cfg);
+        assert_eq!(cfg.server.ports.sync, 19090);
+
+        // ── Malformed value → ports.sync unchanged ──
+        unsafe { std::env::set_var("NODEDB_PORT_SYNC", "notaport") };
+        let mut cfg = ServerConfig::default();
+        let before = cfg.server.ports.sync;
+        apply_env_overrides(&mut cfg);
+        assert_eq!(
+            cfg.server.ports.sync, before,
+            "malformed value must not change config"
+        );
+
+        unsafe { std::env::remove_var("NODEDB_PORT_SYNC") };
     }
 
     #[test]
