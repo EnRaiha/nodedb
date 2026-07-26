@@ -274,6 +274,12 @@ pub(super) fn convert_sort_keys(keys: &[SortKey]) -> Vec<(String, bool)> {
 }
 
 /// Replace scans on `cte_name` with the CTE's actual subquery plan.
+///
+/// Outer constraints on the CTE reference are merged onto the CTE body as far
+/// as the body can carry them: a `Scan` body takes all of them; a
+/// `VectorSearch` body takes filters, projection, and an unordered LIMIT (as
+/// `top_k`). Constraints a body has no slot for — an outer `ORDER BY`, OFFSET,
+/// or DISTINCT over a non-`Scan` body — are not applied.
 pub(super) fn inline_cte(plan: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> SqlPlan {
     match plan {
         // Direct scan on CTE name → replace with CTE plan.
@@ -337,6 +343,34 @@ pub(super) fn inline_cte(plan: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> 
                         window_functions: inner_w.clone(),
                         temporal: *inner_t,
                     }
+                } else if let SqlPlan::VectorSearch { .. } = cte_plan {
+                    // A k-NN body carries its own post-filter list and top-k, so
+                    // outer predicates merge onto it and run inside the engine
+                    // over the candidate set — dropping them would silently
+                    // return the unfiltered top-k.
+                    let mut merged = cte_plan.clone();
+                    if let SqlPlan::VectorSearch {
+                        filters: body_filters,
+                        projection: body_projection,
+                        top_k,
+                        ..
+                    } = &mut merged
+                    {
+                        body_filters.extend(filters.iter().cloned());
+                        if !projection.is_empty() {
+                            body_projection.clone_from(projection);
+                        }
+                        // An outer LIMIT narrows the k-NN cut only while the
+                        // rows still come back in distance order; an outer
+                        // ORDER BY reorders them, so the LIMIT then belongs
+                        // above the search, not on it.
+                        if sort_keys.is_empty()
+                            && let Some(outer_limit) = limit
+                        {
+                            *top_k = (*top_k).min(*outer_limit);
+                        }
+                    }
+                    merged
                 } else {
                     cte_plan.clone()
                 }
@@ -423,5 +457,107 @@ pub(super) fn inline_cte(plan: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> 
 
         // No CTE reference — return as-is.
         _ => plan.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_sql::types::{CompareOp, EngineType, Filter, FilterExpr, SqlValue};
+
+    fn vector_search_body() -> SqlPlan {
+        SqlPlan::VectorSearch {
+            collection: "docs".to_string(),
+            field: "embedding".to_string(),
+            query_vector: vec![0.1, 0.2],
+            top_k: 3,
+            ef_search: 64,
+            metric: nodedb_sql::types::DistanceMetric::L2,
+            filters: Vec::new(),
+            array_prefilter: None,
+            ann_options: nodedb_sql::types::VectorAnnOptions::default(),
+            skip_payload_fetch: false,
+            payload_filters: Vec::new(),
+            projection: Vec::new(),
+        }
+    }
+
+    fn scan_on_cte(filters: Vec<Filter>, limit: Option<usize>) -> SqlPlan {
+        SqlPlan::Scan {
+            collection: "knn".to_string(),
+            alias: None,
+            engine: EngineType::DocumentSchemaless,
+            filters,
+            projection: Vec::new(),
+            sort_keys: Vec::new(),
+            limit,
+            offset: 0,
+            distinct: false,
+            window_functions: Vec::new(),
+            temporal: nodedb_sql::TemporalScope::default(),
+        }
+    }
+
+    fn tag_filter() -> Filter {
+        Filter {
+            expr: FilterExpr::Comparison {
+                field: "tag".to_string(),
+                op: CompareOp::Eq,
+                value: SqlValue::String("keep".to_string()),
+            },
+        }
+    }
+
+    fn expect_vector_search(plan: SqlPlan) -> (Vec<Filter>, usize) {
+        match plan {
+            SqlPlan::VectorSearch { filters, top_k, .. } => (filters, top_k),
+            other => panic!("expected VectorSearch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outer_filter_merges_onto_vector_search_cte_body() {
+        let (filters, top_k) = expect_vector_search(inline_cte(
+            &scan_on_cte(vec![tag_filter()], None),
+            "knn",
+            &vector_search_body(),
+        ));
+        assert_eq!(
+            filters.len(),
+            1,
+            "the outer WHERE must survive inlining, else the k-NN result comes back unfiltered"
+        );
+        assert_eq!(top_k, 3, "a filter alone must not change the requested k");
+    }
+
+    #[test]
+    fn outer_limit_narrows_the_vector_search_top_k() {
+        let (_, top_k) = expect_vector_search(inline_cte(
+            &scan_on_cte(Vec::new(), Some(1)),
+            "knn",
+            &vector_search_body(),
+        ));
+        assert_eq!(top_k, 1, "an outer LIMIT below k must narrow the k-NN cut");
+    }
+
+    #[test]
+    fn outer_limit_above_k_leaves_top_k_untouched() {
+        let (_, top_k) = expect_vector_search(inline_cte(
+            &scan_on_cte(Vec::new(), Some(99)),
+            "knn",
+            &vector_search_body(),
+        ));
+        assert_eq!(top_k, 3, "an outer LIMIT above k cannot widen the k-NN cut");
+    }
+
+    #[test]
+    fn unconstrained_reference_returns_the_vector_search_body_verbatim() {
+        let (filters, top_k) = expect_vector_search(inline_cte(
+            &scan_on_cte(Vec::new(), None),
+            "knn",
+            &vector_search_body(),
+        ));
+        assert!(filters.is_empty());
+        assert_eq!(top_k, 3);
     }
 }
