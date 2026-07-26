@@ -2,7 +2,7 @@
 
 //! Convert sqlparser AST expressions to our SqlExpr IR.
 
-use sqlparser::ast::{self, Expr, Value};
+use sqlparser::ast::{self, Expr, UnaryOperator, Value};
 
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::{SCHEMA_QUALIFIED_MSG, normalize_ident};
@@ -129,6 +129,36 @@ fn convert_expr_inner(expr: &Expr, depth: &mut usize) -> Result<SqlExpr> {
                 op: convert_binary_op(op)?,
                 right: Box::new(convert_expr_depth(right, depth)?),
             })
+        }
+        // A negative integer literal reaches sqlparser as unary minus applied
+        // to a *positive* number, so the most negative `BIGINT` arrives as
+        // `-(9223372036854775808)` — and that operand does not fit an `i64`.
+        // Converting the operand on its own therefore falls back to `Float`
+        // and silently turns an exact integer into an approximate one. Folding
+        // the sign into the literal before parsing keeps the whole `i64` range
+        // exact; anything that still does not fit falls through to the general
+        // path below and is handled as before.
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: inner,
+        } if matches!(
+            inner.as_ref(),
+            Expr::Value(v) if matches!(&v.value, Value::Number(..))
+        ) =>
+        {
+            let Expr::Value(v) = inner.as_ref() else {
+                unreachable!("guarded by the `matches!` above")
+            };
+            let Value::Number(n, _) = &v.value else {
+                unreachable!("guarded by the `matches!` above")
+            };
+            match format!("-{n}").parse::<i64>() {
+                Ok(i) => Ok(SqlExpr::Literal(SqlValue::Int(i))),
+                Err(_) => Ok(SqlExpr::UnaryOp {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(convert_expr_depth(inner, depth)?),
+                }),
+            }
         }
         Expr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
             op: convert_unary_op(op)?,

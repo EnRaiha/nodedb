@@ -40,6 +40,7 @@ impl SqlCatalog for Catalog {
                         is_primary_key: true,
                         default: None,
                         raw_type: Some("INT".into()),
+                        int_width: Some(nodedb_types::columnar::IntWidth::I32),
                     },
                     ColumnInfo {
                         name: "note".into(),
@@ -48,6 +49,7 @@ impl SqlCatalog for Catalog {
                         is_primary_key: false,
                         default: None,
                         raw_type: Some("TEXT".into()),
+                        int_width: None,
                     },
                 ],
                 primary_key: Some("id".into()),

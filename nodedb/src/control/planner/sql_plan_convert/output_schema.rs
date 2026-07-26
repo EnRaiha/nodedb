@@ -20,7 +20,7 @@ use nodedb_sql::types_expr::SqlExpr;
 use super::lateral::collection_name_from_plan;
 use super::output_schema_types::{infer_aggregate_type, infer_computed_expr_type};
 use crate::control::server::response_shape::schema::{
-    OutputColumn, OutputSchema, sql_data_type_to_ddl_col_type,
+    OutputColumn, OutputSchema, sql_data_type_to_ddl_col_type_with_width,
 };
 use crate::control::server::response_shape::types::DdlColType;
 
@@ -94,7 +94,12 @@ fn column_types_for<C: SqlCatalog>(
         Ok(Some(info)) => info
             .columns
             .iter()
-            .map(|c| (c.name.clone(), sql_data_type_to_ddl_col_type(&c.data_type)))
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    sql_data_type_to_ddl_col_type_with_width(&c.data_type, c.int_width),
+                )
+            })
             .collect(),
         _ => HashMap::new(),
     }
@@ -173,7 +178,7 @@ fn ordered_columns_for<C: SqlCatalog>(
             .map(|c| OutputColumn {
                 display_name: c.name.clone(),
                 lookup_key: c.name.clone(),
-                ty: sql_data_type_to_ddl_col_type(&c.data_type),
+                ty: sql_data_type_to_ddl_col_type_with_width(&c.data_type, c.int_width),
             })
             .collect(),
         _ => Vec::new(),
@@ -773,6 +778,7 @@ mod tests {
                 is_primary_key: false,
                 default: None,
                 raw_type: None,
+                int_width: None,
             };
             Ok(Some(nodedb_sql::types::CollectionInfo {
                 name: "metrics".to_string(),

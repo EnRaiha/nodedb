@@ -50,7 +50,19 @@ pub fn has_secondary_index(coll: &StoredCollection) -> bool {
     !coll.indexes.is_empty()
 }
 
+/// Map a declared catalog type string to the PostgreSQL type OID that
+/// `pg_attribute` / `\d` reports for it.
+///
+/// Integer widths are resolved through
+/// [`IntWidth::from_declared_type`](nodedb_types::columnar::IntWidth::from_declared_type)
+/// rather than matched here, so catalog introspection and `RowDescription`
+/// cannot disagree about how wide a column is — a split that previously showed
+/// up as `\d` reporting OID 23 for a column `SELECT` advertised as 20.
 pub fn field_type_to_oid(field_type: &str) -> i64 {
+    if let Some(width) = nodedb_types::columnar::IntWidth::from_declared_type(field_type) {
+        return i64::from(width.pg_oid());
+    }
+
     let normalized = field_type.trim().to_ascii_lowercase();
     let starts_with_type = |name: &str| {
         normalized == name
@@ -72,12 +84,6 @@ pub fn field_type_to_oid(field_type: &str) -> i64 {
         || starts_with_type("float8")
     {
         701
-    } else if starts_with_type("integer") || starts_with_type("int4") || starts_with_type("int") {
-        23
-    } else if starts_with_type("smallint") || starts_with_type("int2") {
-        21
-    } else if starts_with_type("bigint") || starts_with_type("int8") {
-        20
     } else if starts_with_type("float") || starts_with_type("float4") || starts_with_type("real") {
         700
     } else if starts_with_type("bool") || starts_with_type("boolean") {

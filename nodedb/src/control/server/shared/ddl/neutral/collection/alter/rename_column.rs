@@ -14,7 +14,9 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 
-use super::strict_schema::{load_strict_collection, persist_schema_change, write_schema_back};
+use super::strict_schema::{
+    load_strict_collection, persist_schema_change, rename_field, write_schema_back,
+};
 use super::support::{err, status};
 
 /// ALTER COLLECTION <name> RENAME COLUMN <old_name> TO <new_name>
@@ -56,6 +58,7 @@ pub(super) async fn alter_collection_rename_column(
 
     let mut updated = coll;
     write_schema_back(&mut updated, schema);
+    rename_field(&mut updated, old_name, new_name);
     persist_schema_change(state, &updated).await?;
 
     state.audit_record(

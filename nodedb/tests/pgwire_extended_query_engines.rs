@@ -76,10 +76,14 @@ async fn extended_query_kv_integer_value() {
         .iter()
         .find(|c| c.name() == "score")
         .expect("score column must appear in RowDescription");
+    // `score` is declared `INT`, the INT4 alias — issue #217 fixed this column
+    // advertising OID 20 (int8) for every declared integer width. KV resolves
+    // declared widths through the same catalog path as every other engine, so
+    // it now correctly narrows to OID 23 (int4).
     assert_eq!(
         col_score.type_().oid(),
-        20,
-        "KV INT column 'score' must have OID 20 (int8), got {}",
+        23,
+        "KV INT column 'score' must have OID 23 (int4), got {}",
         col_score.type_().oid()
     );
 
@@ -194,10 +198,13 @@ async fn extended_query_columnar_typed_scan() {
     let id: &str = rows[0].get("id");
     assert_eq!(id, "r1");
 
-    // RowDescription: id→TEXT(25), n→INT8(20), score→FLOAT8(701), flag→BOOL(16), label→TEXT(25).
+    // RowDescription: id→TEXT(25), n→INT4(23), score→FLOAT8(701), flag→BOOL(16), label→TEXT(25).
+    // `n` is declared `INT` in the DDL above, which is the INT4 alias — issue
+    // #217 fixed this column advertising OID 20 (int8) for every declared
+    // integer width; it now correctly narrows to OID 23 (int4).
     let expected: &[(&str, u32)] = &[
         ("id", 25),
-        ("n", 20),
+        ("n", 23),
         ("score", 701),
         ("flag", 16),
         ("label", 25),
@@ -316,4 +323,69 @@ async fn extended_query_timeseries_null_param() {
         .expect("null param on timeseries must not panic");
 
     assert_eq!(rows.len(), 0, "NULL param must match 0 rows");
+}
+
+// ── Schemaless engine (binary round-trip) ────────────────────────────────────
+
+/// Binary-format round-trip for declared integer widths on a schemaless
+/// collection. tokio_postgres decodes extended-query results per the
+/// RowDescription OID, so reading each column back with a typed getter that
+/// matches the *advertised* width (`i16`/`i32`/`i64`) fails the `get` if
+/// either the OID or the binary payload width is wrong — this locks the
+/// whole chain: declared width → OID 21/23/20 → binary encoder i16/i32/i64
+/// (issue #217).
+#[tokio::test]
+async fn extended_query_schemaless_int_width_binary_roundtrip() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION bin_widths (id TEXT PRIMARY KEY, s SMALLINT, i INT, b BIGINT)")
+        .await
+        .expect("CREATE COLLECTION bin_widths");
+    srv.exec("INSERT INTO bin_widths (id, s, i, b) VALUES ('r1', 123, 456789, 9876543210)")
+        .await
+        .expect("INSERT bin_widths");
+
+    let stmt = srv
+        .client
+        .prepare_typed(
+            "SELECT id, s, i, b FROM bin_widths WHERE id = $1",
+            &[Type::TEXT],
+        )
+        .await
+        .expect("prepare bin_widths select");
+
+    let rows = srv
+        .client
+        .query(&stmt, &[&"r1"])
+        .await
+        .expect("execute bin_widths select");
+
+    assert_eq!(rows.len(), 1, "expected 1 row");
+
+    // Typed getters matching the advertised OIDs — a wrong OID or a
+    // wrong-width binary payload panics inside `get` before we ever reach
+    // the assertions below.
+    let s = rows[0].get::<_, i16>("s");
+    let i = rows[0].get::<_, i32>("i");
+    let b = rows[0].get::<_, i64>("b");
+    assert_eq!(s, 123);
+    assert_eq!(i, 456789);
+    assert_eq!(b, 9876543210);
+
+    // RowDescription OID check: s→INT2(21), i→INT4(23), b→INT8(20).
+    let expected: &[(&str, u32)] = &[("s", 21), ("i", 23), ("b", 20)];
+    for (col_name, expected_oid) in expected {
+        let col = rows[0]
+            .columns()
+            .iter()
+            .find(|c| c.name() == *col_name)
+            .unwrap_or_else(|| panic!("column '{col_name}' must appear in RowDescription"));
+        assert_eq!(
+            col.type_().oid(),
+            *expected_oid,
+            "bin_widths column '{}' OID must be {}, got {}",
+            col_name,
+            expected_oid,
+            col.type_().oid()
+        );
+    }
 }
