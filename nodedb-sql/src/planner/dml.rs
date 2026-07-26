@@ -6,12 +6,13 @@ use nodedb_types::DatabaseId;
 use sqlparser::ast::{self};
 
 use super::dml_helpers::{
-    build_kv_insert_plan, build_vector_primary_insert_plan, check_declared_int_ranges,
+    build_kv_insert_plan, build_vector_primary_insert_plan, coerce_and_check_rows,
     convert_value_rows, resolve_insert_columns,
 };
 use crate::engine_rules::{self, InsertParams};
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::{normalize_ident, normalize_object_name_checked};
+use crate::planner::declared_type_coerce::coerce_assignments_to_declared_types;
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
@@ -148,14 +149,14 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
     if info.primary == nodedb_types::PrimaryEngine::Vector
         && let Some(ref vpc) = info.vector_primary
     {
-        let rows_parsed = convert_value_rows(&columns, rows_ast)?;
-        check_declared_int_ranges(&info.columns, &rows_parsed)?;
+        let mut rows_parsed = convert_value_rows(&columns, rows_ast)?;
+        coerce_and_check_rows(&info, &mut rows_parsed)?;
         return build_vector_primary_insert_plan(&table_name, vpc, &columns, rows_parsed);
     }
 
     // All other engines: delegate to engine rules.
-    let rows = convert_value_rows(&columns, rows_ast)?;
-    check_declared_int_ranges(&info.columns, &rows)?;
+    let mut rows = convert_value_rows(&columns, rows_ast)?;
+    coerce_and_check_rows(&info, &mut rows)?;
     let column_defaults: Vec<(String, String)> = info
         .columns
         .iter()
@@ -229,8 +230,8 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
     // column order — see `plan_insert` for the full rationale (#202).
     let columns = resolve_insert_columns(columns, &info, rows_ast)?;
 
-    let rows = convert_value_rows(&columns, rows_ast)?;
-    check_declared_int_ranges(&info.columns, &rows)?;
+    let mut rows = convert_value_rows(&columns, rows_ast)?;
+    coerce_and_check_rows(&info, &mut rows)?;
     let column_defaults: Vec<(String, String)> = info
         .columns
         .iter()
@@ -257,7 +258,7 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
 fn plan_upsert_with_on_conflict(
     ins: &ast::Insert,
     catalog: &dyn SqlCatalog,
-    on_conflict_updates: Vec<(String, SqlExpr)>,
+    mut on_conflict_updates: Vec<(String, SqlExpr)>,
 ) -> Result<Vec<SqlPlan>> {
     let table_name = match &ins.table {
         ast::TableObject::TableName(name) => normalize_object_name_checked(name)?,
@@ -307,8 +308,15 @@ fn plan_upsert_with_on_conflict(
     // column order — see `plan_insert` for the full rationale (#202).
     let columns = resolve_insert_columns(columns, &info, rows_ast)?;
 
-    let rows = convert_value_rows(&columns, rows_ast)?;
-    check_declared_int_ranges(&info.columns, &rows)?;
+    let mut rows = convert_value_rows(&columns, rows_ast)?;
+    coerce_and_check_rows(&info, &mut rows)?;
+    // `DO UPDATE SET col = <literal>` writes through the same path as the
+    // inserted row, so its literals carry the same declared-type contract.
+    coerce_assignments_to_declared_types(
+        &info.columns,
+        &mut on_conflict_updates,
+        info.primary_key.as_deref(),
+    )?;
     let column_defaults: Vec<(String, String)> = info
         .columns
         .iter()

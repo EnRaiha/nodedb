@@ -220,6 +220,7 @@ pub fn catalog_collection_info(name: &str) -> Option<CollectionInfo> {
             default: None,
             raw_type: None,
             int_width: None,
+            float_width: None,
         })
         .collect();
     Some(CollectionInfo {

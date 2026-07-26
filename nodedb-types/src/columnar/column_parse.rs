@@ -132,7 +132,17 @@ impl FromStr for ColumnType {
             "BIGINT" | "INT64" | "INTEGER" | "INT" | "INT4" | "INT8" | "SMALLINT" | "INT2" => {
                 Ok(Self::Int64)
             }
-            "FLOAT64" | "DOUBLE" | "REAL" | "FLOAT" => Ok(Self::Float64),
+            // `FLOAT4`/`FLOAT8`/`FLOAT32`/`DOUBLE PRECISION` are PostgreSQL
+            // wire-width float keywords, rejected as unknown types here for
+            // the same reason `INT4` was (issue #223). They all collapse to
+            // the same `Float64` storage variant as `DOUBLE`/`REAL`/`FLOAT` —
+            // nodedb always stores floats as a full f64. The declared width is
+            // carried separately as a [`super::FloatWidth`], which narrows the
+            // advertised wire OID; it is deliberately not a storage variant.
+            // Unlike integers it bounds no writes: narrowing a float rounds
+            // rather than wraps, and PostgreSQL accepts-and-rounds too.
+            "FLOAT64" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" | "REAL" | "FLOAT4"
+            | "FLOAT32" | "FLOAT" => Ok(Self::Float64),
             "TEXT" | "STRING" | "VARCHAR" => Ok(Self::String),
             "BOOL" | "BOOLEAN" => Ok(Self::Bool),
             "BYTES" | "BYTEA" | "BLOB" => Ok(Self::Bytes),

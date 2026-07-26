@@ -13,6 +13,7 @@ pub mod catalog_plan_shapes;
 pub mod catalog_plan_validate;
 pub mod const_fold;
 pub mod cte;
+pub mod declared_type_coerce;
 pub mod dml;
 pub mod dml_helpers;
 pub mod grouping_sets;

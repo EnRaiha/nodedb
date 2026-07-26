@@ -17,6 +17,7 @@ use crate::error::{Result, SqlError};
 use crate::parser::normalize::{
     SCHEMA_QUALIFIED_MSG, normalize_ident, normalize_object_name_checked,
 };
+use crate::planner::declared_type_coerce::coerce_assignments_to_declared_types;
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
@@ -43,7 +44,15 @@ pub fn plan_update(stmt: &ast::Statement, catalog: &dyn SqlCatalog) -> Result<Ve
             name: table_name.clone(),
         })?;
 
-    let assigns = convert_assignments(&update.assignments)?;
+    let mut assigns = convert_assignments(&update.assignments)?;
+    // Re-type each literal assignment to its declared column type before the
+    // range check reads it — the same order, and for the same reason, as the
+    // INSERT path's `coerce_and_check_rows`. Engines with a typed write path
+    // coerce it themselves; the schemaless-document and key-value engines,
+    // which persist the value they are handed, do not — and an `UPDATE` that
+    // leaves a numeric column holding text is the same silent loss on read as
+    // an `INSERT` that does (see `declared_type_coerce`).
+    coerce_assignments_to_declared_types(&info.columns, &mut assigns, info.primary_key.as_deref())?;
     check_declared_int_ranges_in_assignments(&info.columns, &assigns)?;
 
     let filters = match &update.selection {

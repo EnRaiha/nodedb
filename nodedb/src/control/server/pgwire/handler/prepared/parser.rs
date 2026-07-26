@@ -61,10 +61,11 @@ fn ddl_col_type_to_pg(ty: &DdlColType) -> Type {
 ///
 /// Reuses the two established hops — `sql_data_type_to_ddl_col_type_with_width`
 /// then [`ddl_col_type_to_pg`] — rather than introducing a third mapping. The
-/// declared integer width travels with the inferred type so a column declared
-/// `INT` is advertised as int4 (oid 23), not int8: the client encodes its bind
-/// value at exactly the width described, and a 4-byte column behind an 8-byte
-/// promise is a decode failure.
+/// declared numeric widths travel with the inferred type so a column declared
+/// `INT` is advertised as int4 (oid 23), not int8, and one declared `REAL` as
+/// float4 (oid 700), not float8: the client encodes its bind value at exactly
+/// the width described, and a 4-byte column behind an 8-byte promise is a
+/// decode failure.
 ///
 /// # Why some variants are refused
 ///
@@ -88,7 +89,11 @@ fn inferred_param_type(inferred: &nodedb_sql::InferredParamType) -> Option<Type>
         | SqlDataType::Bytes
         | SqlDataType::Timestamp
         | SqlDataType::Timestamptz => Some(ddl_col_type_to_pg(
-            &sql_data_type_to_ddl_col_type_with_width(&inferred.data_type, inferred.int_width),
+            &sql_data_type_to_ddl_col_type_with_width(
+                &inferred.data_type,
+                inferred.int_width,
+                inferred.float_width,
+            ),
         )),
         SqlDataType::Decimal
         | SqlDataType::Uuid

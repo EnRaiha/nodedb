@@ -3,7 +3,7 @@
 //! Unit tests for `$N` placeholder type inference.
 
 use nodedb_types::DatabaseId;
-use nodedb_types::columnar::IntWidth;
+use nodedb_types::columnar::{FloatWidth, IntWidth};
 
 use super::infer_placeholder_types;
 use super::slots::{InferredParamType, parse_placeholder_body};
@@ -24,6 +24,18 @@ fn col(name: &str, data_type: SqlDataType, int_width: Option<IntWidth>) -> Colum
         default: None,
         raw_type: None,
         int_width,
+        float_width: None,
+    }
+}
+
+/// A float column with a declared width — the float analogue of `col`'s
+/// `int_width` argument. Separate because the two families never co-occur on
+/// one column, so widening `col` with a fourth argument would make every
+/// integer and string call site carry a `None` it can never set.
+fn float_col(name: &str, float_width: FloatWidth) -> ColumnInfo {
+    ColumnInfo {
+        float_width: Some(float_width),
+        ..col(name, SqlDataType::Float64, None)
     }
 }
 
@@ -62,6 +74,8 @@ impl SqlCatalog for TestCatalog {
                     col("big", SqlDataType::Int64, Some(IntWidth::I64)),
                     col("label", SqlDataType::String, None),
                     col("flag", SqlDataType::Bool, None),
+                    float_col("ratio", FloatWidth::F32),
+                    float_col("wide", FloatWidth::F64),
                 ],
             )),
             // Two relations sharing a column name: the ambiguity lock.
@@ -100,14 +114,25 @@ fn from_sql(data_type: SqlDataType) -> Option<InferredParamType> {
     Some(InferredParamType {
         data_type,
         int_width: None,
+        float_width: None,
     })
 }
 
-/// A type taken from a catalog column, declared width included.
+/// A type taken from a catalog column, declared integer width included.
 fn from_col(data_type: SqlDataType, int_width: Option<IntWidth>) -> Option<InferredParamType> {
     Some(InferredParamType {
         data_type,
         int_width,
+        float_width: None,
+    })
+}
+
+/// A type taken from a catalog float column, declared float width included.
+fn from_float_col(float_width: FloatWidth) -> Option<InferredParamType> {
+    Some(InferredParamType {
+        data_type: SqlDataType::Float64,
+        int_width: None,
+        float_width: Some(float_width),
     })
 }
 
@@ -309,6 +334,21 @@ fn where_comparison_resolves_column_type_and_width() {
     );
 }
 
+/// The float analogue: a `REAL` column must carry its declared `F32` width so
+/// the caller advertises oid 700 and the client encodes four bytes, while a
+/// `DOUBLE` column stays `F64` (oid 701).
+#[test]
+fn where_comparison_resolves_declared_float_width() {
+    assert_eq!(
+        infer("SELECT id FROM t WHERE ratio = $1"),
+        vec![from_float_col(FloatWidth::F32)]
+    );
+    assert_eq!(
+        infer("SELECT id FROM t WHERE wide = $1"),
+        vec![from_float_col(FloatWidth::F64)]
+    );
+}
+
 /// `$1 = col` is the same form with the operands swapped.
 #[test]
 fn reversed_operand_order_resolves() {
@@ -418,17 +458,22 @@ fn insert_multi_row_values_map_each_row() {
 }
 
 /// No explicit column list: positional against the declared column order,
-/// which is only meaningful when the arity matches it exactly.
+/// which is only meaningful when the arity matches it exactly. `t` declares
+/// seven columns, so seven values are required for the mapping to apply —
+/// the two trailing float columns also pin that declared float width rides
+/// along the same positional path as integer width.
 #[test]
 fn insert_without_column_list_maps_against_declared_order() {
     assert_eq!(
-        infer("INSERT INTO t VALUES ($1, $2, $3, $4, $5)"),
+        infer("INSERT INTO t VALUES ($1, $2, $3, $4, $5, $6, $7)"),
         vec![
             from_col(SqlDataType::String, None),
             from_col(SqlDataType::Int64, Some(IntWidth::I32)),
             from_col(SqlDataType::Int64, Some(IntWidth::I64)),
             from_col(SqlDataType::String, None),
             from_col(SqlDataType::Bool, None),
+            from_float_col(FloatWidth::F32),
+            from_float_col(FloatWidth::F64),
         ]
     );
 }

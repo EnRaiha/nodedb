@@ -41,6 +41,7 @@ impl SqlCatalog for Catalog {
                         default: None,
                         raw_type: Some("INT".into()),
                         int_width: Some(nodedb_types::columnar::IntWidth::I32),
+                        float_width: None,
                     },
                     ColumnInfo {
                         name: "note".into(),
@@ -50,6 +51,7 @@ impl SqlCatalog for Catalog {
                         default: None,
                         raw_type: Some("TEXT".into()),
                         int_width: None,
+                        float_width: None,
                     },
                 ],
                 primary_key: Some("id".into()),

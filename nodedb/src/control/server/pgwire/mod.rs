@@ -6,6 +6,7 @@ pub mod ddl_encode;
 pub mod factory;
 pub mod handler;
 pub mod listener;
+pub mod numeric_narrow;
 pub mod session_encode;
 pub mod system_functions;
 pub mod types;

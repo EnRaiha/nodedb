@@ -21,6 +21,7 @@ use serde_json::Value as JsonValue;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 
+use super::numeric_narrow::checked_narrow_f32;
 use super::types::{
     bool_field, bytea_field, float4_array_field, float4_field, float8_array_field, float8_field,
     int2_field, int4_field, int8_field, json_field, jsonb_field, sqlstate_error, text_field,
@@ -108,13 +109,17 @@ fn rows_to_response(shaped: ShapedRows) -> PgWireResult<Response> {
                 // produced — string pre-rendering (`f64::to_string`) diverges
                 // (e.g. `0.0` → "0" vs "0.0"). Integer/other numerics render to
                 // the same decimal text either way.
-                Some(JsonValue::Number(n)) => match ct {
+                Some(value @ JsonValue::Number(n)) => match ct {
                     DdlColType::Float8 => match n.as_f64() {
                         Some(f) => encoder.encode_field(&f)?,
                         None => encoder.encode_field(&None::<f64>)?,
                     },
-                    DdlColType::Float4 => match n.as_f64() {
-                        Some(f) => encoder.encode_field(&(f as f32))?,
+                    // Narrowing to `real` goes through the shared guard, so a
+                    // finite value beyond f32's range surfaces as SQLSTATE
+                    // 22003 here exactly as it does on the SELECT path,
+                    // instead of reaching the client as `Infinity`.
+                    DdlColType::Float4 => match checked_narrow_f32(value)? {
+                        Some(f) => encoder.encode_field(&f)?,
                         None => encoder.encode_field(&None::<f32>)?,
                     },
                     _ => encoder.encode_field(&n.to_string())?,

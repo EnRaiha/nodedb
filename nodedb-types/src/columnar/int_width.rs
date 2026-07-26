@@ -69,12 +69,7 @@ impl IntWidth {
     /// than re-parsing the string.
     pub fn from_declared_type(declared: &str) -> Option<Self> {
         let normalized = declared.trim().to_ascii_lowercase();
-        let is = |name: &str| {
-            normalized == name
-                || normalized.strip_prefix(name).is_some_and(|rest| {
-                    rest.starts_with('(') || rest.chars().next().is_some_and(char::is_whitespace)
-                })
-        };
+        let is = |name: &str| super::declared_type_matches(&normalized, name);
 
         if is("smallint") || is("int2") {
             Some(Self::I16)

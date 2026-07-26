@@ -3,7 +3,7 @@
 //! Per-position inference state: the slot table, its conflict rule, and the
 //! parsing of a `$N` placeholder body into a position.
 
-use nodedb_types::columnar::IntWidth;
+use nodedb_types::columnar::{FloatWidth, IntWidth};
 use sqlparser::ast::{Expr, Value, ValueWithSpan};
 
 use crate::types::ColumnInfo;
@@ -11,13 +11,14 @@ use crate::types_expr::SqlDataType;
 
 /// A parameter type the statement pins down.
 ///
-/// Carries the declared integer width alongside the logical type because the
+/// Carries the declared numeric width alongside the logical type because the
 /// two are not interchangeable on the wire: a column declared `INT` must be
-/// advertised as `int4` (OID 23), not `int8` (OID 20). The client encodes its
-/// bind value at exactly the width the `ParameterDescription` names, so
-/// collapsing every integer to `int8` here would put a 4-byte column behind an
-/// 8-byte promise — the precise failure the catalog's resolved [`IntWidth`]
-/// exists to prevent.
+/// advertised as `int4` (OID 23), not `int8` (OID 20), and one declared `REAL`
+/// as `float4` (OID 700), not `float8` (OID 701). The client encodes its bind
+/// value at exactly the width the `ParameterDescription` names, so collapsing
+/// every integer to `int8` or every float to `float8` here would put a 4-byte
+/// column behind an 8-byte promise — the precise failure the catalog's
+/// resolved [`IntWidth`] / [`FloatWidth`] exist to prevent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferredParamType {
     /// The logical type this position resolves to.
@@ -25,6 +26,9 @@ pub struct InferredParamType {
     /// Declared width for an integer position, or `None` when the form that
     /// resolved it had no catalog column behind it.
     pub int_width: Option<IntWidth>,
+    /// Declared width for a floating-point position, or `None` when the form
+    /// that resolved it had no catalog column behind it.
+    pub float_width: Option<FloatWidth>,
 }
 
 impl InferredParamType {
@@ -38,6 +42,7 @@ impl InferredParamType {
         Self {
             data_type,
             int_width: None,
+            float_width: None,
         }
     }
 
@@ -47,6 +52,7 @@ impl InferredParamType {
         Self {
             data_type: column.data_type.clone(),
             int_width: column.int_width,
+            float_width: column.float_width,
         }
     }
 }

@@ -286,6 +286,7 @@ fn array_columns(view: &ArrayCatalogView) -> Vec<ColumnInfo> {
             default: None,
             raw_type: None,
             int_width: None,
+            float_width: None,
         });
     }
     for a in &view.attrs {
@@ -297,6 +298,7 @@ fn array_columns(view: &ArrayCatalogView) -> Vec<ColumnInfo> {
             default: None,
             raw_type: None,
             int_width: None,
+            float_width: None,
         });
     }
     cols
@@ -359,6 +361,7 @@ mod tests {
                     default: None,
                     raw_type: None,
                     int_width: None,
+                    float_width: None,
                 })
                 .collect(),
             primary_key: None,

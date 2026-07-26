@@ -63,52 +63,76 @@ pub fn sql_data_type_to_ddl_col_type(
     }
 }
 
-/// Like [`sql_data_type_to_ddl_col_type`], but narrows an `Int8` result to the
-/// column's declared integer width (`ColumnInfo::int_width`) when the catalog
+/// Like [`sql_data_type_to_ddl_col_type`], but narrows the result to the
+/// column's declared numeric width — `Int8` to the declared
+/// [`IntWidth`](nodedb_types::columnar::IntWidth), `Float8` to the declared
+/// [`FloatWidth`](nodedb_types::columnar::FloatWidth) — when the catalog
 /// recorded one.
 ///
-/// # Why only `Int8` is narrowed
+/// # Why only `Int8` and `Float8` are narrowed
 ///
 /// `SqlDataType::Int64` is the single planner-facing type for every integer
 /// width — `SMALLINT`/`INT2`, `INTEGER`/`INT4`, and `BIGINT`/`INT8` all resolve
-/// to it (see `catalog_adapter::type_convert::parse_type_str` and
-/// `nodedb_types::columnar::ColumnType::from_str`), because nodedb's storage —
-/// columnar, strict, and kv alike — always keeps integers as a full `i64`. The
-/// declared width therefore carries no storage meaning; it is authoritative for
-/// the wire contract: a client that declared `SMALLINT` expects OID 21 and, in
-/// binary format, exactly two bytes. Silently widening every integer to
-/// `BIGINT`'s OID 20 breaks ORMs and typed client libraries that trust the
-/// advertised OID (issue #217). Every other `SqlDataType` variant passes
-/// through unchanged with `width` ignored — there is no other wire-ambiguous
-/// case to resolve.
+/// to it — and `SqlDataType::Float64` is likewise the single type for every
+/// float width, with `REAL`/`FLOAT4` and `DOUBLE`/`FLOAT8`/`FLOAT` all
+/// resolving to it (see `catalog_adapter::type_convert::parse_type_str` and
+/// `nodedb_types::columnar::ColumnType::from_str`). nodedb's storage —
+/// columnar, strict, and kv alike — always keeps integers as a full `i64` and
+/// floats as a full `f64`. The declared width therefore carries no storage
+/// meaning; it is authoritative for the wire contract: a client that declared
+/// `SMALLINT` expects OID 21 and, in binary format, exactly two bytes, and one
+/// that declared `REAL` expects OID 700 and exactly four. Silently widening
+/// every integer to `BIGINT`'s OID 20, or every float to `double precision`'s
+/// OID 701, breaks ORMs and typed client libraries that trust the advertised
+/// OID (issue #217). Every other `SqlDataType` variant passes through
+/// unchanged with both widths ignored — there is no other wire-ambiguous case
+/// to resolve.
 ///
-/// # Why this takes a resolved width rather than a type string
+/// # Why this takes resolved widths rather than a type string
 ///
-/// The declared width is also enforced on the write path, and the two must
-/// agree exactly or the narrowing here would be advertising a contract writes
-/// do not honour. Both sides read the same
-/// [`IntWidth`](nodedb_types::columnar::IntWidth), resolved once at the catalog
-/// boundary by `catalog_adapter::type_convert`, so disagreement is not
-/// representable. A `None` width means the catalog has no record of the
-/// declared type (for example a planner-synthesized column) and leaves the base
-/// `Int8` — the widest, and so the only lossless, fallback.
+/// One function resolves both numeric families so no call site can thread a
+/// declared width for one and forget the other. Both widths are resolved once
+/// at the catalog boundary by `catalog_adapter::type_convert` from the same
+/// `fields` entries that catalog introspection (`\d`) reads, so the two
+/// descriptions of a column's type cannot disagree.
+///
+/// For integers the resolved width is *also* enforced on the write path
+/// (`nodedb_sql::planner::dml_helpers::check_declared_int_ranges`), because
+/// narrowing an out-of-range `i64` wraps. Floats have no write-path
+/// counterpart: narrowing rounds rather than wraps, and PostgreSQL itself
+/// accepts-and-rounds a `double` literal into a `real` column. The one float
+/// failure mode — a finite `f64` beyond `f32`'s range overflowing to infinity
+/// — is caught at encode time by the pgwire shape encoder.
+///
+/// A `None` width means the catalog has no record of the declared type (for
+/// example a planner-synthesized column) and leaves the base `Int8` / `Float8`
+/// — the widest, and so the only lossless, fallback.
 pub fn sql_data_type_to_ddl_col_type_with_width(
     ty: &nodedb_sql::types_expr::SqlDataType,
-    width: Option<nodedb_types::columnar::IntWidth>,
+    int_width: Option<nodedb_types::columnar::IntWidth>,
+    float_width: Option<nodedb_types::columnar::FloatWidth>,
 ) -> super::types::DdlColType {
     use super::types::DdlColType;
-    use nodedb_types::columnar::IntWidth;
+    use nodedb_types::columnar::{FloatWidth, IntWidth};
 
     let base = sql_data_type_to_ddl_col_type(ty);
-    let (DdlColType::Int8, Some(width)) = (base, width) else {
-        return base;
-    };
 
-    match width {
-        IntWidth::I16 => DdlColType::Int2,
-        IntWidth::I32 => DdlColType::Int4,
-        IntWidth::I64 => DdlColType::Int8,
+    if let (DdlColType::Int8, Some(width)) = (base, int_width) {
+        return match width {
+            IntWidth::I16 => DdlColType::Int2,
+            IntWidth::I32 => DdlColType::Int4,
+            IntWidth::I64 => DdlColType::Int8,
+        };
     }
+
+    if let (DdlColType::Float8, Some(width)) = (base, float_width) {
+        return match width {
+            FloatWidth::F32 => DdlColType::Float4,
+            FloatWidth::F64 => DdlColType::Float8,
+        };
+    }
+
+    base
 }
 
 #[cfg(test)]
@@ -116,7 +140,7 @@ mod tests {
     use super::super::types::DdlColType;
     use super::*;
     use nodedb_sql::types_expr::SqlDataType;
-    use nodedb_types::columnar::IntWidth;
+    use nodedb_types::columnar::{FloatWidth, IntWidth};
 
     /// Each declared width narrows the `Int8` base to its own wire type, and
     /// the mapping matches the OIDs `IntWidth` itself advertises — locking the
@@ -130,7 +154,31 @@ mod tests {
         ];
         for (width, expected, expected_oid) in cases {
             assert_eq!(
-                sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Int64, Some(*width)),
+                sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Int64, Some(*width), None),
+                *expected,
+                "declared width {width:?} must narrow to {expected:?}"
+            );
+            assert_eq!(
+                width.pg_oid(),
+                *expected_oid,
+                "declared width {width:?} must advertise OID {expected_oid}"
+            );
+        }
+    }
+
+    /// The float analogue: each declared float width narrows the `Float8` base
+    /// to its own wire type, and the mapping matches the OIDs `FloatWidth`
+    /// advertises. A column declared `REAL` must reach the client as float4
+    /// (700), not float8 (701).
+    #[test]
+    fn narrows_float8_to_each_declared_width() {
+        let cases: &[(FloatWidth, DdlColType, u32)] = &[
+            (FloatWidth::F32, DdlColType::Float4, 700),
+            (FloatWidth::F64, DdlColType::Float8, 701),
+        ];
+        for (width, expected, expected_oid) in cases {
+            assert_eq!(
+                sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Float64, None, Some(*width)),
                 *expected,
                 "declared width {width:?} must narrow to {expected:?}"
             );
@@ -143,34 +191,72 @@ mod tests {
     }
 
     /// `width = None` — a planner-synthesized column, or one whose declared
-    /// type the catalog never recorded — stays at the base `Int8`. `BIGINT` is
-    /// the widest integer wire type, so it is the only fallback that cannot
-    /// truncate a stored value.
+    /// type the catalog never recorded — stays at the base `Int8` / `Float8`.
+    /// `BIGINT` and `double precision` are the widest wire types of their
+    /// families, so they are the only fallbacks that cannot lose a stored
+    /// value.
     #[test]
-    fn no_declared_width_stays_int8() {
+    fn no_declared_width_stays_at_the_wider_base() {
         assert_eq!(
-            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Int64, None),
+            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Int64, None, None),
             DdlColType::Int8
+        );
+        assert_eq!(
+            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Float64, None, None),
+            DdlColType::Float8
         );
     }
 
-    /// Only an `Int8` base is eligible for narrowing — every other
-    /// `SqlDataType` passes through `sql_data_type_to_ddl_col_type` exactly,
-    /// with `width` ignored even when one is supplied. A width can never
-    /// disagree with the planner's resolved `SqlDataType` in practice, but
-    /// this proves narrowing is never misapplied to a non-integer column.
+    /// The two width families are independent: an integer width never narrows
+    /// a float column and a float width never narrows an integer one, even
+    /// when both are supplied. Neither combination is reachable from the
+    /// catalog (a declared type resolves to at most one family), but a single
+    /// function taking both must not cross-apply them.
     #[test]
-    fn passes_through_non_int8_types_untouched() {
+    fn widths_do_not_cross_between_numeric_families() {
         assert_eq!(
-            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::String, Some(IntWidth::I16)),
-            DdlColType::Text
-        );
-        assert_eq!(
-            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Float64, Some(IntWidth::I32)),
+            sql_data_type_to_ddl_col_type_with_width(
+                &SqlDataType::Float64,
+                Some(IntWidth::I16),
+                None
+            ),
             DdlColType::Float8
         );
         assert_eq!(
-            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Bool, None),
+            sql_data_type_to_ddl_col_type_with_width(
+                &SqlDataType::Int64,
+                None,
+                Some(FloatWidth::F32)
+            ),
+            DdlColType::Int8
+        );
+        assert_eq!(
+            sql_data_type_to_ddl_col_type_with_width(
+                &SqlDataType::Int64,
+                Some(IntWidth::I32),
+                Some(FloatWidth::F32)
+            ),
+            DdlColType::Int4
+        );
+    }
+
+    /// Only an `Int8` / `Float8` base is eligible for narrowing — every other
+    /// `SqlDataType` passes through `sql_data_type_to_ddl_col_type` exactly,
+    /// with both widths ignored even when supplied. A width can never disagree
+    /// with the planner's resolved `SqlDataType` in practice, but this proves
+    /// narrowing is never misapplied to a non-numeric column.
+    #[test]
+    fn passes_through_non_numeric_types_untouched() {
+        assert_eq!(
+            sql_data_type_to_ddl_col_type_with_width(
+                &SqlDataType::String,
+                Some(IntWidth::I16),
+                Some(FloatWidth::F32)
+            ),
+            DdlColType::Text
+        );
+        assert_eq!(
+            sql_data_type_to_ddl_col_type_with_width(&SqlDataType::Bool, None, None),
             DdlColType::Bool
         );
     }

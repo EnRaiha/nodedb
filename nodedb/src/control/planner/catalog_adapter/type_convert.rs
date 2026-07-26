@@ -3,7 +3,7 @@
 //! Conversion helpers: `StoredCollection` → planner-facing catalog types.
 
 use nodedb_sql::types::{ColumnInfo, EngineType, SqlDataType};
-use nodedb_types::columnar::IntWidth;
+use nodedb_types::columnar::{FloatWidth, IntWidth};
 
 /// Convert a StoredCollection to engine type, columns, and primary key.
 pub(super) fn convert_collection_type(
@@ -12,19 +12,21 @@ pub(super) fn convert_collection_type(
     use nodedb_types::CollectionType;
     use nodedb_types::columnar::DocumentMode;
 
-    // Declared integer widths, resolved once per collection from the raw DDL
+    // Declared numeric widths, resolved once per collection from the raw DDL
     // type strings the catalog records in `fields` for *every* engine.
     //
     // Strict and KV columns are typed by a resolved `ColumnType`, which
-    // deliberately has one `Int64` variant for every declared width (nodedb
-    // stores all integers as i64). `fields` is therefore the only surviving
-    // record of what the author actually wrote, and it is populated for
-    // strict/KV exactly as it is for schemaless/columnar — see
+    // deliberately has one `Int64` variant for every declared integer width
+    // and one `Float64` variant for every declared float width (nodedb stores
+    // all integers as i64 and all floats as f64). `fields` is therefore the
+    // only surviving record of what the author actually wrote, and it is
+    // populated for strict/KV exactly as it is for schemaless/columnar — see
     // `ddl::neutral::collection::create::build`, which fills it from the raw
     // column list before the typed schema is built. Resolving from it here
     // keeps declared-width fidelity uniform across all engines without
     // widening any persisted structure.
-    let declared_widths = declared_int_widths(&stored.fields);
+    let declared_int = declared_widths(&stored.fields, IntWidth::from_declared_type);
+    let declared_float = declared_widths(&stored.fields, FloatWidth::from_declared_type);
 
     match &stored.collection_type {
         CollectionType::Document(DocumentMode::Strict(schema)) => {
@@ -38,7 +40,8 @@ pub(super) fn convert_collection_type(
                     is_primary_key: c.primary_key,
                     default: c.default.clone(),
                     raw_type: None,
-                    int_width: lookup_int_width(&declared_widths, &c.name),
+                    int_width: lookup_width(&declared_int, &c.name),
+                    float_width: lookup_width(&declared_float, &c.name),
                 })
                 .collect();
             let pk = schema
@@ -66,6 +69,7 @@ pub(super) fn convert_collection_type(
                 default: None,
                 raw_type: None,
                 int_width: None,
+                float_width: None,
             }];
             // Add tracked fields from catalog.
             for (name, type_str) in &stored.fields {
@@ -80,6 +84,7 @@ pub(super) fn convert_collection_type(
                     default: None,
                     raw_type: None,
                     int_width: IntWidth::from_declared_type(type_str),
+                    float_width: FloatWidth::from_declared_type(type_str),
                 });
             }
             (EngineType::DocumentSchemaless, columns, Some(pk_name))
@@ -97,7 +102,8 @@ pub(super) fn convert_collection_type(
                     is_primary_key: c.primary_key,
                     default: c.default.clone(),
                     raw_type: None,
-                    int_width: lookup_int_width(&declared_widths, &c.name),
+                    int_width: lookup_width(&declared_int, &c.name),
+                    float_width: lookup_width(&declared_float, &c.name),
                 })
                 .collect();
             let pk = config
@@ -135,7 +141,8 @@ pub(super) fn convert_collection_type(
                     Some((_, type_str)) => (parse_type_str(type_str), None, Some(type_str.clone())),
                     None => (SqlDataType::String, Some("UUID_V7".into()), None),
                 };
-                let pk_width = pk_raw.as_deref().and_then(IntWidth::from_declared_type);
+                let pk_int_width = pk_raw.as_deref().and_then(IntWidth::from_declared_type);
+                let pk_float_width = pk_raw.as_deref().and_then(FloatWidth::from_declared_type);
                 columns.push(ColumnInfo {
                     name: pk_name.into(),
                     data_type: pk_type,
@@ -143,7 +150,8 @@ pub(super) fn convert_collection_type(
                     is_primary_key: true,
                     default: pk_default,
                     raw_type: pk_raw,
-                    int_width: pk_width,
+                    int_width: pk_int_width,
+                    float_width: pk_float_width,
                 });
             }
             for (name, type_str) in &stored.fields {
@@ -158,6 +166,7 @@ pub(super) fn convert_collection_type(
                     default: None,
                     raw_type: Some(type_str.clone()),
                     int_width: IntWidth::from_declared_type(type_str),
+                    float_width: FloatWidth::from_declared_type(type_str),
                 });
             }
             let pk = if profile.is_timeseries() {
@@ -170,29 +179,36 @@ pub(super) fn convert_collection_type(
     }
 }
 
-/// Resolve the declared integer width of every catalog field that names an
-/// integer type, keyed by column name.
+/// Resolve the declared width of every catalog field `resolve` recognizes,
+/// keyed by column name.
 ///
-/// Non-integer fields are dropped rather than stored as `None`, so the result
-/// is usually empty and the common case costs one allocation of zero capacity.
-fn declared_int_widths(fields: &[(String, String)]) -> Vec<(&str, IntWidth)> {
+/// Generic over the width family so the integer and float passes share one
+/// implementation: `resolve` is `IntWidth::from_declared_type` or
+/// `FloatWidth::from_declared_type`, each of which is the single source of
+/// truth for its own keyword set.
+///
+/// Fields `resolve` does not recognize are dropped rather than stored as
+/// `None`, so the result is usually empty and the common case costs one
+/// allocation of zero capacity.
+fn declared_widths<W>(
+    fields: &[(String, String)],
+    resolve: fn(&str) -> Option<W>,
+) -> Vec<(&str, W)> {
     fields
         .iter()
-        .filter_map(|(name, type_str)| {
-            IntWidth::from_declared_type(type_str).map(|w| (name.as_str(), w))
-        })
+        .filter_map(|(name, type_str)| resolve(type_str).map(|w| (name.as_str(), w)))
         .collect()
 }
 
-/// Look up a column's declared integer width by name, case-insensitively to
-/// match the rest of this module's column-name comparisons.
+/// Look up a column's declared width by name, case-insensitively to match the
+/// rest of this module's column-name comparisons.
 ///
-/// `None` means either "not an integer column" or "the catalog has no record
-/// of this column's declared type" — for example a column added by
-/// `ALTER ADD COLUMN`, whose declared width was never recorded in `fields`.
-/// Both degrade to the `BIGINT` wire type, which is the widest and therefore
-/// the only lossless fallback.
-fn lookup_int_width(widths: &[(&str, IntWidth)], column: &str) -> Option<IntWidth> {
+/// `None` means either "not a column of this numeric family" or "the catalog
+/// has no record of this column's declared type" — for example a column added
+/// by `ALTER ADD COLUMN`, whose declared width was never recorded in `fields`.
+/// Both degrade to the widest wire type of the family (`BIGINT` /
+/// `double precision`), which is the only lossless fallback.
+fn lookup_width<W: Copy>(widths: &[(&str, W)], column: &str) -> Option<W> {
     widths
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(column))
@@ -239,7 +255,12 @@ fn parse_type_str(s: &str) -> SqlDataType {
         "INT" | "INTEGER" | "INT4" | "INT8" | "INT64" | "BIGINT" | "SMALLINT" | "INT2" => {
             SqlDataType::Int64
         }
-        "FLOAT" | "FLOAT4" | "FLOAT8" | "FLOAT64" | "DOUBLE" | "REAL" => SqlDataType::Float64,
+        // Same contract as the integer arm above, for the float family: every
+        // spelling `FloatWidth::from_declared_type` recognizes must appear
+        // here, or the column falls through to `_ => String` and advertises
+        // OID 25 (text) no matter what width was declared.
+        "FLOAT" | "FLOAT4" | "FLOAT8" | "FLOAT32" | "FLOAT64" | "DOUBLE" | "DOUBLE PRECISION"
+        | "REAL" => SqlDataType::Float64,
         "BOOL" | "BOOLEAN" => SqlDataType::Bool,
         "BYTES" | "BYTEA" | "BLOB" => SqlDataType::Bytes,
         "TIMESTAMP" | "TIMESTAMPTZ" => SqlDataType::Timestamp,
@@ -266,6 +287,75 @@ mod tests {
         // Case-insensitivity, matching every other arm in this function.
         assert_eq!(parse_type_str("smallint"), SqlDataType::Int64);
         assert_eq!(parse_type_str("int2"), SqlDataType::Int64);
+    }
+
+    /// Every float spelling `FloatWidth::from_declared_type` recognizes must
+    /// also resolve to `SqlDataType::Float64` here — `FLOAT4`/`FLOAT8` were
+    /// rejected by DDL entirely, and a spelling this function does not list
+    /// falls through to `_ => SqlDataType::String` and advertises OID 25.
+    #[test]
+    fn parse_type_str_maps_every_float_spelling_to_float64() {
+        for declared in [
+            "FLOAT",
+            "FLOAT4",
+            "FLOAT8",
+            "FLOAT32",
+            "FLOAT64",
+            "DOUBLE",
+            "DOUBLE PRECISION",
+            "REAL",
+        ] {
+            assert_eq!(
+                parse_type_str(declared),
+                SqlDataType::Float64,
+                "{declared} must resolve to Float64"
+            );
+            assert!(
+                nodedb_types::columnar::FloatWidth::from_declared_type(declared).is_some(),
+                "{declared} must also resolve to a declared FloatWidth"
+            );
+        }
+    }
+
+    /// Declared float widths must be recovered for *every* engine, from the
+    /// same `fields` entries the integer widths come from. A strict collection
+    /// is the case that motivated this: its typed schema collapses `REAL` and
+    /// `DOUBLE` to one `Float64` column type, so `fields` is the only record of
+    /// what was declared.
+    #[test]
+    fn declared_float_widths_are_recovered_for_strict_columns() {
+        use nodedb_types::columnar::{
+            ColumnDef, ColumnType, DocumentMode, FloatWidth, StrictSchema,
+        };
+
+        let schema = StrictSchema::new(
+            ["r", "d", "f"]
+                .into_iter()
+                .map(|name| ColumnDef::nullable(name, ColumnType::Float64))
+                .collect(),
+        )
+        .expect("three nullable float columns are a valid strict schema");
+
+        let mut stored = StoredCollection::new(1, "coll", "owner");
+        stored.collection_type = CollectionType::Document(DocumentMode::Strict(schema));
+        stored.fields = vec![
+            ("r".to_string(), "REAL".to_string()),
+            ("d".to_string(), "DOUBLE".to_string()),
+            ("f".to_string(), "FLOAT".to_string()),
+        ];
+
+        let (_, columns, _) = convert_collection_type(&stored);
+        let width_of = |name: &str| {
+            columns
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("column {name} must be present"))
+                .float_width
+        };
+        assert_eq!(width_of("r"), Some(FloatWidth::F32));
+        assert_eq!(width_of("d"), Some(FloatWidth::F64));
+        // Bare FLOAT is double precision, not single.
+        assert_eq!(width_of("f"), Some(FloatWidth::F64));
     }
 
     /// A columnar (or spatial, which shares the same non-timeseries

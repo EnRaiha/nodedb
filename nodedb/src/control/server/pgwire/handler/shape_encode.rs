@@ -28,6 +28,7 @@ use crate::control::server::response_shape::project::json_value_to_text;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 
 use super::super::ddl_encode::col_type_to_field_with_format;
+use super::super::numeric_narrow::{checked_narrow, checked_narrow_f32};
 
 /// Encode one flat row object into a pgwire `DataRow`, using `cell_keys` (in
 /// order) to look up cells in `row` and `column_types` (parallel to
@@ -114,7 +115,16 @@ fn encode_typed_cell(
                 };
             }
             DdlColType::Float8 => return encoder.encode_field(&v.as_f64()),
-            DdlColType::Float4 => return encoder.encode_field(&v.as_f64().map(|f| f as f32)),
+            // Unlike the integer arms above this is not a range *constraint*
+            // check: narrowing an f64 rounds rather than wraps, so `1.1`
+            // arriving as `1.10000002` is correct PostgreSQL `real` behaviour
+            // and never an error. Only overflow-to-infinity is refused.
+            DdlColType::Float4 => {
+                return match checked_narrow_f32(v)? {
+                    Some(f) => encoder.encode_field(&f),
+                    None => encoder.encode_field(&None::<f32>),
+                };
+            }
             DdlColType::Bool => return encoder.encode_field(&v.as_bool()),
             DdlColType::Text | DdlColType::Varchar => {
                 // TEXT/VARCHAR binary wire bytes are identical to text bytes,
@@ -137,9 +147,12 @@ fn encode_typed_cell(
             },
             _ => encoder.encode_field(&json_value_to_text(v)),
         },
+        // Same overflow guard as the binary arm: the text rendering of a
+        // `real` column must not silently read `Infinity` for a finite stored
+        // value either.
         DdlColType::Float4 => match v {
-            Value::Number(n) => match n.as_f64() {
-                Some(f) => encoder.encode_field(&(f as f32)),
+            Value::Number(_) => match checked_narrow_f32(v)? {
+                Some(f) => encoder.encode_field(&f),
                 None => encoder.encode_field(&None::<f32>),
             },
             _ => encoder.encode_field(&json_value_to_text(v)),
@@ -155,44 +168,6 @@ fn encode_typed_cell(
         },
         _ => encoder.encode_field(&json_value_to_text(v)),
     }
-}
-
-/// Range-check an integer cell against the width its column advertises,
-/// before it is narrowed for binary transmission.
-///
-/// `Ok(None)` means the cell is absent or not an integer and encodes as SQL
-/// NULL, matching the wider `Int8` arm. `Ok(Some(n))` guarantees `n` fits
-/// `width`, so the caller's narrowing cast is lossless by construction.
-///
-/// An out-of-range value is a hard error rather than a truncation: the
-/// column's `RowDescription` already told the client to read two or four
-/// bytes, so no encoding of the true value is available here, and a wrapped
-/// one is undetectable at the far end. SQLSTATE `22003`
-/// (`numeric_value_out_of_range`) is what PostgreSQL raises for the same
-/// condition, so drivers already classify it as a data error.
-///
-/// Writes through SQL are range-checked at plan time
-/// (`nodedb_sql::planner::dml_helpers::check_declared_int_ranges`), which
-/// makes this unreachable for data nodedb accepted itself. It still has to
-/// exist: rows written before a column's width was declared, and rows
-/// arriving over non-SQL ingest paths, are not covered by that check.
-fn checked_narrow(v: &serde_json::Value, width: IntWidth) -> PgWireResult<Option<i64>> {
-    let Some(n) = v.as_i64() else {
-        return Ok(None);
-    };
-    if width.contains(n) {
-        return Ok(Some(n));
-    }
-    Err(pgwire::error::PgWireError::UserError(Box::new(
-        pgwire::error::ErrorInfo::new(
-            "ERROR".into(),
-            "22003".into(),
-            format!(
-                "value {n} is out of range for type {}",
-                width.pg_type_name()
-            ),
-        ),
-    )))
 }
 
 /// Build a `Response::Query` from a protocol-neutral [`ShapedRows`], plus its

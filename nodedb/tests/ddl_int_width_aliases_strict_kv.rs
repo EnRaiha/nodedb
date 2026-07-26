@@ -21,8 +21,10 @@
 //! report OID 20, trading a loud DDL error for a silent width mismatch.
 //!
 //! Companion coverage: `pgwire_ddl_result_types.rs` for schemaless OID
-//! fidelity, and `pgwire_int_width_range_enforcement.rs` for the write-side
-//! range constraint that makes these narrowed OIDs honest.
+//! fidelity, `pgwire_int_width_range_enforcement.rs` for the write-side range
+//! constraint that makes these narrowed OIDs honest, and
+//! `ddl_float_width_aliases_strict_kv.rs` for the float family (which has no
+//! write-side constraint, because narrowing a float rounds rather than wraps).
 
 mod common;
 

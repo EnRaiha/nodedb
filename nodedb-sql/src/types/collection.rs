@@ -86,4 +86,15 @@ pub struct ColumnInfo {
     /// two must agree exactly. Resolving once at the catalog boundary is what
     /// makes disagreement unrepresentable.
     pub int_width: Option<nodedb_types::columnar::IntWidth>,
+    /// Declared width of a floating-point column, resolved once from the
+    /// catalog at adapter-construction time. `None` for non-float columns and
+    /// for float columns whose declared type the catalog never recorded.
+    ///
+    /// The float analogue of [`ColumnInfo::int_width`], and resolved from the
+    /// same source, but read on the read path only: it selects the
+    /// `RowDescription` OID (700 vs 701) and the binary payload width (4 vs 8
+    /// bytes). There is no write-path counterpart because narrowing a float
+    /// rounds rather than wraps — PostgreSQL accepts-and-rounds a `double`
+    /// literal into a `real` column, and so does nodedb.
+    pub float_width: Option<nodedb_types::columnar::FloatWidth>,
 }

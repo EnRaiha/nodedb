@@ -97,7 +97,11 @@ fn column_types_for<C: SqlCatalog>(
             .map(|c| {
                 (
                     c.name.clone(),
-                    sql_data_type_to_ddl_col_type_with_width(&c.data_type, c.int_width),
+                    sql_data_type_to_ddl_col_type_with_width(
+                        &c.data_type,
+                        c.int_width,
+                        c.float_width,
+                    ),
                 )
             })
             .collect(),
@@ -178,7 +182,11 @@ fn ordered_columns_for<C: SqlCatalog>(
             .map(|c| OutputColumn {
                 display_name: c.name.clone(),
                 lookup_key: c.name.clone(),
-                ty: sql_data_type_to_ddl_col_type_with_width(&c.data_type, c.int_width),
+                ty: sql_data_type_to_ddl_col_type_with_width(
+                    &c.data_type,
+                    c.int_width,
+                    c.float_width,
+                ),
             })
             .collect(),
         _ => Vec::new(),
@@ -779,6 +787,7 @@ mod tests {
                 default: None,
                 raw_type: None,
                 int_width: None,
+                float_width: None,
             };
             Ok(Some(nodedb_sql::types::CollectionInfo {
                 name: "metrics".to_string(),

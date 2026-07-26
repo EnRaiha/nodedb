@@ -300,6 +300,39 @@ mod tests {
         assert_eq!("INT2".parse::<ColumnType>().unwrap(), ColumnType::Int64);
     }
 
+    /// The float analogue of [`parse_int_width_aliases_map_to_int64`]:
+    /// `FLOAT4`/`FLOAT8`/`FLOAT32`/`DOUBLE PRECISION` are valid PostgreSQL
+    /// float aliases that were rejected as unknown column types. They all map
+    /// to the same `Float64` storage variant — nodedb always keeps floats as a
+    /// full f64; only the wire (`DdlColType`) layer narrows the advertised OID
+    /// via `FloatWidth`.
+    ///
+    /// Every spelling `FloatWidth::from_declared_type` recognizes must appear
+    /// here, or DDL accepts a width the wire layer honours and vice versa.
+    #[test]
+    fn parse_float_width_aliases_map_to_float64() {
+        for declared in [
+            "FLOAT4",
+            "FLOAT8",
+            "FLOAT32",
+            "FLOAT64",
+            "REAL",
+            "DOUBLE",
+            "DOUBLE PRECISION",
+            "FLOAT",
+        ] {
+            assert_eq!(
+                declared.parse::<ColumnType>().unwrap(),
+                ColumnType::Float64,
+                "{declared} must resolve to the single Float64 storage variant"
+            );
+            assert!(
+                super::super::FloatWidth::from_declared_type(declared).is_some(),
+                "{declared} must also resolve to a declared FloatWidth"
+            );
+        }
+    }
+
     #[test]
     fn parse_vector() {
         assert_eq!(

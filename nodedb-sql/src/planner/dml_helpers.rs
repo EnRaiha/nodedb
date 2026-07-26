@@ -4,6 +4,10 @@ use sqlparser::ast;
 
 use crate::error::{Result, SqlError};
 use crate::parser::normalize::{normalize_ident, normalize_object_name_checked};
+use crate::planner::declared_type_coerce::{
+    coerce_assignments_to_declared_types, coerce_row_to_declared_types,
+    coerce_rows_to_declared_types,
+};
 use crate::resolver::expr::convert_value;
 use crate::types::*;
 
@@ -23,6 +27,30 @@ pub(super) fn convert_value_rows(
                 .collect::<Result<Vec<_>>>()
         })
         .collect()
+}
+
+/// Apply the collection's declared column types to a `VALUES` row set, then
+/// range-check the result.
+///
+/// The single entry point every non-KV `VALUES` path uses, so no engine can
+/// acquire one half of the contract without the other. The order is
+/// load-bearing: coercion is what turns a literal into an integer in the first
+/// place, so range-checking before it would let a value that only becomes an
+/// `i64` through coercion skip its declared-width check entirely.
+///
+/// It is applied for every engine rather than only the ones that need it.
+/// Engines with a typed write path (strict, columnar, timeseries, spatial)
+/// already re-type each field against their declared schema on write and are
+/// unaffected by a value arriving pre-typed; the document-schemaless and
+/// key-value engines store the planner's value verbatim and are corrected by
+/// it. Branching on engine here would put a routing decision outside
+/// `EngineRules` for no behavioural gain — see `declared_type_coerce`.
+pub(super) fn coerce_and_check_rows(
+    info: &CollectionInfo,
+    rows: &mut [Vec<(String, SqlValue)>],
+) -> Result<()> {
+    coerce_rows_to_declared_types(&info.columns, rows, info.primary_key.as_deref())?;
+    check_declared_int_ranges(&info.columns, rows)
 }
 
 /// Reject any integer value that does not fit its column's declared width.
@@ -354,7 +382,7 @@ pub(super) fn build_kv_insert_plan(
     columns: &[String],
     rows_ast: &[Vec<ast::Expr>],
     intent: KvInsertIntent,
-    on_conflict_updates: Vec<(String, SqlExpr)>,
+    mut on_conflict_updates: Vec<(String, SqlExpr)>,
     pk_col: Option<&str>,
     declared_columns: &[ColumnInfo],
 ) -> Result<Vec<SqlPlan>> {
@@ -368,10 +396,6 @@ pub(super) fn build_kv_insert_plan(
             collection: table_name,
         });
     }
-    // KV returns early from every INSERT/UPSERT entry point, so the declared
-    // width check lives here rather than at the call sites — otherwise a
-    // fourth KV entry point could be added without it.
-    check_declared_int_ranges(declared_columns, &convert_value_rows(columns, rows_ast)?)?;
     let key_col_name = pk_col.unwrap_or("key");
     let key_idx = columns.iter().position(|c| c == key_col_name);
     let ttl_idx = columns.iter().position(|c| c == "ttl");
@@ -395,29 +419,61 @@ pub(super) fn build_kv_insert_plan(
         }
         s
     };
-    let mut entries = Vec::with_capacity(rows_ast.len());
-    let mut ttl_secs: u64 = 0;
+    // Resolve every row's literals once, then coerce each cell to its declared
+    // column type. Unlike the strict, columnar, and timeseries engines, KV has
+    // no typed write path: its engine stores the bytes it is handed and the
+    // declared schema exists only here, in the catalog. Without this the
+    // stored cell's type is whatever the literal happened to resolve to — a
+    // fractional literal is an exact `Decimal`, which serializes as a msgpack
+    // string — while `RowDescription` advertises the declared numeric type, and
+    // the read path can only encode SQL NULL for it. See
+    // `declared_type_coerce` for the full rationale.
+    let mut coerced_rows: Vec<Vec<(String, SqlValue)>> = Vec::with_capacity(rows_ast.len());
     for row_exprs in rows_ast {
-        let key_val = match key_idx {
-            Some(idx) => expr_to_sql_value(&row_exprs[idx])?,
+        let mut row: Vec<(String, SqlValue)> = Vec::with_capacity(columns.len());
+        for (i, col) in columns.iter().enumerate() {
+            let Some(expr) = row_exprs.get(i) else { break };
+            row.push((col.clone(), expr_to_sql_value(expr)?));
+        }
+        // The key column is exempt — see `coerce_rows_to_declared_types`.
+        coerce_row_to_declared_types(declared_columns, &mut row, Some(key_col_name))?;
+        coerced_rows.push(row);
+    }
+    // KV returns early from every INSERT/UPSERT entry point, so the declared
+    // width check lives here rather than at the call sites — otherwise a
+    // fourth KV entry point could be added without it. It runs on the coerced
+    // values so a literal that only becomes an integer through coercion is
+    // still range-checked against its declared width.
+    check_declared_int_ranges(declared_columns, &coerced_rows)?;
+    // `ON CONFLICT DO UPDATE SET col = <literal>` writes through the same
+    // untyped KV path as the inserted row, so its literals need the same
+    // declared-type coercion.
+    coerce_assignments_to_declared_types(
+        declared_columns,
+        &mut on_conflict_updates,
+        Some(key_col_name),
+    )?;
+
+    let mut entries = Vec::with_capacity(coerced_rows.len());
+    let mut ttl_secs: u64 = 0;
+    for row in &coerced_rows {
+        let key_val = match key_idx.and_then(|idx| row.get(idx)) {
+            Some((_, value)) => value.clone(),
             None => SqlValue::String(String::new()),
         };
-        if let Some(idx) = ttl_idx {
-            match expr_to_sql_value(&row_exprs[idx]) {
-                Ok(SqlValue::Int(n)) => ttl_secs = n.max(0) as u64,
-                Ok(SqlValue::Float(f)) => ttl_secs = f.max(0.0) as u64,
+        if let Some((_, value)) = ttl_idx.and_then(|idx| row.get(idx)) {
+            match value {
+                SqlValue::Int(n) => ttl_secs = (*n).max(0) as u64,
+                SqlValue::Float(f) => ttl_secs = f.max(0.0) as u64,
                 _ => {}
             }
         }
-        let value_cols: Vec<(String, SqlValue)> = columns
+        let value_cols: Vec<(String, SqlValue)> = row
             .iter()
             .enumerate()
             .filter(|(i, _)| !exclude_from_value.contains(i))
-            .map(|(i, col)| {
-                let val = expr_to_sql_value(&row_exprs[i])?;
-                Ok((col.clone(), val))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .map(|(_, cell)| cell.clone())
+            .collect();
         entries.push((key_val, value_cols));
     }
     Ok(vec![SqlPlan::KvInsert {
