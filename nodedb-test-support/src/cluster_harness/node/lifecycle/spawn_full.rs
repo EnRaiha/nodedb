@@ -22,7 +22,7 @@ use nodedb::wal::WalManager;
 use crate::cluster_harness::cluster::ClusterSpawnConfig;
 
 use super::client_slot::ClusterTestClient;
-use super::types::{DataDir, TestClusterNode};
+use super::types::{DataDir, HARNESS_SUPERUSER, TestClusterNode};
 
 impl TestClusterNode {
     /// [`Self::spawn_with_full_config`] entry point used by every spawn
@@ -111,7 +111,7 @@ impl TestClusterNode {
         // `AuthMode::Trust`, which resolves — but never fabricates — a durable
         // stored identity. Without this every node rejects the harness connect
         // with `trust auth: user 'nodedb' does not exist`.
-        credentials.bootstrap_trust_superuser("nodedb")?;
+        credentials.bootstrap_trust_superuser(HARNESS_SUPERUSER)?;
         let mut shared =
             SharedState::new_with_credentials(dispatcher, Arc::clone(&wal), credentials)?;
 

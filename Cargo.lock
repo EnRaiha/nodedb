@@ -4559,6 +4559,7 @@ dependencies = [
  "nodedb",
  "nodedb-array",
  "nodedb-bridge",
+ "nodedb-client",
  "nodedb-cluster",
  "nodedb-crdt",
  "nodedb-mem",

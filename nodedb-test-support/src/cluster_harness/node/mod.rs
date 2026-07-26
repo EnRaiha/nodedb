@@ -6,5 +6,6 @@
 pub mod graph;
 pub mod inspect;
 pub mod lifecycle;
+pub mod native_client;
 
 pub use lifecycle::TestClusterNode;

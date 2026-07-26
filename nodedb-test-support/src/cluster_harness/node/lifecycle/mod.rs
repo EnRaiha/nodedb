@@ -35,4 +35,4 @@ mod spawn_variants;
 mod teardown;
 mod types;
 
-pub use types::TestClusterNode;
+pub use types::{HARNESS_SUPERUSER, TestClusterNode};

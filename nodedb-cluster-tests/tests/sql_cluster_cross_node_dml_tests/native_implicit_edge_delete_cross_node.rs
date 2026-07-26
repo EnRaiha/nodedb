@@ -26,8 +26,6 @@
 
 use std::time::Duration;
 
-use nodedb_client::NativeClient;
-
 use crate::common::cluster_harness::{TestCluster, wait_for};
 
 const SOURCES: usize = 12;
@@ -123,9 +121,11 @@ async fn native_implicit_edge_delete_cleans_reverse_cross_node() {
         .expect("a non-sequencer-leader coordinator must exist in a 3-node cluster");
     let coordinator = &cluster.nodes[coordinator_idx];
 
-    // Connect a NativeClient to the coordinator's native listener port.
-    let native_addr = format!("127.0.0.1:{}", coordinator.native_port);
-    let native = NativeClient::connect(&native_addr);
+    // Connect a NativeClient to the coordinator's native listener port,
+    // authenticated as the harness's bootstrapped trust superuser (a bare
+    // `NativeClient::connect` defaults to trust user `admin`, which this
+    // harness never provisions).
+    let native = coordinator.native_client();
 
     // Issue the predicate DELETE via the NATIVE protocol.
     // This exercises the `edge_recon_gate::try_edge_recon_dispatch` path.

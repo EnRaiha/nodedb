@@ -10,6 +10,14 @@ use nodedb::event::EventPlane;
 
 use super::client_slot::ClusterTestClient;
 
+/// The sole trust identity the cluster harness bootstraps on every node
+/// (see `spawn_full::spawn_with_full_config_at`'s
+/// `credentials.bootstrap_trust_superuser(HARNESS_SUPERUSER)`). Both the
+/// pre-wired `client` field (pgwire, `user=nodedb`) and
+/// [`super::super::native_client`]'s helper authenticate as this identity —
+/// single source of truth so the two paths cannot drift apart.
+pub const HARNESS_SUPERUSER: &str = "nodedb";
+
 /// Ownership of this node's on-disk data directory.
 ///
 /// `Owned` is the historical behaviour: the node minted its own `tempdir()`
