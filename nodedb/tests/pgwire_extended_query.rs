@@ -800,3 +800,171 @@ async fn extended_query_binary_scalar_params_insert_and_round_trip() {
     assert!((rows[0].get::<_, f64>("f32_col") - 1.25).abs() < 1e-6);
     assert!(rows[0].get::<_, bool>("bool_col"));
 }
+
+/// Regression lock for server-side parameter type inference: a plain
+/// `prepare` (no declared oids) of `LIMIT $1` must report `int8` for the
+/// parameter, not `unknown`.
+///
+/// With `unknown` (oid 0), `tokio-postgres` refuses to serialize an `i64`
+/// bind value at all — `WrongType { postgres: Unknown, rust: "i64" }` —
+/// so the query below fails client-side before a byte reaches the server.
+#[tokio::test]
+async fn extended_query_infers_limit_param_type_without_client_oids() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION t (id STRING PRIMARY KEY, n INT) WITH (engine='document_strict')")
+        .await
+        .unwrap();
+    for (id, n) in [("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
+        server
+            .exec(&format!("INSERT INTO t (id, n) VALUES ('{id}', {n})"))
+            .await
+            .unwrap();
+    }
+
+    let stmt = server
+        .client
+        .prepare("SELECT id FROM t ORDER BY id LIMIT $1")
+        .await
+        .expect("prepare without declared param types should succeed");
+
+    assert_eq!(
+        stmt.params(),
+        &[Type::INT8],
+        "LIMIT $1 must be described as int8, got {:?}",
+        stmt.params()
+    );
+
+    let rows = server
+        .client
+        .query(&stmt, &[&2i64])
+        .await
+        .expect("an i64 must be bindable against the inferred int8 parameter");
+    assert_eq!(
+        rows.len(),
+        2,
+        "inferred-type LIMIT $1 = 2 must bound the result set, got {}",
+        rows.len()
+    );
+}
+
+/// `OFFSET $1` is the other row-count position and must infer the same way.
+#[tokio::test]
+async fn extended_query_infers_offset_param_type_without_client_oids() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION t (id STRING PRIMARY KEY, n INT) WITH (engine='document_strict')")
+        .await
+        .unwrap();
+    for (id, n) in [("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
+        server
+            .exec(&format!("INSERT INTO t (id, n) VALUES ('{id}', {n})"))
+            .await
+            .unwrap();
+    }
+
+    let stmt = server
+        .client
+        .prepare("SELECT id FROM t ORDER BY id LIMIT 10 OFFSET $1")
+        .await
+        .expect("prepare without declared param types should succeed");
+    assert_eq!(stmt.params(), &[Type::INT8]);
+
+    let rows = server
+        .client
+        .query(&stmt, &[&3i64])
+        .await
+        .expect("an i64 must be bindable against the inferred int8 parameter");
+    assert_eq!(rows.len(), 2, "OFFSET $1 = 3 over 5 rows must return 2");
+}
+
+/// An explicit cast names the parameter's type outright, with no catalog
+/// lookup involved — Describe must report it.
+#[tokio::test]
+async fn extended_query_infers_cast_param_type() {
+    let server = TestServer::start().await;
+
+    let stmt = server
+        .client
+        .prepare("SELECT $1::BIGINT AS v")
+        .await
+        .expect("prepare should succeed");
+    assert_eq!(stmt.params(), &[Type::INT8], "$1::BIGINT must report int8");
+
+    let stmt = server
+        .client
+        .prepare("SELECT CAST($1 AS TEXT) AS v")
+        .await
+        .expect("prepare should succeed");
+    assert_eq!(
+        stmt.params(),
+        &[Type::TEXT],
+        "CAST($1 AS TEXT) must report text"
+    );
+}
+
+/// A client-declared type is the client's contract and must survive
+/// inference: declaring `int4` for a `LIMIT` position (which inference would
+/// otherwise call `int8`) keeps `int4` in the ParameterDescription, and the
+/// bound `i32` still drives the limit.
+#[tokio::test]
+async fn extended_query_client_declared_param_type_wins_over_inference() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION t (id STRING PRIMARY KEY, n INT) WITH (engine='document_strict')")
+        .await
+        .unwrap();
+    for (id, n) in [("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5)] {
+        server
+            .exec(&format!("INSERT INTO t (id, n) VALUES ('{id}', {n})"))
+            .await
+            .unwrap();
+    }
+
+    let stmt = server
+        .client
+        .prepare_typed("SELECT id FROM t ORDER BY id LIMIT $1", &[Type::INT4])
+        .await
+        .expect("prepare_typed should succeed");
+    assert_eq!(
+        stmt.params(),
+        &[Type::INT4],
+        "client-declared int4 must not be overwritten by the inferred int8"
+    );
+
+    let rows = server
+        .client
+        .query(&stmt, &[&2i32])
+        .await
+        .expect("binary i32 must decode against the declared int4 parameter");
+    assert_eq!(rows.len(), 2);
+}
+
+/// Under-inference boundary: a column-backed position (`WHERE col = $1`)
+/// needs a catalog lookup this pass deliberately does not perform, so it must
+/// still be described as unknown — never guessed. Reporting a wrong concrete
+/// oid would make the client commit to a binary encoding the server cannot
+/// decode; unknown degrades to text format, which already works.
+#[tokio::test]
+async fn extended_query_column_backed_param_stays_unknown() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION t (id STRING PRIMARY KEY, n INT) WITH (engine='document_strict')")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO t (id, n) VALUES ('a', 1)")
+        .await
+        .unwrap();
+
+    let stmt = server
+        .client
+        .prepare("SELECT id FROM t WHERE n = $1")
+        .await
+        .expect("prepare should succeed");
+    assert_eq!(
+        stmt.params(),
+        &[Type::UNKNOWN],
+        "column-backed parameter must stay unknown until catalog-backed inference lands"
+    );
+}

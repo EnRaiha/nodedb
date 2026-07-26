@@ -56,10 +56,51 @@ fn ddl_col_type_to_pg(ty: &DdlColType) -> Type {
     }
 }
 
+/// Maps a server-inferred parameter type to the pgwire `Type` to advertise
+/// in `ParameterDescription`, or `None` when no faithful wire type exists.
+///
+/// Reuses the two established hops — `sql_data_type_to_ddl_col_type_with_width`
+/// then [`ddl_col_type_to_pg`] — rather than introducing a third mapping.
+/// `None` is passed for the integer width because a placeholder has no
+/// catalog column behind it in this pass; a follow-up that resolves
+/// column-backed positions supplies the column's declared `IntWidth` here.
+///
+/// # Why some variants are refused
+///
+/// Advertising a concrete OID makes the client commit to that type's binary
+/// encoding, so a lossy mapping is worse than saying nothing: an unknown
+/// parameter type is sent as text, which the bind layer already handles.
+/// `Decimal`, `Uuid`, `Vector` and `Geometry` all currently fold into
+/// `DdlColType::Text`, so advertising them would tell a client holding a
+/// `Decimal`/`Uuid` that the server wants TEXT — a client-side `WrongType`
+/// failure where `Unknown` would have worked. They stay unresolved until
+/// each has a real wire type.
+fn inferred_param_type(ty: &nodedb_sql::types_expr::SqlDataType) -> Option<Type> {
+    use crate::control::server::response_shape::schema::sql_data_type_to_ddl_col_type_with_width;
+    use nodedb_sql::types_expr::SqlDataType;
+
+    match ty {
+        SqlDataType::Int64
+        | SqlDataType::Float64
+        | SqlDataType::String
+        | SqlDataType::Bool
+        | SqlDataType::Bytes
+        | SqlDataType::Timestamp
+        | SqlDataType::Timestamptz => Some(ddl_col_type_to_pg(
+            &sql_data_type_to_ddl_col_type_with_width(ty, None),
+        )),
+        SqlDataType::Decimal
+        | SqlDataType::Uuid
+        | SqlDataType::Vector(_)
+        | SqlDataType::Geometry => None,
+    }
+}
+
 /// Implements pgwire's `QueryParser` trait for NodeDB.
 ///
-/// On Parse message: parses SQL via sqlparser, extracts placeholder types
-/// from the catalog schema, and computes the result schema.
+/// On Parse message: parses SQL via sqlparser, resolves each `$N` placeholder
+/// to the type the client declared or (failing that) to the type the SQL
+/// itself pins down, and computes the result schema from the catalog.
 pub struct NodeDbQueryParser {
     state: Arc<SharedState>,
     auth_mode: AuthMode,
@@ -84,6 +125,43 @@ impl NodeDbQueryParser {
             }
         }
         param_types
+    }
+
+    /// Placeholder slots for `sql`, with client-declared types applied and
+    /// every remaining slot filled from SQL-level inference.
+    ///
+    /// Used on both Parse paths — the schema-inferring one and the fallback
+    /// for SQL the planner cannot plan — because inference reads only the SQL
+    /// text: whether planning succeeded has no bearing on it, and letting the
+    /// advertised parameter types depend on that would be arbitrary.
+    fn param_types_with_inference(sql: &str, client_types: &[Option<Type>]) -> Vec<Option<Type>> {
+        let mut param_types = Self::placeholder_types(sql, client_types);
+        Self::fill_inferred_param_types(sql, &mut param_types);
+        param_types
+    }
+
+    /// Fill every parameter slot the client left undeclared with the type
+    /// inferred from the SQL itself.
+    ///
+    /// A client-declared type always wins — that is PostgreSQL semantics: the
+    /// Parse message's type oids are the client's contract, and the server may
+    /// only resolve the positions the client left as unspecified (oid 0).
+    ///
+    /// Inference runs on the *unsubstituted* SQL. The schema-inference pass
+    /// below rewrites `$N` to `NULL` before planning (the resolver cannot
+    /// typecheck a bare placeholder), which erases the position → type link,
+    /// so this must happen before that rewrite and independently of it.
+    fn fill_inferred_param_types(sql: &str, param_types: &mut Vec<Option<Type>>) {
+        let inferred = nodedb_sql::infer_placeholder_types(sql);
+        if inferred.len() > param_types.len() {
+            param_types.resize(inferred.len(), None);
+        }
+        for (slot, ty) in param_types.iter_mut().zip(inferred.iter()) {
+            if slot.is_some() {
+                continue;
+            }
+            *slot = ty.as_ref().and_then(inferred_param_type);
+        }
     }
 
     async fn authorize_plannable_sql(
@@ -167,11 +245,13 @@ impl NodeDbQueryParser {
             Some(Arc::clone(&self.state.retention_policy_registry)),
         );
 
-        // Placeholder inference runs unconditionally so an unplannable
-        // SQL string (e.g. `WHERE id = $1` where the planner needs bound
-        // params to typecheck) still reports the right number of
-        // parameter slots in Describe.
-        let param_types = Self::placeholder_types(sql, client_types);
+        // Placeholder *counting* runs unconditionally so an unplannable SQL
+        // string (e.g. `WHERE id = $1` where the planner needs bound params
+        // to typecheck) still reports the right number of parameter slots in
+        // Describe. Type inference then fills the slots the client left
+        // undeclared, from the SQL alone — it is independent of the planning
+        // pass below and survives that pass failing.
+        let param_types = Self::param_types_with_inference(sql, client_types);
 
         // Strip RETURNING from DML before passing to DataFusion. Retain the
         // parsed spec so we can build result fields for Describe.
@@ -279,7 +359,7 @@ impl QueryParser for NodeDbQueryParser {
         let (param_types, result_fields) = if can_infer_schema {
             self.try_infer_types(sql, types, identity.tenant_id.as_u64(), database_id)
         } else {
-            (Self::placeholder_types(sql, types), Vec::new())
+            (Self::param_types_with_inference(sql, types), Vec::new())
         };
 
         // If type inference produced no result fields and the SQL matches a

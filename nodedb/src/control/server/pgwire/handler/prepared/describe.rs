@@ -36,7 +36,8 @@ impl NodeDbPgHandler {
             .map(|i| {
                 // Client-provided type from the Parse message.
                 let client = target.parameter_types.get(i).and_then(|t| t.clone());
-                // Server-inferred type from DataFusion plan analysis.
+                // Server-side type, resolved at Parse time from the SQL text
+                // (see `NodeDbQueryParser::fill_inferred_param_types`).
                 let server = stmt.param_types.get(i).and_then(|t| t.clone());
                 client.or(server).unwrap_or(Type::UNKNOWN)
             })

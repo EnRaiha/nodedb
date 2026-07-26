@@ -16,9 +16,12 @@ use pgwire::api::results::FieldInfo;
 pub struct ParsedStatement {
     /// Original SQL text (may contain `$1`, `$2` placeholders).
     pub sql: String,
-    /// Inferred parameter types from DataFusion plan analysis.
-    /// Indexed by position: param_types[0] = type of `$1`, etc.
-    /// `None` if inference failed or type is unknown.
+    /// Resolved parameter types, indexed by position: `param_types[0]` is
+    /// the type of `$1`. A slot holds the type the client declared in its
+    /// Parse message when it declared one, otherwise the type inferred from
+    /// the SQL text by `nodedb_sql::infer_placeholder_types`.
+    /// `None` means the position's type is unknown — Describe reports OID 0
+    /// for it and the client sends the value in text format.
     pub param_types: Vec<Option<pgwire::api::Type>>,
     /// Result column schema inferred from the logical plan.
     /// Empty for DML statements (INSERT/UPDATE/DELETE).
