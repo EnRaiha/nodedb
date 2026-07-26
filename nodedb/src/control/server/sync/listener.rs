@@ -163,3 +163,36 @@ async fn accept_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Binding to an address that's already occupied must surface as `Err`,
+    /// not panic or silently succeed — this is the behavior
+    /// `spawn_protocol_listeners` relies on to treat a sync-listener bind
+    /// failure as boot-fatal instead of a silent non-fatal warning.
+    #[tokio::test]
+    async fn start_sync_listener_returns_err_on_occupied_port() {
+        // Reserve an ephemeral port via a real listener so we know it's taken.
+        let occupied = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind ephemeral listener to reserve a port");
+        let addr = occupied
+            .local_addr()
+            .expect("local addr of reserved listener");
+
+        let cfg = SyncListenerConfig {
+            listen_addr: addr,
+            ..Default::default()
+        };
+        let result = start_sync_listener(cfg, None).await;
+
+        assert!(
+            result.is_err(),
+            "expected start_sync_listener to return Err when the address is already bound"
+        );
+
+        drop(occupied);
+    }
+}

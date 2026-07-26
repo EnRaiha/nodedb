@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use anyhow::Context;
 use tracing::info;
 
 use crate::ServerConfig;
@@ -34,6 +35,11 @@ pub struct ListenerInfra {
 ///
 /// The native listener is not spawned here — it is run on the main task
 /// by the caller after this returns.
+///
+/// Returns `Err` if the sync WebSocket listener fails to bind — that
+/// failure is boot-fatal rather than a silent warning, since a server
+/// that comes up without a reachable sync listener leaves NodeDB-Lite
+/// clients unable to connect with no indication anything is wrong.
 pub async fn spawn_protocol_listeners(
     listeners: ProtocolListeners,
     shared: Arc<SharedState>,
@@ -41,7 +47,7 @@ pub async fn spawn_protocol_listeners(
     infra: ListenerInfra,
     base_acceptor: Option<tokio_rustls::TlsAcceptor>,
     cluster_handle: &Option<Arc<ClusterHandle>>,
-) {
+) -> anyhow::Result<()> {
     let ProtocolListeners {
         pg_listener,
         ilp_listener,
@@ -157,7 +163,10 @@ pub async fn spawn_protocol_listeners(
     }
 
     // Sync WebSocket listener for NodeDB-Lite clients.
-    let sync_config = crate::control::server::sync::listener::SyncListenerConfig::default();
+    let sync_config = crate::control::server::sync::listener::SyncListenerConfig {
+        listen_addr: config.sync_addr(),
+        ..Default::default()
+    };
     match crate::control::server::sync::listener::start_sync_listener(
         sync_config,
         Some(Arc::clone(&shared)),
@@ -172,7 +181,7 @@ pub async fn spawn_protocol_listeners(
             );
         }
         Err(e) => {
-            tracing::warn!(error = %e, "sync listener failed to start (non-fatal)");
+            return Err(e).context("sync listener failed to bind");
         }
     }
 
@@ -182,6 +191,8 @@ pub async fn spawn_protocol_listeners(
         handle.lifecycle.to_ready(nodes);
     }
     nodedb_cluster::readiness::notify_ready();
+
+    Ok(())
 }
 
 /// Bind all protocol listeners to their configured addresses.

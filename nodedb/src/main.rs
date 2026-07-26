@@ -224,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
         base_acceptor.clone(),
         &cluster_handle,
     )
-    .await;
+    .await?;
 
     // Native protocol TLS.
     let native_tls = tls_for(native_tls_enabled);
