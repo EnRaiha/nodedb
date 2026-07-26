@@ -15,6 +15,30 @@ use super::audit::emit_ddl_audit;
 use super::types::MetadataCommitApplier;
 
 impl MetadataCommitApplier {
+    /// Release the descriptor drain a `Put*` DDL installed.
+    ///
+    /// A drain is proposed *before* the DDL and is meant to end when that DDL
+    /// concludes. Concluding includes the outcomes that write nothing — an
+    /// entry superseded during replay, or an if-absent create for a descriptor
+    /// that already exists. The drain is keyed to the DDL, not to whether the
+    /// catalog changed, so every path that finishes handling the entry must
+    /// clear it.
+    ///
+    /// Missing one of those paths does not fail loudly: the drain simply
+    /// survives, and `is_draining` then rejects every plan for that descriptor
+    /// as a retryable schema change until the TTL (`max_wait +
+    /// DRAIN_TTL_GRACE`) lapses — the collection reads as broken for a minute
+    /// with no error explaining why.
+    fn clear_implicit_drain(&self, stamped: &catalog_entry::CatalogEntry) {
+        if let Some(weak) = self.shared.get()
+            && let Some(shared) = weak.upgrade()
+            && let Some(drained_id) =
+                crate::control::lease::drain_propose::descriptor_id_for_implicit_clear(stamped)
+        {
+            shared.lease_drain.install_end(&drained_id);
+        }
+    }
+
     pub(super) fn apply_catalog_ddl(
         &self,
         entry: &MetadataEntry,
@@ -72,11 +96,18 @@ impl MetadataCommitApplier {
                 kind = stamped.kind(),
                 "catalog_entry: descriptor entry already superseded or applied"
             );
+            // The DDL that installed the drain is over even though this entry
+            // changed nothing — release it, or every read of the descriptor
+            // stays rejected until the drain TTL lapses.
+            self.clear_implicit_drain(&stamped);
             return Ok(());
         }
 
         debug!(kind = stamped.kind(), "catalog_entry: applying to redb");
         if !catalog_entry::apply::apply_to(&stamped, catalog) {
+            // A `Put*` that wrote nothing (e.g. an if-absent create for a
+            // descriptor that already exists) still concludes its DDL.
+            self.clear_implicit_drain(&stamped);
             return Ok(());
         }
         // Implicit drain clear: if the entry is a `Put*` for one
@@ -88,11 +119,7 @@ impl MetadataCommitApplier {
         if let Some(weak) = self.shared.get()
             && let Some(shared) = weak.upgrade()
         {
-            if let Some(drained_id) =
-                crate::control::lease::drain_propose::descriptor_id_for_implicit_clear(&stamped)
-            {
-                shared.lease_drain.install_end(&drained_id);
-            }
+            self.clear_implicit_drain(&stamped);
             // Run synchronous post-apply side effects INLINE so every
             // in-memory cache update (install_replicated_user,
             // install_replicated_owner, etc.) is visible before the
