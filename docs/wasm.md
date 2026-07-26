@@ -173,7 +173,7 @@ const db = new NodeDbLite();
 
 // Configure sync to Origin
 await db.sync_config({
-  server_url: "ws://localhost:6433",
+  server_url: "ws://localhost:9090",
   auth_token: "your-token",
   auto_sync: true,
   sync_interval_ms: 5000,

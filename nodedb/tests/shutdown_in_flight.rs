@@ -60,6 +60,9 @@ async fn sigterm_during_in_flight_query_does_not_hang() {
     let http_port = free_port();
     let pgwire_port = free_port();
     let native_port = free_port();
+    // Unique too: the sync bind is boot-fatal, so concurrent server
+    // processes must not share the default sync port.
+    let sync_port = free_port();
 
     let mut child = std::process::Command::new(bin)
         .env("NODEDB_DATA_DIR", dir.path())
@@ -67,6 +70,7 @@ async fn sigterm_during_in_flight_query_does_not_hang() {
         .env("NODEDB_PORT_HTTP", http_port.to_string())
         .env("NODEDB_PORT_PGWIRE", pgwire_port.to_string())
         .env("NODEDB_PORT_NATIVE", native_port.to_string())
+        .env("NODEDB_PORT_SYNC", sync_port.to_string())
         .env("RUST_LOG", "error")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

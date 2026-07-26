@@ -237,6 +237,10 @@ resp = true
 ilp = false                       # Example: disable TLS for ILP ingest
 ```
 
+Every listener binds during startup, before the server accepts any
+connection. If a configured port is already in use, startup fails with that
+port named — the server never comes up missing a protocol.
+
 **Server settings:**
 
 | Config field       | Environment variable      | Default                                               |

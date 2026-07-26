@@ -4,6 +4,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Default sync WebSocket port.
+///
+/// Exported because the sync listener's own `SyncListenerConfig::default()`
+/// must agree with the config default — one constant, not two literals that
+/// can drift apart.
+pub const DEFAULT_SYNC_PORT: u16 = 9090;
+
 /// Port configuration for all protocol listeners.
 ///
 /// Always-on protocols have a default port. Optional protocols (RESP, ILP)
@@ -54,7 +61,7 @@ fn default_http_port() -> u16 {
     6480
 }
 fn default_sync_port() -> u16 {
-    9090
+    DEFAULT_SYNC_PORT
 }
 
 #[cfg(test)]
