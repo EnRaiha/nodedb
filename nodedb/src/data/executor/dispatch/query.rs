@@ -58,6 +58,15 @@ impl CoreLoop {
                 },
             ),
 
+            QueryOp::PostProcess { .. } => self.response_error(
+                task,
+                crate::bridge::envelope::ErrorCode::Internal {
+                    detail: "PostProcess must be resolved by the coordinator (gathered and \
+                             lowered to a ProviderScan) before dispatch"
+                        .to_string(),
+                },
+            ),
+
             QueryOp::ProviderScan {
                 rows,
                 filters,

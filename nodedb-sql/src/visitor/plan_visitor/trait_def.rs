@@ -9,8 +9,8 @@ use super::args::{
     AggregateVisitArgs, CreateArrayVisitArgs, DocumentIndexLookupVisitArgs,
     HybridSearchTripleVisitArgs, HybridSearchVisitArgs, InsertVisitArgs, JoinVisitArgs,
     LateralLoopVisitArgs, LateralTopKVisitArgs, MergeVisitArgs, RecursiveScanVisitArgs,
-    RecursiveValueVisitArgs, ScanVisitArgs, SpatialScanVisitArgs, TimeseriesScanVisitArgs,
-    UpdateFromVisitArgs, UpsertVisitArgs, VectorSearchVisitArgs,
+    RecursiveValueVisitArgs, ScanVisitArgs, SpatialScanVisitArgs, SubqueryVisitArgs,
+    TimeseriesScanVisitArgs, UpdateFromVisitArgs, UpsertVisitArgs, VectorSearchVisitArgs,
 };
 use crate::fts_types::FtsQuery;
 use crate::temporal::TemporalScope;
@@ -233,6 +233,9 @@ pub trait PlanVisitor {
         definitions: &[(String, SqlPlan)],
         outer: &SqlPlan,
     ) -> Result<Self::Output, Self::Error>;
+
+    /// Handle [`SqlPlan::Subquery`].
+    fn subquery(&mut self, args: SubqueryVisitArgs<'_>) -> Result<Self::Output, Self::Error>;
 
     /// Handle [`SqlPlan::CreateArray`].
     fn create_array(&mut self, args: CreateArrayVisitArgs<'_>)

@@ -356,6 +356,16 @@ fn apply_limit(mut plan: SqlPlan, limit_clause: &Option<ast::LimitClause>) -> Sq
         }
     };
 
+    // The LIMIT belongs to the query reading the CTE, not to the CTE body, so
+    // it lands on the outer plan — without this a derived table like
+    // `FROM (...) s LIMIT n` comes back unbounded.
+    if let SqlPlan::Cte { definitions, outer } = plan {
+        return SqlPlan::Cte {
+            definitions,
+            outer: Box::new(apply_limit(*outer, limit_clause)),
+        };
+    }
+
     match plan {
         SqlPlan::Scan {
             ref mut limit,

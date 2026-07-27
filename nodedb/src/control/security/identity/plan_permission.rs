@@ -85,6 +85,11 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
         // it only redistributes rows produced by the wrapped plan.
         PhysicalPlan::Query(QueryOp::Exchange(op)) => required_permission(&op.child),
 
+        // PostProcess only reshapes rows produced by its child (sort / offset /
+        // distinct / limit / projection); its required permission is the
+        // child's — recurse rather than assume Read.
+        PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => required_permission(input),
+
         PhysicalPlan::Text(
             TextOp::Search { .. }
             | TextOp::BM25ScoreScan { .. }

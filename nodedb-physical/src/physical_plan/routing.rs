@@ -75,6 +75,13 @@ pub fn plan_contains_cluster_partitioned_leaf(plan: &PhysicalPlan) -> bool {
             plan_contains_cluster_partitioned_leaf(child)
         }
 
+        // Recurse through PostProcess (its materialized input is the real
+        // plan). Normally resolved to a `ProviderScan` before routing, but a
+        // conservative recursion keeps routing correct if one survives.
+        PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => {
+            plan_contains_cluster_partitioned_leaf(input)
+        }
+
         // Recurse through lateral outer plans.
         PhysicalPlan::Query(QueryOp::LateralTopK { outer_plan, .. })
         | PhysicalPlan::Query(QueryOp::LateralLoop { outer_plan, .. }) => {

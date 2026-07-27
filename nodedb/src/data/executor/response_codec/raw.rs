@@ -135,6 +135,77 @@ pub fn flatten_to_relational_rows(bytes: &[u8]) -> Vec<u8> {
     encode_binary_rows(&flat)
 }
 
+/// Flatten a gathered array of vector-search hits into flat relational rows for
+/// the post-processing tail (`QueryOp::PostProcess` → `ProviderScan`).
+///
+/// A hit is `{id: <surrogate u32>, distance, doc_id?, body?: <doc msgpack>}`.
+/// This mirrors the client-facing vector response translator
+/// (`control::server::response_translate::vector`) but emits MessagePack rows
+/// instead of JSON: the document `body`'s columns become top-level (so ORDER BY
+/// / DISTINCT / projection can reference any document column), `distance` is
+/// surfaced, `_surrogate` carries the internal id, and the document's own `id`
+/// column wins over the surrogate. Rows without a body (e.g. a
+/// `skip_payload_fetch` hit) still surface `id` / `distance` / `_surrogate`.
+///
+/// RLS is already enforced by the Data Plane (`VectorOp::Search.rls_filters`,
+/// injected into the inner search before dispatch), so these gathered hits are
+/// post-RLS.
+pub fn flatten_vector_hits_to_relational_rows(bytes: &[u8]) -> Vec<u8> {
+    use nodedb_types::Value;
+
+    #[derive(zerompk::FromMessagePack)]
+    #[msgpack(map)]
+    struct Hit {
+        id: u32,
+        distance: f32,
+        doc_id: Option<String>,
+        body: Option<Vec<u8>>,
+    }
+
+    let hits: Vec<Hit> = match zerompk::from_msgpack(bytes) {
+        Ok(h) => h,
+        // Not a hit array (already flat, or a non-row payload): leave as-is.
+        Err(_) => return bytes.to_vec(),
+    };
+
+    let rows: Vec<Vec<u8>> = hits
+        .into_iter()
+        .filter_map(|h| {
+            // Base columns come from the document body (its own `id` wins over
+            // the internal surrogate). The body is *bare* msgpack (the storage
+            // wire shape), so decode/encode with the native `Value` codec — the
+            // derived `zerompk` codec is tagged and would corrupt the row.
+            let mut fields: std::collections::HashMap<String, Value> = match h
+                .body
+                .as_deref()
+                .and_then(|b| nodedb_types::value_from_msgpack(b).ok())
+            {
+                Some(Value::Object(map)) => map,
+                _ => std::collections::HashMap::new(),
+            };
+            fields
+                .entry("distance".to_string())
+                .or_insert(Value::Float(h.distance as f64));
+            if !fields.contains_key("id") {
+                match h.doc_id {
+                    Some(pk) => {
+                        fields.insert("id".to_string(), Value::String(pk));
+                    }
+                    None => {
+                        fields.insert("id".to_string(), Value::Integer(h.id as i64));
+                    }
+                }
+            }
+            fields
+                .entry("_surrogate".to_string())
+                .or_insert(Value::Integer(h.id as i64));
+            nodedb_types::value_to_msgpack(&Value::Object(fields)).ok()
+        })
+        .collect();
+
+    encode_binary_rows(&rows)
+}
+
 /// Encode a list of pre-built binary msgpack rows into a single msgpack array.
 ///
 /// Each row is already a valid msgpack value (typically a map). This just
@@ -159,5 +230,86 @@ pub(super) fn msgpack_write_array_header(buf: &mut Vec<u8>, len: usize) {
     } else {
         buf.push(0xDD);
         buf.extend_from_slice(&(len as u32).to_be_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_types::Value;
+    use std::collections::HashMap;
+
+    /// A vector hit in the Data-Plane wire shape: a *bare* msgpack map with
+    /// the same field names `VectorSearchHit` emits (`#[msgpack(map)]`).
+    #[derive(zerompk::ToMessagePack)]
+    #[msgpack(map)]
+    struct TestHit {
+        id: u32,
+        distance: f32,
+        doc_id: Option<String>,
+        body: Option<Vec<u8>>,
+    }
+
+    fn bare_doc(pairs: Vec<(&str, Value)>) -> Vec<u8> {
+        let map = pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        nodedb_types::value_to_msgpack(&Value::Object(map)).unwrap()
+    }
+
+    /// Decode the flattened output (a bare msgpack array of bare row maps) into
+    /// per-row column maps.
+    fn decode_rows(out: &[u8]) -> Vec<HashMap<String, Value>> {
+        match nodedb_types::value_from_msgpack(out) {
+            Ok(Value::Array(rows)) => rows
+                .into_iter()
+                .map(|r| match r {
+                    Value::Object(m) => m,
+                    other => panic!("expected row map, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected row array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_vector_hits_merges_body_and_surfaces_metadata() {
+        let body = bare_doc(vec![
+            ("id", Value::String("r0".into())),
+            ("tag", Value::String("keep".into())),
+        ]);
+        let input = zerompk::to_msgpack_vec(&vec![TestHit {
+            id: 7,
+            distance: 0.5,
+            doc_id: None,
+            body: Some(body),
+        }])
+        .unwrap();
+
+        let rows = decode_rows(&flatten_vector_hits_to_relational_rows(&input));
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        // Document's own `id` wins over the internal surrogate.
+        assert_eq!(row.get("id"), Some(&Value::String("r0".into())));
+        // Payload column surfaced to top level.
+        assert_eq!(row.get("tag"), Some(&Value::String("keep".into())));
+        // Search metadata preserved.
+        assert_eq!(row.get("distance"), Some(&Value::Float(0.5f32 as f64)));
+        assert_eq!(row.get("_surrogate"), Some(&Value::Integer(7)));
+    }
+
+    #[test]
+    fn flatten_vector_hits_without_body_falls_back_to_surrogate_id() {
+        let input = zerompk::to_msgpack_vec(&vec![TestHit {
+            id: 42,
+            distance: 1.25,
+            doc_id: None,
+            body: None,
+        }])
+        .unwrap();
+
+        let rows = decode_rows(&flatten_vector_hits_to_relational_rows(&input));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("id"), Some(&Value::Integer(42)));
+        assert_eq!(rows[0].get("_surrogate"), Some(&Value::Integer(42)));
+        assert_eq!(rows[0].get("distance"), Some(&Value::Float(1.25)));
     }
 }

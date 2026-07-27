@@ -396,6 +396,12 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                     out.extend(child_collections);
                 }
 
+                // PostProcess: recurse into the materialized child for the
+                // collections it reads.
+                PostProcess { input, .. } => {
+                    out.extend(touched_collections(input));
+                }
+
                 // ProviderScan is a catalog/constant source — no user collection.
                 ProviderScan { .. } => {}
 
