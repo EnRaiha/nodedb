@@ -290,10 +290,10 @@ impl CoreLoop {
         // overlay merge uses, so a staged Put that satisfies the indexed term
         // but not the residual is excluded exactly like it would be from a
         // base scan result.
-        // `residual_matches` feeds `Vec::retain`/a plain `for` loop below, both
-        // of which need a `bool`, so a division/modulo-by-zero (nodedb issue
-        // #216) is captured via this `Cell` side-channel and checked once
-        // both passes finish.
+        // `residual_matches` feeds `Vec::retain`/a plain `for` loop below,
+        // both of which need a `bool`, so a division/modulo-by-zero is
+        // captured via this `Cell` side-channel and checked once both
+        // passes finish.
         let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
             std::cell::Cell::new(None);
         let residual_matches = |body: &[u8]| -> bool {

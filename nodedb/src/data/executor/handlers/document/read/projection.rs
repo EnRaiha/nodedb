@@ -45,9 +45,9 @@ pub(in crate::data::executor) fn apply_projection(
                 if matches!(existing, Some(v) if !v.is_null()) {
                     continue;
                 }
-                // A computed column is projection-shaped (nodedb issue
-                // #216): a division/modulo-by-zero fails the whole query
-                // instead of silently materializing NULL into the response.
+                // A division/modulo-by-zero in a computed column fails the
+                // whole query instead of silently materializing NULL into
+                // the response.
                 let v = cc.expr.eval(&doc_val)?;
                 out.insert(cc.alias.clone(), serde_json::Value::from(v));
             }
@@ -99,9 +99,9 @@ pub(in crate::data::executor) fn apply_projection_msgpack(
                 continue;
             }
             nodedb_query::msgpack_scan::write_str(&mut buf, &cc.alias);
-            // A computed column is projection-shaped (nodedb issue #216): a
-            // division/modulo-by-zero fails the whole query instead of
-            // silently materializing NULL into the response.
+            // A division/modulo-by-zero in a computed column fails the whole
+            // query instead of silently materializing NULL into the
+            // response.
             let result = cc.expr.eval(&doc_val)?;
             if let Ok(mp) = nodedb_types::value_to_msgpack(&result) {
                 buf.extend_from_slice(&mp);
@@ -196,8 +196,8 @@ mod tests {
         );
     }
 
-    /// nodedb issue #216: a computed column that divides by zero fails the
-    /// projection instead of silently materializing `NULL`.
+    /// A computed column that divides by zero fails the projection instead
+    /// of silently materializing `NULL`.
     #[test]
     fn apply_projection_computed_column_division_by_zero_errors() {
         use crate::bridge::expr_eval::BinaryOp;

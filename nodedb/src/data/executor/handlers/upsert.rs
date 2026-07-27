@@ -399,9 +399,9 @@ pub(in crate::data::executor) fn apply_on_conflict_updates(
                     Err(_) => continue,
                 }
             }
-            // `ON CONFLICT DO UPDATE SET` is write-path-shaped (nodedb
-            // issue #216): a division/modulo-by-zero fails the statement
-            // instead of silently writing NULL.
+            // `ON CONFLICT DO UPDATE SET` is write-path-shaped: a
+            // division/modulo-by-zero fails the statement instead of
+            // silently writing NULL.
             nodedb_physical::physical_plan::UpdateValue::Expr(expr) => {
                 expr.eval_with_excluded(&snapshot, excluded)?
             }

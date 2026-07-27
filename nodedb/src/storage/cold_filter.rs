@@ -87,7 +87,7 @@ pub fn read_parquet_filtered(
     // Step 3: Apply row-level filter if predicates exist.
     //
     // Side-channel: a division/modulo-by-zero in a pushed-down WHERE
-    // predicate (nodedb issue #216) is captured here rather than propagated
+    // predicate is captured here rather than propagated
     // through `ArrowPredicateFn`'s `Result<BooleanArray, ArrowError>` return
     // type, which cannot carry an `EvalError` — the previous code converted
     // it to `arrow::error::ArrowError::DivideByZero`, and `reader.collect()`
@@ -495,8 +495,8 @@ mod tests {
         assert_eq!(rows[0].0, "d2");
     }
 
-    /// nodedb issue #216: a `FilterOp::Expr` predicate that divides by a
-    /// zero-valued column must fail the whole cold-storage read with the
+    /// A `FilterOp::Expr` predicate that divides by a zero-valued column
+    /// must fail the whole cold-storage read with the
     /// typed `crate::Error::DivisionByZero`, not the generic `ColdStorage`
     /// the pre-fix `ArrowError` conversion collapsed it to (verified at the
     /// SQL/pgwire layer as `XX000` vs `22012` — this is the storage-layer

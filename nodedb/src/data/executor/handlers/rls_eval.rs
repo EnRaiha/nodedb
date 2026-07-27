@@ -34,8 +34,8 @@ pub fn rls_check_document(rls_filters: &[u8], doc: &serde_json::Value) -> bool {
 
     let msgpack = nodedb_types::json_to_msgpack_or_empty(doc);
     // RLS is a security boundary: fail closed on a division/modulo-by-zero
-    // (nodedb issue #216) in a filter, exactly like the deserialization
-    // failure above — deny rather than propagate a query error, so a
+    // in a filter, exactly like the deserialization failure above — deny
+    // rather than propagate a query error, so a
     // malformed/adversarial RLS predicate can never be used to distinguish
     // "row exists but errors" from "row doesn't exist".
     match ScanFilter::all_match_binary(&filters, &msgpack) {

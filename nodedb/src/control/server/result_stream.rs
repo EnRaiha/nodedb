@@ -66,8 +66,8 @@ pub(crate) fn stream_response_channel(
                     // No rows on this source — end the stream cleanly.
                     return;
                 }
-                // nodedb issue #216: a streamed Data Plane `Response` error
-                // otherwise degrades to the generic `crate::Error::Dispatch`
+                // A streamed Data Plane `Response` error otherwise degrades
+                // to the generic `crate::Error::Dispatch`
                 // below (SQLSTATE XX000) — special-cased here the same way
                 // `NotFound` already is, so a division/modulo-by-zero
                 // survives this stream-consumption boundary and reaches

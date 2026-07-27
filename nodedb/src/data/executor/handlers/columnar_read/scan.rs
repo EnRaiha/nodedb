@@ -263,11 +263,11 @@ impl CoreLoop {
             },
             &mut matched,
         ) {
-            // `scan_flushed_columnar_segments` returns `crate::Result<()>`, so
-            // `e` already carries the real typed error (nodedb issue #216:
-            // e.g. a division/modulo-by-zero in `filter_predicates`) —
-            // propagate it as-is via `From<crate::Error> for ErrorCode`
-            // instead of collapsing it to `Internal`/`XX000`, mirroring
+            // `scan_flushed_columnar_segments` returns `crate::Result<()>`,
+            // so `e` already carries the real typed error (e.g. a
+            // division/modulo-by-zero in `filter_predicates`) — propagate
+            // it as-is via `From<crate::Error> for ErrorCode` instead of
+            // collapsing it to `Internal`/`XX000`, mirroring
             // `document/read/scan.rs`'s `Err(e) => self.response_error(task, e)`.
             return self.response_error(task, e);
         }
@@ -308,9 +308,9 @@ impl CoreLoop {
                     match row_matches_filters(&row, schema, &filter_predicates) {
                         Ok(true) => {}
                         Ok(false) => continue,
-                        // `row_matches_filters` returns `EvalError`, which has
-                        // exactly one variant (nodedb issue #216) and no
-                        // direct `Into<ErrorCode>` — mirrors
+                        // `row_matches_filters` returns `EvalError`, which
+                        // has exactly one variant and no direct
+                        // `Into<ErrorCode>` — mirrors
                         // `stage_columnar_dml.rs`'s identical call site,
                         // which hardcodes the same typed code rather than
                         // collapsing to `Internal`/`XX000`.
@@ -329,11 +329,10 @@ impl CoreLoop {
                     Ok(v) => v,
                     // `row_to_projected_json` returns `crate::Result<_>`
                     // (unlike `row_matches_filters` above) — its only
-                    // fallible step is a computed-column expression eval
-                    // (nodedb issue #216), and `computed_cols` here is real,
-                    // not `&[]` like the DML staging path, so propagate the
-                    // actual typed error rather than assuming which one it
-                    // is.
+                    // fallible step is a computed-column expression eval,
+                    // and `computed_cols` here is real, not `&[]` like the
+                    // DML staging path, so propagate the actual typed error
+                    // rather than assuming which one it is.
                     Err(e) => {
                         return self.response_error(task, e);
                     }
@@ -371,8 +370,8 @@ impl CoreLoop {
                 },
                 &mut matched,
             ) {
-                // `merge_overlay_into_columnar_scan` returns `crate::Result<()>`
-                // (nodedb issue #216: the overlay's own residual-predicate
+                // `merge_overlay_into_columnar_scan` returns
+                // `crate::Result<()>` (the overlay's own residual-predicate
                 // re-check can divide/modulo by zero) — propagate the typed
                 // error directly, matching both `document/read/scan.rs`'s
                 // generic `self.response_error(task, e)` pattern and

@@ -14,9 +14,9 @@ use nodedb_physical::physical_plan::document::merge_types::{
 /// against `context_doc`.
 ///
 /// A MERGE clause's `AND <condition>` extra predicate is WHERE-shaped, so a
-/// division/modulo-by-zero inside it (nodedb issue #216) fails the whole
-/// statement — the same behavior-flip rule 4 applies to WHERE/projection —
-/// rather than silently skipping to the next clause.
+/// division/modulo-by-zero inside it fails the whole statement — the same
+/// behavior-flip rule 4 applies to WHERE/projection — rather than silently
+/// skipping to the next clause.
 pub(super) fn find_arm<'a>(
     clauses: &'a [MergeClauseOp],
     kind: MergeClauseKindOp,
@@ -277,8 +277,8 @@ pub(in crate::data::executor) fn build_update_doc(
 /// Resolve one `UpdateValue` to JSON: a literal decodes directly from its
 /// msgpack encoding, an expression evaluates against the merged document.
 /// Shared by [`build_insert_doc`] and [`build_update_doc`]. An assignment
-/// expression is write-path-shaped (nodedb issue #216), so a division/
-/// modulo-by-zero fails the whole MERGE statement.
+/// expression is write-path-shaped, so a division/modulo-by-zero fails the
+/// whole MERGE statement.
 fn resolve_update_value(
     val: &UpdateValue,
     merged_ndb: &nodedb_types::Value,

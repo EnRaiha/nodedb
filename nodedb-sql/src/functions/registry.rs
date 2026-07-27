@@ -276,7 +276,7 @@ mod tests {
         );
     }
 
-    /// nodedb issue #216 INVARIANT: every name the runtime evaluator
+    /// INVARIANT: every name the runtime evaluator
     /// (`nodedb_query::functions::*::try_eval`) actually dispatches on MUST
     /// resolve through `FunctionRegistry::lookup`, or `resolver::expr::
     /// functions::convert_function_depth`'s plan-time existence gate rejects
@@ -297,7 +297,7 @@ mod tests {
                 assert!(
                     reg.lookup(name).is_some(),
                     "nodedb_query::functions::{module}::try_eval handles '{name}' \
-                     but FunctionRegistry has no entry for it — nodedb issue #216's \
+                     but FunctionRegistry has no entry for it — the \
                      plan-time gate would reject a call the runtime evaluator supports"
                 );
             }

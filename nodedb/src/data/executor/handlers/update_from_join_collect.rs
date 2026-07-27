@@ -144,11 +144,11 @@ impl CoreLoop {
                             Ok(v) => v,
                             Err(_) => continue,
                         },
-                        // nodedb issue #216: division/modulo by zero fails
-                        // the statement, same as the literal decode-failure
-                        // arm above would if it propagated instead of
-                        // skipping (kept as-is; only the newly-fallible
-                        // expr path is threaded here).
+                        // Division/modulo by zero fails the statement, same
+                        // as the literal decode-failure arm above would if
+                        // it propagated instead of skipping (kept as-is;
+                        // only the newly-fallible expr path is threaded
+                        // here).
                         UpdateValue::Expr(expr) => {
                             expr.eval(&merged_ndb).map_err(crate::Error::from)?.into()
                         }
@@ -281,8 +281,8 @@ impl CoreLoop {
         if let Some(txn_id) = txn_id {
             // `merge_overlay_into_scan` takes an infallible
             // `Fn(&[u8]) -> bool` predicate, so a division/modulo-by-zero
-            // (nodedb issue #216) is captured via this `Cell` side-channel
-            // and checked once the merge returns.
+            // is captured via this `Cell` side-channel and checked once the
+            // merge returns.
             let raw_matches =
                 self.strict_aware_matcher(database_id, tid, target_collection, target_filters);
             let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =

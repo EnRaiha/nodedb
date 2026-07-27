@@ -32,11 +32,11 @@ use super::CoreLoop;
 ///
 /// Returns `Ok(false)` for a strict body that fails to decode against its
 /// own schema (a malformed or stale Binary Tuple never matches, mirroring
-/// the base scan's behavior). Returns `Err(EvalError::DivisionByZero)`
-/// (nodedb issue #216) when `filters` contains a `FilterOp::Expr` predicate
-/// that divides or takes a modulus by zero — this is the base document
-/// scan's WHERE predicate, so the behavior-flip rule applies: the query
-/// fails instead of the row being silently excluded.
+/// the base scan's behavior). Returns `Err(EvalError::DivisionByZero)` when
+/// `filters` contains a `FilterOp::Expr` predicate that divides or takes a
+/// modulus by zero — this is the base document scan's WHERE predicate, so
+/// the behavior-flip rule applies: the query fails instead of the row being
+/// silently excluded.
 pub(in crate::data::executor) fn matches_with_resolved_schema(
     strict_schema: Option<&StrictSchema>,
     filters: &[ScanFilter],
@@ -88,7 +88,7 @@ impl CoreLoop {
     /// `Result`-returning output, so callers that feed it into that merge
     /// wrap the closure this function returns in a second, infallible one
     /// that stashes any `Err` into a local `Cell<Option<EvalError>>` and
-    /// checks it once the merge call returns (nodedb issue #216) — see
+    /// checks it once the merge call returns — see
     /// `stage_bulk_delete.rs`/`stage_bulk_update.rs`'s `raw_matches` /
     /// `matches` pair for the exact pattern.
     pub(in crate::data::executor) fn strict_aware_matcher<'a>(

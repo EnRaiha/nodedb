@@ -3,7 +3,7 @@
 //! ID generation / detection scalar function registrations.
 //!
 //! Evaluated by `nodedb_query::functions::id::try_eval`, but historically
-//! absent from this registry entirely — nodedb issue #216's plan-time
+//! absent from this registry entirely — the plan-time
 //! existence gate (`resolver::expr::functions::convert_function_depth`)
 //! checks every scalar call against this registry, so a `SELECT
 //! gen_random_uuid()` (or any of its siblings below) would have been

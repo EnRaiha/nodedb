@@ -83,8 +83,19 @@ impl Validator {
         let mut violations = Vec::new();
 
         for constraint in constraints {
-            if let Some(violation) = self.check_constraint(state, change, constraint) {
-                violations.push(violation);
+            match self.check_constraint(state, change, constraint) {
+                Ok(Some(violation)) => violations.push(violation),
+                Ok(None) => {}
+                // A predicate that could not be evaluated (division/modulo by
+                // zero) is a hard failure, not a violation to
+                // be batched with the others — surface it immediately so it
+                // bypasses conflict-policy resolution downstream.
+                Err(error) => {
+                    return ValidationOutcome::EvalError {
+                        constraint_name: constraint.name.clone(),
+                        error,
+                    };
+                }
             }
         }
 

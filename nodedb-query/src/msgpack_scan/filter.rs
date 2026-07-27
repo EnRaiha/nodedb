@@ -22,7 +22,7 @@ impl ScanFilter {
     /// Evaluate an AND-group of filters, short-circuiting on the first
     /// `false` or the first evaluation error — same semantics as
     /// `group.iter().all(|f| f.matches_binary(doc))` had before filter
-    /// evaluation could fail (nodedb issue #216). A `pub` associated
+    /// evaluation could fail. A `pub` associated
     /// function (rather than a private free function) so the many call
     /// sites across the `nodedb` crate that used to write
     /// `filters.iter().all(|f| f.matches_binary(doc))` have a single
@@ -59,7 +59,7 @@ impl ScanFilter {
     ///
     /// Returns `Err(EvalError::DivisionByZero)` when this is (or contains,
     /// via an `OR` group) a `FilterOp::Expr` predicate that divides or
-    /// takes a modulus by zero (nodedb issue #216) — see
+    /// takes a modulus by zero — see
     /// `scan_filter::ScanFilter::matches_value` for the WHERE-clause
     /// behavior-flip rationale, which applies identically here.
     pub fn matches_binary(&self, doc: &[u8]) -> Result<bool, EvalError> {

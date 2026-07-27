@@ -336,12 +336,15 @@ mod tests {
             let s = spec(&build_keys, &probe_keys, jt);
 
             // Reference: the owned-Vec in-memory grace oracle.
-            let want = as_multiset(grace_join_in_memory(
-                build.iter().map(|r| (String::new(), r.clone())).collect(),
-                probe.iter().map(|r| (String::new(), r.clone())).collect(),
-                64,
-                &s,
-            ));
+            let want = as_multiset(
+                grace_join_in_memory(
+                    build.iter().map(|r| (String::new(), r.clone())).collect(),
+                    probe.iter().map(|r| (String::new(), r.clone())).collect(),
+                    64,
+                    &s,
+                )
+                .unwrap(),
+            );
 
             // budget 0 = unlimited (in-memory build); spill_budget = build
             // spills to disk + re-partitions, then completes. BOTH must equal
@@ -422,7 +425,8 @@ mod tests {
             probe.iter().map(|r| (String::new(), r.clone())).collect(),
             64,
             &ref_spec,
-        );
+        )
+        .unwrap();
 
         let task = make_task();
         let join = JoinParams {

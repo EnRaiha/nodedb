@@ -137,7 +137,7 @@ impl NodeDbError {
     /// Expression evaluation divided or took a modulus by zero. Distinct
     /// from `plan_error` so clients can match on the specific code
     /// (SQLSTATE `22012`, `division_by_zero`) rather than parsing the
-    /// message (nodedb issue #216).
+    /// message.
     pub fn division_by_zero() -> Self {
         Self {
             code: ErrorCode::DIVISION_BY_ZERO,

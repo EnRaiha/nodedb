@@ -102,8 +102,8 @@ fn try_eval_scalar_function(s: &str) -> Option<nodedb_types::Value> {
         let registry = nodedb_sql::planner::const_fold::default_registry();
         if registry.lookup(&name).is_some() {
             // Zero-arg call: `math::try_eval`'s zero-modulus arm (the only
-            // fallible arm in the scalar-function table, nodedb issue #216)
-            // cannot be reached with an empty argument list, so folding the
+            // fallible arm in the scalar-function table) cannot be reached
+            // with an empty argument list, so folding the
             // `Result` to `Value::Null` on error is unreachable in practice,
             // not a silent swallow.
             let val = nodedb_query::functions::eval_function(&name, &[])

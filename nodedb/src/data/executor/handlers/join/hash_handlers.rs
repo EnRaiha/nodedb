@@ -358,7 +358,7 @@ impl CoreLoop {
             )
         };
 
-        let mut results = probe_hash_index(&ProbeParams {
+        let mut results = match probe_hash_index(&ProbeParams {
             probe_docs: &left_docs,
             index: &right_index,
             index_docs: &right_docs,
@@ -369,7 +369,12 @@ impl CoreLoop {
             index_collection: right_prefix,
             join_filters: &join_filters,
             emit_unmatched_right: true,
-        });
+        }) {
+            Ok(r) => r,
+            // Div/modulo-by-zero in a residual ON predicate surfaces to the
+            // client as SQLSTATE 22012.
+            Err(_e) => return self.response_error(join.task, ErrorCode::DivisionByZero),
+        };
 
         if enforce_output_budget && results.len() >= probe_limit {
             return self.response_error(join.task, ErrorCode::ResourcesExhausted);

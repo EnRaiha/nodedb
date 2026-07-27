@@ -164,9 +164,9 @@ impl CoreLoop {
                                 detail: format!("staged update field '{field}': {e}"),
                             })?,
                         UpdateValue::Expr(expr) => {
-                            // nodedb issue #216: division/modulo by zero
-                            // fails the staged write, same as the literal
-                            // decode-failure arm above.
+                            // Division/modulo by zero fails the staged
+                            // write, same as the literal decode-failure arm
+                            // above.
                             let result: nodedb_types::Value =
                                 expr.eval(&eval_doc).map_err(crate::Error::from)?;
                             result.into()

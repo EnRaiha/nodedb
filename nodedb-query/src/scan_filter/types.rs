@@ -72,7 +72,7 @@ impl ScanFilter {
     /// Evaluate an AND-group of filters, short-circuiting on the first
     /// `false` or the first evaluation error — same semantics as
     /// `group.iter().all(|f| f.matches_value(doc))` had before filter
-    /// evaluation could fail (nodedb issue #216). `pub` so the many call
+    /// evaluation could fail. `pub` so the many call
     /// sites across the `nodedb` crate that used to write
     /// `filters.iter().all(|f| f.matches_value(doc))` have a drop-in
     /// replacement instead of each hand-rolling the same short-circuit loop.
@@ -95,7 +95,7 @@ impl ScanFilter {
     ///
     /// Returns `Err(EvalError::DivisionByZero)` when the filter is (or
     /// contains, via an `OR` group) a `FilterOp::Expr` predicate whose
-    /// expression divides or takes a modulus by zero (nodedb issue #216).
+    /// expression divides or takes a modulus by zero.
     /// This is the deliberate WHERE-clause behavior flip: a predicate like
     /// `10 / denom > 1` used to evaluate to `Value::Null`/`false` (silently
     /// filtering the row out) when `denom` was `0`; it now fails the whole

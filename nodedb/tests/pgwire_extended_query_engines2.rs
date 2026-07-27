@@ -307,9 +307,9 @@ async fn extended_query_oid_mismatch_text_for_int_errors_or_coerces() {
     }
 }
 
-// ── Cross-engine: issue #216 SQLSTATEs through the extended protocol ────────
+// ── Cross-engine: SQLSTATEs through the extended protocol ───────────────────
 
-/// Undefined-function rejection (issue #216, SQLSTATE `42883`) through the
+/// Undefined-function rejection (SQLSTATE `42883`) through the
 /// extended-query path. `sql_undefined_function.rs` proves this fires at
 /// PLAN time over simple-query (where Parse+Bind+Execute collapse into one
 /// round trip). Naively, `pgwire_database_authorization.rs`'s
@@ -350,7 +350,7 @@ async fn extended_query_unknown_function_errors_42883() {
     );
 }
 
-/// Division-by-zero rejection (issue #216, SQLSTATE `22012`) through the
+/// Division-by-zero rejection (SQLSTATE `22012`) through the
 /// extended-query path. Unlike the undefined-function gate above, `10 / d`
 /// is a well-typed expression regardless of `d`'s runtime value, so
 /// Parse/Describe must succeed — the zero divisor can only be discovered
@@ -380,9 +380,7 @@ async fn extended_query_division_by_zero_errors_22012_at_execute() {
             &[Type::TEXT],
         )
         .await
-        .expect(
-            "Parse must succeed — `10 / d` is well-typed independent of d's runtime value",
-        );
+        .expect("Parse must succeed — `10 / d` is well-typed independent of d's runtime value");
 
     let err = srv
         .client

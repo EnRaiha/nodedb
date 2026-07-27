@@ -24,10 +24,10 @@ pub(super) fn running_aggregate(
     indices: &[usize],
     spec: &WindowFuncSpec,
     field: &str,
-) {
+) -> Result<(), crate::expr::EvalError> {
     let len = indices.len();
     if len == 0 {
-        return;
+        return Ok(());
     }
 
     // Accumulate state incrementally row-by-row, but defer writing results
@@ -55,7 +55,7 @@ pub(super) fn running_aggregate(
 
         // Check if the *next* row starts a new peer group (or we're at the end).
         let is_last_in_group =
-            pos + 1 == len || !order_keys_equal(rows, i, indices[pos + 1], &spec.order_by);
+            pos + 1 == len || !order_keys_equal(rows, i, indices[pos + 1], &spec.order_by)?;
 
         if is_last_in_group {
             // Compute the result at the end of this peer group.
@@ -88,4 +88,5 @@ pub(super) fn running_aggregate(
             peer_start = pos + 1;
         }
     }
+    Ok(())
 }

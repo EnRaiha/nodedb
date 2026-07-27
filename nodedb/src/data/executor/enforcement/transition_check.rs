@@ -25,17 +25,16 @@ pub fn check_transition_predicates(
     let old_val = nodedb_types::Value::from(old_doc.clone());
     let new_val = nodedb_types::Value::from(new_doc.clone());
     for check in checks {
-        // A division/modulo-by-zero (nodedb issue #216) inside the predicate
-        // is neither a PASS nor an ordinary FAIL — it's an evaluation error,
-        // surfaced via `detail` rather than folded into the plain "predicate
-        // returned false" case below.
+        // A division/modulo-by-zero inside the predicate is neither a PASS
+        // nor an ordinary FAIL — it's an evaluation error. `eval_with_old`
+        // can only fail with `EvalError::DivisionByZero`, so it surfaces as
+        // SQLSTATE 22012 (`ErrorCode::DivisionByZero`), matching generated
+        // columns / materialized-sum enforcement and Postgres, rather than
+        // being reported under this check's own 23xxx violation code.
         let result = check
             .predicate
             .eval_with_old(&new_val, &old_val)
-            .map_err(|e| ErrorCode::TransitionCheckViolation {
-                collection: collection.to_string(),
-                detail: format!("transition check '{}' failed to evaluate: {e}", check.name),
-            })?;
+            .map_err(|_e| ErrorCode::DivisionByZero)?;
         let passed = match result {
             nodedb_types::Value::Bool(b) => b,
             nodedb_types::Value::Null => false, // NULL treated as FALSE for constraint purposes.
@@ -161,5 +160,30 @@ mod tests {
         let old = serde_json::json!({"x": 1});
         let new = serde_json::json!({"x": 2});
         assert!(check_transition_predicates("coll", &[check], &old, &new).is_err());
+    }
+
+    #[test]
+    fn division_by_zero_predicate_errors_with_division_by_zero_code() {
+        // Predicate: NEW.amount / OLD.divisor >= 1, with OLD.divisor = 0.
+        // A division-by-zero is an evaluation error surfaced as SQLSTATE 22012
+        // (`ErrorCode::DivisionByZero`), not this check's own violation code.
+        let check = make_check(
+            "ratio",
+            SqlExpr::BinaryOp {
+                left: Box::new(SqlExpr::BinaryOp {
+                    left: Box::new(SqlExpr::Column("amount".into())),
+                    op: BinaryOp::Div,
+                    right: Box::new(SqlExpr::OldColumn("divisor".into())),
+                }),
+                op: BinaryOp::GtEq,
+                right: Box::new(SqlExpr::Literal(nodedb_types::Value::Integer(1))),
+            },
+        );
+        let old = serde_json::json!({"divisor": 0});
+        let new = serde_json::json!({"amount": 10});
+        assert!(matches!(
+            check_transition_predicates("coll", &[check], &old, &new),
+            Err(ErrorCode::DivisionByZero)
+        ));
     }
 }

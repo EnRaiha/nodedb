@@ -223,8 +223,8 @@ impl CoreLoop {
                             if matches!(existing, Some(v) if !v.is_null()) {
                                 continue;
                             }
-                            // Computed-column projection is projection-shaped
-                            // (nodedb issue #216): a division/modulo-by-zero
+                            // Computed-column projection is
+                            // projection-shaped: a division/modulo-by-zero
                             // fails the whole scan.
                             let v = cc.expr.eval(&doc_val)?;
                             obj.insert(cc.alias.clone(), serde_json::Value::from(v));

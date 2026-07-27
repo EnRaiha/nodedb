@@ -64,10 +64,10 @@ pub(in crate::data::executor) struct SpatialOverlayMergeParams<'a> {
 /// staged row whose collection has no known columnar schema (defensively
 /// treated as "does not match" rather than surfacing a panic). Returns
 /// `Err` only when the row *does* decode but its computed-column projection
-/// hits a division/modulo-by-zero (nodedb issue #216) — `row_to_projected_json`
-/// is called with no computed columns here (`&[]`), so this is currently
-/// unreachable, but the `Result` return keeps the signature honest about
-/// what `row_to_projected_json` can do.
+/// hits a division/modulo-by-zero — `row_to_projected_json` is called with
+/// no computed columns here (`&[]`), so this is currently unreachable, but
+/// the `Result` return keeps the signature honest about what
+/// `row_to_projected_json` can do.
 fn decode_staged_spatial_row(
     body: &[u8],
     schema: Option<&ColumnarSchema>,
@@ -130,9 +130,9 @@ impl CoreLoop {
         // via `ensure_columnar_engine_schema` at insert time.
         let schema = self.columnar_engines.get(coll_key).map(|e| e.schema());
 
-        // A division/modulo-by-zero (nodedb issue #216) in an attribute or
-        // row-level filter is WHERE-shaped: it fails the whole scan, same
-        // as `handlers::spatial`'s direct `matches_value` calls.
+        // A division/modulo-by-zero in an attribute or row-level filter is
+        // WHERE-shaped: it fails the whole scan, same as
+        // `handlers::spatial`'s direct `matches_value` calls.
         let row_matches = |doc: &Value| -> crate::Result<bool> {
             let Some(doc_geom) = extract_geometry(doc, field) else {
                 return Ok(false);

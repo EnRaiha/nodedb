@@ -15,7 +15,7 @@ pub enum SqlError {
     /// window function registered in the [`FunctionRegistry`](crate::functions::registry::FunctionRegistry).
     /// Caught at plan time in the resolver so the whole statement is
     /// rejected instead of the call silently evaluating to `NULL` for every
-    /// row at runtime (nodedb issue #216).
+    /// row at runtime.
     #[error("function {name}(...) does not exist")]
     UndefinedFunction { name: String },
 

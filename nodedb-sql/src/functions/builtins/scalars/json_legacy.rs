@@ -7,7 +7,7 @@
 //! (`json_value`/`json_query`/`json_exists`): these are the pre-existing
 //! `json_*` document-helper functions evaluated by
 //! `nodedb_query::functions::json::legacy::try_eval`. Historically absent
-//! from this registry entirely — nodedb issue #216's plan-time existence
+//! from this registry entirely — the plan-time existence
 //! gate rejects any name missing here. The list is audited to match every
 //! match arm in `nodedb_query::functions::json::legacy::try_eval` exactly:
 //! `json_extract` / `json_get`, `json_set`, `json_remove`, `json_keys`,

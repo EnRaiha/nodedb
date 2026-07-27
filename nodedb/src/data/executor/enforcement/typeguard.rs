@@ -39,13 +39,10 @@ pub fn inject_defaults(
                     }
                 })?;
             let doc = nodedb_types::Value::Object(fields.clone());
-            let val = expr.eval(&doc).map_err(|e| ErrorCode::TypeGuardViolation {
-                collection: String::new(),
-                detail: format!(
-                    "field '{}': VALUE expression '{}' failed to evaluate: {e}",
-                    guard.field, expr_str
-                ),
-            })?;
+            // A division/modulo-by-zero — the only error `eval` can produce —
+            // surfaces as SQLSTATE 22012, not this guard's own violation
+            // code, matching generated-column enforcement.
+            let val = expr.eval(&doc).map_err(|_e| ErrorCode::DivisionByZero)?;
             fields.insert(guard.field.clone(), val);
         }
         // DEFAULT: inject only if absent or null.
@@ -63,13 +60,9 @@ pub fn inject_defaults(
                         ),
                     })?;
                 let doc = nodedb_types::Value::Object(fields.clone());
-                let val = expr.eval(&doc).map_err(|e| ErrorCode::TypeGuardViolation {
-                    collection: String::new(),
-                    detail: format!(
-                        "field '{}': DEFAULT expression '{}' failed to evaluate: {e}",
-                        guard.field, expr_str
-                    ),
-                })?;
+                // Div-by-zero → SQLSTATE 22012, not this guard's violation
+                // code (see the VALUE arm above).
+                let val = expr.eval(&doc).map_err(|_e| ErrorCode::DivisionByZero)?;
                 fields.insert(guard.field.clone(), val);
             }
         }
@@ -188,15 +181,11 @@ pub fn check_type_guards(
                         guard.field, check_str
                     ),
                 })?;
+            // Div-by-zero → SQLSTATE 22012, not this guard's violation code,
+            // matching CHECK-constraint enforcement elsewhere.
             let result = check_expr
                 .eval(doc)
-                .map_err(|e| ErrorCode::TypeGuardViolation {
-                    collection: collection.to_string(),
-                    detail: format!(
-                        "field '{}': CHECK expression '{}' failed to evaluate: {e}",
-                        guard.field, check_str
-                    ),
-                })?;
+                .map_err(|_e| ErrorCode::DivisionByZero)?;
             match result {
                 nodedb_types::Value::Bool(true) => {} // CHECK passed
                 nodedb_types::Value::Null => {}       // NULL passes CHECK (SQL semantics)

@@ -2,7 +2,7 @@
 
 //! String scalar function registrations.
 //!
-//! nodedb issue #216's plan-time existence gate rejects any name missing
+//! The plan-time existence gate rejects any name missing
 //! here, so this list is audited to match every match arm in
 //! `nodedb_query::functions::string::try_eval` exactly: `upper`, `lower`,
 //! `trim`, `ltrim`, `rtrim`, `length` / `char_length` / `character_length`,

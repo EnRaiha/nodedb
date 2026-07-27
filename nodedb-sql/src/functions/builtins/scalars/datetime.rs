@@ -2,7 +2,7 @@
 
 //! Date/time scalar function registrations.
 //!
-//! nodedb issue #216's plan-time existence gate rejects any name missing
+//! The plan-time existence gate rejects any name missing
 //! here, so this list is audited to match every match arm in
 //! `nodedb_query::functions::datetime::try_eval` exactly: `now` /
 //! `current_timestamp`, `datetime` / `to_datetime`, `unix_secs` /

@@ -115,11 +115,11 @@ impl CoreLoop {
         // to resolve and is left untouched, matching the base scan's own
         // "no prefilter possible" treatment of unrecorded surrogates.
         //
-        // `Vec::retain_mut`'s closure must return `bool`, so a division/
-        // modulo-by-zero (nodedb issue #216) hit while projecting a computed
-        // column can't `?` out of it directly; it's captured in `first_err`
-        // and checked once the retain pass finishes, aborting the merge
-        // before the overlay-addition pass below runs.
+        // `Vec::retain_mut`'s closure must return `bool`, so a
+        // division/modulo-by-zero hit while projecting a computed column
+        // can't `?` out of it directly; it's captured in `first_err` and
+        // checked once the retain pass finishes, aborting the merge before
+        // the overlay-addition pass below runs.
         let mut first_err: Option<crate::Error> = None;
         matched.retain_mut(|(surrogate, row, json)| {
             if first_err.is_some() {

@@ -61,12 +61,27 @@ pub async fn dispatch_trigger_batch(
     }
 
     for trigger in &after_row_triggers {
-        let mask = when_filter::filter_batch_by_when(
+        // An AFTER trigger fires post-commit — there is no statement left to
+        // fail. A division/modulo-by-zero in its WHEN predicate is surfaced
+        // observably (warn) and skips this trigger, rather than being
+        // silently folded to "does not fire".
+        let mask = match when_filter::filter_batch_by_when(
             &batch.rows,
             &batch.collection,
             &batch.operation,
             trigger.when_condition.as_deref(),
-        );
+        ) {
+            Ok(mask) => mask,
+            Err(e) => {
+                tracing::warn!(
+                    trigger = %trigger.name,
+                    collection = %batch.collection,
+                    error = %e,
+                    "AFTER trigger WHEN predicate raised an evaluation error; skipping trigger for this batch"
+                );
+                continue;
+            }
+        };
 
         let passing = when_filter::count_passing(&mask);
         if passing == 0 {

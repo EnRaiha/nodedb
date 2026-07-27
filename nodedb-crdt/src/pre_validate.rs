@@ -45,6 +45,16 @@ pub fn pre_validate(
                 reason: v.reason.clone(),
             }
         }
+        // An unevaluable predicate (division/modulo by zero)
+        // is rejected before it ever reaches Raft — same terminal outcome as a
+        // violation, so the delta never commits.
+        ValidationOutcome::EvalError {
+            constraint_name,
+            error,
+        } => PreValidationResult::FastReject {
+            constraint: constraint_name,
+            reason: format!("CHECK predicate failed to evaluate: {error}"),
+        },
     }
 }
 

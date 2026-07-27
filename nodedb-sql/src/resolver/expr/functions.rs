@@ -67,7 +67,7 @@ pub(super) fn convert_function_depth(func: &ast::Function, depth: &mut usize) ->
         return Ok(expr);
     }
 
-    // Plan-time existence gate (nodedb issue #216): every special-form
+    // Plan-time existence gate: every special-form
     // interception above (FTS surface functions, catalog functions) has
     // already had its shot at `name` and returned early. Anything reaching
     // this point is a plain scalar/aggregate/window call that must be a

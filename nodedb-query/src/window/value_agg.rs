@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use nodedb_types::Value;
 
 use super::spec::{FrameBound, WindowFrame, WindowFuncSpec};
-use super::value_eval::{cmp_values, eval_arg_for_row, order_keys_equal_v, set_cell};
+use super::value_eval::{WindowError, cmp_values, eval_arg_for_row, order_keys_equal_v, set_cell};
 use crate::simd_agg;
 
 pub(super) fn apply_v_aggregate(
@@ -17,23 +17,27 @@ pub(super) fn apply_v_aggregate(
     column_index: &HashMap<String, usize>,
     spec: &WindowFuncSpec,
     write_col: usize,
-) {
+) -> Result<(), WindowError> {
     let use_running = spec.frame.mode == "range"
         && matches!(spec.frame.start, FrameBound::UnboundedPreceding)
         && matches!(spec.frame.end, FrameBound::CurrentRow);
 
     if use_running {
-        apply_v_running_aggregate(rows, indices, column_index, spec, write_col);
+        apply_v_running_aggregate(rows, indices, column_index, spec, write_col)
     } else {
-        apply_v_per_row_aggregate(rows, indices, column_index, spec, write_col);
+        apply_v_per_row_aggregate(rows, indices, column_index, spec, write_col)
     }
 }
 
-fn eval_arg(spec: &WindowFuncSpec, row: &[Value], column_index: &HashMap<String, usize>) -> Value {
-    spec.args
-        .first()
-        .map(|expr| eval_arg_for_row(expr, row, column_index))
-        .unwrap_or(Value::Null)
+fn eval_arg(
+    spec: &WindowFuncSpec,
+    row: &[Value],
+    column_index: &HashMap<String, usize>,
+) -> Result<Value, WindowError> {
+    match spec.args.first() {
+        Some(expr) => Ok(eval_arg_for_row(expr, row, column_index)?),
+        None => Ok(Value::Null),
+    }
 }
 
 fn apply_v_running_aggregate(
@@ -42,10 +46,10 @@ fn apply_v_running_aggregate(
     column_index: &HashMap<String, usize>,
     spec: &WindowFuncSpec,
     write_col: usize,
-) {
+) -> Result<(), WindowError> {
     let len = indices.len();
     if len == 0 {
-        return;
+        return Ok(());
     }
 
     let mut running_sum = 0.0f64;
@@ -56,10 +60,10 @@ fn apply_v_running_aggregate(
 
     for pos in 0..len {
         let i = indices[pos];
-        let val = rows
-            .get(i)
-            .map(|row| eval_arg(spec, row, column_index))
-            .unwrap_or(Value::Null);
+        let val = match rows.get(i) {
+            Some(row) => eval_arg(spec, row, column_index)?,
+            None => Value::Null,
+        };
 
         if let Some(n) = val.as_f64() {
             running_sum += n;
@@ -71,17 +75,17 @@ fn apply_v_running_aggregate(
         }
 
         let is_last_in_group = pos + 1 == len
-            || !order_keys_equal_v(rows, i, indices[pos + 1], column_index, &spec.order_by);
+            || !order_keys_equal_v(rows, i, indices[pos + 1], column_index, &spec.order_by)?;
 
         if is_last_in_group {
-            let first_val = rows
-                .get(indices[0])
-                .map(|row| eval_arg(spec, row, column_index))
-                .unwrap_or(Value::Null);
-            let last_val = rows
-                .get(indices[pos])
-                .map(|row| eval_arg(spec, row, column_index))
-                .unwrap_or(Value::Null);
+            let first_val = match rows.get(indices[0]) {
+                Some(row) => eval_arg(spec, row, column_index)?,
+                None => Value::Null,
+            };
+            let last_val = match rows.get(indices[pos]) {
+                Some(row) => eval_arg(spec, row, column_index)?,
+                None => Value::Null,
+            };
 
             let result = match spec.func_name.as_str() {
                 "sum" => Value::Float(running_sum),
@@ -106,6 +110,7 @@ fn apply_v_running_aggregate(
             peer_start = pos + 1;
         }
     }
+    Ok(())
 }
 
 fn apply_v_per_row_aggregate(
@@ -114,24 +119,20 @@ fn apply_v_per_row_aggregate(
     column_index: &HashMap<String, usize>,
     spec: &WindowFuncSpec,
     write_col: usize,
-) {
+) -> Result<(), WindowError> {
     let len = indices.len();
     if len == 0 {
-        return;
+        return Ok(());
     }
 
     let order_expr = spec.order_by.first().map(|(expr, _)| expr);
     let order_values: Vec<Value> = indices
         .iter()
-        .map(|&i| {
-            order_expr
-                .and_then(|expr| {
-                    rows.get(i)
-                        .map(|row| eval_arg_for_row(expr, row, column_index))
-                })
-                .unwrap_or(Value::Null)
+        .map(|&i| match (order_expr, rows.get(i)) {
+            (Some(expr), Some(row)) => Ok(eval_arg_for_row(expr, row, column_index)?),
+            _ => Ok(Value::Null),
         })
-        .collect();
+        .collect::<Result<Vec<_>, WindowError>>()?;
 
     let peer_groups: Vec<usize> = if spec.frame.mode == "groups" {
         build_v_peer_groups(&order_values)
@@ -141,12 +142,11 @@ fn apply_v_per_row_aggregate(
 
     let all_vals: Vec<Option<f64>> = indices
         .iter()
-        .map(|&i| {
-            rows.get(i)
-                .map(|row| eval_arg(spec, row, column_index).as_f64())
-                .unwrap_or(None)
+        .map(|&i| match rows.get(i) {
+            Some(row) => Ok(eval_arg(spec, row, column_index)?.as_f64()),
+            None => Ok(None),
         })
-        .collect();
+        .collect::<Result<Vec<_>, WindowError>>()?;
 
     let results: Vec<Value> = (0..len)
         .map(|pos| {
@@ -162,11 +162,12 @@ fn apply_v_per_row_aggregate(
                 end_idx,
             )
         })
-        .collect();
+        .collect::<Result<Vec<_>, WindowError>>()?;
 
     for (pos, result) in results.into_iter().enumerate() {
         set_cell(rows, indices[pos], write_col, result);
     }
+    Ok(())
 }
 
 fn aggregate_v_slice(
@@ -177,14 +178,14 @@ fn aggregate_v_slice(
     spec: &WindowFuncSpec,
     start_idx: usize,
     end_idx: usize,
-) -> Value {
+) -> Result<Value, WindowError> {
     let slice_vals: Vec<f64> = all_vals[start_idx..=end_idx]
         .iter()
         .filter_map(|v| *v)
         .collect();
     let slice_count = end_idx - start_idx + 1;
 
-    match spec.func_name.as_str() {
+    let result = match spec.func_name.as_str() {
         "sum" => {
             let rt = simd_agg::ts_runtime();
             Value::Float((rt.sum_f64)(&slice_vals))
@@ -214,34 +215,29 @@ fn aggregate_v_slice(
                 Value::Float((rt.max_f64)(&slice_vals))
             }
         }
-        "first_value" => indices
-            .get(start_idx)
-            .and_then(|&i| rows.get(i))
-            .map(|row| {
-                eval_arg_for_row(
-                    spec.args
-                        .first()
-                        .unwrap_or(&crate::expr::types::SqlExpr::Literal(Value::Null)),
-                    row,
-                    column_index,
-                )
-            })
-            .unwrap_or(Value::Null),
-        "last_value" => indices
-            .get(end_idx)
-            .and_then(|&i| rows.get(i))
-            .map(|row| {
-                eval_arg_for_row(
-                    spec.args
-                        .first()
-                        .unwrap_or(&crate::expr::types::SqlExpr::Literal(Value::Null)),
-                    row,
-                    column_index,
-                )
-            })
-            .unwrap_or(Value::Null),
+        "first_value" => match indices.get(start_idx).and_then(|&i| rows.get(i)) {
+            Some(row) => eval_arg_for_row(
+                spec.args
+                    .first()
+                    .unwrap_or(&crate::expr::types::SqlExpr::Literal(Value::Null)),
+                row,
+                column_index,
+            )?,
+            None => Value::Null,
+        },
+        "last_value" => match indices.get(end_idx).and_then(|&i| rows.get(i)) {
+            Some(row) => eval_arg_for_row(
+                spec.args
+                    .first()
+                    .unwrap_or(&crate::expr::types::SqlExpr::Literal(Value::Null)),
+                row,
+                column_index,
+            )?,
+            None => Value::Null,
+        },
         _ => Value::Null,
-    }
+    };
+    Ok(result)
 }
 
 fn build_v_peer_groups(order_values: &[Value]) -> Vec<usize> {
@@ -452,7 +448,7 @@ mod tests {
             row.push(Value::Null);
         }
         let indices: Vec<usize> = (0..rows.len()).collect();
-        apply_v_aggregate(rows, &indices, cols, spec, write_col);
+        apply_v_aggregate(rows, &indices, cols, spec, write_col).unwrap();
     }
 
     fn frame(mode: &str, start: FrameBound, end: FrameBound) -> WindowFrame {

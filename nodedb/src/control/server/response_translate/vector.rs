@@ -57,8 +57,8 @@ fn apply_rls_filter(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize) {
         }
     };
     // RLS is a security boundary: fail closed. A division/modulo-by-zero
-    // (nodedb issue #216) evaluating a filter against one hit drops that
-    // hit rather than showing it, the same way a filter that evaluates to
+    // evaluating a filter against one hit drops that hit rather than
+    // showing it, the same way a filter that evaluates to
     // `false` already excludes it — matching the "deny on any doubt"
     // posture the corrupt-filter branch above already uses. This
     // response-translation layer has no natural way to fail the whole

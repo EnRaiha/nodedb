@@ -20,9 +20,9 @@ use super::types::SqlExpr;
 /// `thiserror`-derived enum living next to the evaluator it describes.
 /// Everything that historically folded to `Value::Null` (bad casts, wrong
 /// arg counts, unknown-value coercions) keeps doing so — this type exists
-/// solely for division/modulo by a zero divisor (nodedb issue #216), which
-/// must surface as SQLSTATE `22012` (`division_by_zero`) instead of
-/// silently evaluating to `NULL`.
+/// solely for division/modulo by a zero divisor, which must surface as
+/// SQLSTATE `22012` (`division_by_zero`) instead of silently evaluating to
+/// `NULL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum EvalError {
     #[error("division by zero")]
@@ -73,7 +73,7 @@ impl SqlExpr {
     /// TRANSITION CHECK path).
     ///
     /// Returns `Err(EvalError::DivisionByZero)` if evaluation reaches a
-    /// `/` or `%` with a zero divisor (nodedb issue #216) — every other
+    /// `/` or `%` with a zero divisor — every other
     /// historically-`NULL`-folding case (bad casts, wrong arg counts,
     /// unknown-value coercions) is unaffected and still evaluates to
     /// `Ok(Value::Null)`.
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(expr.eval(&doc()).unwrap(), Value::Bool(true));
     }
 
-    // ── Division/modulo by zero (nodedb issue #216) ─────────────────────────
+    // ── Division/modulo by zero ──────────────────────────────────────────────
 
     #[test]
     fn integer_division_by_zero_errors() {

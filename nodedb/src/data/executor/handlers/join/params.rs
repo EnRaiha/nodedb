@@ -148,12 +148,11 @@ impl JoinParams<'_> {
                 })?;
             if !filters.is_empty() {
                 // `Vec::retain`'s closure must return `bool`, so a division/
-                // modulo-by-zero (nodedb issue #216) hit while matching a
-                // post-filter is captured in `first_err` and checked once
-                // the retain pass finishes — this post-filter path is
-                // WHERE-shaped, so (unlike the hash-join probe hot path
-                // this same helper also serves) it gets the full error
-                // treatment here.
+                // modulo-by-zero hit while matching a post-filter is
+                // captured in `first_err` and checked once the retain pass
+                // finishes — this post-filter path is WHERE-shaped, so
+                // (unlike the hash-join probe hot path this same helper
+                // also serves) it gets the full error treatment here.
                 let mut first_err: Option<crate::Error> = None;
                 results.retain(|row| {
                     if first_err.is_some() {

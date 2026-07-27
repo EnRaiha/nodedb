@@ -12,6 +12,7 @@ use std::collections::HashSet;
 
 use nodedb_types::Value;
 
+use crate::expr::EvalError;
 use crate::msgpack_scan::compare::compare_field_bytes;
 use crate::msgpack_scan::field::extract_field;
 use crate::msgpack_scan::reader::{read_f64, read_null, read_str};
@@ -27,15 +28,18 @@ pub fn compute_aggregate_binary(
     field: &str,
     expr: Option<&crate::expr::SqlExpr>,
     docs: &[&[u8]],
-) -> Value {
-    match op {
+) -> Result<Value, EvalError> {
+    Ok(match op {
         "count" => {
             if field == "*" && expr.is_none() {
                 Value::Integer(docs.len() as i64)
             } else {
                 let count = docs
                     .iter()
-                    .filter_map(|d| extract_as_value(d, field, expr))
+                    .map(|d| extract_as_value(d, field, expr))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
                     .filter(|v| !v.is_null())
                     .count();
                 Value::Integer(count as i64)
@@ -45,7 +49,10 @@ pub fn compute_aggregate_binary(
         "sum" => {
             let total: f64 = docs
                 .iter()
-                .filter_map(|d| extract_f64_val(d, field, expr))
+                .map(|d| extract_f64_val(d, field, expr))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
                 .sum();
             Value::Float(total)
         }
@@ -53,7 +60,10 @@ pub fn compute_aggregate_binary(
         "avg" => {
             let (sum, count) = docs
                 .iter()
-                .filter_map(|d| extract_f64_val(d, field, expr))
+                .map(|d| extract_f64_val(d, field, expr))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
                 .fold((0.0f64, 0u64), |(s, c), v| (s + v, c + 1));
             if count == 0 {
                 Value::Null
@@ -62,13 +72,13 @@ pub fn compute_aggregate_binary(
             }
         }
 
-        "min" => find_minmax(docs, field, expr, false),
-        "max" => find_minmax(docs, field, expr, true),
+        "min" => find_minmax(docs, field, expr, false)?,
+        "max" => find_minmax(docs, field, expr, true)?,
 
         "count_distinct" => {
             let mut seen = HashSet::new();
             for doc in docs {
-                if let Some(bytes) = extract_value_bytes(doc, field, expr)
+                if let Some(bytes) = extract_value_bytes(doc, field, expr)?
                     && !value_bytes_are_null(&bytes)
                 {
                     seen.insert(bytes);
@@ -78,19 +88,22 @@ pub fn compute_aggregate_binary(
         }
 
         "stddev" | "stddev_pop" => {
-            stat_aggregate(docs, field, expr, |variance, _n| variance.sqrt(), true)
+            stat_aggregate(docs, field, expr, |variance, _n| variance.sqrt(), true)?
         }
 
-        "stddev_samp" => stat_aggregate(docs, field, expr, |variance, _n| variance.sqrt(), false),
+        "stddev_samp" => stat_aggregate(docs, field, expr, |variance, _n| variance.sqrt(), false)?,
 
-        "variance" | "var_pop" => stat_aggregate(docs, field, expr, |variance, _n| variance, true),
+        "variance" | "var_pop" => stat_aggregate(docs, field, expr, |variance, _n| variance, true)?,
 
-        "var_samp" => stat_aggregate(docs, field, expr, |variance, _n| variance, false),
+        "var_samp" => stat_aggregate(docs, field, expr, |variance, _n| variance, false)?,
 
         "array_agg" => {
             let values: Vec<Value> = docs
                 .iter()
-                .filter_map(|d| extract_as_value(d, field, expr))
+                .map(|d| extract_as_value(d, field, expr))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
                 .filter(|v| !v.is_null())
                 .collect();
             Value::Array(values)
@@ -103,7 +116,7 @@ pub fn compute_aggregate_binary(
                 // When expr is present, evaluate once and derive both bytes and value
                 // from the result to avoid double-decoding the document.
                 if let Some(expr) = expr {
-                    let Some(val) = eval_expr_on_doc(doc, expr) else {
+                    let Some(val) = eval_expr_on_doc(doc, expr)? else {
                         continue;
                     };
                     if val.is_null() {
@@ -113,7 +126,7 @@ pub fn compute_aggregate_binary(
                     if seen_bytes.insert(bytes) {
                         values.push(val);
                     }
-                } else if let Some(bytes) = extract_value_bytes(doc, field, None)
+                } else if let Some(bytes) = extract_value_bytes(doc, field, None)?
                     && !value_bytes_are_null(&bytes)
                     && seen_bytes.insert(bytes)
                     && let Some(v) = value_from_field(doc, field)
@@ -127,7 +140,10 @@ pub fn compute_aggregate_binary(
         "string_agg" | "group_concat" => {
             let values: Vec<String> = docs
                 .iter()
-                .filter_map(|d| extract_str_val(d, field, expr))
+                .map(|d| extract_str_val(d, field, expr))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
                 .collect();
             Value::String(values.join(","))
         }
@@ -135,7 +151,7 @@ pub fn compute_aggregate_binary(
         "approx_count_distinct" => {
             let mut hll = nodedb_types::approx::HyperLogLog::new();
             for doc in docs {
-                if let Some(bytes) = extract_value_bytes(doc, field, expr)
+                if let Some(bytes) = extract_value_bytes(doc, field, expr)?
                     && !value_bytes_are_null(&bytes)
                 {
                     // Hash the raw bytes for HLL.
@@ -151,14 +167,14 @@ pub fn compute_aggregate_binary(
             let (pct, actual_field) = if let Some(idx) = field.find(':') {
                 match field[..idx].parse::<f64>() {
                     Ok(p) => (p, &field[idx + 1..]),
-                    Err(_) => return Value::Null, // invalid quantile
+                    Err(_) => return Ok(Value::Null), // invalid quantile
                 }
             } else {
                 (0.5, field)
             };
             let mut digest = nodedb_types::approx::TDigest::new();
             for doc in docs {
-                if let Some(v) = extract_f64_val(doc, actual_field, expr) {
+                if let Some(v) = extract_f64_val(doc, actual_field, expr)? {
                     digest.add(v);
                 }
             }
@@ -175,14 +191,14 @@ pub fn compute_aggregate_binary(
             let (k, actual_field) = if let Some(idx) = field.find(':') {
                 match field[..idx].parse::<usize>() {
                     Ok(k) => (k, &field[idx + 1..]),
-                    Err(_) => return Value::Null, // invalid k
+                    Err(_) => return Ok(Value::Null), // invalid k
                 }
             } else {
                 (10, field)
             };
             let mut ss = nodedb_types::approx::SpaceSaving::new(k);
             for doc in docs {
-                if let Some(bytes) = extract_value_bytes(doc, actual_field, expr)
+                if let Some(bytes) = extract_value_bytes(doc, actual_field, expr)?
                     && !value_bytes_are_null(&bytes)
                 {
                     ss.add(hash_bytes(&bytes));
@@ -211,17 +227,20 @@ pub fn compute_aggregate_binary(
             let (pct, actual_field) = if let Some(idx) = field.find(':') {
                 match field[..idx].parse::<f64>() {
                     Ok(p) => (p, &field[idx + 1..]),
-                    Err(_) => return Value::Null, // invalid quantile
+                    Err(_) => return Ok(Value::Null), // invalid quantile
                 }
             } else {
                 (0.5, field)
             };
             let mut values: Vec<f64> = docs
                 .iter()
-                .filter_map(|d| extract_f64_val(d, actual_field, expr))
+                .map(|d| extract_f64_val(d, actual_field, expr))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
                 .collect();
             if values.is_empty() {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
             let idx = (pct * (values.len() - 1) as f64).clamp(0.0, (values.len() - 1) as f64);
@@ -233,7 +252,7 @@ pub fn compute_aggregate_binary(
         }
 
         _ => Value::Null,
-    }
+    })
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────
@@ -241,47 +260,60 @@ pub fn compute_aggregate_binary(
 /// Decode a msgpack document directly to `nodedb_types::Value` and evaluate
 /// the expression. No JSON intermediate — msgpack → Value → eval → Value.
 ///
-/// `compute_aggregate_binary` (this module's only public entry point) has
-/// no caller anywhere in the workspace — the live aggregate pipeline goes
-/// through `nodedb/src/data/executor/handlers/accum` instead. A
-/// division/modulo-by-zero (nodedb issue #216) here folds to `None`
-/// exactly like the pre-existing msgpack-decode-failure case on the line
-/// above, rather than threading a `Result` through an otherwise-dead
-/// `Option`-shaped API.
+/// `Ok(None)` means the row is skipped (document could not be decoded);
+/// `Err(EvalError::DivisionByZero)` means the expression divided/modded by
+/// zero and must propagate as a statement failure rather than being folded
+/// to `None`.
 #[inline]
-fn eval_expr_on_doc(doc: &[u8], expr: &crate::expr::SqlExpr) -> Option<Value> {
-    let doc_val = nodedb_types::json_msgpack::value_from_msgpack(doc).ok()?;
-    expr.eval(&doc_val).ok()
+fn eval_expr_on_doc(doc: &[u8], expr: &crate::expr::SqlExpr) -> Result<Option<Value>, EvalError> {
+    let Ok(doc_val) = nodedb_types::json_msgpack::value_from_msgpack(doc) else {
+        return Ok(None);
+    };
+    Ok(Some(expr.eval(&doc_val)?))
 }
 
 /// Extract a numeric value from a field or expression result.
 #[inline]
-fn extract_f64_val(doc: &[u8], field: &str, expr: Option<&crate::expr::SqlExpr>) -> Option<f64> {
+fn extract_f64_val(
+    doc: &[u8],
+    field: &str,
+    expr: Option<&crate::expr::SqlExpr>,
+) -> Result<Option<f64>, EvalError> {
     if let Some(expr) = expr {
-        return value_ops::value_to_f64(&eval_expr_on_doc(doc, expr)?, false);
+        return Ok(eval_expr_on_doc(doc, expr)?.and_then(|v| value_ops::value_to_f64(&v, false)));
     }
-    let (start, _end) = extract_field(doc, 0, field)?;
-    read_f64(doc, start)
+    let Some((start, _end)) = extract_field(doc, 0, field) else {
+        return Ok(None);
+    };
+    Ok(read_f64(doc, start))
 }
 
 /// Extract a string from a field or expression result.
-fn extract_str_val(doc: &[u8], field: &str, expr: Option<&crate::expr::SqlExpr>) -> Option<String> {
+fn extract_str_val(
+    doc: &[u8],
+    field: &str,
+    expr: Option<&crate::expr::SqlExpr>,
+) -> Result<Option<String>, EvalError> {
     if let Some(expr) = expr {
-        return Some(value_ops::value_to_display_string(&eval_expr_on_doc(
-            doc, expr,
-        )?));
+        return Ok(eval_expr_on_doc(doc, expr)?.map(|v| value_ops::value_to_display_string(&v)));
     }
-    let (start, _end) = extract_field(doc, 0, field)?;
-    read_str(doc, start).map(|s| s.to_string())
+    let Some((start, _end)) = extract_field(doc, 0, field) else {
+        return Ok(None);
+    };
+    Ok(read_str(doc, start).map(|s| s.to_string()))
 }
 
 /// Extract a field as `Value`. Uses direct msgpack→Value for scalars;
 /// falls back to full decode only for complex types.
-fn extract_as_value(doc: &[u8], field: &str, expr: Option<&crate::expr::SqlExpr>) -> Option<Value> {
+fn extract_as_value(
+    doc: &[u8],
+    field: &str,
+    expr: Option<&crate::expr::SqlExpr>,
+) -> Result<Option<Value>, EvalError> {
     if let Some(expr) = expr {
         return eval_expr_on_doc(doc, expr);
     }
-    value_from_field(doc, field)
+    Ok(value_from_field(doc, field))
 }
 
 #[inline]
@@ -302,13 +334,13 @@ fn find_minmax(
     field: &str,
     expr: Option<&crate::expr::SqlExpr>,
     want_max: bool,
-) -> Value {
+) -> Result<Value, EvalError> {
     if let Some(expr) = expr {
         // Evaluate expression once per doc; compare on Value
         // since the result may be any type (not a raw field).
         let mut best: Option<Value> = None;
         for doc in docs {
-            let Some(value) = eval_expr_on_doc(doc, expr) else {
+            let Some(value) = eval_expr_on_doc(doc, expr)? else {
                 continue;
             };
             if value.is_null() {
@@ -329,7 +361,7 @@ fn find_minmax(
                 best = Some(value);
             }
         }
-        return best.unwrap_or(Value::Null);
+        return Ok(best.unwrap_or(Value::Null));
     }
 
     let mut best_doc: Option<&[u8]> = None;
@@ -362,16 +394,16 @@ fn find_minmax(
         }
     }
 
-    match (best_doc, best_range) {
+    Ok(match (best_doc, best_range) {
         (Some(doc), Some((start, end))) => {
             if let Some(v) = crate::msgpack_scan::reader::read_value(doc, start) {
-                return v;
+                return Ok(v);
             }
             let bytes = &doc[start..end];
             nodedb_types::json_msgpack::value_from_msgpack(bytes).unwrap_or(Value::Null)
         }
         _ => Value::Null,
-    }
+    })
 }
 
 /// Compute stddev or variance. `population` = true for population variant.
@@ -382,13 +414,16 @@ fn stat_aggregate(
     expr: Option<&crate::expr::SqlExpr>,
     finalize: fn(f64, usize) -> f64,
     population: bool,
-) -> Value {
+) -> Result<Value, EvalError> {
     let values: Vec<f64> = docs
         .iter()
-        .filter_map(|d| extract_f64_val(d, field, expr))
+        .map(|d| extract_f64_val(d, field, expr))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
         .collect();
     if values.len() < 2 {
-        return Value::Null;
+        return Ok(Value::Null);
     }
     let mean = values.iter().sum::<f64>() / values.len() as f64;
     let divisor = if population {
@@ -397,20 +432,24 @@ fn stat_aggregate(
         (values.len() - 1) as f64
     };
     let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / divisor;
-    Value::Float(finalize(variance, values.len()))
+    Ok(Value::Float(finalize(variance, values.len())))
 }
 
 fn extract_value_bytes(
     doc: &[u8],
     field: &str,
     expr: Option<&crate::expr::SqlExpr>,
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<u8>>, EvalError> {
     if let Some(expr) = expr {
-        let val = eval_expr_on_doc(doc, expr)?;
-        return nodedb_types::json_msgpack::value_to_msgpack(&val).ok();
+        let Some(val) = eval_expr_on_doc(doc, expr)? else {
+            return Ok(None);
+        };
+        return Ok(nodedb_types::json_msgpack::value_to_msgpack(&val).ok());
     }
-    let (start, end) = extract_field(doc, 0, field)?;
-    Some(doc[start..end].to_vec())
+    let Some((start, end)) = extract_field(doc, 0, field) else {
+        return Ok(None);
+    };
+    Ok(Some(doc[start..end].to_vec()))
 }
 
 /// Check if msgpack bytes represent null. Msgpack null is the single byte 0xc0.
@@ -444,7 +483,7 @@ mod tests {
         let d3 = encode(&json!({"x": 3}));
         let docs: Vec<&[u8]> = vec![&d1, &d2, &d3];
         assert_eq!(
-            compute_aggregate_binary("count", "x", None, &docs),
+            compute_aggregate_binary("count", "x", None, &docs).unwrap(),
             Value::Integer(3)
         );
     }
@@ -456,7 +495,7 @@ mod tests {
         let d3 = encode(&json!({"v": 30}));
         let docs: Vec<&[u8]> = vec![&d1, &d2, &d3];
         assert_eq!(
-            compute_aggregate_binary("sum", "v", None, &docs),
+            compute_aggregate_binary("sum", "v", None, &docs).unwrap(),
             Value::Float(60.0)
         );
     }
@@ -467,7 +506,7 @@ mod tests {
         let d2 = encode(&json!({"v": 20}));
         let docs: Vec<&[u8]> = vec![&d1, &d2];
         assert_eq!(
-            compute_aggregate_binary("avg", "v", None, &docs),
+            compute_aggregate_binary("avg", "v", None, &docs).unwrap(),
             Value::Float(15.0)
         );
     }
@@ -477,7 +516,7 @@ mod tests {
         let d1 = encode(&json!({"other": 1}));
         let docs: Vec<&[u8]> = vec![&d1];
         assert_eq!(
-            compute_aggregate_binary("avg", "v", None, &docs),
+            compute_aggregate_binary("avg", "v", None, &docs).unwrap(),
             Value::Null
         );
     }
@@ -489,8 +528,8 @@ mod tests {
         let d3 = encode(&json!({"v": 9}));
         let docs: Vec<&[u8]> = vec![&d1, &d2, &d3];
 
-        let min = compute_aggregate_binary("min", "v", None, &docs);
-        let max = compute_aggregate_binary("max", "v", None, &docs);
+        let min = compute_aggregate_binary("min", "v", None, &docs).unwrap();
+        let max = compute_aggregate_binary("max", "v", None, &docs).unwrap();
         assert_eq!(min, Value::Integer(1));
         assert_eq!(max, Value::Integer(9));
     }
@@ -502,7 +541,7 @@ mod tests {
         let d3 = encode(&json!({"v": "a"}));
         let docs: Vec<&[u8]> = vec![&d1, &d2, &d3];
         assert_eq!(
-            compute_aggregate_binary("count_distinct", "v", None, &docs),
+            compute_aggregate_binary("count_distinct", "v", None, &docs).unwrap(),
             Value::Integer(2)
         );
     }
@@ -513,7 +552,7 @@ mod tests {
         let d2 = encode(&json!({"n": "bob"}));
         let docs: Vec<&[u8]> = vec![&d1, &d2];
         assert_eq!(
-            compute_aggregate_binary("string_agg", "n", None, &docs),
+            compute_aggregate_binary("string_agg", "n", None, &docs).unwrap(),
             Value::String("alice,bob".into())
         );
     }
@@ -523,7 +562,7 @@ mod tests {
         let d1 = encode(&json!({"v": 1}));
         let d2 = encode(&json!({"v": 2}));
         let docs: Vec<&[u8]> = vec![&d1, &d2];
-        let result = compute_aggregate_binary("array_agg", "v", None, &docs);
+        let result = compute_aggregate_binary("array_agg", "v", None, &docs).unwrap();
         assert_eq!(
             result,
             Value::Array(vec![Value::Integer(1), Value::Integer(2),])
@@ -541,7 +580,7 @@ mod tests {
         let d7 = encode(&json!({"v": 7.0}));
         let d8 = encode(&json!({"v": 9.0}));
         let docs: Vec<&[u8]> = vec![&d1, &d2, &d3, &d4, &d5, &d6, &d7, &d8];
-        let result = compute_aggregate_binary("stddev_pop", "v", None, &docs);
+        let result = compute_aggregate_binary("stddev_pop", "v", None, &docs).unwrap();
         if let Value::Float(v) = result {
             assert!((v - 2.0).abs() < 0.01);
         } else {
@@ -556,7 +595,7 @@ mod tests {
         let d3 = encode(&json!({"v": 3.0}));
         let docs: Vec<&[u8]> = vec![&d1, &d2, &d3];
         assert_eq!(
-            compute_aggregate_binary("percentile_cont", "v", None, &docs),
+            compute_aggregate_binary("percentile_cont", "v", None, &docs).unwrap(),
             Value::Float(2.0)
         );
     }
@@ -568,7 +607,7 @@ mod tests {
         let d3 = encode(&json!({"v": 30}));
         let docs: Vec<&[u8]> = vec![&d1, &d2, &d3];
         assert_eq!(
-            compute_aggregate_binary("sum", "v", None, &docs),
+            compute_aggregate_binary("sum", "v", None, &docs).unwrap(),
             Value::Float(40.0)
         );
     }
@@ -580,7 +619,7 @@ mod tests {
         let d3 = encode(&json!({"v": "a"}));
         let docs: Vec<&[u8]> = vec![&d1, &d2, &d3];
         assert_eq!(
-            compute_aggregate_binary("count_distinct", "v", None, &docs),
+            compute_aggregate_binary("count_distinct", "v", None, &docs).unwrap(),
             Value::Integer(1)
         );
     }
@@ -591,7 +630,7 @@ mod tests {
         let d2 = encode(&json!({"v": 2}));
         let d3 = encode(&json!({"v": 1}));
         let docs: Vec<&[u8]> = vec![&d1, &d2, &d3];
-        let result = compute_aggregate_binary("array_agg_distinct", "v", None, &docs);
+        let result = compute_aggregate_binary("array_agg_distinct", "v", None, &docs).unwrap();
         assert_eq!(
             result,
             Value::Array(vec![Value::Integer(1), Value::Integer(2),])
@@ -618,7 +657,7 @@ mod tests {
         };
 
         assert_eq!(
-            compute_aggregate_binary("sum", "*", Some(&expr), &docs),
+            compute_aggregate_binary("sum", "*", Some(&expr), &docs).unwrap(),
             Value::Float(2.0)
         );
     }
@@ -632,7 +671,8 @@ mod tests {
             encode(&json!({"region": "ap"})),
         ];
         let refs: Vec<&[u8]> = docs.iter().map(|d| d.as_slice()).collect();
-        let result = compute_aggregate_binary("approx_count_distinct", "region", None, &refs);
+        let result =
+            compute_aggregate_binary("approx_count_distinct", "region", None, &refs).unwrap();
         // HLL may not be exactly 3 but should be close.
         if let Value::Integer(n) = result {
             assert!((2..=4).contains(&n), "expected ~3 distinct, got {n}");
@@ -645,7 +685,7 @@ mod tests {
     fn approx_percentile_basic() {
         let docs: Vec<Vec<u8>> = (1..=100).map(|i| encode(&json!({"val": i}))).collect();
         let refs: Vec<&[u8]> = docs.iter().map(|d| d.as_slice()).collect();
-        let result = compute_aggregate_binary("approx_percentile", "0.5:val", None, &refs);
+        let result = compute_aggregate_binary("approx_percentile", "0.5:val", None, &refs).unwrap();
         if let Value::Float(f) = result {
             assert!(
                 (f - 50.0).abs() < 10.0,
@@ -669,11 +709,27 @@ mod tests {
             docs.push(encode(&json!({"cat": "c"})));
         }
         let refs: Vec<&[u8]> = docs.iter().map(|d| d.as_slice()).collect();
-        let result = compute_aggregate_binary("approx_topk", "3:cat", None, &refs);
+        let result = compute_aggregate_binary("approx_topk", "3:cat", None, &refs).unwrap();
         if let Value::Array(arr) = result {
             assert!(!arr.is_empty(), "should have top-k results");
         } else {
             panic!("expected Array, got {result:?}");
         }
+    }
+
+    #[test]
+    fn division_by_zero_in_expr_propagates() {
+        // `SUM(a / b)` over a document with `b = 0` must surface
+        // `EvalError::DivisionByZero` rather than folding the offending row
+        // to NULL and silently continuing the aggregate.
+        let d1 = encode(&json!({"a": 10, "b": 0}));
+        let docs: Vec<&[u8]> = vec![&d1];
+        let expr = crate::expr::SqlExpr::BinaryOp {
+            left: Box::new(crate::expr::SqlExpr::Column("a".into())),
+            op: crate::expr::BinaryOp::Div,
+            right: Box::new(crate::expr::SqlExpr::Column("b".into())),
+        };
+        let err = compute_aggregate_binary("sum", "*", Some(&expr), &docs).unwrap_err();
+        assert_eq!(err, EvalError::DivisionByZero);
     }
 }

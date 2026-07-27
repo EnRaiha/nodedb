@@ -114,9 +114,9 @@ pub(super) fn apply_computed_columns_rmpv(
     let doc = rmpv_to_nodedb_value(&row);
     let mut fields: Vec<(rmpv::Value, rmpv::Value)> = Vec::with_capacity(computed_cols.len());
     for cc in computed_cols {
-        // A computed column is projection-shaped (nodedb issue #216): a
-        // division/modulo-by-zero fails the whole scan instead of silently
-        // materializing NULL into the response.
+        // A computed column is projection-shaped: a division/modulo-by-zero
+        // fails the whole scan instead of silently materializing NULL into
+        // the response.
         let result = cc.expr.eval(&doc)?;
         fields.push((
             rmpv::Value::String(cc.alias.as_str().into()),

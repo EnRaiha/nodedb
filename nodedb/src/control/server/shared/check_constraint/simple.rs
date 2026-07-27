@@ -36,8 +36,8 @@ pub(super) fn enforce_simple_check(
     let doc = nodedb_types::Value::Object(fields.clone());
 
     // Evaluate the expression against the document. A division/modulo-by-zero
-    // (nodedb issue #216) is neither a PASS nor an ordinary FAIL — it's an
-    // evaluation error, reported under SQLSTATE 22012 rather than folded
+    // is neither a PASS nor an ordinary FAIL — it's an evaluation error,
+    // reported under SQLSTATE 22012 rather than folded
     // into the 23514 (check_violation) the ordinary-failure arm below uses.
     let result = expr.eval(&doc).map_err(|e| {
         ddl_err(

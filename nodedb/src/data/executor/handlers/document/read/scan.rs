@@ -160,8 +160,8 @@ impl CoreLoop {
                     );
                     // `merge_overlay_into_scan` takes an infallible
                     // `Fn(&[u8]) -> bool` predicate, so a division/modulo-by-
-                    // zero (nodedb issue #216) is captured via this `Cell`
-                    // side-channel and checked once the merge returns.
+                    // zero is captured via this `Cell` side-channel and
+                    // checked once the merge returns.
                     let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
                         std::cell::Cell::new(None);
                     let matches = |value: &[u8]| -> bool {
@@ -302,10 +302,12 @@ impl CoreLoop {
                             (id, doc)
                         })
                         .collect();
-                    crate::bridge::window_func::evaluate_window_functions(
+                    if let Err(e) = crate::bridge::window_func::evaluate_window_functions(
                         &mut decoded_rows,
                         &window_specs,
-                    );
+                    ) {
+                        return self.response_error(task, crate::Error::from(e));
+                    }
 
                     // Project first, then dedupe on the projected JSON value
                     // so `SELECT DISTINCT col` honours SQL semantics.

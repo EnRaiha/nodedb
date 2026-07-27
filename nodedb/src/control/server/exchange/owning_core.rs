@@ -114,9 +114,9 @@ pub async fn gather_single_owning_core(
         && let Some(ec) = resp.error_code.as_deref()
         && !matches!(ec, ErrorCode::NotFound)
     {
-        return Err(crate::Error::Dispatch {
-            detail: format!("{ec:?}"),
-        });
+        // Preserve typed codes (e.g. `DivisionByZero` → SQLSTATE 22012) instead
+        // of collapsing every Data-Plane error to a generic `Dispatch` (XX000).
+        return Err(ec.into_dispatch_error());
     }
 
     let payload_bytes: &[u8] = resp.payload.as_ref();

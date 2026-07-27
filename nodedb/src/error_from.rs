@@ -16,8 +16,8 @@ impl From<nodedb_query::expr_parse::ExprParseError> for Error {
     }
 }
 
-/// `EvalError` has exactly one variant today (`DivisionByZero`, nodedb
-/// issue #216); the `match` is exhaustive rather than a `_ =>` fallback so
+/// `EvalError` has exactly one variant today (`DivisionByZero`); the
+/// `match` is exhaustive rather than a `_ =>` fallback so
 /// a future evaluator error is forced to pick its own `crate::Error`
 /// mapping instead of silently inheriting this one.
 impl From<nodedb_query::EvalError> for Error {

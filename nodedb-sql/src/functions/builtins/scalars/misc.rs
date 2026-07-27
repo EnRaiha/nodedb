@@ -3,7 +3,7 @@
 //! Miscellaneous scalar function registrations (coalesce, nullif, greatest,
 //! least, make_array, typeof, utility).
 //!
-//! nodedb issue #216's plan-time existence gate rejects any name missing
+//! The plan-time existence gate rejects any name missing
 //! here. `coalesce` / `nullif` mirror
 //! `nodedb_query::functions::conditional::try_eval`'s full match arm list
 //! together with `greatest` / `least` below (before this audit those two

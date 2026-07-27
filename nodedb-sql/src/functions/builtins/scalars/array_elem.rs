@@ -7,7 +7,7 @@
 //! named on-disk array-engine collection: these operate on an in-row
 //! `Array` value and are evaluated by
 //! `nodedb_query::functions::array::try_eval`. Historically absent from
-//! this registry entirely — nodedb issue #216's plan-time existence gate
+//! this registry entirely — the plan-time existence gate
 //! rejects any name missing here, so every one of these would have been
 //! rejected at plan time despite the runtime evaluator fully supporting
 //! them. The list is audited to match every match arm in

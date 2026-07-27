@@ -12,7 +12,7 @@ use nodedb_types::Value;
 /// Every function here returns `Ok(Value::Null)` on invalid/missing
 /// arguments, matching the crate-wide NULL-propagation convention — except
 /// `mod`'s zero-modulus arm, which returns `Err(EvalError::DivisionByZero)`
-/// (nodedb issue #216) instead of folding to `NULL`. This is the one
+/// instead of folding to `NULL`. This is the one
 /// function in the scalar-function table that can fail, so `try_eval`
 /// carries a `Result` inside the `Option` rather than making every sibling
 /// module in `functions/` fallible for a single arm.
@@ -58,8 +58,8 @@ pub(super) fn try_eval(name: &str, args: &[Value]) -> Option<Result<Value, EvalE
             };
             let b = num_arg(args, 1).unwrap_or(1.0);
             if b == 0.0 {
-                // nodedb issue #216: zero modulus raises SQLSTATE 22012
-                // instead of folding to NULL.
+                // Zero modulus raises SQLSTATE 22012 instead of folding to
+                // NULL.
                 return Some(Err(EvalError::DivisionByZero));
             }
             to_value_number(a % b)

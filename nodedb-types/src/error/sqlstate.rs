@@ -40,8 +40,8 @@ pub const CANNOT_DROP_DEFAULT_DATABASE: &str = "0A000";
 /// `22003` — `numeric_value_out_of_range`
 pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 
-/// `22012` — `division_by_zero` (`/` or `%` with a zero divisor; nodedb
-/// issue #216 — raised at runtime instead of evaluating to `NULL`)
+/// `22012` — `division_by_zero` (`/` or `%` with a zero divisor —
+/// raised at runtime instead of evaluating to `NULL`)
 pub const DIVISION_BY_ZERO: &str = "22012";
 
 // ── Class 23 — Integrity Constraint Violation ────────────────────────────────

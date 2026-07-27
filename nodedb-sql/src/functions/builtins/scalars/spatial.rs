@@ -150,7 +150,7 @@ pub(super) fn spatial_functions() -> Vec<FunctionMeta> {
         //
         // Evaluated by `nodedb_query::geo_functions::eval_geo_function`, but
         // historically absent from this registry (only the `st_*` subset
-        // above was registered). Issue #216's plan-time undefined-function
+        // above was registered). The plan-time undefined-function
         // gate (`resolver::expr::functions::convert_function_depth`) checks
         // every scalar call against this registry, so any name missing here
         // would make a previously-working spatial query fail with 42883.

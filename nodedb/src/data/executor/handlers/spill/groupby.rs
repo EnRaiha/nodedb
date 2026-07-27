@@ -86,14 +86,14 @@ impl GroupBySpiller {
         }
 
         if let Some(state) = self.in_mem.get_mut(&key) {
-            state.feed(aggregates, doc);
+            state.feed(aggregates, doc)?;
         } else {
             if self.in_mem.len() >= self.cap {
                 self.spill_current_run()?;
             }
             let key_len = key.len();
             let mut state = GroupState::new(aggregates);
-            state.feed(aggregates, doc);
+            state.feed(aggregates, doc)?;
             self.in_mem.insert(key, state);
             self.bytes_estimate = self
                 .bytes_estimate
@@ -167,7 +167,8 @@ mod tests {
         for (key, doc) in groups {
             map.entry(key.clone())
                 .or_insert_with(|| GroupState::new(specs))
-                .feed(specs, doc);
+                .feed(specs, doc)
+                .unwrap();
         }
         map.into_iter()
             .map(|(k, s)| (k, s.finalize(specs).into_iter().map(|(_, v)| v).collect()))

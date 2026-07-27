@@ -238,13 +238,13 @@ impl CoreLoop {
                 let merged = match apply_on_conflict_updates(existing_val, &excluded_val, updates) {
                     Ok(v) => v,
                     Err(e) => {
-                        // A division/modulo-by-zero (nodedb issue #216) can
-                        // only be reached by replaying a WAL record logged
-                        // before this fix shipped (a fresh write would now
-                        // fail at statement time, before ever reaching the
-                        // WAL) — warn and skip, matching every other
-                        // decode-failure branch in this replay path, rather
-                        // than crashing startup on a historical record.
+                        // A division/modulo-by-zero can only be reached by
+                        // replaying a WAL record logged before this fix
+                        // shipped (a fresh write would now fail at statement
+                        // time, before ever reaching the WAL) — warn and
+                        // skip, matching every other decode-failure branch
+                        // in this replay path, rather than crashing startup
+                        // on a historical record.
                         warn!(
                             core = self.core_id,
                             collection = %collection,

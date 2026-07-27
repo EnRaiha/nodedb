@@ -12,10 +12,10 @@ use nodedb_query::scan_filter::{FilterOp, ScanFilter};
 /// (scalar functions, JSON operators, column arithmetic) in addition to simple
 /// comparison operators.
 ///
-/// Returns `Err(EvalError::DivisionByZero)` (nodedb issue #216) when a
-/// `FilterOp::Expr` predicate divides or takes a modulus by zero — this is
-/// the columnar engine's WHERE predicate, so the behavior-flip rule applies:
-/// the query fails instead of the row being silently excluded.
+/// Returns `Err(EvalError::DivisionByZero)` when a `FilterOp::Expr`
+/// predicate divides or takes a modulus by zero — this is the columnar
+/// engine's WHERE predicate, so the behavior-flip rule applies: the query
+/// fails instead of the row being silently excluded.
 pub(in crate::data::executor) fn row_matches_filters(
     row: &[nodedb_types::value::Value],
     schema: &nodedb_types::columnar::ColumnarSchema,

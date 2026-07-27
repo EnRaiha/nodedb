@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Pgwire coverage for nodedb issue #216: a call to a scalar function with
-//! no registered definition must fail the whole statement at PLAN time with
+//! Pgwire coverage for undefined scalar function calls: a call to a scalar
+//! function with no registered definition must fail the whole statement at
+//! PLAN time with
 //! SQLSTATE `42883` (`undefined_function`), not silently evaluate to a NULL
 //! row (the pre-fix behavior — the runtime evaluator's `try_eval` chain in
 //! `nodedb-query/src/functions/mod.rs` ends with
@@ -26,7 +27,7 @@ async fn unknown_scalar_function_errors_42883() {
 /// zero rows. If the rejection happened during row-by-row evaluation
 /// instead of at plan time, a `LIMIT 0` (or an empty collection) would
 /// short-circuit before evaluating any row and the call would go
-/// unnoticed — exactly the class of bug #216 reports. Pairing an existing,
+/// unnoticed. Pairing an existing,
 /// genuinely empty collection with `LIMIT 0` gives two independent reasons
 /// no row would ever reach the evaluator, so an error here can only come
 /// from planning.
@@ -58,7 +59,7 @@ async fn known_scalar_function_still_works() {
     assert_eq!(rows, vec!["HELLO".to_string()]);
 }
 
-/// Positive control for the geo/spatial risk called out in issue #216: many
+/// Positive control for the geo/spatial risk: many
 /// `geo_*` utility functions (evaluated by
 /// `nodedb_query::geo_functions::eval_geo_function`) were historically
 /// absent from the SQL-side `FunctionRegistry` that plan-time validation

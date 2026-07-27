@@ -167,11 +167,18 @@ pub(super) fn execute_grouping_sets(
                 }
             }
 
-            let group_key = msgpack_scan::build_group_key(raw, &active_specs);
-            groups
+            let group_key = match msgpack_scan::build_group_key(raw, &active_specs) {
+                Ok(k) => k,
+                Err(_e) => return core.response_error(task, ErrorCode::DivisionByZero),
+            };
+            if groups
                 .entry(group_key)
                 .or_insert_with(|| GroupState::new(&real_agg_slice))
-                .feed(&real_agg_slice, raw);
+                .feed(&real_agg_slice, raw)
+                .is_err()
+            {
+                return core.response_error(task, ErrorCode::DivisionByZero);
+            }
         }
 
         // For an empty grouping set (grand-total), produce one aggregate row
@@ -180,7 +187,11 @@ pub(super) fn execute_grouping_sets(
             let mut grand = GroupState::new(&real_agg_slice);
             for raw in &owned_docs {
                 match ScanFilter::all_match_binary(&filter_predicates, raw) {
-                    Ok(true) => grand.feed(&real_agg_slice, raw),
+                    Ok(true) => {
+                        if grand.feed(&real_agg_slice, raw).is_err() {
+                            return core.response_error(task, ErrorCode::DivisionByZero);
+                        }
+                    }
                     Ok(false) => {}
                     Err(_e) => {
                         return core.response_error(task, ErrorCode::DivisionByZero);
@@ -252,8 +263,8 @@ pub(super) fn execute_grouping_sets(
     // Apply HAVING.
     if !having_predicates.is_empty() {
         // `Vec::retain`'s closure must return `bool`, so a division/modulo-
-        // by-zero (nodedb issue #216) in a HAVING predicate is captured via
-        // this `Cell` side-channel and checked once the retain finishes.
+        // by-zero in a HAVING predicate is captured via this `Cell`
+        // side-channel and checked once the retain finishes.
         let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
             std::cell::Cell::new(None);
         all_rows.retain(|row| {

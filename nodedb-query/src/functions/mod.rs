@@ -26,7 +26,7 @@ use crate::expr::EvalError;
 /// Every function returns `Ok(Value::Null)` on invalid/missing arguments
 /// (SQL NULL propagation semantics) — the sole exception is `mod`'s
 /// zero-modulus arm (`math::try_eval`), which returns
-/// `Err(EvalError::DivisionByZero)` (nodedb issue #216). Every other
+/// `Err(EvalError::DivisionByZero)`. Every other
 /// sibling module here stays `Option<Value>`-shaped internally; only the
 /// `math` arm is threaded as `Option<Result<Value, EvalError>>` and the
 /// rest are wrapped in `Ok` at this dispatch boundary, so a single

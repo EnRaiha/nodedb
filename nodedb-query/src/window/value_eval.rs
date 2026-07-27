@@ -26,6 +26,9 @@ pub enum WindowError {
 
     #[error("window frame error: {detail}")]
     BadFrame { detail: String },
+
+    #[error("division by zero in window expression")]
+    Eval(#[from] crate::expr::EvalError),
 }
 
 /// Evaluate window functions over a `Vec<Vec<Value>>` result set.
@@ -51,16 +54,16 @@ pub fn evaluate_window_functions_value(
         for partition_indices in &partitions {
             match spec.func_name.as_str() {
                 "row_number" => apply_v_row_number(rows, partition_indices, write_col),
-                "rank" => apply_v_rank(rows, partition_indices, column_index, spec, write_col),
+                "rank" => apply_v_rank(rows, partition_indices, column_index, spec, write_col)?,
                 "dense_rank" => {
-                    apply_v_dense_rank(rows, partition_indices, column_index, spec, write_col)
+                    apply_v_dense_rank(rows, partition_indices, column_index, spec, write_col)?
                 }
                 "ntile" => apply_v_ntile(rows, partition_indices, spec, write_col)?,
                 "percent_rank" => {
-                    apply_v_percent_rank(rows, partition_indices, column_index, spec, write_col)
+                    apply_v_percent_rank(rows, partition_indices, column_index, spec, write_col)?
                 }
                 "cume_dist" => {
-                    apply_v_cume_dist(rows, partition_indices, column_index, spec, write_col)
+                    apply_v_cume_dist(rows, partition_indices, column_index, spec, write_col)?
                 }
                 "lag" => apply_v_lag(rows, partition_indices, column_index, spec, write_col)?,
                 "lead" => apply_v_lead(rows, partition_indices, column_index, spec, write_col)?,
@@ -68,7 +71,7 @@ pub fn evaluate_window_functions_value(
                     apply_v_nth_value(rows, partition_indices, column_index, spec, write_col)?
                 }
                 "sum" | "count" | "avg" | "min" | "max" | "first_value" | "last_value" => {
-                    apply_v_aggregate(rows, partition_indices, column_index, spec, write_col)
+                    apply_v_aggregate(rows, partition_indices, column_index, spec, write_col)?
                 }
                 other => {
                     return Err(WindowError::ArgEval {
@@ -103,7 +106,7 @@ fn build_value_partitions(
     let mut order: Vec<String> = Vec::new();
 
     for (i, row) in rows.iter().enumerate() {
-        let key = partition_key(row, column_index, &spec.partition_by);
+        let key = partition_key(row, column_index, &spec.partition_by)?;
         let entry = groups.entry(key.clone()).or_default();
         if entry.is_empty() {
             order.push(key);
@@ -118,15 +121,15 @@ fn partition_key(
     row: &[Value],
     column_index: &HashMap<String, usize>,
     partition_by: &[SqlExpr],
-) -> String {
-    partition_by
+) -> Result<String, WindowError> {
+    Ok(partition_by
         .iter()
         .map(|expr| {
-            let v = eval_arg_for_row(expr, row, column_index);
-            format!("{v:?}")
+            let v = eval_arg_for_row(expr, row, column_index)?;
+            Ok(format!("{v:?}"))
         })
-        .collect::<Vec<_>>()
-        .join("\x00")
+        .collect::<Result<Vec<_>, WindowError>>()?
+        .join("\x00"))
 }
 
 // ── Value comparison helpers (pub(super) for value_agg) ───────────────────────
@@ -146,41 +149,42 @@ pub(super) fn order_keys_equal_v(
     b: usize,
     column_index: &HashMap<String, usize>,
     order_by: &[(SqlExpr, bool)],
-) -> bool {
-    order_by.iter().all(|(expr, _)| {
+) -> Result<bool, WindowError> {
+    for (expr, _) in order_by {
         let row_a = rows.get(a).map(|r| r.as_slice()).unwrap_or(&[]);
         let row_b = rows.get(b).map(|r| r.as_slice()).unwrap_or(&[]);
-        let va = eval_arg_for_row(expr, row_a, column_index);
-        let vb = eval_arg_for_row(expr, row_b, column_index);
-        matches!(cmp_values(&va, &vb), std::cmp::Ordering::Equal)
-    })
+        let va = eval_arg_for_row(expr, row_a, column_index)?;
+        let vb = eval_arg_for_row(expr, row_b, column_index)?;
+        if !matches!(cmp_values(&va, &vb), std::cmp::Ordering::Equal) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // ── Argument evaluation (pub(super) for value_agg) ────────────────────────────
 
 /// Evaluate a window-function argument expression against one row.
 ///
-/// This is the Value-native counterpart of `window::helpers::eval_expr_on_json`
-/// and shares its scoping rationale: it's called from ranking/offset/
-/// aggregate window-function implementations that are still infallible, so
-/// a division/modulo-by-zero (nodedb issue #216) here folds to `NULL`
-/// rather than threading a `Result` through the rest of the value-mode
-/// window evaluator — see the unit-2 completion report.
+/// This is the Value-native counterpart of `window::helpers::eval_expr_on_json`.
+/// A division/modulo-by-zero surfaces as
+/// `Err(EvalError::DivisionByZero)` — which the value-path callers convert into
+/// `WindowError` via `?` — rather than being folded to `NULL`.
 pub(super) fn eval_arg_for_row(
     expr: &SqlExpr,
     row: &[Value],
     column_index: &HashMap<String, usize>,
-) -> Value {
+) -> Result<Value, crate::expr::EvalError> {
     match expr {
-        SqlExpr::Column(name) => column_index
+        SqlExpr::Column(name) => Ok(column_index
             .get(name.as_str())
             .and_then(|&idx| row.get(idx))
             .cloned()
-            .unwrap_or(Value::Null),
-        SqlExpr::Literal(v) => v.clone(),
+            .unwrap_or(Value::Null)),
+        SqlExpr::Literal(v) => Ok(v.clone()),
         other => {
             let doc = row_to_obj(row, column_index);
-            other.eval(&doc).unwrap_or(Value::Null)
+            Ok(other.eval(&doc)?)
         }
     }
 }
@@ -239,9 +243,9 @@ fn apply_v_rank(
     column_index: &HashMap<String, usize>,
     spec: &WindowFuncSpec,
     write_col: usize,
-) {
+) -> Result<(), WindowError> {
     if indices.is_empty() {
-        return;
+        return Ok(());
     }
     let mut current_rank = 1usize;
     set_cell(rows, indices[0], write_col, Value::Integer(1));
@@ -252,7 +256,7 @@ fn apply_v_rank(
             indices[pos],
             column_index,
             &spec.order_by,
-        ) {
+        )? {
             current_rank = pos + 1;
         }
         set_cell(
@@ -262,6 +266,7 @@ fn apply_v_rank(
             Value::Integer(current_rank as i64),
         );
     }
+    Ok(())
 }
 
 fn apply_v_dense_rank(
@@ -270,9 +275,9 @@ fn apply_v_dense_rank(
     column_index: &HashMap<String, usize>,
     spec: &WindowFuncSpec,
     write_col: usize,
-) {
+) -> Result<(), WindowError> {
     if indices.is_empty() {
-        return;
+        return Ok(());
     }
     let mut current_rank = 1usize;
     set_cell(rows, indices[0], write_col, Value::Integer(1));
@@ -283,7 +288,7 @@ fn apply_v_dense_rank(
             indices[pos],
             column_index,
             &spec.order_by,
-        ) {
+        )? {
             current_rank += 1;
         }
         set_cell(
@@ -293,6 +298,7 @@ fn apply_v_dense_rank(
             Value::Integer(current_rank as i64),
         );
     }
+    Ok(())
 }
 
 fn apply_v_ntile(
@@ -319,14 +325,14 @@ fn apply_v_percent_rank(
     column_index: &HashMap<String, usize>,
     spec: &WindowFuncSpec,
     write_col: usize,
-) {
+) -> Result<(), WindowError> {
     let total = indices.len();
     if total == 0 {
-        return;
+        return Ok(());
     }
     if total == 1 {
         set_cell(rows, indices[0], write_col, Value::Float(0.0));
-        return;
+        return Ok(());
     }
     let denom = (total - 1) as f64;
     let mut current_rank = 1usize;
@@ -338,12 +344,13 @@ fn apply_v_percent_rank(
             indices[pos],
             column_index,
             &spec.order_by,
-        ) {
+        )? {
             current_rank = pos + 1;
         }
         let pr = (current_rank - 1) as f64 / denom;
         set_cell(rows, indices[pos], write_col, Value::Float(pr));
     }
+    Ok(())
 }
 
 fn apply_v_cume_dist(
@@ -352,10 +359,10 @@ fn apply_v_cume_dist(
     column_index: &HashMap<String, usize>,
     spec: &WindowFuncSpec,
     write_col: usize,
-) {
+) -> Result<(), WindowError> {
     let total = indices.len();
     if total == 0 {
-        return;
+        return Ok(());
     }
     let denom = total as f64;
     let mut group_start = 0;
@@ -368,7 +375,7 @@ fn apply_v_cume_dist(
                 indices[group_end],
                 column_index,
                 &spec.order_by,
-            )
+            )?
         {
             group_end += 1;
         }
@@ -378,6 +385,7 @@ fn apply_v_cume_dist(
         }
         group_start = group_end;
     }
+    Ok(())
 }
 
 // ── Offset functions ──────────────────────────────────────────────────────────
@@ -387,18 +395,12 @@ fn collect_arg_values(
     indices: &[usize],
     column_index: &HashMap<String, usize>,
     spec: &WindowFuncSpec,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, WindowError> {
     indices
         .iter()
-        .map(|&i| {
-            rows.get(i)
-                .map(|row| {
-                    spec.args
-                        .first()
-                        .map(|expr| eval_arg_for_row(expr, row, column_index))
-                        .unwrap_or(Value::Null)
-                })
-                .unwrap_or(Value::Null)
+        .map(|&i| match (rows.get(i), spec.args.first()) {
+            (Some(row), Some(expr)) => Ok(eval_arg_for_row(expr, row, column_index)?),
+            _ => Ok(Value::Null),
         })
         .collect()
 }
@@ -412,7 +414,7 @@ fn apply_v_lag(
 ) -> Result<(), WindowError> {
     let offset = usize_arg(spec, 1, 1);
     let default = default_arg_value(spec, 2);
-    let values = collect_arg_values(rows, indices, column_index, spec);
+    let values = collect_arg_values(rows, indices, column_index, spec)?;
     for (pos, &i) in indices.iter().enumerate() {
         let val = if pos >= offset {
             values[pos - offset].clone()
@@ -433,7 +435,7 @@ fn apply_v_lead(
 ) -> Result<(), WindowError> {
     let offset = usize_arg(spec, 1, 1);
     let default = default_arg_value(spec, 2);
-    let values = collect_arg_values(rows, indices, column_index, spec);
+    let values = collect_arg_values(rows, indices, column_index, spec)?;
     for (pos, &i) in indices.iter().enumerate() {
         let val = if pos + offset < indices.len() {
             values[pos + offset].clone()
@@ -453,7 +455,7 @@ fn apply_v_nth_value(
     write_col: usize,
 ) -> Result<(), WindowError> {
     let n = usize_arg(spec, 1, 1).max(1);
-    let values = collect_arg_values(rows, indices, column_index, spec);
+    let values = collect_arg_values(rows, indices, column_index, spec)?;
     for (pos, &i) in indices.iter().enumerate() {
         let val = if pos + 1 >= n {
             values[n - 1].clone()

@@ -254,11 +254,10 @@ impl CoreLoop {
                     };
                     if !having_predicates.is_empty() {
                         // `Vec::retain`'s closure must return `bool`, so a
-                        // division/modulo-by-zero (nodedb issue #216) in a
-                        // HAVING predicate is captured via this `Cell`
-                        // side-channel and checked once the retain finishes
-                        // — HAVING is WHERE-shaped, so it gets the full
-                        // error treatment.
+                        // division/modulo-by-zero in a HAVING predicate is
+                        // captured via this `Cell` side-channel and checked
+                        // once the retain finishes — HAVING is WHERE-shaped,
+                        // so it gets the full error treatment.
                         let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
                             std::cell::Cell::new(None);
                         agg_result.rows.retain(|row| {

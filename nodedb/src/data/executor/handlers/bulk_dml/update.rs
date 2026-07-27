@@ -247,11 +247,11 @@ impl CoreLoop {
                                 nodedb_physical::physical_plan::UpdateValue::Expr(expr) => {
                                     let result: nodedb_types::Value = match expr.eval(&eval_doc) {
                                         Ok(v) => v,
-                                        // A division/modulo-by-zero (nodedb
-                                        // issue #216) in an UPDATE assignment
-                                        // fails the whole statement, unlike
-                                        // the literal-decode-failure case
-                                        // above which skips just that field.
+                                        // A division/modulo-by-zero in an
+                                        // UPDATE assignment fails the whole
+                                        // statement, unlike the literal-
+                                        // decode-failure case above which
+                                        // skips just that field.
                                         Err(e) => {
                                             return self
                                                 .response_error(task, crate::Error::from(e));

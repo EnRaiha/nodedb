@@ -30,8 +30,8 @@ fn value_to_decimal(v: &Value) -> Option<Decimal> {
 }
 
 /// Apply a Decimal arithmetic operation, returning `Value::Null` on overflow
-/// and `Err(EvalError::DivisionByZero)` when `/` or `%` see a zero divisor
-/// (nodedb issue #216). The zero check happens before `checked_div`/
+/// and `Err(EvalError::DivisionByZero)` when `/` or `%` see a zero divisor.
+/// The zero check happens before `checked_div`/
 /// `checked_rem` are called because those methods return `None` for both
 /// div-by-zero *and* overflow, and only the former is a `22012` error —
 /// overflow keeps folding to `Value::Null` exactly as before.

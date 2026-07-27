@@ -70,9 +70,9 @@ pub(in crate::data::executor) fn row_to_projected_json(
             if matches!(existing, Some(v) if !v.is_null()) {
                 continue;
             }
-            // A computed column is projection-shaped (nodedb issue #216): a
-            // division/modulo-by-zero fails the whole scan rather than
-            // silently materializing NULL into the response row.
+            // A computed column is projection-shaped: a division/modulo-by-
+            // zero fails the whole scan rather than silently materializing
+            // NULL into the response row.
             let v = cc.expr.eval(&doc_val)?;
             obj.insert(cc.alias.clone(), serde_json::Value::from(v));
         }

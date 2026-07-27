@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Pgwire coverage for nodedb issue #216 (unit 2): division and modulo by a
+//! Pgwire coverage for division-by-zero handling: division and modulo by a
 //! zero divisor must fail the statement at RUNTIME with SQLSTATE `22012`
 //! (`division_by_zero`), not silently evaluate to a NULL row — the pre-fix
 //! behavior. `nodedb-query/src/expr/binary.rs`'s `eval_binary_op` folded a
@@ -125,8 +125,8 @@ async fn modulo_by_zero_errors_22012() {
     .await;
 }
 
-/// The WHERE-clause behavior flip (nodedb issue #216, intended and
-/// Postgres-correct): a WHERE predicate that divides by a column whose
+/// The WHERE-clause behavior flip (intended and Postgres-correct): a WHERE
+/// predicate that divides by a column whose
 /// value is zero for some row used to fold that row's predicate to
 /// `Value::Null`/false and silently exclude it from the result — a
 /// division-by-zero was indistinguishable from a legitimate non-match.

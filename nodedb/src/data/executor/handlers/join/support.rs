@@ -137,13 +137,12 @@ pub(super) fn compare_preextracted(
 /// as-is first, then fall back to suffix matching.
 ///
 /// Returns `Err(EvalError::DivisionByZero)` when a `FilterOp::Expr`
-/// predicate divides or takes a modulus by zero (nodedb issue #216). Callers
-/// on the WHERE-shaped post-filter path (`join::params::filter_and_project`)
-/// propagate this as a genuine statement error; callers on the hash-join
-/// probe hot path (`join::hash`, part of the grace-hash spill/streaming
-/// family spanning several files) fold it to "no match" for now — see the
-/// unit-2 completion report for the follow-up needed to give a join's
-/// residual ON-predicate the same treatment.
+/// predicate divides or takes a modulus by zero. Every caller propagates
+/// this as a genuine statement error (SQLSTATE 22012): the
+/// WHERE-shaped post-filter path (`join::params::filter_and_project`) and the
+/// hash-join probe path (`join::hash`'s `probe_hash_index` / `probe_rows_into`,
+/// including the grace-hash spill/streaming family) both surface it rather than
+/// folding a residual ON-predicate error to "no match".
 pub(super) fn binary_row_matches_filters(
     row: &[u8],
     filters: &[crate::bridge::scan_filter::ScanFilter],

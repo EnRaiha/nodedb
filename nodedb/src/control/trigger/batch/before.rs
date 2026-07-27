@@ -95,13 +95,15 @@ pub async fn execute_before_batch(
     for trigger in &before_triggers {
         let op_str = event.as_str();
 
-        // Pre-filter by WHEN clause.
+        // Pre-filter by WHEN clause. A BEFORE trigger runs pre-commit, so a
+        // division/modulo-by-zero in its WHEN predicate fails the statement
+        // (SQLSTATE 22012) rather than folding to "does not fire".
         let mask = when_filter::filter_batch_by_when(
             &rows,
             collection,
             op_str,
             trigger.when_condition.as_deref(),
-        );
+        )?;
 
         let effective_identity = resolve_trigger_identity(trigger, identity, tenant_id);
 

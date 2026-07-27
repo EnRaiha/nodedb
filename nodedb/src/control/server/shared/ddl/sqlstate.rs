@@ -144,7 +144,7 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             ),
         ),
         ErrorCode::Internal { detail } => ("ERROR", sqlstate::INTERNAL_ERROR, detail.clone()),
-        // nodedb issue #216: division/modulo by zero.
+        // Division/modulo by zero.
         ErrorCode::DivisionByZero => (
             "ERROR",
             sqlstate::DIVISION_BY_ZERO,

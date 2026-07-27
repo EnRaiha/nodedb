@@ -2,7 +2,7 @@
 
 //! Math scalar function registrations.
 //!
-//! nodedb issue #216's plan-time existence gate
+//! The plan-time existence gate
 //! (`resolver::expr::functions::convert_function_depth`) rejects any name
 //! missing here, so this list is audited to match every match arm in
 //! `nodedb_query::functions::math::try_eval` exactly: `abs`, `ceil` /
@@ -77,7 +77,7 @@ pub(super) fn math_functions() -> Vec<FunctionMeta> {
             arg_types::MATH_1_ARGS,
         ),
         // `mod(a, b)`: the zero-modulus arm raises `EvalError::DivisionByZero`
-        // (nodedb issue #216) at the runtime evaluator rather than folding to
+        // at the runtime evaluator rather than folding to
         // NULL — this registration only gates existence/arity, not that
         // runtime behavior.
         m(

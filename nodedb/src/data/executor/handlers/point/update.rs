@@ -186,10 +186,9 @@ impl CoreLoop {
                                 UpdateValue::Expr(expr) => {
                                     let result: nodedb_types::Value = match expr.eval(&eval_doc) {
                                         Ok(v) => v,
-                                        // nodedb issue #216: division/modulo
-                                        // by zero fails the statement, same
-                                        // as the literal-decode-failure arm
-                                        // above.
+                                        // Division/modulo by zero fails the
+                                        // statement, same as the
+                                        // literal-decode-failure arm above.
                                         Err(_e) => {
                                             return self
                                                 .response_error(task, ErrorCode::DivisionByZero);

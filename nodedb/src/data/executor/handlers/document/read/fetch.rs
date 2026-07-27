@@ -104,9 +104,9 @@ impl CoreLoop {
                 // schema (bodies are already normalized).
                 // `versioned_scan_as_of` takes an infallible `Fn(&[u8]) -> bool`
                 // predicate (a storage-engine primitive out of scope for this
-                // fix), so a division/modulo-by-zero (nodedb issue #216) is
-                // captured via this `Cell` side-channel and checked once the
-                // scan returns, rather than silently folded away.
+                // fix), so a division/modulo-by-zero is captured via this
+                // `Cell` side-channel and checked once the scan returns,
+                // rather than silently folded away.
                 let predicate_err: Cell<Option<nodedb_query::EvalError>> = Cell::new(None);
                 let predicate = |body: &[u8]| match matches_with_resolved_schema(
                     strict_schema,
@@ -222,9 +222,8 @@ impl CoreLoop {
         // `scan_documents_filtered`/`versioned_scan_as_of`/`scan_collection`
         // take an infallible `Fn(&[u8]) -> bool` predicate (a storage-engine
         // primitive out of scope for this fix), so a division/modulo-by-zero
-        // (nodedb issue #216) is captured via this `Cell` side-channel and
-        // checked once every branch below returns, rather than silently
-        // folded away.
+        // is captured via this `Cell` side-channel and checked once every
+        // branch below returns, rather than silently folded away.
         let predicate_err: Cell<Option<nodedb_query::EvalError>> = Cell::new(None);
         let matches = |value: &[u8]| -> bool {
             if filter_predicates.is_empty() {

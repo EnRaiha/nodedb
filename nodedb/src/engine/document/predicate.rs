@@ -43,8 +43,8 @@ impl IndexPredicate {
 
     /// Evaluate the predicate against a document value. Returns `true`
     /// only when the expression evaluates to `Bool(true)` — `NULL`,
-    /// `Bool(false)`, any non-boolean result, and (nodedb issue #216) a
-    /// division/modulo-by-zero evaluation error all exclude the row from
+    /// `Bool(false)`, any non-boolean result, and a division/modulo-by-zero
+    /// evaluation error all exclude the row from
     /// the index. This mirrors the existing "anything but exactly `true`
     /// excludes" partial-index philosophy already documented above (which
     /// already fails closed rather than defaulting to "index everything");
