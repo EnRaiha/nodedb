@@ -513,7 +513,7 @@ impl ErrorCode {
     /// code's real SQLSTATE. Codes with a dedicated `crate::Error` variant
     /// round-trip (e.g. `DivisionByZero` → `22012`); the rest keep the prior
     /// behavior of a `Dispatch` carrying the code's debug name.
-    pub(crate) fn into_dispatch_error(&self) -> crate::Error {
+    pub(crate) fn to_dispatch_error(&self) -> crate::Error {
         match self {
             ErrorCode::DivisionByZero => crate::Error::DivisionByZero,
             other => crate::Error::Dispatch {

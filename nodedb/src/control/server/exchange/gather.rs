@@ -230,7 +230,7 @@ pub(crate) async fn gather_all_cores(
                     crate::bridge::envelope::ErrorCode::NotFound => continue,
                     _ => {
                         if first_error.is_none() {
-                            first_error = Some(ec.into_dispatch_error());
+                            first_error = Some(ec.to_dispatch_error());
                         }
                     }
                 }

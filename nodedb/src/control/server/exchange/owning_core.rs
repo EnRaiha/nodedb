@@ -116,7 +116,7 @@ pub async fn gather_single_owning_core(
     {
         // Preserve typed codes (e.g. `DivisionByZero` → SQLSTATE 22012) instead
         // of collapsing every Data-Plane error to a generic `Dispatch` (XX000).
-        return Err(ec.into_dispatch_error());
+        return Err(ec.to_dispatch_error());
     }
 
     let payload_bytes: &[u8] = resp.payload.as_ref();
