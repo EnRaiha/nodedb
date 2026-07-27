@@ -168,21 +168,27 @@ impl PartitionSource {
 }
 
 /// Stream `src`'s rows frame-by-frame and re-hash each into one of `sub_p`
-/// new spill files under `sub_dir`, keyed by `partition_hash_seeded(row, keys,
-/// seed) % sub_p`. Returns the per-sub-partition spill paths (length `sub_p`).
+/// sub-partitions, keyed by `partition_hash_seeded(row, keys, seed) % sub_p`.
+/// Returns the per-sub-partition [`PartitionSource`]s (length `sub_p`).
 ///
-/// Each output is a [`SpillPartitionWriter`]; the row is appended straight to
-/// disk so no sub-partition is ever fully resident. The reader holds at most one
-/// row in RAM at a time.
+/// Normally each output is a [`PartitionSource::Spilled`] file: rows are appended
+/// straight to disk via a [`SpillPartitionWriter`], so no sub-partition is ever
+/// fully resident (the reader holds at most one row in RAM at a time).
 ///
 /// # io_uring fallback
 ///
-/// `src` reaches this function ONLY when it is a [`PartitionSource::Spilled`]
-/// file, which means a `SpillPartitionWriter` was successfully created on the
-/// write path — so io_uring (or its `std::fs` fallback) is available and the
-/// sub-partition writers below can likewise be created. If a writer cannot be
-/// created we treat it as a hard error (`Storage`) rather than silently dropping
-/// rows, because dropping rows would corrupt the join result.
+/// Creating a sub-partition writer requires an io_uring instance. Even though
+/// `src` reaching this function proves io_uring WAS available on the earlier
+/// write path, it can become transiently unavailable here — under heavy parallel
+/// load many concurrent joins can saturate the per-process io_uring / locked-
+/// memory (`RLIMIT_MEMLOCK`) limits, so `SpillPartitionWriter::create` starts
+/// returning `None`. When ANY sub-partition writer cannot be created we fall back
+/// to routing every row of this side into in-memory sub-partition buffers and
+/// return [`PartitionSource::InMemory`]s instead. This mirrors the identical
+/// graceful degradation on the push path (`grace_spill::push_row`): dropping the
+/// on-disk memory bound for this level is an acceptable platform-capability gap
+/// ("correctness preserved, only the memory bound is lost"), whereas failing the
+/// whole join — or dropping rows — is not. A row is NEVER dropped on either arm.
 pub(super) fn repartition_side<S: AsRef<str>>(
     src: PartitionSource,
     keys: &[S],
@@ -190,7 +196,7 @@ pub(super) fn repartition_side<S: AsRef<str>>(
     sub_p: usize,
     sub_dir: &Path,
     side_tag: &str,
-) -> crate::Result<Vec<PathBuf>> {
+) -> crate::Result<Vec<PartitionSource>> {
     std::fs::create_dir_all(sub_dir).map_err(|e| crate::Error::Storage {
         engine: "grace-repartition".into(),
         detail: format!(
@@ -199,52 +205,87 @@ pub(super) fn repartition_side<S: AsRef<str>>(
         ),
     })?;
 
-    // Create one writer per sub-partition up front. `SpillPartitionWriter` is not
-    // `Clone`, so build the Vec with an iterator.
+    // Try to create one spill writer per sub-partition up front. `create`
+    // returns `None` when io_uring is unavailable/exhausted; on the FIRST such
+    // failure abandon the spill path entirely and re-partition this side into
+    // RAM instead (see the io_uring-fallback note above). `SpillPartitionWriter`
+    // is not `Clone`, so build the Vec with a loop.
     let mut writers: Vec<SpillPartitionWriter> = Vec::with_capacity(sub_p);
+    let mut spill_ok = true;
     for sp in 0..sub_p {
         let path = sub_dir.join(format!("sp{sp}.{side_tag}.spill"));
-        let w = SpillPartitionWriter::create(&path).ok_or_else(|| crate::Error::Storage {
-            engine: "grace-repartition".into(),
-            detail: format!(
-                "failed to create sub-partition spill writer {}",
-                path.display()
-            ),
-        })?;
-        writers.push(w);
+        match SpillPartitionWriter::create(&path) {
+            Some(w) => writers.push(w),
+            None => {
+                spill_ok = false;
+                break;
+            }
+        }
     }
 
-    // Stream the source and route each row by the SEEDED hash.
+    if spill_ok {
+        // Spill path: route each row to its sub-partition writer, then finish
+        // each writer into a Spilled source.
+        route_rows(src, keys, seed, sub_p, |sp, value| {
+            writers
+                .get_mut(sp)
+                .ok_or_else(|| sub_index_error(sp, sub_p))?
+                .append_row(value)
+        })?;
+        let mut out = Vec::with_capacity(sub_p);
+        for w in writers {
+            out.push(PartitionSource::Spilled(w.finish()?));
+        }
+        Ok(out)
+    } else {
+        // In-memory fallback: discard any partially-created writers (their empty
+        // files live under `sub_dir` and are cleaned by the caller's
+        // `remove_dir_all`) and buffer rows in RAM instead.
+        drop(writers);
+        let mut buffers: Vec<Vec<(String, Vec<u8>)>> = vec![Vec::new(); sub_p];
+        route_rows(src, keys, seed, sub_p, |sp, value| {
+            buffers
+                .get_mut(sp)
+                .ok_or_else(|| sub_index_error(sp, sub_p))?
+                .push((String::new(), value.to_vec()));
+            Ok(())
+        })?;
+        Ok(buffers.into_iter().map(PartitionSource::InMemory).collect())
+    }
+}
+
+/// Stream every row of `src` (in-memory rows by move, or a spilled file frame-by-
+/// frame — one row resident at a time), compute each row's sub-partition index
+/// via `partition_hash_seeded(row, keys, seed) % sub_p`, and hand `(sp, value)`
+/// to `sink`. Consumes `src`. The `sp` index is always `< sub_p` (modulo result),
+/// so `sink` can index safely; it returns `Err` only on a genuine I/O failure.
+fn route_rows<S, F>(
+    src: PartitionSource,
+    keys: &[S],
+    seed: u64,
+    sub_p: usize,
+    mut sink: F,
+) -> crate::Result<()>
+where
+    S: AsRef<str>,
+    F: FnMut(usize, &[u8]) -> crate::Result<()>,
+{
     match src {
         PartitionSource::InMemory(rows) => {
             for (_, value) in rows {
                 let sp = (partition_hash_seeded(&value, keys, seed) % sub_p as u64) as usize;
-                // `sp < sub_p` by construction of the modulo; index is safe but
-                // use `get_mut` to avoid any panic path in lib code.
-                let w = writers
-                    .get_mut(sp)
-                    .ok_or_else(|| sub_index_error(sp, sub_p))?;
-                w.append_row(&value)?;
+                sink(sp, &value)?;
             }
         }
         PartitionSource::Spilled(path) => {
             let mut reader = FrameStreamReader::open(&path)?;
             while let Some(value) = reader.next_row()? {
                 let sp = (partition_hash_seeded(&value, keys, seed) % sub_p as u64) as usize;
-                let w = writers
-                    .get_mut(sp)
-                    .ok_or_else(|| sub_index_error(sp, sub_p))?;
-                w.append_row(&value)?;
+                sink(sp, &value)?;
             }
         }
     }
-
-    // Finish each writer, collecting the sub-partition spill paths in order.
-    let mut paths = Vec::with_capacity(sub_p);
-    for w in writers {
-        paths.push(w.finish()?);
-    }
-    Ok(paths)
+    Ok(())
 }
 
 /// Construct the (unreachable-in-practice) sub-partition index error without

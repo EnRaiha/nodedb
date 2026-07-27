@@ -364,7 +364,7 @@ impl PartitionedSpiller {
             let sub_dir = spill_dir.join(format!("rp-{next_repartition_id}-d{}", item.depth + 1));
             next_repartition_id += 1;
 
-            let build_sub_paths = repartition_side(
+            let build_subs = repartition_side(
                 item.build,
                 &build_key_refs,
                 new_seed,
@@ -372,7 +372,7 @@ impl PartitionedSpiller {
                 &sub_dir,
                 "build",
             )?;
-            let probe_sub_paths = repartition_side(
+            let probe_subs = repartition_side(
                 item.probe,
                 &probe_key_refs,
                 new_seed,
@@ -382,13 +382,15 @@ impl PartitionedSpiller {
             )?;
 
             // Enqueue SUB_P new items at depth+1. `repartition_side` always
-            // returns exactly SUB_P paths each, positionally aligned by sub-
-            // partition index, so the zip pairs build/probe sub-partitions that
-            // share a seed bucket.
-            for (bp, pp) in build_sub_paths.into_iter().zip(probe_sub_paths) {
+            // returns exactly SUB_P sub-partition sources each, positionally
+            // aligned by sub-partition index, so the zip pairs build/probe sub-
+            // partitions that share a seed bucket. Each source is Spilled on the
+            // normal path or InMemory when io_uring was unavailable at this level
+            // (graceful fallback — see `repartition_side`).
+            for (bp, pp) in build_subs.into_iter().zip(probe_subs) {
                 queue.push(WorkItem {
-                    build: PartitionSource::Spilled(bp),
-                    probe: PartitionSource::Spilled(pp),
+                    build: bp,
+                    probe: pp,
                     depth: item.depth + 1,
                 });
             }
