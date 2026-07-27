@@ -42,5 +42,6 @@ pub(in crate::data::executor) use hits::{
 };
 pub(crate) use raw::{decode_raw_scan_to_docs, encode_raw_document_rows};
 pub use raw::{
-    encode_binary_rows, flatten_to_relational_rows, flatten_vector_hits_to_relational_rows,
+    encode_binary_rows, flatten_hybrid_hits_to_relational_rows, flatten_to_relational_rows,
+    flatten_vector_hits_to_relational_rows,
 };

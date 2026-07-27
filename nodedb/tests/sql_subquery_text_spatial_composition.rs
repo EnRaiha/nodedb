@@ -156,3 +156,109 @@ async fn outer_order_by_reorders_spatial_subquery() {
         "outer ORDER BY must reorder the spatial subquery by a payload column, got: {rows:?}"
     );
 }
+
+// ── Body-less hit bodies: `id` must resolve to the user PK, not the surrogate ─
+//
+// Sparse and hybrid hits carry no document body — they emit the internal
+// surrogate (as `id` / `doc_id`), and the Control-Plane translator normally
+// resolves it to the user PK at the response boundary. The post-processor runs
+// that same translator over the gathered rows, so `SELECT id` over such a
+// subquery must return the user PK (a string), and an outer ORDER BY on it must
+// sort by that PK — not by the raw surrogate.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outer_order_by_id_over_sparse_subquery_returns_user_pk() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE TABLE sparse_sub (id TEXT PRIMARY KEY, terms SPARSEVECTOR)")
+        .await
+        .unwrap();
+    for (id, terms) in [
+        ("a", "{3: 1.0, 7: 1.0}"),
+        ("b", "{3: 1.0}"),
+        ("c", "{7: 1.0}"),
+    ] {
+        server
+            .exec(&format!(
+                "INSERT INTO sparse_sub (id, terms) VALUES ('{id}', '{terms}')"
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Inner ranks a, b, c by descending dot product; the outer ORDER BY id DESC
+    // must reorder to c, b, a — which only holds if `id` is the user PK string,
+    // not the internal surrogate integer.
+    let rows = server
+        .query_text(
+            "SELECT id FROM \
+             (SELECT id FROM sparse_sub \
+              ORDER BY sparse_score(terms, '{3: 1.0, 7: 0.5}') DESC LIMIT 3) s \
+             ORDER BY s.id DESC",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec!["c".to_string(), "b".to_string(), "a".to_string()],
+        "outer ORDER BY id over a sparse subquery must sort by the user PK, got: {rows:?}"
+    );
+}
+
+async fn create_hybrid_collection(server: &TestServer, name: &str) {
+    server
+        .exec(&format!("CREATE COLLECTION {name}"))
+        .await
+        .unwrap();
+    server
+        .exec(&format!(
+            "CREATE VECTOR INDEX idx_{name}_emb ON {name} METRIC cosine DIM 4"
+        ))
+        .await
+        .unwrap();
+    server
+        .exec(&format!(
+            "CREATE SEARCH INDEX idx_{name}_fts ON {name} FIELDS content ANALYZER 'simple'"
+        ))
+        .await
+        .unwrap();
+    for (id, content, emb) in [
+        ("a", "consensus algorithm", "ARRAY[0.1, 0.2, 0.3, 0.4]"),
+        ("b", "distributed consensus", "ARRAY[0.2, 0.3, 0.4, 0.5]"),
+    ] {
+        server
+            .exec(&format!(
+                "INSERT INTO {name} (id, tenant_id, content, embedding) \
+                 VALUES ('{id}', 't1', '{content}', {emb})"
+            ))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outer_order_by_id_over_hybrid_subquery_returns_user_pk() {
+    let server = TestServer::start().await;
+    create_hybrid_collection(&server, "hyb_sub").await;
+
+    // The hybrid hit carries `doc_id` (the surrogate hex) and a fused score, no
+    // document body. `SELECT id` therefore reads NULL unless the surrogate is
+    // resolved to the user PK; the outer ORDER BY id DESC must then yield b, a.
+    let rows = server
+        .query_text(
+            "SELECT id FROM \
+             (SELECT id, rrf_score(\
+                vector_distance(embedding, ARRAY[0.1, 0.2, 0.3, 0.4]), \
+                bm25_score(content, 'consensus')\
+              ) AS score \
+              FROM hyb_sub ORDER BY score DESC LIMIT 5) s \
+             ORDER BY s.id DESC",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec!["b".to_string(), "a".to_string()],
+        "outer ORDER BY id over a hybrid subquery must sort by the resolved user PK, got: {rows:?}"
+    );
+}

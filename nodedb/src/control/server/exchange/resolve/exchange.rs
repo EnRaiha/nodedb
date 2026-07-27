@@ -27,6 +27,8 @@ use crate::control::server::exchange::gather::{
 };
 use crate::control::server::result_stream::ResultStream;
 
+use crate::control::server::response_translate::vector::resolve_surrogate_pk;
+
 use super::capture::DistributedReadCapture;
 use super::join_input::{gather_join_build_side, resolve_join_input};
 use super::materialize::materialize_providers;
@@ -483,23 +485,29 @@ async fn resolve_exchange(
                 Resolved::Stream(s) => return Ok(Resolved::Stream(s)),
             };
 
-            // A vector search emits hit rows (`{id, distance, doc_id, body}`)
-            // rather than flat storage rows; they need the hit-specific flatten
-            // (merge `body` columns, surface `distance` / `_surrogate`) so the
-            // tail can sort / distinct / project by any document column.
-            let is_vector_hits = matches!(
-                &child,
-                PhysicalPlan::Vector(
-                    nodedb_physical::physical_plan::VectorOp::Search { .. }
-                        | nodedb_physical::physical_plan::VectorOp::MultiSearch { .. }
-                )
-            );
+            // Classify the body's row shape so the gathered payload is
+            // flattened correctly:
+            //  - `Vector`  → vector/sparse/multivec hits (`{id, distance,
+            //    doc_id, body}`): merge the document `body` to top-level and
+            //    resolve the surrogate to the user PK.
+            //  - `Hybrid`  → RRF fusion hits (`{doc_id: hex, <score alias>}`,
+            //    no body): resolve `doc_id` to the user PK as `id`.
+            //  - `None`    → flat storage rows (document / text `{id, data}`,
+            //    columnar, spatial) or computed rows: the ordinary storage
+            //    flatten already exposes every column.
+            // `collection` and `hit_kind` are captured before the gather
+            // consumes `child`.
+            let hit_kind = classify_hit_shape(&child);
+            // Extract the collection from the hit op directly: `collection()`
+            // has no arm for sparse / multi-vector search, so it would yield
+            // `None` and the PK resolver would be handed an empty collection.
+            let hit_collection = hit_collection_name(&child);
 
             // Record the child's single base collection in the in-transaction
             // read-set at its own observed read-version (mirrors the root
             // Gather arm). Autocommit reads skip the catalog lookup.
             let probe_collection: Option<String> = if txn_id.is_some() {
-                child.collection().map(str::to_owned)
+                hit_collection.clone()
             } else {
                 None
             };
@@ -523,15 +531,42 @@ async fn resolve_exchange(
                 outcome.merged_array
             };
 
-            // Flatten to the flat relational row shape the `ProviderScan` tail
-            // consumes: vector hits merge their document `body`; storage
-            // `{id, data}` rows unwrap their `data`; computed rows pass through.
-            let rows = if is_vector_hits {
-                crate::data::executor::response_codec::flatten_vector_hits_to_relational_rows(
-                    &merged,
-                )
-            } else {
-                crate::data::executor::response_codec::flatten_to_relational_rows(&merged)
+            // Flatten to the bare relational row shape the `ProviderScan` tail
+            // consumes, resolving surrogate→PK for hit-shaped bodies via the
+            // catalog so `SELECT id` returns the user PK, not the surrogate.
+            use crate::data::executor::response_codec::{
+                flatten_hybrid_hits_to_relational_rows, flatten_to_relational_rows,
+                flatten_vector_hits_to_relational_rows,
+            };
+            let coll = hit_collection.unwrap_or_default();
+            let rows = match hit_kind {
+                HitShape::Vector => flatten_vector_hits_to_relational_rows(&merged, |surrogate| {
+                    resolve_surrogate_pk(
+                        state,
+                        database_id,
+                        tenant_id,
+                        &coll,
+                        nodedb_types::Surrogate::new(surrogate),
+                    )
+                }),
+                HitShape::Hybrid => {
+                    flatten_hybrid_hits_to_relational_rows(&merged, |hex| {
+                        // `__local_<id>` is the headless-vector-leg sentinel; it
+                        // is not a real surrogate and must not be parsed as hex.
+                        if hex.starts_with("__local_") {
+                            return None;
+                        }
+                        let surrogate = u32::from_str_radix(hex, 16).ok()?;
+                        resolve_surrogate_pk(
+                            state,
+                            database_id,
+                            tenant_id,
+                            &coll,
+                            nodedb_types::Surrogate::new(surrogate),
+                        )
+                    })
+                }
+                HitShape::None => flatten_to_relational_rows(&merged),
             };
             Ok(Resolved::Plan(PhysicalPlan::Query(QueryOp::ProviderScan {
                 provider: None,
@@ -547,5 +582,58 @@ async fn resolve_exchange(
 
         // All other plan variants: pass through unchanged.
         other => Ok(Resolved::Plan(other)),
+    }
+}
+
+/// The row shape a `PostProcess` body produces, driving how its gathered
+/// payload is flattened into bare relational rows.
+enum HitShape {
+    /// Vector / sparse / multi-vector hits: `{id: <surrogate>, distance,
+    /// doc_id?, body?}`. Merge the document `body` to top-level and resolve
+    /// the surrogate to the user PK.
+    Vector,
+    /// Hybrid (RRF) fusion hits: `{doc_id: <surrogate hex>, <score alias>,
+    /// ...}` with no body. Resolve `doc_id` to the user PK as `id`.
+    Hybrid,
+    /// Flat storage rows (`{id, data}` document / text, columnar, spatial) or
+    /// computed rows — already fully columned after the storage flatten.
+    None,
+}
+
+/// Classify a resolved `PostProcess` child by the row shape its engine emits.
+fn classify_hit_shape(plan: &PhysicalPlan) -> HitShape {
+    use nodedb_physical::physical_plan::{TextOp, VectorOp};
+    match plan {
+        PhysicalPlan::Vector(
+            VectorOp::Search { .. }
+            | VectorOp::MultiSearch { .. }
+            | VectorOp::SparseSearch { .. }
+            | VectorOp::MultiVectorScoreSearch { .. },
+        ) => HitShape::Vector,
+        PhysicalPlan::Text(TextOp::HybridSearch { .. } | TextOp::HybridSearchTriple { .. }) => {
+            HitShape::Hybrid
+        }
+        _ => HitShape::None,
+    }
+}
+
+/// Collection a `PostProcess` child reads, for the surrogate→PK resolver.
+///
+/// The search ops that emit surrogate-keyed hits carry their collection in a
+/// field `PhysicalPlan::collection` does not surface (sparse / multi-vector),
+/// so match them explicitly; every other body defers to `collection()`.
+fn hit_collection_name(plan: &PhysicalPlan) -> Option<String> {
+    use nodedb_physical::physical_plan::{TextOp, VectorOp};
+    match plan {
+        PhysicalPlan::Vector(
+            VectorOp::Search { collection, .. }
+            | VectorOp::MultiSearch { collection, .. }
+            | VectorOp::SparseSearch { collection, .. }
+            | VectorOp::MultiVectorScoreSearch { collection, .. },
+        )
+        | PhysicalPlan::Text(
+            TextOp::HybridSearch { collection, .. } | TextOp::HybridSearchTriple { collection, .. },
+        ) => Some(collection.clone()),
+        other => other.collection().map(str::to_owned),
     }
 }

@@ -76,7 +76,7 @@ fn apply_rls_filter(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize) {
 /// catalog has no PK mapping for the surrogate (headless row, or a document
 /// that was never written) — callers must leave the row's identifier
 /// untouched in that case rather than fabricate a value.
-pub(super) fn resolve_surrogate_pk(
+pub(crate) fn resolve_surrogate_pk(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: TenantId,
