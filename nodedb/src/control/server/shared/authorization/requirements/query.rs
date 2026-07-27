@@ -70,6 +70,13 @@ pub(super) fn collect_query_requirements<'a>(
             pending.push(&exchange.child);
             true
         }
+        // Recurse into the post-processor's materialized child so the wrapped
+        // subquery body's collection is authorized; without this the catch-all
+        // returns `false` and the body would go unchecked.
+        PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => {
+            pending.push(input);
+            true
+        }
         PhysicalPlan::Query(QueryOp::ProviderScan {
             provider: Some(provider),
             ..

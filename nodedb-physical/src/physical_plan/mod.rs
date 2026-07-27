@@ -324,6 +324,8 @@ impl PhysicalPlan {
             | PhysicalPlan::Graph(GraphOp::WccSuperstep(_)) => None,
             // Exchange: recurse into the child plan to extract the collection.
             PhysicalPlan::Query(QueryOp::Exchange(op)) => op.child.collection(),
+            // PostProcess: recurse into the materialized input plan.
+            PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => input.collection(),
             // ProviderScan is a catalog/constant source — no user collection.
             PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
             // KV ops carry their own collection (sorted-index-only ops → None).

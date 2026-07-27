@@ -76,6 +76,7 @@ impl SqlPlan {
                 .fold(outer.cache_eligibility(), |eligibility, (_, plan)| {
                     eligibility.combine(plan.cache_eligibility())
                 }),
+            Self::Subquery { input, .. } => input.cache_eligibility(),
             Self::LateralTopK { outer, .. } => outer.cache_eligibility(),
             Self::LateralLoop { outer, inner, .. } => {
                 outer.cache_eligibility().combine(inner.cache_eligibility())

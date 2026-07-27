@@ -435,6 +435,116 @@ async fn resolve_exchange(
             })))
         }
 
+        // PostProcess: materialize the child's rows on the coordinator, then
+        // lower to a `ProviderScan` that applies filter → offset → sort →
+        // distinct → project → limit on a single core (its existing tail). This
+        // keeps "run exactly once over the full union" correct: the child is
+        // gathered here, so the relational tail never runs per-shard.
+        PhysicalPlan::Query(QueryOp::PostProcess {
+            input,
+            filters,
+            projection,
+            sort_keys,
+            limit,
+            offset,
+            distinct,
+        }) => {
+            // The converter wraps a sharded body in `Exchange{Gather}`; unwrap
+            // it so the child is the real body plan (a plain body has no
+            // wrapper and routes to its owning vShard directly).
+            let (child, as_aggregate) = match *input {
+                PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+                    child,
+                    mode: ExchangeMode::Gather { as_aggregate },
+                })) => (*child, as_aggregate),
+                other => (other, false),
+            };
+
+            // Resolve any Exchange nested inside the child first (e.g. a
+            // `HashJoin` build-side `Broadcast`) so the plan gathered below is
+            // self-contained — no Exchange may reach a Data-Plane core.
+            let child = match Box::pin(resolve_exchange(
+                state,
+                database_id,
+                tenant_id,
+                child,
+                trace_id,
+                txn_id,
+                captures,
+            ))
+            .await?
+            {
+                Resolved::Plan(p) => p,
+                // The unwrapped body is not itself a root Gather / stream;
+                // surface these defensively without dropping post-processing.
+                Resolved::Gathered(resp, wms, caps) => {
+                    return Ok(Resolved::Gathered(resp, wms, caps));
+                }
+                Resolved::Stream(s) => return Ok(Resolved::Stream(s)),
+            };
+
+            // A vector search emits hit rows (`{id, distance, doc_id, body}`)
+            // rather than flat storage rows; they need the hit-specific flatten
+            // (merge `body` columns, surface `distance` / `_surrogate`) so the
+            // tail can sort / distinct / project by any document column.
+            let is_vector_hits = matches!(
+                &child,
+                PhysicalPlan::Vector(
+                    nodedb_physical::physical_plan::VectorOp::Search { .. }
+                        | nodedb_physical::physical_plan::VectorOp::MultiSearch { .. }
+                )
+            );
+
+            // Record the child's single base collection in the in-transaction
+            // read-set at its own observed read-version (mirrors the root
+            // Gather arm). Autocommit reads skip the catalog lookup.
+            let probe_collection: Option<String> = if txn_id.is_some() {
+                child.collection().map(str::to_owned)
+            } else {
+                None
+            };
+
+            let outcome: GatherOutcome =
+                gather_all_vshards(state, tenant_id, database_id, child, trace_id, txn_id).await?;
+
+            if let Some(coll) = probe_collection
+                && let Some(scan_plan) =
+                    full_scan_plan_for_collection(state, database_id, tenant_id, &coll)?
+            {
+                captures.push(DistributedReadCapture {
+                    scan_plan,
+                    read_version_lsn: outcome.read_version_lsn,
+                });
+            }
+
+            let merged = if as_aggregate {
+                finalize_aggregate(&outcome.merged_array)
+            } else {
+                outcome.merged_array
+            };
+
+            // Flatten to the flat relational row shape the `ProviderScan` tail
+            // consumes: vector hits merge their document `body`; storage
+            // `{id, data}` rows unwrap their `data`; computed rows pass through.
+            let rows = if is_vector_hits {
+                crate::data::executor::response_codec::flatten_vector_hits_to_relational_rows(
+                    &merged,
+                )
+            } else {
+                crate::data::executor::response_codec::flatten_to_relational_rows(&merged)
+            };
+            Ok(Resolved::Plan(PhysicalPlan::Query(QueryOp::ProviderScan {
+                provider: None,
+                rows,
+                filters,
+                projection,
+                sort_keys,
+                limit,
+                offset,
+                distinct,
+            })))
+        }
+
         // All other plan variants: pass through unchanged.
         other => Ok(Resolved::Plan(other)),
     }

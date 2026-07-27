@@ -72,6 +72,13 @@ macro_rules! impl_set_ops_arms_for_convert_visitor {
         ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
             super::super::set_ops::convert_cte(definitions, outer, self.tenant_id, self.ctx)
         }
+
+        fn subquery(
+            &mut self,
+            args: nodedb_sql::SubqueryVisitArgs<'_>,
+        ) -> crate::Result<Vec<nodedb_physical::physical_task::PhysicalTask>> {
+            super::super::set_ops::convert_subquery(args, self.tenant_id, self.ctx)
+        }
     };
 }
 

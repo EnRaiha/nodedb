@@ -2,7 +2,7 @@
 
 //! Set operations and miscellaneous plan conversions (UNION, INTERSECT, EXCEPT, CTE, etc.).
 
-use nodedb_sql::types::{Projection, SqlPlan, SqlValue};
+use nodedb_sql::types::{Projection, SortKey, SqlExpr, SqlPlan, SqlValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{TenantId, VShardId};
@@ -214,6 +214,125 @@ pub(super) fn convert_cte(
         resolved = inline_cte(&resolved, name, cte_plan);
     }
     convert_one(&resolved, tenant_id, ctx)
+}
+
+/// Lower `SqlPlan::Subquery` — relational post-processing over a subquery body
+/// whose leaf could not absorb the outer constraints — into a coordinator-
+/// resolved `QueryOp::PostProcess`.
+///
+/// The body is converted to a single physical plan and, when it is a sharded
+/// source, wrapped in `Exchange{Gather}` so the sort/distinct/offset/limit tail
+/// runs exactly once over the full union at resolve time.
+pub(super) fn convert_subquery(
+    args: nodedb_sql::SubqueryVisitArgs<'_>,
+    tenant_id: TenantId,
+    ctx: &ConvertContext,
+) -> crate::Result<Vec<PhysicalTask>> {
+    let nodedb_sql::SubqueryVisitArgs {
+        input,
+        filters,
+        projection,
+        sort_keys,
+        offset,
+        distinct,
+        limit,
+    } = args;
+
+    // Materialize the body as a single physical plan. A subquery/derived-table
+    // body is one relation; a body that lowers to multiple tasks (e.g. a set
+    // operation) has no single row stream to post-process here.
+    let mut body_tasks = convert_one(input, tenant_id, ctx)?;
+    if body_tasks.len() != 1 {
+        return Err(crate::Error::PlanError {
+            detail: format!(
+                "ORDER BY / OFFSET / DISTINCT over a subquery whose body lowers to {} physical \
+                 tasks is not supported; the body must produce a single relation",
+                body_tasks.len()
+            ),
+        });
+    }
+    let mut child = body_tasks.pop().expect("checked len == 1").plan;
+
+    // A sharded body must be gathered before the relational tail runs, so the
+    // sort/distinct/offset/limit observe the FULL union exactly once.
+    // PostProcess is itself coordinator-local (`is_sharded_source() == false`),
+    // so the top-level `convert()` wrap loop will not gather the child for us.
+    if child.is_sharded_source() {
+        let as_aggregate = matches!(
+            &child,
+            PhysicalPlan::Query(QueryOp::Aggregate { .. })
+                | PhysicalPlan::Query(QueryOp::PartialAggregate { .. })
+        );
+        child = PhysicalPlan::Query(QueryOp::Exchange(ExchangeOp {
+            child: Box::new(child),
+            mode: ExchangeMode::Gather { as_aggregate },
+        }));
+    }
+
+    Ok(vec![PhysicalTask {
+        tenant_id,
+        // Coordinator-local: resolved to a `ProviderScan` over the gathered
+        // rows (empty collection, like a constant result), dispatched once.
+        vshard_id: VShardId::from_collection_in_database(ctx.database_id, ""),
+        database_id: ctx.database_id,
+        plan: PhysicalPlan::Query(QueryOp::PostProcess {
+            input: Box::new(child),
+            filters: super::filter::serialize_filters(filters)?,
+            projection: lower_subquery_projection(projection)?,
+            sort_keys: lower_subquery_sort_keys(sort_keys)?,
+            limit,
+            offset,
+            distinct,
+        }),
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    }])
+}
+
+/// Lower outer projection items to plain column names for the relational tail.
+///
+/// A bare column keeps its unqualified name (the flattened row's column key). A
+/// star selects every column, so no column pruning is applied (empty = all). A
+/// computed projection has no slot in the row-post-processing tail — it is
+/// projected in an outer SELECT, not here.
+fn lower_subquery_projection(projection: &[Projection]) -> crate::Result<Vec<String>> {
+    let mut names = Vec::with_capacity(projection.len());
+    for p in projection {
+        match p {
+            Projection::Column(qname) => {
+                names.push(qname.rsplit('.').next().unwrap_or(qname).to_string());
+            }
+            Projection::Star | Projection::QualifiedStar(_) => return Ok(Vec::new()),
+            Projection::Computed { .. } => {
+                return Err(crate::Error::PlanError {
+                    detail: "a computed projection over an ORDER BY / OFFSET / DISTINCT subquery \
+                             is not supported; select the base columns in the subquery and \
+                             compute them in an outer SELECT"
+                        .into(),
+                });
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Lower outer ORDER BY keys to `(column, ascending)` pairs. Only column
+/// references are representable in the row-post-processing tail; a computed
+/// ORDER BY expression must be projected in the subquery first.
+fn lower_subquery_sort_keys(keys: &[SortKey]) -> crate::Result<Vec<(String, bool)>> {
+    keys.iter()
+        .map(|k| match &k.expr {
+            SqlExpr::Column { name, .. } => Ok((
+                name.rsplit('.').next().unwrap_or(name).to_string(),
+                k.ascending,
+            )),
+            _ => Err(crate::Error::PlanError {
+                detail: "ORDER BY over a subquery supports only column references; project a \
+                         computed ORDER BY expression in the subquery first"
+                    .into(),
+            }),
+        })
+        .collect()
 }
 
 #[cfg(test)]

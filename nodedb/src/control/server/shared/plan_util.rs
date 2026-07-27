@@ -97,6 +97,9 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Graph(GraphOp::WccSuperstep(_)) => None,
         // Exchange: recurse into the child plan to extract the collection.
         PhysicalPlan::Query(QueryOp::Exchange(op)) => extract_collection(&op.child),
+        // PostProcess: recurse into the materialized child (twin of
+        // `PhysicalPlan::collection`).
+        PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => extract_collection(input),
         // ProviderScan is a catalog/constant source — no user collection.
         PhysicalPlan::Query(QueryOp::ProviderScan { .. }) => None,
         // KV ops carry their own collection (sorted-index-only ops return None).

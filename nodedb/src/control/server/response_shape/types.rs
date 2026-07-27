@@ -101,6 +101,11 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         // Recurse into the child to determine the plan kind.
         PhysicalPlan::Query(QueryOp::Exchange(op)) => describe_plan(&op.child),
 
+        // PostProcess reshapes a multi-row subquery result; its kind is the
+        // child's. (Unresolved at this point; resolved to a ProviderScan =
+        // MultiRow before dispatch.)
+        PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => describe_plan(input),
+
         // DML operations that return affected row count.
         PhysicalPlan::Document(DocumentOp::PointPut { .. })
         | PhysicalPlan::Document(DocumentOp::BatchInsert { .. })

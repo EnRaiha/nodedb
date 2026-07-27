@@ -344,35 +344,73 @@ pub(super) fn inline_cte(plan: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> 
                         temporal: *inner_t,
                     }
                 } else if let SqlPlan::VectorSearch { .. } = cte_plan {
-                    // A k-NN body carries its own post-filter list and top-k, so
-                    // outer predicates merge onto it and run inside the engine
-                    // over the candidate set — dropping them would silently
-                    // return the unfiltered top-k.
-                    let mut merged = cte_plan.clone();
+                    // A k-NN body carries its own post-filter list and top-k. An
+                    // outer `WHERE` merges into the engine post-filter so the cut
+                    // counts MATCHING rows, and — when nothing reorders the
+                    // result — an unordered `LIMIT` folds into `top_k` and the
+                    // projection rides along. An outer `ORDER BY` / `OFFSET` /
+                    // `DISTINCT` reorders the k rows, which the search leaf has no
+                    // slot for; those (and a `LIMIT` that must apply after the
+                    // reorder) run in a `Subquery` post-processor over the k rows.
+                    let needs_reorder = !sort_keys.is_empty() || *offset > 0 || *distinct;
+                    let mut leaf = cte_plan.clone();
                     if let SqlPlan::VectorSearch {
                         filters: body_filters,
                         projection: body_projection,
                         top_k,
                         ..
-                    } = &mut merged
+                    } = &mut leaf
                     {
                         body_filters.extend(filters.iter().cloned());
-                        if !projection.is_empty() {
-                            body_projection.clone_from(projection);
-                        }
-                        // An outer LIMIT narrows the k-NN cut only while the
-                        // rows still come back in distance order; an outer
-                        // ORDER BY reorders them, so the LIMIT then belongs
-                        // above the search, not on it.
-                        if sort_keys.is_empty()
-                            && let Some(outer_limit) = limit
-                        {
-                            *top_k = (*top_k).min(*outer_limit);
+                        if !needs_reorder {
+                            if !projection.is_empty() {
+                                body_projection.clone_from(projection);
+                            }
+                            if let Some(outer_limit) = limit {
+                                *top_k = (*top_k).min(*outer_limit);
+                            }
                         }
                     }
-                    merged
-                } else {
+                    if needs_reorder {
+                        // Filters already run in the engine; the tail applies the
+                        // reorder-dependent constraints over the k rows. It sorts
+                        // before projecting, so ORDER BY may reference any column.
+                        SqlPlan::Subquery {
+                            input: Box::new(leaf),
+                            filters: Vec::new(),
+                            projection: projection.clone(),
+                            sort_keys: sort_keys.clone(),
+                            offset: *offset,
+                            distinct: *distinct,
+                            limit: *limit,
+                        }
+                    } else {
+                        leaf
+                    }
+                } else if filters.is_empty()
+                    && sort_keys.is_empty()
+                    && *offset == 0
+                    && !*distinct
+                    && limit.is_none()
+                {
+                    // Any other non-`Scan` body (Aggregate, Join, TextSearch,
+                    // HybridSearch, SparseSearch, SpatialScan, MultiVectorSearch,
+                    // ...) with only an outer projection: the response boundary
+                    // projects by output schema, so no post-processor is needed.
                     cte_plan.clone()
+                } else {
+                    // The body has no slot for these outer constraints. Apply
+                    // them over its materialized rows in a `Subquery`
+                    // post-processor — previously they were silently dropped.
+                    SqlPlan::Subquery {
+                        input: Box::new(cte_plan.clone()),
+                        filters: filters.clone(),
+                        projection: projection.clone(),
+                        sort_keys: sort_keys.clone(),
+                        offset: *offset,
+                        distinct: *distinct,
+                        limit: *limit,
+                    }
                 }
             }
         }
@@ -455,6 +493,26 @@ pub(super) fn inline_cte(plan: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> 
             limit: *limit,
         },
 
+        // A post-processor produced by an earlier CTE definition: recurse into
+        // its body so a later definition's references inside it still inline.
+        SqlPlan::Subquery {
+            input,
+            filters,
+            projection,
+            sort_keys,
+            offset,
+            distinct,
+            limit,
+        } => SqlPlan::Subquery {
+            input: Box::new(inline_cte(input, cte_name, cte_plan)),
+            filters: filters.clone(),
+            projection: projection.clone(),
+            sort_keys: sort_keys.clone(),
+            offset: *offset,
+            distinct: *distinct,
+            limit: *limit,
+        },
+
         // No CTE reference — return as-is.
         _ => plan.clone(),
     }
@@ -463,7 +521,7 @@ pub(super) fn inline_cte(plan: &SqlPlan, cte_name: &str, cte_plan: &SqlPlan) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nodedb_sql::types::{CompareOp, EngineType, Filter, FilterExpr, SqlValue};
+    use nodedb_sql::types::{CompareOp, EngineType, Filter, FilterExpr, SortKey, SqlValue};
 
     fn vector_search_body() -> SqlPlan {
         SqlPlan::VectorSearch {
@@ -559,5 +617,91 @@ mod tests {
         ));
         assert!(filters.is_empty());
         assert_eq!(top_k, 3);
+    }
+
+    /// A CTE-referencing scan carrying an outer ORDER BY / OFFSET / DISTINCT.
+    fn scan_on_cte_reorder(sort_keys: Vec<SortKey>, offset: usize, distinct: bool) -> SqlPlan {
+        SqlPlan::Scan {
+            collection: "knn".to_string(),
+            alias: None,
+            engine: EngineType::DocumentSchemaless,
+            filters: Vec::new(),
+            projection: Vec::new(),
+            sort_keys,
+            limit: None,
+            offset,
+            distinct,
+            window_functions: Vec::new(),
+            temporal: nodedb_sql::TemporalScope::default(),
+        }
+    }
+
+    fn id_sort_key() -> SortKey {
+        SortKey {
+            expr: nodedb_sql::types::SqlExpr::Column {
+                table: Some("s".to_string()),
+                name: "id".to_string(),
+            },
+            ascending: true,
+            nulls_first: false,
+        }
+    }
+
+    #[test]
+    fn outer_order_by_wraps_vector_search_in_subquery() {
+        // An outer ORDER BY cannot fold into the k-NN leaf; it must become a
+        // post-processor over the search, and the leaf keeps its own top_k.
+        match inline_cte(
+            &scan_on_cte_reorder(vec![id_sort_key()], 0, false),
+            "knn",
+            &vector_search_body(),
+        ) {
+            SqlPlan::Subquery {
+                input, sort_keys, ..
+            } => {
+                assert_eq!(
+                    sort_keys.len(),
+                    1,
+                    "the outer ORDER BY must ride the wrapper"
+                );
+                assert!(
+                    matches!(*input, SqlPlan::VectorSearch { top_k: 3, .. }),
+                    "the search leaf keeps its own top_k under the wrapper"
+                );
+            }
+            other => panic!("expected Subquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outer_distinct_and_offset_wrap_vector_search_in_subquery() {
+        match inline_cte(
+            &scan_on_cte_reorder(Vec::new(), 2, true),
+            "knn",
+            &vector_search_body(),
+        ) {
+            SqlPlan::Subquery {
+                offset, distinct, ..
+            } => {
+                assert_eq!(offset, 2, "the outer OFFSET must ride the wrapper");
+                assert!(distinct, "the outer DISTINCT must ride the wrapper");
+            }
+            other => panic!("expected Subquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_limit_does_not_wrap_vector_search() {
+        // A LIMIT with no reorder still folds into top_k (fast path), NOT a
+        // Subquery wrapper.
+        let plan = inline_cte(
+            &scan_on_cte(Vec::new(), Some(1)),
+            "knn",
+            &vector_search_body(),
+        );
+        assert!(
+            matches!(plan, SqlPlan::VectorSearch { top_k: 1, .. }),
+            "an unordered LIMIT must fold into top_k, not wrap: {plan:?}"
+        );
     }
 }

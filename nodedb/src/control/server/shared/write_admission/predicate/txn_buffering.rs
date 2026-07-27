@@ -384,7 +384,8 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | QueryOp::RecursiveScan { .. }
             | QueryOp::RecursiveValue { .. }
             | QueryOp::LateralTopK { .. }
-            | QueryOp::LateralLoop { .. },
+            | QueryOp::LateralLoop { .. }
+            | QueryOp::PostProcess { .. },
         ) => false,
 
         // ---- Meta: control / maintenance / internal-mechanism ops.
