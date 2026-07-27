@@ -99,11 +99,10 @@ pub(crate) async fn handle_direct_op(
             Ok(authorized) => authorized,
             Err(error) => return error_to_native(seq, &error),
         };
-        ctx.state.tenant_request_start(tenant_id);
+        let _request = ctx.state.tenant_request_guard(tenant_id);
         let result =
             crate::control::insert_select::run_authorized_insert_select(ctx.state, authorized)
                 .await;
-        ctx.state.tenant_request_end(tenant_id);
         return match result {
             Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
             Err(e) => error_to_native(seq, &e),
@@ -133,10 +132,9 @@ pub(crate) async fn handle_direct_op(
             Ok(authorized) => authorized,
             Err(error) => return error_to_native(seq, &error),
         };
-        ctx.state.tenant_request_start(tenant_id);
+        let _request = ctx.state.tenant_request_guard(tenant_id);
         let result =
             crate::control::merge_orchestrator::run_authorized_merge(ctx.state, authorized).await;
-        ctx.state.tenant_request_end(tenant_id);
         return match result {
             Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
             Err(e) => error_to_native(seq, &e),
@@ -166,13 +164,12 @@ pub(crate) async fn handle_direct_op(
             Ok(authorized) => authorized,
             Err(error) => return error_to_native(seq, &error),
         };
-        ctx.state.tenant_request_start(tenant_id);
+        let _request = ctx.state.tenant_request_guard(tenant_id);
         let result =
             crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
                 ctx.state, authorized,
             )
             .await;
-        ctx.state.tenant_request_end(tenant_id);
         return match result {
             Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
             Err(e) => error_to_native(seq, &e),
@@ -220,11 +217,8 @@ pub(crate) async fn handle_direct_op(
         // No-edge fast path — behaviorally identical to the pre-migration
         // single-plan dispatch. The local-path WAL append now lives inside
         // `dispatch_single_task` so it is shared with the single-shard edge loop.
-        ctx.state.tenant_request_start(tenant_id);
-        let result =
-            dispatch_single_task(ctx, seq, tenant_id, vshard_id, task.plan, task.txn_id).await;
-        ctx.state.tenant_request_end(tenant_id);
-        return result;
+        let _request = ctx.state.tenant_request_guard(tenant_id);
+        return dispatch_single_task(ctx, seq, tenant_id, vshard_id, task.plan, task.txn_id).await;
     }
 
     // Edge-bearing insert: route the augmented task set the same way native SQL
@@ -233,9 +227,9 @@ pub(crate) async fn handle_direct_op(
     // task sequentially (matching pgwire / native-SQL single-shard multi-task),
     // returning the document task's response. Local WAL durability for the
     // single-shard path is handled inside `dispatch_single_task`.
-    ctx.state.tenant_request_start(tenant_id);
+    let _request = ctx.state.tenant_request_guard(tenant_id);
     // Autocommit direct-ops dispatch: no session read-set to widen with.
-    let result = match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
+    match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
         DispatchClass::MultiShard { .. } => {
             let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
                 &ctx.state.audit,
@@ -248,10 +242,7 @@ pub(crate) async fn handle_direct_op(
                 &emitter,
             ) {
                 Ok(authorized) => authorized,
-                Err(error) => {
-                    ctx.state.tenant_request_end(tenant_id);
-                    return error_to_native(seq, &crate::Error::from(error));
-                }
+                Err(error) => return error_to_native(seq, &crate::Error::from(error)),
             };
             match dispatch_authorized_tasks_to_calvin(
                 ctx.state,
@@ -298,9 +289,7 @@ pub(crate) async fn handle_direct_op(
                 .or(doc_response)
                 .unwrap_or_else(|| NativeResponse::ok(seq))
         }
-    };
-    ctx.state.tenant_request_end(tenant_id);
-    result
+    }
 }
 
 /// Dispatch one plan via the gateway (when wired) or the local SPSC path,

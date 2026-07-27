@@ -454,11 +454,10 @@ impl NodeDbPgHandler {
             )))
         })?;
 
-        self.state.tenant_request_start(tenant_id);
+        let _request = self.state.tenant_request_guard(tenant_id);
         let result = self
             .execute_planned_sql(identity, sql_trimmed, tenant_id, session_id)
             .await;
-        self.state.tenant_request_end(tenant_id);
 
         if result.is_err() {
             self.sessions.fail_transaction(session_id);

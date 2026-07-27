@@ -21,17 +21,20 @@
 
 use std::sync::Arc;
 
+use tokio::task::JoinHandle;
+
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures::{SinkExt, StreamExt};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::control::change_stream::LiveSubscriptionSet;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::http::auth::{AppState, ResolvedIdentity};
 use crate::control::server::shared::authorization::authorize_database;
+use crate::control::server::shared::{ConnectionFutureOutcome, isolate_connection_future};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -66,10 +69,62 @@ pub async fn ws_handler(
         .into_response();
     }
     let trace_id = crate::control::trace_context::extract_from_headers(&headers);
-    ws.on_upgrade(move |socket| {
-        handle_ws_connection(socket, state, identity, database_id, trace_id)
+    ws.on_upgrade(move |socket| async move {
+        match isolate_connection_future(handle_ws_connection(
+            socket,
+            state,
+            identity,
+            database_id,
+            trace_id,
+        ))
+        .await
+        {
+            ConnectionFutureOutcome::Completed(()) => {}
+            ConnectionFutureOutcome::Panicked => {
+                warn!("ws-rpc connection panicked");
+            }
+        }
     })
     .into_response()
+}
+
+/// Owns a sender task until normal completion or connection teardown.
+///
+/// Dropping the guard aborts the task synchronously. This ensures a panic or
+/// cancellation of the connection future cannot detach the sender task.
+struct AbortOnDropJoinHandle {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl AbortOnDropJoinHandle {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    /// Join the sender after the channel is closed. A sender panic is observed
+    /// without inspecting its payload or logging its join error.
+    async fn finish(mut self) {
+        let terminated_unexpectedly = match self.handle.as_mut() {
+            Some(handle) => handle.await.is_err(),
+            None => false,
+        };
+        // Remove only after the await completes. If this future is cancelled
+        // while pending, `Drop` still owns and aborts the sender task.
+        self.handle.take();
+        if terminated_unexpectedly {
+            warn!("ws-rpc sender task terminated unexpectedly");
+        }
+    }
+}
+
+impl Drop for AbortOnDropJoinHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Handle a single WebSocket connection.
@@ -87,7 +142,7 @@ async fn handle_ws_connection(
     // 256 messages provides ~10s of buffer at 25 events/sec.
     let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<String>(256);
 
-    let send_handle = tokio::spawn(async move {
+    let sender = AbortOnDropJoinHandle::new(tokio::spawn(async move {
         loop {
             tokio::select! {
                 Some(msg) = live_rx.recv() => {
@@ -99,7 +154,7 @@ async fn handle_ws_connection(
                 else => break,
             }
         }
-    });
+    }));
 
     // Session ID is set only after successful auth inside process_message.
     let mut authenticated_session_id: Option<String> = None;
@@ -157,7 +212,7 @@ async fn handle_ws_connection(
     drop(live_set);
 
     drop(live_tx);
-    let _ = send_handle.await;
+    sender.finish().await;
     debug!("WebSocket RPC connection closed");
 }
 
@@ -188,4 +243,89 @@ pub fn save_ws_session(shared: &SharedState, session_id: &str) {
         last_lsn = current_lsn,
         "WS session saved for reconnect"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+
+    use tokio::sync::oneshot;
+
+    use super::{AbortOnDropJoinHandle, ConnectionFutureOutcome, isolate_connection_future};
+
+    struct AbortSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for AbortSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sender_is_aborted_when_guard_is_dropped() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let sender = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+            let _signal = AbortSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            pending::<()>().await;
+        }));
+
+        assert!(started_rx.await.is_ok());
+        drop(sender);
+
+        assert!(dropped_rx.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_finishing_aborts_sender() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let sender = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+            let _signal = AbortSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            pending::<()>().await;
+        }));
+        assert!(started_rx.await.is_ok());
+
+        let finishing = tokio::spawn(sender.finish());
+        tokio::task::yield_now().await;
+        finishing.abort();
+        let _ = finishing.await;
+
+        assert!(dropped_rx.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sender_finishes_normally() {
+        let (completed_tx, completed_rx) = oneshot::channel();
+        let sender = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+            let _ = completed_tx.send(());
+        }));
+
+        sender.finish().await;
+
+        assert!(completed_rx.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn isolation_catches_connection_panic_and_releases_sender() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let outcome = isolate_connection_future(async move {
+            let _sender = AbortOnDropJoinHandle::new(tokio::spawn(async move {
+                let _signal = AbortSignal(Some(dropped_tx));
+                let _ = started_tx.send(());
+                pending::<()>().await;
+            }));
+            let _ = started_rx.await;
+            panic!("simulated websocket connection panic");
+        })
+        .await;
+
+        assert!(matches!(outcome, ConnectionFutureOutcome::Panicked));
+        assert!(dropped_rx.await.is_ok());
+    }
 }

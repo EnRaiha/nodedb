@@ -115,7 +115,7 @@ pub async fn crdt_apply(
     // replication. A local-only dispatch would land it on the receiving node only
     // — lost to followers and entirely on leader failover. This handler is scoped
     // to the default database (matching its surrogate assignment above).
-    state.shared.tenant_request_start(identity.tenant_id);
+    let _request = state.shared.tenant_request_guard(identity.tenant_id);
     let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
         identity.tenant_id,
         crate::types::DatabaseId::DEFAULT,
@@ -138,7 +138,6 @@ pub async fn crdt_apply(
         },
     )
     .await;
-    state.shared.tenant_request_end(identity.tenant_id);
 
     result.map_err(ApiError::from)?;
 

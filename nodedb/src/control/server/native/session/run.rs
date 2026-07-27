@@ -4,51 +4,167 @@
 //! absolute/idle timeout enforcement, frame decode, and response emission
 //! (including chunking for oversized responses).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use tracing::{debug, instrument};
 
 use nodedb_types::protocol::{MAX_FRAME_SIZE, NativeResponse};
 
+use super::NativeSession;
 use super::codec::{self, FrameFormat};
 use super::dispatch;
-use super::{NativeSession, chunk_large_response};
+use super::session_chunk::chunk_large_response;
 
-impl NativeSession {
-    /// Run the session: drives the frame loop, then reclaims any
-    /// still-open transaction's Data-Plane overlays on every exit path
-    /// (clean EOF, idle/absolute timeout, or abrupt disconnect/error).
-    pub async fn run(mut self) -> crate::Result<()> {
-        let result = self.run_loop().await;
-        self.reclaim_open_txn().await;
-        result
+/// Rollback dependencies retained independently from the connection future.
+///
+/// The session store is private to one native connection. The authenticated
+/// identity is published once after successful authentication and never
+/// replaced, so teardown cannot accidentally use a later client value.
+pub(crate) struct NativeTxnCleanup {
+    sessions: Arc<crate::control::server::shared::session::SessionStore>,
+    session_id: crate::control::server::shared::session::SessionId,
+    state: Arc<crate::control::state::SharedState>,
+    identity: OnceLock<crate::control::security::identity::AuthenticatedIdentity>,
+    started: AtomicBool,
+    completed: AtomicBool,
+    completion: Notify,
+}
+
+impl NativeTxnCleanup {
+    pub(super) fn new(
+        sessions: Arc<crate::control::server::shared::session::SessionStore>,
+        session_id: crate::control::server::shared::session::SessionId,
+        state: Arc<crate::control::state::SharedState>,
+    ) -> Self {
+        Self {
+            sessions,
+            session_id,
+            state,
+            identity: OnceLock::new(),
+            started: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
+            completion: Notify::new(),
+        }
     }
 
-    /// Reclaim a still-open transaction's Data-Plane overlays if the
-    /// connection ended mid-transaction (no COMMIT/ROLLBACK). Idempotent:
-    /// a no-op when the session is idle, so a graceful end does not
-    /// double-drop.
-    async fn reclaim_open_txn(&self) {
-        use crate::control::server::native::dispatch::NativeTxnDp;
-        use crate::control::server::shared::session::{SessionId, TransactionState, lifecycle};
+    /// Publish the authenticated identity exactly once for teardown.
+    pub(super) fn publish_identity(
+        &self,
+        identity: crate::control::security::identity::AuthenticatedIdentity,
+    ) {
+        // Re-authentication is rejected before publication, so a failed set is
+        // only a duplicate publication of the already authoritative identity.
+        let _ = self.identity.set(identity);
+    }
 
-        let Some(identity) = self.identity.as_ref() else {
+    /// Start cleanup exactly once. Completion is published even when rollback
+    /// panics, and callers never inspect the discarded panic payload.
+    pub(crate) fn start(self: &Arc<Self>) {
+        if self
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // All production callers run on Tokio. If that invariant is ever
+            // violated, do not leave a waiter stuck during shutdown.
+            self.publish_completion();
             return;
         };
-        if self.sessions.transaction_state(self.peer_addr) == TransactionState::Idle {
+        crate::control::server::shared::session::ddl_buffer::discard();
+        let cleanup = Arc::clone(self);
+        handle.spawn(async move {
+            let _ = crate::control::server::shared::isolate_connection_future(
+                Arc::clone(&cleanup).rollback(),
+            )
+            .await;
+            cleanup.publish_completion();
+        });
+    }
+
+    fn publish_completion(&self) {
+        self.completed.store(true, Ordering::Release);
+        self.completion.notify_waiters();
+    }
+
+    /// Start cleanup before the first await and wait with a lost-wakeup-safe
+    /// completion protocol. Cancellation of this waiter does not cancel the
+    /// detached cleanup task.
+    pub(crate) async fn start_and_wait(self: &Arc<Self>) {
+        self.start();
+        loop {
+            if self.completed.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.completion.notified();
+            if self.completed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn rollback(self: Arc<Self>) {
+        use crate::control::server::native::dispatch::NativeTxnDp;
+        use crate::control::server::shared::session::{TransactionState, lifecycle};
+
+        let Some(identity) = self.identity.get().cloned() else {
+            return;
+        };
+        if self.sessions.transaction_state(self.session_id) == TransactionState::Idle {
             return;
         }
         let dp = NativeTxnDp {
             state: self.state.as_ref(),
         };
         lifecycle::run_rollback(
-            &self.sessions,
-            SessionId::from(&self.peer_addr),
-            identity,
+            self.sessions.as_ref(),
+            self.session_id,
+            &identity,
             self.state.as_ref(),
             &dp,
         )
         .await;
+    }
+}
+
+/// Starts rollback synchronously when the owner is dropped. Completion stays
+/// owned by `NativeTxnCleanup`, so an aborted waiter cannot lose teardown.
+struct NativeTxnCleanupGuard {
+    cleanup: Arc<NativeTxnCleanup>,
+}
+
+impl NativeTxnCleanupGuard {
+    fn new(cleanup: Arc<NativeTxnCleanup>) -> Self {
+        Self { cleanup }
+    }
+
+    async fn finish(self) {
+        self.cleanup.start_and_wait().await;
+    }
+}
+
+impl Drop for NativeTxnCleanupGuard {
+    fn drop(&mut self) {
+        self.cleanup.start();
+    }
+}
+
+impl NativeSession {
+    /// Run the session. The guard begins detached cleanup on normal return,
+    /// panic unwinding, or task cancellation; normal completion waits for it.
+    pub async fn run(mut self) -> crate::Result<()> {
+        let guard = NativeTxnCleanupGuard::new(Arc::clone(&self.cleanup));
+        let result = self.run_loop().await;
+        guard.finish().await;
+        result
     }
 
     /// Run the session loop: read frames, route by opcode, write responses.
@@ -138,6 +254,9 @@ impl NativeSession {
                     format!("{e}"),
                 ))),
             };
+            // Crash-injection coverage verifies that a panic after a request
+            // mutates transaction state still runs detached connection cleanup.
+            crate::fail_point!("native_session::after_request");
 
             match outcome {
                 dispatch::SqlOutcome::Response(response) => {

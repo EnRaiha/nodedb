@@ -59,6 +59,7 @@ impl NativeSession {
                 self.auth_context = Some(super::super::super::session_auth::build_auth_context(
                     &trust_id,
                 ));
+                self.cleanup.publish_identity(trust_id.clone());
                 self.identity = Some(trust_id);
             } else {
                 return SqlOutcome::Response(Box::new(NativeResponse::error(

@@ -152,7 +152,7 @@ pub async fn query_ndjson(
         Err(error) => return ApiError::from(crate::Error::from(error)).into_response(),
     };
 
-    state.shared.tenant_request_start(tenant_id);
+    let _request = state.shared.tenant_request_guard(tenant_id);
 
     let mut ndjson = String::new();
     for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
@@ -261,8 +261,6 @@ pub async fn query_ndjson(
             }
         }
     }
-
-    state.shared.tenant_request_end(tenant_id);
 
     Response::builder()
         .header("Content-Type", "application/x-ndjson")

@@ -20,9 +20,23 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use common::native_harness::{NativeTestServer, do_handshake, send_sql};
+#[cfg(feature = "failpoints")]
+use common::native_harness::{read_frame, write_frame};
 
+#[cfg(feature = "failpoints")]
+use nodedb::fail_point::{FailAction, FailGuard};
 use nodedb_types::protocol::HelloFrame;
+#[cfg(feature = "failpoints")]
+use nodedb_types::protocol::NativeRequest;
+#[cfg(feature = "failpoints")]
+use nodedb_types::protocol::opcodes::OpCode;
 use nodedb_types::protocol::opcodes::ResponseStatus;
+#[cfg(feature = "failpoints")]
+use nodedb_types::protocol::request_fields::RequestFields;
+#[cfg(feature = "failpoints")]
+use nodedb_types::protocol::text_fields::TextFields;
+
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Poll `active_txn_overlays` until `pred` is satisfied or `deadline` elapses.
 /// Returns the last observed value; callers assert against it so a timeout
@@ -49,6 +63,7 @@ async fn poll_gauge(
 
 #[tokio::test]
 async fn native_abandoned_txn_overlay_reclaimed_on_teardown() {
+    let _test_guard = TEST_LOCK.lock().await;
     let server = NativeTestServer::start().await;
 
     let baseline = server
@@ -142,6 +157,81 @@ async fn native_abandoned_txn_overlay_reclaimed_on_teardown() {
         0,
         "the never-committed staged row must not be visible: {check:?}"
     );
+
+    server.shutdown().await;
+}
+
+#[cfg(feature = "failpoints")]
+#[tokio::test]
+async fn native_request_panic_reclaims_open_transaction_overlay() {
+    let _test_guard = TEST_LOCK.lock().await;
+    let server = NativeTestServer::start().await;
+    let metrics = server
+        .shared
+        .system_metrics
+        .as_ref()
+        .expect("system_metrics must be wired into the native harness");
+    let baseline = metrics.active_txn_overlays.load(Ordering::Relaxed);
+
+    let (mut stream, _ack) = do_handshake(server.addr, &HelloFrame::current())
+        .await
+        .expect("handshake");
+    let create = send_sql(
+        &mut stream,
+        1,
+        "CREATE COLLECTION native_txn_panic_teardown (id STRING PRIMARY KEY, n INT) \
+         WITH (engine='document_schemaless')",
+    )
+    .await;
+    assert_ne!(create.status, ResponseStatus::Error, "{create:?}");
+    let begin = send_sql(&mut stream, 2, "BEGIN").await;
+    assert_ne!(begin.status, ResponseStatus::Error, "{begin:?}");
+    let insert = send_sql(
+        &mut stream,
+        3,
+        "INSERT INTO native_txn_panic_teardown (id, n) VALUES ('panic-row', 1)",
+    )
+    .await;
+    assert_ne!(insert.status, ResponseStatus::Error, "{insert:?}");
+
+    let after_stage = poll_gauge(&server, Duration::from_secs(5), |v| v > baseline).await;
+    assert!(after_stage > baseline, "staged overlay was not created");
+
+    {
+        let _fail = FailGuard::install("native_session::after_request", FailAction::Panic);
+        let request = NativeRequest {
+            op: OpCode::Sql,
+            seq: 4,
+            fields: RequestFields::Text(TextFields {
+                sql: Some("SELECT 1".into()),
+                ..Default::default()
+            }),
+        };
+        let payload = sonic_rs::to_vec(&request).expect("encode panic-trigger request");
+        write_frame(&mut stream, &payload).await;
+        let closed = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream))
+            .await
+            .expect("panicking connection must close promptly");
+        assert!(closed.is_none(), "panicking connection returned a response");
+    }
+
+    let after_panic = poll_gauge(&server, Duration::from_secs(5), |v| v == baseline).await;
+    assert_eq!(
+        after_panic, baseline,
+        "request panic must reclaim the open transaction overlay"
+    );
+
+    let (mut fresh, _ack) = do_handshake(server.addr, &HelloFrame::current())
+        .await
+        .expect("fresh handshake after isolated panic");
+    let check = send_sql(
+        &mut fresh,
+        1,
+        "SELECT * FROM native_txn_panic_teardown WHERE id = 'panic-row'",
+    )
+    .await;
+    assert_ne!(check.status, ResponseStatus::Error, "{check:?}");
+    assert_eq!(check.rows.as_ref().map(Vec::len).unwrap_or(0), 0);
 
     server.shutdown().await;
 }

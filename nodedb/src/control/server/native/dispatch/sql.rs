@@ -174,9 +174,8 @@ async fn handle_sql_inner(
     // DataFusion planning + dispatch. The streaming fast path (when
     // `allow_stream`) may return a `SqlStream`; otherwise this collapses to a
     // single materialized `NativeResponse`.
-    ctx.state.tenant_request_start(ctx.tenant_id());
+    let _request = ctx.state.tenant_request_guard(ctx.tenant_id());
     let outcome = execute_planned(ctx, seq, sql_trimmed, database_id, allow_stream).await;
-    ctx.state.tenant_request_end(ctx.tenant_id());
 
     if let SqlOutcome::Response(ref r) = outcome
         && r.status == nodedb_types::protocol::ResponseStatus::Error

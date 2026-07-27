@@ -129,12 +129,12 @@ pub async fn query(
     }
 
     // Track active request for quota accounting.
-    state.shared.tenant_request_start(tenant_id);
+    let _request = state.shared.tenant_request_guard(tenant_id);
 
     // Execute each task via the SPSC bridge.
     let mut result_rows = Vec::new();
 
-    let result = async {
+    async {
         for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
             // `INSERT ... SELECT` is orchestrated on the Control Plane: the
             // source is scanned, each target row gets its OWN fresh, registered
@@ -308,10 +308,7 @@ pub async fn query(
 
         Ok(axum::Json(HttpQueryResponse::ok(result_rows)))
     }
-    .await;
-
-    state.shared.tenant_request_end(tenant_id);
-    result
+    .await
 }
 
 fn ddl_error_to_api(error: crate::control::server::shared::ddl::DdlError) -> ApiError {
