@@ -8,6 +8,7 @@ use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::SessionId;
 
 use super::super::types::{error_to_sqlstate, text_field};
 use super::core::NodeDbPgHandler;
@@ -17,7 +18,7 @@ impl NodeDbPgHandler {
     pub(super) async fn handle_explain(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
         let upper = sql.to_uppercase();
@@ -37,11 +38,11 @@ impl NodeDbPgHandler {
 
         let database_id = self
             .sessions
-            .get_current_database(addr)
+            .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let txn_ctx = crate::control::server::shared::session::DmlTxnCtx {
             sessions: &self.sessions,
-            addr,
+            session_id,
         };
         if crate::control::server::shared::ddl::dispatch(
             &self.state,
@@ -109,7 +110,7 @@ impl NodeDbPgHandler {
         // Prepend Calvin preamble row when tasks span multiple vShards.
         {
             use crate::control::planner::calvin::calvin_explain_preamble;
-            let mode = self.sessions.cross_shard_txn_mode(addr);
+            let mode = self.sessions.cross_shard_txn_mode(session_id);
             if let Some(preamble) = calvin_explain_preamble(&tasks, mode, None) {
                 encoder.encode_field(&preamble)?;
                 rows.push(Ok(encoder.take_row()));

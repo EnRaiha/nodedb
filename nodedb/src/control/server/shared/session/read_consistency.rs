@@ -12,7 +12,7 @@
 //! The value is stored as a plain string in the session parameter
 //! map. This module provides the typed parse + accessor.
 
-use std::net::SocketAddr;
+use super::connection::SessionId;
 use std::time::Duration;
 
 use crate::types::ReadConsistency;
@@ -59,7 +59,7 @@ pub fn format_value(rc: &ReadConsistency) -> String {
 impl SessionStore {
     /// Resolve the effective `ReadConsistency` for a session. Falls
     /// back to `Strong` if the parameter is unset or unparseable.
-    pub fn read_consistency(&self, addr: &SocketAddr) -> ReadConsistency {
+    pub fn read_consistency(&self, addr: impl Into<SessionId>) -> ReadConsistency {
         self.get_parameter(addr, PARAM_KEY)
             .and_then(|v| parse_value(&v))
             .unwrap_or_default()
@@ -68,6 +68,8 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
 
     #[test]
@@ -143,7 +145,7 @@ mod tests {
         let store = SessionStore::new();
         let addr: SocketAddr = "127.0.0.1:5432".parse().unwrap();
         store.ensure_session(addr);
-        assert_eq!(store.read_consistency(&addr), ReadConsistency::Strong);
+        assert_eq!(store.read_consistency(addr), ReadConsistency::Strong);
     }
 
     #[test]
@@ -151,7 +153,7 @@ mod tests {
         let store = SessionStore::new();
         let addr: SocketAddr = "127.0.0.1:5432".parse().unwrap();
         store.ensure_session(addr);
-        store.set_parameter(&addr, PARAM_KEY.to_string(), "eventual".to_string());
-        assert_eq!(store.read_consistency(&addr), ReadConsistency::Eventual);
+        store.set_parameter(addr, PARAM_KEY.to_string(), "eventual".to_string());
+        assert_eq!(store.read_consistency(addr), ReadConsistency::Eventual);
     }
 }

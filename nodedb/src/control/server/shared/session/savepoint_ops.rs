@@ -9,13 +9,13 @@
 //! [`SavepointError`] into their own SQLSTATE (`25P01` / `3B001`).
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+use super::connection::SessionId;
 use super::outcome::TxnDataPlane;
 use super::state::TransactionState;
 use super::store::SessionStore;
@@ -31,8 +31,11 @@ pub enum SavepointError {
 }
 
 /// Reject a savepoint command issued outside a transaction block.
-fn require_active_txn(sessions: &SessionStore, addr: &SocketAddr) -> Result<(), SavepointError> {
-    if sessions.transaction_state(addr) == TransactionState::Idle {
+fn require_active_txn(
+    sessions: &SessionStore,
+    session_id: SessionId,
+) -> Result<(), SavepointError> {
+    if sessions.transaction_state(session_id) == TransactionState::Idle {
         return Err(SavepointError::NoActiveTransaction);
     }
     Ok(())
@@ -92,13 +95,13 @@ fn decode_markers(payload: Option<Vec<u8>>) -> (usize, usize) {
 /// marker map is empty.
 pub async fn run_savepoint(
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     tenant_id: TenantId,
     dp: &impl TxnDataPlane,
     name: &str,
 ) -> Result<(), SavepointError> {
-    require_active_txn(sessions, addr)?;
-    let (txn_id, vshards) = sessions.txn_identity(addr);
+    require_active_txn(sessions, session_id)?;
+    let (txn_id, vshards) = sessions.txn_identity(session_id);
     let mut markers: BTreeMap<VShardId, (usize, usize)> = BTreeMap::new();
     if let Some(txn_id) = txn_id {
         for vshard_id in vshards {
@@ -112,7 +115,7 @@ pub async fn run_savepoint(
             markers.insert(vshard_id, decode_markers(payload));
         }
     }
-    sessions.create_savepoint(addr, name.to_string(), markers);
+    sessions.create_savepoint(session_id, name.to_string(), markers);
     Ok(())
 }
 
@@ -123,12 +126,12 @@ pub async fn run_savepoint(
 /// Data-Plane meta-op is dispatched.
 pub fn run_release_savepoint(
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     name: &str,
 ) -> Result<(), SavepointError> {
-    require_active_txn(sessions, addr)?;
+    require_active_txn(sessions, session_id)?;
     sessions
-        .release_savepoint(addr, name)
+        .release_savepoint(session_id, name)
         .map_err(|e| SavepointError::NotFound {
             message: e.to_string(),
         })
@@ -145,19 +148,18 @@ pub fn run_release_savepoint(
 /// writes.
 pub async fn run_rollback_to_savepoint(
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     tenant_id: TenantId,
     dp: &impl TxnDataPlane,
     name: &str,
 ) -> Result<(), SavepointError> {
-    require_active_txn(sessions, addr)?;
-    let markers =
-        sessions
-            .rollback_to_savepoint(addr, name)
-            .map_err(|e| SavepointError::NotFound {
-                message: e.to_string(),
-            })?;
-    let (txn_id, vshards) = sessions.txn_identity(addr);
+    require_active_txn(sessions, session_id)?;
+    let markers = sessions
+        .rollback_to_savepoint(session_id, name)
+        .map_err(|e| SavepointError::NotFound {
+            message: e.to_string(),
+        })?;
+    let (txn_id, vshards) = sessions.txn_identity(session_id);
     if let Some(txn_id) = txn_id {
         for vshard_id in vshards {
             let (value_marker, graph_marker) = markers.get(&vshard_id).copied().unwrap_or((0, 0));

@@ -6,8 +6,8 @@
 //! Separate from wire-level prepared statements managed by pgwire crate's
 //! internal PortalStore — those are handled via Parse/Bind/Execute messages.
 
+use super::connection::SessionId;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 
 use super::store::SessionStore;
 
@@ -116,7 +116,7 @@ impl SessionStore {
     /// Store a SQL-level prepared statement in the session.
     pub fn prepare_sql_statement(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         name: String,
         stmt: SqlPreparedStatement,
     ) -> Result<(), PreparedCacheError> {
@@ -125,18 +125,22 @@ impl SessionStore {
     }
 
     /// Get a SQL-level prepared statement from the session.
-    pub fn get_sql_prepared(&self, addr: &SocketAddr, name: &str) -> Option<SqlPreparedStatement> {
+    pub fn get_sql_prepared(
+        &self,
+        addr: impl Into<SessionId>,
+        name: &str,
+    ) -> Option<SqlPreparedStatement> {
         self.read_session(addr, |session| session.prepared_stmts.get(name).cloned())?
     }
 
     /// Remove a SQL-level prepared statement. Returns true if it existed.
-    pub fn deallocate_sql_prepared(&self, addr: &SocketAddr, name: &str) -> bool {
+    pub fn deallocate_sql_prepared(&self, addr: impl Into<SessionId>, name: &str) -> bool {
         self.write_session(addr, |session| session.prepared_stmts.remove(name))
             .unwrap_or(false)
     }
 
     /// Remove all SQL-level prepared statements from the session.
-    pub fn deallocate_all_sql_prepared(&self, addr: &SocketAddr) {
+    pub fn deallocate_all_sql_prepared(&self, addr: impl Into<SessionId>) {
         self.write_session(addr, |session| session.prepared_stmts.clear());
     }
 }

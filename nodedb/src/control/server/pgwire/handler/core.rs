@@ -29,7 +29,8 @@ use crate::types::RequestId;
 use super::super::types::notice_warning;
 use super::in_flight::InFlightGuard;
 use super::prepared::{NodeDbQueryParser, ParsedStatement};
-use crate::control::server::shared::session::SessionStore;
+use crate::control::server::pgwire::connection_registry::ConnectionRegistry;
+use crate::control::server::shared::session::{ConnectionId, SessionId, SessionStore};
 
 mod simple_query;
 
@@ -50,6 +51,8 @@ pub struct NodeDbPgHandler {
     pub(crate) sessions: Arc<SessionStore>,
     /// Per-connection in-flight COPY IN restore accumulators.
     pub(crate) restore_state: Arc<crate::control::backup::RestoreState>,
+    pub(crate) registry: Arc<ConnectionRegistry>,
+    pub(crate) session_id: SessionId,
 }
 
 impl NodeDbPgHandler {
@@ -66,6 +69,7 @@ impl NodeDbPgHandler {
             Arc::clone(&state),
             auth_mode.clone(),
             Arc::clone(&sessions),
+            SessionId::LegacySocket(([0, 0, 0, 0], 0).into()),
         ));
         Self {
             state,
@@ -74,6 +78,39 @@ impl NodeDbPgHandler {
             auth_mode,
             sessions,
             restore_state: Arc::new(crate::control::backup::RestoreState::new()),
+            registry: Arc::new(ConnectionRegistry::new()),
+            session_id: SessionId::LegacySocket(([0, 0, 0, 0], 0).into()),
+        }
+    }
+
+    /// Build a handler dedicated to one accepted connection.
+    ///
+    /// `QueryContext` owns descriptor-lease state and is intentionally not
+    /// cloneable. Each connection therefore receives a fresh context while
+    /// sharing only explicitly shareable process state.
+    pub(crate) fn for_connection(
+        state: Arc<SharedState>,
+        auth_mode: AuthMode,
+        sessions: Arc<SessionStore>,
+        restore_state: Arc<crate::control::backup::RestoreState>,
+        registry: Arc<ConnectionRegistry>,
+        connection_id: ConnectionId,
+    ) -> Self {
+        let session_id = SessionId::Connection(connection_id);
+        Self {
+            query_ctx: QueryContext::for_state_with_lease(&state),
+            query_parser: Arc::new(NodeDbQueryParser::new(
+                Arc::clone(&state),
+                auth_mode.clone(),
+                Arc::clone(&sessions),
+                session_id,
+            )),
+            state,
+            auth_mode,
+            sessions,
+            restore_state,
+            registry,
+            session_id,
         }
     }
 
@@ -95,14 +132,14 @@ impl NodeDbPgHandler {
     pub(crate) fn resolve_identity<C: ClientInfo>(
         &self,
         client: &C,
-        addr: &std::net::SocketAddr,
+        session_id: &SessionId,
     ) -> PgWireResult<AuthenticatedIdentity> {
         super::auth::resolve_session_identity(
             &self.state,
             self.auth_mode.clone(),
             &self.sessions,
             client,
-            addr,
+            session_id,
         )
     }
 }
@@ -130,14 +167,14 @@ impl ExtendedQueryHandler for NodeDbPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let addr = client.socket_addr();
+        let session_id = self.session_id;
         // Keep long-running prepared statements ineligible for idle teardown.
-        let _in_flight = InFlightGuard::new(&self.sessions, addr);
+        let _in_flight = InFlightGuard::new(&self.sessions, session_id);
 
         let result = self.execute_prepared(client, portal, max_rows).await;
         // Mirror the simple-query path: surface any queued NOTICE messages
         // (e.g. `truncated_before_horizon`) before returning.
-        for message in self.sessions.drain_notices(&addr) {
+        for message in self.sessions.drain_notices(session_id) {
             let notice = notice_warning(&message);
             let _ = client
                 .send(PgWireBackendMessage::NoticeResponse(notice))

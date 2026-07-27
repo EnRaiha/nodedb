@@ -2,6 +2,7 @@
 
 //! Integration tests for session store (transaction lifecycle, params, cursors, live).
 
+use crate::control::server::shared::session::SessionId;
 use crate::control::server::shared::session::state::TransactionState;
 use crate::control::server::shared::session::store::SessionStore;
 
@@ -11,20 +12,20 @@ fn transaction_lifecycle() {
     let addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
     store.ensure_session(addr);
 
-    assert_eq!(store.transaction_state(&addr), TransactionState::Idle);
+    assert_eq!(store.transaction_state(addr), TransactionState::Idle);
 
-    store.begin(&addr, crate::types::Lsn::new(1), 0).unwrap();
-    assert_eq!(store.transaction_state(&addr), TransactionState::InBlock);
+    store.begin(addr, crate::types::Lsn::new(1), 0).unwrap();
+    assert_eq!(store.transaction_state(addr), TransactionState::InBlock);
 
-    store.commit(&addr).unwrap();
-    assert_eq!(store.transaction_state(&addr), TransactionState::Idle);
+    store.commit(addr).unwrap();
+    assert_eq!(store.transaction_state(addr), TransactionState::Idle);
 
-    store.begin(&addr, crate::types::Lsn::new(1), 0).unwrap();
-    store.fail_transaction(&addr);
-    assert_eq!(store.transaction_state(&addr), TransactionState::Failed);
+    store.begin(addr, crate::types::Lsn::new(1), 0).unwrap();
+    store.fail_transaction(addr);
+    assert_eq!(store.transaction_state(addr), TransactionState::Failed);
 
-    store.rollback(&addr).unwrap();
-    assert_eq!(store.transaction_state(&addr), TransactionState::Idle);
+    store.rollback(addr).unwrap();
+    assert_eq!(store.transaction_state(addr), TransactionState::Idle);
 }
 
 #[test]
@@ -34,13 +35,13 @@ fn session_parameters() {
     store.ensure_session(addr);
 
     assert_eq!(
-        store.get_parameter(&addr, "client_encoding"),
+        store.get_parameter(addr, "client_encoding"),
         Some("UTF8".into())
     );
 
-    store.set_parameter(&addr, "application_name".into(), "test_app".into());
+    store.set_parameter(addr, "application_name".into(), "test_app".into());
     assert_eq!(
-        store.get_parameter(&addr, "application_name"),
+        store.get_parameter(addr, "application_name"),
         Some("test_app".into())
     );
 }
@@ -52,7 +53,7 @@ fn session_cleanup() {
     store.ensure_session(addr);
     assert_eq!(store.count(), 1);
 
-    store.remove(&addr);
+    store.remove(addr);
     assert_eq!(store.count(), 0);
 }
 
@@ -62,13 +63,13 @@ fn live_subscription_store_and_check() {
     let addr: std::net::SocketAddr = "127.0.0.1:5001".parse().unwrap();
     store.ensure_session(addr);
 
-    assert!(!store.has_live_subscriptions(&addr));
+    assert!(!store.has_live_subscriptions(addr));
 
     let stream = crate::control::change_stream::ChangeStream::new(64);
     let sub = stream.subscribe(Some("orders".into()), None);
-    store.add_live_subscription(&addr, "live_orders".into(), sub);
+    store.add_live_subscription(addr, "live_orders".into(), sub);
 
-    assert!(store.has_live_subscriptions(&addr));
+    assert!(store.has_live_subscriptions(addr));
 }
 
 #[test]
@@ -79,10 +80,10 @@ fn live_subscription_drain_empty() {
 
     let stream = crate::control::change_stream::ChangeStream::new(64);
     let sub = stream.subscribe(Some("orders".into()), None);
-    store.add_live_subscription(&addr, "live_orders".into(), sub);
+    store.add_live_subscription(addr, "live_orders".into(), sub);
 
     // No events published — drain returns empty.
-    let notifications = store.drain_live_notifications(&addr);
+    let notifications = store.drain_live_notifications(addr);
     assert!(notifications.is_empty());
 }
 
@@ -94,7 +95,7 @@ fn live_subscription_drain_receives_events() {
 
     let stream = crate::control::change_stream::ChangeStream::new(64);
     let sub = stream.subscribe(Some("orders".into()), None);
-    store.add_live_subscription(&addr, "live_orders".into(), sub);
+    store.add_live_subscription(addr, "live_orders".into(), sub);
 
     // Publish a matching event.
     stream.publish(crate::control::change_stream::ChangeEvent {
@@ -107,7 +108,7 @@ fn live_subscription_drain_receives_events() {
         after: None,
     });
 
-    let notifications = store.drain_live_notifications(&addr);
+    let notifications = store.drain_live_notifications(addr);
     assert_eq!(notifications.len(), 1);
     assert_eq!(notifications[0].0, "live_orders");
     assert_eq!(notifications[0].1, "INSERT:o42");
@@ -121,7 +122,7 @@ fn live_subscription_filters_by_collection() {
 
     let stream = crate::control::change_stream::ChangeStream::new(64);
     let sub = stream.subscribe(Some("orders".into()), None);
-    store.add_live_subscription(&addr, "live_orders".into(), sub);
+    store.add_live_subscription(addr, "live_orders".into(), sub);
 
     // Publish event for a different collection — should be filtered out.
     stream.publish(crate::control::change_stream::ChangeEvent {
@@ -134,7 +135,7 @@ fn live_subscription_filters_by_collection() {
         after: None,
     });
 
-    let notifications = store.drain_live_notifications(&addr);
+    let notifications = store.drain_live_notifications(addr);
     assert!(notifications.is_empty());
 }
 
@@ -143,9 +144,9 @@ fn live_subscription_no_session_returns_empty() {
     let store = SessionStore::new();
     let addr: std::net::SocketAddr = "127.0.0.1:5005".parse().unwrap();
     // No session created — should return empty, not panic.
-    let notifications = store.drain_live_notifications(&addr);
+    let notifications = store.drain_live_notifications(addr);
     assert!(notifications.is_empty());
-    assert!(!store.has_live_subscriptions(&addr));
+    assert!(!store.has_live_subscriptions(addr));
 }
 
 /// `run_begin` anchors the session's cross-shard snapshot to the last
@@ -171,15 +172,15 @@ async fn run_begin_anchors_snapshot_epoch() {
 
     // Seed the applied epoch to 7 and BEGIN — the session anchors to 7.
     state.last_applied_calvin_epoch.store(7, Ordering::Release);
-    run_begin(&store, &addr, &state).unwrap();
-    assert_eq!(store.snapshot_epoch(&addr), Some(7));
-    store.commit(&addr).unwrap();
-    assert_eq!(store.snapshot_epoch(&addr), None);
+    run_begin(&store, SessionId::from(&addr), &state).unwrap();
+    assert_eq!(store.snapshot_epoch(addr), Some(7));
+    store.commit(addr).unwrap();
+    assert_eq!(store.snapshot_epoch(addr), None);
 
     // Unset (single-node / no-Calvin): BEGIN anchors to 0.
     state.last_applied_calvin_epoch.store(0, Ordering::Release);
-    run_begin(&store, &addr, &state).unwrap();
-    assert_eq!(store.snapshot_epoch(&addr), Some(0));
+    run_begin(&store, SessionId::from(&addr), &state).unwrap();
+    assert_eq!(store.snapshot_epoch(addr), Some(0));
 }
 
 // ── Multi-vShard overlay teardown + per-vShard savepoint markers ──
@@ -291,15 +292,15 @@ async fn multi_vshard_rollback_drops_every_overlay() {
     let store = SessionStore::new();
     let addr: std::net::SocketAddr = "127.0.0.1:5200".parse().unwrap();
     store.ensure_session(addr);
-    run_begin(&store, &addr, &state).unwrap();
+    run_begin(&store, SessionId::from(&addr), &state).unwrap();
 
     // Stage to two distinct vShards/cores.
-    assert!(store.buffer_write(&addr, staged_task(3)));
-    assert!(store.buffer_write(&addr, staged_task(9)));
+    assert!(store.buffer_write(addr, staged_task(3)));
+    assert!(store.buffer_write(addr, staged_task(9)));
 
     let identity = test_identity();
     let dp = RecordingDp::default();
-    run_rollback(&store, &addr, &identity, &state, &dp).await;
+    run_rollback(&store, SessionId::from(&addr), &identity, &state, &dp).await;
 
     let ops = dp.ops.lock().unwrap();
     let drops: Vec<VShardId> = ops
@@ -322,21 +323,21 @@ async fn multi_vshard_rollback_to_savepoint_rewinds_each_vshard() {
     let store = SessionStore::new();
     let addr: std::net::SocketAddr = "127.0.0.1:5201".parse().unwrap();
     store.ensure_session(addr);
-    store.begin(&addr, Lsn::new(1), 0).unwrap();
+    store.begin(addr, Lsn::new(1), 0).unwrap();
     let tenant = TenantId::new(1);
     let dp = RecordingDp::default();
 
     // Stage on core A (3), then SAVEPOINT — only A is marked.
-    assert!(store.buffer_write(&addr, staged_task(3)));
-    savepoint_ops::run_savepoint(&store, &addr, tenant, &dp, "s1")
+    assert!(store.buffer_write(addr, staged_task(3)));
+    savepoint_ops::run_savepoint(&store, SessionId::from(&addr), tenant, &dp, "s1")
         .await
         .expect("savepoint");
 
     // Stage on core B (9) AFTER the savepoint.
-    assert!(store.buffer_write(&addr, staged_task(9)));
+    assert!(store.buffer_write(addr, staged_task(9)));
 
     // ROLLBACK TO s1 — A rewinds to its saved marker, B rewinds to (0, 0).
-    savepoint_ops::run_rollback_to_savepoint(&store, &addr, tenant, &dp, "s1")
+    savepoint_ops::run_rollback_to_savepoint(&store, SessionId::from(&addr), tenant, &dp, "s1")
         .await
         .expect("rollback to savepoint");
 

@@ -12,7 +12,7 @@ use pgwire::api::auth::DefaultServerParameterProvider;
 /// compatible PostgreSQL version so libpq can parse it, followed by NodeDB's
 /// build identity.
 #[derive(Debug)]
-pub(super) struct NodeDbParameterProvider {
+pub(crate) struct NodeDbParameterProvider {
     inner: DefaultServerParameterProvider,
 }
 

@@ -38,12 +38,12 @@ fn insecure_counter_guard() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+use nodedb_cluster::topology::{ClusterTopology, NodeInfo, NodeState};
 use nodedb_cluster::transport::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use nodedb_cluster::{
     MacKey, NexarTransport, RaftRpcHandler, TlsCredentials, TransportCredentials,
     generate_node_credentials, insecure_transport_count, spki_pin_from_cert_der,
 };
-use nodedb_cluster::topology::{ClusterTopology, NodeInfo, NodeState};
 use nodedb_raft::message::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteResponse};
 use nodedb_raft::transport::RaftTransport;
 

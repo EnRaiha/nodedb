@@ -11,14 +11,12 @@
 //! diverging — a GUC honored on pgwire but silently dropped on native (the
 //! canonical transport) is a real parity defect, not a cosmetic one.
 
-use std::net::SocketAddr;
-
 use crate::control::planner::context::QueryContext;
 use crate::control::planner::context::query::DEFAULT_SHUFFLE_AGG_THRESHOLD;
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::session::SessionStore;
+use super::session::{SessionId, SessionStore};
 
 /// Parse a PostgreSQL-style boolean session value. Returns `None` for any value
 /// that is not a recognized boolean spelling, so a SET handler can reject it
@@ -69,9 +67,10 @@ pub fn apply_planning_session_overrides(
     query_ctx: &QueryContext,
     sessions: &SessionStore,
     state: &SharedState,
-    addr: &SocketAddr,
+    session_id: impl Into<SessionId>,
     tenant_id: TenantId,
 ) -> PlanningOverrideFlags {
+    let session_id = session_id.into();
     // Propagate the tenant's vector-dimension quota so ConvertContext can reject
     // oversized vectors without an extra lock inside the planner.
     {
@@ -85,12 +84,12 @@ pub fn apply_planning_session_overrides(
     // Distributed shuffle-join override (`SET nodedb.force_shuffle_join = on`
     // and, optionally, `SET nodedb.shuffle_num_parts = N`).
     let force_shuffle_join = sessions
-        .get_parameter(addr, "nodedb.force_shuffle_join")
+        .get_parameter(session_id, "nodedb.force_shuffle_join")
         .as_deref()
         .and_then(parse_bool_session_value)
         .unwrap_or(false);
     let shuffle_num_parts = sessions
-        .get_parameter(addr, "nodedb.shuffle_num_parts")
+        .get_parameter(session_id, "nodedb.shuffle_num_parts")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
     query_ctx.set_force_shuffle_join(force_shuffle_join, shuffle_num_parts);
@@ -98,12 +97,12 @@ pub fn apply_planning_session_overrides(
     // Distributed shuffle-aggregate override (`SET nodedb.force_shuffle_agg = on`
     // and, optionally, `SET nodedb.shuffle_agg_num_parts = N`).
     let force_shuffle_agg = sessions
-        .get_parameter(addr, "nodedb.force_shuffle_agg")
+        .get_parameter(session_id, "nodedb.force_shuffle_agg")
         .as_deref()
         .and_then(parse_bool_session_value)
         .unwrap_or(false);
     let shuffle_agg_num_parts = sessions
-        .get_parameter(addr, "nodedb.shuffle_agg_num_parts")
+        .get_parameter(session_id, "nodedb.shuffle_agg_num_parts")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0);
     query_ctx.set_force_shuffle_agg(force_shuffle_agg, shuffle_agg_num_parts);
@@ -115,7 +114,7 @@ pub fn apply_planning_session_overrides(
     // revert to the tuning default for this session.
     let tuning_threshold = state.tuning.cluster_transport.broadcast_threshold_bytes;
     let session_threshold = sessions
-        .get_parameter(addr, "nodedb.broadcast_threshold_bytes")
+        .get_parameter(session_id, "nodedb.broadcast_threshold_bytes")
         .and_then(|v| v.parse::<usize>().ok());
     let broadcast_threshold_bytes = session_threshold.unwrap_or(tuning_threshold);
     query_ctx.set_broadcast_threshold_bytes(broadcast_threshold_bytes);
@@ -125,7 +124,7 @@ pub fn apply_planning_session_overrides(
     // default. Passing the resolved value keeps a SET then RESET reverting to the
     // default. Mirrors `broadcast_threshold_bytes`.
     let session_agg_threshold = sessions
-        .get_parameter(addr, "nodedb.shuffle_agg_threshold")
+        .get_parameter(session_id, "nodedb.shuffle_agg_threshold")
         .and_then(|v| v.parse::<usize>().ok());
     let shuffle_agg_threshold = session_agg_threshold.unwrap_or(DEFAULT_SHUFFLE_AGG_THRESHOLD);
     query_ctx.set_shuffle_agg_threshold(shuffle_agg_threshold);

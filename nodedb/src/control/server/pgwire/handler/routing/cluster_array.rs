@@ -16,6 +16,7 @@ use nodedb_physical::physical_plan::{ClusterArrayOp, PhysicalPlan};
 use crate::control::server::dispatch_utils::publish_cluster_array_change_events;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::schema::OutputSchema;
+use crate::control::server::shared::session::SessionId;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
@@ -25,7 +26,7 @@ use super::super::shape_encode;
 impl NodeDbPgHandler {
     /// Execute a single `ClusterArrayOp` via the `ArrayCoordinator` and shape
     /// its payload into one pgwire `Response`. Any carried notice is pushed to
-    /// the session for `addr`.
+    /// the supplied session.
     ///
     /// On a successful `Put`/`Delete` (writes; `Slice`/`Agg` are reads and
     /// publish nothing), publishes a CDC change event keyed by the op's own
@@ -38,7 +39,7 @@ impl NodeDbPgHandler {
         authorized: crate::control::server::shared::authorization::AuthorizedTask,
         projection: Option<&OutputSchema>,
         result_formats: &[FieldFormat],
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
     ) -> PgWireResult<Response> {
         use crate::control::cluster::ClusterArrayExecutor;
         use std::sync::Arc;
@@ -113,14 +114,14 @@ impl NodeDbPgHandler {
                 let (response, notice) =
                     shape_encode::shaped_query_response(shaped, result_formats);
                 if let Some(n) = notice {
-                    self.sessions.push_notice(addr, n);
+                    self.sessions.push_notice(session_id, n);
                 }
                 Ok(response)
             }
             ShapeOutcome::Passthrough => {
                 let shaped = payload_to_response(&payload_bytes, cluster_plan_kind)?;
                 if let Some(notice) = shaped.notice {
-                    self.sessions.push_notice(addr, notice);
+                    self.sessions.push_notice(session_id, notice);
                 }
                 Ok(shaped.response)
             }

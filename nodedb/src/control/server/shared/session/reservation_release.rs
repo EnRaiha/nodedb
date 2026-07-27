@@ -2,12 +2,11 @@
 
 //! Read-reservation release and abort teardown for graceful transaction exits.
 
-use std::net::SocketAddr;
-
 use nodedb_cluster::calvin::types::ReleaseReason;
 
 use crate::control::state::SharedState;
 
+use super::connection::SessionId;
 use super::store::SessionStore;
 
 /// Drain and release every read reservation this session holds, routing one
@@ -17,10 +16,10 @@ use super::store::SessionStore;
 pub(super) async fn release_session_reservations(
     state: &SharedState,
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     reason: ReleaseReason,
 ) {
-    let (owner, vshards) = sessions.take_reservations(addr);
+    let (owner, vshards) = sessions.take_reservations(session_id);
     let Some(owner) = owner else { return };
     for vshard in vshards {
         let _ = crate::control::planner::calvin::reservation::release_reservation(
@@ -41,16 +40,16 @@ pub(super) async fn release_session_reservations(
 pub(super) async fn release_and_rollback(
     state: &SharedState,
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
 ) {
-    release_session_reservations(state, sessions, addr, ReleaseReason::Abort).await;
-    rollback_with_gap_free(sessions, addr, state);
+    release_session_reservations(state, sessions, session_id, ReleaseReason::Abort).await;
+    rollback_with_gap_free(sessions, session_id, state);
 }
 
 /// Roll the session back to `Idle` and release any pending GAP_FREE sequence
 /// reservations.
-fn rollback_with_gap_free(sessions: &SessionStore, addr: &SocketAddr, state: &SharedState) {
-    if let Ok(reservations) = sessions.rollback(addr) {
+fn rollback_with_gap_free(sessions: &SessionStore, session_id: SessionId, state: &SharedState) {
+    if let Ok(reservations) = sessions.rollback(session_id) {
         for handle in &reservations {
             let key = handle.sequence_key.clone();
             let registry = &state.sequence_registry;

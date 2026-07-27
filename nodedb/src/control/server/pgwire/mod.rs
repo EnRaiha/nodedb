@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 pub mod catalog;
+pub(crate) mod connection;
+pub(crate) mod connection_identity;
+pub(crate) mod connection_registry;
 pub mod ddl;
 pub mod ddl_encode;
 pub mod factory;

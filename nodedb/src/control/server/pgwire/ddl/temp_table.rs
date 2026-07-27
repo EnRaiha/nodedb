@@ -12,8 +12,8 @@ use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::session::SessionStore;
 use crate::control::server::shared::session::temp_tables::{OnCommitAction, TempTableEntry};
+use crate::control::server::shared::session::{SessionId, SessionStore};
 
 /// Handle `CREATE TEMPORARY TABLE name (col1 type1, ...) [ON COMMIT ...]`.
 ///
@@ -22,7 +22,7 @@ use crate::control::server::shared::session::temp_tables::{OnCommitAction, TempT
 pub fn create_temp_table(
     sessions: &SessionStore,
     identity: &AuthenticatedIdentity,
-    addr: &std::net::SocketAddr,
+    session_id: SessionId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let upper = sql.to_uppercase();
@@ -47,7 +47,7 @@ pub fn create_temp_table(
         })?
         .to_lowercase();
 
-    if sessions.has_temp_table(addr, &name) {
+    if sessions.has_temp_table(session_id, &name) {
         return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_owned(),
             "42P07".to_owned(),
@@ -67,7 +67,7 @@ pub fn create_temp_table(
     let schema = Arc::new(parse_temp_table_schema(sql)?);
 
     sessions.register_temp_table(
-        addr,
+        session_id,
         name.clone(),
         TempTableEntry {
             schema,
@@ -85,11 +85,11 @@ pub fn create_temp_table(
 /// Returns `Some(response)` if the table was a temp table, `None` otherwise.
 pub fn drop_temp_table_if_exists(
     sessions: &SessionStore,
-    addr: &std::net::SocketAddr,
+    session_id: SessionId,
     name: &str,
 ) -> Option<PgWireResult<Vec<Response>>> {
-    if sessions.has_temp_table(addr, name) {
-        sessions.remove_temp_table(addr, name);
+    if sessions.has_temp_table(session_id, name) {
+        sessions.remove_temp_table(session_id, name);
         Some(Ok(vec![Response::Execution(Tag::new("DROP TABLE"))]))
     } else {
         None

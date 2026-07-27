@@ -2,8 +2,7 @@
 
 //! Server-side cursor methods on SessionStore.
 
-use std::net::SocketAddr;
-
+use super::connection::SessionId;
 use super::state::CursorState;
 use super::store::SessionStore;
 
@@ -11,7 +10,7 @@ impl SessionStore {
     /// Declare a cursor with pre-fetched results.
     pub fn declare_cursor(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         name: String,
         rows: Vec<String>,
         scrollable: bool,
@@ -33,7 +32,7 @@ impl SessionStore {
     /// Fetch N rows forward from a cursor. Returns (rows, exhausted).
     pub fn fetch_cursor(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         name: &str,
         count: usize,
     ) -> crate::Result<(Vec<String>, bool)> {
@@ -60,7 +59,11 @@ impl SessionStore {
     }
 
     /// Fetch all remaining rows from a cursor.
-    pub fn fetch_cursor_all(&self, addr: &SocketAddr, name: &str) -> crate::Result<Vec<String>> {
+    pub fn fetch_cursor_all(
+        &self,
+        addr: impl Into<SessionId>,
+        name: &str,
+    ) -> crate::Result<Vec<String>> {
         self.write_session(addr, |session| {
             let cursor = session
                 .cursors
@@ -83,7 +86,7 @@ impl SessionStore {
     /// Fetch N rows backward from a cursor (requires SCROLL).
     pub fn fetch_cursor_backward(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         name: &str,
         count: usize,
     ) -> crate::Result<Vec<String>> {
@@ -120,7 +123,7 @@ impl SessionStore {
     /// Move the cursor position without fetching data.
     pub fn move_cursor(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         name: &str,
         forward: bool,
         count: usize,
@@ -160,14 +163,14 @@ impl SessionStore {
     }
 
     /// Close a cursor.
-    pub fn close_cursor(&self, addr: &SocketAddr, name: &str) {
+    pub fn close_cursor(&self, addr: impl Into<SessionId>, name: &str) {
         self.write_session(addr, |session| {
             session.cursors.remove(name);
         });
     }
 
     /// Close all cursors that don't have WITH HOLD (called on transaction end).
-    pub fn close_non_hold_cursors(&self, addr: &SocketAddr) {
+    pub fn close_non_hold_cursors(&self, addr: impl Into<SessionId>) {
         self.write_session(addr, |session| {
             session.cursors.retain(|_, c| c.with_hold);
         });

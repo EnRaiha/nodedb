@@ -2,8 +2,8 @@
 
 //! Transaction lifecycle methods on SessionStore.
 
+use super::connection::SessionId;
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nodedb_cluster::calvin::types::TxnIdWire;
@@ -23,7 +23,7 @@ static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
 
 impl SessionStore {
     /// Get transaction state for a connection.
-    pub fn transaction_state(&self, addr: &SocketAddr) -> TransactionState {
+    pub fn transaction_state(&self, addr: impl Into<SessionId>) -> TransactionState {
         self.read_session(addr, |s| s.tx_state)
             .unwrap_or(TransactionState::Idle)
     }
@@ -36,7 +36,7 @@ impl SessionStore {
     /// data as of this LSN.
     pub fn begin(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         current_lsn: Lsn,
         snapshot_epoch: u64,
     ) -> Result<(), &'static str> {
@@ -70,7 +70,7 @@ impl SessionStore {
     /// hands them here. Guarded on the connection being inside a transaction
     /// block — outside one, the entries are dropped (autocommit reads never
     /// enter validation).
-    pub fn record_read_entries(&self, addr: &SocketAddr, entries: Vec<ReadSetEntry>) {
+    pub fn record_read_entries(&self, addr: impl Into<SessionId>, entries: Vec<ReadSetEntry>) {
         if entries.is_empty() {
             return;
         }
@@ -85,7 +85,7 @@ impl SessionStore {
     /// the `tx_state == InBlock` gate the read-set recording uses internally, so
     /// the hot-key reservation seam can skip autocommit reads without duplicating
     /// the predicate.
-    pub fn is_in_transaction_block(&self, addr: &SocketAddr) -> bool {
+    pub fn is_in_transaction_block(&self, addr: impl Into<SessionId>) -> bool {
         self.read_session(addr, |s| s.tx_state == TransactionState::InBlock)
             .unwrap_or(false)
     }
@@ -93,7 +93,7 @@ impl SessionStore {
     /// The reservation owner id minted for the current transaction, if a hot-key
     /// read has already reserved one. `None` before the first hot-key read (or
     /// outside a transaction block). Short lock scope — reads and drops.
-    pub fn current_reservation_owner(&self, addr: &SocketAddr) -> Option<TxnIdWire> {
+    pub fn current_reservation_owner(&self, addr: impl Into<SessionId>) -> Option<TxnIdWire> {
         self.read_session(addr, |s| s.tx_reservation_owner)
             .flatten()
     }
@@ -103,7 +103,7 @@ impl SessionStore {
     /// and, on the FIRST reservation, adopts `owner` as the transaction's single
     /// reservation owner so every later hot-key read reuses the same `lock_owner`.
     /// Short lock scope — mutates and drops.
-    pub fn record_reservation(&self, addr: &SocketAddr, vshard: u32, owner: TxnIdWire) {
+    pub fn record_reservation(&self, addr: impl Into<SessionId>, vshard: u32, owner: TxnIdWire) {
         self.write_session(addr, |session| {
             session.tx_reservation_vshards.insert(vshard);
             if session.tx_reservation_owner.is_none() {
@@ -118,7 +118,7 @@ impl SessionStore {
     /// lock scope, no await held — the async release routes one
     /// `ReleaseReservation` per vShard AFTER this returns. Draining makes a repeat
     /// call a no-op, so two graceful-exit paths releasing is idempotent.
-    pub fn take_reservations(&self, addr: &SocketAddr) -> (Option<TxnIdWire>, Vec<u32>) {
+    pub fn take_reservations(&self, addr: impl Into<SessionId>) -> (Option<TxnIdWire>, Vec<u32>) {
         self.write_session(addr, |session| {
             let owner = session.tx_reservation_owner.take();
             let vshards = std::mem::take(&mut session.tx_reservation_vshards)
@@ -130,18 +130,18 @@ impl SessionStore {
     }
 
     /// Get the snapshot LSN for the current transaction.
-    pub fn snapshot_lsn(&self, addr: &SocketAddr) -> Option<Lsn> {
+    pub fn snapshot_lsn(&self, addr: impl Into<SessionId>) -> Option<Lsn> {
         self.read_session(addr, |s| s.tx_snapshot_lsn)?
     }
 
     /// Get the cross-shard snapshot epoch for the current transaction.
-    pub fn snapshot_epoch(&self, addr: &SocketAddr) -> Option<u64> {
+    pub fn snapshot_epoch(&self, addr: impl Into<SessionId>) -> Option<u64> {
         self.read_session(addr, |s| s.tx_snapshot_epoch)?
     }
 
     /// Current transaction's overlay id, for stamping a `StageWrite` task
     /// before it is dispatched. `None` outside a transaction block.
-    pub fn tx_id(&self, addr: &SocketAddr) -> Option<TxnId> {
+    pub fn tx_id(&self, addr: impl Into<SessionId>) -> Option<TxnId> {
         self.read_session(addr, |s| s.tx_id).flatten()
     }
 
@@ -151,7 +151,7 @@ impl SessionStore {
     /// `MetaOp::DropTxnOverlay` to EVERY vShard hosting a staging overlay, and by
     /// savepoint mark/rewind to fan the overlay meta-op over all staged vShards.
     /// The returned Vec is empty when no write has staged yet.
-    pub fn txn_identity(&self, addr: &SocketAddr) -> (Option<TxnId>, Vec<VShardId>) {
+    pub fn txn_identity(&self, addr: impl Into<SessionId>) -> (Option<TxnId>, Vec<VShardId>) {
         self.read_session(addr, |s| (s.tx_id, s.tx_vshards.iter().copied().collect()))
             .unwrap_or((None, Vec::new()))
     }
@@ -162,7 +162,7 @@ impl SessionStore {
     /// (a read-your-own-write is not a serialization conflict).
     pub fn buffered_collections<F>(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         extract: F,
     ) -> std::collections::HashSet<String>
     where
@@ -181,13 +181,13 @@ impl SessionStore {
     /// them or transitioning session state, so COMMIT can classify dispatch off
     /// the buffered writes while still holding the option to `rollback` on a
     /// conflict. `commit()` remains the consuming drain.
-    pub fn buffered_tasks(&self, addr: &SocketAddr) -> Vec<PhysicalTask> {
+    pub fn buffered_tasks(&self, addr: impl Into<SessionId>) -> Vec<PhysicalTask> {
         self.read_session(addr, |s| s.tx_buffer.clone())
             .unwrap_or_default()
     }
 
     /// Drain the read-set for conflict checking at COMMIT time.
-    pub fn take_read_set(&self, addr: &SocketAddr) -> Vec<ReadSetEntry> {
+    pub fn take_read_set(&self, addr: impl Into<SessionId>) -> Vec<ReadSetEntry> {
         self.write_session(addr, |session| std::mem::take(&mut session.tx_read_set))
             .unwrap_or_default()
     }
@@ -195,7 +195,7 @@ impl SessionStore {
     /// COMMIT — drain the write buffer and pending offset commits, return to idle.
     ///
     /// Returns the buffered write tasks for atomic dispatch.
-    pub fn commit(&self, addr: &SocketAddr) -> Result<Vec<PhysicalTask>, &'static str> {
+    pub fn commit(&self, addr: impl Into<SessionId>) -> Result<Vec<PhysicalTask>, &'static str> {
         self.write_session(addr, |session| {
             let buffer = std::mem::take(&mut session.tx_buffer);
             session.tx_state = TransactionState::Idle;
@@ -217,7 +217,7 @@ impl SessionStore {
     /// Take pending GAP_FREE sequence reservations (called after successful COMMIT).
     pub fn take_pending_reservations(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
     ) -> Vec<crate::control::sequence::gap_free::ReservationHandle> {
         self.write_session(addr, |session| {
             std::mem::take(&mut session.pending_sequence_reservations)
@@ -226,7 +226,10 @@ impl SessionStore {
     }
 
     /// Take pending offset commits (called after successful COMMIT dispatch).
-    pub fn take_pending_offsets(&self, addr: &SocketAddr) -> Vec<(u64, String, String, u32, u64)> {
+    pub fn take_pending_offsets(
+        &self,
+        addr: impl Into<SessionId>,
+    ) -> Vec<(u64, String, String, u32, u64)> {
         self.write_session(addr, |session| {
             std::mem::take(&mut session.pending_offset_commits)
         })
@@ -238,7 +241,7 @@ impl SessionStore {
     /// Returns `true` if deferred (in transaction), `false` if not (commit immediately).
     pub fn defer_offset_commit(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         tenant_id: u64,
         stream: String,
         group: String,
@@ -266,7 +269,7 @@ impl SessionStore {
     /// against `buffer_write`'s own lock.
     ///
     /// Returns `true` if buffered (in transaction), `false` if not (dispatch immediately).
-    pub fn buffer_write(&self, addr: &SocketAddr, mut task: PhysicalTask) -> bool {
+    pub fn buffer_write(&self, addr: impl Into<SessionId>, mut task: PhysicalTask) -> bool {
         self.write_session(addr, |session| {
             if session.tx_state == TransactionState::InBlock {
                 task.txn_id = session.tx_id;
@@ -284,7 +287,7 @@ impl SessionStore {
     /// Returns any pending GAP_FREE reservations that need to be rolled back.
     pub fn rollback(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
     ) -> Result<Vec<crate::control::sequence::gap_free::ReservationHandle>, &'static str> {
         let reservations = self
             .write_session(addr, |session| {
@@ -306,7 +309,7 @@ impl SessionStore {
     }
 
     /// Mark the current transaction as failed (after a query error inside BEGIN).
-    pub fn fail_transaction(&self, addr: &SocketAddr) {
+    pub fn fail_transaction(&self, addr: impl Into<SessionId>) {
         self.write_session(addr, |session| {
             if session.tx_state == TransactionState::InBlock {
                 session.tx_state = TransactionState::Failed;
@@ -322,7 +325,7 @@ impl SessionStore {
     /// overlay to exactly this point.
     pub fn create_savepoint(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         name: String,
         markers: BTreeMap<VShardId, (usize, usize)>,
     ) {
@@ -339,7 +342,7 @@ impl SessionStore {
     /// Release a savepoint: destroy the named savepoint and every savepoint
     /// established after it, keeping their buffered/staged effects (PostgreSQL
     /// semantics). Returns `Err` (SQLSTATE 3B001) if the name does not exist.
-    pub fn release_savepoint(&self, addr: &SocketAddr, name: &str) -> crate::Result<()> {
+    pub fn release_savepoint(&self, addr: impl Into<SessionId>, name: &str) -> crate::Result<()> {
         self.write_session(addr, |session| {
             let pos = session
                 .savepoints
@@ -367,7 +370,7 @@ impl SessionStore {
     /// Returns `Err` if the savepoint does not exist (matches PostgreSQL behavior).
     pub fn rollback_to_savepoint(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         name: &str,
     ) -> crate::Result<BTreeMap<VShardId, (usize, usize)>> {
         self.write_session(addr, |session| {

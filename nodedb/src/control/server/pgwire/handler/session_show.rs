@@ -8,6 +8,7 @@ use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
 use pgwire::error::{PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::SessionId;
 
 use super::super::types::text_field;
 use super::core::NodeDbPgHandler;
@@ -17,7 +18,7 @@ impl NodeDbPgHandler {
     pub(super) fn handle_show(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
         use crate::control::server::shared::session::parse_show_command;
@@ -35,7 +36,7 @@ impl NodeDbPgHandler {
         };
 
         if param == "all" {
-            return self.handle_show_all(addr);
+            return self.handle_show_all(session_id);
         }
 
         // `SHOW TENANT` (singular) reports the session's *effective* tenant —
@@ -46,7 +47,7 @@ impl NodeDbPgHandler {
         if param == "tenant" {
             let effective = self
                 .sessions
-                .get_effective_tenant_id(addr)
+                .get_effective_tenant_id(session_id)
                 .unwrap_or(identity.tenant_id);
             let name = self
                 .state
@@ -72,7 +73,7 @@ impl NodeDbPgHandler {
             ))]);
         }
 
-        let value = self.resolve_guc(addr, &param)?;
+        let value = self.resolve_guc(session_id, &param)?;
 
         let schema = Arc::new(vec![text_field(&param)]);
         let mut encoder = DataRowEncoder::new(schema.clone());
@@ -95,11 +96,7 @@ impl NodeDbPgHandler {
     /// swallowed as if they were unset session parameters; those commands
     /// are routed through the DDL / AST router before this handler is
     /// reached.
-    pub(super) fn resolve_guc(
-        &self,
-        addr: &std::net::SocketAddr,
-        param: &str,
-    ) -> PgWireResult<String> {
+    pub(super) fn resolve_guc(&self, session_id: SessionId, param: &str) -> PgWireResult<String> {
         use crate::control::server::shared::session::is_known_pg_runtime_parameter;
         use pgwire::error::ErrorInfo;
 
@@ -111,7 +108,7 @@ impl NodeDbPgHandler {
             "server_encoding" => Some("UTF8".into()),
             _ => None,
         };
-        let session_value = self.sessions.get_parameter(addr, param);
+        let session_value = self.sessions.get_parameter(session_id, param);
 
         match (builtin, session_value) {
             (Some(v), _) => Ok(v),
@@ -130,20 +127,17 @@ impl NodeDbPgHandler {
     }
 
     /// SHOW ALL — return all session parameters.
-    pub(super) fn handle_show_all(
-        &self,
-        addr: &std::net::SocketAddr,
-    ) -> PgWireResult<Vec<Response>> {
+    pub(super) fn handle_show_all(&self, session_id: SessionId) -> PgWireResult<Vec<Response>> {
         let schema = Arc::new(vec![text_field("name"), text_field("setting")]);
 
-        let params = self.sessions.all_parameters(addr);
+        let params = self.sessions.all_parameters(session_id);
         let mut rows = Vec::with_capacity(params.len());
         let mut encoder = DataRowEncoder::new(schema.clone());
 
         for (key, session_value) in &params {
             let value = match key.as_str() {
                 "server_version" | "server_version_num" | "server_encoding" => {
-                    self.resolve_guc(addr, key)?
+                    self.resolve_guc(session_id, key)?
                 }
                 _ => session_value.clone(),
             };

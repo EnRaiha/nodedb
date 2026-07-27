@@ -13,8 +13,6 @@
 //! - `NOTIFY` issued inside a `BEGIN` block is buffered until `COMMIT`
 //!   and silently dropped on `ROLLBACK`.
 
-use std::net::SocketAddr;
-
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -22,7 +20,7 @@ use crate::control::notify_bus::normalize_channel;
 use crate::control::security::identity::AuthenticatedIdentity;
 
 use super::core::NodeDbPgHandler;
-use crate::control::server::shared::session::TransactionState;
+use crate::control::server::shared::session::{SessionId, TransactionState};
 
 impl NodeDbPgHandler {
     /// Handle `LISTEN <channel>`.
@@ -32,7 +30,7 @@ impl NodeDbPgHandler {
     pub(super) fn handle_listen(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &SocketAddr,
+        session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
         let channel = parse_listen_channel(sql).ok_or_else(|| {
@@ -45,8 +43,12 @@ impl NodeDbPgHandler {
         let channel = normalize_channel(&channel);
         validate_channel_name(&channel)?;
 
-        self.sessions
-            .listen_channel(addr, identity.tenant_id, &channel, &self.state.notify_bus);
+        self.sessions.listen_channel(
+            session_id,
+            identity.tenant_id,
+            &channel,
+            &self.state.notify_bus,
+        );
         Ok(vec![Response::Execution(Tag::new("LISTEN"))])
     }
 
@@ -57,7 +59,7 @@ impl NodeDbPgHandler {
     pub(super) fn handle_notify(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &SocketAddr,
+        session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
         let (channel, payload) = parse_notify(sql).ok_or_else(|| {
@@ -72,10 +74,10 @@ impl NodeDbPgHandler {
         let channel = normalize_channel(&channel);
         validate_channel_name(&channel)?;
 
-        let tx_state = self.sessions.transaction_state(addr);
+        let tx_state = self.sessions.transaction_state(session_id);
         if tx_state == TransactionState::InBlock {
             // Buffer until COMMIT.
-            self.sessions.buffer_notify(addr, channel, payload);
+            self.sessions.buffer_notify(session_id, channel, payload);
         } else {
             // Fire immediately.
             self.state
@@ -89,13 +91,13 @@ impl NodeDbPgHandler {
     pub(super) fn handle_unlisten(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &SocketAddr,
+        session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
         let upper = sql.trim().to_uppercase();
         if upper == "UNLISTEN *" {
             self.sessions
-                .unlisten_all_channels(addr, identity.tenant_id, &self.state.notify_bus);
+                .unlisten_all_channels(session_id, &self.state.notify_bus);
         } else {
             let channel = parse_unlisten_channel(sql).ok_or_else(|| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -107,7 +109,7 @@ impl NodeDbPgHandler {
             let channel = normalize_channel(&channel);
             validate_channel_name(&channel)?;
             self.sessions.unlisten_channel(
-                addr,
+                session_id,
                 identity.tenant_id,
                 &channel,
                 &self.state.notify_bus,

@@ -74,7 +74,7 @@ pub(crate) fn handle_begin(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
     // ensure the session exists first (SQL "BEGIN" already does this in
     // `sql.rs` before calling here).
     ctx.sessions.ensure_session(*ctx.peer_addr);
-    match lifecycle::run_begin(ctx.sessions, ctx.peer_addr, ctx.state) {
+    match lifecycle::run_begin(ctx.sessions, ctx.peer_addr.into(), ctx.state) {
         Ok(()) => NativeResponse::status_row(seq, "BEGIN"),
         Err(e) => {
             let message = match &e {
@@ -88,7 +88,15 @@ pub(crate) fn handle_begin(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
 
 pub(crate) async fn handle_commit(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
     let dp = NativeTxnDp { state: ctx.state };
-    match commit::run_commit(ctx.sessions, ctx.peer_addr, ctx.identity, ctx.state, &dp).await {
+    match commit::run_commit(
+        ctx.sessions,
+        ctx.peer_addr.into(),
+        ctx.identity,
+        ctx.state,
+        &dp,
+    )
+    .await
+    {
         CommitOutcome::Committed => NativeResponse::status_row(seq, "COMMIT"),
         CommitOutcome::Aborted { reason } => commit_abort_to_native(seq, &reason),
     }
@@ -96,7 +104,14 @@ pub(crate) async fn handle_commit(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResp
 
 pub(crate) async fn handle_rollback(ctx: &DispatchCtx<'_>, seq: u64) -> NativeResponse {
     let dp = NativeTxnDp { state: ctx.state };
-    lifecycle::run_rollback(ctx.sessions, ctx.peer_addr, ctx.identity, ctx.state, &dp).await;
+    lifecycle::run_rollback(
+        ctx.sessions,
+        ctx.peer_addr.into(),
+        ctx.identity,
+        ctx.state,
+        &dp,
+    )
+    .await;
     NativeResponse::status_row(seq, "ROLLBACK")
 }
 

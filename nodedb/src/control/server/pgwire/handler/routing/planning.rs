@@ -8,6 +8,7 @@ use pgwire::api::results::Tag;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -29,7 +30,7 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         sql: &str,
         tenant_id: TenantId,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         params: &[nodedb_sql::ParamValue],
     ) -> PgWireResult<(
         Vec<PhysicalTask>,
@@ -37,44 +38,62 @@ impl NodeDbPgHandler {
         crate::control::lease::QueryLeaseScope,
     )> {
         // Resolve opaque session handle if SET LOCAL nodedb.auth_session is set.
+        // Network provenance is immutable accept-time metadata; all mutable
+        // session state remains keyed by the collision-free SessionId.
+        let peer_addr = match session_id {
+            SessionId::Connection(connection_id) => self
+                .sessions
+                .connection_metadata(connection_id)
+                .map(|metadata| metadata.peer_addr)
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_owned(),
+                        "XX000".to_owned(),
+                        "connection session metadata is unavailable".to_owned(),
+                    )))
+                })?,
+            SessionId::LegacySocket(peer_addr) => peer_addr,
+        };
         let caller_fp = crate::control::security::session_handle::ClientFingerprint::from_peer(
             identity.tenant_id,
-            addr,
+            &peer_addr,
         );
-        let conn_key = addr.to_string();
-        let mut auth_ctx =
-            if let Some(handle) = self.sessions.get_parameter(addr, "nodedb.auth_session") {
-                use crate::control::security::session_handle::ResolveOutcome;
-                match self
-                    .state
-                    .session_handles
-                    .resolve(&handle, &conn_key, &caller_fp)
-                {
-                    ResolveOutcome::Resolved(cached) => *cached,
-                    ResolveOutcome::RateLimited => {
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "FATAL".to_owned(),
-                            "53300".to_owned(),
-                            "session handle resolve rate limit exceeded on this \
+        let conn_key = format!("{session_id:?}");
+        let mut auth_ctx = if let Some(handle) = self
+            .sessions
+            .get_parameter(session_id, "nodedb.auth_session")
+        {
+            use crate::control::security::session_handle::ResolveOutcome;
+            match self
+                .state
+                .session_handles
+                .resolve(&handle, &conn_key, &caller_fp)
+            {
+                ResolveOutcome::Resolved(cached) => *cached,
+                ResolveOutcome::RateLimited => {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_owned(),
+                        "53300".to_owned(),
+                        "session handle resolve rate limit exceeded on this \
                          connection — closing"
-                                .to_owned(),
-                        ))));
-                    }
-                    ResolveOutcome::Miss => {
-                        crate::control::server::session_auth::build_auth_context_with_session(
-                            identity,
-                            &self.sessions,
-                            addr,
-                        )
-                    }
+                            .to_owned(),
+                    ))));
                 }
-            } else {
-                crate::control::server::session_auth::build_auth_context_with_session(
-                    identity,
-                    &self.sessions,
-                    addr,
-                )
-            };
+                ResolveOutcome::Miss => {
+                    crate::control::server::session_auth::build_auth_context_with_session(
+                        identity,
+                        &self.sessions,
+                        session_id,
+                    )
+                }
+            }
+        } else {
+            crate::control::server::session_auth::build_auth_context_with_session(
+                identity,
+                &self.sessions,
+                session_id,
+            )
+        };
 
         // Extract per-query ON DENY override.
         let clean_sql =
@@ -103,13 +122,13 @@ impl NodeDbPgHandler {
                 &self.query_ctx,
                 &self.sessions,
                 &self.state,
-                addr,
+                session_id,
                 tenant_id,
             );
 
         let database_id = self
             .sessions
-            .get_current_database(addr)
+            .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
         // Enforce general CHECK constraints for INSERT/UPDATE before planning.
@@ -135,9 +154,10 @@ impl NodeDbPgHandler {
             let state = Arc::clone(&self.state);
             let tenant = tenant_id.as_u64();
             let db = database_id;
-            self.sessions.get_cached_plan(addr, &clean_sql, move |id| {
-                current_descriptor_version(&state, tenant, db, id)
-            })
+            self.sessions
+                .get_cached_plan(session_id, &clean_sql, move |id| {
+                    current_descriptor_version(&state, tenant, db, id)
+                })
         };
 
         let (tasks, output_schema, lease_scope) = if !params.is_empty() {
@@ -210,7 +230,7 @@ impl NodeDbPgHandler {
             // stale row identity across later writes.
             if !bypass_cache && cache_eligibility.is_cacheable() {
                 self.sessions.put_cached_plan(
-                    addr,
+                    session_id,
                     &clean_sql,
                     planned.clone(),
                     versions,

@@ -247,9 +247,11 @@ pub fn normalize_channel(channel: &str) -> String {
 
 /// Handle for a session's LISTEN subscriptions.
 ///
-/// Stores `(channel, session_id, receiver)` triples so the session can
-/// drain notifications and clean up on disconnect.
+/// Stores the immutable subscription tenant together with `(channel,
+/// session_id, receiver)` so disconnect cleanup cannot be redirected by a
+/// later session-identity change.
 pub struct ListenHandle {
+    pub tenant_id: TenantId,
     pub channel: String,
     pub session_id: u64,
     pub rx: tokio::sync::mpsc::Receiver<Notification>,

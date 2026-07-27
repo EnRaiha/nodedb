@@ -14,12 +14,12 @@
 //! this transparently.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::RwLock;
 
 use tracing::debug;
 
 use crate::control::change_stream::{ChangeEvent, ChangeStream, Subscription};
+use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 
 /// Per-connection LISTEN state.
@@ -34,8 +34,8 @@ struct ListenState {
 
 /// Manages LISTEN/NOTIFY subscriptions across all pgwire connections.
 pub struct ListenNotifyManager {
-    /// Per-connection state: addr → ListenState.
-    connections: RwLock<HashMap<SocketAddr, ListenState>>,
+    /// Per-connection state keyed by a collision-free session identifier.
+    connections: RwLock<HashMap<SessionId, ListenState>>,
 }
 
 impl Default for ListenNotifyManager {
@@ -58,20 +58,20 @@ impl ListenNotifyManager {
     /// creates a change stream subscription.
     pub fn listen(
         &self,
-        addr: &SocketAddr,
+        session_id: SessionId,
         channel: &str,
         tenant_id: TenantId,
         change_stream: &ChangeStream,
     ) {
         let mut conns = self.connections.write().unwrap_or_else(|p| p.into_inner());
-        let state = conns.entry(*addr).or_insert_with(|| ListenState {
+        let state = conns.entry(session_id).or_insert_with(|| ListenState {
             channels: HashSet::new(),
             subscription: None,
             tenant_id,
         });
 
         if state.channels.insert(channel.to_string()) {
-            debug!(%addr, channel, "LISTEN registered");
+            debug!(?session_id, channel, "LISTEN registered");
 
             // Create subscription on first LISTEN.
             if state.subscription.is_none() {
@@ -81,11 +81,11 @@ impl ListenNotifyManager {
     }
 
     /// Handle `UNLISTEN <channel>` command.
-    pub fn unlisten(&self, addr: &SocketAddr, channel: &str) {
+    pub fn unlisten(&self, session_id: SessionId, channel: &str) {
         let mut conns = self.connections.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(state) = conns.get_mut(addr) {
+        if let Some(state) = conns.get_mut(&session_id) {
             state.channels.remove(channel);
-            debug!(%addr, channel, "UNLISTEN");
+            debug!(?session_id, channel, "UNLISTEN");
 
             // If no more channels, drop the subscription.
             if state.channels.is_empty() {
@@ -95,34 +95,34 @@ impl ListenNotifyManager {
     }
 
     /// Handle `UNLISTEN *` — remove all subscriptions for this connection.
-    pub fn unlisten_all(&self, addr: &SocketAddr, _change_stream: &ChangeStream) {
+    pub fn unlisten_all(&self, session_id: SessionId, _change_stream: &ChangeStream) {
         let mut conns = self.connections.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(state) = conns.remove(addr) {
+        if let Some(state) = conns.remove(&session_id) {
             // Subscription cleanup (counter decrement) happens automatically
             // via Subscription::drop when state is dropped here.
-            debug!(%addr, channels = state.channels.len(), "UNLISTEN *");
+            debug!(?session_id, channels = state.channels.len(), "UNLISTEN *");
             drop(state);
         }
     }
 
     /// Clean up when a connection closes.
-    pub fn connection_closed(&self, addr: &SocketAddr, change_stream: &ChangeStream) {
-        self.unlisten_all(addr, change_stream);
+    pub fn connection_closed(&self, session_id: SessionId, change_stream: &ChangeStream) {
+        self.unlisten_all(session_id, change_stream);
     }
 
     /// Check if a connection is listening to a specific channel.
-    pub fn is_listening(&self, addr: &SocketAddr, channel: &str) -> bool {
+    pub fn is_listening(&self, session_id: SessionId, channel: &str) -> bool {
         let conns = self.connections.read().unwrap_or_else(|p| p.into_inner());
         conns
-            .get(addr)
+            .get(&session_id)
             .is_some_and(|s| s.channels.contains(channel))
     }
 
     /// Get all channels a connection is listening to.
-    pub fn channels_for(&self, addr: &SocketAddr) -> Vec<String> {
+    pub fn channels_for(&self, session_id: SessionId) -> Vec<String> {
         let conns = self.connections.read().unwrap_or_else(|p| p.into_inner());
         conns
-            .get(addr)
+            .get(&session_id)
             .map(|s| s.channels.iter().cloned().collect())
             .unwrap_or_default()
     }
@@ -130,9 +130,9 @@ impl ListenNotifyManager {
     /// Check if a change event should be delivered to a connection.
     ///
     /// Returns true if the connection is listening to the event's collection.
-    pub fn should_deliver(&self, addr: &SocketAddr, event: &ChangeEvent) -> bool {
+    pub fn should_deliver(&self, session_id: SessionId, event: &ChangeEvent) -> bool {
         let conns = self.connections.read().unwrap_or_else(|p| p.into_inner());
-        conns.get(addr).is_some_and(|s| {
+        conns.get(&session_id).is_some_and(|s| {
             s.tenant_id == event.tenant_id && s.channels.contains(&event.collection)
         })
     }
@@ -162,19 +162,22 @@ mod tests {
     use super::*;
     use crate::control::change_stream::ChangeOperation;
 
-    fn addr(port: u16) -> SocketAddr {
-        format!("127.0.0.1:{port}").parse().unwrap()
+    fn session(value: u64) -> SessionId {
+        SessionId::Connection(
+            crate::control::server::shared::session::ConnectionId::new(value)
+                .unwrap_or_else(|_| unreachable!()),
+        )
     }
 
     #[test]
     fn listen_and_check() {
         let mgr = ListenNotifyManager::new();
         let stream = ChangeStream::new(64);
-        let a = addr(5000);
+        let a = session(1);
 
-        mgr.listen(&a, "orders", TenantId::new(1), &stream);
-        assert!(mgr.is_listening(&a, "orders"));
-        assert!(!mgr.is_listening(&a, "users"));
+        mgr.listen(a, "orders", TenantId::new(1), &stream);
+        assert!(mgr.is_listening(a, "orders"));
+        assert!(!mgr.is_listening(a, "users"));
         assert_eq!(mgr.listener_count(), 1);
     }
 
@@ -182,11 +185,11 @@ mod tests {
     fn unlisten() {
         let mgr = ListenNotifyManager::new();
         let stream = ChangeStream::new(64);
-        let a = addr(5001);
+        let a = session(2);
 
-        mgr.listen(&a, "orders", TenantId::new(1), &stream);
-        mgr.unlisten(&a, "orders");
-        assert!(!mgr.is_listening(&a, "orders"));
+        mgr.listen(a, "orders", TenantId::new(1), &stream);
+        mgr.unlisten(a, "orders");
+        assert!(!mgr.is_listening(a, "orders"));
         assert_eq!(mgr.listener_count(), 0);
     }
 
@@ -194,9 +197,9 @@ mod tests {
     fn should_deliver() {
         let mgr = ListenNotifyManager::new();
         let stream = ChangeStream::new(64);
-        let a = addr(5002);
+        let a = session(3);
 
-        mgr.listen(&a, "orders", TenantId::new(1), &stream);
+        mgr.listen(a, "orders", TenantId::new(1), &stream);
 
         let event = ChangeEvent {
             lsn: crate::types::Lsn::new(1),
@@ -207,7 +210,7 @@ mod tests {
             timestamp_ms: 0,
             after: None,
         };
-        assert!(mgr.should_deliver(&a, &event));
+        assert!(mgr.should_deliver(a, &event));
 
         // Wrong collection.
         let event2 = ChangeEvent {
@@ -215,7 +218,7 @@ mod tests {
             after: None,
             ..event.clone()
         };
-        assert!(!mgr.should_deliver(&a, &event2));
+        assert!(!mgr.should_deliver(a, &event2));
 
         // Wrong tenant.
         let event3 = ChangeEvent {
@@ -223,7 +226,7 @@ mod tests {
             after: None,
             ..event
         };
-        assert!(!mgr.should_deliver(&a, &event3));
+        assert!(!mgr.should_deliver(a, &event3));
     }
 
     #[test]

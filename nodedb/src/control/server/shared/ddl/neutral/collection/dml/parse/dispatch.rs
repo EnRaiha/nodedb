@@ -124,17 +124,23 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     }
 
     for (task, initial_authorized) in tasks.into_iter().zip(authorized_tasks.into_tasks()) {
-        let routed = route_in_tx_write(state, txn_ctx.sessions, txn_ctx.addr, task, |staged| {
-            let authorized = authorize_final_task_crate_error(state, identity, &staged);
-            async move {
-                crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
-                    state,
-                    authorized?,
-                    TraceId::ZERO,
-                )
-                .await
-            }
-        })
+        let routed = route_in_tx_write(
+            state,
+            txn_ctx.sessions,
+            txn_ctx.session_id,
+            task,
+            |staged| {
+                let authorized = authorize_final_task_crate_error(state, identity, &staged);
+                async move {
+                    crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+                        state,
+                        authorized?,
+                        TraceId::ZERO,
+                    )
+                    .await
+                }
+            },
+        )
         .await;
 
         let task = match routed {

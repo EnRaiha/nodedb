@@ -78,7 +78,7 @@ pub(crate) async fn handle_graph_match(
         crate::control::server::shared::session::record_reads_for_response(
             ctx.state,
             ctx.sessions,
-            ctx.peer_addr,
+            ctx.peer_addr.into(),
             ctx.tenant_id(),
             crate::control::server::shared::session::ResponseReads {
                 plan: &plan_for_response,

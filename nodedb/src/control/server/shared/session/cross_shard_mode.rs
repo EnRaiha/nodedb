@@ -11,7 +11,7 @@
 //! The longer name for the non-atomic mode is intentional — it acts as a
 //! foot-gun guard. `'best_effort'` alone is explicitly rejected.
 
-use std::net::SocketAddr;
+use super::connection::SessionId;
 
 use super::store::SessionStore;
 // The mode enum is a cross-shard *transaction* concept owned by the Calvin
@@ -46,7 +46,7 @@ pub fn format_value(mode: CrossShardTxnMode) -> &'static str {
 impl SessionStore {
     /// Resolve the effective `CrossShardTxnMode` for a session. Falls back to
     /// `Strict` if the parameter is unset or unparseable.
-    pub fn cross_shard_txn_mode(&self, addr: &SocketAddr) -> CrossShardTxnMode {
+    pub fn cross_shard_txn_mode(&self, addr: impl Into<SessionId>) -> CrossShardTxnMode {
         self.get_parameter(addr, PARAM_KEY)
             .and_then(|v| parse_value(&v))
             .unwrap_or_default()
@@ -55,6 +55,8 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
 
     #[test]
@@ -99,7 +101,7 @@ mod tests {
         let store = SessionStore::new();
         let addr: SocketAddr = "127.0.0.1:5432".parse().unwrap();
         store.ensure_session(addr);
-        assert_eq!(store.cross_shard_txn_mode(&addr), CrossShardTxnMode::Strict);
+        assert_eq!(store.cross_shard_txn_mode(addr), CrossShardTxnMode::Strict);
     }
 
     #[test]
@@ -108,12 +110,12 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:5432".parse().unwrap();
         store.ensure_session(addr);
         store.set_parameter(
-            &addr,
+            addr,
             PARAM_KEY.to_string(),
             "best_effort_non_atomic".to_string(),
         );
         assert_eq!(
-            store.cross_shard_txn_mode(&addr),
+            store.cross_shard_txn_mode(addr),
             CrossShardTxnMode::BestEffortNonAtomic
         );
     }

@@ -11,6 +11,8 @@ use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use super::super::types::text_field;
+use crate::control::server::shared::session::SessionId;
+
 use super::core::NodeDbPgHandler;
 
 /// Parse `SELECT current_setting('name')` or
@@ -84,7 +86,7 @@ impl NodeDbPgHandler {
     /// Handle `SELECT current_setting('name' [, missing_ok])`.
     pub(super) fn handle_current_setting(
         &self,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
         let (name, missing_ok) = match parse_current_setting(sql) {
@@ -101,7 +103,7 @@ impl NodeDbPgHandler {
         let schema = Arc::new(vec![text_field("current_setting")]);
         let mut encoder = DataRowEncoder::new(schema.clone());
 
-        match self.resolve_guc(addr, &name) {
+        match self.resolve_guc(session_id, &name) {
             Ok(value) => {
                 encoder.encode_field(&value)?;
             }

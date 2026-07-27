@@ -6,6 +6,7 @@
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::SessionId;
 use crate::types::TraceId;
 
 use super::core::NodeDbPgHandler;
@@ -14,7 +15,7 @@ impl NodeDbPgHandler {
     /// Execute a SELECT query and return results as JSON strings for cursor storage.
     pub(super) async fn execute_query_for_cursor(
         &self,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql: &str,
         identity: &AuthenticatedIdentity,
     ) -> PgWireResult<Vec<String>> {
@@ -22,13 +23,13 @@ impl NodeDbPgHandler {
         let query_ctx =
             crate::control::planner::context::QueryContext::for_state_with_lease(&self.state);
 
-        if let Some(mode) = self.sessions.get_parameter(addr, "rounding_mode") {
+        if let Some(mode) = self.sessions.get_parameter(session_id, "rounding_mode") {
             query_ctx.set_rounding_mode(&mode);
         }
 
         let database_id = self
             .sessions
-            .get_current_database(addr)
+            .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
         let auth_ctx = crate::control::server::session_auth::build_auth_context(identity);

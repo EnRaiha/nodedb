@@ -10,27 +10,28 @@
 //! statement is never idle-killed and that the idle window only starts once a
 //! statement has actually completed.
 
-use std::net::SocketAddr;
-
-use crate::control::server::shared::session::SessionStore;
+use crate::control::server::shared::session::{SessionId, SessionStore};
 
 /// Marks a statement as in flight for the lifetime of the guard.
 pub(crate) struct InFlightGuard<'a> {
     sessions: &'a SessionStore,
-    addr: SocketAddr,
+    session_id: SessionId,
 }
 
 impl<'a> InFlightGuard<'a> {
     /// Begin a request: increment the connection's in-flight counter.
-    pub(crate) fn new(sessions: &'a SessionStore, addr: SocketAddr) -> Self {
-        sessions.begin_request(&addr);
-        Self { sessions, addr }
+    pub(crate) fn new(sessions: &'a SessionStore, session_id: SessionId) -> Self {
+        sessions.begin_request(session_id);
+        Self {
+            sessions,
+            session_id,
+        }
     }
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
         // Decrement in-flight and stamp last-activity on every exit path.
-        self.sessions.end_request(&self.addr);
+        self.sessions.end_request(self.session_id);
     }
 }

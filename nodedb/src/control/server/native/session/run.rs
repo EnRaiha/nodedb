@@ -30,12 +30,12 @@ impl NativeSession {
     /// double-drop.
     async fn reclaim_open_txn(&self) {
         use crate::control::server::native::dispatch::NativeTxnDp;
-        use crate::control::server::shared::session::{TransactionState, lifecycle};
+        use crate::control::server::shared::session::{SessionId, TransactionState, lifecycle};
 
         let Some(identity) = self.identity.as_ref() else {
             return;
         };
-        if self.sessions.transaction_state(&self.peer_addr) == TransactionState::Idle {
+        if self.sessions.transaction_state(self.peer_addr) == TransactionState::Idle {
             return;
         }
         let dp = NativeTxnDp {
@@ -43,7 +43,7 @@ impl NativeSession {
         };
         lifecycle::run_rollback(
             &self.sessions,
-            &self.peer_addr,
+            SessionId::from(&self.peer_addr),
             identity,
             self.state.as_ref(),
             &dp,

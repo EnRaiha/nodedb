@@ -14,8 +14,6 @@
 //! non-atomic ACROSS vShards (no global vote binds them; a failure on one vShard
 //! does not roll back another).
 
-use std::net::SocketAddr;
-
 use crate::control::planner::calvin::{
     CrossShardTxnMode, TxnDispatchPosition, build_single_vshard_tx_class,
     dispatch_strict_atomic_tasks_to_calvin, submit_calvin_routed,
@@ -24,6 +22,7 @@ use crate::control::server::shared::session::read_set::ReadSetEntry;
 use crate::control::state::SharedState;
 use nodedb_physical::physical_task::PhysicalTask;
 
+use super::connection::SessionId;
 use super::outcome::AbortReason;
 use super::store::SessionStore;
 
@@ -33,18 +32,18 @@ use super::store::SessionStore;
 /// vShard. Returns `Some(reason)` on failure, `None` on success.
 pub(super) async fn run_commit_calvin(
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     state: &SharedState,
     buffered: &[PhysicalTask],
     tenant_id: crate::types::TenantId,
     reads: &[ReadSetEntry],
 ) -> Option<AbortReason> {
-    let cross_shard_mode = sessions.cross_shard_txn_mode(addr);
+    let cross_shard_mode = sessions.cross_shard_txn_mode(session_id);
     // The session's read-reservation owner `R`, taken at read time. Fetched once
     // and stamped onto every Calvin submit below so each commit batch acquires
     // its keys as `R` and self-upgrades the shared reservations — never
     // recomputed at commit.
-    let reservation_owner = sessions.current_reservation_owner(addr);
+    let reservation_owner = sessions.current_reservation_owner(session_id);
 
     match cross_shard_mode {
         CrossShardTxnMode::Strict => {

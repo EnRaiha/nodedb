@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,21 @@ use nodedb::control::server::pgwire::listener::PgListener;
 use nodedb::control::state::SharedState;
 use nodedb::data::executor::core_loop::CoreLoop;
 use nodedb::wal::WalManager;
+
+async fn shown_connection_ids(client: &tokio_postgres::Client) -> HashSet<u64> {
+    client
+        .simple_query("SHOW CONNECTIONS")
+        .await
+        .expect("SHOW CONNECTIONS")
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row
+                .get("connection_id")
+                .and_then(|value| value.parse::<u64>().ok()),
+            _ => None,
+        })
+        .collect()
+}
 
 /// End-to-end test: psql-compatible client connects via pgwire,
 /// sends a query, and gets a response.
@@ -144,6 +160,61 @@ async fn pgwire_connect_and_query() {
         "Connection died after query: {:?}",
         result2.err()
     );
+
+    // Connection administration is exact-ID: SHOW exposes the typed ID,
+    // KILL closes only the selected connection, and the admin remains alive.
+    let before_target = shown_connection_ids(&client).await;
+    let (target_client, target_connection) =
+        tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+            .await
+            .expect("target pgwire connect failed");
+    let target_handle = tokio::spawn(target_connection);
+    let after_target = shown_connection_ids(&client).await;
+    let added: Vec<u64> = after_target.difference(&before_target).copied().collect();
+    assert_eq!(added.len(), 1, "target must add exactly one connection ID");
+
+    client
+        .simple_query(&format!("KILL CONNECTION {}", added[0]))
+        .await
+        .expect("KILL CONNECTION");
+    let _target_result = tokio::time::timeout(Duration::from_secs(5), target_handle)
+        .await
+        .expect("target connection did not close after KILL")
+        .expect("target connection task join");
+    assert!(
+        target_client.simple_query("SELECT 1").await.is_err(),
+        "killed client must no longer execute queries"
+    );
+    assert!(
+        client
+            .simple_query("SET search_path = 'public'")
+            .await
+            .is_ok(),
+        "KILL must not close the administering connection"
+    );
+
+    client
+        .simple_query("CREATE USER connection_viewer WITH PASSWORD 'x' ROLE readonly")
+        .await
+        .expect("create non-superuser connection viewer");
+    let viewer_conn_str = format!(
+        "host=127.0.0.1 port={} user=connection_viewer dbname=nodedb",
+        pg_addr.port()
+    );
+    let (viewer, viewer_connection) =
+        tokio_postgres::connect(&viewer_conn_str, tokio_postgres::NoTls)
+            .await
+            .expect("viewer pgwire connect failed");
+    let viewer_handle = tokio::spawn(viewer_connection);
+    assert!(viewer.simple_query("SHOW CONNECTIONS").await.is_err());
+    assert!(
+        viewer
+            .simple_query(&format!("KILL CONNECTION {}", added[0]))
+            .await
+            .is_err()
+    );
+    drop(viewer);
+    let _ = viewer_handle.await;
 
     // Clean up — signal all background tasks to stop.
     drop(client);

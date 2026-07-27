@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::{FutureExt, future::join_all};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
-use pgwire::tokio::process_socket;
-
 use crate::config::auth::AuthMode;
 use crate::control::state::SharedState;
 
+use super::connection_identity::{ConnectionIdAllocator, PgConnectionContext};
 use super::factory::NodeDbPgHandlerFactory;
 
 /// PostgreSQL wire protocol listener.
@@ -24,6 +26,15 @@ use super::factory::NodeDbPgHandlerFactory;
 pub struct PgListener {
     tcp: TcpListener,
     addr: SocketAddr,
+}
+
+fn forced_drain_cleanup_ids(
+    active_connections: &HashMap<
+        crate::control::server::shared::session::ConnectionId,
+        PgConnectionContext,
+    >,
+) -> Vec<crate::control::server::shared::session::ConnectionId> {
+    active_connections.keys().copied().collect()
 }
 
 impl PgListener {
@@ -107,12 +118,31 @@ impl PgListener {
         );
 
         let mut connections = JoinSet::new();
+        let connection_ids = ConnectionIdAllocator::new();
+        // Owned exclusively by this listener task. IDs remain authoritative
+        // when an aborted task cannot return its completion value.
+        let mut active_connections = HashMap::new();
 
         loop {
             tokio::select! {
                 result = self.tcp.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
+                            let local_addr = match stream.local_addr() {
+                                Ok(addr) => addr,
+                                Err(error) => {
+                                    warn!(%peer_addr, %error, "pgwire connection rejected: local address unavailable");
+                                    continue;
+                                }
+                            };
+                            let connection_id = match connection_ids.allocate() {
+                                Ok(id) => id,
+                                Err(error) => {
+                                    warn!(%peer_addr, %error, "pgwire connection rejected: identifier allocation failed");
+                                    continue;
+                                }
+                            };
+                            let context = PgConnectionContext { id: connection_id, peer_addr, local_addr };
                             let permit = match conn_semaphore.clone().try_acquire_owned() {
                                 Ok(permit) => permit,
                                 Err(_) => {
@@ -124,35 +154,38 @@ impl PgListener {
                                     continue;
                                 }
                             };
+                            let cancel = match factory.register_connection(context) {
+                                Ok(cancel) => cancel,
+                                Err(error) => {
+                                    warn!(%peer_addr, %error, "pgwire connection rejected: session registration failed");
+                                    continue;
+                                }
+                            };
 
                             conn_state.connections_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             info!(%peer_addr, "new pgwire connection");
+                            active_connections.insert(connection_id, context);
                             let factory = Arc::clone(&factory);
                             let tls = tls_acceptor.clone();
                             let idle = idle_timeout_secs;
                             let absolute = absolute_timeout_secs;
                             connections.spawn(async move {
-                                if idle == 0 && absolute == 0 {
-                                    // No session timeouts configured: run the
-                                    // plain socket loop with no watchdog wakeups.
-                                    if let Err(e) =
-                                        process_socket(stream, tls, Arc::clone(&factory)).await
-                                    {
-                                        warn!(%peer_addr, error = %e, "pgwire session error");
-                                    }
-                                } else {
+                                let connection = async {
                                     run_with_watchdog(
-                                        stream, tls, &factory, peer_addr, idle, absolute,
+                                        stream, tls, &factory, context, cancel, idle, absolute,
                                     )
                                     .await;
+                                };
+                                if AssertUnwindSafe(connection).catch_unwind().await.is_err() {
+                                    warn!(%peer_addr, "pgwire connection task panicked");
                                 }
                                 // Reclaim any abandoned-transaction Data-Plane
-                                // overlays and drop the shared session entry now
-                                // that the connection has ended (whether it ended
-                                // on its own or was force-closed by the watchdog).
-                                factory.on_connection_end(&peer_addr).await;
+                                // overlays and remove the shared session entry.
+                                // The factory makes both steps panic-isolated
+                                // and idempotent, including forced-drain repeats.
+                                factory.on_connection_end(connection_id, peer_addr).await;
                                 drop(permit);
-                                peer_addr
+                                connection_id
                             });
                         }
                         Err(e) => {
@@ -162,8 +195,10 @@ impl PgListener {
                 }
                 // Reap completed connections to avoid unbounded growth.
                 Some(result) = connections.join_next(), if !connections.is_empty() => {
-                    if let Ok(peer_addr) = result {
-                        info!(%peer_addr, "pgwire connection closed");
+                    if let Ok(connection_id) = result
+                        && let Some(context) = active_connections.remove(&connection_id)
+                    {
+                        info!(connection_id = connection_id.get(), peer_addr = %context.peer_addr, "pgwire connection closed");
                     }
                 }
                 _ = shutdown_handle.await_phase(crate::control::shutdown::ShutdownPhase::DrainingListeners) => {
@@ -188,8 +223,10 @@ impl PgListener {
 
             let drain_result = tokio::time::timeout(drain_timeout, async {
                 while let Some(result) = connections.join_next().await {
-                    if let Ok(peer_addr) = result {
-                        info!(%peer_addr, "drained pgwire connection");
+                    if let Ok(connection_id) = result
+                        && let Some(context) = active_connections.remove(&connection_id)
+                    {
+                        info!(connection_id = connection_id.get(), peer_addr = %context.peer_addr, "drained pgwire connection");
                     }
                 }
             })
@@ -197,11 +234,23 @@ impl PgListener {
 
             if drain_result.is_err() {
                 let remaining = connections.len();
+                let cleanup_ids = forced_drain_cleanup_ids(&active_connections);
                 warn!(
                     remaining,
                     "drain timeout exceeded, aborting remaining pgwire connections"
                 );
                 connections.abort_all();
+                while connections.join_next().await.is_some() {}
+                // Aborted tasks do not execute their tail cleanup. Wait for
+                // all cancellation completions first, then reclaim each
+                // listener-owned connection exactly once before reporting drain.
+                join_all(cleanup_ids.iter().filter_map(|id| {
+                    active_connections
+                        .get(id)
+                        .map(|context| factory.on_connection_end(*id, context.peer_addr))
+                }))
+                .await;
+                active_connections.clear();
             }
         }
 
@@ -211,10 +260,11 @@ impl PgListener {
     }
 }
 
-/// Run `process_socket` under an idle + absolute session-timeout watchdog.
+/// Run the panic-isolated pgwire connection loop under an idle + absolute
+/// session-timeout watchdog.
 ///
-/// pgwire's `process_socket` owns the connection loop and is hard-typed to a
-/// `TcpStream`, so timeouts cannot be enforced inside it. Instead we race the
+/// pgwire owns the framed connection loop and is hard-typed to a `TcpStream`,
+/// so timeouts cannot be enforced inside it. Instead we race the
 /// socket future against a bounded re-check tick: on each wake, close the
 /// connection — by dropping the future, which drops the socket — if the
 /// absolute lifetime is exceeded or the connection is idle-eligible (zero
@@ -229,32 +279,55 @@ async fn run_with_watchdog(
     stream: tokio::net::TcpStream,
     tls: Option<pgwire::tokio::TlsAcceptor>,
     factory: &Arc<NodeDbPgHandlerFactory>,
-    peer_addr: SocketAddr,
+    context: PgConnectionContext,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
     idle: u64,
     absolute: u64,
 ) {
     let started = Instant::now();
-    let mut fut = std::pin::pin!(process_socket(stream, tls, Arc::clone(factory)));
-    // Bounded re-check tick — never a busy loop. Activity may advance the idle
-    // deadline between wakes, which is recomputed via `session_idle_eligible`.
+    let mut fut = std::pin::pin!(super::connection::run(
+        stream,
+        tls,
+        Arc::clone(factory),
+        context,
+    ));
+    if idle == 0 && absolute == 0 {
+        if *cancel.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = &mut fut => {}
+            _ = cancel.changed() => {
+                info!(connection_id = context.id.get(), peer_addr = %context.peer_addr, "pgwire connection cancelled");
+            }
+        }
+        return;
+    }
+    // Bounded re-check tick — never a busy loop. Cancellation is a sticky,
+    // exact-ID watch value; no relay task or unbounded channel is involved.
     let tick = Duration::from_secs(1);
     loop {
+        if *cancel.borrow() {
+            info!(connection_id = context.id.get(), peer_addr = %context.peer_addr, "pgwire connection cancelled");
+            break;
+        }
         tokio::select! {
-            r = &mut fut => {
-                if let Err(e) = r {
-                    warn!(%peer_addr, error = %e, "pgwire session error");
+            _ = &mut fut => break,
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    info!(connection_id = context.id.get(), peer_addr = %context.peer_addr, "pgwire connection cancelled");
+                    break;
                 }
-                break;
             }
             _ = tokio::time::sleep(tick) => {
                 if absolute > 0 && started.elapsed().as_secs() >= absolute {
-                    info!(%peer_addr, absolute, "pgwire absolute session timeout, closing");
+                    info!(connection_id = context.id.get(), peer_addr = %context.peer_addr, absolute, "pgwire absolute session timeout, closing");
                     break;
                 }
                 if idle > 0
-                    && factory.session_idle_eligible(&peer_addr, idle.saturating_mul(1000))
+                    && factory.session_idle_eligible(context.id, idle.saturating_mul(1000))
                 {
-                    info!(%peer_addr, idle, "pgwire idle session timeout, closing");
+                    info!(connection_id = context.id.get(), peer_addr = %context.peer_addr, idle, "pgwire idle session timeout, closing");
                     break;
                 }
             }
@@ -263,4 +336,72 @@ async fn run_with_watchdog(
     // On a timeout break the loop exits with `fut` still pending; it is dropped
     // here at scope end, which closes the socket. The caller then runs the
     // connection-end teardown hook.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forced_drain_snapshots_exact_active_connection_ids() {
+        use crate::control::server::shared::session::ConnectionId;
+
+        let peer: SocketAddr = "127.0.0.1:7001".parse().expect("valid address");
+        let local: SocketAddr = "127.0.0.1:5432".parse().expect("valid address");
+        let first = ConnectionId::new(1).expect("nonzero identifier");
+        let second = ConnectionId::new(2).expect("nonzero identifier");
+        let mut active = HashMap::from([
+            (
+                first,
+                PgConnectionContext {
+                    id: first,
+                    peer_addr: peer,
+                    local_addr: local,
+                },
+            ),
+            (
+                second,
+                PgConnectionContext {
+                    id: second,
+                    peer_addr: peer,
+                    local_addr: local,
+                },
+            ),
+        ]);
+        active.remove(&first);
+
+        assert_eq!(forced_drain_cleanup_ids(&active), vec![second]);
+    }
+
+    #[test]
+    fn active_map_keeps_duplicate_peer_contexts_by_distinct_id() {
+        use crate::control::server::shared::session::ConnectionId;
+
+        let peer: SocketAddr = "127.0.0.1:7001".parse().expect("valid address");
+        let local: SocketAddr = "127.0.0.1:5432".parse().expect("valid address");
+        let first = ConnectionId::new(1).expect("nonzero identifier");
+        let second = ConnectionId::new(2).expect("nonzero identifier");
+        let active = HashMap::from([
+            (
+                first,
+                PgConnectionContext {
+                    id: first,
+                    peer_addr: peer,
+                    local_addr: local,
+                },
+            ),
+            (
+                second,
+                PgConnectionContext {
+                    id: second,
+                    peer_addr: peer,
+                    local_addr: local,
+                },
+            ),
+        ]);
+
+        assert_eq!(active.len(), 2);
+        assert_eq!(active.get(&first).expect("first context").peer_addr, peer);
+        assert_eq!(active.get(&second).expect("second context").peer_addr, peer);
+    }
 }

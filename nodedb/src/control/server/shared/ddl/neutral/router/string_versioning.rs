@@ -235,13 +235,13 @@ pub(super) async fn try_string(
 }
 
 fn restore_forbidden_in_transaction(txn_ctx: &DmlTxnCtx<'_>) -> bool {
-    txn_ctx.sessions.transaction_state(txn_ctx.addr) != TransactionState::Idle
+    txn_ctx.sessions.transaction_state(txn_ctx.session_id) != TransactionState::Idle
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::server::shared::session::SessionStore;
+    use crate::control::server::shared::session::{SessionId, SessionStore};
 
     #[test]
     fn restore_is_forbidden_in_active_or_failed_transactions() {
@@ -250,14 +250,14 @@ mod tests {
         sessions.ensure_session(addr);
         let ctx = DmlTxnCtx {
             sessions: &sessions,
-            addr: &addr,
+            session_id: SessionId::from(&addr),
         };
         assert!(!restore_forbidden_in_transaction(&ctx));
         sessions
-            .begin(&addr, crate::types::Lsn::new(1), 0)
+            .begin(addr, crate::types::Lsn::new(1), 0)
             .expect("begin");
         assert!(restore_forbidden_in_transaction(&ctx));
-        sessions.fail_transaction(&addr);
+        sessions.fail_transaction(addr);
         assert!(restore_forbidden_in_transaction(&ctx));
     }
 }

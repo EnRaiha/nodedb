@@ -7,6 +7,7 @@ pub mod credentials;
 pub mod data_group_recovery;
 pub mod data_plane;
 pub mod listeners;
+pub mod panic_hook;
 pub mod schema_rehydrate;
 pub mod signal;
 pub mod state_wiring;

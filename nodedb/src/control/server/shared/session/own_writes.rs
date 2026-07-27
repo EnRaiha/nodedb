@@ -18,8 +18,7 @@
 //! floor, so a genuine conflict still aborts — this only removes the self-abort,
 //! never a real one.
 
-use std::net::SocketAddr;
-
+use super::connection::SessionId;
 use crate::types::{DatabaseId, Lsn, TenantId};
 
 use super::store::SessionStore;
@@ -32,7 +31,7 @@ impl SessionStore {
     /// ignored. Persists for the life of the session.
     pub fn note_own_write(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         database_id: DatabaseId,
         tenant_id: TenantId,
         collection: &str,
@@ -57,7 +56,7 @@ impl SessionStore {
     /// wrote that collection (no floor to apply).
     pub fn own_write_version(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         database_id: DatabaseId,
         tenant_id: TenantId,
         collection: &str,
@@ -75,6 +74,8 @@ impl SessionStore {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
 
     fn addr() -> SocketAddr {
@@ -92,7 +93,7 @@ mod tests {
     fn absent_collection_returns_zero() {
         let (sessions, a) = store_with_session();
         assert_eq!(
-            sessions.own_write_version(&a, DatabaseId::DEFAULT, TenantId::new(1), "bread"),
+            sessions.own_write_version(a, DatabaseId::DEFAULT, TenantId::new(1), "bread"),
             Lsn::ZERO
         );
     }
@@ -101,14 +102,14 @@ mod tests {
     fn records_and_returns_own_write_version() {
         let (sessions, a) = store_with_session();
         sessions.note_own_write(
-            &a,
+            a,
             DatabaseId::DEFAULT,
             TenantId::new(1),
             "bread",
             Lsn::new(2),
         );
         assert_eq!(
-            sessions.own_write_version(&a, DatabaseId::DEFAULT, TenantId::new(1), "bread"),
+            sessions.own_write_version(a, DatabaseId::DEFAULT, TenantId::new(1), "bread"),
             Lsn::new(2)
         );
     }
@@ -117,7 +118,7 @@ mod tests {
     fn keeps_the_maximum_version() {
         let (sessions, a) = store_with_session();
         sessions.note_own_write(
-            &a,
+            a,
             DatabaseId::DEFAULT,
             TenantId::new(1),
             "bread",
@@ -125,14 +126,14 @@ mod tests {
         );
         // A lower version never lowers the floor.
         sessions.note_own_write(
-            &a,
+            a,
             DatabaseId::DEFAULT,
             TenantId::new(1),
             "bread",
             Lsn::new(3),
         );
         assert_eq!(
-            sessions.own_write_version(&a, DatabaseId::DEFAULT, TenantId::new(1), "bread"),
+            sessions.own_write_version(a, DatabaseId::DEFAULT, TenantId::new(1), "bread"),
             Lsn::new(5)
         );
     }
@@ -140,15 +141,9 @@ mod tests {
     #[test]
     fn zero_version_is_ignored() {
         let (sessions, a) = store_with_session();
-        sessions.note_own_write(
-            &a,
-            DatabaseId::DEFAULT,
-            TenantId::new(1),
-            "bread",
-            Lsn::ZERO,
-        );
+        sessions.note_own_write(a, DatabaseId::DEFAULT, TenantId::new(1), "bread", Lsn::ZERO);
         assert_eq!(
-            sessions.own_write_version(&a, DatabaseId::DEFAULT, TenantId::new(1), "bread"),
+            sessions.own_write_version(a, DatabaseId::DEFAULT, TenantId::new(1), "bread"),
             Lsn::ZERO
         );
     }
@@ -157,7 +152,7 @@ mod tests {
     fn scoped_by_database_tenant_and_collection() {
         let (sessions, a) = store_with_session();
         sessions.note_own_write(
-            &a,
+            a,
             DatabaseId::DEFAULT,
             TenantId::new(1),
             "bread",
@@ -165,11 +160,11 @@ mod tests {
         );
         // A different collection, tenant, or database sees no floor.
         assert_eq!(
-            sessions.own_write_version(&a, DatabaseId::DEFAULT, TenantId::new(1), "milk"),
+            sessions.own_write_version(a, DatabaseId::DEFAULT, TenantId::new(1), "milk"),
             Lsn::ZERO
         );
         assert_eq!(
-            sessions.own_write_version(&a, DatabaseId::DEFAULT, TenantId::new(2), "bread"),
+            sessions.own_write_version(a, DatabaseId::DEFAULT, TenantId::new(2), "bread"),
             Lsn::ZERO
         );
     }

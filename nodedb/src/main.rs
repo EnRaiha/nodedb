@@ -17,8 +17,18 @@ use main_boot::{
     background, data_plane, gates, listeners, post_open, shared_state, shutdown_wiring, startup_log,
 };
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // This is deliberately the first application action: Tokio may create
+    // worker threads while building its runtime, and the default panic hook
+    // renders arbitrary panic payloads.
+    nodedb::bootstrap::panic_hook::install();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(server_main())
+}
+
+async fn server_main() -> anyhow::Result<()> {
     // Operator subcommand dispatch (L.4): handled before config load
     // + tracing init so `nodedb regen-certs`, `nodedb rotate-ca`,
     // `nodedb join-token` exit cleanly without spinning up the

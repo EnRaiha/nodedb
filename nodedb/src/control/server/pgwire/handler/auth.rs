@@ -14,7 +14,7 @@ use crate::control::server::session_auth::identity::stored_user_identity;
 use crate::control::server::shared::authorization::{
     AuthorizationError, authorize_database, authorize_task_set,
 };
-use crate::control::server::shared::session::SessionStore;
+use crate::control::server::shared::session::{SessionId, SessionStore};
 use crate::control::state::SharedState;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -29,7 +29,7 @@ pub(super) fn resolve_session_identity<C: ClientInfo>(
     auth_mode: AuthMode,
     sessions: &SessionStore,
     client: &C,
-    addr: &std::net::SocketAddr,
+    session_id: &SessionId,
 ) -> PgWireResult<AuthenticatedIdentity> {
     let username = client
         .metadata()
@@ -39,7 +39,7 @@ pub(super) fn resolve_session_identity<C: ClientInfo>(
 
     let authenticated_identity = match auth_mode {
         AuthMode::Trust => {
-            let startup_identity = sessions.identity(addr).ok_or_else(|| {
+            let startup_identity = sessions.identity(*session_id).ok_or_else(|| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
                     "FATAL".to_owned(),
                     "28000".to_owned(),
@@ -76,11 +76,11 @@ pub(super) fn resolve_session_identity<C: ClientInfo>(
     };
 
     let mut identity = authenticated_identity.clone();
-    if let Some(effective) = sessions.get_effective_tenant_id(addr) {
+    if let Some(effective) = sessions.get_effective_tenant_id(*session_id) {
         if identity.is_superuser {
             identity.tenant_id = effective;
         } else {
-            sessions.set_effective_tenant_id(addr, None);
+            sessions.set_effective_tenant_id(*session_id, None);
         }
     }
 
@@ -88,7 +88,7 @@ pub(super) fn resolve_session_identity<C: ClientInfo>(
     // transaction can reclaim its Data-Plane staging overlays. DISCARD ALL
     // reconstructs Trust's base authenticated identity after it has released
     // any overlays.
-    sessions.set_identity(addr, identity.clone());
+    sessions.set_identity(*session_id, identity.clone());
 
     Ok(identity)
 }
@@ -98,11 +98,11 @@ impl NodeDbPgHandler {
     pub(super) fn authorize_session_database(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
     ) -> PgWireResult<()> {
         let database_id = self
             .sessions
-            .get_current_database(addr)
+            .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let emitter = ArcAuditEmitter(Arc::clone(&self.state.audit));
         authorize_database(identity, database_id, &emitter).map_err(pgwire_authorization_error)

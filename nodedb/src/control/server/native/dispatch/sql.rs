@@ -146,7 +146,7 @@ async fn handle_sql_inner(
     // DDL: try DDL router first.
     let txn_ctx = crate::control::server::shared::session::DmlTxnCtx {
         sessions: ctx.sessions,
-        addr: ctx.peer_addr,
+        session_id: ctx.peer_addr.into(),
     };
     if let Some(result) = crate::control::server::shared::ddl::dispatch(
         ctx.state,

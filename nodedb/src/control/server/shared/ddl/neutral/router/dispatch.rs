@@ -161,7 +161,7 @@ pub async fn try_dispatch(
         // active `TxnId` (idle sessions → `None`, an autocommit read) and hand
         // it to the MATCH handler for the Data-Plane overlay merge — mirroring
         // the single-hop `GRAPH NEIGHBORS` path.
-        let (txn_id, _) = txn_ctx.sessions.txn_identity(txn_ctx.addr);
+        let (txn_id, _) = txn_ctx.sessions.txn_identity(txn_ctx.session_id);
         return Some(match_ops::match_query(state, identity, database_id, sql, txn_id).await);
     }
 

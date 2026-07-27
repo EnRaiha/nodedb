@@ -17,7 +17,6 @@
 //! into their own protocol's response type.
 
 use std::future::Future;
-use std::net::SocketAddr;
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::gateway::RouteDecision;
@@ -29,6 +28,7 @@ use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::{CrdtOp, MetaOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+use super::connection::SessionId;
 use super::leader_forward::{forward_to_leader, resolve_leader};
 use super::state::TransactionState;
 use super::store::SessionStore;
@@ -62,28 +62,28 @@ pub struct StagedWriteOutcome {
     pub payload: Vec<u8>,
 }
 
-/// Session store + connection address, bundled so the protocol-neutral DDL
-/// dispatch path (`dispatch` -> `try_dispatch` -> `upsert_document` /
-/// `insert_document` -> `plan_and_dispatch`, plus the `COPY FROM` bulk-import
-/// chain) can thread a single extra parameter down to [`route_in_tx_write`]
-/// instead of two positional arguments at every layer.
+/// Session store + collision-free session identity, bundled so the
+/// protocol-neutral DDL dispatch path (`dispatch` -> `try_dispatch` ->
+/// `upsert_document` / `insert_document` -> `plan_and_dispatch`, plus the
+/// `COPY FROM` bulk-import chain) can thread one state identity down to
+/// [`route_in_tx_write`] without coupling storage to network provenance.
 pub struct DmlTxnCtx<'a> {
     pub sessions: &'a SessionStore,
-    pub addr: &'a SocketAddr,
+    pub session_id: SessionId,
 }
 
 /// An owned, session-less scope for callers with no BEGIN/COMMIT transaction
 /// concept over their transport (stateless HTTP, autocommit test helpers).
 ///
-/// It owns a fresh [`SessionStore`] and a placeholder address; because a fresh
-/// store reports [`TransactionState::Idle`] for every address,
+/// It owns a fresh [`SessionStore`] and a private legacy session identity;
+/// because a fresh store reports [`TransactionState::Idle`] for that identity,
 /// [`route_in_tx_write`] always takes the `Read` (immediate autocommit
 /// dispatch) branch through a [`DmlTxnCtx`] borrowed from here — byte-identical
 /// to the pre-gate behavior. Keep the scope alive for the duration of the
 /// dispatch call that borrows its [`ctx`](Self::ctx).
 pub struct DetachedTxnScope {
     sessions: SessionStore,
-    addr: SocketAddr,
+    session_id: SessionId,
 }
 
 impl Default for DetachedTxnScope {
@@ -97,15 +97,15 @@ impl DetachedTxnScope {
     pub fn new() -> Self {
         Self {
             sessions: SessionStore::new(),
-            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            session_id: SessionId::from(std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
         }
     }
 
-    /// Borrow a [`DmlTxnCtx`] pointing at this scope's owned store + address.
+    /// Borrow a [`DmlTxnCtx`] pointing at this scope's owned store + session identity.
     pub fn ctx(&self) -> DmlTxnCtx<'_> {
         DmlTxnCtx {
             sessions: &self.sessions,
-            addr: &self.addr,
+            session_id: self.session_id,
         }
     }
 }
@@ -140,7 +140,7 @@ pub enum StagingGateError {
 pub async fn route_in_tx_write<F, Fut>(
     state: &SharedState,
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     mut task: PhysicalTask,
     dispatch: F,
 ) -> Result<InTxnRoute, StagingGateError>
@@ -148,7 +148,7 @@ where
     F: FnOnce(PhysicalTask) -> Fut,
     Fut: Future<Output = crate::Result<Response>>,
 {
-    if sessions.transaction_state(addr) != TransactionState::InBlock {
+    if sessions.transaction_state(session_id) != TransactionState::InBlock {
         return Ok(InTxnRoute::Read(Box::new(task)));
     }
 
@@ -167,7 +167,7 @@ where
         // Not a write: an in-transaction read. Stamp the active transaction
         // id onto the task so the Data Plane can check this transaction's
         // staging overlay for read-your-own-writes on point lookups.
-        task.txn_id = sessions.tx_id(addr);
+        task.txn_id = sessions.tx_id(session_id);
         return Ok(InTxnRoute::Read(Box::new(task)));
     }
 
@@ -175,12 +175,12 @@ where
     // tag + statement-time constraint errors); the plan is still buffered so
     // COMMIT stays the sole durable apply. Other writes keep buffer + "OK".
     if !is_stageable_write(&task.plan) {
-        sessions.buffer_write(addr, task);
+        sessions.buffer_write(session_id, task);
         return Ok(InTxnRoute::Buffered);
     }
 
     Ok(InTxnRoute::Staged(
-        stage_write(state, sessions, addr, task, dispatch).await?,
+        stage_write(state, sessions, session_id, task, dispatch).await?,
     ))
 }
 
@@ -194,7 +194,7 @@ where
 pub(super) async fn stage_write<F, Fut>(
     state: &SharedState,
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     task: PhysicalTask,
     dispatch: F,
 ) -> Result<StagedWriteOutcome, StagingGateError>
@@ -210,7 +210,7 @@ where
             plan: Box::new(task.plan.clone()),
         }),
         post_set_op: PostSetOp::None,
-        txn_id: sessions.tx_id(addr),
+        txn_id: sessions.tx_id(session_id),
     };
 
     // Stage on the vShard's CURRENT leader. When this node leads the vShard (or
@@ -242,7 +242,7 @@ where
     let payload = resp.payload.as_ref().to_vec();
 
     // Durable path unchanged: still buffered, replayed at COMMIT.
-    sessions.buffer_write(addr, task);
+    sessions.buffer_write(session_id, task);
 
     Ok(StagedWriteOutcome {
         kind,

@@ -87,7 +87,7 @@ pub(super) async fn run_dispatch_loop(
         let routed = match route_in_tx_expander(
             ctx.state,
             ctx.sessions,
-            ctx.peer_addr,
+            ctx.peer_addr.into(),
             task,
             |stage_task| async move {
                 dispatch_task(ctx, stage_task)
@@ -102,7 +102,7 @@ pub(super) async fn run_dispatch_loop(
                 route_in_tx_write(
                     ctx.state,
                     ctx.sessions,
-                    ctx.peer_addr,
+                    ctx.peer_addr.into(),
                     *task,
                     |stage_task| async move {
                         dispatch_task(ctx, stage_task)
@@ -192,7 +192,7 @@ pub(super) async fn run_dispatch_loop(
             crate::control::server::shared::session::record_reads_for_response(
                 ctx.state,
                 ctx.sessions,
-                ctx.peer_addr,
+                ctx.peer_addr.into(),
                 ctx.tenant_id(),
                 crate::control::server::shared::session::ResponseReads {
                     plan: &plan_for_response,

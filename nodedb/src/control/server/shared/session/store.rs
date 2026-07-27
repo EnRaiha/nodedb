@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Concurrent session store — keyed by socket address.
+//! Concurrent session store keyed by collision-free session identities.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::RwLock;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -11,11 +10,34 @@ use nodedb_types::DatabaseId;
 
 use crate::types::TenantId;
 
+use super::connection::{ConnectionId, ConnectionMetadata, ConnectionRegistrationError, SessionId};
 use super::state::{ConnSession, TransactionState, now_unix_ms};
 
-/// Concurrent session store — keyed by socket address.
+struct SessionEntry {
+    session: ConnSession,
+    metadata: Option<ConnectionMetadata>,
+}
+
+impl SessionEntry {
+    fn legacy() -> Self {
+        Self {
+            session: ConnSession::new(),
+            metadata: None,
+        }
+    }
+
+    fn connection(metadata: ConnectionMetadata) -> Self {
+        Self {
+            session: ConnSession::new(),
+            metadata: Some(metadata),
+        }
+    }
+}
+
+/// Concurrent session store with typed connection registrations and legacy
+/// socket-address compatibility.
 pub struct SessionStore {
-    sessions: RwLock<HashMap<SocketAddr, ConnSession>>,
+    sessions: RwLock<HashMap<SessionId, SessionEntry>>,
 }
 
 impl Default for SessionStore {
@@ -31,55 +53,109 @@ impl SessionStore {
         }
     }
 
-    /// Ensure a session exists for this address.
-    pub fn ensure_session(&self, addr: SocketAddr) {
+    /// Preserve the legacy address-keyed session behavior.
+    pub fn ensure_session(&self, addr: std::net::SocketAddr) {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        sessions.entry(addr).or_insert_with(ConnSession::new);
+        sessions
+            .entry(SessionId::from(addr))
+            .or_insert_with(SessionEntry::legacy);
     }
 
-    /// Remove a session (connection closed).
-    pub fn remove(&self, addr: &SocketAddr) {
-        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        sessions.remove(addr);
+    /// Reset mutable state while preserving immutable typed-connection metadata.
+    pub fn reset_session(&self, id: impl Into<SessionId>) {
+        self.write_session(id, |session| *session = ConnSession::new());
     }
 
-    /// List all active sessions as (peer_address, transaction_state) pairs.
-    pub fn all_sessions(&self) -> Vec<(String, String)> {
+    /// Register one immutable typed connection. Existing registrations are
+    /// never overwritten, including registrations with matching endpoints.
+    pub fn register_connection(
+        &self,
+        id: ConnectionId,
+        metadata: ConnectionMetadata,
+    ) -> Result<(), ConnectionRegistrationError> {
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
+        let key = SessionId::from(id);
+        if sessions.contains_key(&key) {
+            return Err(ConnectionRegistrationError::Duplicate(id));
+        }
+        sessions.insert(key, SessionEntry::connection(metadata));
+        Ok(())
+    }
+
+    /// Return immutable accept-time metadata for a registered connection.
+    pub fn connection_metadata(&self, id: ConnectionId) -> Option<ConnectionMetadata> {
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
+        sessions
+            .get(&SessionId::from(id))
+            .and_then(|entry| entry.metadata)
+    }
+
+    /// Snapshot registered typed connections and their immutable metadata.
+    pub fn connection_snapshot(&self) -> Vec<(ConnectionId, ConnectionMetadata)> {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions
             .iter()
-            .map(|(addr, session)| {
-                let tx = match session.tx_state {
-                    TransactionState::Idle => "idle",
-                    TransactionState::InBlock => "in_transaction",
-                    TransactionState::Failed => "failed",
-                };
-                (addr.to_string(), tx.to_string())
+            .filter_map(|(key, entry)| match (key, entry.metadata) {
+                (SessionId::Connection(id), Some(metadata)) => Some((*id, metadata)),
+                _ => None,
             })
             .collect()
     }
 
-    /// Number of active sessions.
+    /// Snapshot only exact typed connections for administrative display.
+    pub fn connection_snapshot_with_state(
+        &self,
+    ) -> Vec<(ConnectionId, ConnectionMetadata, TransactionState)> {
+        let sessions = self
+            .sessions
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut snapshot: Vec<_> = sessions
+            .iter()
+            .filter_map(|(key, entry)| match (key, entry.metadata) {
+                (SessionId::Connection(id), Some(metadata)) => {
+                    Some((*id, metadata, entry.session.tx_state))
+                }
+                _ => None,
+            })
+            .collect();
+        snapshot.sort_unstable_by_key(|(id, _, _)| *id);
+        snapshot
+    }
+
+    /// Remove a session (connection closed).
+    pub fn remove(&self, id: impl Into<SessionId>) {
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
+        sessions.remove(&id.into());
+    }
+
+    pub fn all_sessions(&self) -> Vec<(String, String)> {
+        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
+        sessions
+            .iter()
+            .map(|(id, entry)| {
+                let label = match id {
+                    SessionId::Connection(id) => format!("connection:{id}"),
+                    SessionId::LegacySocket(addr) => addr.to_string(),
+                };
+                let tx = match entry.session.tx_state {
+                    TransactionState::Idle => "idle",
+                    TransactionState::InBlock => "in_transaction",
+                    TransactionState::Failed => "failed",
+                };
+                (label, tx.to_string())
+            })
+            .collect()
+    }
+
     pub fn count(&self) -> usize {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions.len()
     }
 
-    /// Look up cached physical tasks for a SQL string in the
-    /// session's plan cache. `current_version` maps each
-    /// recorded descriptor id to its current persisted version
-    /// (or `None` if dropped). The cache returns a hit only
-    /// when every recorded `(id, version)` pair still matches.
-    ///
-    /// On a hit returns the cached tasks, the
-    /// `DescriptorVersionSet` they were built against, and the
-    /// `OutputSchema` they were compiled with — the caller
-    /// passes the version set into
-    /// `SharedState::acquire_plan_lease_scope` so cache hits
-    /// and fresh plans share the same lease-acquisition path.
     pub fn get_cached_plan<F>(
         &self,
-        addr: &SocketAddr,
+        id: impl Into<SessionId>,
         sql: &str,
         current_version: F,
     ) -> Option<(
@@ -92,149 +168,103 @@ impl SessionStore {
     {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
         sessions
-            .get_mut(addr)
-            .and_then(|s| s.plan_cache.get(sql, current_version))
+            .get_mut(&id.into())
+            .and_then(|entry| entry.session.plan_cache.get(sql, current_version))
     }
 
-    /// Store compiled physical tasks in the session's plan
-    /// cache along with the descriptor version set and output
-    /// schema they were built against.
     pub fn put_cached_plan(
         &self,
-        addr: &SocketAddr,
+        id: impl Into<SessionId>,
         sql: &str,
         tasks: Vec<nodedb_physical::physical_task::PhysicalTask>,
         versions: crate::control::planner::descriptor_set::DescriptorVersionSet,
         output_schema: crate::control::server::response_shape::schema::OutputSchema,
     ) {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(session) = sessions.get_mut(addr) {
-            session.plan_cache.put(sql, tasks, versions, output_schema);
+        if let Some(entry) = sessions.get_mut(&id.into()) {
+            entry
+                .session
+                .plan_cache
+                .put(sql, tasks, versions, output_schema);
         }
     }
 
-    /// Retrieve the `current_database` for a connection, or `None` if the session
-    /// does not exist or has not had a database bound yet.
-    pub fn get_current_database(&self, addr: &SocketAddr) -> Option<DatabaseId> {
+    pub fn get_current_database(&self, id: impl Into<SessionId>) -> Option<DatabaseId> {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
-        sessions.get(addr)?.current_database
+        sessions.get(&id.into())?.session.current_database
     }
 
-    /// Bind a database to a session.  Called at pgwire startup once the database
-    /// name from the StartupMessage has been resolved to a `DatabaseId`.
-    pub fn set_current_database(&self, addr: &SocketAddr, db_id: DatabaseId) {
-        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(session) = sessions.get_mut(addr) {
-            session.current_database = Some(db_id);
-        }
+    pub fn set_current_database(&self, id: impl Into<SessionId>, db_id: DatabaseId) {
+        self.write_session(id, |session| session.current_database = Some(db_id));
     }
 
-    /// Read the session's superuser tenant override, if any. Returns `None`
-    /// when the session has never run `SET TENANT` (the common case).
-    pub fn get_effective_tenant_id(&self, addr: &SocketAddr) -> Option<TenantId> {
+    pub fn get_effective_tenant_id(&self, id: impl Into<SessionId>) -> Option<TenantId> {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
-        sessions.get(addr).and_then(|s| s.effective_tenant_id)
+        sessions
+            .get(&id.into())
+            .and_then(|entry| entry.session.effective_tenant_id)
     }
 
-    /// Install or clear the session's tenant override. Callers MUST have
-    /// already verified the connection is a superuser and is not inside an
-    /// active transaction — this method performs no policy checks.
-    ///
-    /// Invalidates the session's plan cache and SQL-level prepared statements
-    /// so plans built against the prior tenant's catalog cannot be reused.
-    pub fn set_effective_tenant_id(&self, addr: &SocketAddr, tenant: Option<TenantId>) {
-        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(session) = sessions.get_mut(addr) {
+    pub fn set_effective_tenant_id(&self, id: impl Into<SessionId>, tenant: Option<TenantId>) {
+        self.write_session(id, |session| {
             session.effective_tenant_id = tenant;
             session.plan_cache.clear();
             session.prepared_stmts.clear();
-        }
+        });
     }
 
-    /// Read the identity resolved for queries on this connection, if any.
-    /// Returns `None` when no query has resolved an identity yet (the session
-    /// never issued a statement past auth) or the session does not exist.
     pub fn identity(
         &self,
-        addr: &SocketAddr,
+        id: impl Into<SessionId>,
     ) -> Option<crate::control::security::identity::AuthenticatedIdentity> {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
-        sessions.get(addr).and_then(|s| s.identity.clone())
+        sessions
+            .get(&id.into())
+            .and_then(|entry| entry.session.identity.clone())
     }
 
-    /// Stash the identity resolved for queries on this connection. Called from
-    /// the per-query auth chokepoint (`resolve_identity`) so a connection torn
-    /// down mid-transaction can reclaim its Data-Plane overlays without a live
-    /// query. Overwrites any prior value — the identity in force for the most
-    /// recent query is the one teardown must use. Creates the session entry if
-    /// absent so the extended-query path (which resolves identity before
-    /// `ensure_session`) still records it.
     pub fn set_identity(
         &self,
-        addr: &SocketAddr,
+        id: impl Into<SessionId>,
         identity: crate::control::security::identity::AuthenticatedIdentity,
     ) {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
         sessions
-            .entry(*addr)
-            .or_insert_with(ConnSession::new)
+            .entry(id.into())
+            .or_insert_with(SessionEntry::legacy)
+            .session
             .identity = Some(identity);
     }
 
-    /// Record the start of a statement executing on this connection. Bumps the
-    /// in-flight counter so the idle watchdog never closes a connection with a
-    /// statement in progress. Creates the session entry if absent (mirrors
-    /// `set_identity`) so the extended-query path — which can begin execution
-    /// before `ensure_session` runs — still has its in-flight state tracked.
-    pub fn begin_request(&self, addr: &SocketAddr) {
+    pub fn begin_request(&self, id: impl Into<SessionId>) {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
         sessions
-            .entry(*addr)
-            .or_insert_with(ConnSession::new)
+            .entry(id.into())
+            .or_insert_with(SessionEntry::legacy)
+            .session
             .in_flight
             .fetch_add(1, Relaxed);
     }
 
-    /// Record the completion of a statement on this connection: decrement the
-    /// in-flight counter (saturating — never underflows if the session was
-    /// already removed by a concurrent teardown) and stamp last-activity to
-    /// "now" so the idle window restarts from statement completion.
-    pub fn end_request(&self, addr: &SocketAddr) {
-        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(session) = sessions.get_mut(addr) {
-            // Exclusive write lock held: no concurrent mutator, so a
-            // load-check-store is a safe saturating decrement.
+    pub fn end_request(&self, id: impl Into<SessionId>) {
+        self.write_session(id, |session| {
             if session.in_flight.load(Relaxed) > 0 {
                 session.in_flight.fetch_sub(1, Relaxed);
             }
             session.last_activity_ms.store(now_unix_ms(), Relaxed);
-        }
+        });
     }
 
-    /// Whether the connection at `addr` is eligible for idle timeout: the
-    /// session exists, has zero statements in flight, and its last activity is
-    /// at least `idle_ms` in the past relative to `now_ms`. Returns `false`
-    /// when the session is missing — nothing to time out.
-    pub fn idle_eligible(&self, addr: &SocketAddr, idle_ms: u64, now_ms: u64) -> bool {
-        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
-        match sessions.get(addr) {
-            Some(session) => {
-                session.in_flight.load(Relaxed) == 0
-                    && now_ms.saturating_sub(session.last_activity_ms.load(Relaxed)) >= idle_ms
-            }
-            None => false,
-        }
+    pub fn idle_eligible(&self, id: impl Into<SessionId>, idle_ms: u64, now_ms: u64) -> bool {
+        self.read_session(id, |session| {
+            session.in_flight.load(Relaxed) == 0
+                && now_ms.saturating_sub(session.last_activity_ms.load(Relaxed)) >= idle_ms
+        })
+        .unwrap_or(false)
     }
 
-    /// Reset per-session state for a `USE DATABASE` switch:
-    ///   1. Aborts any open transaction (discards tx_buffer, resets state to Idle).
-    ///   2. Clears all SQL-level prepared statements.
-    ///   3. Clears the wire-level plan cache.
-    ///   4. Rebinds `current_database` to the new id.
-    pub fn reset_for_database_switch(&self, addr: &SocketAddr, new_db: DatabaseId) {
-        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(session) = sessions.get_mut(addr) {
-            // Abort open transaction.
+    pub fn reset_for_database_switch(&self, id: impl Into<SessionId>, new_db: DatabaseId) {
+        self.write_session(id, |session| {
             session.tx_state = TransactionState::Idle;
             session.tx_buffer.clear();
             session.tx_snapshot_lsn = None;
@@ -247,35 +277,127 @@ impl SessionStore {
             session.savepoints.clear();
             session.pending_offset_commits.clear();
             session.pending_notifies.clear();
-            // Invalidate prepared statements and plan cache.
             session.prepared_stmts.clear();
             session.plan_cache.clear();
-            // A USE DATABASE switch crosses out of any tenant override — the
-            // new database may not exist (or have the same id) in the override
-            // tenant, so the safe contract is to drop the override on switch.
             session.effective_tenant_id = None;
-            // Rebind database.
             session.current_database = Some(new_db);
-        }
+        });
     }
 
-    /// Access the session map with a read lock for use by other session submodules.
     pub(super) fn read_session<R>(
         &self,
-        addr: &SocketAddr,
+        id: impl Into<SessionId>,
         f: impl FnOnce(&ConnSession) -> R,
     ) -> Option<R> {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
-        sessions.get(addr).map(f)
+        sessions.get(&id.into()).map(|entry| f(&entry.session))
     }
 
-    /// Access the session map with a write lock for use by other session submodules.
     pub(super) fn write_session<R>(
         &self,
-        addr: &SocketAddr,
+        id: impl Into<SessionId>,
         f: impl FnOnce(&mut ConnSession) -> R,
     ) -> Option<R> {
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        sessions.get_mut(addr).map(f)
+        sessions
+            .get_mut(&id.into())
+            .map(|entry| f(&mut entry.session))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn address(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn typed_connections_with_same_peer_are_isolated() {
+        let store = SessionStore::new();
+        let peer = address(4000);
+        let first = ConnectionId::new(1).unwrap();
+        let second = ConnectionId::new(2).unwrap();
+        let first_metadata = ConnectionMetadata {
+            peer_addr: peer,
+            local_addr: address(5432),
+        };
+        let second_metadata = ConnectionMetadata {
+            peer_addr: peer,
+            local_addr: address(6432),
+        };
+        store.register_connection(first, first_metadata).unwrap();
+        store.register_connection(second, second_metadata).unwrap();
+
+        store.set_current_database(first, DatabaseId::new(1));
+        store.set_current_database(second, DatabaseId::new(2));
+        assert_eq!(store.get_current_database(first), Some(DatabaseId::new(1)));
+        assert_eq!(store.get_current_database(second), Some(DatabaseId::new(2)));
+        assert_eq!(store.connection_metadata(first), Some(first_metadata));
+        assert_eq!(store.connection_metadata(second), Some(second_metadata));
+
+        store.remove(first);
+        assert_eq!(store.get_current_database(first), None);
+        assert_eq!(store.get_current_database(second), Some(DatabaseId::new(2)));
+    }
+
+    #[test]
+    fn duplicate_typed_connection_is_rejected_without_overwrite() {
+        let store = SessionStore::new();
+        let id = ConnectionId::new(7).unwrap();
+        let first = ConnectionMetadata {
+            peer_addr: address(4001),
+            local_addr: address(5432),
+        };
+        let second = ConnectionMetadata {
+            peer_addr: address(4002),
+            local_addr: address(6432),
+        };
+        store.register_connection(id, first).unwrap();
+        assert_eq!(
+            store.register_connection(id, second),
+            Err(ConnectionRegistrationError::Duplicate(id))
+        );
+        assert_eq!(store.connection_metadata(id), Some(first));
+    }
+
+    #[test]
+    fn typed_snapshot_excludes_legacy_and_sorts_by_connection_id() {
+        let store = SessionStore::new();
+        store.ensure_session(address(4999));
+        let later = ConnectionId::new(9).unwrap_or_else(|_| unreachable!());
+        let earlier = ConnectionId::new(2).unwrap_or_else(|_| unreachable!());
+        let metadata = ConnectionMetadata {
+            peer_addr: address(4004),
+            local_addr: address(5432),
+        };
+        assert!(store.register_connection(later, metadata).is_ok());
+        assert!(store.register_connection(earlier, metadata).is_ok());
+        let snapshot = store.connection_snapshot_with_state();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].0, earlier);
+        assert_eq!(snapshot[1].0, later);
+    }
+
+    #[test]
+    fn legacy_address_session_is_distinct_from_typed_connection() {
+        let store = SessionStore::new();
+        let peer = address(4003);
+        let id = ConnectionId::new(9).unwrap();
+        store.ensure_session(peer);
+        store
+            .register_connection(
+                id,
+                ConnectionMetadata {
+                    peer_addr: peer,
+                    local_addr: address(5432),
+                },
+            )
+            .unwrap();
+        store.set_current_database(peer, DatabaseId::new(3));
+        store.set_current_database(id, DatabaseId::new(4));
+        assert_eq!(store.get_current_database(peer), Some(DatabaseId::new(3)));
+        assert_eq!(store.get_current_database(id), Some(DatabaseId::new(4)));
     }
 }

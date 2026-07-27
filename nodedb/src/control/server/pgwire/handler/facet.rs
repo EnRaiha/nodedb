@@ -14,6 +14,7 @@ use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::SessionId;
 use crate::types::{DatabaseId, VShardId};
 use nodedb_physical::physical_plan::QueryOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -26,7 +27,7 @@ use super::plan::multirow_payload_to_response;
 pub(super) async fn execute_facet_counts_sql(
     handler: &NodeDbPgHandler,
     identity: &AuthenticatedIdentity,
-    addr: &std::net::SocketAddr,
+    session_id: SessionId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let parsed = parse_facet_counts_args(sql)?;
@@ -34,7 +35,7 @@ pub(super) async fn execute_facet_counts_sql(
     let tenant_id = identity.tenant_id;
     let database_id = handler
         .sessions
-        .get_current_database(addr)
+        .get_current_database(session_id)
         .unwrap_or(DatabaseId::DEFAULT);
     let vshard = VShardId::from_collection_in_database(database_id, &parsed.collection);
 
@@ -81,14 +82,14 @@ pub(super) async fn execute_facet_counts_sql(
 pub(super) async fn execute_search_with_facets_sql(
     handler: &NodeDbPgHandler,
     identity: &AuthenticatedIdentity,
-    addr: &std::net::SocketAddr,
+    session_id: SessionId,
     sql: &str,
 ) -> PgWireResult<Vec<Response>> {
     let parsed = parse_search_with_facets_args(sql)?;
 
     // Step 1: Execute the main search query via the standard DataFusion path.
     let search_results = handler
-        .execute_query_for_cursor(addr, &parsed.query, identity)
+        .execute_query_for_cursor(session_id, &parsed.query, identity)
         .await?;
 
     // Step 2: Extract collection and filter from the query for facet counting.
@@ -98,7 +99,7 @@ pub(super) async fn execute_search_with_facets_sql(
     let tenant_id = identity.tenant_id;
     let database_id = handler
         .sessions
-        .get_current_database(addr)
+        .get_current_database(session_id)
         .unwrap_or(DatabaseId::DEFAULT);
     let vshard = VShardId::from_collection_in_database(database_id, &collection);
 

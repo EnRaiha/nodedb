@@ -2,8 +2,7 @@
 
 //! LIVE SELECT subscription methods on SessionStore.
 
-use std::net::SocketAddr;
-
+use super::connection::SessionId;
 use super::store::SessionStore;
 
 impl SessionStore {
@@ -12,7 +11,7 @@ impl SessionStore {
     /// `channel` is the notification channel name (e.g., "live_orders").
     pub fn add_live_subscription(
         &self,
-        addr: &SocketAddr,
+        addr: impl Into<SessionId>,
         channel: String,
         sub: crate::control::change_stream::Subscription,
     ) {
@@ -27,7 +26,7 @@ impl SessionStore {
     ///
     /// Non-blocking: uses `try_recv` to avoid waiting. Called between
     /// queries to deliver notifications in the PostgreSQL standard way.
-    pub fn drain_live_notifications(&self, addr: &SocketAddr) -> Vec<(String, String)> {
+    pub fn drain_live_notifications(&self, addr: impl Into<SessionId>) -> Vec<(String, String)> {
         self.write_session(addr, |session| {
             let mut notifications = Vec::new();
             for (channel, sub) in &mut session.live_subscriptions {
@@ -69,7 +68,7 @@ impl SessionStore {
     }
 
     /// Check if a connection has any active LIVE SELECT subscriptions.
-    pub fn has_live_subscriptions(&self, addr: &SocketAddr) -> bool {
+    pub fn has_live_subscriptions(&self, addr: impl Into<SessionId>) -> bool {
         self.read_session(addr, |s| !s.live_subscriptions.is_empty())
             .unwrap_or(false)
     }

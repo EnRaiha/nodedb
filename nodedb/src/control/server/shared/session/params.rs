@@ -2,22 +2,21 @@
 
 //! Session parameter methods (SET/SHOW) on SessionStore.
 
-use std::net::SocketAddr;
-
+use super::connection::SessionId;
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 
 use super::store::SessionStore;
 
 impl SessionStore {
     /// Set a session parameter.
-    pub fn set_parameter(&self, addr: &SocketAddr, key: String, value: String) {
+    pub fn set_parameter(&self, addr: impl Into<SessionId>, key: String, value: String) {
         self.write_session(addr, |session| {
             session.parameters.insert(key, value);
         });
     }
 
     /// Reset one mutable session parameter to its connection default.
-    pub fn reset_parameter(&self, addr: &SocketAddr, key: &str) {
+    pub fn reset_parameter(&self, addr: impl Into<SessionId>, key: &str) {
         let defaults = super::state::default_parameters();
         let default = defaults
             .into_iter()
@@ -33,7 +32,7 @@ impl SessionStore {
     }
 
     /// Reset every mutable session parameter and tenant override.
-    pub fn reset_all_parameters(&self, addr: &SocketAddr) {
+    pub fn reset_all_parameters(&self, addr: impl Into<SessionId>) {
         self.write_session(addr, |session| {
             session.parameters = super::state::default_parameters();
             session.effective_tenant_id = None;
@@ -41,7 +40,7 @@ impl SessionStore {
     }
 
     /// Get a session parameter.
-    pub fn get_parameter(&self, addr: &SocketAddr, key: &str) -> Option<String> {
+    pub fn get_parameter(&self, addr: impl Into<SessionId>, key: &str) -> Option<String> {
         self.read_session(addr, |session| {
             session.parameters.get(key).cloned().or_else(|| {
                 session
@@ -54,7 +53,7 @@ impl SessionStore {
     }
 
     /// Get all session parameters.
-    pub fn all_parameters(&self, addr: &SocketAddr) -> Vec<(String, String)> {
+    pub fn all_parameters(&self, addr: impl Into<SessionId>) -> Vec<(String, String)> {
         self.read_session(addr, |s| {
             let mut params: Vec<_> = s
                 .parameters
@@ -280,28 +279,28 @@ mod tests {
         let addr = "127.0.0.1:5000".parse().expect("socket address");
         store.ensure_session(addr);
 
-        store.set_parameter(&addr, "datestyle".into(), "SQL, DMY".into());
-        store.reset_parameter(&addr, "datestyle");
+        store.set_parameter(addr, "datestyle".into(), "SQL, DMY".into());
+        store.reset_parameter(addr, "datestyle");
         assert_eq!(
-            store.get_parameter(&addr, "datestyle"),
+            store.get_parameter(addr, "datestyle"),
             Some("ISO, MDY".into())
         );
 
-        store.set_parameter(&addr, "default_read_consistency".into(), "eventual".into());
-        store.reset_parameter(&addr, "default_read_consistency");
+        store.set_parameter(addr, "default_read_consistency".into(), "eventual".into());
+        store.reset_parameter(addr, "default_read_consistency");
         assert_eq!(
-            store.get_parameter(&addr, "default_read_consistency"),
+            store.get_parameter(addr, "default_read_consistency"),
             Some("strong".into())
         );
 
         store.set_parameter(
-            &addr,
+            addr,
             "cross_shard_txn".into(),
             "best_effort_non_atomic".into(),
         );
-        store.reset_parameter(&addr, "cross_shard_txn");
+        store.reset_parameter(addr, "cross_shard_txn");
         assert_eq!(
-            store.get_parameter(&addr, "cross_shard_txn"),
+            store.get_parameter(addr, "cross_shard_txn"),
             Some("strict".into())
         );
     }
@@ -311,17 +310,17 @@ mod tests {
         let store = SessionStore::new();
         let addr = "127.0.0.1:5000".parse().expect("socket address");
         store.ensure_session(addr);
-        store.set_parameter(&addr, "application_name".into(), "worker".into());
-        store.set_parameter(&addr, "nodedb.consistency".into(), "eventual".into());
+        store.set_parameter(addr, "application_name".into(), "worker".into());
+        store.set_parameter(addr, "nodedb.consistency".into(), "eventual".into());
 
-        store.reset_all_parameters(&addr);
+        store.reset_all_parameters(addr);
 
         assert_eq!(
-            store.get_parameter(&addr, "application_name"),
+            store.get_parameter(addr, "application_name"),
             Some(String::new())
         );
         assert_eq!(
-            store.get_parameter(&addr, "nodedb.consistency"),
+            store.get_parameter(addr, "nodedb.consistency"),
             Some("strong".into())
         );
     }

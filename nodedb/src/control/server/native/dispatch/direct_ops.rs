@@ -354,15 +354,21 @@ async fn dispatch_single_task(
     // response the same way the non-staged branch below shapes it.
     let plan_for_staged_response = task.plan.clone();
 
-    let task = match route_in_tx_write(ctx.state, ctx.sessions, ctx.peer_addr, task, |stage_task| {
-        dispatch_authorized_single_task(
-            ctx,
-            stage_task.tenant_id,
-            stage_task.vshard_id,
-            stage_task.plan,
-            stage_task.txn_id,
-        )
-    })
+    let task = match route_in_tx_write(
+        ctx.state,
+        ctx.sessions,
+        ctx.peer_addr.into(),
+        task,
+        |stage_task| {
+            dispatch_authorized_single_task(
+                ctx,
+                stage_task.tenant_id,
+                stage_task.vshard_id,
+                stage_task.plan,
+                stage_task.txn_id,
+            )
+        },
+    )
     .await
     {
         Ok(InTxnRoute::Read(routed_task)) => *routed_task,
@@ -420,7 +426,7 @@ async fn dispatch_single_task(
                 crate::control::server::shared::session::record_reads_for_response(
                     ctx.state,
                     ctx.sessions,
-                    ctx.peer_addr,
+                    ctx.peer_addr.into(),
                     ctx.tenant_id(),
                     crate::control::server::shared::session::ResponseReads {
                         plan: &plan_for_response,

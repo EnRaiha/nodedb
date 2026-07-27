@@ -6,6 +6,7 @@ use pgwire::api::results::Response;
 use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 
 use super::super::core::NodeDbPgHandler;
@@ -21,13 +22,13 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         sql: &str,
         tenant_id: TenantId,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
     ) -> PgWireResult<Vec<Response>> {
         self.execute_planned_sql_inner(
             identity,
             sql,
             tenant_id,
-            addr,
+            session_id,
             &[],
             ResultShaping {
                 projection: None,
@@ -43,11 +44,11 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         sql: &str,
         tenant_id: TenantId,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         params: &[nodedb_sql::ParamValue],
         shaping: ResultShaping<'_>,
     ) -> PgWireResult<Vec<Response>> {
-        self.execute_planned_sql_inner(identity, sql, tenant_id, addr, params, shaping)
+        self.execute_planned_sql_inner(identity, sql, tenant_id, session_id, params, shaping)
             .await
     }
 }

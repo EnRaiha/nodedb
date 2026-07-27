@@ -23,7 +23,6 @@
 //! No validation happens here — the entries are captured for the commit-time
 //! optimistic-concurrency check to consume.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use nodedb_cluster::calvin::types::LockKeyWire;
@@ -35,6 +34,7 @@ use crate::control::server::shared::plan_util::{extract_collection, plan_engine,
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, KeyRepr, Lsn, TenantId, VShardId};
 
+use super::connection::SessionId;
 use super::store::SessionStore;
 
 /// Which peer engine served a read. Mirrors the top-level [`PhysicalPlan`]
@@ -128,7 +128,7 @@ pub struct ReadCapture<'a> {
 pub async fn record_read_set(
     state: &SharedState,
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     tenant_id: TenantId,
     capture: ReadCapture<'_>,
 ) {
@@ -151,7 +151,7 @@ pub async fn record_read_set(
     // `tenant_id` (from the dispatched task / identity), and the database is the
     // session's current database.
     let database_id = sessions
-        .get_current_database(addr)
+        .get_current_database(session_id)
         .unwrap_or(DatabaseId::DEFAULT);
 
     // Read-your-writes floor: raise the captured read-version to the session's
@@ -165,7 +165,8 @@ pub async fn record_read_set(
     // OTHER-session write (higher `coll_write_lsn`) still exceeds the floor and
     // still aborts — this removes only the self-abort. `read_lsn` (the per-shard
     // watermark used by single-shard SI) is deliberately left untouched.
-    let own_write_version = sessions.own_write_version(addr, database_id, tenant_id, &collection);
+    let own_write_version =
+        sessions.own_write_version(session_id, database_id, tenant_id, &collection);
     let effective_read_version = read_version_lsn.max(own_write_version);
 
     let entries: Vec<ReadSetEntry> = watermarks
@@ -181,7 +182,7 @@ pub async fn record_read_set(
         })
         .collect();
 
-    sessions.record_read_entries(addr, entries);
+    sessions.record_read_entries(session_id, entries);
 
     // RESERVE-AT-READ: when an interactive transaction reads a HOT point key,
     // take a sequenced SHARED reservation on it and remember the granted owner on
@@ -191,7 +192,7 @@ pub async fn record_read_set(
     // changes the read result and never fails the read.
 
     // Autocommit reads never reserve: there is no transaction to carry the owner.
-    if !sessions.is_in_transaction_block(addr) {
+    if !sessions.is_in_transaction_block(session_id) {
         return;
     }
 
@@ -221,10 +222,10 @@ pub async fn record_read_set(
     // Reuse the transaction's single reservation owner (None on the first hot-key
     // read; the assignment mints it, and `record_reservation` adopts it). Guard
     // dropped inside the accessor — nothing is held across the await below.
-    let owner = sessions.current_reservation_owner(addr);
+    let owner = sessions.current_reservation_owner(session_id);
     let wire_key = lock_key_to_wire(&lock_key);
     match submit_reserve_read(state, wire_key, vshard, owner).await {
-        Ok(r) => sessions.record_reservation(addr, vshard, r),
+        Ok(r) => sessions.record_reservation(session_id, vshard, r),
         Err(e) => {
             tracing::debug!(error = %e, "hot-key read reservation failed; proceeding under OCC");
         }
@@ -289,8 +290,12 @@ mod tests {
     use super::*;
     use nodedb_physical::physical_plan::{DocumentOp, KvOp};
 
-    fn addr() -> SocketAddr {
-        "127.0.0.1:5599".parse().expect("test addr")
+    fn session_id() -> SessionId {
+        SessionId::from(
+            "127.0.0.1:5599"
+                .parse::<std::net::SocketAddr>()
+                .expect("test address"),
+        )
     }
 
     fn kv_get(collection: &str, key: &[u8]) -> PhysicalPlan {
@@ -309,12 +314,15 @@ mod tests {
         })
     }
 
-    fn begun_session() -> (SessionStore, SocketAddr) {
+    fn begun_session() -> (SessionStore, SessionId) {
         let sessions = SessionStore::new();
-        let a = addr();
-        sessions.ensure_session(a);
-        sessions.begin(&a, Lsn::new(5), 0).expect("begin");
-        (sessions, a)
+        let session_id = session_id();
+        sessions.ensure_session(match session_id {
+            SessionId::LegacySocket(addr) => addr,
+            SessionId::Connection(_) => unreachable!("legacy test identity"),
+        });
+        sessions.begin(session_id, Lsn::new(5), 0).expect("begin");
+        (sessions, session_id)
     }
 
     /// Build a minimal `SharedState` for the read-capture seam. The hot-key
@@ -342,7 +350,7 @@ mod tests {
         record_read_set(
             &state,
             &sessions,
-            &a,
+            a,
             TenantId::new(1),
             ReadCapture {
                 plan: &kv_get("c", b"k1"),
@@ -352,7 +360,7 @@ mod tests {
             },
         )
         .await;
-        let rs = sessions.take_read_set(&a);
+        let rs = sessions.take_read_set(a);
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].engine, EngineTag::Kv);
         assert_eq!(rs[0].collection, "c");
@@ -374,7 +382,7 @@ mod tests {
         record_read_set(
             &state,
             &sessions,
-            &a,
+            a,
             TenantId::new(1),
             ReadCapture {
                 plan: &kv_batch_get("c"),
@@ -384,7 +392,7 @@ mod tests {
             },
         )
         .await;
-        let rs = sessions.take_read_set(&a);
+        let rs = sessions.take_read_set(a);
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].key, ReadKey::Predicate);
     }
@@ -398,7 +406,7 @@ mod tests {
         record_read_set(
             &state,
             &sessions,
-            &a,
+            a,
             TenantId::new(1),
             ReadCapture {
                 plan: &kv_batch_get("c"),
@@ -412,7 +420,7 @@ mod tests {
             },
         )
         .await;
-        let rs = sessions.take_read_set(&a);
+        let rs = sessions.take_read_set(a);
         assert_eq!(rs.len(), 3);
         let mut lsns: Vec<u64> = rs.iter().map(|e| e.read_lsn.as_u64()).collect();
         lsns.sort_unstable();
@@ -429,7 +437,7 @@ mod tests {
         record_read_set(
             &state,
             &sessions,
-            &a,
+            a,
             TenantId::new(1),
             ReadCapture {
                 plan: &kv_get("c", b"missing"),
@@ -439,7 +447,7 @@ mod tests {
             },
         )
         .await;
-        let rs = sessions.take_read_set(&a);
+        let rs = sessions.take_read_set(a);
         assert_eq!(rs.len(), 1);
         assert_eq!(
             rs[0].key,
@@ -470,7 +478,7 @@ mod tests {
         record_read_set(
             &state,
             &sessions,
-            &a,
+            a,
             TenantId::new(1),
             ReadCapture {
                 plan: &doc_point_get("docs", 42),
@@ -480,7 +488,7 @@ mod tests {
             },
         )
         .await;
-        let rs = sessions.take_read_set(&a);
+        let rs = sessions.take_read_set(a);
         assert_eq!(rs.len(), 1);
         assert_eq!(
             rs[0].key,
@@ -500,7 +508,7 @@ mod tests {
         record_read_set(
             &state,
             &sessions,
-            &a,
+            a,
             TenantId::new(1),
             ReadCapture {
                 plan: &doc_point_get("docs", 999),
@@ -510,7 +518,7 @@ mod tests {
             },
         )
         .await;
-        let rs = sessions.take_read_set(&a);
+        let rs = sessions.take_read_set(a);
         assert_eq!(rs.len(), 1);
         assert_eq!(rs[0].key, ReadKey::Predicate);
     }
@@ -519,13 +527,13 @@ mod tests {
     async fn autocommit_reads_are_not_recorded() {
         let (state, _dir) = test_state();
         let sessions = SessionStore::new();
-        let a = addr();
-        sessions.ensure_session(a);
+        let a = session_id();
+        sessions.ensure_session(std::net::SocketAddr::from(([127, 0, 0, 1], 5599)));
         // No BEGIN: outside a transaction block the read-set stays empty.
         record_read_set(
             &state,
             &sessions,
-            &a,
+            a,
             TenantId::new(1),
             ReadCapture {
                 plan: &kv_get("c", b"k1"),
@@ -535,7 +543,7 @@ mod tests {
             },
         )
         .await;
-        assert!(sessions.take_read_set(&a).is_empty());
+        assert!(sessions.take_read_set(a).is_empty());
     }
 
     #[tokio::test]
@@ -545,7 +553,7 @@ mod tests {
         record_read_set(
             &state,
             &sessions,
-            &a,
+            a,
             TenantId::new(1),
             ReadCapture {
                 plan: &kv_get("c", b"k1"),
@@ -555,7 +563,7 @@ mod tests {
             },
         )
         .await;
-        assert!(sessions.take_read_set(&a).is_empty());
+        assert!(sessions.take_read_set(a).is_empty());
     }
 
     #[test]

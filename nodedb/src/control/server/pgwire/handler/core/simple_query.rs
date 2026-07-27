@@ -25,21 +25,20 @@ impl SimpleQueryHandler for NodeDbPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let addr = client.socket_addr();
-        self.sessions.ensure_session(addr);
+        let session_id = self.session_id;
 
         // Keep this statement ineligible for idle teardown until every exit
         // path completes and the guard stamps the session's last activity.
-        let _in_flight = InFlightGuard::new(&self.sessions, addr);
+        let _in_flight = InFlightGuard::new(&self.sessions, session_id);
 
-        let identity = self.resolve_identity(client, &addr)?;
-        self.authorize_session_database(&identity, &addr)?;
+        let identity = self.resolve_identity(client, &session_id)?;
+        self.authorize_session_database(&identity, session_id)?;
 
         // Emit db.id / db.name trace fields at session bind so that any
         // downstream spans inherit the database context.
         let current_db = self
             .sessions
-            .get_current_database(&addr)
+            .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let db_name: String = self
             .state
@@ -60,7 +59,7 @@ impl SimpleQueryHandler for NodeDbPgHandler {
         // Send notice if BEGIN is called (advisory transactions).
         let upper = query.trim().to_uppercase();
         if (upper == "BEGIN" || upper == "BEGIN TRANSACTION" || upper == "START TRANSACTION")
-            && self.sessions.transaction_state(&addr) == TransactionState::InBlock
+            && self.sessions.transaction_state(session_id) == TransactionState::InBlock
         {
             let notice = super::super::super::types::notice_warning(
                 "there is already a transaction in progress",
@@ -71,7 +70,7 @@ impl SimpleQueryHandler for NodeDbPgHandler {
         }
 
         if (upper == "COMMIT" || upper == "END")
-            && self.sessions.transaction_state(&addr) == TransactionState::Idle
+            && self.sessions.transaction_state(session_id) == TransactionState::Idle
         {
             let notice =
                 super::super::super::types::notice_warning("there is no transaction in progress");
@@ -93,13 +92,13 @@ impl SimpleQueryHandler for NodeDbPgHandler {
             },
         );
 
-        let result = self.execute_sql(&identity, &addr, query).await;
+        let result = self.execute_sql(&identity, session_id, query).await;
 
         // Drain queued NOTICE messages emitted by response shapers (e.g.
         // `truncated_before_horizon` on array slices) and send them before
         // the query result so the client associates the warning with the
         // current statement.
-        for message in self.sessions.drain_notices(&addr) {
+        for message in self.sessions.drain_notices(session_id) {
             let notice = super::super::super::types::notice_warning(&message);
             let _ = client
                 .send(PgWireBackendMessage::NoticeResponse(notice))
@@ -110,8 +109,8 @@ impl SimpleQueryHandler for NodeDbPgHandler {
         // async NotificationResponse messages. This is the standard
         // PostgreSQL notification delivery model: notifications are
         // delivered between queries.
-        if self.sessions.has_live_subscriptions(&addr) {
-            let notifications = self.sessions.drain_live_notifications(&addr);
+        if self.sessions.has_live_subscriptions(session_id) {
+            let notifications = self.sessions.drain_live_notifications(session_id);
             for (channel, payload) in notifications {
                 let notification = pgwire::messages::response::NotificationResponse::new(
                     0, // backend PID (not meaningful for NodeDB)
@@ -125,8 +124,8 @@ impl SimpleQueryHandler for NodeDbPgHandler {
 
         // Drain pending LISTEN/NOTIFY notifications and deliver as pgwire
         // NotificationResponse messages (between queries, per PG semantics).
-        if self.sessions.has_listen_subscriptions(&addr) {
-            let notifications = self.sessions.drain_listen_notifications(&addr);
+        if self.sessions.has_listen_subscriptions(session_id) {
+            let notifications = self.sessions.drain_listen_notifications(session_id);
             for n in notifications {
                 let notification = pgwire::messages::response::NotificationResponse::new(
                     n.pid, n.channel, n.payload,

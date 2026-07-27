@@ -255,17 +255,23 @@ pub(super) async fn dispatch_and_respond(
         txn_id: None,
     };
 
-    let routed = route_in_tx_write(state, txn_ctx.sessions, txn_ctx.addr, task, |staged| {
-        crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn(
-            state,
-            staged.tenant_id,
-            staged.database_id,
-            staged.vshard_id,
-            staged.plan,
-            TraceId::ZERO,
-            staged.txn_id,
-        )
-    })
+    let routed = route_in_tx_write(
+        state,
+        txn_ctx.sessions,
+        txn_ctx.session_id,
+        task,
+        |staged| {
+            crate::control::server::dispatch_utils::dispatch_to_data_plane_with_txn(
+                state,
+                staged.tenant_id,
+                staged.database_id,
+                staged.vshard_id,
+                staged.plan,
+                TraceId::ZERO,
+                staged.txn_id,
+            )
+        },
+    )
     .await;
 
     let payload = match routed {
