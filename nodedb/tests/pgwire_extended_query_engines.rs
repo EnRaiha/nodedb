@@ -76,8 +76,8 @@ async fn extended_query_kv_integer_value() {
         .iter()
         .find(|c| c.name() == "score")
         .expect("score column must appear in RowDescription");
-    // `score` is declared `INT`, the INT4 alias — issue #217 fixed this column
-    // advertising OID 20 (int8) for every declared integer width. KV resolves
+    // `score` is declared `INT`, the INT4 alias — this column previously
+    // advertised OID 20 (int8) for every declared integer width. KV resolves
     // declared widths through the same catalog path as every other engine, so
     // it now correctly narrows to OID 23 (int4).
     assert_eq!(
@@ -199,8 +199,8 @@ async fn extended_query_columnar_typed_scan() {
     assert_eq!(id, "r1");
 
     // RowDescription: id→TEXT(25), n→INT4(23), score→FLOAT8(701), flag→BOOL(16), label→TEXT(25).
-    // `n` is declared `INT` in the DDL above, which is the INT4 alias — issue
-    // #217 fixed this column advertising OID 20 (int8) for every declared
+    // `n` is declared `INT` in the DDL above, which is the INT4 alias — this
+    // column previously advertised OID 20 (int8) for every declared
     // integer width; it now correctly narrows to OID 23 (int4).
     let expected: &[(&str, u32)] = &[
         ("id", 25),
@@ -332,8 +332,7 @@ async fn extended_query_timeseries_null_param() {
 /// RowDescription OID, so reading each column back with a typed getter that
 /// matches the *advertised* width (`i16`/`i32`/`i64`) fails the `get` if
 /// either the OID or the binary payload width is wrong — this locks the
-/// whole chain: declared width → OID 21/23/20 → binary encoder i16/i32/i64
-/// (issue #217).
+/// whole chain: declared width → OID 21/23/20 → binary encoder i16/i32/i64.
 #[tokio::test]
 async fn extended_query_schemaless_int_width_binary_roundtrip() {
     let srv = TestServer::start().await;

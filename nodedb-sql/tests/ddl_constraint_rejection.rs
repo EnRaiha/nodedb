@@ -222,7 +222,7 @@ fn not_null_and_default_accepted() {
     }
 }
 
-// ── ENGINE = <name> trailing suffix (E1/#157 regression) ─────────────────────
+// ── ENGINE = <name> trailing suffix (E1 regression) ──────────────────────────
 //
 // A MySQL-style trailing `ENGINE = <name>` (or `ENGINE=<name>`) after the
 // column list must feed the same `engine` field as `WITH (engine='<name>')`,

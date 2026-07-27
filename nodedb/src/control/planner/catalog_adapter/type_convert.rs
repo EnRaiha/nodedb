@@ -250,7 +250,7 @@ fn parse_type_str(s: &str) -> SqlDataType {
         // Every spelling `IntWidth::from_declared_type` recognizes must appear
         // here too, or the column resolves to the `_ => String` default and
         // advertises OID 25 (text) — the exact failure that made `SMALLINT`
-        // columns unreadable (issue #217). `parse_type_str` decides *whether*
+        // columns unreadable. `parse_type_str` decides *whether*
         // the column is an integer; `IntWidth` decides *how wide*.
         "INT" | "INTEGER" | "INT4" | "INT8" | "INT64" | "BIGINT" | "SMALLINT" | "INT2" => {
             SqlDataType::Int64
@@ -276,7 +276,7 @@ mod tests {
     use crate::control::security::catalog::StoredCollection;
 
     /// `SMALLINT`/`INT2` are valid PostgreSQL wire-width integer keywords
-    /// (issue #217) that must resolve to the same `SqlDataType::Int64` arm as
+    /// that must resolve to the same `SqlDataType::Int64` arm as
     /// `INT`/`INTEGER`/`INT4`/`INT8`/`BIGINT` — previously they were unlisted
     /// and fell through to the `_ => SqlDataType::String` default, which is
     /// what produced the wire OID 25 (text) bug for `SMALLINT` columns.

@@ -74,9 +74,8 @@ pub enum SqlError {
     /// A positional `INSERT`/`UPSERT` `VALUES` row (no explicit column
     /// list) supplied more values than the target collection has declared
     /// columns. Binding the overflow value(s) to a synthetic `col{N}` name
-    /// would silently store them under an unaddressable column — the same
-    /// failure mode as #202 — so this is rejected rather than guessed
-    /// at.
+    /// would silently store them under an unaddressable column, so this is
+    /// rejected rather than guessed at.
     #[error(
         "INSERT/UPSERT into '{collection}': row has {given} value(s) but only \
          {declared} column(s) are declared; supply an explicit column list \

@@ -177,7 +177,7 @@ async fn wal_restart_durability() {
     assert!((v - expected).abs() < 0.01);
 }
 
-/// Regression for #172: a timeseries collection must survive a GRACEFUL
+/// Regression: a timeseries collection must survive a GRACEFUL
 /// (SIGTERM → final-checkpoint flush) restart with EXACTLY its rows — and stay
 /// stable across a SECOND graceful restart. The two restarts are the crux the
 /// single-restart durability test above cannot see:
@@ -245,7 +245,7 @@ async fn timeseries_survives_repeated_graceful_restart_172() {
         "the most-recent point must survive the first restart, not just the count"
     );
 
-    // ── Graceful restart 2 ── (the mode that duplicated in #172)
+    // ── Graceful restart 2 ── (the mode that previously duplicated rows)
     srv2.graceful_shutdown().await;
     let (srv3, _dir) = TestServer::open_on_path(dir).await;
 

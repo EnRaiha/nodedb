@@ -3,9 +3,9 @@
 //! End-to-end pgwire tests for `SHOW GRAPH STATS`.
 //!
 //! Covers the compact and VERBOSE response forms, error handling for
-//! unknown collections, and the persistence-rooted invariant motivated
-//! by issue #107 (counts come from the durable edge store, not from
-//! the in-memory CSR cache).
+//! unknown collections, and the persistence-rooted invariant that
+//! counts come from the durable edge store, not from
+//! the in-memory CSR cache.
 
 mod common;
 

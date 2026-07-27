@@ -122,8 +122,8 @@ impl FromStr for ColumnType {
 
         match upper.as_str() {
             // `INT4`/`INT8`/`SMALLINT`/`INT2` are PostgreSQL wire-width integer
-            // keywords (issue #223: strict/kv `CREATE COLLECTION` rejected
-            // them as unknown types even though they're valid aliases). They
+            // keywords: strict/kv `CREATE COLLECTION` used to reject
+            // them as unknown types even though they're valid aliases. They
             // all collapse to the same `Int64` storage variant as
             // `BIGINT`/`INTEGER`/`INT` — nodedb always stores integers as a
             // full i64. The declared width is carried separately as an
@@ -134,7 +134,7 @@ impl FromStr for ColumnType {
             }
             // `FLOAT4`/`FLOAT8`/`FLOAT32`/`DOUBLE PRECISION` are PostgreSQL
             // wire-width float keywords, rejected as unknown types here for
-            // the same reason `INT4` was (issue #223). They all collapse to
+            // the same reason `INT4` was. They all collapse to
             // the same `Float64` storage variant as `DOUBLE`/`REAL`/`FLOAT` —
             // nodedb always stores floats as a full f64. The declared width is
             // carried separately as a [`super::FloatWidth`], which narrows the

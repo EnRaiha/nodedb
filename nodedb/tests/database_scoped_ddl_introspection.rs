@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression coverage for issue #151: DDL introspection (`DESCRIBE`,
+//! Regression coverage: DDL introspection (`DESCRIBE`,
 //! `SHOW COLLECTIONS`, `SHOW INDEXES`) must resolve against the session's
 //! current database, not hardcoded `DatabaseId::DEFAULT`.
 //!
@@ -84,7 +84,7 @@ async fn describe_collection_finds_it_in_non_default_database() {
     );
 }
 
-/// Regression for issue #173: `DESCRIBE` on a strict collection created with an
+/// Regression: `DESCRIBE` on a strict collection created with an
 /// explicit `id ... PRIMARY KEY` listed the `id` field twice — once from the
 /// unconditional synthetic `id` row and once from iterating the declared
 /// `coll.fields` — with contradictory nullability. The synthetic row is now

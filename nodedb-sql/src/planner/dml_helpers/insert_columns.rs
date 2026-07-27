@@ -14,7 +14,7 @@ use crate::types::*;
 /// column names. Left alone, `convert_value_rows` falls back to synthetic
 /// `col0`, `col1`, ... names for every value (see its `col{i}` fallback
 /// below): the row stores fine, but named projections and WHERE predicates
-/// can never find it again (#202).
+/// can never find it again.
 ///
 /// Named inserts (`columns` already non-empty) and schemaless collections
 /// (`info.columns` empty — there is no declared order to bind to) pass

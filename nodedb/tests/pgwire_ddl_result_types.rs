@@ -265,7 +265,7 @@ async fn show_collections_row_description_preserves_int8_column() {
     );
 }
 
-/// Upstream issue #217 repro: integer OID wire fidelity. A schemaless
+/// Integer OID wire fidelity repro. A schemaless
 /// `CREATE COLLECTION` (no `WITH (engine=...)` clause) declaring every
 /// PostgreSQL integer width — `INT`, `INTEGER`, `INT4`, `BIGINT`, `INT8`,
 /// `SMALLINT`, `INT2` — must advertise each column's *own* wire OID in

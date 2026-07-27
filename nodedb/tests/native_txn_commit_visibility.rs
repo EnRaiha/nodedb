@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Issue #193: a row committed inside an explicit native-protocol transaction
+//! A row committed inside an explicit native-protocol transaction
 //! (OpCode::Begin → SQL INSERT → OpCode::Commit) must be visible to every
 //! read path — PK point lookups and filtered aggregates, not just full scans —
 //! on the writing connection and on fresh connections.

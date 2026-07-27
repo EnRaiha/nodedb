@@ -84,7 +84,7 @@ pub fn sql_data_type_to_ddl_col_type(
 /// that declared `REAL` expects OID 700 and exactly four. Silently widening
 /// every integer to `BIGINT`'s OID 20, or every float to `double precision`'s
 /// OID 701, breaks ORMs and typed client libraries that trust the advertised
-/// OID (issue #217). Every other `SqlDataType` variant passes through
+/// OID. Every other `SqlDataType` variant passes through
 /// unchanged with both widths ignored — there is no other wire-ambiguous case
 /// to resolve.
 ///

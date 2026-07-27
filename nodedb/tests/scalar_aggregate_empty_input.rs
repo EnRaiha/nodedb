@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! D1/#159: a scalar aggregate (no GROUP BY) over zero input rows must
+//! D1: a scalar aggregate (no GROUP BY) over zero input rows must
 //! still emit exactly one identity row — `COUNT(*)` -> `0`,
 //! `SUM`/`AVG`/`MIN`/`MAX` -> `NULL` — never an empty result set.
 //!

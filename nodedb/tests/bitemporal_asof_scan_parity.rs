@@ -167,7 +167,7 @@ async fn asof_audit_null_honours_order_by() {
     );
 }
 
-/// Regression for issue #170: `AS OF SYSTEM TIME NULL` (all-versions audit) with
+/// Regression: `AS OF SYSTEM TIME NULL` (all-versions audit) with
 /// a `WHERE` predicate on a strict (`document_strict`) collection returned zero
 /// rows. The audit fetch applied the predicate against the raw stored Binary
 /// Tuple body via a MessagePack-only matcher (`matches_binary`), which never
