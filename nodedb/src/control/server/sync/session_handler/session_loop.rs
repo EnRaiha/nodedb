@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! WebSocket session loop for NodeDB-Lite sync connections.
 use std::net::SocketAddr;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use super::super::listener::SyncListenerState;
+use super::super::listener::{SyncListenerState, SyncRegistrationCleanupGuard};
 use super::super::wire::{DeltaPushMsg, PresenceUpdateMsg, SyncMessageType};
 use super::array::{build_array_inbound, dispatch_array_frame, is_array_frame};
 
@@ -16,16 +16,14 @@ use crate::control::state::SharedState;
 pub(in crate::control::server::sync) async fn handle_sync_session(
     mut ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     addr: SocketAddr,
+    session_id: String,
     state: &SyncListenerState,
     shared: Option<Arc<SharedState>>,
 ) {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    let session_id = format!(
-        "sync-{addr}-{}",
-        state.connections_accepted.load(Ordering::Relaxed)
-    );
+    let cleanup = SyncRegistrationCleanupGuard::new(shared.clone(), session_id.clone());
     let mut session = super::super::session::SyncSession::with_rate_limit(
         session_id.clone(),
         &state.config.rate_limit,
@@ -476,32 +474,7 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
         }
     }
 
-    // Remove all shape subscriptions for this session from the persistent registry
-    // so that the process-global registry does not grow unbounded.
-    if let Some(shared) = shared.as_ref() {
-        shared.shape_registry.remove_session(&session_id);
-    }
-
-    if crdt_registered && let Some(shared) = shared.as_ref() {
-        shared.crdt_sync_delivery.unregister(&session_id);
-    }
-
-    if array_delivery_registered && let Some(shared) = shared.as_ref() {
-        shared.array_delivery.unregister(&session_id);
-        shared.array_subscriber_cursors.remove_session(&session_id);
-    }
-
-    if definition_sync_registered && let Some(shared) = shared.as_ref() {
-        shared.definition_sync_fanout.unregister(&session_id);
-    }
-
-    if presence_registered && let Some(shared) = shared.as_ref() {
-        let mut mgr = shared.presence.write().await;
-        let outbound = mgr.unregister_session(&session_id);
-        let senders = mgr.senders().clone();
-        drop(mgr);
-        outbound.send_all(&senders);
-    }
+    cleanup.finish().await;
 
     info!(
         session = %session_id,

@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 use crate::config::auth::AuthMode;
 use crate::control::server::conn_stream::ConnStream;
 use crate::control::server::ilp_auth::AuthenticatedIlpContext;
+use crate::control::server::shared::{ConnectionFutureOutcome, isolate_connection_future};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
@@ -109,34 +110,50 @@ impl IlpListener {
                             if let Some(ref acceptor) = tls_acceptor {
                                 let acceptor = acceptor.clone();
                                 connections.spawn(async move {
-                                    match tokio::time::timeout(
-                                        std::time::Duration::from_secs(10),
-                                        acceptor.accept(stream),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(tls_stream)) => {
-                                            let cs = ConnStream::tls(tls_stream);
-                                            if let Err(e) = handle_ilp_connection(cs, peer, &state, &auth_mode).await {
-                                                warn!(%peer, error = %e, "ILP TLS connection error (data may be lost)");
+                                    let outcome = isolate_connection_future(async move {
+                                        let _permit = permit;
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(10),
+                                            acceptor.accept(stream),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(tls_stream)) => {
+                                                let cs = ConnStream::tls(tls_stream);
+                                                if let Err(e) = handle_ilp_connection(cs, peer, &state, &auth_mode).await {
+                                                    warn!(%peer, error = %e, "ILP TLS connection error (data may be lost)");
+                                                }
+                                            }
+                                            Ok(Err(e)) => {
+                                                warn!(%peer, error = %e, "ILP TLS handshake failed");
+                                            }
+                                            Err(_) => {
+                                                warn!(%peer, "ILP TLS handshake timed out");
                                             }
                                         }
-                                        Ok(Err(e)) => {
-                                            warn!(%peer, error = %e, "ILP TLS handshake failed");
-                                        }
-                                        Err(_) => {
-                                            warn!(%peer, "ILP TLS handshake timed out");
-                                        }
+                                        peer
+                                    })
+                                    .await;
+                                    if matches!(outcome, ConnectionFutureOutcome::Panicked) {
+                                        warn!(%peer, "ILP TLS connection panicked");
                                     }
-                                    drop(permit);
+                                    peer
                                 });
                             } else {
                                 connections.spawn(async move {
-                                    let cs = ConnStream::plain(stream);
-                                    if let Err(e) = handle_ilp_connection(cs, peer, &state, &auth_mode).await {
-                                        warn!(%peer, error = %e, "ILP connection error (data may be lost)");
+                                    let outcome = isolate_connection_future(async move {
+                                        let _permit = permit;
+                                        let cs = ConnStream::plain(stream);
+                                        if let Err(e) = handle_ilp_connection(cs, peer, &state, &auth_mode).await {
+                                            warn!(%peer, error = %e, "ILP connection error (data may be lost)");
+                                        }
+                                        peer
+                                    })
+                                    .await;
+                                    if matches!(outcome, ConnectionFutureOutcome::Panicked) {
+                                        warn!(%peer, "ILP connection panicked");
                                     }
-                                    drop(permit);
+                                    peer
                                 });
                             }
                         }
@@ -145,7 +162,11 @@ impl IlpListener {
                         }
                     }
                 }
-                _ = connections.join_next(), if !connections.is_empty() => {}
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if matches!(result, Some(Err(_))) {
+                        warn!("ILP connection task ended unexpectedly");
+                    }
+                }
                 _ = shutdown_handle.await_phase(crate::control::shutdown::ShutdownPhase::DrainingListeners) => {
                     info!(addr = %self.addr, "ILP listener shutting down");
                     break;
@@ -157,7 +178,11 @@ impl IlpListener {
         let drain = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while connections.join_next().await.is_some() {}
         });
-        let _ = drain.await;
+        if drain.await.is_err() {
+            warn!(addr = %self.addr, "ILP connection drain timed out; aborting remaining tasks");
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        }
         drain_guard.report_drained();
         Ok(())
     }

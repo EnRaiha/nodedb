@@ -14,10 +14,10 @@ use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::session::TransactionState;
 use crate::control::server::shared::session::savepoint_ops::{
     self, DeferredOffsetCmd, SavepointError,
 };
+use crate::control::server::shared::session::{SessionId, TransactionState};
 
 use super::core::NodeDbPgHandler;
 use super::transaction_cmds::PgwireTxnDp;
@@ -46,12 +46,12 @@ impl NodeDbPgHandler {
     pub(super) fn try_handle_deferred_offset(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql_trimmed: &str,
         upper: &str,
     ) -> Option<PgWireResult<Vec<Response>>> {
         let cmd = savepoint_ops::parse_deferred_offset(sql_trimmed, upper)?;
-        if self.sessions.transaction_state(addr) != TransactionState::InBlock {
+        if self.sessions.transaction_state(session_id) != TransactionState::InBlock {
             return None;
         }
         let tenant_id = identity.tenant_id.as_u64();
@@ -64,7 +64,7 @@ impl NodeDbPgHandler {
                 lsn,
             } => {
                 self.sessions.defer_offset_commit(
-                    addr,
+                    session_id,
                     tenant_id,
                     stream,
                     group,
@@ -85,7 +85,7 @@ impl NodeDbPgHandler {
                     }
                     for (pid, lsn) in latest {
                         self.sessions.defer_offset_commit(
-                            addr,
+                            session_id,
                             tenant_id,
                             stream.clone(),
                             group.clone(),
@@ -103,13 +103,19 @@ impl NodeDbPgHandler {
     pub(super) async fn handle_savepoint(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql_trimmed: &str,
     ) -> PgWireResult<Vec<Response>> {
         let sp_name = sql_trimmed.split_whitespace().nth(1).unwrap_or("sp");
         let dp = PgwireTxnDp { handler: self };
-        match savepoint_ops::run_savepoint(&self.sessions, addr, identity.tenant_id, &dp, sp_name)
-            .await
+        match savepoint_ops::run_savepoint(
+            &self.sessions,
+            session_id,
+            identity.tenant_id,
+            &dp,
+            sp_name,
+        )
+        .await
         {
             Ok(()) => Ok(vec![Response::Execution(Tag::new("SAVEPOINT"))]),
             Err(e) => Err(savepoint_error_to_pgerror(&e)),
@@ -119,11 +125,11 @@ impl NodeDbPgHandler {
     /// Handle RELEASE SAVEPOINT <name>.
     pub(super) fn handle_release_savepoint(
         &self,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql_trimmed: &str,
     ) -> PgWireResult<Vec<Response>> {
         let sp_name = sql_trimmed.split_whitespace().last().unwrap_or("sp");
-        match savepoint_ops::run_release_savepoint(&self.sessions, addr, sp_name) {
+        match savepoint_ops::run_release_savepoint(&self.sessions, session_id, sp_name) {
             Ok(()) => Ok(vec![Response::Execution(Tag::new("RELEASE"))]),
             Err(e) => Err(savepoint_error_to_pgerror(&e)),
         }
@@ -133,14 +139,14 @@ impl NodeDbPgHandler {
     pub(super) async fn handle_rollback_to_savepoint(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql_trimmed: &str,
     ) -> PgWireResult<Vec<Response>> {
         let sp_name = sql_trimmed.split_whitespace().last().unwrap_or("sp");
         let dp = PgwireTxnDp { handler: self };
         match savepoint_ops::run_rollback_to_savepoint(
             &self.sessions,
-            addr,
+            session_id,
             identity.tenant_id,
             &dp,
             sp_name,

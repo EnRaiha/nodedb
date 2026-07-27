@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 mod auth;
+mod connection_admin;
 mod copy_handler;
 mod core;
 mod current_setting;
@@ -26,6 +27,7 @@ mod sql_prepared;
 mod sql_split;
 mod stream_response;
 mod submit;
+mod tenant_session;
 mod transaction_cmds;
 mod transaction_savepoint;
 mod trust_auth;

@@ -16,13 +16,12 @@
 //! hosts that decision so all transports funnel through one implementation
 //! instead of divergent copies.
 
-use std::net::SocketAddr;
-
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::exchange::DistributedReadCapture;
 use crate::control::state::SharedState;
 use crate::types::{Lsn, TenantId, VShardId};
 
+use super::connection::SessionId;
 use super::read_set::{ReadCapture, record_read_set};
 use super::store::SessionStore;
 
@@ -56,7 +55,7 @@ pub struct ResponseReads<'a> {
 pub async fn record_reads_for_response(
     state: &SharedState,
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     tenant_id: TenantId,
     reads: ResponseReads<'_>,
 ) {
@@ -65,7 +64,7 @@ pub async fn record_reads_for_response(
             record_read_set(
                 state,
                 sessions,
-                addr,
+                session_id,
                 tenant_id,
                 ReadCapture {
                     plan: &cap.scan_plan,
@@ -80,7 +79,7 @@ pub async fn record_reads_for_response(
         record_read_set(
             state,
             sessions,
-            addr,
+            session_id,
             tenant_id,
             ReadCapture {
                 plan: reads.plan,

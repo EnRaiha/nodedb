@@ -18,7 +18,7 @@ use crate::config::auth::AuthMode;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::response_shape::types::DdlColType;
 use crate::control::server::shared::authorization::{authorize_database, authorize_task_set};
-use crate::control::server::shared::session::SessionStore;
+use crate::control::server::shared::session::{SessionId, SessionStore};
 use crate::control::state::SharedState;
 
 use super::super::auth::{pgwire_authorization_error, resolve_session_identity};
@@ -111,14 +111,21 @@ pub struct NodeDbQueryParser {
     state: Arc<SharedState>,
     auth_mode: AuthMode,
     sessions: Arc<SessionStore>,
+    session_id: SessionId,
 }
 
 impl NodeDbQueryParser {
-    pub fn new(state: Arc<SharedState>, auth_mode: AuthMode, sessions: Arc<SessionStore>) -> Self {
+    pub fn new(
+        state: Arc<SharedState>,
+        auth_mode: AuthMode,
+        sessions: Arc<SessionStore>,
+        session_id: SessionId,
+    ) -> Self {
         Self {
             state,
             auth_mode,
             sessions,
+            session_id,
         }
     }
 
@@ -350,17 +357,16 @@ impl QueryParser for NodeDbQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let addr = client.socket_addr();
         let identity = resolve_session_identity(
             &self.state,
             self.auth_mode.clone(),
             &self.sessions,
             client,
-            &addr,
+            &self.session_id,
         )?;
         let database_id = self
             .sessions
-            .get_current_database(&addr)
+            .get_current_database(self.session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let emitter = ArcAuditEmitter(Arc::clone(&self.state.audit));
         authorize_database(&identity, database_id, &emitter).map_err(pgwire_authorization_error)?;

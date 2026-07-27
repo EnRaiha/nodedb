@@ -38,8 +38,14 @@ pub(crate) async fn handle_savepoint(
 ) -> NativeResponse {
     let sp_name = sql_trimmed.split_whitespace().nth(1).unwrap_or("sp");
     let dp = NativeTxnDp { state: ctx.state };
-    match savepoint_ops::run_savepoint(ctx.sessions, ctx.peer_addr, ctx.tenant_id(), &dp, sp_name)
-        .await
+    match savepoint_ops::run_savepoint(
+        ctx.sessions,
+        ctx.peer_addr.into(),
+        ctx.tenant_id(),
+        &dp,
+        sp_name,
+    )
+    .await
     {
         Ok(()) => NativeResponse::status_row(seq, "SAVEPOINT"),
         Err(e) => savepoint_error_to_native(seq, &e),
@@ -53,7 +59,7 @@ pub(crate) fn handle_release_savepoint(
     sql_trimmed: &str,
 ) -> NativeResponse {
     let sp_name = sql_trimmed.split_whitespace().last().unwrap_or("sp");
-    match savepoint_ops::run_release_savepoint(ctx.sessions, ctx.peer_addr, sp_name) {
+    match savepoint_ops::run_release_savepoint(ctx.sessions, ctx.peer_addr.into(), sp_name) {
         Ok(()) => NativeResponse::status_row(seq, "RELEASE"),
         Err(e) => savepoint_error_to_native(seq, &e),
     }
@@ -69,7 +75,7 @@ pub(crate) async fn handle_rollback_to_savepoint(
     let dp = NativeTxnDp { state: ctx.state };
     match savepoint_ops::run_rollback_to_savepoint(
         ctx.sessions,
-        ctx.peer_addr,
+        ctx.peer_addr.into(),
         ctx.tenant_id(),
         &dp,
         sp_name,

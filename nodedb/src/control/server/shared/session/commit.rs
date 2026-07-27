@@ -2,8 +2,6 @@
 
 //! Protocol-neutral COMMIT orchestration shared by pgwire and native sessions.
 
-use std::net::SocketAddr;
-
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
 use crate::control::gateway::RouteDecision;
 use crate::control::planner::calvin::{DispatchClass, classify_dispatch, read_vshards_of};
@@ -14,37 +12,39 @@ use nodedb_cluster::calvin::types::ReleaseReason;
 use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
+use super::connection::SessionId;
 use super::ddl_buffer;
 use super::outcome::{AbortReason, CommitOutcome, TxnDataPlane};
 use super::overlay_drop::drop_txn_overlay;
 use super::read_set::ReadSetEntry;
 use super::store::SessionStore;
 
-/// Run the neutral COMMIT sequence for the connection at `addr`.
+/// Run the neutral COMMIT sequence for one collision-free session.
 ///
 /// Returns [`CommitOutcome::Committed`] once every durable batch has flushed
 /// and all post-commit side effects have fired, or [`CommitOutcome::Aborted`]
 /// with the reason the transport maps to its wire error.
 pub async fn run_commit(
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     identity: &AuthenticatedIdentity,
     state: &SharedState,
     dp: &impl TxnDataPlane,
 ) -> CommitOutcome {
-    let read_set = sessions.take_read_set(addr);
+    let read_set = sessions.take_read_set(session_id);
     // Collections this transaction wrote itself. A read of a collection the
     // same transaction has written is a read-your-own-write, not a
     // serialization conflict — reading uncommitted own state (served from the
     // staging overlay, which reports no watermark) must not abort the commit.
     // The read-set is collection-granular, so exclusion is too.
-    let written_collections =
-        sessions.buffered_collections(addr, |plan| extract_collection(plan).map(String::from));
+    let written_collections = sessions.buffered_collections(session_id, |plan| {
+        extract_collection(plan).map(String::from)
+    });
     // Peek the buffered write tasks WITHOUT draining them or leaving the block.
     // The session stays `InBlock` through classification and dispatch; the
     // buffered batch is flushed to Calvin as the COMMIT finalization (see
     // `run_commit_calvin`), then `sessions.commit` below drains the buffer.
-    let buffered = sessions.buffered_tasks(addr);
+    let buffered = sessions.buffered_tasks(session_id);
     let tenant_id = identity.tenant_id;
     // The interactive-COMMIT read-set widens dispatch classification: a txn that
     // writes shard X but read shard Y participates in {X, Y} and must route
@@ -64,10 +64,10 @@ pub async fn run_commit(
         // single-shard SI validation only — classifying an empty buffer would
         // misread a lone cross-shard READ as `MultiShard` and wrongly reject it.
         if let Some(outcome) =
-            si_conflict_abort(sessions, addr, state, &read_set, &written_collections)
+            si_conflict_abort(sessions, session_id, state, &read_set, &written_collections)
         {
             // Release read reservations (owner still set), then roll back.
-            super::reservation_release::release_and_rollback(state, sessions, addr).await;
+            super::reservation_release::release_and_rollback(state, sessions, session_id).await;
             return outcome;
         }
     } else {
@@ -80,11 +80,12 @@ pub async fn run_commit(
                 // and returns a serialization abort (SQLSTATE 40001) on an ABORT
                 // verdict.
                 if let Some(reason) = super::commit_calvin::run_commit_calvin(
-                    sessions, addr, state, &buffered, tenant_id, &read_set,
+                    sessions, session_id, state, &buffered, tenant_id, &read_set,
                 )
                 .await
                 {
-                    super::reservation_release::release_and_rollback(state, sessions, addr).await;
+                    super::reservation_release::release_and_rollback(state, sessions, session_id)
+                        .await;
                     return CommitOutcome::Aborted { reason };
                 }
             }
@@ -102,27 +103,37 @@ pub async fn run_commit(
                     // this gives it the same leader routing, OCC, durability,
                     // and apply ordering as any multi-participant commit.
                     if let Some(reason) = super::commit_calvin::run_commit_calvin(
-                        sessions, addr, state, &buffered, tenant_id, &read_set,
+                        sessions, session_id, state, &buffered, tenant_id, &read_set,
                     )
                     .await
                     {
-                        super::reservation_release::release_and_rollback(state, sessions, addr)
-                            .await;
+                        super::reservation_release::release_and_rollback(
+                            state, sessions, session_id,
+                        )
+                        .await;
                         return CommitOutcome::Aborted { reason };
                     }
                 } else {
-                    if let Some(outcome) =
-                        si_conflict_abort(sessions, addr, state, &read_set, &written_collections)
-                    {
-                        super::reservation_release::release_and_rollback(state, sessions, addr)
-                            .await;
+                    if let Some(outcome) = si_conflict_abort(
+                        sessions,
+                        session_id,
+                        state,
+                        &read_set,
+                        &written_collections,
+                    ) {
+                        super::reservation_release::release_and_rollback(
+                            state, sessions, session_id,
+                        )
+                        .await;
                         return outcome;
                     }
                     if let Some(reason) =
                         dispatch_single_shard(state, dp, &buffered, tenant_id, vshard_id).await
                     {
-                        super::reservation_release::release_and_rollback(state, sessions, addr)
-                            .await;
+                        super::reservation_release::release_and_rollback(
+                            state, sessions, session_id,
+                        )
+                        .await;
                         return CommitOutcome::Aborted { reason };
                     }
                 }
@@ -138,13 +149,13 @@ pub async fn run_commit(
     super::reservation_release::release_session_reservations(
         state,
         sessions,
-        addr,
+        session_id,
         ReleaseReason::Commit,
     )
     .await;
     // Transition the session out of the block NOW — this drains the write buffer
     // and clears snapshot/txn state, moving the session to `Idle`.
-    match sessions.commit(addr) {
+    match sessions.commit(session_id) {
         Ok(_) => {}
         Err(_msg) => {
             return CommitOutcome::Aborted {
@@ -185,7 +196,7 @@ pub async fn run_commit(
     }
 
     // Flush pending offset commits (deferred from COMMIT OFFSET inside transaction).
-    let pending_offsets = sessions.take_pending_offsets(addr);
+    let pending_offsets = sessions.take_pending_offsets(session_id);
     for (tid, stream, group, partition_id, lsn) in pending_offsets {
         if let Err(e) = state
             .offset_store
@@ -202,7 +213,7 @@ pub async fn run_commit(
     }
 
     // Finalize GAP_FREE reservations (numbers become permanent).
-    let reservations = sessions.take_pending_reservations(addr);
+    let reservations = sessions.take_pending_reservations(session_id);
     for handle in &reservations {
         state.sequence_registry.gap_free_manager().commit(handle);
         // Log to _system.sequence_log.
@@ -226,9 +237,9 @@ pub async fn run_commit(
     }
 
     // Close non-WITH-HOLD cursors on transaction end.
-    sessions.close_non_hold_cursors(addr);
+    sessions.close_non_hold_cursors(session_id);
     // Flush NOTIFY messages buffered during this transaction.
-    sessions.flush_pending_notifies(addr, identity.tenant_id, &state.notify_bus);
+    sessions.flush_pending_notifies(session_id, identity.tenant_id, &state.notify_bus);
     CommitOutcome::Committed
 }
 
@@ -247,12 +258,12 @@ pub async fn run_commit(
 /// shard, and is run exclusively on the `SingleShard` / read-only paths.
 fn si_conflict_abort(
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     state: &SharedState,
     read_set: &[ReadSetEntry],
     written_collections: &std::collections::HashSet<String>,
 ) -> Option<CommitOutcome> {
-    let snapshot_lsn = sessions.snapshot_lsn(addr)?;
+    let snapshot_lsn = sessions.snapshot_lsn(session_id)?;
     let current_lsn = state.wal.next_lsn();
     let current = crate::types::Lsn::new(current_lsn.as_u64().saturating_sub(1));
     for entry in read_set {

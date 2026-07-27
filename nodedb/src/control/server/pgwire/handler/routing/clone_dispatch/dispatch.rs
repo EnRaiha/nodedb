@@ -21,6 +21,7 @@ use crate::control::server::pgwire::handler::shape_encode;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::kv::apply_kv_wrap;
 use crate::control::server::response_shape::schema::OutputSchema;
+use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -42,7 +43,7 @@ impl NodeDbPgHandler {
         tasks: Vec<PhysicalTask>,
         identity: &crate::control::security::identity::AuthenticatedIdentity,
         tenant_id: TenantId,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         projection: Option<&OutputSchema>,
         result_formats: &[FieldFormat],
     ) -> PgWireResult<Option<Vec<Response>>> {
@@ -99,14 +100,14 @@ impl NodeDbPgHandler {
                         let (response, notice) =
                             shape_encode::shaped_query_response(shaped, result_formats);
                         if let Some(n) = notice {
-                            self.sessions.push_notice(addr, n);
+                            self.sessions.push_notice(session_id, n);
                         }
                         Ok(Some(vec![response]))
                     }
                     ShapeOutcome::Passthrough => {
                         let shaped = multirow_payload_to_response(&empty);
                         if let Some(notice) = shaped.notice {
-                            self.sessions.push_notice(addr, notice);
+                            self.sessions.push_notice(session_id, notice);
                         }
                         Ok(Some(vec![shaped.response]))
                     }
@@ -294,14 +295,14 @@ impl NodeDbPgHandler {
                             let (response, notice) =
                                 shape_encode::shaped_query_response(shaped, result_formats);
                             if let Some(n) = notice {
-                                self.sessions.push_notice(addr, n);
+                                self.sessions.push_notice(session_id, n);
                             }
                             pg_responses.push(response);
                         }
                         ShapeOutcome::Passthrough => {
                             let shaped = multirow_payload_to_response(resp.payload.as_ref());
                             if let Some(notice) = shaped.notice {
-                                self.sessions.push_notice(addr, notice);
+                                self.sessions.push_notice(session_id, notice);
                             }
                             pg_responses.push(shaped.response);
                         }

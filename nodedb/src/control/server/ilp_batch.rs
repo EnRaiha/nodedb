@@ -191,28 +191,9 @@ pub(crate) async fn flush_authenticated_ilp_batch(
     // all collection permissions have passed. The tenant is never caller input.
     let tenant_id = identity.tenant_id;
     state.check_tenant_quota(tenant_id)?;
-    let _request = TenantRequestAccounting::start(state, tenant_id);
+    let _request = state.tenant_request_guard(tenant_id);
 
     flush_ilp_batch_inner(state, identity, database_id, groups).await
-}
-
-/// Cancellation-safe tenant request accounting for one ILP batch.
-struct TenantRequestAccounting<'a> {
-    state: &'a SharedState,
-    tenant_id: TenantId,
-}
-
-impl<'a> TenantRequestAccounting<'a> {
-    fn start(state: &'a SharedState, tenant_id: TenantId) -> Self {
-        state.tenant_request_start(tenant_id);
-        Self { state, tenant_id }
-    }
-}
-
-impl Drop for TenantRequestAccounting<'_> {
-    fn drop(&mut self) {
-        self.state.tenant_request_end(self.tenant_id);
-    }
 }
 
 /// Inner dispatch logic for ILP batch (separated for clean quota bookkeeping).

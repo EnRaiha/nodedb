@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -10,7 +12,9 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use super::admission::AdmissionRegistry;
-use super::native::session::NativeSession;
+use super::native::session::{NativeConnectionResources, NativeSession};
+use crate::control::server::shared::session::ConnectionId;
+use crate::control::server::shared::{ConnectionFutureOutcome, isolate_connection_future};
 use crate::control::state::SharedState;
 
 /// TCP accept loop for the Control Plane.
@@ -73,10 +77,13 @@ impl Listener {
             bus,
             admission,
         } = params;
-        let drain_guard = bus.register_task(
+        // Native cancellation can leave a transaction overlay that must be
+        // reclaimed before the Data Plane is allowed to drain. This listener
+        // therefore forms a shutdown correctness barrier rather than a
+        // best-effort, budget-abortable task.
+        let drain_guard = bus.register_critical_task(
             crate::control::shutdown::ShutdownPhase::DrainingListeners,
             "native",
-            None,
         );
         let mut shutdown_handle = bus.handle();
 
@@ -105,6 +112,8 @@ impl Listener {
         );
 
         let mut connections = JoinSet::new();
+        let mut cleanups = HashMap::new();
+        let next_connection_id = AtomicU64::new(0);
 
         loop {
             tokio::select! {
@@ -128,58 +137,93 @@ impl Listener {
                                 }
                             };
 
-                            state.connections_accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            info!(%peer_addr, "new native connection");
+                            let Some(raw_connection_id) = next_connection_id
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                                    current.checked_add(1)
+                                })
+                                .ok()
+                                .and_then(|previous| previous.checked_add(1))
+                            else {
+                                state.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                                warn!(%peer_addr, "native connection identity exhausted, rejecting");
+                                continue;
+                            };
+                            let connection_id = match ConnectionId::new(raw_connection_id) {
+                                Ok(connection_id) => connection_id,
+                                Err(_) => {
+                                    state.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                                    warn!(%peer_addr, "native connection identity invalid, rejecting");
+                                    continue;
+                                }
+                            };
+                            state.connections_accepted.fetch_add(1, Ordering::Relaxed);
+                            info!(%peer_addr, connection_id = %connection_id, "new native connection");
+                            let resources =
+                                NativeConnectionResources::new(peer_addr, Arc::clone(&state));
+                            let cleanup = resources.cleanup();
+                            cleanups.insert(connection_id, cleanup.clone());
                             let state_clone = Arc::clone(&state);
                             let mode = auth_mode.clone();
                             let admission_clone = Arc::clone(&admission);
                             if let Some(ref acceptor) = tls_acceptor {
                                 let acceptor = acceptor.clone();
                                 connections.spawn(async move {
-                                    match tokio::time::timeout(
-                                        Duration::from_secs(10),
-                                        acceptor.accept(stream),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(tls_stream)) => {
-                                            let session = NativeSession::new_tls(
-                                                tls_stream,
-                                                peer_addr,
-                                                state_clone,
-                                                mode,
-                                                admission_clone,
-                                                permit,
-                                            );
-                                            if let Err(e) = session.run().await {
-                                                warn!(%peer_addr, error = %e, "TLS session terminated with error");
+                                    let outcome = isolate_connection_future(async move {
+                                        let _permit = permit;
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(10),
+                                            acceptor.accept(stream),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(tls_stream)) => {
+                                                let session = NativeSession::new_tls(
+                                                    tls_stream,
+                                                    peer_addr,
+                                                    state_clone,
+                                                    mode,
+                                                    admission_clone,
+                                                    _permit,
+                                                    resources,
+                                                );
+                                                if let Err(e) = session.run().await {
+                                                    warn!(%peer_addr, error = %e, "TLS session terminated with error");
+                                                }
                                             }
+                                            Ok(Err(e)) => warn!(%peer_addr, error = %e, "native TLS handshake failed"),
+                                            Err(_) => warn!(%peer_addr, "native TLS handshake timed out"),
                                         }
-                                        Ok(Err(e)) => {
-                                            warn!(%peer_addr, error = %e, "native TLS handshake failed");
-                                            // permit is dropped here, releasing global slot
-                                        }
-                                        Err(_) => {
-                                            warn!(%peer_addr, "native TLS handshake timed out");
-                                            // permit is dropped here, releasing global slot
-                                        }
+                                    })
+                                    .await;
+                                    if matches!(outcome, ConnectionFutureOutcome::Panicked) {
+                                        warn!(%peer_addr, "native TLS connection panicked");
                                     }
-                                    peer_addr
+                                    cleanup.start_and_wait().await;
+                                    connection_id
                                 });
                             } else {
-                                let session = NativeSession::new(
-                                    stream,
-                                    peer_addr,
-                                    state_clone,
-                                    mode,
-                                    admission_clone,
-                                    permit,
-                                );
                                 connections.spawn(async move {
-                                    if let Err(e) = session.run().await {
-                                        warn!(%peer_addr, error = %e, "session terminated with error");
+                                    let outcome = isolate_connection_future(async move {
+                                        let _permit = permit;
+                                        let session = NativeSession::new(
+                                            stream,
+                                            peer_addr,
+                                            state_clone,
+                                            mode,
+                                            admission_clone,
+                                            _permit,
+                                            resources,
+                                        );
+                                        if let Err(e) = session.run().await {
+                                            warn!(%peer_addr, error = %e, "session terminated with error");
+                                        }
+                                    })
+                                    .await;
+                                    if matches!(outcome, ConnectionFutureOutcome::Panicked) {
+                                        warn!(%peer_addr, "native connection panicked");
                                     }
-                                    peer_addr
+                                    cleanup.start_and_wait().await;
+                                    connection_id
                                 });
                             }
                         }
@@ -190,8 +234,12 @@ impl Listener {
                 }
                 // Reap completed connections.
                 Some(result) = connections.join_next(), if !connections.is_empty() => {
-                    if let Ok(peer_addr) = result {
-                        info!(%peer_addr, "native connection closed");
+                    match result {
+                        Ok(connection_id) => {
+                            cleanups.remove(&connection_id);
+                            info!(connection_id = %connection_id, "native connection closed");
+                        }
+                        Err(_) => warn!("native connection task ended unexpectedly"),
                     }
                 }
                 _ = shutdown_handle.await_phase(crate::control::shutdown::ShutdownPhase::DrainingListeners) => {
@@ -216,8 +264,12 @@ impl Listener {
 
             let drain_result = tokio::time::timeout(drain_timeout, async {
                 while let Some(result) = connections.join_next().await {
-                    if let Ok(peer_addr) = result {
-                        info!(%peer_addr, "drained native connection");
+                    match result {
+                        Ok(connection_id) => {
+                            cleanups.remove(&connection_id);
+                            info!(connection_id = %connection_id, "drained native connection");
+                        }
+                        Err(_) => warn!("native connection task ended unexpectedly while draining"),
                     }
                 }
             })
@@ -230,7 +282,25 @@ impl Listener {
                     "drain timeout exceeded, aborting remaining native connections"
                 );
                 connections.abort_all();
+                // Join every aborted task before shutdown advances: this runs
+                // connection-future drops and releases their permits.
+                while let Some(result) = connections.join_next().await {
+                    if let Ok(connection_id) = result {
+                        cleanups.remove(&connection_id);
+                    }
+                }
             }
+        }
+
+        // Aborted tasks cannot return their ID, so cleanup ownership remains in
+        // this exact-ID map until after the join. Start every cleanup before any
+        // await, then await their sticky completions before reporting drained.
+        let retained_cleanups: Vec<_> = cleanups.into_values().collect();
+        for cleanup in &retained_cleanups {
+            cleanup.start();
+        }
+        for cleanup in retained_cleanups {
+            cleanup.start_and_wait().await;
         }
 
         info!(addr = %self.addr, "native listener stopped");

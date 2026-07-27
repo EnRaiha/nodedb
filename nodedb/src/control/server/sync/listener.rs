@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::control::security::jwt::JwtConfig;
+use crate::control::server::shared::{ConnectionFutureOutcome, isolate_connection_future};
 use crate::control::state::SharedState;
 
 use super::rate_limit::RateLimitConfig;
@@ -70,18 +71,150 @@ impl SyncListenerState {
         self.active_sessions.load(Ordering::Relaxed) < self.config.max_sessions as u64
     }
 
-    pub fn session_opened(&self) {
-        self.active_sessions.fetch_add(1, Ordering::Relaxed);
-        self.connections_accepted.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn session_closed(&self) {
-        self.active_sessions.fetch_sub(1, Ordering::Relaxed);
-    }
-
     pub fn session_rejected(&self) {
         self.connections_rejected.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Owns accounting for exactly one accepted sync connection.
+///
+/// The guard is moved into the connection task before its WebSocket upgrade.
+/// Consequently normal completion, a caught panic, and Tokio task cancellation
+/// all release the active-session slot through the same `Drop` path.
+struct SyncSessionGuard {
+    state: Arc<SyncListenerState>,
+    sequence: u64,
+}
+
+impl SyncSessionGuard {
+    /// Reserve a never-reused accepted-connection sequence. Exhaustion is
+    /// fail-closed rather than allowing an atomic counter to wrap and collide
+    /// with an earlier session's registry key.
+    fn open(state: Arc<SyncListenerState>) -> Option<Self> {
+        let sequence = state
+            .connections_accepted
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .ok()?
+            .checked_add(1)?;
+        state.active_sessions.fetch_add(1, Ordering::Relaxed);
+        Some(Self { state, sequence })
+    }
+
+    fn session_id(&self, addr: SocketAddr) -> String {
+        format!("sync-{addr}-{}", self.sequence)
+    }
+}
+
+impl Drop for SyncSessionGuard {
+    fn drop(&mut self) {
+        self.state.active_sessions.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Owns cleanup of all registry entries for one sync session.
+///
+/// Cleanup starts synchronously from `Drop`, before its first await, so task
+/// cancellation and panic unwinding cannot strand a registered session.
+struct SyncRegistrationCleanup {
+    shared: Arc<SharedState>,
+    session_id: String,
+    started: std::sync::atomic::AtomicBool,
+}
+
+impl SyncRegistrationCleanup {
+    fn new(shared: Arc<SharedState>, session_id: String) -> Self {
+        Self {
+            shared,
+            session_id,
+            started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn start(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        if self
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        let cleanup = Arc::clone(self);
+        Some(handle.spawn(async move {
+            cleanup.run().await;
+        }))
+    }
+
+    async fn run(self: Arc<Self>) {
+        self.shared.shape_registry.remove_session(&self.session_id);
+        self.shared.crdt_sync_delivery.unregister(&self.session_id);
+        self.shared.array_delivery.unregister(&self.session_id);
+        self.shared
+            .array_subscriber_cursors
+            .remove_session(&self.session_id);
+        self.shared
+            .array_merger_registry
+            .remove_session(&self.session_id);
+        self.shared
+            .definition_sync_fanout
+            .unregister(&self.session_id);
+
+        let mut presence = self.shared.presence.write().await;
+        let outbound = presence.unregister_session(&self.session_id);
+        let senders = presence.senders().clone();
+        drop(presence);
+        outbound.send_all(&senders);
+    }
+}
+
+/// Ensures normal completion awaits registry cleanup while cancellation and
+/// panic unwinding detach the exact same cleanup task.
+pub(super) struct SyncRegistrationCleanupGuard {
+    cleanup: Option<Arc<SyncRegistrationCleanup>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SyncRegistrationCleanupGuard {
+    pub(super) fn new(shared: Option<Arc<SharedState>>, session_id: String) -> Self {
+        Self {
+            cleanup: shared
+                .map(|shared| Arc::new(SyncRegistrationCleanup::new(shared, session_id))),
+            handle: None,
+        }
+    }
+
+    fn start(&mut self) {
+        if self.handle.is_none()
+            && let Some(cleanup) = self.cleanup.as_ref()
+        {
+            self.handle = cleanup.start();
+        }
+    }
+
+    pub(super) async fn finish(mut self) {
+        self.start();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for SyncRegistrationCleanupGuard {
+    fn drop(&mut self) {
+        self.start();
+    }
+}
+
+/// Run the full accepted-connection future under the protocol-neutral panic
+/// boundary while retaining session accounting until the future is dropped.
+async fn run_accepted_session<T>(
+    guard: SyncSessionGuard,
+    future: impl std::future::Future<Output = T>,
+) -> ConnectionFutureOutcome<T> {
+    let _guard = guard;
+    isolate_connection_future(future).await
 }
 
 /// Bind the sync WebSocket listener socket.
@@ -182,21 +315,42 @@ async fn accept_loop(
                     continue;
                 }
 
-                state.session_opened();
+                // Create the guard after admission and move it into the task
+                // before WebSocket upgrade or session processing can panic.
+                let Some(guard) = SyncSessionGuard::open(Arc::clone(&state)) else {
+                    state.session_rejected();
+                    warn!(%addr, "sync: accepted-session identity exhausted, rejecting");
+                    continue;
+                };
+                let session_id = guard.session_id(addr);
                 let state_clone = Arc::clone(&state);
                 let shared_clone = shared.clone();
 
                 tokio::spawn(async move {
-                    match tokio_tungstenite::accept_async(stream).await {
-                        Ok(ws) => {
-                            info!(%addr, "sync: WebSocket connection established");
-                            handle_sync_session(ws, addr, &state_clone, shared_clone).await;
+                    let outcome = run_accepted_session(guard, async {
+                        match tokio_tungstenite::accept_async(stream).await {
+                            Ok(ws) => {
+                                info!(%addr, "sync: WebSocket connection established");
+                                handle_sync_session(
+                                    ws,
+                                    addr,
+                                    session_id,
+                                    &state_clone,
+                                    shared_clone,
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                warn!(%addr, error = %error, "sync: WebSocket upgrade failed");
+                            }
                         }
-                        Err(e) => {
-                            warn!(%addr, error = %e, "sync: WebSocket upgrade failed");
-                        }
+                    })
+                    .await;
+                    if matches!(outcome, ConnectionFutureOutcome::Panicked) {
+                        // Do not inspect a panic payload: it may contain client
+                        // data or application internals.
+                        warn!(%addr, "sync connection panicked; closing connection");
                     }
-                    state_clone.session_closed();
                 });
             }
             Err(e) => {
@@ -209,8 +363,17 @@ async fn accept_loop(
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::server::sync::presence::SessionSender;
+    use crate::control::server::sync::shape::definition::{ShapeDefinition, ShapeType};
+    use crate::event::crdt_sync::types::DeliveryConfig;
+    use crate::wal::WalManager;
 
     /// Binding to an address that's already occupied must surface as `Err`,
     /// not panic or silently succeed — this is the behavior `bind_listeners`
@@ -286,5 +449,223 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("TLS-terminating proxy"));
+    }
+
+    fn listener_state() -> Arc<SyncListenerState> {
+        Arc::new(SyncListenerState::new(SyncListenerConfig::default()))
+    }
+
+    fn test_shared_state() -> (Arc<SharedState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create sync cleanup test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("sync-cleanup.wal"))
+                .expect("open sync cleanup test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let shared = SharedState::new(dispatcher, wal).expect("construct sync cleanup SharedState");
+        (shared, dir)
+    }
+
+    async fn wait_for_detached_cleanup(mut complete: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !complete() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached sync registration cleanup must complete promptly");
+    }
+
+    #[tokio::test]
+    async fn panicking_accepted_session_releases_accounting() {
+        let state = listener_state();
+        let guard = SyncSessionGuard::open(Arc::clone(&state))
+            .expect("fresh listener state must allocate an accepted-session identity");
+        let outcome = run_accepted_session(guard, async {
+            panic!("sync panic payload must remain private");
+        })
+        .await;
+
+        assert_eq!(outcome, ConnectionFutureOutcome::Panicked);
+        assert_eq!(state.active_sessions.load(Ordering::Relaxed), 0);
+        assert_eq!(state.connections_accepted.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn aborted_accepted_session_releases_accounting() {
+        let state = listener_state();
+        let guard = SyncSessionGuard::open(Arc::clone(&state))
+            .expect("fresh listener state must allocate an accepted-session identity");
+        let task = tokio::spawn(run_accepted_session(guard, std::future::pending::<()>()));
+        assert_eq!(state.active_sessions.load(Ordering::Relaxed), 1);
+
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(state.active_sessions.load(Ordering::Relaxed), 0);
+        assert_eq!(state.connections_accepted.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn accepted_sessions_from_the_same_peer_have_unique_ids() {
+        let state = listener_state();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 41234));
+        let first = SyncSessionGuard::open(Arc::clone(&state))
+            .expect("first accepted session must allocate an identity");
+        let second = SyncSessionGuard::open(Arc::clone(&state))
+            .expect("second accepted session must allocate an identity");
+
+        assert_ne!(first.session_id(addr), second.session_id(addr));
+        assert_eq!(state.connections_accepted.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn accepted_session_identity_exhaustion_is_fail_closed() {
+        let state = listener_state();
+        state
+            .connections_accepted
+            .store(u64::MAX, Ordering::Relaxed);
+
+        assert!(SyncSessionGuard::open(Arc::clone(&state)).is_none());
+        assert_eq!(state.active_sessions.load(Ordering::Relaxed), 0);
+        assert_eq!(state.connections_accepted.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn dropped_cleanup_guard_removes_every_session_registry() {
+        let (shared, _dir) = test_shared_state();
+        let session_id = "sync-cleanup-drop-regression".to_owned();
+
+        let shape_baseline = shared.shape_registry.active_sessions();
+        let crdt_baseline = shared.crdt_sync_delivery.session_count();
+        let array_delivery_baseline = shared.array_delivery.active_sessions();
+        let definition_baseline = shared.definition_sync_fanout.active_sessions();
+        let presence_baseline = shared.presence.read().await.senders().len();
+
+        shared.shape_registry.subscribe(
+            &session_id,
+            1,
+            ShapeDefinition {
+                shape_id: "cleanup-shape".into(),
+                tenant_id: 1,
+                shape_type: ShapeType::Document {
+                    collection: "cleanup_collection".into(),
+                    predicate: Vec::new(),
+                },
+                description: "cleanup regression shape".into(),
+                field_filter: Vec::new(),
+            },
+        );
+        let (crdt_rx, crdt_control_rx) = shared.crdt_sync_delivery.register(
+            session_id.clone(),
+            7,
+            1,
+            Vec::new(),
+            &DeliveryConfig::default(),
+        );
+        let array_delivery_rx = shared.array_delivery.register(session_id.clone());
+        shared
+            .array_subscriber_cursors
+            .register(&session_id, "cleanup_array", None);
+        let merger = shared
+            .array_merger_registry
+            .get_or_create(&session_id, "cleanup_array");
+        let definition_rx = shared.definition_sync_fanout.register(session_id.clone());
+        let (presence_tx, _presence_rx) = mpsc::channel(1);
+        shared
+            .presence
+            .write()
+            .await
+            .register_session(session_id.clone(), SessionSender::new(presence_tx));
+
+        assert_eq!(shared.shape_registry.active_sessions(), shape_baseline + 1);
+        assert_eq!(shared.crdt_sync_delivery.session_count(), crdt_baseline + 1);
+        assert_eq!(
+            shared.array_delivery.active_sessions(),
+            array_delivery_baseline + 1
+        );
+        assert!(
+            shared
+                .array_subscriber_cursors
+                .get(&session_id, "cleanup_array")
+                .is_some()
+        );
+        assert_eq!(
+            shared.definition_sync_fanout.active_sessions(),
+            definition_baseline + 1
+        );
+        assert!(
+            shared
+                .presence
+                .read()
+                .await
+                .senders()
+                .contains_key(&session_id)
+        );
+
+        let (guard_created_tx, guard_created_rx) = oneshot::channel();
+        let cleanup_shared = Arc::clone(&shared);
+        let cleanup_session_id = session_id.clone();
+        let guard_owner = tokio::spawn(async move {
+            let _guard =
+                SyncRegistrationCleanupGuard::new(Some(cleanup_shared), cleanup_session_id);
+            let _ = guard_created_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        guard_created_rx
+            .await
+            .expect("cleanup guard owner must start before cancellation");
+        guard_owner.abort();
+        let _ = guard_owner.await;
+
+        wait_for_detached_cleanup(|| {
+            shared.shape_registry.active_sessions() == shape_baseline
+                && shared.crdt_sync_delivery.session_count() == crdt_baseline
+                && crdt_rx.is_closed()
+                && crdt_control_rx.is_closed()
+                && shared.array_delivery.active_sessions() == array_delivery_baseline
+                && array_delivery_rx.is_closed()
+                && shared
+                    .array_subscriber_cursors
+                    .get(&session_id, "cleanup_array")
+                    .is_none()
+                && shared.definition_sync_fanout.active_sessions() == definition_baseline
+                && definition_rx.is_closed()
+        })
+        .await;
+        let replacement_merger = shared
+            .array_merger_registry
+            .get_or_create(&session_id, "cleanup_array");
+        assert!(
+            !Arc::ptr_eq(&merger, &replacement_merger),
+            "cleanup must remove the prior session-scoped array merger"
+        );
+        shared.array_merger_registry.remove_session(&session_id);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let presence = shared.presence.read().await;
+                if presence.senders().len() == presence_baseline
+                    && !presence.senders().contains_key(&session_id)
+                {
+                    break;
+                }
+                drop(presence);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached cleanup must unregister presence promptly");
+    }
+
+    #[tokio::test]
+    async fn completed_accepted_session_releases_accounting() {
+        let state = listener_state();
+        let guard = SyncSessionGuard::open(Arc::clone(&state))
+            .expect("fresh listener state must allocate an accepted-session identity");
+        let outcome = run_accepted_session(guard, async {}).await;
+
+        assert_eq!(outcome, ConnectionFutureOutcome::Completed(()));
+        assert_eq!(state.active_sessions.load(Ordering::Relaxed), 0);
+        assert_eq!(state.connections_accepted.load(Ordering::Relaxed), 1);
     }
 }

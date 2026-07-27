@@ -11,6 +11,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::authorize_collection;
+use crate::control::server::shared::session::SessionId;
 
 use super::super::types::text_field;
 use super::auth::pgwire_authorization_error;
@@ -22,7 +23,7 @@ impl NodeDbPgHandler {
     pub(super) fn handle_live_select(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
         let coll_name =
@@ -37,7 +38,7 @@ impl NodeDbPgHandler {
 
         let database_id = self
             .sessions
-            .get_current_database(addr)
+            .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let emitter = ArcAuditEmitter(Arc::clone(&self.state.audit));
         authorize_collection(
@@ -60,7 +61,7 @@ impl NodeDbPgHandler {
         let channel = format!("live_{coll_name}");
 
         self.sessions
-            .add_live_subscription(addr, channel.clone(), sub);
+            .add_live_subscription(session_id, channel.clone(), sub);
 
         tracing::info!(
             sub_id,

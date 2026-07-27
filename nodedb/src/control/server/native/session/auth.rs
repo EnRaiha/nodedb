@@ -115,6 +115,7 @@ impl NativeSession {
                 self.auth_context = Some(super::super::super::session_auth::build_auth_context(
                     &identity,
                 ));
+                self.cleanup.publish_identity(identity.clone());
                 self.identity = Some(identity);
                 resp
             }

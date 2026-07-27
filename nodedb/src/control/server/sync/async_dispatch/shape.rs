@@ -58,7 +58,7 @@ pub(crate) async fn handle_shape_subscribe_async(
 ///
 /// Dispatches into the Data Plane for Document shapes; returns lightweight
 /// or empty payloads for Vector / Graph / Array (see inline comments).
-/// Caller is responsible for quota accounting (tenant_request_start/end).
+/// Caller is responsible for holding a tenant request guard.
 async fn take_shape_snapshot_async(
     shared: &SharedState,
     session_id: &str,
@@ -69,8 +69,8 @@ async fn take_shape_snapshot_async(
     use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
     use nodedb_physical::physical_plan::DocumentOp;
 
-    shared.tenant_request_start(tid);
-    let result = match &shape.shape_type {
+    let _request = shared.tenant_request_guard(tid);
+    match &shape.shape_type {
         nodedb_types::sync::shape::ShapeType::Document {
             collection,
             predicate,
@@ -124,7 +124,6 @@ async fn take_shape_snapshot_async(
                     array = %array_name,
                     "array shape subscribe: array not known to Origin schema registry"
                 );
-                shared.tenant_request_end(tid);
                 return super::super::shape::handler::ShapeSnapshotData::empty();
             }
             shared
@@ -144,9 +143,7 @@ async fn take_shape_snapshot_async(
             );
             super::super::shape::handler::ShapeSnapshotData::empty()
         }
-    };
-    shared.tenant_request_end(tid);
-    result
+    }
 }
 
 /// Re-snapshot a previously subscribed shape in response to a ResyncRequest.

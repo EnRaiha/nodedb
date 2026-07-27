@@ -40,9 +40,9 @@ impl NodeDbPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let addr = client.socket_addr();
-        let identity = self.resolve_identity(client, &addr)?;
-        self.authorize_session_database(&identity, &addr)?;
+        let session_id = self.session_id;
+        let identity = self.resolve_identity(client, &session_id)?;
+        self.authorize_session_database(&identity, session_id)?;
         let stmt = &portal.statement.statement;
         let tenant_id = identity.tenant_id;
 
@@ -63,7 +63,7 @@ impl NodeDbPgHandler {
         // sqlparser-based execution because the shapes aren't standard COPY
         // grammar. See `control::backup::detect`.
         if let Some(intent) = crate::control::backup::detect(&stmt.sql) {
-            return self.intent_to_response(&identity, addr, intent).await;
+            return self.intent_to_response(&identity, session_id, intent).await;
         }
 
         // Convert pgwire binary parameters to typed ParamValues for AST/DSL
@@ -90,7 +90,9 @@ impl NodeDbPgHandler {
                     format!("DSL parameter bind: {e}"),
                 )))
             })?;
-            let mut results = self.execute_sql(&identity, &addr, bound.as_str()).await?;
+            let mut results = self
+                .execute_sql(&identity, session_id, bound.as_str())
+                .await?;
             return Ok(results.pop().unwrap_or(Response::EmptyQuery));
         }
 
@@ -138,7 +140,7 @@ impl NodeDbPgHandler {
                 &identity,
                 &stmt.sql,
                 tenant_id,
-                &addr,
+                session_id,
                 &params,
                 ResultShaping {
                     projection: projection.as_ref(),

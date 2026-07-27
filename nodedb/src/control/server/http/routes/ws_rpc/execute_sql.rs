@@ -70,7 +70,7 @@ pub async fn execute_sql(
     )?
     .into_tasks();
 
-    shared.tenant_request_start(tenant_id);
+    let _request = shared.tenant_request_guard(tenant_id);
 
     let mut results = Vec::new();
     for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
@@ -98,10 +98,7 @@ pub async fn execute_sql(
                         }
                     }
                 }
-                Err(e) => {
-                    shared.tenant_request_end(tenant_id);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
             continue;
         }
@@ -138,10 +135,7 @@ pub async fn execute_sql(
                         }
                     }
                 }
-                Err(e) => {
-                    shared.tenant_request_end(tenant_id);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
             continue;
         }
@@ -182,10 +176,7 @@ pub async fn execute_sql(
                         }
                     }
                 }
-                Err(e) => {
-                    shared.tenant_request_end(tenant_id);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
             continue;
         }
@@ -225,14 +216,9 @@ pub async fn execute_sql(
                     }
                 }
             }
-            Err(e) => {
-                shared.tenant_request_end(tenant_id);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     }
-
-    shared.tenant_request_end(tenant_id);
 
     match results.len() {
         0 => Ok(serde_json::Value::Null),

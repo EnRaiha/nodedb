@@ -10,6 +10,7 @@ use nodedb_physical::physical_task::PhysicalTask;
 use crate::control::planner::calvin::plan_needs_implicit_edge_recon;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::schema::OutputSchema;
+use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 
 use super::planning::consistency_for_tasks;
@@ -25,10 +26,10 @@ impl NodeDbPgHandler {
         tasks: &[PhysicalTask],
         tenant_id: TenantId,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         result_formats: &[FieldFormat],
     ) -> PgWireResult<Option<Vec<Response>>> {
-        let tx_state = self.sessions.transaction_state(addr);
+        let tx_state = self.sessions.transaction_state(session_id);
         if tx_state == crate::control::server::shared::session::TransactionState::InBlock
             || self.state.calvin_completion_registry.get().is_none()
         {
@@ -48,9 +49,15 @@ impl NodeDbPgHandler {
             return Ok(None);
         }
 
-        self.dispatch_calvin_multishard(tasks.to_vec(), tenant_id, identity, addr, result_formats)
-            .await
-            .map(Some)
+        self.dispatch_calvin_multishard(
+            tasks.to_vec(),
+            tenant_id,
+            identity,
+            session_id,
+            result_formats,
+        )
+        .await
+        .map(Some)
     }
 
     /// Forward an ordinary remote-leader task set through the gateway.
@@ -62,7 +69,7 @@ impl NodeDbPgHandler {
         tasks: &[PhysicalTask],
         identity: &AuthenticatedIdentity,
         tenant_id: TenantId,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         projection: Option<&OutputSchema>,
         result_formats: &[FieldFormat],
     ) -> PgWireResult<Option<Vec<Response>>> {
@@ -73,7 +80,7 @@ impl NodeDbPgHandler {
 
         let database_id = self
             .sessions
-            .get_current_database(addr)
+            .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let authorized_tasks = self.authorize_tasks(identity, tasks)?;
         self.dispatch_tasks_via_gateway(

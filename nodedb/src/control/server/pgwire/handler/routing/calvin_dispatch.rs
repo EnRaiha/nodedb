@@ -14,7 +14,7 @@ use crate::control::planner::calvin::{
     dispatch_authorized_tasks_to_calvin, is_dependent_predicate,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::session::TransactionState;
+use crate::control::server::shared::session::{SessionId, TransactionState};
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
@@ -33,14 +33,14 @@ impl NodeDbPgHandler {
         tasks: Vec<PhysicalTask>,
         tenant_id: TenantId,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         result_formats: &[pgwire::api::results::FieldFormat],
     ) -> PgWireResult<Vec<Response>> {
-        let cross_shard_mode = self.sessions.cross_shard_txn_mode(addr);
-        let tx_state = self.sessions.transaction_state(addr);
+        let cross_shard_mode = self.sessions.cross_shard_txn_mode(session_id);
+        let tx_state = self.sessions.transaction_state(session_id);
         let database_id = self
             .sessions
-            .get_current_database(addr)
+            .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
         // Presence guard preserved from the inlined implementation: BOTH the

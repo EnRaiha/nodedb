@@ -19,7 +19,7 @@ use super::super::handler::NodeDbPgHandler;
 use super::provider::NodeDbParameterProvider;
 
 /// Enum dispatch for startup handler — avoids dyn trait object issues.
-pub(super) enum AuthStartup {
+pub(crate) enum AuthStartup {
     Trust(Arc<NodeDbPgHandler>),
     Scram {
         sasl: Box<pgwire::api::auth::sasl::SASLAuthStartupHandler<NodeDbParameterProvider>>,
@@ -42,7 +42,7 @@ pub(super) enum AuthStartup {
 /// connect; errors on the first query that requires the db).
 fn bind_startup_database<C: pgwire::api::ClientInfo>(
     client: &C,
-    addr: &std::net::SocketAddr,
+    session_id: crate::control::server::shared::session::SessionId,
     handler: &NodeDbPgHandler,
 ) {
     let db_name = match client.metadata().get("database") {
@@ -50,7 +50,7 @@ fn bind_startup_database<C: pgwire::api::ClientInfo>(
         _ => return,
     };
 
-    handler.sessions.ensure_session(*addr);
+    let _ = session_id;
 
     let db_id = handler
         .state
@@ -61,7 +61,7 @@ fn bind_startup_database<C: pgwire::api::ClientInfo>(
         .flatten();
 
     if let Some(id) = db_id {
-        handler.sessions.set_current_database(addr, id);
+        handler.sessions.set_current_database(session_id, id);
     }
     // If the name is not found we leave current_database unset (None).
     // The first query that actually needs a database context will produce
@@ -96,9 +96,7 @@ impl StartupHandler for AuthStartup {
                     // identities must remain connection-local, including the
                     // empty-store bootstrap identity.
                     let identity = handler.resolve_trust_user(client)?;
-                    let addr = client.socket_addr();
-                    handler.sessions.ensure_session(addr);
-                    handler.sessions.set_identity(&addr, identity);
+                    handler.sessions.set_identity(handler.session_id, identity);
                     pgwire::api::auth::finish_authentication(
                         client,
                         &super::provider::nodedb_parameter_provider(),
@@ -123,8 +121,7 @@ impl StartupHandler for AuthStartup {
                 // `psql -d <name>` sets this key in the pgwire StartupMessage;
                 // we resolve it once at handshake time so every query on this
                 // connection executes in the declared database context.
-                let addr = client.socket_addr();
-                bind_startup_database(client, &addr, handler);
+                bind_startup_database(client, handler.session_id, handler);
 
                 Ok(())
             }
@@ -164,8 +161,7 @@ impl StartupHandler for AuthStartup {
                             &format!("SCRAM-SHA-256 auth: {username}"),
                         );
                         // Bind the `database` startup parameter to the session.
-                        let addr = client.socket_addr();
-                        bind_startup_database(client, &addr, handler);
+                        bind_startup_database(client, handler.session_id, handler);
                     }
                     Err(_) if was_in_auth => {
                         // SCRAM failed. This is the single place the lockout

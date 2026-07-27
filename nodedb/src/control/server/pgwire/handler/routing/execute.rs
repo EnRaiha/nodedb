@@ -9,6 +9,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use crate::control::planner::calvin::{DispatchClass, classify_dispatch};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
+use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -26,12 +27,12 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         sql: &str,
         tenant_id: TenantId,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         params: &[nodedb_sql::ParamValue],
         shaping: ResultShaping<'_>,
     ) -> PgWireResult<Vec<Response>> {
         let (mut tasks, output_schema, _plan_lease_scope) = self
-            .plan_statement_to_tasks(identity, sql, tenant_id, addr, params)
+            .plan_statement_to_tasks(identity, sql, tenant_id, session_id, params)
             .await?;
 
         if tasks.is_empty() {
@@ -49,7 +50,7 @@ impl NodeDbPgHandler {
         // classify/Calvin/single-shard path as an explicit edge.
         let edge_database_id = self
             .sessions
-            .get_current_database(addr)
+            .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         crate::control::planner::implicit_edges::append_implicit_edge_tasks(
             &self.state,
@@ -81,7 +82,7 @@ impl NodeDbPgHandler {
                 tasks.clone(),
                 identity,
                 tenant_id,
-                addr,
+                session_id,
                 effective_schema,
                 shaping.formats,
             )
@@ -93,7 +94,13 @@ impl NodeDbPgHandler {
         // Implicit-edge dependent predicates must be preempted onto the
         // OLLP/Calvin path before gateway forwarding or ordinary dispatch.
         if let Some(responses) = self
-            .maybe_dispatch_implicit_edge_recon(&tasks, tenant_id, identity, addr, shaping.formats)
+            .maybe_dispatch_implicit_edge_recon(
+                &tasks,
+                tenant_id,
+                identity,
+                session_id,
+                shaping.formats,
+            )
             .await?
         {
             return Ok(responses);
@@ -104,7 +111,7 @@ impl NodeDbPgHandler {
                 &tasks,
                 identity,
                 tenant_id,
-                addr,
+                session_id,
                 effective_schema,
                 shaping.formats,
             )
@@ -113,7 +120,7 @@ impl NodeDbPgHandler {
             return Ok(responses);
         }
 
-        let tx_state = self.sessions.transaction_state(addr);
+        let tx_state = self.sessions.transaction_state(session_id);
         // Autocommit statement routing: no session read-set to widen with.
         match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
             DispatchClass::SingleShard { .. } => {
@@ -135,7 +142,7 @@ impl NodeDbPgHandler {
                     ))));
                 }
 
-                let cross_shard_mode = self.sessions.cross_shard_txn_mode(addr);
+                let cross_shard_mode = self.sessions.cross_shard_txn_mode(session_id);
                 if cross_shard_mode
                     == crate::control::server::shared::session::cross_shard_mode::CrossShardTxnMode::Strict
                 {
@@ -144,7 +151,7 @@ impl NodeDbPgHandler {
                             tasks,
                             tenant_id,
                             identity,
-                            addr,
+                            session_id,
                             shaping.formats,
                         )
                         .await;
@@ -156,7 +163,7 @@ impl NodeDbPgHandler {
             tasks,
             tenant_id,
             identity,
-            addr,
+            session_id,
             effective_schema,
             shaping.formats,
         )
@@ -169,7 +176,7 @@ impl NodeDbPgHandler {
         tasks: Vec<PhysicalTask>,
         tenant_id: TenantId,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         projection: Option<&OutputSchema>,
         result_formats: &[FieldFormat],
     ) -> PgWireResult<Vec<Response>> {
@@ -212,7 +219,7 @@ impl NodeDbPgHandler {
                         )))
                     })?;
                 let response = self
-                    .dispatch_cluster_array_task(authorized, projection, result_formats, addr)
+                    .dispatch_cluster_array_task(authorized, projection, result_formats, session_id)
                     .await?;
                 responses.push(response);
                 continue;
@@ -223,7 +230,7 @@ impl NodeDbPgHandler {
             // every other dispatch loop (native, DSL/UPSERT). Moved to
             // `execute_dml_hooks.rs` to keep this file under the size limit;
             // behavior is unchanged.
-            match self.route_task_in_txn(addr, identity, task).await? {
+            match self.route_task_in_txn(session_id, identity, task).await? {
                 super::execute_dml_hooks::TxnRouteOutcome::Proceed(routed_task) => {
                     task = *routed_task;
                 }
@@ -244,7 +251,7 @@ impl NodeDbPgHandler {
             // the request and the data plane merges the transaction's own staged
             // writes into the scan (read-your-own-writes); the streaming path
             // builds per-core requests without the transaction id.
-            let in_transaction = self.sessions.transaction_state(addr)
+            let in_transaction = self.sessions.transaction_state(session_id)
                 == crate::control::server::shared::session::TransactionState::InBlock;
             if !in_transaction
                 && let Some(stream_response) = self
@@ -252,7 +259,7 @@ impl NodeDbPgHandler {
                         &task,
                         identity,
                         plan_kind,
-                        addr,
+                        session_id,
                         projection,
                         result_formats,
                     )
@@ -266,7 +273,7 @@ impl NodeDbPgHandler {
             // interception (moved to execute_dml_hooks.rs to keep this file
             // under the size limit; behavior is unchanged).
             let (dml_info, old_row, truncate_restart_collection) = match self
-                .run_pre_dispatch_hooks(identity, tenant_id, addr, plan_kind, task)
+                .run_pre_dispatch_hooks(identity, tenant_id, session_id, plan_kind, task)
                 .await?
             {
                 super::execute_dml_hooks::PreDispatchOutcome::Handled(resp) => {
@@ -310,7 +317,7 @@ impl NodeDbPgHandler {
                 || resp.error_code.as_deref()
                     == Some(&crate::bridge::envelope::ErrorCode::NotFound);
             if records_read
-                && self.sessions.transaction_state(addr)
+                && self.sessions.transaction_state(session_id)
                     == crate::control::server::shared::session::TransactionState::InBlock
             {
                 let watermarks = if shard_watermarks.is_empty() {
@@ -321,7 +328,7 @@ impl NodeDbPgHandler {
                 crate::control::server::shared::session::record_reads_for_response(
                     &self.state,
                     &self.sessions,
-                    addr,
+                    session_id,
                     identity.tenant_id,
                     crate::control::server::shared::session::ResponseReads {
                         plan: &plan_for_response,
@@ -355,7 +362,7 @@ impl NodeDbPgHandler {
                     )
             {
                 self.sessions.note_own_write(
-                    addr,
+                    session_id,
                     task_database_id,
                     identity.tenant_id,
                     collection,
@@ -428,14 +435,14 @@ impl NodeDbPgHandler {
                         let (response, notice) =
                             shape_encode::shaped_query_response(shaped, result_formats);
                         if let Some(n) = notice {
-                            self.sessions.push_notice(addr, n);
+                            self.sessions.push_notice(session_id, n);
                         }
                         responses.push(response);
                     }
                     ShapeOutcome::Passthrough => {
                         let shaped = payload_to_response(&resp.payload, plan_kind)?;
                         if let Some(notice) = shaped.notice {
-                            self.sessions.push_notice(addr, notice);
+                            self.sessions.push_notice(session_id, notice);
                         }
                         responses.push(shaped.response);
                     }
@@ -448,7 +455,7 @@ impl NodeDbPgHandler {
             let (response, notice) =
                 set_ops::apply_set_ops(&dedup_payloads, dedup_set_op, projection, result_formats);
             if let Some(n) = notice {
-                self.sessions.push_notice(addr, n);
+                self.sessions.push_notice(session_id, n);
             }
             responses.push(response);
         }

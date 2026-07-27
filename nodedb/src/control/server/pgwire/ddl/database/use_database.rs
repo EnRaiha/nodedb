@@ -10,13 +10,11 @@
 //! If the named database does not exist, returns `DATABASE_NOT_FOUND` (3D000).
 //! `\c <name>` in the CLI expands to `USE DATABASE <name>`.
 
-use std::net::SocketAddr;
-
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::session::SessionStore;
+use crate::control::server::shared::session::{SessionId, SessionStore};
 use crate::control::state::SharedState;
 
 use super::super::super::types::sqlstate_error;
@@ -29,7 +27,7 @@ pub fn handle_use_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     name: &str,
 ) -> PgWireResult<Vec<Response>> {
     let catalog = state.credentials.catalog();
@@ -58,7 +56,7 @@ pub fn handle_use_database(
     }
 
     // Session reset: abort open transaction, invalidate prepared statements.
-    sessions.reset_for_database_switch(addr, db_id);
+    sessions.reset_for_database_switch(session_id, db_id);
 
     state.audit_record_with_db(
         crate::control::security::audit::AuditEvent::DdlChange,

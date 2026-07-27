@@ -13,6 +13,7 @@ use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::SessionId;
 use crate::control::trigger::dml_hook::DmlWriteInfo;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
@@ -39,7 +40,7 @@ impl NodeDbPgHandler {
     /// pre-refactor `stage_in_tx_point_write` behavior exactly.
     pub(super) async fn route_task_in_txn(
         &self,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         identity: &AuthenticatedIdentity,
         task: PhysicalTask,
     ) -> PgWireResult<TxnRouteOutcome> {
@@ -58,21 +59,30 @@ impl NodeDbPgHandler {
         // statements in the same txn); every other task falls through to the
         // neutral staging gate. The expander dispatches each derived point op via
         // the SAME closure, so it must be `Fn` — hence `user_id.clone()` per call.
-        let routed =
-            match route_in_tx_expander(&self.state, &self.sessions, addr, task, |stage_task| {
-                self.dispatch_authorized_task(stage_task, user_id.clone(), identity)
-            })
-            .await
-            {
-                Ok(ExpanderOutcome::Handled(route)) => Ok(route),
-                Ok(ExpanderOutcome::Passthrough(task)) => {
-                    route_in_tx_write(&self.state, &self.sessions, addr, *task, |stage_task| {
+        let routed = match route_in_tx_expander(
+            &self.state,
+            &self.sessions,
+            session_id,
+            task,
+            |stage_task| self.dispatch_authorized_task(stage_task, user_id.clone(), identity),
+        )
+        .await
+        {
+            Ok(ExpanderOutcome::Handled(route)) => Ok(route),
+            Ok(ExpanderOutcome::Passthrough(task)) => {
+                route_in_tx_write(
+                    &self.state,
+                    &self.sessions,
+                    session_id,
+                    *task,
+                    |stage_task| {
                         self.dispatch_authorized_task(stage_task, user_id.clone(), identity)
-                    })
-                    .await
-                }
-                Err(e) => Err(e),
-            };
+                    },
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
 
         match routed {
             Ok(InTxnRoute::Read(routed_task)) => Ok(TxnRouteOutcome::Proceed(routed_task)),
@@ -136,7 +146,7 @@ impl NodeDbPgHandler {
         &self,
         identity: &AuthenticatedIdentity,
         tenant_id: TenantId,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         plan_kind: PlanKind,
         mut task: PhysicalTask,
     ) -> PgWireResult<PreDispatchOutcome> {
@@ -145,7 +155,7 @@ impl NodeDbPgHandler {
 
         let database_id = self
             .sessions
-            .get_current_database(addr)
+            .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
         // Fetch OLD row and fire BEFORE/INSTEAD OF triggers if applicable.
@@ -259,7 +269,7 @@ impl NodeDbPgHandler {
                                     &[],
                                 );
                             if let Some(n) = notice {
-                                self.sessions.push_notice(addr, n);
+                                self.sessions.push_notice(session_id, n);
                             }
                             return Ok(PreDispatchOutcome::Handled(response));
                         }
@@ -270,7 +280,7 @@ impl NodeDbPgHandler {
                                     plan_kind,
                                 )?;
                             if let Some(notice) = shaped.notice {
-                                self.sessions.push_notice(addr, notice);
+                                self.sessions.push_notice(session_id, notice);
                             }
                             return Ok(PreDispatchOutcome::Handled(shaped.response));
                         }

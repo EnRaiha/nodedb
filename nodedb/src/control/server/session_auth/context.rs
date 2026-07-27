@@ -7,6 +7,7 @@ use nodedb_sql::parser::preprocess::lex::rfind_ascii_case_insensitive;
 
 use crate::control::security::auth_context::{AuthContext, generate_session_id};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::session::SessionId;
 
 /// Build an `AuthContext` from an `AuthenticatedIdentity`.
 ///
@@ -58,12 +59,13 @@ pub fn enrich_auth_context_with_scopes(
 pub fn build_auth_context_with_session(
     identity: &AuthenticatedIdentity,
     sessions: &crate::control::server::shared::session::SessionStore,
-    addr: &std::net::SocketAddr,
+    session_id: impl Into<SessionId>,
 ) -> AuthContext {
+    let session_id = session_id.into();
     let mut ctx = build_auth_context(identity);
 
     // Read ON DENY override from SET LOCAL nodedb.on_deny = '...'.
-    if let Some(on_deny_val) = sessions.get_parameter(addr, "nodedb.on_deny")
+    if let Some(on_deny_val) = sessions.get_parameter(session_id, "nodedb.on_deny")
         && let Ok(mode) = crate::control::security::deny::parse_on_deny(&[&on_deny_val])
     {
         ctx.on_deny_override = Some(mode);
@@ -71,7 +73,7 @@ pub fn build_auth_context_with_session(
 
     // The active session database overrides the per-user default so that
     // `$auth.database_id` tracks `USE DATABASE` commands within a session.
-    if let Some(db) = sessions.get_current_database(addr) {
+    if let Some(db) = sessions.get_current_database(session_id) {
         ctx.database_id = Some(db);
     }
 

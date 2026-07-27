@@ -7,11 +7,10 @@
 //! discard, and staging-overlay release via the injected [`TxnDataPlane`].
 //! Transports only shape the returned tag / error.
 
-use std::net::SocketAddr;
-
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
+use super::connection::SessionId;
 use super::ddl_buffer;
 use super::outcome::TxnDataPlane;
 use super::overlay_drop::drop_txn_overlay;
@@ -22,7 +21,7 @@ use super::store::SessionStore;
 /// to the transport's `25P02`) if the connection cannot begin a transaction.
 pub fn run_begin(
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     state: &SharedState,
 ) -> Result<(), crate::Error> {
     let snapshot_lsn = {
@@ -36,7 +35,7 @@ pub fn run_begin(
         .load(std::sync::atomic::Ordering::Acquire);
     ddl_buffer::activate();
     sessions
-        .begin(addr, snapshot_lsn, snapshot_epoch)
+        .begin(session_id, snapshot_lsn, snapshot_epoch)
         .map_err(|msg| crate::Error::BadRequest {
             detail: msg.to_owned(),
         })
@@ -51,7 +50,7 @@ pub fn run_begin(
 /// original swallow-on-error behavior.
 pub async fn run_rollback(
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     identity: &AuthenticatedIdentity,
     state: &SharedState,
     dp: &impl TxnDataPlane,
@@ -60,17 +59,38 @@ pub async fn run_rollback(
     // Snapshot the overlay identity BEFORE `rollback()` clears session state,
     // so the staging overlay can be released on EVERY vShard the transaction
     // staged writes to (a transaction may span multiple cores).
-    let (overlay_txn_id, overlay_vshards) = sessions.txn_identity(addr);
+    let (overlay_txn_id, overlay_vshards) = sessions.txn_identity(session_id);
     // Release this transaction's read reservations while the reservation owner is
     // still set — `rollback` below clears it. Best-effort; lease GC backstops.
     super::reservation_release::release_session_reservations(
         state,
         sessions,
-        addr,
+        session_id,
         nodedb_cluster::calvin::types::ReleaseReason::Abort,
     )
     .await;
-    let reservations = sessions.rollback(addr).unwrap_or_default();
+    // Keep the session's transaction identity intact until every overlay has
+    // been released. Detached connection teardown can be cancelled at any
+    // await point; clearing `tx_id` first would make an interrupted cleanup
+    // permanently lose the only identifiers needed to reclaim the overlays.
+    if let Some(txn_id) = overlay_txn_id {
+        for vshard_id in overlay_vshards {
+            // Teardown of an aborted transaction's overlay: surface a failure at
+            // ERROR (the overlay, keyed by `txn_id`, is reclaimable by its holder)
+            // and continue reaping the remaining vShards. ROLLBACK is infallible
+            // for the client, so there is no outcome to change here.
+            if let Err(e) = drop_txn_overlay(state, dp, identity.tenant_id, vshard_id, txn_id).await
+            {
+                tracing::error!(
+                    vshard = vshard_id.as_u32(),
+                    error = %e,
+                    "failed to release per-transaction staging overlay on rollback"
+                );
+            }
+        }
+    }
+
+    let reservations = sessions.rollback(session_id).unwrap_or_default();
     for handle in &reservations {
         let key = &handle.sequence_key;
         let registry = &state.sequence_registry;
@@ -93,26 +113,7 @@ pub async fn run_rollback(
             );
         }
     }
-    sessions.close_non_hold_cursors(addr);
+    sessions.close_non_hold_cursors(session_id);
     // Discard NOTIFY messages buffered during this transaction.
-    sessions.discard_pending_notifies(addr);
-
-    // Release any staging overlay populated by statement-time point writes on
-    // every vShard the transaction staged to, so no core's overlay leaks.
-    if let Some(txn_id) = overlay_txn_id {
-        for vshard_id in overlay_vshards {
-            // Teardown of an aborted transaction's overlay: surface a failure at
-            // ERROR (the overlay, keyed by `txn_id`, is reclaimable by its holder)
-            // and continue reaping the remaining vShards. ROLLBACK is infallible
-            // for the client, so there is no outcome to change here.
-            if let Err(e) = drop_txn_overlay(state, dp, identity.tenant_id, vshard_id, txn_id).await
-            {
-                tracing::error!(
-                    vshard = vshard_id.as_u32(),
-                    error = %e,
-                    "failed to release per-transaction staging overlay on rollback"
-                );
-            }
-        }
-    }
+    sessions.discard_pending_notifies(session_id);
 }

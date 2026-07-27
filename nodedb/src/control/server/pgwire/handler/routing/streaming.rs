@@ -16,6 +16,7 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::schema::OutputSchema;
+use crate::control::server::shared::session::SessionId;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
@@ -42,13 +43,13 @@ impl NodeDbPgHandler {
         task: &PhysicalTask,
         identity: &AuthenticatedIdentity,
         plan_kind: PlanKind,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         projection: Option<&OutputSchema>,
         result_formats: &[FieldFormat],
     ) -> PgWireResult<Option<Response>> {
         if task.post_set_op != PostSetOp::None
             || !matches!(plan_kind, PlanKind::MultiRow)
-            || self.sessions.transaction_state(addr)
+            || self.sessions.transaction_state(session_id)
                 == crate::control::server::shared::session::TransactionState::InBlock
         {
             return Ok(None);

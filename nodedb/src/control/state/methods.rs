@@ -345,7 +345,7 @@ impl SharedState {
     }
 
     /// Record request start for tenant quota tracking.
-    pub fn tenant_request_start(&self, tenant_id: TenantId) {
+    pub(super) fn tenant_request_start(&self, tenant_id: TenantId) {
         match self.tenants.lock() {
             Ok(mut t) => t.request_start(tenant_id),
             Err(poisoned) => poisoned.into_inner().request_start(tenant_id),
@@ -353,7 +353,7 @@ impl SharedState {
     }
 
     /// Record request end for tenant quota tracking.
-    pub fn tenant_request_end(&self, tenant_id: TenantId) {
+    pub(super) fn tenant_request_end(&self, tenant_id: TenantId) {
         match self.tenants.lock() {
             Ok(mut t) => t.request_end(tenant_id),
             Err(poisoned) => poisoned.into_inner().request_end(tenant_id),

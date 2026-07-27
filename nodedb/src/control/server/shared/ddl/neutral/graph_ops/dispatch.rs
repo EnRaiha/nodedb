@@ -99,7 +99,7 @@ pub async fn dispatch_graph(
             // session's active `TxnId` so the Data Plane merges this
             // transaction's staged edge writes (`GraphTxnOverlay`). Idle
             // sessions resolve to `None` (autocommit read).
-            let (txn_id, _) = txn_ctx.sessions.txn_identity(txn_ctx.addr);
+            let (txn_id, _) = txn_ctx.sessions.txn_identity(txn_ctx.session_id);
             Some(
                 traverse::neighbors(
                     state,

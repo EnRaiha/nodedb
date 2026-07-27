@@ -8,13 +8,15 @@ use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use super::super::types::text_field;
+use crate::control::server::shared::session::SessionId;
+
 use super::core::NodeDbPgHandler;
 
 impl NodeDbPgHandler {
     /// Handle FETCH [ALL | FORWARD n | BACKWARD n | n] FROM cursor_name.
     pub(super) fn handle_fetch(
         &self,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql: &str,
         upper: &str,
     ) -> PgWireResult<Vec<Response>> {
@@ -27,17 +29,17 @@ impl NodeDbPgHandler {
             FetchDirection::Forward => {
                 let (rows, _) = self
                     .sessions
-                    .fetch_cursor(addr, &cursor_name, count)
+                    .fetch_cursor(session_id, &cursor_name, count)
                     .map_err(|e| cursor_error(&e.to_string()))?;
                 rows
             }
             FetchDirection::All => self
                 .sessions
-                .fetch_cursor_all(addr, &cursor_name)
+                .fetch_cursor_all(session_id, &cursor_name)
                 .map_err(|e| cursor_error(&e.to_string()))?,
             FetchDirection::Backward => self
                 .sessions
-                .fetch_cursor_backward(addr, &cursor_name, count)
+                .fetch_cursor_backward(session_id, &cursor_name, count)
                 .map_err(|e| cursor_error(&e.to_string()))?,
         };
 
@@ -57,7 +59,7 @@ impl NodeDbPgHandler {
     /// Handle MOVE [FORWARD | BACKWARD] n IN cursor_name.
     pub(super) fn handle_move(
         &self,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         upper: &str,
     ) -> PgWireResult<Vec<Response>> {
         let parts: Vec<&str> = upper.split_whitespace().collect();
@@ -69,7 +71,7 @@ impl NodeDbPgHandler {
 
         let moved = self
             .sessions
-            .move_cursor(addr, &cursor_name, forward, count)
+            .move_cursor(session_id, &cursor_name, forward, count)
             .map_err(|e| cursor_error(&e.to_string()))?;
 
         Ok(vec![Response::Execution(Tag::new("MOVE").with_rows(moved))])

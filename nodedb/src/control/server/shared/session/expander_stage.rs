@@ -32,7 +32,6 @@
 //! and falls through to `route_in_tx_write` unchanged.
 
 use std::future::Future;
-use std::net::SocketAddr;
 
 use crate::bridge::envelope::{PhysicalPlan, Response};
 use crate::control::insert_select::resolve_and_emit_insert_select_ops;
@@ -42,6 +41,7 @@ use crate::control::update_from_join_orchestrator::resolve_and_emit_update_from_
 use nodedb_physical::physical_plan::DocumentOp;
 use nodedb_physical::physical_task::PhysicalTask;
 
+use super::connection::SessionId;
 use super::staging_gate::{
     InTxnRoute, StagedTagKind, StagedWriteOutcome, StagingGateError, stage_write,
 };
@@ -77,7 +77,7 @@ pub(crate) enum ExpanderOutcome {
 pub(crate) async fn route_in_tx_expander<F, Fut>(
     state: &SharedState,
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     mut task: PhysicalTask,
     dispatch: F,
 ) -> Result<ExpanderOutcome, StagingGateError>
@@ -88,7 +88,7 @@ where
     // Only an in-transaction `MERGE` / `UPDATE ... FROM` / `INSERT ... SELECT`
     // is handled here. Autocommit and every other plan fall through
     // (`Passthrough`) to the neutral staging gate.
-    if sessions.transaction_state(addr) != TransactionState::InBlock {
+    if sessions.transaction_state(session_id) != TransactionState::InBlock {
         return Ok(ExpanderOutcome::Passthrough(Box::new(task)));
     }
     let (ops, kind) = match &task.plan {
@@ -101,7 +101,7 @@ where
             // source scan) fold this transaction's staging overlay: a MERGE
             // matches — and reuses the surrogate of — a row an earlier
             // statement in the same transaction staged.
-            task.txn_id = sessions.tx_id(addr);
+            task.txn_id = sessions.tx_id(session_id);
             // Resolve the merge and derive the concrete point ops. A resolve
             // / surrogate-assignment failure is a genuine dispatch error; map
             // it into the gate's `Dispatch` variant so the caller renders it
@@ -119,7 +119,7 @@ where
             // source scan) fold this transaction's staging overlay: an
             // `UPDATE ... FROM` matches — and reuses the surrogate of — a row
             // an earlier statement in the same transaction staged.
-            task.txn_id = sessions.tx_id(addr);
+            task.txn_id = sessions.tx_id(session_id);
             // Resolve the update and derive the concrete point ops. A resolve
             // failure is a genuine dispatch error; map it into the gate's
             // `Dispatch` variant so the caller renders it exactly like any
@@ -133,7 +133,7 @@ where
             // Stamp the active transaction id so the source scan folds this
             // transaction's staging overlay: an `INSERT ... SELECT` copies a
             // row an earlier statement in the same transaction staged.
-            task.txn_id = sessions.tx_id(addr);
+            task.txn_id = sessions.tx_id(session_id);
             // Resolve the copy and derive the concrete, fresh-surrogate
             // `PointInsert` ops. A resolve / surrogate-assignment failure is a
             // genuine dispatch error; map it into the gate's `Dispatch` variant
@@ -148,7 +148,7 @@ where
         _ => return Ok(ExpanderOutcome::Passthrough(Box::new(task))),
     };
     Ok(ExpanderOutcome::Handled(
-        stage_and_aggregate(state, sessions, addr, ops, kind, dispatch).await?,
+        stage_and_aggregate(state, sessions, session_id, ops, kind, dispatch).await?,
     ))
 }
 
@@ -161,7 +161,7 @@ where
 async fn stage_and_aggregate<F, Fut>(
     state: &SharedState,
     sessions: &SessionStore,
-    addr: &SocketAddr,
+    session_id: SessionId,
     ops: Vec<PhysicalTask>,
     kind: StagedTagKind,
     dispatch: F,
@@ -177,7 +177,7 @@ where
     // never buffered.
     let mut affected = 0usize;
     for op in ops {
-        let outcome = stage_write(state, sessions, addr, op, &dispatch).await?;
+        let outcome = stage_write(state, sessions, session_id, op, &dispatch).await?;
         affected += outcome.affected;
     }
 

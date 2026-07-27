@@ -58,9 +58,8 @@ pub(crate) async fn handle_graph_match(
     // staging overlay identically to every other direct-op read.
     let txn_id = ctx.sessions.tx_id(ctx.peer_addr);
     let plan_for_response = plan.clone();
-    ctx.state.tenant_request_start(tenant_id);
+    let _request = ctx.state.tenant_request_guard(tenant_id);
     let raw = dispatch_authorized_single_task(ctx, tenant_id, vshard_id, plan, txn_id).await;
-    ctx.state.tenant_request_end(tenant_id);
 
     let response = match raw {
         Ok(response) => response,
@@ -78,7 +77,7 @@ pub(crate) async fn handle_graph_match(
         crate::control::server::shared::session::record_reads_for_response(
             ctx.state,
             ctx.sessions,
-            ctx.peer_addr,
+            ctx.peer_addr.into(),
             ctx.tenant_id(),
             crate::control::server::shared::session::ResponseReads {
                 plan: &plan_for_response,

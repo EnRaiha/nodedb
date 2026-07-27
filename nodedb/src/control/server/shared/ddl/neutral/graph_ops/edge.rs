@@ -159,7 +159,7 @@ pub async fn insert_edge(
     // `stage_edge_dual_home` so RYOW works from either endpoint; a single-home
     // edge stages once. This is the write-side complement to the `delete_edge`
     // staging below. Autocommit is untouched.
-    if txn_ctx.sessions.transaction_state(txn_ctx.addr) == TransactionState::InBlock {
+    if txn_ctx.sessions.transaction_state(txn_ctx.session_id) == TransactionState::InBlock {
         super::edge_stage::stage_edge_dual_home(
             state,
             tenant_id,
@@ -330,7 +330,7 @@ pub async fn delete_edge(
     // observes the edge as removed (read-your-own-writes), COMMIT replays the
     // buffered `EdgeDelete`, and ROLLBACK discards the overlay. Autocommit is
     // untouched.
-    if txn_ctx.sessions.transaction_state(txn_ctx.addr) == TransactionState::InBlock {
+    if txn_ctx.sessions.transaction_state(txn_ctx.session_id) == TransactionState::InBlock {
         super::edge_stage::stage_edge_dual_home(
             state,
             tenant_id,

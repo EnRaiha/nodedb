@@ -17,7 +17,9 @@ use crate::bridge::envelope::{ErrorCode, Response as DpResponse};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::pgwire::types::error_to_sqlstate;
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
-use crate::control::server::shared::session::{AbortReason, CommitOutcome, TxnDataPlane, commit};
+use crate::control::server::shared::session::{
+    AbortReason, CommitOutcome, SessionId, TxnDataPlane, commit,
+};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::core::NodeDbPgHandler;
@@ -47,10 +49,10 @@ impl NodeDbPgHandler {
     pub(in crate::control::server::pgwire::handler) async fn handle_commit(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
     ) -> PgWireResult<Vec<Response>> {
         let dp = PgwireTxnDp { handler: self };
-        match commit::run_commit(&self.sessions, addr, identity, &self.state, &dp).await {
+        match commit::run_commit(&self.sessions, session_id, identity, &self.state, &dp).await {
             CommitOutcome::Committed => Ok(vec![Response::Execution(Tag::new("COMMIT"))]),
             CommitOutcome::Aborted { reason } => Err(commit_abort_to_pgerror(&reason)),
         }

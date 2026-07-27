@@ -243,7 +243,7 @@ pub(crate) async fn apply_delta_and_finalize(
         vshard_id,
         plan,
     );
-    shared.tenant_request_start(tenant_id);
+    let _request = shared.tenant_request_guard(tenant_id);
     let dispatch_result = match authorized {
         Ok(authorized) => {
             super::super::raft_dispatch::dispatch_sync_bytes(
@@ -258,7 +258,6 @@ pub(crate) async fn apply_delta_and_finalize(
         }
         Err(error) => Err(error),
     };
-    shared.tenant_request_end(tenant_id);
 
     match dispatch_result {
         Ok(payload) => {

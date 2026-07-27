@@ -12,7 +12,6 @@
 //!   `restore::restore_tenant`.
 
 use std::fmt::Debug;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use nodedb_types::error::sqlstate as ss;
@@ -25,13 +24,14 @@ use pgwire::api::results::{CopyResponse, Response, Tag};
 use pgwire::api::{ClientInfo, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::messages::copy::{CopyData, CopyDone};
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 
 use crate::control::backup;
 use crate::control::backup::CopyIntent;
 use crate::control::backup::state::AppendError;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::server::shared::session::{ConnectionId, SessionId};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
@@ -47,7 +47,7 @@ impl NodeDbPgHandler {
     pub(super) async fn intent_to_response(
         &self,
         identity: &AuthenticatedIdentity,
-        addr: SocketAddr,
+        session_id: SessionId,
         intent: CopyIntent,
     ) -> PgWireResult<Response> {
         // Backup and restore both operate on a whole tenant — authorize
@@ -88,8 +88,17 @@ impl NodeDbPgHandler {
                 dry_run,
                 force,
             } => {
+                let connection_id = match session_id {
+                    SessionId::Connection(connection_id) => connection_id,
+                    SessionId::LegacySocket(_) => {
+                        return Err(sqlstate(
+                            ss::INTERNAL_ERROR,
+                            "COPY restore requires a typed connection",
+                        ));
+                    }
+                };
                 self.restore_state.begin(
-                    conn_id(&addr),
+                    connection_id.get(),
                     backup::RestorePending::new(tenant_id, dry_run, force, COPY_IN_CAP),
                 );
                 // Empty out-stream — server tells client "send me bytes".
@@ -106,17 +115,18 @@ impl NodeDbPgHandler {
 pub struct NodeDbCopyHandler {
     pub state: Arc<SharedState>,
     pub restore_state: Arc<backup::RestoreState>,
+    pub connection_id: ConnectionId,
 }
 
 #[async_trait]
 impl CopyHandler for NodeDbCopyHandler {
-    async fn on_copy_data<C>(&self, client: &mut C, copy_data: CopyData) -> PgWireResult<()>
+    async fn on_copy_data<C>(&self, _client: &mut C, copy_data: CopyData) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let id = conn_id(&client.socket_addr());
+        let id = self.connection_id.get();
         match self.restore_state.append(id, &copy_data.data) {
             Ok(()) => Ok(()),
             Err(e @ AppendError::NotPending) => {
@@ -129,13 +139,23 @@ impl CopyHandler for NodeDbCopyHandler {
         }
     }
 
+    async fn on_copy_fail<C>(&self, _client: &mut C, _fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        cancel_restore(&self.restore_state, self.connection_id);
+        sqlstate(ss::QUERY_CANCELED, "COPY restore aborted")
+    }
+
     async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let id = conn_id(&client.socket_addr());
+        let id = self.connection_id.get();
         let pending = self.restore_state.take(id).ok_or_else(|| {
             sqlstate(
                 ss::FEATURE_NOT_SUPPORTED,
@@ -175,12 +195,8 @@ impl CopyHandler for NodeDbCopyHandler {
     }
 }
 
-fn conn_id(addr: &SocketAddr) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    addr.hash(&mut h);
-    h.finish()
+fn cancel_restore(state: &backup::RestoreState, connection_id: ConnectionId) {
+    state.cancel(connection_id.get());
 }
 
 fn sqlstate(code: &str, message: &str) -> PgWireError {
@@ -196,4 +212,32 @@ fn internal(e: crate::Error) -> PgWireError {
     // restore orchestrator already scrubs envelope errors. We pass
     // through everything else (RPC failures, dispatch errors).
     sqlstate(ss::INTERNAL_ERROR, &e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_fail_cancels_only_the_exact_pending_restore() {
+        let state = backup::RestoreState::new();
+        let first = ConnectionId::new(1).unwrap_or_else(|_| unreachable!());
+        let second = ConnectionId::new(2).unwrap_or_else(|_| unreachable!());
+        state.begin(
+            first.get(),
+            backup::RestorePending::new(1, false, false, 16),
+        );
+        state.begin(
+            second.get(),
+            backup::RestorePending::new(1, false, false, 16),
+        );
+
+        cancel_restore(&state, first);
+
+        assert_eq!(
+            state.append(first.get(), b"x"),
+            Err(AppendError::NotPending)
+        );
+        assert!(state.append(second.get(), b"x").is_ok());
+    }
 }

@@ -5,8 +5,8 @@
 //! Temporary tables store data as Arrow RecordBatches in memory.
 //! Auto-dropped on disconnect.
 
+use super::connection::SessionId;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -116,26 +116,31 @@ impl Default for TempTableRegistry {
 
 impl SessionStore {
     /// Register a temporary table in the session.
-    pub fn register_temp_table(&self, addr: &SocketAddr, name: String, entry: TempTableEntry) {
+    pub fn register_temp_table(
+        &self,
+        addr: impl Into<SessionId>,
+        name: String,
+        entry: TempTableEntry,
+    ) {
         self.write_session(addr, |session| {
             session.temp_tables.register(name, entry);
         });
     }
 
     /// Check if a temp table exists in the session.
-    pub fn has_temp_table(&self, addr: &SocketAddr, name: &str) -> bool {
+    pub fn has_temp_table(&self, addr: impl Into<SessionId>, name: &str) -> bool {
         self.read_session(addr, |s| s.temp_tables.exists(name))
             .unwrap_or(false)
     }
 
     /// Remove a temp table from the session.
-    pub fn remove_temp_table(&self, addr: &SocketAddr, name: &str) -> bool {
+    pub fn remove_temp_table(&self, addr: impl Into<SessionId>, name: &str) -> bool {
         self.write_session(addr, |session| session.temp_tables.remove(name))
             .unwrap_or(false)
     }
 
     /// Get all temp table names for the session.
-    pub fn temp_table_names(&self, addr: &SocketAddr) -> Vec<String> {
+    pub fn temp_table_names(&self, addr: impl Into<SessionId>) -> Vec<String> {
         self.read_session(addr, |s| s.temp_tables.names())
             .unwrap_or_default()
     }

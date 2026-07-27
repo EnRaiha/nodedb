@@ -16,7 +16,7 @@ use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::session::prepared_cache::SqlPreparedStatement;
+use crate::control::server::shared::session::{SessionId, prepared_cache::SqlPreparedStatement};
 
 use super::core::NodeDbPgHandler;
 
@@ -24,14 +24,14 @@ impl NodeDbPgHandler {
     /// Handle `PREPARE name [(type, ...)] AS query`.
     pub(super) fn handle_prepare(
         &self,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
         let (name, param_type_names, body_sql) = parse_prepare_statement(sql)?;
 
         self.sessions
             .prepare_sql_statement(
-                addr,
+                session_id,
                 name,
                 SqlPreparedStatement {
                     sql: body_sql,
@@ -61,20 +61,23 @@ impl NodeDbPgHandler {
     pub(super) fn handle_execute<'a>(
         &'a self,
         identity: &'a AuthenticatedIdentity,
-        addr: &'a std::net::SocketAddr,
+        session_id: SessionId,
         sql: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PgWireResult<Vec<Response>>> + Send + 'a>>
     {
         Box::pin(async move {
             let (name, param_values) = parse_execute_statement(sql)?;
 
-            let stmt = self.sessions.get_sql_prepared(addr, &name).ok_or_else(|| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "26000".to_owned(),
-                    format!("prepared statement \"{name}\" does not exist"),
-                )))
-            })?;
+            let stmt = self
+                .sessions
+                .get_sql_prepared(session_id, &name)
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_owned(),
+                        "26000".to_owned(),
+                        format!("prepared statement \"{name}\" does not exist"),
+                    )))
+                })?;
 
             // Validate parameter count.
             let expected_count = count_placeholders(&stmt.sql);
@@ -96,14 +99,14 @@ impl NodeDbPgHandler {
             // Execute through the standard pipeline. The substituted SQL is the
             // PREPARE body (e.g., SELECT/INSERT), never another EXECUTE statement,
             // so this does not recurse further.
-            self.execute_sql(identity, addr, &final_sql).await
+            self.execute_sql(identity, session_id, &final_sql).await
         })
     }
 
     /// Handle `DEALLOCATE name` or `DEALLOCATE ALL`.
     pub(super) fn handle_deallocate(
         &self,
-        addr: &std::net::SocketAddr,
+        session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
         let trimmed = sql.trim();
@@ -111,7 +114,7 @@ impl NodeDbPgHandler {
 
         // DEALLOCATE ALL
         if rest.eq_ignore_ascii_case("ALL") {
-            self.sessions.deallocate_all_sql_prepared(addr);
+            self.sessions.deallocate_all_sql_prepared(session_id);
             return Ok(vec![Response::Execution(Tag::new("DEALLOCATE ALL"))]);
         }
 
@@ -125,7 +128,7 @@ impl NodeDbPgHandler {
         // Strip quotes if present.
         let name = name.trim_matches('"');
 
-        if !self.sessions.deallocate_sql_prepared(addr, name) {
+        if !self.sessions.deallocate_sql_prepared(session_id, name) {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
                 "26000".to_owned(),
