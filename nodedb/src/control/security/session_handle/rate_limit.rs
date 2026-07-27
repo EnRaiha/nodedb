@@ -22,8 +22,9 @@
 //!   the number of live pgwire connections, which is itself capped.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
+
+use parking_lot::RwLock;
 
 /// Result of an admission check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +61,7 @@ impl PerConnectionRateLimiter {
 
     /// Test seam — caller supplies the clock.
     pub(super) fn admit_at(&self, conn_key: &str, now: Instant) -> RateLimitDecision {
-        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.write();
         let cutoff = now.checked_sub(self.window).unwrap_or(now);
 
         let entry = state.entry(conn_key.to_string()).or_default();
@@ -87,20 +88,22 @@ impl PerConnectionRateLimiter {
     /// Forget a connection on disconnect to reclaim memory. Safe to call
     /// for unknown keys.
     pub(super) fn forget(&self, conn_key: &str) {
-        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.write();
         state.remove(conn_key);
     }
 
     /// Test introspection: current attempt count in the window.
     #[cfg(test)]
     pub(super) fn attempts_in_window(&self, conn_key: &str) -> usize {
-        let state = self.state.read().unwrap_or_else(|p| p.into_inner());
+        let state = self.state.read();
         state.get(conn_key).map(|q| q.len()).unwrap_or(0)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
 
     #[test]
@@ -110,6 +113,31 @@ mod tests {
         assert_eq!(rl.admit("c"), RateLimitDecision::Allowed);
         assert_eq!(rl.admit("c"), RateLimitDecision::Allowed);
         assert_eq!(rl.admit("c"), RateLimitDecision::Denied);
+    }
+
+    #[test]
+    fn rate_limit_remains_enforced_after_panic_while_write_locked() {
+        let limiter = PerConnectionRateLimiter::new(1, Duration::from_secs(60));
+        let now = Instant::now();
+        assert_eq!(limiter.admit_at("conn", now), RateLimitDecision::Allowed);
+
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _map = limiter.state.write();
+            panic!("simulated interrupted session-handle rate-limit update");
+        }));
+        assert!(panic_result.is_err());
+
+        // The prior admitted attempt remains counted, so the connection stays denied.
+        assert_eq!(
+            limiter.admit_at("conn", now + Duration::from_millis(1)),
+            RateLimitDecision::Denied
+        );
+        // A later disconnect mutation clears the entry and permits a new connection.
+        limiter.forget("conn");
+        assert_eq!(
+            limiter.admit_at("conn", now + Duration::from_millis(2)),
+            RateLimitDecision::Allowed
+        );
     }
 
     #[test]

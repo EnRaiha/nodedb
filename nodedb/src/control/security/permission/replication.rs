@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Applier-side helpers for replicated permissions and ownership.
-//!
-//! All `install_replicated_*` methods mutate only the in-memory
-//! caches — the catalog redb write happens in
-//! `catalog_entry::apply::{permission, owner}`. The handler's
-//! single-node fallback path writes both, matching the pattern
-//! used by every other replicated DDL family.
-//!
-//! `prepare_*` helpers build the catalog-shape record on the
-//! proposer side without mutating anything, so the proposer and
-//! every follower's applier converge on identical state.
 
 use crate::control::security::catalog::{StoredOwner, StoredPermission};
 use crate::control::security::identity::Permission;
@@ -20,8 +10,7 @@ use crate::types::TenantId;
 use super::store::PermissionStore;
 use super::types::{Grant, format_permission, owner_key, parse_permission};
 
-/// Build a `StoredOwner` ready for proposing as
-/// `CatalogEntry::PutOwner`. Pure construction, no state mutated.
+/// Build a `StoredOwner` ready for proposing as `CatalogEntry::PutOwner`.
 pub fn prepare_owner(
     object_type: &str,
     tenant_id: TenantId,
@@ -38,8 +27,7 @@ pub fn prepare_owner(
 }
 
 impl PermissionStore {
-    /// Build a `StoredPermission` ready for replication via
-    /// `CatalogEntry::PutPermission`. No state is mutated.
+    /// Build a `StoredPermission` ready for replication without mutating state.
     pub fn prepare_permission(
         &self,
         target: &str,
@@ -58,19 +46,14 @@ impl PermissionStore {
 
     /// Whether a grant already exists (proposer-side pre-check).
     pub fn permission_exists(&self, target: &str, grantee: &str, permission: Permission) -> bool {
-        let grants = match self.grants.read() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        grants.contains(&Grant {
+        self.grants.read().contains(&Grant {
             target: target.to_string(),
             grantee: grantee.to_string(),
             permission,
         })
     }
 
-    /// Install (insert-or-keep) a replicated permission grant into
-    /// the in-memory set on every node.
+    /// Install a replicated permission grant into the in-memory cache.
     pub fn install_replicated_permission(&self, stored: &StoredPermission) {
         let Some(perm) = parse_permission(&stored.permission) else {
             tracing::warn!(
@@ -79,19 +62,14 @@ impl PermissionStore {
             );
             return;
         };
-        let mut grants = match self.grants.write() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        grants.insert(Grant {
+        self.grants.write().insert(Grant {
             target: stored.target.clone(),
             grantee: stored.grantee.clone(),
             permission: perm,
         });
     }
 
-    /// Remove a replicated permission grant from the in-memory set
-    /// on every node. Returns `true` if a grant was removed.
+    /// Remove a replicated permission grant from the in-memory cache.
     pub fn install_replicated_revoke(&self, target: &str, grantee: &str, permission: &str) -> bool {
         let Some(perm) = parse_permission(permission) else {
             tracing::warn!(
@@ -100,30 +78,20 @@ impl PermissionStore {
             );
             return false;
         };
-        let mut grants = match self.grants.write() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        grants.remove(&Grant {
+        self.grants.write().remove(&Grant {
             target: target.to_string(),
             grantee: grantee.to_string(),
             permission: perm,
         })
     }
 
-    /// Whether an owner record already exists (proposer-side
-    /// pre-check). `tenant_id` is the raw `u32` value.
+    /// Whether an owner record already exists (proposer-side pre-check).
     pub fn owner_exists(&self, object_type: &str, tenant_id: u64, object_name: &str) -> bool {
         let key = owner_key(object_type, 0, tenant_id, object_name);
-        let owners = match self.owners.read() {
-            Ok(o) => o,
-            Err(p) => p.into_inner(),
-        };
-        owners.contains_key(&key)
+        self.owners.read().contains_key(&key)
     }
 
-    /// Install (insert-or-replace) a replicated owner record into
-    /// the in-memory map on every node.
+    /// Install a replicated owner record into the in-memory cache.
     pub fn install_replicated_owner(&self, stored: &StoredOwner) {
         let key = owner_key(
             &stored.object_type,
@@ -131,31 +99,20 @@ impl PermissionStore {
             stored.tenant_id,
             &stored.object_name,
         );
-        let mut owners = match self.owners.write() {
-            Ok(o) => o,
-            Err(p) => p.into_inner(),
-        };
-        owners.insert(key, stored.owner_username.clone());
+        self.owners
+            .write()
+            .insert(key, stored.owner_username.clone());
     }
 
-    /// Remove every grant whose `target` matches the given string
-    /// from the in-memory set on every node. Used by
-    /// `PurgeCollection` post-apply to evict grants keyed on the
-    /// purged collection so stale cache entries cannot outlive the
-    /// catalog row they reference. Returns the number of grants
-    /// evicted.
+    /// Remove all grants whose target matches the supplied string.
     pub fn remove_grants_for_target(&self, target: &str) -> usize {
-        let mut grants = match self.grants.write() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut grants = self.grants.write();
         let before = grants.len();
         grants.retain(|g| g.target != target);
         before - grants.len()
     }
 
-    /// Remove a replicated owner record from the in-memory map on
-    /// every node. Returns `true` if a record was removed.
+    /// Remove a replicated owner record from the in-memory cache.
     pub fn install_replicated_remove_owner(
         &self,
         object_type: &str,
@@ -173,10 +130,6 @@ impl PermissionStore {
         object_name: &str,
     ) -> bool {
         let key = owner_key(object_type, database_id, tenant_id, object_name);
-        let mut owners = match self.owners.write() {
-            Ok(o) => o,
-            Err(p) => p.into_inner(),
-        };
-        owners.remove(&key).is_some()
+        self.owners.write().remove(&key).is_some()
     }
 }

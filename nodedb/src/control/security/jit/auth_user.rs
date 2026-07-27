@@ -8,8 +8,9 @@
 //! via external providers (JWT/OIDC).
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use parking_lot::RwLock;
 
 use tracing::info;
 
@@ -115,7 +116,7 @@ impl AuthUserStore {
 
     /// Get an auth user by ID.
     pub fn get(&self, id: &str) -> Option<AuthUserRecord> {
-        let users = self.users.read().unwrap_or_else(|p| p.into_inner());
+        let users = self.users.read();
         users.get(id).cloned()
     }
 
@@ -134,7 +135,7 @@ impl AuthUserStore {
         if let Some(ref catalog) = self.catalog {
             catalog.put_auth_user(&record.to_stored())?;
         }
-        let mut users = self.users.write().unwrap_or_else(|p| p.into_inner());
+        let mut users = self.users.write();
         users.insert(record.id.clone(), record);
         Ok(())
     }
@@ -146,7 +147,7 @@ impl AuthUserStore {
             .unwrap_or_default()
             .as_secs();
 
-        let mut users = self.users.write().unwrap_or_else(|p| p.into_inner());
+        let mut users = self.users.write();
         if let Some(user) = users.get_mut(id) {
             user.last_seen = now;
             if let Some(ref catalog) = self.catalog {
@@ -158,7 +159,7 @@ impl AuthUserStore {
 
     /// Deactivate a user (blocks even with valid JWT).
     pub fn deactivate(&self, id: &str) -> crate::Result<bool> {
-        let mut users = self.users.write().unwrap_or_else(|p| p.into_inner());
+        let mut users = self.users.write();
         if let Some(user) = users.get_mut(id) {
             user.is_active = false;
             user.status = AuthStatus::Suspended;
@@ -174,7 +175,7 @@ impl AuthUserStore {
 
     /// Set the status of an auth user.
     pub fn set_status(&self, id: &str, status: AuthStatus) -> crate::Result<bool> {
-        let mut users = self.users.write().unwrap_or_else(|p| p.into_inner());
+        let mut users = self.users.write();
         if let Some(user) = users.get_mut(id) {
             user.status = status;
             user.is_active = matches!(
@@ -193,7 +194,7 @@ impl AuthUserStore {
 
     /// List all auth users, optionally filtered by active status.
     pub fn list(&self, active_only: bool) -> Vec<AuthUserRecord> {
-        let users = self.users.read().unwrap_or_else(|p| p.into_inner());
+        let users = self.users.read();
         users
             .values()
             .filter(|u| !active_only || u.is_active)
@@ -205,7 +206,7 @@ impl AuthUserStore {
     /// Returns the number of purged records.
     pub fn purge_inactive(&self, inactive_before_secs: u64) -> crate::Result<usize> {
         let to_purge: Vec<String> = {
-            let users = self.users.read().unwrap_or_else(|p| p.into_inner());
+            let users = self.users.read();
             users
                 .values()
                 .filter(|u| !u.is_active && u.last_seen < inactive_before_secs)
@@ -215,7 +216,7 @@ impl AuthUserStore {
 
         let count = to_purge.len();
         if count > 0 {
-            let mut users = self.users.write().unwrap_or_else(|p| p.into_inner());
+            let mut users = self.users.write();
             for id in &to_purge {
                 users.remove(id);
                 if let Some(ref catalog) = self.catalog {
@@ -230,7 +231,7 @@ impl AuthUserStore {
 
     /// Total user count.
     pub fn count(&self) -> usize {
-        let users = self.users.read().unwrap_or_else(|p| p.into_inner());
+        let users = self.users.read();
         users.len()
     }
 
@@ -248,6 +249,8 @@ impl Default for AuthUserStore {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
 
     fn test_user(id: &str) -> AuthUserRecord {
@@ -312,6 +315,30 @@ mod tests {
 
         assert_eq!(store.list(true).len(), 1);
         assert_eq!(store.list(false).len(), 2);
+    }
+
+    #[test]
+    fn auth_user_state_remains_enforced_after_panic_while_write_locked() {
+        let store = AuthUserStore::new();
+        store.upsert(test_user("existing")).unwrap();
+        store.set_status("existing", AuthStatus::Banned).unwrap();
+
+        let panic_result = catch_unwind(AssertUnwindSafe(|| {
+            let _users = store.users.write();
+            panic!("simulated interrupted JIT auth-user update");
+        }));
+        assert!(panic_result.is_err());
+
+        // The existing denied status remains authoritative after the panic.
+        assert_eq!(store.get_status("existing"), Some(AuthStatus::Banned));
+        assert!(!store.is_active("existing"));
+
+        // The cache remains mutable and readable for later authenticated users.
+        store.upsert(test_user("later")).unwrap();
+        store.set_status("later", AuthStatus::ReadOnly).unwrap();
+        assert_eq!(store.get_status("later"), Some(AuthStatus::ReadOnly));
+        assert!(store.get("later").is_some());
+        assert!(store.is_active("later"));
     }
 
     #[test]

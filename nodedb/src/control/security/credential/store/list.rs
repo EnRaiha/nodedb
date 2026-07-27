@@ -10,20 +10,14 @@ use super::core::{CredentialStore, read_lock, write_lock};
 impl CredentialStore {
     /// List all active users with full details (for SHOW USERS).
     pub fn list_user_details(&self) -> Vec<UserRecord> {
-        let users = match read_lock(&self.users) {
-            Ok(u) => u,
-            Err(_) => return Vec::new(),
-        };
+        let users = read_lock(&self.users);
         users.values().filter(|u| u.is_active).cloned().collect()
     }
 
     /// List ALL user records (active and inactive). Used by the
     /// recovery verifier for a complete redb↔memory comparison.
     pub fn list_all_user_details(&self) -> Vec<UserRecord> {
-        let users = match read_lock(&self.users) {
-            Ok(u) => u,
-            Err(_) => return Vec::new(),
-        };
+        let users = read_lock(&self.users);
         users.values().cloned().collect()
     }
 
@@ -38,17 +32,14 @@ impl CredentialStore {
             replacement.insert(record.username.clone(), record);
         }
 
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         *users = replacement;
         Ok(())
     }
 
     /// List all active usernames.
     pub fn list_users(&self) -> Vec<String> {
-        let users = match read_lock(&self.users) {
-            Ok(u) => u,
-            Err(_) => return Vec::new(),
-        };
+        let users = read_lock(&self.users);
         users
             .values()
             .filter(|u| u.is_active)
@@ -58,7 +49,7 @@ impl CredentialStore {
 
     /// Check if any users exist.
     pub fn is_empty(&self) -> bool {
-        read_lock(&self.users).map(|u| u.is_empty()).unwrap_or(true)
+        read_lock(&self.users).is_empty()
     }
 
     /// Access the underlying system catalog (for API key persistence

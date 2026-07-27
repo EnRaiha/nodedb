@@ -81,7 +81,7 @@ impl CredentialStore {
         let lockout_duration_ms = self.lockout_duration.as_millis() as u64;
         let gc_cutoff_ms = now_epoch_ms.saturating_sub(lockout_duration_ms);
 
-        let mut attempts = write_lock(&self.login_attempts)?;
+        let mut attempts = write_lock(&self.login_attempts);
 
         for (username, stored) in records {
             // Reconstruct the Instant-based locked_until from the epoch timestamp.
@@ -130,15 +130,7 @@ impl CredentialStore {
             return Ok(());
         }
 
-        let attempts = match read_lock(&self.login_attempts) {
-            Ok(a) => a,
-            Err(_) => {
-                tracing::error!(
-                    "login_attempts lock poisoned in check_lockout, allowing access as fallback"
-                );
-                return Ok(());
-            }
-        };
+        let attempts = read_lock(&self.login_attempts);
 
         if let Some(tracker) = attempts.get(username)
             && let Some(locked_until) = tracker.locked_until
@@ -173,13 +165,7 @@ impl CredentialStore {
             return;
         }
 
-        let mut attempts = match write_lock(&self.login_attempts) {
-            Ok(a) => a,
-            Err(_) => {
-                tracing::error!("login_attempts lock poisoned in record_login_failure");
-                return;
-            }
-        };
+        let mut attempts = write_lock(&self.login_attempts);
 
         let tracker = attempts
             .entry(username.to_string())
@@ -253,13 +239,7 @@ impl CredentialStore {
             return;
         }
 
-        let mut attempts = match write_lock(&self.login_attempts) {
-            Ok(a) => a,
-            Err(_) => {
-                tracing::error!("login_attempts lock poisoned in record_login_success");
-                return;
-            }
-        };
+        let mut attempts = write_lock(&self.login_attempts);
 
         attempts.remove(username);
         drop(attempts);
@@ -277,10 +257,31 @@ impl CredentialStore {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
     use crate::control::security::audit::NoopAuditEmitter;
 
     const NOOP: &NoopAuditEmitter = &NoopAuditEmitter;
+
+    #[test]
+    fn login_attempt_cache_remains_enforced_after_panic_while_write_locked() {
+        let mut store = CredentialStore::new().expect("in-memory credential store");
+        store.set_lockout_policy(2, 300, 0);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _attempts = store.login_attempts.write();
+            panic!("simulated interrupted lockout update");
+        }));
+        assert!(result.is_err());
+
+        store.record_login_failure("poison-free-lockout", None, NOOP);
+        assert!(store.check_lockout("poison-free-lockout").is_ok());
+        store.record_login_failure("poison-free-lockout", None, NOOP);
+        assert!(store.check_lockout("poison-free-lockout").is_err());
+        store.record_login_success("poison-free-lockout");
+        assert!(store.check_lockout("poison-free-lockout").is_ok());
+    }
 
     #[test]
     fn lockout_after_threshold() {
@@ -434,7 +435,7 @@ mod tests {
             store.set_lockout_policy_with_grace(5, 300, 0, 0);
             store.rebuild_lockout_cache().expect("rebuild");
 
-            let attempts = read_lock(&store.login_attempts).expect("lock");
+            let attempts = read_lock(&store.login_attempts);
             let tracker = attempts.get("ivan").expect("ivan not found");
             assert_eq!(
                 tracker.last_failure_ip,

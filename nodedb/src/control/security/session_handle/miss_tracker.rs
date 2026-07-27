@@ -18,9 +18,10 @@
 //! observability should reflect that.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use parking_lot::RwLock;
 
 use crate::types::TenantId;
 
@@ -33,21 +34,21 @@ impl TenantMissCounters {
     pub(super) fn increment(&self, tenant_id: TenantId) {
         // Fast path: reader lock + existing entry.
         {
-            let map = self.by_tenant.read().unwrap_or_else(|p| p.into_inner());
+            let map = self.by_tenant.read();
             if let Some(counter) = map.get(&tenant_id) {
                 counter.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
         // Slow path: insert.
-        let mut map = self.by_tenant.write().unwrap_or_else(|p| p.into_inner());
+        let mut map = self.by_tenant.write();
         map.entry(tenant_id)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn get(&self, tenant_id: TenantId) -> u64 {
-        let map = self.by_tenant.read().unwrap_or_else(|p| p.into_inner());
+        let map = self.by_tenant.read();
         map.get(&tenant_id)
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0)
@@ -90,7 +91,7 @@ impl PerConnectionSpikeDetector {
     }
 
     pub(super) fn record_at(&self, conn_key: &str, now: Instant) -> SpikeOutcome {
-        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.write();
         let cutoff = now.checked_sub(self.window).unwrap_or(now);
 
         let entry = state
@@ -125,13 +126,15 @@ impl PerConnectionSpikeDetector {
     }
 
     pub(super) fn forget(&self, conn_key: &str) {
-        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.state.write();
         state.remove(conn_key);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::*;
 
     #[test]
@@ -143,6 +146,40 @@ mod tests {
         assert_eq!(c.get(TenantId::new(1)), 2);
         assert_eq!(c.get(TenantId::new(2)), 1);
         assert_eq!(c.get(TenantId::new(3)), 0);
+    }
+
+    #[test]
+    fn miss_counter_and_spike_detector_survive_panics_while_write_locked() {
+        let counters = TenantMissCounters::default();
+        let tenant_id = TenantId::new(9);
+        counters.increment(tenant_id);
+        let counter_panic = catch_unwind(AssertUnwindSafe(|| {
+            let _map = counters.by_tenant.write();
+            panic!("simulated interrupted miss-counter update");
+        }));
+        assert!(counter_panic.is_err());
+        counters.increment(tenant_id);
+        assert_eq!(counters.get(tenant_id), 2);
+
+        let detector = PerConnectionSpikeDetector::new(2, Duration::from_secs(60));
+        let now = Instant::now();
+        assert_eq!(detector.record_at("conn", now), SpikeOutcome::Quiet);
+        let detector_panic = catch_unwind(AssertUnwindSafe(|| {
+            let _map = detector.state.write();
+            panic!("simulated interrupted spike-detector update");
+        }));
+        assert!(detector_panic.is_err());
+        // The earlier miss remains counted, so the threshold is still enforced.
+        assert_eq!(
+            detector.record_at("conn", now + Duration::from_millis(1)),
+            SpikeOutcome::Fired
+        );
+        // Subsequent mutation can clear the connection-local state.
+        detector.forget("conn");
+        assert_eq!(
+            detector.record_at("conn", now + Duration::from_millis(2)),
+            SpikeOutcome::Quiet
+        );
     }
 
     #[test]

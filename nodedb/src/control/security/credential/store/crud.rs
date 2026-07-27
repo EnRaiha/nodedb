@@ -27,7 +27,7 @@ impl CredentialStore {
         // Preserve duplicate precedence without holding the users write lock
         // during the intentionally expensive Argon2 computation.
         {
-            let users = read_lock(&self.users)?;
+            let users = read_lock(&self.users);
             if users.contains_key(username) {
                 return Err(crate::Error::BadRequest {
                     detail: format!("user '{username}' already exists"),
@@ -40,7 +40,7 @@ impl CredentialStore {
         let scram_salted_password = compute_scram_salted_password(password, &salt);
         let password_hash = hash_password_argon2(password, &self.argon2_config)?;
 
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         // Another writer can create the user while Argon2 runs.
         if users.contains_key(username) {
             return Err(crate::Error::BadRequest {
@@ -90,7 +90,7 @@ impl CredentialStore {
         roles: Vec<Role>,
         accessible_databases: Vec<nodedb_types::id::DatabaseId>,
     ) -> crate::Result<u64> {
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         if users.contains_key(name) {
             return Err(crate::Error::BadRequest {
                 detail: format!("user or service account '{name}' already exists"),
@@ -136,7 +136,7 @@ impl CredentialStore {
     /// record would still trip the `CREATE USER` uniqueness check.
     pub fn drop_user(&self, username: &str) -> crate::Result<bool> {
         let record = {
-            let mut users = write_lock(&self.users)?;
+            let mut users = write_lock(&self.users);
             match users.remove(username) {
                 Some(record) => record,
                 None => return Ok(false),
@@ -151,7 +151,7 @@ impl CredentialStore {
     /// change role/access — no session invalidation reason.
     pub fn update_password(&self, username: &str, password: &str) -> crate::Result<()> {
         let (observed_user_id, is_service_account) = {
-            let users = read_lock(&self.users)?;
+            let users = read_lock(&self.users);
             let record = users
                 .get(username)
                 .ok_or_else(|| crate::Error::BadRequest {
@@ -170,7 +170,7 @@ impl CredentialStore {
         let scram_salted_password = compute_scram_salted_password(password, &salt);
         let password_hash = hash_password_argon2(password, &self.argon2_config)?;
 
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         let record = users
             .get_mut(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -207,7 +207,7 @@ impl CredentialStore {
 
     /// Mark a user as requiring a password change on next login.
     pub fn set_must_change_password(&self, username: &str, required: bool) -> crate::Result<()> {
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         let record = users
             .get_mut(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -225,7 +225,7 @@ impl CredentialStore {
 
     /// Set password expiry to 0 (never expires) for a user.
     pub fn set_password_never_expires(&self, username: &str) -> crate::Result<()> {
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         let record = users
             .get_mut(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -243,7 +243,7 @@ impl CredentialStore {
 
     /// Set a specific password expiry timestamp for a user.
     pub fn set_password_expires_at(&self, username: &str, expires_at: u64) -> crate::Result<()> {
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         let record = users
             .get_mut(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -262,7 +262,7 @@ impl CredentialStore {
     /// Replace all roles for a user. Triggers identity rehydrate on open
     /// sessions via `RoleAltered`.
     pub fn update_roles(&self, username: &str, roles: Vec<Role>) -> crate::Result<()> {
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         let record = users
             .get_mut(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -277,7 +277,7 @@ impl CredentialStore {
     /// Add a role to a user (if not already present). Triggers `RoleGranted`
     /// soft-revoke on open sessions.
     pub fn add_role(&self, username: &str, role: Role) -> crate::Result<()> {
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         let record = users
             .get_mut(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -302,7 +302,7 @@ impl CredentialStore {
         name: &str,
         databases: Vec<nodedb_types::id::DatabaseId>,
     ) -> crate::Result<()> {
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         let record = users
             .get_mut(name)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -321,7 +321,7 @@ impl CredentialStore {
     /// Remove a role from a user. Triggers `RoleRevoked` soft-revoke on
     /// open sessions.
     pub fn remove_role(&self, username: &str, role: &Role) -> crate::Result<()> {
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         let record = users
             .get_mut(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -342,6 +342,7 @@ mod tests {
         super::core::{assert_bad_request, assert_user_unchanged},
         CredentialStore,
     };
+
     use crate::control::security::identity::Role;
     use crate::control::security::time::now_secs;
     use crate::types::TenantId;
@@ -349,7 +350,7 @@ mod tests {
     #[test]
     fn create_user_rejects_empty_password_without_mutation() {
         let store = CredentialStore::new().expect("in-memory credential store");
-        let next_user_id = *store.next_user_id.read().expect("next user ID lock");
+        let next_user_id = *store.next_user_id.read();
 
         let error = store
             .create_user(
@@ -363,7 +364,7 @@ mod tests {
         assert_bad_request(error);
         assert!(store.get_user("empty-password").is_none());
         assert_eq!(
-            *store.next_user_id.read().expect("next user ID lock"),
+            *store.next_user_id.read(),
             next_user_id,
             "rejected create must not allocate a user ID"
         );

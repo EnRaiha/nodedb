@@ -9,8 +9,10 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock};
+
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::info;
 
 use super::super::super::catalog::SystemCatalog;
@@ -59,26 +61,18 @@ pub struct CredentialStore {
         std::sync::OnceLock<Arc<crate::control::security::buses::UserChangeBus>>,
 }
 
+/// Acquire a poison-free read guard for security-critical credential state.
 pub(in crate::control::security::credential) fn read_lock<T>(
     lock: &RwLock<T>,
-) -> crate::Result<std::sync::RwLockReadGuard<'_, T>> {
-    lock.read().map_err(|e| {
-        tracing::error!("credential store read lock poisoned: {e}");
-        crate::Error::Internal {
-            detail: "credential store lock poisoned".into(),
-        }
-    })
+) -> RwLockReadGuard<'_, T> {
+    lock.read()
 }
 
+/// Acquire a poison-free write guard for security-critical credential state.
 pub(in crate::control::security::credential) fn write_lock<T>(
     lock: &RwLock<T>,
-) -> crate::Result<std::sync::RwLockWriteGuard<'_, T>> {
-    lock.write().map_err(|e| {
-        tracing::error!("credential store write lock poisoned: {e}");
-        crate::Error::Internal {
-            detail: "credential store lock poisoned".into(),
-        }
-    })
+) -> RwLockWriteGuard<'_, T> {
+    lock.write()
 }
 
 /// The principal receiving a password assignment.
@@ -212,7 +206,7 @@ impl CredentialStore {
     }
 
     pub(in crate::control::security::credential) fn alloc_user_id(&self) -> crate::Result<u64> {
-        let mut next = write_lock(&self.next_user_id)?;
+        let mut next = write_lock(&self.next_user_id);
         let id = *next;
         *next += 1;
         self.persist_next_id(*next)?;
@@ -266,13 +260,13 @@ impl CredentialStore {
     ) -> crate::Result<u64> {
         // Fast path: slot already exists — just fetch_add.
         {
-            let map = read_lock(&self.versions)?;
+            let map = read_lock(&self.versions);
             if let Some(ctr) = map.get(&user_id) {
                 return Ok(ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
             }
         }
         // Slow path: insert under write-lock (double-checked).
-        let mut map = write_lock(&self.versions)?;
+        let mut map = write_lock(&self.versions);
         let ctr = map
             .entry(user_id)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)));
@@ -283,7 +277,7 @@ impl CredentialStore {
     /// never had a mutation recorded (e.g. loaded from a previous store that
     /// pre-dates versions).
     pub fn current_version(&self, user_id: u64) -> u64 {
-        let map = self.versions.read().unwrap_or_else(|p| p.into_inner());
+        let map = read_lock(&self.versions);
         match map.get(&user_id) {
             Some(ctr) => ctr.load(std::sync::atomic::Ordering::Relaxed),
             None => 0,
@@ -364,7 +358,7 @@ impl CredentialStore {
         }
 
         // 4. Discard the per-user version counter.
-        write_lock(&self.versions)?.remove(&user_id);
+        write_lock(&self.versions).remove(&user_id);
 
         Ok(())
     }
@@ -398,6 +392,8 @@ pub(super) fn assert_user_unchanged(before: &UserRecord, after: &UserRecord) {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     use super::CredentialStore;
     use crate::config::auth::Argon2Config;
     use crate::control::security::catalog::{StoredUser, SystemCatalog};
@@ -409,6 +405,31 @@ mod tests {
 
     fn assert_bad_request(error: crate::Error) {
         assert!(matches!(error, crate::Error::BadRequest { .. }));
+    }
+
+    #[test]
+    fn users_cache_remains_available_after_panic_while_write_locked() {
+        let store = CredentialStore::new().expect("in-memory credential store");
+        store
+            .create_user(
+                "poison-free-user",
+                "correct-password",
+                TenantId::new(4),
+                vec![Role::ReadWrite],
+            )
+            .expect("create user");
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _users = store.users.write();
+            panic!("simulated interrupted credential cache mutation");
+        }));
+        assert!(result.is_err());
+
+        assert!(store.verify_password("poison-free-user", "correct-password"));
+        assert_eq!(store.list_users(), vec!["poison-free-user".to_string()]);
+        store
+            .add_role("poison-free-user", Role::ReadOnly)
+            .expect("mutation after interrupted cache write");
     }
 
     #[test]

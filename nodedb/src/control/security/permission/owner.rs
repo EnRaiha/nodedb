@@ -9,10 +9,7 @@ use super::store::PermissionStore;
 use super::types::owner_key;
 
 impl PermissionStore {
-    /// Set the owner of an object. Direct CRUD path used by
-    /// single-node mode and tests; cluster mode flows through
-    /// `CatalogEntry::PutOwner` (or via `install_replicated_owner`
-    /// from a parent variant's post_apply).
+    /// Set the owner of an object. Cluster mode flows through catalog replication.
     pub fn set_owner(
         &self,
         object_type: &str,
@@ -52,14 +49,7 @@ impl PermissionStore {
             })?;
         }
 
-        let mut owners = match self.owners.write() {
-            Ok(o) => o,
-            Err(p) => {
-                tracing::error!("owner store lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
-        owners.insert(key, owner_username.to_string());
+        self.owners.write().insert(key, owner_username.to_string());
         Ok(())
     }
 
@@ -88,14 +78,7 @@ impl PermissionStore {
             catalog.delete_owner(object_type, database_id, tenant_id.as_u64(), object_name)?;
         }
 
-        let mut owners = match self.owners.write() {
-            Ok(o) => o,
-            Err(p) => {
-                tracing::error!("owner store lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
-        owners.remove(&key);
+        self.owners.write().remove(&key);
         Ok(())
     }
 
@@ -117,25 +100,14 @@ impl PermissionStore {
         object_name: &str,
     ) -> Option<String> {
         let key = owner_key(object_type, database_id, tenant_id.as_u64(), object_name);
-        let owners = match self.owners.read() {
-            Ok(o) => o,
-            Err(p) => {
-                tracing::error!("owner store lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
-        owners.get(&key).cloned()
+        self.owners.read().get(&key).cloned()
     }
 
     /// List all objects of a given type owned in a tenant.
-    /// Returns `(object_name, owner_username)` pairs.
     pub fn list_owners(&self, object_type: &str, tenant_id: TenantId) -> Vec<(String, String)> {
         let prefix = format!("{object_type}:");
-        let owners = match self.owners.read() {
-            Ok(o) => o,
-            Err(p) => p.into_inner(),
-        };
-        owners
+        self.owners
+            .read()
             .iter()
             .filter_map(|(key, owner)| {
                 let suffix = key.strip_prefix(&prefix)?;

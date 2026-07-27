@@ -32,7 +32,9 @@ use super::super::hash::{
     compute_scram_salted_password, generate_scram_salt, hash_password_argon2,
 };
 use super::super::record::UserRecord;
-use super::core::{CredentialStore, PasswordPrincipal, read_lock, validate_password_assignment};
+use super::core::{
+    CredentialStore, PasswordPrincipal, read_lock, validate_password_assignment, write_lock,
+};
 
 impl CredentialStore {
     /// Build a `StoredUser` ready for replication via
@@ -48,7 +50,7 @@ impl CredentialStore {
         roles: Vec<Role>,
     ) -> crate::Result<StoredUser> {
         {
-            let users = read_lock(&self.users)?;
+            let users = read_lock(&self.users);
             if users.contains_key(username) {
                 return Err(crate::Error::BadRequest {
                     detail: format!("user '{username}' already exists"),
@@ -95,7 +97,7 @@ impl CredentialStore {
         new_password: Option<&str>,
         new_roles: Option<Vec<Role>>,
     ) -> crate::Result<StoredUser> {
-        let users = read_lock(&self.users)?;
+        let users = read_lock(&self.users);
         let existing = users
             .get(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -141,7 +143,7 @@ impl CredentialStore {
         username: &str,
         required: bool,
     ) -> crate::Result<StoredUser> {
-        let users = read_lock(&self.users)?;
+        let users = read_lock(&self.users);
         let existing = users
             .get(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -166,7 +168,7 @@ impl CredentialStore {
         username: &str,
         expires_at: u64,
     ) -> crate::Result<StoredUser> {
-        let users = read_lock(&self.users)?;
+        let users = read_lock(&self.users);
         let existing = users
             .get(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -191,7 +193,7 @@ impl CredentialStore {
         username: &str,
         database_id: u64,
     ) -> crate::Result<StoredUser> {
-        let users = read_lock(&self.users)?;
+        let users = read_lock(&self.users);
         let existing = users
             .get(username)
             .ok_or_else(|| crate::Error::BadRequest {
@@ -216,8 +218,8 @@ impl CredentialStore {
     /// the log entry (e.g. `RoleGranted`, `UserDropped`).  Pass `None` for
     /// plain `CREATE USER` entries where no open sessions exist.
     ///
-    /// Never errors — a poisoned lock falls through to in-place recovery so a
-    /// single bad user write doesn't stall raft.
+    /// Uses poison-free cache locks, so a panic in a prior caller cannot stall
+    /// Raft cache publication.
     pub fn install_replicated_user(
         &self,
         stored: &StoredUser,
@@ -227,7 +229,7 @@ impl CredentialStore {
 
         // Bump next_user_id to stay ahead of replicated ids.
         {
-            let mut next = self.next_user_id.write().unwrap_or_else(|p| p.into_inner());
+            let mut next = write_lock(&self.next_user_id);
             if stored.user_id + 1 > *next {
                 *next = stored.user_id + 1;
             }
@@ -236,10 +238,16 @@ impl CredentialStore {
         // Redb was committed by the catalog applier (or the single-node
         // caller) before this cache installation. Do not write it again: a
         // second write would mutate `updated_at` and could overwrite a
-        // conditional catalog-apply failure. Only update local versions and
-        // publish the same cache-invalidation signals.
-        let user_id = record.user_id;
-        let _ = self.bump_version(user_id);
+        // conditional catalog-apply failure. Publish invalidation only after
+        // the new cache value is visible to observers.
+        {
+            let mut users = write_lock(&self.users);
+            users.insert(stored.username.clone(), record);
+        }
+        let user_id = stored.user_id;
+        if let Err(error) = self.bump_version(user_id) {
+            tracing::error!(user_id, error = %error, "replicated user version update failed");
+        }
         if let Some(bus) = self.uc_bus.get() {
             bus.publish(super::super::super::buses::UserChanged { user_id });
         }
@@ -248,9 +256,6 @@ impl CredentialStore {
         {
             bus.publish(super::super::super::buses::SessionInvalidated { user_id, reason });
         }
-
-        let mut users = self.users.write().unwrap_or_else(|p| p.into_inner());
-        users.insert(stored.username.clone(), record);
     }
 
     /// Remove a replicated dropped user from the in-memory cache and
@@ -261,7 +266,7 @@ impl CredentialStore {
     /// delete is harmless.
     pub fn install_replicated_drop(&self, username: &str) {
         let record = {
-            let mut users = self.users.write().unwrap_or_else(|p| p.into_inner());
+            let mut users = write_lock(&self.users);
             users.remove(username)
         };
         if let Some(record) = record {
@@ -276,13 +281,14 @@ mod tests {
         super::core::{assert_bad_request, assert_user_unchanged},
         CredentialStore,
     };
+
     use crate::control::security::identity::Role;
     use crate::types::TenantId;
 
     #[test]
     fn prepare_user_rejects_empty_password_without_id_allocation_or_proposal() {
         let store = CredentialStore::new().expect("in-memory credential store");
-        let next_user_id = *store.next_user_id.read().expect("next user ID lock");
+        let next_user_id = *store.next_user_id.read();
 
         let error = store
             .prepare_user(
@@ -296,7 +302,7 @@ mod tests {
         assert_bad_request(error);
         assert!(store.get_user("replicated-empty").is_none());
         assert_eq!(
-            *store.next_user_id.read().expect("next user ID lock"),
+            *store.next_user_id.read(),
             next_user_id,
             "rejected proposal preparation must not allocate a user ID"
         );

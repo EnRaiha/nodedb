@@ -27,13 +27,7 @@ impl PermissionStore {
         identity: &AuthenticatedIdentity,
         role_store: &RoleStore,
     ) -> bool {
-        let grants = match self.grants.read() {
-            Ok(g) => g,
-            Err(p) => {
-                tracing::error!("permission grants lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
+        let grants = self.grants.read();
 
         let user_grantee = format!("user:{}", identity.username);
         if grants.contains(&Grant {
@@ -264,13 +258,7 @@ impl PermissionStore {
             tenant_id.as_u64(),
             object_name,
         );
-        let owners = match self.owners.read() {
-            Ok(o) => o,
-            Err(p) => {
-                tracing::error!("owner store lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
+        let owners = self.owners.read();
         owners.get(&key).is_some_and(|o| o == username)
     }
 }
@@ -644,5 +632,82 @@ mod tests {
         let roles = RoleStore::new();
         let id = identity("admin", vec![], true);
         assert!(store.check_tenant(&id, Permission::Backup, TenantId::new(9), &roles, NOOP));
+    }
+
+    #[test]
+    fn grant_cache_preserves_denial_and_accepts_mutation_after_panic_while_locked() {
+        let store = PermissionStore::new();
+        let roles = RoleStore::new();
+        let denied = identity("bob", vec![], false);
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.grants.write();
+            panic!("simulated interrupted permission update");
+        }));
+        assert!(panic_result.is_err());
+
+        assert!(!store.check(
+            &denied,
+            Permission::Read,
+            DatabaseId::DEFAULT,
+            "orders",
+            &roles,
+            NOOP
+        ));
+        let target = collection_target(TenantId::new(1), "orders");
+        store
+            .grant(&target, "user:bob", Permission::Read, "admin", None)
+            .expect("post-panic grant must succeed");
+        assert!(store.check(
+            &denied,
+            Permission::Read,
+            DatabaseId::DEFAULT,
+            "orders",
+            &roles,
+            NOOP
+        ));
+    }
+
+    #[test]
+    fn owner_cache_preserves_decision_and_accepts_mutation_after_panic_while_locked() {
+        let store = PermissionStore::new();
+        let roles = RoleStore::new();
+        store
+            .set_owner("collection", TenantId::new(1), "orders", "alice", None)
+            .expect("seed owner");
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.owners.write();
+            panic!("simulated interrupted owner update");
+        }));
+        assert!(panic_result.is_err());
+
+        let alice = identity("alice", vec![], false);
+        assert!(store.check(
+            &alice,
+            Permission::Write,
+            DatabaseId::DEFAULT,
+            "orders",
+            &roles,
+            NOOP
+        ));
+        store
+            .set_owner("collection", TenantId::new(1), "orders", "bob", None)
+            .expect("post-panic ownership mutation must succeed");
+        assert!(!store.check(
+            &alice,
+            Permission::Write,
+            DatabaseId::DEFAULT,
+            "orders",
+            &roles,
+            NOOP
+        ));
+        let bob = identity("bob", vec![], false);
+        assert!(store.check(
+            &bob,
+            Permission::Write,
+            DatabaseId::DEFAULT,
+            "orders",
+            &roles,
+            NOOP
+        ));
     }
 }

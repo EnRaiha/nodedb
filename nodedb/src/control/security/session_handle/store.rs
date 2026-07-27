@@ -4,8 +4,9 @@
 //! handle resolver. See `super::mod` for the design rationale.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use parking_lot::RwLock;
 
 use super::fingerprint::{ClientFingerprint, FingerprintMode};
 use super::miss_tracker::{PerConnectionSpikeDetector, SpikeOutcome, TenantMissCounters};
@@ -112,7 +113,7 @@ impl SessionHandleStore {
     where
         F: Fn(AuditEvent) + Send + Sync + 'static,
     {
-        let mut slot = self.audit_hook.write().unwrap_or_else(|p| p.into_inner());
+        let mut slot = self.audit_hook.write();
         *slot = Box::new(hook);
     }
 
@@ -129,7 +130,7 @@ impl SessionHandleStore {
             expires_at: now + self.default_ttl_secs,
         };
 
-        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
+        let mut sessions = self.sessions.write();
         let handle = loop {
             let candidate = generate_handle();
             if !sessions.contains_key(&candidate) {
@@ -169,7 +170,7 @@ impl SessionHandleStore {
         }
 
         let now = now_secs();
-        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
+        let sessions = self.sessions.read();
         let Some(cached) = sessions.get(handle) else {
             drop(sessions);
             self.record_miss(conn_key, caller_fingerprint.tenant_id);
@@ -208,13 +209,13 @@ impl SessionHandleStore {
     }
 
     fn emit_audit(&self, event: AuditEvent) {
-        let hook = self.audit_hook.read().unwrap_or_else(|p| p.into_inner());
+        let hook = self.audit_hook.read();
         (hook)(event);
     }
 
     /// Invalidate a handle. Returns true if the handle existed.
     pub fn invalidate(&self, handle: &str) -> bool {
-        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
+        let mut sessions = self.sessions.write();
         sessions.remove(handle).is_some()
     }
 
@@ -227,14 +228,14 @@ impl SessionHandleStore {
     /// Number of active (non-expired) handles.
     pub fn count(&self) -> usize {
         let now = now_secs();
-        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
+        let sessions = self.sessions.read();
         sessions.values().filter(|s| now < s.expires_at).count()
     }
 
     /// Age of the oldest active session handle in seconds.
     pub fn oldest_age_secs(&self) -> u64 {
         let now = now_secs();
-        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
+        let sessions = self.sessions.read();
         sessions
             .values()
             .filter(|s| now < s.expires_at)
@@ -291,6 +292,27 @@ mod tests {
 
     fn fp(tenant: u64, a: u8, b: u8, c: u8, d: u8) -> ClientFingerprint {
         ClientFingerprint::new(TenantId::new(tenant), IpAddr::V4(Ipv4Addr::new(a, b, c, d)))
+    }
+
+    #[test]
+    fn resolve_and_invalidate_survive_panic_while_session_cache_is_write_locked() {
+        let store = SessionHandleStore::new(3600);
+        let origin = fp(1, 10, 0, 0, 5);
+        let handle = store.create(ctx(1, "alice"), origin);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _sessions = store.sessions.write();
+            panic!("simulated interrupted session-handle cache update");
+        }));
+        assert!(result.is_err());
+        assert!(matches!(
+            store.resolve(&handle, "connection", &origin),
+            ResolveOutcome::Resolved(_)
+        ));
+        assert!(store.invalidate(&handle));
+        assert!(matches!(
+            store.resolve(&handle, "connection", &origin),
+            ResolveOutcome::Miss
+        ));
     }
 
     #[test]

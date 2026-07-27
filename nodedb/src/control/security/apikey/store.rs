@@ -12,8 +12,8 @@
 //! and every node's applier calls `install_replicated_key` to upsert the
 //! cache plus `catalog.put_api_key` for redb durability.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 use crate::control::security::catalog::{StoredApiKey, SystemCatalog};
 use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, DatabaseSet, Role};
@@ -45,9 +45,7 @@ impl ApiKeyStore {
     /// Load API keys from the catalog into the cache.
     pub fn load_from(&self, catalog: &SystemCatalog) -> crate::Result<()> {
         let stored_keys = catalog.load_all_api_keys()?;
-        let mut keys = self.keys.write().map_err(|e| crate::Error::Internal {
-            detail: format!("api key lock poisoned: {e}"),
-        })?;
+        let mut keys = self.keys.write();
         for stored in stored_keys {
             let record = ApiKeyRecord::from_stored(stored);
             keys.insert(record.key_id.clone(), record);
@@ -64,9 +62,7 @@ impl ApiKeyStore {
     /// a divergent registry.
     pub(crate) fn clear_and_reload(&self, catalog: &SystemCatalog) -> crate::Result<()> {
         {
-            let mut keys = self.keys.write().map_err(|e| crate::Error::Internal {
-                detail: format!("api key lock poisoned during repair: {e}"),
-            })?;
+            let mut keys = self.keys.write();
             keys.clear();
         }
         self.load_from(catalog)
@@ -124,9 +120,7 @@ impl ApiKeyStore {
             self.persist_to(catalog, &record)?;
         }
 
-        let mut keys = self.keys.write().map_err(|e| crate::Error::Internal {
-            detail: format!("api key lock poisoned: {e}"),
-        })?;
+        let mut keys = self.keys.write();
         keys.insert(key_id.clone(), record);
 
         Ok(format!("ndb_{key_id}.{secret}"))
@@ -136,7 +130,7 @@ impl ApiKeyStore {
     pub fn verify_key(&self, token: &str) -> Option<ApiKeyRecord> {
         let (key_id, secret) = parse_token(token)?;
 
-        let keys = self.keys.read().ok()?;
+        let keys = self.keys.read();
         let record = keys.get(key_id)?;
 
         if !record.is_valid() {
@@ -224,7 +218,7 @@ impl ApiKeyStore {
     /// hook after the applier has written the record to local redb.
     pub fn install_replicated_key(&self, stored: &StoredApiKey) {
         let record = ApiKeyRecord::from_stored(stored.clone());
-        let mut keys = self.keys.write().unwrap_or_else(|p| p.into_inner());
+        let mut keys = self.keys.write();
         keys.insert(stored.key_id.clone(), record);
     }
 
@@ -233,7 +227,7 @@ impl ApiKeyStore {
     /// `CatalogEntry::DeleteApiKey` variant. The redb record stays
     /// in place with `is_revoked = true` so audit trails survive.
     pub fn install_replicated_revoke(&self, key_id: &str) {
-        let mut keys = self.keys.write().unwrap_or_else(|p| p.into_inner());
+        let mut keys = self.keys.write();
         if let Some(record) = keys.get_mut(key_id) {
             record.is_revoked = true;
         }
@@ -242,15 +236,13 @@ impl ApiKeyStore {
     /// Look up a replicated key by id. Used by handler pre-checks
     /// before proposing a revoke.
     pub fn get_key(&self, key_id: &str) -> Option<ApiKeyRecord> {
-        let keys = self.keys.read().unwrap_or_else(|p| p.into_inner());
+        let keys = self.keys.read();
         keys.get(key_id).cloned()
     }
 
     /// Revoke an API key by key_id.
     pub fn revoke_key(&self, key_id: &str, catalog: Option<&SystemCatalog>) -> crate::Result<bool> {
-        let mut keys = self.keys.write().map_err(|e| crate::Error::Internal {
-            detail: format!("api key lock poisoned: {e}"),
-        })?;
+        let mut keys = self.keys.write();
 
         if let Some(record) = keys.get_mut(key_id) {
             record.is_revoked = true;
@@ -265,10 +257,7 @@ impl ApiKeyStore {
 
     /// List all keys for a user (does not return secrets).
     pub fn list_keys_for_user(&self, username: &str) -> Vec<ApiKeyRecord> {
-        let keys = match self.keys.read() {
-            Ok(k) => k,
-            Err(_) => return Vec::new(),
-        };
+        let keys = self.keys.read();
         keys.values()
             .filter(|k| k.username == username)
             .cloned()
@@ -277,10 +266,7 @@ impl ApiKeyStore {
 
     /// List all keys (admin view).
     pub fn list_all_keys(&self) -> Vec<ApiKeyRecord> {
-        let keys = match self.keys.read() {
-            Ok(k) => k,
-            Err(_) => return Vec::new(),
-        };
+        let keys = self.keys.read();
         keys.values().cloned().collect()
     }
 }
@@ -348,6 +334,24 @@ mod tests {
     }
 
     #[test]
+    fn key_cache_remains_usable_after_panic_while_write_locked() {
+        let store = ApiKeyStore::new();
+        let token = store
+            .create_key(empty_params("panic-safe", 9), None)
+            .expect("create key");
+        let (key_id, _) = parse_token(&token).expect("parse generated token");
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.keys.write();
+            panic!("simulated interrupted API key cache update");
+        }));
+        assert!(outcome.is_err());
+        assert!(store.verify_key(&token).is_some());
+        assert!(store.revoke_key(key_id, None).expect("revoke key"));
+        assert!(store.verify_key(&token).is_none());
+    }
+
+    #[test]
     fn expired_key_rejected() {
         let store = ApiKeyStore::new();
         let key_id = generate_key_id();
@@ -367,7 +371,7 @@ mod tests {
             accessible_databases: vec![],
         };
 
-        store.keys.write().unwrap().insert(key_id.clone(), record);
+        store.keys.write().insert(key_id.clone(), record);
 
         let token = format!("ndb_{key_id}.{secret}");
         assert!(store.verify_key(&token).is_none());

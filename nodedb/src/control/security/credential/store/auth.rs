@@ -35,8 +35,8 @@ pub enum AuthRejection {
     /// (password expired, change required, account inactive, service
     /// account). Must NOT count toward the lockout counter.
     PolicyDenied,
-    /// Verification could not be performed (poisoned lock, unparseable
-    /// stored hash). Must NOT count toward the lockout counter.
+    /// Verification could not be performed because stored credential data is
+    /// invalid. Must NOT count toward the lockout counter.
     Internal,
 }
 
@@ -61,7 +61,7 @@ impl CredentialStore {
     /// Look up a user by username. Returns None if not found or
     /// inactive.
     pub fn get_user(&self, username: &str) -> Option<UserRecord> {
-        let users = read_lock(&self.users).ok()?;
+        let users = read_lock(&self.users);
         users.get(username).filter(|u| u.is_active).cloned()
     }
 
@@ -73,12 +73,9 @@ impl CredentialStore {
     /// classifies whether the rejection counts toward account lockout:
     /// only an unknown user (`BadCredential`) does; service accounts,
     /// inactive accounts and expired/must-change passwords (`PolicyDenied`)
-    /// and lock-poisoning (`Internal`) do not.
+    /// do not.
     pub fn get_scram_credentials(&self, username: &str) -> ScramLookup {
-        let users = match read_lock(&self.users) {
-            Ok(u) => u,
-            Err(_) => return ScramLookup::Rejected(AuthRejection::Internal),
-        };
+        let users = read_lock(&self.users);
         let u = match users.get(username) {
             Some(u) => u,
             // Unknown user — a genuine credential failure.
@@ -160,14 +157,7 @@ impl CredentialStore {
         username: &str,
         password: &str,
     ) -> PasswordVerification {
-        let users = match read_lock(&self.users) {
-            Ok(u) => u,
-            Err(_) => {
-                // Timing oracle mitigation: run a dummy hash even on lock failure.
-                let _ = hash_password_argon2(password, &self.argon2_config);
-                return PasswordVerification::Rejected(AuthRejection::Internal);
-            }
-        };
+        let users = read_lock(&self.users);
         let record = match users.get(username) {
             Some(r) => r,
             None => {
@@ -245,17 +235,7 @@ impl CredentialStore {
     ///
     /// Failure is non-fatal: a warning is logged and login continues.
     fn apply_rehash(&self, username: &str, new_hash: String) {
-        let mut users = match write_lock(&self.users) {
-            Ok(u) => u,
-            Err(e) => {
-                tracing::warn!(
-                    username,
-                    error = %e,
-                    "rehash write-back: could not acquire write lock; skipping"
-                );
-                return;
-            }
-        };
+        let mut users = write_lock(&self.users);
         let record = match users.get_mut(username) {
             Some(r) => r,
             None => {
@@ -280,10 +260,9 @@ impl CredentialStore {
     }
 
     /// Compute the login warning string (grace period / must_change_password).
-    /// Re-reads the record under read lock; if the lock or user is unavailable,
-    /// returns `None` (warning loss is acceptable compared to failing the login).
+    /// Re-reads the record under the poison-free credential cache lock.
     fn compute_login_warning(&self, username: &str, now: u64, grace_secs: u64) -> Option<String> {
-        let users = read_lock(&self.users).ok()?;
+        let users = read_lock(&self.users);
         let record = users.get(username)?;
 
         if record.must_change_password {
@@ -338,6 +317,7 @@ impl CredentialStore {
 mod tests {
     use super::*;
     use crate::control::security::identity::Role;
+
     use crate::types::TenantId;
 
     #[test]
@@ -359,7 +339,6 @@ mod tests {
         store
             .users
             .write()
-            .expect("users lock")
             .get_mut("frank")
             .expect("frank")
             .password_expires_at = 1;
@@ -385,7 +364,6 @@ mod tests {
         store
             .users
             .write()
-            .expect("users lock")
             .get_mut("grace_user")
             .expect("grace_user")
             .password_expires_at = crate::control::security::time::now_secs() - 1;
@@ -433,7 +411,6 @@ mod tests {
         store
             .users
             .write()
-            .expect("users lock")
             .get_mut("ivan")
             .expect("ivan")
             .password_expires_at = 1;
@@ -458,7 +435,6 @@ mod tests {
         store
             .users
             .write()
-            .expect("users lock")
             .get_mut("karl")
             .expect("karl")
             .password_expires_at = 1;
@@ -479,7 +455,6 @@ mod tests {
         store
             .users
             .write()
-            .expect("users lock")
             .get_mut("judy")
             .expect("judy")
             .password_expires_at = crate::control::security::time::now_secs() - 1;

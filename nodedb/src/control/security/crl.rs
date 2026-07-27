@@ -20,8 +20,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use parking_lot::RwLock;
 use tracing::{info, warn};
 
 /// A set of revoked certificate serial numbers.
@@ -206,10 +207,7 @@ pub fn spawn_crl_reload_task(
                 }
             }
 
-            let mut store = crl_store.write().unwrap_or_else(|p| {
-                warn!("CRL store lock poisoned, recovering");
-                p.into_inner()
-            });
+            let mut store = crl_store.write();
             if let Err(e) = store.reload_from_file(&crl_path) {
                 warn!(
                     error = %e,
@@ -225,13 +223,7 @@ pub fn spawn_crl_reload_task(
 ///
 /// Returns `true` if the certificate should be rejected (is revoked).
 pub fn check_revocation(crl_store: &SharedCrlStore, serial_hex: &str) -> bool {
-    match crl_store.read() {
-        Ok(store) => store.is_revoked(serial_hex),
-        Err(_) => {
-            warn!("CRL store lock poisoned — failing open (allowing connection)");
-            false
-        }
-    }
+    crl_store.read().is_revoked(serial_hex)
 }
 
 /// CRL-related errors.
@@ -267,6 +259,19 @@ mod tests {
     }
 
     #[test]
+    fn revocation_remains_enforced_after_panic_while_write_locked() {
+        let shared = Arc::new(RwLock::new(CrlStore::new()));
+        shared.write().revoked_serials.insert("ABCD".into());
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.write();
+            panic!("simulated interrupted CRL update");
+        }));
+        assert!(outcome.is_err());
+        assert!(check_revocation(&shared, "ABCD"));
+    }
+
+    #[test]
     fn shared_crl_no_path() {
         let result = load_shared_crl(None).unwrap();
         assert!(result.is_none());
@@ -281,7 +286,7 @@ mod tests {
     #[test]
     fn revocation_check_thread_safe() {
         let store = Arc::new(RwLock::new(CrlStore::new()));
-        store.write().unwrap().revoked_serials.insert("AA".into());
+        store.write().revoked_serials.insert("AA".into());
 
         assert!(check_revocation(&store, "AA"));
         assert!(!check_revocation(&store, "BB"));
