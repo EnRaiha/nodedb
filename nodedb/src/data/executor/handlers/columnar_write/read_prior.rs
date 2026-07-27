@@ -2,6 +2,9 @@
 
 //! Flushed-segment PK lookup for ON CONFLICT DO UPDATE prior-row reads.
 
+use std::mem::size_of;
+
+use nodedb_types::decode_bounds::checked_decode_capacity;
 use nodedb_types::value::Value;
 
 use crate::data::executor::core_loop::CoreLoop;
@@ -47,8 +50,19 @@ impl CoreLoop {
             nodedb_columnar::SegmentReader::open(seg_bytes).ok()?
         };
         let schema = engine.schema();
-        let mut row = Vec::with_capacity(schema.columns.len());
-        for col_idx in 0..schema.columns.len() {
+        // Schema cardinality is catalog-owned rather than byte-decoded; bind
+        // it once so the allocation's direct trusted bound is explicit.
+        let column_count = schema.columns.len();
+        let row_capacity = checked_decode_capacity(
+            column_count,
+            size_of::<Value>(),
+            column_count,
+            1,
+            column_count,
+            usize::MAX,
+        )?;
+        let mut row = Vec::with_capacity(row_capacity);
+        for col_idx in 0..column_count {
             let decoded = reader.read_column(col_idx).ok()?;
             row.push(crate::data::executor::scan_normalize::decoded_col_to_value(
                 &decoded,

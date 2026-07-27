@@ -59,8 +59,7 @@ pub fn create_typeguard(
     identity: &AuthenticatedIdentity,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let upper = sql.to_uppercase();
-    let or_replace = upper.contains("OR REPLACE");
+    let or_replace = find_ascii_case_insensitive(sql, "OR REPLACE").is_some();
 
     let coll_name = extract_collection_name(sql)?;
     let field_list = extract_outer_parens(sql)?;

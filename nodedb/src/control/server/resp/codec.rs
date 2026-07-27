@@ -301,9 +301,20 @@ fn parse_array(buf: &[u8]) -> io::Result<Option<(RespValue, usize)>> {
         return Ok(Some((RespValue::nil_array(), crlf_pos + 2)));
     }
 
-    let count = count as usize;
+    let count = usize::try_from(count).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "RESP array count exceeds usize")
+    })?;
     let mut offset = crlf_pos + 2;
-    let mut items = Vec::with_capacity(count);
+    // RESP array cardinality is peer-controlled. Each non-null element needs
+    // at least three bytes (`-\r\n`), so reject an impossible declaration
+    // before looping and grow as complete elements are parsed.
+    let minimum_bytes = count
+        .checked_mul(3)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RESP array count overflow"))?;
+    if buf.len().saturating_sub(offset) < minimum_bytes {
+        return Ok(None);
+    }
+    let mut items = Vec::new();
 
     for _ in 0..count {
         match parse_value(&buf[offset..])? {
@@ -413,6 +424,13 @@ mod tests {
             }
             other => panic!("expected array, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_huge_array_count_with_tiny_input_returns_none() {
+        let mut parser = RespParser::new();
+        parser.feed(b"*4294967295\r\n");
+        assert!(parser.try_parse().unwrap().is_none());
     }
 
     #[test]

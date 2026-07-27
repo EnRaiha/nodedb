@@ -2,9 +2,9 @@
 
 //! SQL dispatch: DataFusion planning + Data Plane execution.
 
-use nodedb_types::TraceId;
 use nodedb_types::protocol::NativeResponse;
 use nodedb_types::value::Value;
+use nodedb_types::{TraceId, strip_prefix_ascii_case_insensitive};
 
 use std::sync::Arc;
 
@@ -118,8 +118,8 @@ async fn handle_sql_inner(
     if upper.starts_with("SET ") {
         return resp(handle_set_sql(ctx, seq, sql_trimmed));
     }
-    if upper.starts_with("RESET ") {
-        let param = sql_trimmed[6..].trim().to_lowercase();
+    if let Some(rest) = strip_prefix_ascii_case_insensitive(sql_trimmed, "RESET ") {
+        let param = rest.trim().to_lowercase();
         ctx.sessions
             .set_parameter(ctx.peer_addr, param, String::new());
         return resp(NativeResponse::status_row(seq, "RESET"));

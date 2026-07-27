@@ -28,10 +28,8 @@ pub async fn dispatch_sql(
     sql: &str,
 ) -> Option<crate::Result<DispatchOutcome>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
-
     // ── PUBLISH TO <topic> <payload> ─────────────────────────────────────────
-    if upper.starts_with("PUBLISH TO ") {
+    if nodedb_types::starts_with_ascii_case_insensitive(trimmed, "PUBLISH TO ") {
         return Some(handle_publish(state, identity, trimmed).await);
     }
 
@@ -46,8 +44,7 @@ async fn handle_publish(
     sql: &str,
 ) -> crate::Result<DispatchOutcome> {
     let prefix = "PUBLISH TO ";
-    let upper = sql.to_uppercase();
-    if !upper.starts_with(prefix) {
+    if !nodedb_types::starts_with_ascii_case_insensitive(sql, prefix) {
         return Err(crate::Error::BadRequest {
             detail: "expected PUBLISH TO <topic> <payload>".into(),
         });

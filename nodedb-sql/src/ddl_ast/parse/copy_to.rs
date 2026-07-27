@@ -3,6 +3,8 @@
 //! Parse `COPY <collection> TO '<path>' [WITH (...)]` and
 //! `COPY (SELECT ...) TO '<path>' [WITH (...)]`.
 
+use nodedb_types::{starts_with_ascii_case_insensitive, strip_prefix_ascii_case_insensitive};
+
 use crate::ddl_ast::statement::{CopyFormat, CopyToSource, MiscStmt, NodedbStatement};
 use crate::error::SqlError;
 use crate::parser::preprocess::lex::find_ascii_case_insensitive;
@@ -16,12 +18,16 @@ use super::copy_from::{
 /// Returns `None` if the SQL is not a COPY statement. Returns `Some(Err)` on
 /// parse errors. Returns `Some(Ok(CopyToFile {...}))` on success.
 pub(super) fn try_parse(upper: &str, trimmed: &str) -> Option<Result<NodedbStatement, SqlError>> {
-    if !upper.starts_with("COPY ") {
+    if !starts_with_ascii_case_insensitive(trimmed, "COPY ") {
         return None;
     }
 
-    let after_copy = trimmed["COPY ".len()..].trim_start();
-    let upper_after = upper["COPY ".len()..].trim_start();
+    let after_copy = strip_prefix_ascii_case_insensitive(trimmed, "COPY ")
+        .unwrap_or("")
+        .trim_start();
+    let upper_after = strip_prefix_ascii_case_insensitive(upper, "COPY ")
+        .unwrap_or("")
+        .trim_start();
 
     // Query form: `COPY (SELECT ...) TO '<path>'` — the `(` starts immediately.
     // Skip FROM/TO prefix checks; parse_copy_to will handle it.
@@ -93,12 +99,19 @@ fn parse_table_form(trimmed: &str) -> Result<NodedbStatement, SqlError> {
 /// `COPY (SELECT ...) TO '<path>' [WITH (...)]`
 fn parse_query_form(trimmed: &str) -> Result<NodedbStatement, SqlError> {
     // Find the matching close-paren for the leading `(`.
-    let after_copy = trimmed["COPY ".len()..].trim_start();
+    let after_copy = strip_prefix_ascii_case_insensitive(trimmed, "COPY ")
+        .unwrap_or("")
+        .trim_start();
     let close = find_matching_paren(after_copy).ok_or_else(|| SqlError::Parse {
         detail: "COPY: unclosed parenthesis in query form".to_string(),
     })?;
 
-    let query = after_copy[1..close].trim().to_string();
+    let query = after_copy
+        .strip_prefix('(')
+        .and_then(|body| close.checked_sub(1).and_then(|end| body.get(..end)))
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if query.is_empty() {
         return Err(SqlError::Parse {
             detail: "COPY: empty query in query form".to_string(),
@@ -107,8 +120,7 @@ fn parse_query_form(trimmed: &str) -> Result<NodedbStatement, SqlError> {
 
     // After the closing paren, expect " TO '<path>'"
     let after_paren = after_copy[close + 1..].trim_start();
-    let upper_after = after_paren.to_uppercase();
-    if !upper_after.starts_with("TO ") {
+    if !starts_with_ascii_case_insensitive(after_paren, "TO ") {
         return Err(SqlError::Parse {
             detail: format!(
                 "COPY: expected TO after query, got: {}",
@@ -117,7 +129,9 @@ fn parse_query_form(trimmed: &str) -> Result<NodedbStatement, SqlError> {
         });
     }
 
-    let after_to = after_paren["TO ".len()..].trim_start();
+    let after_to = strip_prefix_ascii_case_insensitive(after_paren, "TO ")
+        .unwrap_or("")
+        .trim_start();
     let (path, _rest, format, delimiter, header) = parse_path_and_opts(after_to)?;
 
     Ok(NodedbStatement::Misc(MiscStmt::CopyToFile {
@@ -189,10 +203,13 @@ mod tests {
 
     #[test]
     fn unicode_collection_before_to_preserves_original_offsets() {
-        let stmt = ok("COPY usersﬀﬀ TO '/tmp/out.ndjson'");
+        let stmt = ok("COPY usersßﬀİ TO '/tmp/out.ndjson'");
         match stmt {
             NodedbStatement::Misc(MiscStmt::CopyToFile { source, path, .. }) => {
-                assert_eq!(source, CopyToSource::Collection("usersﬀﬀ".to_string()));
+                assert_eq!(
+                    source,
+                    CopyToSource::Collection("usersßﬀi\u{307}".to_string())
+                );
                 assert_eq!(path, "/tmp/out.ndjson");
             }
             other => panic!("unexpected: {other:?}"),

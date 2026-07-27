@@ -32,7 +32,8 @@ use std::mem::size_of;
 pub use block::bit_width_for_range;
 
 use crate::bounds::{
-    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, u32_to_usize,
+    checked_add, checked_capacity, checked_mul, checked_range, decoded_len, encode_input_len,
+    u32_to_usize,
 };
 use crate::error::CodecError;
 use block::{decode_block, encode_block, skip_block};
@@ -93,7 +94,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<i64>, CodecError> {
         return Ok(Vec::new());
     }
 
-    let mut values = Vec::with_capacity(total_count);
+    let value_capacity = checked_capacity(total_count, size_of::<i64>(), "FastLanes values")?;
+    let mut values = Vec::with_capacity(value_capacity);
     let mut offset = GLOBAL_HEADER_SIZE;
     for block_idx in 0..block_count {
         offset = decode_block(
@@ -133,7 +135,8 @@ pub fn block_byte_offsets(data: &[u8]) -> Result<Vec<usize>, CodecError> {
         });
     }
     let (total_count, num_blocks) = parse_header(data)?;
-    let mut offsets = Vec::with_capacity(num_blocks);
+    let offset_capacity = checked_capacity(num_blocks, size_of::<usize>(), "FastLanes offsets")?;
+    let mut offsets = Vec::with_capacity(offset_capacity);
     let mut pos = GLOBAL_HEADER_SIZE;
     for i in 0..num_blocks {
         offsets.push(pos);
@@ -183,7 +186,8 @@ pub fn decode_block_range(
     })?;
     let selected_bytes = checked_mul(selected_count, size_of::<i64>(), "FastLanes range bytes")?;
     decoded_len(selected_bytes, "FastLanes range")?;
-    let mut values = Vec::with_capacity(selected_count);
+    let selected_capacity = checked_capacity(selected_count, size_of::<i64>(), "FastLanes range")?;
+    let mut values = Vec::with_capacity(selected_capacity);
     for i in start_block..end_block {
         offset = decode_block(
             data,
@@ -234,7 +238,8 @@ pub fn decode_single_block(data: &[u8], block_idx: usize) -> Result<Vec<i64>, Co
     }
 
     let expected_count = expected_block_count(total_count, block_idx)?;
-    let mut values = Vec::with_capacity(expected_count);
+    let value_capacity = checked_capacity(expected_count, size_of::<i64>(), "FastLanes block")?;
+    let mut values = Vec::with_capacity(value_capacity);
     decode_block(data, offset, &mut values, block_idx, expected_count)?;
     Ok(values)
 }

@@ -23,10 +23,8 @@ pub(super) fn parse_where(text: &str) -> crate::Result<Vec<WherePredicate>> {
             continue;
         }
 
-        let upper_part = part.to_uppercase();
-
         // NOT EXISTS { MATCH ... }
-        if upper_part.starts_with("NOT EXISTS") {
+        if nodedb_types::starts_with_ascii_case_insensitive(part, "NOT EXISTS") {
             let brace_start = part.find('{').ok_or_else(|| crate::Error::BadRequest {
                 detail: "NOT EXISTS requires { MATCH ... }".to_string(),
             })?;
@@ -105,14 +103,9 @@ pub(super) fn parse_return(text: &str) -> (Vec<ReturnColumn>, bool) {
     }
 
     // Strip DISTINCT keyword.
-    let (effective, distinct) = {
-        let upper = trimmed.to_uppercase();
-        if upper.starts_with("DISTINCT ") {
-            (&trimmed[9..], true)
-        } else {
-            (trimmed, false)
-        }
-    };
+    let (effective, distinct) =
+        nodedb_types::strip_prefix_ascii_case_insensitive(trimmed, "DISTINCT ")
+            .map_or((trimmed, false), |rest| (rest, true));
 
     let columns = split_top_level_commas(effective)
         .into_iter()

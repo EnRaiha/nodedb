@@ -7,6 +7,11 @@
 //! delta encoding for posting list compression.
 
 use std::collections::HashMap;
+use std::mem::size_of;
+
+use nodedb_types::decode_bounds::checked_decode_capacity;
+
+const MAX_DOC_ID_MAP_ALLOCATION_BYTES: usize = 64 * 1024 * 1024;
 
 /// Bidirectional map: `u32 ↔ String` document ID.
 ///
@@ -93,13 +98,34 @@ impl DocIdMap {
 
     /// Deserialize from bytes. Returns `None` if the buffer is malformed.
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < 4 {
+        if buf.len() < 4 || buf.len() > MAX_DOC_ID_MAP_ALLOCATION_BYTES {
             return None;
         }
-        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let count = usize::try_from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])).ok()?;
+        // Every encoded entry occupies at least its u16 length field, so the
+        // frame itself bounds both container allocations before reserving.
+        if count > (buf.len() - 4) / 2 {
+            return None;
+        }
+        let reverse_capacity = checked_decode_capacity(
+            count,
+            size_of::<String>(),
+            buf.len() - 4,
+            2,
+            (buf.len() - 4) / 2,
+            MAX_DOC_ID_MAP_ALLOCATION_BYTES,
+        )?;
+        let forward_capacity = checked_decode_capacity(
+            count,
+            size_of::<(String, u32)>(),
+            buf.len() - 4,
+            2,
+            (buf.len() - 4) / 2,
+            MAX_DOC_ID_MAP_ALLOCATION_BYTES,
+        )?;
         let mut pos = 4;
-        let mut forward = HashMap::with_capacity(count);
-        let mut reverse = Vec::with_capacity(count);
+        let mut forward = HashMap::with_capacity(forward_capacity);
+        let mut reverse = Vec::with_capacity(reverse_capacity);
 
         for i in 0..count {
             if pos + 2 > buf.len() {
@@ -174,6 +200,11 @@ mod tests {
         assert_eq!(restored.to_u32("world"), None); // Tombstoned.
         assert_eq!(restored.to_u32("foo"), Some(2));
         assert_eq!(restored.len(), 3); // 3 slots (including tombstone).
+    }
+
+    #[test]
+    fn from_bytes_rejects_huge_count_with_tiny_payload_before_allocation() {
+        assert!(DocIdMap::from_bytes(&u32::MAX.to_le_bytes()).is_none());
     }
 
     #[test]

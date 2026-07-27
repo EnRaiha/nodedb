@@ -30,7 +30,8 @@
 use std::mem::size_of;
 
 use crate::bounds::{
-    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, u32_to_usize,
+    checked_add, checked_capacity, checked_mul, checked_range, decoded_len, encode_input_len,
+    u32_to_usize,
 };
 use crate::error::CodecError;
 
@@ -190,7 +191,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
     let mut pos = 7;
     let dict_bytes = checked_mul(dict_size, 8, "ALP-RD dictionary")?;
     checked_range(data, pos, dict_bytes, "ALP-RD dictionary")?;
-    let mut dict = Vec::with_capacity(dict_size);
+    let dict_capacity = checked_capacity(dict_size, size_of::<u64>(), "ALP-RD dictionary")?;
+    let mut dict = Vec::with_capacity(dict_capacity);
     let mut previous = None;
     for _ in 0..dict_size {
         let entry = u64::from_le_bytes([
@@ -216,7 +218,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
     // Read indices.
     let index_bytes = checked_mul(count, if use_u8_indices { 1 } else { 2 }, "ALP-RD indices")?;
     checked_range(data, pos, index_bytes, "ALP-RD indices")?;
-    let mut indices = Vec::with_capacity(count);
+    let index_capacity = checked_capacity(count, size_of::<usize>(), "ALP-RD indices")?;
+    let mut indices = Vec::with_capacity(index_capacity);
     if use_u8_indices {
         for i in 0..count {
             indices.push(data[pos + i] as usize);
@@ -243,7 +246,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
         });
     }
 
-    let mut values = Vec::with_capacity(count);
+    let value_capacity = checked_capacity(count, size_of::<f64>(), "ALP-RD values")?;
+    let mut values = Vec::with_capacity(value_capacity);
     for (i, &idx) in indices.iter().enumerate() {
         if idx >= dict.len() {
             return Err(CodecError::Corrupt {

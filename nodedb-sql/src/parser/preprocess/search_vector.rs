@@ -11,31 +11,21 @@ const SEARCH_KEYWORD: &str = "SEARCH";
 const USING_KEYWORD: &str = "USING";
 const VECTOR_KEYWORD: &str = "VECTOR";
 
+use nodedb_types::strip_prefix_ascii_case_insensitive;
+
 pub fn try_rewrite_search_using_vector(sql: &str) -> Option<String> {
     let trimmed = sql.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
-    let upper = trimmed.to_uppercase();
-    let stripped = upper.trim_start();
-    if !stripped.starts_with(SEARCH_KEYWORD) {
-        return None;
-    }
-    let leading = trimmed.len() - trimmed.trim_start().len();
-    let after_search = trimmed[leading + SEARCH_KEYWORD.len()..].trim_start();
+    let source = trimmed.trim_start();
+    let leading = trimmed.len() - source.len();
+    let after_search = strip_prefix_ascii_case_insensitive(source, SEARCH_KEYWORD)?.trim_start();
     if after_search.is_empty() {
         return None;
     }
 
     let (collection, rest) = take_identifier(after_search)?;
     let rest = rest.trim_start();
-    let rest_upper = rest.to_uppercase();
-    if !rest_upper.starts_with(USING_KEYWORD) {
-        return None;
-    }
-    let after_using = rest[USING_KEYWORD.len()..].trim_start();
-    let after_using_upper = after_using.to_uppercase();
-    if !after_using_upper.starts_with(VECTOR_KEYWORD) {
-        return None;
-    }
-    let after_vec = after_using[VECTOR_KEYWORD.len()..].trim_start();
+    let after_using = strip_prefix_ascii_case_insensitive(rest, USING_KEYWORD)?.trim_start();
+    let after_vec = strip_prefix_ascii_case_insensitive(after_using, VECTOR_KEYWORD)?.trim_start();
     let body = strip_parentheses(after_vec)?;
     let (field, vector_expr, limit) = split_vector_args(body)?;
 
@@ -134,6 +124,15 @@ mod tests {
             out,
             "SELECT * FROM articles ORDER BY vector_distance(embedding, ARRAY[0.1, 0.3, -0.2]) LIMIT 10"
         );
+    }
+
+    #[test]
+    fn unicode_case_expansions_in_vector_expression_preserve_original_text() {
+        let out = try_rewrite_search_using_vector(
+            "SEARCH docs USING VECTOR(embedding, ARRAY['ß', 'ﬀ', 'İ'], 5)",
+        )
+        .expect("search vector form should rewrite");
+        assert!(out.contains("ARRAY['ß', 'ﬀ', 'İ']"));
     }
 
     #[test]

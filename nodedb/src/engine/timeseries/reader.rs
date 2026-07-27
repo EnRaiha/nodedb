@@ -264,7 +264,9 @@ pub fn read_log_segment_from_bytes(
 
     // Parse raw bytes back into log entries.
     // Format per entry: [timestamp_ms:8] [data_len:4] [data:N]
-    let mut entries = Vec::with_capacity(entry_count);
+    // The header count is decoded from segment bytes. Allocate only after a
+    // full entry has been consumed from the decompressed block.
+    let mut entries = Vec::new();
     let mut raw_cur = Cursor::new(&raw);
 
     while raw_cur.remaining() >= 12 && entries.len() < entry_count {

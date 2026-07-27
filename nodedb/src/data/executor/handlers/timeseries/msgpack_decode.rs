@@ -19,10 +19,12 @@ pub(super) fn decode_msgpack_rows(
 ) -> Result<Vec<Vec<(String, MsgpackValue)>>, &'static str> {
     let mut pos = 0;
     let array_len = read_array_header(payload, &mut pos)?;
-    let mut rows = Vec::with_capacity(array_len);
+    // Array/map cardinalities are peer-controlled msgpack values. Grow after
+    // each complete row has been decoded from the bounded payload.
+    let mut rows = Vec::new();
     for _ in 0..array_len {
         let map_len = read_map_header(payload, &mut pos)?;
-        let mut fields = Vec::with_capacity(map_len);
+        let mut fields = Vec::new();
         for _ in 0..map_len {
             let key = read_str(payload, &mut pos)?;
             let val = read_value(payload, &mut pos)?;
@@ -42,8 +44,8 @@ fn read_array_header(buf: &[u8], pos: &mut usize) -> Result<usize, &'static str>
         let len = read_be_u16(buf, pos)? as usize;
         Ok(len)
     } else if b == 0xDD {
-        let len = read_be_u32(buf, pos)? as usize;
-        Ok(len)
+        let len = read_be_u32(buf, pos)?;
+        usize::try_from(len).map_err(|_| "msgpack array length exceeds usize")
     } else {
         Err("expected msgpack array")
     }
@@ -58,8 +60,8 @@ fn read_map_header(buf: &[u8], pos: &mut usize) -> Result<usize, &'static str> {
         let len = read_be_u16(buf, pos)? as usize;
         Ok(len)
     } else if b == 0xDF {
-        let len = read_be_u32(buf, pos)? as usize;
-        Ok(len)
+        let len = read_be_u32(buf, pos)?;
+        usize::try_from(len).map_err(|_| "msgpack map length exceeds usize")
     } else {
         Err("expected msgpack map")
     }
@@ -226,4 +228,17 @@ fn read_be_i64(buf: &[u8], pos: &mut usize) -> Result<i64, &'static str> {
 
 fn read_be_f64(buf: &[u8], pos: &mut usize) -> Result<f64, &'static str> {
     Ok(f64::from_be_bytes(read_bytes::<8>(buf, pos)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn huge_array_count_with_tiny_payload_is_rejected_without_reservation() {
+        assert!(matches!(
+            decode_msgpack_rows(&[0xDD, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Err("unexpected EOF in map header") | Err("msgpack array length exceeds usize")
+        ));
+    }
 }

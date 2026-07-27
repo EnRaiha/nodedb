@@ -43,6 +43,21 @@ pub const MAX_COLUMN_ENTRIES: usize = MAX_CELLS_PER_TILE;
 /// Reject a length value that exceeds `cap`. Used everywhere a `usize`
 /// length is decoded from segment bytes.
 pub fn check_decoded_size(value: usize, cap: usize, what: &str) -> ArrayResult<()> {
+    checked_capacity(value, cap, 0, 0, what).map(|_| ())
+}
+
+/// Validate a decoded collection count before it drives an allocation.
+///
+/// `min_encoded_bytes` is the smallest on-wire representation per entry. It
+/// rejects a tiny frame carrying a huge count before reserving memory, while
+/// the caller still validates each variable-sized entry as it is consumed.
+pub fn checked_capacity(
+    value: usize,
+    cap: usize,
+    remaining_bytes: usize,
+    min_encoded_bytes: usize,
+    what: &str,
+) -> ArrayResult<usize> {
     if value > cap {
         return Err(ArrayError::SegmentCorruption {
             detail: format!(
@@ -50,5 +65,38 @@ pub fn check_decoded_size(value: usize, cap: usize, what: &str) -> ArrayResult<(
             ),
         });
     }
-    Ok(())
+    let minimum_bytes =
+        value
+            .checked_mul(min_encoded_bytes)
+            .ok_or_else(|| ArrayError::SegmentCorruption {
+                detail: format!("decoded {what} minimum encoded size overflows"),
+            })?;
+    if minimum_bytes > remaining_bytes {
+        return Err(ArrayError::SegmentCorruption {
+            detail: format!(
+                "decoded {what} requires at least {minimum_bytes} encoded bytes, only {remaining_bytes} remain"
+            ),
+        });
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_capacity_rejects_count_without_minimum_encoded_bytes() {
+        assert!(checked_capacity(2, 8, 7, 4, "test entries").is_err());
+    }
+
+    #[test]
+    fn checked_capacity_rejects_count_over_hard_cap() {
+        assert!(checked_capacity(9, 8, 36, 4, "test entries").is_err());
+    }
+
+    #[test]
+    fn checked_capacity_returns_validated_count() {
+        assert_eq!(checked_capacity(2, 8, 8, 4, "test entries").unwrap(), 2);
+    }
 }

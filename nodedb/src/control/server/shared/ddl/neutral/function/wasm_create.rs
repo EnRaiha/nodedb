@@ -122,36 +122,52 @@ fn parse_wasm_create(sql: &str) -> Result<ParsedWasmCreate, DdlError> {
     let header = parse_function_header(sql, &[" LANGUAGE "])?;
 
     // rest starts with "LANGUAGE ..."
-    let after_lang_kw = header.rest.strip_prefix("LANGUAGE").unwrap_or(&header.rest);
+    let after_lang_kw = if header
+        .rest
+        .get(.."LANGUAGE".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("LANGUAGE"))
+    {
+        header.rest.get("LANGUAGE".len()..).unwrap_or_default()
+    } else {
+        &header.rest
+    };
     let after_lang = after_lang_kw.trim();
-    let after_lang_upper = after_lang.to_uppercase();
-    if !after_lang_upper.starts_with("WASM") {
+    if !after_lang
+        .get(.."WASM".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WASM"))
+    {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
             message: "expected LANGUAGE WASM".to_string(),
         });
     }
-    let after_wasm = after_lang["WASM".len()..].trim();
+    let after_wasm = after_lang.get("WASM".len()..).unwrap_or_default().trim();
 
     // Optional WITH (FUEL = N, MEMORY = N)
     let (fuel, memory, after_with) = parse_wasm_with(after_wasm)?;
 
     // AS '<base64>'
-    let after_with_upper = after_with.to_uppercase();
-    if !after_with_upper.starts_with("AS") {
+    if !after_with
+        .get(.."AS".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AS"))
+    {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
             message: "expected AS '<base64>'".to_string(),
         });
     }
-    let body_part = after_with["AS".len()..].trim();
+    let body_part = after_with.get("AS".len()..).unwrap_or_default().trim();
 
     // Extract string literal.
-    let base64_body = if body_part.starts_with('\'') && body_part.ends_with('\'') {
-        body_part[1..body_part.len() - 1].replace("''", "'")
-    } else {
-        body_part.to_string()
-    };
+    let base64_body =
+        if body_part.starts_with('\'') && body_part.ends_with('\'') && body_part.len() >= 2 {
+            body_part
+                .get(1..body_part.len() - 1)
+                .unwrap_or_default()
+                .replace("''", "'")
+        } else {
+            body_part.to_string()
+        };
 
     if base64_body.is_empty() {
         return Err(DdlError {
@@ -172,11 +188,13 @@ fn parse_wasm_create(sql: &str) -> Result<ParsedWasmCreate, DdlError> {
 }
 
 fn parse_wasm_with(s: &str) -> Result<(Option<u64>, Option<usize>, &str), DdlError> {
-    let upper = s.to_uppercase();
-    if !upper.starts_with("WITH") {
+    if !s
+        .get(.."WITH".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WITH"))
+    {
         return Ok((None, None, s));
     }
-    let after = &s["WITH".len()..].trim_start();
+    let after = s.get("WITH".len()..).unwrap_or_default().trim_start();
     if !after.starts_with('(') {
         return Ok((None, None, s));
     }
@@ -184,8 +202,8 @@ fn parse_wasm_with(s: &str) -> Result<(Option<u64>, Option<usize>, &str), DdlErr
         sqlstate: "42601".to_string(),
         message: "unmatched '(' in WITH".to_string(),
     })?;
-    let inner = &after[1..close];
-    let rest = after[close + 1..].trim();
+    let inner = after.get(1..close).unwrap_or_default();
+    let rest = after.get(close + 1..).unwrap_or_default().trim();
 
     let mut fuel = None;
     let mut memory = None;

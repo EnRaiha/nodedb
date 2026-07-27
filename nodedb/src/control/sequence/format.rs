@@ -90,36 +90,40 @@ pub fn parse_format_template(
                 )));
             }
 
-            let upper = token_name.to_uppercase();
-            let token = if upper == "SEQ" {
+            let token = if token_name.eq_ignore_ascii_case("SEQ") {
                 seq_count += 1;
                 FormatToken::Seq { padding: 0 }
-            } else if let Some(rest) = upper.strip_prefix("SEQ:") {
+            } else if let Some(rest) =
+                nodedb_types::strip_prefix_ascii_case_insensitive(&token_name, "SEQ:")
+            {
                 seq_count += 1;
                 let padding: u8 = rest
                     .parse()
                     .map_err(|_| fmt_err(format!("invalid SEQ padding width: '{rest}'")))?;
                 FormatToken::Seq { padding }
-            } else {
-                match upper.as_str() {
-                    "YYYY" => FormatToken::Year4,
-                    "YY" => FormatToken::Year2,
-                    "MM" => FormatToken::Month,
-                    "DD" => FormatToken::Day,
-                    "Q" => FormatToken::Quarter,
-                    "WW" => FormatToken::IsoWeek,
-                    "TENANT" => FormatToken::Tenant,
-                    _ if upper.starts_with("CUSTOM:") => {
-                        let key = token_name["CUSTOM:".len()..].to_string();
-                        if key.is_empty() {
-                            return Err(fmt_err(
-                                "CUSTOM token requires a key: {CUSTOM:key}".into(),
-                            ));
-                        }
-                        FormatToken::Custom(key)
-                    }
-                    _ => return Err(fmt_err(format!("unknown format token: '{{{token_name}}}'"))),
+            } else if token_name.eq_ignore_ascii_case("YYYY") {
+                FormatToken::Year4
+            } else if token_name.eq_ignore_ascii_case("YY") {
+                FormatToken::Year2
+            } else if token_name.eq_ignore_ascii_case("MM") {
+                FormatToken::Month
+            } else if token_name.eq_ignore_ascii_case("DD") {
+                FormatToken::Day
+            } else if token_name.eq_ignore_ascii_case("Q") {
+                FormatToken::Quarter
+            } else if token_name.eq_ignore_ascii_case("WW") {
+                FormatToken::IsoWeek
+            } else if token_name.eq_ignore_ascii_case("TENANT") {
+                FormatToken::Tenant
+            } else if let Some(key) =
+                nodedb_types::strip_prefix_ascii_case_insensitive(&token_name, "CUSTOM:")
+            {
+                if key.is_empty() {
+                    return Err(fmt_err("CUSTOM token requires a key: {CUSTOM:key}".into()));
                 }
+                FormatToken::Custom(key.to_string())
+            } else {
+                return Err(fmt_err(format!("unknown format token: '{{{token_name}}}'")));
             };
             tokens.push(token);
         } else {
@@ -353,6 +357,12 @@ mod tests {
         assert_eq!(tokens[3], FormatToken::Month);
         assert_eq!(tokens[4], FormatToken::Literal("-".into()));
         assert_eq!(tokens[5], FormatToken::Seq { padding: 5 });
+    }
+
+    #[test]
+    fn unicode_custom_key_preserves_original_bytes() {
+        let tokens = parse_format_template("{CUSTOM:ß}{sEq}").unwrap();
+        assert!(matches!(&tokens[0], FormatToken::Custom(key) if key == "ß"));
     }
 
     #[test]

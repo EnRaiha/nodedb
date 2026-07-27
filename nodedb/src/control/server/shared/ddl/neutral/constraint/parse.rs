@@ -237,21 +237,20 @@ fn parse_simple_comparison(s: &str) -> Result<crate::bridge::expr_eval::SqlExpr,
 fn parse_value_ref(s: &str) -> Result<crate::bridge::expr_eval::SqlExpr, DdlError> {
     use crate::bridge::expr_eval::SqlExpr;
 
-    let upper = s.to_uppercase();
-    if let Some(col) = upper.strip_prefix("OLD.") {
+    if let Some(col) = nodedb_types::strip_prefix_ascii_case_insensitive(s, "OLD.") {
         return Ok(SqlExpr::OldColumn(col.to_lowercase()));
     }
-    if let Some(col) = upper.strip_prefix("NEW.") {
+    if let Some(col) = nodedb_types::strip_prefix_ascii_case_insensitive(s, "NEW.") {
         return Ok(SqlExpr::Column(col.to_lowercase()));
     }
 
-    if upper == "TRUE" {
+    if s.eq_ignore_ascii_case("TRUE") {
         return Ok(SqlExpr::Literal(nodedb_types::Value::Bool(true)));
     }
-    if upper == "FALSE" {
+    if s.eq_ignore_ascii_case("FALSE") {
         return Ok(SqlExpr::Literal(nodedb_types::Value::Bool(false)));
     }
-    if upper == "NULL" {
+    if s.eq_ignore_ascii_case("NULL") {
         return Ok(SqlExpr::Literal(nodedb_types::Value::Null));
     }
     if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {

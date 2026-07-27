@@ -226,15 +226,27 @@ fn parse_notify_targets_raw(raw: &str) -> Result<Vec<NotifyTarget>, DdlError> {
         if part.is_empty() {
             continue;
         }
-        let upper_part = part.to_uppercase();
-        if upper_part.starts_with("TOPIC ") {
+        if part
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("TOPIC "))
+        {
             let name = extract_inner_quoted(part, 6)?;
             targets.push(NotifyTarget::Topic { name });
-        } else if upper_part.starts_with("WEBHOOK ") {
+        } else if part
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WEBHOOK "))
+        {
             let url = extract_inner_quoted(part, 8)?;
             targets.push(NotifyTarget::Webhook { url });
-        } else if upper_part.starts_with("INSERT INTO ") {
-            let (table, columns) = parse_insert_target(&part[12..])?;
+        } else if part
+            .get(..12)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("INSERT INTO "))
+        {
+            let after_insert = part.get(12..).ok_or_else(|| DdlError {
+                sqlstate: "42601".to_string(),
+                message: "expected INSERT INTO target".to_string(),
+            })?;
+            let (table, columns) = parse_insert_target(after_insert)?;
             targets.push(NotifyTarget::InsertInto { table, columns });
         }
     }

@@ -42,8 +42,6 @@ fn err(sqlstate: &str, message: String) -> DdlError {
 ///   [WITH (refresh_policy = '...', retention = '...')]
 /// ```
 pub(super) fn parse_create_sql(sql: &str) -> Result<ContinuousAggregateDef, DdlError> {
-    let upper = sql.to_uppercase();
-
     // Extract name: word after "CONTINUOUS AGGREGATE"
     let ca_pos = find_ascii_case_insensitive(sql, KW_CONTINUOUS_AGGREGATE)
         .ok_or_else(|| err("42601", "expected CONTINUOUS AGGREGATE keyword".to_string()))?;
@@ -67,7 +65,7 @@ pub(super) fn parse_create_sql(sql: &str) -> Result<ContinuousAggregateDef, DdlE
         .to_lowercase();
 
     // Extract bucket interval: between BUCKET ' and '
-    let bucket_interval = extract_quoted_value(&upper, sql, KW_BUCKET)
+    let bucket_interval = extract_quoted_value(sql, sql, KW_BUCKET)
         .ok_or_else(|| err("42601", "expected BUCKET '<interval>' clause".to_string()))?;
 
     let bucket_interval_ms = nodedb_types::kv_parsing::parse_interval_to_ms(&bucket_interval)
@@ -75,7 +73,7 @@ pub(super) fn parse_create_sql(sql: &str) -> Result<ContinuousAggregateDef, DdlE
         as i64;
 
     // Extract aggregates: between AGGREGATE and GROUP BY / WITH / end
-    let aggregates = extract_aggregates(&upper, sql)?;
+    let aggregates = extract_aggregates(sql, sql)?;
     if aggregates.is_empty() {
         return Err(err(
             "42601",
@@ -84,10 +82,10 @@ pub(super) fn parse_create_sql(sql: &str) -> Result<ContinuousAggregateDef, DdlE
     }
 
     // Extract GROUP BY columns (optional).
-    let group_by = extract_group_by(&upper, sql);
+    let group_by = extract_group_by(sql, sql);
 
     // Extract WITH options (optional).
-    let (refresh_policy, retention_period_ms) = extract_with_options(&upper, sql);
+    let (refresh_policy, retention_period_ms) = extract_with_options(sql, sql);
 
     Ok(ContinuousAggregateDef {
         // Placeholder: the caller (`create_continuous_aggregate`) rebuilds

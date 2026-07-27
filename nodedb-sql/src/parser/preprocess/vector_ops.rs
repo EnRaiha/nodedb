@@ -3,6 +3,8 @@
 //! Rewrite pgvector's `<->` distance operator into a `vector_distance()`
 //! function call that standard sqlparser can parse.
 
+use nodedb_types::starts_with_ascii_case_insensitive;
+
 use super::lex::{SqlSegment, find_operator_positions, has_operator_outside_literals, segments};
 
 /// Rewrite all occurrences of `expr <-> expr` to `vector_distance(expr, expr)`.
@@ -50,9 +52,7 @@ fn last_text_segment(sql: &str) -> &str {
 /// Returns (operand_text, consumed_length).
 fn extract_right_operand(after: &str) -> Option<(String, usize)> {
     let trimmed = after.trim_start();
-    let upper = trimmed.to_uppercase();
-
-    if upper.starts_with("ARRAY[") {
+    if starts_with_ascii_case_insensitive(trimmed, "ARRAY[") {
         let mut depth = 0;
         for (i, c) in trimmed.char_indices() {
             match c {
@@ -197,6 +197,15 @@ mod tests {
             "got: {rewritten}"
         );
         assert!(!rewritten.contains("<->"));
+    }
+
+    #[test]
+    fn array_operand_with_unicode_case_expansions_preserves_original_text() {
+        let rewritten = rewrite_arrow_distance(
+            "SELECT * FROM docs ORDER BY embedding <-> ARRAY['ﬀ', 'İ', 'ß']",
+        )
+        .expect("array operand should rewrite");
+        assert!(rewritten.contains("ARRAY['ﬀ', 'İ', 'ß']"));
     }
 
     #[test]

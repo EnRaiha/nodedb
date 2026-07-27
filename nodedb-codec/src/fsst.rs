@@ -29,8 +29,8 @@
 use std::mem::size_of;
 
 use crate::bounds::{
-    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, encode_u32_len,
-    u32_to_usize,
+    checked_add, checked_capacity, checked_mul, checked_range, decoded_len, encode_input_len,
+    encode_u32_len, u32_to_usize,
 };
 use crate::error::CodecError;
 
@@ -243,7 +243,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
         });
     }
     let mut pos = 2;
-    let mut symbols: Vec<Vec<u8>> = Vec::with_capacity(sym_count);
+    let symbol_capacity = checked_capacity(sym_count, size_of::<Vec<u8>>(), "FSST symbols")?;
+    let mut symbols: Vec<Vec<u8>> = Vec::with_capacity(symbol_capacity);
 
     for _ in 0..sym_count {
         let len = usize::from(checked_range(data, pos, 1, "FSST symbol length")?[0]);
@@ -286,7 +287,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
     let offsets_size = checked_mul(string_count, 4, "FSST offsets")?;
     decoded_len(offsets_size, "FSST offsets")?;
     let offsets_data = checked_range(data, pos, offsets_size, "FSST offsets")?;
-    let mut offsets = Vec::with_capacity(string_count);
+    let offset_capacity = checked_capacity(string_count, size_of::<usize>(), "FSST offsets")?;
+    let mut offsets = Vec::with_capacity(offset_capacity);
     for i in 0..string_count {
         let off_pos = checked_mul(i, 4, "FSST offset position")?;
         offsets.push(u32_to_usize(
@@ -308,7 +310,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<Vec<u8>>, CodecError> {
     }
 
     // Decode each string.
-    let mut result = Vec::with_capacity(string_count);
+    let result_capacity = checked_capacity(string_count, size_of::<Vec<u8>>(), "FSST results")?;
+    let mut result = Vec::with_capacity(result_capacity);
     let mut prev_end = 0;
     let mut decoded_total = 0usize;
     for &end in &offsets {
@@ -395,8 +398,8 @@ fn encode_string(table: &SymbolTable, input: &[u8]) -> Result<Vec<u8>, CodecErro
 }
 
 fn decode_string(symbols: &[Vec<u8>], encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
-    let capacity = checked_mul(encoded.len(), MAX_SYMBOL_LEN, "FSST decoded string")?;
-    decoded_len(capacity, "FSST decoded string")?;
+    let expanded_capacity = checked_mul(encoded.len(), MAX_SYMBOL_LEN, "FSST decoded string")?;
+    let capacity = decoded_len(expanded_capacity, "FSST decoded string")?;
     let mut out = Vec::with_capacity(capacity);
     let mut pos = 0;
 

@@ -130,15 +130,27 @@ struct ParsedAggregateCreate {
 
 fn parse_aggregate_create(sql: &str) -> Result<ParsedAggregateCreate, DdlError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
 
-    let (or_replace, after) = if upper.starts_with("CREATE OR REPLACE AGGREGATE FUNCTION ") {
+    let (or_replace, after) = if trimmed
+        .get(.."CREATE OR REPLACE AGGREGATE FUNCTION ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CREATE OR REPLACE AGGREGATE FUNCTION "))
+    {
         (
             true,
-            &trimmed["CREATE OR REPLACE AGGREGATE FUNCTION ".len()..],
+            trimmed
+                .get("CREATE OR REPLACE AGGREGATE FUNCTION ".len()..)
+                .unwrap_or_default(),
         )
-    } else if upper.starts_with("CREATE AGGREGATE FUNCTION ") {
-        (false, &trimmed["CREATE AGGREGATE FUNCTION ".len()..])
+    } else if trimmed
+        .get(.."CREATE AGGREGATE FUNCTION ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CREATE AGGREGATE FUNCTION "))
+    {
+        (
+            false,
+            trimmed
+                .get("CREATE AGGREGATE FUNCTION ".len()..)
+                .unwrap_or_default(),
+        )
     } else {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
@@ -150,53 +162,73 @@ fn parse_aggregate_create(sql: &str) -> Result<ParsedAggregateCreate, DdlError> 
         sqlstate: "42601".to_string(),
         message: "expected '('".to_string(),
     })?;
-    let name = after[..paren_open].trim().to_lowercase();
+    let name = after
+        .get(..paren_open)
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
     validate_identifier(&name)?;
 
     let paren_close = find_matching_paren(after, paren_open).ok_or_else(|| DdlError {
         sqlstate: "42601".to_string(),
         message: "unmatched '('".to_string(),
     })?;
-    let params_str = &after[paren_open + 1..paren_close];
+    let params_str = after.get(paren_open + 1..paren_close).unwrap_or_default();
     let parameters = parse_parameters(params_str)?;
 
-    let rest = after[paren_close + 1..].trim();
-    let rest_upper = rest.to_uppercase();
+    let rest = after.get(paren_close + 1..).unwrap_or_default().trim();
 
-    if !rest_upper.starts_with("RETURNS ") {
+    if !rest
+        .get(.."RETURNS ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RETURNS "))
+    {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
             message: "expected RETURNS <type>".to_string(),
         });
     }
-    let after_returns = rest["RETURNS ".len()..].trim();
+    let after_returns = rest.get("RETURNS ".len()..).unwrap_or_default().trim();
 
     let lang_pos =
         find_ascii_case_insensitive(after_returns, "LANGUAGE").ok_or_else(|| DdlError {
             sqlstate: "42601".to_string(),
             message: "expected LANGUAGE WASM".to_string(),
         })?;
-    let return_type = after_returns[..lang_pos].trim().to_uppercase();
+    let return_type = after_returns
+        .get(..lang_pos)
+        .unwrap_or_default()
+        .trim()
+        .to_uppercase();
 
-    let after_lang = after_returns[lang_pos + "LANGUAGE".len()..].trim();
-    if !after_lang.to_uppercase().starts_with("WASM") {
+    let after_lang = after_returns
+        .get(lang_pos + "LANGUAGE".len()..)
+        .unwrap_or_default()
+        .trim();
+    if !after_lang
+        .get(.."WASM".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WASM"))
+    {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
             message: "expected LANGUAGE WASM".to_string(),
         });
     }
-    let after_wasm = after_lang["WASM".len()..].trim();
+    let after_wasm = after_lang.get("WASM".len()..).unwrap_or_default().trim();
 
-    let after_upper = after_wasm.to_uppercase();
-    if !after_upper.starts_with("AS") {
+    if !after_wasm
+        .get(.."AS".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AS"))
+    {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
             message: "expected AS '<base64>'".to_string(),
         });
     }
-    let body = after_wasm["AS".len()..].trim();
-    let base64_body = if body.starts_with('\'') && body.ends_with('\'') {
-        body[1..body.len() - 1].replace("''", "'")
+    let body = after_wasm.get("AS".len()..).unwrap_or_default().trim();
+    let base64_body = if body.starts_with('\'') && body.ends_with('\'') && body.len() >= 2 {
+        body.get(1..body.len() - 1)
+            .unwrap_or_default()
+            .replace("''", "'")
     } else {
         body.to_string()
     };

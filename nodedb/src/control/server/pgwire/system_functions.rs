@@ -8,6 +8,8 @@
 //! introduce new privileges; the rewritten DDL goes through the
 //! normal router and its existing authorization checks apply.
 
+use nodedb_types::strip_prefix_ascii_case_insensitive;
+
 /// Rewrite `SELECT _system.purge_collection('<name>')` (optionally
 /// `SELECT _system.purge_collection('<tenant>', '<name>')` —
 /// two-argument form supported so superusers can target a specific
@@ -25,10 +27,7 @@ pub fn rewrite_purge_collection(sql: &str, upper: &str) -> Option<String> {
         return None;
     }
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let trimmed_upper = trimmed.to_uppercase();
-    if !trimmed_upper.starts_with("SELECT ") {
-        return None;
-    }
+    strip_prefix_ascii_case_insensitive(trimmed, "SELECT ")?;
 
     let paren = trimmed.find('(')?;
     let close = trimmed.rfind(')')?;
@@ -63,15 +62,17 @@ pub fn rewrite_purge_collection(sql: &str, upper: &str) -> Option<String> {
 /// either).
 fn strip_quotes(s: &str) -> Option<String> {
     let s = s.trim();
-    if s.len() >= 2 {
-        let first = s.as_bytes()[0];
-        let last = s.as_bytes()[s.len() - 1];
-        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-            let inner = &s[1..s.len() - 1];
-            if !inner.contains(first as char) {
-                return Some(inner.to_string());
-            }
-        }
+    if let Some(inner) = s
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return (!inner.contains('\'')).then(|| inner.to_string());
+    }
+    if let Some(inner) = s
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        return (!inner.contains('"')).then(|| inner.to_string());
     }
     None
 }
@@ -113,6 +114,14 @@ mod tests {
         assert_eq!(
             rewrite(r#"SELECT _system.purge_collection("MyCol")"#),
             Some(r#"DROP COLLECTION "MyCol" PURGE"#.to_string())
+        );
+    }
+
+    #[test]
+    fn unicode_collection_name_preserves_original_argument_boundaries() {
+        assert_eq!(
+            rewrite("SeLeCt _system.purge_collection('Straße')"),
+            Some(r#"DROP COLLECTION "Straße" PURGE"#.to_string())
         );
     }
 

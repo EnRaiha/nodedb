@@ -7,6 +7,8 @@
 //! returning `None` lets dispatch fall through to that handler.
 //! `COPY ... TO` and `COPY (SELECT ...) TO` are rejected with typed errors.
 
+use nodedb_types::strip_prefix_ascii_case_insensitive;
+
 use crate::ddl_ast::statement::{CopyFormat, MiscStmt, NodedbStatement};
 use crate::error::SqlError;
 use crate::parser::preprocess::lex::find_ascii_case_insensitive;
@@ -104,8 +106,16 @@ fn parse_copy_from(trimmed: &str) -> Result<NodedbStatement, SqlError> {
 
 /// Strip surrounding double or single quotes from an identifier or path.
 pub(super) fn strip_quotes(s: &str) -> &str {
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        &s[1..s.len() - 1]
+    if let Some(inner) = s
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        inner
+    } else if let Some(inner) = s
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        inner
     } else {
         s
     }
@@ -122,7 +132,7 @@ pub(super) fn extract_quoted_string(s: &str) -> Result<(String, &str), SqlError>
             ),
         });
     }
-    let inner = &s[1..];
+    let inner = s.strip_prefix('\'').unwrap_or("");
     // Find the closing quote (handle escaped '' as a literal quote).
     let mut result = String::new();
     let mut chars = inner.char_indices();
@@ -152,8 +162,7 @@ pub(super) fn extract_quoted_string(s: &str) -> Result<(String, &str), SqlError>
 pub(super) fn parse_with_clause(
     s: &str,
 ) -> Result<(Option<CopyFormat>, Option<char>, bool), SqlError> {
-    let upper = s.to_uppercase();
-    if !upper.starts_with("WITH") {
+    if !nodedb_types::starts_with_ascii_case_insensitive(s, "WITH") {
         return Err(SqlError::Parse {
             detail: format!(
                 "COPY: unexpected trailing content: {}",
@@ -161,7 +170,9 @@ pub(super) fn parse_with_clause(
             ),
         });
     }
-    let after_with = s["WITH".len()..].trim_start();
+    let after_with = strip_prefix_ascii_case_insensitive(s, "WITH")
+        .unwrap_or("")
+        .trim_start();
     if !after_with.starts_with('(') {
         return Err(SqlError::Parse {
             detail: "COPY: WITH clause must be enclosed in parentheses".to_string(),
@@ -319,12 +330,12 @@ mod tests {
 
     #[test]
     fn unicode_collection_before_from_preserves_original_offsets() {
-        let stmt = ok("COPY usersﬀﬀ FROM '/tmp/users.ndjson'");
+        let stmt = ok("COPY usersßﬀİ FROM '/tmp/users.ndjson'");
         match stmt {
             NodedbStatement::Misc(MiscStmt::CopyFromFile {
                 collection, path, ..
             }) => {
-                assert_eq!(collection, "usersﬀﬀ");
+                assert_eq!(collection, "usersßﬀi\u{307}");
                 assert_eq!(path, "/tmp/users.ndjson");
             }
             other => panic!("unexpected: {other:?}"),

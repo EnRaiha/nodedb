@@ -9,6 +9,9 @@
 //!
 //! Records are serialized as MessagePack for compact wire representation.
 
+use std::mem::size_of;
+
+use nodedb_types::decode_bounds::checked_decode_capacity;
 use serde::{Deserialize, Serialize};
 use sonic_rs;
 use zerompk::{FromMessagePack, ToMessagePack};
@@ -290,13 +293,27 @@ pub fn decode_row_from_wal(
                 let count = u32::from_le_bytes(count_bytes.try_into().map_err(|_| {
                     crate::error::ColumnarError::Serialization("truncated vector count".into())
                 })?) as usize;
-                if count > MAX_FIELD_LEN / 4 {
+                let remaining_values = data.len().saturating_sub(cursor) / 4;
+                let max_count = (MAX_FIELD_LEN / 4).min(remaining_values);
+                if count > max_count {
                     return Err(crate::error::ColumnarError::Serialization(format!(
-                        "vector count {count} exceeds maximum {}",
-                        MAX_FIELD_LEN / 4
+                        "vector count {count} exceeds maximum {max_count}"
                     )));
                 }
-                let mut arr = Vec::with_capacity(count);
+                let capacity = checked_decode_capacity(
+                    count,
+                    size_of::<nodedb_types::value::Value>(),
+                    data.len().saturating_sub(cursor),
+                    4,
+                    max_count,
+                    usize::MAX,
+                )
+                .ok_or_else(|| {
+                    crate::error::ColumnarError::Serialization(
+                        "vector count exceeds decode allocation bounds".into(),
+                    )
+                })?;
+                let mut arr = Vec::with_capacity(capacity);
                 for _ in 0..count {
                     let fb = read_slice(data, &mut cursor, 4, "vector f32")?;
                     let f = f32::from_le_bytes(fb.try_into().map_err(|_| {
@@ -329,6 +346,17 @@ mod tests {
     use nodedb_types::value::Value;
 
     use super::*;
+
+    #[test]
+    fn rejects_huge_vector_count_with_tiny_payload_before_allocation() {
+        // tag + one value whose vector count claims nearly u32::MAX values.
+        let mut bytes = vec![9];
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_row_from_wal(&bytes),
+            Err(crate::error::ColumnarError::Serialization(_))
+        ));
+    }
 
     #[test]
     fn wal_record_roundtrip() {

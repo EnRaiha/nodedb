@@ -30,11 +30,10 @@ pub async fn create_sorted_index(
     identity: &AuthenticatedIdentity,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let upper = sql.to_uppercase();
+    let upper = sql.to_ascii_uppercase();
 
     // Extract index name.
-    let rest = upper
-        .strip_prefix("CREATE SORTED INDEX ")
+    let rest = nodedb_types::strip_prefix_ascii_case_insensitive(sql, "CREATE SORTED INDEX ")
         .ok_or_else(|| ddl_err("42601", "expected CREATE SORTED INDEX"))?;
     let index_name = rest
         .split_whitespace()
@@ -89,9 +88,7 @@ pub async fn drop_sorted_index(
     identity: &AuthenticatedIdentity,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let upper = sql.to_uppercase();
-    let rest = upper
-        .strip_prefix("DROP SORTED INDEX ")
+    let rest = nodedb_types::strip_prefix_ascii_case_insensitive(sql, "DROP SORTED INDEX ")
         .ok_or_else(|| ddl_err("42601", "expected DROP SORTED INDEX"))?;
     let index_name = rest
         .split_whitespace()

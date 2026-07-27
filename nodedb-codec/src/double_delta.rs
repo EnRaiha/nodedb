@@ -31,7 +31,9 @@
 
 use std::mem::size_of;
 
-use crate::bounds::{checked_add, checked_mul, decoded_len, encode_input_len, u32_to_usize};
+use crate::bounds::{
+    checked_add, checked_capacity, checked_mul, decoded_len, encode_input_len, u32_to_usize,
+};
 use crate::error::CodecError;
 
 // ---------------------------------------------------------------------------
@@ -207,7 +209,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<i64>, CodecError> {
             detail: "invalid first value".into(),
         })?);
 
-    let mut values = Vec::with_capacity(count);
+    let value_capacity = checked_capacity(count, size_of::<i64>(), "DoubleDelta values")?;
+    let mut values = Vec::with_capacity(value_capacity);
     values.push(first_value);
 
     if count == 1 {

@@ -12,7 +12,7 @@ use crate::codec::column_codec::{
 };
 use crate::codec::coord_rle::decode_coord_axis_rle;
 use crate::codec::limits::{
-    MAX_ATTRS_PER_TILE, MAX_AXES_PER_TILE, MAX_CELLS_PER_TILE, check_decoded_size,
+    MAX_ATTRS_PER_TILE, MAX_AXES_PER_TILE, MAX_CELLS_PER_TILE, check_decoded_size, checked_capacity,
 };
 use crate::codec::tag::{CodecTag, peek_tag};
 use crate::error::{ArrayError, ArrayResult};
@@ -108,10 +108,16 @@ fn decode_structural(body: &[u8]) -> ArrayResult<SparseTile> {
             .expect("invariant: bounds-checked above (pos + 4 <= body.len())"),
     ) as usize;
     pos += 4;
-    check_decoded_size(axis_count, MAX_AXES_PER_TILE, "axis_count")?;
+    let axis_capacity = checked_capacity(
+        axis_count,
+        MAX_AXES_PER_TILE,
+        body.len() - pos,
+        4,
+        "axis_count",
+    )?;
 
     // Coordinate axes.
-    let mut dim_dicts = Vec::with_capacity(axis_count);
+    let mut dim_dicts = Vec::with_capacity(axis_capacity);
     for _ in 0..axis_count {
         let axis_bytes = read_framed(body, &mut pos)?;
         let mut inner_pos = 0;
@@ -150,9 +156,15 @@ fn decode_structural(body: &[u8]) -> ArrayResult<SparseTile> {
             .expect("invariant: bounds-checked above (pos + 4 <= body.len())"),
     ) as usize;
     pos += 4;
-    check_decoded_size(attr_count, MAX_ATTRS_PER_TILE, "attr_count")?;
+    let attr_capacity = checked_capacity(
+        attr_count,
+        MAX_ATTRS_PER_TILE,
+        body.len() - pos,
+        4,
+        "attr_count",
+    )?;
 
-    let mut attr_cols = Vec::with_capacity(attr_count);
+    let mut attr_cols = Vec::with_capacity(attr_capacity);
     for _ in 0..attr_count {
         let col_bytes = read_framed(body, &mut pos)?;
         let col = decode_attr_col(col_bytes)?;
@@ -300,6 +312,15 @@ mod tests {
         let tile = b.build();
         let out = roundtrip(&tile);
         assert_eq!(out.row_kinds, tile.row_kinds);
+    }
+
+    #[test]
+    fn huge_axis_count_in_tiny_structural_payload_is_rejected_before_allocation() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&(MAX_AXES_PER_TILE as u32).to_le_bytes());
+        let error = decode_structural(&body).unwrap_err();
+        assert!(matches!(error, ArrayError::SegmentCorruption { .. }));
     }
 
     #[test]

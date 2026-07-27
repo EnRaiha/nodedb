@@ -13,6 +13,7 @@ pub(super) use nodedb_physical::physical_plan::{ReturningColumns, ReturningItem,
 
 use crate::Error;
 use nodedb_sql::parser::preprocess::lex::{find_ascii_keyword, keyword_position_outside_literals};
+use nodedb_types::starts_with_ascii_case_insensitive;
 
 const RETURNING_KEYWORD: &str = "RETURNING";
 
@@ -27,10 +28,11 @@ const RETURNING_KEYWORD: &str = "RETURNING";
 /// Arithmetic expressions (e.g. `RETURNING stock * 2`) are rejected with
 /// a typed error — only bare column names and `*` are supported.
 pub(super) fn strip_returning(sql: &str) -> Result<(String, Option<ReturningSpec>), Error> {
-    let upper = sql.to_uppercase();
-    let trimmed = upper.trim_start();
+    let trimmed = sql.trim_start();
 
-    if !trimmed.starts_with("UPDATE") && !trimmed.starts_with("DELETE") {
+    if !starts_with_ascii_case_insensitive(trimmed, "UPDATE")
+        && !starts_with_ascii_case_insensitive(trimmed, "DELETE")
+    {
         return Ok((sql.to_string(), None));
     }
 

@@ -27,8 +27,8 @@
 use std::mem::size_of;
 
 use crate::bounds::{
-    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, encode_u32_len,
-    u32_to_usize,
+    checked_add, checked_capacity, checked_mul, checked_range, decoded_len, encode_input_len,
+    encode_u32_len, u32_to_usize,
 };
 use crate::error::CodecError;
 use crate::fastlanes;
@@ -239,7 +239,12 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
     let exceptions_end = checked_add(HEADER_SIZE, exceptions_size, "ALP exceptions")?;
     checked_range(data, HEADER_SIZE, exceptions_size, "ALP exceptions")?;
 
-    let mut exceptions = Vec::with_capacity(exception_count);
+    let exception_capacity = checked_capacity(
+        exception_count,
+        size_of::<(usize, u64)>(),
+        "ALP exception allocation",
+    )?;
+    let mut exceptions = Vec::with_capacity(exception_capacity);
     let mut pos = HEADER_SIZE;
     let mut previous_index = None;
     for _ in 0..exception_count {
@@ -283,7 +288,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<f64>, CodecError> {
     }
 
     // Reconstruct f64 values using the same decode mode that was selected during encode.
-    let mut values = Vec::with_capacity(count);
+    let value_capacity = checked_capacity(count, size_of::<f64>(), "ALP values")?;
+    let mut values = Vec::with_capacity(value_capacity);
     for &int_val in &encoded_ints {
         values.push(alp_decode_value(int_val, decode_exp, mode));
     }

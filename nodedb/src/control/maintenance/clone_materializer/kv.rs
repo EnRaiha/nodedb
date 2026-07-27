@@ -240,7 +240,9 @@ fn parse_materialize_scan_payload(payload: &[u8]) -> crate::Result<ScanPage> {
 
     let (entry_count, mut entry_off) = msgpack_scan::array_header(payload, off).ok_or_else(bad)?;
 
-    let mut entries = Vec::with_capacity(entry_count);
+    // `entry_count` is attacker-controlled msgpack metadata. Grow only after
+    // each complete entry has been structurally consumed from `payload`.
+    let mut entries = Vec::new();
     for _ in 0..entry_count {
         let (pair_len, mut pair_off) =
             msgpack_scan::array_header(payload, entry_off).ok_or_else(bad)?;

@@ -129,14 +129,14 @@ fn parse_analyzer_name(after_analyzer: &str) -> Result<String, DdlError> {
             "syntax: ANALYZER requires a quoted name, e.g. ANALYZER 'english'",
         ));
     };
-    let rest = &trimmed[1..];
+    let rest = trimmed.get(quote.len_utf8()..).unwrap_or_default();
     let end = rest.find(quote).ok_or_else(|| {
         ddl_err(
             "42601",
             "syntax: unterminated ANALYZER name literal (missing closing quote)",
         )
     })?;
-    let name = rest[..end].trim().to_string();
+    let name = rest.get(..end).unwrap_or_default().trim().to_string();
     if name.is_empty() {
         return Err(ddl_err("42601", "ANALYZER name must not be empty"));
     }
@@ -168,6 +168,12 @@ mod tests {
     #[test]
     fn rejects_unterminated_literal() {
         assert!(parse_analyzer_name("'english").is_err());
+    }
+
+    #[test]
+    fn parses_unicode_name_and_rejects_truncated_quote() {
+        assert_eq!(parse_analyzer_name("'日本語'").unwrap(), "日本語");
+        assert!(parse_analyzer_name("'").is_err());
     }
 
     #[test]

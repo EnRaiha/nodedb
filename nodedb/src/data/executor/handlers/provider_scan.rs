@@ -137,7 +137,9 @@ fn decode_flat_row_array(bytes: &[u8]) -> Vec<Vec<u8>> {
     let Some((count, mut pos)) = msgpack_scan::array_header(bytes, 0) else {
         return Vec::new();
     };
-    let mut rows = Vec::with_capacity(count);
+    // `count` comes from the msgpack payload. Grow only after `skip_value`
+    // establishes that the corresponding row bytes are present.
+    let mut rows = Vec::new();
     for _ in 0..count {
         let start = pos;
         let Some(end) = msgpack_scan::skip_value(bytes, pos) else {

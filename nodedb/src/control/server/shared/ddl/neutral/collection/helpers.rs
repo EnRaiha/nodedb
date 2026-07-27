@@ -14,7 +14,7 @@ use sonic_rs;
 pub(crate) fn parse_origin_column_def(s: &str) -> crate::Result<nodedb_types::columnar::ColumnDef> {
     use nodedb_types::columnar::{ColumnDef, ColumnType};
 
-    let upper = s.to_uppercase();
+    let upper = s.to_ascii_uppercase();
     let tokens: Vec<&str> = s.split_whitespace().collect();
     if tokens.len() < 2 {
         return Err(crate::Error::BadRequest {
@@ -51,8 +51,8 @@ pub(crate) fn parse_origin_column_def(s: &str) -> crate::Result<nodedb_types::co
                 }
             })?;
 
-    let is_not_null = upper.contains("NOT NULL");
-    let is_pk = upper.contains("PRIMARY KEY");
+    let is_not_null = find_ascii_case_insensitive(s, "NOT NULL").is_some();
+    let is_pk = find_ascii_case_insensitive(s, "PRIMARY KEY").is_some();
     let nullable = !is_not_null && !is_pk;
 
     let default = if let Some(pos) = find_ascii_case_insensitive(s, "DEFAULT ") {

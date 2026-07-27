@@ -44,12 +44,13 @@ pub struct ParsedStreamingMv {
 /// lineage collection.
 pub fn parse_streaming_mv(query_sql: &str) -> Result<ParsedStreamingMv, DdlError> {
     let query = query_sql.trim().trim_end_matches(';').trim();
-    let query_upper = query.to_uppercase();
-
     // Extract FROM <stream>.
     let from_pos = find_ascii_case_insensitive(query, " FROM ")
         .ok_or_else(|| parse_err("expected FROM clause"))?;
-    let after_from = query[from_pos + 6..].trim();
+    let after_from = query
+        .get(from_pos + " FROM ".len()..)
+        .unwrap_or_default()
+        .trim();
     let source_stream = after_from
         .split_whitespace()
         .next()
@@ -58,7 +59,10 @@ pub fn parse_streaming_mv(query_sql: &str) -> Result<ParsedStreamingMv, DdlError
 
     // Extract GROUP BY columns.
     let group_by_columns = if let Some(gb_pos) = find_ascii_case_insensitive(query, " GROUP BY ") {
-        let gb_str = query[gb_pos + 10..].trim();
+        let gb_str = query
+            .get(gb_pos + " GROUP BY ".len()..)
+            .unwrap_or_default()
+            .trim();
         gb_str
             .split(',')
             .map(|s| s.trim().to_lowercase())
@@ -72,7 +76,13 @@ pub fn parse_streaming_mv(query_sql: &str) -> Result<ParsedStreamingMv, DdlError
     let filter_expr = if let Some(where_pos) = find_ascii_case_insensitive(query, " WHERE ") {
         let end = find_ascii_case_insensitive(query, " GROUP BY ").unwrap_or(query.len());
         if where_pos < end {
-            Some(query[where_pos + 7..end].trim().to_string())
+            Some(
+                query
+                    .get(where_pos + " WHERE ".len()..end)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            )
         } else {
             None
         }
@@ -81,10 +91,16 @@ pub fn parse_streaming_mv(query_sql: &str) -> Result<ParsedStreamingMv, DdlError
     };
 
     // Extract SELECT list (between SELECT and FROM).
-    if !query_upper.starts_with("SELECT ") {
+    if !query
+        .get(.."SELECT ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SELECT "))
+    {
         return Err(parse_err("expected SELECT"));
     }
-    let select_list = query[7..from_pos].trim();
+    let select_list = query
+        .get("SELECT ".len()..from_pos)
+        .unwrap_or_default()
+        .trim();
 
     // Parse aggregates from SELECT list.
     let aggregates = parse_select_aggregates(select_list);
@@ -119,8 +135,11 @@ fn parse_select_aggregates(select_list: &str) -> Vec<AggDef> {
         // Split on AS to get alias.
         let (expr_part, alias) = if let Some(as_pos) = rfind_ascii_case_insensitive(item, " AS ") {
             (
-                item[..as_pos].trim(),
-                item[as_pos + 4..].trim().to_lowercase(),
+                item.get(..as_pos).unwrap_or_default().trim(),
+                item.get(as_pos + " AS ".len()..)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_lowercase(),
             )
         } else {
             (item, item.to_lowercase().replace(['(', ')', '*', ' '], "_"))

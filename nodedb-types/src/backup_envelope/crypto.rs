@@ -256,7 +256,14 @@ pub fn parse_encrypted(
 
     // Parse and decrypt sections.
     let mut cursor = HEADER_LEN + CRYPTO_BLOCK_LEN;
-    let mut sections = Vec::with_capacity(section_count as usize);
+    // Ciphertext includes the mandatory AES-GCM authentication tag, so every
+    // encrypted section consumes its fixed framing plus at least 16 bytes.
+    let section_capacity = super::read::checked_section_capacity(
+        section_count,
+        trailer_start.saturating_sub(cursor),
+        ENC_SECTION_OVERHEAD + 16,
+    )?;
+    let mut sections = Vec::with_capacity(section_capacity);
 
     for _ in 0..section_count {
         // Each encrypted section: origin(8) + body_len(4) + nonce(12) + ciphertext(body_len) + crc(4)
@@ -334,6 +341,24 @@ mod tests {
         w.push_section(2, b"beta data chunk".to_vec()).unwrap();
         w.push_section(3, vec![]).unwrap();
         w
+    }
+
+    #[test]
+    fn encrypted_parse_rejects_huge_section_count_with_tiny_body_before_allocation() {
+        let kek = test_kek();
+        let mut bytes = EnvelopeWriter::new(meta())
+            .finalize_encrypted(&kek)
+            .unwrap();
+        bytes[40..42].copy_from_slice(&u16::MAX.to_le_bytes());
+        let header_crc = crc32c::crc32c(&bytes[..48]);
+        bytes[48..52].copy_from_slice(&header_crc.to_le_bytes());
+        let trailer_start = bytes.len() - TRAILER_LEN;
+        let trailer_crc = crc32c::crc32c(&bytes[..trailer_start]);
+        bytes[trailer_start..].copy_from_slice(&trailer_crc.to_le_bytes());
+        assert_eq!(
+            parse_encrypted(&bytes, DEFAULT_MAX_TOTAL_BYTES, &kek),
+            Err(EnvelopeError::Truncated)
+        );
     }
 
     #[test]

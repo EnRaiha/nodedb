@@ -2,6 +2,10 @@
 
 //! `parse` — decode and fully validate a plaintext backup envelope.
 
+use std::mem::size_of;
+
+use crate::decode_bounds::checked_decode_capacity;
+
 use super::types::{Envelope, EnvelopeError, EnvelopeMeta, Section, read2, read4, read8};
 use super::types::{HEADER_LEN, MAGIC, SECTION_OVERHEAD, TRAILER_LEN, VERSION};
 
@@ -70,8 +74,13 @@ pub(super) fn parse_sections(
     trailer_start: usize,
     meta: EnvelopeMeta,
 ) -> Result<Envelope, EnvelopeError> {
+    let section_capacity = checked_section_capacity(
+        section_count,
+        trailer_start.saturating_sub(body_start),
+        SECTION_OVERHEAD,
+    )?;
     let mut cursor = body_start;
-    let mut sections = Vec::with_capacity(section_count as usize);
+    let mut sections = Vec::with_capacity(section_capacity);
     for _ in 0..section_count {
         if cursor + SECTION_OVERHEAD > trailer_start {
             return Err(EnvelopeError::Truncated);
@@ -102,6 +111,29 @@ pub(super) fn parse_sections(
     Ok(Envelope { meta, sections })
 }
 
+/// Bounds a section container by the minimum encoded size of each section.
+/// This runs before allocation so an untrusted header count cannot reserve
+/// more entries than the bytes remaining in the frame can describe.
+pub(super) fn checked_section_capacity(
+    section_count: u16,
+    remaining_bytes: usize,
+    minimum_section_bytes: usize,
+) -> Result<usize, EnvelopeError> {
+    if minimum_section_bytes == 0 {
+        return Err(EnvelopeError::Truncated);
+    }
+    let count = usize::from(section_count);
+    checked_decode_capacity(
+        count,
+        size_of::<Section>(),
+        remaining_bytes,
+        minimum_section_bytes,
+        usize::from(u16::MAX),
+        usize::MAX,
+    )
+    .ok_or(EnvelopeError::Truncated)
+}
+
 // ── shared tests for plaintext path ─────────────────────────────────────────
 
 #[cfg(test)]
@@ -117,6 +149,21 @@ mod tests {
             hash_seed: 0,
             snapshot_watermark: 12345,
         }
+    }
+
+    #[test]
+    fn rejects_huge_section_count_with_tiny_body_before_allocation() {
+        let mut bytes = EnvelopeWriter::new(meta()).finalize();
+        bytes[40..42].copy_from_slice(&u16::MAX.to_le_bytes());
+        let header_crc = crc32c::crc32c(&bytes[..48]);
+        bytes[48..52].copy_from_slice(&header_crc.to_le_bytes());
+        let trailer_start = bytes.len() - TRAILER_LEN;
+        let trailer_crc = crc32c::crc32c(&bytes[..trailer_start]);
+        bytes[trailer_start..].copy_from_slice(&trailer_crc.to_le_bytes());
+        assert_eq!(
+            parse(&bytes, DEFAULT_MAX_TOTAL_BYTES),
+            Err(EnvelopeError::Truncated)
+        );
     }
 
     #[test]

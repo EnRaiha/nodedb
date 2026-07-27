@@ -74,6 +74,10 @@ jobs:
         run: |
           python3 scripts/ci/check_authorized_dispatch.py --self-test
           python3 scripts/ci/check_authorized_dispatch.py
+      - name: Robust-parsing gate
+        run: |
+          python3 scripts/ci/check_robust_parsing.py --self-test
+          python3 scripts/ci/check_robust_parsing.py
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:

@@ -18,9 +18,31 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use nodedb_mem::{EngineId, MemoryGovernor};
+use nodedb_types::decode_bounds::checked_decode_capacity;
 use serde::{Deserialize, Serialize};
 
 use crate::error::VectorError;
+
+/// Hard ceiling for a decoded PQ vector. This bounds corrupted persisted
+/// configuration even when the codec has no memory governor attached.
+const MAX_PQ_DECODE_DIM: usize = 1_048_576;
+const MAX_PQ_CODEBOOK_BYTES: usize = 64 * 1024 * 1024;
+// MessagePack stores each f32 as a marker plus four payload bytes and also
+// carries nested-array headers. A 96 MiB envelope covers every codec whose
+// complete decoded allocation (floats plus Vec headers) fits the 64 MiB cap.
+const MAX_PQ_SERIALIZED_BYTES: usize = 96 * 1024 * 1024;
+
+fn pq_codebook_allocation_bytes(m: usize, k: usize, sub_dim: usize) -> Option<usize> {
+    let outer_headers = m.checked_mul(size_of::<Vec<Vec<f32>>>())?;
+    let centroid_count = m.checked_mul(k)?;
+    let centroid_headers = centroid_count.checked_mul(size_of::<Vec<f32>>())?;
+    let float_bytes = centroid_count
+        .checked_mul(sub_dim)?
+        .checked_mul(size_of::<f32>())?;
+    outer_headers
+        .checked_add(centroid_headers)?
+        .checked_add(float_bytes)
+}
 
 /// Reserve `bytes` from `governor` for `EngineId::Vector`, or succeed silently
 /// when no governor is configured. The returned guard (if any) must be kept
@@ -83,13 +105,22 @@ impl PqCodec {
     /// `max_iter` = k-means iterations (20 is usually sufficient).
     pub fn train(vectors: &[&[f32]], dim: usize, m: usize, k: usize, max_iter: usize) -> Self {
         assert!(!vectors.is_empty());
-        assert!(dim > 0 && m > 0 && k > 0);
+        assert!(
+            dim > 0
+                && dim <= MAX_PQ_DECODE_DIM
+                && m > 0
+                && k > 0
+                && k <= usize::from(u8::MAX) + 1
+                && k <= vectors.len()
+        );
         assert!(
             dim.is_multiple_of(m),
             "dim ({dim}) must be divisible by m ({m})"
         );
 
         let sub_dim = dim / m;
+        let codebook_bytes = pq_codebook_allocation_bytes(m, k, sub_dim);
+        assert!(codebook_bytes.is_some_and(|bytes| bytes <= MAX_PQ_CODEBOOK_BYTES));
         let mut codebooks = Vec::with_capacity(m);
 
         for sub in 0..m {
@@ -191,9 +222,41 @@ impl PqCodec {
     /// Charges `dim * size_of::<f32>()` bytes to the governor (if set)
     /// before allocating the output buffer.
     pub fn decode(&self, code: &[u8]) -> Result<Vec<f32>, VectorError> {
-        debug_assert_eq!(code.len(), self.m);
-        let _g = try_reserve_or_skip(&self.governor, self.dim * size_of::<f32>())?;
-        let mut out = Vec::with_capacity(self.dim);
+        self.validate_shape()?;
+        let decoded_dim = self
+            .m
+            .checked_mul(self.sub_dim)
+            .filter(|&value| value == self.dim && value <= MAX_PQ_DECODE_DIM)
+            .ok_or(VectorError::DimensionMismatch {
+                expected: self.dim,
+                got: 0,
+            })?;
+        if code.len() != self.m {
+            return Err(VectorError::DimensionMismatch {
+                expected: self.m,
+                got: code.len(),
+            });
+        }
+        if code.iter().any(|&index| usize::from(index) >= self.k) {
+            return Err(VectorError::DeserializationFailed(
+                "PQ code contains an out-of-range centroid index".to_string(),
+            ));
+        }
+        let output_capacity = checked_decode_capacity(
+            decoded_dim,
+            size_of::<f32>(),
+            0,
+            0,
+            MAX_PQ_DECODE_DIM,
+            MAX_PQ_DECODE_DIM * size_of::<f32>(),
+        )
+        .ok_or(VectorError::DimensionMismatch {
+            expected: self.dim,
+            got: 0,
+        })?;
+        let allocation_bytes = output_capacity * size_of::<f32>();
+        let _g = try_reserve_or_skip(&self.governor, allocation_bytes)?;
+        let mut out = Vec::with_capacity(output_capacity);
         for (sub, &c) in code.iter().enumerate() {
             out.extend_from_slice(&self.codebooks[sub][c as usize]);
         }
@@ -208,6 +271,7 @@ impl PqCodec {
     /// allocating the output buffer.  The estimate is conservative:
     /// `m * k * sub_dim * size_of::<f32>() + 64` (header + framing overhead).
     pub fn to_bytes(&self) -> Result<Vec<u8>, VectorError> {
+        self.validate_shape()?;
         const MAGIC: &[u8; 6] = b"NDPQ\0\0";
         const VERSION: u8 = 1;
         let estimated = self.m * self.k * self.sub_dim * size_of::<f32>() + 64;
@@ -238,8 +302,43 @@ impl PqCodec {
                 expected: PQ_FORMAT_VERSION,
             });
         }
-        zerompk::from_msgpack::<Self>(&bytes[7..])
-            .map_err(|e| VectorError::DeserializationFailed(e.to_string()))
+        let payload = &bytes[7..];
+        if payload.len() > MAX_PQ_SERIALIZED_BYTES {
+            return Err(VectorError::DeserializationFailed(
+                "PQ codec payload exceeds the decode limit".to_string(),
+            ));
+        }
+        super::pq_decode::preflight_pq_payload(payload, MAX_PQ_DECODE_DIM, MAX_PQ_CODEBOOK_BYTES)?;
+        let codec = zerompk::from_msgpack::<Self>(payload)
+            .map_err(|e| VectorError::DeserializationFailed(e.to_string()))?;
+        codec.validate_shape()?;
+        Ok(codec)
+    }
+
+    fn validate_shape(&self) -> Result<(), VectorError> {
+        let valid_scalar_shape = self.dim > 0
+            && self.m > 0
+            && self.k > 0
+            && self.k <= usize::from(u8::MAX) + 1
+            && self.sub_dim > 0
+            && self
+                .m
+                .checked_mul(self.sub_dim)
+                .is_some_and(|dim| dim == self.dim && dim <= MAX_PQ_DECODE_DIM);
+        let codebook_bytes = pq_codebook_allocation_bytes(self.m, self.k, self.sub_dim);
+        let valid_codebooks = self.codebooks.len() == self.m
+            && self.codebooks.iter().all(|book| {
+                book.len() == self.k && book.iter().all(|centroid| centroid.len() == self.sub_dim)
+            });
+        if !valid_scalar_shape
+            || !codebook_bytes.is_some_and(|bytes| bytes <= MAX_PQ_CODEBOOK_BYTES)
+            || !valid_codebooks
+        {
+            return Err(VectorError::DeserializationFailed(
+                "invalid PQ codec shape".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn nearest_centroid(&self, subspace: usize, sub_vec: &[f32]) -> usize {
@@ -390,6 +489,105 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
+    fn train_rejects_dimension_above_decode_limit() {
+        let vector = [0.0];
+        PqCodec::train(&[&vector], MAX_PQ_DECODE_DIM + 1, 1, 1, 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn train_rejects_raw_64_mib_codebook_once_container_overhead_is_counted() {
+        let vector = [0.0];
+        let vectors = vec![vector.as_slice(); 256];
+        PqCodec::train(&vectors, 65_536, 1, 256, 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn train_rejects_codebook_above_decode_limit() {
+        let vector = [0.0];
+        let vectors = vec![vector.as_slice(); 17];
+        PqCodec::train(&vectors, MAX_PQ_DECODE_DIM, 1, 17, 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn train_rejects_more_centroids_than_training_vectors() {
+        let vector = [0.0];
+        PqCodec::train(&[&vector], 1, 1, 2, 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn train_rejects_centroid_count_above_u8_encoding_range() {
+        let vector = [0.0];
+        PqCodec::train(&[&vector], 1, 1, 257, 1);
+    }
+
+    #[test]
+    fn decode_rejects_unbounded_configured_dimension_before_allocation() {
+        let codec = PqCodec {
+            dim: MAX_PQ_DECODE_DIM + 1,
+            m: 1,
+            k: 1,
+            sub_dim: MAX_PQ_DECODE_DIM + 1,
+            codebooks: vec![vec![vec![]]],
+            governor: None,
+        };
+        assert!(codec.decode(&[0]).is_err());
+    }
+
+    #[test]
+    fn from_bytes_rejects_oversized_outer_array_before_allocation() {
+        // PqCodec's zerompk representation is a five-element array:
+        // dim, m, k, sub_dim, codebooks.
+        let mut payload = vec![0x95, 1, 1, 1, 1, 0xdd];
+        payload.extend_from_slice(&u32::try_from(MAX_PQ_DECODE_DIM + 1).unwrap().to_be_bytes());
+        let mut bytes = b"NDPQ\0\0\x01".to_vec();
+        bytes.extend_from_slice(&payload);
+        assert!(matches!(
+            PqCodec::from_bytes(&bytes),
+            Err(VectorError::DeserializationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_rejects_malformed_codebook_shape() {
+        let malformed = PqCodec {
+            dim: 4,
+            m: 2,
+            k: 1,
+            sub_dim: 2,
+            codebooks: vec![vec![vec![0.0, 0.0]]],
+            governor: None,
+        };
+        let payload = zerompk::to_msgpack_vec(&malformed).unwrap();
+        let mut bytes = b"NDPQ\0\0\x01".to_vec();
+        bytes.extend_from_slice(&payload);
+        assert!(matches!(
+            PqCodec::from_bytes(&bytes),
+            Err(VectorError::DeserializationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_out_of_range_centroid_index() {
+        let codec = PqCodec {
+            dim: 1,
+            m: 1,
+            k: 1,
+            sub_dim: 1,
+            codebooks: vec![vec![vec![0.0]]],
+            governor: None,
+        };
+        assert!(matches!(
+            codec.decode(&[1]),
+            Err(VectorError::DeserializationFailed(_))
+        ));
+    }
+
+    #[test]
     fn encode_decode_roundtrip() {
         let vecs = make_clustered_data();
         let refs: Vec<&[f32]> = vecs.iter().map(|v| v.as_slice()).collect();
@@ -460,9 +658,8 @@ mod tests {
         assert_eq!(&bytes[0..6], b"NDPQ\0\0", "magic mismatch");
         // Version byte.
         assert_eq!(bytes[6], 1u8, "version must be 1");
-        // Payload at offset 7 must decode back to a valid PqCodec.
-        let restored = zerompk::from_msgpack::<PqCodec>(&bytes[7..])
-            .expect("msgpack payload at offset 7 must decode");
+        // The complete persisted envelope must pass bounded preflight and decode.
+        let restored = PqCodec::from_bytes(&bytes).expect("persisted PQ codec must decode");
         assert_eq!(restored.dim, codec.dim);
         assert_eq!(restored.m, codec.m);
     }
