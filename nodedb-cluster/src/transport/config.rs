@@ -170,6 +170,9 @@ pub struct TlsCredentials {
     /// Stable across cert renewals that reuse the same key-pair; changes on
     /// key rotation.  Transmitted in `JoinRequest` so peers can pin us.
     pub spki_pin: [u8; 32],
+    /// SPKI of the issuer node named by the out-of-band join token. Present
+    /// only during the joining node's initial seed/redirect bootstrap.
+    pub bootstrap_peer_spki: Option<[u8; 32]>,
 }
 
 /// Build a QUIC server config with mutual TLS (production mode).
@@ -178,8 +181,10 @@ pub struct TlsCredentials {
 /// When `identity_store` contains topology entries, the `PinnedClientVerifier`
 /// wraps the WebPki chain verifier and additionally checks the connecting
 /// client's SPKI fingerprint or SPIFFE URI SAN against the topology pin.
-/// Connections from nodes not yet in the topology are accepted in the bootstrap
-/// window (defense-in-depth: `verify_peer_identity` at the app layer also fires).
+/// Unknown identities are accepted only before initial topology installation
+/// or when credential issuance explicitly preauthorized their SPKI. The
+/// application layer additionally restricts a not-yet-committed peer to its
+/// identity-bound JoinRequest.
 pub fn make_raft_server_config_mtls(
     creds: &TlsCredentials,
     tuning: &ClusterTransportTuning,
@@ -391,6 +396,7 @@ pub fn issue_leaf_for_sans(
         crls: Vec::new(),
         cluster_secret,
         spki_pin,
+        bootstrap_peer_spki: None,
     })
 }
 

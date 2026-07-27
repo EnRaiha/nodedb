@@ -118,6 +118,8 @@ pub async fn init_cluster_with_transport(
         detail: format!("cluster start: {e}"),
     })?;
 
+    transport.install_identity_topology(Arc::clone(&state.topology));
+
     info!(
         node_id = config.node_id,
         nodes = state.topology.read().map(|t| t.node_count()).unwrap_or(0),

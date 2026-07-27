@@ -22,7 +22,7 @@
 //! Tests build transports on ephemeral loopback ports and do not depend
 //! on any cluster infrastructure beyond the transport layer itself.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -43,6 +43,7 @@ use nodedb_cluster::{
     MacKey, NexarTransport, RaftRpcHandler, TlsCredentials, TransportCredentials,
     generate_node_credentials, insecure_transport_count, spki_pin_from_cert_der,
 };
+use nodedb_cluster::topology::{ClusterTopology, NodeInfo, NodeState};
 use nodedb_raft::message::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteResponse};
 use nodedb_raft::transport::RaftTransport;
 
@@ -224,6 +225,7 @@ fn creds_signed_by(
         crls: Vec::new(),
         cluster_secret,
         spki_pin,
+        bootstrap_peer_spki: None,
     }
 }
 
@@ -237,11 +239,31 @@ async fn spawn_server(transport: Arc<NexarTransport>) -> tokio::sync::watch::Sen
     tx
 }
 
+/// Register each peer's pinned SPKI in a shared topology and install it on
+/// every transport, mirroring a joined cluster. The mTLS identity store fails
+/// closed against unknown peers, so a baseline RPC only succeeds once the
+/// sender's identity is visible in topology.
+fn install_shared_identity(nodes: &[(u64, [u8; 32])], transports: &[&Arc<NexarTransport>]) {
+    let mut topo = ClusterTopology::new();
+    for (id, spki) in nodes {
+        topo.add_node(
+            NodeInfo::new(*id, "127.0.0.1:0".parse().unwrap(), NodeState::Active)
+                .with_spki_pin(Some(*spki)),
+        );
+    }
+    let topology = Arc::new(RwLock::new(topo));
+    for t in transports {
+        t.install_identity_topology(topology.clone());
+    }
+}
+
 /// L.1: two transports under the same cluster CA can talk. Baseline.
 #[tokio::test]
 async fn l1_same_ca_mtls_connects() {
     let (ca, server_creds) = generate_node_credentials("nodedb").unwrap();
     let client_creds = creds_signed_by(&ca, "nodedb", server_creds.cluster_secret);
+    let server_spki = server_creds.spki_pin;
+    let client_spki = client_creds.spki_pin;
 
     let server = Arc::new(
         NexarTransport::new(
@@ -259,6 +281,7 @@ async fn l1_same_ca_mtls_connects() {
         )
         .unwrap(),
     );
+    install_shared_identity(&[(1, server_spki), (2, client_spki)], &[&server, &client]);
     client.register_peer(1, server.local_addr());
     let _tx = spawn_server(server.clone()).await;
 
@@ -363,6 +386,7 @@ async fn l2_mismatched_mac_key_rejects_rpcs() {
         crls: Vec::new(),
         cluster_secret: [0xAAu8; 32],
         spki_pin: client_spki_pin,
+        bootstrap_peer_spki: None,
     };
     // Deliberately mismatched cluster secrets.
     server_creds.cluster_secret = [0x55u8; 32];
@@ -408,6 +432,8 @@ async fn l2_mismatched_mac_key_rejects_rpcs() {
 async fn l2_many_sequential_rpcs_all_accepted() {
     let (ca, server_creds) = generate_node_credentials("nodedb").unwrap();
     let client_creds = creds_signed_by(&ca, "nodedb", server_creds.cluster_secret);
+    let server_spki = server_creds.spki_pin;
+    let client_spki = client_creds.spki_pin;
 
     let server = Arc::new(
         NexarTransport::new(
@@ -425,6 +451,7 @@ async fn l2_many_sequential_rpcs_all_accepted() {
         )
         .unwrap(),
     );
+    install_shared_identity(&[(1, server_spki), (2, client_spki)], &[&server, &client]);
     client.register_peer(1, server.local_addr());
     let _tx = spawn_server(server.clone()).await;
 
@@ -501,6 +528,7 @@ fn debug_on_transport_credentials_redacts() {
         crls: Vec::new(),
         cluster_secret: [0xAB; 32],
         spki_pin: [0u8; 32],
+        bootstrap_peer_spki: None,
     };
     let tc = TransportCredentials::Mtls(creds);
     let s = format!("{tc:?}");

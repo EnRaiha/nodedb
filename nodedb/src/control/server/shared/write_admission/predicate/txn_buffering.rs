@@ -224,6 +224,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
         // ---- Crdt: raw Apply is rejected in transactions; reads are not encoded ----
         PhysicalPlan::Crdt(
             CrdtOp::Apply { .. }
+            | CrdtOp::ApplyAuthenticated { .. }
             | CrdtOp::Read { .. }
             | CrdtOp::PreviewApply { .. }
             | CrdtOp::ReadConstraints { .. }

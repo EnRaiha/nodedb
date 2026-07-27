@@ -49,6 +49,41 @@ pub(super) fn wal_append_crdt_op(
             })?;
             Some(wal.append_crdt_delta(tenant_id, vshard_id, database_id, &crdt_payload)?)
         }
+        CrdtOp::ApplyAuthenticated {
+            collection,
+            document_id,
+            delta,
+            surrogate,
+            provenance,
+            expected_frontier_digest,
+            auth_user_id,
+            auth_device_id,
+            auth_seq_no,
+            delta_signature,
+            signing_required,
+            ..
+        } => {
+            let payload = crate::wal::CrdtDeltaWalPayload::new(
+                delta.clone(),
+                Some(collection.clone()),
+                Some(provenance.clone()),
+                *expected_frontier_digest,
+                Some(document_id.clone()),
+                Some(surrogate.as_u32()),
+            )
+            .with_signing(crate::wal::CrdtDeltaSigning {
+                auth_user_id: *auth_user_id,
+                auth_device_id: *auth_device_id,
+                auth_seq_no: *auth_seq_no,
+                delta_signature: *delta_signature,
+                required: *signing_required,
+            });
+            let crdt_payload = payload.encode().map_err(|e| crate::Error::Serialization {
+                format: "msgpack".into(),
+                detail: format!("wal authenticated crdt delta: {e}"),
+            })?;
+            Some(wal.append_crdt_delta(tenant_id, vshard_id, database_id, &crdt_payload)?)
+        }
         CrdtOp::ImportSnapshot {
             collection, bytes, ..
         } => {

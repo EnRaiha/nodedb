@@ -27,6 +27,25 @@ impl WalManager {
             if file_len == 0 {
                 continue;
             }
+            if file_len == nodedb_wal::preamble::PREAMBLE_SIZE as u64 {
+                use std::io::Read as _;
+                let mut bytes = [0u8; nodedb_wal::preamble::PREAMBLE_SIZE];
+                let mut file = std::fs::File::open(&seg.path).map_err(|error| {
+                    crate::Error::SegmentCorrupted {
+                        detail: format!("read WAL preamble '{}': {error}", seg.path.display()),
+                    }
+                })?;
+                file.read_exact(&mut bytes)
+                    .map_err(|error| crate::Error::SegmentCorrupted {
+                        detail: format!("read WAL preamble '{}': {error}", seg.path.display()),
+                    })?;
+                nodedb_wal::preamble::SegmentPreamble::from_bytes(
+                    &bytes,
+                    &nodedb_wal::preamble::WAL_PREAMBLE_MAGIC,
+                )
+                .map_err(crate::Error::Wal)?;
+                continue;
+            }
 
             let info = nodedb_wal::recovery::recover(&seg.path).map_err(crate::Error::Wal)?;
 

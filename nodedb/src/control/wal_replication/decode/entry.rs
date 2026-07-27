@@ -115,6 +115,7 @@ fn to_physical_plan(
         // CRDT family (`PhysicalPlan::Crdt`).
         ReplicatedWrite::CrdtApply { .. }
         | ReplicatedWrite::CrdtApplyFenced { .. }
+        | ReplicatedWrite::CrdtApplyAuthenticated { .. }
         | ReplicatedWrite::CrdtImportCollection { .. }
         | ReplicatedWrite::CrdtListInsert { .. }
         | ReplicatedWrite::CrdtListDelete { .. }

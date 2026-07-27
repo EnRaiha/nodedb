@@ -19,6 +19,39 @@ use super::super::wire::{
     CompensationHint, DeltaPushMsg, DeltaRejectMsg, SyncFrame, SyncMessageType,
 };
 
+fn delta_signature_valid(
+    delta_msg: &DeltaPushMsg,
+    user_id: u64,
+    session_signing_key: Option<&[u8; 32]>,
+    session_producer_id: u64,
+    session_epoch: u64,
+    signing_required: bool,
+) -> bool {
+    let signed = delta_msg.delta_signature != [0; 32];
+    if !signed {
+        return !signing_required;
+    }
+    if session_producer_id == 0 || delta_msg.device_id != session_producer_id {
+        return false;
+    }
+    session_signing_key.is_some_and(|key| {
+        let mut verifier = nodedb_crdt::DeltaSigner::new();
+        verifier.register_key(user_id, *key);
+        verifier
+            .verify_sync_delta(
+                user_id,
+                session_producer_id,
+                session_epoch,
+                delta_msg.seq,
+                &delta_msg.collection,
+                &delta_msg.document_id,
+                &delta_msg.delta,
+                &delta_msg.delta_signature,
+            )
+            .is_ok()
+    })
+}
+
 /// Apply a CRDT delta on the Data Plane, converting the outcome into the final
 /// client frame.
 ///
@@ -27,9 +60,8 @@ use super::super::wire::{
 ///
 /// A delta can be refused in two structurally different ways:
 ///
-/// 1. **Applied-then-rejected by the validator.** The delta is Raft-committed and
-///    imported on every replica (a committed CRDT delta cannot be un-imported),
-///    but the post-import constraint check (UNIQUE / NOT NULL) found a violation.
+/// 1. **Deterministically rejected by the validator.** Every replica validates
+///    the detached candidate and discards it before authoritative installation.
 ///    The Data Plane surfaces this as a structured [`ViolationType`] in
 ///    `SyncAckResult.reject`; we map it precisely to a typed
 ///    [`CompensationHint`] via [`ViolationType::to_compensation_hint`] — this is
@@ -45,6 +77,7 @@ pub(crate) async fn apply_delta_and_finalize(
     delta_msg: &DeltaPushMsg,
     ack_frame: SyncFrame,
     identity: Option<&AuthenticatedIdentity>,
+    session_signing_key: Option<&[u8; 32]>,
     session_producer_id: u64,
     session_epoch: u64,
 ) -> Option<SyncFrame> {
@@ -73,6 +106,63 @@ pub(crate) async fn apply_delta_and_finalize(
         &shared.rls,
         &audit,
     );
+
+    let (constraint_version_required, signing_required) = match shared
+        .credentials
+        .catalog()
+        .get_collection(
+            DatabaseId::DEFAULT,
+            tenant_id.as_u64(),
+            &delta_msg.collection,
+        ) {
+        Ok(Some(collection)) => (
+            collection.constraint_version,
+            collection.crdt_signing_required,
+        ),
+        Ok(None) => {
+            let reject = DeltaRejectMsg {
+                mutation_id: delta_msg.mutation_id,
+                reason: "collection not found".into(),
+                compensation: Some(CompensationHint::PermissionDenied),
+            };
+            return SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject);
+        }
+        Err(error) => {
+            warn!(%error, collection = %delta_msg.collection, "sync signing policy lookup failed");
+            let reject = DeltaRejectMsg {
+                mutation_id: delta_msg.mutation_id,
+                reason: "collection security policy is temporarily unavailable".into(),
+                compensation: Some(CompensationHint::PermissionDenied),
+            };
+            return SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject);
+        }
+    };
+
+    if signing_required && !shared.wal.payloads_authenticated() {
+        let reject = DeltaRejectMsg {
+            mutation_id: delta_msg.mutation_id,
+            reason: "SIGNED_DELTAS requires authenticated WAL encryption".into(),
+            compensation: Some(CompensationHint::PermissionDenied),
+        };
+        return SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject);
+    }
+
+    let signing_valid = delta_signature_valid(
+        delta_msg,
+        identity.user_id,
+        session_signing_key,
+        session_producer_id,
+        session_epoch,
+        signing_required,
+    );
+    if !signing_valid {
+        let reject = DeltaRejectMsg {
+            mutation_id: delta_msg.mutation_id,
+            reason: "CRDT delta signature is missing or invalid".into(),
+            compensation: Some(CompensationHint::PermissionDenied),
+        };
+        return SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject);
+    }
 
     // Dispatch a CrdtApply plan to the Data Plane. If the CRDT engine
     // rejects it (constraint violation), we get an error back.
@@ -124,43 +214,21 @@ pub(crate) async fn apply_delta_and_finalize(
         seq: delta_msg.seq,
     };
 
-    // Stamp the constraint-set version this delta is admitted against. The
-    // apply-time write-gate compares it on every replica against the
-    // constraint version that replica has installed, rejecting a delta that
-    // outran its `SetConstraints` (the reconcile loop installs constraints
-    // asynchronously, so a create-race delta can commit first). Read the raw
-    // `constraint_version` field from the catalog under the session tenant —
-    // the exact value the constraint reconcile loop
-    // (`bootstrap::constraint_reconcile`) replicates via `ConstraintChange`
-    // and every replica installs into its validator. Admission and install
-    // MUST use identical normalization or the gate mis-fences, so this takes
-    // the value verbatim — no `.max(1)` (the install side applies none).
-    // `constraint_version` bumps only when the derived constraint set
-    // actually changes; a collection with no constraints stamps `0` (no
-    // fence, gate open). Missing collection ⇒ `0` (gate open; safe).
-    let constraint_version_required = shared
-        .credentials
-        .catalog()
-        .get_collection(
-            DatabaseId::DEFAULT,
-            tenant_id.as_u64(),
-            &delta_msg.collection,
-        )
-        .ok()
-        .flatten()
-        .map(|col| col.constraint_version)
-        .unwrap_or(0);
-
-    let plan = PhysicalPlan::Crdt(CrdtOp::Apply {
+    let plan = PhysicalPlan::Crdt(CrdtOp::ApplyAuthenticated {
         collection: delta_msg.collection.clone(),
         document_id: delta_msg.document_id.clone(),
         delta: delta_msg.delta.clone(),
         peer_id: delta_msg.peer_id,
         mutation_id: delta_msg.mutation_id,
         surrogate,
-        provenance: Some(prov),
+        provenance: prov,
         constraint_version_required,
         expected_frontier_digest: None,
+        auth_user_id: identity.user_id,
+        auth_device_id: session_producer_id,
+        auth_seq_no: delta_msg.seq,
+        delta_signature: delta_msg.delta_signature,
+        signing_required,
     });
 
     let vshard_id = crate::types::VShardId::from_collection_in_database(
@@ -411,7 +479,8 @@ fn compensation_hint_for_dispatch_error(e: &crate::Error) -> CompensationHint {
 mod tests {
     use super::{
         DeltaAuthorizationFailure, authorize_delta_write_with,
-        compensation_hint_for_dispatch_error, permission_denied_delta_reject,
+        compensation_hint_for_dispatch_error, delta_signature_valid,
+        permission_denied_delta_reject,
     };
     use crate::bridge::envelope::ErrorCode;
     use crate::control::security::audit::NoopAuditEmitter;
@@ -442,12 +511,57 @@ mod tests {
             delta: Vec::new(),
             peer_id: 1,
             mutation_id: 42,
+            device_id: 0,
+            delta_signature: [0; 32],
             checksum: 0,
             device_valid_time_ms: None,
             producer_id: 0,
             epoch: 0,
             seq: 0,
         }
+    }
+
+    #[test]
+    fn required_signing_rejects_unsigned_delta() {
+        assert!(!delta_signature_valid(
+            &delta(),
+            7,
+            Some(&[0x42; 32]),
+            9,
+            3,
+            true,
+        ));
+        assert!(delta_signature_valid(&delta(), 7, None, 0, 0, false));
+    }
+
+    #[test]
+    fn signature_binds_payload_user_device_and_sequence() {
+        let key = [0x42; 32];
+        let mut signer = nodedb_crdt::DeltaSigner::new();
+        signer.register_key(7, key);
+        let mut msg = delta();
+        msg.delta = b"exact delta".to_vec();
+        msg.device_id = 9;
+        msg.seq = 11;
+        msg.delta_signature = signer
+            .sign_sync_delta(
+                7,
+                msg.device_id,
+                3,
+                msg.seq,
+                &msg.collection,
+                &msg.document_id,
+                &msg.delta,
+            )
+            .expect("sign");
+        assert!(delta_signature_valid(&msg, 7, Some(&key), 9, 3, true));
+
+        let mut tampered = msg.clone();
+        tampered.delta.push(0);
+        assert!(!delta_signature_valid(&tampered, 7, Some(&key), 9, 3, true));
+        assert!(!delta_signature_valid(&msg, 8, Some(&key), 9, 3, true));
+        assert!(!delta_signature_valid(&msg, 7, Some(&key), 10, 3, true));
+        assert!(!delta_signature_valid(&msg, 7, Some(&key), 9, 4, true));
     }
 
     #[test]

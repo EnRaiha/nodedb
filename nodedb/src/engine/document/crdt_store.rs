@@ -30,14 +30,6 @@ impl<'a> CrdtDocumentEngine<'a> {
         Some(loro_value_to_json(&loro_val))
     }
 
-    /// Apply a CRDT delta to a document in the given collection.
-    ///
-    /// The delta is a Loro-encoded change that merges conflict-free with
-    /// concurrent edits from other peers, routed to the collection's doc.
-    pub fn apply_delta(&mut self, collection: &str, delta: &[u8]) -> crate::Result<()> {
-        self.crdt.apply_committed_delta(collection, delta)
-    }
-
     /// Check if a document exists in the CRDT store.
     pub fn exists(&self, collection: &str, doc_id: &str) -> bool {
         self.crdt.row_exists(collection, doc_id)

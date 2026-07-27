@@ -35,7 +35,11 @@ use super::support::{
 fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> Result<(), TypedClusterError> {
     if matches!(
         plan,
-        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
+        PhysicalPlan::Crdt(
+            nodedb_physical::physical_plan::CrdtOp::Apply { .. }
+                | nodedb_physical::physical_plan::CrdtOp::ApplyAuthenticated { .. }
+                | nodedb_physical::physical_plan::CrdtOp::ImportSnapshot { .. }
+        )
     ) {
         return Err(TypedClusterError::Internal {
             code: PLAN_DECODE_FAILED,

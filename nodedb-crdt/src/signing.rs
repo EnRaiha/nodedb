@@ -238,6 +238,41 @@ impl DeltaSigner {
         }
     }
 
+    /// Sign a sync delta while binding its session epoch and logical target.
+    /// Length-prefixing prevents ambiguous concatenations and the domain tag
+    /// keeps this protocol separate from generic [`Self::sign`] callers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_sync_delta(
+        &self,
+        user_id: u64,
+        device_id: u64,
+        epoch: u64,
+        seq_no: u64,
+        collection: &str,
+        document_id: &str,
+        delta_bytes: &[u8],
+    ) -> Result<[u8; SIGNATURE_SIZE]> {
+        let message = sync_delta_message(epoch, collection, document_id, delta_bytes)?;
+        self.sign(user_id, device_id, seq_no, &message)
+    }
+
+    /// Verify the target- and epoch-bound sync-delta signature.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_sync_delta(
+        &self,
+        user_id: u64,
+        device_id: u64,
+        epoch: u64,
+        seq_no: u64,
+        collection: &str,
+        document_id: &str,
+        delta_bytes: &[u8],
+        signature: &[u8; SIGNATURE_SIZE],
+    ) -> Result<()> {
+        let message = sync_delta_message(epoch, collection, document_id, delta_bytes)?;
+        self.verify(user_id, device_id, seq_no, &message, signature)
+    }
+
     /// Access the shared device registry.
     pub fn registry(&self) -> &Arc<DeviceRegistry> {
         &self.registry
@@ -248,6 +283,33 @@ impl Default for DeltaSigner {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn sync_delta_message(
+    epoch: u64,
+    collection: &str,
+    document_id: &str,
+    delta_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let collection_len = u32::try_from(collection.len()).map_err(|_| {
+        CrdtError::DeltaApplyFailed("collection name too long for signed delta".into())
+    })?;
+    let document_len = u32::try_from(document_id.len())
+        .map_err(|_| CrdtError::DeltaApplyFailed("document id too long for signed delta".into()))?;
+    let capacity = 36usize
+        .checked_add(collection.len())
+        .and_then(|size| size.checked_add(document_id.len()))
+        .and_then(|size| size.checked_add(delta_bytes.len()))
+        .ok_or_else(|| CrdtError::DeltaApplyFailed("signed delta message too large".into()))?;
+    let mut message = Vec::with_capacity(capacity);
+    message.extend_from_slice(b"nodedb-sync-delta-v1");
+    message.extend_from_slice(&epoch.to_le_bytes());
+    message.extend_from_slice(&collection_len.to_le_bytes());
+    message.extend_from_slice(collection.as_bytes());
+    message.extend_from_slice(&document_len.to_le_bytes());
+    message.extend_from_slice(document_id.as_bytes());
+    message.extend_from_slice(delta_bytes);
+    Ok(message)
 }
 
 /// Compute HMAC-SHA256 over the canonical delta-signing message.

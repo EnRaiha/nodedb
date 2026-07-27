@@ -55,6 +55,26 @@ pub enum CrdtOp {
         expected_frontier_digest: Option<[u8; 32]>,
     },
 
+    /// External sync delta carrying server-derived identity and catalog-owned
+    /// signing enforcement. Kept distinct from trusted/internal `Apply` so a
+    /// transport cannot accidentally omit the signing admission fields.
+    ApplyAuthenticated {
+        collection: String,
+        document_id: String,
+        delta: Vec<u8>,
+        peer_id: u64,
+        mutation_id: u64,
+        surrogate: Surrogate,
+        provenance: nodedb_types::sync::wire::SyncProvenance,
+        constraint_version_required: u64,
+        expected_frontier_digest: Option<[u8; 32]>,
+        auth_user_id: u64,
+        auth_device_id: u64,
+        auth_seq_no: u64,
+        delta_signature: [u8; 32],
+        signing_required: bool,
+    },
+
     /// Import a per-collection Loro snapshot into the tenant CRDT engine.
     ///
     /// Used by the durable RESTORE re-issue path: the snapshot is replicated

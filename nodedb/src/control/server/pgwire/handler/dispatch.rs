@@ -467,7 +467,14 @@ impl NodeDbPgHandler {
 }
 
 fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> crate::Result<()> {
-    if matches!(plan, PhysicalPlan::Crdt(CrdtOp::Apply { .. })) {
+    if matches!(
+        plan,
+        PhysicalPlan::Crdt(
+            CrdtOp::Apply { .. }
+                | CrdtOp::ApplyAuthenticated { .. }
+                | CrdtOp::ImportSnapshot { .. }
+        )
+    ) {
         return Err(crate::Error::CrdtApplyRequiresAdmission);
     }
     Ok(())

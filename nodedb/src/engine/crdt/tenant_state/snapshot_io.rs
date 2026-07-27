@@ -41,13 +41,36 @@ impl TenantCrdtEngine {
 
     /// Import a full CRDT snapshot for a single collection (snapshot restore).
     ///
-    /// Fails when the blob's operations cannot be fully applied — a restore
-    /// that left operations causally pending has NOT restored the collection,
-    /// and reporting success would leave the caller unable to tell a complete
-    /// restore from a partial one.
+    /// Routes through the validated apply path so a restored snapshot is held
+    /// to the same constraints as any peer delta: a violating row is rejected
+    /// rather than silently trusted. Fails when the blob's operations cannot be
+    /// fully applied — a restore that left operations causally pending has NOT
+    /// restored the collection, and reporting success would leave the caller
+    /// unable to tell a complete restore from a partial one.
     pub fn import_snapshot_bytes(&mut self, collection: &str, bytes: &[u8]) -> crate::Result<()> {
-        self.state_mut(collection)?
-            .import(bytes)
-            .map_err(crate::Error::Crdt)
+        match self.apply_committed_delta_validated(
+            collection,
+            bytes,
+            nodedb_types::Surrogate::ZERO,
+            "",
+            0,
+        ) {
+            super::ValidatedApplyOutcome::Clean { .. } => Ok(()),
+            super::ValidatedApplyOutcome::Rejected(reason) => Err(crate::Error::Crdt(
+                nodedb_crdt::CrdtError::ConstraintViolation {
+                    constraint: "snapshot import".into(),
+                    collection: collection.into(),
+                    detail: reason.to_string(),
+                },
+            )),
+            super::ValidatedApplyOutcome::Malformed => Err(crate::Error::Crdt(
+                nodedb_crdt::CrdtError::DeltaApplyFailed("malformed snapshot".into()),
+            )),
+            super::ValidatedApplyOutcome::PendingDependencies => Err(crate::Error::Crdt(
+                nodedb_crdt::CrdtError::DeltaApplyFailed(
+                    "snapshot import left operations causally pending".into(),
+                ),
+            )),
+        }
     }
 }

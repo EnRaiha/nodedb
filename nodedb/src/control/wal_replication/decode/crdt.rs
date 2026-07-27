@@ -16,6 +16,12 @@ pub(super) struct ApplyArgs<'a> {
     pub(super) provenance_bytes: &'a Option<Vec<u8>>,
     pub(super) constraint_version_required: u64,
     pub(super) expected_frontier_digest: Option<[u8; 32]>,
+    pub(super) auth_user_id: u64,
+    pub(super) auth_device_id: u64,
+    pub(super) auth_seq_no: u64,
+    pub(super) delta_signature: [u8; 32],
+    pub(super) signing_required: bool,
+    pub(super) authenticated: bool,
 }
 
 pub(super) fn apply(ctx: &DecodeCtx, args: ApplyArgs<'_>) -> crate::Result<PhysicalPlan> {
@@ -27,20 +33,49 @@ pub(super) fn apply(ctx: &DecodeCtx, args: ApplyArgs<'_>) -> crate::Result<Physi
         provenance_bytes,
         constraint_version_required,
         expected_frontier_digest,
+        auth_user_id,
+        auth_device_id,
+        auth_seq_no,
+        delta_signature,
+        signing_required,
+        authenticated,
     } = args;
     let surrogate = assign_or_zero(ctx, collection, document_id.as_bytes())?;
     let provenance = decode_sync_engines::decode_provenance(provenance_bytes)?;
-    Ok(PhysicalPlan::Crdt(CrdtOp::Apply {
-        collection: collection.to_owned(),
-        document_id: document_id.to_owned(),
-        delta: delta.to_vec(),
-        peer_id,
-        mutation_id: 0,
-        surrogate,
-        provenance,
-        constraint_version_required,
-        expected_frontier_digest,
-    }))
+    if authenticated {
+        let provenance = provenance.ok_or_else(|| crate::Error::Serialization {
+            format: "msgpack".into(),
+            detail: "authenticated CRDT replay is missing sync provenance".into(),
+        })?;
+        Ok(PhysicalPlan::Crdt(CrdtOp::ApplyAuthenticated {
+            collection: collection.to_owned(),
+            document_id: document_id.to_owned(),
+            delta: delta.to_vec(),
+            peer_id,
+            mutation_id: 0,
+            surrogate,
+            provenance,
+            constraint_version_required,
+            expected_frontier_digest,
+            auth_user_id,
+            auth_device_id,
+            auth_seq_no,
+            delta_signature,
+            signing_required,
+        }))
+    } else {
+        Ok(PhysicalPlan::Crdt(CrdtOp::Apply {
+            collection: collection.to_owned(),
+            document_id: document_id.to_owned(),
+            delta: delta.to_vec(),
+            peer_id,
+            mutation_id: 0,
+            surrogate,
+            provenance,
+            constraint_version_required,
+            expected_frontier_digest,
+        }))
+    }
 }
 
 /// Per-collection Loro doc import — no surrogate, no provenance. Every

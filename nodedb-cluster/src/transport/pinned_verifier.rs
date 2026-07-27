@@ -14,12 +14,10 @@
 //!    check is strictly additive; it never bypasses standard X.509 validation.
 //! 2. If the verified leaf cert's SPIFFE id or SPKI fingerprint matches a
 //!    topology entry, the handshake is accepted.
-//! 3. If no topology entry exists for this cert (unknown node), the handshake
-//!    is accepted in the bootstrap window.  The application-layer
-//!    `verify_peer_identity` call in `server.rs` fires as a defence-in-depth
-//!    second layer once `node_id` is known from the MAC envelope.
-//! 4. If a topology entry *exists* and the cert does **not** match, the
-//!    handshake is rejected with `rustls::Error::InvalidCertificate`.
+//! 3. An unknown cert is accepted only before initial topology installation or
+//!    when its SPKI was explicitly preauthorized by credential issuance.
+//! 4. After topology installation, every other unknown or mismatched identity
+//!    is rejected with `rustls::Error::InvalidCertificate`.
 
 use std::sync::Arc;
 
@@ -210,9 +208,34 @@ pub(crate) fn check_cert_pin(
         return Ok(rustls::server::danger::ClientCertVerified::assertion());
     }
 
-    // No topology entry found for this cert — bootstrap window.
-    warn!("TLS pin check: cert not in topology, accepting as bootstrap window");
-    Ok(rustls::server::danger::ClientCertVerified::assertion())
+    if let Some((_node_id, expires_at_ms)) =
+        super::peer_identity_verifier::enrollment_identity_from_cert_der(cert_der)
+    {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(u64::MAX);
+        let remaining = expires_at_ms.saturating_sub(now_ms);
+        if remaining > 0
+            && remaining <= 15 * 60 * 1_000
+            && !store.is_enrollment_revoked(&spki)
+            && store.is_preauthorized(&spki)
+        {
+            debug!("TLS pin check: accepted explicitly preauthorized enrollment identity");
+            return Ok(rustls::server::danger::ClientCertVerified::assertion());
+        }
+    }
+    if store.bootstrap_window_open() {
+        warn!("TLS pin check: accepting initial seed while topology is not yet installed");
+        return Ok(rustls::server::danger::ClientCertVerified::assertion());
+    }
+
+    warn!("TLS pin check: rejecting unknown cert after bootstrap closure");
+    Err(rustls::Error::InvalidCertificate(
+        rustls::CertificateError::Other(rustls::OtherError(Arc::new(PinCheckError(
+            "peer identity is neither topology-pinned nor preauthorized".into(),
+        )))),
+    ))
 }
 
 /// Opaque error type wrapped by `rustls::OtherError` for pin-check failures.
@@ -314,6 +337,14 @@ mod tests {
         (cert_der, pin)
     }
 
+    fn gen_enrollment_cert(expires_at_ms: u64) -> Vec<u8> {
+        use rcgen::{CertificateParams, KeyPair};
+        let key = KeyPair::generate().unwrap();
+        let marker = format!("nodedb-enrollment-7-{expires_at_ms}");
+        let params = CertificateParams::new(vec!["localhost".to_string(), marker]).unwrap();
+        params.self_signed(&key).unwrap().der().to_vec()
+    }
+
     fn gen_cert_with_spiffe(spiffe_uri: &str) -> (Vec<u8>, [u8; 32]) {
         use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
         let key = KeyPair::generate().unwrap();
@@ -360,16 +391,90 @@ mod tests {
         );
     }
 
-    /// A cert not in the topology at all is accepted (bootstrap window).
+    /// An unknown cert is rejected once a store reports bootstrap closure.
     #[test]
-    fn unknown_spki_bootstrap_window_accepted() {
+    fn unknown_spki_after_bootstrap_is_rejected() {
         let (cert_der, _pin) = gen_cert_and_pin();
-        let store = MapIdentityStore::new(); // empty topology
-        let result = check_cert_pin(&cert_der, &store);
-        assert!(
-            result.is_ok(),
-            "expected bootstrap window accept, got: {result:?}"
+        let store = MapIdentityStore::new();
+        assert!(check_cert_pin(&cert_der, &store).is_err());
+    }
+
+    #[test]
+    fn ca_signed_enrollment_marker_is_bounded() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let store = crate::transport::TopologyIdentityStore::new();
+        store.install_topology(Arc::new(RwLock::new(
+            crate::topology::ClusterTopology::new(),
+        )));
+        let valid = gen_enrollment_cert(now_ms + 60_000);
+        let valid_pin = spki_pin_from_cert_der(&valid).unwrap();
+        assert!(store.preauthorize(
+            valid_pin,
+            std::time::Instant::now() + std::time::Duration::from_secs(60)
+        ));
+        assert!(check_cert_pin(&valid, &store).is_ok());
+
+        let expired = gen_enrollment_cert(now_ms);
+        let expired_pin = spki_pin_from_cert_der(&expired).unwrap();
+        assert!(store.preauthorize(
+            expired_pin,
+            std::time::Instant::now() + std::time::Duration::from_secs(60)
+        ));
+        assert!(check_cert_pin(&expired, &store).is_err());
+
+        let excessive = gen_enrollment_cert(now_ms + 16 * 60_000);
+        let excessive_pin = spki_pin_from_cert_der(&excessive).unwrap();
+        assert!(store.preauthorize(
+            excessive_pin,
+            std::time::Instant::now() + std::time::Duration::from_secs(60)
+        ));
+        assert!(check_cert_pin(&excessive, &store).is_err());
+    }
+
+    #[test]
+    fn revoked_enrollment_marker_is_rejected() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cert = gen_enrollment_cert(now_ms + 60_000);
+        let pin = spki_pin_from_cert_der(&cert).unwrap();
+        let store = crate::transport::TopologyIdentityStore::new();
+        store.install_topology(Arc::new(RwLock::new(
+            crate::topology::ClusterTopology::new(),
+        )));
+        assert!(store.preauthorize(
+            pin,
+            std::time::Instant::now() + std::time::Duration::from_secs(60)
+        ));
+        assert!(check_cert_pin(&cert, &store).is_ok());
+        store.revoke_preauthorization(
+            &pin,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
         );
+        assert!(check_cert_pin(&cert, &store).is_err());
+    }
+
+    #[test]
+    fn explicitly_preauthorized_enrollment_pin_is_accepted() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let cert_der = gen_enrollment_cert(now_ms + 60_000);
+        let pin = spki_pin_from_cert_der(&cert_der).unwrap();
+        let store = crate::transport::TopologyIdentityStore::new();
+        store.install_topology(Arc::new(RwLock::new(
+            crate::topology::ClusterTopology::new(),
+        )));
+        assert!(store.preauthorize(
+            pin,
+            std::time::Instant::now() + std::time::Duration::from_secs(60)
+        ));
+        assert!(check_cert_pin(&cert_der, &store).is_ok());
     }
 
     /// A cert with a SPIFFE id that matches the topology entry is accepted.

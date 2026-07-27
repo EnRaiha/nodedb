@@ -274,6 +274,7 @@ fn columnar_routing(op: &ColumnarOp, database_id: DatabaseId) -> PlanRouting {
 fn crdt_routing(op: &CrdtOp, database_id: DatabaseId) -> PlanRouting {
     match op {
         CrdtOp::Apply { collection, .. }
+        | CrdtOp::ApplyAuthenticated { collection, .. }
         | CrdtOp::ListInsert { collection, .. }
         | CrdtOp::ListDelete { collection, .. }
         | CrdtOp::ListMove { collection, .. }

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! WebSocket session loop for NodeDB-Lite sync connections.
-
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::Ordering};
 
@@ -47,9 +46,7 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
     let mut presence_rx: Option<tokio::sync::mpsc::Receiver<std::sync::Arc<Vec<u8>>>> = None;
     let mut presence_registered = false;
 
-    // Built lazily on the first array frame, once the handshake has established
-    // the session's tenant — the inbound engine binds that tenant for Raft-log
-    // routing and shape fan-out (see `build_array_inbound`).
+    // Built lazily after the handshake establishes the session tenant.
     let mut array_inbound: Option<Arc<crate::control::array_sync::OriginArrayInbound>> = None;
 
     let mut array_delivery_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>> = None;
@@ -287,6 +284,7 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
                                 delta_msg,
                                 response,
                                 session.identity.as_ref(),
+                                session.delta_signing_key.as_ref(),
                                 session.producer_id,
                                 session.accepted_epoch,
                             )

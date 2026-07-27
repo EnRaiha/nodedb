@@ -2,8 +2,9 @@
 
 //! WebSocket listener for NodeDB-Lite sync connections.
 //!
-//! Accepts `ws://` connections on the Tokio Control Plane. Each connection
-//! spawns a sync session with full RLS, audit, DLQ, and rate limiting.
+//! Accepts loopback-only `ws://` connections on the Tokio Control Plane for a
+//! local TLS-terminating proxy. Each connection spawns a sync session with full
+//! RLS, audit, DLQ, and rate limiting. Public plaintext binds are rejected.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -90,6 +91,16 @@ impl SyncListenerState {
 /// joins the cluster — and fail loudly on a port conflict while nothing is
 /// yet exposed. See `bootstrap::listeners::bind_listeners`.
 pub async fn bind_sync_listener(addr: SocketAddr) -> crate::Result<TcpListener> {
+    // Plaintext `ws://` sync must terminate TLS at a loopback proxy: reject any
+    // public bind here so both the fail-fast boot path (`bind_listeners`) and
+    // the convenience `start_sync_listener` path are covered by one guard.
+    if !addr.ip().is_loopback() {
+        return Err(crate::Error::Config {
+            detail: format!(
+                "plaintext sync listener {addr} must bind to loopback behind a TLS-terminating proxy"
+            ),
+        });
+    }
     TcpListener::bind(&addr)
         .await
         .map_err(|e| crate::Error::Config {
@@ -257,5 +268,23 @@ mod tests {
             cfg.listen_addr.port(),
             crate::config::server::DEFAULT_SYNC_PORT
         );
+    }
+
+    #[test]
+    fn default_plaintext_sync_listener_is_loopback_only() {
+        assert!(SyncListenerConfig::default().listen_addr.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn public_plaintext_sync_bind_is_rejected() {
+        let config = SyncListenerConfig {
+            listen_addr: "0.0.0.0:9090".parse().unwrap(),
+            ..SyncListenerConfig::default()
+        };
+        let error = match start_sync_listener(config, None).await {
+            Ok(_) => panic!("public plaintext listener unexpectedly started"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("TLS-terminating proxy"));
     }
 }

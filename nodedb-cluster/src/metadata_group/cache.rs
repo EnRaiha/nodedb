@@ -164,6 +164,8 @@ impl MetadataCache {
                 // and installs the batch on the owning node. The cluster
                 // cache has no surrogate state to track.
             }
+            MetadataEntry::EnrollmentPreauthorization { .. }
+            | MetadataEntry::EnrollmentPreauthorizationRevoke { .. } => {}
             MetadataEntry::JoinTokenTransition { .. } => {
                 // Token lifecycle transitions are enforced by the bootstrap-
                 // listener handler at apply time. The cluster cache records

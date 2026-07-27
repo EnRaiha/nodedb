@@ -20,6 +20,7 @@ use super::types::*;
 #[derive(Clone)]
 pub struct SystemCatalog {
     pub(super) db: Arc<Database>,
+    pub(super) crdt_signing_root: Arc<std::sync::RwLock<Option<[u8; 32]>>>,
     #[cfg(test)]
     pub(super) fail_next_user_counter_write: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -41,6 +42,7 @@ impl SystemCatalog {
 
         Ok(Self {
             db: Arc::new(db),
+            crdt_signing_root: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
             fail_next_user_counter_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -56,6 +58,7 @@ impl SystemCatalog {
         Self::ensure_bootstrapped(&db)?;
         Ok(Self {
             db: Arc::new(db),
+            crdt_signing_root: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
             fail_next_user_counter_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })

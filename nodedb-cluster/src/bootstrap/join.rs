@@ -158,27 +158,38 @@ async fn try_join_once(
     // the one peer that can actually answer. `HashSet` deduplicates
     // so a redirect loop can't consume all attempts against the same
     // address.
-    let mut work: std::collections::VecDeque<SocketAddr> =
-        config.seed_nodes.iter().copied().collect();
+    let mut work: std::collections::VecDeque<(SocketAddr, bool)> = config
+        .seed_nodes
+        .iter()
+        .copied()
+        .map(|addr| (addr, true))
+        .collect();
     {
         // Sort so the designated bootstrapper surfaces first. Leader
         // redirects get prepended with push_front below, keeping the
         // "most likely to answer" candidate at the head.
-        let mut sorted: Vec<SocketAddr> = work.drain(..).collect();
-        sorted.sort();
+        let mut sorted: Vec<(SocketAddr, bool)> = work.drain(..).collect();
+        sorted.sort_by_key(|(addr, _)| *addr);
         work.extend(sorted);
     }
     let mut visited: HashSet<SocketAddr> = HashSet::new();
     let mut redirects: u32 = 0;
     let mut last_err: Option<ClusterError> = None;
 
-    while let Some(addr) = work.pop_front() {
+    while let Some((addr, enforce_issuer_pin)) = work.pop_front() {
         if !visited.insert(addr) {
             continue;
         }
 
         let rpc = RaftRpc::JoinRequest(req_template.clone());
-        match transport.send_rpc_to_addr(addr, rpc).await {
+        let response = if enforce_issuer_pin {
+            transport.send_rpc_to_addr(addr, rpc).await
+        } else {
+            transport
+                .send_rpc_to_authenticated_redirect(addr, rpc)
+                .await
+        };
+        match response {
             Ok(RaftRpc::JoinResponse(resp)) => {
                 if resp.success {
                     return apply_join_response(config, catalog, transport, &resp);
@@ -193,7 +204,10 @@ async fn try_join_once(
                             "following leader redirect"
                         );
                         redirects += 1;
-                        work.push_front(leader);
+                        // The redirect address is authenticated by the pinned
+                        // issuer's response envelope. Do not require the leader
+                        // to present the issuer's leaf certificate.
+                        work.push_front((leader, false));
                         continue;
                     }
                     debug!(

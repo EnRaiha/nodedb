@@ -8,8 +8,10 @@ use crate::message::{
 
 /// Trait for Raft network transport.
 ///
-/// The `nodedb-cluster` crate implements this over nexar's QUIC/RDMA
-/// transport. Tests use an in-memory channel-based implementation.
+/// The `nodedb-cluster` crate is the sole production implementation and
+/// supplies authenticated, replay-protected cluster envelopes over mTLS QUIC.
+/// This consensus crate must remain network-agnostic: exposing these messages
+/// from a listener here would bypass peer identity and frame authentication.
 pub trait RaftTransport: Send + Sync {
     /// Send AppendEntries RPC to a peer and await response.
     fn append_entries(

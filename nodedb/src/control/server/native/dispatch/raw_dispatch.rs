@@ -41,11 +41,15 @@ pub(super) async fn dispatch_authorized_single_task(
     plan: PhysicalPlan,
     txn_id: Option<TxnId>,
 ) -> crate::Result<Response> {
-    if matches!(
-        &plan,
-        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
-    ) {
-        return dispatch_external_crdt_apply(ctx, tenant_id, plan, txn_id).await;
+    match &plan {
+        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. }) => {
+            return dispatch_external_crdt_apply(ctx, tenant_id, plan, txn_id).await;
+        }
+        PhysicalPlan::Crdt(
+            nodedb_physical::physical_plan::CrdtOp::ApplyAuthenticated { .. }
+            | nodedb_physical::physical_plan::CrdtOp::ImportSnapshot { .. },
+        ) => return Err(crate::Error::CrdtApplyRequiresAdmission),
+        _ => {}
     }
     let task = nodedb_physical::physical_task::PhysicalTask {
         tenant_id,

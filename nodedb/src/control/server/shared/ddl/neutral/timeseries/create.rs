@@ -65,6 +65,7 @@ pub fn create_timeseries(
         // Stamped by the metadata applier at commit time.
         descriptor_version: 0,
         constraint_version: 0,
+        crdt_signing_required: false,
         modification_hlc: nodedb_types::Hlc::ZERO,
         fields,
         field_defs: Vec::new(),

@@ -26,6 +26,9 @@ use super::config::TlsCredentials;
 /// There is no default. Every production code path resolves this before
 /// constructing a transport, making the insecure path impossible to reach
 /// by omission.
+// TLS credentials are constructed once per transport. Keeping them inline
+// avoids an otherwise unnecessary allocation on the production-only variant.
+#[allow(clippy::large_enum_variant)]
 pub enum TransportCredentials {
     /// Mutual TLS — both sides present certificates signed by the cluster
     /// CA. Handshake rejects peers whose cert chains to any other trust

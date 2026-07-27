@@ -19,7 +19,7 @@ use nodedb_types::sync::wire::{AckStatus, SyncProvenance};
 
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::sync_gate::SyncAdmit;
-use crate::engine::crdt::tenant_state::ValidatedApplyOutcome;
+use crate::engine::crdt::tenant_state::{DeltaSigningAdmission, ValidatedApplyOutcome};
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::task::ExecutionTask;
@@ -41,6 +41,11 @@ pub(in crate::data::executor) struct CrdtApplyParams<'a> {
     pub provenance: Option<&'a SyncProvenance>,
     pub constraint_version_required: u64,
     pub expected_frontier_digest: Option<[u8; 32]>,
+    pub auth_user_id: u64,
+    pub auth_device_id: u64,
+    pub auth_seq_no: u64,
+    pub delta_signature: [u8; 32],
+    pub signing_required: bool,
 }
 
 impl CoreLoop {
@@ -112,6 +117,11 @@ impl CoreLoop {
             provenance,
             constraint_version_required,
             expected_frontier_digest,
+            auth_user_id,
+            auth_device_id,
+            auth_seq_no,
+            delta_signature,
+            signing_required,
         } = params;
         let tenant_id = task.request.tenant_id;
 
@@ -331,12 +341,24 @@ impl CoreLoop {
                     if constraint_version_required > installed {
                         (GateOutcome::Pending { installed }, None)
                     } else {
-                        let applied = engine.apply_committed_delta_validated(
+                        let applied = engine.apply_committed_delta_authenticated(
                             collection,
                             delta,
                             surrogate,
                             document_id,
                             peer_id,
+                            DeltaSigningAdmission {
+                                auth: nodedb_crdt::CrdtAuthContext {
+                                    user_id: auth_user_id,
+                                    tenant_id: tenant_id.as_u64(),
+                                    auth_expires_at: 0,
+                                    delta_signature,
+                                    device_id: auth_device_id,
+                                    seq_no: auth_seq_no,
+                                },
+                                required: signing_required,
+                                preverified: true,
+                            },
                         );
                         // On a Clean apply, read the merged row back and encode
                         // it while the engine borrow is still live so the bytes

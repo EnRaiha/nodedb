@@ -152,7 +152,10 @@ where
         return Ok(InTxnRoute::Read(Box::new(task)));
     }
 
-    if matches!(&task.plan, PhysicalPlan::Crdt(CrdtOp::Apply { .. })) {
+    if matches!(
+        &task.plan,
+        PhysicalPlan::Crdt(CrdtOp::Apply { .. } | CrdtOp::ApplyAuthenticated { .. })
+    ) {
         return Err(StagingGateError::Dispatch(
             crate::Error::CrdtApplyForbiddenInTransaction,
         ));

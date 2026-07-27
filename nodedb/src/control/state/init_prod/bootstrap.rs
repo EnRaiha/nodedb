@@ -79,6 +79,9 @@ pub(super) fn run(
     auth_config: &crate::config::auth::AuthConfig,
 ) -> crate::Result<ProdBootstrap> {
     let mut credentials = CredentialStore::open(catalog_path)?;
+    credentials
+        .catalog()
+        .configure_crdt_signing_root(wal.crdt_signing_root()?)?;
 
     // Bring the surrogate PK catalog up to the current key layout before
     // any allocation path reads it: v1 (bare) → v2 (database-scoped) →

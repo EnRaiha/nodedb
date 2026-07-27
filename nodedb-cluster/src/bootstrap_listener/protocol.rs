@@ -22,6 +22,7 @@ use crate::error::ClusterError;
 /// bundle is under 8 KiB; the cap guards against a malformed
 /// `len` prefix exhausting memory before decode.
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
+pub(super) const DELIVERY_ACK: &[u8] = b"nodedb-bootstrap-delivered-v1";
 
 /// Request: "I am `node_id`, this is my join token, issue me creds."
 #[derive(

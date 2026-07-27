@@ -40,6 +40,7 @@ pub(super) struct GroupSetup {
     pub(super) sequencer_state_machine: Arc<Mutex<SequencerStateMachine>>,
     pub(super) calvin_read_result_senders: Arc<Mutex<BTreeMap<u32, Sender<ReadResultEvent>>>>,
     pub(super) metadata_applier: Arc<dyn nodedb_cluster::MetadataApplier>,
+    pub(super) token_state: nodedb_cluster::SharedTokenStateMirror,
     pub(super) plan_executor: Arc<crate::control::LocalPlanExecutor>,
     pub(super) vshard_handler: nodedb_cluster::VShardEnvelopeHandler,
     pub(super) tick_interval: Duration,
@@ -128,11 +129,41 @@ pub(super) fn build_group_setup(
     // reader observes the change, bumps the applied-index watcher,
     // broadcasts `CatalogChangeEvent`, and spawns Data Plane
     // `Register` dispatches on committed `CollectionDdl::Create`.
+    let token_state: nodedb_cluster::SharedTokenStateMirror = Arc::new(Mutex::new(
+        shared
+            .credentials
+            .catalog()
+            .list_join_token_states()?
+            .into_iter()
+            .map(|state| (state.token_hash, state))
+            .collect(),
+    ));
     let metadata_applier_concrete = Arc::new(MetadataCommitApplier::new(
         handle.metadata_cache.clone(),
         shared.catalog_change_tx.clone(),
         shared.credentials.clone(),
+        Arc::clone(&token_state),
     ));
+    metadata_applier_concrete.install_transport(Arc::clone(&handle.transport));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(u64::MAX);
+    for (spki, expires_at_ms) in shared
+        .credentials
+        .catalog()
+        .list_enrollment_preauthorizations(now_ms)?
+    {
+        let ttl = std::time::Duration::from_millis(expires_at_ms - now_ms);
+        if !handle.transport.preauthorize_peer_identity(spki, ttl) {
+            // Keep startup live and admission fail-closed if durable state from
+            // an older/corrupt deployment exceeds the current bounded cache.
+            tracing::error!(
+                ?spki,
+                "enrollment preauthorization capacity exhausted during rehydration; identity not admitted"
+            );
+        }
+    }
     // Install the Weak<SharedState> before the raft loop starts
     // ticking so no commit can reach the applier without it.
     metadata_applier_concrete.install_shared(Arc::downgrade(shared));
@@ -222,6 +253,7 @@ pub(super) fn build_group_setup(
         sequencer_state_machine,
         calvin_read_result_senders,
         metadata_applier,
+        token_state,
         plan_executor,
         vshard_handler,
         tick_interval,

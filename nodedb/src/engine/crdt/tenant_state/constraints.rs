@@ -125,4 +125,15 @@ impl TenantCrdtEngine {
     pub fn is_bitemporal(&self, collection: &str) -> bool {
         self.validator.is_bitemporal(collection)
     }
+
+    /// Require signed, replay-protected peer deltas for this tenant's
+    /// collection. The caller must also install a tenant signing verifier.
+    pub fn require_delta_signing(&mut self, collection: impl Into<String>) {
+        self.validator.require_delta_signing(collection);
+    }
+
+    /// Install the tenant's registered user/device signing keys.
+    pub fn set_delta_verifier(&mut self, verifier: nodedb_crdt::DeltaSigner) {
+        self.validator.set_delta_verifier(verifier);
+    }
 }

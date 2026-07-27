@@ -7,9 +7,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use quinn::Endpoint;
+use rustls::pki_types::CertificateDer;
 
 use super::protocol::{
-    BootstrapCredsRequest, BootstrapCredsResponse, MAX_FRAME_BYTES, decode_response, encode_request,
+    BootstrapCredsRequest, BootstrapCredsResponse, DELIVERY_ACK, MAX_FRAME_BYTES, decode_response,
+    encode_request,
 };
 
 /// Errors from [`fetch_creds`].
@@ -21,6 +23,8 @@ pub enum FetchError {
     Bind(String),
     #[error("bootstrap connect {addr}: {detail}")]
     Connect { addr: SocketAddr, detail: String },
+    #[error("bootstrap issuer identity mismatch: {0}")]
+    IssuerIdentity(String),
     #[error("bootstrap stream open: {0}")]
     Stream(String),
     #[error("bootstrap io: {0}")]
@@ -46,8 +50,21 @@ pub async fn fetch_creds(
     // CryptoProvider registered before we build the client config.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let client_config = nexar::transport::tls::make_bootstrap_client_config()
+    let ca_der = crate::auth::join_token::bootstrap_ca_cert(token_hex)
+        .map_err(|e| FetchError::ClientConfig(format!("token bootstrap CA: {e}")))?;
+    let expected_issuer_spki = crate::auth::join_token::bootstrap_issuer_spki(token_hex)
+        .map_err(|e| FetchError::ClientConfig(format!("token bootstrap issuer: {e}")))?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca_der))
+        .map_err(|e| FetchError::ClientConfig(format!("add token bootstrap CA: {e}")))?;
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"nexar/1".to_vec()];
+    let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
         .map_err(|e| FetchError::ClientConfig(e.to_string()))?;
+    let client_config = quinn::ClientConfig::new(std::sync::Arc::new(quic_config));
 
     let bind_addr: SocketAddr = if seed.is_ipv6() {
         "[::]:0".parse().expect("valid ipv6 any")
@@ -57,12 +74,9 @@ pub async fn fetch_creds(
     let mut endpoint = Endpoint::client(bind_addr).map_err(|e| FetchError::Bind(e.to_string()))?;
     endpoint.set_default_client_config(client_config);
 
-    // The self-signed server cert's SNI is "localhost" in nexar's
-    // `generate_self_signed_cert`; we skip verification via the
-    // bootstrap client config so the SNI value is cosmetic.
     let fut = async {
         let connecting = endpoint
-            .connect(seed, "localhost")
+            .connect(seed, crate::transport::config::SNI_HOSTNAME)
             .map_err(|e| FetchError::Connect {
                 addr: seed,
                 detail: e.to_string(),
@@ -71,6 +85,22 @@ pub async fn fetch_creds(
             addr: seed,
             detail: e.to_string(),
         })?;
+        let peer_identity = conn
+            .peer_identity()
+            .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
+            .and_then(|chain| chain.first().cloned())
+            .ok_or_else(|| {
+                FetchError::IssuerIdentity("peer supplied no leaf certificate".into())
+            })?;
+        let actual_issuer_spki = crate::transport::peer_identity_verifier::spki_pin_from_cert_der(
+            peer_identity.as_ref(),
+        )
+        .map_err(|e| FetchError::IssuerIdentity(format!("invalid peer leaf: {e}")))?;
+        if actual_issuer_spki != expected_issuer_spki {
+            return Err(FetchError::IssuerIdentity(
+                "peer leaf SPKI does not match the join token".into(),
+            ));
+        }
         let (mut send, mut recv) = conn
             .open_bi()
             .await
@@ -82,11 +112,24 @@ pub async fn fetch_creds(
         };
         let body = encode_request(&req).map_err(|e| FetchError::Codec(e.to_string()))?;
         write_frame(&mut send, &body).await?;
-        send.finish().map_err(|e| FetchError::Io(e.to_string()))?;
 
         let resp_bytes = read_frame(&mut recv).await?;
         let resp: BootstrapCredsResponse =
             decode_response(&resp_bytes).map_err(|e| FetchError::Codec(e.to_string()))?;
+        if resp.ok {
+            // The token is durably consumed before the server exposes these
+            // bytes. Once a complete success response is decoded, an ACK
+            // transport failure must not discard the only usable bundle and
+            // strand the joiner. The server retains the bounded enrollment
+            // authorization when this best-effort ACK is absent.
+            if let Err(error) = write_frame(&mut send, DELIVERY_ACK).await {
+                tracing::warn!(%error, "bootstrap delivery ACK write failed after bundle receipt");
+            } else if let Err(error) = send.finish() {
+                tracing::warn!(%error, "bootstrap delivery ACK finish failed after bundle receipt");
+            }
+        } else {
+            let _ = send.finish();
+        }
         Ok::<_, FetchError>(resp)
     };
 

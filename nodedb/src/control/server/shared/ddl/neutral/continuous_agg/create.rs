@@ -187,6 +187,7 @@ pub async fn create_continuous_aggregate(
             created_at: now,
             descriptor_version: 0,
             constraint_version: 0,
+            crdt_signing_required: false,
             modification_hlc: nodedb_types::Hlc::ZERO,
             fields: Vec::new(),
             field_defs: Vec::new(),

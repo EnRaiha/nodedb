@@ -4,12 +4,14 @@ pub mod auth_context;
 pub mod client;
 pub mod config;
 pub mod credentials;
+mod identity_admission;
 pub mod peer_identity_store;
 pub mod peer_identity_verifier;
 pub mod pinned_verifier;
 pub mod rpc_handler;
 pub mod server;
 mod stream_dispatch;
+mod topology_identity_store;
 
 pub use auth_context::AuthContext;
 
@@ -19,6 +21,7 @@ pub use config::{
     generate_node_credentials_multi_san, issue_leaf_for_sans, load_crls_from_pem,
     make_raft_client_config_mtls, make_raft_server_config_mtls,
 };
+pub use peer_identity_verifier::enrollment_identity_from_cert_der;
 pub use pinned_verifier::{PinnedClientVerifier, PinnedServerVerifier};
 
 /// Re-exported PKI types used in the public shape of [`TlsCredentials`].
@@ -38,3 +41,4 @@ pub use peer_identity_verifier::{
     IDENTITY_MISMATCH_QUIC_ERROR, VerifyMethod, VerifyOutcome, spki_pin_from_cert_der,
 };
 pub use rpc_handler::RaftRpcHandler;
+pub use topology_identity_store::TopologyIdentityStore;

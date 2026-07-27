@@ -74,6 +74,26 @@ fn resolve_crdt_flag(
     Ok(crdt)
 }
 
+fn validate_crdt_signing_storage(
+    signing_required: bool,
+    crdt: bool,
+    wal_authenticated: bool,
+) -> Result<(), DdlError> {
+    if signing_required && !crdt {
+        return Err(err(
+            "42601",
+            "SIGNED_DELTAS requires WITH (crdt=true)".to_string(),
+        ));
+    }
+    if signing_required && !wal_authenticated {
+        return Err(err(
+            "55000",
+            "SIGNED_DELTAS requires authenticated WAL encryption".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Per-surface configuration. The fields are the entire surface-level
 /// difference between `CREATE COLLECTION` and `CREATE TABLE`.
 pub struct Variant {
@@ -251,11 +271,17 @@ pub async fn build_and_persist(
     let append_only = flags.iter().any(|f| f == "APPEND_ONLY");
     let hash_chain = flags.iter().any(|f| f == "HASH_CHAIN");
     let bitemporal = bitemporal_flag;
+    let crdt_signing_required = flags.iter().any(|flag| flag == "SIGNED_DELTAS");
     if hash_chain && !append_only {
         return Err(err("42601", "HASH_CHAIN requires APPEND_ONLY".to_string()));
     }
 
     let crdt = resolve_crdt_flag(options, &collection_type)?;
+    validate_crdt_signing_storage(
+        crdt_signing_required,
+        crdt,
+        state.wal.payloads_authenticated(),
+    )?;
     let balanced =
         parse_balanced_clause_from_raw(balanced_raw.unwrap_or("")).map_err(|e| err("42601", e))?;
 
@@ -279,6 +305,7 @@ pub async fn build_and_persist(
         created_at: now,
         descriptor_version: 0,
         constraint_version: 0,
+        crdt_signing_required,
         modification_hlc: nodedb_types::Hlc::ZERO,
         fields,
         field_defs: Vec::new(),
@@ -474,7 +501,7 @@ mod tests {
     //! Collection name validation tests. Relocated verbatim from the pgwire
     //! `pgwire::ddl::collection::create::tests` module (now deleted).
 
-    use super::resolve_crdt_flag;
+    use super::{resolve_crdt_flag, validate_crdt_signing_storage};
 
     fn opts(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -505,6 +532,22 @@ mod tests {
         let err = resolve_crdt_flag(&options, &nodedb_types::CollectionType::document())
             .expect_err("a non-boolean crdt value must be rejected");
         assert_eq!(err.sqlstate, "42601");
+    }
+
+    #[test]
+    fn signed_deltas_require_crdt_and_authenticated_wal() {
+        let no_crdt = validate_crdt_signing_storage(true, false, true)
+            .expect_err("signed deltas without CRDT must be rejected");
+        assert_eq!(no_crdt.sqlstate, "42601");
+
+        let unauthenticated_wal = validate_crdt_signing_storage(true, true, false)
+            .expect_err("signed deltas without authenticated WAL must be rejected");
+        assert_eq!(unauthenticated_wal.sqlstate, "55000");
+
+        validate_crdt_signing_storage(true, true, true)
+            .expect("signed CRDT deltas with authenticated WAL must be accepted");
+        validate_crdt_signing_storage(false, false, false)
+            .expect("ordinary collections do not require WAL encryption");
     }
 
     #[test]

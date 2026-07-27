@@ -118,6 +118,9 @@ pub(super) fn parse_collection_body(trimmed: &str, name: &str) -> Result<Collect
     if upper_body.contains("BITEMPORAL") {
         flags.push("BITEMPORAL".to_string());
     }
+    if upper_body.contains("SIGNED_DELTAS") {
+        flags.push("SIGNED_DELTAS".to_string());
+    }
 
     let balanced_raw = extract_balanced_raw(body);
 
@@ -214,6 +217,16 @@ mod tests {
         )
         .expect("agreeing engine clauses are accepted");
         assert_eq!(engine, Some("kv".to_string()));
+    }
+
+    #[test]
+    fn signed_deltas_with_option_is_preserved_as_a_collection_flag() {
+        let (_, _, _, flags, _) = parse_collection_body(
+            "CREATE COLLECTION t (id INT PRIMARY KEY) WITH (engine='document', crdt=true, signed_deltas=true)",
+            "t",
+        )
+        .expect("signed CRDT collection should parse");
+        assert!(flags.iter().any(|flag| flag == "SIGNED_DELTAS"));
     }
 
     #[test]

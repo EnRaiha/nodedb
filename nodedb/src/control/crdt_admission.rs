@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Serialized CRDT apply admission.
-//!
-//! A preview and its fenced apply run in one Control-Plane vShard admission
-//! slot. Replicated transaction/restore writers can still advance the frontier
-//! after preview, so an apply-side mismatch repeats the entire preview and
-//! policy evaluation under that same slot; policy output is never reused.
+//! Serialized preview, policy, and fenced CRDT apply admission.
 
 use std::time::Duration;
 
@@ -19,15 +14,11 @@ use crate::control::wal_replication::to_replicated_entry;
 use crate::event::EventSource;
 use crate::types::{DatabaseId, TenantId, VShardId};
 
-/// Synchronous, fail-closed admission policy over the authoritative post-image.
 pub trait CrdtPostImagePolicy: Send + Sync {
-    /// Rejecting returns a typed error and prevents proposal or local apply.
     fn evaluate(&self, preview: &CrdtPreviewResult) -> crate::Result<()>;
 }
 
-/// Explicit temporary policy for trusted internal callers.
-///
-/// External transports must replace this with their exact post-image policy.
+/// Explicit policy for trusted internal callers.
 pub struct TrustedInternalCrdtPolicy;
 
 impl CrdtPostImagePolicy for TrustedInternalCrdtPolicy {
@@ -38,7 +29,6 @@ impl CrdtPostImagePolicy for TrustedInternalCrdtPolicy {
 
 const FRONTIER_RETRY_LIMIT: usize = 8;
 
-/// Capability-bearing inputs for an externally initiated CRDT apply.
 pub struct AuthorizedCrdtApplyAdmissionRequest<'a> {
     pub authorized: AuthorizedTask,
     pub collection: &'a str,
@@ -47,7 +37,6 @@ pub struct AuthorizedCrdtApplyAdmissionRequest<'a> {
     pub policy: &'a dyn CrdtPostImagePolicy,
 }
 
-/// Inputs for one trusted-internal serialized CRDT delta admission.
 pub struct CrdtApplyAdmissionRequest<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
@@ -58,13 +47,11 @@ pub struct CrdtApplyAdmissionRequest<'a> {
     pub policy: &'a dyn CrdtPostImagePolicy,
 }
 
-/// Successful admitted apply, preserving the Data Plane write version.
 pub struct CrdtAdmissionOutcome {
     pub payload: Vec<u8>,
     pub write_version: crate::types::Lsn,
 }
 
-/// Inputs for serialized RESTORE delta generation and admission.
 pub struct CrdtRestoreAdmissionRequest<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
@@ -94,6 +81,7 @@ struct CrdtAdmissionWorkflow<'a> {
 pub fn changes_crdt_frontier(op: &CrdtOp) -> bool {
     match op {
         CrdtOp::Apply { .. }
+        | CrdtOp::ApplyAuthenticated { .. }
         | CrdtOp::ImportSnapshot { .. }
         | CrdtOp::ListInsert { .. }
         | CrdtOp::ListDelete { .. }
@@ -127,6 +115,7 @@ pub async fn dispatch_authorized_crdt_apply_admitted_outcome(
         event_source,
         policy,
     } = request;
+    enforce_external_signing_policy(state, &authorized, collection)?;
     let task = authorized.into_physical_task();
     dispatch_crdt_apply_admitted_outcome(
         state,
@@ -141,6 +130,36 @@ pub async fn dispatch_authorized_crdt_apply_admitted_outcome(
         },
     )
     .await
+}
+
+fn enforce_external_signing_policy(
+    state: &SharedState,
+    authorized: &AuthorizedTask,
+    collection: &str,
+) -> crate::Result<()> {
+    let stored = state
+        .credentials
+        .catalog()
+        .get_collection(
+            authorized.database_id(),
+            authorized.tenant_id().as_u64(),
+            collection,
+        )?
+        .ok_or_else(|| crate::Error::CollectionNotFound {
+            tenant_id: authorized.tenant_id(),
+            collection: collection.to_owned(),
+        })?;
+    if stored.crdt_signing_required
+        && matches!(authorized.plan(), PhysicalPlan::Crdt(CrdtOp::Apply { .. }))
+    {
+        return Err(crate::Error::RejectedAuthz {
+            tenant_id: authorized.tenant_id(),
+            resource: format!(
+                "collection:{collection}:unsigned_crdt_delta_requires_authenticated_sync"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Preview, authorize, fence, and durably apply one trusted-internal CRDT delta.
@@ -158,17 +177,32 @@ pub(crate) async fn dispatch_crdt_apply_admitted_outcome(
         policy,
     } = request;
     let (document_id, delta) = match &plan {
-        PhysicalPlan::Crdt(CrdtOp::Apply {
-            collection: plan_collection,
-            document_id,
-            delta,
-            expected_frontier_digest: None,
-            ..
-        }) if plan_collection == collection => (document_id.clone(), delta.clone()),
-        PhysicalPlan::Crdt(CrdtOp::Apply {
-            expected_frontier_digest: Some(_),
-            ..
-        }) => return Err(crate::Error::CrdtAdmissionCallerFence),
+        PhysicalPlan::Crdt(
+            CrdtOp::Apply {
+                collection: plan_collection,
+                document_id,
+                delta,
+                expected_frontier_digest: None,
+                ..
+            }
+            | CrdtOp::ApplyAuthenticated {
+                collection: plan_collection,
+                document_id,
+                delta,
+                expected_frontier_digest: None,
+                ..
+            },
+        ) if plan_collection == collection => (document_id.clone(), delta.clone()),
+        PhysicalPlan::Crdt(
+            CrdtOp::Apply {
+                expected_frontier_digest: Some(_),
+                ..
+            }
+            | CrdtOp::ApplyAuthenticated {
+                expected_frontier_digest: Some(_),
+                ..
+            },
+        ) => return Err(crate::Error::CrdtAdmissionCallerFence),
         _ => {
             return Err(crate::Error::CrdtAdmissionInvalidPlan {
                 reason: "expected an unfenced CRDT Apply for the supplied collection",
@@ -277,6 +311,37 @@ fn stamp_fence(plan: PhysicalPlan, digest: [u8; 32]) -> crate::Result<PhysicalPl
             constraint_version_required,
             expected_frontier_digest: Some(digest),
         })),
+        PhysicalPlan::Crdt(CrdtOp::ApplyAuthenticated {
+            collection,
+            document_id,
+            delta,
+            peer_id,
+            mutation_id,
+            surrogate,
+            provenance,
+            constraint_version_required,
+            expected_frontier_digest: None,
+            auth_user_id,
+            auth_device_id,
+            auth_seq_no,
+            delta_signature,
+            signing_required,
+        }) => Ok(PhysicalPlan::Crdt(CrdtOp::ApplyAuthenticated {
+            collection,
+            document_id,
+            delta,
+            peer_id,
+            mutation_id,
+            surrogate,
+            provenance,
+            constraint_version_required,
+            expected_frontier_digest: Some(digest),
+            auth_user_id,
+            auth_device_id,
+            auth_seq_no,
+            delta_signature,
+            signing_required,
+        })),
         _ => Err(crate::Error::CrdtAdmissionInvalidPlan {
             reason: "validated CRDT Apply plan was changed before fence stamping",
         }),
@@ -295,7 +360,8 @@ pub async fn dispatch_authorized_crdt_apply_admitted(
     )
 }
 
-/// Payload-only compatibility wrapper for trusted internal callers.
+/// Payload-only compatibility wrapper for trusted internal test callers.
+#[cfg(test)]
 pub(crate) async fn dispatch_crdt_apply_admitted(
     state: &SharedState,
     request: CrdtApplyAdmissionRequest<'_>,
@@ -939,6 +1005,65 @@ mod tests {
             seen.lock().expect("policy lock").len(),
             FRONTIER_RETRY_LIMIT
         );
+    }
+
+    #[tokio::test]
+    async fn signed_delta_collection_rejects_plain_external_apply_before_preview() {
+        let (state, _side, _directory) = fixture();
+        let tenant_id = TenantId::new(1);
+        let mut collection =
+            crate::control::security::catalog::StoredCollection::new(1, "docs", "owner");
+        collection.crdt = true;
+        collection.crdt_signing_required = true;
+        state
+            .credentials
+            .catalog()
+            .put_collection(DatabaseId::DEFAULT, &collection)
+            .expect("store signed-delta collection");
+        let task = nodedb_physical::physical_task::PhysicalTask {
+            tenant_id,
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, "docs"),
+            plan: apply_plan(),
+            post_set_op: nodedb_physical::physical_task::PostSetOp::None,
+            txn_id: None,
+        };
+        let identity =
+            crate::control::security::identity::AuthenticatedIdentity::new_internal_service(
+                1,
+                "crdt-test",
+                tenant_id,
+                Vec::new(),
+                true,
+                None,
+                crate::control::security::identity::AuthenticatedIdentity::default_database_set(
+                    true,
+                ),
+            );
+        let authorized = crate::control::server::shared::authorization::authorize_task_set(
+            &identity,
+            std::slice::from_ref(&task),
+            &state.permissions,
+            &state.roles,
+            &crate::control::security::audit::NoopAuditEmitter,
+        )
+        .expect("authorize test task")
+        .into_tasks()
+        .into_iter()
+        .next()
+        .expect("one authorized task");
+        let result = dispatch_authorized_crdt_apply_admitted(
+            &state,
+            AuthorizedCrdtApplyAdmissionRequest {
+                authorized,
+                collection: "docs",
+                timeout: Duration::from_millis(10),
+                event_source: EventSource::User,
+                policy: &TrustedInternalCrdtPolicy,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(crate::Error::RejectedAuthz { .. })));
     }
 
     #[tokio::test]

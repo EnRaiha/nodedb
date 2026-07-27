@@ -151,7 +151,11 @@ pub struct DispatchRouteStreamParams<'a> {
 fn reject_unadmitted_crdt_apply(plan: &PhysicalPlan) -> Result<(), Error> {
     if matches!(
         plan,
-        PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
+        PhysicalPlan::Crdt(
+            nodedb_physical::physical_plan::CrdtOp::Apply { .. }
+                | nodedb_physical::physical_plan::CrdtOp::ApplyAuthenticated { .. }
+                | nodedb_physical::physical_plan::CrdtOp::ImportSnapshot { .. }
+        )
     ) {
         return Err(Error::CrdtApplyRequiresAdmission);
     }
@@ -229,7 +233,10 @@ async fn dispatch_local(
     if txn_id.is_some()
         && matches!(
             &route.plan,
-            PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::Apply { .. })
+            PhysicalPlan::Crdt(
+                nodedb_physical::physical_plan::CrdtOp::Apply { .. }
+                    | nodedb_physical::physical_plan::CrdtOp::ApplyAuthenticated { .. }
+            )
         )
     {
         return Err(Error::CrdtApplyForbiddenInTransaction);

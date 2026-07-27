@@ -77,6 +77,9 @@ pub struct SyncSession {
     /// The fencing epoch accepted by `SyncProducerRegistry` at handshake.
     /// `0` for non-Lite sessions.
     pub accepted_epoch: u64,
+    /// Catalog-backed per-user HMAC key issued after JWT authentication.
+    /// Zero/absent in trust mode and test-only sessions without a catalog.
+    pub delta_signing_key: Option<[u8; 32]>,
 }
 
 impl SyncSession {
@@ -109,6 +112,7 @@ impl SyncSession {
             last_seen_lsn: 0,
             producer_id: 0,
             accepted_epoch: 0,
+            delta_signing_key: None,
         }
     }
 

@@ -359,6 +359,11 @@ mod tests {
                 provenance: Some(&provenance),
                 constraint_version_required: 1,
                 expected_frontier_digest: Some([0xFF; 32]),
+                auth_user_id: 0,
+                auth_device_id: 0,
+                auth_seq_no: 0,
+                delta_signature: [0; 32],
+                signing_required: false,
             },
         );
 
@@ -416,6 +421,11 @@ mod tests {
                 provenance: None,
                 constraint_version_required: 0,
                 expected_frontier_digest: Some(preview.frontier_digest),
+                auth_user_id: 0,
+                auth_device_id: 0,
+                auth_seq_no: 0,
+                delta_signature: [0; 32],
+                signing_required: false,
             },
         );
         assert_eq!(applied.status, Status::Ok);
@@ -452,6 +462,11 @@ mod tests {
                 provenance: None,
                 constraint_version_required: 0,
                 expected_frontier_digest: Some(preview.frontier_digest),
+                auth_user_id: 0,
+                auth_device_id: 0,
+                auth_seq_no: 0,
+                delta_signature: [0; 32],
+                signing_required: false,
             },
         );
         assert_eq!(stale.status, Status::Error);
@@ -482,6 +497,11 @@ mod tests {
                 provenance: None,
                 constraint_version_required: 0,
                 expected_frontier_digest: None,
+                auth_user_id: 0,
+                auth_device_id: 0,
+                auth_seq_no: 0,
+                delta_signature: [0; 32],
+                signing_required: false,
             },
         );
         assert_eq!(

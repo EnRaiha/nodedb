@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
-
-//! The [`ReplicatedWrite`] enum — a write operation serialized for Raft
-//! replication. Variant order is append-only wire ABI; never reorder or insert.
-//! Uses only trivially serializable types (no `Arc`, no `Instant`).
+//! Append-only Raft write wire ABI; variants must never be reordered.
 
 use super::aliases::{default_ivf_cells, default_ivf_nprobe, default_pq_m};
 use super::wire_shapes::{ConstraintChangeOp, ReplicatedBatchEdge};
 use nodedb_types::{PayloadIndexKind, VectorQuantization, VectorStorageDtype};
 
-/// Raft-replicated write; variant order is append-only wire ABI.
 #[derive(
     Debug,
     Clone,
@@ -22,7 +18,6 @@ pub enum ReplicatedWrite {
         collection: String,
         document_id: String,
         value: Vec<u8>,
-        /// Leader-assigned surrogate; replicas bind it verbatim.
         surrogate: u32,
     },
     PointInsert {
@@ -31,20 +26,17 @@ pub enum ReplicatedWrite {
         value: Vec<u8>,
         #[serde(default)]
         if_absent: bool,
-        /// Leader-assigned global surrogate (binding key = `document_id`).
         surrogate: u32,
     },
     PointDelete {
         collection: String,
         document_id: String,
-        /// Leader-assigned global surrogate (binding key = `document_id`).
         surrogate: u32,
     },
     PointUpdate {
         collection: String,
         document_id: String,
         updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
-        /// Leader-assigned global surrogate (binding key = `document_id`).
         surrogate: u32,
     },
     DocUpsert {
@@ -52,7 +44,6 @@ pub enum ReplicatedWrite {
         document_id: String,
         value: Vec<u8>,
         on_conflict_updates: Vec<(String, nodedb_physical::physical_plan::UpdateValue)>,
-        /// Leader-assigned global surrogate (binding key = `document_id`).
         surrogate: u32,
     },
     DocBatchInsert {
@@ -491,5 +482,19 @@ pub enum ReplicatedWrite {
         constraint_version_required: u64,
         /// Mandatory exact preview frontier; absent on legacy `CrdtApply`.
         expected_frontier_digest: [u8; 32],
+    },
+    CrdtApplyAuthenticated {
+        collection: String,
+        document_id: String,
+        delta: Vec<u8>,
+        peer_id: u64,
+        provenance: Option<Vec<u8>>,
+        constraint_version_required: u64,
+        expected_frontier_digest: Option<[u8; 32]>,
+        auth_user_id: u64,
+        auth_device_id: u64,
+        auth_seq_no: u64,
+        delta_signature: [u8; 32],
+        signing_required: bool,
     },
 }

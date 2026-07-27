@@ -29,6 +29,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+/// Maximum exclusive ownership interval for one credential issuance attempt.
+/// A later Raft `BeginInFlight` may replace an abandoned lease only after this
+/// absolute deadline, making crash recovery deterministic on every replica.
+pub const INFLIGHT_LEASE_DURATION_MS: u64 = 30_000;
+
 /// Lifecycle states for a join token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinTokenLifecycle {
@@ -36,10 +41,21 @@ pub enum JoinTokenLifecycle {
     Issued,
     /// A joiner at `node_addr` is currently receiving its bundle.
     /// If the joiner times out, the state reverts to `Issued`.
-    InFlight { node_addr: SocketAddr },
+    InFlight {
+        node_addr: SocketAddr,
+        lease_id: [u8; 16],
+        lease_expires_at_ms: u64,
+    },
     /// Bundle was successfully delivered to `node_addr`.
     /// Replay attempts on the same token are rejected.
-    Consumed { node_addr: SocketAddr, ts_ms: u64 },
+    Consumed {
+        node_addr: SocketAddr,
+        lease_id: [u8; 16],
+        ts_ms: u64,
+        /// Opaque host-encrypted credential response retained for idempotent
+        /// recovery when commit or transport acknowledgement is indeterminate.
+        recovery_bundle: Vec<u8>,
+    },
     /// Token's expiry timestamp has passed without being consumed.
     Expired,
     /// Explicitly invalidated (e.g. operator revoke).
@@ -59,6 +75,22 @@ pub struct JoinTokenState {
     pub attempt: u32,
 }
 
+/// Unforgeable ownership proof for one `Issued` → `InFlight` acquisition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InflightLease {
+    pub(crate) id: [u8; 16],
+}
+
+impl InflightLease {
+    pub(crate) fn generate() -> Result<Self, TokenStateError> {
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).map_err(|error| TokenStateError::Random {
+            detail: error.to_string(),
+        })?;
+        Ok(Self { id })
+    }
+}
+
 /// Error from token state transitions.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TokenStateError {
@@ -74,6 +106,8 @@ pub enum TokenStateError {
     NotFound,
     #[error("unexpected lifecycle state for this transition")]
     InvalidTransition,
+    #[error("secure random generation failed: {detail}")]
+    Random { detail: String },
     /// The Raft proposer returned an error. The transition was not
     /// replicated; single-use enforcement may be incomplete.
     #[error("raft proposer error: {detail}")]
@@ -108,17 +142,24 @@ pub trait TokenStateBackend: Send + Sync + 'static {
         &self,
         token_hash: &[u8; 32],
         node_addr: SocketAddr,
-    ) -> Result<(), TokenStateError>;
-    /// Transition from `InFlight` → `Consumed`. Called after the bundle
-    /// has been sent and the peer has acknowledged receipt.
+    ) -> Result<InflightLease, TokenStateError>;
+    /// Transition from `InFlight` → `Consumed`. Production bootstrap must
+    /// commit this transition before exposing usable credential bytes.
     async fn mark_consumed(
         &self,
         token_hash: &[u8; 32],
         node_addr: SocketAddr,
+        lease: InflightLease,
         ts_ms: u64,
+        recovery_bundle: Vec<u8>,
     ) -> Result<(), TokenStateError>;
-    /// Revert `InFlight` → `Issued` (joiner timed out before ACK).
-    async fn revert_inflight(&self, token_hash: &[u8; 32]) -> Result<(), TokenStateError>;
+    /// Revert `InFlight` → `Issued` only while no usable credential bytes
+    /// have been exposed to the joiner and the caller still owns that attempt.
+    async fn revert_inflight(
+        &self,
+        token_hash: &[u8; 32],
+        lease: InflightLease,
+    ) -> Result<(), TokenStateError>;
     /// Look up the current state.
     fn get(&self, token_hash: &[u8; 32]) -> Option<JoinTokenState>;
 }
@@ -144,37 +185,49 @@ impl InMemoryTokenStore {
 impl TokenStateBackend for InMemoryTokenStore {
     async fn register(&self, state: JoinTokenState) {
         let mut map = self.inner.lock().expect("token store lock poisoned");
-        map.insert(state.token_hash, state);
+        map.entry(state.token_hash).or_insert(state);
     }
 
     async fn begin_inflight(
         &self,
         token_hash: &[u8; 32],
         node_addr: SocketAddr,
-    ) -> Result<(), TokenStateError> {
+    ) -> Result<InflightLease, TokenStateError> {
+        let lease = InflightLease::generate()?;
         let mut map = self.inner.lock().expect("token store lock poisoned");
         let entry = map.get_mut(token_hash).ok_or(TokenStateError::NotFound)?;
+        let now_ms = epoch_ms();
         match &entry.lifecycle {
             JoinTokenLifecycle::Issued => {
-                let now_ms = epoch_ms();
                 if now_ms > entry.expires_at_ms {
                     entry.lifecycle = JoinTokenLifecycle::Expired;
                     return Err(TokenStateError::Expired);
                 }
-                entry.lifecycle = JoinTokenLifecycle::InFlight { node_addr };
+                entry.lifecycle = JoinTokenLifecycle::InFlight {
+                    node_addr,
+                    lease_id: lease.id,
+                    lease_expires_at_ms: now_ms.saturating_add(INFLIGHT_LEASE_DURATION_MS),
+                };
                 entry.attempt += 1;
-                Ok(())
+                Ok(lease)
             }
             JoinTokenLifecycle::InFlight {
-                node_addr: existing,
-            } => {
-                if *existing == node_addr {
-                    // Idempotent: same joiner re-presenting (e.g. reconnect).
-                    Ok(())
-                } else {
-                    Err(TokenStateError::InFlightConflict)
+                lease_expires_at_ms,
+                ..
+            } if now_ms >= *lease_expires_at_ms => {
+                if now_ms > entry.expires_at_ms {
+                    entry.lifecycle = JoinTokenLifecycle::Expired;
+                    return Err(TokenStateError::Expired);
                 }
+                entry.lifecycle = JoinTokenLifecycle::InFlight {
+                    node_addr,
+                    lease_id: lease.id,
+                    lease_expires_at_ms: now_ms.saturating_add(INFLIGHT_LEASE_DURATION_MS),
+                };
+                entry.attempt += 1;
+                Ok(lease)
             }
+            JoinTokenLifecycle::InFlight { .. } => Err(TokenStateError::InFlightConflict),
             JoinTokenLifecycle::Consumed { .. } => Err(TokenStateError::AlreadyConsumed),
             JoinTokenLifecycle::Expired => Err(TokenStateError::Expired),
             JoinTokenLifecycle::Aborted => Err(TokenStateError::Aborted),
@@ -185,13 +238,20 @@ impl TokenStateBackend for InMemoryTokenStore {
         &self,
         token_hash: &[u8; 32],
         node_addr: SocketAddr,
+        lease: InflightLease,
         ts_ms: u64,
+        recovery_bundle: Vec<u8>,
     ) -> Result<(), TokenStateError> {
         let mut map = self.inner.lock().expect("token store lock poisoned");
         let entry = map.get_mut(token_hash).ok_or(TokenStateError::NotFound)?;
         match &entry.lifecycle {
-            JoinTokenLifecycle::InFlight { .. } => {
-                entry.lifecycle = JoinTokenLifecycle::Consumed { node_addr, ts_ms };
+            JoinTokenLifecycle::InFlight { lease_id, .. } if *lease_id == lease.id => {
+                entry.lifecycle = JoinTokenLifecycle::Consumed {
+                    node_addr,
+                    lease_id: lease.id,
+                    ts_ms,
+                    recovery_bundle,
+                };
                 Ok(())
             }
             JoinTokenLifecycle::Consumed { .. } => Err(TokenStateError::AlreadyConsumed),
@@ -199,11 +259,15 @@ impl TokenStateBackend for InMemoryTokenStore {
         }
     }
 
-    async fn revert_inflight(&self, token_hash: &[u8; 32]) -> Result<(), TokenStateError> {
+    async fn revert_inflight(
+        &self,
+        token_hash: &[u8; 32],
+        lease: InflightLease,
+    ) -> Result<(), TokenStateError> {
         let mut map = self.inner.lock().expect("token store lock poisoned");
         let entry = map.get_mut(token_hash).ok_or(TokenStateError::NotFound)?;
         match &entry.lifecycle {
-            JoinTokenLifecycle::InFlight { .. } => {
+            JoinTokenLifecycle::InFlight { lease_id, .. } if *lease_id == lease.id => {
                 entry.lifecycle = JoinTokenLifecycle::Issued;
                 Ok(())
             }
@@ -223,12 +287,13 @@ impl TokenStateBackend for InMemoryTokenStore {
 pub fn spawn_inflight_timeout<B: TokenStateBackend>(
     backend: Arc<B>,
     token_hash: [u8; 32],
+    lease: InflightLease,
     timeout: Duration,
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(timeout).await;
         // If still InFlight, revert — the joiner timed out.
-        let _ = backend.revert_inflight(&token_hash).await;
+        let _ = backend.revert_inflight(&token_hash, lease).await;
     });
 }
 
@@ -265,24 +330,33 @@ mod tests {
         store.register(make_state(hash, 60)).await;
 
         let addr = dummy_addr();
-        store.begin_inflight(&hash, addr).await.unwrap();
+        let lease = store.begin_inflight(&hash, addr).await.unwrap();
         {
             let s = store.get(&hash).unwrap();
-            assert_eq!(
+            assert!(matches!(
                 s.lifecycle,
-                JoinTokenLifecycle::InFlight { node_addr: addr }
-            );
+                JoinTokenLifecycle::InFlight {
+                    node_addr,
+                    lease_id,
+                    lease_expires_at_ms,
+                } if node_addr == addr && lease_id == lease.id && lease_expires_at_ms > epoch_ms()
+            ));
             assert_eq!(s.attempt, 1);
         }
 
         let ts = epoch_ms();
-        store.mark_consumed(&hash, addr, ts).await.unwrap();
+        store
+            .mark_consumed(&hash, addr, lease, ts, vec![1, 2, 3])
+            .await
+            .unwrap();
         let s = store.get(&hash).unwrap();
         assert_eq!(
             s.lifecycle,
             JoinTokenLifecycle::Consumed {
                 node_addr: addr,
-                ts_ms: ts
+                lease_id: lease.id,
+                ts_ms: ts,
+                recovery_bundle: vec![1, 2, 3],
             }
         );
     }
@@ -293,8 +367,11 @@ mod tests {
         let hash = [0x02u8; 32];
         store.register(make_state(hash, 60)).await;
         let addr = dummy_addr();
-        store.begin_inflight(&hash, addr).await.unwrap();
-        store.mark_consumed(&hash, addr, epoch_ms()).await.unwrap();
+        let lease = store.begin_inflight(&hash, addr).await.unwrap();
+        store
+            .mark_consumed(&hash, addr, lease, epoch_ms(), Vec::new())
+            .await
+            .unwrap();
 
         // Second begin_inflight must be rejected.
         assert_eq!(
@@ -309,8 +386,8 @@ mod tests {
         let hash = [0x03u8; 32];
         store.register(make_state(hash, 60)).await;
         let addr = dummy_addr();
-        store.begin_inflight(&hash, addr).await.unwrap();
-        store.revert_inflight(&hash).await.unwrap();
+        let lease = store.begin_inflight(&hash, addr).await.unwrap();
+        store.revert_inflight(&hash, lease).await.unwrap();
         let s = store.get(&hash).unwrap();
         assert_eq!(s.lifecycle, JoinTokenLifecycle::Issued);
         // Second attempt is allowed after revert.
@@ -354,16 +431,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inflight_same_addr_is_idempotent() {
+    async fn inflight_same_addr_is_exclusive() {
         let store = InMemoryTokenStore::new();
         let hash = [0x06u8; 32];
         store.register(make_state(hash, 60)).await;
         let addr = dummy_addr();
-        store.begin_inflight(&hash, addr).await.unwrap();
-        // Same addr: idempotent
-        store.begin_inflight(&hash, addr).await.unwrap();
-        let s = store.get(&hash).unwrap();
-        // attempt incremented only on the first begin_inflight
-        assert_eq!(s.attempt, 1);
+        let lease = store.begin_inflight(&hash, addr).await.unwrap();
+        assert_eq!(
+            store.begin_inflight(&hash, addr).await.unwrap_err(),
+            TokenStateError::InFlightConflict
+        );
+        let wrong = InflightLease::generate().unwrap();
+        assert_eq!(
+            store
+                .mark_consumed(&hash, addr, wrong, epoch_ms(), Vec::new())
+                .await
+                .unwrap_err(),
+            TokenStateError::InvalidTransition
+        );
+        store
+            .mark_consumed(&hash, addr, lease, epoch_ms(), Vec::new())
+            .await
+            .unwrap();
     }
 }

@@ -173,6 +173,10 @@ impl WalWriter {
         })
     }
 
+    pub(crate) fn can_set_encryption_ring(&self) -> bool {
+        self.file_offset == 0 && self.buffer.is_empty()
+    }
+
     /// Set the encryption key. When set, all subsequent records will have
     /// their payloads encrypted with AES-256-GCM.
     ///

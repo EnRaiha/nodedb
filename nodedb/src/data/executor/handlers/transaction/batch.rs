@@ -338,17 +338,22 @@ impl CoreLoop {
             let tenant_id = crate::types::TenantId::new(tid);
             match self.get_crdt_engine(task.request.database_id, tenant_id) {
                 Ok(engine) => {
-                    // NOTE: applies committed CRDT deltas via a bare import, with NO
-                    // constraint validation. If deterministic apply-time validation is
-                    // ever added, it MUST also gate this path (and the WAL replay path) —
-                    // otherwise a delta rejected on one path could persist here and
-                    // diverge from peers.
-                    if let Err(e) = engine.apply_committed_delta(&collection, &delta) {
+                    let outcome = engine.apply_committed_delta_validated(
+                        &collection,
+                        &delta,
+                        nodedb_types::Surrogate::ZERO,
+                        "",
+                        0,
+                    );
+                    if !matches!(
+                        outcome,
+                        crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Clean { .. }
+                    ) {
                         error!(
                             core = self.core_id,
                             crdt_delta_index = crdt_idx,
-                            error = %e,
-                            "CRDT delta apply failed; transaction rollback required"
+                            ?outcome,
+                            "CRDT delta validation failed; transaction rollback required"
                         );
                         return Some(Response {
                             request_id: task.request_id(),
@@ -359,7 +364,7 @@ impl CoreLoop {
                             watermark_lsn: self.watermark,
                             error_code: Some(Box::new(
                                 crate::bridge::envelope::ErrorCode::Internal {
-                                    detail: format!("CRDT delta apply failed: {e}"),
+                                    detail: format!("CRDT delta validation failed: {outcome:?}"),
                                 },
                             )),
                             read_set_valid: None,

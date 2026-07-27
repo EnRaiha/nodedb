@@ -107,6 +107,8 @@ impl SyncTestClient {
             producer_id: self.producer_id,
             epoch: self.epoch,
             seq,
+            device_id: 0,
+            delta_signature: [0; 32],
         };
         let frame = SyncFrame::try_encode(SyncMessageType::DeltaPush, &push)
             .ok_or_else(|| "failed to encode DeltaPushMsg".to_string())?;

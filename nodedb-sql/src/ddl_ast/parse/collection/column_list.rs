@@ -80,6 +80,7 @@ fn is_with_clause_inner(upper_inner: &str) -> bool {
             | "APPEND_ONLY"
             | "HASH_CHAIN"
             | "BITEMPORAL"
+            | "SIGNED_DELTAS"
     )
 }
 

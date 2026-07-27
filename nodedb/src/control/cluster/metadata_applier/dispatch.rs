@@ -133,20 +133,99 @@ impl MetadataCommitApplier {
                 lite_id,
                 producer_id,
                 tenant_id,
+                user_id,
                 epoch,
                 created_ms,
             } => {
                 return self.apply_sync_producer_register(
-                    lite_id,
-                    *producer_id,
-                    *tenant_id,
-                    *epoch,
-                    *created_ms,
+                    super::sync_and_routing::SyncProducerRegistrationApply {
+                        lite_id,
+                        producer_id: *producer_id,
+                        tenant_id: *tenant_id,
+                        user_id: *user_id,
+                        epoch: *epoch,
+                        created_ms: *created_ms,
+                    },
                     raft_index,
                 );
             }
             MetadataEntry::SyncProducerFence { lite_id, new_epoch } => {
                 return self.apply_sync_producer_fence(lite_id, *new_epoch, raft_index);
+            }
+            MetadataEntry::JoinTokenTransition {
+                token_hash,
+                transition,
+                ts_ms,
+            } => {
+                nodedb_cluster::apply_token_transition_to_mirror(
+                    &self.token_state,
+                    *token_hash,
+                    transition,
+                    *ts_ms,
+                );
+                let state = self
+                    .token_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(token_hash)
+                    .cloned();
+                if let Some(state) = state {
+                    self.credentials.catalog().put_join_token_state(&state)?;
+                }
+                return Ok(());
+            }
+            MetadataEntry::EnrollmentPreauthorization {
+                spki,
+                expires_at_ms,
+            } => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(u64::MAX);
+                if *expires_at_ms <= now_ms {
+                    return Ok(());
+                }
+                self.credentials
+                    .catalog()
+                    .put_enrollment_preauthorization(spki, *expires_at_ms)?;
+                let ttl = std::time::Duration::from_millis(expires_at_ms - now_ms);
+                let transport = self.transport.get().ok_or_else(|| crate::Error::Internal {
+                    detail: "metadata enrollment apply has no cluster transport".into(),
+                })?;
+                if !transport.preauthorize_peer_identity(*spki, ttl) {
+                    // Admission remains fail-closed, but replicated metadata
+                    // application must never wedge on a bounded runtime cache.
+                    // The issuer reserves capacity before proposing, so this is
+                    // only a defensive path for stale/corrupt excess entries.
+                    tracing::error!(
+                        ?spki,
+                        "metadata enrollment preauthorization capacity exhausted; entry persisted but not admitted"
+                    );
+                }
+                return Ok(());
+            }
+            MetadataEntry::EnrollmentPreauthorizationRevoke {
+                spki,
+                expires_at_ms,
+            } => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(u64::MAX);
+                if *expires_at_ms <= now_ms {
+                    return Ok(());
+                }
+                self.credentials
+                    .catalog()
+                    .remove_enrollment_preauthorization(spki)?;
+                let transport = self.transport.get().ok_or_else(|| crate::Error::Internal {
+                    detail: "metadata enrollment revoke has no cluster transport".into(),
+                })?;
+                transport.revoke_peer_preauthorization(
+                    spki,
+                    std::time::Duration::from_millis(expires_at_ms - now_ms),
+                );
+                return Ok(());
             }
             MetadataEntry::RoutingChange(RoutingChange::SetPlacement {
                 group_id,

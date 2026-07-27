@@ -4286,6 +4286,7 @@ dependencies = [
  "async-trait",
  "crc32c",
  "futures",
+ "getrandom 0.3.4",
  "hmac 0.12.1",
  "nexar",
  "nodedb-raft",

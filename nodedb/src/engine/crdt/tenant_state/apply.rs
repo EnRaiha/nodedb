@@ -20,16 +20,19 @@ impl TenantCrdtEngine {
         pre_validate::pre_validate(&self.validator, &view, change)
     }
 
-    /// Apply a validated delta for a collection from Raft commit.
+    /// Test-only raw import used to seed transaction rollback fixtures.
     ///
-    /// This is called AFTER Raft consensus — the delta has been committed
-    /// to the Raft log and now needs to be applied to the local state.
-    ///
-    /// Fails when the delta's operations cannot be fully applied. At this
-    /// point the entry is already committed on every replica, so an import
-    /// that silently left operations causally pending would diverge this
-    /// replica from the log with no way to detect it.
-    pub fn apply_committed_delta(&mut self, collection: &str, delta: &[u8]) -> crate::Result<()> {
+    /// Production applies always go through the validated / authenticated paths
+    /// ([`Self::apply_committed_delta_validated`] /
+    /// [`Self::apply_committed_delta_authenticated`]), which apply into a
+    /// detached candidate and enforce constraints and signing before any
+    /// authoritative state moves — so no unvalidated peer delta can mutate it.
+    #[cfg(test)]
+    pub(crate) fn apply_committed_delta(
+        &mut self,
+        collection: &str,
+        delta: &[u8],
+    ) -> crate::Result<()> {
         self.state_mut(collection)?
             .import(delta)
             .map_err(crate::Error::Crdt)

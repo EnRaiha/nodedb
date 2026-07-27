@@ -21,6 +21,19 @@ use super::loop_build::build_raft_loop;
 use super::observability::{ObservabilityInputs, finish_observability};
 use super::proposer_wiring::wire_proposers;
 
+fn bootstrap_listener_addr(
+    mut transport_addr: std::net::SocketAddr,
+) -> crate::Result<std::net::SocketAddr> {
+    let port = transport_addr
+        .port()
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Config {
+            detail: "cluster transport port 65535 leaves no bootstrap-listener port".into(),
+        })?;
+    transport_addr.set_port(port);
+    Ok(transport_addr)
+}
+
 /// Start the Raft event loop and RPC server.
 ///
 /// Must be called after `SharedState` is constructed (needs the WAL and
@@ -36,6 +49,9 @@ pub fn start_raft(
     let (multi_raft, setup) = build_group_setup(handle, &shared, data_dir, transport_tuning)?;
     let hooks = build_hooks(handle, &shared, data_dir)?;
     let loop_build = build_raft_loop(handle, &shared, data_dir, multi_raft, setup, hooks)?;
+
+    let bootstrap_raft_loop = Arc::clone(&loop_build.raft_loop);
+    let bootstrap_token_state = Arc::clone(&loop_build.token_state);
 
     wire_proposers(
         &shared,
@@ -61,5 +77,48 @@ pub fn start_raft(
         },
     );
 
+    if let Some(material) = crate::control::cluster::tls::load_bootstrap_issuer_material(data_dir)?
+    {
+        let proposer: Arc<dyn nodedb_cluster::decommission::MetadataProposer> = Arc::new(
+            crate::control::cluster::bootstrap_listener::BootstrapMetadataProposer::new(
+                &bootstrap_raft_loop,
+                Arc::clone(&handle.group_watchers),
+            ),
+        );
+        let token_store = Arc::new(nodedb_cluster::RaftBackedTokenStore::new(
+            Arc::clone(&proposer),
+            bootstrap_token_state,
+        ));
+        let (listen, _task) = crate::control::cluster::bootstrap_listener::spawn(
+            bootstrap_listener_addr(handle.transport.local_addr())?,
+            &material,
+            crate::control::cluster::bootstrap_listener::BootstrapEnrollment {
+                token_store,
+                transport: Arc::clone(&handle.transport),
+                metadata_proposer: proposer,
+            },
+            shared.shutdown.raw_receiver(),
+        )?;
+        tracing::info!(%listen, "durable cluster bootstrap listener started");
+    }
+
     Ok(ready_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_listener_uses_a_distinct_deterministic_port() {
+        let transport = "127.0.0.1:9400".parse().unwrap();
+        assert_eq!(
+            bootstrap_listener_addr(transport).unwrap(),
+            "127.0.0.1:9401".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert!(
+            bootstrap_listener_addr("127.0.0.1:65535".parse::<std::net::SocketAddr>().unwrap())
+                .is_err()
+        );
+    }
 }

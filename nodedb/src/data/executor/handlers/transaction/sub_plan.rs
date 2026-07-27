@@ -366,9 +366,11 @@ impl CoreLoop {
         _crdt_deltas: &mut Vec<(Vec<u8>, u64, String)>,
     ) -> Result<Response, ErrorCode> {
         match op {
-            CrdtOp::Apply { .. } => Err(ErrorCode::Unsupported {
-                detail: "CRDT Apply is not supported inside transaction batches".into(),
-            }),
+            CrdtOp::Apply { .. } | CrdtOp::ApplyAuthenticated { .. } => {
+                Err(ErrorCode::Unsupported {
+                    detail: "CRDT Apply is not supported inside transaction batches".into(),
+                })
+            }
             _ => self.exec_tx_passthrough(tid, plan),
         }
     }
