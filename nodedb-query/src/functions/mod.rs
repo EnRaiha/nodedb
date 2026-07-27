@@ -19,40 +19,52 @@ mod types;
 
 use nodedb_types::Value;
 
+use crate::expr::EvalError;
+
 /// Evaluate a scalar function call.
-pub fn eval_function(name: &str, args: &[Value]) -> Value {
+///
+/// Every function returns `Ok(Value::Null)` on invalid/missing arguments
+/// (SQL NULL propagation semantics) — the sole exception is `mod`'s
+/// zero-modulus arm (`math::try_eval`), which returns
+/// `Err(EvalError::DivisionByZero)`. Every other
+/// sibling module here stays `Option<Value>`-shaped internally; only the
+/// `math` arm is threaded as `Option<Result<Value, EvalError>>` and the
+/// rest are wrapped in `Ok` at this dispatch boundary, so a single
+/// fallible arm doesn't force every scalar-function module to carry a
+/// `Result` it can never actually produce.
+pub fn eval_function(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     if let Some(v) = string::try_eval(name, args) {
-        return v;
+        return Ok(v);
     }
-    if let Some(v) = math::try_eval(name, args) {
-        return v;
+    if let Some(r) = math::try_eval(name, args) {
+        return r;
     }
     if let Some(v) = conditional::try_eval(name, args) {
-        return v;
+        return Ok(v);
     }
     if let Some(v) = id::try_eval(name, args) {
-        return v;
+        return Ok(v);
     }
     if let Some(v) = datetime::try_eval(name, args) {
-        return v;
+        return Ok(v);
     }
     if let Some(v) = json::try_eval(name, args) {
-        return v;
+        return Ok(v);
     }
     if let Some(v) = types::try_eval(name, args) {
-        return v;
+        return Ok(v);
     }
     if let Some(v) = array::try_eval(name, args) {
-        return v;
+        return Ok(v);
     }
     if let Some(v) = fts::try_eval_fts(name, args) {
-        return v;
+        return Ok(v);
     }
     if let Some(v) = system::try_eval(name, args) {
-        return v;
+        return Ok(v);
     }
     // Geo / Spatial functions — delegated to geo_functions module.
-    crate::geo_functions::eval_geo_function(name, args).unwrap_or(Value::Null)
+    Ok(crate::geo_functions::eval_geo_function(name, args).unwrap_or(Value::Null))
 }
 
 #[cfg(test)]
@@ -61,7 +73,13 @@ mod tests {
     use crate::expr::SqlExpr;
 
     fn eval_fn(name: &str, args: Vec<Value>) -> Value {
-        eval_function(name, &args)
+        eval_function(name, &args).unwrap()
+    }
+
+    #[test]
+    fn mod_by_zero_errors() {
+        let err = eval_function("mod", &[Value::Integer(5), Value::Integer(0)]).unwrap_err();
+        assert_eq!(err, EvalError::DivisionByZero);
     }
 
     #[test]
@@ -119,7 +137,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        assert_eq!(expr.eval(&doc), Value::String("ALICE".into()));
+        assert_eq!(expr.eval(&doc).unwrap(), Value::String("ALICE".into()));
     }
 
     #[test]

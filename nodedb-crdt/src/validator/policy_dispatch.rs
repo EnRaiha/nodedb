@@ -4,12 +4,13 @@
 
 use crate::CrdtAuthContext;
 use crate::constraint::{Constraint, ConstraintKind};
+use crate::dead_letter::CompensationHint;
 use crate::error::Result;
 use crate::policy::{ConflictPolicy, PolicyResolution, ResolvedAction};
 use crate::row_lookup::RowLookup;
 
 use super::core::Validator;
-use super::types::{ProposedChange, ValidationOutcome};
+use super::types::{ProposedChange, ValidationOutcome, Violation};
 
 impl Validator {
     /// Validate with declarative policy resolution.
@@ -194,6 +195,56 @@ impl Validator {
                         Ok(PolicyResolution::Escalate { violations })
                     }
                 }
+            }
+            ValidationOutcome::EvalError {
+                constraint_name,
+                error,
+            } => {
+                // An unevaluable predicate (division/modulo by zero)
+                // is NOT a resolvable conflict — it must never be
+                // handed to a declarative policy, which would "resolve" a delta
+                // the server cannot actually evaluate. Escalate straight to the
+                // DLQ (fails closed) regardless of the collection's configured
+                // policy, mirroring `EscalateToDlq` but for an eval error.
+                let constraint = self
+                    .constraints
+                    .all()
+                    .iter()
+                    .find(|c| c.name == constraint_name)
+                    .cloned()
+                    .unwrap_or_else(|| Constraint {
+                        name: constraint_name.clone(),
+                        collection: change.collection.clone(),
+                        field: String::new(),
+                        kind: ConstraintKind::NotNull,
+                    });
+                let reason = format!("CHECK `{constraint_name}` failed to evaluate: {error}");
+                let hint = CompensationHint::ManualIntervention {
+                    reason: reason.clone(),
+                };
+                self.dlq
+                    .enqueue(crate::dead_letter::EnqueueDeadLetterArgs {
+                        peer_id,
+                        user_id: auth.user_id,
+                        tenant_id: auth.tenant_id,
+                        delta: delta_bytes,
+                        constraint: &constraint,
+                        reason: reason.clone(),
+                        hint: hint.clone(),
+                    })?;
+                tracing::warn!(
+                    constraint = %constraint_name,
+                    collection = %change.collection,
+                    %error,
+                    "CRDT CHECK predicate raised an evaluation error; escalated to DLQ"
+                );
+                Ok(PolicyResolution::Escalate {
+                    violations: vec![Violation {
+                        constraint_name,
+                        reason,
+                        hint,
+                    }],
+                })
             }
         }
     }

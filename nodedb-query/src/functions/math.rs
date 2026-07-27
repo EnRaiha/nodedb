@@ -3,15 +3,25 @@
 //! Math scalar functions.
 
 use super::shared::num_arg;
+use crate::expr::EvalError;
 use crate::value_ops::to_value_number;
 use nodedb_types::Value;
 
-pub(super) fn try_eval(name: &str, args: &[Value]) -> Option<Value> {
+/// Dispatch a math scalar function call.
+///
+/// Every function here returns `Ok(Value::Null)` on invalid/missing
+/// arguments, matching the crate-wide NULL-propagation convention — except
+/// `mod`'s zero-modulus arm, which returns `Err(EvalError::DivisionByZero)`
+/// instead of folding to `NULL`. This is the one
+/// function in the scalar-function table that can fail, so `try_eval`
+/// carries a `Result` inside the `Option` rather than making every sibling
+/// module in `functions/` fallible for a single arm.
+pub(super) fn try_eval(name: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
     let v = match name {
         "abs" => num_arg(args, 0).map_or(Value::Null, |n| to_value_number(n.abs())),
         "round" => {
             let Some(n) = num_arg(args, 0) else {
-                return Some(Value::Null);
+                return Some(Ok(Value::Null));
             };
             let decimals = num_arg(args, 1).unwrap_or(0.0) as u32;
             let mode_str = super::shared::str_arg(args, 2).unwrap_or_default();
@@ -36,7 +46,7 @@ pub(super) fn try_eval(name: &str, args: &[Value]) -> Option<Value> {
         "floor" => num_arg(args, 0).map_or(Value::Null, |n| to_value_number(n.floor())),
         "power" | "pow" => {
             let Some(base) = num_arg(args, 0) else {
-                return Some(Value::Null);
+                return Some(Ok(Value::Null));
             };
             let exp = num_arg(args, 1).unwrap_or(1.0);
             to_value_number(base.powf(exp))
@@ -44,14 +54,15 @@ pub(super) fn try_eval(name: &str, args: &[Value]) -> Option<Value> {
         "sqrt" => num_arg(args, 0).map_or(Value::Null, |n| to_value_number(n.sqrt())),
         "mod" => {
             let Some(a) = num_arg(args, 0) else {
-                return Some(Value::Null);
+                return Some(Ok(Value::Null));
             };
             let b = num_arg(args, 1).unwrap_or(1.0);
             if b == 0.0 {
-                Value::Null
-            } else {
-                to_value_number(a % b)
+                // Zero modulus raises SQLSTATE 22012 instead of folding to
+                // NULL.
+                return Some(Err(EvalError::DivisionByZero));
             }
+            to_value_number(a % b)
         }
         "sign" => num_arg(args, 0).map_or(Value::Null, |n| to_value_number(n.signum())),
         "log" | "ln" => num_arg(args, 0).map_or(Value::Null, |n| to_value_number(n.ln())),
@@ -60,5 +71,5 @@ pub(super) fn try_eval(name: &str, args: &[Value]) -> Option<Value> {
         "exp" => num_arg(args, 0).map_or(Value::Null, |n| to_value_number(n.exp())),
         _ => return None,
     };
-    Some(v)
+    Some(Ok(v))
 }

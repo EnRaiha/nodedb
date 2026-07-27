@@ -20,32 +20,36 @@ use super::spec::WindowFuncSpec;
 /// Unknown window function names must be rejected by the planner before
 /// reaching this dispatcher; an unrecognised name here is an internal bug
 /// and panics rather than silently dropping the projection.
+///
+/// A division/modulo-by-zero in any PARTITION BY / ORDER BY / argument
+/// expression propagates as `Err(EvalError::DivisionByZero)` rather than
+/// folding to NULL.
 pub fn evaluate_window_functions(
     rows: &mut [(String, serde_json::Value)],
     specs: &[WindowFuncSpec],
-) {
+) -> Result<(), crate::expr::EvalError> {
     for spec in specs {
-        let partitions = build_partitions(rows, &spec.partition_by);
+        let partitions = build_partitions(rows, &spec.partition_by)?;
 
         for partition_indices in &partitions {
             match spec.func_name.as_str() {
                 "row_number" => apply_row_number(rows, partition_indices, &spec.alias),
-                "rank" => apply_rank(rows, partition_indices, &spec.alias, &spec.order_by),
+                "rank" => apply_rank(rows, partition_indices, &spec.alias, &spec.order_by)?,
                 "dense_rank" => {
-                    apply_dense_rank(rows, partition_indices, &spec.alias, &spec.order_by)
+                    apply_dense_rank(rows, partition_indices, &spec.alias, &spec.order_by)?
                 }
                 "ntile" => apply_ntile(rows, partition_indices, spec),
                 "percent_rank" => {
-                    apply_percent_rank(rows, partition_indices, &spec.alias, &spec.order_by)
+                    apply_percent_rank(rows, partition_indices, &spec.alias, &spec.order_by)?
                 }
                 "cume_dist" => {
-                    apply_cume_dist(rows, partition_indices, &spec.alias, &spec.order_by)
+                    apply_cume_dist(rows, partition_indices, &spec.alias, &spec.order_by)?
                 }
                 "lag" => apply_lag(rows, partition_indices, spec),
                 "lead" => apply_lead(rows, partition_indices, spec),
                 "nth_value" => apply_nth_value(rows, partition_indices, spec),
                 "sum" | "count" | "avg" | "min" | "max" | "first_value" | "last_value" => {
-                    apply_aggregate_window(rows, partition_indices, spec)
+                    apply_aggregate_window(rows, partition_indices, spec)?
                 }
                 other => {
                     unreachable!(
@@ -55,6 +59,7 @@ pub fn evaluate_window_functions(
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -106,7 +111,7 @@ mod tests {
             order_by: vec![],
             frame: WindowFrame::default(),
         };
-        evaluate_window_functions(&mut rows, &[spec]);
+        evaluate_window_functions(&mut rows, &[spec]).unwrap();
         assert_eq!(rows[0].1["rn"], json!(1));
         assert_eq!(rows[4].1["rn"], json!(5));
     }
@@ -122,7 +127,7 @@ mod tests {
             order_by: vec![],
             frame: WindowFrame::default(),
         };
-        evaluate_window_functions(&mut rows, &[spec]);
+        evaluate_window_functions(&mut rows, &[spec]).unwrap();
         assert_eq!(rows[0].1["rn"], json!(1));
         assert_eq!(rows[2].1["rn"], json!(3));
         assert_eq!(rows[3].1["rn"], json!(1));
@@ -140,7 +145,7 @@ mod tests {
             order_by: vec![(SqlExpr::Column("salary".into()), true)],
             frame: WindowFrame::default(),
         };
-        evaluate_window_functions(&mut rows, &[spec]);
+        evaluate_window_functions(&mut rows, &[spec]).unwrap();
         assert_eq!(rows[0].1["running_total"], json!(100.0));
         assert_eq!(rows[1].1["running_total"], json!(220.0));
         assert_eq!(rows[2].1["running_total"], json!(310.0));
@@ -159,7 +164,7 @@ mod tests {
             order_by: vec![(SqlExpr::Column("n".into()), true)],
             frame: WindowFrame::default(),
         };
-        evaluate_window_functions(&mut rows, &[spec]);
+        evaluate_window_functions(&mut rows, &[spec]).unwrap();
         assert_eq!(rows[0].1["pr"], json!(0.0));
         assert_eq!(rows[1].1["pr"], json!(0.25));
         assert_eq!(rows[2].1["pr"], json!(0.5));
@@ -185,7 +190,7 @@ mod tests {
             order_by: vec![(SqlExpr::Column("n".into()), true)],
             frame: WindowFrame::default(),
         };
-        evaluate_window_functions(&mut rows, &[spec]);
+        evaluate_window_functions(&mut rows, &[spec]).unwrap();
         assert_eq!(rows[0].1["pr"], json!(0.0));
         assert_eq!(rows[1].1["pr"], json!(0.0));
         assert_eq!(rows[2].1["pr"], json!(2.0 / 3.0));
@@ -203,7 +208,7 @@ mod tests {
             order_by: vec![(SqlExpr::Column("n".into()), true)],
             frame: WindowFrame::default(),
         };
-        evaluate_window_functions(&mut rows, &[spec]);
+        evaluate_window_functions(&mut rows, &[spec]).unwrap();
         assert_eq!(rows[0].1["cd"], json!(0.2));
         assert_eq!(rows[1].1["cd"], json!(0.4));
         assert_eq!(rows[2].1["cd"], json!(0.6));
@@ -227,7 +232,7 @@ mod tests {
             order_by: vec![(SqlExpr::Column("n".into()), true)],
             frame: WindowFrame::default(),
         };
-        evaluate_window_functions(&mut rows, &[spec]);
+        evaluate_window_functions(&mut rows, &[spec]).unwrap();
         // Peers share value of last peer's position / N.
         assert_eq!(rows[0].1["cd"], json!(0.5));
         assert_eq!(rows[1].1["cd"], json!(0.5));
@@ -249,7 +254,7 @@ mod tests {
             order_by: vec![(SqlExpr::Column("n".into()), true)],
             frame: WindowFrame::default(),
         };
-        evaluate_window_functions(&mut rows, &[spec]);
+        evaluate_window_functions(&mut rows, &[spec]).unwrap();
         assert_eq!(rows[0].1["nv"], json!(null));
         assert_eq!(rows[1].1["nv"], json!(2));
         assert_eq!(rows[2].1["nv"], json!(2));
@@ -269,6 +274,6 @@ mod tests {
             order_by: vec![],
             frame: WindowFrame::default(),
         };
-        evaluate_window_functions(&mut rows, &[spec]);
+        evaluate_window_functions(&mut rows, &[spec]).unwrap();
     }
 }

@@ -101,7 +101,13 @@ fn try_eval_scalar_function(s: &str) -> Option<nodedb_types::Value> {
         // registry so we don't accidentally evaluate user identifiers.
         let registry = nodedb_sql::planner::const_fold::default_registry();
         if registry.lookup(&name).is_some() {
-            let val = nodedb_query::functions::eval_function(&name, &[]);
+            // Zero-arg call: `math::try_eval`'s zero-modulus arm (the only
+            // fallible arm in the scalar-function table) cannot be reached
+            // with an empty argument list, so folding the
+            // `Result` to `Value::Null` on error is unreachable in practice,
+            // not a silent swallow.
+            let val = nodedb_query::functions::eval_function(&name, &[])
+                .unwrap_or(nodedb_types::Value::Null);
             if !matches!(val, nodedb_types::Value::Null) {
                 return Some(val);
             }

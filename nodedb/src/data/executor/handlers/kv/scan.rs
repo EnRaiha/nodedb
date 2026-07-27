@@ -142,12 +142,17 @@ impl CoreLoop {
             };
 
             // Apply filter predicates post-scan (already works on raw msgpack).
-            if !filter_predicates.is_empty()
-                && !filter_predicates
-                    .iter()
-                    .all(|f| f.matches_binary(&entry_mp))
-            {
-                continue;
+            if !filter_predicates.is_empty() {
+                match crate::bridge::scan_filter::ScanFilter::all_match_binary(
+                    &filter_predicates,
+                    &entry_mp,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_e) => {
+                        return self.response_error(task, ErrorCode::DivisionByZero);
+                    }
+                }
             }
 
             result_entries.push(entry_mp);

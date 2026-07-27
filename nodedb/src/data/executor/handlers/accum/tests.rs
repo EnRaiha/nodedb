@@ -46,19 +46,19 @@ fn merge_from_count() {
 
     let mut combined = AggAccum::new(&spec);
     for d in &docs_a {
-        combined.feed(&spec, d);
+        combined.feed(&spec, d).unwrap();
     }
     for d in &docs_b {
-        combined.feed(&spec, d);
+        combined.feed(&spec, d).unwrap();
     }
 
     let mut a = AggAccum::new(&spec);
     for d in &docs_a {
-        a.feed(&spec, d);
+        a.feed(&spec, d).unwrap();
     }
     let mut b = AggAccum::new(&spec);
     for d in &docs_b {
-        b.feed(&spec, d);
+        b.feed(&spec, d).unwrap();
     }
     a.merge_from(b);
 
@@ -84,22 +84,22 @@ fn merge_from_sum_avg() {
     let mut combined_sum = AggAccum::new(&sum_spec);
     let mut combined_avg = AggAccum::new(&avg_spec);
     for d in docs_a.iter().chain(docs_b.iter()) {
-        combined_sum.feed(&sum_spec, d);
-        combined_avg.feed(&avg_spec, d);
+        combined_sum.feed(&sum_spec, d).unwrap();
+        combined_avg.feed(&avg_spec, d).unwrap();
     }
 
     // Merge path.
     let mut a_sum = AggAccum::new(&sum_spec);
     let mut a_avg = AggAccum::new(&avg_spec);
     for d in &docs_a {
-        a_sum.feed(&sum_spec, d);
-        a_avg.feed(&avg_spec, d);
+        a_sum.feed(&sum_spec, d).unwrap();
+        a_avg.feed(&avg_spec, d).unwrap();
     }
     let mut b_sum = AggAccum::new(&sum_spec);
     let mut b_avg = AggAccum::new(&avg_spec);
     for d in &docs_b {
-        b_sum.feed(&sum_spec, d);
-        b_avg.feed(&avg_spec, d);
+        b_sum.feed(&sum_spec, d).unwrap();
+        b_avg.feed(&avg_spec, d).unwrap();
     }
     a_sum.merge_from(b_sum);
     a_avg.merge_from(b_avg);
@@ -140,22 +140,22 @@ fn merge_from_sum_avg_distinct() {
     let mut combined_sum = AggAccum::new(&sum_spec);
     let mut combined_avg = AggAccum::new(&avg_spec);
     for d in docs_a.iter().chain(docs_b.iter()) {
-        combined_sum.feed(&sum_spec, d);
-        combined_avg.feed(&avg_spec, d);
+        combined_sum.feed(&sum_spec, d).unwrap();
+        combined_avg.feed(&avg_spec, d).unwrap();
     }
 
     // Spilled-run merge path.
     let mut a_sum = AggAccum::new(&sum_spec);
     let mut a_avg = AggAccum::new(&avg_spec);
     for d in &docs_a {
-        a_sum.feed(&sum_spec, d);
-        a_avg.feed(&avg_spec, d);
+        a_sum.feed(&sum_spec, d).unwrap();
+        a_avg.feed(&avg_spec, d).unwrap();
     }
     let mut b_sum = AggAccum::new(&sum_spec);
     let mut b_avg = AggAccum::new(&avg_spec);
     for d in &docs_b {
-        b_sum.feed(&sum_spec, d);
-        b_avg.feed(&avg_spec, d);
+        b_sum.feed(&sum_spec, d).unwrap();
+        b_avg.feed(&avg_spec, d).unwrap();
     }
     a_sum.merge_from(b_sum);
     a_avg.merge_from(b_avg);
@@ -185,21 +185,21 @@ fn merge_from_min_max() {
     let mut combined_min = AggAccum::new(&min_spec);
     let mut combined_max = AggAccum::new(&max_spec);
     for d in docs_a.iter().chain(docs_b.iter()) {
-        combined_min.feed(&min_spec, d);
-        combined_max.feed(&max_spec, d);
+        combined_min.feed(&min_spec, d).unwrap();
+        combined_max.feed(&max_spec, d).unwrap();
     }
 
     let mut a_min = AggAccum::new(&min_spec);
     let mut a_max = AggAccum::new(&max_spec);
     for d in &docs_a {
-        a_min.feed(&min_spec, d);
-        a_max.feed(&max_spec, d);
+        a_min.feed(&min_spec, d).unwrap();
+        a_max.feed(&max_spec, d).unwrap();
     }
     let mut b_min = AggAccum::new(&min_spec);
     let mut b_max = AggAccum::new(&max_spec);
     for d in &docs_b {
-        b_min.feed(&min_spec, d);
-        b_max.feed(&max_spec, d);
+        b_min.feed(&min_spec, d).unwrap();
+        b_max.feed(&max_spec, d).unwrap();
     }
     a_min.merge_from(b_min);
     a_max.merge_from(b_max);
@@ -227,16 +227,16 @@ fn merge_from_welford() {
 
     let mut combined = AggAccum::new(&spec);
     for d in docs_a.iter().chain(docs_b.iter()) {
-        combined.feed(&spec, d);
+        combined.feed(&spec, d).unwrap();
     }
 
     let mut a = AggAccum::new(&spec);
     for d in &docs_a {
-        a.feed(&spec, d);
+        a.feed(&spec, d).unwrap();
     }
     let mut b = AggAccum::new(&spec);
     for d in &docs_b {
-        b.feed(&spec, d);
+        b.feed(&spec, d).unwrap();
     }
     a.merge_from(b);
 
@@ -268,15 +268,15 @@ fn merge_from_count_distinct() {
 
     let mut combined = AggAccum::new(&spec);
     for d in docs_a.iter().chain(docs_b.iter()) {
-        combined.feed(&spec, d);
+        combined.feed(&spec, d).unwrap();
     }
     let mut a = AggAccum::new(&spec);
     for d in &docs_a {
-        a.feed(&spec, d);
+        a.feed(&spec, d).unwrap();
     }
     let mut b = AggAccum::new(&spec);
     for d in &docs_b {
-        b.feed(&spec, d);
+        b.feed(&spec, d).unwrap();
     }
     a.merge_from(b);
 
@@ -298,16 +298,16 @@ fn merge_from_hll() {
 
     let mut combined = AggAccum::new(&spec);
     for d in docs_a.iter().chain(docs_b.iter()) {
-        combined.feed(&spec, d);
+        combined.feed(&spec, d).unwrap();
     }
 
     let mut a = AggAccum::new(&spec);
     for d in &docs_a {
-        a.feed(&spec, d);
+        a.feed(&spec, d).unwrap();
     }
     let mut b = AggAccum::new(&spec);
     for d in &docs_b {
-        b.feed(&spec, d);
+        b.feed(&spec, d).unwrap();
     }
     a.merge_from(b);
 
@@ -331,11 +331,11 @@ fn merge_from_tdigest() {
 
     let mut a = AggAccum::new(&spec);
     for d in &docs_a {
-        a.feed(&spec, d);
+        a.feed(&spec, d).unwrap();
     }
     let mut b = AggAccum::new(&spec);
     for d in &docs_b {
-        b.feed(&spec, d);
+        b.feed(&spec, d).unwrap();
     }
     a.merge_from(b);
 
@@ -355,11 +355,11 @@ fn merge_from_topk() {
 
     let mut a = AggAccum::new(&spec);
     for d in &docs_a {
-        a.feed(&spec, d);
+        a.feed(&spec, d).unwrap();
     }
     let mut b = AggAccum::new(&spec);
     for d in &docs_b {
-        b.feed(&spec, d);
+        b.feed(&spec, d).unwrap();
     }
     a.merge_from(b);
 
@@ -378,16 +378,16 @@ fn merge_from_array_agg() {
 
     let mut combined = AggAccum::new(&spec);
     for d in docs_a.iter().chain(docs_b.iter()) {
-        combined.feed(&spec, d);
+        combined.feed(&spec, d).unwrap();
     }
 
     let mut a = AggAccum::new(&spec);
     for d in &docs_a {
-        a.feed(&spec, d);
+        a.feed(&spec, d).unwrap();
     }
     let mut b = AggAccum::new(&spec);
     for d in &docs_b {
-        b.feed(&spec, d);
+        b.feed(&spec, d).unwrap();
     }
     a.merge_from(b);
 
@@ -409,16 +409,16 @@ fn merge_from_string_agg() {
 
     let mut combined = AggAccum::new(&spec);
     for d in docs_a.iter().chain(docs_b.iter()) {
-        combined.feed(&spec, d);
+        combined.feed(&spec, d).unwrap();
     }
 
     let mut a = AggAccum::new(&spec);
     for d in &docs_a {
-        a.feed(&spec, d);
+        a.feed(&spec, d).unwrap();
     }
     let mut b = AggAccum::new(&spec);
     for d in &docs_b {
-        b.feed(&spec, d);
+        b.feed(&spec, d).unwrap();
     }
     a.merge_from(b);
 
@@ -440,16 +440,16 @@ fn merge_from_percentile_cont() {
 
     let mut combined = AggAccum::new(&spec);
     for d in docs_a.iter().chain(docs_b.iter()) {
-        combined.feed(&spec, d);
+        combined.feed(&spec, d).unwrap();
     }
 
     let mut a = AggAccum::new(&spec);
     for d in &docs_a {
-        a.feed(&spec, d);
+        a.feed(&spec, d).unwrap();
     }
     let mut b = AggAccum::new(&spec);
     for d in &docs_b {
-        b.feed(&spec, d);
+        b.feed(&spec, d).unwrap();
     }
     a.merge_from(b);
 

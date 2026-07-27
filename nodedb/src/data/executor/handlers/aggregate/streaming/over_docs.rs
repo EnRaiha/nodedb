@@ -78,14 +78,12 @@ impl CoreLoop {
                 sub_aggregates,
             }) {
                 Ok(g) => g,
-                Err(e) => {
-                    return self.response_error(
-                        task,
-                        ErrorCode::Internal {
-                            detail: e.to_string(),
-                        },
-                    );
-                }
+                // Map through `From<crate::Error> for ErrorCode` rather than a
+                // blanket `Internal` wrap, so a division/modulo-by-zero in a
+                // WHERE filter, computed GROUP BY key, or aggregate argument
+                // keeps its `DivisionByZero` code (SQLSTATE 22012) instead of
+                // degrading to a generic internal error (XX000).
+                Err(e) => return self.response_error(task, ErrorCode::from(e)),
             };
 
         match self.finalize_groups(super::finalize::FinalizeGroupsParams {

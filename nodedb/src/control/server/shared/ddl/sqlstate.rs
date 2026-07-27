@@ -92,10 +92,10 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             sqlstate::STATE_TRANSITION_VIOLATION,
             format!("state transition violation on {collection}: {detail}"),
         ),
-        ErrorCode::TransitionCheckViolation { collection } => (
+        ErrorCode::TransitionCheckViolation { collection, detail } => (
             "ERROR",
             sqlstate::TRANSITION_CHECK_VIOLATION,
-            format!("transition check violation on {collection}"),
+            format!("transition check violation on {collection}: {detail}"),
         ),
         ErrorCode::TypeGuardViolation { collection, detail } => (
             "ERROR",
@@ -144,6 +144,12 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             ),
         ),
         ErrorCode::Internal { detail } => ("ERROR", sqlstate::INTERNAL_ERROR, detail.clone()),
+        // Division/modulo by zero.
+        ErrorCode::DivisionByZero => (
+            "ERROR",
+            sqlstate::DIVISION_BY_ZERO,
+            "division by zero".into(),
+        ),
         ErrorCode::Unsupported { detail } => {
             ("ERROR", sqlstate::FEATURE_NOT_SUPPORTED, detail.clone())
         }

@@ -327,6 +327,9 @@ impl PartitionedSpiller {
                 let probe_docs = item.probe.materialize()?;
 
                 let index = HashIndex::build(&build_docs, &build_key_refs);
+                // `join_filters: &[]` here → `probe_hash_index` never evaluates a
+                // residual predicate on this path, so the `?` is a no-op today;
+                // it is threaded for signature consistency.
                 let mut part = probe_hash_index(&ProbeParams {
                     probe_docs: &probe_docs,
                     index: &index,
@@ -338,7 +341,7 @@ impl PartitionedSpiller {
                     index_collection: &index_collection,
                     join_filters: &[],
                     emit_unmatched_right,
-                });
+                })?;
                 results.append(&mut part);
                 continue;
             }
@@ -637,8 +640,9 @@ mod tests {
                     emit_unmatched_right: true,
                 };
                 // partitions=4 matches the reference's own clamp rules
-                let want =
-                    as_multiset(grace_join_in_memory(build.clone(), probe.clone(), 4, &spec));
+                let want = as_multiset(
+                    grace_join_in_memory(build.clone(), probe.clone(), 4, &spec).unwrap(),
+                );
 
                 for p in [1usize, 4] {
                     let dir = tempfile::tempdir().unwrap();
@@ -724,8 +728,9 @@ mod tests {
                     index_collection: "r",
                     emit_unmatched_right: true,
                 };
-                let want =
-                    as_multiset(grace_join_in_memory(build.clone(), probe.clone(), 4, &spec));
+                let want = as_multiset(
+                    grace_join_in_memory(build.clone(), probe.clone(), 4, &spec).unwrap(),
+                );
                 for p in [1usize, 4] {
                     let dir = tempfile::tempdir().unwrap();
                     // budget=1 forces spill; materialize_cap large → no re-partition.
@@ -766,8 +771,9 @@ mod tests {
                     index_collection: "r",
                     emit_unmatched_right: true,
                 };
-                let want =
-                    as_multiset(grace_join_in_memory(build.clone(), probe.clone(), 4, &spec));
+                let want = as_multiset(
+                    grace_join_in_memory(build.clone(), probe.clone(), 4, &spec).unwrap(),
+                );
                 for p in [1usize, 4] {
                     let dir = tempfile::tempdir().unwrap();
                     let got = run_spiller(
@@ -838,8 +844,9 @@ mod tests {
                     index_collection: "r",
                     emit_unmatched_right: true,
                 };
-                let want =
-                    as_multiset(grace_join_in_memory(build.clone(), probe.clone(), 1, &spec));
+                let want = as_multiset(
+                    grace_join_in_memory(build.clone(), probe.clone(), 1, &spec).unwrap(),
+                );
                 let dir = tempfile::tempdir().unwrap();
                 // materialize_cap sizing (the property under test is RE-PARTITION
                 // that COMPLETES). Each build row is a small msgpack map

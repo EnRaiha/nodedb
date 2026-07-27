@@ -96,10 +96,14 @@ impl CoreLoop {
         let mut affected = 0u64;
         for row in &rows {
             // Skip rows that don't match WHERE filters.
-            if !filter_predicates.is_empty()
-                && !row_matches_filters(row, &schema, &filter_predicates)
-            {
-                continue;
+            if !filter_predicates.is_empty() {
+                match row_matches_filters(row, &schema, &filter_predicates) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_e) => {
+                        return self.response_error(task, ErrorCode::DivisionByZero);
+                    }
+                }
             }
             // Apply field updates to the row.
             let mut new_row = row.clone();
@@ -283,14 +287,19 @@ impl CoreLoop {
         // Collect only the PK values of rows that match the WHERE filter
         // (can't mutate while iterating).
         let rows: Vec<Vec<nodedb_types::value::Value>> = engine.scan_memtable_rows().collect();
-        let pk_values: Vec<nodedb_types::value::Value> = rows
-            .iter()
-            .filter(|row| {
-                filter_predicates.is_empty()
-                    || row_matches_filters(row, &schema, &filter_predicates)
-            })
-            .map(|row| row[pk_cols[0]].clone())
-            .collect();
+        let mut pk_values: Vec<nodedb_types::value::Value> = Vec::new();
+        for row in &rows {
+            if !filter_predicates.is_empty() {
+                match row_matches_filters(row, &schema, &filter_predicates) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_e) => {
+                        return self.response_error(task, ErrorCode::DivisionByZero);
+                    }
+                }
+            }
+            pk_values.push(row[pk_cols[0]].clone());
+        }
 
         // Undo capture (only on the durable COMMIT-replay path): the location
         // and PK bytes of each tombstoned row, so the undo can clear its

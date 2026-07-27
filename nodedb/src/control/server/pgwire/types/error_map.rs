@@ -38,6 +38,12 @@ pub fn error_to_sqlstate(err: &crate::Error) -> (&'static str, &'static str, Str
                  it is hard-deleted"
             ),
         ),
+        crate::Error::UndefinedFunction { name } => (
+            "ERROR",
+            sqlstate::UNDEFINED_FUNCTION,
+            format!("function {name}(...) does not exist"),
+        ),
+        crate::Error::DivisionByZero => ("ERROR", sqlstate::DIVISION_BY_ZERO, err.to_string()),
         crate::Error::DocumentNotFound {
             collection,
             document_id,
@@ -134,6 +140,10 @@ pub(crate) fn numeric_code_to_sqlstate(code: nodedb_types::error::ErrorCode) -> 
         Ec::DOCUMENT_NOT_FOUND => sqlstate::NO_DATA,
         // Mirrors the `BadRequest` / `PlanError` arms.
         Ec::BAD_REQUEST | Ec::PLAN_ERROR => sqlstate::SYNTAX_ERROR,
+        // Mirrors the `UndefinedFunction` arm.
+        Ec::UNDEFINED_FUNCTION => sqlstate::UNDEFINED_FUNCTION,
+        // Mirrors the `DivisionByZero` arm.
+        Ec::DIVISION_BY_ZERO => sqlstate::DIVISION_BY_ZERO,
         // Mirrors the `FanOutExceeded` arm.
         Ec::FAN_OUT_EXCEEDED => sqlstate::STATEMENT_TOO_COMPLEX,
         // Mirrors the `RejectedAuthz` arm.

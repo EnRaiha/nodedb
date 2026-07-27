@@ -187,7 +187,11 @@ impl CoreLoop {
                 // Build merged document for predicate / expression evaluation.
                 let merged = build_merged(&target_doc, source_doc, source_alias);
                 // Find first MATCHED arm whose predicate is satisfied.
-                if let Some(arm) = find_arm(clauses, MergeClauseKindOp::Matched, &merged) {
+                let arm = match find_arm(clauses, MergeClauseKindOp::Matched, &merged) {
+                    Ok(arm) => arm,
+                    Err(e) => return self.response_error(task, e),
+                };
+                if let Some(arm) = arm {
                     let db_id = task.request.database_id.as_u64();
                     match apply_action(
                         self,
@@ -212,8 +216,11 @@ impl CoreLoop {
             } else {
                 // No matching source row — check NOT MATCHED BY SOURCE arms.
                 let merged = target_doc.clone();
-                if let Some(arm) = find_arm(clauses, MergeClauseKindOp::NotMatchedBySource, &merged)
-                {
+                let arm = match find_arm(clauses, MergeClauseKindOp::NotMatchedBySource, &merged) {
+                    Ok(arm) => arm,
+                    Err(e) => return self.response_error(task, e),
+                };
+                if let Some(arm) = arm {
                     let db_id = task.request.database_id.as_u64();
                     match apply_action(
                         self,
@@ -243,7 +250,11 @@ impl CoreLoop {
             if matched_source_keys.contains(src_key.as_str()) {
                 continue;
             }
-            if let Some(arm) = find_arm(clauses, MergeClauseKindOp::NotMatched, src_doc) {
+            let arm = match find_arm(clauses, MergeClauseKindOp::NotMatched, src_doc) {
+                Ok(arm) => arm,
+                Err(e) => return self.response_error(task, e),
+            };
+            if let Some(arm) = arm {
                 match apply_insert_action(
                     self,
                     ApplyInsertActionParams {

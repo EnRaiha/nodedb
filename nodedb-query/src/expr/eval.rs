@@ -14,6 +14,21 @@ use crate::value_ops::{coerced_eq, is_truthy, to_value_number, value_to_f64};
 use super::binary::eval_binary_op;
 use super::types::SqlExpr;
 
+/// Error type for row-scope `SqlExpr` evaluation.
+///
+/// Mirrors the [`WindowError`](crate::window::WindowError) idiom: a small,
+/// `thiserror`-derived enum living next to the evaluator it describes.
+/// Everything that historically folded to `Value::Null` (bad casts, wrong
+/// arg counts, unknown-value coercions) keeps doing so — this type exists
+/// solely for division/modulo by a zero divisor, which must surface as
+/// SQLSTATE `22012` (`division_by_zero`) instead of silently evaluating to
+/// `NULL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum EvalError {
+    #[error("division by zero")]
+    DivisionByZero,
+}
+
 /// Row scope for `SqlExpr::eval_scope`: how `Column(..)` and `OldColumn(..)`
 /// resolve to `Value`s. The shared evaluator walks the AST once and calls
 /// into this scope for every leaf column reference — both `eval()` and
@@ -56,7 +71,13 @@ impl SqlExpr {
     /// return `Null`. Arithmetic on non-numeric values returns `Null`.
     /// `OldColumn(..)` resolves to `Null` (use `eval_with_old` for the
     /// TRANSITION CHECK path).
-    pub fn eval(&self, doc: &Value) -> Value {
+    ///
+    /// Returns `Err(EvalError::DivisionByZero)` if evaluation reaches a
+    /// `/` or `%` with a zero divisor — every other
+    /// historically-`NULL`-folding case (bad casts, wrong arg counts,
+    /// unknown-value coercions) is unaffected and still evaluates to
+    /// `Ok(Value::Null)`.
+    pub fn eval(&self, doc: &Value) -> Result<Value, EvalError> {
         self.eval_scope(&RowScope {
             new_doc: doc,
             old_doc: None,
@@ -67,7 +88,7 @@ impl SqlExpr {
     /// Evaluate with access to both NEW and OLD documents, used by
     /// TRANSITION CHECK predicates. `Column(name)` resolves against
     /// `new_doc`; `OldColumn(name)` resolves against `old_doc`.
-    pub fn eval_with_old(&self, new_doc: &Value, old_doc: &Value) -> Value {
+    pub fn eval_with_old(&self, new_doc: &Value, old_doc: &Value) -> Result<Value, EvalError> {
         self.eval_scope(&RowScope {
             new_doc,
             old_doc: Some(old_doc),
@@ -79,7 +100,7 @@ impl SqlExpr {
     /// `INSERT ... ON CONFLICT DO UPDATE`. `Column(name)` resolves
     /// against the existing (current) row `doc`; `ExcludedColumn(name)`
     /// resolves against `excluded`.
-    pub fn eval_with_excluded(&self, doc: &Value, excluded: &Value) -> Value {
+    pub fn eval_with_excluded(&self, doc: &Value, excluded: &Value) -> Result<Value, EvalError> {
         self.eval_scope(&RowScope {
             new_doc: doc,
             old_doc: None,
@@ -89,40 +110,48 @@ impl SqlExpr {
 
     /// Shared walker: one match, one recursion scheme, parameterised by the
     /// row-scope so `eval` and `eval_with_old` can't drift out of sync.
-    fn eval_scope(&self, scope: &RowScope<'_>) -> Value {
+    ///
+    /// CASE and COALESCE stay short-circuiting: an untaken CASE branch or an
+    /// already-satisfied COALESCE argument is never evaluated, so `CASE WHEN
+    /// false THEN 1/0 ELSE 0 END` and `COALESCE(1, 1/0)` never reach the
+    /// division and cannot raise `DivisionByZero`.
+    fn eval_scope(&self, scope: &RowScope<'_>) -> Result<Value, EvalError> {
         match self {
-            SqlExpr::Column(name) => scope.column(name),
-            SqlExpr::OldColumn(name) => scope.old_column(name),
-            SqlExpr::ExcludedColumn(name) => scope.excluded_column(name),
+            SqlExpr::Column(name) => Ok(scope.column(name)),
+            SqlExpr::OldColumn(name) => Ok(scope.old_column(name)),
+            SqlExpr::ExcludedColumn(name) => Ok(scope.excluded_column(name)),
 
-            SqlExpr::Literal(v) => v.clone(),
+            SqlExpr::Literal(v) => Ok(v.clone()),
 
             SqlExpr::BinaryOp { left, op, right } => {
-                let l = left.eval_scope(scope);
-                let r = right.eval_scope(scope);
+                let l = left.eval_scope(scope)?;
+                let r = right.eval_scope(scope)?;
                 eval_binary_op(&l, *op, &r)
             }
 
             SqlExpr::Negate(inner) => {
-                let v = inner.eval_scope(scope);
+                let v = inner.eval_scope(scope)?;
                 if let Some(b) = v.as_bool() {
-                    Value::Bool(!b)
+                    Ok(Value::Bool(!b))
                 } else {
                     match value_to_f64(&v, false) {
-                        Some(n) => to_value_number(-n),
-                        None => Value::Null,
+                        Some(n) => Ok(to_value_number(-n)),
+                        None => Ok(Value::Null),
                     }
                 }
             }
 
             SqlExpr::Function { name, args } => {
-                let evaluated: Vec<Value> = args.iter().map(|a| a.eval_scope(scope)).collect();
+                let evaluated: Vec<Value> = args
+                    .iter()
+                    .map(|a| a.eval_scope(scope))
+                    .collect::<Result<_, EvalError>>()?;
                 crate::functions::eval_function(name, &evaluated)
             }
 
             SqlExpr::Cast { expr, to_type } => {
-                let v = expr.eval_scope(scope);
-                crate::cast::eval_cast(&v, to_type)
+                let v = expr.eval_scope(scope)?;
+                Ok(crate::cast::eval_cast(&v, to_type))
             }
 
             SqlExpr::Case {
@@ -130,9 +159,12 @@ impl SqlExpr {
                 when_thens,
                 else_expr,
             } => {
-                let op_val = operand.as_ref().map(|e| e.eval_scope(scope));
+                let op_val = match operand {
+                    Some(e) => Some(e.eval_scope(scope)?),
+                    None => None,
+                };
                 for (when_expr, then_expr) in when_thens {
-                    let when_val = when_expr.eval_scope(scope);
+                    let when_val = when_expr.eval_scope(scope)?;
                     let matches = match &op_val {
                         Some(ov) => coerced_eq(ov, &when_val),
                         None => is_truthy(&when_val),
@@ -143,34 +175,34 @@ impl SqlExpr {
                 }
                 match else_expr {
                     Some(e) => e.eval_scope(scope),
-                    None => Value::Null,
+                    None => Ok(Value::Null),
                 }
             }
 
             SqlExpr::Coalesce(exprs) => {
                 for expr in exprs {
-                    let v = expr.eval_scope(scope);
+                    let v = expr.eval_scope(scope)?;
                     if !v.is_null() {
-                        return v;
+                        return Ok(v);
                     }
                 }
-                Value::Null
+                Ok(Value::Null)
             }
 
             SqlExpr::NullIf(a, b) => {
-                let va = a.eval_scope(scope);
-                let vb = b.eval_scope(scope);
+                let va = a.eval_scope(scope)?;
+                let vb = b.eval_scope(scope)?;
                 if coerced_eq(&va, &vb) {
-                    Value::Null
+                    Ok(Value::Null)
                 } else {
-                    va
+                    Ok(va)
                 }
             }
 
             SqlExpr::IsNull { expr, negated } => {
-                let v = expr.eval_scope(scope);
+                let v = expr.eval_scope(scope)?;
                 let is_null = v.is_null();
-                Value::Bool(if *negated { !is_null } else { is_null })
+                Ok(Value::Bool(if *negated { !is_null } else { is_null }))
             }
         }
     }
@@ -199,19 +231,19 @@ mod tests {
     #[test]
     fn column_ref() {
         let expr = SqlExpr::Column("name".into());
-        assert_eq!(expr.eval(&doc()), Value::String("Alice".into()));
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::String("Alice".into()));
     }
 
     #[test]
     fn missing_column() {
         let expr = SqlExpr::Column("missing".into());
-        assert_eq!(expr.eval(&doc()), Value::Null);
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::Null);
     }
 
     #[test]
     fn literal() {
         let expr = SqlExpr::Literal(Value::Integer(42));
-        assert_eq!(expr.eval(&doc()), Value::Integer(42));
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::Integer(42));
     }
 
     #[test]
@@ -221,7 +253,7 @@ mod tests {
             op: BinaryOp::Add,
             right: Box::new(SqlExpr::Literal(Value::Float(1.5))),
         };
-        assert_eq!(expr.eval(&doc()), Value::Integer(12));
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::Integer(12));
     }
 
     #[test]
@@ -231,7 +263,7 @@ mod tests {
             op: BinaryOp::Mul,
             right: Box::new(SqlExpr::Column("qty".into())),
         };
-        assert_eq!(expr.eval(&doc()), Value::Integer(42));
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::Integer(42));
     }
 
     #[test]
@@ -248,7 +280,7 @@ mod tests {
             )],
             else_expr: Some(Box::new(SqlExpr::Literal(Value::String("minor".into())))),
         };
-        assert_eq!(expr.eval(&doc()), Value::String("adult".into()));
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::String("adult".into()));
     }
 
     #[test]
@@ -258,7 +290,7 @@ mod tests {
             SqlExpr::Literal(Value::String("default@example.com".into())),
         ]);
         assert_eq!(
-            expr.eval(&doc()),
+            expr.eval(&doc()).unwrap(),
             Value::String("default@example.com".into())
         );
     }
@@ -269,6 +301,121 @@ mod tests {
             expr: Box::new(SqlExpr::Column("email".into())),
             negated: false,
         };
-        assert_eq!(expr.eval(&doc()), Value::Bool(true));
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::Bool(true));
+    }
+
+    // ── Division/modulo by zero ──────────────────────────────────────────────
+
+    #[test]
+    fn integer_division_by_zero_errors() {
+        let expr = SqlExpr::BinaryOp {
+            left: Box::new(SqlExpr::Literal(Value::Integer(1))),
+            op: BinaryOp::Div,
+            right: Box::new(SqlExpr::Literal(Value::Integer(0))),
+        };
+        assert_eq!(expr.eval(&doc()), Err(EvalError::DivisionByZero));
+    }
+
+    #[test]
+    fn float_division_by_zero_errors() {
+        let expr = SqlExpr::BinaryOp {
+            left: Box::new(SqlExpr::Literal(Value::Float(1.5))),
+            op: BinaryOp::Div,
+            right: Box::new(SqlExpr::Literal(Value::Float(0.0))),
+        };
+        assert_eq!(expr.eval(&doc()), Err(EvalError::DivisionByZero));
+    }
+
+    #[test]
+    fn decimal_division_by_decimal_zero_errors() {
+        let expr = SqlExpr::BinaryOp {
+            left: Box::new(SqlExpr::Literal(Value::Decimal(
+                rust_decimal::Decimal::new(15, 1),
+            ))),
+            op: BinaryOp::Div,
+            right: Box::new(SqlExpr::Literal(Value::Decimal(
+                rust_decimal::Decimal::ZERO,
+            ))),
+        };
+        assert_eq!(expr.eval(&doc()), Err(EvalError::DivisionByZero));
+    }
+
+    #[test]
+    fn modulo_by_zero_errors() {
+        let expr = SqlExpr::BinaryOp {
+            left: Box::new(SqlExpr::Literal(Value::Integer(5))),
+            op: BinaryOp::Mod,
+            right: Box::new(SqlExpr::Literal(Value::Integer(0))),
+        };
+        assert_eq!(expr.eval(&doc()), Err(EvalError::DivisionByZero));
+    }
+
+    #[test]
+    fn scalar_mod_function_by_zero_errors() {
+        let expr = SqlExpr::Function {
+            name: "mod".into(),
+            args: vec![
+                SqlExpr::Literal(Value::Integer(5)),
+                SqlExpr::Literal(Value::Integer(0)),
+            ],
+        };
+        assert_eq!(expr.eval(&doc()), Err(EvalError::DivisionByZero));
+    }
+
+    /// An untaken CASE branch must never be evaluated — `1/0` in the THEN
+    /// arm of a WHEN that doesn't match must not raise `DivisionByZero`.
+    #[test]
+    fn case_laziness_untaken_branch_not_evaluated() {
+        let expr = SqlExpr::Case {
+            operand: None,
+            when_thens: vec![(
+                SqlExpr::Literal(Value::Bool(false)),
+                SqlExpr::BinaryOp {
+                    left: Box::new(SqlExpr::Literal(Value::Integer(1))),
+                    op: BinaryOp::Div,
+                    right: Box::new(SqlExpr::Literal(Value::Integer(0))),
+                },
+            )],
+            else_expr: Some(Box::new(SqlExpr::Literal(Value::Integer(0)))),
+        };
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::Integer(0));
+    }
+
+    /// COALESCE stops at the first non-null argument — a later `1/0`
+    /// argument must never be evaluated once an earlier one is non-null.
+    #[test]
+    fn coalesce_laziness_short_circuits_before_division() {
+        let expr = SqlExpr::Coalesce(vec![
+            SqlExpr::Literal(Value::Integer(1)),
+            SqlExpr::BinaryOp {
+                left: Box::new(SqlExpr::Literal(Value::Integer(1))),
+                op: BinaryOp::Div,
+                right: Box::new(SqlExpr::Literal(Value::Integer(0))),
+            },
+        ]);
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::Integer(1));
+    }
+
+    /// Control: `NULL + 1` still folds to `Ok(Null)` — non-division NULL
+    /// propagation is untouched by this fix.
+    #[test]
+    fn null_arithmetic_still_folds_to_null() {
+        let expr = SqlExpr::BinaryOp {
+            left: Box::new(SqlExpr::Literal(Value::Null)),
+            op: BinaryOp::Add,
+            right: Box::new(SqlExpr::Literal(Value::Integer(1))),
+        };
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::Null);
+    }
+
+    /// Control: a valid (non-zero-divisor) division still succeeds.
+    #[test]
+    fn valid_division_still_succeeds() {
+        let expr = SqlExpr::BinaryOp {
+            left: Box::new(SqlExpr::Literal(Value::Integer(10))),
+            op: BinaryOp::Div,
+            right: Box::new(SqlExpr::Literal(Value::Integer(2))),
+        };
+        assert_eq!(expr.eval(&doc()).unwrap(), Value::Integer(5));
     }
 }

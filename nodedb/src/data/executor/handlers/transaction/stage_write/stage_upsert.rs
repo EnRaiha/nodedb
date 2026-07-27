@@ -137,7 +137,7 @@ impl CoreLoop {
         let merged = if on_conflict_updates.is_empty() {
             merge_values(existing_val, new_val)
         } else {
-            apply_on_conflict_updates(existing_val, &new_val, on_conflict_updates)
+            apply_on_conflict_updates(existing_val, &new_val, on_conflict_updates)?
         };
 
         let bitemporal = self.is_bitemporal(ctx.database_id, ctx.tid, ctx.collection);

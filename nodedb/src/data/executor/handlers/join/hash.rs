@@ -124,7 +124,14 @@ pub(super) struct ProbeParams<'a> {
 /// the EXACT same emission logic batch-by-batch without duplicating it. The
 /// composed behavior here is byte-identical to passing the whole probe side in a
 /// single batch.
-pub(super) fn probe_hash_index(p: &ProbeParams<'_>) -> Vec<Vec<u8>> {
+///
+/// A division/modulo-by-zero in a join's residual ON predicate PROPAGATES
+/// as an `EvalError` (surfaced to the client as SQLSTATE 22012) rather than
+/// folding to "no match": this fn is fallible and threads the error up to
+/// the bridge Response boundary.
+pub(super) fn probe_hash_index(
+    p: &ProbeParams<'_>,
+) -> Result<Vec<Vec<u8>>, nodedb_query::EvalError> {
     let is_right = p.join_type == "right" || p.join_type == "full";
     let is_cross = p.join_type == "cross";
 
@@ -134,7 +141,7 @@ pub(super) fn probe_hash_index(p: &ProbeParams<'_>) -> Vec<Vec<u8>> {
         for (_, left_val) in p.probe_docs {
             for (_, right_val) in p.index_docs {
                 if results.len() >= p.limit {
-                    return results;
+                    return Ok(results);
                 }
                 let merged = merge_join_docs_binary(
                     left_val,
@@ -142,13 +149,16 @@ pub(super) fn probe_hash_index(p: &ProbeParams<'_>) -> Vec<Vec<u8>> {
                     p.probe_collection,
                     p.index_collection,
                 );
-                if p.join_filters.is_empty() || binary_row_matches_filters(&merged, p.join_filters)
+                // A division/modulo-by-zero in a join's residual ON
+                // predicate PROPAGATES here (SQLSTATE 22012) rather than
+                // folding to "no match".
+                if p.join_filters.is_empty() || binary_row_matches_filters(&merged, p.join_filters)?
                 {
                     results.push(merged);
                 }
             }
         }
-        return results;
+        return Ok(results);
     }
 
     // For RIGHT/FULL joins, pre-allocate a complete tracking vector so we
@@ -162,14 +172,14 @@ pub(super) fn probe_hash_index(p: &ProbeParams<'_>) -> Vec<Vec<u8>> {
     };
     let mut results = Vec::new();
 
-    probe_rows_into(p, &mut results, &mut index_matched);
+    probe_rows_into(p, &mut results, &mut index_matched)?;
 
     // RIGHT/FULL: emit unmatched index-side rows.
     if is_right && p.emit_unmatched_right {
         emit_unmatched_right_into(p, &mut results, &index_matched);
     }
 
-    results
+    Ok(results)
 }
 
 /// Append join output for the probe rows in `p.probe_docs` to `results`,
@@ -189,11 +199,14 @@ pub(super) fn probe_hash_index(p: &ProbeParams<'_>) -> Vec<Vec<u8>> {
 ///
 /// `index_matched` must be sized `p.index_docs.len()` for RIGHT/FULL joins (and
 /// may be empty otherwise — it is only indexed when the join is RIGHT/FULL).
+///
+/// A division/modulo-by-zero in a residual ON predicate PROPAGATES as an
+/// `EvalError` (SQLSTATE 22012) rather than folding to "no match".
 pub(super) fn probe_rows_into(
     p: &ProbeParams<'_>,
     results: &mut Vec<Vec<u8>>,
     index_matched: &mut [bool],
-) {
+) -> Result<(), nodedb_query::EvalError> {
     let is_left = p.join_type == "left" || p.join_type == "full";
     let is_right = p.join_type == "right" || p.join_type == "full";
     let is_semi = p.join_type == "semi";
@@ -205,22 +218,26 @@ pub(super) fn probe_rows_into(
         if !is_right && results.len() >= p.limit {
             break;
         }
-        let (_, _, matched_indices) = p.index.probe(value, p.probe_keys, p.index_docs);
-        let matched_indices = matched_indices
-            .into_iter()
-            .filter(|&index| {
-                if p.join_filters.is_empty() {
-                    return true;
-                }
-                let merged = merge_join_docs_binary(
-                    value,
-                    Some(&p.index_docs[index].1),
-                    p.probe_collection,
-                    p.index_collection,
-                );
-                binary_row_matches_filters(&merged, p.join_filters)
-            })
-            .collect::<Vec<_>>();
+        let (_, _, candidate_indices) = p.index.probe(value, p.probe_keys, p.index_docs);
+        // A closure can't use `?`, so filter with an explicit loop: a div-by-zero
+        // in the residual ON predicate returns `Err` from this fn (SQLSTATE
+        // 22012) instead of folding to "no match".
+        let mut matched_indices: Vec<usize> = Vec::new();
+        for index in candidate_indices {
+            if p.join_filters.is_empty() {
+                matched_indices.push(index);
+                continue;
+            }
+            let merged = merge_join_docs_binary(
+                value,
+                Some(&p.index_docs[index].1),
+                p.probe_collection,
+                p.index_collection,
+            );
+            if binary_row_matches_filters(&merged, p.join_filters)? {
+                matched_indices.push(index);
+            }
+        }
 
         if !matched_indices.is_empty() {
             if is_semi {
@@ -255,6 +272,7 @@ pub(super) fn probe_rows_into(
             ));
         }
     }
+    Ok(())
 }
 
 /// Emit unmatched index-side (build/right) rows for RIGHT/FULL joins into

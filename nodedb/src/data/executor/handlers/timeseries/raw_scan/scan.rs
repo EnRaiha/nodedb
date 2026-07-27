@@ -131,8 +131,15 @@ impl CoreLoop {
                     // Encode rmpv row to msgpack bytes for binary filter eval.
                     let mut buf = Vec::new();
                     rmpv::encode::write_value(&mut buf, &row).ok();
-                    if !filter_predicates.iter().all(|f| f.matches_binary(&buf)) {
-                        continue;
+                    match crate::bridge::scan_filter::ScanFilter::all_match_binary(
+                        filter_predicates,
+                        &buf,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_e) => {
+                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        }
                     }
                 }
                 results.push(row);
@@ -182,7 +189,7 @@ impl CoreLoop {
         // aggregates and bucketed queries remain committed-only.
         if let Some(txn_id) = txn_id {
             let coll_key = (task.request.database_id, tid, collection.to_string());
-            self.merge_overlay_into_timeseries_scan(
+            if let Err(e) = self.merge_overlay_into_timeseries_scan(
                 crate::data::executor::handlers::transaction::overlay::TimeseriesOverlayMergeParams {
                     txn_id,
                     coll_key: &coll_key,
@@ -192,7 +199,9 @@ impl CoreLoop {
                     limit,
                 },
                 &mut results,
-            );
+            ) {
+                return self.response_error(task, e);
+            }
         }
 
         // Apply computed columns (e.g. time_bucket) if present.
@@ -213,10 +222,14 @@ impl CoreLoop {
             if computed_cols.is_empty() {
                 results
             } else {
-                results
+                match results
                     .into_iter()
                     .map(|row| apply_computed_columns_rmpv(row, &computed_cols))
-                    .collect()
+                    .collect::<crate::Result<Vec<_>>>()
+                {
+                    Ok(rows) => rows,
+                    Err(e) => return self.response_error(task, e),
+                }
             }
         } else {
             results

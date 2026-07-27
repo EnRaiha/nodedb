@@ -5,7 +5,7 @@
 //! Builds a deterministic string key from field values extracted directly
 //! from msgpack bytes, avoiding full document decode.
 
-use crate::expr::{GroupKeySpec, SqlExpr};
+use crate::expr::{EvalError, GroupKeySpec, SqlExpr};
 use crate::msgpack_scan::field::extract_field;
 use crate::msgpack_scan::index::FieldIndex;
 use crate::msgpack_scan::reader::{read_f64, read_i64, read_null, read_str};
@@ -23,9 +23,15 @@ use crate::msgpack_scan::reader::{read_f64, read_i64, read_null, read_str};
 /// document bytes, so the same spec on the same bytes yields a byte-identical
 /// slot on producer and consumer. A spec with neither `field` nor `expr`
 /// contributes no slot.
-pub fn build_group_key(doc: &[u8], group_keys: &[GroupKeySpec]) -> String {
+///
+/// Returns `Err(EvalError::DivisionByZero)` when a computed key expression
+/// divides or takes a modulus by zero: `GROUP BY a/b` with
+/// `b = 0` fails the whole statement with SQLSTATE `22012`, exactly like a
+/// WHERE/projection expression, instead of silently grouping the row under a
+/// `null` key.
+pub fn build_group_key(doc: &[u8], group_keys: &[GroupKeySpec]) -> Result<String, EvalError> {
     if group_keys.is_empty() {
-        return "__all__".to_string();
+        return Ok("__all__".to_string());
     }
 
     let mut key_buf = String::new();
@@ -42,22 +48,24 @@ pub fn build_group_key(doc: &[u8], group_keys: &[GroupKeySpec]) -> String {
             if written > 0 {
                 key_buf.push(',');
             }
-            append_computed_value(&mut key_buf, doc, expr);
+            append_computed_value(&mut key_buf, doc, expr)?;
             written += 1;
         }
     }
     key_buf.push(']');
-    key_buf
+    Ok(key_buf)
 }
 
 /// Build a GROUP BY key using a pre-built `FieldIndex` for O(1) lookups.
+///
+/// Shares [`build_group_key`]'s computed-key error contract.
 pub fn build_group_key_indexed(
     doc: &[u8],
     group_keys: &[GroupKeySpec],
     idx: &FieldIndex,
-) -> String {
+) -> Result<String, EvalError> {
     if group_keys.is_empty() {
-        return "__all__".to_string();
+        return Ok("__all__".to_string());
     }
 
     let mut key_buf = String::new();
@@ -77,12 +85,12 @@ pub fn build_group_key_indexed(
             if written > 0 {
                 key_buf.push(',');
             }
-            append_computed_value(&mut key_buf, doc, expr);
+            append_computed_value(&mut key_buf, doc, expr)?;
             written += 1;
         }
     }
     key_buf.push(']');
-    key_buf
+    Ok(key_buf)
 }
 
 /// Append the msgpack value at `doc[start..end]` to the key buffer as a JSON
@@ -131,16 +139,22 @@ fn append_field_value_range(buf: &mut String, doc: &[u8], range: Option<(usize, 
 /// slot is byte-identical wherever the same expression meets the same document.
 /// A document that cannot be decoded, or a value that cannot be re-encoded,
 /// contributes `null` — mirroring the missing-field handling above.
-fn append_computed_value(buf: &mut String, doc: &[u8], expr: &SqlExpr) {
+///
+/// An expression that fails to evaluate (division/modulo by zero)
+/// returns `Err(EvalError::DivisionByZero)`: a computed GROUP BY
+/// key gets the same `22012` statement-failure treatment as a WHERE/projection
+/// expression rather than silently grouping the row under a `null` key.
+fn append_computed_value(buf: &mut String, doc: &[u8], expr: &SqlExpr) -> Result<(), EvalError> {
     let Ok(doc_val) = nodedb_types::json_msgpack::value_from_msgpack(doc) else {
         buf.push_str("null");
-        return;
+        return Ok(());
     };
-    let val = expr.eval(&doc_val);
+    let val = expr.eval(&doc_val)?;
     match nodedb_types::json_msgpack::value_to_msgpack(&val) {
         Ok(vb) => append_value_at(buf, &vb, 0, vb.len()),
         Err(_) => buf.push_str("null"),
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -159,49 +173,49 @@ mod tests {
     #[test]
     fn single_string_field() {
         let doc = encode(&json!({"name": "alice", "age": 30}));
-        let key = build_group_key(&doc, &keys(&["name"]));
+        let key = build_group_key(&doc, &keys(&["name"])).unwrap();
         assert_eq!(key, r#"["alice"]"#);
     }
 
     #[test]
     fn single_int_field() {
         let doc = encode(&json!({"status": 200}));
-        let key = build_group_key(&doc, &keys(&["status"]));
+        let key = build_group_key(&doc, &keys(&["status"])).unwrap();
         assert_eq!(key, "[200]");
     }
 
     #[test]
     fn multiple_fields() {
         let doc = encode(&json!({"city": "ny", "year": 2024}));
-        let key = build_group_key(&doc, &keys(&["city", "year"]));
+        let key = build_group_key(&doc, &keys(&["city", "year"])).unwrap();
         assert_eq!(key, r#"["ny",2024]"#);
     }
 
     #[test]
     fn missing_field_is_null() {
         let doc = encode(&json!({"x": 1}));
-        let key = build_group_key(&doc, &keys(&["missing"]));
+        let key = build_group_key(&doc, &keys(&["missing"])).unwrap();
         assert_eq!(key, "[null]");
     }
 
     #[test]
     fn empty_group_fields() {
         let doc = encode(&json!({"x": 1}));
-        let key = build_group_key(&doc, &[]);
+        let key = build_group_key(&doc, &[]).unwrap();
         assert_eq!(key, "__all__");
     }
 
     #[test]
     fn null_field_value() {
         let doc = encode(&json!({"v": null}));
-        let key = build_group_key(&doc, &keys(&["v"]));
+        let key = build_group_key(&doc, &keys(&["v"])).unwrap();
         assert_eq!(key, "[null]");
     }
 
     #[test]
     fn float_field() {
         let doc = encode(&json!({"temp": 36.6}));
-        let key = build_group_key(&doc, &keys(&["temp"]));
+        let key = build_group_key(&doc, &keys(&["temp"])).unwrap();
         assert_eq!(key, "[36.6]");
     }
 
@@ -223,12 +237,38 @@ mod tests {
         let lower = encode(&json!({"label": "alpha", "score": 7}));
         let upper = encode(&json!({"label": "ALPHA", "score": 3}));
         assert_eq!(
-            build_group_key(&lower, &[upper_label_spec()]),
+            build_group_key(&lower, &[upper_label_spec()]).unwrap(),
             r#"["ALPHA"]"#
         );
         assert_eq!(
-            build_group_key(&upper, &[upper_label_spec()]),
+            build_group_key(&upper, &[upper_label_spec()]).unwrap(),
             r#"["ALPHA"]"#
+        );
+    }
+
+    /// A computed GROUP BY key that divides by zero fails the statement with a
+    /// division-by-zero error rather than grouping the row under a `null`
+    /// key.
+    #[test]
+    fn computed_key_division_by_zero_errors() {
+        let doc = encode(&json!({"n": 10, "d": 0}));
+        let spec = GroupKeySpec {
+            output_name: "q".to_string(),
+            field: None,
+            expr: Some(SqlExpr::BinaryOp {
+                left: Box::new(SqlExpr::Column("n".to_string())),
+                op: crate::expr::BinaryOp::Div,
+                right: Box::new(SqlExpr::Column("d".to_string())),
+            }),
+        };
+        assert_eq!(
+            build_group_key(&doc, std::slice::from_ref(&spec)),
+            Err(EvalError::DivisionByZero)
+        );
+        let idx = FieldIndex::build(&doc, 0).unwrap_or_else(FieldIndex::empty);
+        assert_eq!(
+            build_group_key_indexed(&doc, std::slice::from_ref(&spec), &idx),
+            Err(EvalError::DivisionByZero)
         );
     }
 
@@ -238,8 +278,8 @@ mod tests {
         let specs = [upper_label_spec()];
         let idx = FieldIndex::build(&doc, 0).unwrap_or_else(FieldIndex::empty);
         assert_eq!(
-            build_group_key(&doc, &specs),
-            build_group_key_indexed(&doc, &specs, &idx),
+            build_group_key(&doc, &specs).unwrap(),
+            build_group_key_indexed(&doc, &specs, &idx).unwrap(),
         );
     }
 
@@ -247,6 +287,6 @@ mod tests {
     fn mixed_column_and_computed_keys() {
         let doc = encode(&json!({"region": "us", "label": "west"}));
         let specs = [GroupKeySpec::column("region"), upper_label_spec()];
-        assert_eq!(build_group_key(&doc, &specs), r#"["us","WEST"]"#);
+        assert_eq!(build_group_key(&doc, &specs).unwrap(), r#"["us","WEST"]"#);
     }
 }

@@ -240,7 +240,14 @@ pub fn fold_function_call(
         .map(|a| fold_constant(a, registry).map(sql_to_ndb_value))
         .collect::<Option<_>>()?;
 
-    let result = nodedb_query::functions::eval_function(&name.to_lowercase(), &folded_args);
+    // A call that can fail at plan-time constant-fold (e.g. `mod(5, 0)`
+    // with literal args) is treated the same as any other
+    // unfoldable expression — `None` here leaves the `SqlExpr::Function`
+    // node in place so it flows to the row-scope evaluator, which raises
+    // the real `22012` error at execution time. This mirrors how
+    // `fold_binary`'s `checked_div`/`checked_rem` already decline to fold
+    // (via `?`) rather than baking a bad result into the plan.
+    let result = nodedb_query::functions::eval_function(&name.to_lowercase(), &folded_args).ok()?;
     Some(ndb_to_sql_value(result))
 }
 

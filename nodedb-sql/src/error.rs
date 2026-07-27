@@ -11,6 +11,14 @@ pub enum SqlError {
     #[error("table not found: {name}")]
     UnknownTable { name: String },
 
+    /// A function call in an expression names no scalar, aggregate, or
+    /// window function registered in the [`FunctionRegistry`](crate::functions::registry::FunctionRegistry).
+    /// Caught at plan time in the resolver so the whole statement is
+    /// rejected instead of the call silently evaluating to `NULL` for every
+    /// row at runtime.
+    #[error("function {name}(...) does not exist")]
+    UndefinedFunction { name: String },
+
     #[error("unknown column '{column}' in table '{table}'")]
     UnknownColumn { table: String, column: String },
 

@@ -184,7 +184,16 @@ impl CoreLoop {
                                     }
                                 }
                                 UpdateValue::Expr(expr) => {
-                                    let result: nodedb_types::Value = expr.eval(&eval_doc);
+                                    let result: nodedb_types::Value = match expr.eval(&eval_doc) {
+                                        Ok(v) => v,
+                                        // Division/modulo by zero fails the
+                                        // statement, same as the
+                                        // literal-decode-failure arm above.
+                                        Err(_e) => {
+                                            return self
+                                                .response_error(task, ErrorCode::DivisionByZero);
+                                        }
+                                    };
                                     // Convert nodedb_types::Value → serde_json::Value so the
                                     // downstream re-encode path (strict or msgpack) can proceed
                                     // through its existing json-based branches unchanged.

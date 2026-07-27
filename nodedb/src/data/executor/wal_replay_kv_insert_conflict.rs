@@ -235,7 +235,27 @@ impl CoreLoop {
                         return 0;
                     }
                 };
-                let merged = apply_on_conflict_updates(existing_val, &excluded_val, updates);
+                let merged = match apply_on_conflict_updates(existing_val, &excluded_val, updates) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // A division/modulo-by-zero can only be reached by
+                        // replaying a WAL record logged before this fix
+                        // shipped (a fresh write would now fail at statement
+                        // time, before ever reaching the WAL) — warn and
+                        // skip, matching every other decode-failure branch
+                        // in this replay path, rather than crashing startup
+                        // on a historical record.
+                        warn!(
+                            core = self.core_id,
+                            collection = %collection,
+                            key = %String::from_utf8_lossy(key),
+                            ?e,
+                            "WAL kv_insert_on_conflict_update replay: ON CONFLICT expression \
+                             failed to evaluate, skipping record"
+                        );
+                        return 0;
+                    }
+                };
                 match nodedb_types::value_to_msgpack(&merged) {
                     Ok(b) => b,
                     Err(e) => {
@@ -419,7 +439,8 @@ mod tests {
         // decoded logical value, not raw bytes.
         let existing_val = nodedb_types::value_from_msgpack(&seed).expect("decode seed");
         let excluded_val = nodedb_types::value_from_msgpack(&excluded).expect("decode excluded");
-        let expected = super::apply_on_conflict_updates(existing_val, &excluded_val, &updates);
+        let expected =
+            super::apply_on_conflict_updates(existing_val, &excluded_val, &updates).unwrap();
 
         let stored = get_value(&h.core, "players", b"p1").expect("value present after replay");
         let stored_val = nodedb_types::value_from_msgpack(&stored).expect("decode stored value");
@@ -521,7 +542,8 @@ mod tests {
         // raw bytes (per-instance key ordering differs between live and replay).
         let existing_val = nodedb_types::value_from_msgpack(&seed).expect("decode seed");
         let excluded_val = nodedb_types::value_from_msgpack(&excluded).expect("decode excluded");
-        let expected = super::apply_on_conflict_updates(existing_val, &excluded_val, &updates);
+        let expected =
+            super::apply_on_conflict_updates(existing_val, &excluded_val, &updates).unwrap();
         // Read at now_ms=0: this record installs an absolute expiry of 6_000,
         // which is already in the past on the wall clock `get_value` uses, so
         // read before expiry to assert the merged value landed.

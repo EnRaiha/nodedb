@@ -52,7 +52,7 @@ impl CoreLoop {
             Vec<nodedb_types::value::Value>,
             serde_json::Value,
         )>,
-    ) {
+    ) -> crate::Result<()> {
         let FlushedScanCtx {
             collection,
             engine_key,
@@ -196,7 +196,7 @@ impl CoreLoop {
                         continue;
                     }
                     if !filter_predicates.is_empty()
-                        && !row_matches_filters(&row, schema, filter_predicates)
+                        && !row_matches_filters(&row, schema, filter_predicates)?
                     {
                         continue;
                     }
@@ -223,10 +223,11 @@ impl CoreLoop {
                             if matches!(existing, Some(v) if !v.is_null()) {
                                 continue;
                             }
-                            obj.insert(
-                                cc.alias.clone(),
-                                serde_json::Value::from(cc.expr.eval(&doc_val)),
-                            );
+                            // Computed-column projection is
+                            // projection-shaped: a division/modulo-by-zero
+                            // fails the whole scan.
+                            let v = cc.expr.eval(&doc_val)?;
+                            obj.insert(cc.alias.clone(), serde_json::Value::from(v));
                         }
                         if !projection.is_empty() {
                             obj.retain(|k, _| {
@@ -243,5 +244,6 @@ impl CoreLoop {
                 }
             }
         }
+        Ok(())
     }
 }

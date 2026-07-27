@@ -47,7 +47,7 @@ pub(in crate::data::executor) fn row_to_projected_json(
     projection: &[String],
     computed_cols: &[crate::bridge::expr_eval::ComputedColumn],
     all_versions: bool,
-) -> serde_json::Value {
+) -> crate::Result<serde_json::Value> {
     let mut obj = serde_json::Map::new();
     for (i, col_def) in schema.columns.iter().enumerate() {
         let force_system_col =
@@ -70,10 +70,11 @@ pub(in crate::data::executor) fn row_to_projected_json(
             if matches!(existing, Some(v) if !v.is_null()) {
                 continue;
             }
-            obj.insert(
-                cc.alias.clone(),
-                serde_json::Value::from(cc.expr.eval(&doc_val)),
-            );
+            // A computed column is projection-shaped: a division/modulo-by-
+            // zero fails the whole scan rather than silently materializing
+            // NULL into the response row.
+            let v = cc.expr.eval(&doc_val)?;
+            obj.insert(cc.alias.clone(), serde_json::Value::from(v));
         }
         if !projection.is_empty() {
             obj.retain(|k, _| {
@@ -83,7 +84,7 @@ pub(in crate::data::executor) fn row_to_projected_json(
             });
         }
     }
-    serde_json::Value::Object(obj)
+    Ok(serde_json::Value::Object(obj))
 }
 
 /// Write a timeseries columnar memtable cell value directly as msgpack bytes.

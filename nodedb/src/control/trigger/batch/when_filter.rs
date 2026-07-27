@@ -30,15 +30,22 @@ use crate::control::trigger::when_parse::WhenTarget;
 ///
 /// If raw bytes are unavailable (rows created via `from_decoded`, i.e. in
 /// tests) the function falls through to the existing decode + substitute path.
+///
+/// A division/modulo-by-zero in the WHEN predicate returns
+/// `Err(EvalError::DivisionByZero)` rather than folding a row to "does not
+/// fire". Callers decide what that means for their timing: a pre-commit BEFORE
+/// trigger propagates it and fails the statement (SQLSTATE 22012); a
+/// post-commit AFTER dispatcher (which has no statement left to fail) logs it
+/// and skips the trigger.
 pub fn filter_batch_by_when(
     rows: &[TriggerBatchRow],
     collection: &str,
     operation: &str,
     when_condition: Option<&str>,
-) -> Vec<bool> {
+) -> Result<Vec<bool>, nodedb_query::EvalError> {
     let when_cond = match when_condition {
         Some(cond) => cond,
-        None => return vec![true; rows.len()],
+        None => return Ok(vec![true; rows.len()]),
     };
 
     // Attempt to parse as binary-evaluable filter(s) — supports AND-joined predicates.
@@ -53,13 +60,17 @@ pub fn filter_batch_by_when(
                     WhenTarget::Old => row.old_raw(),
                 };
                 match raw {
-                    Some(bytes) => filters.iter().all(|f| f.matches_binary(bytes)),
+                    // A division/modulo-by-zero propagates as `Err` — never a
+                    // silent "does not fire".
+                    Some(bytes) => {
+                        crate::bridge::scan_filter::ScanFilter::all_match_binary(&filters, bytes)
+                    }
                     // No raw bytes (test rows from from_decoded) — fall back to
                     // the decode + substitute path for this row.
                     None => {
                         let bindings = build_row_bindings(row, collection, operation);
                         let bound_cond = bindings.substitute(when_cond);
-                        evaluate_simple_condition(&bound_cond)
+                        Ok(evaluate_simple_condition(&bound_cond))
                     }
                 }
             })
@@ -67,13 +78,14 @@ pub fn filter_batch_by_when(
     }
 
     // General path: substitute bindings and evaluate.
-    rows.iter()
+    Ok(rows
+        .iter()
         .map(|row| {
             let bindings = build_row_bindings(row, collection, operation);
             let bound_cond = bindings.substitute(when_cond);
             evaluate_simple_condition(&bound_cond)
         })
-        .collect()
+        .collect())
 }
 
 /// Build [`RowBindings`] for a single batch row.
@@ -117,14 +129,14 @@ mod tests {
             row_with_field("x", nodedb_types::Value::Integer(1)),
             row_with_field("x", nodedb_types::Value::Integer(2)),
         ];
-        let mask = filter_batch_by_when(&rows, "c", "INSERT", None);
+        let mask = filter_batch_by_when(&rows, "c", "INSERT", None).unwrap();
         assert_eq!(mask, vec![true, true]);
     }
 
     #[test]
     fn when_true_all_pass() {
         let rows = vec![row_with_field("x", nodedb_types::Value::Integer(1))];
-        let mask = filter_batch_by_when(&rows, "c", "INSERT", Some("TRUE"));
+        let mask = filter_batch_by_when(&rows, "c", "INSERT", Some("TRUE")).unwrap();
         assert_eq!(mask, vec![true]);
     }
 
@@ -134,7 +146,7 @@ mod tests {
             row_with_field("x", nodedb_types::Value::Integer(1)),
             row_with_field("x", nodedb_types::Value::Integer(2)),
         ];
-        let mask = filter_batch_by_when(&rows, "c", "INSERT", Some("FALSE"));
+        let mask = filter_batch_by_when(&rows, "c", "INSERT", Some("FALSE")).unwrap();
         assert_eq!(mask, vec![false, false]);
     }
 

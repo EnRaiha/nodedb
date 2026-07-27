@@ -80,6 +80,12 @@ pub enum ErrorDetails {
     FanOutExceeded { shards_touched: u16, limit: u16 },
     #[serde(rename = "sql_not_enabled")]
     SqlNotEnabled,
+    /// A function call names no registered scalar/aggregate/window function.
+    #[serde(rename = "undefined_function")]
+    UndefinedFunction { name: String },
+    /// Expression evaluation divided or took a modulus by zero.
+    #[serde(rename = "division_by_zero")]
+    DivisionByZero,
 
     // Auth
     #[serde(rename = "authorization_denied")]

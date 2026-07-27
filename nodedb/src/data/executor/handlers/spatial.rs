@@ -283,18 +283,26 @@ impl CoreLoop {
                 continue;
             }
 
-            if !attr_filters.iter().all(|f| f.matches_value(&doc)) {
-                continue;
+            match ScanFilter::all_match_value(&attr_filters, &doc) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_e) => {
+                    return self.response_error(task, ErrorCode::DivisionByZero);
+                }
             }
-            if !row_level_filters.iter().all(|f| f.matches_value(&doc)) {
-                continue;
+            match ScanFilter::all_match_value(&row_level_filters, &doc) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_e) => {
+                    return self.response_error(task, ErrorCode::DivisionByZero);
+                }
             }
 
             results.push(project_doc(&doc, &doc_id, projection));
         }
 
-        if let Some(txn_id) = task.request.txn_id {
-            self.merge_overlay_into_spatial_scan(
+        if let Some(txn_id) = task.request.txn_id
+            && let Err(e) = self.merge_overlay_into_spatial_scan(
                 super::transaction::overlay::SpatialOverlayMergeParams {
                     txn_id,
                     coll_key: &coll_key,
@@ -307,7 +315,9 @@ impl CoreLoop {
                     row_level_filters: &row_level_filters,
                 },
                 &mut results,
-            );
+            )
+        {
+            return self.response_error(task, e);
         }
 
         match response_codec::encode_value_vec(&results) {
@@ -389,11 +399,19 @@ impl CoreLoop {
                 continue;
             }
 
-            if !attr_filters.iter().all(|f| f.matches_value(&doc)) {
-                continue;
+            match ScanFilter::all_match_value(attr_filters, &doc) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_e) => {
+                    return self.response_error(task, ErrorCode::DivisionByZero);
+                }
             }
-            if !rls_filters.iter().all(|f| f.matches_value(&doc)) {
-                continue;
+            match ScanFilter::all_match_value(rls_filters, &doc) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_e) => {
+                    return self.response_error(task, ErrorCode::DivisionByZero);
+                }
             }
 
             results.push(project_doc(&doc, doc_id, projection));
@@ -405,7 +423,7 @@ impl CoreLoop {
                 crate::types::TenantId::new(tid),
                 collection.to_string(),
             );
-            self.merge_overlay_into_spatial_scan(
+            if let Err(e) = self.merge_overlay_into_spatial_scan(
                 super::transaction::overlay::SpatialOverlayMergeParams {
                     txn_id,
                     coll_key: &coll_key,
@@ -418,7 +436,9 @@ impl CoreLoop {
                     row_level_filters: rls_filters,
                 },
                 &mut results,
-            );
+            ) {
+                return self.response_error(task, e);
+            }
         }
 
         match response_codec::encode_value_vec(&results) {

@@ -10,71 +10,117 @@
 
 use nodedb_types::Value;
 
-use crate::expr::SqlExpr;
+use crate::expr::{EvalError, SqlExpr};
 use crate::msgpack_scan::field::extract_field;
 use crate::msgpack_scan::reader::{read_f64, read_str, read_value};
 use crate::value_ops;
 
 // ── Expression evaluator ───────────────────────────────────────────────────
 
+/// Evaluate `expr` against a decoded document.
+///
+/// The `Result<Option<Value>, EvalError>` shape distinguishes the two ways a
+/// per-row aggregate argument can decline to contribute a value:
+/// - `Ok(None)` — the row is *skipped* (document could not be decoded, or the
+///   expression legitimately yields no value). Matches SQL aggregate semantics
+///   where a NULL/absent argument is excluded from the accumulation.
+/// - `Err(EvalError::DivisionByZero)` — the expression divided or took a
+///   modulus by zero. This is a statement failure that
+///   surfaces as SQLSTATE `22012`, exactly like a WHERE/projection expression,
+///   rather than silently dropping the row from the aggregate.
 #[inline]
-fn eval_expr(doc: &[u8], expr: &SqlExpr) -> Option<Value> {
-    let doc_val = nodedb_types::json_msgpack::value_from_msgpack(doc).ok()?;
-    Some(expr.eval(&doc_val))
+fn eval_expr(doc: &[u8], expr: &SqlExpr) -> Result<Option<Value>, EvalError> {
+    let Ok(doc_val) = nodedb_types::json_msgpack::value_from_msgpack(doc) else {
+        return Ok(None);
+    };
+    Ok(Some(expr.eval(&doc_val)?))
 }
 
 // ── Public extraction helpers ──────────────────────────────────────────────
 
 /// Extract a numeric (f64) value from `field`, or evaluate `expr` if provided.
-/// Returns `None` when the field is absent or cannot be converted to f64.
+/// Returns `Ok(None)` when the field is absent or cannot be converted to f64,
+/// and `Err(EvalError::DivisionByZero)` when `expr` divides/mods by zero.
 #[inline]
-pub fn extract_f64(doc: &[u8], field: &str, expr: Option<&SqlExpr>) -> Option<f64> {
+pub fn extract_f64(
+    doc: &[u8],
+    field: &str,
+    expr: Option<&SqlExpr>,
+) -> Result<Option<f64>, EvalError> {
     if let Some(expr) = expr {
-        return value_ops::value_to_f64(&eval_expr(doc, expr)?, false);
+        return Ok(eval_expr(doc, expr)?.and_then(|v| value_ops::value_to_f64(&v, false)));
     }
-    let (start, _end) = extract_field(doc, 0, field)?;
-    read_f64(doc, start)
+    let Some((start, _end)) = extract_field(doc, 0, field) else {
+        return Ok(None);
+    };
+    Ok(read_f64(doc, start))
 }
 
 /// Extract a display string from `field`, or evaluate `expr` if provided.
-/// Returns `None` when the field is absent.
-pub fn extract_str(doc: &[u8], field: &str, expr: Option<&SqlExpr>) -> Option<String> {
+/// Returns `Ok(None)` when the field is absent.
+pub fn extract_str(
+    doc: &[u8],
+    field: &str,
+    expr: Option<&SqlExpr>,
+) -> Result<Option<String>, EvalError> {
     if let Some(expr) = expr {
-        return Some(value_ops::value_to_display_string(&eval_expr(doc, expr)?));
+        return Ok(eval_expr(doc, expr)?.map(|v| value_ops::value_to_display_string(&v)));
     }
-    let (start, _end) = extract_field(doc, 0, field)?;
-    read_str(doc, start).map(|s| s.to_string())
+    let Some((start, _end)) = extract_field(doc, 0, field) else {
+        return Ok(None);
+    };
+    Ok(read_str(doc, start).map(|s| s.to_string()))
 }
 
 /// Extract a field as `Value`.  Uses direct msgpack→Value for scalars;
 /// falls back to full document decode only for complex types.
-pub fn extract_value(doc: &[u8], field: &str, expr: Option<&SqlExpr>) -> Option<Value> {
+pub fn extract_value(
+    doc: &[u8],
+    field: &str,
+    expr: Option<&SqlExpr>,
+) -> Result<Option<Value>, EvalError> {
     if let Some(expr) = expr {
         return eval_expr(doc, expr);
     }
-    let (start, end) = extract_field(doc, 0, field)?;
+    let Some((start, end)) = extract_field(doc, 0, field) else {
+        return Ok(None);
+    };
     if let Some(v) = read_value(doc, start) {
-        return Some(v);
+        return Ok(Some(v));
     }
     let field_bytes = &doc[start..end];
-    nodedb_types::json_msgpack::value_from_msgpack(field_bytes).ok()
+    Ok(nodedb_types::json_msgpack::value_from_msgpack(field_bytes).ok())
 }
 
 /// Extract a field or expression result as raw msgpack bytes.
 /// Used by `count_distinct`, `approx_count_distinct`, `approx_topk`, etc.
-pub fn extract_bytes(doc: &[u8], field: &str, expr: Option<&SqlExpr>) -> Option<Vec<u8>> {
+pub fn extract_bytes(
+    doc: &[u8],
+    field: &str,
+    expr: Option<&SqlExpr>,
+) -> Result<Option<Vec<u8>>, EvalError> {
     if let Some(expr) = expr {
-        let val = eval_expr(doc, expr)?;
-        return nodedb_types::json_msgpack::value_to_msgpack(&val).ok();
+        let Some(val) = eval_expr(doc, expr)? else {
+            return Ok(None);
+        };
+        return Ok(nodedb_types::json_msgpack::value_to_msgpack(&val).ok());
     }
-    let (start, end) = extract_field(doc, 0, field)?;
-    Some(doc[start..end].to_vec())
+    let Some((start, end)) = extract_field(doc, 0, field) else {
+        return Ok(None);
+    };
+    Ok(Some(doc[start..end].to_vec()))
 }
 
-/// Returns `Some(())` when the field is present and non-null.
+/// Returns `Ok(Some(()))` when the field is present and non-null.
 /// Used by `count(field)` accumulator to count non-null values.
 #[inline]
-pub fn extract_non_null(doc: &[u8], field: &str, expr: Option<&SqlExpr>) -> Option<()> {
-    let v = extract_value(doc, field, expr)?;
-    if v.is_null() { None } else { Some(()) }
+pub fn extract_non_null(
+    doc: &[u8],
+    field: &str,
+    expr: Option<&SqlExpr>,
+) -> Result<Option<()>, EvalError> {
+    let Some(v) = extract_value(doc, field, expr)? else {
+        return Ok(None);
+    };
+    Ok(if v.is_null() { None } else { Some(()) })
 }

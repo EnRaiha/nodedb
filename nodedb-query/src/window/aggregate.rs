@@ -21,7 +21,7 @@ pub(super) fn apply_aggregate_window(
     rows: &mut [(String, serde_json::Value)],
     indices: &[usize],
     spec: &WindowFuncSpec,
-) {
+) -> Result<(), crate::expr::EvalError> {
     let field = spec
         .args
         .first()
@@ -39,11 +39,11 @@ pub(super) fn apply_aggregate_window(
         && matches!(spec.frame.end, FrameBound::CurrentRow);
 
     if use_running {
-        running_aggregate(rows, indices, spec, field);
-        return;
+        running_aggregate(rows, indices, spec, field)?;
+        return Ok(());
     }
 
-    per_row_aggregate(rows, indices, spec, field);
+    per_row_aggregate(rows, indices, spec, field)
 }
 
 /// Per-row frame evaluator.
@@ -58,22 +58,21 @@ fn per_row_aggregate(
     indices: &[usize],
     spec: &WindowFuncSpec,
     field: &str,
-) {
+) -> Result<(), crate::expr::EvalError> {
     let len = indices.len();
     if len == 0 {
-        return;
+        return Ok(());
     }
 
     // Extract order-by values for RANGE numeric offsets.
     let order_expr = spec.order_by.first().map(|(expr, _)| expr);
     let order_values: Vec<serde_json::Value> = indices
         .iter()
-        .map(|&i| {
-            order_expr
-                .map(|expr| super::helpers::eval_expr_on_json(expr, &rows[i].1))
-                .unwrap_or(serde_json::Value::Null)
+        .map(|&i| match order_expr {
+            Some(expr) => super::helpers::eval_expr_on_json(expr, &rows[i].1),
+            None => Ok(serde_json::Value::Null),
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Peer groups needed for GROUPS mode (and for RANGE CurrentRow peer
     // awareness — reused from the frame module which handles both).
@@ -104,6 +103,7 @@ fn per_row_aggregate(
         let row_idx = indices[pos];
         set_window_col(&mut rows[row_idx].1, &spec.alias, result);
     }
+    Ok(())
 }
 
 /// Aggregate `field` over the slice `indices[start_idx..=end_idx]`.
@@ -227,7 +227,7 @@ mod tests {
             "n",
             rows_frame(FrameBound::Preceding(1), FrameBound::Following(1)),
         );
-        apply_aggregate_window(&mut rows, &indices, &spec);
+        apply_aggregate_window(&mut rows, &indices, &spec).unwrap();
         // row 0 (n=1): sum of [1,2] = 3
         // row 1 (n=2): sum of [1,2,3] = 6
         // row 2 (n=3): sum of [2,3,4] = 9
@@ -249,7 +249,7 @@ mod tests {
             "n",
             rows_frame(FrameBound::UnboundedPreceding, FrameBound::CurrentRow),
         );
-        apply_aggregate_window(&mut rows, &indices, &spec);
+        apply_aggregate_window(&mut rows, &indices, &spec).unwrap();
         assert_eq!(rows[0].1["result"], json!(1.0));
         assert_eq!(rows[1].1["result"], json!(3.0));
         assert_eq!(rows[2].1["result"], json!(6.0));
@@ -266,7 +266,7 @@ mod tests {
             "n",
             rows_frame(FrameBound::CurrentRow, FrameBound::UnboundedFollowing),
         );
-        apply_aggregate_window(&mut rows, &indices, &spec);
+        apply_aggregate_window(&mut rows, &indices, &spec).unwrap();
         // row 0: sum 1+2+3+4+5=15
         // row 1: sum 2+3+4+5=14
         // ...
@@ -295,7 +295,7 @@ mod tests {
             "n",
             range_frame(FrameBound::UnboundedPreceding, FrameBound::CurrentRow),
         );
-        apply_aggregate_window(&mut rows, &indices, &spec);
+        apply_aggregate_window(&mut rows, &indices, &spec).unwrap();
         // Row a (n=1, pos=0): CURRENT ROW expands to last peer at pos=1, sum=1+1=2
         assert_eq!(rows[0].1["result"], json!(2.0));
         // Row b (n=1, pos=1): same
@@ -324,7 +324,7 @@ mod tests {
             "n",
             groups_frame(FrameBound::Preceding(1), FrameBound::Following(1)),
         );
-        apply_aggregate_window(&mut rows, &indices, &spec);
+        apply_aggregate_window(&mut rows, &indices, &spec).unwrap();
         // pos=0 (group 0): frame → groups 0..=1 → rows 0..=2 → sum=1+1+2=4
         assert_eq!(rows[0].1["result"], json!(4.0));
         // pos=1 (group 0): same frame

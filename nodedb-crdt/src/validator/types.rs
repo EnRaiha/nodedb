@@ -13,6 +13,19 @@ pub enum ValidationOutcome {
     Accepted,
     /// One or more constraints violated — delta rejected.
     Rejected(Vec<Violation>),
+    /// A CHECK predicate could not be *evaluated* — division/modulo by zero.
+    /// Kept distinct from [`ValidationOutcome::Rejected`]
+    /// because an eval error is a hard statement failure (SQLSTATE `22012`),
+    /// NOT a resolvable conflict: declarative conflict policies
+    /// (`LastWriterWins`, `RenameSuffix`, …) must never "resolve" an
+    /// unevaluable predicate the way they resolve a genuine violation. It fails
+    /// closed — escalated straight to the dead-letter queue.
+    EvalError {
+        /// The CHECK constraint whose predicate failed to evaluate.
+        constraint_name: String,
+        /// The underlying evaluation error (currently only `DivisionByZero`).
+        error: nodedb_query::EvalError,
+    },
 }
 
 /// A single constraint violation.

@@ -415,3 +415,41 @@ fn check_constraint_rejects_malformed_expr() {
         _ => panic!("expected rejection for malformed CHECK expression"),
     }
 }
+
+/// A CHECK predicate that divides by zero is an *evaluation* error, not an
+/// ordinary violation: `validate` returns `ValidationOutcome::EvalError` so the
+/// downstream conflict-policy machinery never "resolves" an unevaluable
+/// predicate. Distinct from both `Rejected` (a genuine violation) and
+/// `Accepted`.
+#[test]
+fn check_constraint_division_by_zero_surfaces_eval_error() {
+    let state = CrdtState::new(1).unwrap();
+    let mut cs = ConstraintSet::new();
+    // `100 / age` is unevaluable when age = 0.
+    cs.add_check(
+        "people_ratio_check",
+        "people",
+        "age",
+        "100 / age > 0",
+        "100 / age > 0",
+    );
+    let validator = Validator::new(cs, 100);
+
+    let change = ProposedChange {
+        collection: "people".into(),
+        row_id: "p1".into(),
+        surrogate: nodedb_types::Surrogate::ZERO,
+        fields: vec![("age".into(), LoroValue::I64(0))],
+    };
+
+    match validator.validate(&state, &change) {
+        ValidationOutcome::EvalError {
+            constraint_name,
+            error,
+        } => {
+            assert_eq!(constraint_name, "people_ratio_check");
+            assert_eq!(error, nodedb_query::EvalError::DivisionByZero);
+        }
+        other => panic!("expected ValidationOutcome::EvalError, got {other:?}"),
+    }
+}

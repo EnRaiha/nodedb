@@ -105,11 +105,8 @@ pub(in crate::data::executor) fn map_enforcement_error(e: ErrorCode) -> crate::E
         ErrorCode::StateTransitionViolation { collection, detail } => {
             crate::Error::StateTransitionViolation { collection, detail }
         }
-        ErrorCode::TransitionCheckViolation { collection } => {
-            crate::Error::TransitionCheckViolation {
-                collection,
-                detail: "transition check predicate failed".to_string(),
-            }
+        ErrorCode::TransitionCheckViolation { collection, detail } => {
+            crate::Error::TransitionCheckViolation { collection, detail }
         }
         ErrorCode::RetentionViolation { collection } => crate::Error::RetentionViolation {
             collection,
