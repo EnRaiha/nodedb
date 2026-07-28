@@ -243,7 +243,7 @@ impl CoreLoop {
         // surrogate prefilter is active we therefore scan flushed segments and
         // apply a per-row membership test below, mirroring the live-memtable
         // phase. See the method-level doc comment for the full rationale.
-        self.scan_flushed_columnar_segments(
+        if let Err(e) = self.scan_flushed_columnar_segments(
             super::scan_flushed::FlushedScanCtx {
                 collection,
                 engine_key: &engine_key,
@@ -262,7 +262,15 @@ impl CoreLoop {
                 ts_valid_until_idx,
             },
             &mut matched,
-        );
+        ) {
+            // `scan_flushed_columnar_segments` returns `crate::Result<()>`,
+            // so `e` already carries the real typed error (e.g. a
+            // division/modulo-by-zero in `filter_predicates`) — propagate
+            // it as-is via `From<crate::Error> for ErrorCode` instead of
+            // collapsing it to `Internal`/`XX000`, mirroring
+            // `document/read/scan.rs`'s `Err(e) => self.response_error(task, e)`.
+            return self.response_error(task, e);
+        }
 
         // ── Phase 2: live memtable ──────────────────────────────────────────
         // Rows still in the active memtable (not yet flushed).
@@ -296,18 +304,39 @@ impl CoreLoop {
                 ) {
                     continue;
                 }
-                if !filter_predicates.is_empty()
-                    && !row_matches_filters(&row, schema, &filter_predicates)
-                {
-                    continue;
+                if !filter_predicates.is_empty() {
+                    match row_matches_filters(&row, schema, &filter_predicates) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        // `row_matches_filters` returns `EvalError`, which
+                        // has exactly one variant and no direct
+                        // `Into<ErrorCode>` — mirrors
+                        // `stage_columnar_dml.rs`'s identical call site,
+                        // which hardcodes the same typed code rather than
+                        // collapsing to `Internal`/`XX000`.
+                        Err(_e) => {
+                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        }
+                    }
                 }
-                let obj = super::convert::row_to_projected_json(
+                let obj = match super::convert::row_to_projected_json(
                     &row,
                     schema,
                     projection,
                     &computed_cols,
                     all_versions,
-                );
+                ) {
+                    Ok(v) => v,
+                    // `row_to_projected_json` returns `crate::Result<_>`
+                    // (unlike `row_matches_filters` above) — its only
+                    // fallible step is a computed-column expression eval,
+                    // and `computed_cols` here is real, not `&[]` like the
+                    // DML staging path, so propagate the actual typed error
+                    // rather than assuming which one it is.
+                    Err(e) => {
+                        return self.response_error(task, e);
+                    }
+                };
                 matched.push((row_surrogate, row, obj));
                 if sort_keys.is_empty() && matched.len() >= limit {
                     break;
@@ -329,7 +358,7 @@ impl CoreLoop {
                 task.request.tenant_id,
                 collection.to_string(),
             );
-            self.merge_overlay_into_columnar_scan(
+            if let Err(e) = self.merge_overlay_into_columnar_scan(
                 crate::data::executor::handlers::transaction::overlay::ColumnarOverlayMergeParams {
                     txn_id,
                     coll_key: &coll_key,
@@ -340,7 +369,16 @@ impl CoreLoop {
                     all_versions,
                 },
                 &mut matched,
-            );
+            ) {
+                // `merge_overlay_into_columnar_scan` returns
+                // `crate::Result<()>` (the overlay's own residual-predicate
+                // re-check can divide/modulo by zero) — propagate the typed
+                // error directly, matching both `document/read/scan.rs`'s
+                // generic `self.response_error(task, e)` pattern and
+                // `stage_columnar_dml.rs`'s identical call to this same
+                // function (`Err(e) => return Err(self.response_error(task, e))`).
+                return self.response_error(task, e);
+            }
         }
 
         if !sort_keys.is_empty() {

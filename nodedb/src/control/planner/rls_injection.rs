@@ -193,6 +193,15 @@ fn inject_rls_for_plan(
             inject_rls_for_plan(tenant_id, child, rls_store, auth)?;
         }
 
+        // ── PostProcess: recurse into the materialized child ──
+        //
+        // The post-processor wraps a subquery body (a sharded scan under
+        // `Exchange{Gather}`); without this arm the catch-all swallows it and
+        // the inner scan never receives its RLS filter — an RLS bypass.
+        PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => {
+            inject_rls_for_plan(tenant_id, input, rls_store, auth)?;
+        }
+
         // ── LateralTopK / LateralLoop: recurse into outer_plan; also inject
         //    RLS into the inner_filters that the executor applies per outer row ──
         //

@@ -28,14 +28,20 @@ fn render_value(value: &LoroValue) -> String {
 }
 
 impl Validator {
+    ///
+    /// Returns `Err(EvalError)` when a CHECK predicate cannot be *evaluated*
+    /// (division/modulo by zero). This is distinct from an
+    /// ordinary constraint failure (`Ok(Some(Violation))`): the caller lifts it
+    /// to [`ValidationOutcome::EvalError`], a hard statement failure that
+    /// declarative conflict policies must never "resolve".
     pub(crate) fn check_constraint(
         &self,
         state: &impl RowLookup,
         change: &ProposedChange,
         constraint: &Constraint,
-    ) -> Option<Violation> {
+    ) -> Result<Option<Violation>, nodedb_query::EvalError> {
         match &constraint.kind {
-            ConstraintKind::Unique => self.check_unique(state, change, constraint),
+            ConstraintKind::Unique => Ok(self.check_unique(state, change, constraint)),
             ConstraintKind::ForeignKey {
                 ref_collection,
                 ref_key,
@@ -43,8 +49,8 @@ impl Validator {
             | ConstraintKind::BiTemporalFK {
                 ref_collection,
                 ref_key,
-            } => self.check_foreign_key(state, change, constraint, ref_collection, ref_key),
-            ConstraintKind::NotNull => self.check_not_null(change, constraint),
+            } => Ok(self.check_foreign_key(state, change, constraint, ref_collection, ref_key)),
+            ConstraintKind::NotNull => Ok(self.check_not_null(change, constraint)),
             ConstraintKind::Check { expr, .. } => self.check_expr(change, constraint, expr),
         }
     }
@@ -60,7 +66,7 @@ impl Validator {
         change: &ProposedChange,
         constraint: &Constraint,
         expr: &str,
-    ) -> Option<Violation> {
+    ) -> Result<Option<Violation>, nodedb_query::EvalError> {
         // Build a row Value::Object from the proposed change's fields so the
         // expression evaluator can resolve column references by name.
         let mut row = std::collections::HashMap::with_capacity(change.fields.len());
@@ -72,7 +78,10 @@ impl Validator {
         let parsed = match nodedb_query::expr_parse::parse_generated_expr(expr) {
             Ok((expr, _deps)) => expr,
             Err(e) => {
-                return Some(Violation {
+                // A malformed *stored* predicate is a catalog-integrity failure,
+                // not an evaluation error — it stays an ordinary Violation
+                // (fails closed) so a corrupt entry can't bypass its invariant.
+                return Ok(Some(Violation {
                     constraint_name: constraint.name.clone(),
                     reason: format!("invalid CHECK expression `{expr}`: {e}"),
                     hint: CompensationHint::ManualIntervention {
@@ -81,20 +90,27 @@ impl Validator {
                             constraint.name
                         ),
                     },
-                });
+                }));
             }
         };
 
+        // A division/modulo-by-zero inside the predicate
+        // is neither a PASS nor an ordinary FAIL — it's an evaluation error,
+        // propagated as `Err(EvalError)` and lifted by `validate` to
+        // `ValidationOutcome::EvalError`. That keeps it out of the conflict-
+        // policy machinery: an unevaluable predicate is a hard SQLSTATE-22012
+        // failure, never something LastWriterWins et al. may "resolve".
         match parsed.eval(&row_value) {
-            nodedb_types::Value::Bool(true) => None,
-            nodedb_types::Value::Null => None,
-            _ => Some(Violation {
+            Ok(nodedb_types::Value::Bool(true)) => Ok(None),
+            Ok(nodedb_types::Value::Null) => Ok(None),
+            Ok(_) => Ok(Some(Violation {
                 constraint_name: constraint.name.clone(),
                 reason: format!("CHECK `{}` failed: {expr}", constraint.name),
                 hint: CompensationHint::ManualIntervention {
                     reason: format!("row violates CHECK predicate `{expr}`"),
                 },
-            }),
+            })),
+            Err(e) => Err(e),
         }
     }
 

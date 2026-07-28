@@ -149,22 +149,36 @@ pub(super) fn execute_grouping_sets(
                 if use_field_index {
                     let idx = msgpack_scan::FieldIndex::build(raw, 0)
                         .unwrap_or_else(msgpack_scan::FieldIndex::empty);
-                    if !filter_predicates
-                        .iter()
-                        .all(|f| f.matches_binary_indexed(raw, &idx))
-                    {
-                        continue;
+                    match ScanFilter::all_match_binary_indexed(&filter_predicates, raw, &idx) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_e) => {
+                            return core.response_error(task, ErrorCode::DivisionByZero);
+                        }
                     }
-                } else if !filter_predicates.iter().all(|f| f.matches_binary(raw)) {
-                    continue;
+                } else {
+                    match ScanFilter::all_match_binary(&filter_predicates, raw) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_e) => {
+                            return core.response_error(task, ErrorCode::DivisionByZero);
+                        }
+                    }
                 }
             }
 
-            let group_key = msgpack_scan::build_group_key(raw, &active_specs);
-            groups
+            let group_key = match msgpack_scan::build_group_key(raw, &active_specs) {
+                Ok(k) => k,
+                Err(_e) => return core.response_error(task, ErrorCode::DivisionByZero),
+            };
+            if groups
                 .entry(group_key)
                 .or_insert_with(|| GroupState::new(&real_agg_slice))
-                .feed(&real_agg_slice, raw);
+                .feed(&real_agg_slice, raw)
+                .is_err()
+            {
+                return core.response_error(task, ErrorCode::DivisionByZero);
+            }
         }
 
         // For an empty grouping set (grand-total), produce one aggregate row
@@ -172,8 +186,16 @@ pub(super) fn execute_grouping_sets(
         if active_keys.is_empty() && groups.is_empty() {
             let mut grand = GroupState::new(&real_agg_slice);
             for raw in &owned_docs {
-                if filter_predicates.iter().all(|f| f.matches_binary(raw)) {
-                    grand.feed(&real_agg_slice, raw);
+                match ScanFilter::all_match_binary(&filter_predicates, raw) {
+                    Ok(true) => {
+                        if grand.feed(&real_agg_slice, raw).is_err() {
+                            return core.response_error(task, ErrorCode::DivisionByZero);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_e) => {
+                        return core.response_error(task, ErrorCode::DivisionByZero);
+                    }
                 }
             }
             groups.insert(String::new(), grand);
@@ -240,10 +262,27 @@ pub(super) fn execute_grouping_sets(
 
     // Apply HAVING.
     if !having_predicates.is_empty() {
+        // `Vec::retain`'s closure must return `bool`, so a division/modulo-
+        // by-zero in a HAVING predicate is captured via this `Cell`
+        // side-channel and checked once the retain finishes.
+        let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
+            std::cell::Cell::new(None);
         all_rows.retain(|row| {
+            if predicate_err.get().is_some() {
+                return true;
+            }
             let mp = nodedb_types::json_to_msgpack_or_empty(row);
-            having_predicates.iter().all(|f| f.matches_binary(&mp))
+            match ScanFilter::all_match_binary(&having_predicates, &mp) {
+                Ok(keep) => keep,
+                Err(e) => {
+                    predicate_err.set(Some(e));
+                    true
+                }
+            }
         });
+        if predicate_err.take().is_some() {
+            return core.response_error(task, ErrorCode::DivisionByZero);
+        }
     }
 
     // Apply user aliases for real aggregates (grouping aliases were applied above).

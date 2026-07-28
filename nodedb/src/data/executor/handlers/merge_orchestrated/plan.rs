@@ -147,11 +147,11 @@ impl CoreLoop {
                 target_doc.clone()
             };
 
-            if let Some(arm) = find_arm(params.clauses, arm_kind, &context) {
+            if let Some(arm) = find_arm(params.clauses, arm_kind, &context)? {
                 match &arm.action {
                     MergeActionOp::Update { updates: upd } => {
                         let updated =
-                            build_update_doc(&target_doc, source_doc, params.source_alias, upd);
+                            build_update_doc(&target_doc, source_doc, params.source_alias, upd)?;
                         updates.push(MergeUpdate {
                             doc_id: doc_id.clone(),
                             surrogate,
@@ -175,7 +175,7 @@ impl CoreLoop {
             if matched_source_keys.contains(src_key.as_str()) {
                 continue;
             }
-            if let Some(arm) = find_arm(params.clauses, MergeClauseKindOp::NotMatched, src_doc)
+            if let Some(arm) = find_arm(params.clauses, MergeClauseKindOp::NotMatched, src_doc)?
                 && let MergeActionOp::Insert { columns, values } = &arm.action
             {
                 let body = encode_doc_body(&build_insert_doc(
@@ -183,7 +183,7 @@ impl CoreLoop {
                     values,
                     src_doc,
                     params.source_alias,
-                ));
+                )?);
                 inserts.push(MergeInsert {
                     join_key: src_key.clone(),
                     body,

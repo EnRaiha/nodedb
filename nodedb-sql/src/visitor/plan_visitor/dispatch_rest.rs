@@ -22,6 +22,23 @@ pub(super) fn dispatch_rest<V: PlanVisitor>(
         SqlPlan::Intersect { left, right, all } => visitor.intersect(left, right, *all),
         SqlPlan::Except { left, right, all } => visitor.except(left, right, *all),
         SqlPlan::Cte { definitions, outer } => visitor.cte(definitions, outer),
+        SqlPlan::Subquery {
+            input,
+            filters,
+            projection,
+            sort_keys,
+            offset,
+            distinct,
+            limit,
+        } => visitor.subquery(super::args::SubqueryVisitArgs {
+            input,
+            filters,
+            projection,
+            sort_keys,
+            offset: *offset,
+            distinct: *distinct,
+            limit: *limit,
+        }),
         SqlPlan::CreateArray {
             name,
             dims,

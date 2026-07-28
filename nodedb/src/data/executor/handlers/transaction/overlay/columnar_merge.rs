@@ -75,7 +75,7 @@ impl CoreLoop {
         &self,
         params: ColumnarOverlayMergeParams<'_>,
         matched: &mut Vec<ColumnarMatchedRow>,
-    ) {
+    ) -> crate::Result<()> {
         let ColumnarOverlayMergeParams {
             txn_id,
             coll_key,
@@ -90,11 +90,14 @@ impl CoreLoop {
         // never ages out of the overlay reaper.
         self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
-            return;
+            return Ok(());
         };
 
-        let predicate = |row: &[Value]| -> bool {
-            filter_predicates.is_empty() || row_matches_filters(row, schema, filter_predicates)
+        let predicate = |row: &[Value]| -> Result<bool, nodedb_query::EvalError> {
+            if filter_predicates.is_empty() {
+                return Ok(true);
+            }
+            row_matches_filters(row, schema, filter_predicates)
         };
 
         // Surrogates already represented in the base result. Additions
@@ -111,7 +114,17 @@ impl CoreLoop {
         // result). A row with no recorded surrogate has no overlay identity
         // to resolve and is left untouched, matching the base scan's own
         // "no prefilter possible" treatment of unrecorded surrogates.
+        //
+        // `Vec::retain_mut`'s closure must return `bool`, so a
+        // division/modulo-by-zero hit while projecting a computed column
+        // can't `?` out of it directly; it's captured in `first_err` and
+        // checked once the retain pass finishes, aborting the merge before
+        // the overlay-addition pass below runs.
+        let mut first_err: Option<crate::Error> = None;
         matched.retain_mut(|(surrogate, row, json)| {
+            if first_err.is_some() {
+                return true;
+            }
             let Some(s) = surrogate else {
                 return true;
             };
@@ -119,16 +132,27 @@ impl CoreLoop {
                 Some(Staged::Tombstone) => false,
                 Some(Staged::Put(body)) => match decode_staged_row(body) {
                     Some(new_row) => {
-                        if !predicate(&new_row) {
-                            return false;
+                        match predicate(&new_row) {
+                            Ok(true) => {}
+                            Ok(false) => return false,
+                            Err(e) => {
+                                first_err = Some(crate::Error::from(e));
+                                return true;
+                            }
                         }
-                        *json = row_to_projected_json(
+                        match row_to_projected_json(
                             &new_row,
                             schema,
                             projection,
                             computed_cols,
                             all_versions,
-                        );
+                        ) {
+                            Ok(v) => *json = v,
+                            Err(e) => {
+                                first_err = Some(e);
+                                return true;
+                            }
+                        }
                         *row = new_row;
                         true
                     }
@@ -139,6 +163,9 @@ impl CoreLoop {
                 None => true,
             }
         });
+        if let Some(e) = first_err {
+            return Err(e);
+        }
 
         // Overlay additions: staged puts for surrogates the base scan did
         // not return, appended when the decoded row satisfies the scan's
@@ -153,13 +180,14 @@ impl CoreLoop {
             let Some(new_row) = decode_staged_row(body) else {
                 continue;
             };
-            if !predicate(&new_row) {
+            if !predicate(&new_row)? {
                 continue;
             }
             let json =
-                row_to_projected_json(&new_row, schema, projection, computed_cols, all_versions);
+                row_to_projected_json(&new_row, schema, projection, computed_cols, all_versions)?;
             matched.push((Some(Surrogate::new(surrogate)), new_row, json));
             seen.insert(surrogate);
         }
+        Ok(())
     }
 }

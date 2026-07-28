@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Upstream issue #223: `document_strict` and `kv` collections must accept
+//! `document_strict` and `kv` collections must accept
 //! every PostgreSQL integer-width keyword in DDL *and* report each column's
 //! declared width faithfully on the wire.
 //!

@@ -209,6 +209,29 @@ pub(super) async fn materialize_providers(
             }))
         }
 
+        // PostProcess: recurse into the materialized child so any catalog
+        // providers nested in the subquery body are filled before resolution.
+        PhysicalPlan::Query(QueryOp::PostProcess {
+            input,
+            filters,
+            projection,
+            sort_keys,
+            limit,
+            offset,
+            distinct,
+        }) => {
+            let input = Box::pin(materialize_providers(state, identity, *input)).await?;
+            Ok(PhysicalPlan::Query(QueryOp::PostProcess {
+                input: Box::new(input),
+                filters,
+                projection,
+                sort_keys,
+                limit,
+                offset,
+                distinct,
+            }))
+        }
+
         // All other variants: no catalog providers can be nested here —
         // pass through unchanged.
         other => Ok(other),

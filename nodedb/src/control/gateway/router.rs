@@ -66,7 +66,7 @@ pub fn route_plan(
     // Commit-time meta-ops (ResolveTxn / TransactionBatch) carry no collection
     // name, so their vShard cannot be derived here — the primary_vshard
     // fallback would silently send them to vShard 0 and durably apply the
-    // commit batch on the wrong core (#193). They are dispatched with the
+    // commit batch on the wrong core. They are dispatched with the
     // task's pre-classified `vshard_id` (see `dispatch_single_shard`), never
     // through the gateway.
     {
@@ -463,7 +463,7 @@ mod tests {
 
     /// Commit-time meta-ops carry no collection name, so the router cannot
     /// derive their vShard — silently falling back to vShard 0 durably applies
-    /// the commit batch on the wrong core (#193). They must be rejected here;
+    /// the commit batch on the wrong core. They must be rejected here;
     /// callers dispatch them with the task's pre-classified `vshard_id`.
     #[test]
     fn commit_meta_ops_are_rejected() {

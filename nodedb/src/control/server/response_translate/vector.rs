@@ -56,8 +56,16 @@ fn apply_rls_filter(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize) {
             return;
         }
     };
+    // RLS is a security boundary: fail closed. A division/modulo-by-zero
+    // evaluating a filter against one hit drops that hit rather than
+    // showing it, the same way a filter that evaluates to
+    // `false` already excludes it — matching the "deny on any doubt"
+    // posture the corrupt-filter branch above already uses. This
+    // response-translation layer has no natural way to fail the whole
+    // request without larger dispatch-chain changes, and dropping hits is
+    // the strictly safer outcome for an RLS filter regardless.
     hits.retain(|h| match h.body.as_deref() {
-        Some(body) => filters.iter().all(|f| f.matches_binary(body)),
+        Some(body) => ScanFilter::all_match_binary(&filters, body).unwrap_or(false),
         None => false,
     });
     if hits.len() > top_k {
@@ -76,7 +84,7 @@ fn apply_rls_filter(hits: &mut Vec<Hit>, rls_filters: &[u8], top_k: usize) {
 /// catalog has no PK mapping for the surrogate (headless row, or a document
 /// that was never written) — callers must leave the row's identifier
 /// untouched in that case rather than fabricate a value.
-pub(super) fn resolve_surrogate_pk(
+pub(crate) fn resolve_surrogate_pk(
     state: &SharedState,
     database_id: DatabaseId,
     tenant_id: TenantId,

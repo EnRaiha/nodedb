@@ -92,6 +92,46 @@ pub enum QueryOp {
         distinct: bool,
     },
 
+    /// Relational post-processing over a materialized child plan.
+    ///
+    /// Coordinator-resolved, exactly like [`QueryOp::Exchange`]: at resolve time
+    /// the coordinator gathers `input`'s rows, flattens them to the relational
+    /// row shape, and rewrites this node into a [`QueryOp::ProviderScan`]
+    /// carrying the same relational parameters — which applies
+    /// filter→offset→sort→distinct→project→limit on a single core. A Data-Plane
+    /// core must NEVER see this node (defensive error if it does).
+    ///
+    /// Lowered from `SqlPlan::Subquery`: an outer `ORDER BY` / `OFFSET` /
+    /// `DISTINCT` / post-reorder `LIMIT` over a subquery/derived-table body
+    /// whose leaf plan could not absorb those constraints. Constraints the leaf
+    /// DID absorb (a `WHERE` pushed into a search engine, an unordered `LIMIT`
+    /// folded into `top_k`) are applied by `input` and not repeated here.
+    PostProcess {
+        /// The subquery body to materialize. Wrapped in `Exchange{Gather}` by
+        /// the converter when the body is a sharded source, so the gather runs
+        /// exactly once over the full union before post-processing.
+        input: Box<crate::physical_plan::PhysicalPlan>,
+        /// Serialized `Vec<ScanFilter>` (MessagePack). Empty = no predicate.
+        #[serde(default)]
+        filters: Vec<u8>,
+        /// Output column names to keep. Empty = emit all columns.
+        #[serde(default)]
+        projection: Vec<String>,
+        /// Sort keys: `(column_name, ascending)`. Empty = unordered.
+        #[serde(default)]
+        sort_keys: Vec<(String, bool)>,
+        /// Maximum rows to emit after offset/sort/distinct/projection.
+        /// `None` = unlimited.
+        #[serde(default)]
+        limit: Option<usize>,
+        /// Number of rows to skip before applying limit.
+        #[serde(default)]
+        offset: usize,
+        /// SQL DISTINCT: deduplicate on the projected row.
+        #[serde(default)]
+        distinct: bool,
+    },
+
     /// Aggregate: GROUP BY + aggregate functions.
     Aggregate {
         collection: String,

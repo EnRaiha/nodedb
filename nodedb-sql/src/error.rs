@@ -11,6 +11,14 @@ pub enum SqlError {
     #[error("table not found: {name}")]
     UnknownTable { name: String },
 
+    /// A function call in an expression names no scalar, aggregate, or
+    /// window function registered in the [`FunctionRegistry`](crate::functions::registry::FunctionRegistry).
+    /// Caught at plan time in the resolver so the whole statement is
+    /// rejected instead of the call silently evaluating to `NULL` for every
+    /// row at runtime.
+    #[error("function {name}(...) does not exist")]
+    UndefinedFunction { name: String },
+
     #[error("unknown column '{column}' in table '{table}'")]
     UnknownColumn { table: String, column: String },
 
@@ -66,9 +74,8 @@ pub enum SqlError {
     /// A positional `INSERT`/`UPSERT` `VALUES` row (no explicit column
     /// list) supplied more values than the target collection has declared
     /// columns. Binding the overflow value(s) to a synthetic `col{N}` name
-    /// would silently store them under an unaddressable column — the same
-    /// failure mode as #202 — so this is rejected rather than guessed
-    /// at.
+    /// would silently store them under an unaddressable column, so this is
+    /// rejected rather than guessed at.
     #[error(
         "INSERT/UPSERT into '{collection}': row has {given} value(s) but only \
          {declared} column(s) are declared; supply an explicit column list \

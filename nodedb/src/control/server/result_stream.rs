@@ -66,6 +66,20 @@ pub(crate) fn stream_response_channel(
                     // No rows on this source — end the stream cleanly.
                     return;
                 }
+                // A streamed Data Plane `Response` error otherwise degrades
+                // to the generic `crate::Error::Dispatch`
+                // below (SQLSTATE XX000) — special-cased here the same way
+                // `NotFound` already is, so a division/modulo-by-zero
+                // survives this stream-consumption boundary and reaches
+                // pgwire as SQLSTATE `22012` instead of a generic internal
+                // error.
+                if matches!(
+                    resp.error_code.as_deref(),
+                    Some(crate::bridge::envelope::ErrorCode::DivisionByZero)
+                ) {
+                    Err(crate::Error::DivisionByZero)?;
+                    return;
+                }
                 let detail = match resp.error_code {
                     Some(ref ec) => format!("data plane error: {ec:?}"),
                     None => "unknown data plane error".to_string(),

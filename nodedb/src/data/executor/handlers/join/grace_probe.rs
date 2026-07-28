@@ -61,10 +61,14 @@ impl CoreLoop {
         let flush = |batch: &mut Vec<(String, Vec<u8>)>,
                      batch_bytes: &mut usize,
                      results: &mut Vec<Vec<u8>>,
-                     index_matched: &mut [bool]| {
+                     index_matched: &mut [bool]|
+         -> Result<(), nodedb_query::EvalError> {
             if batch.is_empty() {
-                return;
+                return Ok(());
             }
+            // A residual-ON-predicate div/modulo-by-zero propagates out of the
+            // flush closure; the caller's `?` converts it to
+            // `crate::Error::DivisionByZero` (SQLSTATE 22012).
             probe_rows_into(
                 &ProbeParams {
                     probe_docs: batch,
@@ -80,9 +84,10 @@ impl CoreLoop {
                 },
                 results,
                 index_matched,
-            );
+            )?;
             batch.clear();
             *batch_bytes = 0;
+            Ok(())
         };
 
         probe_source.for_each(self, |id, bytes| {
@@ -100,7 +105,7 @@ impl CoreLoop {
                     &mut batch_bytes,
                     &mut results,
                     &mut index_matched,
-                );
+                )?;
             }
             Ok(())
         })?;
@@ -111,7 +116,7 @@ impl CoreLoop {
             &mut batch_bytes,
             &mut results,
             &mut index_matched,
-        );
+        )?;
 
         // RIGHT/FULL: emit unmatched index-side rows ONCE, after all probe
         // batches. The in-memory path runs this same sweep via probe_hash_index.

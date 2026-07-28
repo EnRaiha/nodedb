@@ -419,6 +419,21 @@ pub fn build_output_schema<C: SqlCatalog>(
         SqlPlan::Cte { outer, .. } => {
             build_output_schema(std::slice::from_ref(outer.as_ref()), catalog, database_id)
         }
+        // A post-processor's projected shape is its outer projection; an empty
+        // projection (SELECT *) inherits the body's columns. (Synthesized during
+        // conversion, so this is normally unreached — the schema is derived from
+        // the pre-inline `Cte` above — but the arm keeps derivation correct if a
+        // `Subquery` is ever schema-derived directly.)
+        SqlPlan::Subquery {
+            input, projection, ..
+        } => {
+            if projection.is_empty() {
+                build_output_schema(std::slice::from_ref(input.as_ref()), catalog, database_id)
+            } else {
+                let types = HashMap::new();
+                schema_from_projection(projection, &types, &[])
+            }
+        }
         SqlPlan::LateralTopK { projection, .. } | SqlPlan::LateralLoop { projection, .. } => {
             // No single source collection spans both outer and inner rows;
             // default every projected field to `Text` rather than picking

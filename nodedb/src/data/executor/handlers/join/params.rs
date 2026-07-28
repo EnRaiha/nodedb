@@ -147,7 +147,28 @@ impl JoinParams<'_> {
                     }
                 })?;
             if !filters.is_empty() {
-                results.retain(|row| super::binary_row_matches_filters(row, &filters));
+                // `Vec::retain`'s closure must return `bool`, so a division/
+                // modulo-by-zero hit while matching a post-filter is
+                // captured in `first_err` and checked once the retain pass
+                // finishes — this post-filter path is WHERE-shaped, so
+                // (unlike the hash-join probe hot path this same helper
+                // also serves) it gets the full error treatment here.
+                let mut first_err: Option<crate::Error> = None;
+                results.retain(|row| {
+                    if first_err.is_some() {
+                        return true;
+                    }
+                    match super::binary_row_matches_filters(row, &filters) {
+                        Ok(keep) => keep,
+                        Err(e) => {
+                            first_err = Some(crate::Error::from(e));
+                            true
+                        }
+                    }
+                });
+                if let Some(e) = first_err {
+                    return Err(e);
+                }
             }
         }
 
@@ -164,7 +185,7 @@ impl JoinParams<'_> {
                     row,
                     &computed,
                     &[],
-                );
+                )?;
             }
         } else if !self.projection.is_empty() {
             for row in results.iter_mut() {

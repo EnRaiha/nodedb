@@ -41,7 +41,7 @@ async fn assert_create_then_dml_visible(
         "native CREATE must succeed: {create_resp:?}"
     );
 
-    // The #137 assertion: DDL committed on this native connection must be
+    // The key assertion: DDL committed on this native connection must be
     // immediately visible to DML on the SAME native connection — no
     // "table not found" / collection-not-found error.
     let insert_resp = send_sql(&mut stream, 2, insert_sql).await;

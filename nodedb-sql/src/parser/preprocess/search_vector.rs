@@ -6,40 +6,110 @@
 //! `<field>` may be omitted (and the third arg becomes the limit). When the
 //! collection has a single declared vector column the planner resolves the
 //! field; otherwise `vector_distance` rejects the call with a typed error.
+//!
+//! The same clause is also accepted in subquery position — `FROM (SEARCH ...)
+//! s`, `IN (SELECT id FROM (SEARCH ...) s)` — so a k-NN result composes with
+//! joins and relational filters inside one statement.
+
+use super::lex::{find_ascii_case_insensitive, find_operator_positions};
 
 const SEARCH_KEYWORD: &str = "SEARCH";
 const USING_KEYWORD: &str = "USING";
 const VECTOR_KEYWORD: &str = "VECTOR";
 
-use nodedb_types::strip_prefix_ascii_case_insensitive;
-
 pub fn try_rewrite_search_using_vector(sql: &str) -> Option<String> {
     let trimmed = sql.trim_end_matches(|c: char| c == ';' || c.is_whitespace());
-    let source = trimmed.trim_start();
-    let leading = trimmed.len() - source.len();
-    let after_search = strip_prefix_ascii_case_insensitive(source, SEARCH_KEYWORD)?.trim_start();
-    if after_search.is_empty() {
+    let leading = trimmed.len() - trimmed.trim_start().len();
+    let (select, consumed) = parse_search_clause(&trimmed[leading..])?;
+    // A top-level `SEARCH` clause owns the whole statement; anything past the
+    // closing paren is not part of the DSL form and must not be rewritten.
+    if !trimmed[leading + consumed..].trim().is_empty() {
         return None;
     }
 
-    let (collection, rest) = take_identifier(after_search)?;
-    let rest = rest.trim_start();
-    let after_using = strip_prefix_ascii_case_insensitive(rest, USING_KEYWORD)?.trim_start();
-    let after_vec = strip_prefix_ascii_case_insensitive(after_using, VECTOR_KEYWORD)?.trim_start();
-    let body = strip_parentheses(after_vec)?;
+    let trailing = &sql[trimmed.len()..];
+    Some(format!("{select}{trailing}"))
+}
+
+/// Rewrite every `(SEARCH <coll> USING VECTOR(...))` occurrence that sits in
+/// subquery position into `(SELECT ...)`, leaving the rest of `sql` untouched.
+///
+/// Returns `None` when no occurrence was rewritten.
+pub fn try_rewrite_nested_search_using_vector(sql: &str) -> Option<String> {
+    find_ascii_case_insensitive(sql, SEARCH_KEYWORD)?;
+
+    let mut out = String::new();
+    let mut copied = 0usize;
+    for open in find_operator_positions(sql, "(") {
+        if open < copied {
+            continue;
+        }
+        let after_open = open + 1;
+        let inner = &sql[after_open..];
+        let leading = inner.len() - inner.trim_start().len();
+        let Some((select, consumed)) = parse_search_clause(&inner[leading..]) else {
+            continue;
+        };
+        out.push_str(&sql[copied..after_open]);
+        out.push_str(&select);
+        copied = after_open + leading + consumed;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&sql[copied..]);
+    Some(out)
+}
+
+/// Parse a `SEARCH <coll> USING VECTOR(...)` clause at the start of `input`.
+///
+/// Returns the canonical `SELECT` and the number of bytes consumed (through
+/// the clause's closing paren).
+fn parse_search_clause(input: &str) -> Option<(String, usize)> {
+    let after_search = keyword_rest(input, SEARCH_KEYWORD)?;
+    let (collection, rest) = take_identifier(after_search.trim_start())?;
+    let after_using = keyword_rest(rest, USING_KEYWORD)?;
+    let after_vector = keyword_rest(after_using, VECTOR_KEYWORD)?;
+    let (body, consumed_args) = take_parenthesized(after_vector)?;
     let (field, vector_expr, limit) = split_vector_args(body)?;
 
-    let trailing = sql[leading + (trimmed.len() - leading)..].to_string();
     let order_by = match field {
         Some(name) => format!("vector_distance({name}, {vector_expr})"),
         None => format!("vector_distance({vector_expr})"),
     };
-    Some(format!(
-        "SELECT * FROM {collection} ORDER BY {order_by} LIMIT {limit}{trailing}"
-    ))
+    let select = format!("SELECT * FROM {collection} ORDER BY {order_by} LIMIT {limit}");
+    let consumed = input.len() - after_vector.len() + consumed_args;
+    Some((select, consumed))
 }
 
+/// Match `keyword` at the start of `input` (case-insensitive, whole word) and
+/// return the remainder with leading whitespace stripped.
+fn keyword_rest<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
+    let trimmed = input.trim_start();
+    // Compare bytes: slicing `trimmed` at `keyword.len()` would panic when the
+    // input starts with a multi-byte character. An ASCII match guarantees the
+    // offset is a char boundary, so the slices below are safe.
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < keyword.len()
+        || !bytes[..keyword.len()].eq_ignore_ascii_case(keyword.as_bytes())
+    {
+        return None;
+    }
+    let rest = &trimmed[keyword.len()..];
+    if rest.chars().next().is_some_and(is_ident_char) {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+/// Take a collection name: a bare identifier, or a double-quoted one. The
+/// quoted form is returned with its quotes intact so the rewritten `SELECT`
+/// keeps the exact spelling the user wrote — a name that needs quoting still
+/// needs it after the rewrite.
 fn take_identifier(input: &str) -> Option<(&str, &str)> {
+    if input.starts_with('"') {
+        return take_quoted_identifier(input);
+    }
     let end = input
         .char_indices()
         .find(|(_, c)| !is_ident_char(*c))
@@ -51,17 +121,58 @@ fn take_identifier(input: &str) -> Option<(&str, &str)> {
     Some((&input[..end], &input[end..]))
 }
 
+/// Take a `"quoted name"`, honouring the doubled-quote escape (`""`). Returns
+/// the quoted span verbatim and the remainder.
+fn take_quoted_identifier(input: &str) -> Option<(&str, &str)> {
+    let mut chars = input.char_indices().skip(1);
+    while let Some((offset, c)) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        // A doubled quote is an escaped quote, not the end of the identifier.
+        if input[offset + 1..].starts_with('"') {
+            chars.next();
+            continue;
+        }
+        let end = offset + 1;
+        // An empty name ("") is not a usable collection reference.
+        if end == 2 {
+            return None;
+        }
+        return Some((&input[..end], &input[end..]));
+    }
+    None
+}
+
 fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-fn strip_parentheses(input: &str) -> Option<&str> {
-    let trimmed = input.trim();
-    let bytes = trimmed.as_bytes();
-    if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+/// Take a parenthesized group at the start of `input`, returning its body and
+/// the number of bytes consumed (through the matching close paren). Parens
+/// inside string literals do not affect nesting depth.
+fn take_parenthesized(input: &str) -> Option<(&str, usize)> {
+    if !input.starts_with('(') {
         return None;
     }
-    Some(trimmed[1..trimmed.len() - 1].trim())
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    for (offset, c) in input.char_indices() {
+        match c {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '(' if !in_single && !in_double => depth += 1,
+            ')' if !in_single && !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((input[1..offset].trim(), offset + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn split_vector_args(body: &str) -> Option<(Option<String>, String, String)> {
@@ -154,6 +265,135 @@ mod tests {
     #[test]
     fn returns_none_when_using_fusion() {
         assert!(try_rewrite_search_using_vector("SEARCH c USING FUSION(ARRAY[0.5])").is_none());
+    }
+
+    #[test]
+    fn rewrites_search_in_derived_table_position() {
+        let out = try_rewrite_nested_search_using_vector(
+            "SELECT * FROM (SEARCH docs USING VECTOR(emb, ARRAY[0.1], 2)) s WHERE s.id = 'a1'",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "SELECT * FROM (SELECT * FROM docs ORDER BY vector_distance(emb, ARRAY[0.1]) LIMIT 2) s WHERE s.id = 'a1'"
+        );
+    }
+
+    #[test]
+    fn rewrites_every_nested_occurrence() {
+        let out = try_rewrite_nested_search_using_vector(
+            "SELECT a.id FROM (SEARCH docs USING VECTOR(emb, ARRAY[0.1], 2)) a \
+             JOIN (SEARCH docs USING VECTOR(emb, ARRAY[0.9], 3)) b ON a.id = b.id",
+        )
+        .unwrap();
+        assert_eq!(out.matches("SELECT * FROM docs ORDER BY").count(), 2);
+        assert!(!out.to_uppercase().contains("SEARCH"));
+    }
+
+    #[test]
+    fn nested_rewrite_ignores_search_inside_string_literal() {
+        assert!(
+            try_rewrite_nested_search_using_vector(
+                "SELECT * FROM docs WHERE title = '(SEARCH docs USING VECTOR(emb, ARRAY[0.1], 2))'",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn rewrites_a_quoted_collection_name() {
+        let out = try_rewrite_search_using_vector(
+            "SEARCH \"MixedCase\" USING VECTOR(embedding, ARRAY[0.1, 0.3], 2)",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "SELECT * FROM \"MixedCase\" ORDER BY vector_distance(embedding, ARRAY[0.1, 0.3]) LIMIT 2",
+            "the quotes must survive the rewrite, or a name that needs them stops resolving"
+        );
+    }
+
+    #[test]
+    fn rewrites_a_quoted_collection_name_in_subquery_position() {
+        let out = try_rewrite_nested_search_using_vector(
+            "SELECT id FROM (SEARCH \"MixedCase\" USING VECTOR(embedding, ARRAY[0.1], 2)) s",
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "SELECT id FROM (SELECT * FROM \"MixedCase\" ORDER BY vector_distance(embedding, ARRAY[0.1]) LIMIT 2) s"
+        );
+    }
+
+    #[test]
+    fn quoted_collection_name_keeps_its_escaped_quotes() {
+        let out = try_rewrite_search_using_vector(
+            "SEARCH \"od\"\"d\" USING VECTOR(embedding, ARRAY[0.1], 1)",
+        )
+        .unwrap();
+        assert!(
+            out.starts_with("SELECT * FROM \"od\"\"d\" ORDER BY"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_unterminated_or_empty_quoted_collection_name() {
+        assert!(
+            try_rewrite_search_using_vector("SEARCH \"unterminated USING VECTOR(e, ARRAY[0.1], 1)")
+                .is_none()
+        );
+        assert!(
+            try_rewrite_search_using_vector("SEARCH \"\" USING VECTOR(e, ARRAY[0.1], 1)").is_none()
+        );
+    }
+
+    #[test]
+    fn nested_rewrite_survives_multibyte_text_after_an_open_paren() {
+        // The clause scan runs at every `(`. Matching the keyword on bytes
+        // keeps a multi-byte literal from slicing mid-character.
+        assert!(
+            try_rewrite_nested_search_using_vector(
+                "INSERT INTO t (name) VALUES ('日本語') /* SEARCH */",
+            )
+            .is_none()
+        );
+        assert!(
+            try_rewrite_nested_search_using_vector(
+                "SELECT * FROM t WHERE tag IN ('🙂😀', 'SEARCH')"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn nested_rewrite_returns_none_for_plain_subquery() {
+        assert!(
+            try_rewrite_nested_search_using_vector("SELECT * FROM (SELECT * FROM docs) s")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn nested_rewrite_returns_none_for_fusion_subquery() {
+        assert!(
+            try_rewrite_nested_search_using_vector(
+                "SELECT * FROM (SEARCH docs USING FUSION(ARRAY[0.5])) s"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn top_level_rewrite_rejects_trailing_clause() {
+        // Only the DSL form is a statement; trailing SQL means the caller wrote
+        // something else and must get a parse error, not a silent rewrite.
+        assert!(
+            try_rewrite_search_using_vector(
+                "SEARCH t USING VECTOR(emb, ARRAY[1.0], 3) WHERE x = 1"
+            )
+            .is_none()
+        );
     }
 
     #[test]

@@ -85,7 +85,7 @@ impl CoreLoop {
                         crate::types::TenantId::new(tid),
                         collection.to_string(),
                     );
-                    self.merge_overlay_into_index_lookup(
+                    if let Err(e) = self.merge_overlay_into_index_lookup(
                         super::super::transaction::overlay::IndexOverlayMergeParams {
                             txn_id,
                             coll_key: &coll_key,
@@ -96,13 +96,18 @@ impl CoreLoop {
                             // `DocumentOp::IndexLookup` carries no residual
                             // filters at all (it returns bare doc IDs, used by
                             // bitmap-producer callers) — the empty slice makes
-                            // the merge's residual re-check a no-op.
+                            // the merge's residual re-check a no-op, so this
+                            // call site can never actually observe `Err` —
+                            // handled uniformly with the other call site
+                            // anyway rather than assuming that invariant.
                             residual: &[],
                             strict_schema: None,
                         },
                         &mut doc_ids,
                         &|body| self.decode_indexed_body(&config_key, body),
-                    );
+                    ) {
+                        return self.response_error(task, e);
+                    }
                 }
                 let payload = serde_json::json!(doc_ids);
                 match sonic_rs::to_vec(&payload) {
@@ -238,7 +243,7 @@ impl CoreLoop {
         };
         if let Some(txn_id) = task.request.txn_id {
             let (is_array, case_insensitive) = self.index_path_flags(&config_key, path);
-            self.merge_overlay_into_index_lookup(
+            if let Err(e) = self.merge_overlay_into_index_lookup(
                 super::super::transaction::overlay::IndexOverlayMergeParams {
                     txn_id,
                     coll_key: &coll_key,
@@ -251,7 +256,9 @@ impl CoreLoop {
                 },
                 &mut doc_ids,
                 &|body| self.decode_indexed_body(&config_key, body),
-            );
+            ) {
+                return self.response_error(task, e);
+            }
         }
 
         let mut rows: Vec<(String, Vec<u8>)> = Vec::new();
@@ -277,10 +284,16 @@ impl CoreLoop {
                     // excluded — checked on the raw stored body, exactly as a
                     // base scan applies its filters, for committed and staged
                     // bodies alike.
-                    if !residual.is_empty()
-                        && !matches_with_resolved_schema(strict_schema.as_ref(), &residual, &bytes)
-                    {
-                        continue;
+                    match if residual.is_empty() {
+                        Ok(true)
+                    } else {
+                        matches_with_resolved_schema(strict_schema.as_ref(), &residual, &bytes)
+                    } {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(_e) => {
+                            return self.response_error(task, ErrorCode::DivisionByZero);
+                        }
                     }
                     let payload = if let Some(ref schema) = strict_schema {
                         match super::super::super::strict_format::binary_tuple_to_msgpack(

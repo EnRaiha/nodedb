@@ -142,8 +142,8 @@ pub fn plan_insert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
     }
 
     // Positional INSERT (no column list): bind values to the collection's
-    // declared column order so named projections/predicates can find them
-    // (#202). No-op for named inserts and schemaless collections.
+    // declared column order so named projections/predicates can find them.
+    // No-op for named inserts and schemaless collections.
     let columns = resolve_insert_columns(columns, &info, rows_ast)?;
 
     // Vector-primary collection: bypass document encoding.
@@ -228,7 +228,7 @@ pub fn plan_upsert(ins: &ast::Insert, catalog: &dyn SqlCatalog) -> Result<Vec<Sq
     }
 
     // Positional UPSERT (no column list): bind to the collection's declared
-    // column order — see `plan_insert` for the full rationale (#202).
+    // column order — see `plan_insert` for the full rationale.
     let columns = resolve_insert_columns(columns, &info, rows_ast)?;
 
     let mut rows = convert_value_rows(&columns, rows_ast)?;
@@ -306,7 +306,7 @@ fn plan_upsert_with_on_conflict(
     }
 
     // Positional UPSERT (no column list): bind to the collection's declared
-    // column order — see `plan_insert` for the full rationale (#202).
+    // column order — see `plan_insert` for the full rationale.
     let columns = resolve_insert_columns(columns, &info, rows_ast)?;
 
     let mut rows = convert_value_rows(&columns, rows_ast)?;

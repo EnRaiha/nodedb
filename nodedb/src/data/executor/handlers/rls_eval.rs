@@ -33,7 +33,18 @@ pub fn rls_check_document(rls_filters: &[u8], doc: &serde_json::Value) -> bool {
     };
 
     let msgpack = nodedb_types::json_to_msgpack_or_empty(doc);
-    filters.iter().all(|f| f.matches_binary(&msgpack))
+    // RLS is a security boundary: fail closed on a division/modulo-by-zero
+    // in a filter, exactly like the deserialization failure above — deny
+    // rather than propagate a query error, so a
+    // malformed/adversarial RLS predicate can never be used to distinguish
+    // "row exists but errors" from "row doesn't exist".
+    match ScanFilter::all_match_binary(&filters, &msgpack) {
+        Ok(pass) => pass,
+        Err(e) => {
+            tracing::warn!(error = %e, "RLS filter evaluation failed — denying access");
+            false
+        }
+    }
 }
 
 /// Evaluate RLS filters against raw MessagePack document bytes.
@@ -55,7 +66,14 @@ pub fn rls_check_msgpack_bytes(rls_filters: &[u8], doc_bytes: &[u8]) -> bool {
 
     // Ensure bytes are standard msgpack for matches_binary.
     let mp = super::super::doc_format::json_to_msgpack(doc_bytes);
-    filters.iter().all(|f| f.matches_binary(&mp))
+    // RLS is a security boundary: fail closed — see `rls_check_document`.
+    match ScanFilter::all_match_binary(&filters, &mp) {
+        Ok(pass) => pass,
+        Err(e) => {
+            tracing::warn!(error = %e, "RLS filter evaluation failed — denying access");
+            false
+        }
+    }
 }
 
 #[cfg(test)]

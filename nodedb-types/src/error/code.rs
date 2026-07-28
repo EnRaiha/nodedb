@@ -43,6 +43,10 @@ impl ErrorCode {
     pub const PLAN_ERROR: Self = Self(1200);
     pub const FAN_OUT_EXCEEDED: Self = Self(1201);
     pub const SQL_NOT_ENABLED: Self = Self(1202);
+    /// A function call names no registered scalar/aggregate/window function.
+    pub const UNDEFINED_FUNCTION: Self = Self(1203);
+    /// Expression evaluation divided or took a modulus by zero.
+    pub const DIVISION_BY_ZERO: Self = Self(1204);
 
     // Engine ops (1300–1399)
     pub const ARRAY: Self = Self(1300);

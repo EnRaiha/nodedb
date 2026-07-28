@@ -69,6 +69,11 @@
 // |  61 | MoveTenantSnapshotFailed  |
 // |  62 | MoveTenantCutoverFailed   |
 // |  63 | MoveTenantAlreadyAtTarget |
+// |  64 | MirrorReadOnly            |
+// |  65 | StaleReadNotLeader        |
+// |  66 | MirrorNotPromoted         |
+// |  67 | UndefinedFunction         |
+// |  68 | DivisionByZero            |
 
 pub(super) const TAG_CONSTRAINT_VIOLATION: u16 = 1;
 pub(super) const TAG_WRITE_CONFLICT: u16 = 2;
@@ -136,3 +141,5 @@ pub(super) const TAG_MOVE_TENANT_ALREADY_AT_TARGET: u16 = 63;
 pub(super) const TAG_MIRROR_READ_ONLY: u16 = 64;
 pub(super) const TAG_STALE_READ_NOT_LEADER: u16 = 65;
 pub(super) const TAG_MIRROR_NOT_PROMOTED: u16 = 66;
+pub(super) const TAG_UNDEFINED_FUNCTION: u16 = 67;
+pub(super) const TAG_DIVISION_BY_ZERO: u16 = 68;

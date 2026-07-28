@@ -125,7 +125,7 @@ pub(super) fn grace_join_in_memory(
     probe_docs: Vec<(String, Vec<u8>)>,
     partitions: usize,
     spec: &GraceSpec,
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>, nodedb_query::EvalError> {
     let build_keys = spec.build_keys;
     let probe_keys = spec.probe_keys;
     let join_type = spec.join_type;
@@ -183,12 +183,12 @@ pub(super) fn grace_join_in_memory(
             index_collection,
             join_filters: &[],
             emit_unmatched_right,
-        });
+        })?;
         results.append(&mut part_results);
     }
 
     results.truncate(limit);
-    results
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -236,6 +236,7 @@ mod tests {
             join_filters: &[],
             emit_unmatched_right: spec.emit_unmatched_right,
         })
+        .unwrap()
     }
 
     /// Single-key fixtures: matches, non-matches, duplicate keys (count must be
@@ -317,7 +318,8 @@ mod tests {
             let want = as_multiset(reference(&build, &probe, &spec));
 
             for p in [1usize, 2, 4, 8] {
-                let candidate = grace_join_in_memory(build.clone(), probe.clone(), p, &spec);
+                let candidate =
+                    grace_join_in_memory(build.clone(), probe.clone(), p, &spec).unwrap();
                 assert_eq!(
                     want,
                     as_multiset(candidate),
@@ -404,7 +406,8 @@ mod tests {
             };
             let want = as_multiset(reference(&build, &probe, &spec));
             for p in [1usize, 2, 4, 8] {
-                let candidate = grace_join_in_memory(build.clone(), probe.clone(), p, &spec);
+                let candidate =
+                    grace_join_in_memory(build.clone(), probe.clone(), p, &spec).unwrap();
                 assert_eq!(
                     want,
                     as_multiset(candidate),
@@ -433,7 +436,8 @@ mod tests {
             };
             let want = as_multiset(reference(&build, &probe, &spec));
             for p in [1usize, 2, 4, 8] {
-                let candidate = grace_join_in_memory(build.clone(), probe.clone(), p, &spec);
+                let candidate =
+                    grace_join_in_memory(build.clone(), probe.clone(), p, &spec).unwrap();
                 assert_eq!(
                     want,
                     as_multiset(candidate),
@@ -462,7 +466,8 @@ mod tests {
             };
             let want = as_multiset(reference(&build, &probe, &spec));
             for p in [1usize, 2, 4, 8] {
-                let candidate = grace_join_in_memory(build.clone(), probe.clone(), p, &spec);
+                let candidate =
+                    grace_join_in_memory(build.clone(), probe.clone(), p, &spec).unwrap();
                 assert_eq!(
                     want,
                     as_multiset(candidate),
@@ -497,7 +502,8 @@ mod tests {
             ..unbounded_spec
         };
         for p in [1usize, 2, 4, 8] {
-            let candidate = grace_join_in_memory(build.clone(), probe.clone(), p, &limited_spec);
+            let candidate =
+                grace_join_in_memory(build.clone(), probe.clone(), p, &limited_spec).unwrap();
             assert_eq!(candidate.len(), limit, "limit truncation p={p}");
         }
     }

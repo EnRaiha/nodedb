@@ -68,7 +68,10 @@ pub(in crate::data::executor) fn merge_state_frames(
 
     while let Some(row) = reader.next_row()? {
         // Byte-identical group key reconstruction from the flat row fields.
-        let key = msgpack_scan::build_group_key(&row, &row_keys);
+        // `row_keys` are plain column specs (the producer already materialized
+        // any computed key into a field), so this cannot divide by zero; the
+        // `?` upholds the crate-wide contract without a reachable error path.
+        let key = msgpack_scan::build_group_key(&row, &row_keys)?;
 
         // Extract the `__agg_state` binary field.
         let (val_start, _val_end) = msgpack_scan::extract_field(&row, 0, AGG_STATE_FIELD)
@@ -208,11 +211,13 @@ mod tests {
     ) {
         let mut groups: HashMap<String, GroupState> = HashMap::new();
         for doc in docs {
-            let key = nodedb_query::msgpack_scan::build_group_key(doc, group_by);
+            let key =
+                nodedb_query::msgpack_scan::build_group_key(doc, group_by).expect("group key");
             groups
                 .entry(key)
                 .or_insert_with(|| GroupState::new(specs))
-                .feed(specs, doc);
+                .feed(specs, doc)
+                .expect("feed");
         }
 
         let mut f = std::fs::File::create(path).expect("create frame file");
@@ -257,10 +262,12 @@ mod tests {
     ) -> HashMap<String, Vec<Value>> {
         let mut map: HashMap<String, GroupState> = HashMap::new();
         for doc in docs {
-            let key = nodedb_query::msgpack_scan::build_group_key(doc, group_by);
+            let key =
+                nodedb_query::msgpack_scan::build_group_key(doc, group_by).expect("group key");
             map.entry(key)
                 .or_insert_with(|| GroupState::new(specs))
-                .feed(specs, doc);
+                .feed(specs, doc)
+                .expect("feed");
         }
         map.into_iter()
             .map(|(k, s)| (k, s.finalize(specs).into_iter().map(|(_, v)| v).collect()))

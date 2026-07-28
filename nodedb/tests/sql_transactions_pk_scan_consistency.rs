@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! #148 regression: after a committed transactional DELETE, the PK
+//! Regression: after a committed transactional DELETE, the PK
 //! point-lookup path and the full-scan path must agree — both must report
 //! the row gone. A prior bug left the point-lookup index stale while the
 //! scan (or vice versa) still reflected the deleted row.

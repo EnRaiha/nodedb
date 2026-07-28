@@ -23,15 +23,15 @@ pub(super) fn apply_rank(
     indices: &[usize],
     alias: &str,
     order_by: &[(SqlExpr, bool)],
-) {
+) -> Result<(), crate::expr::EvalError> {
     if indices.is_empty() {
-        return;
+        return Ok(());
     }
     let mut current_rank = 1;
     set_window_col(&mut rows[indices[0]].1, alias, serde_json::json!(1));
 
     for pos in 1..indices.len() {
-        if !order_keys_equal(rows, indices[pos - 1], indices[pos], order_by) {
+        if !order_keys_equal(rows, indices[pos - 1], indices[pos], order_by)? {
             current_rank = pos + 1;
         }
         set_window_col(
@@ -40,6 +40,7 @@ pub(super) fn apply_rank(
             serde_json::json!(current_rank),
         );
     }
+    Ok(())
 }
 
 pub(super) fn apply_dense_rank(
@@ -47,15 +48,15 @@ pub(super) fn apply_dense_rank(
     indices: &[usize],
     alias: &str,
     order_by: &[(SqlExpr, bool)],
-) {
+) -> Result<(), crate::expr::EvalError> {
     if indices.is_empty() {
-        return;
+        return Ok(());
     }
     let mut current_rank = 1;
     set_window_col(&mut rows[indices[0]].1, alias, serde_json::json!(1));
 
     for pos in 1..indices.len() {
-        if !order_keys_equal(rows, indices[pos - 1], indices[pos], order_by) {
+        if !order_keys_equal(rows, indices[pos - 1], indices[pos], order_by)? {
             current_rank += 1;
         }
         set_window_col(
@@ -64,6 +65,7 @@ pub(super) fn apply_dense_rank(
             serde_json::json!(current_rank),
         );
     }
+    Ok(())
 }
 
 pub(super) fn apply_ntile(
@@ -101,26 +103,27 @@ pub(super) fn apply_percent_rank(
     indices: &[usize],
     alias: &str,
     order_by: &[(SqlExpr, bool)],
-) {
+) -> Result<(), crate::expr::EvalError> {
     let total = indices.len();
     if total == 0 {
-        return;
+        return Ok(());
     }
     if total == 1 {
         set_window_col(&mut rows[indices[0]].1, alias, serde_json::json!(0.0));
-        return;
+        return Ok(());
     }
     let denom = (total - 1) as f64;
     let mut current_rank = 1usize;
     set_window_col(&mut rows[indices[0]].1, alias, serde_json::json!(0.0));
 
     for pos in 1..total {
-        if !order_keys_equal(rows, indices[pos - 1], indices[pos], order_by) {
+        if !order_keys_equal(rows, indices[pos - 1], indices[pos], order_by)? {
             current_rank = pos + 1;
         }
         let pr = (current_rank - 1) as f64 / denom;
         set_window_col(&mut rows[indices[pos]].1, alias, serde_json::json!(pr));
     }
+    Ok(())
 }
 
 /// PostgreSQL `cume_dist()` — `rows_at_or_before_current_peer / partition_rows`.
@@ -131,10 +134,10 @@ pub(super) fn apply_cume_dist(
     indices: &[usize],
     alias: &str,
     order_by: &[(SqlExpr, bool)],
-) {
+) -> Result<(), crate::expr::EvalError> {
     let total = indices.len();
     if total == 0 {
-        return;
+        return Ok(());
     }
     let denom = total as f64;
 
@@ -142,7 +145,7 @@ pub(super) fn apply_cume_dist(
     while group_start < total {
         let mut group_end = group_start + 1;
         while group_end < total
-            && order_keys_equal(rows, indices[group_start], indices[group_end], order_by)
+            && order_keys_equal(rows, indices[group_start], indices[group_end], order_by)?
         {
             group_end += 1;
         }
@@ -152,4 +155,5 @@ pub(super) fn apply_cume_dist(
         }
         group_start = group_end;
     }
+    Ok(())
 }

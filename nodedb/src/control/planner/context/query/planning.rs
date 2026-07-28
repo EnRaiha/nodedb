@@ -90,6 +90,9 @@ impl QueryContext {
                 tenant_id,
                 collection: name,
             },
+            nodedb_sql::SqlError::UndefinedFunction { name } => {
+                crate::Error::UndefinedFunction { name }
+            }
             other => crate::Error::PlanError {
                 detail: format!("{other}"),
             },
@@ -113,6 +116,9 @@ impl QueryContext {
                     tenant_id,
                     collection: name,
                 },
+                nodedb_sql::SqlError::UndefinedFunction { name } => {
+                    crate::Error::UndefinedFunction { name }
+                }
                 other => crate::Error::PlanError {
                     detail: other.to_string(),
                 },
@@ -281,6 +287,9 @@ impl QueryContext {
                     tenant_id,
                     collection: name,
                 },
+                nodedb_sql::SqlError::UndefinedFunction { name } => {
+                    crate::Error::UndefinedFunction { name }
+                }
                 other => crate::Error::PlanError {
                     detail: other.to_string(),
                 },
@@ -302,6 +311,9 @@ impl QueryContext {
                     tenant_id,
                     collection: name,
                 },
+                nodedb_sql::SqlError::UndefinedFunction { name } => {
+                    crate::Error::UndefinedFunction { name }
+                }
                 other => crate::Error::PlanError {
                     detail: other.to_string(),
                 },

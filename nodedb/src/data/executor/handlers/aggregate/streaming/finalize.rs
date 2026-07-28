@@ -153,10 +153,27 @@ impl CoreLoop {
                 }
             };
             if !having_predicates.is_empty() {
+                // `Vec::retain`'s closure must return `bool`, so a division/
+                // modulo-by-zero in a HAVING predicate is captured via this
+                // `Cell` side-channel and checked once the retain finishes.
+                let predicate_err: std::cell::Cell<Option<nodedb_query::EvalError>> =
+                    std::cell::Cell::new(None);
                 results.retain(|row| {
+                    if predicate_err.get().is_some() {
+                        return true;
+                    }
                     let mp = nodedb_types::json_to_msgpack_or_empty(row);
-                    having_predicates.iter().all(|f| f.matches_binary(&mp))
+                    match ScanFilter::all_match_binary(&having_predicates, &mp) {
+                        Ok(keep) => keep,
+                        Err(e) => {
+                            predicate_err.set(Some(e));
+                            true
+                        }
+                    }
                 });
+                if let Some(e) = predicate_err.take() {
+                    return Err(crate::Error::from(e));
+                }
             }
         }
 

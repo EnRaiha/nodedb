@@ -208,15 +208,18 @@ pub(crate) async fn gather_all_cores(
     // the read plan targets one collection, so one non-zero value survives.
     let mut max_read_version = Lsn::ZERO;
     let mut shard_watermarks: Vec<(VShardId, Lsn)> = Vec::new();
-    let mut had_error = false;
-    let mut error_msg = String::new();
+    // First error seen across cores, kept as a TYPED `crate::Error` so a code
+    // like `DivisionByZero` surfaces as SQLSTATE 22012 rather than collapsing
+    // to a generic `Dispatch` (XX000). Only surfaced if no core produced data.
+    let mut first_error: Option<crate::Error> = None;
 
     for (core_id, result) in results {
         let resp = match result {
             Ok(r) => r,
             Err(e) => {
-                had_error = true;
-                error_msg = e.to_string();
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
                 continue;
             }
         };
@@ -226,8 +229,9 @@ pub(crate) async fn gather_all_cores(
                 match ec {
                     crate::bridge::envelope::ErrorCode::NotFound => continue,
                     _ => {
-                        had_error = true;
-                        error_msg = format!("{ec:?}");
+                        if first_error.is_none() {
+                            first_error = Some(ec.to_dispatch_error());
+                        }
                     }
                 }
             }
@@ -255,8 +259,11 @@ pub(crate) async fn gather_all_cores(
         all_elements.extend(extract_msgpack_elements(payload_bytes));
     }
 
-    if had_error && all_elements.is_empty() && raw.is_empty() {
-        return Err(crate::Error::Dispatch { detail: error_msg });
+    if all_elements.is_empty()
+        && raw.is_empty()
+        && let Some(err) = first_error
+    {
+        return Err(err);
     }
 
     let merged_array = encode_msgpack_array(&all_elements);

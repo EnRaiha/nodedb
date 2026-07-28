@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression coverage for C1/#156: a table-qualified WHERE column
+//! Regression coverage for C1: a table-qualified WHERE column
 //! (`u.name` / `users.name`) on a single-table query must not silently
 //! match zero rows. Before the fix the qualifier was retained into the
 //! scan filter's field name (`"u.name"`), which no stored document ever

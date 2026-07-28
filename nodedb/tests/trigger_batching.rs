@@ -140,28 +140,28 @@ fn classify_invalid_body_row_at_a_time() {
 #[test]
 fn when_none_all_pass() {
     let rows = vec![row("a"), row("b"), row("c")];
-    let mask = filter_batch_by_when(&rows, "c", "INSERT", None);
+    let mask = filter_batch_by_when(&rows, "c", "INSERT", None).unwrap();
     assert_eq!(mask, vec![true, true, true]);
 }
 
 #[test]
 fn when_true_all_pass() {
     let rows = vec![row("a"), row("b")];
-    let mask = filter_batch_by_when(&rows, "c", "INSERT", Some("TRUE"));
+    let mask = filter_batch_by_when(&rows, "c", "INSERT", Some("TRUE")).unwrap();
     assert_eq!(mask, vec![true, true]);
 }
 
 #[test]
 fn when_false_none_pass() {
     let rows = vec![row("a"), row("b")];
-    let mask = filter_batch_by_when(&rows, "c", "INSERT", Some("FALSE"));
+    let mask = filter_batch_by_when(&rows, "c", "INSERT", Some("FALSE")).unwrap();
     assert_eq!(mask, vec![false, false]);
 }
 
 #[test]
 fn when_null_none_pass() {
     let rows = vec![row("a")];
-    let mask = filter_batch_by_when(&rows, "c", "INSERT", Some("NULL"));
+    let mask = filter_batch_by_when(&rows, "c", "INSERT", Some("NULL")).unwrap();
     assert_eq!(mask, vec![false]);
 }
 

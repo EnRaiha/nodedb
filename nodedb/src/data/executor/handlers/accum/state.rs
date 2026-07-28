@@ -81,10 +81,15 @@ impl GroupState {
         }
     }
 
-    pub(crate) fn feed(&mut self, aggregates: &[AggregateSpec], doc: &[u8]) {
+    pub(crate) fn feed(
+        &mut self,
+        aggregates: &[AggregateSpec],
+        doc: &[u8],
+    ) -> Result<(), nodedb_query::EvalError> {
         for (accum, agg) in self.accums.iter_mut().zip(aggregates) {
-            accum.feed(agg, doc);
+            accum.feed(agg, doc)?;
         }
+        Ok(())
     }
 
     /// Merge a partial `GroupState` from a spilled run into `self`.

@@ -156,13 +156,26 @@ impl TenantCrdtEngine {
             } else {
                 Surrogate::ZERO
             };
-            let ValidationOutcome::Rejected(violations) =
-                self.validate_committed_row(coll, row, sg)
-            else {
-                continue;
-            };
-            let Some(violation) = violations.into_iter().next() else {
-                continue;
+            let violation = match self.validate_committed_row(coll, row, sg) {
+                ValidationOutcome::Accepted => continue,
+                ValidationOutcome::Rejected(violations) => match violations.into_iter().next() {
+                    Some(v) => v,
+                    None => continue,
+                },
+                // A CHECK predicate that could not be evaluated (division/modulo
+                // by zero) fails closed: roll back and route to the DLQ
+                // exactly like a genuine violation — never silently
+                // treated as accepted (which the old `let-else` would have done).
+                ValidationOutcome::EvalError {
+                    constraint_name,
+                    error,
+                } => Violation {
+                    constraint_name,
+                    reason: format!("CHECK predicate failed to evaluate: {error}"),
+                    hint: nodedb_crdt::dead_letter::CompensationHint::ManualIntervention {
+                        reason: format!("CHECK predicate raised an evaluation error: {error}"),
+                    },
+                },
             };
             let violation = self.dlq_and_translate(coll, delta, peer_id, violation);
             match previous {

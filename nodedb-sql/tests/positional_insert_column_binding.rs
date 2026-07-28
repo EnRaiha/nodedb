@@ -4,7 +4,7 @@
 //! explicit column list) must bind each value to the collection's
 //! DECLARED column names, not synthetic `col0`, `col1`, ... placeholders.
 //!
-//! The defect (#202): `INSERT INTO probe VALUES (42, 'stored?')` on
+//! The defect: `INSERT INTO probe VALUES (42, 'stored?')` on
 //! `probe (id INT PRIMARY KEY, note TEXT)` stored the row under `col0`/
 //! `col1` instead of `id`/`note`. `SELECT *` still looked correct (it
 //! doesn't care about names), but any named projection or `WHERE`
@@ -121,7 +121,7 @@ fn insert_rows(plan: SqlPlan) -> Vec<Vec<(String, SqlValue)>> {
     }
 }
 
-/// The core regression (#202): a positional INSERT must bind its
+/// The core regression: a positional INSERT must bind its
 /// values to the DECLARED column names, not `col0`/`col1`.
 #[test]
 fn positional_insert_binds_declared_column_names() {

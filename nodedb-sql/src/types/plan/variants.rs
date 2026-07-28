@@ -478,6 +478,40 @@ pub enum SqlPlan {
         outer: Box<SqlPlan>,
     },
 
+    /// Relational post-processing over a subquery/derived-table body whose leaf
+    /// plan cannot absorb the outer query's constraints.
+    ///
+    /// Produced by CTE / derived-table inlining when the referenced body is not
+    /// a plain `Scan` (which carries its own filters/sort/limit/offset/distinct)
+    /// and the outer reference adds constraints the body has no slot for — an
+    /// `ORDER BY`, `OFFSET`, `DISTINCT`, or a `LIMIT` that must apply *after* a
+    /// reorder. Without this node those constraints were silently dropped,
+    /// returning the body's unordered/unoffset/undeduplicated rows.
+    ///
+    /// The Data Plane materializes `input`'s rows, then applies, in this order:
+    /// filter → offset → sort → distinct → project → limit — matching
+    /// `QueryOp::ProviderScan` semantics (which this lowers onto). Constraints
+    /// the body CAN absorb (e.g. an unordered `LIMIT` folded into a vector
+    /// search's `top_k`, or a `WHERE` pushed into the engine as a post-filter)
+    /// are applied at the leaf during inlining and are NOT repeated here.
+    Subquery {
+        /// The subquery body whose rows are post-processed.
+        input: Box<SqlPlan>,
+        /// Predicates applied to the materialized rows (outer `WHERE` that the
+        /// body leaf did not absorb).
+        filters: Vec<Filter>,
+        /// Outer projection (target list). Empty = inherit the body's columns.
+        projection: Vec<Projection>,
+        /// Outer `ORDER BY` keys applied over the materialized rows.
+        sort_keys: Vec<SortKey>,
+        /// Outer `OFFSET` (0 = none).
+        offset: usize,
+        /// Outer `DISTINCT`.
+        distinct: bool,
+        /// Outer `LIMIT` (`None` = unbounded).
+        limit: Option<usize>,
+    },
+
     // ── Array (ND sparse) ─────────────────────────────────────
     /// `CREATE ARRAY <name> DIMS (...) ATTRS (...) TILE_EXTENTS (...)`.
     /// AST is engine-agnostic — the Origin converter builds the typed

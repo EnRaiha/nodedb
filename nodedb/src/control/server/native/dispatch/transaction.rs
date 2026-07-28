@@ -34,7 +34,7 @@ use super::DispatchCtx;
 /// The gateway must NOT be used here: commit-time tasks carry `MetaOp` plans
 /// (`ResolveTxn`, `TransactionBatch`) with no named collection, so the
 /// gateway's router cannot derive a route for them and falls back to
-/// vShard 0 — durably applying the commit batch on the wrong core (#193).
+/// vShard 0 — durably applying the commit batch on the wrong core.
 pub(crate) struct NativeTxnDp<'a> {
     pub(crate) state: &'a SharedState,
 }

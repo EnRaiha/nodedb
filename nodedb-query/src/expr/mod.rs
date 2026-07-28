@@ -12,4 +12,5 @@ pub mod codec;
 pub mod eval;
 pub mod types;
 
+pub use eval::EvalError;
 pub use types::{BinaryOp, CastType, ComputedColumn, GroupKeySpec, SqlExpr};

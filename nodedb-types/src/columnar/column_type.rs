@@ -286,9 +286,9 @@ mod tests {
         assert_eq!("UUID".parse::<ColumnType>().unwrap(), ColumnType::Uuid);
     }
 
-    /// `INT4`/`INT8`/`SMALLINT`/`INT2` are wire-width DDL keywords (issue
-    /// #223: strict/kv `CREATE COLLECTION` rejected them as unknown column
-    /// types even though they're valid PostgreSQL integer aliases). They all
+    /// `INT4`/`INT8`/`SMALLINT`/`INT2` are wire-width DDL keywords: strict/kv
+    /// `CREATE COLLECTION` used to reject them as unknown column
+    /// types even though they're valid PostgreSQL integer aliases. They all
     /// map to the same `Int64` storage variant as `BIGINT`/`INTEGER`/`INT` —
     /// nodedb's columnar/strict/kv storage always keeps integers as a full
     /// i64; only the wire (`DdlColType`) layer narrows the advertised OID.

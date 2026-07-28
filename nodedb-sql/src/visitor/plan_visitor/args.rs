@@ -32,6 +32,17 @@ pub struct ScanVisitArgs<'a> {
     pub temporal: &'a TemporalScope,
 }
 
+/// Parameters for [`super::trait_def::PlanVisitor::subquery`].
+pub struct SubqueryVisitArgs<'a> {
+    pub input: &'a SqlPlan,
+    pub filters: &'a [Filter],
+    pub projection: &'a [Projection],
+    pub sort_keys: &'a [SortKey],
+    pub offset: usize,
+    pub distinct: bool,
+    pub limit: Option<usize>,
+}
+
 /// Parameters for [`super::trait_def::PlanVisitor::document_index_lookup`].
 pub struct DocumentIndexLookupVisitArgs<'a> {
     pub collection: &'a str,

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Regression guard for #150: a `GROUP BY` with a SELECT-list alias on the
+//! Regression guard: a `GROUP BY` with a SELECT-list alias on the
 //! group KEY must preserve that alias as the output column name, keep the
 //! SELECT-list order, and return non-null, correct aggregate values.
 //!
@@ -18,7 +18,7 @@ use common::pgwire_harness::TestServer;
 /// `SELECT k AS label, COUNT(*) AS n FROM t GROUP BY k` must:
 /// - return the aliases `label` and `n` as the column NAMES (not `k`/`count`),
 /// - keep SELECT-list ORDER (`label` first, `n` second),
-/// - return non-null, correct `COUNT(*)` values (guards the #150 null risk:
+/// - return non-null, correct `COUNT(*)` values (guards the null risk:
 ///   the group-key value must still resolve under the raw grouped column key).
 #[tokio::test]
 async fn group_by_alias_and_order_preserved() {
@@ -67,7 +67,7 @@ async fn group_by_alias_and_order_preserved() {
         "two distinct group keys expected, got {data_rows:?}"
     );
 
-    // Counts are non-null and correct (guards the #150 null risk).
+    // Counts are non-null and correct (guards the null risk).
     let mut counts = std::collections::HashMap::new();
     for (label, n) in data_rows {
         counts.insert(label, n);
