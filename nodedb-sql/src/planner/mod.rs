@@ -16,6 +16,7 @@ pub mod cte;
 pub mod declared_type_coerce;
 pub mod dml;
 pub mod dml_helpers;
+pub mod geometry_expr;
 pub mod grouping_sets;
 pub mod index_ddl;
 pub mod join;
@@ -25,7 +26,6 @@ pub mod select;
 
 pub use select::qualified_name;
 pub mod sort;
-pub mod spatial_ctor;
 pub mod subquery;
 pub mod union;
 pub mod window;

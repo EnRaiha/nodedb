@@ -172,38 +172,6 @@ pub(crate) fn eval_constant_expr(expr: &SqlExpr, functions: &FunctionRegistry) -
     crate::planner::const_fold::fold_constant(expr, functions).unwrap_or(SqlValue::Null)
 }
 
-/// Extract a geometry argument: handles ST_Point(lon, lat), ST_GeomFromGeoJSON('...'),
-/// or a raw string literal containing GeoJSON.
-pub(super) fn extract_geometry_arg(expr: &ast::Expr) -> Result<String> {
-    match expr {
-        // ST_Point(lon, lat) → GeoJSON Point
-        ast::Expr::Function(func) => {
-            let name = func
-                .name
-                .0
-                .iter()
-                .map(|p| match p {
-                    ast::ObjectNamePart::Identifier(ident) => normalize_ident(ident),
-                    _ => String::new(),
-                })
-                .collect::<Vec<_>>()
-                .join(".");
-            let args = extract_func_args(func)?;
-            match name.as_str() {
-                "st_point" if args.len() >= 2 => {
-                    let lon = extract_float(&args[0])?;
-                    let lat = extract_float(&args[1])?;
-                    Ok(format!(r#"{{"type":"Point","coordinates":[{lon},{lat}]}}"#))
-                }
-                "st_geomfromgeojson" if !args.is_empty() => extract_string_literal(&args[0]),
-                _ => Ok(format!("{expr}")),
-            }
-        }
-        // Raw string literal: assumed to be GeoJSON.
-        _ => extract_string_literal(expr).or_else(|_| Ok(format!("{expr}"))),
-    }
-}
-
 pub(super) fn extract_column_name(expr: &ast::Expr) -> Result<String> {
     match expr {
         ast::Expr::Identifier(ident) => Ok(normalize_ident(ident)),

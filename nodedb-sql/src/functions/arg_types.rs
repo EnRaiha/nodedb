@@ -31,8 +31,6 @@ const INT64_ONLY: &[ColumnType] = &[ColumnType::Int64];
 
 const VECTOR_ONLY: &[ColumnType] = &[ColumnType::Vector(0)];
 
-const GEOMETRY_ONLY: &[ColumnType] = &[ColumnType::Geometry];
-
 const TIMESTAMP_TYPES: &[ColumnType] = &[ColumnType::Timestamp, ColumnType::Timestamptz];
 
 const ARRAY_ONLY: &[ColumnType] = &[ColumnType::Array];
@@ -150,77 +148,6 @@ pub static RRF_SCORE_TRIPLE_ARGS: &[ArgTypeSpec] = &[
 /// named (`depth =>`, `label =>`).
 pub static GRAPH_SCORE_ARGS: &[ArgTypeSpec] =
     &[any("node_id_col"), any("seed_id"), any_variadic("options")];
-
-// ── Spatial ───────────────────────────────────────────────────────────────────
-
-pub static SPATIAL_3_ARGS: &[ArgTypeSpec] = &[
-    typed("geom1", GEOMETRY_ONLY),
-    typed("geom2", GEOMETRY_ONLY),
-    typed("distance", FLOAT64_ONLY),
-];
-
-pub static SPATIAL_2_ARGS: &[ArgTypeSpec] =
-    &[typed("geom1", GEOMETRY_ONLY), typed("geom2", GEOMETRY_ONLY)];
-
-pub static ST_BUFFER_ARGS: &[ArgTypeSpec] = &[
-    typed("geom", GEOMETRY_ONLY),
-    typed("distance", FLOAT64_ONLY),
-    typed("segments", INT64_ONLY),
-];
-
-pub static ST_ENVELOPE_ARGS: &[ArgTypeSpec] = &[typed("geom", GEOMETRY_ONLY)];
-
-pub static ST_POINT_ARGS: &[ArgTypeSpec] = &[typed("x", FLOAT64_ONLY), typed("y", FLOAT64_ONLY)];
-
-pub static ST_GEOHASH_ARGS: &[ArgTypeSpec] = &[
-    typed("lng", FLOAT64_ONLY),
-    typed("lat", FLOAT64_ONLY),
-    typed("precision", INT64_ONLY),
-];
-
-pub static ST_GEOHASHDECODE_ARGS: &[ArgTypeSpec] = &[typed("geohash", TEXT)];
-
-pub static H3_LATLNGTOCELL_ARGS: &[ArgTypeSpec] = &[
-    typed("lat", FLOAT64_ONLY),
-    typed("lng", FLOAT64_ONLY),
-    typed("resolution", INT64_ONLY),
-];
-
-pub static H3_CELLTOLATLNG_ARGS: &[ArgTypeSpec] = &[typed("h3_index", TEXT)];
-
-/// `geo_distance`/`haversine_distance`/`geo_bearing`/`haversine_bearing`
-/// (lng1, lat1, lng2, lat2).
-pub static HAVERSINE_ARGS: &[ArgTypeSpec] = &[
-    typed("lng1", FLOAT64_ONLY),
-    typed("lat1", FLOAT64_ONLY),
-    typed("lng2", FLOAT64_ONLY),
-    typed("lat2", FLOAT64_ONLY),
-];
-
-/// `geo_circle(lng, lat, radius_m, segments?)`.
-pub static GEO_CIRCLE_ARGS: &[ArgTypeSpec] = &[
-    typed("lng", FLOAT64_ONLY),
-    typed("lat", FLOAT64_ONLY),
-    typed("radius_m", FLOAT64_ONLY),
-    typed("segments", INT64_ONLY),
-];
-
-/// `geo_bbox(min_lng, min_lat, max_lng, max_lat)`.
-pub static GEO_BBOX_ARGS: &[ArgTypeSpec] = &[
-    typed("min_lng", FLOAT64_ONLY),
-    typed("min_lat", FLOAT64_ONLY),
-    typed("max_lng", FLOAT64_ONLY),
-    typed("max_lat", FLOAT64_ONLY),
-];
-
-/// `geo_line(point1, point2, ...)` — at least 2 Point geometries.
-pub static GEO_LINE_ARGS: &[ArgTypeSpec] = &[
-    typed("point1", GEOMETRY_ONLY),
-    typed_variadic("point2", GEOMETRY_ONLY),
-];
-
-/// `geo_polygon(ring1, ring2, ...)` — each ring an array of `[lng, lat]` pairs.
-pub static GEO_POLYGON_ARGS: &[ArgTypeSpec] = &[any_variadic("ring")];
 
 // ── Timeseries ────────────────────────────────────────────────────────────────
 

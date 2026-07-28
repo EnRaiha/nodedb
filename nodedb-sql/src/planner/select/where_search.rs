@@ -17,7 +17,7 @@ use sqlparser::ast;
 use super::entry_ann::parse_ann_options;
 use super::helpers::{
     convert_where_to_filters, extract_column_name, extract_float, extract_float_array,
-    extract_func_args, extract_geometry_arg, extract_string_literal, metric_from_func_name,
+    extract_func_args, extract_string_literal, metric_from_func_name,
 };
 use crate::error::{Result, SqlError};
 use crate::functions::registry::{FunctionRegistry, SearchTrigger};
@@ -318,11 +318,11 @@ fn plan_spatial_from_where(
         field: "query geometry".into(),
         context: name.into(),
     })?;
-    let geom_str = extract_geometry_arg(geom_arg)?;
-    let geometry: nodedb_types::geometry::Geometry =
-        sonic_rs::from_str(&geom_str).map_err(|e| SqlError::InvalidFunction {
+    let geometry = crate::planner::geometry_expr::resolve_geometry_expr(geom_arg).map_err(|e| {
+        SqlError::InvalidFunction {
             detail: format!("invalid geometry in {name}: {e}"),
-        })?;
+        }
+    })?;
     let issues = nodedb_spatial::validate::validate_geometry(&geometry);
     if !issues.is_empty() {
         return Err(SqlError::InvalidFunction {

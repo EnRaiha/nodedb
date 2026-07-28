@@ -40,13 +40,14 @@ pub(crate) fn expr_to_sql_value(expr: &ast::Expr) -> Result<SqlValue> {
             let vals = elem.iter().map(expr_to_sql_value).collect::<Result<_>>()?;
             Ok(SqlValue::Array(vals))
         }
-        // `ST_Point(...)` / `ST_GeomFromGeoJSON(...)` synthesise a GeoJSON
-        // string in place rather than resolving as registered scalar
-        // functions, so they keep their bespoke handling.
+        // A geometry-producing call resolves through the geometry-expression
+        // resolver, which turns a malformed geometry into an error rather
+        // than the NULL the generic folder would produce — storing NULL for
+        // `ST_GeomFromText('POINT(')` would lose the row's geometry silently.
         ast::Expr::Function(func) => {
-            match crate::planner::spatial_ctor::try_spatial_constructor(func) {
+            match crate::planner::geometry_expr::fold_geometry_function(func) {
                 Some(result) => result,
-                // Non-spatial functions (`now()`, `date_add(...)`, registered
+                // Non-geometry functions (`now()`, `date_add(...)`, registered
                 // scalars) fold through the shared pipeline below.
                 None => fold_constant_value(expr),
             }

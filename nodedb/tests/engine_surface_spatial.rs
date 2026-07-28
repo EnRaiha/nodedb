@@ -284,6 +284,86 @@ async fn sql_geometry_insert_into_document_collection_matches_spatial_predicate(
     assert_eq!(rows[0][0], "Times Square");
 }
 
+// ── Predicate argument order ────────────────────────────────────────────────
+// `ST_Contains(loc, q)` asks whether the STORED geometry contains the query
+// geometry — the geofencing shape, where `loc` is a zone polygon and `q` a
+// point. `ST_Within(loc, q)` is its converse. Evaluating either with the
+// operands reversed silently returns the wrong rows rather than erroring, so
+// both directions are pinned with a literal query geometry.
+
+#[tokio::test]
+async fn st_contains_matches_the_zone_holding_the_query_point() {
+    let srv = TestServer::start().await;
+    srv.exec(
+        "CREATE COLLECTION sp_zones \
+         COLUMNS (id TEXT, boundary GEOMETRY) \
+         WITH (engine='spatial')",
+    )
+    .await
+    .unwrap();
+    srv.exec(
+        "INSERT INTO sp_zones (id, boundary) \
+         VALUES ('inner', ST_GeomFromText('POLYGON((0 0, 5 0, 5 5, 0 5, 0 0))'))",
+    )
+    .await
+    .unwrap();
+    srv.exec(
+        "INSERT INTO sp_zones (id, boundary) \
+         VALUES ('elsewhere', ST_GeomFromText('POLYGON((90 40, 95 40, 95 45, 90 45, 90 40))'))",
+    )
+    .await
+    .unwrap();
+
+    let rows = srv
+        .query_rows(
+            "SELECT id FROM sp_zones WHERE \
+             ST_Contains(boundary, '{\"type\":\"Point\",\"coordinates\":[1,2]}')",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the zone containing the point may match, got {rows:?}"
+    );
+    assert_eq!(rows[0][0], "inner");
+}
+
+#[tokio::test]
+async fn st_within_matches_the_point_inside_the_query_polygon() {
+    let srv = TestServer::start().await;
+    srv.exec(
+        "CREATE COLLECTION sp_points_in_zone \
+         COLUMNS (id TEXT, loc GEOMETRY) \
+         WITH (engine='spatial')",
+    )
+    .await
+    .unwrap();
+    srv.exec("INSERT INTO sp_points_in_zone (id, loc) VALUES ('inside', ST_Point(1, 2))")
+        .await
+        .unwrap();
+    srv.exec("INSERT INTO sp_points_in_zone (id, loc) VALUES ('outside', ST_Point(90, 40))")
+        .await
+        .unwrap();
+
+    let rows = srv
+        .query_rows(
+            "SELECT id FROM sp_points_in_zone WHERE \
+             ST_Within(loc, '{\"type\":\"Polygon\",\"coordinates\":\
+             [[[0,0],[5,0],[5,5],[0,5],[0,0]]]}')",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the point inside the polygon may match, got {rows:?}"
+    );
+    assert_eq!(rows[0][0], "inside");
+}
+
 #[tokio::test]
 async fn count_spatial_rows() {
     let srv = TestServer::start().await;

@@ -103,44 +103,6 @@ impl Geometry {
             Geometry::GeometryCollection { .. } => "GeometryCollection",
         }
     }
-
-    /// Compute the centroid of the geometry.
-    pub fn centroid(&self) -> Option<[f64; 2]> {
-        match self {
-            Geometry::Point { coordinates } => Some(*coordinates),
-            Geometry::LineString { coordinates } => {
-                if coordinates.is_empty() {
-                    return None;
-                }
-                let n = coordinates.len() as f64;
-                let sum_lng: f64 = coordinates.iter().map(|c| c[0]).sum();
-                let sum_lat: f64 = coordinates.iter().map(|c| c[1]).sum();
-                Some([sum_lng / n, sum_lat / n])
-            }
-            Geometry::Polygon { coordinates } => {
-                // Centroid of exterior ring.
-                coordinates.first().and_then(|ring| {
-                    if ring.is_empty() {
-                        return None;
-                    }
-                    let n = ring.len() as f64;
-                    let sum_lng: f64 = ring.iter().map(|c| c[0]).sum();
-                    let sum_lat: f64 = ring.iter().map(|c| c[1]).sum();
-                    Some([sum_lng / n, sum_lat / n])
-                })
-            }
-            Geometry::MultiPoint { coordinates } => {
-                if coordinates.is_empty() {
-                    return None;
-                }
-                let n = coordinates.len() as f64;
-                let sum_lng: f64 = coordinates.iter().map(|c| c[0]).sum();
-                let sum_lat: f64 = coordinates.iter().map(|c| c[1]).sum();
-                Some([sum_lng / n, sum_lat / n])
-            }
-            _ => None,
-        }
-    }
 }
 
 /// Parse a GeoJSON string into a [`Geometry`].
@@ -186,29 +148,6 @@ pub fn haversine_bearing(lng1: f64, lat1: f64, lng2: f64, lat2: f64) -> f64 {
     let x = lat1_r.cos() * lat2_r.sin() - lat1_r.sin() * lat2_r.cos() * dlng.cos();
     let bearing = y.atan2(x).to_degrees();
     (bearing + 360.0) % 360.0
-}
-
-/// Approximate area of a polygon on Earth's surface in square meters.
-///
-/// Uses the Shoelace formula on projected coordinates (simple equirectangular).
-/// Accurate for small polygons; for large polygons use spherical excess.
-pub fn polygon_area(ring: &[[f64; 2]]) -> f64 {
-    if ring.len() < 3 {
-        return 0.0;
-    }
-    let mut sum = 0.0;
-    let n = ring.len();
-    for i in 0..n {
-        let j = (i + 1) % n;
-        // Convert to approximate meters from center.
-        let lat_avg = ((ring[i][1] + ring[j][1]) / 2.0).to_radians();
-        let x1 = ring[i][0].to_radians() * EARTH_RADIUS_M * lat_avg.cos();
-        let y1 = ring[i][1].to_radians() * EARTH_RADIUS_M;
-        let x2 = ring[j][0].to_radians() * EARTH_RADIUS_M * lat_avg.cos();
-        let y2 = ring[j][1].to_radians() * EARTH_RADIUS_M;
-        sum += x1 * y2 - x2 * y1;
-    }
-    (sum / 2.0).abs()
 }
 
 /// Check if a point is inside a polygon (ray casting algorithm).
@@ -270,18 +209,6 @@ mod tests {
     }
 
     #[test]
-    fn polygon_area_simple() {
-        // ~1 degree square near equator ≈ 111km × 111km ≈ 12,321 km²
-        let ring = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]];
-        let area = polygon_area(&ring);
-        let area_km2 = area / 1e6;
-        assert!(
-            (area_km2 - 12321.0).abs() < 500.0,
-            "expected ~12321 km², got {area_km2}"
-        );
-    }
-
-    #[test]
     fn point_in_polygon_inside() {
         let ring = vec![
             [0.0, 0.0],
@@ -292,20 +219,6 @@ mod tests {
         ];
         assert!(point_in_polygon(5.0, 5.0, &ring));
         assert!(!point_in_polygon(15.0, 5.0, &ring));
-    }
-
-    #[test]
-    fn centroid_point() {
-        let p = Geometry::point(10.0, 20.0);
-        assert_eq!(p.centroid(), Some([10.0, 20.0]));
-    }
-
-    #[test]
-    fn centroid_linestring() {
-        let ls = Geometry::line_string(vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]]);
-        let c = ls.centroid().unwrap();
-        assert!((c[0] - 6.6667).abs() < 0.01);
-        assert!((c[1] - 3.3333).abs() < 0.01);
     }
 
     #[test]

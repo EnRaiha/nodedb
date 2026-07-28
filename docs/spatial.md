@@ -17,8 +17,10 @@ Spatial is a **columnar profile**. Collections with a `SPATIAL_INDEX` column mod
 - **R\*-tree index** — Bulk loading, nearest neighbor, range queries
 - **Geohash** — Encode/decode, neighbor cells, area covering
 - **H3 hexagonal index** — Uber's H3 via h3o for uniform-area spatial binning
-- **OGC predicates** — `ST_Contains`, `ST_Intersects`, `ST_Within`, `ST_DWithin`, `ST_Distance`, `ST_Intersection`, `ST_Buffer`, `ST_Envelope`, `ST_Union`
-- **Geometry constructors** — `ST_MakePoint`, `ST_GeomFromText` (WKT), `ST_GeomFromWKB`, `ST_GeomFromGeoJSON` — usable directly in `INSERT VALUES`
+- **OGC predicates** — `ST_Contains`, `ST_Intersects`, `ST_Within`, `ST_Disjoint`, `ST_DWithin`, `ST_IsValid`
+- **Geometry constructors** — `ST_Point`, `ST_MakePoint`, `ST_GeomFromText` (WKT), `ST_GeomFromWKB`, `ST_GeomFromGeoJSON`, `ST_MakeLine`, `ST_MakePolygon`, `ST_MakeEnvelope`
+- **Accessors and measures** — `ST_AsText`, `ST_AsGeoJSON`, `ST_X`, `ST_Y`, `ST_GeometryType`, `ST_NPoints`, `ST_SRID`, `ST_Distance`, `ST_Length`, `ST_Perimeter`, `ST_Area`
+- **Geometry operations** — `ST_Buffer`, `ST_Envelope`, `ST_Centroid`, `ST_Union`, `ST_Intersection`
 - **Format support** — WKB, WKT, GeoJSON interchange. GeoParquet v1.1.0 + GeoArrow metadata.
 - **Hybrid spatial-vector** — Spatial R\*-tree narrows candidates by location, then HNSW ranks by semantic similarity in one query
 - **Spatial join** — R\*-tree probe join between two collections
@@ -80,6 +82,84 @@ SELECT h3_latlngtocell(40.748, -73.985, 9) AS hex;
 SELECT r.name, z.zone_name
 FROM restaurants r, delivery_zones z
 WHERE ST_Contains(z.boundary, r.location);
+```
+
+## Geometry Functions
+
+Every geometry function works in every position a geometry expression may
+appear: an `INSERT` value, a `SELECT` projection, and a spatial predicate's
+query-geometry argument. Constructors nest, so `ST_Buffer(ST_Point(...), 500)`
+is a valid search area.
+
+A string literal in geometry position is read as either WKT or GeoJSON, so
+`ST_DWithin(loc, 'POINT(1 2)', 500)` and
+`ST_DWithin(loc, '{"type":"Point","coordinates":[1,2]}', 500)` are equivalent.
+
+### Constructors
+
+| Function | Result |
+| --- | --- |
+| `ST_Point(lng, lat)` | Point |
+| `ST_MakePoint(x, y [, z])` | Point |
+| `ST_GeomFromText(wkt [, srid])` | Geometry parsed from WKT |
+| `ST_GeomFromGeoJSON(json)` | Geometry parsed from GeoJSON |
+| `ST_GeomFromWKB(bytes [, srid])` | Geometry parsed from WKB; accepts an `X'...'` literal or its hex string |
+| `ST_MakeLine(point, point, ...)` | LineString |
+| `ST_MakePolygon(ring, ...)` | Polygon, each ring an array of `[lng, lat]` pairs |
+| `ST_MakeEnvelope(min_lng, min_lat, max_lng, max_lat)` | Rectangular Polygon |
+
+### Accessors
+
+| Function | Result |
+| --- | --- |
+| `ST_AsText(geom)` | WKT rendering |
+| `ST_AsGeoJSON(geom)` | GeoJSON rendering |
+| `ST_X(geom)` / `ST_Y(geom)` | Ordinate of a Point; NULL for any other geometry |
+| `ST_GeometryType(geom)` | Type name, e.g. `Point` |
+| `ST_NPoints(geom)` | Total vertex count |
+| `ST_SRID(geom)` | Always `4326` — geometry is stored as GeoJSON, which RFC 7946 defines as WGS 84 |
+| `ST_IsValid(geom)` | Whether the geometry is well-formed |
+
+### Measures
+
+Every measure is geodesic: lengths in meters, areas in square meters.
+
+| Function | Result |
+| --- | --- |
+| `ST_Distance(a, b)` | Distance between two geometries |
+| `ST_Length(geom)` | Total length of linear components; `0` for points and polygons |
+| `ST_Perimeter(geom)` | Boundary length of areal components, holes included |
+| `ST_Area(geom)` | Area of areal components, less holes; `0` for points and lines |
+
+### Predicates and operations
+
+| Function | Result |
+| --- | --- |
+| `ST_Contains(a, b)` | Whether `a` contains `b` |
+| `ST_Within(a, b)` | Whether `a` lies within `b` — the converse of `ST_Contains` |
+| `ST_Intersects(a, b)` / `ST_Disjoint(a, b)` | Whether the two geometries share any point |
+| `ST_DWithin(a, b, meters)` | Whether the two geometries lie within a geodesic distance |
+| `ST_Buffer(geom, meters [, segments])` | Geometry grown by a distance |
+| `ST_Envelope(geom)` | Bounding rectangle |
+| `ST_Centroid(geom)` | Centroid, weighted by the highest dimension present |
+| `ST_Union(a, b)` / `ST_Intersection(a, b)` | Combined / shared geometry |
+
+`ST_Contains`, `ST_Within`, `ST_Intersects` and `ST_DWithin` are answered from
+the R\*-tree when the first argument is an indexed geometry column; the rest
+evaluate per row.
+
+```sql
+-- Read stored geometry back in either interchange format
+SELECT name, ST_AsText(location), ST_X(location), ST_Y(location)
+FROM restaurants;
+
+-- Measure and describe
+SELECT name, ST_GeometryType(boundary), ST_Area(boundary), ST_Perimeter(boundary)
+FROM delivery_zones;
+
+-- A buffered point is a valid query geometry
+SELECT name FROM restaurants
+WHERE ST_Within(location, ST_Buffer(ST_Point(-73.990, 40.750), 1000));
 ```
 
 ## Spatial as a Peer Engine

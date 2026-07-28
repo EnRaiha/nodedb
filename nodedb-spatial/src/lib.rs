@@ -15,6 +15,7 @@ pub mod geohash;
 pub mod geohash_index;
 pub mod h3;
 pub mod hybrid;
+pub mod measures;
 pub mod operations;
 pub mod persist;
 pub mod predicates;
@@ -31,6 +32,7 @@ pub use h3::{
     h3_to_boundary, h3_to_center,
 };
 pub use hybrid::{SpatialPreFilterResult, bitmap_contains, ids_to_bitmap, spatial_prefilter};
+pub use measures::{st_area, st_centroid};
 pub use operations::{st_buffer, st_envelope, st_union};
 pub use persist::{
     RTreeCheckpointError, SpatialIndexMeta, SpatialIndexType, deserialize_meta, meta_storage_key,

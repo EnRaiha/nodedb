@@ -46,7 +46,11 @@ pub(in crate::data::executor) fn apply_predicate(
         SpatialPredicate::DWithin => {
             crate::engine::spatial::st_dwithin(query, doc, distance_meters)
         }
-        SpatialPredicate::Contains => crate::engine::spatial::st_contains(query, doc),
+        // `ST_Contains(loc, q)` asks whether the *stored* geometry contains
+        // the query geometry — the geofencing shape, where `loc` is a zone
+        // polygon and `q` a point. `ST_Within(loc, q)` is its converse. Both
+        // pass the stored geometry in the position SQL named first.
+        SpatialPredicate::Contains => crate::engine::spatial::st_contains(doc, query),
         SpatialPredicate::Intersects => crate::engine::spatial::st_intersects(query, doc),
         SpatialPredicate::Within => crate::engine::spatial::st_within(doc, query),
     }
