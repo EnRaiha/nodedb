@@ -13,6 +13,8 @@ mod msgpack_decode;
 pub mod paths;
 pub mod raw_scan;
 mod scan;
+mod sort;
+mod time_range;
 
 pub(in crate::data::executor) use ingest_dispatch::{TimeseriesApplyMode, TimeseriesIngestExec};
 pub(in crate::data::executor) use scan::TimeseriesScanParams;

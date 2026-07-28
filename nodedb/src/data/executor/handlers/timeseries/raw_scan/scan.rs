@@ -30,6 +30,9 @@ pub(in crate::data::executor) struct RawScanParams<'a> {
     /// aggregate branch never reaches this handler, so continuous
     /// aggregates stay committed-only.
     pub txn_id: Option<crate::types::TxnId>,
+    /// `ORDER BY` keys as `(column, ascending)`. Empty = the engine's natural
+    /// order (memtable rows, then partition rows).
+    pub sort_keys: &'a [(String, bool)],
 }
 
 impl CoreLoop {
@@ -49,6 +52,7 @@ impl CoreLoop {
             computed_columns: computed_columns_bytes,
             all_versions,
             txn_id,
+            sort_keys,
         } = params;
 
         // A no-LIMIT SQL `SELECT * FROM <timeseries>` arrives as
@@ -67,6 +71,20 @@ impl CoreLoop {
             )
         } else {
             limit
+        };
+
+        // An ordered query cannot stop at `limit` while gathering: the first
+        // `limit` rows the engine happens to find are not the first `limit` of
+        // the requested order. Gather up to the memory budget instead, sort,
+        // then cut to `limit`.
+        let gather_limit = if sort_keys.is_empty() {
+            limit
+        } else {
+            crate::data::executor::handlers::scan_budget::fetch_limit_for(
+                usize::MAX,
+                0,
+                scan_budget_bytes,
+            )
         };
 
         // Scan-quiesce gate.
@@ -123,7 +141,7 @@ impl CoreLoop {
                 .map(|(i, (name, ty))| (i, name, ty, mt.column(i)))
                 .collect();
             for &idx in &filtered_indices {
-                if results.len() >= limit {
+                if results.len() >= gather_limit {
                     break;
                 }
                 let row = emit_memtable_row(mt, &columns, idx as usize);
@@ -166,7 +184,7 @@ impl CoreLoop {
                     .filter(|p| p.exists())
                     .collect();
 
-                let remaining = limit.saturating_sub(results.len());
+                let remaining = gather_limit.saturating_sub(results.len());
                 if remaining > 0 && !partition_dirs.is_empty() {
                     let partition_rows = scan_partitions_parallel(
                         &partition_dirs,
@@ -176,7 +194,7 @@ impl CoreLoop {
                         has_filters,
                     );
                     results.extend(partition_rows);
-                    results.truncate(limit);
+                    results.truncate(gather_limit);
                 }
             }
         }
@@ -196,7 +214,7 @@ impl CoreLoop {
                     time_range,
                     filter_predicates,
                     has_filters,
-                    limit,
+                    limit: gather_limit,
                 },
                 &mut results,
             ) {
@@ -236,13 +254,22 @@ impl CoreLoop {
         };
 
         // Audit-log order: ascending by system time across all versions.
-        let results = if all_versions {
+        let mut results = if all_versions {
             let mut sorted = results;
             sorted.sort_by_key(rmpv_system_time);
             sorted
         } else {
             results
         };
+
+        // ORDER BY, then the row limit — so an ordered query returns the first
+        // `limit` rows of the requested order rather than an arbitrary `limit`
+        // rows sorted among themselves. Audit-log reads keep their system-time
+        // order, which is the semantics of `AS OF SYSTEM TIME NULL`.
+        if !all_versions {
+            super::super::sort::sort_rows(&mut results, sort_keys);
+        }
+        results.truncate(limit);
 
         let array = rmpv::Value::Array(results);
         let mut buf = Vec::new();

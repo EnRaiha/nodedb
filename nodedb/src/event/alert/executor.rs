@@ -165,6 +165,7 @@ async fn execute_aggregate_scan(
         projection: Vec::new(),
         limit: 10_000, // Safety cap on group cardinality.
         filters,
+        sort_keys: Vec::new(),
         bucket_interval_ms: 0, // No time bucketing — aggregate over entire window.
         group_by: alert.group_by.clone(),
         aggregates: vec![(

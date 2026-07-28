@@ -47,6 +47,7 @@ fn register(ctx: &mut TestCtx, collection: &str, conflict_policy: Option<String>
             enforcement: Box::new(EnforcementOptions::default()),
             bitemporal: false,
             conflict_policy,
+            timeseries: None,
         }),
     );
     assert_eq!(resp.status, Status::Ok, "register document collection");

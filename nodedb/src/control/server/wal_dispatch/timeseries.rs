@@ -310,6 +310,7 @@ mod tests {
             projection: vec![],
             limit: 10,
             filters: vec![],
+            sort_keys: Vec::new(),
             bucket_interval_ms: 0,
             group_by: vec![],
             aggregates: vec![],

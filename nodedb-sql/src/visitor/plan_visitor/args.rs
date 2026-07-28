@@ -129,6 +129,7 @@ pub struct TimeseriesScanVisitArgs<'a> {
     pub projection: &'a [Projection],
     pub gap_fill: &'a str,
     pub limit: usize,
+    pub sort_keys: &'a [SortKey],
     pub tiered: bool,
     pub temporal: &'a TemporalScope,
 }

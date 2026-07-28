@@ -188,10 +188,10 @@ async fn wal_restart_durability() {
 ///     rows, so the survivors come back DOUBLED. Both faces are silent on an
 ///     append-only engine, so only the exact count separates them.
 #[tokio::test]
-async fn timeseries_survives_repeated_graceful_restart_172() {
+async fn timeseries_survives_two_consecutive_graceful_restarts() {
     let srv = TestServer::start().await;
     srv.exec(
-        "CREATE COLLECTION ts_172 \
+        "CREATE COLLECTION ts_two_restarts \
          COLUMNS (id TEXT, ts BIGINT TIME_KEY, val FLOAT) \
          WITH (engine='timeseries')",
     )
@@ -203,7 +203,7 @@ async fn timeseries_survives_repeated_graceful_restart_172() {
     const N: usize = 5;
     for i in 0..N {
         srv.exec(&format!(
-            "INSERT INTO ts_172 (id, ts, val) VALUES ('p{i}', {ts}, {i}.0)",
+            "INSERT INTO ts_two_restarts (id, ts, val) VALUES ('p{i}', {ts}, {i}.0)",
             ts = 1000 + i as u64 * 1000
         ))
         .await
@@ -212,7 +212,10 @@ async fn timeseries_survives_repeated_graceful_restart_172() {
 
     // Live sanity: all N present before any restart, so any later discrepancy
     // is recovery, not ingest.
-    let live = srv.query_rows("SELECT id FROM ts_172").await.unwrap();
+    let live = srv
+        .query_rows("SELECT id FROM ts_two_restarts")
+        .await
+        .unwrap();
     assert_eq!(
         live.len(),
         N,
@@ -229,7 +232,7 @@ async fn timeseries_survives_repeated_graceful_restart_172() {
     let (srv2, dir) = TestServer::open_on_path(dir).await;
 
     let after_1 = srv2
-        .query_rows("SELECT id FROM ts_172 ORDER BY ts")
+        .query_rows("SELECT id FROM ts_two_restarts ORDER BY ts")
         .await
         .unwrap();
     assert_eq!(
@@ -249,13 +252,16 @@ async fn timeseries_survives_repeated_graceful_restart_172() {
     srv2.graceful_shutdown().await;
     let (srv3, _dir) = TestServer::open_on_path(dir).await;
 
-    let after_2 = srv3.query_rows("SELECT id FROM ts_172").await.unwrap();
+    let after_2 = srv3
+        .query_rows("SELECT id FROM ts_two_restarts")
+        .await
+        .unwrap();
     assert_eq!(
         after_2.len(),
         N,
         "after a SECOND graceful restart the count must still be exactly {N}; \
          more means replay re-appended the partition-resident rows on top of \
-         themselves (#172 duplication): {after_2:?}"
+         themselves: {after_2:?}"
     );
 }
 

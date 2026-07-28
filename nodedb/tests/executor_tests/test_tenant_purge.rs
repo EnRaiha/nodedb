@@ -197,6 +197,7 @@ fn purge_removes_all_tenant_data() {
             projection: vec![],
             limit: 100,
             filters: vec![],
+            sort_keys: Vec::new(),
             bucket_interval_ms: 0,
             group_by: vec![],
             aggregates: vec![],

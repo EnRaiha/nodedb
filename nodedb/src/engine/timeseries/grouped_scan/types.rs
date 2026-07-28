@@ -52,12 +52,22 @@ pub(super) enum AggColInfo {
     Skip,
 }
 
+/// Resolve the column indices an aggregate pass needs.
+///
+/// `ts_idx` is the schema's own designated time column — passed in, never
+/// looked up by name. The time column is whatever the collection declared as
+/// its `TIME_KEY`, so searching for a conventional name would fail on every
+/// collection that named it something else and silently collapse the whole
+/// aggregate to an empty result.
 pub(super) fn resolve_schema(
     schema: &[(String, ColumnType)],
+    ts_idx: usize,
     group_by: &[String],
     aggregates: &[(String, String)],
 ) -> Option<ResolvedSchema> {
-    let ts_idx = schema.iter().position(|(n, _)| n == "timestamp")?;
+    if ts_idx >= schema.len() {
+        return None;
+    }
     let group_cols: Vec<_> = group_by
         .iter()
         .map(|name| {

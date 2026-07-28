@@ -655,6 +655,7 @@ mod tests {
                 enforcement: Box::new(EnforcementOptions::default()),
                 bitemporal: false,
                 conflict_policy: None,
+                timeseries: None,
             }),
             PhysicalPlan::Document(DocumentOp::IndexLookup {
                 collection: "c".into(),
@@ -1392,6 +1393,7 @@ mod tests {
                 projection: Vec::new(),
                 limit: 0,
                 filters: Vec::new(),
+                sort_keys: Vec::new(),
                 bucket_interval_ms: 0,
                 group_by: Vec::new(),
                 aggregates: Vec::new(),

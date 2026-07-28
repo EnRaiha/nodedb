@@ -148,6 +148,12 @@ pub(in crate::data::executor) fn ndb_field_to_value(
 }
 
 /// Infer a columnar schema from a `nodedb_types::Value::Object` (first row).
+///
+/// Last resort only: reached when the collection has no catalog schema to send
+/// (`schema_bytes` empty) — a test fixture, or a WAL redo record replayed
+/// before the boot-time schema seed. Types come from the row's own values;
+/// a column's *name* says nothing about its type, so a column called
+/// `timestamp` holding a string is a string column.
 pub(in crate::data::executor) fn infer_schema_from_value(row: &Value) -> ColumnarSchema {
     let obj = match row {
         Value::Object(m) => m,
@@ -159,17 +165,15 @@ pub(in crate::data::executor) fn infer_schema_from_value(row: &Value) -> Columna
 
     let mut columns = Vec::new();
     for (key, val) in obj {
-        let lower = key.to_lowercase();
-        let col_type = if lower == "timestamp" || lower == "ts" || lower == "time" {
-            ColumnType::Timestamp
-        } else {
-            match val {
-                Value::Float(_) => ColumnType::Float64,
-                Value::Integer(_) => ColumnType::Int64,
-                Value::Bool(_) => ColumnType::Bool,
-                _ => ColumnType::String,
-            }
+        let col_type = match val {
+            Value::Float(_) => ColumnType::Float64,
+            Value::Integer(_) => ColumnType::Int64,
+            Value::Bool(_) => ColumnType::Bool,
+            Value::DateTime(_) => ColumnType::Timestamptz,
+            Value::NaiveDateTime(_) => ColumnType::Timestamp,
+            _ => ColumnType::String,
         };
+        let lower = key.to_lowercase();
         if lower == "id" {
             columns.push(ColumnDef::required(key.clone(), col_type).with_primary_key());
         } else {

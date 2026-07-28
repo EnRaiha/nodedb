@@ -4,6 +4,15 @@
 
 use nodedb_types::{Surrogate, SystemTimeScope};
 
+/// An unconstrained `(min_ts_ms, max_ts_ms)` envelope.
+///
+/// The Control Plane always plans a timeseries scan unbounded: narrowing it
+/// requires knowing which column is the collection's declared `TIME_KEY`, and
+/// that is resolved in the Data Plane where the collection's registered schema
+/// lives. Internal callers that already know an exact window (retention,
+/// continuous-aggregate refresh) pass their own bounds instead.
+pub const UNBOUNDED_TIME_RANGE: (i64, i64) = (i64::MIN, i64::MAX);
+
 /// Timeseries engine physical operations.
 #[derive(
     Debug,
@@ -22,11 +31,18 @@ pub enum TimeseriesOp {
     /// memtable and sealed disk partitions.
     Scan {
         collection: String,
-        /// `(min_ts_ms, max_ts_ms)`. (0, i64::MAX) = no time filter.
+        /// `(min_ts_ms, max_ts_ms)` pruning envelope. The Data Plane narrows
+        /// it further using the query's bounds on the declared `TIME_KEY`;
+        /// see [`UNBOUNDED_TIME_RANGE`].
         time_range: (i64, i64),
         projection: Vec<String>,
         limit: usize,
         filters: Vec<u8>,
+        /// `ORDER BY` keys as `(column, ascending)` in significance order.
+        /// Empty = the engine's natural order. Applied to the materialized
+        /// result before `limit` is enforced, so an ordered query returns the
+        /// first `limit` rows of the ordering the client asked for.
+        sort_keys: Vec<(String, bool)>,
         /// time_bucket interval in milliseconds. 0 = no bucketing.
         bucket_interval_ms: i64,
         /// GROUP BY column names (empty = no grouping or whole-table agg).

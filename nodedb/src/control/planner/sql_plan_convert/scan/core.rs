@@ -15,9 +15,7 @@ use super::super::aggregate::{
 use super::super::expr::convert_sort_keys;
 use super::super::filter::serialize_filters;
 use super::super::scan_params::ScanParams;
-use super::super::value::{
-    extract_time_range, sql_value_to_bytes, sql_value_to_nodedb_value, sql_value_to_string,
-};
+use super::super::value::{sql_value_to_bytes, sql_value_to_nodedb_value, sql_value_to_string};
 use super::helpers::valid_at_from_scope;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -81,10 +79,13 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_scan(
 
     let physical = match engine {
         EngineType::Timeseries => {
-            let time_range = extract_time_range(filters);
+            // The time range is derived in the Data Plane, from the query's
+            // bounds on the collection's declared TIME_KEY column. Only the
+            // core holding the collection knows which column that is.
             PhysicalPlan::Timeseries(TimeseriesOp::Scan {
                 collection: collection.into(),
-                time_range,
+                time_range: UNBOUNDED_TIME_RANGE,
+                sort_keys: sort.clone(),
                 projection: proj_names,
                 limit: limit.unwrap_or(usize::MAX),
                 filters: filter_bytes,

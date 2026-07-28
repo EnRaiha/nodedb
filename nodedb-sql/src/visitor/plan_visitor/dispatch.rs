@@ -228,6 +228,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             projection,
             gap_fill,
             limit,
+            sort_keys,
             tiered,
             temporal,
         } => visitor.timeseries_scan(TimeseriesScanVisitArgs {
@@ -240,6 +241,7 @@ pub fn dispatch<V: PlanVisitor>(visitor: &mut V, plan: &SqlPlan) -> Result<V::Ou
             projection,
             gap_fill,
             limit: *limit,
+            sort_keys,
             tiered: *tiered,
             temporal,
         }),

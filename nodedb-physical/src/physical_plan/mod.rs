@@ -33,7 +33,7 @@ pub use crdt::CrdtOp;
 pub use document::{
     BalancedDef, DocumentOp, EnforcementOptions, GeneratedColumnSpec, MaterializedSumBinding,
     OllpPredictedEdge, PeriodLockConfig, RegisteredIndex, RegisteredIndexState, ReturningColumns,
-    ReturningItem, ReturningSpec, StorageMode, UpdateValue,
+    ReturningItem, ReturningSpec, StorageMode, TimeseriesSchema, UpdateValue,
 };
 pub use exchange::{ExchangeMode, ExchangeOp};
 pub use graph::{
@@ -45,7 +45,7 @@ pub use query::{AggregateSpec, GroupKeySpec, JoinProjection, QueryOp};
 pub use routing::plan_contains_cluster_partitioned_leaf;
 pub use spatial::{SpatialOp, SpatialPredicate};
 pub use text::TextOp;
-pub use timeseries::TimeseriesOp;
+pub use timeseries::{TimeseriesOp, UNBOUNDED_TIME_RANGE};
 pub use vector::VectorOp;
 pub use wire::{decode, encode};
 

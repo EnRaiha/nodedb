@@ -237,6 +237,7 @@ fn build_scan_task(
             projection: Vec::new(),
             limit: usize::MAX,
             filters: agg.filters.clone(),
+            sort_keys: Vec::new(),
             bucket_interval_ms,
             group_by: agg.group_by.clone(),
             aggregates: agg.aggregates.clone(),

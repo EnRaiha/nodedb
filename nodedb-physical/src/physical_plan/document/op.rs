@@ -4,6 +4,7 @@ use nodedb_types::{Surrogate, SurrogateBitmap, SystemTimeScope};
 
 use super::merge_types::MergeClauseOp;
 use super::ollp_edge::OllpPredictedEdge;
+use super::timeseries_schema::TimeseriesSchema;
 use super::types::{EnforcementOptions, RegisteredIndex, ReturningSpec, StorageMode, UpdateValue};
 
 /// Document engine physical operations (schemaless + strict + DML).
@@ -184,6 +185,12 @@ pub enum DocumentOp {
         /// `None` = no explicit policy persisted; the registry falls back to
         /// the ephemeral default.
         conflict_policy: Option<String>,
+        /// Declared columns + designated `TIME_KEY` for a timeseries
+        /// collection. `Some` for every `engine='timeseries'` collection;
+        /// `None` for every other engine. The Data Plane builds the
+        /// collection's memtable schema from this instead of inferring one
+        /// from the first ingested batch.
+        timeseries: Option<Box<TimeseriesSchema>>,
     },
 
     /// Lookup documents by secondary index value.

@@ -85,10 +85,19 @@ pub fn ingest_batch_with_lvc(
         // Build column values in schema order.
         let mut values: Vec<ColumnValue> = Vec::with_capacity(schema.columns.len());
 
-        for (col_name, col_type) in &schema.columns {
+        for (col_idx, (col_name, col_type)) in schema.columns.iter().enumerate() {
             match col_type {
-                ColumnType::Timestamp => {
+                // Only the designated time column takes the line's timestamp.
+                // Any other timestamp column is an ordinary column and carries
+                // whatever the row itself supplied.
+                ColumnType::Timestamp if col_idx == schema.timestamp_idx => {
                     values.push(ColumnValue::Timestamp(ts_ms));
+                }
+                ColumnType::Timestamp => {
+                    values.push(ColumnValue::Timestamp(find_field_timestamp_ms(
+                        &line.fields,
+                        col_name,
+                    )));
                 }
                 ColumnType::Symbol => {
                     // Look up tag value first (tags are borrowed &str), then
@@ -143,6 +152,29 @@ pub fn ingest_batch_with_lvc(
     }
 
     (accepted, rejected)
+}
+
+/// Read a non-designated timestamp column's value from the line's field set.
+///
+/// Numeric fields are epoch milliseconds; string fields are parsed as a
+/// datetime literal. A field that is absent or unparseable yields 0 — the same
+/// "no value supplied" floor the numeric column readers use.
+fn find_field_timestamp_ms<'a>(fields: &[(Cow<'a, str>, FieldValue<'a>)], name: &str) -> i64 {
+    for (key, value) in fields {
+        if key.as_ref() != name {
+            continue;
+        }
+        return match value {
+            FieldValue::Int(i) => *i,
+            FieldValue::UInt(u) => *u as i64,
+            FieldValue::Float(f) => *f as i64,
+            FieldValue::Bool(_) => 0,
+            FieldValue::Str(text) => nodedb_types::datetime::NdbDateTime::parse(text.as_ref())
+                .map(|dt| dt.unix_millis())
+                .unwrap_or(0),
+        };
+    }
+    0
 }
 
 fn find_field_str<'a>(fields: &[(Cow<'a, str>, FieldValue<'a>)], name: &str) -> Option<String> {

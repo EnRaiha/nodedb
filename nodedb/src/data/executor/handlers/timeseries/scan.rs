@@ -18,6 +18,9 @@ pub(in crate::data::executor) struct TimeseriesScanParams<'a> {
     pub time_range: (i64, i64),
     pub limit: usize,
     pub filters: &'a [u8],
+    /// `ORDER BY` keys as `(column, ascending)`. Applied to the materialized
+    /// result before `limit`, on both the raw and the aggregate branch.
+    pub sort_keys: &'a [(String, bool)],
     pub bucket_interval_ms: i64,
     pub group_by: &'a [String],
     pub aggregates: &'a [(String, String)],
@@ -51,6 +54,7 @@ impl CoreLoop {
             time_range,
             limit,
             filters,
+            sort_keys,
             bucket_interval_ms,
             group_by,
             aggregates,
@@ -62,6 +66,11 @@ impl CoreLoop {
 
         let all_versions = system_time.is_all_versions();
         let system_as_of_ms = system_time.as_of_ms();
+
+        // The collection's declared TIME_KEY drives partition pruning and
+        // projection pushdown. Resolved once here and threaded through both
+        // branches; nothing downstream guesses it from a column name.
+        let time_key = self.ts_time_column(task.request.database_id, tid, collection);
 
         // Lazy-load partition registry from disk if not yet loaded.
         if let Err(e) = self.ensure_ts_registry(tid, task.request.database_id, collection) {
@@ -108,6 +117,15 @@ impl CoreLoop {
                 expr: None,
             });
         }
+        // Narrow the plan's envelope with the query's own bounds on the
+        // declared time column. The Control Plane sends an unbounded range
+        // precisely because only this core knows which column that is.
+        let time_range = super::time_range::narrow_time_range(
+            time_range,
+            &filter_predicates,
+            Some(time_key.as_str()),
+        );
+
         let has_filters = !filter_predicates.is_empty();
         let is_aggregate = !aggregates.is_empty();
         let has_time_range = time_range.0 > 0 || time_range.1 < i64::MAX;
@@ -127,7 +145,9 @@ impl CoreLoop {
 
         // Determine needed columns (projection pushdown).
         let needed_columns: Vec<String> = if is_aggregate || bucket_interval_ms > 0 {
-            let mut needed: Vec<String> = vec!["timestamp".to_string()];
+            // The aggregate pipeline always needs the time column: it is the
+            // bucketing key and the ordering key.
+            let mut needed: Vec<String> = vec![time_key.clone()];
             for g in group_by {
                 if !needed.contains(g) {
                     needed.push(g.clone());
@@ -162,6 +182,7 @@ impl CoreLoop {
                 aggregates,
                 gap_fill,
                 needed_columns: &needed_columns,
+                sort_keys,
             })
         } else {
             // In-transaction read-your-own-writes is confined to the RAW scan
@@ -184,6 +205,7 @@ impl CoreLoop {
                 computed_columns,
                 all_versions,
                 txn_id: overlay_txn,
+                sort_keys,
             })
         }
     }

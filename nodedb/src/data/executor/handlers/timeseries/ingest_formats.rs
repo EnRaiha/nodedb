@@ -38,6 +38,26 @@ fn decode_canonical_ilp_lines(payload: &[u8]) -> Result<Vec<String>, ErrorCode> 
     Ok(lines)
 }
 
+/// Is `column` the time column of the row being ingested?
+///
+/// A collection created through DDL designates its time column explicitly, so
+/// the match is against that declared name and nothing else — a column called
+/// `timestamp` in a collection whose `TIME_KEY` is `captured_at` is an
+/// ordinary column and must keep its value.
+///
+/// `declared` is `None` only for a measurement with no DDL behind it (raw ILP
+/// protocol ingest). There the conventional names are the only signal
+/// available, so they remain the fallback.
+fn is_time_column(column: &str, declared: Option<&str>) -> bool {
+    match declared {
+        Some(time_key) => column.eq_ignore_ascii_case(time_key),
+        None => {
+            let lower = column.to_lowercase();
+            lower == "ts" || lower == "timestamp" || lower == "time"
+        }
+    }
+}
+
 impl CoreLoop {
     /// Decode the canonical Calvin ILP representation without reformatting any
     /// identifiers, unsigned values, escaped tags, or nanosecond timestamps.
@@ -119,14 +139,19 @@ impl CoreLoop {
             );
         }
 
+        // The declared TIME_KEY is resolved once per batch: it is a property
+        // of the collection, not of any individual row.
+        let time_key = self
+            .declared_ts_time_key(task.request.database_id, tid, collection)
+            .map(str::to_string);
+
         let mut ilp_buf = String::new();
         for row in &rows {
             let mut fields = Vec::new();
             let mut timestamp_ns: Option<i64> = None;
 
             for (key, val) in row {
-                let lower = key.to_lowercase();
-                if lower == "ts" || lower == "timestamp" || lower == "time" {
+                if is_time_column(key, time_key.as_deref()) {
                     match val {
                         MsgpackValue::Str(s) => {
                             timestamp_ns = parse_ts_string_to_nanos(s);
@@ -256,6 +281,12 @@ impl CoreLoop {
             );
         }
 
+        // The declared TIME_KEY is resolved once per batch: it is a property
+        // of the collection, not of any individual row.
+        let time_key = self
+            .declared_ts_time_key(task.request.database_id, tid, collection)
+            .map(str::to_string);
+
         let mut ilp_buf = String::new();
         for row_val in rows.iter() {
             let obj = match row_val.as_object() {
@@ -267,8 +298,7 @@ impl CoreLoop {
             let mut timestamp_ns: Option<i64> = None;
 
             for (key, val) in obj.iter() {
-                let lower = key.to_lowercase();
-                if lower == "ts" || lower == "timestamp" || lower == "time" {
+                if is_time_column(key, time_key.as_deref()) {
                     if let Some(s) = val.as_str() {
                         timestamp_ns = parse_ts_string_to_nanos(s);
                     } else if let Some(n) = val.as_i64() {

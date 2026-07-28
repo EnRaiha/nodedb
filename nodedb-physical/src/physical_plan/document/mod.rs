@@ -6,6 +6,7 @@ pub mod enforcement_types;
 pub mod merge_types;
 pub mod ollp_edge;
 pub mod op;
+pub mod timeseries_schema;
 pub mod types;
 pub mod update_value;
 
@@ -15,6 +16,7 @@ pub use enforcement_types::{
 pub use merge_types::{MergeActionOp, MergeClauseKind as MergeClauseKindOp, MergeClauseOp};
 pub use ollp_edge::OllpPredictedEdge;
 pub use op::DocumentOp;
+pub use timeseries_schema::TimeseriesSchema;
 pub use types::{
     BalancedDef, EnforcementOptions, GeneratedColumnSpec, MaterializedSumBinding, PeriodLockConfig,
     RegisteredIndex, RegisteredIndexState, ReturningColumns, ReturningItem, ReturningSpec,

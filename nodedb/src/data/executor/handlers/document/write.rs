@@ -296,6 +296,9 @@ pub(in crate::data::executor) struct RegisterDocumentCollectionParams<'a> {
     /// `Some` rehydrates this core's `PolicyRegistry` so the policy survives
     /// register/reboot instead of falling back to `CollectionPolicy::ephemeral()`.
     pub conflict_policy: Option<&'a str>,
+    /// Declared columns + designated `TIME_KEY` when this is a timeseries
+    /// collection; `None` for every other engine.
+    pub timeseries: Option<&'a nodedb_physical::physical_plan::TimeseriesSchema>,
 }
 
 impl CoreLoop {
@@ -318,6 +321,7 @@ impl CoreLoop {
             enforcement,
             bitemporal,
             conflict_policy,
+            timeseries,
         } = params;
         let mode_label = match storage_mode {
             nodedb_physical::physical_plan::StorageMode::Schemaless => "document_schemaless",
@@ -341,6 +345,7 @@ impl CoreLoop {
         config.enforcement = enforcement.clone();
         config.bitemporal = bitemporal;
         config.conflict_policy = conflict_policy.map(str::to_string);
+        config.timeseries = timeseries.map(|ts| Box::new(ts.clone()));
         config.index_paths = indexes
             .iter()
             .map(crate::engine::document::store::IndexPath::from_registered)

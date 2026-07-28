@@ -22,6 +22,25 @@ use super::admission;
 use super::ingest_dispatch::{TimeseriesApplyMode, TimeseriesIngestParams};
 
 impl CoreLoop {
+    /// Schema for a collection's very first memtable.
+    ///
+    /// A collection created through DDL declares its columns and its
+    /// `TIME_KEY`; that declaration is the schema, so the time key keeps its
+    /// name and position and every declared column exists from the first row
+    /// on. Only a collection with no declaration — raw ILP protocol ingest
+    /// into a measurement that was never created — falls back to inferring a
+    /// shape from the batch itself.
+    fn initial_ts_schema(
+        &self,
+        task: &crate::data::executor::task::ExecutionTask,
+        tid: crate::types::TenantId,
+        collection: &str,
+        lines: &[ilp::IlpLine<'_>],
+    ) -> crate::engine::timeseries::columnar_memtable::ColumnarSchema {
+        self.declared_ts_memtable_schema(task.request.database_id, tid, collection)
+            .unwrap_or_else(|| ilp_ingest::infer_schema(lines))
+    }
+
     /// Check every condition that could reject a commit-deferred ILP ingest
     /// before it is allowed to cast a Calvin commit vote. The simulation is
     /// deliberately isolated from live state: schema evolution and dictionary
@@ -49,7 +68,7 @@ impl CoreLoop {
                     })?
             }
             None => {
-                let mut schema = ilp_ingest::infer_schema(lines);
+                let mut schema = self.initial_ts_schema(task, tid, collection, lines);
                 if bitemporal {
                     ilp_ingest::ensure_bitemporal_columns(&mut schema);
                 }
@@ -165,7 +184,7 @@ impl CoreLoop {
             self.is_bitemporal(task.request.database_id.as_u64(), tid.as_u64(), collection);
         let is_new_memtable = !self.columnar_memtables.contains_key(&key);
         if is_new_memtable {
-            let mut schema = ilp_ingest::infer_schema(&lines);
+            let mut schema = self.initial_ts_schema(task, tid, collection, &lines);
             if bitemporal {
                 ilp_ingest::ensure_bitemporal_columns(&mut schema);
             }

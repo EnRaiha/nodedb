@@ -53,24 +53,19 @@ fn decode_staged_row(body: &[u8]) -> Option<Value> {
     }
 }
 
-/// Extract the timestamp value (ms) from a staged row map, matching the time
-/// column under any alias the planner's time-range extractor recognizes
-/// (`ts` / `timestamp` / `time`; see the Control Plane `extract_time_range`).
-/// Rows staged verbatim keep the INSERT's own column name, so the lookup must
-/// try every alias. Rows without a numeric timestamp fall outside every
-/// bounded range and are treated as non-matching by the caller.
-fn row_timestamp_ms(row: &Value) -> Option<i64> {
+/// Extract the time value (ms) from a staged row map.
+///
+/// A staged row keeps the INSERT's own column names, so the lookup is by the
+/// collection's declared time column — the same name the base scan prunes on.
+/// A row that carries no readable instant under that name falls outside every
+/// bounded range and is treated as non-matching by the caller.
+fn row_timestamp_ms(row: &Value, time_column: &str) -> Option<i64> {
     let Value::Object(map) = row else {
         return None;
     };
-    for key in ["timestamp", "ts", "time"] {
-        match map.get(key) {
-            Some(Value::Integer(ms)) => return Some(*ms),
-            Some(Value::Float(ms)) => return Some(*ms as i64),
-            _ => {}
-        }
-    }
-    None
+    map.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(time_column))
+        .and_then(|(_, value)| nodedb_query::scan_filter::value_as_timestamp_ms(value))
 }
 
 /// Convert a decoded staged row (`Value::Object`) into the `rmpv::Value::Map`
@@ -118,6 +113,8 @@ impl CoreLoop {
             limit,
         } = params;
 
+        let time_column = self.ts_time_column(coll_key.0, coll_key.1, &coll_key.2);
+
         // Read-your-own-writes refreshes the lease (see the reaper).
         self.touch_overlay(txn_id);
         let Some(overlay) = self.txn_overlays.get(&txn_id) else {
@@ -140,7 +137,7 @@ impl CoreLoop {
 
             // Time-range prune, mirroring the base memtable scan's
             // `timestamp_range_filter` (inclusive bounds).
-            match row_timestamp_ms(&row) {
+            match row_timestamp_ms(&row, &time_column) {
                 Some(ts) if ts >= time_range.0 && ts <= time_range.1 => {}
                 _ => continue,
             }

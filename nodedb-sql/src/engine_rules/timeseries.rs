@@ -49,6 +49,7 @@ impl EngineRules for TimeseriesRules {
             projection: p.projection,
             gap_fill: String::new(),
             limit: p.limit.unwrap_or(10000),
+            sort_keys: p.sort_keys,
             tiered: false,
             temporal: p.temporal,
         })
@@ -110,6 +111,9 @@ impl EngineRules for TimeseriesRules {
             projection: Vec::new(),
             gap_fill: String::new(),
             limit: p.limit,
+            // ORDER BY is attached later by `apply_order_by`, which sees the
+            // outer SELECT's sort list.
+            sort_keys: Vec::new(),
             tiered: p.has_auto_tier,
             temporal: p.temporal,
         })

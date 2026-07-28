@@ -39,6 +39,7 @@ fn register_with_generated(
             enforcement: Box::new(enforcement),
             bitemporal: false,
             conflict_policy: None,
+            timeseries: None,
         }),
     );
 }

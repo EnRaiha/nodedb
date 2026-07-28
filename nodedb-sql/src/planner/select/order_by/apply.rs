@@ -117,6 +117,37 @@ pub(in crate::planner::select) fn apply_order_by(
             grouping_sets: grouping_sets.clone(),
             sort_keys,
         }),
+        // A timeseries scan carries its own sort keys: the engine returns
+        // rows in the order it finds them (memtable, then partitions), which
+        // is not the order the client asked for. Dropping the sort here would
+        // silently answer `ORDER BY ts DESC` with ascending rows.
+        SqlPlan::TimeseriesScan {
+            collection,
+            time_range,
+            bucket_interval_ms,
+            group_by,
+            aggregates,
+            filters,
+            projection,
+            gap_fill,
+            limit,
+            tiered,
+            temporal,
+            ..
+        } => Ok(SqlPlan::TimeseriesScan {
+            collection: collection.clone(),
+            time_range: *time_range,
+            bucket_interval_ms: *bucket_interval_ms,
+            group_by: group_by.clone(),
+            aggregates: aggregates.clone(),
+            filters: filters.clone(),
+            projection: projection.clone(),
+            gap_fill: gap_fill.clone(),
+            limit: *limit,
+            sort_keys,
+            tiered: *tiered,
+            temporal: *temporal,
+        }),
         // Cte wraps an inner outer plan; push ORDER BY into that outer
         // so derived-table queries (`SELECT … FROM (…) AS t ORDER BY …`)
         // honour the sort. inline_cte downstream merges the outer Scan

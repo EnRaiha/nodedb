@@ -265,6 +265,9 @@ pub enum SqlPlan {
         projection: Vec<Projection>,
         gap_fill: String,
         limit: usize,
+        /// ORDER BY applied to the scan result. Empty = the engine's natural
+        /// order (ascending by the collection's time key).
+        sort_keys: Vec<SortKey>,
         tiered: bool,
         /// Bitemporal system-time / valid-time scope. Only non-default
         /// on collections created `WITH BITEMPORAL`; `TimeseriesRules::plan_scan`

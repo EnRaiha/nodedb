@@ -79,6 +79,7 @@ pub(super) struct TimeseriesScanParams<'a> {
     pub projection: &'a [Projection],
     pub gap_fill: &'a str,
     pub limit: &'a usize,
+    pub sort_keys: &'a [nodedb_sql::types::SortKey],
     pub tiered: &'a bool,
     pub tenant_id: TenantId,
     pub ctx: &'a ConvertContext,

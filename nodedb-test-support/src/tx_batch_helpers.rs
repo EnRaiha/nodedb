@@ -284,6 +284,7 @@ pub fn timeseries_scan(collection: &str) -> PhysicalPlan {
         projection: Vec::new(),
         limit: 100,
         filters: Vec::new(),
+        sort_keys: Vec::new(),
         bucket_interval_ms: 0,
         group_by: Vec::new(),
         aggregates: Vec::new(),

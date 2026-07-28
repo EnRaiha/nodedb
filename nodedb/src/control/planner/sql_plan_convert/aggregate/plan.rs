@@ -12,7 +12,6 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::convert::{ConvertContext, db_qualified};
 use super::super::filter::serialize_filters;
-use super::super::value::extract_time_range;
 use super::spec::{
     agg_expr_to_pair, agg_expr_to_spec, extract_collection_name, extract_scan_alias,
     group_by_to_specs, group_by_to_strings, inline_join_side, join_side_collection,
@@ -220,14 +219,15 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
 
     // Timeseries aggregates: route through TimeseriesOp::Scan with time_range + aggregates.
     if engine == Some(EngineType::Timeseries) {
-        let time_range = extract_time_range(filters_ref);
         return Ok(vec![PhysicalTask {
             tenant_id,
             vshard_id: vshard,
             database_id: ctx.database_id,
             plan: PhysicalPlan::Timeseries(TimeseriesOp::Scan {
                 collection,
-                time_range,
+                // Derived in the Data Plane against the declared TIME_KEY.
+                time_range: UNBOUNDED_TIME_RANGE,
+                sort_keys: bridge_sort_keys.clone(),
                 projection: Vec::new(),
                 limit,
                 filters: filter_bytes,

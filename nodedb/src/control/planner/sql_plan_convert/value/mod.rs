@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Value conversion utilities: SqlValue ↔ nodedb_types::Value, msgpack encoding,
-//! column default evaluation, and WHERE-clause time-range extraction.
+//! and column default evaluation.
 
 pub(super) mod assignments;
 pub(super) mod convert;
 pub(super) mod defaults;
 pub(super) mod msgpack_write;
 pub(super) mod rows;
-pub(super) mod time_range;
 
 pub(super) use assignments::{
     assignments_to_update_values, assignments_to_update_values_qualified,
@@ -22,4 +21,3 @@ pub(super) use msgpack_write::{
     write_msgpack_value,
 };
 pub(super) use rows::rows_to_msgpack_array;
-pub(super) use time_range::extract_time_range;

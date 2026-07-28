@@ -18,6 +18,7 @@ macro_rules! impl_scan_search_arms_for_convert_visitor {
                 projection,
                 gap_fill,
                 limit,
+                sort_keys,
                 tiered,
                 temporal,
             } = args;
@@ -32,6 +33,7 @@ macro_rules! impl_scan_search_arms_for_convert_visitor {
                     projection,
                     gap_fill,
                     limit: &limit,
+                    sort_keys,
                     tiered: &tiered,
                     tenant_id: self.tenant_id,
                     ctx: self.ctx,

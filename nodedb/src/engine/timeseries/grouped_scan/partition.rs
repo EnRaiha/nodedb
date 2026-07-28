@@ -35,7 +35,7 @@ pub fn aggregate_memtable(
         return Some(GroupedAggResult::new(num_aggs));
     }
 
-    let resolved = resolve_schema(&schema.columns, group_by, aggregates)?;
+    let resolved = resolve_schema(&schema.columns, schema.timestamp_idx, group_by, aggregates)?;
 
     let col_refs: Vec<Option<&ColumnData>> = (0..schema.columns.len())
         .map(|i| Some(mt.column(i)))
@@ -119,7 +119,12 @@ pub fn aggregate_partition(p: PartitionAggParams<'_>) -> Option<GroupedAggResult
         return Some(GroupedAggResult::new(num_aggs));
     }
 
-    let resolved = resolve_schema(&schema.columns, p.group_by, p.aggregates)?;
+    let resolved = resolve_schema(
+        &schema.columns,
+        schema.timestamp_idx,
+        p.group_by,
+        p.aggregates,
+    )?;
 
     // Load sparse index for block-level skip.
     let sparse_idx = ColumnarSegmentReader::read_sparse_index(p.partition_dir, None)

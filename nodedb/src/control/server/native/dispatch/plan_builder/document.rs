@@ -420,6 +420,7 @@ pub(crate) fn build_register(fields: &TextFields, collection: &str) -> crate::Re
         enforcement: Box::new(nodedb_physical::physical_plan::EnforcementOptions::default()),
         bitemporal: false,
         conflict_policy: None,
+        timeseries: None,
     }))
 }
 

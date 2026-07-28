@@ -27,6 +27,7 @@ pub(crate) fn build_scan(fields: &TextFields, collection: &str) -> crate::Result
         projection: Vec::new(),
         limit,
         filters: Vec::new(),
+        sort_keys: Vec::new(),
         bucket_interval_ms,
         group_by: Vec::new(),
         aggregates: Vec::new(),

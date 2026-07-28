@@ -11,6 +11,7 @@ use nodedb_physical::physical_plan::*;
 use super::super::aggregate::{
     agg_expr_to_pair, extract_computed_columns, extract_projection_names,
 };
+use super::super::expr::convert_sort_keys;
 use super::super::filter::serialize_filters;
 use super::super::scan_params::TimeseriesScanParams;
 use super::super::value::{row_to_msgpack, write_msgpack_array_header};
@@ -30,6 +31,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
         projection,
         gap_fill,
         limit,
+        sort_keys,
         tiered,
         tenant_id,
         ctx,
@@ -73,6 +75,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_scan(
             projection: proj_names,
             limit: *limit,
             filters: filter_bytes,
+            sort_keys: convert_sort_keys(sort_keys),
             bucket_interval_ms: *bucket_interval_ms,
             group_by: group_by.to_vec(),
             aggregates: agg_pairs,

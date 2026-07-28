@@ -167,6 +167,28 @@ pub(crate) fn extend_with_catalog_indexes(
     }
 }
 
+/// Extract the declared timeseries shape — column list plus designated
+/// `TIME_KEY` — from a stored collection, or `None` for every other engine.
+///
+/// The time key is read from the persisted `ColumnarProfile::Timeseries`
+/// rather than re-derived from the column list, so the name the Data Plane
+/// uses is always the one DDL resolved and the catalog recorded.
+fn build_timeseries_schema(
+    coll: &StoredCollection,
+) -> Option<Box<nodedb_physical::physical_plan::TimeseriesSchema>> {
+    let nodedb_types::CollectionType::Columnar(nodedb_types::ColumnarProfile::Timeseries {
+        time_key,
+        ..
+    }) = &coll.collection_type
+    else {
+        return None;
+    };
+    Some(Box::new(nodedb_physical::physical_plan::TimeseriesSchema {
+        time_key: time_key.clone(),
+        columns: coll.fields.clone(),
+    }))
+}
+
 /// Build the `CollectionConfig` a `DocumentOp::Register` would install in
 /// `doc_configs`, straight from the durable catalog — storage mode,
 /// enforcement options, generated columns, and secondary indexes.
@@ -253,6 +275,7 @@ pub(crate) fn build_doc_config_from_stored(
     config.enforcement = enforcement;
     config.bitemporal = coll.bitemporal;
     config.conflict_policy = coll.conflict_policy.clone();
+    config.timeseries = build_timeseries_schema(coll);
     config.index_paths = indexes
         .iter()
         .map(crate::engine::document::store::IndexPath::from_registered)
@@ -278,6 +301,7 @@ async fn dispatch_register_from_stored_inner(
             enforcement: Box::new(config.enforcement),
             bitemporal: config.bitemporal,
             conflict_policy: config.conflict_policy.clone(),
+            timeseries: config.timeseries.clone(),
         },
     );
 

@@ -19,9 +19,18 @@ pub(in crate::data::executor) fn encode_grouped_results(
     aggregates: &[(String, String)],
     limit: usize,
     bucket_interval_ms: i64,
+    sort_keys: &[(String, bool)],
 ) -> Vec<u8> {
     let has_bucket = bucket_interval_ms > 0;
-    let num_groups = result.groups.len().min(limit);
+    // An ordered query has to see every group before cutting to `limit`:
+    // groups arrive in hash-map order, so the first `limit` of them are an
+    // arbitrary subset. Unordered queries keep the cheap early cut.
+    let gather = if sort_keys.is_empty() {
+        limit
+    } else {
+        usize::MAX
+    };
+    let num_groups = result.groups.len().min(gather);
 
     // Pre-compute aggregate key names once (not per group).
     let agg_keys: Vec<String> = aggregates
@@ -35,7 +44,7 @@ pub(in crate::data::executor) fn encode_grouped_results(
     let mut rows: Vec<rmpv::Value> = Vec::with_capacity(num_groups);
 
     for (count, (key, accums)) in result.groups.iter().enumerate() {
-        if count >= limit {
+        if count >= gather {
             break;
         }
 
@@ -92,6 +101,9 @@ pub(in crate::data::executor) fn encode_grouped_results(
 
         rows.push(rmpv::Value::Map(fields));
     }
+
+    super::sort::sort_rows(&mut rows, sort_keys);
+    rows.truncate(limit);
 
     let array = rmpv::Value::Array(rows);
     let mut buf = Vec::new();

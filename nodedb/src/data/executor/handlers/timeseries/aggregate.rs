@@ -29,6 +29,9 @@ pub(in crate::data::executor) struct TsAggregateParams<'a> {
     pub aggregates: &'a [(String, String)],
     pub gap_fill: &'a str,
     pub needed_columns: &'a [String],
+    /// `ORDER BY` keys as `(output column, ascending)`, applied to the encoded
+    /// group rows before `limit`.
+    pub sort_keys: &'a [(String, bool)],
 }
 
 impl CoreLoop {
@@ -49,6 +52,7 @@ impl CoreLoop {
             aggregates,
             gap_fill,
             needed_columns,
+            sort_keys,
         } = params;
 
         let key = (task.request.database_id, tid, collection.to_string());
@@ -186,6 +190,7 @@ impl CoreLoop {
             aggregates,
             limit,
             bucket_interval_ms,
+            sort_keys,
         );
         self.response_with_payload(task, payload)
     }

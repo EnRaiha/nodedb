@@ -22,6 +22,7 @@ mod state;
 #[cfg(test)]
 pub(crate) mod tests;
 mod tick;
+mod ts_declared_schema;
 mod vector_index_rebuild;
 mod vector_index_seed;
 pub(in crate::data::executor) mod write_index;

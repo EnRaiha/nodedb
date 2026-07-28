@@ -250,6 +250,15 @@ impl CoreLoop {
             return self.response_error(task, error);
         }
 
+        // A staged row is read back by name, so the line's timestamp must be
+        // keyed under the collection's own time column — the same name the
+        // base scan and the overlay merge resolve.
+        let time_column = self.ts_time_column(
+            task.request.database_id,
+            crate::types::TenantId::new(tid),
+            collection,
+        );
+
         // Encode every already-admitted row before mutating an overlay.
         let mut encoded_rows = Vec::with_capacity(lines.len());
         for row in parsed.lines() {
@@ -279,7 +288,7 @@ impl CoreLoop {
                 object.insert(name.to_string(), value);
             }
             if let Some(timestamp) = row.timestamp_ns {
-                object.insert("timestamp".into(), Value::Integer(timestamp / 1_000_000));
+                object.insert(time_column.clone(), Value::Integer(timestamp / 1_000_000));
             }
             let body = match nodedb_types::value_to_msgpack(&Value::Object(object)) {
                 Ok(body) => body,

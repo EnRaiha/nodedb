@@ -25,6 +25,12 @@ pub struct CollectionConfig {
     /// `execute_register_document_collection` can rehydrate it into this
     /// core's `PolicyRegistry`. `None` = no explicit policy persisted.
     pub conflict_policy: Option<String>,
+    /// Declared columns + designated `TIME_KEY` for a timeseries collection.
+    /// `Some` only for `engine='timeseries'`. Read by the timeseries ingest
+    /// and scan paths so the collection's storage layout and its time column
+    /// come from the DDL rather than from whatever the first ingested batch
+    /// happened to look like.
+    pub timeseries: Option<Box<nodedb_physical::physical_plan::TimeseriesSchema>>,
 }
 
 impl CollectionConfig {
@@ -37,6 +43,7 @@ impl CollectionConfig {
             enforcement: nodedb_physical::physical_plan::EnforcementOptions::default(),
             bitemporal: false,
             conflict_policy: None,
+            timeseries: None,
         }
     }
 
