@@ -37,12 +37,11 @@ pub(crate) fn split_values(s: &str) -> Vec<&str> {
 /// Parse a SQL literal value to a `serde_json::Value`.
 pub(crate) fn parse_sql_value(val: &str) -> nodedb_types::Value {
     let trimmed = val.trim();
-    let upper = trimmed.to_uppercase();
-    if upper.starts_with("ARRAY[") && trimmed.ends_with(']') {
-        let Some(start) = trimmed.find('[') else {
-            return nodedb_types::Value::Null;
-        };
-        let inner = &trimmed[start + 1..trimmed.len() - 1];
+    if nodedb_types::starts_with_ascii_case_insensitive(trimmed, "ARRAY[") && trimmed.ends_with(']')
+    {
+        let inner = trimmed
+            .get("ARRAY[".len()..trimmed.len().saturating_sub(1))
+            .unwrap_or_default();
         let items = if inner.trim().is_empty() {
             Vec::new()
         } else {

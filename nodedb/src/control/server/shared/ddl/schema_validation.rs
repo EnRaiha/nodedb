@@ -74,17 +74,14 @@ pub(crate) fn parse_fields_clause_from_pairs(
     let mut serial_fields: Vec<String> = Vec::new();
 
     for (name, type_str) in columns {
-        let upper_type = type_str.to_uppercase();
-        let actual_type = match upper_type.as_str() {
-            "SERIAL" => {
-                serial_fields.push(name.clone());
-                "INT".to_string()
-            }
-            "BIGSERIAL" => {
-                serial_fields.push(name.clone());
-                "BIGINT".to_string()
-            }
-            _ => type_str.clone(),
+        let actual_type = if type_str.eq_ignore_ascii_case("SERIAL") {
+            serial_fields.push(name.clone());
+            "INT".to_string()
+        } else if type_str.eq_ignore_ascii_case("BIGSERIAL") {
+            serial_fields.push(name.clone());
+            "BIGINT".to_string()
+        } else {
+            type_str.clone()
         };
         fields.push((name.clone(), actual_type));
     }
@@ -137,8 +134,7 @@ pub fn validate_document_schema(
 /// Returns `(dimension, metric)` if the type is a vector type.
 /// Supports: `VECTOR(384)`, `VECTOR(384, cosine)`, `VECTOR(768, l2)`.
 pub fn parse_vector_type(type_str: &str) -> Option<(usize, String)> {
-    let upper = type_str.to_uppercase();
-    if !upper.starts_with("VECTOR") {
+    if !nodedb_types::starts_with_ascii_case_insensitive(type_str, "VECTOR") {
         return None;
     }
     // Extract parenthesized args.

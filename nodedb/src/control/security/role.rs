@@ -6,8 +6,8 @@
 //! defined in `identity.rs`. This module manages user-defined custom roles
 //! with optional single-parent inheritance.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 use crate::types::TenantId;
 
@@ -52,9 +52,7 @@ impl RoleStore {
 
     pub fn load_from(&self, catalog: &SystemCatalog) -> crate::Result<()> {
         let stored = catalog.load_all_roles()?;
-        let mut roles = self.roles.write().map_err(|e| crate::Error::Internal {
-            detail: format!("role store lock poisoned: {e}"),
-        })?;
+        let mut roles = self.roles.write();
         for s in stored {
             let role = CustomRole {
                 name: s.name.clone(),
@@ -80,9 +78,7 @@ impl RoleStore {
     /// `&RoleStore` reference.
     pub(crate) fn clear_and_reload(&self, catalog: &SystemCatalog) -> crate::Result<()> {
         {
-            let mut roles = self.roles.write().map_err(|e| crate::Error::Internal {
-                detail: format!("role store lock poisoned during repair: {e}"),
-            })?;
+            let mut roles = self.roles.write();
             roles.clear();
         }
         self.load_from(catalog)
@@ -109,13 +105,13 @@ impl RoleStore {
             },
             created_at: stored.created_at,
         };
-        let mut roles = self.roles.write().unwrap_or_else(|p| p.into_inner());
+        let mut roles = self.roles.write();
         roles.insert(stored.name.clone(), custom);
     }
 
     /// Remove a replicated role from the in-memory cache.
     pub fn install_replicated_drop_role(&self, name: &str) {
-        let mut roles = self.roles.write().unwrap_or_else(|p| p.into_inner());
+        let mut roles = self.roles.write();
         roles.remove(name);
     }
 
@@ -135,9 +131,7 @@ impl RoleStore {
                 detail: format!("'{name}' is a built-in role and cannot be created"),
             });
         }
-        let roles = self.roles.read().map_err(|e| crate::Error::Internal {
-            detail: format!("role store lock poisoned: {e}"),
-        })?;
+        let roles = self.roles.read();
         if roles.contains_key(name) {
             return Err(crate::Error::BadRequest {
                 detail: format!("role '{name}' already exists"),
@@ -173,9 +167,7 @@ impl RoleStore {
             });
         }
 
-        let mut roles = self.roles.write().map_err(|e| crate::Error::Internal {
-            detail: format!("role store lock poisoned: {e}"),
-        })?;
+        let mut roles = self.roles.write();
 
         if roles.contains_key(name) {
             return Err(crate::Error::BadRequest {
@@ -221,9 +213,7 @@ impl RoleStore {
             });
         }
 
-        let mut roles = self.roles.write().map_err(|e| crate::Error::Internal {
-            detail: format!("role store lock poisoned: {e}"),
-        })?;
+        let mut roles = self.roles.write();
 
         // Check no other role inherits from this one.
         let has_children = roles.values().any(|r| r.parent.as_deref() == Some(name));
@@ -256,9 +246,7 @@ impl RoleStore {
         let mut chain = vec![role.clone()];
 
         if let Role::Custom(name) = role {
-            let roles = self.roles.read().map_err(|e| crate::Error::Internal {
-                detail: format!("role store lock poisoned: {e}"),
-            })?;
+            let roles = self.roles.read();
 
             let mut current = name.as_str();
 
@@ -304,24 +292,19 @@ impl RoleStore {
     /// chain invariant `create_role` enforces at creation. The parent's
     /// existence is the caller's responsibility.
     pub fn check_inheritance_cycle(&self, role_name: &str, parent: &str) -> crate::Result<()> {
-        let roles = self.roles.read().map_err(|e| crate::Error::Internal {
-            detail: format!("role store lock poisoned: {e}"),
-        })?;
+        let roles = self.roles.read();
         check_inheritance_chain(role_name, parent, &roles)
     }
 
     /// Look up a custom role by name. Returns None if not found.
     pub fn get_role(&self, name: &str) -> Option<CustomRole> {
-        let roles = self.roles.read().ok()?;
+        let roles = self.roles.read();
         roles.get(name).cloned()
     }
 
     /// List all custom roles.
     pub fn list_roles(&self) -> Vec<CustomRole> {
-        let roles = match self.roles.read() {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
+        let roles = self.roles.read();
         roles.values().cloned().collect()
     }
 }
@@ -410,6 +393,23 @@ mod tests {
             .create_role("analyst", TenantId::new(1), None, None)
             .unwrap();
         assert!(store.get_role("analyst").is_some());
+    }
+
+    #[test]
+    fn role_cache_remains_usable_after_panic_while_write_locked() {
+        let store = RoleStore::new();
+        store
+            .create_role("analyst", TenantId::new(1), None, None)
+            .expect("create role");
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.roles.write();
+            panic!("simulated interrupted role cache update");
+        }));
+        assert!(outcome.is_err());
+        assert!(store.get_role("analyst").is_some());
+        assert!(store.drop_role("analyst", None).expect("drop role"));
+        assert!(store.get_role("analyst").is_none());
     }
 
     #[test]
@@ -615,7 +615,7 @@ mod tests {
             .create_role("roleA_child", TenantId::new(1), Some("roleC"), None)
             .unwrap();
         // Cycle: call check_inheritance_chain directly for roleA → roleC (roleA is ancestor).
-        let roles_guard = store2.roles.read().unwrap();
+        let roles_guard = store2.roles.read();
         let err = check_inheritance_chain("roleA", "roleC", &roles_guard).unwrap_err();
         drop(roles_guard);
         assert!(

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use nodedb_types::find_ascii_case_insensitive;
+
 use super::ScanFilter;
 
 /// Parse simple SQL predicates into `ScanFilter` values.
@@ -49,8 +51,7 @@ fn parse_single_predicate(clause: &str) -> Option<ScanFilter> {
         }
     }
 
-    let upper = clause.to_uppercase();
-    if let Some(pos) = upper.find(" LIKE ") {
+    if let Some(pos) = find_ascii_case_insensitive(clause, " LIKE ") {
         let field = clause[..pos].trim().to_string();
         let raw_value = clause[pos + 6..].trim();
         return Some(ScanFilter {
@@ -61,7 +62,7 @@ fn parse_single_predicate(clause: &str) -> Option<ScanFilter> {
             expr: None,
         });
     }
-    if let Some(pos) = upper.find(" ILIKE ") {
+    if let Some(pos) = find_ascii_case_insensitive(clause, " ILIKE ") {
         let field = clause[..pos].trim().to_string();
         let raw_value = clause[pos + 7..].trim();
         return Some(ScanFilter {
@@ -78,18 +79,19 @@ fn parse_single_predicate(clause: &str) -> Option<ScanFilter> {
 
 fn parse_predicate_value(raw: &str) -> serde_json::Value {
     let raw = raw.trim();
-    if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
-        let inner = &raw[1..raw.len() - 1];
+    if let Some(inner) = raw
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
         return serde_json::Value::String(inner.replace("''", "'"));
     }
-    let upper = raw.to_uppercase();
-    if upper == "TRUE" {
+    if raw.eq_ignore_ascii_case("TRUE") {
         return serde_json::Value::Bool(true);
     }
-    if upper == "FALSE" {
+    if raw.eq_ignore_ascii_case("FALSE") {
         return serde_json::Value::Bool(false);
     }
-    if upper == "NULL" {
+    if raw.eq_ignore_ascii_case("NULL") {
         return serde_json::Value::Null;
     }
     if let Ok(i) = raw.parse::<i64>() {
@@ -99,4 +101,22 @@ fn parse_predicate_value(raw: &str) -> serde_json::Value {
         return serde_json::json!(f);
     }
     serde_json::Value::String(raw.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_before_like_preserves_original_byte_offsets() {
+        let filters = parse_simple_predicates("Straße LIKE 'ß%'");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].field, "Straße");
+        assert_eq!(filters[0].value, nodedb_types::Value::String("ß%".into()));
+
+        let filters = parse_simple_predicates("İstanbul ILIKE 'İ%'");
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].field, "İstanbul");
+        assert_eq!(filters[0].value, nodedb_types::Value::String("İ%".into()));
+    }
 }

@@ -4167,6 +4167,7 @@ dependencies = [
  "object_store",
  "p256",
  "p384",
+ "parking_lot",
  "parquet",
  "pem",
  "pgwire",
@@ -8688,7 +8689,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "pagedb"
-version = "0.1.0"

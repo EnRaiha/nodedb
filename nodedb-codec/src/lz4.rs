@@ -7,8 +7,8 @@
 //! allocation and each LZ4 block before extending the result.
 
 use crate::bounds::{
-    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, encode_u32_len,
-    u32_to_usize,
+    checked_add, checked_capacity, checked_mul, checked_range, decoded_len, encode_input_len,
+    encode_u32_len, u32_to_usize,
 };
 use crate::error::CodecError;
 
@@ -63,7 +63,8 @@ pub fn encode_with_block_size(data: &[u8], block_size: usize) -> Result<Vec<u8>,
 /// Decompress LZ4 block-compressed bytes back to raw data.
 pub fn decode(data: &[u8]) -> Result<Vec<u8>, CodecError> {
     let header = read_header(data)?;
-    let mut result = Vec::with_capacity(header.uncompressed_size);
+    let result_capacity = checked_capacity(header.uncompressed_size, 1, "LZ4 decoded bytes")?;
+    let mut result = Vec::with_capacity(result_capacity);
     let mut block_offset = header.data_offset;
 
     for (index, &compressed_len) in header.block_lengths.iter().enumerate() {
@@ -164,7 +165,12 @@ fn read_header(data: &[u8]) -> Result<Lz4Header, CodecError> {
     let table_len = checked_mul(block_count, 4, "LZ4 block-length table")?;
     let data_offset = checked_add(HEADER_SIZE, table_len, "LZ4 data offset")?;
     let table = checked_range(data, HEADER_SIZE, table_len, "LZ4 block-length table")?;
-    let mut block_lengths = Vec::with_capacity(block_count);
+    let block_length_capacity = checked_capacity(
+        block_count,
+        std::mem::size_of::<usize>(),
+        "LZ4 block lengths",
+    )?;
+    let mut block_lengths = Vec::with_capacity(block_length_capacity);
     let mut total_compressed = 0usize;
     for bytes in table.chunks_exact(4) {
         let len = u32_to_usize(

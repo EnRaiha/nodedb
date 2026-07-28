@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use nodedb_types::strip_prefix_ascii_case_insensitive;
 use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -21,20 +22,18 @@ impl NodeDbPgHandler {
         session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
-        let upper = sql.to_uppercase();
-        let is_analyze = upper.starts_with("EXPLAIN ANALYZE ");
-
-        let inner_sql = if is_analyze {
-            sql[16..].trim()
-        } else if upper.starts_with("EXPLAIN ") {
-            sql[8..].trim()
-        } else {
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "42601".to_owned(),
-                "syntax error in EXPLAIN".to_owned(),
-            ))));
-        };
+        let inner_sql =
+            if let Some(inner) = strip_prefix_ascii_case_insensitive(sql, "EXPLAIN ANALYZE ") {
+                inner.trim()
+            } else if let Some(inner) = strip_prefix_ascii_case_insensitive(sql, "EXPLAIN ") {
+                inner.trim()
+            } else {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    "syntax error in EXPLAIN".to_owned(),
+                ))));
+            };
 
         let database_id = self
             .sessions

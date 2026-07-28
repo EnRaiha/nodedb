@@ -10,8 +10,8 @@
 //! - Support key rotation with configurable overlap period
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 
+use parking_lot::RwLock;
 use tracing::info;
 
 /// An auth-scoped API key record.
@@ -78,19 +78,28 @@ impl AuthApiKey {
     }
 }
 
+/// Coupled indexes for auth API key verification.
+///
+/// Both maps share one lock so every mutation publishes an internally
+/// consistent key/hash pair and no caller can acquire them in a conflicting
+/// order.
+#[derive(Default)]
+struct AuthApiKeyState {
+    /// key_id → AuthApiKey.
+    keys: HashMap<String, AuthApiKey>,
+    /// secret_hash (hex) → key_id for O(1) lookup during verification.
+    hash_index: HashMap<String, String>,
+}
+
 /// Auth API key store.
 pub struct AuthApiKeyStore {
-    /// key_id → AuthApiKey.
-    keys: RwLock<HashMap<String, AuthApiKey>>,
-    /// secret_hash (hex) → key_id for O(1) lookup during verification.
-    hash_index: RwLock<HashMap<String, String>>,
+    state: RwLock<AuthApiKeyState>,
 }
 
 impl AuthApiKeyStore {
     pub fn new() -> Self {
         Self {
-            keys: RwLock::new(HashMap::new()),
-            hash_index: RwLock::new(HashMap::new()),
+            state: RwLock::new(AuthApiKeyState::default()),
         }
     }
 
@@ -115,23 +124,19 @@ impl AuthApiKeyStore {
         .1
     }
 
-    /// Internal create: returns `(key_id, token)` so callers like `rotate()`
-    /// don't have to re-parse the token to recover the key_id. Parsing the
-    /// token would require a silent fallback on malformed input; the internal
-    /// pair makes that impossible.
-    fn create_key_inner(
-        &self,
+    /// Build an unpublished key record and token. Callers publish the record
+    /// and hash index together through [`Self::insert_key`].
+    fn build_key_record(
         auth_user_id: &str,
         tenant_id: u64,
         scopes: Vec<String>,
         rate_limit_qps: u64,
         rate_limit_burst: u64,
         expires_days: u64,
-    ) -> (String, String) {
+    ) -> (AuthApiKey, String, String) {
         let key_id = generate_key_id();
         let secret = generate_secret();
         let token = format!("nda_{key_id}_{secret}");
-
         let secret_hash = hash_secret(&secret);
         let now = now_secs();
         let expires_at = if expires_days > 0 {
@@ -139,10 +144,10 @@ impl AuthApiKeyStore {
         } else {
             0
         };
-
+        let hash_hex = hex_encode(&secret_hash);
         let record = AuthApiKey {
-            key_id: key_id.clone(),
-            secret_hash: secret_hash.clone(),
+            key_id,
+            secret_hash,
             auth_user_id: auth_user_id.into(),
             tenant_id,
             scopes,
@@ -157,13 +162,34 @@ impl AuthApiKeyStore {
             superseded_at: 0,
             superseded_by: None,
         };
+        (record, hash_hex, token)
+    }
 
-        let hash_hex = hex_encode(&secret_hash);
-        let mut keys = self.keys.write().unwrap_or_else(|p| p.into_inner());
-        let mut idx = self.hash_index.write().unwrap_or_else(|p| p.into_inner());
-        keys.insert(key_id.clone(), record);
-        idx.insert(hash_hex, key_id.clone());
+    fn insert_key(state: &mut AuthApiKeyState, record: AuthApiKey, hash_hex: String) {
+        let key_id = record.key_id.clone();
+        state.hash_index.insert(hash_hex, key_id.clone());
+        state.keys.insert(key_id, record);
+    }
 
+    fn create_key_inner(
+        &self,
+        auth_user_id: &str,
+        tenant_id: u64,
+        scopes: Vec<String>,
+        rate_limit_qps: u64,
+        rate_limit_burst: u64,
+        expires_days: u64,
+    ) -> (String, String) {
+        let (record, hash_hex, token) = Self::build_key_record(
+            auth_user_id,
+            tenant_id,
+            scopes,
+            rate_limit_qps,
+            rate_limit_burst,
+            expires_days,
+        );
+        let key_id = record.key_id.clone();
+        Self::insert_key(&mut self.state.write(), record, hash_hex);
         (key_id, token)
     }
 
@@ -178,11 +204,9 @@ impl AuthApiKeyStore {
         let secret_hash = hash_secret(secret);
         let hash_hex = hex_encode(&secret_hash);
 
-        let idx = self.hash_index.read().unwrap_or_else(|p| p.into_inner());
-        let key_id = idx.get(&hash_hex)?;
-
-        let keys = self.keys.read().unwrap_or_else(|p| p.into_inner());
-        let key = keys.get(key_id)?;
+        let state = self.state.read();
+        let key_id = state.hash_index.get(&hash_hex)?;
+        let key = state.keys.get(key_id)?;
 
         if !key.is_valid(now_secs()) {
             return None;
@@ -196,8 +220,8 @@ impl AuthApiKeyStore {
     /// silently recording post-rotation use of a dead key as if it were live.
     pub fn touch(&self, key_id: &str, ip: &str) {
         let now = now_secs();
-        let mut keys = self.keys.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(key) = keys.get_mut(key_id) {
+        let mut state = self.state.write();
+        if let Some(key) = state.keys.get_mut(key_id) {
             if !key.is_valid(now) {
                 return;
             }
@@ -208,8 +232,8 @@ impl AuthApiKeyStore {
 
     /// Revoke a key.
     pub fn revoke(&self, key_id: &str) -> bool {
-        let mut keys = self.keys.write().unwrap_or_else(|p| p.into_inner());
-        if let Some(key) = keys.get_mut(key_id) {
+        let mut state = self.state.write();
+        if let Some(key) = state.keys.get_mut(key_id) {
             key.is_revoked = true;
             true
         } else {
@@ -220,66 +244,59 @@ impl AuthApiKeyStore {
     /// Rotate a key: create a new key that replaces the old one.
     /// Both are valid during the overlap period.
     pub fn rotate(&self, old_key_id: &str, overlap_hours: u64) -> Option<String> {
-        // Precondition + snapshot in one read lock: the source key must be
-        // currently valid. Rotating a revoked or already-superseded key would
-        // silently mint a replacement for a dead credential — return None.
-        let old = {
-            let keys = self.keys.read().unwrap_or_else(|p| p.into_inner());
-            let old = keys.get(old_key_id)?;
-            if !old.is_valid(now_secs()) {
+        // Generate the replacement before acquiring the write lock, but do not
+        // publish it. The source is re-read and validated under that one lock
+        // before either index is mutated.
+        let source = {
+            let state = self.state.read();
+            let source = state.keys.get(old_key_id)?;
+            if !source.is_valid(now_secs()) || source.superseded_by.is_some() {
                 return None;
             }
-            old.clone()
+            source.clone()
         };
-
-        // Use the inner constructor so we get the new key_id back directly —
-        // no token re-parsing, no silent empty-string fallback on malformed
-        // input. The forward/reverse pointer pair is always consistent.
-        let (new_key_id, new_token) = self.create_key_inner(
-            &old.auth_user_id,
-            old.tenant_id,
-            old.scopes.clone(),
-            old.rate_limit_qps,
-            old.rate_limit_burst,
-            0, // New key inherits no expiry — set separately if needed.
+        let (mut replacement, hash_hex, token) = Self::build_key_record(
+            &source.auth_user_id,
+            source.tenant_id,
+            source.scopes.clone(),
+            source.rate_limit_qps,
+            source.rate_limit_burst,
+            0,
         );
+        let replacement_id = replacement.key_id.clone();
+        replacement.replaces_key_id = Some(old_key_id.to_owned());
 
-        let mut keys = self.keys.write().unwrap_or_else(|p| p.into_inner());
-
-        // Forward pointer on the new key (audit / admin view).
-        if let Some(new_key) = keys.get_mut(&new_key_id) {
-            new_key.replaces_key_id = Some(old_key_id.to_string());
+        let mut state = self.state.write();
+        let now = now_secs();
+        let old = state.keys.get_mut(old_key_id)?;
+        if !old.is_valid(now) || old.superseded_by.is_some() {
+            return None;
         }
-
-        // Reverse pointer + invalidation state on the old key — this is what
-        // verify() reads. Zero-overlap is special-cased to is_revoked=true to
-        // avoid a clock-edge race where `now > superseded_at == now` is false
-        // for the first ~1s and the "immediate cutover" key still verifies.
-        if let Some(old_key) = keys.get_mut(old_key_id) {
-            old_key.superseded_by = Some(new_key_id.clone());
-            if overlap_hours == 0 {
-                old_key.is_revoked = true;
-            } else {
-                old_key.superseded_at = now_secs() + overlap_hours * 3600;
-            }
+        old.superseded_by = Some(replacement_id.clone());
+        if overlap_hours == 0 {
+            old.is_revoked = true;
+        } else {
+            old.superseded_at = now + overlap_hours * 3600;
         }
+        Self::insert_key(&mut state, replacement, hash_hex);
 
         info!(
             old_key = %old_key_id,
-            new_key = %new_key_id,
+            new_key = %replacement_id,
             overlap_hours,
             "auth API key rotated"
         );
-
-        Some(new_token)
+        Some(token)
     }
 
     /// List all keys for an auth user.
     pub fn list_for_user(&self, auth_user_id: &str) -> Vec<AuthApiKey> {
         let now = now_secs();
-        let keys = self.keys.read().unwrap_or_else(|p| p.into_inner());
-        keys.values()
-            .filter(|k| k.auth_user_id == auth_user_id && k.is_valid(now))
+        let state = self.state.read();
+        state
+            .keys
+            .values()
+            .filter(|key| key.auth_user_id == auth_user_id && key.is_valid(now))
             .cloned()
             .collect()
     }
@@ -287,8 +304,13 @@ impl AuthApiKeyStore {
     /// List all keys (admin view).
     pub fn list_all(&self) -> Vec<AuthApiKey> {
         let now = now_secs();
-        let keys = self.keys.read().unwrap_or_else(|p| p.into_inner());
-        keys.values().filter(|k| k.is_valid(now)).cloned().collect()
+        let state = self.state.read();
+        state
+            .keys
+            .values()
+            .filter(|key| key.is_valid(now))
+            .cloned()
+            .collect()
     }
 }
 
@@ -338,6 +360,55 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_and_hash_indexes_remain_usable_after_panic_while_state_write_locked() {
+        let store = AuthApiKeyStore::new();
+        let token = store.create_key("panic-safe", 1, vec![], 0, 0, 0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = store.state.write();
+            panic!("simulated interrupted auth-key cache update");
+        }));
+        assert!(result.is_err());
+
+        let key = store
+            .verify(&token)
+            .expect("lookup after interrupted update");
+        let hash_hex = hex_encode(&key.secret_hash);
+        let state = store.state.read();
+        assert_eq!(state.hash_index.get(&hash_hex), Some(&key.key_id));
+        assert!(state.keys.contains_key(&key.key_id));
+    }
+
+    #[test]
+    fn concurrent_verify_and_create_complete_without_lock_order_deadlock() {
+        use std::sync::{Arc, Barrier};
+
+        let store = Arc::new(AuthApiKeyStore::new());
+        let token = store.create_key("existing", 1, vec![], 0, 0, 0);
+        let start = Arc::new(Barrier::new(3));
+
+        let verify_store = Arc::clone(&store);
+        let verify_start = Arc::clone(&start);
+        let verifier = std::thread::spawn(move || {
+            verify_start.wait();
+            for _ in 0..1_000 {
+                assert!(verify_store.verify(&token).is_some());
+            }
+        });
+        let create_store = Arc::clone(&store);
+        let create_start = Arc::clone(&start);
+        let creator = std::thread::spawn(move || {
+            create_start.wait();
+            for _ in 0..1_000 {
+                create_store.create_key("created", 1, vec![], 0, 0, 0);
+            }
+        });
+
+        start.wait();
+        verifier.join().expect("verification thread must complete");
+        creator.join().expect("creation thread must complete");
+    }
 
     #[test]
     fn create_and_verify() {
@@ -499,8 +570,11 @@ mod tests {
 
         let _new_token = store.rotate(&old_id, 24).unwrap();
 
-        let keys = store.keys.read().unwrap_or_else(|p| p.into_inner());
-        let old = keys.get(&old_id).expect("old key record still present");
+        let state = store.state.read();
+        let old = state
+            .keys
+            .get(&old_id)
+            .expect("old key record still present");
         assert!(
             old.is_revoked || old.expires_at > 0 || old.superseded_at > 0,
             "rotate() must leave an invalidation marker on the old key record itself; \
@@ -545,8 +619,8 @@ mod tests {
         // Old key is now invalid (zero-overlap → immediate revoke).
         store.touch(&old_id, "10.0.0.99");
 
-        let keys = store.keys.read().unwrap_or_else(|p| p.into_inner());
-        let old = keys.get(&old_id).expect("record still present");
+        let state = store.state.read();
+        let old = state.keys.get(&old_id).expect("record still present");
         assert_eq!(
             old.last_used_ip, "",
             "touch() must be a no-op on an invalidated key; got last_used_ip={:?}",
@@ -595,6 +669,9 @@ mod tests {
             store.rotate(&key_id, 24).is_none(),
             "rotate() on a revoked key must fail, not silently create a replacement"
         );
+        let state = store.state.read();
+        assert_eq!(state.keys.len(), 1);
+        assert_eq!(state.hash_index.len(), 1);
     }
 
     #[test]
@@ -606,13 +683,19 @@ mod tests {
         let token_a = store.create_key("u1", 1, vec![], 0, 0, 0);
         let id_a = store.verify(&token_a).unwrap().key_id;
 
-        let _token_b = store.rotate(&id_a, 0).unwrap();
-        // A is now invalidated. A second rotation from A must not succeed.
+        let token_b = store.rotate(&id_a, 24).unwrap();
+        // A remains credential-valid during the overlap, but is no longer an
+        // authoritative rotation source. A second rotation must not mint C.
+        assert!(store.verify(&token_a).is_some());
+        assert!(store.verify(&token_b).is_some());
         assert!(
             store.rotate(&id_a, 24).is_none(),
             "rotate() on an already-superseded key must fail; chain rotations \
-             must go through the current-active key, not a retired one"
+             must go through the current-active key, not an overlapping source"
         );
+        let state = store.state.read();
+        assert_eq!(state.keys.len(), 2);
+        assert_eq!(state.hash_index.len(), 2);
     }
 
     #[test]

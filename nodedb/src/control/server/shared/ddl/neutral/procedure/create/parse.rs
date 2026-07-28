@@ -32,12 +32,25 @@ pub struct ParsedCreateProcedure {
 /// [WITH (...)] AS BEGIN ... END;`.
 pub fn parse_create_procedure(sql: &str) -> Result<ParsedCreateProcedure, DdlError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
 
-    let (or_replace, rest) = if upper.starts_with("CREATE OR REPLACE PROCEDURE ") {
-        (true, &trimmed["CREATE OR REPLACE PROCEDURE ".len()..])
-    } else if upper.starts_with("CREATE PROCEDURE ") {
-        (false, &trimmed["CREATE PROCEDURE ".len()..])
+    let (or_replace, rest) = if trimmed
+        .get(.."CREATE OR REPLACE PROCEDURE ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CREATE OR REPLACE PROCEDURE "))
+    {
+        (
+            true,
+            trimmed
+                .get("CREATE OR REPLACE PROCEDURE ".len()..)
+                .unwrap_or_default(),
+        )
+    } else if trimmed
+        .get(.."CREATE PROCEDURE ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CREATE PROCEDURE "))
+    {
+        (
+            false,
+            trimmed.get("CREATE PROCEDURE ".len()..).unwrap_or_default(),
+        )
     } else {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
@@ -50,7 +63,11 @@ pub fn parse_create_procedure(sql: &str) -> Result<ParsedCreateProcedure, DdlErr
         sqlstate: "42601".to_string(),
         message: "expected '(' after procedure name".to_string(),
     })?;
-    let name = rest[..paren_open].trim().to_lowercase();
+    let name = rest
+        .get(..paren_open)
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
     if name.is_empty() {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
@@ -62,24 +79,34 @@ pub fn parse_create_procedure(sql: &str) -> Result<ParsedCreateProcedure, DdlErr
         sqlstate: "42601".to_string(),
         message: "unmatched '(' in parameter list".to_string(),
     })?;
-    let params_str = &rest[paren_open + 1..paren_close];
+    let params_str = rest.get(paren_open + 1..paren_close).unwrap_or_default();
     let parameters = parse_procedure_params(params_str)?;
 
-    let after_params = rest[paren_close + 1..].trim();
+    let after_params = rest.get(paren_close + 1..).unwrap_or_default().trim();
 
     // Optional WITH (...) clause.
     let (max_iterations, timeout_secs, after_with) = parse_with_clause(after_params)?;
 
     // Expect AS then BEGIN...END body.
-    let rest_upper = after_with.to_uppercase();
-    let body_start = if rest_upper.starts_with("AS ") || rest_upper.starts_with("AS\n") {
-        after_with["AS".len()..].trim()
+    let has_as = after_with
+        .get(.."AS".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AS"));
+    let has_as_separator = after_with
+        .as_bytes()
+        .get("AS".len())
+        .is_some_and(|byte| byte.is_ascii_whitespace());
+    let body_start = if has_as && has_as_separator {
+        after_with.get("AS".len()..).unwrap_or_default().trim()
     } else {
         after_with
     };
 
     let body_sql = body_start.trim().trim_end_matches(';').trim().to_string();
-    if body_sql.is_empty() || !body_sql.to_uppercase().starts_with("BEGIN") {
+    if body_sql.is_empty()
+        || !body_sql
+            .get(.."BEGIN".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("BEGIN"))
+    {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
             message: "procedure body must start with BEGIN".to_string(),
@@ -142,12 +169,14 @@ fn parse_procedure_params(params_str: &str) -> Result<Vec<ProcedureParam>, DdlEr
 /// Returns `(max_iterations, timeout_secs, rest)` where `rest` is the
 /// unconsumed tail of the input.
 fn parse_with_clause(s: &str) -> Result<(u64, u64, &str), DdlError> {
-    let upper = s.to_uppercase();
-    if !upper.starts_with("WITH") {
+    if !s
+        .get(.."WITH".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("WITH"))
+    {
         return Ok((1_000_000, 60, s));
     }
 
-    let after_with = &s["WITH".len()..].trim_start();
+    let after_with = s.get("WITH".len()..).unwrap_or_default().trim_start();
     if !after_with.starts_with('(') {
         return Ok((1_000_000, 60, s));
     }
@@ -156,8 +185,8 @@ fn parse_with_clause(s: &str) -> Result<(u64, u64, &str), DdlError> {
         sqlstate: "42601".to_string(),
         message: "unmatched '(' in WITH clause".to_string(),
     })?;
-    let inner = &after_with[1..close];
-    let rest = after_with[close + 1..].trim();
+    let inner = after_with.get(1..close).unwrap_or_default();
+    let rest = after_with.get(close + 1..).unwrap_or_default().trim();
 
     let mut max_iter = 1_000_000u64;
     let mut timeout = 60u64;

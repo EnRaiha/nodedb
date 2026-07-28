@@ -12,6 +12,7 @@
 //!   DEALLOCATE ALL
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
+use nodedb_types::strip_prefix_ascii_case_insensitive;
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -110,7 +111,9 @@ impl NodeDbPgHandler {
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
         let trimmed = sql.trim();
-        let rest = trimmed[11..].trim(); // skip "DEALLOCATE "
+        let rest = strip_prefix_ascii_case_insensitive(trimmed, "DEALLOCATE ")
+            .unwrap_or(trimmed)
+            .trim();
 
         // DEALLOCATE ALL
         if rest.eq_ignore_ascii_case("ALL") {
@@ -119,11 +122,9 @@ impl NodeDbPgHandler {
         }
 
         // DEALLOCATE PREPARE name (PG compatibility — PREPARE keyword is optional).
-        let name = if rest.to_uppercase().starts_with("PREPARE ") {
-            rest[8..].trim()
-        } else {
-            rest
-        };
+        let name = strip_prefix_ascii_case_insensitive(rest, "PREPARE ")
+            .unwrap_or(rest)
+            .trim();
 
         // Strip quotes if present.
         let name = name.trim_matches('"');
@@ -145,7 +146,15 @@ impl NodeDbPgHandler {
 /// Returns (name, param_type_names, body_sql).
 fn parse_prepare_statement(sql: &str) -> PgWireResult<(String, Vec<String>, String)> {
     let trimmed = sql.trim();
-    let rest = trimmed[8..].trim(); // skip "PREPARE "
+    let rest = strip_prefix_ascii_case_insensitive(trimmed, "PREPARE ")
+        .ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "syntax error: PREPARE name [(type, ...)] AS query".to_owned(),
+            )))
+        })?
+        .trim();
 
     // Find the AS keyword (case-insensitive).
     let as_pos = find_ascii_case_insensitive(rest, " AS ").ok_or_else(|| {
@@ -201,7 +210,15 @@ fn parse_prepare_statement(sql: &str) -> PgWireResult<(String, Vec<String>, Stri
 /// substituted into the SQL body as literals.
 fn parse_execute_statement(sql: &str) -> PgWireResult<(String, Vec<String>)> {
     let trimmed = sql.trim();
-    let rest = trimmed[8..].trim(); // skip "EXECUTE "
+    let rest = strip_prefix_ascii_case_insensitive(trimmed, "EXECUTE ")
+        .ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "42601".to_owned(),
+                "syntax error: EXECUTE name [(value, ...)]".to_owned(),
+            )))
+        })?
+        .trim();
 
     // Check for parenthesized parameters.
     if let Some(paren_pos) = rest.find('(') {

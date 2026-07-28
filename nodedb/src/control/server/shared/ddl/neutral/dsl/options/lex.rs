@@ -161,4 +161,12 @@ mod tests {
     fn double_quoted_identifier_unwraps() {
         assert_eq!(words("(\"Odd Name\")"), ["(", "'Odd Name'", ")"]);
     }
+
+    #[test]
+    fn unicode_quoted_value_tokenizes() {
+        // Regression: a multi-byte quoted value (e.g. an ANALYZER name) must
+        // round-trip intact and never panic on a byte-index slice — the failure
+        // mode of the pre-grammar `[1..]` / `[..end]` analyzer-name parser.
+        assert_eq!(words("ANALYZER '日本語'"), ["ANALYZER", "'日本語'"]);
+    }
 }

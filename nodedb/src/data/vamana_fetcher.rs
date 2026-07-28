@@ -280,7 +280,9 @@ fn align_up(value: usize, align: usize) -> usize {
 ///
 /// `bytes` must be at least `dim * 4` bytes long.
 fn decode_f32_le(bytes: &[u8], dim: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(dim);
+    // `dim` originates in the validated Vamana layout; the byte slice remains
+    // the direct proof for this allocation bound.
+    let mut out = Vec::with_capacity(bytes.len() / 4);
     for i in 0..dim {
         let start = i * 4;
         let val = f32::from_le_bytes([

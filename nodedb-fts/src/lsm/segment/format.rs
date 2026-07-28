@@ -19,6 +19,10 @@
 //! [term_len: u16 LE][term_bytes][posting_offset: u64 LE][posting_len: u32 LE][df: u32 LE]
 //! ```
 
+use std::mem::size_of;
+
+use nodedb_types::decode_bounds::checked_decode_capacity;
+
 use super::error::SegmentError;
 
 /// Segment file magic bytes.
@@ -153,7 +157,23 @@ pub fn write_term_entry(buf: &mut Vec<u8>, entry: &TermDictEntry) -> Result<(), 
 /// Returns `None` if the buffer is malformed (used internally where the caller
 /// already checked the CRC and header; `None` here means structural corruption).
 pub fn parse_term_dict(buf: &[u8], num_terms: u32) -> Option<Vec<TermDictEntry>> {
-    let mut entries = Vec::with_capacity(num_terms as usize);
+    let num_terms = usize::try_from(num_terms).ok()?;
+    // A term entry has at least its two-byte length and three fixed numeric
+    // fields (16 bytes), so the declared count cannot exceed frame capacity.
+    const MIN_TERM_ENTRY_BYTES: usize = 18;
+    const MAX_TERM_DICT_ALLOCATION_BYTES: usize = 64 * 1024 * 1024;
+    if num_terms > buf.len() / MIN_TERM_ENTRY_BYTES {
+        return None;
+    }
+    let entries_capacity = checked_decode_capacity(
+        num_terms,
+        size_of::<TermDictEntry>(),
+        buf.len(),
+        MIN_TERM_ENTRY_BYTES,
+        buf.len() / MIN_TERM_ENTRY_BYTES,
+        MAX_TERM_DICT_ALLOCATION_BYTES,
+    )?;
+    let mut entries = Vec::with_capacity(entries_capacity);
     let mut pos = 0;
     for _ in 0..num_terms {
         if pos + 2 > buf.len() {
@@ -292,6 +312,11 @@ mod tests {
         let header = parse_header(&buf).unwrap();
         assert_eq!(header.num_terms, 0);
         assert_eq!(header.version, VERSION);
+    }
+
+    #[test]
+    fn rejects_huge_term_count_with_tiny_dictionary_before_allocation() {
+        assert!(parse_term_dict(&[], u32::MAX).is_none());
     }
 
     #[test]

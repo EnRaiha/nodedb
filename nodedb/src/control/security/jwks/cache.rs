@@ -9,8 +9,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::RwLock;
 use std::time::Instant;
+
+use parking_lot::RwLock;
 
 use super::key::VerificationKey;
 
@@ -42,7 +43,7 @@ impl JwksCache {
 
     /// Look up a verification key by provider name and `kid`.
     pub fn get(&self, provider: &str, kid: &str) -> Option<VerificationKey> {
-        let providers = self.providers.read().unwrap_or_else(|p| p.into_inner());
+        let providers = self.providers.read();
         providers
             .get(provider)
             .and_then(|pk| pk.keys.get(kid).cloned())
@@ -50,7 +51,7 @@ impl JwksCache {
 
     /// Check if a provider has any cached keys.
     pub fn has_provider(&self, provider: &str) -> bool {
-        let providers = self.providers.read().unwrap_or_else(|p| p.into_inner());
+        let providers = self.providers.read();
         providers.contains_key(provider)
     }
 
@@ -60,7 +61,7 @@ impl JwksCache {
         let key_map: HashMap<String, VerificationKey> =
             keys.into_iter().map(|k| (k.kid.clone(), k)).collect();
 
-        let mut providers = self.providers.write().unwrap_or_else(|p| p.into_inner());
+        let mut providers = self.providers.write();
         providers.insert(
             provider.to_string(),
             ProviderKeys {
@@ -79,7 +80,7 @@ impl JwksCache {
     /// Check if enough time has passed since last re-fetch attempt.
     /// Used to rate-limit on-demand re-fetches for unknown `kid`.
     pub fn can_refetch(&self, provider: &str, min_interval_secs: u64) -> bool {
-        let providers = self.providers.read().unwrap_or_else(|p| p.into_inner());
+        let providers = self.providers.read();
         match providers.get(provider) {
             Some(pk) => pk.last_refetch_attempt.elapsed().as_secs() >= min_interval_secs,
             None => true, // No cache yet — allow fetch.
@@ -88,7 +89,7 @@ impl JwksCache {
 
     /// Record a re-fetch attempt (even if it fails).
     pub fn mark_refetch_attempted(&self, provider: &str) {
-        let mut providers = self.providers.write().unwrap_or_else(|p| p.into_inner());
+        let mut providers = self.providers.write();
         if let Some(pk) = providers.get_mut(provider) {
             pk.last_refetch_attempt = Instant::now();
         }
@@ -96,7 +97,7 @@ impl JwksCache {
 
     /// Check if cached keys are stale (older than refresh interval).
     pub fn is_stale(&self, provider: &str, max_age_secs: u64) -> bool {
-        let providers = self.providers.read().unwrap_or_else(|p| p.into_inner());
+        let providers = self.providers.read();
         match providers.get(provider) {
             Some(pk) => pk.fetched_at.elapsed().as_secs() >= max_age_secs,
             None => true,
@@ -131,7 +132,7 @@ impl JwksCache {
         };
 
         let now = Instant::now();
-        let mut providers = self.providers.write().unwrap_or_else(|p| p.into_inner());
+        let mut providers = self.providers.write();
 
         for (provider_name, entries) in disk_cache {
             let key_map: HashMap<String, VerificationKey> = entries
@@ -259,6 +260,18 @@ mod tests {
             algorithm: "RS256".into(),
             key_type: KeyType::Rsa(vec![0x30, 0x82, 0x01]),
         }
+    }
+
+    #[test]
+    fn lookup_survives_panic_while_provider_cache_is_write_locked() {
+        let cache = JwksCache::new(None);
+        cache.update_provider("provider", vec![test_key("kid")]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _providers = cache.providers.write();
+            panic!("simulated interrupted JWKS refresh");
+        }));
+        assert!(result.is_err());
+        assert!(cache.get("provider", "kid").is_some());
     }
 
     #[test]

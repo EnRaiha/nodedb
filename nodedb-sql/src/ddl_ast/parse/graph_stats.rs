@@ -7,31 +7,33 @@
 //! collection is optional; absence selects a tenant-wide aggregate over
 //! all graph collections owned by the session tenant.
 
+use nodedb_types::{starts_with_ascii_case_insensitive, strip_prefix_ascii_case_insensitive};
+
 use crate::ddl_ast::statement::{GraphStmt, NodedbStatement};
 use crate::error::SqlError;
 
 pub(super) fn try_parse(
-    upper: &str,
+    _upper: &str,
     _parts: &[&str],
     trimmed: &str,
 ) -> Option<Result<NodedbStatement, SqlError>> {
-    if !upper.starts_with("SHOW GRAPH STATS") {
+    if !starts_with_ascii_case_insensitive(trimmed, "SHOW GRAPH STATS") {
         return None;
     }
 
     // Consume the leading keyword span exactly so any trailing chars are
     // available for arg parsing (quoted collection, VERBOSE, AS OF ...).
-    let after = trimmed[16..].trim_start();
-    let after_upper = after.to_ascii_uppercase();
+    let after = strip_prefix_ascii_case_insensitive(trimmed, "SHOW GRAPH STATS")
+        .unwrap_or("")
+        .trim_start();
 
     // Collection (optional single-quoted literal).
-    let (collection, rest, rest_upper) = if let Some(stripped) = after.strip_prefix('\'') {
+    let (collection, rest) = if let Some(stripped) = after.strip_prefix('\'') {
         match stripped.find('\'') {
             Some(end) => {
                 let name = &stripped[..end];
-                let tail = stripped[end + 1..].trim_start();
-                let tail_upper = tail.to_ascii_uppercase();
-                (Some(name.to_string()), tail, tail_upper)
+                let tail = stripped.get(end + 1..).unwrap_or("").trim_start();
+                (Some(name.to_string()), tail)
             }
             None => {
                 return Some(Err(SqlError::Parse {
@@ -40,24 +42,26 @@ pub(super) fn try_parse(
             }
         }
     } else {
-        (None, after, after_upper)
+        (None, after)
     };
 
     // VERBOSE flag (optional; order-insensitive relative to AS OF).
     let mut verbose = false;
     let mut working = rest;
-    let mut working_upper = rest_upper;
-    if working_upper.starts_with("VERBOSE") {
+    if starts_with_ascii_case_insensitive(working, "VERBOSE") {
         verbose = true;
-        working = working[7..].trim_start();
-        working_upper = working.to_ascii_uppercase();
+        working = strip_prefix_ascii_case_insensitive(working, "VERBOSE")
+            .unwrap_or("")
+            .trim_start();
     }
 
     // AS OF SYSTEM TIME <ms> (optional). Ordering: if VERBOSE wasn't first,
     // check it again here so either order is accepted.
     let mut as_of: Option<i64> = None;
-    if working_upper.starts_with("AS OF SYSTEM TIME") {
-        let after_kw = working[17..].trim_start();
+    if starts_with_ascii_case_insensitive(working, "AS OF SYSTEM TIME") {
+        let after_kw = strip_prefix_ascii_case_insensitive(working, "AS OF SYSTEM TIME")
+            .unwrap_or("")
+            .trim_start();
         let ms_token: String = after_kw
             .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '-')
@@ -79,14 +83,15 @@ pub(super) fn try_parse(
                 }));
             }
         }
-        working = after_kw[ms_token.len()..].trim_start();
-        working_upper = working.to_ascii_uppercase();
+        working = after_kw.get(ms_token.len()..).unwrap_or("").trim_start();
     }
 
     // VERBOSE may appear after AS OF too.
-    if !verbose && working_upper.starts_with("VERBOSE") {
+    if !verbose && starts_with_ascii_case_insensitive(working, "VERBOSE") {
         verbose = true;
-        working = working[7..].trim_start();
+        working = strip_prefix_ascii_case_insensitive(working, "VERBOSE")
+            .unwrap_or("")
+            .trim_start();
     }
 
     if !working.is_empty() {
@@ -129,6 +134,15 @@ mod tests {
         assert_eq!(col, None);
         assert!(!verbose);
         assert_eq!(as_of, None);
+    }
+
+    #[test]
+    fn unicode_collection_before_options_preserves_original_offsets() {
+        let (col, verbose, as_of) =
+            expect_stats("SHOW GRAPH STATS 'ﬀİß' VERBOSE AS OF SYSTEM TIME 42");
+        assert_eq!(col.as_deref(), Some("ﬀİß"));
+        assert!(verbose);
+        assert_eq!(as_of, Some(42));
     }
 
     #[test]

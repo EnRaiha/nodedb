@@ -65,6 +65,9 @@ nodedb-test-support = { path = "nodedb-test-support" }
 # Async runtimes
 tokio = { version = "1", features = ["full"] }
 
+# Poison-free synchronization for security-critical in-memory state.
+parking_lot = "0.12"
+
 # Error handling & diagnostics
 thiserror = "2.0"
 tracing = "0.1"

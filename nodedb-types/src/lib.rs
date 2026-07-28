@@ -15,6 +15,7 @@ pub mod quota;
 
 pub mod approx;
 pub mod array_cell;
+pub mod ascii;
 pub mod backup_envelope;
 pub mod bbox;
 pub mod calvin;
@@ -25,6 +26,7 @@ pub mod columnar;
 pub mod conversion;
 pub mod crdt_preview;
 pub mod datetime;
+pub mod decode_bounds;
 pub mod diagnostic;
 pub mod document;
 pub mod dropped_collection;
@@ -68,6 +70,10 @@ pub mod wire_version;
 
 pub use approx::{CountMinSketch, HyperLogLog, SpaceSaving, TDigest};
 pub use array_cell::ArrayCell;
+pub use ascii::{
+    find_ascii_case_insensitive, find_ascii_case_insensitive_from, rfind_ascii_case_insensitive,
+    starts_with_ascii_case_insensitive, strip_prefix_ascii_case_insensitive,
+};
 pub use audit_dml::AuditDmlMode;
 pub use bbox::{BoundingBox, geometry_bbox};
 pub use clone::{CloneOrigin, CloneStatus, MAX_CLONE_DEPTH};

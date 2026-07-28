@@ -46,6 +46,7 @@ arrow = { workspace = true }
 # Async runtime (Control Plane)
 tokio = { workspace = true }
 async-trait = { workspace = true }
+parking_lot = { workspace = true }
 
 # Error handling & diagnostics
 thiserror = { workspace = true }

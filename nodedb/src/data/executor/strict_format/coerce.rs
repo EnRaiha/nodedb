@@ -262,9 +262,8 @@ fn validate_and_encode_vector(col_name: &str, dim: u32, floats: &[f32]) -> crate
 /// - `"[0.1, 0.2, 0.3]"` (JSON-style)
 fn parse_vector_string(s: &str) -> Option<Vec<f32>> {
     // Try ARRAY[...] SQL literal format.
-    let upper = s.to_uppercase();
-    if upper.starts_with("ARRAY[") {
-        let start = s.find('[')? + 1;
+    if nodedb_types::starts_with_ascii_case_insensitive(s, "ARRAY[") {
+        let start = "ARRAY[".len();
         let end = s.rfind(']')?;
         if end <= start {
             return None;

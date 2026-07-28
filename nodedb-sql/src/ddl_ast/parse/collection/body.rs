@@ -6,9 +6,9 @@ use super::column_list::{extract_column_pairs, find_column_list_paren_end};
 use super::engine_suffix::extract_engine_suffix;
 use super::with_clause::{extract_balanced_raw, extract_with_options};
 use crate::error::SqlError;
-use crate::parser::preprocess::lex::{
-    find_ascii_case_insensitive, keyword_position_outside_literals,
-};
+use nodedb_types::find_ascii_case_insensitive;
+
+use crate::parser::preprocess::lex::keyword_position_outside_literals;
 
 /// Parsed body of a `CREATE COLLECTION` / `CREATE TABLE` statement.
 ///
@@ -68,16 +68,16 @@ pub(super) fn parse_collection_body(trimmed: &str, name: &str) -> Result<Collect
     let Some(name_end) = name_end else {
         return Ok((None, Vec::new(), Vec::new(), Vec::new(), None));
     };
-    if name_source[..name_end]
-        .trim_matches(['"', '`'])
-        .to_lowercase()
-        != name
-    {
+    let parsed_name = name_source
+        .get(..name_end)
+        .unwrap_or("")
+        .trim_matches(['"', '`']);
+    if parsed_name.to_lowercase() != name {
         return Ok((None, Vec::new(), Vec::new(), Vec::new(), None));
     }
     let body = name_source[name_end..].trim();
 
-    let upper_body = body.to_uppercase();
+    let upper_body = body.to_ascii_uppercase();
 
     let columns = extract_column_pairs(body)?;
     let (with_engine, options) = extract_with_options(body);

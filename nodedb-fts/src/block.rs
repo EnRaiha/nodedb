@@ -17,7 +17,10 @@
 //! compression and SIMD unpack; in-memory blocks expose typed `Surrogate`
 //! values so cross-engine bitmap intersections stay type-safe.
 
+use std::mem::size_of;
+
 use nodedb_types::Surrogate;
+use nodedb_types::decode_bounds::checked_decode_capacity;
 
 use crate::codec::{bitpack, delta, smallfloat};
 
@@ -159,6 +162,10 @@ impl PostingBlock {
         let doc_count = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
         pos += 2;
 
+        if doc_count > BLOCK_SIZE {
+            return None;
+        }
+
         if doc_count == 0 {
             return Some(Self {
                 doc_ids: Vec::new(),
@@ -205,7 +212,15 @@ impl PostingBlock {
         pos += doc_count;
 
         // Position data.
-        let mut positions = Vec::with_capacity(doc_count);
+        let positions_capacity = checked_decode_capacity(
+            doc_count,
+            size_of::<Vec<u32>>(),
+            buf.len().saturating_sub(pos),
+            4,
+            BLOCK_SIZE,
+            BLOCK_SIZE * size_of::<Vec<u32>>(),
+        )?;
+        let mut positions = Vec::with_capacity(positions_capacity);
         for _ in 0..doc_count {
             if pos + 2 > buf.len() {
                 return None;
@@ -326,6 +341,11 @@ mod tests {
         assert_eq!(blocks[0].len(), 128);
         assert_eq!(blocks[1].len(), 128);
         assert_eq!(blocks[2].len(), 44);
+    }
+
+    #[test]
+    fn rejects_huge_doc_count_with_tiny_payload_before_allocation() {
+        assert!(PostingBlock::from_bytes(&u16::MAX.to_le_bytes()).is_none());
     }
 
     #[test]

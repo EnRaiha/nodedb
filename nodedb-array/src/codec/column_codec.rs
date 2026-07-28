@@ -11,7 +11,7 @@
 use nodedb_codec::error::CodecError;
 use nodedb_types::Surrogate;
 
-use crate::codec::limits::{MAX_COLUMN_ENTRIES, check_decoded_size};
+use crate::codec::limits::{MAX_COLUMN_ENTRIES, checked_capacity};
 use crate::error::{ArrayError, ArrayResult};
 use crate::types::cell_value::value::CellValue;
 
@@ -182,9 +182,15 @@ pub fn decode_attr_col(data: &[u8]) -> ArrayResult<Vec<CellValue>> {
                     .try_into()
                     .expect("invariant: bounds-checked above (body.len() >= 4)"),
             ) as usize;
-            check_decoded_size(count, MAX_COLUMN_ENTRIES, "attr_col_msgpack count")?;
+            let capacity = checked_capacity(
+                count,
+                MAX_COLUMN_ENTRIES,
+                body.len() - 4,
+                4,
+                "attr_col_msgpack count",
+            )?;
             let mut pos = 4;
-            let mut values = Vec::with_capacity(count);
+            let mut values = Vec::with_capacity(capacity);
             for _ in 0..count {
                 if pos + 4 > body.len() {
                     return Err(ArrayError::SegmentCorruption {
@@ -298,6 +304,17 @@ mod tests {
         let data = encode_attr_col(&vals).unwrap();
         let out = decode_attr_col(&data).unwrap();
         assert_eq!(out, vals);
+    }
+
+    #[test]
+    fn huge_msgpack_count_in_tiny_payload_is_rejected_before_allocation() {
+        let mut data = vec![ATTR_TAG_MSGPACK];
+        data.extend_from_slice(&(MAX_COLUMN_ENTRIES as u32).to_le_bytes());
+        let result = decode_attr_col(&data);
+        assert!(matches!(
+            result,
+            Err(crate::error::ArrayError::SegmentCorruption { .. })
+        ));
     }
 
     #[test]

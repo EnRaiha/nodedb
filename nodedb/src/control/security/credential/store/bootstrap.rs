@@ -24,7 +24,7 @@ impl CredentialStore {
     /// interactive superuser.
     pub fn bootstrap_superuser(&self, username: &str, password: &str) -> crate::Result<()> {
         let (observed_user_id, principal) = {
-            let users = read_lock(&self.users)?;
+            let users = read_lock(&self.users);
             match users.get(username) {
                 Some(record) => (
                     Some(record.user_id),
@@ -41,7 +41,7 @@ impl CredentialStore {
         let scram_salted_password = compute_scram_salted_password(password, &salt);
         let password_hash = hash_password_argon2(password, &self.argon2_config)?;
 
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
 
         if observed_user_id.is_some() && !users.contains_key(username) {
             return Err(changed_during_bootstrap(username));
@@ -75,7 +75,7 @@ impl CredentialStore {
             self.persist_user(&mut candidate)?;
             users.insert(username.to_string(), candidate);
         } else {
-            let mut next_user_id = write_lock(&self.next_user_id)?;
+            let mut next_user_id = write_lock(&self.next_user_id);
             let user_id = *next_user_id;
             let following_user_id = user_id.checked_add(1).ok_or_else(|| crate::Error::Config {
                 detail: "user ID space exhausted".into(),
@@ -115,7 +115,7 @@ impl CredentialStore {
     /// remains catalog-valid if the node restarts. Password-mode bootstrap
     /// replaces that material before password listeners start.
     pub fn bootstrap_trust_superuser(&self, username: &str) -> crate::Result<()> {
-        let mut configured_name = write_lock(&self.trust_superuser_name)?;
+        let mut configured_name = write_lock(&self.trust_superuser_name);
         if let Some(existing_name) = configured_name.as_deref()
             && existing_name != username
         {
@@ -127,7 +127,7 @@ impl CredentialStore {
         }
 
         let observed_user_id = {
-            let users = read_lock(&self.users)?;
+            let users = read_lock(&self.users);
             match users.get(username) {
                 Some(record) if record.is_service_account => {
                     return Err(service_account_bootstrap_error(username));
@@ -138,7 +138,7 @@ impl CredentialStore {
         };
 
         if let Some(observed_user_id) = observed_user_id {
-            let mut users = write_lock(&self.users)?;
+            let mut users = write_lock(&self.users);
             let existing = users
                 .get(username)
                 .ok_or_else(|| changed_during_bootstrap(username))?;
@@ -171,12 +171,12 @@ impl CredentialStore {
         let scram_salted_password = compute_scram_salted_password(&secret, &salt);
         let password_hash = hash_password_argon2(&secret, &self.argon2_config)?;
 
-        let mut users = write_lock(&self.users)?;
+        let mut users = write_lock(&self.users);
         if users.contains_key(username) {
             return Err(changed_during_bootstrap(username));
         }
 
-        let mut next_user_id = write_lock(&self.next_user_id)?;
+        let mut next_user_id = write_lock(&self.next_user_id);
         let user_id = *next_user_id;
         let following_user_id = user_id.checked_add(1).ok_or_else(|| crate::Error::Config {
             detail: "user ID space exhausted".into(),
@@ -210,7 +210,7 @@ impl CredentialStore {
 
     /// Return the durable principal configured for trust-mode auto-authentication.
     pub fn configured_trust_superuser(&self) -> crate::Result<Option<String>> {
-        Ok(read_lock(&self.trust_superuser_name)?.clone())
+        Ok(read_lock(&self.trust_superuser_name).clone())
     }
 }
 
@@ -237,6 +237,16 @@ fn service_account_bootstrap_error(username: &str) -> crate::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    trait GuardExpect<T> {
+        fn expect(self, message: &str) -> Self;
+    }
+
+    impl<'a, T> GuardExpect<T> for parking_lot::RwLockReadGuard<'a, T> {
+        fn expect(self, _message: &str) -> Self {
+            self
+        }
+    }
 
     fn assert_bad_request(error: crate::Error) {
         assert!(matches!(error, crate::Error::BadRequest { .. }));

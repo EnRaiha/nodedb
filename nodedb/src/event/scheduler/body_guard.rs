@@ -49,14 +49,11 @@ pub fn validate_scheduled_body(body_sql: &str) -> crate::Result<()> {
 
 fn strip_procedural_wrapper(sql: &str) -> &str {
     let trimmed = sql.trim();
-    let upper = trimmed.to_uppercase();
-    if let Some(rest) = upper.strip_prefix("BEGIN")
-        && let Some(end_pos) = rest.rfind("END")
+    if let Some(rest) = nodedb_types::strip_prefix_ascii_case_insensitive(trimmed, "BEGIN")
+        && let Some(end_pos) = nodedb_types::rfind_ascii_case_insensitive(rest, "END")
+        && let Some(body) = rest.get(..end_pos)
     {
-        // Map back to original indices.
-        let start = trimmed.len() - rest.len();
-        let end = start + end_pos;
-        return trimmed[start..end].trim().trim_end_matches(';').trim();
+        return body.trim().trim_end_matches(';').trim();
     }
     trimmed
 }

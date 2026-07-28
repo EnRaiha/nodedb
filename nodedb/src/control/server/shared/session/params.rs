@@ -4,6 +4,7 @@
 
 use super::connection::SessionId;
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
+use nodedb_types::strip_prefix_ascii_case_insensitive;
 
 use super::store::SessionStore;
 
@@ -72,18 +73,11 @@ impl SessionStore {
 /// Returns (key, value) on success, or None if not a valid SET command.
 pub fn parse_set_command(sql: &str) -> Option<(String, String)> {
     let trimmed = sql.trim();
-    let upper = trimmed.to_uppercase();
 
-    // Strip SET prefix.
-    let rest = if upper.starts_with("SET SESSION ") {
-        &trimmed[12..]
-    } else if upper.starts_with("SET LOCAL ") {
-        &trimmed[10..]
-    } else if upper.starts_with("SET ") {
-        &trimmed[4..]
-    } else {
-        return None;
-    };
+    // Strip SET prefix while retaining a suffix of the unchanged SQL text.
+    let rest = strip_prefix_ascii_case_insensitive(trimmed, "SET SESSION ")
+        .or_else(|| strip_prefix_ascii_case_insensitive(trimmed, "SET LOCAL "))
+        .or_else(|| strip_prefix_ascii_case_insensitive(trimmed, "SET "))?;
 
     let rest = rest.trim();
 
@@ -235,19 +229,17 @@ pub const SETTABLE_RUNTIME_PARAMETERS: &[&str] = &[
 /// can be set via `SET`. Used to reject unknown SET keys with `42704`,
 /// matching the behavior of `SHOW <unknown>`.
 pub fn is_known_settable_runtime_parameter(name: &str) -> bool {
-    let lower = name.to_lowercase();
     SETTABLE_RUNTIME_PARAMETERS
         .iter()
-        .any(|p| p.eq_ignore_ascii_case(&lower))
+        .any(|p| p.eq_ignore_ascii_case(name))
 }
 
 /// Returns `true` if `name` (case-insensitive) is a known PostgreSQL or
 /// NodeDB session parameter.
 pub fn is_known_pg_runtime_parameter(name: &str) -> bool {
-    let lower = name.to_lowercase();
     KNOWN_PG_RUNTIME_PARAMETERS
         .iter()
-        .any(|p| p.eq_ignore_ascii_case(&lower))
+        .any(|p| p.eq_ignore_ascii_case(name))
 }
 
 /// Parse a SHOW command: `SHOW <parameter>` or `SHOW ALL`.
@@ -255,13 +247,9 @@ pub fn is_known_pg_runtime_parameter(name: &str) -> bool {
 /// Returns the parameter name, or "all" for SHOW ALL.
 pub fn parse_show_command(sql: &str) -> Option<String> {
     let trimmed = sql.trim();
-    let upper = trimmed.to_uppercase();
-
-    if !upper.starts_with("SHOW ") {
-        return None;
-    }
-
-    let param = trimmed[5..].trim().to_lowercase();
+    let param = strip_prefix_ascii_case_insensitive(trimmed, "SHOW ")?
+        .trim()
+        .to_lowercase();
     if param.is_empty() {
         return None;
     }

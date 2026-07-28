@@ -18,6 +18,7 @@
 use crate::codec::coord_delta::{decode_coord_axis, encode_coord_axis};
 use crate::codec::limits::{
     MAX_CELLS_PER_TILE, MAX_DICT_CARDINALITY, MAX_RLE_RUN_LEN, MAX_RLE_RUNS, check_decoded_size,
+    checked_capacity,
 };
 use crate::error::{ArrayError, ArrayResult};
 use crate::tile::sparse_tile::DimDict;
@@ -127,7 +128,13 @@ fn decode_rle(data: &[u8], pos: &mut usize) -> ArrayResult<DimDict> {
             .expect("invariant: bounds check at line 113 guarantees 4 bytes available"),
     ) as usize;
     *pos += 4;
-    check_decoded_size(run_count, MAX_RLE_RUNS, "rle run_count")?;
+    checked_capacity(
+        run_count,
+        MAX_RLE_RUNS,
+        data.len() - *pos,
+        8,
+        "rle run_count",
+    )?;
 
     let mut indices: Vec<u32> = Vec::new();
     let mut total_len: usize = 0;
@@ -167,9 +174,15 @@ fn decode_rle(data: &[u8], pos: &mut usize) -> ArrayResult<DimDict> {
             .expect("invariant: bounds check at line 143 guarantees 4 bytes available"),
     ) as usize;
     *pos += 4;
-    check_decoded_size(dict_count, MAX_DICT_CARDINALITY, "rle dict_count")?;
+    let capacity = checked_capacity(
+        dict_count,
+        MAX_DICT_CARDINALITY,
+        data.len() - *pos,
+        4,
+        "rle dict_count",
+    )?;
 
-    let mut values: Vec<CoordValue> = Vec::with_capacity(dict_count);
+    let mut values: Vec<CoordValue> = Vec::with_capacity(capacity);
     for _ in 0..dict_count {
         if *pos + 4 > data.len() {
             return Err(ArrayError::SegmentCorruption {
@@ -213,6 +226,18 @@ mod tests {
         encode_coord_axis_rle(dict, &mut buf).unwrap();
         let mut pos = 0;
         decode_coord_axis_rle(&buf, &mut pos).unwrap()
+    }
+
+    #[test]
+    fn huge_run_count_in_tiny_payload_is_rejected_before_allocation() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&RLE_MARKER.to_le_bytes());
+        data.extend_from_slice(&(MAX_RLE_RUNS as u32).to_le_bytes());
+        let result = decode_coord_axis_rle(&data, &mut 0);
+        assert!(matches!(
+            result,
+            Err(crate::error::ArrayError::SegmentCorruption { .. })
+        ));
     }
 
     #[test]

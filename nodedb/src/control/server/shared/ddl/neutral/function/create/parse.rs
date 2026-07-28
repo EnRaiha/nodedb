@@ -53,21 +53,28 @@ pub fn parse_create_function(sql: &str) -> Result<ParsedCreateFunction, DdlError
 
 /// Extract optional volatility keyword and the body after AS.
 fn extract_volatility_and_body(s: &str) -> Result<(FunctionVolatility, &str), DdlError> {
-    let upper = s.to_uppercase();
     let mut rest = s;
     let mut volatility = FunctionVolatility::Immutable; // default
 
     for kw in ["IMMUTABLE", "STABLE", "VOLATILE"] {
-        if upper.starts_with(kw) {
+        if s.get(..kw.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(kw))
+        {
             volatility = FunctionVolatility::parse(kw).unwrap_or_default();
-            rest = s[kw.len()..].trim();
+            rest = s.get(kw.len()..).unwrap_or_default().trim();
             break;
         }
     }
 
-    let rest_upper = rest.to_uppercase();
-    if !rest_upper.starts_with("AS ") && !rest_upper.starts_with("AS\n") {
-        if rest_upper.starts_with("AS") {
+    let has_as = rest
+        .get(.."AS".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("AS"));
+    let has_as_separator = rest
+        .as_bytes()
+        .get("AS".len())
+        .is_some_and(|byte| byte.is_ascii_whitespace());
+    if !has_as || !has_as_separator {
+        if has_as {
             return Err(DdlError {
                 sqlstate: "42601".to_string(),
                 message: "expected function body after AS".to_string(),
@@ -78,7 +85,7 @@ fn extract_volatility_and_body(s: &str) -> Result<(FunctionVolatility, &str), Dd
             message: "expected AS <body>".to_string(),
         });
     }
-    let body = rest["AS".len()..].trim();
+    let body = rest.get("AS".len()..).unwrap_or_default().trim();
 
     Ok((volatility, body))
 }

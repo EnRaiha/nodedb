@@ -68,24 +68,28 @@ unsafe fn avx512(a: &[u8], b: &[u8]) -> u32 {
 unsafe fn avx2(a: &[u8], b: &[u8]) -> u32 {
     let mut count = 0u32;
     let n8 = a.len() / 8;
-    let ap = a.as_ptr() as *const u64;
-    let bp = b.as_ptr() as *const u64;
     let mut i = 0usize;
     while i + 4 <= n8 {
-        let x0 = (*ap.add(i)) ^ (*bp.add(i));
-        let x1 = (*ap.add(i + 1)) ^ (*bp.add(i + 1));
-        let x2 = (*ap.add(i + 2)) ^ (*bp.add(i + 2));
-        let x3 = (*ap.add(i + 3)) ^ (*bp.add(i + 3));
-        count += x0.count_ones() + x1.count_ones() + x2.count_ones() + x3.count_ones();
+        for word in i..i + 4 {
+            let start = word * 8;
+            let end = start + 8;
+            let av = u64::from_ne_bytes(a[start..end].try_into().unwrap_or([0u8; 8]));
+            let bv = u64::from_ne_bytes(b[start..end].try_into().unwrap_or([0u8; 8]));
+            count += (av ^ bv).count_ones();
+        }
         i += 4;
     }
     while i < n8 {
-        count += ((*ap.add(i)) ^ (*bp.add(i))).count_ones();
+        let start = i * 8;
+        let end = start + 8;
+        let av = u64::from_ne_bytes(a[start..end].try_into().unwrap_or([0u8; 8]));
+        let bv = u64::from_ne_bytes(b[start..end].try_into().unwrap_or([0u8; 8]));
+        count += (av ^ bv).count_ones();
         i += 1;
     }
     let tail_start = n8 * 8;
     for j in tail_start..a.len() {
-        count += (*a.as_ptr().add(j) ^ *b.as_ptr().add(j)).count_ones();
+        count += (a[j] ^ b[j]).count_ones();
     }
     count
 }
@@ -180,6 +184,28 @@ mod tests {
         let a: Vec<u8> = (0..dim as u8).collect();
         let b: Vec<u8> = a.iter().map(|&x| !x).collect();
         assert_eq!(hamming_distance(&a, &b), 512);
+    }
+
+    #[test]
+    fn unaligned_subslices_match_scalar() {
+        let a_storage: Vec<u8> = (0..258).map(|i| (i * 31 + 7) as u8).collect();
+        let b_storage: Vec<u8> = (0..259).map(|i| (i * 17 + 3) as u8).collect();
+        let a = &a_storage[1..257];
+        let b = &b_storage[2..258];
+        assert_eq!(hamming_distance(a, b), scalar(a, b));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_directly_handles_unaligned_subslices() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let a_storage: Vec<u8> = (0..258).map(|i| (i * 31 + 7) as u8).collect();
+        let b_storage: Vec<u8> = (0..259).map(|i| (i * 17 + 3) as u8).collect();
+        let a = &a_storage[1..257];
+        let b = &b_storage[2..258];
+        assert_eq!(unsafe { avx2(a, b) }, scalar(a, b));
     }
 
     #[test]

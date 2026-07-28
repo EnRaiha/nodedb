@@ -115,12 +115,22 @@ pub async fn try_dispatch(
             // string router, which ran after the typed-AST parse gate —
             // recognizing it here in the `None` branch preserves that
             // ordering exactly.
-            if upper.starts_with("INSERT INTO ") {
-                let after_into = sql["INSERT INTO ".len()..].trim_start();
+            if sql
+                .get(.."INSERT INTO ".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("INSERT INTO "))
+            {
+                let after_into = sql
+                    .get("INSERT INTO ".len()..)
+                    .unwrap_or_default()
+                    .trim_start();
                 let coll_end = after_into
                     .find(|c: char| c.is_whitespace())
                     .unwrap_or(after_into.len());
-                if after_into[coll_end..].trim_start().starts_with('{')
+                if after_into
+                    .get(coll_end..)
+                    .unwrap_or_default()
+                    .trim_start()
+                    .starts_with('{')
                     && let Some(result) =
                         collection::insert_document(state, identity, database_id, sql, txn_ctx)
                             .await
@@ -132,13 +142,22 @@ pub async fn try_dispatch(
             // UPSERT INTO — same as INSERT but merges into existing document
             // if it exists. Handles both (cols) VALUES (vals) and { } object
             // literal forms.
-            if upper.starts_with("UPSERT INTO ")
+            if sql
+                .get(.."UPSERT INTO ".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UPSERT INTO "))
                 && (upper.contains("VALUES") || {
-                    let after_into = sql["UPSERT INTO ".len()..].trim_start();
+                    let after_into = sql
+                        .get("UPSERT INTO ".len()..)
+                        .unwrap_or_default()
+                        .trim_start();
                     let coll_end = after_into
                         .find(|c: char| c.is_whitespace())
                         .unwrap_or(after_into.len());
-                    after_into[coll_end..].trim_start().starts_with('{')
+                    after_into
+                        .get(coll_end..)
+                        .unwrap_or_default()
+                        .trim_start()
+                        .starts_with('{')
                 })
                 && let Some(result) =
                     collection::upsert_document(state, identity, database_id, sql, txn_ctx).await

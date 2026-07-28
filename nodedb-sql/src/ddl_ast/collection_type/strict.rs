@@ -47,19 +47,13 @@ pub(crate) fn build_strict_schema(
         }
 
         // GENERATED ALWAYS AS: extract and store the expression when present in type_str.
-        let upper_type = type_str.to_uppercase();
-        let gen_kw = if upper_type.contains("GENERATED ALWAYS AS") {
-            Some("GENERATED ALWAYS AS")
-        } else if upper_type.contains("GENERATED AS") {
-            Some("GENERATED AS")
-        } else {
-            None
-        };
-        if let Some(kw) = gen_kw {
-            let gen_pos = find_ascii_case_insensitive(type_str, kw).expect(
-                "invariant: kw was found via upper_type.contains(kw) in the enclosing if-let",
-            );
-            let after_gen = type_str[gen_pos + kw.len()..].trim();
+        let gen_kw = ["GENERATED ALWAYS AS", "GENERATED AS"]
+            .into_iter()
+            .find_map(|keyword| {
+                find_ascii_case_insensitive(type_str, keyword).map(|position| (position, keyword))
+            });
+        if let Some((gen_pos, kw)) = gen_kw {
+            let after_gen = type_str.get(gen_pos + kw.len()..).unwrap_or("").trim();
             if after_gen.starts_with('(') {
                 let mut depth = 0usize;
                 let mut end = 0usize;
@@ -77,7 +71,10 @@ pub(crate) fn build_strict_schema(
                     }
                 }
                 if end > 1 {
-                    let expr_text = &after_gen[1..end];
+                    let expr_text = after_gen
+                        .strip_prefix('(')
+                        .and_then(|body| end.checked_sub(1).and_then(|last| body.get(..last)))
+                        .unwrap_or("");
                     match nodedb_query::expr_parse::parse_generated_expr(expr_text) {
                         Ok((parsed_expr, deps)) => {
                             if let Ok(expr_json) = sonic_rs::to_string(&parsed_expr) {

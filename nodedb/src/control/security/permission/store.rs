@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `PermissionStore` — in-memory grants + ownership maps with
-//! redb persistence. Boot replay (`load_from`) and the legacy
-//! `grant` / `revoke` / `grants_on` / `grants_for` CRUD live
-//! here. Evaluation lives in [`super::check`], ownership CRUD in
-//! [`super::owner`], applier helpers in [`super::replication`].
+//! `PermissionStore` — in-memory grants + ownership maps with redb persistence.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
 
 use crate::control::security::catalog::{StoredPermission, SystemCatalog};
 use crate::control::security::identity::Permission;
@@ -16,7 +13,8 @@ use crate::types::TenantId;
 
 use super::types::{Grant, format_permission, owner_key, parse_permission};
 
-/// Permission store: grants + ownership with in-memory cache and redb persistence.
+/// Permission store: grants + ownership with poison-free in-memory caches and
+/// redb persistence.
 pub struct PermissionStore {
     pub(super) grants: RwLock<HashSet<Grant>>,
     /// "collection:{tenant_id}:{name}" → owner username
@@ -39,13 +37,7 @@ impl PermissionStore {
 
     pub fn load_from(&self, catalog: &SystemCatalog) -> crate::Result<()> {
         let stored_perms = catalog.load_all_permissions()?;
-        let mut grants = match self.grants.write() {
-            Ok(g) => g,
-            Err(p) => {
-                tracing::error!("permission grants lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
+        let mut grants = self.grants.write();
         for sp in stored_perms {
             if let Some(perm) = parse_permission(&sp.permission) {
                 grants.insert(Grant {
@@ -57,13 +49,7 @@ impl PermissionStore {
         }
 
         let stored_owners = catalog.load_all_owners()?;
-        let mut owners = match self.owners.write() {
-            Ok(o) => o,
-            Err(p) => {
-                tracing::error!("owner store lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
+        let mut owners = self.owners.write();
         for so in stored_owners {
             let key = owner_key(
                 &so.object_type,
@@ -83,9 +69,6 @@ impl PermissionStore {
     }
 
     /// Grant a permission on a target to a grantee (role name or "user:username").
-    ///
-    /// Direct CRUD path used by single-node mode and tests. Cluster
-    /// mode flows through [`super::replication`] instead.
     pub fn grant(
         &self,
         target: &str,
@@ -110,14 +93,7 @@ impl PermissionStore {
             })?;
         }
 
-        let mut grants = match self.grants.write() {
-            Ok(g) => g,
-            Err(p) => {
-                tracing::error!("permission grants lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
-        grants.insert(grant);
+        self.grants.write().insert(grant);
         Ok(())
     }
 
@@ -139,77 +115,35 @@ impl PermissionStore {
             catalog.delete_permission(target, grantee, &format_permission(permission))?;
         }
 
-        let mut grants = match self.grants.write() {
-            Ok(g) => g,
-            Err(p) => {
-                tracing::error!("permission grants lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
-        Ok(grants.remove(&grant))
+        Ok(self.grants.write().remove(&grant))
     }
 
     /// List all grants for a grantee.
     pub fn grants_for(&self, grantee: &str) -> Vec<Grant> {
-        let grants = match self.grants.read() {
-            Ok(g) => g,
-            Err(p) => {
-                tracing::error!("permission grants lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
-        grants
+        self.grants
+            .read()
             .iter()
             .filter(|g| g.grantee == grantee)
             .cloned()
             .collect()
     }
 
-    /// Replace the entire in-memory grants + owners state
-    /// with the contents of `other`. Used by the catalog
-    /// recovery sanity checker to repair a divergent registry
-    /// by loading a fresh `PermissionStore` from redb and then
-    /// swapping its contents into `self`. Callers keep their
-    /// existing `Arc<PermissionStore>` reference stable.
+    /// Replace the entire in-memory grants + owners state with `other`.
     pub(crate) fn clear_and_install_from(&self, other: &Self) {
         let fresh_grants = other.snapshot_grants();
         let fresh_owners = other.snapshot_owners();
-        let mut grants = match self.grants.write() {
-            Ok(g) => g,
-            Err(p) => {
-                tracing::error!("permission grants lock poisoned during repair — recovering");
-                p.into_inner()
-            }
-        };
+        let mut grants = self.grants.write();
         grants.clear();
-        for g in fresh_grants {
-            grants.insert(g);
-        }
+        grants.extend(fresh_grants);
         drop(grants);
-        let mut owners = match self.owners.write() {
-            Ok(o) => o,
-            Err(p) => {
-                tracing::error!("owner store lock poisoned during repair — recovering");
-                p.into_inner()
-            }
-        };
+        let mut owners = self.owners.write();
         owners.clear();
-        for (k, v) in fresh_owners {
-            owners.insert(k, v);
-        }
+        owners.extend(fresh_owners);
     }
 
-    /// Deterministic snapshot of every grant held in memory,
-    /// sorted by `(target, grantee, permission)` so diff-based
-    /// callers (the recovery sanity checker) can compare
-    /// against a catalog load without caring about HashSet
-    /// iteration order.
+    /// Deterministic snapshot of every grant held in memory.
     pub fn snapshot_grants(&self) -> Vec<Grant> {
-        let grants = match self.grants.read() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let mut out: Vec<Grant> = grants.iter().cloned().collect();
+        let mut out: Vec<Grant> = self.grants.read().iter().cloned().collect();
         out.sort_by(|a, b| {
             let a_key = (
                 a.target.clone(),
@@ -226,39 +160,25 @@ impl PermissionStore {
         out
     }
 
-    /// Deterministic snapshot of every owner held in memory as
-    /// `(owner_key, username)` pairs, sorted by key.
-    /// `owner_key` is the internal `"collection:{tenant}:{name}"`
-    /// composite — used by the sanity checker to cross-check
-    /// against `catalog.load_all_owners()`.
+    /// Deterministic snapshot of every owner held in memory as sorted pairs.
     pub fn snapshot_owners(&self) -> Vec<(String, String)> {
-        let owners = match self.owners.read() {
-            Ok(o) => o,
-            Err(p) => p.into_inner(),
-        };
-        let mut out: Vec<(String, String)> =
-            owners.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut out: Vec<(String, String)> = self
+            .owners
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 
     /// List all grants scoped to the given tenant ID prefix.
-    ///
-    /// Returns every grant whose internal target starts with
-    /// `"collection:{tenant_id}:"`, plus any function-scoped grants
-    /// belonging to the same tenant (`"func:{tenant_id}:"`).
     pub fn all_grants(&self, tenant_id: TenantId) -> Vec<Grant> {
         let tid = tenant_id.as_u64();
         let col_prefix = format!("collection:{tid}:");
         let func_prefix = format!("function:{tid}:");
-        let grants = match self.grants.read() {
-            Ok(g) => g,
-            Err(p) => {
-                tracing::error!("permission grants lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
-        grants
+        self.grants
+            .read()
             .iter()
             .filter(|g| g.target.starts_with(&col_prefix) || g.target.starts_with(&func_prefix))
             .cloned()
@@ -267,14 +187,8 @@ impl PermissionStore {
 
     /// List all grants on a target.
     pub fn grants_on(&self, target: &str) -> Vec<Grant> {
-        let grants = match self.grants.read() {
-            Ok(g) => g,
-            Err(p) => {
-                tracing::error!("permission grants lock poisoned — recovering data");
-                p.into_inner()
-            }
-        };
-        grants
+        self.grants
+            .read()
             .iter()
             .filter(|g| g.target == target)
             .cloned()

@@ -20,7 +20,8 @@
 //! ```
 
 use crate::bounds::{
-    checked_add, checked_range, decoded_len, encode_input_len, encode_u32_len, u32_to_usize,
+    checked_add, checked_capacity, checked_range, decoded_len, encode_input_len, encode_u32_len,
+    u32_to_usize,
 };
 use crate::error::CodecError;
 
@@ -234,7 +235,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>, CodecError> {
         }
         stream_pos[index] = end - 4;
     }
-    let mut output = vec![0u8; uncompressed_size];
+    let output_capacity = checked_capacity(uncompressed_size, 1, "rANS decoded bytes")?;
+    let mut output = vec![0u8; output_capacity];
     for (index, out_byte) in output.iter_mut().enumerate() {
         let stream_index = index % NUM_STREAMS;
         let (symbol, state) =

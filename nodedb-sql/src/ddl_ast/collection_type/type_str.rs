@@ -12,14 +12,16 @@ use crate::parser::preprocess::lex::find_ascii_case_insensitive;
 /// The `default_expr` is the raw expression text following the `DEFAULT` keyword,
 /// trimmed of surrounding whitespace.
 pub fn parse_column_type_str_full(type_str: &str) -> (String, bool, bool, Option<String>) {
-    let upper = type_str.to_uppercase();
-    let is_pk = upper.contains("PRIMARY KEY");
-    let is_not_null = upper.contains("NOT NULL");
+    let is_pk = find_ascii_case_insensitive(type_str, "PRIMARY KEY").is_some();
+    let is_not_null = find_ascii_case_insensitive(type_str, "NOT NULL").is_some();
 
     // Extract the DEFAULT clause from the type_str.
     // type_str may look like: "TEXT DEFAULT upper('x')" or "INT NOT NULL DEFAULT 1 + 2".
     let default_expr = if let Some(def_pos) = find_ascii_case_insensitive(type_str, "DEFAULT") {
-        let after = type_str[def_pos + "DEFAULT".len()..].trim();
+        let after = type_str
+            .get(def_pos + "DEFAULT".len()..)
+            .unwrap_or("")
+            .trim();
         let expression = &after[..default_expression_end(after)];
         if expression.trim().is_empty() {
             None
@@ -103,8 +105,8 @@ mod tests {
     #[test]
     fn default_after_unicode_type_text_preserves_original_offsets() {
         let (bare_type, is_pk, is_not_null, default_expr) =
-            parse_column_type_str_full("CUSTOMﬀﬀ DEFAULT 42");
-        assert_eq!(bare_type, "CUSTOMﬀﬀ");
+            parse_column_type_str_full("CUSTOMßﬀİ DEFAULT 42");
+        assert_eq!(bare_type, "CUSTOMßﬀİ");
         assert!(!is_pk);
         assert!(!is_not_null);
         assert_eq!(default_expr.as_deref(), Some("42"));

@@ -148,15 +148,17 @@ fn build_out_response(
 /// Returns (procedure_name, argument_values_as_sql_strings).
 fn parse_call(sql: &str) -> Result<(String, Vec<String>), DdlError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
 
-    if !upper.starts_with("CALL ") {
+    if !trimmed
+        .get(.."CALL ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CALL "))
+    {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
             message: "expected CALL <procedure>(...)".to_string(),
         });
     }
-    let after_call = &trimmed["CALL ".len()..].trim();
+    let after_call = trimmed.get("CALL ".len()..).unwrap_or_default().trim();
 
     // Find the paren that starts the argument list.
     let paren_pos = after_call.find('(').ok_or_else(|| DdlError {
@@ -164,7 +166,11 @@ fn parse_call(sql: &str) -> Result<(String, Vec<String>), DdlError> {
         message: "expected '(' after procedure name in CALL".to_string(),
     })?;
 
-    let name = after_call[..paren_pos].trim().to_lowercase();
+    let name = after_call
+        .get(..paren_pos)
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
     if name.is_empty() {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
@@ -178,7 +184,9 @@ fn parse_call(sql: &str) -> Result<(String, Vec<String>), DdlError> {
         message: "unmatched '(' in CALL".to_string(),
     })?;
 
-    let args_str = &after_call[paren_pos + 1..close_paren];
+    let args_str = after_call
+        .get(paren_pos + 1..close_paren)
+        .unwrap_or_default();
     let args = if args_str.trim().is_empty() {
         Vec::new()
     } else {

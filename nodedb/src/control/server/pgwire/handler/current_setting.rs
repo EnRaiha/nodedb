@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use nodedb_types::strip_prefix_ascii_case_insensitive;
 use pgwire::api::results::{DataRowEncoder, QueryResponse, Response};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -27,16 +28,8 @@ use super::core::NodeDbPgHandler;
 /// errors).
 pub fn parse_current_setting(sql: &str) -> Option<(String, bool)> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let trimmed_upper = trimmed.to_uppercase();
-    if !trimmed_upper.starts_with("SELECT ") {
-        return None;
-    }
-
-    let rest = trimmed[7..].trim();
-    let rest_upper = rest.to_uppercase();
-    if !rest_upper.starts_with("CURRENT_SETTING(") {
-        return None;
-    }
+    let rest = strip_prefix_ascii_case_insensitive(trimmed, "SELECT ")?.trim();
+    strip_prefix_ascii_case_insensitive(rest, "CURRENT_SETTING(")?;
 
     let paren = rest.find('(')?;
     let close = rest.rfind(')')?;
@@ -69,17 +62,8 @@ pub fn parse_current_setting(sql: &str) -> Option<(String, bool)> {
 /// Escapes are not honored.
 fn strip_quotes(s: &str) -> Option<String> {
     let s = s.trim();
-    if s.len() >= 2 {
-        let first = s.as_bytes()[0];
-        let last = s.as_bytes()[s.len() - 1];
-        if first == b'\'' && last == b'\'' {
-            let inner = &s[1..s.len() - 1];
-            if !inner.contains('\'') {
-                return Some(inner.to_string());
-            }
-        }
-    }
-    None
+    let inner = s.strip_prefix('\'')?.strip_suffix('\'')?;
+    (!inner.contains('\'')).then(|| inner.to_string())
 }
 
 impl NodeDbPgHandler {
@@ -188,6 +172,14 @@ mod tests {
     fn rejects_unrelated_select() {
         assert_eq!(parse_current_setting("SELECT 1"), None);
         assert_eq!(parse_current_setting("SELECT version()"), None);
+    }
+
+    #[test]
+    fn unicode_setting_name_preserves_original_argument_boundaries() {
+        assert_eq!(
+            parse_current_setting("SeLeCt current_setting('Straße.setting', TRUE)"),
+            Some(("straße.setting".to_string(), true))
+        );
     }
 
     #[test]

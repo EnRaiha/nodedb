@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::mem::size_of;
+
 use nodedb_types::columnar::ColumnType;
 use nodedb_types::datetime::NdbDateTime;
+use nodedb_types::decode_bounds::checked_decode_capacity;
 use nodedb_types::value::Value;
 
 /// Decode a fixed-size raw byte slice into a value.
@@ -40,7 +43,22 @@ pub(super) fn decode_fixed_value(col_type: &ColumnType, raw: &[u8]) -> Value {
             let Ok(d) = usize::try_from(*dim) else {
                 return Value::Null;
             };
-            let mut floats = Vec::with_capacity(d);
+            // The schema dimension is configuration, but corrupt tuple bytes
+            // must still bound the allocation used to materialize it.
+            if d > raw.len() / 4 {
+                return Value::Null;
+            }
+            let Some(floats_capacity) = checked_decode_capacity(
+                d,
+                size_of::<Value>(),
+                raw.len(),
+                4,
+                raw.len() / 4,
+                usize::MAX,
+            ) else {
+                return Value::Null;
+            };
+            let mut floats = Vec::with_capacity(floats_capacity);
             for chunk in raw.chunks_exact(4).take(d) {
                 let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
                 floats.push(Value::Float(f32::from_le_bytes(bytes) as f64));
@@ -73,5 +91,18 @@ pub(super) fn decode_variable_value(col_type: &ColumnType, raw: &[u8]) -> Value 
             }
         },
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_dimension_larger_than_raw_bytes_returns_null_without_reserving() {
+        assert!(matches!(
+            decode_fixed_value(&ColumnType::Vector(u32::MAX), &[]),
+            Value::Null
+        ));
     }
 }

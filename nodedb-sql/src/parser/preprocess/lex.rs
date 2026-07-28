@@ -255,54 +255,12 @@ pub fn has_brace_outside_literals(sql: &str) -> bool {
     has_operator_outside_literals(sql, "{")
 }
 
-/// Find an ASCII `needle` in `text` without allocating a case-transformed
-/// copy. The returned byte offset always belongs to `text`.
-pub fn find_ascii_case_insensitive(text: &str, needle: &str) -> Option<usize> {
-    find_ascii_case_insensitive_from(text, needle, 0)
-}
-
-/// Find the last ASCII `needle` in `text` without allocating a transformed
-/// copy. The returned byte offset always belongs to `text`.
-pub fn rfind_ascii_case_insensitive(text: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(text.len());
-    }
-    if !needle.is_ascii() || needle.len() > text.len() {
-        return None;
-    }
-
-    let haystack = text.as_bytes();
-    let needle = needle.as_bytes();
-    (0..=haystack.len() - needle.len()).rev().find(|&position| {
-        haystack[position..position + needle.len()]
-            .iter()
-            .zip(needle)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-    })
-}
-
-/// Find an ASCII `needle` at or after byte offset `start` in `text`.
-///
-/// `start` need not be a UTF-8 character boundary because matching is performed
-/// on bytes. A successful position is always a boundary: an ASCII needle can
-/// only begin on an ASCII byte in the original string.
-pub fn find_ascii_case_insensitive_from(text: &str, needle: &str, start: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return (start <= text.len()).then_some(start);
-    }
-    if !needle.is_ascii() || start > text.len() || needle.len() > text.len() - start {
-        return None;
-    }
-
-    let haystack = text.as_bytes();
-    let needle = needle.as_bytes();
-    (start..=haystack.len() - needle.len()).find(|&position| {
-        haystack[position..position + needle.len()]
-            .iter()
-            .zip(needle)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-    })
-}
+/// Dependency-neutral byte-stable ASCII matching helpers. Re-exported here
+/// to preserve the SQL parser's existing public API; SQL keyword boundary and
+/// literal-segment handling remain local to this module.
+pub use nodedb_types::{
+    find_ascii_case_insensitive, find_ascii_case_insensitive_from, rfind_ascii_case_insensitive,
+};
 
 fn is_identifier_char(character: char) -> bool {
     character.is_alphanumeric() || character == '_'

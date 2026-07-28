@@ -8,6 +8,11 @@
 //! Default weights configurable per collection.
 
 use std::collections::HashMap;
+use std::mem::size_of;
+
+use nodedb_types::decode_bounds::checked_decode_capacity;
+
+const MAX_FIELD_SCORING_BYTES: usize = 64 * 1024 * 1024;
 
 use crate::bm25::bm25_score;
 use crate::posting::Bm25Params;
@@ -89,12 +94,21 @@ pub fn config_to_bytes(config: &FieldScoringConfig) -> Vec<u8> {
 
 /// Deserialize field scoring config from bytes.
 pub fn config_from_bytes(buf: &[u8]) -> Option<FieldScoringConfig> {
-    if buf.len() < 4 {
+    if buf.len() < 4 || buf.len() > MAX_FIELD_SCORING_BYTES {
         return None;
     }
     let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // Every entry requires a two-byte field length and a four-byte weight.
+    let weights_capacity = checked_decode_capacity(
+        count,
+        size_of::<(String, f32)>(),
+        buf.len() - 4,
+        6,
+        (buf.len() - 4) / 6,
+        MAX_FIELD_SCORING_BYTES,
+    )?;
     let mut pos = 4;
-    let mut weights = HashMap::with_capacity(count);
+    let mut weights = HashMap::with_capacity(weights_capacity);
 
     for _ in 0..count {
         if pos + 2 > buf.len() {

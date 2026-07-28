@@ -207,12 +207,22 @@ impl SparseIndex {
         }
 
         let block_size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let block_count = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
-        let col_count = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
+        let block_count =
+            usize::try_from(u32::from_le_bytes([data[8], data[9], data[10], data[11]]))
+                .map_err(|_| SparseIndexError::Corrupt("block count exceeds usize".into()))?;
+        let col_count =
+            usize::try_from(u32::from_le_bytes([data[12], data[13], data[14], data[15]]))
+                .map_err(|_| SparseIndexError::Corrupt("column count exceeds usize".into()))?;
 
         let mut pos = 16;
 
-        let mut column_names = Vec::with_capacity(col_count);
+        // Every column name consumes its u16 length field, so reject a forged
+        // cardinality before allocating or entering a potentially huge loop.
+        let remaining = data.len() - pos;
+        if col_count > remaining / 2 {
+            return Err(SparseIndexError::Truncated);
+        }
+        let mut column_names = Vec::new();
         for _ in 0..col_count {
             if pos + 2 > data.len() {
                 return Err(SparseIndexError::Truncated);
@@ -229,8 +239,15 @@ impl SparseIndex {
             column_names.push(name);
         }
 
-        let entry_size = 24 + col_count * 16;
-        let mut blocks = Vec::with_capacity(block_count);
+        let entry_size = col_count
+            .checked_mul(16)
+            .and_then(|stats_bytes| 24usize.checked_add(stats_bytes))
+            .ok_or_else(|| SparseIndexError::Corrupt("sparse-index entry size overflow".into()))?;
+        let remaining = data.len().saturating_sub(pos);
+        if block_count > remaining / entry_size {
+            return Err(SparseIndexError::Truncated);
+        }
+        let mut blocks = Vec::new();
         for _ in 0..block_count {
             if pos + entry_size > data.len() {
                 return Err(SparseIndexError::Truncated);
@@ -262,7 +279,7 @@ impl SparseIndex {
             ]);
             pos += 24;
 
-            let mut column_stats = Vec::with_capacity(col_count);
+            let mut column_stats = Vec::new();
             for _ in 0..col_count {
                 let min = f64::from_le_bytes([
                     data[pos],
@@ -429,6 +446,28 @@ mod tests {
             codecs: vec![nodedb_codec::ColumnCodec::Auto; 2],
         };
         (columns, schema)
+    }
+
+    #[test]
+    fn from_bytes_rejects_huge_column_count_with_tiny_input() {
+        let mut data = vec![0u8; 16];
+        data[..4].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        data[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            SparseIndex::from_bytes(&data),
+            Err(SparseIndexError::Truncated) | Err(SparseIndexError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn from_bytes_rejects_huge_block_count_with_tiny_input() {
+        let mut data = vec![0u8; 16];
+        data[..4].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        data[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            SparseIndex::from_bytes(&data),
+            Err(SparseIndexError::Truncated) | Err(SparseIndexError::Corrupt(_))
+        ));
     }
 
     #[test]

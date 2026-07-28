@@ -14,7 +14,9 @@
 //   [u32 LE] index count (= cell count)
 //   [zigzag-varint deltas ...] index deltas (first value as-is, then deltas)
 
-use crate::codec::limits::{MAX_CELLS_PER_TILE, MAX_DICT_CARDINALITY, check_decoded_size};
+use crate::codec::limits::{
+    MAX_CELLS_PER_TILE, MAX_DICT_CARDINALITY, check_decoded_size, checked_capacity,
+};
 use crate::error::{ArrayError, ArrayResult};
 use crate::tile::sparse_tile::DimDict;
 use crate::types::coord::value::CoordValue;
@@ -150,9 +152,15 @@ pub fn decode_coord_axis(data: &[u8], pos: &mut usize) -> ArrayResult<DimDict> {
                         .expect("invariant: preceding bounds check guarantees 4 bytes available"),
                 ) as usize;
                 *pos += 4;
-                check_decoded_size(dict_count, MAX_DICT_CARDINALITY, "coord_delta dict_count")?;
+                let capacity = checked_capacity(
+                    dict_count,
+                    MAX_DICT_CARDINALITY,
+                    data.len() - *pos,
+                    4,
+                    "coord_delta dict_count",
+                )?;
 
-                let mut out: Vec<CoordValue> = Vec::with_capacity(dict_count);
+                let mut out: Vec<CoordValue> = Vec::with_capacity(capacity);
                 for _ in 0..dict_count {
                     if *pos + 4 > data.len() {
                         return Err(ArrayError::SegmentCorruption {
@@ -238,9 +246,15 @@ pub fn decode_coord_axis(data: &[u8], pos: &mut usize) -> ArrayResult<DimDict> {
             .expect("invariant: preceding bounds check guarantees 4 bytes available"),
     ) as usize;
     *pos += 4;
-    check_decoded_size(idx_count, MAX_CELLS_PER_TILE, "coord_delta idx_count")?;
+    let capacity = checked_capacity(
+        idx_count,
+        MAX_CELLS_PER_TILE,
+        data.len() - *pos,
+        1,
+        "coord_delta idx_count",
+    )?;
 
-    let mut indices: Vec<u32> = Vec::with_capacity(idx_count);
+    let mut indices: Vec<u32> = Vec::with_capacity(capacity);
     let mut prev: i64 = 0;
     for _ in 0..idx_count {
         let (zz, consumed) =
@@ -361,6 +375,18 @@ mod tests {
         let out = roundtrip(&d);
         assert_eq!(out.indices, d.indices);
         assert_eq!(out.values, d.values);
+    }
+
+    #[test]
+    fn huge_msgpack_dictionary_count_in_tiny_payload_is_rejected_before_allocation() {
+        let mut data = Vec::new();
+        data.push(DICT_TAG_MSGPACK);
+        data.extend_from_slice(&(MAX_DICT_CARDINALITY as u32).to_le_bytes());
+        let result = decode_coord_axis(&data, &mut 0);
+        assert!(matches!(
+            result,
+            Err(crate::error::ArrayError::SegmentCorruption { .. })
+        ));
     }
 
     #[test]

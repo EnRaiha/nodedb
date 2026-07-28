@@ -15,8 +15,8 @@ use std::collections::HashSet;
 use std::mem::size_of;
 
 use crate::bounds::{
-    checked_add, checked_mul, checked_range, decoded_len, encode_input_len, encode_u32_len,
-    u32_to_usize,
+    checked_add, checked_capacity, checked_mul, checked_range, decoded_len, encode_input_len,
+    encode_u32_len, u32_to_usize,
 };
 use crate::error::CodecError;
 
@@ -265,7 +265,12 @@ pub fn decode(data: &[u8]) -> Result<Vec<CrdtOp>, CodecError> {
             detail: "CRDT actor index out of range".into(),
         });
     }
-    let mut first_seen = vec![false; actor_count];
+    let actor_capacity = checked_capacity(
+        actor_count,
+        size_of::<bool>(),
+        "CRDT actor first-seen allocation",
+    )?;
+    let mut first_seen = vec![false; actor_capacity];
     let mut next_actor = 0usize;
     for &index in &actor_indices {
         if !first_seen[index] {
@@ -308,7 +313,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<CrdtOp>, CodecError> {
     }
 
     // Reconstruct ops.
-    let mut ops = Vec::with_capacity(count);
+    let operation_capacity = checked_capacity(count, size_of::<CrdtOp>(), "CRDT operations")?;
+    let mut ops = Vec::with_capacity(operation_capacity);
     for i in 0..count {
         ops.push(CrdtOp {
             lamport: lamports[i] as u64,

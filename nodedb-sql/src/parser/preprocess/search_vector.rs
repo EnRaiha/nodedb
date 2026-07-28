@@ -36,9 +36,6 @@ pub fn try_rewrite_search_using_vector(sql: &str) -> Option<String> {
 ///
 /// Returns `None` when no occurrence was rewritten.
 pub fn try_rewrite_nested_search_using_vector(sql: &str) -> Option<String> {
-    // Cheap gate: every other pass in the pipeline fronts its scan with a
-    // substring check, and this one runs on every statement that is not itself
-    // a top-level SEARCH.
     find_ascii_case_insensitive(sql, SEARCH_KEYWORD)?;
 
     let mut out = String::new();
@@ -238,6 +235,15 @@ mod tests {
             out,
             "SELECT * FROM articles ORDER BY vector_distance(embedding, ARRAY[0.1, 0.3, -0.2]) LIMIT 10"
         );
+    }
+
+    #[test]
+    fn unicode_case_expansions_in_vector_expression_preserve_original_text() {
+        let out = try_rewrite_search_using_vector(
+            "SEARCH docs USING VECTOR(embedding, ARRAY['ß', 'ﬀ', 'İ'], 5)",
+        )
+        .expect("search vector form should rewrite");
+        assert!(out.contains("ARRAY['ß', 'ﬀ', 'İ']"));
     }
 
     #[test]

@@ -86,7 +86,9 @@ fn parse_msgpack_rows(bytes: &[u8]) -> crate::Result<Vec<&[u8]>> {
             detail: "post-aggregation: invalid msgpack array header".into(),
         })?;
 
-    let mut rows = Vec::with_capacity(count);
+    // The msgpack array header is untrusted; reserve only after each row has
+    // been proven present by `skip_value`.
+    let mut rows = Vec::new();
     for _ in 0..count {
         let start = pos;
         pos = reader::skip_value(bytes, pos).ok_or_else(|| crate::Error::PlanError {

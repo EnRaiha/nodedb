@@ -137,22 +137,36 @@ pub fn drop_checkpoint(
 
 /// Parse: `CMD 'name' ON collection WHERE id = 'doc-id'`
 fn parse_checkpoint_sql(sql: &str, prefix: &str) -> Result<(String, String, String), DdlError> {
-    let rest = sql[prefix.len()..].trim();
+    let rest = sql
+        .get(..prefix.len())
+        .filter(|actual| actual.eq_ignore_ascii_case(prefix))
+        .and_then(|_| sql.get(prefix.len()..))
+        .ok_or_else(|| err("42601", format!("expected {prefix}")))?
+        .trim();
 
     let name = extract_quoted(rest)
         .ok_or_else(|| err("42601", "expected quoted checkpoint name".to_string()))?;
-    let after_name = rest[name.len() + 2..].trim();
+    let after_name = rest.get(name.len() + 2..).unwrap_or_default().trim();
 
-    let upper_rest = after_name.to_uppercase();
-    if !upper_rest.starts_with("ON ") {
+    if !after_name
+        .get(.."ON ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ON "))
+    {
         return Err(err("42601", "expected ON <collection>".to_string()));
     }
-    let after_on = after_name[3..].trim();
+    let after_on = after_name.get("ON ".len()..).unwrap_or_default().trim();
 
     let where_pos = find_ascii_case_insensitive(after_on, "WHERE")
         .ok_or_else(|| err("42601", "expected WHERE id = '<doc_id>'".to_string()))?;
-    let collection = after_on[..where_pos].trim().to_lowercase();
-    let where_clause = after_on[where_pos + 5..].trim();
+    let collection = after_on
+        .get(..where_pos)
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    let where_clause = after_on
+        .get(where_pos + "WHERE".len()..)
+        .unwrap_or_default()
+        .trim();
 
     let doc_id = parse_id_equals(where_clause)?;
 
@@ -163,8 +177,9 @@ fn extract_quoted(s: &str) -> Option<String> {
     if !s.starts_with('\'') {
         return None;
     }
-    let end = s[1..].find('\'')?;
-    Some(s[1..=end].to_owned())
+    let quoted = s.get(1..)?;
+    let end = quoted.find('\'')?;
+    Some(quoted.get(..end)?.to_owned())
 }
 
 fn parse_id_equals(clause: &str) -> Result<String, DdlError> {
@@ -174,7 +189,12 @@ fn parse_id_equals(clause: &str) -> Result<String, DdlError> {
             "expected 'id = <value>' in WHERE clause".to_string(),
         )
     })?;
-    let value_part = clause[eq_pos + 1..].trim().trim_end_matches(';').trim();
+    let value_part = clause
+        .get(eq_pos + 1..)
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches(';')
+        .trim();
     let doc_id = value_part.trim_matches('\'').trim_matches('"').to_owned();
     if doc_id.is_empty() {
         return Err(err("42601", "document ID is empty".to_string()));

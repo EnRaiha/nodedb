@@ -6,7 +6,7 @@
 //! general CHECK constraints. For UPDATE, fetches the current document
 //! and merges SET values for cross-field CHECK evaluation.
 
-use nodedb_types::DatabaseId;
+use nodedb_types::{DatabaseId, strip_prefix_ascii_case_insensitive};
 use std::collections::HashMap;
 
 use nodedb_sql::parser::preprocess::lex::{
@@ -22,15 +22,14 @@ use super::super::core::NodeDbPgHandler;
 /// Extract the collection name and operation type from an INSERT or UPDATE SQL
 /// statement. Returns `None` for any other statement kind.
 fn extract_collection_from_sql(sql: &str) -> Option<(String, bool)> {
-    let upper = sql.to_uppercase();
-    if upper.starts_with("INSERT INTO ") {
-        let after = sql["INSERT INTO ".len()..].trim_start();
+    if let Some(after) = strip_prefix_ascii_case_insensitive(sql, "INSERT INTO ") {
+        let after = after.trim_start();
         let end = after
             .find(|c: char| c.is_whitespace() || c == '(')
             .unwrap_or(after.len());
         Some((after[..end].to_lowercase(), true))
-    } else if upper.starts_with("UPDATE ") {
-        let after = sql["UPDATE ".len()..].trim_start();
+    } else if let Some(after) = strip_prefix_ascii_case_insensitive(sql, "UPDATE ") {
+        let after = after.trim_start();
         let end = after
             .find(|c: char| c.is_whitespace())
             .unwrap_or(after.len());
@@ -277,11 +276,11 @@ fn extract_where_id(sql: &str) -> Option<String> {
         }
 
         let after_id = after[end_pos..].trim_start();
-        if !after_id.starts_with('=') {
+        let Some(val_str) = after_id.strip_prefix('=') else {
             search_start = end_pos;
             continue;
-        }
-        let val_str = after_id[1..].trim_start();
+        };
+        let val_str = val_str.trim_start();
 
         if let Some(inner) = val_str.strip_prefix('\'') {
             let end = inner.find('\'')?;
@@ -326,19 +325,20 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// Parse a SQL literal string into a Value (best-effort).
 fn parse_sql_literal(s: &str) -> nodedb_types::Value {
     let s = s.trim();
-    let upper = s.to_uppercase();
 
-    if upper == "NULL" {
+    if s.eq_ignore_ascii_case("NULL") {
         return nodedb_types::Value::Null;
     }
-    if upper == "TRUE" {
+    if s.eq_ignore_ascii_case("TRUE") {
         return nodedb_types::Value::Bool(true);
     }
-    if upper == "FALSE" {
+    if s.eq_ignore_ascii_case("FALSE") {
         return nodedb_types::Value::Bool(false);
     }
-    if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
-        let inner = &s[1..s.len() - 1];
+    if let Some(inner) = s
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
         return nodedb_types::Value::String(inner.replace("''", "'"));
     }
     if let Ok(i) = s.parse::<i64>() {

@@ -85,14 +85,13 @@ pub fn try_parse_when_to_filter(condition: &str) -> Option<(WhenTarget, ScanFilt
     };
 
     // IS NULL / IS NOT NULL (checked before general operator split)
-    let upper = rest.to_uppercase();
-    if let Some(field) = upper.strip_suffix(" IS NOT NULL") {
+    if let Some(field) = strip_suffix_ci(rest, " IS NOT NULL") {
         let field = field.trim();
         if is_simple_identifier(field) {
             return Some((
                 target,
                 ScanFilter {
-                    field: rest[..field.len()].to_string(),
+                    field: field.to_string(),
                     op: FilterOp::IsNotNull,
                     value: Value::Null,
                     clauses: vec![],
@@ -102,13 +101,13 @@ pub fn try_parse_when_to_filter(condition: &str) -> Option<(WhenTarget, ScanFilt
         }
         return None;
     }
-    if let Some(field) = upper.strip_suffix(" IS NULL") {
+    if let Some(field) = strip_suffix_ci(rest, " IS NULL") {
         let field = field.trim();
         if is_simple_identifier(field) {
             return Some((
                 target,
                 ScanFilter {
-                    field: rest[..field.len()].to_string(),
+                    field: field.to_string(),
                     op: FilterOp::IsNull,
                     value: Value::Null,
                     clauses: vec![],
@@ -158,14 +157,14 @@ pub fn try_parse_when_to_filter(condition: &str) -> Option<(WhenTarget, ScanFilt
 
 /// Strip a case-insensitive prefix and return the remainder.
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() < prefix.len() {
-        return None;
-    }
-    if s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
-    }
+    nodedb_types::strip_prefix_ascii_case_insensitive(s, prefix)
+}
+
+fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    let start = s.len().checked_sub(suffix.len())?;
+    s.get(start..)
+        .filter(|tail| tail.eq_ignore_ascii_case(suffix))
+        .and_then(|_| s.get(..start))
 }
 
 /// Return true if `s` is a simple SQL identifier (letters, digits, underscores).
@@ -184,18 +183,16 @@ fn is_simple_identifier(s: &str) -> bool {
 /// - NULL (case-insensitive)           → `Value::Null`
 /// - Boolean: TRUE / FALSE             → `Value::Bool`
 fn parse_value(s: &str) -> Option<Value> {
-    let upper = s.to_uppercase();
-
     // NULL
-    if upper == "NULL" {
+    if s.eq_ignore_ascii_case("NULL") {
         return Some(Value::Null);
     }
 
     // Boolean
-    if upper == "TRUE" {
+    if s.eq_ignore_ascii_case("TRUE") {
         return Some(Value::Bool(true));
     }
-    if upper == "FALSE" {
+    if s.eq_ignore_ascii_case("FALSE") {
         return Some(Value::Bool(false));
     }
 
@@ -331,6 +328,13 @@ mod tests {
     fn is_null_lowercase() {
         let (_, f) = parse("NEW.x is null").unwrap();
         assert_eq!(f.op, FilterOp::IsNull);
+    }
+
+    #[test]
+    fn unicode_literal_does_not_affect_ascii_keyword_parsing() {
+        let (_, f) = parse("NEW.name = 'ß'").unwrap();
+        assert_eq!(f.field, "name");
+        assert_eq!(f.value, Value::String("ß".into()));
     }
 
     #[test]

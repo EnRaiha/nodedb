@@ -29,15 +29,19 @@ pub(super) fn parse_iso8601_to_unix(s: &str) -> crate::Result<u64> {
     if s.len() < 16 {
         return Err(bad(format!("unrecognised datetime format: '{s}'")));
     }
-    let sep = s.as_bytes()[10];
+    let sep = s
+        .as_bytes()
+        .get(10)
+        .copied()
+        .ok_or_else(|| bad(format!("unrecognised datetime format: '{s}'")))?;
     if sep != b'T' && sep != b't' && sep != b' ' {
         return Err(bad(format!(
             "expected 'T' or space between date and time in '{s}'"
         )));
     }
 
-    let date_secs = parse_date_to_unix(&s[..10])?;
-    let (time_str, tz_offset_secs) = split_timezone(&s[11..])?;
+    let date_secs = parse_date_to_unix(s.get(..10).unwrap_or_default())?;
+    let (time_str, tz_offset_secs) = split_timezone(s.get(11..).unwrap_or_default())?;
     let time_secs = parse_time_of_day(time_str)?;
 
     // A local wall-clock time at offset `+OFF` is UTC `local - OFF`.
@@ -62,20 +66,21 @@ fn split_timezone(rest: &str) -> crate::Result<(&str, i64)> {
     let Some(sign_idx) = rest.find(['+', '-']) else {
         return Ok((rest, 0));
     };
-    let sign: i64 = if rest.as_bytes()[sign_idx] == b'-' {
-        -1
-    } else {
-        1
+    let sign = match rest.as_bytes().get(sign_idx).copied() {
+        Some(b'-') => -1,
+        Some(b'+') => 1,
+        _ => return Err(bad(format!("malformed timezone offset: '{rest}'"))),
     };
-    let digits: String = rest[sign_idx + 1..]
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect();
+    let offset = rest.get(sign_idx + 1..).unwrap_or_default();
+    let digits: String = offset.chars().filter(|c| c.is_ascii_digit()).collect();
+    if !offset.chars().all(|c| c.is_ascii_digit() || c == ':') {
+        return Err(bad(format!("malformed timezone offset: '{rest}'")));
+    }
     let (oh, om) = match digits.len() {
         2 => (parse_u(&digits, "offset hour")?, 0),
         4 => (
-            parse_u(&digits[..2], "offset hour")?,
-            parse_u(&digits[2..], "offset minute")?,
+            parse_u(digits.get(..2).unwrap_or_default(), "offset hour")?,
+            parse_u(digits.get(2..).unwrap_or_default(), "offset minute")?,
         ),
         _ => return Err(bad(format!("malformed timezone offset: '{rest}'"))),
     };
@@ -83,7 +88,7 @@ fn split_timezone(rest: &str) -> crate::Result<(&str, i64)> {
         return Err(bad(format!("timezone offset out of range: '{rest}'")));
     }
     Ok((
-        &rest[..sign_idx],
+        rest.get(..sign_idx).unwrap_or_default(),
         sign * (oh as i64 * 3600 + om as i64 * 60),
     ))
 }
@@ -97,8 +102,8 @@ fn parse_time_of_day(t: &str) -> crate::Result<u64> {
     if parts.len() != 2 && parts.len() != 3 {
         return Err(bad(format!("expected HH:MM[:SS], got '{t}'")));
     }
-    let h = parse_u(parts[0], "hour")?;
-    let m = parse_u(parts[1], "minute")?;
+    let h = parse_u(parts.first().copied().unwrap_or_default(), "hour")?;
+    let m = parse_u(parts.get(1).copied().unwrap_or_default(), "minute")?;
     let sec = match parts.get(2) {
         Some(s) => parse_u(s, "second")?,
         None => 0,
@@ -118,13 +123,20 @@ fn parse_time_of_day(t: &str) -> crate::Result<u64> {
 
 /// Parse YYYY-MM-DD to midnight-UTC Unix timestamp.
 fn parse_date_to_unix(s: &str) -> crate::Result<u64> {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 || parts[0].len() != 4 || parts[1].len() != 2 || parts[2].len() != 2 {
+    let bytes = s.as_bytes();
+    if bytes.len() != 10
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    {
         return Err(bad(format!("expected YYYY-MM-DD, got '{s}'")));
     }
-    let y = parse_u(parts[0], "year")? as i64;
-    let mo = parse_u(parts[1], "month")?;
-    let d = parse_u(parts[2], "day")?;
+    let y = parse_u(s.get(..4).unwrap_or_default(), "year")? as i64;
+    let mo = parse_u(s.get(5..7).unwrap_or_default(), "month")?;
+    let d = parse_u(s.get(8..10).unwrap_or_default(), "day")?;
     if !(1..=12).contains(&mo) {
         return Err(bad(format!("month out of range (1-12) in '{s}'")));
     }
@@ -241,6 +253,20 @@ mod tests {
             parse_iso8601_to_unix("2026-12-31T23:59Z").unwrap(),
             base + 23 * 3600 + 59 * 60,
         );
+    }
+
+    #[test]
+    fn unicode_and_truncated_components_are_rejected_without_panicking() {
+        for input in [
+            "2026-12-3",
+            "2026-12-31T",
+            "2026-12-31T12:3",
+            "2026-12-31T12:30:00+0",
+            "2026-１２-31",
+            "2026-12-31T12:30:00+０5:30",
+        ] {
+            assert!(parse_iso8601_to_unix(input).is_err(), "input={input}");
+        }
     }
 
     #[test]

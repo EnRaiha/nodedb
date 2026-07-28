@@ -144,12 +144,25 @@ pub(super) fn parse_function_header(
     terminators: &[&str],
 ) -> Result<FunctionHeader, DdlError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let upper = trimmed.to_uppercase();
 
-    let (or_replace, after) = if upper.starts_with("CREATE OR REPLACE FUNCTION ") {
-        (true, &trimmed["CREATE OR REPLACE FUNCTION ".len()..])
-    } else if upper.starts_with("CREATE FUNCTION ") {
-        (false, &trimmed["CREATE FUNCTION ".len()..])
+    let (or_replace, after) = if trimmed
+        .get(.."CREATE OR REPLACE FUNCTION ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CREATE OR REPLACE FUNCTION "))
+    {
+        (
+            true,
+            trimmed
+                .get("CREATE OR REPLACE FUNCTION ".len()..)
+                .unwrap_or_default(),
+        )
+    } else if trimmed
+        .get(.."CREATE FUNCTION ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CREATE FUNCTION "))
+    {
+        (
+            false,
+            trimmed.get("CREATE FUNCTION ".len()..).unwrap_or_default(),
+        )
     } else {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
@@ -162,7 +175,11 @@ pub(super) fn parse_function_header(
         sqlstate: "42601".to_string(),
         message: "expected '(' after function name".to_string(),
     })?;
-    let name = after[..paren_open].trim().to_lowercase();
+    let name = after
+        .get(..paren_open)
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
     if name.is_empty() {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
@@ -176,22 +193,26 @@ pub(super) fn parse_function_header(
         sqlstate: "42601".to_string(),
         message: "unmatched '(' in parameter list".to_string(),
     })?;
-    let params_str = &after[paren_open + 1..paren_close];
+    let params_str = after.get(paren_open + 1..paren_close).unwrap_or_default();
     let parameters = parse_parameters(params_str)?;
 
     // RETURNS <type>
-    let after_params = after[paren_close + 1..].trim();
-    let after_params_upper = after_params.to_uppercase();
-    if !after_params_upper.starts_with("RETURNS ") {
+    let after_params = after.get(paren_close + 1..).unwrap_or_default().trim();
+    if !after_params
+        .get(.."RETURNS ".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("RETURNS "))
+    {
         return Err(DdlError {
             sqlstate: "42601".to_string(),
             message: "expected RETURNS <type>".to_string(),
         });
     }
-    let after_returns = after_params["RETURNS ".len()..].trim();
+    let after_returns = after_params
+        .get("RETURNS ".len()..)
+        .unwrap_or_default()
+        .trim();
 
     // Find the earliest terminator keyword to delimit the return type.
-    let after_returns_upper = after_returns.to_uppercase();
     let mut earliest = after_returns.len();
     for term in terminators {
         if let Some(pos) = find_ascii_case_insensitive(after_returns, term) {
@@ -199,14 +220,26 @@ pub(super) fn parse_function_header(
         }
         // Handle keyword at end of string (no trailing space).
         let trimmed_term = term.trim();
-        if after_returns_upper.ends_with(trimmed_term) {
+        if after_returns.len() >= trimmed_term.len()
+            && after_returns
+                .get(after_returns.len() - trimmed_term.len()..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(trimmed_term))
+        {
             let pos = after_returns.len() - trimmed_term.len();
             earliest = earliest.min(pos);
         }
     }
 
-    let return_type = after_returns[..earliest].trim().to_uppercase();
-    let rest = after_returns[earliest..].trim().to_string();
+    let return_type = after_returns
+        .get(..earliest)
+        .unwrap_or_default()
+        .trim()
+        .to_uppercase();
+    let rest = after_returns
+        .get(earliest..)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
 
     if return_type.is_empty() {
         return Err(DdlError {

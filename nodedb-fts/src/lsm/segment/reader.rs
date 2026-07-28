@@ -2,6 +2,10 @@
 
 //! Segment reader: reads term dictionary and decodes posting blocks on demand.
 
+use std::mem::size_of;
+
+use nodedb_types::decode_bounds::checked_decode_capacity;
+
 use crate::block::PostingBlock;
 
 use super::error::SegmentError;
@@ -75,10 +79,25 @@ impl SegmentReader {
             return Vec::new();
         };
 
-        let start = self.header.posting_data_offset as usize + entry.posting_offset as usize;
-        let end = start + entry.posting_len as usize;
-        // Clamp to body (excluding footer).
-        let body_end = self.data.len() - format::FOOTER_SIZE;
+        let Some(start) = usize::try_from(self.header.posting_data_offset)
+            .ok()
+            .and_then(|base| {
+                usize::try_from(entry.posting_offset)
+                    .ok()
+                    .and_then(|offset| base.checked_add(offset))
+            })
+        else {
+            return Vec::new();
+        };
+        let Some(end) = usize::try_from(entry.posting_len)
+            .ok()
+            .and_then(|len| start.checked_add(len))
+        else {
+            return Vec::new();
+        };
+        let Some(body_end) = self.data.len().checked_sub(format::FOOTER_SIZE) else {
+            return Vec::new();
+        };
         if end > body_end {
             return Vec::new();
         }
@@ -105,9 +124,28 @@ fn decode_term_blocks(buf: &[u8]) -> Vec<PostingBlock> {
     if buf.len() < 4 {
         return Vec::new();
     }
-    let num_blocks = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let num_blocks = match usize::try_from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])) {
+        Ok(count) => count,
+        Err(_) => return Vec::new(),
+    };
+    // Each block has at least its four-byte length prefix, so the remaining
+    // bytes prove a safe upper bound before reserving the result vector.
+    if num_blocks > (buf.len() - 4) / 4 {
+        return Vec::new();
+    }
+    const MAX_POSTING_BLOCK_ALLOCATION_BYTES: usize = 64 * 1024 * 1024;
+    let Some(blocks_capacity) = checked_decode_capacity(
+        num_blocks,
+        size_of::<PostingBlock>(),
+        buf.len() - 4,
+        4,
+        (buf.len() - 4) / 4,
+        MAX_POSTING_BLOCK_ALLOCATION_BYTES,
+    ) else {
+        return Vec::new();
+    };
     let mut pos = 4;
-    let mut blocks = Vec::with_capacity(num_blocks);
+    let mut blocks = Vec::with_capacity(blocks_capacity);
 
     for _ in 0..num_blocks {
         if pos + 4 > buf.len() {
@@ -168,6 +206,11 @@ mod tests {
     }
 
     #[test]
+    fn rejects_huge_block_count_with_tiny_payload_before_allocation() {
+        assert!(decode_term_blocks(&u32::MAX.to_le_bytes()).is_empty());
+    }
+
+    #[test]
     fn open_and_read() {
         let seg_data = make_segment();
         let reader = SegmentReader::open(seg_data).unwrap();
@@ -180,6 +223,14 @@ mod tests {
             vec![nodedb_types::Surrogate(0), nodedb_types::Surrogate(5)]
         );
         assert_eq!(blocks[0].term_freqs, vec![2, 1]);
+    }
+
+    #[test]
+    fn overflowing_posting_offset_returns_empty() {
+        let seg_data = make_segment();
+        let mut reader = SegmentReader::open(seg_data).unwrap();
+        reader.term_dict[0].posting_offset = u64::MAX;
+        assert!(reader.read_postings("alpha").is_empty());
     }
 
     #[test]

@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
+use nodedb_types::strip_prefix_ascii_case_insensitive;
 use pgwire::api::results::{DataRowEncoder, QueryResponse, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -62,7 +63,7 @@ impl NodeDbPgHandler {
         use super::super::types::error_to_sqlstate;
 
         let sql_trimmed = sql.trim();
-        let upper = sql_trimmed.to_uppercase();
+        let upper = sql_trimmed.to_ascii_uppercase();
 
         if sql_trimmed.is_empty() || sql_trimmed == ";" {
             return Ok(vec![Response::EmptyQuery]);
@@ -239,8 +240,8 @@ impl NodeDbPgHandler {
         // parameter allowlist and rejects unknown names with `42704`.
         // See [the dispatch order below].
 
-        if upper.starts_with("RESET ") {
-            let param = sql_trimmed[6..].trim().to_lowercase();
+        if let Some(rest) = strip_prefix_ascii_case_insensitive(sql_trimmed, "RESET ") {
+            let param = rest.trim().to_lowercase();
             // `RESET TENANT` is the inverse of `SET TENANT = ...` and must
             // clear the session's effective_tenant_id override (not just an
             // entry in the parameter bag). All policy checks (superuser,
