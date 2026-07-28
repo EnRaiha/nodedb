@@ -31,14 +31,13 @@ pub async fn query_last_values(
     database_id: DatabaseId,
     collection: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let tenant_id = identity.tenant_id;
     let plan = PhysicalPlan::Meta(MetaOp::QueryLastValues {
         collection: collection.to_string(),
     });
 
-    let payload = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
+    let payload = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
         state,
-        tenant_id,
+        identity,
         database_id,
         collection,
         plan,
@@ -87,15 +86,14 @@ pub async fn query_last_value(
     collection: &str,
     series_id: u64,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    let tenant_id = identity.tenant_id;
     let plan = PhysicalPlan::Meta(MetaOp::QueryLastValue {
         collection: collection.to_string(),
         series_id,
     });
 
-    let payload = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
+    let payload = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
         state,
-        tenant_id,
+        identity,
         database_id,
         collection,
         plan,

@@ -105,12 +105,15 @@ impl DataPlaneSnapshotBuilder {
         merged: &mut TenantDataSnapshot,
     ) -> Result<(), Error> {
         let plan = PhysicalPlan::Meta(MetaOp::CreateTenantSnapshot { tenant_id });
-        let bytes = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
+        let bytes = crate::control::server::shared::ddl::sync_dispatch::dispatch_system(
             &self.shared,
-            TenantId::new(tenant_id),
-            DatabaseId::DEFAULT,
-            "__system",
-            plan,
+            crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
+                crate::control::server::shared::ddl::sync_dispatch::SystemReason::ClusterSnapshot,
+                TenantId::new(tenant_id),
+                DatabaseId::DEFAULT,
+                "__system",
+                plan,
+            ),
             TENANT_SNAPSHOT_TIMEOUT,
         )
         .await?;

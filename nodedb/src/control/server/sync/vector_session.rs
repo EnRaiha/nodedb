@@ -13,7 +13,7 @@ use nodedb_types::sync::wire::AckStatus;
 use super::session::SyncSession;
 use super::vector_handler::{VectorDispatcher, VectorInsertParams};
 use super::wire::*;
-use crate::types::{DatabaseId, TenantId, VShardId};
+use crate::types::{TenantId, VShardId};
 
 impl SyncSession {
     /// Process a `VectorInsertMsg`: allocate surrogate, dispatch to Data Plane,
@@ -67,7 +67,7 @@ impl SyncSession {
         }
 
         let surrogate = match dispatcher.assign_surrogate(
-            DatabaseId::DEFAULT,
+            self.database_id(),
             self.tenant_id.unwrap_or(TenantId::new(0)),
             &msg.collection,
             &msg.id,
@@ -96,7 +96,7 @@ impl SyncSession {
         };
 
         let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
+        let vshard = VShardId::from_collection_in_database(self.database_id(), &msg.collection);
 
         debug!(
             session = %self.session_id,
@@ -200,7 +200,7 @@ impl SyncSession {
         // Resolve surrogate — idempotent: if the surrogate was never assigned,
         // the delete is a no-op.
         let surrogate = match dispatcher.assign_surrogate(
-            DatabaseId::DEFAULT,
+            self.database_id(),
             self.tenant_id.unwrap_or(TenantId::new(0)),
             &msg.collection,
             &msg.id,
@@ -229,7 +229,7 @@ impl SyncSession {
         };
 
         let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
+        let vshard = VShardId::from_collection_in_database(self.database_id(), &msg.collection);
 
         debug!(
             session = %self.session_id,

@@ -9,7 +9,9 @@ use serde_json::{Map, Value as JsonValue};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
-use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
+use crate::control::server::shared::ddl::sync_dispatch::{
+    SystemReason, SystemTask, dispatch_system,
+};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
@@ -66,9 +68,19 @@ pub async fn select_diff(
         from_version_json: from_vv,
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let delta_bytes = dispatch_async(state, tenant_id, database_id, collection, plan, timeout)
-        .await
-        .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
+    let delta_bytes = dispatch_system(
+        state,
+        SystemTask::new(
+            SystemReason::CatalogMaintenance,
+            tenant_id,
+            database_id,
+            collection,
+            plan,
+        ),
+        timeout,
+    )
+    .await
+    .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
 
     let columns = vec![
         "from_version".to_string(),

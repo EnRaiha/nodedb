@@ -116,6 +116,24 @@ impl SyncSession {
         }
     }
 
+    /// Database this session is bound to.
+    ///
+    /// Derived from the handshake-established identity's default database, so
+    /// it cannot drift from the principal the session authenticated as. Every
+    /// session-bound sync operation — catalog lookup, surrogate assignment,
+    /// vShard routing, snapshot dispatch — routes through this rather than
+    /// assuming the built-in default, which would let a user whose default
+    /// database is not `DEFAULT` read and write across the database boundary.
+    ///
+    /// An unauthenticated session has no identity and therefore no database;
+    /// callers must establish identity before they have anything to route.
+    pub fn database_id(&self) -> crate::types::DatabaseId {
+        self.identity
+            .as_ref()
+            .and_then(|identity| identity.default_database)
+            .unwrap_or(crate::types::DatabaseId::DEFAULT)
+    }
+
     /// Session uptime in seconds.
     pub fn uptime_secs(&self) -> u64 {
         self.created_at.elapsed().as_secs()

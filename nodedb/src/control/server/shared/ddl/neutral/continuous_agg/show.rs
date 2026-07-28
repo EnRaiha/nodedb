@@ -61,12 +61,15 @@ pub async fn show_continuous_aggregates(
         .unwrap_or_default();
 
     // Best-effort runtime stats from the local manager.
-    let runtime_infos: Vec<AggregateInfo> = match sync_dispatch::dispatch_async(
+    let runtime_infos: Vec<AggregateInfo> = match sync_dispatch::dispatch_system(
         state,
-        tenant_id,
-        database_id,
-        "__system",
-        PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
+        sync_dispatch::SystemTask::new(
+            sync_dispatch::SystemReason::CatalogMaintenance,
+            tenant_id,
+            database_id,
+            "__system",
+            PhysicalPlan::Meta(MetaOp::ListContinuousAggregates),
+        ),
         Duration::from_secs(5),
     )
     .await

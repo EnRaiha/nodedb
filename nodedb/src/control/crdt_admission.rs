@@ -261,16 +261,19 @@ async fn preview(
 ) -> crate::Result<CrdtPreviewResult> {
     let response = tokio::time::timeout(
         workflow.timeout,
-        crate::control::server::shared::ddl::sync_dispatch::dispatch_async_response_with_source(
+        crate::control::server::shared::ddl::sync_dispatch::dispatch_system_response_with_source(
             workflow.state,
-            workflow.tenant_id,
-            workflow.database_id,
-            workflow.collection,
-            PhysicalPlan::Crdt(CrdtOp::PreviewApply {
-                collection: workflow.collection.to_owned(),
-                document_id: document_id.to_owned(),
-                delta: delta.to_vec(),
-            }),
+            crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
+                crate::control::server::shared::ddl::sync_dispatch::SystemReason::AdmittedContinuation,
+                workflow.tenant_id,
+                workflow.database_id,
+                workflow.collection,
+                PhysicalPlan::Crdt(CrdtOp::PreviewApply {
+                    collection: workflow.collection.to_owned(),
+                    document_id: document_id.to_owned(),
+                    delta: delta.to_vec(),
+                }),
+            ),
             workflow.timeout,
             workflow.event_source,
         ),
@@ -449,17 +452,20 @@ async fn generate_restore_delta(
     surrogate: nodedb_types::Surrogate,
 ) -> crate::Result<Vec<u8>> {
     let response =
-        crate::control::server::shared::ddl::sync_dispatch::dispatch_async_response_with_source(
+        crate::control::server::shared::ddl::sync_dispatch::dispatch_system_response_with_source(
             workflow.state,
-            workflow.tenant_id,
-            workflow.database_id,
-            workflow.collection,
-            PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
-                collection: workflow.collection.to_owned(),
-                document_id: document_id.to_owned(),
-                target_version_json: target_version_json.to_owned(),
-                surrogate,
-            }),
+            crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
+                crate::control::server::shared::ddl::sync_dispatch::SystemReason::AdmittedContinuation,
+                workflow.tenant_id,
+                workflow.database_id,
+                workflow.collection,
+                PhysicalPlan::Crdt(CrdtOp::RestoreToVersion {
+                    collection: workflow.collection.to_owned(),
+                    document_id: document_id.to_owned(),
+                    target_version_json: target_version_json.to_owned(),
+                    surrogate,
+                }),
+            ),
             workflow.timeout,
             workflow.event_source,
         )

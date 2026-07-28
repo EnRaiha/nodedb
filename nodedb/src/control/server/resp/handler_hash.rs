@@ -11,6 +11,7 @@ use nodedb_physical::physical_plan::KvOp;
 use super::codec::RespValue;
 use super::command::RespCommand;
 use super::handler::{dispatch_kv, dispatch_kv_write};
+use super::payload::{payload_field_i64, payload_json};
 use super::session::RespSession;
 
 pub(super) async fn handle_hget(
@@ -33,7 +34,7 @@ pub(super) async fn handle_hget(
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let json: serde_json::Value = sonic_rs::from_slice(&resp.payload).unwrap_or_default();
+            let json = payload_json(&resp.payload);
             match json.get(&field) {
                 Some(serde_json::Value::Null) | None => RespValue::nil(),
                 Some(serde_json::Value::String(s)) => RespValue::bulk_str(s),
@@ -41,7 +42,7 @@ pub(super) async fn handle_hget(
             }
         }
         Ok(_) => RespValue::nil(),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -68,7 +69,7 @@ pub(super) async fn handle_hmget(
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let json: serde_json::Value = sonic_rs::from_slice(&resp.payload).unwrap_or_default();
+            let json = payload_json(&resp.payload);
             let items: Vec<RespValue> = fields
                 .iter()
                 .map(|f| match json.get(f) {
@@ -80,7 +81,7 @@ pub(super) async fn handle_hmget(
             RespValue::array(items)
         }
         Ok(_) => RespValue::nil_array(),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -113,7 +114,7 @@ pub(super) async fn handle_hset(
         &key,
     ) {
         Ok(s) => s,
-        Err(e) => return RespValue::err(format!("ERR {e}")),
+        Err(e) => return RespValue::from_error(&e),
     };
 
     let plan = PhysicalPlan::Kv(KvOp::FieldSet {
@@ -125,12 +126,11 @@ pub(super) async fn handle_hset(
 
     match dispatch_kv_write(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let added =
-                super::handler::parse_json_field_i64(&resp.payload, "fields_added").unwrap_or(0);
+            let added = payload_field_i64(&resp.payload, "fields_added").unwrap_or(0);
             RespValue::integer(added)
         }
         Ok(_) => RespValue::integer(0),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -141,6 +141,6 @@ pub(super) async fn handle_flushdb(session: &RespSession, state: &SharedState) -
 
     match dispatch_kv_write(state, session, plan).await {
         Ok(_) => RespValue::ok(),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }

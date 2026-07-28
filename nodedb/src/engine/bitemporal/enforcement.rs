@@ -128,12 +128,15 @@ async fn run_one(state: &Arc<SharedState>, entry: &Entry) {
         }),
     };
 
-    match crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
+    match crate::control::server::shared::ddl::sync_dispatch::dispatch_system(
         state,
-        tenant_id,
-        entry.database_id,
-        &entry.collection,
-        plan,
+        crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
+            crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
+            tenant_id,
+            entry.database_id,
+            &entry.collection,
+            plan,
+        ),
         Duration::from_secs(DISPATCH_DEADLINE_SECS),
     )
     .await

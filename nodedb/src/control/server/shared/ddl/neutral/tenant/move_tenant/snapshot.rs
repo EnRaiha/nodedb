@@ -39,15 +39,21 @@ pub async fn run(
     });
     // Route to the source database: the snapshot reads the tenant's live
     // data from the database it is being moved out of.
-    let raw =
-        sync_dispatch::dispatch_async(state, tenant_id, source_db_id, "__system", plan, timeout)
-            .await
-            .map_err(|e| {
-                NodeDbError::move_tenant_snapshot_failed(
-                    tenant_id.as_u64().to_string(),
-                    format!("{e}"),
-                )
-            })?;
+    let raw = sync_dispatch::dispatch_system(
+        state,
+        sync_dispatch::SystemTask::new(
+            sync_dispatch::SystemReason::TenantLifecycle,
+            tenant_id,
+            source_db_id,
+            "__system",
+            plan,
+        ),
+        timeout,
+    )
+    .await
+    .map_err(|e| {
+        NodeDbError::move_tenant_snapshot_failed(tenant_id.as_u64().to_string(), format!("{e}"))
+    })?;
     Ok(Bytes::from(raw))
 }
 

@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! WebSocket session loop for NodeDB-Lite sync connections.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{info, warn};
+
+use crate::control::server::sync::listener::{SyncListenerState, SyncRegistrationCleanupGuard};
+use crate::control::server::sync::wire::SyncFrame;
+use crate::control::state::SharedState;
+
+use super::channels::{Flow, SessionChannels};
+use super::inbound::{InboundCtx, handle_frame};
+use super::outbound::{pump_deliveries, register_channels};
+
+/// Handle one sync session with full RLS, audit, DLQ wired in.
+pub(in crate::control::server::sync) async fn handle_sync_session(
+    mut ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    addr: SocketAddr,
+    session_id: String,
+    state: &SyncListenerState,
+    shared: Option<Arc<SharedState>>,
+) {
+    let cleanup = SyncRegistrationCleanupGuard::new(shared.clone(), session_id.clone());
+    let mut session = crate::control::server::sync::session::SyncSession::with_rate_limit(
+        session_id.clone(),
+        &state.config.rate_limit,
+    );
+    session.device_metadata.remote_addr = addr.to_string();
+
+    let jwt_validator =
+        crate::control::security::jwt::JwtValidator::new(state.config.jwt_config.clone());
+
+    let mut channels = SessionChannels::default();
+
+    loop {
+        // Flush any outbound definition-sync frames before blocking. This
+        // handles the window between registration and the next WS message.
+        if let Some(ref mut rx) = channels.definition_sync_rx {
+            while let Ok(frame_bytes) = rx.try_recv() {
+                if ws.send(Message::Binary(frame_bytes.into())).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        // Await the next inbound message OR a definition-sync frame, whichever
+        // arrives first.  Without this select! the handler would block on
+        // ws.next() indefinitely when no client traffic is expected, starving
+        // the server-push delivery path.
+        let msg_result = if let Some(ref mut rx) = channels.definition_sync_rx {
+            tokio::select! {
+                biased;
+                ws_msg = ws.next() => {
+                    match ws_msg {
+                        Some(r) => r,
+                        None => break,
+                    }
+                }
+                frame_bytes = rx.recv() => {
+                    match frame_bytes {
+                        Some(bytes) => {
+                            if ws.send(Message::Binary(bytes.into())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        } else {
+            match ws.next().await {
+                Some(r) => r,
+                None => break,
+            }
+        };
+
+        match msg_result {
+            Ok(Message::Binary(data)) => {
+                if let Some(frame) = SyncFrame::from_bytes(&data) {
+                    let ctx = InboundCtx {
+                        session: &mut session,
+                        channels: &mut channels,
+                        shared: &shared,
+                        jwt_validator: &jwt_validator,
+                        session_id: &session_id,
+                    };
+                    match handle_frame(&mut ws, ctx, &frame).await {
+                        Flow::Break => break,
+                        Flow::Continue => {}
+                    }
+                }
+            }
+            Ok(Message::Ping(data)) => {
+                let Ok(_) = ws.send(Message::Pong(data)).await else {
+                    break;
+                };
+            }
+            Ok(Message::Close(_)) => break,
+            Err(e) => {
+                warn!(session = %session_id, error = %e, "sync: WebSocket error");
+                break;
+            }
+            _ => {}
+        }
+
+        register_channels(&session, &mut channels, &shared, &session_id).await;
+
+        if pump_deliveries(&mut ws, &mut session, &mut channels, &shared).await == Flow::Break {
+            break;
+        }
+
+        if session.idle_secs() > state.config.idle_timeout_secs {
+            info!(session = %session_id, "sync: idle timeout, closing");
+            break;
+        }
+    }
+
+    cleanup.finish().await;
+
+    info!(
+        session = %session_id,
+        admitted = session.mutations_processed,
+        applied = session.mutations_applied,
+        rejected = session.mutations_rejected,
+        not_applied = session.mutations_not_applied,
+        silent_dropped = session.mutations_silent_dropped,
+        uptime_secs = session.uptime_secs(),
+        "sync: session closed"
+    );
+}

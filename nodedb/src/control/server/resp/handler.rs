@@ -2,8 +2,6 @@
 
 //! RESP command handlers: translate Redis commands into KvOp dispatches.
 
-use sonic_rs;
-
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::credential::store::{AuthRejection, PasswordVerification};
@@ -13,7 +11,8 @@ use nodedb_physical::physical_plan::KvOp;
 use super::codec::RespValue;
 use super::command::RespCommand;
 // Re-export for sub-handlers that import via `super::handler::dispatch_kv` etc.
-pub(super) use super::gateway_dispatch::{dispatch_kv, dispatch_kv_write, parse_json_field_i64};
+pub(super) use super::gateway_dispatch::{dispatch_kv, dispatch_kv_write};
+use super::payload::{payload_field_i64, scan_keys};
 use super::session::RespSession;
 
 /// Execute a RESP command and return the response.
@@ -85,12 +84,26 @@ fn handle_echo(cmd: &RespCommand) -> RespValue {
 
 fn handle_select(cmd: &RespCommand, session: &mut RespSession) -> RespValue {
     match cmd.arg_str(0) {
+        Some(name) if is_internal_collection(name) => {
+            RespValue::err("NOPERM the internal catalog collection cannot be selected")
+        }
         Some(name) => {
             session.collection = name.to_string();
             RespValue::ok()
         }
         None => RespValue::err("ERR wrong number of arguments for 'select' command"),
     }
+}
+
+/// Whether `name` addresses server-internal catalog storage.
+///
+/// Authorization refuses these collections at dispatch, but SELECT is where the
+/// client names one, and refusing it there both reports the mistake at its
+/// source and keeps the session from carrying an internal collection in its
+/// state at all.
+fn is_internal_collection(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "_system" || name.starts_with("_system.")
 }
 
 /// AUTH [username] password
@@ -188,7 +201,7 @@ async fn handle_expire(
     match dispatch_kv_write(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => RespValue::integer(1),
         Ok(_) => RespValue::integer(0),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -212,7 +225,7 @@ async fn handle_ttl(
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let ttl_ms = parse_json_field_i64(&resp.payload, "ttl_ms").unwrap_or(-2);
+            let ttl_ms = payload_field_i64(&resp.payload, "ttl_ms").unwrap_or(-2);
             if ttl_ms < 0 {
                 // -1 (no TTL) or -2 (not found) — same for both TTL and PTTL.
                 RespValue::integer(ttl_ms)
@@ -224,7 +237,7 @@ async fn handle_ttl(
             }
         }
         Ok(_) => RespValue::integer(-2),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -245,7 +258,7 @@ async fn handle_persist(
     match dispatch_kv_write(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => RespValue::integer(1),
         Ok(_) => RespValue::integer(0),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -313,37 +326,19 @@ async fn handle_scan(cmd: &RespCommand, session: &RespSession, state: &SharedSta
     });
 
     match dispatch_kv(state, session, plan).await {
-        Ok(resp) if resp.status == Status::Ok => {
-            // KV scan returns a flat msgpack array of entry maps.
-            let json: serde_json::Value = match sonic_rs::from_slice(&resp.payload) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "RESP SCAN: failed to decode KV scan payload");
-                    return RespValue::err(format!("ERR scan decode failed: {e}"));
-                }
-            };
-
-            let entries = match json {
-                serde_json::Value::Array(arr) => arr,
-                _ => Vec::new(),
-            };
-
-            let keys: Vec<RespValue> = entries
-                .iter()
-                .filter_map(|e| {
-                    e.get("key").and_then(|k| k.as_str()).and_then(|b64| {
-                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-                            .ok()
-                            .map(RespValue::bulk)
-                    })
-                })
-                .collect();
-
+        Ok(resp) if resp.status == Status::Ok => match scan_keys(&resp.payload) {
             // Cursor "0" signals scan complete (no pagination in this path).
-            RespValue::array(vec![RespValue::bulk_str("0"), RespValue::array(keys)])
-        }
+            Some(keys) => RespValue::array(vec![
+                RespValue::bulk_str("0"),
+                RespValue::array(keys.into_iter().map(RespValue::bulk).collect()),
+            ]),
+            None => {
+                tracing::warn!("RESP SCAN: failed to decode KV scan payload");
+                RespValue::err("ERR scan result could not be decoded")
+            }
+        },
         Ok(_) => RespValue::array(vec![RespValue::bulk_str("0"), RespValue::array(vec![])]),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -361,34 +356,15 @@ async fn handle_keys(cmd: &RespCommand, session: &RespSession, state: &SharedSta
     });
 
     match dispatch_kv(state, session, plan).await {
-        Ok(resp) if resp.status == Status::Ok => {
-            let json: serde_json::Value = match sonic_rs::from_slice(&resp.payload) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "RESP KEYS: failed to decode KV scan payload");
-                    return RespValue::err(format!("ERR keys decode failed: {e}"));
-                }
-            };
-            let entries = match json {
-                serde_json::Value::Array(arr) => arr,
-                _ => Vec::new(),
-            };
-
-            let keys: Vec<RespValue> = entries
-                .iter()
-                .filter_map(|e| {
-                    e.get("key").and_then(|k| k.as_str()).and_then(|b64| {
-                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-                            .ok()
-                            .map(RespValue::bulk)
-                    })
-                })
-                .collect();
-
-            RespValue::array(keys)
-        }
+        Ok(resp) if resp.status == Status::Ok => match scan_keys(&resp.payload) {
+            Some(keys) => RespValue::array(keys.into_iter().map(RespValue::bulk).collect()),
+            None => {
+                tracing::warn!("RESP KEYS: failed to decode KV scan payload");
+                RespValue::err("ERR keys result could not be decoded")
+            }
+        },
         Ok(_) => RespValue::array(vec![]),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -408,21 +384,15 @@ async fn handle_dbsize(session: &RespSession, state: &SharedState) -> RespValue 
     });
 
     match dispatch_kv(state, session, plan).await {
-        Ok(resp) if resp.status == Status::Ok => {
-            let json: serde_json::Value = match sonic_rs::from_slice(&resp.payload) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "RESP DBSIZE: failed to decode KV scan payload");
-                    return RespValue::err(format!("ERR dbsize decode failed: {e}"));
-                }
-            };
-            let count = match &json {
-                serde_json::Value::Array(arr) => arr.len() as i64,
-                _ => 0,
-            };
-            RespValue::integer(count)
-        }
-        _ => RespValue::integer(0),
+        Ok(resp) if resp.status == Status::Ok => match scan_keys(&resp.payload) {
+            Some(keys) => RespValue::integer(keys.len() as i64),
+            None => {
+                tracing::warn!("RESP DBSIZE: failed to decode KV scan payload");
+                RespValue::err("ERR dbsize result could not be decoded")
+            }
+        },
+        Ok(_) => RespValue::integer(0),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 

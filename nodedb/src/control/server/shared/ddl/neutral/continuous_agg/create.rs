@@ -246,12 +246,15 @@ pub async fn create_continuous_aggregate(
             owner_username: stored.owner.clone(),
         });
         let plan = PhysicalPlan::Meta(MetaOp::RegisterContinuousAggregate { def: def.clone() });
-        sync_dispatch::dispatch_async(
+        sync_dispatch::dispatch_system(
             state,
-            tenant_id,
-            database_id,
-            &def.source,
-            plan,
+            sync_dispatch::SystemTask::new(
+                sync_dispatch::SystemReason::CatalogMaintenance,
+                tenant_id,
+                database_id,
+                &def.source,
+                plan,
+            ),
             Duration::from_secs(5),
         )
         .await

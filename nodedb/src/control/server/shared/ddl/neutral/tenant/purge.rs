@@ -10,7 +10,7 @@
 //!
 //! Ported verbatim from the pgwire `ddl::tenant::purge` handler, including
 //! the `PhysicalPlan::Meta(MetaOp::PurgeTenant)` Data Plane dispatch (300s
-//! timeout via `sync_dispatch::dispatch_async`).
+//! timeout via `sync_dispatch::dispatch_system`).
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -74,12 +74,15 @@ pub async fn purge_tenant(
         nodedb_physical::physical_plan::MetaOp::PurgeTenant { tenant_id: tid },
     );
 
-    match sync_dispatch::dispatch_async(
+    match sync_dispatch::dispatch_system(
         state,
-        tenant_id,
-        database_id,
-        "__system",
-        plan,
+        sync_dispatch::SystemTask::new(
+            sync_dispatch::SystemReason::TenantLifecycle,
+            tenant_id,
+            database_id,
+            "__system",
+            plan,
+        ),
         std::time::Duration::from_secs(300),
     )
     .await

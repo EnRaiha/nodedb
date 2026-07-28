@@ -144,7 +144,7 @@ pub(crate) async fn execute_plan_all_local_cores(
             // Merge the per-core partial snapshots by typed field concatenation
             // (the same disjoint-per-core merge pattern as BSP/WCC) and return
             // one snapshot blob — identical in shape to the local
-            // `snapshot_self`/`dispatch_async` path. At 1 core/node this is the
+            // `snapshot_self`/`dispatch_system` path. At 1 core/node this is the
             // lone core's snapshot verbatim.
             MetaOp::CreateTenantSnapshot { .. } => {
                 fan_tenant_snapshot_all_cores(state, tenant_id, database_id, plan, trace_id).await

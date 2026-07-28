@@ -67,12 +67,15 @@ pub async fn register_tiers(
             def: agg_def.clone(),
         });
 
-        crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
+        crate::control::server::shared::ddl::sync_dispatch::dispatch_system(
             state,
-            tenant_id,
-            DatabaseId::new(def.database_id),
-            &source,
-            plan,
+            crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
+                crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
+                tenant_id,
+                DatabaseId::new(def.database_id),
+                &source,
+                plan,
+            ),
             Duration::from_secs(5),
         )
         .await?;
@@ -110,12 +113,15 @@ pub async fn unregister_tiers(
         // All aggregates routed via the base collection for vShard affinity.
         let route_collection = &def.collection;
 
-        crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
+        crate::control::server::shared::ddl::sync_dispatch::dispatch_system(
             state,
-            tenant_id,
-            DatabaseId::new(def.database_id),
-            route_collection,
-            plan,
+            crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
+                crate::control::server::shared::ddl::sync_dispatch::SystemReason::RetentionEnforcement,
+                tenant_id,
+                DatabaseId::new(def.database_id),
+                route_collection,
+                plan,
+            ),
             Duration::from_secs(5),
         )
         .await?;

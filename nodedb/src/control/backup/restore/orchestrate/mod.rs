@@ -259,13 +259,16 @@ pub async fn restore_tenant(
         }
     }
     if let Some(plan) = local_plan {
-        sync_dispatch::dispatch_async(
+        sync_dispatch::dispatch_system(
             state,
-            TenantId::new(tenant_id),
-            // TODO(A8-followup): backup/restore not yet multi-database.
-            crate::types::DatabaseId::DEFAULT,
-            "__system",
-            plan,
+            sync_dispatch::SystemTask::new(
+                sync_dispatch::SystemReason::BackupRestore,
+                TenantId::new(tenant_id),
+                // TODO(A8-followup): backup/restore not yet multi-database.
+                crate::types::DatabaseId::DEFAULT,
+                "__system",
+                plan,
+            ),
             NODE_RESTORE_TIMEOUT,
         )
         .await?;

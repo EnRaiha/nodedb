@@ -25,7 +25,9 @@ use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
+use crate::control::server::shared::ddl::sync_dispatch::{
+    SystemReason, SystemTask, dispatch_system,
+};
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::MetaOp;
 
@@ -93,12 +95,15 @@ pub async fn convert_collection(
         schema_json: schema_json_for_dp,
     });
 
-    dispatch_async(
+    dispatch_system(
         state,
-        tenant_id,
-        database_id,
-        &collection,
-        plan,
+        SystemTask::new(
+            SystemReason::DdlApply,
+            tenant_id,
+            database_id,
+            &collection,
+            plan,
+        ),
         Duration::from_secs(60),
     )
     .await

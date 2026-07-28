@@ -9,6 +9,7 @@ mod handler_kv;
 pub mod handler_pubsub;
 mod handler_sorted;
 pub mod listener;
+mod payload;
 pub mod session;
 
 pub use listener::{DEFAULT_RESP_PORT, RespListener};

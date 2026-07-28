@@ -14,7 +14,9 @@ use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::types::CheckpointRecord;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
+use crate::control::server::shared::ddl::sync_dispatch::{
+    SystemReason, SystemTask, dispatch_system,
+};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
@@ -43,9 +45,19 @@ pub async fn create_checkpoint(
         collection: collection.clone(),
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let vv_bytes = dispatch_async(state, tenant_id, database_id, &collection, plan, timeout)
-        .await
-        .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
+    let vv_bytes = dispatch_system(
+        state,
+        SystemTask::new(
+            SystemReason::CatalogMaintenance,
+            tenant_id,
+            database_id,
+            &collection,
+            plan,
+        ),
+        timeout,
+    )
+    .await
+    .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
 
     let vv_json = String::from_utf8(vv_bytes)
         .map_err(|e| err("XX000", format!("version vector decode: {e}")))?;

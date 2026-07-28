@@ -96,10 +96,14 @@ pub(crate) async fn apply_delta_and_finalize(
         Some(identity) => identity,
         None => return permission_denied_delta_reject(delta_msg),
     };
+    // Same binding the session's reads use: the principal's database, not the
+    // built-in default. A delta must land in the database its subscriber will
+    // read it back from.
+    let database_id = identity.default_database.unwrap_or(DatabaseId::DEFAULT);
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&shared.audit));
     let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
         tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         &delta_msg.collection,
         identity,
         "sync".into(),
@@ -110,11 +114,8 @@ pub(crate) async fn apply_delta_and_finalize(
     let (constraint_version_required, signing_required) = match shared
         .credentials
         .catalog()
-        .get_collection(
-            DatabaseId::DEFAULT,
-            tenant_id.as_u64(),
-            &delta_msg.collection,
-        ) {
+        .get_collection(database_id, tenant_id.as_u64(), &delta_msg.collection)
+    {
         Ok(Some(collection)) => (
             collection.constraint_version,
             collection.crdt_signing_required,
@@ -183,7 +184,7 @@ pub(crate) async fn apply_delta_and_finalize(
     }
 
     let surrogate = match shared.surrogate_assigner.assign(
-        DatabaseId::DEFAULT,
+        database_id,
         tenant_id,
         &delta_msg.collection,
         delta_msg.document_id.as_bytes(),
@@ -231,15 +232,13 @@ pub(crate) async fn apply_delta_and_finalize(
         signing_required,
     });
 
-    let vshard_id = crate::types::VShardId::from_collection_in_database(
-        DatabaseId::DEFAULT,
-        &delta_msg.collection,
-    );
+    let vshard_id =
+        crate::types::VShardId::from_collection_in_database(database_id, &delta_msg.collection);
     let authorized = super::super::raft_dispatch::authorize_sync_task(
         shared,
         Some(identity),
         tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         vshard_id,
         plan,
     );
@@ -327,7 +326,7 @@ pub(crate) async fn apply_delta_and_finalize(
 
             let ack = super::super::wire::DeltaAckMsg {
                 mutation_id,
-                lsn: 0, // WAL LSN is not surfaced by dispatch_async_with_source; left as 0.
+                lsn: 0, // WAL LSN is not surfaced by dispatch_system_with_source; left as 0.
                 clock_skew_warning_ms,
                 applied_seq: gate_result.applied_seq,
                 status: gate_result.status,
@@ -392,7 +391,7 @@ fn authorize_delta_write_with(
     let identity = identity.ok_or(DeltaAuthorizationFailure::IdentityNotEstablished)?;
     authorize_collection(
         identity,
-        DatabaseId::DEFAULT,
+        identity.default_database.unwrap_or(DatabaseId::DEFAULT),
         collection,
         Permission::Write,
         permissions,

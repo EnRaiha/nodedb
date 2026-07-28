@@ -309,7 +309,7 @@ pub fn noop_dispatch_error(op: &str) -> crate::Error {
 /// Cluster path: proposes through Raft and returns the apply payload bytes.
 ///
 /// Single-node path: falls through to
-/// [`crate::control::server::shared::ddl::sync_dispatch::dispatch_async_with_source`].
+/// [`crate::control::server::shared::ddl::sync_dispatch::dispatch_system_with_source`].
 pub async fn dispatch_sync_bytes(
     state: &SharedState,
     collection: &str,
@@ -392,12 +392,15 @@ pub async fn dispatch_write_replicated(
         state
             .vshard_admission_sequencer
             .run(vshard_id, || async {
-                crate::control::server::shared::ddl::sync_dispatch::dispatch_async_response_with_source(
+                crate::control::server::shared::ddl::sync_dispatch::dispatch_system_response_with_source(
                     state,
-                    tenant_id,
-                    database_id,
-                    collection,
-                    plan,
+                    crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
+                        crate::control::server::shared::ddl::sync_dispatch::SystemReason::AdmittedContinuation,
+                        tenant_id,
+                        database_id,
+                        collection,
+                        plan,
+                    ),
                     timeout,
                     event_source,
                 )
@@ -405,12 +408,15 @@ pub async fn dispatch_write_replicated(
             })
             .await?
     } else {
-        crate::control::server::shared::ddl::sync_dispatch::dispatch_async_response_with_source(
+        crate::control::server::shared::ddl::sync_dispatch::dispatch_system_response_with_source(
             state,
-            tenant_id,
-            database_id,
-            collection,
-            plan,
+            crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
+                crate::control::server::shared::ddl::sync_dispatch::SystemReason::AdmittedContinuation,
+                tenant_id,
+                database_id,
+                collection,
+                plan,
+            ),
             timeout,
             event_source,
         )
@@ -429,7 +435,7 @@ pub async fn dispatch_write_replicated(
         });
     }
 
-    // Mirror `dispatch_async_with_source`: advance the tenant write-HLC on the
+    // Mirror `dispatch_system_with_source`: advance the tenant write-HLC on the
     // success path (the Response-returning core leaves this to the caller).
     state.advance_tenant_write_hlc(tenant_id.as_u64());
     Ok(resp.payload.to_vec())

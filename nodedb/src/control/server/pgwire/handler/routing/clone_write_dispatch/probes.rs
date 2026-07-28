@@ -9,6 +9,7 @@ use std::time::Duration;
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
 use crate::bridge::envelope::{Priority, Request, Response, Status};
+use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::types::{ReadConsistency, RequestId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
@@ -20,6 +21,7 @@ use nodedb_physical::physical_plan::{DocumentOp, KvOp, PhysicalPlan};
 /// registered surrogate for the PK — the handler will return "not found".
 pub(super) async fn probe_row_in_target(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
     db_id: DatabaseId,
     collection_qualified: &str,
@@ -35,6 +37,7 @@ pub(super) async fn probe_row_in_target(
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
+    let plan = with_caller_rls(state, identity, tenant_id, plan)?;
     let vshard_id = VShardId::from_collection_in_database(db_id, collection_qualified);
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, db_id, plan).await?;
     Ok(!resp.payload.is_empty() && resp.status == Status::Ok)
@@ -45,6 +48,7 @@ pub(super) async fn probe_row_in_target(
 /// Returns `None` when the row is absent in source (PointGet returned empty).
 pub(super) async fn fetch_source_row(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
     source_db_id: DatabaseId,
     source_coll_qualified: &str,
@@ -60,6 +64,7 @@ pub(super) async fn fetch_source_row(
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
+    let plan = with_caller_rls(state, identity, tenant_id, plan)?;
     let vshard_id = VShardId::from_collection_in_database(source_db_id, source_coll_qualified);
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, source_db_id, plan).await?;
     if resp.payload.is_empty() || resp.status != Status::Ok {
@@ -74,6 +79,7 @@ pub(super) async fn fetch_source_row(
 /// is present.
 pub(super) async fn probe_kv_key_in_target(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
     db_id: DatabaseId,
     collection_qualified: &str,
@@ -87,6 +93,7 @@ pub(super) async fn probe_kv_key_in_target(
         // delegated to source, so no isolation ceiling applies.
         surrogate_ceiling: None,
     });
+    let plan = with_caller_rls(state, identity, tenant_id, plan)?;
     let vshard_id = VShardId::from_collection_in_database(db_id, collection_qualified);
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, db_id, plan).await?;
     Ok(!resp.payload.is_empty() && resp.status == Status::Ok)
@@ -97,6 +104,7 @@ pub(super) async fn probe_kv_key_in_target(
 /// Returns `None` when the key is absent in source (KvOp::Get returned empty).
 pub(super) async fn fetch_kv_source_value(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
     source_db_id: DatabaseId,
     source_coll_qualified: &str,
@@ -111,12 +119,36 @@ pub(super) async fn fetch_kv_source_value(
         // a missed source row would silently drop data on the clone.
         surrogate_ceiling: None,
     });
+    let plan = with_caller_rls(state, identity, tenant_id, plan)?;
     let vshard_id = VShardId::from_collection_in_database(source_db_id, source_coll_qualified);
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, source_db_id, plan).await?;
     if resp.payload.is_empty() || resp.status != Status::Ok {
         return Ok(None);
     }
     Ok(Some(resp.payload.as_ref().to_vec()))
+}
+
+/// Apply the requesting principal's row-level security to a probe plan.
+///
+/// Copy-up reads a row out of the source collection and writes it into the
+/// clone, where the source's policies no longer govern it. Without this the
+/// clone would launder policy-excluded rows into readable ones. Presence probes
+/// carry the same filters so a row the caller cannot see is not reported as
+/// present either.
+fn with_caller_rls(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    tenant_id: TenantId,
+    mut plan: PhysicalPlan,
+) -> crate::Result<PhysicalPlan> {
+    let auth_ctx = crate::control::server::session_auth::context::build_auth_context(identity);
+    crate::control::planner::rls_injection::inject_rls_for_single_plan(
+        tenant_id.as_u64(),
+        &mut plan,
+        &state.rls,
+        &auth_ctx,
+    )?;
+    Ok(plan)
 }
 
 /// Dispatch a plan directly to the local Data Plane, bypassing WAL and Raft.

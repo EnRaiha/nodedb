@@ -21,7 +21,6 @@ use super::super::wire::{
     SyncMessageType, TimeseriesPushMsg, VectorDeleteMsg, VectorInsertMsg,
 };
 use crate::control::state::SharedState;
-use crate::types::DatabaseId;
 
 /// Result of attempting to dispatch one frame as an engine sync message.
 pub(super) enum EngineOutcome {
@@ -72,10 +71,7 @@ pub(super) async fn dispatch_engine_frame(
     };
 
     let dispatcher_identity = session.identity.clone();
-    let dispatcher_database = dispatcher_identity
-        .as_ref()
-        .and_then(|identity| identity.default_database)
-        .unwrap_or(DatabaseId::DEFAULT);
+    let dispatcher_database = session.database_id();
 
     match frame.msg_type {
         SyncMessageType::TimeseriesPush => dispatch!(

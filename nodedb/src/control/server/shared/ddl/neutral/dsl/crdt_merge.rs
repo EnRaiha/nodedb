@@ -71,9 +71,9 @@ pub async fn crdt_merge(
         document_id: source_id.to_string(),
     });
 
-    let source_bytes = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
+    let source_bytes = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
         state,
-        tenant_id,
+        identity,
         database_id,
         collection,
         source_plan,

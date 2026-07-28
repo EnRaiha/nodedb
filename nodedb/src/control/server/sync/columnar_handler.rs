@@ -318,7 +318,7 @@ impl SyncSession {
         let decoded = decoded_rows.len() as u64;
 
         let tenant_id = self.tenant_id.unwrap_or(TenantId::new(0));
-        let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &msg.collection);
+        let vshard = VShardId::from_collection_in_database(self.database_id(), &msg.collection);
 
         debug!(
             session = %self.session_id,

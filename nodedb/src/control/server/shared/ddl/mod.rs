@@ -11,6 +11,7 @@ pub mod schema_validation;
 pub mod sql_parse;
 pub mod sqlstate;
 pub mod sync_dispatch;
+pub mod user_dispatch;
 
 pub use self::dispatch::dispatch;
 pub use self::result::{DdlError, DdlResult};

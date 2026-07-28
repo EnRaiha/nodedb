@@ -86,6 +86,7 @@ impl NodeDbPgHandler {
                     let key_str = String::from_utf8_lossy(key).into_owned();
                     let key_in_target = probe_kv_key_in_target(
                         &self.state,
+                        identity,
                         tenant_id,
                         db_id,
                         collection_qualified,
@@ -169,10 +170,16 @@ impl NodeDbPgHandler {
         // FieldSet is not a delete.
         let _ = is_delete;
 
-        let key_in_target =
-            probe_kv_key_in_target(&self.state, tenant_id, db_id, collection_qualified, &kv_key)
-                .await
-                .map_err(|e| write_err(&format!("clone kv write probe: {e}")))?;
+        let key_in_target = probe_kv_key_in_target(
+            &self.state,
+            identity,
+            tenant_id,
+            db_id,
+            collection_qualified,
+            &kv_key,
+        )
+        .await
+        .map_err(|e| write_err(&format!("clone kv write probe: {e}")))?;
 
         if key_in_target {
             // Row exists in target — let the normal FieldSet proceed.
@@ -190,6 +197,7 @@ impl NodeDbPgHandler {
 
         let source_value = fetch_kv_source_value(
             &self.state,
+            identity,
             tenant_id,
             source_db_id,
             &source_coll_qualified,

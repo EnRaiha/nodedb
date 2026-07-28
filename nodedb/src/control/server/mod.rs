@@ -20,7 +20,6 @@ pub mod resp;
 pub mod response_shape;
 pub mod response_translate;
 pub mod result_stream;
-pub mod session;
 pub mod session_auth;
 pub mod shared;
 pub mod shuffle;

@@ -144,7 +144,7 @@ async fn evaluate_alert(
 /// Dispatch an aggregate scan to the Data Plane via the SPSC bridge.
 ///
 /// Builds a `TimeseriesOp::Scan` with the alert's aggregate function and
-/// group-by columns, dispatches via `dispatch_async`, and decodes the
+/// group-by columns, dispatches via `dispatch_system`, and decodes the
 /// MessagePack response into `(group_key, agg_value)` pairs.
 async fn execute_aggregate_scan(
     state: &Arc<SharedState>,
@@ -179,12 +179,15 @@ async fn execute_aggregate_scan(
         valid_at_ms: None,
     });
 
-    let payload = sync_dispatch::dispatch_async(
+    let payload = sync_dispatch::dispatch_system(
         state,
-        tenant_id,
-        crate::types::DatabaseId::new(alert.database_id),
-        &alert.collection,
-        plan,
+        sync_dispatch::SystemTask::new(
+            sync_dispatch::SystemReason::EventPlane,
+            tenant_id,
+            crate::types::DatabaseId::new(alert.database_id),
+            &alert.collection,
+            plan,
+        ),
         Duration::from_secs(30),
     )
     .await?;

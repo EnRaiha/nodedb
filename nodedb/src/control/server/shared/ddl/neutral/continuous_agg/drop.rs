@@ -110,12 +110,15 @@ pub async fn drop_continuous_aggregate(
                 &name,
             );
         let plan = PhysicalPlan::Meta(MetaOp::UnregisterContinuousAggregate { name: name.clone() });
-        sync_dispatch::dispatch_async(
+        sync_dispatch::dispatch_system(
             state,
-            tenant_id,
-            database_id,
-            &stored.source,
-            plan,
+            sync_dispatch::SystemTask::new(
+                sync_dispatch::SystemReason::CatalogMaintenance,
+                tenant_id,
+                database_id,
+                &stored.source,
+                plan,
+            ),
             Duration::from_secs(5),
         )
         .await

@@ -126,12 +126,15 @@ async fn dispatch_rename_ops(
         // Route to the destination database: cutover materializes the
         // re-keyed namespace under target_db_id, so the rename dispatch
         // targets the shard owning the new db-qualified storage.
-        sync_dispatch::dispatch_async(
+        sync_dispatch::dispatch_system(
             state,
-            tenant_id,
-            target_db_id,
-            "__system",
-            plan,
+            sync_dispatch::SystemTask::new(
+                sync_dispatch::SystemReason::TenantLifecycle,
+                tenant_id,
+                target_db_id,
+                "__system",
+                plan,
+            ),
             RENAME_DISPATCH_TIMEOUT,
         )
         .await

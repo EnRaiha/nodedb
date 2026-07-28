@@ -67,7 +67,6 @@ pub async fn crdt_state(
 
     let collection = &args[0];
     let document_id = &args[1];
-    let tenant_id = identity.tenant_id;
 
     let plan = PhysicalPlan::Crdt(CrdtOp::Read {
         collection: collection.clone(),
@@ -75,9 +74,11 @@ pub async fn crdt_state(
     });
 
     // Synchronous dispatch via the blocking bridge.
-    let result = crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
+    // A CRDT state read is a read of the collection's rows, so it carries the
+    // same authorization and row-level security as any other read of them.
+    let result = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
         state,
-        tenant_id,
+        identity,
         database_id,
         collection,
         plan,

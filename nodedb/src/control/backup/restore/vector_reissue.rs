@@ -119,7 +119,7 @@ pub fn build_vector_set_params_plan(
 ///
 /// Branches identically to a normal write:
 /// - Cluster: `to_replicated_entry` + `propose_replicated_entry`.
-/// - Single-node: `wal_append_if_write` then `sync_dispatch::dispatch_async`.
+/// - Single-node: `wal_append_if_write` then `sync_dispatch::dispatch_system`.
 pub async fn reissue_vector_durably(
     state: &SharedState,
     tenant_id: TenantId,
@@ -148,12 +148,15 @@ pub async fn reissue_vector_durably(
 
     // Single-node: WAL first (durable for restart replay), then install live.
     wal_append_if_write(&state.wal, tenant_id, vshard, database_id, &plan)?;
-    sync_dispatch::dispatch_async(
+    sync_dispatch::dispatch_system(
         state,
-        tenant_id,
-        database_id,
-        collection,
-        plan,
+        sync_dispatch::SystemTask::new(
+            sync_dispatch::SystemReason::BackupRestore,
+            tenant_id,
+            database_id,
+            collection,
+            plan,
+        ),
         REISSUE_TIMEOUT,
     )
     .await?;

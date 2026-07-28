@@ -48,6 +48,21 @@ impl RespValue {
         Self::Error(msg.into())
     }
 
+    /// Create an error response from a typed error.
+    ///
+    /// Routes through the canonical error→RESP mapping so a refusal reaches the
+    /// client as the code it actually is (`NOPERM` for an authorization or
+    /// policy denial, `MOVED`, `TIMEOUT`, `BUSY`, …) instead of a generic `ERR`
+    /// that reads like a server fault. `Error::Bridge` already carries a
+    /// RESP-shaped detail (the gateway mapping, or the local `BUSY` retry
+    /// hint), so it is passed through rather than mapped twice.
+    pub fn from_error(error: &crate::Error) -> Self {
+        match error {
+            crate::Error::Bridge { detail } => Self::Error(detail.clone()),
+            other => Self::Error(crate::control::gateway::GatewayErrorMap::to_resp(other)),
+        }
+    }
+
     /// Create an integer response.
     pub fn integer(n: i64) -> Self {
         Self::Integer(n)

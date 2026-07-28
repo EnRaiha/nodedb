@@ -14,7 +14,7 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId};
 
 use super::result::DdlError;
-use super::sync_dispatch::dispatch_async;
+use super::sync_dispatch::{SystemReason, SystemTask, dispatch_system};
 
 /// Dispatch `plan` for `collection` and translate any Data-Plane refusal into
 /// a [`DdlError`] carrying `sqlstate` and `context`.
@@ -28,11 +28,21 @@ pub(crate) async fn apply_in_engine(
     context: &str,
 ) -> Result<(), DdlError> {
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    dispatch_async(state, tenant_id, database_id, collection, plan, timeout)
-        .await
-        .map(|_| ())
-        .map_err(|e| DdlError {
-            sqlstate: sqlstate.to_string(),
-            message: format!("{context}: {e}"),
-        })
+    dispatch_system(
+        state,
+        SystemTask::new(
+            SystemReason::DdlApply,
+            tenant_id,
+            database_id,
+            collection,
+            plan,
+        ),
+        timeout,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| DdlError {
+        sqlstate: sqlstate.to_string(),
+        message: format!("{context}: {e}"),
+    })
 }

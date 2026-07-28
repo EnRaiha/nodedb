@@ -128,12 +128,15 @@ impl nodedb_cluster::SnapshotApplier for DataPlaneSnapshotApplier {
             collections_to_clear,
         });
 
-        crate::control::server::shared::ddl::sync_dispatch::dispatch_async(
+        crate::control::server::shared::ddl::sync_dispatch::dispatch_system(
             &self.shared,
-            TenantId::new(0),
-            DatabaseId::DEFAULT,
-            "__system",
-            plan,
+            crate::control::server::shared::ddl::sync_dispatch::SystemTask::new(
+                crate::control::server::shared::ddl::sync_dispatch::SystemReason::ClusterSnapshot,
+                TenantId::new(0),
+                DatabaseId::DEFAULT,
+                "__system",
+                plan,
+            ),
             SNAPSHOT_APPLY_TIMEOUT,
         )
         .await

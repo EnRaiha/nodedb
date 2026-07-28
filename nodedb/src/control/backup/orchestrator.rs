@@ -47,7 +47,7 @@ pub async fn backup_tenant(state: &Arc<SharedState>, tenant_id: u64) -> Result<B
 
     // Collect per-node sections first. The orchestrator's own
     // dispatches advance the tenant write-HLC high-water via
-    // `dispatch_async`; capturing the envelope watermark AFTER the
+    // `dispatch_system`; capturing the envelope watermark AFTER the
     // fan-out guarantees `envelope.watermark ≥ tenant_write_hlc`
     // at backup time, so a subsequent restore of this envelope into
     // the same (unchanged) cluster passes the staleness gate.
@@ -287,13 +287,16 @@ async fn snapshot_self(
     tenant_id: u64,
     plan: &PhysicalPlan,
 ) -> Result<Vec<u8>, Error> {
-    sync_dispatch::dispatch_async(
+    sync_dispatch::dispatch_system(
         state,
-        TenantId::new(tenant_id),
-        // TODO(A8-followup): backup/restore not yet multi-database.
-        DatabaseId::DEFAULT,
-        "__system",
-        plan.clone(),
+        sync_dispatch::SystemTask::new(
+            sync_dispatch::SystemReason::BackupRestore,
+            TenantId::new(tenant_id),
+            // TODO(A8-followup): backup/restore not yet multi-database.
+            DatabaseId::DEFAULT,
+            "__system",
+            plan.clone(),
+        ),
         NODE_SNAPSHOT_TIMEOUT,
     )
     .await

@@ -80,6 +80,7 @@ impl NodeDbPgHandler {
 
         let row_in_target = probe_row_in_target(
             &self.state,
+            identity,
             tenant_id,
             db_id,
             collection_qualified,
@@ -116,6 +117,7 @@ impl NodeDbPgHandler {
 
         let source_row_bytes = fetch_source_row(
             &self.state,
+            identity,
             tenant_id,
             source_db_id,
             &source_coll_qualified,

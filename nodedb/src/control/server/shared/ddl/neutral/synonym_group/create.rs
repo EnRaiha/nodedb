@@ -9,7 +9,9 @@ use nodedb_fts::SynonymGroupRecord;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::catalog::StoredSynonymGroup;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
+use crate::control::server::shared::ddl::sync_dispatch::{
+    SystemReason, SystemTask, dispatch_system,
+};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::MetaOp;
@@ -94,12 +96,15 @@ pub async fn create_synonym_group(
     });
 
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    dispatch_async(
+    dispatch_system(
         state,
-        tenant_id,
-        database_id,
-        SYNONYM_SENTINEL_COLLECTION,
-        plan,
+        SystemTask::new(
+            SystemReason::CatalogMaintenance,
+            tenant_id,
+            database_id,
+            SYNONYM_SENTINEL_COLLECTION,
+            plan,
+        ),
         timeout,
     )
     .await

@@ -17,7 +17,7 @@ use nodedb_sql::ddl_ast::GraphDirection;
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
-use crate::control::server::shared::ddl::sync_dispatch;
+use crate::control::server::shared::ddl::user_dispatch;
 use crate::control::state::SharedState;
 use crate::data::executor::response_codec;
 use crate::engine::graph::edge_store::Direction;
@@ -120,9 +120,9 @@ pub async fn rag_fusion(
         bm25_field: params.bm25_field,
     });
 
-    let payload = sync_dispatch::dispatch_async(
+    let payload = user_dispatch::dispatch_for_identity(
         state,
-        identity.tenant_id,
+        identity,
         database_id,
         &collection,
         plan,

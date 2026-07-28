@@ -8,7 +8,9 @@ use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
+use crate::control::server::shared::ddl::sync_dispatch::{
+    SystemReason, SystemTask, dispatch_system,
+};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
@@ -54,9 +56,19 @@ pub async fn compact_history(
         target_version_json: record.version_vector_json.clone(),
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    dispatch_async(state, tenant_id, database_id, &collection, plan, timeout)
-        .await
-        .map_err(|e| err("XX000", format!("compact dispatch: {e}")))?;
+    dispatch_system(
+        state,
+        SystemTask::new(
+            SystemReason::CatalogMaintenance,
+            tenant_id,
+            database_id,
+            &collection,
+            plan,
+        ),
+        timeout,
+    )
+    .await
+    .map_err(|e| err("XX000", format!("compact dispatch: {e}")))?;
 
     // Delete checkpoints created before the cutoff.
     let deleted = catalog

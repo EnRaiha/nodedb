@@ -97,7 +97,7 @@ pub(super) async fn dispatch_kv_write(
 fn authorize_resp_task(
     state: &SharedState,
     session: &RespSession,
-    plan: PhysicalPlan,
+    mut plan: PhysicalPlan,
     vshard_id: VShardId,
 ) -> crate::Result<crate::control::server::shared::authorization::AuthorizedTask> {
     let identity = session
@@ -107,6 +107,23 @@ fn authorize_resp_task(
             tenant_id: session.tenant_id,
             resource: "RESP AUTH required before data access".into(),
         })?;
+
+    // Row-level security is injected here, before the capability is minted, for
+    // the same reason the native path injects before dispatch: the plan the
+    // capability authorizes must be the plan the Data Plane executes. Every
+    // RESP command reaches the Data Plane through this function, so this is the
+    // whole protocol's RLS enforcement point.
+    //
+    // Operations that cannot carry a filter (`BatchGet`, `FieldGet`) fail
+    // closed here with a typed error rather than executing unfiltered.
+    let auth_ctx = crate::control::server::session_auth::context::build_auth_context(identity);
+    crate::control::planner::rls_injection::inject_rls_for_single_plan(
+        session.tenant_id.as_u64(),
+        &mut plan,
+        &state.rls,
+        &auth_ctx,
+    )?;
+
     let task = PhysicalTask {
         tenant_id: session.tenant_id,
         vshard_id,
@@ -169,13 +186,4 @@ fn map_busy_error(e: crate::Error) -> crate::Error {
         },
         _ => e,
     }
-}
-
-/// Parse a JSON payload and extract an integer field.
-pub(super) fn parse_json_field_i64(
-    payload: &crate::bridge::envelope::Payload,
-    field: &str,
-) -> Option<i64> {
-    let json: serde_json::Value = sonic_rs::from_slice(payload).ok()?;
-    json.get(field)?.as_i64()
 }

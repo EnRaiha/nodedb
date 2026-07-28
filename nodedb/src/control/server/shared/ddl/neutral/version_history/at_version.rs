@@ -10,7 +10,9 @@ use serde_json::{Map, Value as JsonValue};
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
-use crate::control::server::shared::ddl::sync_dispatch::dispatch_async;
+use crate::control::server::shared::ddl::sync_dispatch::{
+    SystemReason, SystemTask, dispatch_system,
+};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
@@ -50,9 +52,19 @@ pub async fn select_at_version(
         version_vector_json: vv_json,
     });
     let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let payload = dispatch_async(state, tenant_id, database_id, &collection, plan, timeout)
-        .await
-        .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
+    let payload = dispatch_system(
+        state,
+        SystemTask::new(
+            SystemReason::CatalogMaintenance,
+            tenant_id,
+            database_id,
+            &collection,
+            plan,
+        ),
+        timeout,
+    )
+    .await
+    .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
 
     let text = String::from_utf8_lossy(&payload).into_owned();
 

@@ -15,7 +15,8 @@ use nodedb_physical::physical_plan::KvOp;
 
 use super::codec::RespValue;
 use super::command::RespCommand;
-use super::handler::{dispatch_kv, dispatch_kv_write, parse_json_field_i64};
+use super::handler::{dispatch_kv, dispatch_kv_write};
+use super::payload::{payload_field_i64, payload_json};
 use super::session::RespSession;
 
 /// ZADD key score member [score member ...]
@@ -69,7 +70,7 @@ pub(super) async fn handle_zadd(
             &member,
         ) {
             Ok(s) => s,
-            Err(e) => return RespValue::err(format!("ERR {e}")),
+            Err(e) => return RespValue::from_error(&e),
         };
         let plan = PhysicalPlan::Kv(KvOp::Put {
             collection: index_name.clone(),
@@ -81,7 +82,7 @@ pub(super) async fn handle_zadd(
 
         match dispatch_kv_write(state, session, plan).await {
             Ok(_) => added += 1,
-            Err(e) => return RespValue::err(format!("ERR {e}")),
+            Err(e) => return RespValue::from_error(&e),
         }
 
         i += 2;
@@ -108,10 +109,10 @@ pub(super) async fn handle_zrem(
 
     match dispatch_kv_write(state, session, plan).await {
         Ok(resp) => {
-            let count = parse_json_field_i64(&resp.payload, "deleted").unwrap_or(0);
+            let count = payload_field_i64(&resp.payload, "deleted").unwrap_or(0);
             RespValue::integer(count)
         }
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -132,14 +133,14 @@ pub(super) async fn handle_zrank(
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let rank = parse_json_field_i64(&resp.payload, "rank");
+            let rank = payload_field_i64(&resp.payload, "rank");
             match rank {
                 Some(r) if r > 0 => RespValue::integer(r - 1), // Convert to 0-based.
                 _ => RespValue::nil(),
             }
         }
         Ok(_) => RespValue::nil(),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -172,8 +173,10 @@ pub(super) async fn handle_zrange(
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let rows: Vec<serde_json::Value> =
-                sonic_rs::from_slice(&resp.payload).unwrap_or_default();
+            let rows: Vec<serde_json::Value> = match payload_json(&resp.payload) {
+                serde_json::Value::Array(rows) => rows,
+                _ => Vec::new(),
+            };
             let total = rows.len() as i64;
 
             let actual_start = if start < 0 {
@@ -202,7 +205,7 @@ pub(super) async fn handle_zrange(
             RespValue::array(items)
         }
         Ok(_) => RespValue::array(vec![]),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -214,11 +217,11 @@ pub(super) async fn handle_zcard(session: &RespSession, state: &SharedState) -> 
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let count = parse_json_field_i64(&resp.payload, "count").unwrap_or(0);
+            let count = payload_field_i64(&resp.payload, "count").unwrap_or(0);
             RespValue::integer(count)
         }
         Ok(_) => RespValue::integer(0),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
 
@@ -252,6 +255,6 @@ pub(super) async fn handle_zscore(
             RespValue::nil()
         }
         Ok(_) => RespValue::nil(),
-        Err(e) => RespValue::err(format!("ERR {e}")),
+        Err(e) => RespValue::from_error(&e),
     }
 }
