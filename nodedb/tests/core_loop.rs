@@ -94,9 +94,15 @@ mod test_timeseries_budget;
 mod test_timeseries_scan_budget;
 #[path = "executor_tests/test_transaction.rs"]
 mod test_transaction;
+#[path = "executor_tests/test_transaction_cross_engine.rs"]
+mod test_transaction_cross_engine;
 #[path = "executor_tests/test_transaction_matrix.rs"]
 mod test_transaction_matrix;
+#[path = "executor_tests/test_transaction_matrix_helpers.rs"]
+mod test_transaction_matrix_helpers;
 #[path = "executor_tests/test_transaction_matrix_kv.rs"]
 mod test_transaction_matrix_kv;
+#[path = "executor_tests/test_transaction_matrix_side_effects.rs"]
+mod test_transaction_matrix_side_effects;
 #[path = "executor_tests/test_vector.rs"]
 mod test_vector;

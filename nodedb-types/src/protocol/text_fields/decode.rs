@@ -320,6 +320,9 @@ impl<'a> zerompk::FromMessagePack<'a> for TextFields {
                 FID_INDEX_TYPE => {
                     out.index_type = Some(reader.read_string()?.into_owned());
                 }
+                FID_VECTOR_DIM => {
+                    out.vector_dim = Some(reader.read_u32()?);
+                }
                 FID_DATABASE => {
                     out.database = Some(reader.read_string()?.into_owned());
                 }

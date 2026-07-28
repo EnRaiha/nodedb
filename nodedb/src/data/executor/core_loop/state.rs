@@ -96,6 +96,15 @@ pub struct CoreLoop {
     pub(in crate::data::executor) vector_params:
         HashMap<(DatabaseId, TenantId, String), crate::engine::vector::hnsw::HnswParams>,
 
+    /// Vector dimension declared by `CREATE VECTOR INDEX ... DIM <n>`, per
+    /// index. Every vector written to the field is checked against it, so a
+    /// pipeline emitting the wrong embedding width is rejected at the write
+    /// rather than discovered as poor search results. Absent = never declared
+    /// (a pre-existing index, or one created before DIM was enforced), in
+    /// which case the index adopts the width of the first vector it sees.
+    /// Key: `(DatabaseId, TenantId, collection_key)` — same shape as `vector_params`.
+    pub(in crate::data::executor) declared_dims: HashMap<(DatabaseId, TenantId, String), usize>,
+
     /// redb-backed graph edge storage for this core.
     pub(in crate::data::executor) edge_store: EdgeStore,
 

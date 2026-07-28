@@ -58,6 +58,14 @@ pub struct IndexConfig {
     pub ivf_cells: usize,
     /// IVF probe count (for IvfPq only).
     pub ivf_nprobe: usize,
+    /// Vector width declared when the index was created. Every vector written
+    /// to the index is checked against it, so a producer emitting the wrong
+    /// embedding width is rejected at the write rather than discovered as poor
+    /// search results. `0` = never declared, in which case the index adopts
+    /// the width of the first vector it sees. Defaulted on decode so indexes
+    /// snapshotted before the field existed keep loading.
+    #[serde(default)]
+    pub declared_dim: usize,
 }
 
 /// Default PQ subquantizer count (segments per vector).
@@ -75,6 +83,7 @@ impl Default for IndexConfig {
             pq_m: DEFAULT_PQ_M,
             ivf_cells: DEFAULT_IVF_CELLS,
             ivf_nprobe: DEFAULT_IVF_NPROBE,
+            declared_dim: 0,
         }
     }
 }

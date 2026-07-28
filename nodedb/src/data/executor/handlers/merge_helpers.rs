@@ -140,7 +140,7 @@ pub(super) fn apply_action(
                         is_strict: strict_schema.is_some(),
                         has_vectors,
                     },
-                );
+                )?;
             }
             Ok(true)
         }

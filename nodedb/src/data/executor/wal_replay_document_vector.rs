@@ -148,7 +148,12 @@ impl CoreLoop {
             // key (`surrogate_to_doc_id`), not the user PK; reproduce that here
             // so a later delete can still find and soft-delete the node.
             let row_key = surrogate_to_doc_id(surrogate);
-            let deltas = self.apply_point_put_vector_indexes(
+            // The forward path rejects a width mismatch before the write is
+            // acknowledged, so one can only appear here for a record journalled
+            // before that check existed. It is already durable — refusing to
+            // boot over it would be worse than indexing the rest of the
+            // document — so it is reported and its vector fields skipped.
+            let deltas = match self.apply_point_put_vector_indexes(
                 crate::data::executor::handlers::point::apply_put::VectorIndexPutParams {
                     database_id,
                     tid: tenant_id,
@@ -158,7 +163,20 @@ impl CoreLoop {
                     value: &value,
                     wal_lsn: record_lsn,
                 },
-            );
+            ) {
+                Ok(deltas) => deltas,
+                Err(e) => {
+                    tracing::warn!(
+                        core = self.core_id,
+                        %collection,
+                        lsn = record_lsn,
+                        error = %e,
+                        "WAL replay: vector indexing rejected this document; \
+                         its embeddings will not be searchable"
+                    );
+                    continue;
+                }
+            };
             if !deltas.is_empty() {
                 rebuilt += deltas.len();
             }

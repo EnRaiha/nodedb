@@ -36,6 +36,11 @@ NodeDB's vector engine is built for production semantic search — not vectors s
 CREATE COLLECTION articles;
 CREATE VECTOR INDEX idx_articles_embedding ON articles METRIC cosine DIM 384;
 
+-- DIM is required and is enforced on every write: an embedding of any other
+-- width is rejected at INSERT rather than quietly indexed at the wrong size.
+-- Name the column explicitly to carry several embeddings on one collection.
+CREATE VECTOR INDEX idx_articles_clip ON articles (clip_embedding) METRIC cosine DIM 512;
+
 -- Insert documents with embeddings
 INSERT INTO articles {
     title: 'Understanding Transformers',

@@ -3,6 +3,7 @@
 //! Protocol-neutral DDL dispatch shared by native + http entrypoints.
 pub mod catalog;
 pub mod dispatch;
+pub mod engine_apply;
 pub mod neutral;
 pub mod owner;
 pub mod result;

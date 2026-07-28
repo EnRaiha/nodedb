@@ -59,6 +59,7 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
         ReplicatedWrite::SetVectorParams {
             collection,
             field_name,
+            dim,
             m,
             ef_construction,
             metric,
@@ -69,6 +70,7 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
         } => Ok(set_params(SetParamsFields {
             collection,
             field_name,
+            dim: *dim,
             m: *m,
             ef_construction: *ef_construction,
             metric,
@@ -256,6 +258,7 @@ pub(super) fn delete(collection: &str, vector_id: u32) -> PhysicalPlan {
 pub(super) struct SetParamsFields<'a> {
     pub(super) collection: &'a str,
     pub(super) field_name: &'a str,
+    pub(super) dim: usize,
     pub(super) m: usize,
     pub(super) ef_construction: usize,
     pub(super) metric: &'a str,
@@ -269,6 +272,7 @@ pub(super) fn set_params(f: SetParamsFields) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::SetParams {
         collection: f.collection.to_owned(),
         field_name: f.field_name.to_owned(),
+        dim: f.dim,
         m: f.m,
         ef_construction: f.ef_construction,
         metric: f.metric.to_owned(),

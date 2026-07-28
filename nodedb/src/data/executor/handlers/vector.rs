@@ -22,6 +22,8 @@ pub(in crate::data::executor) struct SetVectorParamsInput<'a> {
     pub collection: &'a str,
     /// Named vector field this config applies to. Empty = default field.
     pub field_name: &'a str,
+    /// Declared vector dimension; `0` = not declared.
+    pub dim: usize,
     pub m: usize,
     pub ef_construction: usize,
     pub metric: &'a str,
@@ -68,6 +70,21 @@ impl CoreLoop {
         field_name: &str,
     ) -> Result<&mut VectorCollection, ErrorCode> {
         let index_key = CoreLoop::vector_index_key(database_id, tid, collection, field_name);
+
+        // A dimension declared at `CREATE VECTOR INDEX ... DIM <n>` binds
+        // before the index has materialized. Checking only against an
+        // already-built index lets the very first write define the width and
+        // silently supersede the declaration.
+        if let Some(&declared) = self.declared_dims.get(&index_key)
+            && declared != 0
+            && declared != dim
+        {
+            return Err(ErrorCode::RejectedConstraint {
+                detail: String::new(),
+                constraint: format!("dimension mismatch: index declares {declared}, got {dim}"),
+            });
+        }
+
         if let Some(existing) = self.vector_collections.get(&index_key)
             && existing.dim() != dim
         {

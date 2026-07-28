@@ -135,10 +135,17 @@ impl CoreLoop {
                 },
             ),
 
-            TextOp::SetAnalyzer {
+            TextOp::SetTextConfig {
                 collection,
                 analyzer_name,
-            } => self.execute_set_analyzer(task, tid, collection, analyzer_name),
+                fuzzy_default,
+            } => self.execute_set_text_config(
+                task,
+                tid,
+                collection,
+                analyzer_name.as_deref(),
+                *fuzzy_default,
+            ),
         }
     }
 }

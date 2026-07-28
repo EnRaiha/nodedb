@@ -130,6 +130,11 @@ pub enum VectorOp {
         /// default (unnamed) vector field. Lets one collection carry
         /// multiple vector indexes, one per `VECTOR` / embedding column.
         field_name: String,
+        /// Declared vector dimension. Enforced against every vector written
+        /// to this field; `0` means "not declared" and leaves the index to
+        /// adopt the width of whatever arrives first.
+        #[serde(default)]
+        dim: usize,
         m: usize,
         ef_construction: usize,
         metric: String,

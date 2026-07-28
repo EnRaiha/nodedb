@@ -38,6 +38,9 @@ impl CoreLoop {
             let db = crate::types::DatabaseId::DEFAULT.as_u64();
             let key = CoreLoop::vector_index_key(db, e.tenant_id, &e.collection, &e.field_name);
             let (params, config) = build_index_config_from_stored(e);
+            if e.dim > 0 {
+                self.declared_dims.insert(key.clone(), e.dim);
+            }
             self.vector_params.insert(key.clone(), params);
             self.index_configs.insert(key, config);
         }
@@ -97,6 +100,7 @@ fn build_index_config_from_stored(
         pq_m: resolved_pq_m,
         ivf_cells: resolved_ivf_cells,
         ivf_nprobe: resolved_ivf_nprobe,
+        declared_dim: e.dim,
     };
 
     (params, config)

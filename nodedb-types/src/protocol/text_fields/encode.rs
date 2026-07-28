@@ -128,6 +128,7 @@ impl zerompk::ToMessagePack for TextFields {
         write_opt_field!(writer, FID_EF_CONSTRUCTION, self.ef_construction);
         write_opt_field!(writer, FID_METRIC, self.metric);
         write_opt_field!(writer, FID_INDEX_TYPE, self.index_type);
+        write_opt_field!(writer, FID_VECTOR_DIM, self.vector_dim);
         write_opt_field!(writer, FID_DATABASE, self.database);
         write_opt_field!(writer, FID_SQL_PARAMS, self.sql_params);
         write_opt_field!(writer, FID_LIST_PATH, self.list_path);

@@ -38,7 +38,9 @@ async fn insert_select_row_visible_to_vector_fts_and_scan() {
         .await
         .unwrap();
     server
-        .exec("CREATE SEARCH INDEX idx_isc_target_fts ON isc_target FIELDS body ANALYZER 'simple'")
+        .exec(
+            "CREATE SEARCH INDEX idx_isc_target_fts ON isc_target FIELDS body ANALYZER 'standard'",
+        )
         .await
         .unwrap();
 

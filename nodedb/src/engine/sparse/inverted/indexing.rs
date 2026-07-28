@@ -66,6 +66,20 @@ impl InvertedIndex {
             .set_collection_analyzer(database_id, tid.as_u64(), collection, analyzer_name)
     }
 
+    /// Bind whether searches over `collection` fall back to fuzzy matching by
+    /// default, persisted to backend metadata. `FtsIndex::search` ORs it into
+    /// every query's own fuzzy flag.
+    pub fn set_collection_fuzzy(
+        &self,
+        database_id: u64,
+        tid: TenantId,
+        collection: &str,
+        fuzzy: bool,
+    ) -> crate::Result<()> {
+        self.inner
+            .set_collection_fuzzy(database_id, tid.as_u64(), collection, fuzzy)
+    }
+
     /// Index a document's text content.
     pub fn index_document(
         &self,

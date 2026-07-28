@@ -285,7 +285,7 @@ impl CoreLoop {
                 // use). Both are no-ops unless the collection has a vector
                 // field, so a non-vector collection pays nothing.
                 if has_vectors && let Some(surrogate) = row_surrogate {
-                    self.update_reindex_vector_indexes(UpdateVectorReindex {
+                    if let Err(e) = self.update_reindex_vector_indexes(UpdateVectorReindex {
                         database_id,
                         tid,
                         collection: target_collection,
@@ -294,7 +294,9 @@ impl CoreLoop {
                         new_body: &updated_bytes,
                         is_strict: strict_schema.is_some(),
                         has_vectors,
-                    });
+                    }) {
+                        return self.response_error(task, e);
+                    }
                     write_set.push(WriteSetEntry {
                         surrogate: surrogate.as_u32(),
                         is_delete: false,

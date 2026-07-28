@@ -232,7 +232,15 @@ pub async fn handle_alter_vector_index_set(
 
     for pair in inner.split(',') {
         let pair = pair.trim();
-        if let Some((key, val)) = pair.split_once('=') {
+        // A list item with no `=` used to be skipped, so a typo'd item was
+        // dropped while the statement reported success for the ones around it.
+        let Some((key, val)) = pair.split_once('=') else {
+            return Err(ddl_err(
+                "42601",
+                format!("malformed SET item '{pair}'; each item must be <parameter> = <value>"),
+            ));
+        };
+        {
             let key = key.trim().to_lowercase();
             let val = val.trim().trim_matches('\'').trim_matches('"');
             match key.as_str() {
@@ -318,6 +326,9 @@ pub async fn handle_alter_vector_index_set(
         let set_plan = PhysicalPlan::Vector(VectorOp::SetParams {
             collection: collection.clone(),
             field_name: field_name.clone(),
+            // ALTER never redeclares the dimension: `0` preserves whatever
+            // CREATE declared rather than clearing the enforced width.
+            dim: 0,
             m,
             ef_construction,
             metric: String::new(),

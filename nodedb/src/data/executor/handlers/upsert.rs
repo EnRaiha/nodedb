@@ -245,7 +245,7 @@ impl CoreLoop {
                         // vector index — re-index the surrogate's vectors from
                         // the merged body so KNN search reflects the overwrite in
                         // the same process. No-op when `has_vectors` is false.
-                        self.update_reindex_vector_indexes(
+                        if let Err(e) = self.update_reindex_vector_indexes(
                             super::point::update_reindex_vector::UpdateVectorReindex {
                                 database_id,
                                 tid,
@@ -256,7 +256,9 @@ impl CoreLoop {
                                 is_strict: strict_schema.is_some(),
                                 has_vectors,
                             },
-                        );
+                        ) {
+                            return self.response_error(task, e);
+                        }
 
                         // Carry the surrogate + post-image back so the Control
                         // Plane can mint a post-apply `Put` redo. The autocommit

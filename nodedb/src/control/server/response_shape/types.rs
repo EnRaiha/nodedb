@@ -82,7 +82,7 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
 
         // Analyzer-binding DDL config write — opaque execution result, same
         // as `VectorOp::SetParams`.
-        PhysicalPlan::Text(TextOp::SetAnalyzer { .. })
+        PhysicalPlan::Text(TextOp::SetTextConfig { .. })
         // Preview results are an internal typed zerompk control-plane value,
         // never a client document row. Preserve the bytes for the admission
         // caller to decode as `CrdtPreviewResult`.

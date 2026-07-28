@@ -342,7 +342,7 @@ async fn vector_search_with_array_slice_prefilter_fuses_e2e() {
     srv.exec("CREATE COLLECTION genes TYPE document")
         .await
         .expect("CREATE COLLECTION genes");
-    srv.exec("CREATE VECTOR INDEX idx_genes_emb ON genes FIELD embedding METRIC cosine DIM 3")
+    srv.exec("CREATE VECTOR INDEX idx_genes_emb ON genes (embedding) METRIC cosine DIM 3")
         .await
         .expect("CREATE VECTOR INDEX");
 

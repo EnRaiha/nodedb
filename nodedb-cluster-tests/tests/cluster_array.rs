@@ -285,7 +285,7 @@ async fn cluster_array_vector_prefilter_distributed() {
         .expect("CREATE COLLECTION genes");
     cluster
         .exec_ddl_on_any_leader(
-            "CREATE VECTOR INDEX idx_genes_emb ON genes FIELD embedding METRIC cosine DIM 3",
+            "CREATE VECTOR INDEX idx_genes_emb ON genes (embedding) METRIC cosine DIM 3",
         )
         .await
         .expect("CREATE VECTOR INDEX");

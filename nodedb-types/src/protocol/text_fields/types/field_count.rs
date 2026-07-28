@@ -255,6 +255,9 @@ impl TextFields {
         if self.index_type.is_some() {
             n += 1;
         }
+        if self.vector_dim.is_some() {
+            n += 1;
+        }
         if self.database.is_some() {
             n += 1;
         }

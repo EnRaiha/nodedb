@@ -185,6 +185,7 @@ fn vector_insert_byte_identical() {
     let mut ops = vec![PhysicalPlan::Vector(VectorOp::SetParams {
         collection: "vecs".into(),
         field_name: String::new(),
+        dim: 3,
         m: 16,
         ef_construction: 200,
         metric: "cosine".into(),

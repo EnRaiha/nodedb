@@ -91,6 +91,7 @@ impl CoreLoop {
             build_tx: None,
             build_rx: None,
             vector_params: HashMap::new(),
+            declared_dims: HashMap::new(),
             edge_store,
             hlc,
             last_stamp_ms: std::sync::atomic::AtomicI64::new(0),

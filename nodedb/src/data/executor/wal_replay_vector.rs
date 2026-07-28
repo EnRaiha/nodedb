@@ -99,69 +99,14 @@ impl CoreLoop {
             let tombstones = tombstones.for_database(database_id);
 
             if is_vector_params {
-                // Newer records append the vector field name as the 9th
-                // element; older records have 8 (quantization params, no field
-                // name) or 4 (no quantization params). Try the full shape, fall
-                // back to the legacy 4-tuple with the default (unnamed) field.
-                let decoded = zerompk::from_msgpack::<(
-                    String,
-                    usize,
-                    usize,
-                    String,
-                    String,
-                    usize,
-                    usize,
-                    usize,
-                    String,
-                )>(&record.payload)
-                .ok()
-                .map(|(c, m, ef, metric, _it, _pq, _ic, _ip, field)| (c, m, ef, metric, field))
-                .or_else(|| {
-                    zerompk::from_msgpack::<(String, usize, usize, String)>(&record.payload)
-                        .ok()
-                        .map(|(c, m, ef, metric)| (c, m, ef, metric, String::new()))
-                });
-                if let Some((collection, m, ef_construction, metric, field_name)) = decoded {
-                    if tombstones.is_tombstoned(tenant_id, &collection, record_lsn) {
-                        skipped += 1;
-                        continue;
-                    }
-                    let index_key = CoreLoop::vector_index_key(
-                        database_id,
-                        tenant_id,
-                        &collection,
-                        &field_name,
-                    );
-                    use crate::engine::vector::distance::DistanceMetric;
-                    let metric_enum = match metric.as_str() {
-                        "l2" | "euclidean" => DistanceMetric::L2,
-                        "cosine" => DistanceMetric::Cosine,
-                        "inner_product" | "ip" | "dot" => DistanceMetric::InnerProduct,
-                        "manhattan" | "l1" => DistanceMetric::Manhattan,
-                        "chebyshev" | "linf" => DistanceMetric::Chebyshev,
-                        "hamming" => DistanceMetric::Hamming,
-                        "jaccard" => DistanceMetric::Jaccard,
-                        "pearson" => DistanceMetric::Pearson,
-                        _ => DistanceMetric::Cosine,
-                    };
-                    let params = HnswParams {
-                        m,
-                        m0: m * 2,
-                        ef_construction,
-                        metric: metric_enum,
-                        dtype: nodedb_types::vector_dtype::VectorStorageDtype::F32,
-                    };
-                    self.vector_params.insert(index_key, params);
-                    tracing::debug!(
-                        core = self.core_id,
-                        %collection,
-                        field = %field_name,
-                        m,
-                        ef_construction,
-                        %metric,
-                        "WAL replay: restored vector params"
-                    );
-                }
+                self.restore_vector_params_record(
+                    database_id,
+                    tenant_id,
+                    record_lsn,
+                    &record.payload,
+                    &tombstones,
+                    &mut skipped,
+                );
                 continue;
             }
 

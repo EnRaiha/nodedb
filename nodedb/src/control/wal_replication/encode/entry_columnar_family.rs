@@ -105,7 +105,7 @@ pub(super) fn text_write(op: &TextOp) -> Option<ReplicatedWrite> {
         | TextOp::PhraseSearch { .. }
         | TextOp::HybridSearch { .. }
         | TextOp::HybridSearchTriple { .. }
-        | TextOp::SetAnalyzer { .. } => return None,
+        | TextOp::SetTextConfig { .. } => return None,
     })
 }
 

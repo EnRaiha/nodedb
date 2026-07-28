@@ -3,8 +3,9 @@
 //! Per-collection analyzer configuration stored in backend metadata.
 //!
 //! Uses structural `(tid, collection, subkey)` meta blobs:
-//! - `subkey = "analyzer"` → analyzer name (e.g. "german", "cjk_bigram")
+//! - `subkey = "analyzer"` → analyzer name (e.g. "german", "standard")
 //! - `subkey = "language"` → lang code (e.g. "de", "ja")
+//! - `subkey = "fuzzy"` → `"1"` when the collection defaults to fuzzy matching
 //!
 //! Applied automatically at both index time and query time.
 
@@ -47,6 +48,37 @@ impl<B: FtsBackend> FtsIndex<B> {
             "language",
             lang_code.as_bytes(),
         )
+    }
+
+    /// Set whether searches over this collection fall back to fuzzy
+    /// (Levenshtein) matching by default. Persists to backend metadata.
+    pub fn set_collection_fuzzy(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+        fuzzy: bool,
+    ) -> Result<(), B::Error> {
+        self.backend.write_meta(
+            database_id,
+            tid,
+            collection,
+            "fuzzy",
+            if fuzzy { b"1" } else { b"0" },
+        )
+    }
+
+    /// Whether this collection defaults to fuzzy matching. `false` when unset.
+    pub fn get_collection_fuzzy(
+        &self,
+        database_id: u64,
+        tid: u64,
+        collection: &str,
+    ) -> Result<bool, B::Error> {
+        Ok(self
+            .backend
+            .read_meta(database_id, tid, collection, "fuzzy")?
+            .is_some_and(|bytes| bytes.as_slice() == b"1"))
     }
 
     /// Get the configured analyzer name for a collection.
@@ -113,6 +145,20 @@ impl<B: FtsBackend> FtsIndex<B> {
             text, lang_code, stop_list,
         ))
     }
+}
+
+/// Whether `name` resolves to a real analyzer.
+///
+/// [`resolve_analyzer`] falls back to the standard analyzer for anything it
+/// does not know, which silently turns a misspelled analyzer name into a
+/// different analyzer. Callers that accept a name from a user — DDL, config —
+/// gate on this first so the fallback is only ever reached for a name that
+/// was already checked. The two must stay in step: every arm below has a
+/// matching arm there.
+pub fn analyzer_exists(name: &str) -> bool {
+    name == "standard"
+        || LanguageAnalyzer::new(name).is_some()
+        || NoStemAnalyzer::new(name).is_some()
 }
 
 /// Resolve an analyzer name to a `Box<dyn TextAnalyzer>`.

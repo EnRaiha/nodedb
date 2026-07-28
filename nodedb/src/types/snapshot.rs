@@ -492,6 +492,7 @@ mod tests {
             pq_m: 16,
             ivf_cells: 512,
             ivf_nprobe: 32,
+            declared_dim: 128,
         };
 
         let params_bytes = zerompk::to_msgpack_vec(&non_default_params).expect("encode HnswParams");

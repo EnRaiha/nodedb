@@ -28,6 +28,8 @@ pub(in crate::data::executor) struct PointUpdateParams<'a> {
     pub returning: Option<&'a ReturningSpec>,
 }
 
+use super::update_reindex_secondary::UpdateSecondaryReindex;
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_point_update(
         &mut self,
@@ -386,16 +388,9 @@ impl CoreLoop {
                             &updated_bytes,
                         );
 
-                        // Maintain the secondary HNSW vector index. The body
-                        // rewrite above (sparse.put / bitemporal_update_reindex)
-                        // reconciled storage + the secondary btree/FTS/graph
-                        // overlays, but never the vector index — re-index the
-                        // surrogate's vectors from the new body so KNN search
-                        // reflects an embedding change in the same process.
-                        // No-op when the collection has no vector index.
                         let has_vectors = self.collection_has_vectors(database_id, tid, collection);
-                        self.update_reindex_vector_indexes(
-                            super::update_reindex_vector::UpdateVectorReindex {
+                        if let Err(e) =
+                            self.update_reindex_vector_and_sparse(UpdateSecondaryReindex {
                                 database_id,
                                 tid,
                                 collection,
@@ -404,25 +399,10 @@ impl CoreLoop {
                                 new_body: &updated_bytes,
                                 is_strict,
                                 has_vectors,
-                            },
-                        );
-
-                        // Maintain the sparse inverted index the same way: the
-                        // body rewrite never touched it, so re-index the row's
-                        // sparse literal from the new body. No-op when the
-                        // collection declares no `SparseVector` column.
-                        let has_sparse = self.collection_has_sparse(database_id, tid, collection);
-                        self.update_reindex_sparse_indexes(
-                            super::update_reindex_sparse::UpdateSparseReindex {
-                                database_id,
-                                tid,
-                                collection,
-                                row_key,
-                                new_body: &updated_bytes,
-                                is_strict,
-                                has_sparse,
-                            },
-                        );
+                            })
+                        {
+                            return self.response_error(task, e);
+                        }
 
                         // Emit update event to Event Plane. `current_bytes`
                         // is the pre-update row already read above; the

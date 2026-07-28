@@ -31,7 +31,9 @@ async fn merge_insert_visible_to_vector_fts_and_scan() {
         .await
         .unwrap();
     server
-        .exec("CREATE SEARCH INDEX idx_mcv_target_fts ON mcv_target FIELDS body ANALYZER 'simple'")
+        .exec(
+            "CREATE SEARCH INDEX idx_mcv_target_fts ON mcv_target FIELDS body ANALYZER 'standard'",
+        )
         .await
         .unwrap();
 

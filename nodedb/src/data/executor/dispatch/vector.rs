@@ -112,6 +112,7 @@ impl CoreLoop {
             VectorOp::SetParams {
                 collection,
                 field_name,
+                dim,
                 m,
                 ef_construction,
                 metric,
@@ -125,6 +126,7 @@ impl CoreLoop {
                     tid,
                     collection,
                     field_name,
+                    dim: *dim,
                     m: *m,
                     ef_construction: *ef_construction,
                     metric,

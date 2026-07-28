@@ -147,11 +147,15 @@ pub enum TextOp {
     /// the in-transaction staged-write overlay, and query-time scoring alike.
     /// Config-only, single-node, non-WAL-durable — the same dispatch shape
     /// `VectorOp::SetParams` uses for `CREATE VECTOR INDEX`.
-    SetAnalyzer {
+    SetTextConfig {
         collection: String,
-        /// Analyzer name (e.g. "standard", "simple", "english", "cjk_bigram").
-        /// Unrecognized names fall back to the standard analyzer at resolve
-        /// time (see `nodedb_fts::index::analyzer_config::resolve_analyzer`).
-        analyzer_name: String,
+        /// Analyzer name, already checked against
+        /// `nodedb_fts::index::analyzer_config::analyzer_exists` by the DDL
+        /// layer (e.g. "standard", "english", "japanese"). `None` leaves the
+        /// collection's current analyzer in place.
+        analyzer_name: Option<String>,
+        /// Whether searches over this collection fall back to fuzzy matching
+        /// by default. `None` leaves the current setting in place.
+        fuzzy_default: Option<bool>,
     },
 }

@@ -45,7 +45,7 @@ async fn create_hybrid_collection(server: &TestServer, name: &str) {
         .unwrap();
     server
         .exec(&format!(
-            "CREATE SEARCH INDEX idx_{name}_fts ON {name} FIELDS content ANALYZER 'simple'"
+            "CREATE SEARCH INDEX idx_{name}_fts ON {name} FIELDS content ANALYZER 'standard'"
         ))
         .await
         .unwrap();

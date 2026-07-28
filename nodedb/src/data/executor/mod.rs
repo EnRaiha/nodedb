@@ -49,3 +49,4 @@ mod wal_replay_redo_graph;
 mod wal_replay_spatial;
 mod wal_replay_vector;
 mod wal_replay_vector_extended;
+mod wal_replay_vector_params;

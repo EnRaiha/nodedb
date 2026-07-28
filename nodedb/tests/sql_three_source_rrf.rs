@@ -43,7 +43,7 @@ async fn create_triple_collection(server: &TestServer, name: &str) {
         .unwrap();
     server
         .exec(&format!(
-            "CREATE SEARCH INDEX idx_{name}_fts ON {name} FIELDS body ANALYZER 'simple'"
+            "CREATE SEARCH INDEX idx_{name}_fts ON {name} FIELDS body ANALYZER 'standard'"
         ))
         .await
         .unwrap();

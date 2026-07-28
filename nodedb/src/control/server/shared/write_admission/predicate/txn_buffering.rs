@@ -356,7 +356,7 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | TextOp::PhraseSearch { .. }
             | TextOp::HybridSearch { .. }
             | TextOp::HybridSearchTriple { .. }
-            | TextOp::SetAnalyzer { .. },
+            | TextOp::SetTextConfig { .. },
         ) => false,
 
         // ---- Spatial: encoded (buffered) ----
@@ -826,6 +826,7 @@ mod tests {
             PhysicalPlan::Vector(VectorOp::SetParams {
                 collection: "c".into(),
                 field_name: String::new(),
+                dim: 0,
                 m: 0,
                 ef_construction: 0,
                 metric: String::new(),
@@ -1500,9 +1501,10 @@ mod tests {
                 rls_filters: Vec::new(),
                 score_alias: None,
             }),
-            PhysicalPlan::Text(TextOp::SetAnalyzer {
+            PhysicalPlan::Text(TextOp::SetTextConfig {
                 collection: "c".into(),
-                analyzer_name: "standard".into(),
+                analyzer_name: Some("standard".into()),
+                fuzzy_default: None,
             }),
         ];
         for p in &plans {

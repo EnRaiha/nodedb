@@ -22,6 +22,7 @@ impl CoreLoop {
             tid,
             collection,
             field_name,
+            dim,
             m,
             ef_construction,
             metric,
@@ -152,14 +153,27 @@ impl CoreLoop {
             dtype: nodedb_types::vector_dtype::VectorStorageDtype::F32,
         };
 
+        // `0` means the statement did not declare a dimension (ALTER, or a
+        // pre-DIM index): keep whatever was declared before rather than
+        // erasing an enforced width.
+        let resolved_dim = if dim > 0 {
+            dim
+        } else {
+            existing.as_ref().map(|c| c.declared_dim).unwrap_or(0)
+        };
+
         let config = crate::engine::vector::index_config::IndexConfig {
             hnsw: params.clone(),
             index_type: idx_type,
             pq_m: resolved_pq_m,
             ivf_cells: resolved_ivf_cells,
             ivf_nprobe: resolved_ivf_nprobe,
+            declared_dim: resolved_dim,
         };
 
+        if resolved_dim > 0 {
+            self.declared_dims.insert(index_key.clone(), resolved_dim);
+        }
         self.vector_params.insert(index_key.clone(), params);
         self.index_configs.insert(index_key, config);
         self.response_ok(task)

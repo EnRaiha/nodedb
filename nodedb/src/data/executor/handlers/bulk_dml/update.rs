@@ -337,17 +337,20 @@ impl CoreLoop {
                         // (soft-delete the old HNSW node + insert the new
                         // one, keyed by the stable surrogate). No-op unless
                         // the collection has a vector field (gated above).
-                        if has_vectors {
-                            self.update_reindex_vector_indexes(UpdateVectorReindex {
-                                database_id,
-                                tid,
-                                collection,
-                                row_key: doc_id,
-                                surrogate,
-                                new_body: &updated_bytes,
-                                is_strict: strict_schema.is_some(),
-                                has_vectors,
-                            });
+                        if has_vectors
+                            && let Err(e) =
+                                self.update_reindex_vector_indexes(UpdateVectorReindex {
+                                    database_id,
+                                    tid,
+                                    collection,
+                                    row_key: doc_id,
+                                    surrogate,
+                                    new_body: &updated_bytes,
+                                    is_strict: strict_schema.is_some(),
+                                    has_vectors,
+                                })
+                        {
+                            return self.response_error(task, e);
                         }
                     }
                     // Emit an update event per affected row to the Event Plane,

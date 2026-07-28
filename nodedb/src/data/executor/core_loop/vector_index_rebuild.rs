@@ -71,7 +71,10 @@ impl CoreLoop {
             let mut rebuilt = 0usize;
             for (surrogate, value) in docs {
                 let doc_id = crate::engine::document::store::surrogate_to_doc_id(surrogate);
-                let deltas = self.apply_point_put_vector_indexes(VectorIndexPutParams {
+                // Same as WAL replay: the document is already durable, so a
+                // width mismatch from before the forward-path check existed is
+                // reported and skipped rather than aborting the rebuild.
+                let deltas = match self.apply_point_put_vector_indexes(VectorIndexPutParams {
                     database_id: db,
                     tid: tenant_id,
                     collection: &collection,
@@ -79,7 +82,19 @@ impl CoreLoop {
                     surrogate,
                     value: &value,
                     wal_lsn: 0,
-                });
+                }) {
+                    Ok(deltas) => deltas,
+                    Err(e) => {
+                        tracing::warn!(
+                            core = self.core_id,
+                            %collection,
+                            error = %e,
+                            "vector-index rebuild rejected this document; \
+                             its embeddings will not be searchable"
+                        );
+                        continue;
+                    }
+                };
                 if !deltas.is_empty() {
                     rebuilt += 1;
                 }

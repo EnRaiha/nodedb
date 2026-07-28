@@ -104,6 +104,7 @@ pub fn build_vector_set_params_plan(
     PhysicalPlan::Vector(VectorOp::SetParams {
         collection: collection.to_string(),
         field_name: field_name.to_string(),
+        dim: config.declared_dim,
         m: config.hnsw.m,
         ef_construction: config.hnsw.ef_construction,
         metric: metric_to_str(config.hnsw.metric).to_string(),

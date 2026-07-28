@@ -52,7 +52,7 @@ pub(crate) fn extract_collection(plan: &PhysicalPlan) -> Option<&str> {
         | PhysicalPlan::Text(TextOp::BM25ScoreScan { collection, .. })
         | PhysicalPlan::Text(TextOp::FtsIndexDoc { collection, .. })
         | PhysicalPlan::Text(TextOp::FtsDeleteDoc { collection, .. })
-        | PhysicalPlan::Text(TextOp::SetAnalyzer { collection, .. })
+        | PhysicalPlan::Text(TextOp::SetTextConfig { collection, .. })
         | PhysicalPlan::Query(QueryOp::PartialAggregate { collection, .. })
         | PhysicalPlan::Query(QueryOp::FacetCounts { collection, .. })
         | PhysicalPlan::Document(DocumentOp::BulkUpdate { collection, .. })

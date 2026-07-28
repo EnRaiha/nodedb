@@ -437,7 +437,7 @@ impl CoreLoop {
                 value,
                 wal_lsn: wal_lsn.map(|l| l.as_u64()).unwrap_or(0),
             },
-        );
+        )?;
         // Sparse inverted-index maintenance mirrors the dense-vector side-effect
         // above: a no-op unless the strict schema declares a `SparseVector`
         // column, so non-sparse collections are byte-identical to before.

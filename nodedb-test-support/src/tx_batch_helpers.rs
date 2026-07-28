@@ -107,6 +107,7 @@ pub fn vector_set_params(collection: &str) -> PhysicalPlan {
     PhysicalPlan::Vector(VectorOp::SetParams {
         collection: collection.into(),
         field_name: String::new(),
+        dim: 0,
         m: 16,
         ef_construction: 200,
         metric: "cosine".into(),

@@ -185,6 +185,7 @@ pub(crate) fn build_set_params(
     Ok(PhysicalPlan::Vector(VectorOp::SetParams {
         collection: collection.to_string(),
         field_name: fields.field_name.clone().unwrap_or_default(),
+        dim: fields.vector_dim.unwrap_or(0) as usize,
         m,
         ef_construction,
         metric,

@@ -69,7 +69,7 @@ pub(crate) fn wal_append_text_op(
         | TextOp::PhraseSearch { .. }
         | TextOp::HybridSearch { .. }
         | TextOp::HybridSearchTriple { .. }
-        | TextOp::SetAnalyzer { .. } => None,
+        | TextOp::SetTextConfig { .. } => None,
     };
     Ok(appended)
 }

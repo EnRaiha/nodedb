@@ -6,46 +6,47 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::support::ddl_err;
+use super::options::{ColumnMode, HeaderSpec, NameMode, parse_index_statement};
 
-/// CREATE SPARSE INDEX [name] ON <collection> (<field>)
+const CONTEXT: &str = "CREATE SPARSE INDEX";
+const LEADING: &[&str] = &["CREATE", "SPARSE", "INDEX"];
+
+const SYNTAX: &str = "CREATE SPARSE INDEX [IF NOT EXISTS] [<name>] ON <collection> [(<field>)]";
+
+const HEADER: HeaderSpec = HeaderSpec {
+    name: NameMode::Optional {
+        fallback: "_auto_sparse",
+    },
+    columns: ColumnMode::AtMostOne,
+    syntax: SYNTAX,
+};
+
+/// The field a sparse index covers when the statement names none.
+const DEFAULT_FIELD: &str = "_sparse";
+
+/// `CREATE SPARSE INDEX [IF NOT EXISTS] [<name>] ON <collection> [(<field>)]`
 pub fn create_sparse_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    parts: &[&str],
+    sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    if parts.len() < 6 {
-        return Err(ddl_err(
-            "42601",
-            "syntax: CREATE SPARSE INDEX [name] ON <collection> (<field>)",
-        ));
-    }
+    // This surface carries no options, so any trailing token is a statement
+    // the handler does not implement rather than one it may ignore.
+    let stmt = parse_index_statement(sql, LEADING, &HEADER, &[], CONTEXT)?;
 
-    let (index_name, on_idx) = if parts[3].eq_ignore_ascii_case("ON") {
-        ("_auto_sparse".to_string(), 3)
-    } else {
-        if parts.len() < 7 || !parts[4].eq_ignore_ascii_case("ON") {
-            return Err(ddl_err("42601", "expected ON after index name"));
-        }
-        (parts[3].to_string(), 4)
+    let index_name = &stmt.header.name;
+    let collection = &stmt.header.collection;
+    let field = match stmt.header.column() {
+        "" => DEFAULT_FIELD,
+        named => named,
     };
-
-    let collection = parts
-        .get(on_idx + 1)
-        .ok_or_else(|| ddl_err("42601", "expected collection name after ON"))?;
-
-    let field = parts
-        .get(on_idx + 2)
-        .map(|s| s.trim_matches(|c| c == '(' || c == ')'))
-        .unwrap_or("_sparse");
-
     let tenant_id = identity.tenant_id;
 
     crate::control::server::shared::ddl::owner::propose_owner(
         state,
         "sparse_index",
         tenant_id,
-        &index_name,
+        index_name,
         &identity.username,
     )?;
 
@@ -57,7 +58,51 @@ pub fn create_sparse_index(
     );
 
     Ok(vec![DdlResult::Status {
-        command: "CREATE SPARSE INDEX".to_string(),
+        command: CONTEXT.to_string(),
         rows_affected: None,
     }])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::options::IndexStatement;
+    use super::*;
+
+    fn parse(sql: &str) -> Result<IndexStatement, DdlError> {
+        parse_index_statement(sql, LEADING, &HEADER, &[], CONTEXT)
+    }
+
+    #[test]
+    fn name_is_optional() {
+        assert_eq!(
+            parse("CREATE SPARSE INDEX ON docs (terms)")
+                .unwrap()
+                .header
+                .name,
+            "_auto_sparse"
+        );
+        assert_eq!(
+            parse("CREATE SPARSE INDEX idx ON docs (terms)")
+                .unwrap()
+                .header
+                .name,
+            "idx"
+        );
+    }
+
+    #[test]
+    fn field_is_optional() {
+        assert_eq!(
+            parse("CREATE SPARSE INDEX ON docs")
+                .unwrap()
+                .header
+                .column(),
+            ""
+        );
+    }
+
+    #[test]
+    fn unrecognized_trailing_tokens_are_rejected() {
+        assert!(parse("CREATE SPARSE INDEX ON docs (terms) USING SOMETHING").is_err());
+    }
 }

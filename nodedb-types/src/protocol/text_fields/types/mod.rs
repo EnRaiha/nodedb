@@ -378,6 +378,11 @@ pub struct TextFields {
     /// Index type ("hnsw", "hnsw_pq", "ivf_pq").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_type: Option<String>,
+    /// Declared vector dimension, enforced against every vector written to
+    /// the field. `None` = not declared; the index adopts the width of the
+    /// first vector it sees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_dim: Option<u32>,
 
     // ── Database context ─────────────────────────────────────
     /// Target database name sent in the `Auth` handshake frame.

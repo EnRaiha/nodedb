@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Protocol-neutral CREATE SPATIAL INDEX DDL handling.
+//! Protocol-neutral `CREATE SPATIAL INDEX` DDL handling.
 //!
 //! Syntax:
 //! ```sql
-//! CREATE SPATIAL INDEX <name> ON <collection>(<field>) [USING RTREE|GEOHASH] [PRECISION <n>]
+//! CREATE SPATIAL INDEX [IF NOT EXISTS] [<name>] ON <collection>(<field>)
+//!     [USING RTREE|GEOHASH] [PRECISION <n>]
 //! DROP INDEX <name>   -- handled by existing DROP INDEX path
 //! ```
+//!
+//! `ON <collection> FIELDS <field>` is accepted as an equivalent spelling of
+//! the parenthesized column. Parsing goes through the shared index-DDL grammar
+//! so an unknown `USING` value, an out-of-range `PRECISION`, and any leftover
+//! token are rejected rather than replaced by a default the statement never
+//! asked for.
 //!
 //! The handler builds [`DdlResult`](super::super::result::DdlResult) directly
 //! and carries no pgwire types.
@@ -16,45 +23,56 @@ use crate::control::state::SharedState;
 
 use super::super::owner;
 use super::super::result::{DdlError, DdlResult};
+use super::dsl::options::{
+    ColumnMode, HeaderSpec, NameMode, OptionSpec, closed_set, parse_index_statement,
+};
 
-/// CREATE SPATIAL INDEX <name> ON <collection>(<field>) [USING RTREE|GEOHASH] [PRECISION <n>]
+const CONTEXT: &str = "CREATE SPATIAL INDEX";
+const LEADING: &[&str] = &["CREATE", "SPATIAL", "INDEX"];
+
+const SYNTAX: &str = "CREATE SPATIAL INDEX [IF NOT EXISTS] [<name>] ON <collection>(<field>) \
+     [USING RTREE|GEOHASH] [PRECISION <1-12>]";
+
+const HEADER: HeaderSpec = HeaderSpec {
+    name: NameMode::Optional {
+        fallback: "_auto_spatial",
+    },
+    columns: ColumnMode::ExactlyOne,
+    syntax: SYNTAX,
+};
+
+const OPTIONS: &[OptionSpec] = &[OptionSpec::ident("USING"), OptionSpec::uint("PRECISION")];
+
+const KNOWN_INDEX_TYPES: &[&str] = &["rtree", "geohash"];
+
+/// Geohash cells are encoded in base-32 characters; twelve is the finest
+/// resolution the encoder produces.
+const MAX_GEOHASH_PRECISION: usize = 12;
+
+/// Default geohash resolution — roughly a 1 km cell, the useful middle of the
+/// range for the point-proximity queries this index serves.
+const DEFAULT_GEOHASH_PRECISION: usize = 6;
+
+/// `CREATE SPATIAL INDEX [IF NOT EXISTS] [<name>] ON <collection>(<field>)
+///  [USING RTREE|GEOHASH] [PRECISION <n>]`
 pub fn create_spatial_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    parts: &[&str],
+    sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    // Minimum: CREATE SPATIAL INDEX name ON collection(field)
-    if parts.len() < 6 {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "syntax: CREATE SPATIAL INDEX <name> ON <collection>(<field>) [USING RTREE|GEOHASH] [PRECISION <n>]".to_string(),
-        });
-    }
+    let stmt = parse_index_statement(sql, LEADING, &HEADER, OPTIONS, CONTEXT)?;
 
-    let index_name = parts[3];
-    if !parts[4].eq_ignore_ascii_case("ON") {
-        return Err(DdlError {
-            sqlstate: "42601".to_string(),
-            message: "expected ON after index name".to_string(),
-        });
-    }
+    let index_type = match stmt.options.text("USING") {
+        Some(value) => closed_set(value, KNOWN_INDEX_TYPES, "index type", CONTEXT)?,
+        None => "rtree".to_string(),
+    };
 
-    // Parse collection(field) — field may be in the same token or next token.
-    let collection_field = parts[5];
-    let (collection, field) = parse_collection_field(collection_field, parts.get(6).copied())?;
+    let precision = resolve_precision(&index_type, stmt.options.uint("PRECISION"))?;
 
+    let index_name = &stmt.header.name;
+    let collection = &stmt.header.collection;
+    let field = stmt.header.column();
     let tenant_id = identity.tenant_id;
-
-    // Parse optional USING and PRECISION.
-    let upper_parts: Vec<String> = parts.iter().map(|p| p.to_uppercase()).collect();
-    let index_type = parse_index_type(&upper_parts);
-    let precision = parse_precision(&upper_parts);
-
-    // Validate index type / field combination.
-    if index_type == "geohash" && precision == 0 {
-        // Default geohash precision.
-        let _precision = 6;
-    }
 
     owner::propose_owner(
         state,
@@ -69,74 +87,124 @@ pub fn create_spatial_index(
         Some(tenant_id),
         &identity.username,
         &format!(
-            "created spatial index '{index_name}' on '{collection}'({field}) using {index_type}{}",
-            if precision > 0 {
-                format!(" precision {precision}")
-            } else {
-                String::new()
+            "created spatial index '{index_name}' on '{collection}'({field}) \
+             using {index_type}{}",
+            match precision {
+                Some(p) => format!(" precision {p}"),
+                None => String::new(),
             }
         ),
     );
 
     Ok(vec![DdlResult::Status {
-        command: "CREATE SPATIAL INDEX".to_string(),
+        command: CONTEXT.to_string(),
         rows_affected: None,
     }])
 }
 
-/// Parse "collection(field)" or "collection" + "(field)".
-fn parse_collection_field(first: &str, second: Option<&str>) -> Result<(String, String), DdlError> {
-    // Try "collection(field)" format.
-    if let Some(paren_pos) = first.find('(') {
-        let collection = &first[..paren_pos];
-        let field = first[paren_pos + 1..].trim_end_matches(')').trim();
-        if collection.is_empty() || field.is_empty() {
-            return Err(DdlError {
+/// Resolve the geohash resolution, or reject a `PRECISION` that cannot apply.
+///
+/// The bound is a real limit of the encoder, so a value past it is a statement
+/// that cannot be honoured — clamping it silently builds an index at a
+/// resolution other than the one requested.
+fn resolve_precision(
+    index_type: &str,
+    requested: Option<usize>,
+) -> Result<Option<usize>, DdlError> {
+    if index_type != "geohash" {
+        return match requested {
+            None => Ok(None),
+            Some(_) => Err(DdlError {
                 sqlstate: "42601".to_string(),
-                message: "expected collection(field) format".to_string(),
-            });
-        }
-        return Ok((collection.to_string(), field.to_string()));
+                message: format!("{CONTEXT}: PRECISION applies only to USING GEOHASH"),
+            }),
+        };
     }
 
-    // Try "collection" + "(field)" as separate tokens.
-    if let Some(second) = second {
-        let field = second.trim_matches(|c| c == '(' || c == ')').trim();
-        if !field.is_empty() {
-            return Ok((first.to_string(), field.to_string()));
-        }
+    match requested {
+        None => Ok(Some(DEFAULT_GEOHASH_PRECISION)),
+        Some(p) if (1..=MAX_GEOHASH_PRECISION).contains(&p) => Ok(Some(p)),
+        Some(p) => Err(DdlError {
+            sqlstate: "22023".to_string(),
+            message: format!(
+                "{CONTEXT}: PRECISION must be between 1 and {MAX_GEOHASH_PRECISION}, got {p}"
+            ),
+        }),
     }
-
-    Err(DdlError {
-        sqlstate: "42601".to_string(),
-        message: "expected collection(field) after ON".to_string(),
-    })
 }
 
-/// Parse USING clause: RTREE (default) or GEOHASH.
-fn parse_index_type(upper_parts: &[String]) -> &'static str {
-    for (i, part) in upper_parts.iter().enumerate() {
-        if part == "USING"
-            && let Some(next) = upper_parts.get(i + 1)
-        {
-            return match next.as_str() {
-                "GEOHASH" => "geohash",
-                _ => "rtree",
-            };
-        }
-    }
-    "rtree"
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::server::shared::ddl::neutral::dsl::options::IndexStatement;
 
-/// Parse PRECISION clause for geohash.
-fn parse_precision(upper_parts: &[String]) -> u8 {
-    for (i, part) in upper_parts.iter().enumerate() {
-        if part == "PRECISION"
-            && let Some(next) = upper_parts.get(i + 1)
-            && let Ok(p) = next.parse::<u8>()
-        {
-            return p.min(12);
-        }
+    fn parse(sql: &str) -> Result<IndexStatement, DdlError> {
+        parse_index_statement(sql, LEADING, &HEADER, OPTIONS, CONTEXT)
     }
-    0
+
+    #[test]
+    fn documented_fields_form_is_accepted() {
+        let stmt = parse("CREATE SPATIAL INDEX ON restaurants FIELDS location").unwrap();
+        assert_eq!(stmt.header.collection, "restaurants");
+        assert_eq!(stmt.header.column(), "location");
+        assert_eq!(stmt.header.name, "_auto_spatial");
+    }
+
+    #[test]
+    fn documented_unnamed_paren_form_is_accepted() {
+        let stmt = parse("CREATE SPATIAL INDEX ON locations(geom) USING RTREE").unwrap();
+        assert_eq!(stmt.header.collection, "locations");
+        assert_eq!(stmt.header.column(), "geom");
+        assert_eq!(stmt.options.text("USING"), Some("RTREE"));
+    }
+
+    #[test]
+    fn named_form_still_parses() {
+        let stmt = parse("CREATE SPATIAL INDEX idx_geo ON locations (geom)").unwrap();
+        assert_eq!(stmt.header.name, "idx_geo");
+    }
+
+    #[test]
+    fn unknown_index_type_is_rejected() {
+        let opts = parse("CREATE SPATIAL INDEX ON l(geom) USING QUADTREE").unwrap();
+        let err = closed_set(
+            opts.options.text("USING").unwrap(),
+            KNOWN_INDEX_TYPES,
+            "index type",
+            CONTEXT,
+        )
+        .unwrap_err();
+        assert!(err.message.to_lowercase().contains("quadtree"));
+    }
+
+    #[test]
+    fn non_numeric_precision_is_rejected() {
+        assert!(parse("CREATE SPATIAL INDEX ON l(geom) USING GEOHASH PRECISION high").is_err());
+    }
+
+    #[test]
+    fn unrecognized_trailing_tokens_are_rejected() {
+        assert!(parse("CREATE SPATIAL INDEX ON l(geom) WITH (index = 'rtree')").is_err());
+    }
+
+    #[test]
+    fn geohash_defaults_to_a_stated_precision() {
+        assert_eq!(
+            resolve_precision("geohash", None).unwrap(),
+            Some(DEFAULT_GEOHASH_PRECISION)
+        );
+    }
+
+    #[test]
+    fn out_of_range_precision_is_rejected_not_clamped() {
+        assert!(resolve_precision("geohash", Some(99)).is_err());
+        assert!(resolve_precision("geohash", Some(0)).is_err());
+        assert_eq!(resolve_precision("geohash", Some(12)).unwrap(), Some(12));
+    }
+
+    #[test]
+    fn precision_on_an_rtree_is_rejected() {
+        assert!(resolve_precision("rtree", Some(6)).is_err());
+        assert_eq!(resolve_precision("rtree", None).unwrap(), None);
+    }
 }

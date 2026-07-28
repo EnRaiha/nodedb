@@ -39,6 +39,12 @@ CREATE SEARCH INDEX ON articles FIELDS title, body
     ANALYZER 'english'
     FUZZY true;
 
+-- `CREATE FULLTEXT INDEX` is an exact alias, and the column list may also be
+-- written in parentheses. ANALYZER takes 'standard' or a supported language
+-- name; an unknown name is rejected rather than silently falling back.
+-- FUZZY sets the collection default — queries may still opt in per call.
+CREATE FULLTEXT INDEX idx_articles_text ON articles (title, body) ANALYZER 'english';
+
 -- Basic search with text_match
 SELECT title, bm25_score(body, 'distributed database rust') AS score
 FROM articles

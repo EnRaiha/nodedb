@@ -20,8 +20,9 @@
 //! aggregation in the path.
 //!
 //! `CREATE FULLTEXT INDEX` is the documented keyword alias of
-//! `CREATE SEARCH INDEX`; both DDL handlers share the same data-plane
-//! wire-up gap and both keywords must populate the same indexer.
+//! `CREATE SEARCH INDEX`; both keywords must populate the same indexer, and
+//! both must read the same statement the same way — the two spellings of the
+//! column list, the analyzer name, and any token neither understands.
 
 mod common;
 
@@ -98,7 +99,9 @@ async fn bm25_score_strict_returns_non_null_for_indexed_rows() {
     let server = TestServer::start().await;
     server.exec(STRICT_DDL).await.unwrap();
     server
-        .exec("CREATE SEARCH INDEX idx_strict_bm25 ON docs_strict FIELDS content ANALYZER 'simple'")
+        .exec(
+            "CREATE SEARCH INDEX idx_strict_bm25 ON docs_strict FIELDS content ANALYZER 'standard'",
+        )
         .await
         .unwrap();
     seed_three(&server, "docs_strict").await;
@@ -110,7 +113,7 @@ async fn bm25_score_strict_returns_non_null_for_indexed_rows() {
     assert_eq!(rows.len(), 3, "expected 3 rows, got {rows:?}");
 
     let pairs = id_score_pairs(&rows);
-    assert_term_rows_scored(&pairs, "strict / simple analyzer");
+    assert_term_rows_scored(&pairs, "strict / standard analyzer");
 }
 
 // ── 2. Schemaless control: same INSERTs / index produce non-NULL scores ────
@@ -123,7 +126,7 @@ async fn bm25_score_schemaless_control_returns_non_null_for_indexed_rows() {
     let server = TestServer::start().await;
     server.exec(SCHEMALESS_DDL).await.unwrap();
     server
-        .exec("CREATE SEARCH INDEX idx_schemaless_bm25 ON docs_schemaless FIELDS content ANALYZER 'simple'")
+        .exec("CREATE SEARCH INDEX idx_schemaless_bm25 ON docs_schemaless FIELDS content ANALYZER 'standard'")
         .await
         .unwrap();
     seed_three(&server, "docs_schemaless").await;
@@ -138,17 +141,17 @@ async fn bm25_score_schemaless_control_returns_non_null_for_indexed_rows() {
     assert_term_rows_scored(&pairs, "schemaless control");
 }
 
-// ── 3. Strict-doc must work under a non-'simple' analyzer ─────────────────
+// ── 3. Strict-doc must work under a stemming language analyzer ────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bm25_score_strict_works_under_standard_analyzer() {
-    // The bug is at the write site, not the analyzer — every analyzer
-    // must see the same indexed content. If only `simple` worked, the
-    // fix would be analyzer-specific and the systemic flaw would remain.
+async fn bm25_score_strict_works_under_language_analyzer() {
+    // The bug is at the write site, not the analyzer — every analyzer must
+    // see the same indexed content. If only the default worked, the fix
+    // would be analyzer-specific and the systemic flaw would remain.
     let server = TestServer::start().await;
     server.exec(STRICT_DDL).await.unwrap();
     server
-        .exec("CREATE SEARCH INDEX idx_strict_standard ON docs_strict FIELDS content ANALYZER 'standard'")
+        .exec("CREATE SEARCH INDEX idx_strict_standard ON docs_strict FIELDS content ANALYZER 'english'")
         .await
         .unwrap();
     seed_three(&server, "docs_strict").await;
@@ -156,27 +159,25 @@ async fn bm25_score_strict_works_under_standard_analyzer() {
     let rows = server
         .query_rows("SELECT id, bm25_score(content, 'consensus') FROM docs_strict ORDER BY id")
         .await
-        .expect("bm25_score under standard analyzer must succeed");
+        .expect("bm25_score under a language analyzer must succeed");
     assert_eq!(rows.len(), 3, "expected 3 rows, got {rows:?}");
 
     let pairs = id_score_pairs(&rows);
-    assert_term_rows_scored(&pairs, "strict / standard analyzer");
+    assert_term_rows_scored(&pairs, "strict / english analyzer");
 }
 
 // ── 4. CREATE FULLTEXT INDEX (alias) must wire the same indexer ────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fulltext_index_keyword_populates_strict_inverted_index() {
-    // `CREATE FULLTEXT INDEX` and `CREATE SEARCH INDEX` are documented
-    // as equivalents. Both DDL handlers currently only record ownership
-    // and audit — neither dispatches to the data plane to populate the
-    // index. The same observable failure mode (NULL bm25 score on rows
-    // that contain the term) must be captured for both keywords so a
-    // fix has to wire both, not one.
+    // `CREATE FULLTEXT INDEX` and `CREATE SEARCH INDEX` are documented as
+    // equivalents. The same observable failure mode (NULL bm25 score on rows
+    // that contain the term) is captured for both keywords so neither can be
+    // wired without the other.
     let server = TestServer::start().await;
     server.exec(STRICT_DDL).await.unwrap();
     server
-        .exec("CREATE FULLTEXT INDEX idx_strict_fulltext ON docs_strict FIELDS content ANALYZER 'simple'")
+        .exec("CREATE FULLTEXT INDEX idx_strict_fulltext ON docs_strict FIELDS content ANALYZER 'standard'")
         .await
         .unwrap();
     seed_three(&server, "docs_strict").await;
@@ -206,7 +207,7 @@ async fn bm25_score_strict_indexes_existing_rows_when_index_created_after_insert
     seed_three(&server, "docs_strict").await;
     server
         .exec(
-            "CREATE SEARCH INDEX idx_strict_after ON docs_strict FIELDS content ANALYZER 'simple'",
+            "CREATE SEARCH INDEX idx_strict_after ON docs_strict FIELDS content ANALYZER 'standard'",
         )
         .await
         .unwrap();
@@ -219,4 +220,89 @@ async fn bm25_score_strict_indexes_existing_rows_when_index_created_after_insert
 
     let pairs = id_score_pairs(&rows);
     assert_term_rows_scored(&pairs, "strict / DDL after INSERT");
+}
+
+// ── 6. CREATE FULLTEXT INDEX statement shapes ──────────────────────────────
+//
+// The handler reads the field name out of a fixed token position, so the
+// documented `collection(field)` spelling fails the length check and a
+// comma-separated field list is read as a single field named `title,` with
+// the remaining columns dropped. Both mean the statement the user wrote and
+// the index the server built do not agree.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_fulltext_index_accepts_documented_paren_column_form() {
+    // `CREATE FULLTEXT INDEX <name> ON <collection>(<field>)` is the form
+    // shown in `docs/query-language.md`.
+    let server = TestServer::start().await;
+    server.exec(STRICT_DDL).await.unwrap();
+    server
+        .exec("CREATE FULLTEXT INDEX idx_strict_paren ON docs_strict(content)")
+        .await
+        .expect("documented collection(field) form must be accepted");
+    seed_three(&server, "docs_strict").await;
+
+    let rows = server
+        .query_rows("SELECT id, bm25_score(content, 'consensus') FROM docs_strict ORDER BY id")
+        .await
+        .expect("bm25_score after the documented CREATE form must succeed");
+    assert_eq!(rows.len(), 3, "expected 3 rows, got {rows:?}");
+    assert_term_rows_scored(&id_score_pairs(&rows), "strict / documented paren form");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_fulltext_index_covers_every_field_in_a_list() {
+    // A comma-separated field list must index every named field — the
+    // `CREATE SEARCH INDEX ... FIELDS a, b` alias accepts one, so users
+    // reasonably write one here. Today only the first token is read (with
+    // its trailing comma attached) and the rest are dropped in silence.
+    let server = TestServer::start().await;
+    server
+        .exec(
+            "CREATE COLLECTION docs_two TYPE DOCUMENT STRICT (\
+               id STRING PRIMARY KEY, title STRING, content STRING\
+             )",
+        )
+        .await
+        .unwrap();
+    server
+        .exec("CREATE FULLTEXT INDEX idx_two ON docs_two (title, content)")
+        .await
+        .expect("multi-field CREATE FULLTEXT INDEX must be accepted");
+    server
+        .exec(
+            "INSERT INTO docs_two (id, title, content) VALUES \
+             ('r0', 'consensus notes', 'replication log')",
+        )
+        .await
+        .unwrap();
+
+    // The *second* field in the list is the one silently dropped today.
+    let rows = server
+        .query_rows("SELECT id, bm25_score(content, 'replication') FROM docs_two ORDER BY id")
+        .await
+        .expect("bm25_score on the second listed field must succeed");
+    assert_eq!(rows.len(), 1, "expected 1 row, got {rows:?}");
+    let score = rows[0][1].trim().parse::<f64>().ok();
+    assert!(
+        score.is_some_and(|s| s > 0.0),
+        "bm25_score on `content` must be positive — a NULL cell means the \
+         second field of the list was never indexed; got {:?}",
+        rows[0][1]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_fulltext_index_rejects_unrecognized_trailing_tokens() {
+    // Tokens past the field name are dropped, so an unsupported clause reads
+    // as a successful CREATE and the option it carried is never applied.
+    let server = TestServer::start().await;
+    server.exec(STRICT_DDL).await.unwrap();
+    server
+        .expect_error(
+            "CREATE FULLTEXT INDEX idx_strict_tail ON docs_strict (content) \
+             WITH (analyzer = 'simple')",
+            "unrecognized option 'WITH'",
+        )
+        .await;
 }

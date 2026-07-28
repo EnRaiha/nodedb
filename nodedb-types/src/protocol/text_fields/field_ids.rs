@@ -95,3 +95,4 @@ pub(super) const FID_LIST_INDEX: u16 = 86;
 pub(super) const FID_LIST_FROM_INDEX: u16 = 87;
 pub(super) const FID_LIST_TO_INDEX: u16 = 88;
 pub(super) const FID_LIST_FIELDS_JSON: u16 = 89;
+pub(super) const FID_VECTOR_DIM: u16 = 90;

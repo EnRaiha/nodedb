@@ -77,6 +77,8 @@ pub enum ReplicatedWrite {
         collection: String,
         #[serde(default)]
         field_name: String,
+        #[serde(default)]
+        dim: usize,
         m: usize,
         ef_construction: usize,
         metric: String,

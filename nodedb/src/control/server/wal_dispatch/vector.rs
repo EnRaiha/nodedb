@@ -348,6 +348,7 @@ pub(crate) fn wal_append_vector_op(
         VectorOp::SetParams {
             collection,
             field_name,
+            dim,
             m,
             ef_construction,
             metric,
@@ -356,8 +357,9 @@ pub(crate) fn wal_append_vector_op(
             ivf_cells,
             ivf_nprobe,
         } => {
-            // `field_name` is appended last so older 4-/8-element WAL records
-            // still decode (replay reads the leading positions first).
+            // Fields are appended, never reordered, so older 4-/8-/9-element
+            // WAL records still decode (replay reads the leading positions
+            // first and falls back on the shorter shapes).
             let entry = zerompk::to_msgpack_vec(&(
                 collection,
                 m,
@@ -368,6 +370,7 @@ pub(crate) fn wal_append_vector_op(
                 ivf_cells,
                 ivf_nprobe,
                 field_name,
+                dim,
             ))
             .map_err(|e| crate::Error::Serialization {
                 format: "msgpack".into(),

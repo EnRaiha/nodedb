@@ -82,6 +82,16 @@ impl<B: FtsBackend> FtsIndex<B> {
             mode,
             prefilter,
         } = params;
+        // A collection configured with `FUZZY true` falls back to fuzzy
+        // matching even when the query did not ask for it — that is what
+        // makes it an index property rather than a per-query flag. Resolved
+        // here, at the one point every search path funnels through, so no
+        // caller can be wired up without it.
+        let fuzzy_enabled = fuzzy_enabled
+            || self
+                .get_collection_fuzzy(database_id, tid, collection)
+                .map_err(FtsIndexError::backend)?;
+
         // Parse the query for NOT / - negation operators before analysis.
         let parsed = parse_query(query)?;
 

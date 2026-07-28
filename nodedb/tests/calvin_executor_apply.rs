@@ -161,6 +161,7 @@ fn calvin_static_apply_failure_rolls_back_cleanly() {
         PhysicalPlan::Vector(VectorOp::SetParams {
             collection: "vec_coll".to_string(),
             field_name: String::new(),
+            dim: 3,
             m: 16,
             ef_construction: 200,
             metric: "cosine".into(),

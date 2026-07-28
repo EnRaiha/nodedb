@@ -56,13 +56,13 @@ impl CoreLoop {
     pub(in crate::data::executor) fn update_reindex_vector_indexes(
         &mut self,
         p: UpdateVectorReindex<'_>,
-    ) {
+    ) -> crate::Result<()> {
         // Gate: skip all vector work unless this collection has a vector index.
         // Trusts the caller's precomputed `has_vectors` instead of recomputing
         // it here, so a caller looping over N rows pays for the (unindexed,
         // `vector_params`-scanning) schemaless check once, not once per row.
         if !p.has_vectors {
-            return;
+            return Ok(());
         }
 
         // Remove the surrogate's old vector nodes (and their reverse-map
@@ -87,13 +87,13 @@ impl CoreLoop {
                 p.collection.to_string(),
             );
             let Some(config) = self.doc_configs.get(&config_key) else {
-                return;
+                return Ok(());
             };
             let Some(doc) = self.decode_stored_document(config, p.new_body) else {
-                return;
+                return Ok(());
             };
             let Ok(mp) = nodedb_types::json_to_msgpack(&doc) else {
-                return;
+                return Ok(());
             };
             owned_mp = mp;
             &owned_mp
@@ -112,6 +112,7 @@ impl CoreLoop {
             surrogate: p.surrogate,
             value: mp,
             wal_lsn: 0,
-        });
+        })?;
+        Ok(())
     }
 }
