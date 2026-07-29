@@ -12,6 +12,7 @@ use super::aliases::resolve_order_by_target;
 use super::triggers::try_extract_sort_search;
 use crate::error::Result;
 use crate::functions::registry::FunctionRegistry;
+use crate::planner::agg_bind::{BindName, bind_aggregate_calls};
 use crate::resolver::expr::convert_expr;
 use crate::types::*;
 
@@ -52,17 +53,52 @@ pub(in crate::planner::select) fn apply_order_by(
         return Ok(search_plan);
     }
 
-    // Normal sort keys.
-    let sort_keys: Vec<SortKey> = exprs
-        .iter()
-        .map(|o| {
-            Ok(SortKey {
-                expr: convert_expr(&o.expr)?,
-                ascending: o.options.asc.unwrap_or(true),
-                nulls_first: o.options.nulls_first.unwrap_or(false),
+    // After GROUP BY, an ORDER BY term may name an aggregate — projected or
+    // not — or compute over one. Those values exist only once the groups are
+    // finalized, so each call is bound to the column it lands in and any
+    // aggregate the sort alone introduces joins the computed list.
+    let mut bound_aggregates: Option<Vec<AggregateExpr>> = None;
+    let sort_keys: Vec<SortKey> = if let SqlPlan::Aggregate { aggregates, .. } = plan {
+        let mut extended = aggregates.clone();
+        let keys = exprs
+            .iter()
+            .map(|o| {
+                // ORDER BY sorts after aggregates are renamed to their user
+                // aliases, so the key must address the output name.
+                let bound = bind_aggregate_calls(
+                    &o.expr,
+                    select_items,
+                    &mut extended,
+                    functions,
+                    BindName::Output,
+                )?;
+                Ok(SortKey {
+                    expr: convert_expr(&bound)?,
+                    ascending: o.options.asc.unwrap_or(true),
+                    nulls_first: o
+                        .options
+                        .nulls_first
+                        .unwrap_or(!o.options.asc.unwrap_or(true)),
+                })
             })
-        })
-        .collect::<Result<_>>()?;
+            .collect::<Result<Vec<_>>>()?;
+        bound_aggregates = Some(extended);
+        keys
+    } else {
+        exprs
+            .iter()
+            .map(|o| {
+                Ok(SortKey {
+                    expr: convert_expr(&o.expr)?,
+                    ascending: o.options.asc.unwrap_or(true),
+                    nulls_first: o
+                        .options
+                        .nulls_first
+                        .unwrap_or(!o.options.asc.unwrap_or(true)),
+                })
+            })
+            .collect::<Result<_>>()?
+    };
 
     match plan {
         SqlPlan::Scan {
@@ -111,7 +147,7 @@ pub(in crate::planner::select) fn apply_order_by(
             group_by: group_by.clone(),
             group_by_aliases: group_by_aliases.clone(),
             output_order: output_order.clone(),
-            aggregates: aggregates.clone(),
+            aggregates: bound_aggregates.unwrap_or_else(|| aggregates.clone()),
             having: having.clone(),
             limit: *limit,
             grouping_sets: grouping_sets.clone(),

@@ -18,7 +18,10 @@ pub fn convert_sort_keys(exprs: &[sqlparser::ast::OrderByExpr]) -> Result<Vec<So
             Ok(SortKey {
                 expr: convert_expr(&o.expr)?,
                 ascending: o.options.asc.unwrap_or(true),
-                nulls_first: o.options.nulls_first.unwrap_or(false),
+                nulls_first: o
+                    .options
+                    .nulls_first
+                    .unwrap_or(!o.options.asc.unwrap_or(true)),
             })
         })
         .collect()

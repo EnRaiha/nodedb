@@ -284,7 +284,9 @@ impl CoreLoop {
                 // before truncating to LIMIT so the visible top-N
                 // reflects the requested sort, not hash-map iteration
                 // order.
-                sort_aggregated_rows(&mut agg_result.rows, sort_keys);
+                if let Err(e) = sort_aggregated_rows(&mut agg_result.rows, sort_keys) {
+                    return self.response_error(task, e);
+                }
                 agg_result.rows.truncate(limit);
 
                 return match crate::data::executor::response_codec::encode_json_vec(

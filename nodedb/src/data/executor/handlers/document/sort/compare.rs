@@ -62,9 +62,14 @@ pub(in crate::data::executor) fn compare_sort_values(
         let (Some(va), Some(vb)) = (a.get(idx), b.get(idx)) else {
             continue;
         };
-        let ord = compare_json(va, vb);
+        // NULL placement is decided by the key's NULLS FIRST/LAST setting and
+        // is never flipped by the sort direction.
+        let ord = match key.order_nulls(va.is_null(), vb.is_null()) {
+            Some(ord) => ord,
+            None => key.direct(compare_json(va, vb)),
+        };
         if ord != std::cmp::Ordering::Equal {
-            return if key.ascending { ord } else { ord.reverse() };
+            return ord;
         }
     }
     std::cmp::Ordering::Equal
@@ -89,14 +94,20 @@ pub(in crate::data::executor) fn compare_docs_by_keys_binary(
         let a_range = msgpack_scan::extract_field(a_bytes, 0, field);
         let b_range = msgpack_scan::extract_field(b_bytes, 0, field);
 
-        let cmp = match (a_range, b_range) {
-            (Some(ar), Some(br)) => msgpack_scan::compare_field_bytes(a_bytes, ar, b_bytes, br),
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (None, None) => std::cmp::Ordering::Equal,
+        // An absent field and a stored NULL are both NULL for ordering, and
+        // their placement follows the key's NULLS FIRST/LAST setting.
+        let ordered = match key.order_nulls(
+            is_null_range(a_bytes, a_range),
+            is_null_range(b_bytes, b_range),
+        ) {
+            Some(ord) => ord,
+            None => match (a_range, b_range) {
+                (Some(ar), Some(br)) => {
+                    key.direct(msgpack_scan::compare_field_bytes(a_bytes, ar, b_bytes, br))
+                }
+                _ => std::cmp::Ordering::Equal,
+            },
         };
-
-        let ordered = if key.ascending { cmp } else { cmp.reverse() };
         if ordered != std::cmp::Ordering::Equal {
             return ordered;
         }
@@ -129,5 +140,15 @@ pub(in crate::data::executor) fn decode_sort_values(bytes: &[u8]) -> crate::Resu
             engine: "sort".into(),
             detail: format!("sort run corrupt: key values undecodable: {e}"),
         }),
+    }
+}
+
+/// Whether an extracted field range is SQL NULL: the field is absent, or the
+/// bytes it points at are a msgpack nil.
+pub(in crate::data::executor) fn is_null_range(doc: &[u8], range: Option<(usize, usize)>) -> bool {
+    const MSGPACK_NIL: u8 = 0xc0;
+    match range {
+        None => true,
+        Some((start, _)) => doc.get(start) == Some(&MSGPACK_NIL),
     }
 }

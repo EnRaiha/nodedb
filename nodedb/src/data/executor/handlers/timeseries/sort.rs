@@ -122,9 +122,14 @@ fn compare_key_rows(a: &[rmpv::Value], b: &[rmpv::Value], sort_keys: &[SortKeySp
     for (idx, key) in sort_keys.iter().enumerate() {
         let av = a.get(idx).filter(|v| !matches!(v, rmpv::Value::Nil));
         let bv = b.get(idx).filter(|v| !matches!(v, rmpv::Value::Nil));
-        let ord = compare_values(av, bv);
+        // NULL placement comes from the key's NULLS FIRST/LAST setting, which
+        // the sort direction never flips.
+        let ord = match key.order_nulls(av.is_none(), bv.is_none()) {
+            Some(ord) => ord,
+            None => key.direct(compare_values(av, bv)),
+        };
         if ord != Ordering::Equal {
-            return if key.ascending { ord } else { ord.reverse() };
+            return ord;
         }
     }
     Ordering::Equal

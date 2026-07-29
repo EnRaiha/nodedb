@@ -11,6 +11,7 @@ use nodedb_physical::physical_plan::*;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::super::convert::{ConvertContext, db_qualified};
+use super::super::expr::convert_sort_keys;
 use super::super::filter::serialize_filters;
 use super::spec::{
     agg_expr_to_pair, agg_expr_to_spec, extract_collection_name, extract_scan_alias,
@@ -44,32 +45,12 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
         tenant_id,
         ctx,
     } = p;
-    // Encode SortKey expressions into the wire-friendly
-    // `(column_name, ascending)` shape. The post-aggregate sorter
-    // only supports bare column references — non-column sort
-    // expressions (e.g. `ORDER BY a + b`, `ORDER BY COUNT(*)`) need
-    // a dedicated post-aggregate projection step that is not yet
-    // wired through this path. Returning a typed error here surfaces
-    // the limitation up to the client; silently dropping such keys
-    // would yield unordered output that looks correct, which is the
-    // exact silent-narrowing class the audit guidance forbids.
-    let mut bridge_sort_keys: Vec<SortKeySpec> = Vec::with_capacity(sort_keys.len());
-    for k in sort_keys {
-        match &k.expr {
-            SqlExpr::Column { name, .. } => {
-                bridge_sort_keys.push(SortKeySpec::column(name.clone(), k.ascending))
-            }
-            other => {
-                return Err(crate::Error::PlanError {
-                    detail: format!(
-                        "ORDER BY after GROUP BY currently supports bare column references only; \
-                         expression {other:?} requires a post-aggregate projection step that is \
-                         not yet implemented"
-                    ),
-                });
-            }
-        }
-    }
+    // Post-aggregate sort keys are expressions over the finalized group row.
+    // The planner has already bound any aggregate call in them to the output
+    // column it lands in, so the executor evaluates them like any other row
+    // expression.
+    let bridge_sort_keys: Vec<SortKeySpec> = convert_sort_keys(sort_keys);
+
     // Check if aggregating over a join.
     if let SqlPlan::Join {
         left,

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod agg_bind;
 pub mod agg_naming;
 pub mod aggregate;
 pub mod aggregate_order;

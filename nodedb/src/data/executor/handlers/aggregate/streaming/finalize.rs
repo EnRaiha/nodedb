@@ -180,7 +180,7 @@ impl CoreLoop {
         apply_user_aliases_to_rows(&mut results, aggregates);
         // Post-aggregate ORDER BY: sort group rows before
         // truncating so LIMIT picks the requested top-N.
-        sort_aggregated_rows(&mut results, sort_keys);
+        sort_aggregated_rows(&mut results, sort_keys)?;
         results.truncate(limit);
 
         crate::data::executor::response_codec::encode_json_vec(&results)

@@ -250,7 +250,10 @@ fn plan_lateral_top_k(args: LateralTopKPlanArgs<'_>) -> Result<SqlPlan> {
                     convert_expr(&o.expr).ok().map(|expr| SortKey {
                         expr,
                         ascending: o.options.asc.unwrap_or(true),
-                        nulls_first: o.options.nulls_first.unwrap_or(false),
+                        nulls_first: o
+                            .options
+                            .nulls_first
+                            .unwrap_or(!o.options.asc.unwrap_or(true)),
                     })
                 })
                 .collect(),

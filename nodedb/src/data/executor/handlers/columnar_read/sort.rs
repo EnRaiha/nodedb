@@ -62,16 +62,22 @@ pub(in crate::data::executor) fn compare_sort_values(
     for (idx, key) in sort_keys.iter().enumerate() {
         let av = a.get(idx).unwrap_or(&Value::Null);
         let bv = b.get(idx).unwrap_or(&Value::Null);
-        let ord = compare_values(av, bv);
+        // NULL placement comes from the key's NULLS FIRST/LAST setting and is
+        // never reversed by the sort direction.
+        let ord = match key.order_nulls(matches!(av, Value::Null), matches!(bv, Value::Null)) {
+            Some(ord) => ord,
+            None => key.direct(compare_values(av, bv)),
+        };
         if ord != std::cmp::Ordering::Equal {
-            return if key.ascending { ord } else { ord.reverse() };
+            return ord;
         }
     }
     std::cmp::Ordering::Equal
 }
 
+/// Compare two non-NULL values. NULL handling lives in the caller, which
+/// applies the key's NULLS FIRST/LAST setting before reaching here.
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
-    // Null sorts last in ascending order (Postgres default).
     match (a, b) {
         (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
         (Value::Null, _) => std::cmp::Ordering::Greater,

@@ -35,31 +35,58 @@ pub(super) fn apply_user_aliases_to_rows(
 
 /// Sort finalized group rows by the post-aggregate ORDER BY terms.
 ///
-/// Each row is a `serde_json::Value::Object` keyed by output column name, and
-/// the planner rejects a post-aggregate ORDER BY that is not a bare output
-/// column, so every key here resolves by name. Keys missing from a row sort as
-/// null. The sort is stable to preserve relative order of equal-key rows.
+/// Each row is a `serde_json::Value::Object` keyed by output column name. A
+/// key naming one of those columns reads straight out of the row; a computed
+/// key (`ORDER BY 1000 / SUM(amount)`) is evaluated against it, with the
+/// planner having already bound each aggregate call to the column it lands in.
+///
+/// Evaluation is fallible — a zero divisor in a sort key fails the statement
+/// with SQLSTATE `22012` — so every row's keys are evaluated up front, where
+/// the error can propagate, rather than inside the comparator. Keys missing
+/// from a row sort as NULL, placed by the key's NULLS FIRST/LAST setting. The
+/// sort is stable to preserve relative order of equal-key rows.
 pub(super) fn sort_aggregated_rows(
     rows: &mut [serde_json::Value],
     sort_keys: &[nodedb_physical::physical_plan::SortKeySpec],
-) {
+) -> crate::Result<()> {
     if sort_keys.is_empty() {
-        return;
+        return Ok(());
     }
-    rows.sort_by(|a, b| {
-        for key in sort_keys {
-            let Some(column) = key.as_column() else {
-                continue;
+
+    let keyed: Vec<Vec<serde_json::Value>> = rows
+        .iter()
+        .map(|row| {
+            sort_keys
+                .iter()
+                .map(|k| nodedb_query::eval_expr_on_json(&k.expr, row).map_err(crate::Error::from))
+                .collect::<crate::Result<Vec<_>>>()
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&a, &b| {
+        for (idx, key) in sort_keys.iter().enumerate() {
+            let av = keyed[a].get(idx);
+            let bv = keyed[b].get(idx);
+            let ord = match key.order_nulls(
+                matches!(av, None | Some(serde_json::Value::Null)),
+                matches!(bv, None | Some(serde_json::Value::Null)),
+            ) {
+                Some(ord) => ord,
+                None => key.direct(compare_json_values(av, bv)),
             };
-            let av = a.get(column);
-            let bv = b.get(column);
-            let ord = compare_json_values(av, bv);
             if ord != std::cmp::Ordering::Equal {
-                return if key.ascending { ord } else { ord.reverse() };
+                return ord;
             }
         }
         std::cmp::Ordering::Equal
     });
+
+    let original = rows.to_vec();
+    for (dst, &src) in order.iter().enumerate() {
+        rows[dst] = original[src].clone();
+    }
+    Ok(())
 }
 
 /// Compare two `Option<&serde_json::Value>` for sort. Nulls / absent

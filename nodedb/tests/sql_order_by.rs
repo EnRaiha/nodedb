@@ -282,3 +282,114 @@ async fn order_by_expression_absent_from_projection_sorts_rows() {
          order means the sort key was silently dropped)"
     );
 }
+
+// ── NULL ordering ────────────────────────────────────────────────────────────
+//
+// PostgreSQL treats the placement of NULLs as part of the sort: `ASC` defaults
+// to NULLS LAST and `DESC` to NULLS FIRST, and an explicit `NULLS FIRST` /
+// `NULLS LAST` overrides that default *without* being flipped by the sort
+// direction. A key that carried only the direction had to guess, so half of
+// these four spellings answered with NULLs on the wrong end while reporting
+// success.
+
+/// Seed a collection where one row's sort column is NULL.
+async fn create_nullable(server: &TestServer, collection: &str) {
+    server
+        .exec(&format!(
+            "CREATE COLLECTION {collection} (id TEXT PRIMARY KEY, val INT) \
+             WITH (engine='document_strict')"
+        ))
+        .await
+        .unwrap();
+    server
+        .exec(&format!(
+            "INSERT INTO {collection} (id, val) VALUES ('a', 10)"
+        ))
+        .await
+        .unwrap();
+    server
+        .exec(&format!(
+            "INSERT INTO {collection} (id, val) VALUES ('n', NULL)"
+        ))
+        .await
+        .unwrap();
+    server
+        .exec(&format!(
+            "INSERT INTO {collection} (id, val) VALUES ('b', 20)"
+        ))
+        .await
+        .unwrap();
+}
+
+/// `ORDER BY col` (ascending, no NULLS clause) puts NULLs last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_by_ascending_defaults_to_nulls_last() {
+    let server = TestServer::start().await;
+    create_nullable(&server, "obn_asc").await;
+
+    let rows = server
+        .query_text("SELECT id FROM obn_asc ORDER BY val")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec!["a".to_string(), "b".to_string(), "n".to_string()],
+        "ascending sorts NULLs last by default; got {rows:?}"
+    );
+}
+
+/// `ORDER BY col DESC` (no NULLS clause) puts NULLs first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_by_descending_defaults_to_nulls_first() {
+    let server = TestServer::start().await;
+    create_nullable(&server, "obn_desc").await;
+
+    let rows = server
+        .query_text("SELECT id FROM obn_desc ORDER BY val DESC")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec!["n".to_string(), "b".to_string(), "a".to_string()],
+        "descending sorts NULLs first by default; got {rows:?}"
+    );
+}
+
+/// An explicit `NULLS FIRST` on an ascending sort overrides the default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_by_ascending_honors_explicit_nulls_first() {
+    let server = TestServer::start().await;
+    create_nullable(&server, "obn_af").await;
+
+    let rows = server
+        .query_text("SELECT id FROM obn_af ORDER BY val ASC NULLS FIRST")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec!["n".to_string(), "a".to_string(), "b".to_string()],
+        "explicit NULLS FIRST must override the ascending default; got {rows:?}"
+    );
+}
+
+/// An explicit `NULLS LAST` on a descending sort overrides the default — the
+/// NULL placement is not flipped by the direction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_by_descending_honors_explicit_nulls_last() {
+    let server = TestServer::start().await;
+    create_nullable(&server, "obn_dl").await;
+
+    let rows = server
+        .query_text("SELECT id FROM obn_dl ORDER BY val DESC NULLS LAST")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec!["b".to_string(), "a".to_string(), "n".to_string()],
+        "explicit NULLS LAST must override the descending default; got {rows:?}"
+    );
+}

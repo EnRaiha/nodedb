@@ -77,9 +77,14 @@ pub(in crate::data::executor) fn compare_key_rows(
         let (Some(va), Some(vb)) = (a.get(idx), b.get(idx)) else {
             continue;
         };
-        let ord = compare_json(va, vb);
+        // NULL placement follows the key's NULLS FIRST/LAST setting, which the
+        // sort direction never flips.
+        let ord = match key.order_nulls(va.is_null(), vb.is_null()) {
+            Some(ord) => ord,
+            None => key.direct(compare_json(va, vb)),
+        };
         if ord != std::cmp::Ordering::Equal {
-            return if key.ascending { ord } else { ord.reverse() };
+            return ord;
         }
     }
     std::cmp::Ordering::Equal

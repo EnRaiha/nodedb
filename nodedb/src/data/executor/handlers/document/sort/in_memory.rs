@@ -5,7 +5,9 @@
 use nodedb_physical::physical_plan::SortKeySpec;
 use nodedb_query::msgpack_scan;
 
-use super::compare::{SortValues, all_column_keys, compare_sort_values, eval_sort_values};
+use super::compare::{
+    SortValues, all_column_keys, compare_sort_values, eval_sort_values, is_null_range,
+};
 
 /// Pre-extracted sort key offsets for a single row.
 /// Each entry is `Option<(usize, usize)>` — byte range of the sort key value.
@@ -90,13 +92,18 @@ fn compare_with_preextracted(
     sort_keys: &[SortKeySpec],
 ) -> std::cmp::Ordering {
     for (i, key) in sort_keys.iter().enumerate() {
-        let cmp = match (a_offsets[i], b_offsets[i]) {
-            (Some(ar), Some(br)) => msgpack_scan::compare_field_bytes(a_bytes, ar, b_bytes, br),
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (None, None) => std::cmp::Ordering::Equal,
+        let ordered = match key.order_nulls(
+            is_null_range(a_bytes, a_offsets[i]),
+            is_null_range(b_bytes, b_offsets[i]),
+        ) {
+            Some(ord) => ord,
+            None => match (a_offsets[i], b_offsets[i]) {
+                (Some(ar), Some(br)) => {
+                    key.direct(msgpack_scan::compare_field_bytes(a_bytes, ar, b_bytes, br))
+                }
+                _ => std::cmp::Ordering::Equal,
+            },
         };
-        let ordered = if key.ascending { cmp } else { cmp.reverse() };
         if ordered != std::cmp::Ordering::Equal {
             return ordered;
         }
@@ -205,6 +212,7 @@ mod tests {
                 right: Box::new(nodedb_query::SqlExpr::Column("val".into())),
             },
             ascending: true,
+            nulls_first: false,
         };
         sort_rows(&mut rows, &[key]).expect("sort_rows failed");
         let order: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
@@ -226,6 +234,7 @@ mod tests {
                 right: Box::new(nodedb_query::SqlExpr::Column("val".into())),
             },
             ascending: true,
+            nulls_first: false,
         };
         sort_rows(&mut rows, &[key]).expect_err("zero divisor in a sort key must fail the sort");
     }

@@ -275,6 +275,7 @@ pub(super) fn convert_sort_keys(keys: &[SortKey]) -> Vec<SortKeySpec> {
         .map(|k| SortKeySpec {
             expr: sql_expr_to_bridge_expr(&k.expr),
             ascending: k.ascending,
+            nulls_first: k.nulls_first,
         })
         .collect()
 }

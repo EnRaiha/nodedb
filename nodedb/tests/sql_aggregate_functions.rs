@@ -315,3 +315,86 @@ async fn having_excludes_groups_failing_the_aggregate_predicate() {
         "surviving group must be click: {rows:?}"
     );
 }
+
+// ── Post-aggregate ORDER BY ──────────────────────────────────────────────────
+//
+// After GROUP BY, an ORDER BY term may be an aggregate the query does not
+// project, or an expression computed over one. Both address values that exist
+// only once the groups are finalized.
+
+/// `ORDER BY` an aggregate that is not in the SELECT list. The aggregate has
+/// to be computed to sort by it, and must not become an output column the
+/// client did not ask for.
+#[tokio::test]
+async fn order_by_unprojected_aggregate_sorts_groups() {
+    let srv = TestServer::start().await;
+    create_events(&srv).await;
+
+    // Per-category totals: view = 60, click = 90, purchase = 60.
+    // Descending by total: click (90), then view and purchase (60 each).
+    let rows = srv
+        .query_rows("SELECT category FROM events GROUP BY category ORDER BY SUM(amount) DESC")
+        .await
+        .expect("ORDER BY over an unprojected aggregate must plan and execute");
+
+    assert_eq!(rows.len(), 3, "one row per category; got {rows:?}");
+    assert_eq!(
+        rows[0][0], "click",
+        "click has the largest total (90) and must sort first; got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].len(),
+        1,
+        "the sort-only aggregate must not add an output column; got {rows:?}"
+    );
+}
+
+/// `ORDER BY` an expression computed over an aggregate. The sort value exists
+/// in no column of the group row, so it has to be evaluated after the groups
+/// are finalized.
+#[tokio::test]
+async fn order_by_expression_over_aggregate_sorts_groups() {
+    let srv = TestServer::start().await;
+    create_events(&srv).await;
+
+    // 1000 / SUM(amount): view = 16, click = 11, purchase = 16. Ascending by
+    // that expression puts click first — the inverse of ordering by SUM
+    // itself, so a sort that ignored the division cannot produce this.
+    let rows = srv
+        .query_rows("SELECT category FROM events GROUP BY category ORDER BY 1000 / SUM(amount)")
+        .await
+        .expect("ORDER BY over an aggregate expression must plan and execute");
+
+    assert_eq!(rows.len(), 3, "one row per category; got {rows:?}");
+    assert_eq!(
+        rows[0][0], "click",
+        "click has the largest total, so the smallest 1000/total; got {rows:?}"
+    );
+}
+
+/// The same expression sort with the aggregate also projected under an alias.
+/// The rename to the user alias happens before the sort, so the sort key must
+/// still resolve.
+#[tokio::test]
+async fn order_by_expression_over_aliased_aggregate_sorts_groups() {
+    let srv = TestServer::start().await;
+    create_events(&srv).await;
+
+    let rows = srv
+        .query_rows(
+            "SELECT category, SUM(amount) AS total FROM events \
+             GROUP BY category ORDER BY 1000 / SUM(amount)",
+        )
+        .await
+        .expect("ORDER BY over an aliased aggregate expression must plan and execute");
+
+    assert_eq!(rows.len(), 3, "one row per category; got {rows:?}");
+    assert_eq!(rows[0][0], "click", "click sorts first; got {rows:?}");
+    let total: f64 = rows[0][1]
+        .parse()
+        .unwrap_or_else(|_| panic!("aliased total must be numeric; got {rows:?}"));
+    assert!(
+        (total - 90.0).abs() < 1e-9,
+        "the aliased total must still be projected; got {rows:?}"
+    );
+}
