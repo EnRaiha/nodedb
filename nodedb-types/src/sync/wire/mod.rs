@@ -72,7 +72,7 @@ pub mod vector;
 #[cfg(test)]
 mod tests;
 
-pub use ack_result::SyncAckResult;
+pub use ack_result::{SyncAckResult, SyncOutcome};
 pub use ack_status::AckStatus;
 pub use array::{
     ArrayAckMsg, ArrayCatchupRequestMsg, ArrayDeltaBatchMsg, ArrayDeltaMsg, ArrayRejectMsg,

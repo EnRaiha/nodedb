@@ -55,6 +55,22 @@ impl CoreLoop {
         };
         let (preview, frontier_digest) = match preview {
             Ok(preview) => preview,
+            // Causally-pending operations are the one preview failure that is
+            // not permanent: the identical bytes preview cleanly once the
+            // missing history arrives. Classifying it as a prevalidation
+            // rejection told every caller the delta would never apply, which on
+            // the sync path became a terminal reject and lost the write.
+            Err(crate::Error::Crdt(nodedb_crdt::CrdtError::PreviewPendingDependencies)) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::RetryableRefusal {
+                        reason: format!(
+                            "delta for {collection}/{document_id} depends on operations absent \
+                             from this collection's document; nothing was applied"
+                        ),
+                    },
+                );
+            }
             Err(error) => {
                 return self.response_error(
                     task,

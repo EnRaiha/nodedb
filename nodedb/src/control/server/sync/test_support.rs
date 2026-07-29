@@ -11,11 +11,10 @@
 pub(super) fn mock_applied_ack(result: &crate::Result<()>, seq: u64) -> crate::Result<Vec<u8>> {
     match result {
         Ok(()) => {
-            let ack = nodedb_types::sync::wire::SyncAckResult {
-                status: nodedb_types::sync::wire::AckStatus::Applied,
-                applied_seq: seq,
-                reject: None,
-            };
+            let ack = nodedb_types::sync::wire::SyncAckResult::acked(
+                nodedb_types::sync::wire::AckStatus::Applied,
+                seq,
+            );
             zerompk::to_msgpack_vec(&ack).map_err(|e| crate::Error::Internal {
                 detail: e.to_string(),
             })

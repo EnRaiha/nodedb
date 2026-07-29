@@ -276,7 +276,9 @@ impl SyncSession {
                 rejected: msg.rows.len() as u64,
                 reject_reason: Some("unauthenticated".to_string()),
                 applied_seq: 0,
-                status: AckStatus::Applied,
+                status: AckStatus::Rejected {
+                    reason: "unauthenticated".to_string(),
+                },
             };
             return SyncFrame::try_encode(SyncMessageType::ColumnarInsertAck, &ack);
         }
@@ -308,7 +310,9 @@ impl SyncSession {
                         rejected: total,
                         reject_reason: Some(format!("row {i} msgpack decode failed: {e}")),
                         applied_seq: 0,
-                        status: AckStatus::Applied,
+                        status: AckStatus::Rejected {
+                            reason: format!("row {i} msgpack decode failed: {e}"),
+                        },
                     };
                     return SyncFrame::try_encode(SyncMessageType::ColumnarInsertAck, &ack);
                 }
@@ -352,23 +356,27 @@ impl SyncSession {
                 // Decode SyncAckResult from the Data Plane response payload.
                 // On decode failure fall back to Applied so the client is
                 // still ACKed (the insert succeeded).
-                let gate_result = super::ack_decode::decode_sync_ack(
+                let wire = super::ack_decode::decode_sync_ack(
                     &payload_bytes,
                     "columnar",
                     &self.session_id,
                     &msg.collection,
                     msg.seq,
-                );
+                )
+                .into_wire();
 
-                self.mutations_processed += decoded;
+                // A terminally refused batch landed no rows, so none of it may
+                // be counted as processed or reported as accepted.
+                let accepted = if wire.accepted { decoded } else { 0 };
+                self.mutations_processed += accepted;
                 let ack = ColumnarInsertAckMsg {
                     collection: msg.collection.clone(),
                     batch_id: msg.batch_id,
-                    accepted: decoded,
-                    rejected: total.saturating_sub(decoded),
-                    reject_reason: None,
-                    applied_seq: gate_result.applied_seq,
-                    status: gate_result.status,
+                    accepted,
+                    rejected: total.saturating_sub(accepted),
+                    reject_reason: wire.reject_reason,
+                    applied_seq: wire.applied_seq,
+                    status: wire.status,
                 };
                 SyncFrame::try_encode(SyncMessageType::ColumnarInsertAck, &ack)
             }
@@ -387,7 +395,9 @@ impl SyncSession {
                     rejected: total,
                     reject_reason: Some(e.to_string()),
                     applied_seq: 0,
-                    status: AckStatus::Applied,
+                    status: AckStatus::Rejected {
+                        reason: e.to_string(),
+                    },
                 };
                 SyncFrame::try_encode(SyncMessageType::ColumnarInsertAck, &ack)
             }
@@ -414,11 +424,7 @@ mod tests {
         fn ok(n: u64) -> (Self, MockCallLog) {
             let calls = Arc::new(Mutex::new(Vec::new()));
             // Encode a SyncAckResult so the handler can decode it.
-            let ack_result = nodedb_types::sync::wire::SyncAckResult {
-                status: AckStatus::Applied,
-                applied_seq: n,
-                reject: None,
-            };
+            let ack_result = nodedb_types::sync::wire::SyncAckResult::acked(AckStatus::Applied, n);
             let payload = zerompk::to_msgpack_vec(&ack_result).expect("encode SyncAckResult");
             (
                 Self {

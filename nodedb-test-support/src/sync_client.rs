@@ -83,8 +83,9 @@ impl SyncTestClient {
         })
     }
 
-    /// Push one delta for `(collection, document_id)` and wait for the
-    /// matching `DeltaAck` or `DeltaReject` response.
+    /// Push one delta for `(collection, document_id)` on the next stream
+    /// sequence number and wait for the matching `DeltaAck` or `DeltaReject`
+    /// response.
     pub async fn push_delta(
         &mut self,
         collection: &str,
@@ -95,7 +96,27 @@ impl SyncTestClient {
     ) -> Result<DeltaOutcome, String> {
         let seq = self.next_seq;
         self.next_seq += 1;
+        self.push_delta_at_seq(collection, document_id, peer_id, mutation_id, seq, delta)
+            .await
+    }
 
+    /// Push one delta at an explicitly chosen stream sequence number.
+    ///
+    /// A real edge client stores the seq assigned at first send on its durable
+    /// pending-delta record and reuses it verbatim on every re-send, so a
+    /// refusal that Origin reports as retryable comes back at the *same* seq.
+    /// [`Self::push_delta`] allocates a fresh seq per call and cannot express
+    /// that; this entry point can, which is what makes the held
+    /// high-water-mark observable from the client side.
+    pub async fn push_delta_at_seq(
+        &mut self,
+        collection: &str,
+        document_id: &str,
+        peer_id: u64,
+        mutation_id: u64,
+        seq: u64,
+        delta: Vec<u8>,
+    ) -> Result<DeltaOutcome, String> {
         let push = DeltaPushMsg {
             collection: collection.to_string(),
             document_id: document_id.to_string(),

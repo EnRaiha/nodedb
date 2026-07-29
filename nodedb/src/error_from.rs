@@ -136,6 +136,12 @@ impl From<Error> for NodeDbError {
             }
             err @ Error::OffsetRegression { .. } => NodeDbError::bad_request(err.to_string()),
             Error::DeadlineExceeded { .. } => NodeDbError::deadline_exceeded(),
+            // Nothing applied, and the identical write is expected to succeed
+            // once the transient precondition clears — the same contract as a
+            // write conflict, which callers already retry.
+            Error::RetryableRefusal { ref reason } => {
+                NodeDbError::write_conflict("crdt", reason.clone())
+            }
             Error::ConflictRetry {
                 collection,
                 document_id,

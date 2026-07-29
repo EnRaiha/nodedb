@@ -32,7 +32,9 @@ impl SyncSession {
                 accepted: false,
                 reject_reason: Some("unauthenticated".to_string()),
                 applied_seq: 0,
-                status: AckStatus::Applied,
+                status: AckStatus::Rejected {
+                    reason: "unauthenticated".to_string(),
+                },
             };
             return SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack);
         }
@@ -74,7 +76,9 @@ impl SyncSession {
                     accepted: false,
                     reject_reason: Some(format!("surrogate assignment failed: {e}")),
                     applied_seq: 0,
-                    status: AckStatus::Applied,
+                    status: AckStatus::Rejected {
+                        reason: format!("surrogate assignment failed: {e}"),
+                    },
                 };
                 return SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack);
             }
@@ -113,21 +117,22 @@ impl SyncSession {
         {
             Ok(payload_bytes) => {
                 self.mutations_processed += 1;
-                let gate_result = super::ack_decode::decode_sync_ack(
+                let wire = super::ack_decode::decode_sync_ack(
                     &payload_bytes,
                     "fts index",
                     &self.session_id,
                     &msg.collection,
                     msg.seq,
-                );
+                )
+                .into_wire();
                 let ack = FtsIndexAckMsg {
                     collection: msg.collection.clone(),
                     doc_id: msg.doc_id.clone(),
                     batch_id: msg.batch_id,
-                    accepted: true,
-                    reject_reason: None,
-                    applied_seq: gate_result.applied_seq,
-                    status: gate_result.status,
+                    accepted: wire.accepted,
+                    reject_reason: wire.reject_reason,
+                    applied_seq: wire.applied_seq,
+                    status: wire.status,
                 };
                 SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack)
             }
@@ -147,7 +152,9 @@ impl SyncSession {
                     accepted: false,
                     reject_reason: Some(e.to_string()),
                     applied_seq: 0,
-                    status: AckStatus::Applied,
+                    status: AckStatus::Rejected {
+                        reason: e.to_string(),
+                    },
                 };
                 SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack)
             }
@@ -171,7 +178,9 @@ impl SyncSession {
                 accepted: false,
                 reject_reason: Some("unauthenticated".to_string()),
                 applied_seq: 0,
-                status: AckStatus::Applied,
+                status: AckStatus::Rejected {
+                    reason: "unauthenticated".to_string(),
+                },
             };
             return SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack);
         }
@@ -199,7 +208,9 @@ impl SyncSession {
                     accepted: false,
                     reject_reason: Some(format!("surrogate lookup failed: {e}")),
                     applied_seq: 0,
-                    status: AckStatus::Applied,
+                    status: AckStatus::Rejected {
+                        reason: format!("surrogate lookup failed: {e}"),
+                    },
                 };
                 return SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack);
             }
@@ -237,21 +248,22 @@ impl SyncSession {
         {
             Ok(payload_bytes) => {
                 self.mutations_processed += 1;
-                let gate_result = super::ack_decode::decode_sync_ack(
+                let wire = super::ack_decode::decode_sync_ack(
                     &payload_bytes,
                     "fts delete",
                     &self.session_id,
                     &msg.collection,
                     msg.seq,
-                );
+                )
+                .into_wire();
                 let ack = FtsDeleteAckMsg {
                     collection: msg.collection.clone(),
                     doc_id: msg.doc_id.clone(),
                     batch_id: msg.batch_id,
-                    accepted: true,
-                    reject_reason: None,
-                    applied_seq: gate_result.applied_seq,
-                    status: gate_result.status,
+                    accepted: wire.accepted,
+                    reject_reason: wire.reject_reason,
+                    applied_seq: wire.applied_seq,
+                    status: wire.status,
                 };
                 SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack)
             }
@@ -271,7 +283,9 @@ impl SyncSession {
                     accepted: false,
                     reject_reason: Some(e.to_string()),
                     applied_seq: 0,
-                    status: AckStatus::Applied,
+                    status: AckStatus::Rejected {
+                        reason: e.to_string(),
+                    },
                 };
                 SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack)
             }

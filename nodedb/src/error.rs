@@ -52,6 +52,17 @@ pub enum Error {
     #[error("CRDT delta pre-validation rejected: {constraint} — {reason}")]
     RejectedPrevalidation { constraint: String, reason: String },
 
+    /// Nothing was applied, and the identical frame is expected to succeed once
+    /// a transient precondition resolves.
+    ///
+    /// Distinct from [`Self::RejectedPrevalidation`] and
+    /// [`Self::RejectedConstraint`], which are permanent: a caller that owns a
+    /// retry channel (the sync listener) must surface this as a retryable ack
+    /// rather than a terminal rejection, or the sender abandons a write the
+    /// server is still holding its stream position open for.
+    #[error("write refused without applying, retry the same frame: {reason}")]
+    RetryableRefusal { reason: String },
+
     #[error("append-only violation on {collection}: {detail}")]
     AppendOnlyViolation { collection: String, detail: String },
 

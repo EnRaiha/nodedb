@@ -253,25 +253,33 @@ impl SyncSession {
                 // Decode SyncAckResult from the Data Plane response payload.
                 // On decode failure fall back to Applied so the client is
                 // still ACKed (the ingest succeeded).
-                let gate_result = super::ack_decode::decode_sync_ack(
+                let wire = super::ack_decode::decode_sync_ack(
                     &payload_bytes,
                     "timeseries",
                     &self.session_id,
                     &msg.collection,
                     msg.seq,
-                );
+                )
+                .into_wire();
 
+                // A terminally refused batch ingested no samples, so none of it
+                // may be reported as accepted.
+                let accepted = if wire.accepted {
+                    decoded_count as u64
+                } else {
+                    0
+                };
                 let ack = TimeseriesAckMsg {
                     collection: msg.collection.clone(),
-                    accepted: decoded_count as u64,
-                    rejected: msg.sample_count.saturating_sub(decoded_count as u64),
+                    accepted,
+                    rejected: msg.sample_count.saturating_sub(accepted),
                     // WAL LSN is not surfaced by the dispatch helper (returns
                     // payload bytes only); `applied_seq` is the real producer
                     // frontier. Don't conflate the two — leave `lsn` 0 rather
                     // than report a sequence number as a WAL LSN.
                     lsn: 0,
-                    applied_seq: gate_result.applied_seq,
-                    status: gate_result.status,
+                    applied_seq: wire.applied_seq,
+                    status: wire.status,
                 };
                 SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack)
             }

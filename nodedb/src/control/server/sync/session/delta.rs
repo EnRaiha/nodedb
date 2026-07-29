@@ -203,9 +203,15 @@ impl SyncSession {
                 };
                 match ack.status {
                     AckStatus::Applied | AckStatus::Duplicate => self.mutations_applied += 1,
+                    // `Gap` is a retryable refusal: nothing applied, and the
+                    // client is expected to re-push. It belongs with the other
+                    // not-applied outcomes, not with the rejections — counting
+                    // it as rejected is what made a held stream look like a
+                    // permanent refusal in the session's close line.
                     AckStatus::Accepted | AckStatus::Fenced | AckStatus::Gap { .. } => {
                         self.mutations_not_applied += 1
                     }
+                    AckStatus::Rejected { .. } => self.mutations_rejected += 1,
                 }
             }
             _ => {}

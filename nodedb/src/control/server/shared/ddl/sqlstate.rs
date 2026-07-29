@@ -28,6 +28,14 @@ pub fn error_code_to_sqlstate(code: &ErrorCode) -> (&'static str, &'static str, 
             sqlstate::CHECK_VIOLATION,
             format!("pre-validation rejected: {reason}"),
         ),
+        // Nothing applied and the identical statement is expected to succeed
+        // later, so drivers get the same class they already retry on rather
+        // than a check violation they would surface as permanent.
+        ErrorCode::RetryableRefusal { reason } => (
+            "ERROR",
+            sqlstate::SERIALIZATION_FAILURE,
+            format!("write refused without applying, retry: {reason}"),
+        ),
         ErrorCode::NotFound => ("ERROR", sqlstate::NO_DATA, "not found".into()),
         ErrorCode::RejectedAuthz => (
             "ERROR",

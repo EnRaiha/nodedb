@@ -35,7 +35,9 @@ impl SyncSession {
                 accepted: false,
                 reject_reason: Some("unauthenticated".to_string()),
                 applied_seq: 0,
-                status: AckStatus::Applied,
+                status: AckStatus::Rejected {
+                    reason: "unauthenticated".to_string(),
+                },
             };
             return SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack);
         }
@@ -61,7 +63,13 @@ impl SyncSession {
                     msg.vector.len()
                 )),
                 applied_seq: 0,
-                status: AckStatus::Applied,
+                status: AckStatus::Rejected {
+                    reason: format!(
+                        "dimension mismatch: stated {}, actual {}",
+                        msg.dim,
+                        msg.vector.len()
+                    ),
+                },
             };
             return SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack);
         }
@@ -89,7 +97,9 @@ impl SyncSession {
                     accepted: false,
                     reject_reason: Some(format!("surrogate assignment failed: {e}")),
                     applied_seq: 0,
-                    status: AckStatus::Applied,
+                    status: AckStatus::Rejected {
+                        reason: format!("surrogate assignment failed: {e}"),
+                    },
                 };
                 return SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack);
             }
@@ -133,22 +143,23 @@ impl SyncSession {
             .await
         {
             Ok(payload_bytes) => {
-                let gate_result = super::ack_decode::decode_sync_ack(
+                let wire = super::ack_decode::decode_sync_ack(
                     &payload_bytes,
                     "vector insert",
                     &self.session_id,
                     &msg.collection,
                     msg.seq,
-                );
+                )
+                .into_wire();
                 self.mutations_processed += 1;
                 let ack = VectorInsertAckMsg {
                     collection: msg.collection.clone(),
                     id: msg.id.clone(),
                     batch_id: msg.batch_id,
-                    accepted: true,
-                    reject_reason: None,
-                    applied_seq: gate_result.applied_seq,
-                    status: gate_result.status,
+                    accepted: wire.accepted,
+                    reject_reason: wire.reject_reason,
+                    applied_seq: wire.applied_seq,
+                    status: wire.status,
                 };
                 SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack)
             }
@@ -168,7 +179,9 @@ impl SyncSession {
                     accepted: false,
                     reject_reason: Some(e.to_string()),
                     applied_seq: 0,
-                    status: AckStatus::Applied,
+                    status: AckStatus::Rejected {
+                        reason: e.to_string(),
+                    },
                 };
                 SyncFrame::try_encode(SyncMessageType::VectorInsertAck, &ack)
             }
@@ -192,7 +205,9 @@ impl SyncSession {
                 accepted: false,
                 reject_reason: Some("unauthenticated".to_string()),
                 applied_seq: 0,
-                status: AckStatus::Applied,
+                status: AckStatus::Rejected {
+                    reason: "unauthenticated".to_string(),
+                },
             };
             return SyncFrame::try_encode(SyncMessageType::VectorDeleteAck, &ack);
         }
@@ -222,7 +237,9 @@ impl SyncSession {
                     accepted: false,
                     reject_reason: Some(format!("surrogate lookup failed: {e}")),
                     applied_seq: 0,
-                    status: AckStatus::Applied,
+                    status: AckStatus::Rejected {
+                        reason: format!("surrogate lookup failed: {e}"),
+                    },
                 };
                 return SyncFrame::try_encode(SyncMessageType::VectorDeleteAck, &ack);
             }
@@ -260,22 +277,23 @@ impl SyncSession {
             .await
         {
             Ok(payload_bytes) => {
-                let gate_result = super::ack_decode::decode_sync_ack(
+                let wire = super::ack_decode::decode_sync_ack(
                     &payload_bytes,
                     "vector delete",
                     &self.session_id,
                     &msg.collection,
                     msg.seq,
-                );
+                )
+                .into_wire();
                 self.mutations_processed += 1;
                 let ack = VectorDeleteAckMsg {
                     collection: msg.collection.clone(),
                     id: msg.id.clone(),
                     batch_id: msg.batch_id,
-                    accepted: true,
-                    reject_reason: None,
-                    applied_seq: gate_result.applied_seq,
-                    status: gate_result.status,
+                    accepted: wire.accepted,
+                    reject_reason: wire.reject_reason,
+                    applied_seq: wire.applied_seq,
+                    status: wire.status,
                 };
                 SyncFrame::try_encode(SyncMessageType::VectorDeleteAck, &ack)
             }
@@ -295,7 +313,9 @@ impl SyncSession {
                     accepted: false,
                     reject_reason: Some(e.to_string()),
                     applied_seq: 0,
-                    status: AckStatus::Applied,
+                    status: AckStatus::Rejected {
+                        reason: e.to_string(),
+                    },
                 };
                 SyncFrame::try_encode(SyncMessageType::VectorDeleteAck, &ack)
             }

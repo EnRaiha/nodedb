@@ -214,7 +214,8 @@ async fn dispatch_columnar_seq(
         .await
         .map_err(|e| e.to_string())?;
     let ack: SyncAckResult = zerompk::from_msgpack(&payload).map_err(|e| e.to_string())?;
-    Ok(ack.status)
+    ack.status()
+        .ok_or_else(|| format!("columnar ingest was terminally refused: {:?}", ack.outcome))
 }
 
 /// Retry `dispatch_columnar_seq` on transient dispatch errors (the data

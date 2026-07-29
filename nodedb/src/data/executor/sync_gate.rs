@@ -184,27 +184,26 @@ impl CoreLoop {
         status: AckStatus,
         applied_seq: u64,
     ) -> Response {
-        self.sync_ack_response_ext(task, status, applied_seq, None)
+        self.sync_outcome_response(task, SyncAckResult::acked(status, applied_seq))
     }
 
-    /// Like [`Self::sync_ack_response`] but carries an optional constraint
-    /// rejection alongside the idempotency ack. Used by the CRDT apply path,
-    /// where a delta can be durably applied yet violate a constraint — the
-    /// high-water-mark still advances (status `Applied`), and the deterministic
-    /// [`ViolationType`](nodedb_types::sync::violation::ViolationType) rides
-    /// back in `reject` for the Control Plane to surface.
-    pub(in crate::data::executor) fn sync_ack_response_ext(
+    /// Build the gate reply for a frame the validator refused **permanently**.
+    ///
+    /// The high-water-mark still advances: the same bytes will fail identically
+    /// on a re-push, so holding the stream for them buys nothing. A refusal the
+    /// sender *should* retry is not this — it reports an
+    /// [`AckStatus::Gap`] through [`Self::sync_ack_response`] and holds the
+    /// mark, which is what keeps the re-push admissible.
+    pub(in crate::data::executor) fn sync_reject_response(
         &self,
         task: &ExecutionTask,
-        status: AckStatus,
+        violation: nodedb_types::sync::violation::ViolationType,
         applied_seq: u64,
-        reject: Option<nodedb_types::sync::violation::ViolationType>,
     ) -> Response {
-        let gate_result = SyncAckResult {
-            status,
-            applied_seq,
-            reject,
-        };
+        self.sync_outcome_response(task, SyncAckResult::rejected(violation, applied_seq))
+    }
+
+    fn sync_outcome_response(&self, task: &ExecutionTask, gate_result: SyncAckResult) -> Response {
         match zerompk::to_msgpack_vec(&gate_result) {
             Ok(bytes) => self.response_with_payload(task, bytes),
             Err(e) => self.response_error(

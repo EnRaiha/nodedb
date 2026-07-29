@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 //! A peer CRDT delta admitted against a `constraint_version` the accepting
-//! replica has not installed yet is fenced — rejected with a retryable
-//! `CompensationHint::Retry` and left unimported — rather than merged ahead
-//! of the constraint that is supposed to police it. Once the constraint
-//! installs, the re-pushed delta is accepted normally.
+//! replica has not installed yet is fenced — refused retryably and left
+//! unimported — rather than merged ahead of the constraint that is supposed to
+//! police it. Once the constraint installs, the delta re-pushed at its original
+//! seq is accepted normally.
 //!
 //! ## What this guards
 //!
@@ -15,8 +15,16 @@
 //! replica has installed were allowed to import, that replica would
 //! (temporarily, until reconcile catches up) accept rows a stricter
 //! constraint would have rejected — a real, if narrow, correctness gap.
-//! The fence closes it: such a delta is rejected with
-//! `CompensationHint::Retry` and never merged into the tenant document.
+//! The fence closes it: such a delta is refused and never merged into the
+//! tenant document.
+//!
+//! The refusal is **retryable**, not terminal: the same bytes at the same seq
+//! succeed the moment reconcile installs the constraint. So it must reach the
+//! edge as `DeltaAck { status: Gap }` and Origin must hold the producer
+//! high-water-mark, keeping the re-push admissible instead of deduplicating it
+//! to `Duplicate`. A terminal `DeltaReject` here would make the edge retire the
+//! write while Origin waits forever for a re-push — see
+//! `sync_retryable_delta_refusal.rs` for the sibling retryable refusal.
 //!
 //! ## Why this test is deterministic, not racy
 //!
@@ -40,11 +48,15 @@ use nodedb::control::server::sync::listener::{SyncListenerConfig, start_sync_lis
 use nodedb_crdt::{Constraint, ConstraintKind};
 use nodedb_test_support::sync_client::{DeltaOutcome, SyncTestClient};
 use nodedb_types::TenantId;
-use nodedb_types::sync::compensation::CompensationHint;
+use nodedb_types::sync::wire::AckStatus;
 
 const COLL: &str = "users";
 const DOC: &str = "doc1";
 const PEER_ID: u64 = 7;
+/// The stream seq both pushes use. An edge client assigns a seq once and
+/// reuses it across re-sends, so the re-push must be admissible at the seq the
+/// fenced first send already claimed.
+const SEQ: u64 = 1;
 
 /// Build a Loro snapshot delta inserting one row `row_id` with a single
 /// `email` field, mirroring the pattern used by the sibling CRDT sync tests.
@@ -170,22 +182,27 @@ async fn peer_delta_fenced_until_constraint_installed() {
 
     // Delta A (seq 1): admitted against constraint_version=1 (the catalog
     // already bumped it at CREATE UNIQUE INDEX), but the replica has 0
-    // installed — the fence must reject it, not merge it.
+    // installed — the fence must refuse it, not merge it.
     let outcome_a = client
-        .push_delta(COLL, DOC, PEER_ID, 1, row_delta(COLL, DOC, "a@b.com"))
+        .push_delta_at_seq(COLL, DOC, PEER_ID, 1, SEQ, row_delta(COLL, DOC, "a@b.com"))
         .await
         .expect("push delta A");
-    match outcome_a {
-        DeltaOutcome::Reject(reject) => match reject.compensation {
-            Some(CompensationHint::Retry { .. }) => {}
-            other => panic!(
-                "expected CompensationHint::Retry for the version-fenced delta A, got: {other:?}"
-            ),
-        },
-        DeltaOutcome::Ack(_) => {
-            panic!("expected delta A to be fenced (constraint not installed yet), but it was acked")
-        }
-    }
+    let ack_a = match outcome_a {
+        DeltaOutcome::Ack(ack) => ack,
+        DeltaOutcome::Reject(reject) => panic!(
+            "the version fence is a retryable refusal and must be acked as Gap, but Origin sent a \
+             terminal DeltaReject (reason={:?}, compensation={:?}) — the edge rolls the write back \
+             and never re-pushes, while Origin holds the high-water-mark for it",
+            reject.reason, reject.compensation
+        ),
+    };
+    assert_eq!(
+        ack_a.status,
+        AckStatus::Gap { expected: SEQ },
+        "the fenced delta applied nothing; the ack must report the gap at the seq Origin still \
+         expects, got {:?}",
+        ack_a.status
+    );
 
     // The fenced delta must NOT have been imported — the document is absent.
     let landed = read_crdt_doc(&cluster.nodes[0].client, Duration::from_secs(5))
@@ -223,15 +240,29 @@ async fn peer_delta_fenced_until_constraint_installed() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Re-push the same row as a NEW seq — required(1) <= installed(1) now,
-    // and a single fresh row has no unique conflict, so it must be acked.
+    // Re-push at the SAME seq, exactly as an edge client does: the seq is
+    // stored on the durable pending-delta record at first send and reused
+    // verbatim. required(1) <= installed(1) now and a single fresh row has no
+    // unique conflict, so it must apply. A `Duplicate` here would mean the
+    // fenced delta advanced the high-water-mark after all and the write is lost.
     let outcome_b = client
-        .push_delta(COLL, DOC, PEER_ID, 2, row_delta(COLL, DOC, "a@b.com"))
+        .push_delta_at_seq(COLL, DOC, PEER_ID, 1, SEQ, row_delta(COLL, DOC, "a@b.com"))
         .await
         .expect("push delta B");
-    assert!(
-        matches!(outcome_b, DeltaOutcome::Ack(_)),
-        "expected delta B to be acked once the constraint is installed, got: {outcome_b:?}"
+    let ack_b = match outcome_b {
+        DeltaOutcome::Ack(ack) => ack,
+        DeltaOutcome::Reject(reject) => panic!(
+            "delta B must apply once the constraint is installed, got DeltaReject \
+             (reason={:?}, compensation={:?})",
+            reject.reason, reject.compensation
+        ),
+    };
+    assert_eq!(
+        ack_b.status,
+        AckStatus::Applied,
+        "the held high-water-mark must admit the same-seq re-push rather than deduplicate it, \
+         got {:?}",
+        ack_b.status
     );
 
     // Now it must be imported — the document exists with a non-empty payload.

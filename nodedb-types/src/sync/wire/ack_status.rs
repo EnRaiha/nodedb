@@ -37,4 +37,16 @@ pub enum AckStatus {
     /// must keep the message queued until a terminal status arrives — treating
     /// this as success would retire a write that may still be refused.
     Accepted,
+    /// The message will never apply, and `reason` says why.
+    ///
+    /// Terminal, and the only status that is: a sender must compensate rather
+    /// than re-send. It lives in this enum, rather than beside it as a separate
+    /// `accepted` flag, so that a receiver matching on the status cannot read a
+    /// refusal as an apply. The engine ack messages that also carry `accepted`
+    /// and `reject_reason` derive both from this variant, so the two can never
+    /// disagree.
+    ///
+    /// Contrast [`Self::Gap`], which is a *retryable* refusal: nothing applied,
+    /// but the identical message at the same sequence is expected to succeed.
+    Rejected { reason: String },
 }
