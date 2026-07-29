@@ -15,6 +15,15 @@ use crate::sync::wire::ack_status::AckStatus;
 pub struct TimeseriesPushMsg {
     /// Source Lite instance ID (UUID v7).
     pub lite_id: String,
+    /// Monotonic batch ID for ACK correlation, echoed verbatim on
+    /// [`TimeseriesAckMsg::batch_id`].
+    ///
+    /// Identifies *this* batch specifically, which `seq` cannot: `applied_seq`
+    /// on the ack is a cumulative producer frontier, so it can only retire
+    /// batches at or below the frontier. A terminally rejected batch never
+    /// advances the frontier, so without this field the sender has no way to
+    /// name the one batch it must retire.
+    pub batch_id: u64,
     /// Collection name.
     pub collection: String,
     /// Gorilla-encoded timestamp block.
@@ -50,6 +59,12 @@ pub struct TimeseriesPushMsg {
 pub struct TimeseriesAckMsg {
     /// Collection acknowledged.
     pub collection: String,
+    /// The [`TimeseriesPushMsg::batch_id`] this ack answers, echoed verbatim.
+    ///
+    /// Every ack path sets it, including the rejection paths that never reach
+    /// the Data Plane — a rejection the sender cannot correlate back to a batch
+    /// is a rejection it cannot act on.
+    pub batch_id: u64,
     /// Number of samples accepted.
     pub accepted: u64,
     /// Number of samples rejected (duplicates, out-of-retention, etc.)

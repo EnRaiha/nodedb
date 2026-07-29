@@ -174,17 +174,17 @@ impl SyncSession {
         self.last_activity = std::time::Instant::now();
 
         if !self.authenticated {
-            return rejected_timeseries_ack(msg);
+            return rejected_timeseries_ack(msg, "session is not authenticated");
         }
         let Some(identity) = self.identity.as_ref() else {
             // `authenticated` is never a substitute for a handshake-bound
             // identity: it could otherwise write under a fabricated tenant.
-            return rejected_timeseries_ack(msg);
+            return rejected_timeseries_ack(msg, "session has no handshake-bound identity");
         };
         let tenant_id = identity.tenant_id;
         let database_id = dispatcher.database_id();
         if !identity.can_access_database(database_id) {
-            return rejected_timeseries_ack(msg);
+            return rejected_timeseries_ack(msg, "identity may not access the target database");
         }
 
         // Decode Gorilla blocks to verify integrity.
@@ -193,15 +193,13 @@ impl SyncSession {
 
         let decoded_count = timestamps.len().min(values.len());
         if decoded_count == 0 {
-            let ack = TimeseriesAckMsg {
-                collection: msg.collection.clone(),
-                accepted: 0,
-                rejected: msg.sample_count,
-                lsn: 0,
-                applied_seq: 0,
-                status: AckStatus::Applied,
-            };
-            return SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack);
+            // The Gorilla blocks yielded no usable sample pair. Re-sending the
+            // identical bytes cannot decode any better, so this is terminal —
+            // the sender must drop the batch rather than spin on it.
+            return rejected_timeseries_ack(
+                msg,
+                "gorilla timestamp/value blocks decoded to zero samples",
+            );
         }
 
         // Build ILP-format payload for Data Plane ingest.
@@ -271,6 +269,7 @@ impl SyncSession {
                 };
                 let ack = TimeseriesAckMsg {
                     collection: msg.collection.clone(),
+                    batch_id: msg.batch_id,
                     accepted,
                     rejected: msg.sample_count.saturating_sub(accepted),
                     // WAL LSN is not surfaced by the dispatch helper (returns
@@ -284,19 +283,28 @@ impl SyncSession {
                 SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack)
             }
             Err(e) => {
+                // Whether the sender should re-send or compensate is read from
+                // the typed error, not assumed from the fact that dispatch
+                // failed: a timeout or an unavailable leader refused nothing on
+                // the merits, and reporting it as terminal would drop the batch.
+                let status = super::refusal::ack_status_for_dispatch_error(&e, msg.seq);
                 error!(
                     session = %self.session_id,
                     collection = %msg.collection,
+                    batch_id = msg.batch_id,
                     error = %e,
+                    retryable = matches!(status, AckStatus::Gap { .. }),
                     "timeseries ingest dispatch failed; reporting samples as rejected"
                 );
                 let ack = TimeseriesAckMsg {
                     collection: msg.collection.clone(),
+                    batch_id: msg.batch_id,
                     accepted: 0,
                     rejected: msg.sample_count,
                     lsn: 0,
-                    applied_seq: 0,
-                    status: AckStatus::Applied,
+                    // Nothing applied, so the producer frontier does not move.
+                    applied_seq: msg.seq.saturating_sub(1),
+                    status,
                 };
                 SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack)
             }
@@ -304,14 +312,28 @@ impl SyncSession {
     }
 }
 
-fn rejected_timeseries_ack(msg: &TimeseriesPushMsg) -> Option<SyncFrame> {
+/// Refuse a batch terminally, before it ever reaches the Data Plane.
+///
+/// Every one of these refusals is a property of the batch or the session that
+/// re-sending cannot change, so the sender must compensate rather than retry.
+/// The status carries the reason instead of a bare `Applied`: a receiver that
+/// matches on the status would otherwise read a refusal as an apply and retire
+/// a write that never landed.
+fn rejected_timeseries_ack(
+    msg: &TimeseriesPushMsg,
+    reason: impl Into<String>,
+) -> Option<SyncFrame> {
     let ack = TimeseriesAckMsg {
         collection: msg.collection.clone(),
+        batch_id: msg.batch_id,
         accepted: 0,
         rejected: msg.sample_count,
         lsn: 0,
-        applied_seq: 0,
-        status: AckStatus::Applied,
+        // Nothing applied, so the producer frontier does not move.
+        applied_seq: msg.seq.saturating_sub(1),
+        status: AckStatus::Rejected {
+            reason: reason.into(),
+        },
     };
     SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack)
 }
@@ -332,31 +354,54 @@ mod tests {
     struct MockDispatcher {
         calls: MockCallLog,
         database_id: DatabaseId,
-        result: crate::Result<Vec<u8>>,
+        /// Produces the dispatch outcome on each call.
+        ///
+        /// A factory rather than a stored `Result` so the error's *type*
+        /// survives to the handler. The handler classifies retryable-vs-terminal
+        /// on that type, so a mock that flattened every failure into `Internal`
+        /// could not express a retryable refusal at all — it would silently
+        /// assert only the terminal half of the behavior.
+        outcome: Box<dyn Fn() -> crate::Result<Vec<u8>> + Send + Sync>,
     }
 
     impl MockDispatcher {
-        fn ok() -> (Self, MockCallLog) {
+        fn with(
+            outcome: impl Fn() -> crate::Result<Vec<u8>> + Send + Sync + 'static,
+        ) -> (Self, MockCallLog) {
             let calls = Arc::new(Mutex::new(Vec::new()));
-            // Return an empty payload — handler falls back to Applied.
             (
                 Self {
                     calls: calls.clone(),
                     database_id: DatabaseId::DEFAULT,
-                    result: Ok(Vec::new()),
+                    outcome: Box::new(outcome),
                 },
                 calls,
             )
         }
 
+        fn ok() -> (Self, MockCallLog) {
+            // Empty payload — the handler falls back to Applied.
+            Self::with(|| Ok(Vec::new()))
+        }
+
         fn err() -> Self {
-            Self {
-                calls: Arc::new(Mutex::new(Vec::new())),
-                database_id: DatabaseId::DEFAULT,
-                result: Err(crate::Error::Internal {
+            Self::with(|| {
+                Err(crate::Error::Internal {
                     detail: "mock failure".to_string(),
-                }),
-            }
+                })
+            })
+            .0
+        }
+
+        /// A dispatch that refused nothing on the merits — the batch never got
+        /// a verdict and re-sending it is expected to succeed.
+        fn retryable() -> Self {
+            Self::with(|| {
+                Err(crate::Error::RetryableRefusal {
+                    reason: "shard is rebalancing".to_string(),
+                })
+            })
+            .0
         }
     }
 
@@ -381,12 +426,7 @@ mod tests {
                 collection,
                 ilp_payload,
             ));
-            match &self.result {
-                Ok(b) => Ok(b.clone()),
-                Err(e) => Err(crate::Error::Internal {
-                    detail: e.to_string(),
-                }),
-            }
+            (self.outcome)()
         }
     }
 
@@ -411,6 +451,10 @@ mod tests {
         );
     }
 
+    /// Batch ID stamped on every test push, distinct from the sample count and
+    /// the seq so an ack echoing the wrong field is visible.
+    const BATCH_ID: u64 = 77;
+
     /// Build a minimal `TimeseriesPushMsg` with valid Gorilla-encoded blocks
     /// for a single sample (timestamp=1000 ms, value=42.0).
     fn make_push_msg(collection: &str) -> TimeseriesPushMsg {
@@ -427,6 +471,7 @@ mod tests {
         TimeseriesPushMsg {
             collection: collection.to_string(),
             lite_id: "lite-1".to_string(),
+            batch_id: BATCH_ID,
             sample_count: 1,
             ts_block,
             val_block,
@@ -458,6 +503,72 @@ mod tests {
         assert!(
             calls.lock().unwrap().is_empty(),
             "dispatcher must not be called for unauthenticated sessions"
+        );
+    }
+
+    // ── Test: every ack names the batch it answers ──────────────────────────
+
+    #[tokio::test]
+    async fn an_applied_ack_echoes_the_batch_it_answers() {
+        let mut session = make_session();
+        authenticate(&mut session);
+        let (mock, _calls) = MockDispatcher::ok();
+        let msg = make_push_msg("metrics");
+
+        let frame = session.handle_timeseries_push(&msg, &mock).await;
+
+        let decoded: TimeseriesAckMsg = frame.unwrap().decode_body().unwrap();
+        assert_eq!(
+            decoded.batch_id, BATCH_ID,
+            "the ack must name the batch it answers, not a sample count or seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_refusal_names_the_batch_so_it_can_be_retired_alone() {
+        // The whole point of carrying batch_id: a batch refused before it ever
+        // reaches the Data Plane never advances the producer frontier, so
+        // `applied_seq` cannot identify it. Without the echo the sender cannot
+        // tell which batch to drop, and re-sends it forever.
+        let mut session = make_session();
+        let (mock, _calls) = MockDispatcher::ok();
+        let msg = make_push_msg("metrics");
+
+        let frame = session.handle_timeseries_push(&msg, &mock).await;
+
+        let decoded: TimeseriesAckMsg = frame.unwrap().decode_body().unwrap();
+        assert_eq!(decoded.batch_id, BATCH_ID);
+        assert!(
+            matches!(decoded.status, AckStatus::Rejected { .. }),
+            "a refused batch must not be acked as applied, got {:?}",
+            decoded.status
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_batch_is_refused_terminally_rather_than_acked() {
+        // Empty Gorilla blocks decode to nothing. Re-sending the same bytes
+        // cannot decode any better, so the sender must drop the batch — but it
+        // must be told that, not handed an `Applied` for a write that vanished.
+        let mut session = make_session();
+        authenticate(&mut session);
+        let (mock, calls) = MockDispatcher::ok();
+        let mut msg = make_push_msg("metrics");
+        msg.ts_block = Vec::new();
+        msg.val_block = Vec::new();
+
+        let frame = session.handle_timeseries_push(&msg, &mock).await;
+
+        let decoded: TimeseriesAckMsg = frame.unwrap().decode_body().unwrap();
+        assert_eq!(decoded.batch_id, BATCH_ID);
+        assert!(
+            matches!(decoded.status, AckStatus::Rejected { .. }),
+            "an undecodable batch must be refused, got {:?}",
+            decoded.status
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "an undecodable batch must never reach the Data Plane"
         );
     }
 
@@ -552,5 +663,37 @@ mod tests {
             "on dispatch failure all samples are rejected"
         );
         assert_eq!(decoded.rejected, 1);
+        assert_eq!(decoded.batch_id, BATCH_ID);
+        assert!(
+            matches!(decoded.status, AckStatus::Rejected { .. }),
+            "a failed dispatch must never be acked as applied, got {:?}",
+            decoded.status
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_that_never_got_a_verdict_is_retryable_not_terminal() {
+        // A timeout or an unavailable leader refused nothing on the merits.
+        // Reporting it as terminal tells the sender to compensate, destroying a
+        // batch the cluster never actually rejected.
+        let mut session = make_session();
+        authenticate(&mut session);
+        let mock = MockDispatcher::retryable();
+        let mut msg = make_push_msg("metrics");
+        msg.seq = 9;
+
+        let frame = session.handle_timeseries_push(&msg, &mock).await;
+
+        let decoded: TimeseriesAckMsg = frame.unwrap().decode_body().unwrap();
+        assert_eq!(
+            decoded.status,
+            AckStatus::Gap { expected: 9 },
+            "a retryable refusal must resume at the batch's own seq"
+        );
+        assert_eq!(decoded.batch_id, BATCH_ID);
+        assert_eq!(
+            decoded.applied_seq, 8,
+            "nothing applied, so the producer frontier must not advance past the batch"
+        );
     }
 }

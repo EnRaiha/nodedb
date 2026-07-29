@@ -132,11 +132,17 @@ impl SyncSession {
                 );
                 let ack = TimeseriesAckMsg {
                     collection: msg.collection.clone(),
+                    batch_id: msg.batch_id,
                     accepted: 0,
                     rejected: msg.sample_count,
                     lsn: 0,
-                    applied_seq: 0,
-                    status: AckStatus::Applied,
+                    // Nothing applied, so the producer frontier does not move.
+                    applied_seq: msg.seq.saturating_sub(1),
+                    // Retryable, not terminal: the data is fine and the wiring
+                    // is not. Telling the sender to compensate would destroy a
+                    // good batch over a server-side misconfiguration, whereas a
+                    // re-send succeeds the moment interception is repaired.
+                    status: AckStatus::Gap { expected: msg.seq },
                 };
                 SyncFrame::try_encode(SyncMessageType::TimeseriesAck, &ack)
             }

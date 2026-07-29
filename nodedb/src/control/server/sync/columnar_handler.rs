@@ -388,16 +388,15 @@ impl SyncSession {
                     error = %e,
                     "columnar insert dispatch failed; reporting rows as rejected"
                 );
+                let status = super::refusal::ack_status_for_dispatch_error(&e, msg.seq);
                 let ack = ColumnarInsertAckMsg {
                     collection: msg.collection.clone(),
                     batch_id: msg.batch_id,
                     accepted: 0,
                     rejected: total,
-                    reject_reason: Some(e.to_string()),
-                    applied_seq: 0,
-                    status: AckStatus::Rejected {
-                        reason: e.to_string(),
-                    },
+                    reject_reason: super::refusal::reject_reason_for(&status),
+                    applied_seq: msg.seq.saturating_sub(1),
+                    status,
                 };
                 SyncFrame::try_encode(SyncMessageType::ColumnarInsertAck, &ack)
             }

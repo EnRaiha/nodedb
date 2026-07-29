@@ -145,16 +145,15 @@ impl SyncSession {
                     error = %e,
                     "fts index dispatch failed"
                 );
+                let status = super::refusal::ack_status_for_dispatch_error(&e, msg.seq);
                 let ack = FtsIndexAckMsg {
                     collection: msg.collection.clone(),
                     doc_id: msg.doc_id.clone(),
                     batch_id: msg.batch_id,
                     accepted: false,
-                    reject_reason: Some(e.to_string()),
-                    applied_seq: 0,
-                    status: AckStatus::Rejected {
-                        reason: e.to_string(),
-                    },
+                    reject_reason: super::refusal::reject_reason_for(&status),
+                    applied_seq: msg.seq.saturating_sub(1),
+                    status,
                 };
                 SyncFrame::try_encode(SyncMessageType::FtsIndexAck, &ack)
             }
@@ -276,16 +275,15 @@ impl SyncSession {
                     error = %e,
                     "fts delete dispatch failed"
                 );
+                let status = super::refusal::ack_status_for_dispatch_error(&e, msg.seq);
                 let ack = FtsDeleteAckMsg {
                     collection: msg.collection.clone(),
                     doc_id: msg.doc_id.clone(),
                     batch_id: msg.batch_id,
                     accepted: false,
-                    reject_reason: Some(e.to_string()),
-                    applied_seq: 0,
-                    status: AckStatus::Rejected {
-                        reason: e.to_string(),
-                    },
+                    reject_reason: super::refusal::reject_reason_for(&status),
+                    applied_seq: msg.seq.saturating_sub(1),
+                    status,
                 };
                 SyncFrame::try_encode(SyncMessageType::FtsDeleteAck, &ack)
             }

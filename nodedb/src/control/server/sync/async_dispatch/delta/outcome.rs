@@ -28,6 +28,7 @@ use tracing::warn;
 use nodedb_types::sync::violation::ViolationType;
 use nodedb_types::sync::wire::{AckStatus, SyncAckResult, SyncOutcome};
 
+use super::super::super::refusal::retryable_refusal_reason;
 use super::super::super::wire::{
     CompensationHint, DeltaAckMsg, DeltaPushMsg, DeltaRejectMsg, SyncFrame, SyncMessageType,
 };
@@ -176,19 +177,6 @@ fn frame_for_dispatch_error(delta_msg: &DeltaPushMsg, error: &crate::Error) -> O
         compensation: Some(hint),
     };
     SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject)
-}
-
-/// The reason text when `error` says "nothing applied, re-push the same frame".
-///
-/// Matched on the typed error only — never by substring-matching the human
-/// message, which is how a rewording silently turns a retry into a loss.
-fn retryable_refusal_reason(error: &crate::Error) -> Option<&str> {
-    use crate::bridge::envelope::ErrorCode;
-    match error {
-        crate::Error::RetryableRefusal { reason } => Some(reason),
-        crate::Error::DataPlane(ErrorCode::RetryableRefusal { reason }) => Some(reason),
-        _ => None,
-    }
 }
 
 /// Classify a dispatch failure into the hint the edge compensates against.
