@@ -8,6 +8,7 @@ use crate::engine_rules::{self, AggregateParams};
 use crate::error::Result;
 use crate::functions::registry::{FunctionRegistry, SearchTrigger};
 use crate::parser::normalize::normalize_ident;
+use crate::planner::group_by::{convert_group_by_with_projection, group_by_output_aliases};
 use crate::planner::grouping_sets::expand_group_by;
 use crate::resolver::columns::ResolvedTable;
 use crate::resolver::expr::convert_expr;
@@ -29,12 +30,24 @@ pub fn plan_aggregate(
     let (group_by_exprs, grouping_sets) = if let Some(exp) = grouping_expansion {
         (exp.canonical_keys, Some(exp.grouping_sets))
     } else {
-        (convert_group_by(&select.group_by)?, None)
+        (
+            convert_group_by_with_projection(
+                &select.group_by,
+                &select.projection,
+                &table.info.columns,
+            )?,
+            None,
+        )
     };
 
     let mut aggregates = extract_aggregates_from_projection(&select.projection, functions)?;
+    // HAVING is bound to the aggregates' computed output columns, and any
+    // aggregate it alone introduces is added to `aggregates` so it is actually
+    // computed.
     let having = match &select.having {
-        Some(expr) => super::select::convert_where_to_filters(expr)?,
+        Some(expr) => {
+            super::having::plan_having(expr, &select.projection, &mut aggregates, functions)?
+        }
         None => Vec::new(),
     };
 
@@ -104,56 +117,6 @@ pub fn plan_aggregate(
     }
 
     Ok(base_plan)
-}
-
-/// Derive the SELECT-list output alias for each GROUP BY key by correlating
-/// each key with the projection item that references the same column. Returns
-/// a `Vec` parallel to `group_by`: `Some(alias)` when a projection item
-/// explicitly aliases that grouped column (`SELECT k AS label ... GROUP BY k`),
-/// otherwise `None` (the output column name falls back to the raw grouped
-/// column name).
-pub fn group_by_output_aliases(
-    projection: &[ast::SelectItem],
-    group_by: &[SqlExpr],
-) -> Vec<Option<String>> {
-    group_by
-        .iter()
-        .map(|key| {
-            key_column_name(key).and_then(|name| projection_alias_for_column(projection, name))
-        })
-        .collect()
-}
-
-/// The bare column name of a GROUP BY key, when the key is a column reference.
-pub(super) fn key_column_name(key: &SqlExpr) -> Option<&str> {
-    match key {
-        SqlExpr::Column { name, .. } => Some(name.as_str()),
-        _ => None,
-    }
-}
-
-/// The explicit alias of the projection item that references bare column
-/// `col`, if any. Only `expr AS alias` items where `expr` is that column
-/// (bare or qualified) qualify; unaliased items yield `None`.
-fn projection_alias_for_column(projection: &[ast::SelectItem], col: &str) -> Option<String> {
-    for item in projection {
-        if let ast::SelectItem::ExprWithAlias { expr, alias } = item
-            && expr_column_name(expr).is_some_and(|n| n == col)
-        {
-            return Some(normalize_ident(alias));
-        }
-    }
-    None
-}
-
-/// The bare column name referenced by an `ast::Expr`, when it is a simple or
-/// compound identifier; `None` for any other expression shape.
-pub(super) fn expr_column_name(expr: &ast::Expr) -> Option<String> {
-    match expr {
-        ast::Expr::Identifier(ident) => Some(normalize_ident(ident)),
-        ast::Expr::CompoundIdentifier(parts) => parts.last().map(normalize_ident),
-        _ => None,
-    }
 }
 
 /// Attach `grouping_sets` to an existing `SqlPlan::Aggregate` node, or wrap it
@@ -336,14 +299,6 @@ fn parse_interval_to_ms(s: &str) -> i64 {
     nodedb_types::kv_parsing::parse_interval_to_ms(s)
         .map(|ms| ms as i64)
         .unwrap_or(0)
-}
-
-/// Convert GROUP BY clause to SqlExpr list.
-pub fn convert_group_by(group_by: &GroupByExpr) -> Result<Vec<SqlExpr>> {
-    match group_by {
-        GroupByExpr::All(_) => Ok(Vec::new()),
-        GroupByExpr::Expressions(exprs, _) => exprs.iter().map(convert_expr).collect(),
-    }
 }
 
 /// Scan the SELECT projection for `GROUPING(col)` calls and return synthetic

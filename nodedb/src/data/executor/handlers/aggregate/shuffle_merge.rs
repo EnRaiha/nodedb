@@ -113,7 +113,7 @@ pub(in crate::data::executor) struct ShuffleAggregateParams<'a> {
     pub aggregates: &'a [AggregateSpec],
     pub having: &'a [u8],
     pub limit: usize,
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
 }
 
 impl CoreLoop {

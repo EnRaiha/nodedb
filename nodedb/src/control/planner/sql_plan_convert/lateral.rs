@@ -6,10 +6,11 @@
 //! inside the `QueryOp` so the Data Plane executor can materialise outer rows
 //! in-process before iterating over them.
 
-use nodedb_sql::types::{Filter, Projection, SortKey, SqlExpr, SqlPlan};
+use nodedb_sql::types::{Filter, Projection, SortKey, SqlPlan};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::types::TenantId;
+use nodedb_physical::physical_plan::SortKeySpec;
 use nodedb_physical::physical_plan::{JoinProjection, QueryOp};
 
 use super::convert::ConvertContext;
@@ -172,17 +173,13 @@ fn inner_filters_from_plan(plan: &SqlPlan) -> crate::Result<Vec<u8>> {
     }
 }
 
-/// Convert `SortKey` list to `(field, ascending)` pairs.
+/// Convert `SortKey` list to its physical form.
 ///
-/// Only `SqlExpr::Column` keys are meaningful for a document scan; other
-/// expression forms are skipped (they would be invalid in a plain scan).
-fn sort_keys_to_spec(keys: &[SortKey]) -> Vec<(String, bool)> {
-    keys.iter()
-        .filter_map(|k| match &k.expr {
-            SqlExpr::Column { name, .. } => Some((name.clone(), k.ascending)),
-            _ => None,
-        })
-        .collect()
+/// Every key is carried, including computed ones: the scan evaluates the
+/// expression per row, so dropping a non-column key here would silently
+/// return the lateral side unordered.
+fn sort_keys_to_spec(keys: &[SortKey]) -> Vec<SortKeySpec> {
+    super::expr::convert_sort_keys(keys)
 }
 
 /// Convert `Projection` list to `JoinProjection` list.

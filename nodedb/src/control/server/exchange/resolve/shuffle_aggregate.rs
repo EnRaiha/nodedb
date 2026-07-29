@@ -270,11 +270,16 @@ pub async fn resolve_shuffle_aggregate(
     // over the union. Pushing `limit` to each part would truncate parts
     // independently — a silent per-part row drop, and a result that disagrees with
     // the single-node Gather path's GLOBAL cap. The cap is reapplied at step 8.
+    // Post-aggregate ORDER BY is restricted to bare output columns by the
+    // planner, which is what the shuffle wire form carries. A key that is not
+    // a column would have been rejected at plan time, so none reaches here.
     let wire_sort_keys: Vec<SortKey> = sort_keys
         .iter()
-        .map(|(column, ascending)| SortKey {
-            column: column.clone(),
-            ascending: *ascending,
+        .filter_map(|k| {
+            k.as_column().map(|column| SortKey {
+                column: column.to_string(),
+                ascending: k.ascending,
+            })
         })
         .collect();
 

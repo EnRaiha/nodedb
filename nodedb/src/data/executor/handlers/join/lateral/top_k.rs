@@ -24,7 +24,7 @@ pub struct LateralTopKParams<'a> {
     pub outer_alias: &'a str,
     pub inner_collection: &'a str,
     pub inner_filters: &'a [u8],
-    pub inner_order_by: &'a [(String, bool)],
+    pub inner_order_by: &'a [nodedb_physical::physical_plan::SortKeySpec],
     pub inner_limit: usize,
     pub correlation_keys: &'a [(String, String)],
     pub lateral_alias: &'a str,

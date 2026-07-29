@@ -294,3 +294,36 @@ async fn groups_without_order_by_is_plan_time_error() {
         "error should mention GROUPS or ORDER BY: {msg}"
     );
 }
+
+// ── Expression arguments over an explicit frame ──────────────────────────────
+
+/// A framed aggregate whose argument is an expression must average the
+/// *evaluated* expression over the frame. A bare-column argument over the same
+/// frame already computes correctly, so an all-NULL column here means the
+/// argument expression was dropped rather than evaluated — a silently wrong
+/// (empty) result rather than an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn framed_aggregate_over_expression_argument_averages_evaluated_values() {
+    let server = TestServer::start().await;
+    create_nums(&server).await;
+
+    let rows = server
+        .query_rows(
+            "SELECT id, AVG(n * 2) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING \
+             AND CURRENT ROW) AS a FROM nums ORDER BY n",
+        )
+        .await
+        .expect("framed AVG over an expression argument must plan and execute");
+
+    assert_eq!(rows.len(), 5, "rows: {rows:?}");
+
+    // Argument n*2 = 2,4,6,8,10; running means = 2,3,4,5,6.
+    let expected = [2.0, 3.0, 4.0, 5.0, 6.0];
+    for (i, &want) in expected.iter().enumerate() {
+        let got = col(&rows, i, 1);
+        assert!(
+            (got - want).abs() < 1e-9,
+            "row {i}: got {got}, want {want}; rows={rows:?}"
+        );
+    }
+}

@@ -31,7 +31,7 @@ pub(in crate::data::executor) struct TsAggregateParams<'a> {
     pub needed_columns: &'a [String],
     /// `ORDER BY` keys as `(output column, ascending)`, applied to the encoded
     /// group rows before `limit`.
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
 }
 
 impl CoreLoop {
@@ -184,14 +184,17 @@ impl CoreLoop {
         };
 
         // Phase 4: Encode response (MessagePack, no serde_json intermediate).
-        let payload = super::encode::encode_grouped_results(
+        let payload = match super::encode::encode_grouped_results(
             &merged,
             group_by,
             aggregates,
             limit,
             bucket_interval_ms,
             sort_keys,
-        );
+        ) {
+            Ok(p) => p,
+            Err(e) => return self.response_error(task, e),
+        };
         self.response_with_payload(task, payload)
     }
 }

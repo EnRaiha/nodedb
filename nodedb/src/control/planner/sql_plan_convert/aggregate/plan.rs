@@ -53,10 +53,12 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
     // the limitation up to the client; silently dropping such keys
     // would yield unordered output that looks correct, which is the
     // exact silent-narrowing class the audit guidance forbids.
-    let mut bridge_sort_keys: Vec<(String, bool)> = Vec::with_capacity(sort_keys.len());
+    let mut bridge_sort_keys: Vec<SortKeySpec> = Vec::with_capacity(sort_keys.len());
     for k in sort_keys {
         match &k.expr {
-            SqlExpr::Column { name, .. } => bridge_sort_keys.push((name.clone(), k.ascending)),
+            SqlExpr::Column { name, .. } => {
+                bridge_sort_keys.push(SortKeySpec::column(name.clone(), k.ascending))
+            }
             other => {
                 return Err(crate::Error::PlanError {
                     detail: format!(

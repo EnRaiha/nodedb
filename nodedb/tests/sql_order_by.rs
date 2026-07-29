@@ -243,3 +243,42 @@ async fn order_by_after_group_by_sorts_groups() {
          downstream consumers cannot rely on the declared sort."
     );
 }
+
+/// `ORDER BY <expression>` where the expression is NOT also a projected
+/// column. The sort key must still be evaluated and applied; dropping it
+/// returns rows in storage order while reporting success, so a client that
+/// declared a sort silently receives unsorted data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn order_by_expression_absent_from_projection_sorts_rows() {
+    let server = TestServer::start().await;
+
+    server
+        .exec(
+            "CREATE COLLECTION obx (id TEXT PRIMARY KEY, val INT) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .unwrap();
+    // Inserted in an order that differs from the sorted order of `100 / val`,
+    // so storage order cannot be mistaken for a correct sort.
+    for (id, val) in [("a", 2), ("b", 20), ("c", 5)] {
+        server
+            .exec(&format!("INSERT INTO obx (id, val) VALUES ('{id}', {val})"))
+            .await
+            .unwrap();
+    }
+
+    // 100/val → a:50, b:5, c:20 → ascending by the expression: b, c, a.
+    let rows = server
+        .query_text("SELECT id FROM obx ORDER BY 100 / val")
+        .await
+        .expect("ORDER BY over an expression must plan and execute");
+
+    assert_eq!(
+        rows,
+        vec!["b".to_string(), "c".to_string(), "a".to_string()],
+        "ORDER BY over an expression not present in the SELECT list must \
+         still sort; got {rows:?} (insertion order is a,b,c — an unchanged \
+         order means the sort key was silently dropped)"
+    );
+}

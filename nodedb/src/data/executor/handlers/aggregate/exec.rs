@@ -32,7 +32,7 @@ pub(in crate::data::executor) struct AggregateExecInputs<'a> {
     pub sub_group_by: &'a [String],
     pub sub_aggregates: &'a [AggregateSpec],
     pub grouping_sets: &'a [Vec<u32>],
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
 }
 
 impl CoreLoop {

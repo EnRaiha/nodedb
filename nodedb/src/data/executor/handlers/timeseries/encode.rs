@@ -19,8 +19,8 @@ pub(in crate::data::executor) fn encode_grouped_results(
     aggregates: &[(String, String)],
     limit: usize,
     bucket_interval_ms: i64,
-    sort_keys: &[(String, bool)],
-) -> Vec<u8> {
+    sort_keys: &[nodedb_physical::physical_plan::SortKeySpec],
+) -> crate::Result<Vec<u8>> {
     let has_bucket = bucket_interval_ms > 0;
     // An ordered query has to see every group before cutting to `limit`:
     // groups arrive in hash-map order, so the first `limit` of them are an
@@ -102,11 +102,11 @@ pub(in crate::data::executor) fn encode_grouped_results(
         rows.push(rmpv::Value::Map(fields));
     }
 
-    super::sort::sort_rows(&mut rows, sort_keys);
+    super::sort::sort_rows(&mut rows, sort_keys)?;
     rows.truncate(limit);
 
     let array = rmpv::Value::Array(rows);
     let mut buf = Vec::new();
     rmpv::encode::write_value(&mut buf, &array).unwrap_or(());
-    buf
+    Ok(buf)
 }

@@ -166,7 +166,7 @@ pub(super) fn bind_filter_outer(
 pub(super) fn build_scan_plan(
     collection: &str,
     filter_bytes: Vec<u8>,
-    order_by: &[(String, bool)],
+    order_by: &[nodedb_physical::physical_plan::SortKeySpec],
     limit: usize,
 ) -> PhysicalPlan {
     PhysicalPlan::Document(DocumentOp::Scan {

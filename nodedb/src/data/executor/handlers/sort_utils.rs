@@ -2,17 +2,30 @@
 
 //! Shared msgpack-row sorting utilities used by scan handlers.
 
-/// Sort msgpack-map rows by `(field, ascending)` keys. Decodes each row to
-/// JSON, extracts the sort fields, and reorders the original msgpack bytes.
-/// The `bool` matches the document scan convention (`true` = ascending).
+use nodedb_physical::physical_plan::SortKeySpec;
+use nodedb_query::{EvalError, compare_json, eval_expr_on_json};
+
+/// Sort msgpack-map rows by the ORDER BY terms. Decodes each row to JSON,
+/// evaluates each sort expression against it, and reorders the original
+/// msgpack bytes.
+///
+/// A sort key is an expression, so evaluating it can fail — `ORDER BY 1/qty`
+/// over a row with `qty = 0` returns `Err(EvalError::DivisionByZero)` and the
+/// statement fails with SQLSTATE `22012`, the same as it would in a
+/// projection. Returning the rows unsorted instead would answer a different
+/// query than the client asked for.
 ///
 /// Decode failures for individual rows are logged at debug level and treated
-/// as `null` for comparison purposes, so they sort to the start/end rather
-/// than causing the entire sort to fail.
+/// as `null` for comparison purposes, so they sort to the start rather than
+/// failing the entire scan.
 pub(in crate::data::executor) fn sort_msgpack_rows(
     rows: &mut [Vec<u8>],
-    sort_keys: &[(String, bool)],
-) {
+    sort_keys: &[SortKeySpec],
+) -> Result<(), EvalError> {
+    if sort_keys.is_empty() {
+        return Ok(());
+    }
+
     let decoded: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| match nodedb_types::json_from_msgpack(r) {
@@ -24,37 +37,50 @@ pub(in crate::data::executor) fn sort_msgpack_rows(
         })
         .collect();
 
+    let keyed = sort_key_values(&decoded, sort_keys)?;
+
     let mut indices: Vec<usize> = (0..rows.len()).collect();
-    indices.sort_by(|&a, &b| {
-        for (field, asc) in sort_keys {
-            let va = decoded[a].get(field).unwrap_or(&serde_json::Value::Null);
-            let vb = decoded[b].get(field).unwrap_or(&serde_json::Value::Null);
-            let ord = compare_json(va, vb);
-            if ord != std::cmp::Ordering::Equal {
-                return if *asc { ord } else { ord.reverse() };
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
+    indices.sort_by(|&a, &b| compare_key_rows(&keyed[a], &keyed[b], sort_keys));
 
     let original: Vec<Vec<u8>> = rows.to_vec();
     for (dst, src) in indices.iter().enumerate() {
         rows[dst] = original[*src].clone();
     }
+    Ok(())
 }
 
-fn compare_json(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
-    use serde_json::Value;
-    match (a, b) {
-        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-        (Value::Null, _) => std::cmp::Ordering::Less,
-        (_, Value::Null) => std::cmp::Ordering::Greater,
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        (Value::Number(x), Value::Number(y)) => x
-            .as_f64()
-            .partial_cmp(&y.as_f64())
-            .unwrap_or(std::cmp::Ordering::Equal),
-        (Value::String(x), Value::String(y)) => x.cmp(y),
-        _ => a.to_string().cmp(&b.to_string()),
+/// Evaluate every sort expression against every row, up front.
+///
+/// Sorting compares a pair at a time and `sort_by` cannot report an error, so
+/// the fallible work happens here where it can propagate.
+pub(in crate::data::executor) fn sort_key_values(
+    rows: &[serde_json::Value],
+    sort_keys: &[SortKeySpec],
+) -> Result<Vec<Vec<serde_json::Value>>, EvalError> {
+    rows.iter()
+        .map(|row| {
+            sort_keys
+                .iter()
+                .map(|k| eval_expr_on_json(&k.expr, row))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect()
+}
+
+/// Compare two rows' pre-evaluated sort values.
+pub(in crate::data::executor) fn compare_key_rows(
+    a: &[serde_json::Value],
+    b: &[serde_json::Value],
+    sort_keys: &[SortKeySpec],
+) -> std::cmp::Ordering {
+    for (idx, key) in sort_keys.iter().enumerate() {
+        let (Some(va), Some(vb)) = (a.get(idx), b.get(idx)) else {
+            continue;
+        };
+        let ord = compare_json(va, vb);
+        if ord != std::cmp::Ordering::Equal {
+            return if key.ascending { ord } else { ord.reverse() };
+        }
     }
+    std::cmp::Ordering::Equal
 }

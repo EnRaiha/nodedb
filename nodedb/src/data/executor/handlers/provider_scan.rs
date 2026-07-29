@@ -21,7 +21,7 @@ pub(in crate::data::executor) struct ProviderScanParams<'a> {
     pub rows_bytes: &'a [u8],
     pub filters_bytes: &'a [u8],
     pub projection: &'a [String],
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
     pub limit: Option<usize>,
     pub offset: usize,
     pub distinct: bool,
@@ -102,8 +102,10 @@ impl CoreLoop {
         }
 
         // ── 4. Sort. ──────────────────────────────────────────────────────────
-        if !sort_keys.is_empty() {
-            sort_msgpack_rows(&mut rows, sort_keys);
+        if !sort_keys.is_empty()
+            && let Err(e) = sort_msgpack_rows(&mut rows, sort_keys)
+        {
+            return self.response_error(task, crate::Error::from(e));
         }
 
         // ── 5. Distinct (on the would-be projected row). ──────────────────────

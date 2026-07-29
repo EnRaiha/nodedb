@@ -38,11 +38,11 @@ pub enum TimeseriesOp {
         projection: Vec<String>,
         limit: usize,
         filters: Vec<u8>,
-        /// `ORDER BY` keys as `(column, ascending)` in significance order.
+        /// `ORDER BY` terms, each an expression, in significance order.
         /// Empty = the engine's natural order. Applied to the materialized
         /// result before `limit` is enforced, so an ordered query returns the
         /// first `limit` rows of the ordering the client asked for.
-        sort_keys: Vec<(String, bool)>,
+        sort_keys: Vec<crate::physical_plan::SortKeySpec>,
         /// time_bucket interval in milliseconds. 0 = no bucketing.
         bucket_interval_ms: i64,
         /// GROUP BY column names (empty = no grouping or whole-table agg).

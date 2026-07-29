@@ -23,7 +23,7 @@ pub(in crate::data::executor) struct FlushedScanCtx<'a> {
     pub schema: &'a nodedb_types::columnar::ColumnarSchema,
     pub projection: &'a [String],
     pub limit: usize,
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
     pub filter_predicates: &'a [ScanFilter],
     pub prefilter: Option<&'a nodedb_types::surrogate_bitmap::SurrogateBitmap>,
     pub computed_cols: &'a [ComputedColumn],

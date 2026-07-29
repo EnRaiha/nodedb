@@ -2,6 +2,7 @@
 
 //! Expression conversion and CTE inlining.
 
+use nodedb_physical::physical_plan::SortKeySpec;
 use nodedb_sql::types::{SortKey, SqlExpr, SqlPlan};
 
 use super::value::sql_value_to_nodedb_value;
@@ -264,11 +265,16 @@ fn convert_expr_inner(expr: &SqlExpr, qualify: bool) -> crate::bridge::expr_eval
     }
 }
 
-pub(super) fn convert_sort_keys(keys: &[SortKey]) -> Vec<(String, bool)> {
+/// Lower planner sort keys to their physical form.
+///
+/// Every key is carried, expression and all. A key the Data Plane could not
+/// name as a stored column used to be dropped here, which silently answered
+/// `ORDER BY 100 / weight` with rows in storage order.
+pub(super) fn convert_sort_keys(keys: &[SortKey]) -> Vec<SortKeySpec> {
     keys.iter()
-        .filter_map(|k| match &k.expr {
-            SqlExpr::Column { name, .. } => Some((name.clone(), k.ascending)),
-            _ => None,
+        .map(|k| SortKeySpec {
+            expr: sql_expr_to_bridge_expr(&k.expr),
+            ascending: k.ascending,
         })
         .collect()
 }

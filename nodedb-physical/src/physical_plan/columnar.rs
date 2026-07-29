@@ -61,10 +61,10 @@ pub enum ColumnarOp {
         limit: usize,
         filters: Vec<u8>,
         rls_filters: Vec<u8>,
-        /// ORDER BY clause: `(field_name, ascending)` pairs, applied
-        /// against matching rows before the `limit` is enforced. Empty
-        /// for scans with no ORDER BY.
-        sort_keys: Vec<(String, bool)>,
+        /// ORDER BY terms, each an expression, applied against matching
+        /// rows before the `limit` is enforced. Empty for scans with no
+        /// ORDER BY.
+        sort_keys: Vec<crate::physical_plan::SortKeySpec>,
         /// System-time selection. `Current` = current-state read; `AsOf(ms)` =
         /// rows whose `_ts_system` is ≤ ms; `AllVersions` = every `_ts_system`
         /// row ordered ascending (audit log), system-time column projected.

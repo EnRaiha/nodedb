@@ -61,12 +61,22 @@ impl HashIndex {
     }
 
     /// Find all doc indices whose key bytes match the probe key.
+    ///
+    /// A join with no equi-key at all (`ON a.x > b.y`, or a cross join) has
+    /// nothing to hash on: every build row is a candidate, and the residual ON
+    /// predicate decides which pairs survive. Treating "no keys requested" as
+    /// "no key bytes matched" would drop every pair and answer such a join with
+    /// zero rows.
     pub(super) fn probe(
         &self,
         probe_doc: &[u8],
         probe_keys: &[&str],
         build_docs: &[(String, Vec<u8>)],
     ) -> (u64, Vec<(usize, usize)>, Vec<usize>) {
+        if probe_keys.is_empty() {
+            return (0, Vec::new(), (0..build_docs.len()).collect());
+        }
+
         let (hash, probe_ranges) = hash_join_key(probe_doc, probe_keys, &self.state);
         let mut matched = Vec::new();
         if let Some(bucket) = self.buckets.get(&hash) {

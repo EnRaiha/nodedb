@@ -199,7 +199,12 @@ impl CoreLoop {
         // Sort ascending by `field` and cap at `limit` — the same ordering the
         // secondary-index range path yields (index-key order) and the same
         // truncation the non-bitemporal fallback applies.
-        if let Err(e) = sort::sort_rows(&mut rows, &[(field.to_string(), true)]) {
+        if let Err(e) = sort::sort_rows(
+            &mut rows,
+            &[nodedb_physical::physical_plan::SortKeySpec::column(
+                field, true,
+            )],
+        ) {
             return self.response_error(
                 task,
                 ErrorCode::Internal {

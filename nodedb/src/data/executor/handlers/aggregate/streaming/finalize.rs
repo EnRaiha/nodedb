@@ -28,7 +28,7 @@ pub(in crate::data::executor) struct FinalizeGroupsParams<'a> {
     pub limit: usize,
     pub sub_group_by: &'a [String],
     pub sub_aggregates: &'a [AggregateSpec],
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
 }
 
 impl CoreLoop {

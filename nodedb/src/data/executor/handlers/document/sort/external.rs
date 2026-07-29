@@ -1,19 +1,37 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! External sort infrastructure: sort helpers, run files, and k-way merge.
+//! External sort: spill sorted runs to per-core files, then k-way merge.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io::{BufReader, Read as _};
 use std::path::{Path, PathBuf};
 
+use nodedb_physical::physical_plan::SortKeySpec;
 use tracing::debug;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::io::uring_seq_reader::UringSeqReader;
 use crate::data::io::uring_writer::UringWriter;
 
-use nodedb_query::msgpack_scan;
+use super::compare::{
+    SortValues, all_column_keys, compare_docs_by_keys_binary, compare_sort_values,
+    decode_sort_values, encode_sort_values, eval_sort_values,
+};
+use super::in_memory::sort_rows;
+
+/// A row on its way through the sort: the document plus, when the ORDER BY has
+/// a computed key, that row's evaluated key values.
+///
+/// The evaluated keys travel *with* the row into the spill file and back out
+/// again, so the k-way merge orders runs by exactly the values the in-memory
+/// run sort used. Re-deriving them at merge time would mean re-evaluating the
+/// expression against a row that no longer carries the columns it referenced.
+struct SortRecord {
+    id: String,
+    doc: Vec<u8>,
+    keys: SortValues,
+}
 
 impl CoreLoop {
     /// External sort: split filtered rows into sorted runs, spill each run
@@ -26,10 +44,10 @@ impl CoreLoop {
     /// not by tempfile auto-delete. The merge reads each run back incrementally
     /// via [`UringSeqReader`] — one row at a time — so peak read memory is one
     /// refill buffer per run, not the whole run.
-    pub(super) fn external_sort(
+    pub(in crate::data::executor) fn external_sort(
         &self,
         rows: Vec<(String, Vec<u8>)>,
-        sort_keys: &[(String, bool)],
+        sort_keys: &[SortKeySpec],
         output_limit: usize,
     ) -> crate::Result<Vec<(String, Vec<u8>)>> {
         // Spill directory for the named sort run files. `create_dir_all` is a
@@ -43,6 +61,7 @@ impl CoreLoop {
         })?;
 
         let total_rows = rows.len();
+        let computed_keys = !all_column_keys(sort_keys);
 
         // Declared FIRST so it Drops LAST — after the readers below close their
         // fds — guaranteeing the spill files are unlinked only once no reader
@@ -62,11 +81,18 @@ impl CoreLoop {
             let mut framed = Vec::new();
             framed.extend_from_slice(&(run.len() as u32).to_le_bytes());
             for (id, val) in &run {
+                let key_bytes = if computed_keys {
+                    encode_sort_values(&eval_sort_values(val, sort_keys)?)?
+                } else {
+                    Vec::new()
+                };
                 let id_bytes = id.as_bytes();
                 framed.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
                 framed.extend_from_slice(id_bytes);
                 framed.extend_from_slice(&(val.len() as u32).to_le_bytes());
                 framed.extend_from_slice(val);
+                framed.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+                framed.extend_from_slice(&key_bytes);
             }
 
             let run_path = spill_dir.join(format!("run-{run_idx}.spill"));
@@ -90,9 +116,9 @@ impl CoreLoop {
 
         let mut heap: BinaryHeap<Reverse<MergeEntry>> = BinaryHeap::new();
         for reader in &mut readers {
-            if let Some(row) = reader.next_row()? {
+            if let Some(record) = reader.next_row()? {
                 heap.push(Reverse(MergeEntry {
-                    row,
+                    record,
                     run_idx: reader.run_idx,
                     sort_keys: sort_keys.to_vec(),
                 }));
@@ -101,14 +127,15 @@ impl CoreLoop {
 
         let mut result = Vec::with_capacity(output_limit.min(total_rows));
         while let Some(Reverse(entry)) = heap.pop() {
-            result.push(entry.row);
+            let run_idx = entry.run_idx;
+            result.push((entry.record.id, entry.record.doc));
             if result.len() >= output_limit {
                 break;
             }
-            if let Some(next_row) = readers[entry.run_idx].next_row()? {
+            if let Some(next) = readers[run_idx].next_row()? {
                 heap.push(Reverse(MergeEntry {
-                    row: next_row,
-                    run_idx: entry.run_idx,
+                    record: next,
+                    run_idx,
                     sort_keys: sort_keys.to_vec(),
                 }));
             }
@@ -157,131 +184,6 @@ fn write_sort_run(path: &Path, bytes: &[u8]) -> crate::Result<()> {
     }
 }
 
-/// Compare two raw msgpack documents by a list of sort keys.
-///
-/// Uses binary field extraction — no decode. Used by both in-memory
-/// sort and external merge sort for consistent ordering.
-pub(super) fn compare_docs_by_keys_binary(
-    a_bytes: &[u8],
-    b_bytes: &[u8],
-    sort_keys: &[(String, bool)],
-) -> std::cmp::Ordering {
-    for (field, asc) in sort_keys {
-        let a_range = msgpack_scan::extract_field(a_bytes, 0, field);
-        let b_range = msgpack_scan::extract_field(b_bytes, 0, field);
-
-        let cmp = match (a_range, b_range) {
-            (Some(ar), Some(br)) => msgpack_scan::compare_field_bytes(a_bytes, ar, b_bytes, br),
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (None, None) => std::cmp::Ordering::Equal,
-        };
-
-        let ordered = if *asc { cmp } else { cmp.reverse() };
-        if ordered != std::cmp::Ordering::Equal {
-            return ordered;
-        }
-    }
-    std::cmp::Ordering::Equal
-}
-
-/// Pre-extracted sort key offsets for a single row.
-/// Each entry is `Option<(usize, usize)>` — byte range of the sort key value.
-type SortKeyOffsets = Vec<Option<(usize, usize)>>;
-
-pub(in crate::data::executor) fn sort_rows(
-    rows: &mut [(String, Vec<u8>)],
-    sort_keys: &[(String, bool)],
-) -> crate::Result<()> {
-    if sort_keys.is_empty() {
-        return Ok(());
-    }
-
-    // Pre-extract sort key offsets for all rows — one scan per row instead
-    // of O(N log N) scans during comparisons.
-    let key_offsets: Vec<SortKeyOffsets> = rows
-        .iter()
-        .map(|(_, bytes)| {
-            sort_keys
-                .iter()
-                .map(|(field, _)| msgpack_scan::extract_field(bytes, 0, field))
-                .collect()
-        })
-        .collect();
-
-    // Sort indices using pre-extracted offsets.
-    let mut indices: Vec<usize> = (0..rows.len()).collect();
-    indices.sort_by(|&ai, &bi| {
-        compare_with_preextracted(
-            &rows[ai].1,
-            &key_offsets[ai],
-            &rows[bi].1,
-            &key_offsets[bi],
-            sort_keys,
-        )
-    });
-
-    // Apply permutation in-place. `key_offsets` is no longer needed after
-    // sorting the index; it is dropped here.
-    drop(key_offsets);
-    apply_permutation(rows, indices)
-}
-
-/// Compare two docs using pre-extracted sort key offsets.
-fn compare_with_preextracted(
-    a_bytes: &[u8],
-    a_offsets: &[Option<(usize, usize)>],
-    b_bytes: &[u8],
-    b_offsets: &[Option<(usize, usize)>],
-    sort_keys: &[(String, bool)],
-) -> std::cmp::Ordering {
-    for (i, (_, asc)) in sort_keys.iter().enumerate() {
-        let cmp = match (a_offsets[i], b_offsets[i]) {
-            (Some(ar), Some(br)) => msgpack_scan::compare_field_bytes(a_bytes, ar, b_bytes, br),
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (None, None) => std::cmp::Ordering::Equal,
-        };
-        let ordered = if *asc { cmp } else { cmp.reverse() };
-        if ordered != std::cmp::Ordering::Equal {
-            return ordered;
-        }
-    }
-    std::cmp::Ordering::Equal
-}
-
-/// Apply a permutation to rows using the sorted index order.
-///
-/// `indices[i]` = the original row index that should appear at position `i`.
-///
-/// Returns `Err` if `indices` is not a valid permutation of `0..rows.len()`:
-/// an out-of-range index or a duplicate (slot already consumed) both surface as
-/// `crate::Error::Internal` rather than silently producing sentinel rows.
-fn apply_permutation(rows: &mut [(String, Vec<u8>)], indices: Vec<usize>) -> crate::Result<()> {
-    // Wrap each row in `Option` so we can move individual elements out by
-    // index without cloning. Each slot is taken exactly once during the
-    // scatter, so no element is ever double-moved.
-    let mut src: Vec<Option<(String, Vec<u8>)>> =
-        rows.iter_mut().map(|r| Some(std::mem::take(r))).collect();
-    let n = src.len();
-    for (target_pos, &src_idx) in indices.iter().enumerate() {
-        // Checked access: out-of-range index is an invariant violation.
-        let slot = src.get_mut(src_idx).ok_or_else(|| crate::Error::Internal {
-            detail: format!(
-                "apply_permutation: index {src_idx} out of range (len={n}, target_pos={target_pos})"
-            ),
-        })?;
-        // None means this slot was already consumed — duplicate index in `indices`.
-        let row = slot.take().ok_or_else(|| crate::Error::Internal {
-            detail: format!(
-                "apply_permutation: duplicate index {src_idx} at target_pos={target_pos} (len={n})"
-            ),
-        })?;
-        rows[target_pos] = row;
-    }
-    Ok(())
-}
-
 /// Read backend for a sort run: io_uring streaming on Linux, blocking
 /// `std::fs` (`BufReader`) when io_uring is unavailable.
 enum RunBackend {
@@ -291,14 +193,14 @@ enum RunBackend {
     Std(BufReader<std::fs::File>),
 }
 
-pub(super) struct RunReader {
+struct RunReader {
     backend: RunBackend,
     remaining: u32,
-    pub(super) run_idx: usize,
+    run_idx: usize,
 }
 
 impl RunReader {
-    pub(super) fn open(path: &Path, run_idx: usize) -> crate::Result<Self> {
+    fn open(path: &Path, run_idx: usize) -> crate::Result<Self> {
         let mut backend = match UringSeqReader::open_default(path) {
             Some(r) => RunBackend::Uring(Box::new(r)),
             None => RunBackend::Std(BufReader::new(std::fs::File::open(path).map_err(|e| {
@@ -339,58 +241,49 @@ impl RunReader {
         }
     }
 
-    pub(super) fn next_row(&mut self) -> crate::Result<Option<(String, Vec<u8>)>> {
+    /// Read one length-prefixed field. A short read mid-record is corruption —
+    /// error, never silently drop rows.
+    fn read_field(&mut self) -> crate::Result<Vec<u8>> {
+        let mut buf4 = [0u8; 4];
+        if !Self::read_full(&mut self.backend, &mut buf4)? {
+            return Err(crate::Error::Storage {
+                engine: "sort".into(),
+                detail: "sort run truncated: expected row frame".into(),
+            });
+        }
+        let len = u32::from_le_bytes(buf4) as usize;
+        let mut buf = vec![0u8; len];
+        if len > 0 && !Self::read_full(&mut self.backend, &mut buf)? {
+            return Err(crate::Error::Storage {
+                engine: "sort".into(),
+                detail: "sort run truncated: expected row frame".into(),
+            });
+        }
+        Ok(buf)
+    }
+
+    fn next_row(&mut self) -> crate::Result<Option<SortRecord>> {
         if self.remaining == 0 {
             return Ok(None);
         }
         self.remaining -= 1;
 
-        let mut buf4 = [0u8; 4];
-
-        // A run that ends before `remaining` rows have been read is corruption —
-        // error, never silently drop rows.
-        if !Self::read_full(&mut self.backend, &mut buf4)? {
-            return Err(crate::Error::Storage {
-                engine: "sort".into(),
-                detail: "sort run truncated: expected row frame".into(),
-            });
-        }
-        let id_len = u32::from_le_bytes(buf4) as usize;
-        let mut id_buf = vec![0u8; id_len];
-        if !Self::read_full(&mut self.backend, &mut id_buf)? {
-            return Err(crate::Error::Storage {
-                engine: "sort".into(),
-                detail: "sort run truncated: expected row frame".into(),
-            });
-        }
+        let id_buf = self.read_field()?;
         let id = String::from_utf8(id_buf).map_err(|_| crate::Error::Storage {
             engine: "sort".into(),
             detail: "sort run corrupt: id not valid utf-8".into(),
         })?;
+        let doc = self.read_field()?;
+        let keys = decode_sort_values(&self.read_field()?)?;
 
-        if !Self::read_full(&mut self.backend, &mut buf4)? {
-            return Err(crate::Error::Storage {
-                engine: "sort".into(),
-                detail: "sort run truncated: expected row frame".into(),
-            });
-        }
-        let val_len = u32::from_le_bytes(buf4) as usize;
-        let mut val_buf = vec![0u8; val_len];
-        if !Self::read_full(&mut self.backend, &mut val_buf)? {
-            return Err(crate::Error::Storage {
-                engine: "sort".into(),
-                detail: "sort run truncated: expected row frame".into(),
-            });
-        }
-
-        Ok(Some((id, val_buf)))
+        Ok(Some(SortRecord { id, doc, keys }))
     }
 }
 
-pub(super) struct MergeEntry {
-    pub(super) row: (String, Vec<u8>),
-    pub(super) run_idx: usize,
-    pub(super) sort_keys: Vec<(String, bool)>,
+struct MergeEntry {
+    record: SortRecord,
+    run_idx: usize,
+    sort_keys: Vec<SortKeySpec>,
 }
 
 impl PartialEq for MergeEntry {
@@ -409,7 +302,13 @@ impl PartialOrd for MergeEntry {
 
 impl Ord for MergeEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        compare_docs_by_keys_binary(&self.row.1, &other.row.1, &self.sort_keys)
+        // Rows spilled with evaluated keys are merged by those keys; a
+        // column-only sort carries none and compares straight from the bytes.
+        if self.record.keys.is_empty() && other.record.keys.is_empty() {
+            compare_docs_by_keys_binary(&self.record.doc, &other.record.doc, &self.sort_keys)
+        } else {
+            compare_sort_values(&self.record.keys, &other.record.keys, &self.sort_keys)
+        }
     }
 }
 
@@ -421,127 +320,8 @@ mod tests {
         nodedb_types::json_msgpack::json_to_msgpack(v).expect("encode")
     }
 
-    #[test]
-    fn sort_by_int_field_asc() {
-        let mut rows = vec![
-            (
-                "a".into(),
-                encode(&serde_json::json!({"id": "a", "val": 30})),
-            ),
-            (
-                "b".into(),
-                encode(&serde_json::json!({"id": "b", "val": 10})),
-            ),
-            (
-                "c".into(),
-                encode(&serde_json::json!({"id": "c", "val": 20})),
-            ),
-        ];
-        sort_rows(&mut rows, &[("val".into(), true)]).expect("sort_rows failed");
-        let order: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(order, vec!["b", "c", "a"], "ASC by val: 10, 20, 30");
-    }
-
-    #[test]
-    fn sort_by_int_field_desc() {
-        let mut rows = vec![
-            (
-                "a".into(),
-                encode(&serde_json::json!({"id": "a", "val": 30})),
-            ),
-            (
-                "b".into(),
-                encode(&serde_json::json!({"id": "b", "val": 10})),
-            ),
-            (
-                "c".into(),
-                encode(&serde_json::json!({"id": "c", "val": 20})),
-            ),
-        ];
-        sort_rows(&mut rows, &[("val".into(), false)]).expect("sort_rows failed");
-        assert_eq!(rows[0].0, "a", "DESC first should be a (val=30)");
-        assert_eq!(rows[1].0, "c", "DESC second should be c (val=20)");
-        assert_eq!(rows[2].0, "b", "DESC third should be b (val=10)");
-    }
-
-    #[test]
-    fn sort_by_string_field_asc() {
-        let mut rows = vec![
-            (
-                "1".into(),
-                encode(&serde_json::json!({"id": "1", "name": "Charlie"})),
-            ),
-            (
-                "2".into(),
-                encode(&serde_json::json!({"id": "2", "name": "Alice"})),
-            ),
-            (
-                "3".into(),
-                encode(&serde_json::json!({"id": "3", "name": "Bob"})),
-            ),
-        ];
-        sort_rows(&mut rows, &[("name".into(), true)]).expect("sort_rows failed");
-        assert_eq!(rows[0].0, "2", "first should be Alice");
-        assert_eq!(rows[2].0, "1", "last should be Charlie");
-    }
-
-    // --- apply_permutation invariant tests ---
-
-    #[test]
-    fn apply_permutation_valid_reorders_correctly() {
-        // Permutation [2, 0, 1] moves row at index 2 → pos 0, index 0 → pos 1, index 1 → pos 2.
-        let mut rows: Vec<(String, Vec<u8>)> = vec![
-            ("a".into(), vec![1]),
-            ("b".into(), vec![2]),
-            ("c".into(), vec![3]),
-        ];
-        apply_permutation(&mut rows, vec![2, 0, 1]).expect("valid permutation must succeed");
-        assert_eq!(rows[0].0, "c");
-        assert_eq!(rows[1].0, "a");
-        assert_eq!(rows[2].0, "b");
-    }
-
-    #[test]
-    fn apply_permutation_duplicate_index_errors_not_sentinel() {
-        // indices [0, 0] is NOT a valid permutation of [0, 1].
-        // The second use of index 0 must return Err, not silently write ("", []).
-        let mut rows: Vec<(String, Vec<u8>)> = vec![("x".into(), vec![10]), ("y".into(), vec![20])];
-        let result = apply_permutation(&mut rows, vec![0, 0]);
-        assert!(
-            result.is_err(),
-            "duplicate index must return Err, not a silent sentinel row"
-        );
-    }
-
-    #[test]
-    fn apply_permutation_out_of_range_index_errors() {
-        // index 5 is out of range for a 2-element slice.
-        let mut rows: Vec<(String, Vec<u8>)> = vec![("x".into(), vec![10]), ("y".into(), vec![20])];
-        let result = apply_permutation(&mut rows, vec![0, 5]);
-        assert!(
-            result.is_err(),
-            "out-of-range index must return Err, not panic"
-        );
-    }
-}
-
-/// End-to-end spill+merge coverage exercising the real io_uring spill write
-/// (`write_sort_run`) and streaming read (`RunReader`) path.
-///
-/// Tested at the primitive level (write_sort_run + RunReader + manual k-way
-/// heap merge) rather than via `CoreLoop::external_sort`, because constructing
-/// a `CoreLoop` requires a full Data-Plane core bring-up; the merge logic here
-/// is a faithful copy of `external_sort`'s loop so it covers the same path.
-#[cfg(all(test, target_os = "linux"))]
-mod spill_merge_tests {
-    use super::*;
-
-    fn encode(v: &serde_json::Value) -> Vec<u8> {
-        nodedb_types::json_msgpack::json_to_msgpack(v).expect("encode")
-    }
-
-    /// Build a framed run blob (count header + per-row frames) byte-identical to
-    /// `external_sort`'s spill layout.
+    /// Build a framed run blob byte-identical to `external_sort`'s spill
+    /// layout, including the trailing (here empty) evaluated-keys field.
     fn frame(rows: &[(String, Vec<u8>)]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
@@ -551,6 +331,7 @@ mod spill_merge_tests {
             out.extend_from_slice(idb);
             out.extend_from_slice(&(val.len() as u32).to_le_bytes());
             out.extend_from_slice(val);
+            out.extend_from_slice(&0u32.to_le_bytes());
         }
         out
     }
@@ -568,7 +349,7 @@ mod spill_merge_tests {
     #[test]
     fn spill_then_kway_merge_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let sort_keys = vec![("val".to_string(), true)];
+        let sort_keys = vec![SortKeySpec::column("val", true)];
 
         // Three runs, each internally sorted ascending by `val`.
         let runs = [
@@ -588,7 +369,7 @@ mod spill_merge_tests {
         for reader in &mut readers {
             if let Some(r) = reader.next_row().unwrap() {
                 heap.push(Reverse(MergeEntry {
-                    row: r,
+                    record: r,
                     run_idx: reader.run_idx,
                     sort_keys: sort_keys.clone(),
                 }));
@@ -597,11 +378,12 @@ mod spill_merge_tests {
 
         let mut out: Vec<String> = Vec::new();
         while let Some(Reverse(entry)) = heap.pop() {
-            out.push(entry.row.0.clone());
-            if let Some(next) = readers[entry.run_idx].next_row().unwrap() {
+            let run_idx = entry.run_idx;
+            out.push(entry.record.id.clone());
+            if let Some(next) = readers[run_idx].next_row().unwrap() {
                 heap.push(Reverse(MergeEntry {
-                    row: next,
-                    run_idx: entry.run_idx,
+                    record: next,
+                    run_idx,
                     sort_keys: sort_keys.clone(),
                 }));
             }

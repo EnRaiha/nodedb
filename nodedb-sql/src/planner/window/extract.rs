@@ -18,7 +18,7 @@ use crate::error::{Result, SqlError};
 use crate::functions::registry::{FunctionCategory, FunctionRegistry};
 use crate::parser::normalize::{SCHEMA_QUALIFIED_MSG, normalize_ident};
 use crate::resolver::expr::convert_expr;
-use crate::types::{SortKey, WindowSpec};
+use crate::types::{SortKey, SqlExpr, WindowSpec};
 use nodedb_query::{FrameBound, WindowFrame};
 
 use super::frame::convert_window_frame;
@@ -99,17 +99,8 @@ fn convert_window_spec(
         }
     }
 
-    let args = match &func.args {
-        ast::FunctionArguments::List(args) => args
-            .args
-            .iter()
-            .filter_map(|a| match a {
-                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_expr(e).ok(),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+    let args = convert_window_args(func, &name)?;
+    validate_constant_args(&name, &args)?;
 
     // Resolve the OVER target into a flattened partition/order/frame.
     let flat = match &func.over {
@@ -183,6 +174,64 @@ fn convert_window_spec(
         alias: alias.into(),
         frame,
     })
+}
+
+/// Convert a window function's argument list.
+///
+/// Each argument is a full expression that the evaluator evaluates per row.
+/// An argument the converter cannot represent is an error, never a dropped
+/// argument: discarding one silently turns `SUM(price * qty) OVER (...)` into
+/// a windowed column of NULLs that still reports success.
+fn convert_window_args(func: &ast::Function, name: &str) -> Result<Vec<SqlExpr>> {
+    let ast::FunctionArguments::List(list) = &func.args else {
+        return Ok(Vec::new());
+    };
+
+    let mut args = Vec::with_capacity(list.args.len());
+    for arg in &list.args {
+        match arg {
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => args.push(convert_expr(e)?),
+            // `COUNT(*) OVER (...)` — a wildcard carries no value to evaluate.
+            // The evaluator counts frame rows when no argument is present.
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) => {}
+            other => {
+                return Err(SqlError::Unsupported {
+                    detail: format!("argument form in '{name}() OVER (...)': {other:?}"),
+                });
+            }
+        }
+    }
+    Ok(args)
+}
+
+/// Reject a non-constant in the argument positions PostgreSQL requires to be
+/// constant: the `LAG`/`LEAD` offset and default, the `NTILE` bucket count,
+/// and the `NTH_VALUE` position.
+///
+/// The evaluator resolves these once per partition rather than per row. Left
+/// unvalidated, a non-constant there falls back to the position's default and
+/// silently answers a different query than the one asked.
+fn validate_constant_args(name: &str, args: &[SqlExpr]) -> Result<()> {
+    let constant_positions: &[usize] = match name {
+        "lag" | "lead" => &[1, 2],
+        "ntile" => &[0],
+        "nth_value" => &[1],
+        _ => return Ok(()),
+    };
+
+    for &pos in constant_positions {
+        if let Some(arg) = args.get(pos)
+            && !matches!(arg, SqlExpr::Literal(_))
+        {
+            return Err(SqlError::Unsupported {
+                detail: format!(
+                    "argument {} of '{name}() OVER (...)' must be a constant",
+                    pos + 1
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

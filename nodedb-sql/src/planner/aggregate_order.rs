@@ -10,9 +10,9 @@ use crate::error::Result;
 use crate::functions::registry::FunctionRegistry;
 use crate::parser::normalize::normalize_ident;
 use crate::planner::aggregate::{
-    expr_column_name, extract_aggregates_from_projection, function_args_exprs, key_column_name,
-    normalize_function_name,
+    extract_aggregates_from_projection, function_args_exprs, normalize_function_name,
 };
+use crate::planner::group_by::{expr_column_name, key_column_name};
 use crate::resolver::expr::convert_expr;
 use crate::types::query::AggOutputSlot;
 use crate::types_expr::SqlExpr;

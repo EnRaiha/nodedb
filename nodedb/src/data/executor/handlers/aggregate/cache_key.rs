@@ -59,7 +59,7 @@ pub(super) struct AggregateCacheKeyInputs<'a> {
     pub sub_group_by: &'a [String],
     pub sub_aggregates: &'a [AggregateSpec],
     pub limit: usize,
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
 }
 
 pub(super) fn aggregate_cache_key(
@@ -92,7 +92,7 @@ pub(super) fn aggregate_cache_key(
     }
     let sort = sort_keys
         .iter()
-        .map(|(field, ascending)| format!("{field}:{}", u8::from(*ascending)))
+        .map(|k| format!("{:?}:{}", k.expr, u8::from(k.ascending)))
         .collect::<Vec<_>>()
         .join(",");
     let _ = write!(rest, "\0limit:{limit}\0sort:{sort}");

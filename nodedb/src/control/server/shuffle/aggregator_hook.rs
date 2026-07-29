@@ -132,10 +132,12 @@ impl RegistryShuffleAggregator {
                     message: format!("shuffle aggregate: decode aggregate specs failed: {e}"),
                 }
             })?;
-        let sort_keys: Vec<(String, bool)> = req
+        let sort_keys: Vec<nodedb_physical::physical_plan::SortKeySpec> = req
             .sort_keys
             .iter()
-            .map(|k| (k.column.clone(), k.ascending))
+            .map(|k| {
+                nodedb_physical::physical_plan::SortKeySpec::column(k.column.clone(), k.ascending)
+            })
             .collect();
         let limit = usize::try_from(req.limit).unwrap_or(usize::MAX);
 

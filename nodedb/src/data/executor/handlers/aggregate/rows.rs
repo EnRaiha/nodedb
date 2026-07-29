@@ -33,24 +33,29 @@ pub(super) fn apply_user_aliases_to_rows(
     }
 }
 
-/// Sort aggregated rows by `sort_keys = [(column, ascending), ...]`.
+/// Sort finalized group rows by the post-aggregate ORDER BY terms.
 ///
-/// Each row is a `serde_json::Value::Object`; for every key, the
-/// extracted value is converted to a comparable form (numbers compared
-/// numerically, strings lexically, nulls last). Keys missing from a
-/// row sort as null. The sort is stable to preserve relative order of
-/// equal-key rows.
-pub(super) fn sort_aggregated_rows(rows: &mut [serde_json::Value], sort_keys: &[(String, bool)]) {
+/// Each row is a `serde_json::Value::Object` keyed by output column name, and
+/// the planner rejects a post-aggregate ORDER BY that is not a bare output
+/// column, so every key here resolves by name. Keys missing from a row sort as
+/// null. The sort is stable to preserve relative order of equal-key rows.
+pub(super) fn sort_aggregated_rows(
+    rows: &mut [serde_json::Value],
+    sort_keys: &[nodedb_physical::physical_plan::SortKeySpec],
+) {
     if sort_keys.is_empty() {
         return;
     }
     rows.sort_by(|a, b| {
-        for (column, ascending) in sort_keys {
+        for key in sort_keys {
+            let Some(column) = key.as_column() else {
+                continue;
+            };
             let av = a.get(column);
             let bv = b.get(column);
             let ord = compare_json_values(av, bv);
             if ord != std::cmp::Ordering::Equal {
-                return if *ascending { ord } else { ord.reverse() };
+                return if key.ascending { ord } else { ord.reverse() };
             }
         }
         std::cmp::Ordering::Equal

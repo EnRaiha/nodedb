@@ -22,7 +22,7 @@ pub(in crate::data::executor) struct DocumentScanParams<'a> {
     pub collection: &'a str,
     pub limit: usize,
     pub offset: usize,
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
     pub filters: &'a [u8],
     pub distinct: bool,
     pub projection: &'a [String],
@@ -234,13 +234,10 @@ impl CoreLoop {
                     filtered
                 } else if filtered.len() <= self.query_tuning.sort_run_size {
                     let mut v = filtered;
+                    // Propagate the typed error: a zero divisor in a sort key
+                    // is a `22012` statement failure, not an internal fault.
                     if let Err(e) = sort::sort_rows(&mut v, sort_keys) {
-                        return self.response_error(
-                            task,
-                            ErrorCode::Internal {
-                                detail: format!("in-memory sort failed: {e}"),
-                            },
-                        );
+                        return self.response_error(task, e);
                     }
                     v
                 } else {
@@ -248,12 +245,10 @@ impl CoreLoop {
                         Ok(merged) => merged,
                         Err(e) => {
                             warn!(core = self.core_id, error = %e, "external sort failed");
-                            return self.response_error(
-                                task,
-                                ErrorCode::Internal {
-                                    detail: format!("external sort failed: {e}"),
-                                },
-                            );
+                            // Same typed propagation as the in-memory path: a
+                            // sort-key evaluation failure keeps its SQLSTATE
+                            // rather than degrading to a generic internal error.
+                            return self.response_error(task, e);
                         }
                     }
                 };

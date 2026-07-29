@@ -16,6 +16,7 @@ pub mod expr_parse;
 pub mod functions;
 pub mod fusion;
 pub mod geo_functions;
+pub mod json_expr;
 pub mod json_ops;
 pub mod metadata_filter;
 pub mod msgpack_scan;
@@ -35,6 +36,7 @@ pub use fusion::{
     DEFAULT_RRF_K, FusedResult, RankedResult, reciprocal_rank_fusion,
     reciprocal_rank_fusion_linear, reciprocal_rank_fusion_weighted,
 };
+pub use json_expr::{compare_json, eval_expr_on_json};
 pub use partition_hash::{partition_hash, partition_hash_seeded};
 pub use scan_filter::ScanFilter;
 pub use window::{

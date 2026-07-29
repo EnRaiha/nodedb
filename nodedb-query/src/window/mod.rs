@@ -6,6 +6,7 @@
 //! appended to every row (e.g., ROW_NUMBER, RANK, SUM OVER).
 
 pub mod aggregate;
+pub mod arg;
 pub mod eval;
 pub mod frame;
 pub mod helpers;

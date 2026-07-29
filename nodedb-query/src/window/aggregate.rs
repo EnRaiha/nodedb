@@ -10,10 +10,9 @@
 //!   concrete `[start_idx, end_idx]` slice for every row and aggregates over
 //!   it.
 
-use crate::expr::SqlExpr;
-
+use super::arg::{ArgValues, arg_at, eval_arg_values};
 use super::frame::{build_peer_groups, evaluate_frame_bounds};
-use super::helpers::{as_f64, get_field, set_window_col};
+use super::helpers::{as_f64, set_window_col};
 use super::running::running_aggregate;
 use super::spec::{FrameBound, WindowFuncSpec};
 
@@ -22,14 +21,10 @@ pub(super) fn apply_aggregate_window(
     indices: &[usize],
     spec: &WindowFuncSpec,
 ) -> Result<(), crate::expr::EvalError> {
-    let field = spec
-        .args
-        .first()
-        .and_then(|e| match e {
-            SqlExpr::Column(c) => Some(c.as_str()),
-            _ => None,
-        })
-        .unwrap_or("*");
+    // The argument is an expression evaluated per row, not a column name: a
+    // zero divisor inside it fails the statement here rather than folding the
+    // aggregate to a silently-wrong total.
+    let arg_values = eval_arg_values(rows, indices, spec, 0)?;
 
     // Fast path: RANGE UNBOUNDED PRECEDING TO CURRENT ROW is the most common
     // pattern (the PostgreSQL default for ordered windows). Use the running
@@ -39,11 +34,11 @@ pub(super) fn apply_aggregate_window(
         && matches!(spec.frame.end, FrameBound::CurrentRow);
 
     if use_running {
-        running_aggregate(rows, indices, spec, field)?;
+        running_aggregate(rows, indices, spec, &arg_values)?;
         return Ok(());
     }
 
-    per_row_aggregate(rows, indices, spec, field)
+    per_row_aggregate(rows, indices, spec, &arg_values)
 }
 
 /// Per-row frame evaluator.
@@ -51,13 +46,13 @@ pub(super) fn apply_aggregate_window(
 /// For each row position `pos` in the partition:
 /// 1. Resolve the concrete `[start_idx, end_idx]` frame slice via
 ///    `evaluate_frame_bounds`.
-/// 2. Aggregate `field` over `indices[start_idx..=end_idx]`.
+/// 2. Aggregate the evaluated argument over `indices[start_idx..=end_idx]`.
 /// 3. Write the result back under `spec.alias`.
 fn per_row_aggregate(
     rows: &mut [(String, serde_json::Value)],
     indices: &[usize],
     spec: &WindowFuncSpec,
-    field: &str,
+    arg_values: &ArgValues,
 ) -> Result<(), crate::expr::EvalError> {
     let len = indices.len();
     if len == 0 {
@@ -82,20 +77,17 @@ fn per_row_aggregate(
         Vec::new()
     };
 
-    // Pre-collect all numeric values to avoid repeated borrow issues.
-    let all_vals: Vec<Option<f64>> = indices
-        .iter()
-        .map(|&i| as_f64(&get_field(&rows[i].1, field)))
+    // Numeric view of the evaluated argument, one slot per partition position.
+    let all_vals: Vec<Option<f64>> = (0..len)
+        .map(|pos| as_f64(&arg_at(arg_values, pos)))
         .collect();
 
-    // We need to write into `rows` after computing each result; collect
-    // results first so we only borrow `rows` immutably during computation.
     let results: Vec<serde_json::Value> = (0..len)
         .map(|pos| {
             let (start_idx, end_idx) =
                 evaluate_frame_bounds(&spec.frame, pos, len, &order_values, &peer_groups);
 
-            aggregate_slice(&all_vals, indices, rows, field, spec, start_idx, end_idx)
+            aggregate_slice(&all_vals, arg_values, spec, start_idx, end_idx)
         })
         .collect();
 
@@ -106,12 +98,11 @@ fn per_row_aggregate(
     Ok(())
 }
 
-/// Aggregate `field` over the slice `indices[start_idx..=end_idx]`.
+/// Aggregate the evaluated argument over the frame slice
+/// `[start_idx, end_idx]` (partition positions, not row indices).
 fn aggregate_slice(
     all_vals: &[Option<f64>],
-    indices: &[usize],
-    rows: &[(String, serde_json::Value)],
-    field: &str,
+    arg_values: &ArgValues,
     spec: &WindowFuncSpec,
     start_idx: usize,
     end_idx: usize,
@@ -120,14 +111,24 @@ fn aggregate_slice(
         .iter()
         .filter_map(|v| *v)
         .collect();
-    let slice_count = end_idx - start_idx + 1;
 
     match spec.func_name.as_str() {
         "sum" => {
             let rt = crate::simd_agg::ts_runtime();
             serde_json::json!((rt.sum_f64)(&slice_vals))
         }
-        "count" => serde_json::json!(slice_count),
+        // `COUNT(*)` counts frame rows; `COUNT(expr)` counts the rows whose
+        // argument is non-NULL, so a NULL argument is excluded rather than
+        // inflating the count.
+        "count" => match arg_values {
+            None => serde_json::json!(end_idx - start_idx + 1),
+            Some(values) => serde_json::json!(
+                values[start_idx..=end_idx]
+                    .iter()
+                    .filter(|v| !v.is_null())
+                    .count()
+            ),
+        },
         "avg" => {
             if slice_vals.is_empty() {
                 serde_json::Value::Null
@@ -152,14 +153,8 @@ fn aggregate_slice(
                 serde_json::json!((rt.max_f64)(&slice_vals))
             }
         }
-        "first_value" => indices
-            .get(start_idx)
-            .map(|&i| get_field(&rows[i].1, field))
-            .unwrap_or(serde_json::Value::Null),
-        "last_value" => indices
-            .get(end_idx)
-            .map(|&i| get_field(&rows[i].1, field))
-            .unwrap_or(serde_json::Value::Null),
+        "first_value" => arg_at(arg_values, start_idx),
+        "last_value" => arg_at(arg_values, end_idx),
         _ => serde_json::Value::Null,
     }
 }

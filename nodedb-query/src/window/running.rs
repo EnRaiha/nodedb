@@ -11,19 +11,20 @@
 //! computed at the *last* peer in the group (i.e., they all include each
 //! other). This matches PostgreSQL behaviour for RANGE CURRENT ROW.
 
-use super::helpers::{as_f64, get_field, order_keys_equal, set_window_col};
+use super::arg::{ArgValues, arg_at};
+use super::helpers::{as_f64, order_keys_equal, set_window_col};
 use super::spec::WindowFuncSpec;
 
 /// Apply a peer-aware running aggregate over a sorted partition.
 ///
 /// `indices` is the sorted slice of row indices within the partition.
-/// `order_by` is the `(column, ascending)` list from the window spec — used
-/// to detect peer groups.
+/// `arg_values` holds the function argument already evaluated once per
+/// partition position; `None` is the no-argument form (`COUNT(*)`).
 pub(super) fn running_aggregate(
     rows: &mut [(String, serde_json::Value)],
     indices: &[usize],
     spec: &WindowFuncSpec,
-    field: &str,
+    arg_values: &ArgValues,
 ) -> Result<(), crate::expr::EvalError> {
     let len = indices.len();
     if len == 0 {
@@ -43,13 +44,15 @@ pub(super) fn running_aggregate(
 
     for pos in 0..len {
         let i = indices[pos];
-        let val = get_field(&rows[i].1, field);
+        let val = arg_at(arg_values, pos);
         if let Some(n) = as_f64(&val) {
             running_sum += n;
             running_count += 1;
             running_min = Some(running_min.map_or(n, |m: f64| m.min(n)));
             running_max = Some(running_max.map_or(n, |m: f64| m.max(n)));
-        } else if spec.func_name == "count" {
+        } else if spec.func_name == "count" && (arg_values.is_none() || !val.is_null()) {
+            // `COUNT(*)` counts every row; `COUNT(expr)` counts rows whose
+            // argument is non-NULL, including non-numeric values.
             running_count += 1;
         }
 
@@ -75,8 +78,8 @@ pub(super) fn running_aggregate(
                 "max" => running_max
                     .map(|m| serde_json::json!(m))
                     .unwrap_or(serde_json::Value::Null),
-                "first_value" => get_field(&rows[indices[0]].1, field),
-                "last_value" => get_field(&rows[indices[pos]].1, field),
+                "first_value" => arg_at(arg_values, 0),
+                "last_value" => arg_at(arg_values, pos),
                 _ => serde_json::Value::Null,
             };
 

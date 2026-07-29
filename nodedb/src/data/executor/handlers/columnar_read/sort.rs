@@ -1,37 +1,76 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! ORDER BY comparator: sort a materialized row buffer by a typed sort-key list.
+//! ORDER BY for columnar rows: sort-key evaluation and comparison.
 
-/// Compare two columnar rows by the planner's sort-key list. Missing
-/// columns compare as `Null`; unknown column names fall through as
-/// `Equal` so a mis-typed ORDER BY at least keeps scan order stable.
-pub(in crate::data::executor) fn sort_rows_by_keys(
-    a: &[nodedb_types::value::Value],
-    b: &[nodedb_types::value::Value],
+use nodedb_physical::physical_plan::SortKeySpec;
+use nodedb_types::value::Value;
+
+/// Evaluate every sort key for one row.
+///
+/// A key that names a stored column reads straight out of the row. A computed
+/// key (`ORDER BY 100 / weight`) is evaluated against the row, so the sort
+/// orders by the value the client asked for instead of dropping the key and
+/// answering in scan order. A zero divisor there fails the statement with
+/// SQLSTATE `22012`, exactly as it does in the projection.
+pub(in crate::data::executor) fn eval_row_sort_values(
+    row: &[Value],
     schema: &nodedb_types::columnar::ColumnarSchema,
-    sort_keys: &[(String, bool)],
-) -> std::cmp::Ordering {
-    use nodedb_types::value::Value;
-    for (field, ascending) in sort_keys {
-        let idx = match schema.columns.iter().position(|c| &c.name == field) {
-            Some(i) => i,
-            None => continue,
+    sort_keys: &[SortKeySpec],
+) -> crate::Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(sort_keys.len());
+    let mut row_object: Option<Value> = None;
+
+    for key in sort_keys {
+        if let Some(field) = key.as_column() {
+            let value = schema
+                .columns
+                .iter()
+                .position(|c| c.name == field)
+                .and_then(|idx| row.get(idx).cloned())
+                .unwrap_or(Value::Null);
+            out.push(value);
+            continue;
+        }
+
+        // Build the row object once, and only when a computed key needs it.
+        let object = match row_object {
+            Some(ref o) => o,
+            None => row_object.insert(row_to_object(row, schema)),
         };
+        out.push(key.expr.eval(object).map_err(crate::Error::from)?);
+    }
+    Ok(out)
+}
+
+fn row_to_object(row: &[Value], schema: &nodedb_types::columnar::ColumnarSchema) -> Value {
+    let mut map = std::collections::HashMap::with_capacity(schema.columns.len());
+    for (idx, column) in schema.columns.iter().enumerate() {
+        map.insert(
+            column.name.clone(),
+            row.get(idx).cloned().unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(map)
+}
+
+/// Compare two rows by their pre-evaluated sort values.
+pub(in crate::data::executor) fn compare_sort_values(
+    a: &[Value],
+    b: &[Value],
+    sort_keys: &[SortKeySpec],
+) -> std::cmp::Ordering {
+    for (idx, key) in sort_keys.iter().enumerate() {
         let av = a.get(idx).unwrap_or(&Value::Null);
         let bv = b.get(idx).unwrap_or(&Value::Null);
         let ord = compare_values(av, bv);
         if ord != std::cmp::Ordering::Equal {
-            return if *ascending { ord } else { ord.reverse() };
+            return if key.ascending { ord } else { ord.reverse() };
         }
     }
     std::cmp::Ordering::Equal
 }
 
-fn compare_values(
-    a: &nodedb_types::value::Value,
-    b: &nodedb_types::value::Value,
-) -> std::cmp::Ordering {
-    use nodedb_types::value::Value;
+fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     // Null sorts last in ascending order (Postgres default).
     match (a, b) {
         (Value::Null, Value::Null) => std::cmp::Ordering::Equal,

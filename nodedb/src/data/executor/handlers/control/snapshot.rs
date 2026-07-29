@@ -199,7 +199,9 @@ impl CoreLoop {
                 Ok(mut docs) => {
                     if let Err(e) = super::super::document::sort::sort_rows(
                         &mut docs,
-                        &[(field.to_string(), true)],
+                        &[nodedb_physical::physical_plan::SortKeySpec::column(
+                            field, true,
+                        )],
                     ) {
                         return self.response_error(
                             task,

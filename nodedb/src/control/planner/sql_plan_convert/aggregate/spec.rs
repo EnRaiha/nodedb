@@ -150,7 +150,7 @@ pub(super) fn agg_expr_to_spec(a: &AggregateExpr) -> AggregateSpec {
         })
         .unwrap_or_else(|| ("*".into(), None));
 
-    let function = aggregate_function_name(a);
+    let function = nodedb_sql::planner::agg_naming::aggregate_function_name(a);
     let canonical = nodedb_query::agg_key::canonical_agg_key(&function, &field);
     let user_alias = if a.alias.eq_ignore_ascii_case(&canonical) {
         None
@@ -181,30 +181,10 @@ pub(in crate::control::planner::sql_plan_convert) fn agg_expr_to_pair(
             _ => format!("{arg:?}"),
         })
         .unwrap_or_else(|| "*".into());
-    (aggregate_function_name(a), field)
-}
-
-fn aggregate_function_name(a: &AggregateExpr) -> String {
-    if a.distinct {
-        match a.function.as_str() {
-            "count" => "count_distinct".into(),
-            "array_agg" => "array_agg_distinct".into(),
-            // SUM(DISTINCT col) / AVG(DISTINCT col) route to a dedicated
-            // accumulator that dedupes input values before summing. The
-            // plain "sum"/"avg" accumulator does not dedupe, so without
-            // this remap `DISTINCT` would be silently ignored.
-            "sum" => "sum_distinct".into(),
-            "avg" => "avg_distinct".into(),
-            // MIN(DISTINCT) and MAX(DISTINCT) yield the same result as
-            // their non-distinct counterparts (the smallest / largest
-            // value is the same whether or not duplicates are deduped),
-            // so we accept the DISTINCT modifier but route to the
-            // regular accumulator.
-            _ => a.function.clone(),
-        }
-    } else {
-        a.function.clone()
-    }
+    (
+        nodedb_sql::planner::agg_naming::aggregate_function_name(a),
+        field,
+    )
 }
 
 pub(super) fn group_by_to_strings(exprs: &[SqlExpr]) -> Vec<String> {

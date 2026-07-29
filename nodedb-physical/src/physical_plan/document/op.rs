@@ -117,7 +117,7 @@ pub enum DocumentOp {
         collection: String,
         limit: usize,
         offset: usize,
-        sort_keys: Vec<(String, bool)>,
+        sort_keys: Vec<crate::physical_plan::SortKeySpec>,
         /// Filter predicates serialized as JSON.
         filters: Vec<u8>,
         distinct: bool,

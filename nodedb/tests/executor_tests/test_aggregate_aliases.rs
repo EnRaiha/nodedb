@@ -132,7 +132,7 @@ fn computed_group_count_plan(function: &str) -> PhysicalPlan {
 fn grouped_count_shape_plan(
     user_alias: &str,
     limit: usize,
-    sort_keys: Vec<(String, bool)>,
+    sort_keys: Vec<nodedb_physical::physical_plan::SortKeySpec>,
 ) -> PhysicalPlan {
     PhysicalPlan::Query(QueryOp::Aggregate {
         collection: "cache_alias_users".into(),
@@ -279,7 +279,14 @@ fn aggregate_cache_separates_limit_and_sort_shape() {
         &mut ctx.core,
         &mut ctx.tx,
         &mut ctx.rx,
-        grouped_count_shape_plan("row_count", 1, vec![("row_count".into(), true)]),
+        grouped_count_shape_plan(
+            "row_count",
+            1,
+            vec![nodedb_physical::physical_plan::SortKeySpec::column(
+                "row_count",
+                true,
+            )],
+        ),
     );
     let ascending_rows = payload_value(&ascending);
     assert_eq!(ascending_rows.as_array().map(Vec::len), Some(1));
@@ -289,7 +296,14 @@ fn aggregate_cache_separates_limit_and_sort_shape() {
         &mut ctx.core,
         &mut ctx.tx,
         &mut ctx.rx,
-        grouped_count_shape_plan("row_count", 2, vec![("row_count".into(), false)]),
+        grouped_count_shape_plan(
+            "row_count",
+            2,
+            vec![nodedb_physical::physical_plan::SortKeySpec::column(
+                "row_count",
+                false,
+            )],
+        ),
     );
     let descending_rows = payload_value(&descending);
     assert_eq!(descending_rows.as_array().map(Vec::len), Some(2));

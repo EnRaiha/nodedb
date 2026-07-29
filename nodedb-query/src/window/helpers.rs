@@ -43,10 +43,6 @@ pub(super) fn set_window_col(row: &mut serde_json::Value, alias: &str, val: serd
     }
 }
 
-pub(super) fn get_field(doc: &serde_json::Value, field: &str) -> serde_json::Value {
-    doc.get(field).cloned().unwrap_or(serde_json::Value::Null)
-}
-
 /// Evaluate a `SqlExpr` against a serde_json document, returning a serde_json value.
 ///
 /// A division/modulo-by-zero in a PARTITION BY / ORDER BY expression is
@@ -58,15 +54,7 @@ pub(super) fn eval_expr_on_json(
     expr: &SqlExpr,
     doc: &serde_json::Value,
 ) -> Result<serde_json::Value, crate::expr::EvalError> {
-    match expr {
-        SqlExpr::Column(name) => Ok(get_field(doc, name)),
-        SqlExpr::Literal(v) => Ok(serde_json::Value::from(v.clone())),
-        other => {
-            let ndb_doc = nodedb_types::Value::from(doc.clone());
-            let result = other.eval(&ndb_doc)?;
-            Ok(serde_json::Value::from(result))
-        }
-    }
+    crate::json_expr::eval_expr_on_json(expr, doc)
 }
 
 pub(super) fn as_f64(v: &serde_json::Value) -> Option<f64> {

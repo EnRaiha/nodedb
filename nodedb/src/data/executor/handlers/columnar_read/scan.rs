@@ -14,7 +14,7 @@ use crate::data::executor::task::ExecutionTask;
 
 use super::bitemporal::bitemporal_row_visible;
 use super::filter::row_matches_filters;
-use super::sort::sort_rows_by_keys;
+use super::sort::{compare_sort_values, eval_row_sort_values};
 
 /// Parameters for a columnar base scan. Bundled as a struct because the
 /// raw parameter list exceeds the project's too-many-arguments bound.
@@ -28,7 +28,7 @@ pub(in crate::data::executor) struct ColumnarScanParams<'a> {
     /// them (hence the `_` destructure).
     #[allow(dead_code)]
     pub rls_filters: &'a [u8],
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
     /// Bitemporal system-time selection. `Current` is a current-state read;
     /// `AsOf(ms)` drops rows with `_ts_system > ms`; `AllVersions` emits every
     /// `_ts_system` row ordered ascending (audit log), with the system-time
@@ -382,7 +382,23 @@ impl CoreLoop {
         }
 
         if !sort_keys.is_empty() {
-            matched.sort_by(|(_, a, _), (_, b, _)| sort_rows_by_keys(a, b, schema, sort_keys));
+            // Sort keys are expressions, so evaluating them can fail. Evaluate
+            // every row's keys first — `sort_by` has no way to report an error
+            // — then order by the results.
+            let mut keyed = Vec::with_capacity(matched.len());
+            for (_, row, _) in &matched {
+                match eval_row_sort_values(row, schema, sort_keys) {
+                    Ok(values) => keyed.push(values),
+                    Err(e) => return self.response_error(task, e),
+                }
+            }
+            let mut order: Vec<usize> = (0..matched.len()).collect();
+            order.sort_by(|&a, &b| compare_sort_values(&keyed[a], &keyed[b], sort_keys));
+            let mut reordered: Vec<_> = order
+                .into_iter()
+                .map(|i| matched[i].clone())
+                .collect::<Vec<_>>();
+            std::mem::swap(&mut matched, &mut reordered);
         } else if all_versions {
             // Audit-log order: ascending by system time. The hidden
             // `_ts_system` column index was resolved above.

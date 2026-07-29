@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! In-memory document sort.
+
+use nodedb_physical::physical_plan::SortKeySpec;
+use nodedb_query::msgpack_scan;
+
+use super::compare::{SortValues, all_column_keys, compare_sort_values, eval_sort_values};
+
+/// Pre-extracted sort key offsets for a single row.
+/// Each entry is `Option<(usize, usize)>` — byte range of the sort key value.
+type SortKeyOffsets = Vec<Option<(usize, usize)>>;
+
+pub(in crate::data::executor) fn sort_rows(
+    rows: &mut [(String, Vec<u8>)],
+    sort_keys: &[SortKeySpec],
+) -> crate::Result<()> {
+    if sort_keys.is_empty() {
+        return Ok(());
+    }
+
+    if all_column_keys(sort_keys) {
+        return sort_rows_by_column(rows, sort_keys);
+    }
+    sort_rows_by_expression(rows, sort_keys)
+}
+
+/// Zero-decode path: every key names a stored field, so ordering is decided
+/// straight from the msgpack bytes.
+fn sort_rows_by_column(
+    rows: &mut [(String, Vec<u8>)],
+    sort_keys: &[SortKeySpec],
+) -> crate::Result<()> {
+    // Pre-extract sort key offsets for all rows — one scan per row instead
+    // of O(N log N) scans during comparisons.
+    let key_offsets: Vec<SortKeyOffsets> = rows
+        .iter()
+        .map(|(_, bytes)| {
+            sort_keys
+                .iter()
+                .map(|k| {
+                    k.as_column()
+                        .and_then(|f| msgpack_scan::extract_field(bytes, 0, f))
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+    indices.sort_by(|&ai, &bi| {
+        compare_with_preextracted(
+            &rows[ai].1,
+            &key_offsets[ai],
+            &rows[bi].1,
+            &key_offsets[bi],
+            sort_keys,
+        )
+    });
+
+    // Apply permutation in-place. `key_offsets` is no longer needed after
+    // sorting the index; it is dropped here.
+    drop(key_offsets);
+    apply_permutation(rows, indices)
+}
+
+/// Computed-key path: evaluate every key once per row, then order by the
+/// resulting values.
+fn sort_rows_by_expression(
+    rows: &mut [(String, Vec<u8>)],
+    sort_keys: &[SortKeySpec],
+) -> crate::Result<()> {
+    let values: Vec<SortValues> = rows
+        .iter()
+        .map(|(_, bytes)| eval_sort_values(bytes, sort_keys))
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+    indices.sort_by(|&ai, &bi| compare_sort_values(&values[ai], &values[bi], sort_keys));
+
+    drop(values);
+    apply_permutation(rows, indices)
+}
+
+/// Compare two docs using pre-extracted sort key offsets.
+fn compare_with_preextracted(
+    a_bytes: &[u8],
+    a_offsets: &[Option<(usize, usize)>],
+    b_bytes: &[u8],
+    b_offsets: &[Option<(usize, usize)>],
+    sort_keys: &[SortKeySpec],
+) -> std::cmp::Ordering {
+    for (i, key) in sort_keys.iter().enumerate() {
+        let cmp = match (a_offsets[i], b_offsets[i]) {
+            (Some(ar), Some(br)) => msgpack_scan::compare_field_bytes(a_bytes, ar, b_bytes, br),
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (None, None) => std::cmp::Ordering::Equal,
+        };
+        let ordered = if key.ascending { cmp } else { cmp.reverse() };
+        if ordered != std::cmp::Ordering::Equal {
+            return ordered;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Apply a permutation to rows using the sorted index order.
+///
+/// `indices[i]` = the original row index that should appear at position `i`.
+///
+/// Returns `Err` if `indices` is not a valid permutation of `0..rows.len()`:
+/// an out-of-range index or a duplicate (slot already consumed) both surface as
+/// `crate::Error::Internal` rather than silently producing sentinel rows.
+pub(in crate::data::executor) fn apply_permutation(
+    rows: &mut [(String, Vec<u8>)],
+    indices: Vec<usize>,
+) -> crate::Result<()> {
+    // Wrap each row in `Option` so we can move individual elements out by
+    // index without cloning. Each slot is taken exactly once during the
+    // scatter, so no element is ever double-moved.
+    let mut src: Vec<Option<(String, Vec<u8>)>> =
+        rows.iter_mut().map(|r| Some(std::mem::take(r))).collect();
+    let n = src.len();
+    for (target_pos, &src_idx) in indices.iter().enumerate() {
+        // Checked access: out-of-range index is an invariant violation.
+        let slot = src.get_mut(src_idx).ok_or_else(|| crate::Error::Internal {
+            detail: format!(
+                "apply_permutation: index {src_idx} out of range (len={n}, target_pos={target_pos})"
+            ),
+        })?;
+        // None means this slot was already consumed — duplicate index in `indices`.
+        let row = slot.take().ok_or_else(|| crate::Error::Internal {
+            detail: format!(
+                "apply_permutation: duplicate index {src_idx} at target_pos={target_pos} (len={n})"
+            ),
+        })?;
+        rows[target_pos] = row;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode(v: &serde_json::Value) -> Vec<u8> {
+        nodedb_types::json_msgpack::json_to_msgpack(v).expect("encode")
+    }
+
+    fn col(name: &str, asc: bool) -> SortKeySpec {
+        SortKeySpec::column(name, asc)
+    }
+
+    fn rows_with_vals(vals: &[(&str, i64)]) -> Vec<(String, Vec<u8>)> {
+        vals.iter()
+            .map(|(id, v)| {
+                (
+                    (*id).to_string(),
+                    encode(&serde_json::json!({"id": id, "val": v})),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sort_by_int_field_asc() {
+        let mut rows = rows_with_vals(&[("a", 30), ("b", 10), ("c", 20)]);
+        sort_rows(&mut rows, &[col("val", true)]).expect("sort_rows failed");
+        let order: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(order, vec!["b", "c", "a"], "ASC by val: 10, 20, 30");
+    }
+
+    #[test]
+    fn sort_by_int_field_desc() {
+        let mut rows = rows_with_vals(&[("a", 30), ("b", 10), ("c", 20)]);
+        sort_rows(&mut rows, &[col("val", false)]).expect("sort_rows failed");
+        let order: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(order, vec!["a", "c", "b"], "DESC by val: 30, 20, 10");
+    }
+
+    #[test]
+    fn sort_by_string_field_asc() {
+        let mut rows = vec![
+            ("a".into(), encode(&serde_json::json!({"name": "charlie"}))),
+            ("b".into(), encode(&serde_json::json!({"name": "alpha"}))),
+            ("c".into(), encode(&serde_json::json!({"name": "bravo"}))),
+        ];
+        sort_rows(&mut rows, &[col("name", true)]).expect("sort_rows failed");
+        let order: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(order, vec!["b", "c", "a"]);
+    }
+
+    /// A computed key sorts by the evaluated value, not by any stored field.
+    /// `100 / val` inverts the ordering of `val`, so a sort that silently fell
+    /// back to the raw column — or dropped the key — cannot produce this order.
+    #[test]
+    fn sort_by_computed_expression_orders_by_evaluated_value() {
+        let mut rows = rows_with_vals(&[("a", 2), ("b", 20), ("c", 5)]);
+        let key = SortKeySpec {
+            expr: nodedb_query::SqlExpr::BinaryOp {
+                left: Box::new(nodedb_query::SqlExpr::Literal(
+                    nodedb_types::Value::Integer(100),
+                )),
+                op: nodedb_query::BinaryOp::Div,
+                right: Box::new(nodedb_query::SqlExpr::Column("val".into())),
+            },
+            ascending: true,
+        };
+        sort_rows(&mut rows, &[key]).expect("sort_rows failed");
+        let order: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+        // 100/20 = 5, 100/5 = 20, 100/2 = 50.
+        assert_eq!(order, vec!["b", "c", "a"]);
+    }
+
+    /// A zero divisor inside a sort key fails the sort instead of ordering the
+    /// row under a folded NULL.
+    #[test]
+    fn sort_by_computed_expression_propagates_division_by_zero() {
+        let mut rows = rows_with_vals(&[("a", 2), ("b", 0)]);
+        let key = SortKeySpec {
+            expr: nodedb_query::SqlExpr::BinaryOp {
+                left: Box::new(nodedb_query::SqlExpr::Literal(
+                    nodedb_types::Value::Integer(100),
+                )),
+                op: nodedb_query::BinaryOp::Div,
+                right: Box::new(nodedb_query::SqlExpr::Column("val".into())),
+            },
+            ascending: true,
+        };
+        sort_rows(&mut rows, &[key]).expect_err("zero divisor in a sort key must fail the sort");
+    }
+
+    #[test]
+    fn apply_permutation_valid_reorders_correctly() {
+        let mut rows = rows_with_vals(&[("a", 1), ("b", 2), ("c", 3)]);
+        apply_permutation(&mut rows, vec![2, 0, 1]).expect("valid permutation");
+        let order: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(order, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn apply_permutation_duplicate_index_errors_not_sentinel() {
+        let mut rows = rows_with_vals(&[("a", 1), ("b", 2)]);
+        apply_permutation(&mut rows, vec![0, 0]).expect_err("duplicate index must error");
+    }
+
+    #[test]
+    fn apply_permutation_out_of_range_index_errors() {
+        let mut rows = rows_with_vals(&[("a", 1), ("b", 2)]);
+        apply_permutation(&mut rows, vec![0, 5]).expect_err("out-of-range index must error");
+    }
+}

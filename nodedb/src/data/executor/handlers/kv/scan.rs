@@ -20,7 +20,7 @@ pub(in crate::data::executor) struct KvScanHandlerParams<'a> {
     pub count: usize,
     pub match_pattern: Option<&'a str>,
     pub filters: &'a [u8],
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
     pub surrogate_ceiling: Option<u32>,
 }
 
@@ -158,8 +158,11 @@ impl CoreLoop {
             result_entries.push(entry_mp);
         }
 
-        if !sort_keys.is_empty() {
-            super::super::sort_utils::sort_msgpack_rows(&mut result_entries, sort_keys);
+        if !sort_keys.is_empty()
+            && let Err(e) =
+                super::super::sort_utils::sort_msgpack_rows(&mut result_entries, sort_keys)
+        {
+            return self.response_error(task, crate::Error::from(e));
         }
 
         // Build response as flat msgpack array — same format as document/columnar scan.

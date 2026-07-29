@@ -77,9 +77,9 @@ pub enum QueryOp {
         /// Output column names to keep. Empty = emit all columns.
         #[serde(default)]
         projection: Vec<String>,
-        /// Sort keys: `(column_name, ascending)`. Empty = unordered.
+        /// ORDER BY terms, each an expression. Empty = unordered.
         #[serde(default)]
-        sort_keys: Vec<(String, bool)>,
+        sort_keys: Vec<crate::physical_plan::SortKeySpec>,
         /// Maximum rows to emit after offset/sort/distinct/projection.
         /// `None` = unlimited.
         #[serde(default)]
@@ -117,9 +117,9 @@ pub enum QueryOp {
         /// Output column names to keep. Empty = emit all columns.
         #[serde(default)]
         projection: Vec<String>,
-        /// Sort keys: `(column_name, ascending)`. Empty = unordered.
+        /// ORDER BY terms, each an expression. Empty = unordered.
         #[serde(default)]
-        sort_keys: Vec<(String, bool)>,
+        sort_keys: Vec<crate::physical_plan::SortKeySpec>,
         /// Maximum rows to emit after offset/sort/distinct/projection.
         /// `None` = unlimited.
         #[serde(default)]
@@ -164,7 +164,7 @@ pub enum QueryOp {
         /// for plain GROUP BY). The executor applies the sort after all
         /// groups are finalized and HAVING is filtered.
         #[serde(default)]
-        sort_keys: Vec<(String, bool)>,
+        sort_keys: Vec<crate::physical_plan::SortKeySpec>,
     },
 
     /// Partial aggregate: each core computes locally, Control Plane merges.
@@ -320,8 +320,8 @@ pub enum QueryOp {
         having: Vec<u8>,
         /// Output row cap after sort. `usize::MAX` = no explicit LIMIT.
         limit: usize,
-        /// Post-aggregation sort keys: `(column_name, ascending)`.
-        sort_keys: Vec<(String, bool)>,
+        /// Post-aggregation ORDER BY terms, each an expression.
+        sort_keys: Vec<crate::physical_plan::SortKeySpec>,
     },
 
     /// Nested loop join: fallback for non-equi joins.
@@ -435,9 +435,8 @@ pub enum QueryOp {
         inner_collection: String,
         /// Non-correlated filters applied to every inner scan (msgpack bytes).
         inner_filters: Vec<u8>,
-        /// Sort keys for the inner per-outer-row result.
-        /// Each entry is `(field_name, ascending)`.
-        inner_order_by: Vec<(String, bool)>,
+        /// ORDER BY terms for the inner per-outer-row result.
+        inner_order_by: Vec<crate::physical_plan::SortKeySpec>,
         /// Maximum inner rows per outer row.
         inner_limit: usize,
         /// Equi-join pairs `(outer_col, inner_col)`.

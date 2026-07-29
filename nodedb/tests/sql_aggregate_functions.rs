@@ -266,3 +266,52 @@ async fn select_distinct_multicolumn_dedupes_tuples() {
         rows.len()
     );
 }
+
+/// `HAVING` filters groups on an aggregate predicate. The clause must keep the
+/// groups that satisfy it — dropping every group instead returns an empty
+/// result for a query that has matching data, a silent wrong answer rather
+/// than an error.
+#[tokio::test]
+async fn having_keeps_groups_matching_the_aggregate_predicate() {
+    let srv = TestServer::start().await;
+    create_events(&srv).await;
+
+    // Per-category totals: view = 10+20+30 = 60, click = 40+50 = 90,
+    // purchase = 60. All three exceed 0, so all three groups must survive.
+    let rows = srv
+        .query_rows("SELECT category FROM events GROUP BY category HAVING SUM(amount) > 0")
+        .await
+        .expect("GROUP BY with HAVING must plan and execute");
+
+    assert_eq!(
+        rows.len(),
+        3,
+        "all three groups have SUM(amount) > 0 and must survive HAVING; \
+         got {rows:?} (an empty result means every group was dropped)"
+    );
+}
+
+/// `HAVING` must also *exclude* the groups that fail the predicate — a clause
+/// that is parsed but never applied would return all three groups here.
+#[tokio::test]
+async fn having_excludes_groups_failing_the_aggregate_predicate() {
+    let srv = TestServer::start().await;
+    create_events(&srv).await;
+
+    // Per-category totals: view = 60, click = 90, purchase = 60.
+    // A threshold of 80 leaves exactly one group: click.
+    let rows = srv
+        .query_rows("SELECT category FROM events GROUP BY category HAVING SUM(amount) > 80")
+        .await
+        .expect("GROUP BY with HAVING must plan and execute");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the click group (SUM = 90) exceeds 80; got {rows:?}"
+    );
+    assert_eq!(
+        rows[0][0], "click",
+        "surviving group must be click: {rows:?}"
+    );
+}

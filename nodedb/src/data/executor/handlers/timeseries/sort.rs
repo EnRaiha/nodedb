@@ -10,24 +10,121 @@
 
 use std::cmp::Ordering;
 
-/// Sort materialized result rows by the planner's `(column, ascending)` list.
+use nodedb_physical::physical_plan::SortKeySpec;
+
+/// Sort materialized result rows by the planner's ORDER BY terms.
 ///
-/// Rows are compared on the named fields in significance order. A field that
-/// is absent from a row compares as NULL, and NULL sorts last ascending —
-/// PostgreSQL's default. An unknown column name leaves the order untouched
-/// rather than shuffling rows arbitrarily.
-pub(in crate::data::executor) fn sort_rows(rows: &mut [rmpv::Value], sort_keys: &[(String, bool)]) {
+/// A key that names a column is read from the row. A computed key
+/// (`ORDER BY 100 / value`) is evaluated against the row, so the sort orders
+/// by the requested value instead of dropping the key and returning the
+/// engine's natural order under a sort the client asked for. Evaluation can
+/// fail — a zero divisor surfaces as SQLSTATE `22012` — so every row's keys
+/// are evaluated up front, where the error can propagate, rather than inside
+/// the comparator.
+///
+/// Rows are compared on the keys in significance order. A field absent from a
+/// row compares as NULL, and NULL sorts last ascending — PostgreSQL's default.
+pub(in crate::data::executor) fn sort_rows(
+    rows: &mut [rmpv::Value],
+    sort_keys: &[SortKeySpec],
+) -> crate::Result<()> {
     if sort_keys.is_empty() {
-        return;
+        return Ok(());
     }
-    rows.sort_by(|a, b| compare_rows(a, b, sort_keys));
+
+    let keyed: Vec<Vec<rmpv::Value>> = rows
+        .iter()
+        .map(|row| eval_row_keys(row, sort_keys))
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&a, &b| compare_key_rows(&keyed[a], &keyed[b], sort_keys));
+
+    let original = rows.to_vec();
+    for (dst, &src) in order.iter().enumerate() {
+        rows[dst] = original[src].clone();
+    }
+    Ok(())
 }
 
-fn compare_rows(a: &rmpv::Value, b: &rmpv::Value, sort_keys: &[(String, bool)]) -> Ordering {
-    for (field, ascending) in sort_keys {
-        let ord = compare_values(field_of(a, field), field_of(b, field));
+/// Evaluate every sort key against one result row.
+fn eval_row_keys(row: &rmpv::Value, sort_keys: &[SortKeySpec]) -> crate::Result<Vec<rmpv::Value>> {
+    let mut out = Vec::with_capacity(sort_keys.len());
+    let mut row_value: Option<nodedb_types::Value> = None;
+
+    for key in sort_keys {
+        if let Some(field) = key.as_column() {
+            out.push(field_of(row, field).cloned().unwrap_or(rmpv::Value::Nil));
+            continue;
+        }
+
+        // Build the row's evaluable form once, and only when a computed key
+        // needs it.
+        let value = match row_value {
+            Some(ref v) => v,
+            None => row_value.insert(rmpv_to_value(row)),
+        };
+        let evaluated = key.expr.eval(value).map_err(crate::Error::from)?;
+        out.push(value_to_rmpv(&evaluated));
+    }
+    Ok(out)
+}
+
+fn rmpv_to_value(row: &rmpv::Value) -> nodedb_types::Value {
+    let rmpv::Value::Map(entries) = row else {
+        return nodedb_types::Value::Null;
+    };
+    let mut map = std::collections::HashMap::with_capacity(entries.len());
+    for (key, value) in entries {
+        if let rmpv::Value::String(name) = key
+            && let Some(name) = name.as_str()
+        {
+            map.insert(name.to_string(), rmpv_value_to_value(value));
+        }
+    }
+    nodedb_types::Value::Object(map)
+}
+
+fn rmpv_value_to_value(value: &rmpv::Value) -> nodedb_types::Value {
+    match value {
+        rmpv::Value::Nil => nodedb_types::Value::Null,
+        rmpv::Value::Boolean(b) => nodedb_types::Value::Bool(*b),
+        rmpv::Value::Integer(n) => n
+            .as_i64()
+            .map(nodedb_types::Value::Integer)
+            .or_else(|| n.as_f64().map(nodedb_types::Value::Float))
+            .unwrap_or(nodedb_types::Value::Null),
+        rmpv::Value::F32(f) => nodedb_types::Value::Float(*f as f64),
+        rmpv::Value::F64(f) => nodedb_types::Value::Float(*f),
+        rmpv::Value::String(s) => s
+            .as_str()
+            .map(|s| nodedb_types::Value::String(s.to_string()))
+            .unwrap_or(nodedb_types::Value::Null),
+        rmpv::Value::Array(items) => {
+            nodedb_types::Value::Array(items.iter().map(rmpv_value_to_value).collect())
+        }
+        _ => nodedb_types::Value::Null,
+    }
+}
+
+fn value_to_rmpv(value: &nodedb_types::Value) -> rmpv::Value {
+    match value {
+        nodedb_types::Value::Null => rmpv::Value::Nil,
+        nodedb_types::Value::Bool(b) => rmpv::Value::Boolean(*b),
+        nodedb_types::Value::Integer(n) => rmpv::Value::Integer((*n).into()),
+        nodedb_types::Value::Float(f) => rmpv::Value::F64(*f),
+        nodedb_types::Value::String(s) => rmpv::Value::String(s.clone().into()),
+        other => rmpv::Value::String(format!("{other:?}").into()),
+    }
+}
+
+fn compare_key_rows(a: &[rmpv::Value], b: &[rmpv::Value], sort_keys: &[SortKeySpec]) -> Ordering {
+    for (idx, key) in sort_keys.iter().enumerate() {
+        let av = a.get(idx).filter(|v| !matches!(v, rmpv::Value::Nil));
+        let bv = b.get(idx).filter(|v| !matches!(v, rmpv::Value::Nil));
+        let ord = compare_values(av, bv);
         if ord != Ordering::Equal {
-            return if *ascending { ord } else { ord.reverse() };
+            return if key.ascending { ord } else { ord.reverse() };
         }
     }
     Ordering::Equal
@@ -111,7 +208,7 @@ mod tests {
             row(&[("ts", rmpv::Value::Integer(300.into()))]),
             row(&[("ts", rmpv::Value::Integer(200.into()))]),
         ];
-        sort_rows(&mut rows, &[("ts".to_string(), false)]);
+        sort_rows(&mut rows, &[SortKeySpec::column("ts", false)]).expect("sort");
         assert_eq!(ints("ts", &rows), vec![300, 200, 100]);
     }
 
@@ -121,7 +218,7 @@ mod tests {
             row(&[("ts", rmpv::Value::Integer(300.into()))]),
             row(&[("ts", rmpv::Value::Integer(100.into()))]),
         ];
-        sort_rows(&mut rows, &[("ts".to_string(), true)]);
+        sort_rows(&mut rows, &[SortKeySpec::column("ts", true)]).expect("sort");
         assert_eq!(ints("ts", &rows), vec![100, 300]);
     }
 
@@ -139,8 +236,12 @@ mod tests {
         ];
         sort_rows(
             &mut rows,
-            &[("host".to_string(), true), ("ts".to_string(), true)],
-        );
+            &[
+                SortKeySpec::column("host", true),
+                SortKeySpec::column("ts", true),
+            ],
+        )
+        .expect("sort");
         assert_eq!(ints("ts", &rows), vec![100, 200]);
     }
 
@@ -151,7 +252,7 @@ mod tests {
             row(&[("other", rmpv::Value::Integer(1.into()))]),
             row(&[("ts", rmpv::Value::Integer(5.into()))]),
         ];
-        sort_rows(&mut rows, &[("ts".to_string(), true)]);
+        sort_rows(&mut rows, &[SortKeySpec::column("ts", true)]).expect("sort");
         assert_eq!(ints("ts", &rows)[0], 5);
     }
 
@@ -162,7 +263,7 @@ mod tests {
             row(&[("v", rmpv::Value::Integer(2.into()))]),
             row(&[("v", rmpv::Value::F64(1.5))]),
         ];
-        sort_rows(&mut rows, &[("v".to_string(), true)]);
+        sort_rows(&mut rows, &[SortKeySpec::column("v", true)]).expect("sort");
         let vs: Vec<f64> = rows
             .iter()
             .map(|r| as_f64(field_of(r, "v").unwrap()).unwrap())
@@ -176,7 +277,7 @@ mod tests {
             row(&[("ts", rmpv::Value::Integer(2.into()))]),
             row(&[("ts", rmpv::Value::Integer(1.into()))]),
         ];
-        sort_rows(&mut rows, &[("nope".to_string(), true)]);
+        sort_rows(&mut rows, &[SortKeySpec::column("nope", true)]).expect("sort");
         assert_eq!(ints("ts", &rows), vec![2, 1]);
     }
 
@@ -186,7 +287,7 @@ mod tests {
             row(&[("ts", rmpv::Value::Integer(2.into()))]),
             row(&[("ts", rmpv::Value::Integer(1.into()))]),
         ];
-        sort_rows(&mut rows, &[]);
+        sort_rows(&mut rows, &[]).expect("sort");
         assert_eq!(ints("ts", &rows), vec![2, 1]);
     }
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod agg_naming;
 pub mod aggregate;
 pub mod aggregate_order;
 pub mod array_ddl;
@@ -17,7 +18,9 @@ pub mod declared_type_coerce;
 pub mod dml;
 pub mod dml_helpers;
 pub mod geometry_expr;
+pub mod group_by;
 pub mod grouping_sets;
+pub mod having;
 pub mod index_ddl;
 pub mod join;
 pub mod lateral;

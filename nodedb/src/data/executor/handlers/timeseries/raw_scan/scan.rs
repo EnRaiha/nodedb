@@ -32,7 +32,7 @@ pub(in crate::data::executor) struct RawScanParams<'a> {
     pub txn_id: Option<crate::types::TxnId>,
     /// `ORDER BY` keys as `(column, ascending)`. Empty = the engine's natural
     /// order (memtable rows, then partition rows).
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
 }
 
 impl CoreLoop {
@@ -266,8 +266,8 @@ impl CoreLoop {
         // `limit` rows of the requested order rather than an arbitrary `limit`
         // rows sorted among themselves. Audit-log reads keep their system-time
         // order, which is the semantics of `AS OF SYSTEM TIME NULL`.
-        if !all_versions {
-            super::super::sort::sort_rows(&mut results, sort_keys);
+        if !all_versions && let Err(e) = super::super::sort::sort_rows(&mut results, sort_keys) {
+            return self.response_error(task, e);
         }
         results.truncate(limit);
 

@@ -444,3 +444,28 @@ async fn join_with_post_filter_honors_narrow_limit() {
         "LIMIT 1 must truncate the filtered rows to one: {rows:?}"
     );
 }
+
+/// A JOIN whose ON clause contains ONLY an inequality — no equality key to
+/// hash on. The existing non-equi tests all pair their inequalities with an
+/// equijoin key; with no key at all the join must still evaluate the predicate
+/// over the candidate pairs rather than returning nothing, which silently
+/// drops every matching row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_with_only_an_inequality_predicate_returns_matching_pairs() {
+    let server = TestServer::start().await;
+    setup_join_tables(&server).await;
+
+    // j_t1.x = {10, 20}; j_t3.z = {1, 2, 3}. Every (t1, t3) pair satisfies
+    // x > z, so all 2 x 3 = 6 pairs must be returned.
+    let rows = server
+        .query_text("SELECT j_t1.id FROM j_t1 JOIN j_t3 ON j_t1.x > j_t3.z")
+        .await
+        .expect("inequality-only JOIN must plan and execute");
+
+    assert_eq!(
+        rows.len(),
+        6,
+        "all 6 (t1, t3) pairs satisfy x > z; got {rows:?} (an empty result \
+         means the inequality-only ON clause matched nothing)"
+    );
+}

@@ -20,7 +20,7 @@ pub(in crate::data::executor) struct TimeseriesScanParams<'a> {
     pub filters: &'a [u8],
     /// `ORDER BY` keys as `(column, ascending)`. Applied to the materialized
     /// result before `limit`, on both the raw and the aggregate branch.
-    pub sort_keys: &'a [(String, bool)],
+    pub sort_keys: &'a [nodedb_physical::physical_plan::SortKeySpec],
     pub bucket_interval_ms: i64,
     pub group_by: &'a [String],
     pub aggregates: &'a [(String, String)],

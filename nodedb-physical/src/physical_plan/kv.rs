@@ -110,10 +110,10 @@ pub enum KvOp {
         filters: Vec<u8>,
         /// Optional glob pattern for key matching (e.g., "user:*").
         match_pattern: Option<String>,
-        /// Sort keys: `(field, descending)` pairs applied to the scan result
+        /// ORDER BY terms, each an expression, applied to the scan result
         /// before encoding. Empty = unsorted (engine native order).
         #[serde(default)]
-        sort_keys: Vec<(String, bool)>,
+        sort_keys: Vec<crate::physical_plan::SortKeySpec>,
         /// Clone snapshot-isolation ceiling: when set, scan results
         /// drop entries whose surrogate exceeds this value.  Populated
         /// by the clone resolver when rewriting a target-side scan for

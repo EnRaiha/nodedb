@@ -45,9 +45,9 @@ pub fn evaluate_window_functions(
                 "cume_dist" => {
                     apply_cume_dist(rows, partition_indices, &spec.alias, &spec.order_by)?
                 }
-                "lag" => apply_lag(rows, partition_indices, spec),
-                "lead" => apply_lead(rows, partition_indices, spec),
-                "nth_value" => apply_nth_value(rows, partition_indices, spec),
+                "lag" => apply_lag(rows, partition_indices, spec)?,
+                "lead" => apply_lead(rows, partition_indices, spec)?,
+                "nth_value" => apply_nth_value(rows, partition_indices, spec)?,
                 "sum" | "count" | "avg" | "min" | "max" | "first_value" | "last_value" => {
                     apply_aggregate_window(rows, partition_indices, spec)?
                 }

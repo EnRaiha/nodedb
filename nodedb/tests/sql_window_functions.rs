@@ -334,3 +334,87 @@ async fn window_dispatch_never_silently_drops_projection() {
         }
     }
 }
+
+// ── Expression arguments ─────────────────────────────────────────────────────
+//
+// A window function's argument may be any expression, not just a bare column.
+// When the argument is dropped instead of evaluated, the windowed column comes
+// back as 0/NULL for every row with no error — the same silent-drop failure
+// this file's module doc names, reached through the argument slot rather than
+// the dispatcher.
+
+/// `SUM(<expr>) OVER (ORDER BY ...)` must accumulate the *evaluated*
+/// expression, not a zero/NULL placeholder. Bare-column arguments already
+/// accumulate correctly, so an all-zero result here means the argument
+/// expression was never evaluated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_aggregate_over_expression_argument_accumulates_evaluated_values() {
+    let server = TestServer::start().await;
+    setup_numbered_rows(&server).await;
+
+    let rows = server
+        .query_rows(
+            "SELECT id, SUM(n * 2) OVER (ORDER BY n) AS s \
+             FROM s ORDER BY n",
+        )
+        .await
+        .expect("window SUM over an expression argument must plan and execute");
+
+    assert_eq!(rows.len(), 5, "rows: {rows:?}");
+    let got = parse_f64s(&rows, 1);
+
+    // n = 1..5, argument n*2 = 2,4,6,8,10 → running totals 2,6,12,20,30.
+    let expected = [2.0, 6.0, 12.0, 20.0, 30.0];
+    for (i, &want) in expected.iter().enumerate() {
+        assert!(
+            (got[i] - want).abs() < 1e-9,
+            "row {i}: got {}, want {want}; rows={rows:?}",
+            got[i]
+        );
+    }
+
+    // Regression guard for the specific silent failure mode: an unevaluated
+    // argument yields an all-zero (or all-NULL) column that still "succeeds".
+    assert!(
+        got.iter().any(|v| *v != 0.0 && !v.is_nan()),
+        "every window value was zero/NULL — the argument expression was \
+         never evaluated: {rows:?}"
+    );
+}
+
+/// `LAG(<expr>) OVER (ORDER BY ...)` must return the previous row's
+/// *evaluated* expression. Only the first row has no predecessor, so an
+/// all-NULL column means the argument expression was never evaluated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_offset_over_expression_argument_returns_previous_evaluated_value() {
+    let server = TestServer::start().await;
+    setup_numbered_rows(&server).await;
+
+    let rows = server
+        .query_rows(
+            "SELECT id, LAG(n * 10) OVER (ORDER BY n) AS prev \
+             FROM s ORDER BY n",
+        )
+        .await
+        .expect("window LAG over an expression argument must plan and execute");
+
+    assert_eq!(rows.len(), 5, "rows: {rows:?}");
+
+    // n = 1..5, argument n*10 = 10,20,30,40,50 → LAG = NULL,10,20,30,40.
+    let first = rows[0].get(1).cloned().unwrap_or_default();
+    assert!(
+        first.is_empty() || first.to_lowercase() == "null",
+        "first row has no predecessor and must be NULL; got {first:?}"
+    );
+
+    let got = parse_f64s(&rows, 1);
+    let expected = [10.0, 20.0, 30.0, 40.0];
+    for (i, &want) in expected.iter().enumerate() {
+        assert!(
+            (got[i + 1] - want).abs() < 1e-9,
+            "row {}: got {}, want {want}; rows={rows:?}",
+            i + 1,
+            got[i + 1]
+        );
+    }
+}
