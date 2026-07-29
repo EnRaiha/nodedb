@@ -176,7 +176,7 @@ async fn single_node_calvin_flag_on_routes_cross_shard_write_through_sequencer()
     // on the destination's home vShard.
     let v = query_graph_json(
         &node.client,
-        &format!("GRAPH TRAVERSE FROM '{dst}' DEPTH 1 LABEL 'l' DIRECTION in"),
+        &format!("GRAPH TRAVERSE IN 'sncalvin_graph' FROM '{dst}' DEPTH 1 LABEL 'l' DIRECTION in"),
     )
     .await;
     let reached = traversed_node_ids(&v);

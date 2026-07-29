@@ -143,6 +143,7 @@ fn kv_protocol_command_sequence() {
                 b"c".to_vec(),
                 b"missing".to_vec(),
             ],
+            rls_filters: Vec::new(),
         }),
     );
 
@@ -356,6 +357,7 @@ fn kv_field_get_and_set() {
             collection: "users".into(),
             key: b"u1".to_vec(),
             fields: vec!["name".into(), "age".into()],
+            rls_filters: Vec::new(),
         }),
     );
     let result: serde_json::Value = payload_value(&payload);
@@ -388,6 +390,7 @@ fn kv_field_get_and_set() {
             collection: "users".into(),
             key: b"u1".to_vec(),
             fields: vec!["region".into()],
+            rls_filters: Vec::new(),
         }),
     );
     let result: serde_json::Value = payload_value(&payload);

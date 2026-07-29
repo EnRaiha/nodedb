@@ -539,9 +539,13 @@ fn trigger_security_as_str() {
     assert_eq!(TriggerSecurity::Definer.as_str(), "DEFINER");
 }
 
+/// Bodies fire from a `WriteEvent` that carries a tenant but no user identity,
+/// so there is no invoking session left to adopt — every trigger executes as
+/// definer. The default names what actually happens rather than a guarantee the
+/// execution model cannot honour.
 #[test]
-fn trigger_security_default_is_invoker() {
-    assert_eq!(TriggerSecurity::default(), TriggerSecurity::Invoker);
+fn trigger_security_default_is_definer() {
+    assert_eq!(TriggerSecurity::default(), TriggerSecurity::Definer);
 }
 
 // ---------------------------------------------------------------------------

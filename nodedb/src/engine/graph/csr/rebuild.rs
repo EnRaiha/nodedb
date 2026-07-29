@@ -61,6 +61,20 @@ pub fn rebuild_sharded_from_store_as_of(
         })?;
     }
 
+    // Third pass: restore each node's global identity. Without this the rebuilt
+    // index knows the graph's shape but binds no surrogate, so every
+    // cross-engine read — which meets the other engines on the surrogate — sees
+    // an empty graph side until live writes happen to rebind the nodes.
+    // A binding whose partition holds no edges at all is skipped rather than
+    // vivifying an empty partition: `set_node_surrogate` is a no-op for a name
+    // the rebuild never interned, so the only effect would be a partition that
+    // exists solely to be empty.
+    for (db, tid, node, raw) in store.scan_all_node_surrogates()? {
+        if let Some(partition) = sharded.partition_mut(db, tid) {
+            partition.set_node_surrogate(&node, nodedb_types::Surrogate::new(raw));
+        }
+    }
+
     if let Err(e) = sharded.compact_all() {
         tracing::warn!(
             layer = nodedb_types::diagnostic::DiagnosticLayer::Csr.as_str(),
@@ -86,5 +100,110 @@ pub fn rebuild_from_store(store: &EdgeStore) -> crate::Result<CsrIndex> {
     match sharded.entry(db, tid) {
         Entry::Occupied(entry) => Ok(entry.remove()),
         Entry::Vacant(_) => Ok(CsrIndex::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_graph::{Direction, SurrogateBfsParams};
+    use nodedb_types::{DatabaseId, Surrogate, TenantId};
+
+    use super::*;
+    use crate::engine::graph::edge_store::EdgeRef;
+
+    const DB: DatabaseId = DatabaseId::DEFAULT;
+
+    fn tenant() -> TenantId {
+        TenantId::new(1)
+    }
+
+    fn store_with_a_bound_edge(path: &std::path::Path) -> EdgeStore {
+        let store = EdgeStore::open(path).unwrap();
+        store
+            .put_edge_versioned(
+                EdgeRef::new(DB, tenant(), "people", "a", "knows", "b")
+                    .with_surrogates(Surrogate::new(10), Surrogate::new(20)),
+                b"{}",
+                100,
+                100,
+                i64::MAX,
+            )
+            .unwrap();
+        store
+    }
+
+    /// The whole point of the durable binding: reopen the store, rebuild, and a
+    /// surrogate-domain read still finds the graph.
+    ///
+    /// Before the identity table existed, the rebuild produced a structurally
+    /// correct CSR with no surrogate bound to any node — so a cross-engine
+    /// traversal reached everything and could report none of it, which reads as
+    /// "the graph is empty" rather than "identity was lost on restart".
+    #[test]
+    fn a_reopened_store_rebuilds_with_node_identities_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.redb");
+        drop(store_with_a_bound_edge(&path));
+
+        // Reopen: this is what `CoreLoop::open` does on every start.
+        let reopened = EdgeStore::open(&path).unwrap();
+        let csr = rebuild_from_store(&reopened).unwrap();
+
+        assert_eq!(csr.node_surrogate("a"), Some(Surrogate::new(10)));
+        assert_eq!(csr.node_surrogate("b"), Some(Surrogate::new(20)));
+
+        let seeds = [csr.local_id_for_surrogate(Surrogate::new(10)).expect(
+            "a surrogate-seeded read must resolve after a restart, not just after a live write",
+        )];
+        let hops = csr.traverse_surrogates_in_collection(SurrogateBfsParams {
+            seeds: &seeds,
+            label_filter: None,
+            direction: Direction::Out,
+            max_depth: 2,
+            max_visited: 100,
+            collection: "people",
+        });
+        assert!(
+            hops.reached.contains(Surrogate::new(20)),
+            "the neighbour must be intersectable with another engine's bitmap"
+        );
+        assert_eq!(hops.unaddressable, 0);
+    }
+
+    /// A store written before the identity table existed rebuilds normally —
+    /// with no bindings, which is exactly the state it was in.
+    #[test]
+    fn a_rebuild_without_any_bindings_still_produces_the_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EdgeStore::open(&dir.path().join("graph.redb")).unwrap();
+        store
+            .put_edge_versioned(
+                EdgeRef::new(DB, tenant(), "people", "a", "knows", "b"),
+                b"{}",
+                100,
+                100,
+                i64::MAX,
+            )
+            .unwrap();
+
+        let csr = rebuild_from_store(&store).unwrap();
+        assert!(csr.contains_node("a") && csr.contains_node("b"));
+        assert_eq!(csr.node_surrogate("a"), None);
+    }
+
+    /// A cascade delete takes the node's binding with it, and leaves the
+    /// neighbours' alone.
+    #[test]
+    fn a_cascaded_node_delete_drops_only_that_nodes_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.redb");
+        let store = store_with_a_bound_edge(&path);
+        store
+            .delete_edges_for_node(DB.as_u64(), tenant(), "a", 200)
+            .unwrap();
+
+        let remaining = store.scan_all_node_surrogates().unwrap();
+        assert_eq!(remaining.len(), 1, "only `a` is gone: {remaining:?}");
+        assert_eq!(remaining[0].2, "b");
     }
 }

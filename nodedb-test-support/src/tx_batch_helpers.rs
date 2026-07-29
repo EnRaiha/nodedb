@@ -202,6 +202,7 @@ pub fn edge_put(collection: &str, src: &str, dst: &str) -> PhysicalPlan {
 
 pub fn neighbors(_collection: &str, src: &str) -> PhysicalPlan {
     PhysicalPlan::Graph(GraphOp::Neighbors {
+        collection: None,
         node_id: src.into(),
         edge_label: Some("REL".into()),
         direction: nodedb::engine::graph::edge_store::Direction::Out,

@@ -43,6 +43,7 @@ fn graph_neighbors_isolated() {
             edge_label: Some("FOLLOWS".into()),
             direction: nodedb::engine::graph::edge_store::Direction::Out,
             rls_filters: Vec::new(),
+            collection: None,
         }),
     );
     assert_eq!(resp_a.status, Status::Ok);
@@ -63,6 +64,7 @@ fn graph_neighbors_isolated() {
             edge_label: Some("FOLLOWS".into()),
             direction: nodedb::engine::graph::edge_store::Direction::Out,
             rls_filters: Vec::new(),
+            collection: None,
         }),
     );
     assert_eq!(resp_b.status, Status::Ok);

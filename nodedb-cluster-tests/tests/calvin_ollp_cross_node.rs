@@ -265,7 +265,7 @@ async fn ollp_implicit_edge_delete_cleans_reverse_cross_node() {
             Duration::from_millis(100),
             || {
                 cluster.nodes[idx]
-                    .traversed_node_ids("GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in")
+                    .traversed_node_ids("GRAPH TRAVERSE IN 'ollp_impl_edge_del' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in")
                     .len()
                     > SOURCES
             },
@@ -336,7 +336,7 @@ async fn ollp_implicit_edge_delete_cleans_reverse_cross_node() {
             Duration::from_millis(100),
             || {
                 let ids = cluster.nodes[idx]
-                    .traversed_node_ids("GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in");
+                    .traversed_node_ids("GRAPH TRAVERSE IN 'ollp_impl_edge_del' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in");
                 // Only the start node `hub` should remain reachable.
                 ids.iter().all(|id| id == "hub")
             },

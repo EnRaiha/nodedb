@@ -259,7 +259,7 @@ async fn shape_subscribe_without_read_grant_delivers_no_documents() {
 
 /// A read-level RLS policy must apply to the snapshot. The rows here belong to
 /// `alice`; the subscribing principal is `shape_reader`, so the policy excludes
-/// every row.
+/// every row — the snapshot is delivered, and it is empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shape_subscribe_applies_row_level_security() {
     let server = TestServer::start().await;

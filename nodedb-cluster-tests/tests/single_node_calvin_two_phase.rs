@@ -126,7 +126,7 @@ async fn cross_shard_calvin_write_flushes_and_is_visible() {
     let msgs = node
         .client
         .simple_query(&format!(
-            "GRAPH TRAVERSE FROM '{dst}' DEPTH 1 LABEL 'l' DIRECTION in"
+            "GRAPH TRAVERSE IN 'sncalvin_2p_graph' FROM '{dst}' DEPTH 1 LABEL 'l' DIRECTION in"
         ))
         .await
         .expect("reverse traversal query");

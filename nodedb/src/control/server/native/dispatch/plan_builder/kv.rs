@@ -76,6 +76,7 @@ pub(crate) fn build_batch_get(
     Ok(PhysicalPlan::Kv(KvOp::BatchGet {
         collection: collection.to_string(),
         keys,
+        rls_filters: Vec::new(),
     }))
 }
 
@@ -133,6 +134,7 @@ pub(crate) fn build_field_get(
         collection: collection.to_string(),
         key,
         fields: field_names,
+        rls_filters: Vec::new(),
     }))
 }
 

@@ -25,6 +25,8 @@ use super::hop::{NeighborHopParams, execute_neighbor_hop};
 pub struct CrossCoreBfsParams<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
+    /// Collection scope, or `None` for a label-only traversal.
+    pub collection: Option<&'a str>,
     pub start_nodes: Vec<String>,
     pub edge_label: Option<String>,
     pub direction: crate::engine::graph::edge_store::Direction,
@@ -43,6 +45,7 @@ pub async fn cross_core_bfs_with_options(
     let CrossCoreBfsParams {
         tenant_id,
         database_id,
+        collection,
         start_nodes,
         edge_label,
         direction,
@@ -68,6 +71,7 @@ pub async fn cross_core_bfs_with_options(
             tenant_id,
             database_id,
             NeighborHopParams {
+                collection,
                 frontier: &frontier,
                 edge_label: edge_label.as_deref(),
                 direction,

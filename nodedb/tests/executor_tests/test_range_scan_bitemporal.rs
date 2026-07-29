@@ -125,6 +125,7 @@ fn range_scan_scores(
             lower: lower.map(|b| b.to_vec()),
             upper: upper.map(|b| b.to_vec()),
             limit: 100,
+            rls_filters: Vec::new(),
         }),
     );
     assert_eq!(resp.status, Status::Ok, "RangeScan status");

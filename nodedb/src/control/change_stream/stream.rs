@@ -247,8 +247,15 @@ impl ChangeStream {
     /// Returns change events matching the collection filter that occurred
     /// at or after `since_ms` (epoch milliseconds). Limited to the ring
     /// buffer capacity (most recent N events).
+    /// Recorded changes for one tenant.
+    ///
+    /// `recent_changes` is a single process-wide ring shared by every tenant on
+    /// the node, so the tenant filter is what keeps one tenant's document ids
+    /// and post-images out of another's result set. It is a required argument
+    /// rather than an `Option` for exactly that reason.
     pub fn query_changes(
         &self,
+        tenant_id: TenantId,
         collection: Option<&str>,
         since_ms: u64,
         limit: usize,
@@ -258,7 +265,11 @@ impl ChangeStream {
             Err(p) => p.into_inner(),
         };
         buf.iter()
-            .filter(|e| e.timestamp_ms >= since_ms && collection.is_none_or(|c| e.collection == c))
+            .filter(|e| {
+                e.tenant_id == tenant_id
+                    && e.timestamp_ms >= since_ms
+                    && collection.is_none_or(|c| e.collection == c)
+            })
             .take(limit)
             .cloned()
             .collect()

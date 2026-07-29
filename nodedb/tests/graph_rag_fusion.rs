@@ -237,3 +237,199 @@ async fn graph_rag_fusion_graph_k_affects_expanded_node_score() {
          means the graph_k value is being ignored"
     );
 }
+
+// ── 5. Fusion meets on surrogate identity, not on node names ────────────────
+
+/// A vector hit that is not a graph node must still rank, under a key that can
+/// meet the other legs.
+///
+/// The seeding path used to mint a node *name* from each hit's surrogate purely
+/// to start the walk, and fell back to a `__local_<hnsw_id>` sentinel when the
+/// surrogate was bound to no graph node. That sentinel is an index-internal id:
+/// it can never equal another leg's key, so such a row could never fuse, and it
+/// leaked into the response's `node_id`. Expansion now seeds from the surrogate
+/// directly and the reporting key falls back to the document identity instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vector_only_hit_ranks_without_an_index_local_sentinel() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION ragf_surrogate")
+        .await
+        .unwrap();
+    server
+        .exec(
+            "CREATE VECTOR INDEX idx_ragf_surrogate ON ragf_surrogate \
+             METRIC cosine DIM 2",
+        )
+        .await
+        .unwrap();
+
+    // `lonely` is the vector-nearest row and participates in no edge, so it has
+    // no graph node binding — exactly the case the sentinel used to cover.
+    server
+        .exec("INSERT INTO ragf_surrogate (id, embedding) VALUES ('lonely', ARRAY[1.0, 0.0])")
+        .await
+        .unwrap();
+
+    let rows = server
+        .query_text(
+            "GRAPH RAG FUSION ON ragf_surrogate \
+             QUERY ARRAY[1.0, 0.0] \
+             VECTOR_FIELD 'embedding' \
+             VECTOR_TOP_K 3 \
+             EXPANSION_DEPTH 1 \
+             FINAL_TOP_K 5",
+        )
+        .await
+        .expect("a vector-only hit must still produce a ranked result");
+
+    let blob = rows.join("");
+    assert!(
+        !blob.contains("__local_"),
+        "an index-local id must never surface as a node_id; got: {blob}"
+    );
+}
+
+/// Graph expansion is seeded by the vector hits' identity, so a node reachable
+/// only by traversal still joins the ranking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expansion_reaches_neighbours_of_vector_hits() {
+    let server = TestServer::start().await;
+    server.exec("CREATE COLLECTION ragf_seed").await.unwrap();
+    server
+        .exec("CREATE VECTOR INDEX idx_ragf_seed ON ragf_seed METRIC cosine DIM 2")
+        .await
+        .unwrap();
+    server
+        .exec("INSERT INTO ragf_seed (id, embedding) VALUES ('near', ARRAY[1.0, 0.0])")
+        .await
+        .unwrap();
+    // `far` is the vector opposite of the query, so it enters the ranking only
+    // by being one hop from the seed.
+    server
+        .exec("INSERT INTO ragf_seed (id, embedding) VALUES ('far', ARRAY[-1.0, 0.0])")
+        .await
+        .unwrap();
+    server
+        .exec("GRAPH INSERT EDGE IN 'ragf_seed' FROM 'near' TO 'far' TYPE 'hop'")
+        .await
+        .unwrap();
+
+    let blob = server
+        .query_text(
+            "GRAPH RAG FUSION ON ragf_seed \
+             QUERY ARRAY[1.0, 0.0] \
+             VECTOR_FIELD 'embedding' \
+             VECTOR_TOP_K 1 \
+             EXPANSION_DEPTH 1 \
+             EDGE_LABEL 'hop' \
+             FINAL_TOP_K 5",
+        )
+        .await
+        .expect("fusion must succeed")
+        .join("");
+
+    assert!(
+        blob.contains("\"far\""),
+        "the seed's neighbour must be reached by expansion; got: {blob}"
+    );
+}
+
+/// A row that is both the vector-nearest hit and the only text match must fuse
+/// into **one** ranked entry carrying **both** contributions.
+///
+/// This is the assertion that the reporting-key change actually bought
+/// something. The vector leg keys a surrogate-bound-but-nodeless hit by its
+/// document identity; the text leg keys every hit by that same document
+/// identity. If the two keys did not agree, RRF would see two separate
+/// documents and the row would carry only one leg's contribution — the failure
+/// is invisible to a "no `__local_` sentinel appears" check, because a sentinel
+/// key also produces a plausible-looking result set.
+///
+/// The k-constants make the two cases numerically distinguishable. With
+/// `RRF_K (60.0, 1.0, 60.0)`:
+///   - text rank 0 alone            → 1/(1+0+1)      = 0.5
+///   - vector rank 0 alone          → 1/(60+0+1)     ≈ 0.0164
+///   - both, fused on one key       → 0.5 + 0.0164   ≈ 0.5164
+/// So a top score strictly above 0.5 is reachable only by the two legs meeting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vector_and_text_hits_on_one_row_fuse_into_a_single_entry() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION ragf_crossleg")
+        .await
+        .unwrap();
+    server
+        .exec("CREATE VECTOR INDEX idx_ragf_crossleg_emb ON ragf_crossleg METRIC cosine DIM 2")
+        .await
+        .unwrap();
+    server
+        .exec(
+            "CREATE SEARCH INDEX idx_ragf_crossleg_fts ON ragf_crossleg \
+             FIELDS body ANALYZER 'standard'",
+        )
+        .await
+        .unwrap();
+
+    // `both` is the vector-nearest row AND the only row whose body contains
+    // `entangled` — the row the two legs must agree on.
+    server
+        .exec(
+            "INSERT INTO ragf_crossleg (id, body, embedding) \
+             VALUES ('both', 'entangled photons', ARRAY[1.0, 0.0])",
+        )
+        .await
+        .unwrap();
+    // `vector_only` also ranks in the vector leg, but matches no text.
+    server
+        .exec(
+            "INSERT INTO ragf_crossleg (id, body, embedding) \
+             VALUES ('vector_only', 'unrelated prose', ARRAY[0.9, 0.1])",
+        )
+        .await
+        .unwrap();
+
+    let blob = server
+        .query_text(
+            "GRAPH RAG FUSION ON ragf_crossleg \
+             QUERY ARRAY[1.0, 0.0] \
+             VECTOR_FIELD 'embedding' \
+             VECTOR_TOP_K 5 \
+             BM25 'entangled' ON 'body' \
+             EXPANSION_DEPTH 1 \
+             FINAL_TOP_K 10 \
+             RRF_K (60.0, 1.0, 60.0)",
+        )
+        .await
+        .expect("three-source fusion must succeed")
+        .join("");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&blob).unwrap_or_else(|e| panic!("response is not JSON: {e}: {blob}"));
+    let results = parsed
+        .get("results")
+        .and_then(|r| r.as_array())
+        .unwrap_or_else(|| panic!("response carries no results array: {blob}"));
+
+    let scores: Vec<f64> = results
+        .iter()
+        .filter_map(|r| r.get("rrf_score").and_then(serde_json::Value::as_f64))
+        .collect();
+    let best = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    assert!(
+        best > 0.5,
+        "the vector and text legs must fuse onto one key: a top score of {best} \
+         is at most one leg's contribution (text-alone is exactly 0.5, \
+         vector-alone ≈0.0164); got: {blob}"
+    );
+
+    // The same row must not also appear under a second key — that is the shape
+    // a key disagreement takes when both legs happen to rank the same document.
+    let above_half = scores.iter().filter(|s| **s > 0.4).count();
+    assert_eq!(
+        above_half, 1,
+        "exactly one entry may carry the text leg's contribution; \
+         more than one means the legs keyed the same row differently: {blob}"
+    );
+}

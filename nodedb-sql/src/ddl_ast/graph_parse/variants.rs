@@ -50,11 +50,13 @@ pub(super) fn parse_set_labels(toks: &[Tok<'_>], remove: bool) -> Option<NodedbS
 }
 
 pub(super) fn parse_traverse(toks: &[Tok<'_>]) -> Option<NodedbStatement> {
+    let collection = quoted_after(toks, "IN")?;
     let start = quoted_after(toks, "FROM")?;
     let depth = usize_after(toks, "DEPTH").unwrap_or(2);
     let edge_label = quoted_after(toks, "LABEL");
     let direction = direction_after(toks);
     Some(NodedbStatement::Graph(GraphStmt::GraphTraverse {
+        collection,
         start,
         depth,
         edge_label,
@@ -63,10 +65,12 @@ pub(super) fn parse_traverse(toks: &[Tok<'_>]) -> Option<NodedbStatement> {
 }
 
 pub(super) fn parse_neighbors(toks: &[Tok<'_>]) -> Option<NodedbStatement> {
+    let collection = quoted_after(toks, "IN")?;
     let node = quoted_after(toks, "OF")?;
     let edge_label = quoted_after(toks, "LABEL");
     let direction = direction_after(toks);
     Some(NodedbStatement::Graph(GraphStmt::GraphNeighbors {
+        collection,
         node,
         edge_label,
         direction,
@@ -74,11 +78,13 @@ pub(super) fn parse_neighbors(toks: &[Tok<'_>]) -> Option<NodedbStatement> {
 }
 
 pub(super) fn parse_path(toks: &[Tok<'_>]) -> Option<NodedbStatement> {
+    let collection = quoted_after(toks, "IN")?;
     let src = quoted_after(toks, "FROM")?;
     let dst = quoted_after(toks, "TO")?;
     let max_depth = usize_after(toks, "MAX_DEPTH").unwrap_or(10);
     let edge_label = quoted_after(toks, "LABEL");
     Some(NodedbStatement::Graph(GraphStmt::GraphPath {
+        collection,
         src,
         dst,
         max_depth,

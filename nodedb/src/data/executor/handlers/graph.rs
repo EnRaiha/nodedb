@@ -47,6 +47,16 @@ pub(in crate::data::executor) struct GraphHopParams<'a> {
     pub frontier_bitmap: Option<&'a nodedb_types::SurrogateBitmap>,
 }
 
+/// Arguments for [`CoreLoop::execute_graph_neighbors_multi`].
+pub(in crate::data::executor) struct GraphNeighborsMultiArgs<'a> {
+    pub node_ids: &'a [String],
+    pub edge_label: &'a Option<String>,
+    pub direction: crate::engine::graph::edge_store::Direction,
+    pub max_results: u32,
+    /// Collection scope, or `None` for a label-only traversal.
+    pub collection: Option<&'a str>,
+}
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_graph_hop(
         &self,
@@ -151,11 +161,23 @@ impl CoreLoop {
         node_id: &str,
         edge_label: &Option<String>,
         direction: crate::engine::graph::edge_store::Direction,
+        collection: Option<&str>,
     ) -> Response {
         debug!(core = self.core_id, tid, %node_id, ?edge_label, ?direction, "graph neighbors");
         let database_id = task.request.database_id.as_u64();
+        // A named collection restricts the walk to that collection's edges;
+        // the partition holds every collection's edges under one node space, so
+        // the unscoped `neighbors` would silently span all of them.
         let durable: Vec<(String, String)> = match self.csr_partition(database_id, tid) {
-            Some(partition) => partition.neighbors(node_id, edge_label.as_deref(), direction),
+            Some(partition) => match collection {
+                Some(collection) => partition.neighbors_in_collection(
+                    node_id,
+                    edge_label.as_deref(),
+                    direction,
+                    collection,
+                ),
+                None => partition.neighbors(node_id, edge_label.as_deref(), direction),
+            },
             None => Vec::new(),
         };
         // Read-your-own-writes: fold this transaction's staged edge writes
@@ -207,11 +229,15 @@ impl CoreLoop {
         &self,
         task: &ExecutionTask,
         tid: u64,
-        node_ids: &[String],
-        edge_label: &Option<String>,
-        direction: crate::engine::graph::edge_store::Direction,
-        max_results: u32,
+        args: GraphNeighborsMultiArgs<'_>,
     ) -> Response {
+        let GraphNeighborsMultiArgs {
+            node_ids,
+            edge_label,
+            direction,
+            max_results,
+            collection,
+        } = args;
         debug!(
             core = self.core_id,
             tid,
@@ -232,7 +258,15 @@ impl CoreLoop {
         let mut truncated = false;
         if let Some(partition) = self.csr_partition(database_id, tid) {
             'outer: for raw_src in node_ids {
-                let neighbors = partition.neighbors(raw_src, edge_label.as_deref(), direction);
+                let neighbors = match collection {
+                    Some(collection) => partition.neighbors_in_collection(
+                        raw_src,
+                        edge_label.as_deref(),
+                        direction,
+                        collection,
+                    ),
+                    None => partition.neighbors(raw_src, edge_label.as_deref(), direction),
+                };
                 for (label, node) in neighbors {
                     if owned.len() >= cap {
                         truncated = true;

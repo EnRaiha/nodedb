@@ -13,9 +13,10 @@
 //! edges carry the collection axis) and filters the collection-scoped read
 //! paths by it. These tests exercise that primitive directly: one CSR
 //! partition (one database/tenant) holding TWO collections, asserting a
-//! collection-scoped read sees only its own edges while the unscoped,
-//! collection-less view (bare `GRAPH NEIGHBORS` / traversal, which have no
-//! collection at any layer of the stack) still sees the merged graph.
+//! collection-scoped read sees only its own edges while the index's own
+//! unscoped read still sees the merged graph. That merged view is an internal
+//! primitive, not a statement: every client traversal names a collection, since
+//! one that named none could not be authorized.
 //!
 //! Pre-fix these assertions cannot hold: the CSR had no per-edge collection
 //! tag, so a collection-scoped read of collection A necessarily also returned
@@ -120,9 +121,9 @@ fn scoped_read_of_unknown_collection_is_empty_not_merged() {
     );
 }
 
-/// The collection-less merged view (bare `GRAPH NEIGHBORS` / traversal — these
-/// carry no collection at any layer of the stack) still sees every collection's
-/// edges. This is the intended tenant-wide behavior and proves the two
+/// The index's collection-less read still sees every collection's edges. It is
+/// reachable only from inside the engine — no statement can ask for it — and it
+/// proves the two
 /// collections genuinely share ONE partition: the per-edge tag — not a separate
 /// per-collection partition — is what scopes the MATCH/RAG reads above.
 #[test]

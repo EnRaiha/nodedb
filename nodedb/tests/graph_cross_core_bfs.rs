@@ -109,7 +109,7 @@ async fn cross_core_bfs_does_not_issue_one_rpc_per_frontier_node() {
     let calls_before = broadcast_call_count();
     let start = Instant::now();
     let rows = server
-        .query_text("GRAPH TRAVERSE FROM 'root' DEPTH 2 LABEL 'l' DIRECTION out")
+        .query_text("GRAPH TRAVERSE IN 'bfs_nodes' FROM 'root' DEPTH 2 LABEL 'l' DIRECTION out")
         .await
         .unwrap();
     let elapsed = start.elapsed();
@@ -171,7 +171,7 @@ async fn cross_core_shortest_path_batches_frontier() {
 
     let start = Instant::now();
     let rows = server
-        .query_text("GRAPH PATH FROM 'root' TO 'target' MAX_DEPTH 3 LABEL 'l'")
+        .query_text("GRAPH PATH IN 'sp_nodes' FROM 'root' TO 'target' MAX_DEPTH 3 LABEL 'l'")
         .await
         .unwrap();
     let elapsed = start.elapsed();
@@ -219,7 +219,7 @@ async fn cross_core_bfs_respects_max_visited_mid_hop() {
 
     let start = Instant::now();
     let rows = server
-        .query_text("GRAPH TRAVERSE FROM 'root' DEPTH 2 LABEL 'l' DIRECTION out")
+        .query_text("GRAPH TRAVERSE IN 'bfs_cap' FROM 'root' DEPTH 2 LABEL 'l' DIRECTION out")
         .await
         .unwrap();
     let elapsed = start.elapsed();
@@ -259,7 +259,7 @@ async fn cross_core_bfs_stops_on_empty_frontier() {
 
     let start = Instant::now();
     let rows = server
-        .query_text("GRAPH TRAVERSE FROM 'a' DEPTH 5 LABEL 'l' DIRECTION out")
+        .query_text("GRAPH TRAVERSE IN 'bfs_empty' FROM 'a' DEPTH 5 LABEL 'l' DIRECTION out")
         .await
         .unwrap();
     let elapsed = start.elapsed();

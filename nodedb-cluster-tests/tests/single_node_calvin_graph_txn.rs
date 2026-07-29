@@ -77,7 +77,8 @@ fn another_source_on_distinct_core(num_cores: u32, first: &str, dst: &str) -> St
     panic!("could not find a second source on a distinct core");
 }
 
-/// Run `GRAPH NEIGHBORS OF '<node>' LABEL '<label>' DIRECTION <dir>` and return
+/// Run `GRAPH NEIGHBORS IN 'sncgtx_graph' OF '<node>' LABEL '<label>'
+/// DIRECTION <dir>` and return
 /// the neighbor node ids from the single-row `[{"label":..,"node":..}, ...]`
 /// JSON payload in the first column.
 async fn neighbors(
@@ -86,7 +87,8 @@ async fn neighbors(
     label: &str,
     dir: &str,
 ) -> Vec<String> {
-    let sql = format!("GRAPH NEIGHBORS OF '{node}' LABEL '{label}' DIRECTION {dir}");
+    let sql =
+        format!("GRAPH NEIGHBORS IN 'sncgtx_graph' OF '{node}' LABEL '{label}' DIRECTION {dir}");
     let msgs = client.simple_query(&sql).await.expect("GRAPH NEIGHBORS");
     let mut out = Vec::new();
     for msg in msgs {

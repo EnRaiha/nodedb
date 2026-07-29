@@ -26,17 +26,29 @@ pub enum GraphStmt {
         remove: bool,
     },
     GraphTraverse {
+        /// Collection whose edges the traversal is scoped to. Required: a
+        /// traversal with no collection cannot be authorized, and the CSR
+        /// partition holds every collection's edges under one node space.
+        collection: String,
         start: String,
         depth: usize,
         edge_label: Option<String>,
         direction: GraphDirection,
     },
     GraphNeighbors {
+        /// Collection whose edges the traversal is scoped to. Required: a
+        /// traversal with no collection cannot be authorized, and the CSR
+        /// partition holds every collection's edges under one node space.
+        collection: String,
         node: String,
         edge_label: Option<String>,
         direction: GraphDirection,
     },
     GraphPath {
+        /// Collection whose edges the traversal is scoped to. Required: a
+        /// traversal with no collection cannot be authorized, and the CSR
+        /// partition holds every collection's edges under one node space.
+        collection: String,
         src: String,
         dst: String,
         max_depth: usize,

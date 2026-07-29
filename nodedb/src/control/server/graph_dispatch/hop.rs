@@ -62,6 +62,8 @@ pub(super) struct HopOutput {
 
 /// Parameters for one BFS hop.
 pub(super) struct NeighborHopParams<'a> {
+    /// Collection whose edges this hop traverses.
+    pub collection: Option<&'a str>,
     pub frontier: &'a [String],
     pub edge_label: Option<&'a str>,
     pub direction: Direction,
@@ -80,6 +82,7 @@ pub(super) async fn execute_neighbor_hop(
     params: NeighborHopParams<'_>,
 ) -> crate::Result<HopOutput> {
     let NeighborHopParams {
+        collection,
         frontier,
         edge_label,
         direction,
@@ -102,12 +105,15 @@ pub(super) async fn execute_neighbor_hop(
     if shared.cluster_routing.is_none() {
         let triples = expand_local(
             shared,
-            tenant_id,
-            database_id,
+            ExpandScope {
+                tenant_id,
+                database_id,
+                collection,
+                edge_label,
+                direction,
+                max_results: remaining_budget,
+            },
             frontier,
-            edge_label,
-            direction,
-            remaining_budget,
         )
         .await?;
         let merged = dedup_destinations(&triples);
@@ -127,12 +133,15 @@ pub(super) async fn execute_neighbor_hop(
     } else {
         expand_local(
             shared,
-            tenant_id,
-            database_id,
+            ExpandScope {
+                tenant_id,
+                database_id,
+                collection,
+                edge_label,
+                direction,
+                max_results: remaining_budget,
+            },
             &local_nodes,
-            edge_label,
-            direction,
-            remaining_budget,
         )
         .await?
     };
@@ -143,12 +152,15 @@ pub(super) async fn execute_neighbor_hop(
     if !remote_by_owner.is_empty() {
         let remote_triples = expand_remote(
             shared,
-            tenant_id,
-            database_id,
+            ExpandScope {
+                tenant_id,
+                database_id,
+                collection,
+                edge_label,
+                direction,
+                max_results: remaining_budget,
+            },
             remote_by_owner,
-            edge_label,
-            direction,
-            remaining_budget,
         )
         .await?;
         all_triples.extend(remote_triples);
@@ -249,17 +261,33 @@ fn partition_frontier_by_owner(
     Ok((local, remote.into_values().collect()))
 }
 
+/// Shared scope for one expansion of a BFS frontier.
+struct ExpandScope<'a> {
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    /// Collection scope, or `None` for a label-only traversal.
+    collection: Option<&'a str>,
+    edge_label: Option<&'a str>,
+    direction: Direction,
+    max_results: u32,
+}
+
 /// Expand a locally-owned subset on all local Data-Plane cores.
 async fn expand_local(
     shared: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
+    scope: ExpandScope<'_>,
     node_ids: &[String],
-    edge_label: Option<&str>,
-    direction: Direction,
-    max_results: u32,
 ) -> crate::Result<Vec<NeighborTriple>> {
+    let ExpandScope {
+        tenant_id,
+        database_id,
+        collection,
+        edge_label,
+        direction,
+        max_results,
+    } = scope;
     let plan = PhysicalPlan::Graph(GraphOp::NeighborsMulti {
+        collection: collection.map(str::to_string),
         node_ids: node_ids.to_vec(),
         edge_label: edge_label.map(str::to_string),
         direction,
@@ -282,13 +310,17 @@ async fn expand_local(
 /// decode every returned payload with the shared `{src,label,node}` decoder.
 async fn expand_remote(
     shared: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
+    scope: ExpandScope<'_>,
     owners: Vec<RemoteOwnerBatch>,
-    edge_label: Option<&str>,
-    direction: Direction,
-    max_results: u32,
 ) -> crate::Result<Vec<NeighborTriple>> {
+    let ExpandScope {
+        tenant_id,
+        database_id,
+        collection,
+        edge_label,
+        direction,
+        max_results,
+    } = scope;
     // The dispatcher's remote path needs an owned `Arc<SharedState>`. In
     // cluster mode the gateway is always wired; `gateway_shared` fails loudly
     // if it is absent (rather than silently degrading to a partial local-only
@@ -310,6 +342,7 @@ async fn expand_remote(
             node_ids,
         } = owner;
         let plan = PhysicalPlan::Graph(GraphOp::NeighborsMulti {
+            collection: collection.map(str::to_string),
             node_ids,
             edge_label: edge_label_owned.clone(),
             direction,

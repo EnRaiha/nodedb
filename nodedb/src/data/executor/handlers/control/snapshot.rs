@@ -19,6 +19,10 @@ pub(in crate::data::executor) struct RangeScanArgs<'a> {
     pub lower: Option<&'a [u8]>,
     pub upper: Option<&'a [u8]>,
     pub limit: usize,
+    /// Row-level-security filters applied to the scanned rows before they are
+    /// returned. The index-backed and fallback full-scan paths both filter, so
+    /// which one the collection happens to take is not observable.
+    pub rls_filters: &'a [u8],
 }
 
 impl CoreLoop {
@@ -135,6 +139,7 @@ impl CoreLoop {
             lower,
             upper,
             limit,
+            rls_filters,
         } = args;
         debug!(core = self.core_id, %collection, %field, limit, "range scan");
 
@@ -151,7 +156,24 @@ impl CoreLoop {
                     upper,
                     limit,
                 }) {
-                Ok(r) => r,
+                Ok(r) => {
+                    let mut kept = Vec::with_capacity(r.len());
+                    for (id, bytes) in r {
+                        match self.row_passes_rls(&bytes, rls_filters) {
+                            Ok(true) => kept.push((id, bytes)),
+                            Ok(false) => {}
+                            Err(e) => {
+                                return self.response_error(
+                                    task,
+                                    ErrorCode::Internal {
+                                        detail: e.to_string(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    kept
+                }
                 Err(e) => {
                     warn!(core = self.core_id, error = %e, "sparse range scan failed");
                     return self.response_error(
@@ -166,11 +188,12 @@ impl CoreLoop {
         // If the index returned nothing, fall back to full scan + sort.
         // This handles collections without a secondary index on `field`.
         if results.is_empty() {
-            let scan_result = self.scan_collection(
+            let scan_result = self.scan_collection_with_rls(
                 task.request.database_id.as_u64(),
                 tid,
                 collection,
                 limit.max(1000),
+                rls_filters,
             );
             match scan_result {
                 Ok(mut docs) => {

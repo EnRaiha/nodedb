@@ -158,6 +158,7 @@ fn purge_removes_all_tenant_data() {
             edge_label: Some("KNOWS".into()),
             direction: nodedb::engine::graph::edge_store::Direction::Out,
             rls_filters: Vec::new(),
+            collection: None,
         }),
     );
     assert_eq!(graph_resp.status, Status::Ok);

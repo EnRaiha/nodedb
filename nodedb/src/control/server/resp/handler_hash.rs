@@ -30,6 +30,7 @@ pub(super) async fn handle_hget(
         collection: session.collection.clone(),
         key,
         fields: vec![field.clone()],
+        rls_filters: Vec::new(),
     });
 
     match dispatch_kv(state, session, plan).await {
@@ -65,6 +66,7 @@ pub(super) async fn handle_hmget(
         collection: session.collection.clone(),
         key,
         fields: fields.clone(),
+        rls_filters: Vec::new(),
     });
 
     match dispatch_kv(state, session, plan).await {

@@ -109,6 +109,8 @@ fn hash_join_completeness_past_50k_cap() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -154,6 +156,8 @@ fn sort_merge_join_completeness_past_50k_cap() {
             join_type: "inner".into(),
             limit: 1_000_000,
             pre_sorted: false,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -208,6 +212,8 @@ fn nested_loop_join_completeness_past_50k_cap() {
             .unwrap(),
             join_type: "inner".into(),
             limit: 1_000_000,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -275,6 +281,8 @@ fn hash_join_left_side_over_budget_streams_and_completes() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -337,6 +345,8 @@ fn hash_join_right_side_over_budget_spills_and_completes() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -398,6 +408,8 @@ fn hash_join_build_side_spill_returns_all_matches_across_partitions() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -469,6 +481,8 @@ fn hash_join_probe_side_spill_returns_all_matches() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -510,6 +524,8 @@ fn sort_merge_join_left_over_budget_surfaces_error() {
             join_type: "inner".into(),
             limit: 1_000_000,
             pre_sorted: false,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -546,6 +562,8 @@ fn sort_merge_join_right_over_budget_surfaces_error() {
             join_type: "inner".into(),
             limit: 1_000_000,
             pre_sorted: false,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -581,6 +599,8 @@ fn nested_loop_join_left_over_budget_surfaces_error() {
             condition: Vec::new(),
             join_type: "inner".into(),
             limit: 1_000_000,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -616,6 +636,8 @@ fn nested_loop_join_right_over_budget_surfaces_error() {
             condition: Vec::new(),
             join_type: "inner".into(),
             limit: 1_000_000,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -663,6 +685,8 @@ fn no_limit_join_output_over_budget_surfaces_error() {
             join_type: "inner".into(),
             // usize::MAX = no SQL LIMIT — output bounded by the byte budget.
             limit: usize::MAX,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -724,6 +748,8 @@ fn no_limit_join_within_budget_returns_all_rows_past_10k() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -780,6 +806,8 @@ fn explicit_limit_join_caps_at_k_regardless_of_budget() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -832,6 +860,8 @@ fn join_budget_zero_is_unlimited() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 }

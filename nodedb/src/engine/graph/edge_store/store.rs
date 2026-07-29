@@ -32,6 +32,17 @@ pub(super) const EDGES: TableDefinition<(u64, u64, &str), &[u8]> = TableDefiniti
 pub(super) const REVERSE_EDGES: TableDefinition<(u64, u64, &str), &[u8]> =
     TableDefinition::new("reverse_edges");
 
+/// Node identity table: `(db, tid, node_name)` → global surrogate.
+///
+/// The CSR is rebuilt from `EDGES` on every open, and the edge record names its
+/// endpoints but says nothing about their global identity. Without this table
+/// the rebuilt index has no surrogate bound to any node until live writes
+/// repopulate it, so every cross-engine read — which meets other engines on the
+/// surrogate — silently sees an empty graph side after a restart. One row per
+/// node, not per edge: identity belongs to the node.
+pub(super) const NODE_SURROGATES: TableDefinition<(u64, u64, &str), u32> =
+    TableDefinition::new("node_surrogates");
+
 pub(super) fn redb_err<E: std::fmt::Display>(ctx: &str, e: E) -> crate::Error {
     crate::Error::Storage {
         engine: "graph".into(),
@@ -95,6 +106,9 @@ impl EdgeStore {
             let _ = write_txn
                 .open_table(GRAPH_STATS)
                 .map_err(|e| redb_err("open graph_stats", e))?;
+            let _ = write_txn
+                .open_table(NODE_SURROGATES)
+                .map_err(|e| redb_err("open node_surrogates", e))?;
         }
         write_txn.commit().map_err(|e| redb_err("commit", e))?;
 

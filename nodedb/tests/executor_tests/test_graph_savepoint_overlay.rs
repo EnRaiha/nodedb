@@ -79,6 +79,7 @@ fn neighbors(node: &str, label: &str) -> PhysicalPlan {
         edge_label: Some(label.into()),
         direction: Direction::Out,
         rls_filters: Vec::new(),
+        collection: None,
     })
 }
 

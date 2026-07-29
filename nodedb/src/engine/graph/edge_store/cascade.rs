@@ -56,6 +56,11 @@ impl EdgeStore {
                 old_properties,
             ));
         }
+        // The node itself is going away, so its identity binding goes with it.
+        // Only this node's: the neighbours survive and keep theirs. A rolled-back
+        // delete restores the binding along with the edges (see the transaction
+        // undo path), so this is not a one-way loss.
+        self.delete_node_surrogate(DatabaseId::new(db), tid, node)?;
         Ok(removed)
     }
 

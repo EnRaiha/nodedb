@@ -98,7 +98,8 @@ pub trait NodeDb: NodeDbMarker {
     /// followed.
     ///
     /// On Lite: direct CSR pointer-chasing in contiguous memory. Microseconds.
-    /// On Remote: `GRAPH TRAVERSE FROM '<start>' DEPTH <n> [LABEL '<l>']`.
+    /// On Remote: `GRAPH TRAVERSE IN '<collection>' FROM '<start>' DEPTH <n>
+    /// [LABEL '<l>']`.
     async fn graph_traverse(
         &self,
         collection: &str,
@@ -378,7 +379,7 @@ pub trait NodeDb: NodeDbMarker {
     /// edge_filter)` to discover outgoing neighbors. Inherits the
     /// underlying impl's edge direction semantics. Implementations with
     /// a server-side shortest-path operator (e.g. NodeDB's
-    /// `GRAPH PATH FROM <src> TO <dst>` DSL) should override for
+    /// `GRAPH PATH IN <collection> FROM <src> TO <dst>` DSL) should override for
     /// performance — round-tripping per-hop is O(path_length) wire
     /// hops.
     async fn graph_shortest_path(

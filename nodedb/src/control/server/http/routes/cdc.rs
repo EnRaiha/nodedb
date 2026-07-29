@@ -74,10 +74,12 @@ pub async fn sse_stream(
     let since_ms = params.since_ms.unwrap_or(0);
     let shared = Arc::clone(&state.shared);
 
-    // First, replay any missed events from the ring buffer.
-    let backlog = shared
-        .change_stream
-        .query_changes(Some(&collection), since_ms, 10_000);
+    // First, replay any missed events from the ring buffer. The ring is shared
+    // by every tenant on the node, so the query is tenant-scoped at the source.
+    let backlog =
+        shared
+            .change_stream
+            .query_changes(tenant_id, Some(&collection), since_ms, 10_000);
 
     // Then subscribe for new events going forward.
     let mut subscription = shared
@@ -129,15 +131,34 @@ pub async fn poll_changes(
             .into_response();
     }
 
-    let _tenant_id: TenantId = identity.tenant_id();
+    let tenant_id: TenantId = identity.tenant_id();
     let collection = collection.to_lowercase();
     let since_ms = params.since_ms.unwrap_or(0);
     let limit = params.limit.unwrap_or(100).min(10_000);
 
-    let changes = state
-        .shared
-        .change_stream
-        .query_changes(Some(&collection), since_ms, limit);
+    // A change row exposes the collection's document ids and post-images, so
+    // reading the stream needs the same grant reading the collection needs.
+    if let Err(error) = crate::control::server::shared::authorization::authorize_collection(
+        &identity.0,
+        crate::types::DatabaseId::DEFAULT,
+        &collection,
+        crate::control::security::identity::Permission::Read,
+        &state.shared.permissions,
+        &state.shared.roles,
+        &crate::control::security::audit::NoopAuditEmitter,
+    ) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            format!("permission denied: {}", error.resource()),
+        )
+            .into_response();
+    }
+
+    let changes =
+        state
+            .shared
+            .change_stream
+            .query_changes(tenant_id, Some(&collection), since_ms, limit);
 
     let change_json: Vec<serde_json::Value> = changes
         .iter()

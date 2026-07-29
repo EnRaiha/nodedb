@@ -17,6 +17,68 @@ use nodedb_query::msgpack_scan;
 use nodedb_types::columnar::StrictSchema;
 
 impl CoreLoop {
+    /// [`Self::scan_collection`] with row-level-security filters applied.
+    ///
+    /// `rls_filters` is the MessagePack `Vec<ScanFilter>` the planner injected
+    /// for this collection; empty means no policy applies and the scan is
+    /// returned unchanged. Callers that scan a collection directly — rather
+    /// than through a plan variant with its own filter slot — use this, so a
+    /// locally-scanned side of a join is filtered exactly as the same rows
+    /// would be if they arrived through a `Scan` plan.
+    ///
+    /// A filter that fails to deserialize is an error, never an empty filter
+    /// set: silently dropping security filters would return the unfiltered
+    /// rows.
+    pub fn scan_collection_with_rls(
+        &self,
+        did: u64,
+        tid: u64,
+        collection: &str,
+        limit: usize,
+        rls_filters: &[u8],
+    ) -> crate::Result<Vec<(String, Vec<u8>)>> {
+        let docs = self.scan_collection(did, tid, collection, limit)?;
+        if rls_filters.is_empty() {
+            return Ok(docs);
+        }
+
+        let filters: Vec<crate::bridge::scan_filter::ScanFilter> =
+            zerompk::from_msgpack(rls_filters).map_err(|e| crate::Error::PlanError {
+                detail: format!("RLS filter deserialization failed (join side): {e}"),
+            })?;
+
+        let mut kept = Vec::with_capacity(docs.len());
+        for (id, bytes) in docs {
+            if crate::bridge::scan_filter::ScanFilter::all_match_binary(&filters, &bytes)? {
+                kept.push((id, bytes));
+            }
+        }
+        Ok(kept)
+    }
+
+    /// Whether a stored row passes the caller's row-level-security filters.
+    ///
+    /// `rls_filters` is the MessagePack `Vec<ScanFilter>` the planner injected;
+    /// empty means no policy applies and every row passes. Used by point and
+    /// batch reads, which have no pushdown filter slot in storage and so
+    /// evaluate the policy on the fetched bytes.
+    pub(in crate::data::executor) fn row_passes_rls(
+        &self,
+        row: &[u8],
+        rls_filters: &[u8],
+    ) -> crate::Result<bool> {
+        if rls_filters.is_empty() {
+            return Ok(true);
+        }
+        let filters: Vec<crate::bridge::scan_filter::ScanFilter> =
+            zerompk::from_msgpack(rls_filters).map_err(|e| crate::Error::PlanError {
+                detail: format!("RLS filter deserialization failed: {e}"),
+            })?;
+        Ok(crate::bridge::scan_filter::ScanFilter::all_match_binary(
+            &filters, row,
+        )?)
+    }
+
     /// Universal scan: reads from the correct engine for `collection` and
     /// returns `(doc_id, msgpack_bytes)` pairs in standard msgpack map format.
     ///

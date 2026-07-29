@@ -2,7 +2,7 @@
 
 //! Versioned-key builders, parsers, sentinel constants, and `EdgeRef`.
 
-use nodedb_types::{DatabaseId, TenantId};
+use nodedb_types::{DatabaseId, Surrogate, TenantId};
 
 /// Soft-delete marker.
 pub const TOMBSTONE_SENTINEL: &[u8] = &[0xFF];
@@ -16,6 +16,11 @@ pub const SYSTEM_TIME_WIDTH: usize = 20;
 
 /// Identifies a base edge: database + tenant + collection + `(src, label, dst)`
 /// triple. Borrowed so write paths don't allocate per edge.
+///
+/// The endpoints' `Surrogate`s ride along because they are known at write time
+/// and are the only chance to make them durable. They identify the *nodes*, not
+/// the edge, so the write path stores them in their own table rather than in the
+/// edge value — a node with a thousand edges binds its identity once.
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeRef<'a> {
     pub db: DatabaseId,
@@ -24,9 +29,17 @@ pub struct EdgeRef<'a> {
     pub src: &'a str,
     pub label: &'a str,
     pub dst: &'a str,
+    /// Global identity of `src`, or [`Surrogate::ZERO`] when the caller has
+    /// none to record (delete and erase paths, which change no binding).
+    pub src_surrogate: Surrogate,
+    /// Global identity of `dst`. Same `ZERO` convention as `src_surrogate`.
+    pub dst_surrogate: Surrogate,
 }
 
 impl<'a> EdgeRef<'a> {
+    /// An edge reference that records no identity binding. Use
+    /// [`Self::with_surrogates`] on write paths that know the endpoints'
+    /// surrogates — without it the binding does not survive a restart.
     pub const fn new(
         db: DatabaseId,
         tid: TenantId,
@@ -42,7 +55,17 @@ impl<'a> EdgeRef<'a> {
             src,
             label,
             dst,
+            src_surrogate: Surrogate::ZERO,
+            dst_surrogate: Surrogate::ZERO,
         }
+    }
+
+    /// Attach the endpoints' global identities, so the write persists them
+    /// alongside the edge and a rebuild can restore them.
+    pub const fn with_surrogates(mut self, src: Surrogate, dst: Surrogate) -> Self {
+        self.src_surrogate = src;
+        self.dst_surrogate = dst;
+        self
     }
 
     /// Return an `EdgeRef` with `src` and `dst` swapped — used when building
@@ -55,6 +78,8 @@ impl<'a> EdgeRef<'a> {
             src: self.dst,
             label: self.label,
             dst: self.src,
+            src_surrogate: self.dst_surrogate,
+            dst_surrogate: self.src_surrogate,
         }
     }
 }
@@ -177,5 +202,26 @@ mod tests {
         assert_eq!(r.dst, "a");
         assert_eq!(r.collection, "c");
         assert_eq!(r.label, "L");
+    }
+
+    /// The reverse index writes the same edge from the other endpoint, so the
+    /// identities must swap with the names. Carrying them straight through
+    /// would bind each node to the other's surrogate.
+    #[test]
+    fn edge_ref_reversed_swaps_surrogates_with_endpoints() {
+        let e = EdgeRef::new(DatabaseId::DEFAULT, TenantId::new(1), "c", "a", "L", "b")
+            .with_surrogates(Surrogate::new(10), Surrogate::new(20));
+        let r = e.reversed();
+        assert_eq!(r.src, "b");
+        assert_eq!(r.src_surrogate, Surrogate::new(20));
+        assert_eq!(r.dst, "a");
+        assert_eq!(r.dst_surrogate, Surrogate::new(10));
+    }
+
+    #[test]
+    fn edge_ref_without_surrogates_records_no_binding() {
+        let e = EdgeRef::new(DatabaseId::DEFAULT, TenantId::new(1), "c", "a", "L", "b");
+        assert_eq!(e.src_surrogate, Surrogate::ZERO);
+        assert_eq!(e.dst_surrogate, Surrogate::ZERO);
     }
 }

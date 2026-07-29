@@ -6,6 +6,7 @@
 //! All methods return `Err((entry_index, detail))` on fatal failure so the
 //! caller can escalate to a typed `RollbackFailed` response.
 
+use nodedb_types::Surrogate;
 use tracing::error;
 
 use crate::data::executor::core_loop::CoreLoop;
@@ -225,9 +226,24 @@ impl CoreLoop {
                 let tenant = nodedb_types::TenantId::new(tid);
                 let ord = self.hlc.next_ordinal();
                 let valid_from_ms = nodedb_types::ordinal_to_ms(ord);
+                // The cascade that produced this entry dropped the endpoints'
+                // durable identity bindings. The in-memory CSR still holds
+                // them, so restoring the edge restores the binding with it —
+                // otherwise a rolled-back delete would leave the graph intact
+                // but invisible to every cross-engine read after a restart.
+                let (src_surrogate, dst_surrogate) = self
+                    .csr_partition(did, tid)
+                    .map(|p| {
+                        (
+                            p.node_surrogate(&src_id).unwrap_or(Surrogate::ZERO),
+                            p.node_surrogate(&dst_id).unwrap_or(Surrogate::ZERO),
+                        )
+                    })
+                    .unwrap_or((Surrogate::ZERO, Surrogate::ZERO));
                 self.edge_store
                     .put_edge_versioned_with_stats(
-                        EdgeRef::new(database, tenant, &collection, &src_id, &label, &dst_id),
+                        EdgeRef::new(database, tenant, &collection, &src_id, &label, &dst_id)
+                            .with_surrogates(src_surrogate, dst_surrogate),
                         &old_properties,
                         ord,
                         valid_from_ms,

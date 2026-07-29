@@ -113,7 +113,7 @@ async fn implicit_edge_reverse_traverse_reaches_all_sources_from_any_node() {
                     tokio::runtime::Handle::current().block_on(async {
                         let v = query_graph_json(
                             &cluster.nodes[idx].client,
-                            "GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
+                            "GRAPH TRAVERSE IN 'graph_impl_xnode' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
                         )
                         .await;
                         // hub + all sources => SOURCES + 1 distinct ids.
@@ -134,7 +134,7 @@ async fn implicit_edge_reverse_traverse_reaches_all_sources_from_any_node() {
     for idx in 0..cluster.nodes.len() {
         let v = query_graph_json(
             &cluster.nodes[idx].client,
-            "GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
+            "GRAPH TRAVERSE IN 'graph_impl_xnode' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
         )
         .await;
         let ids = traversed_node_ids(&v);

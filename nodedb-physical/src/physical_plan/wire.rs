@@ -126,6 +126,8 @@ mod tests {
             post_filters: vec![5, 6],
             left_input: None,
             right_input: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
             left_bitmap: None,
             right_bitmap: None,
         });

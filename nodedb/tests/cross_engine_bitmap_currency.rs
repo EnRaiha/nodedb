@@ -468,6 +468,8 @@ fn document_scan_bitmap_filters_columnar_aggregate() {
             right_input: None,
             left_bitmap: Some(Box::new(bm_subplan)),
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
     // The join result has prefixed keys: "catalog.id", "metrics.id", etc.

@@ -299,6 +299,7 @@ impl NodeDbPgHandler {
                 return Ok(resp);
             }
             Resolved::Plan(resolved_plan) => {
+                let resolved_plan = *resolved_plan;
                 task.plan = resolved_plan;
             }
             Resolved::Stream(stream) => {

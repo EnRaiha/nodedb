@@ -129,6 +129,9 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_aggregate(
                 right_input,
                 left_bitmap: None,
                 right_bitmap: None,
+                // Populated by `rls_injection` after conversion, per side.
+                left_rls_filters: Vec::new(),
+                right_rls_filters: Vec::new(),
             }),
             post_set_op: PostSetOp::None,
             txn_id: None,

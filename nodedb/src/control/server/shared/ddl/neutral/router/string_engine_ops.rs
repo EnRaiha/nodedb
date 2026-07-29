@@ -293,7 +293,12 @@ pub(super) async fn try_string(
         return Some(chunk_text::execute_chunk_text(sql));
     }
     if upper.starts_with("SHOW CHANGES ") {
-        return Some(show_changes::show_changes(state, sql));
+        return Some(show_changes::show_changes(
+            state,
+            identity,
+            database_id,
+            sql,
+        ));
     }
     if upper.starts_with("SELECT ESTIMATE_COUNT(") || upper.starts_with("SELECT ESTIMATE_COUNT (") {
         return Some(estimate_count::estimate_count(state, identity, database_id, sql).await);

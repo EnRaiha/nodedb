@@ -80,6 +80,7 @@ fn transaction_edge_put_committed() {
             edge_label: Some("KNOWS".into()),
             direction: nodedb::engine::graph::edge_store::Direction::Out,
             rls_filters: Vec::new(),
+            collection: None,
         }),
     );
     assert_eq!(n.status, Status::Ok);
@@ -191,6 +192,7 @@ fn transaction_edge_put_rolled_back_on_failure() {
             edge_label: Some("KNOWS".into()),
             direction: nodedb::engine::graph::edge_store::Direction::Out,
             rls_filters: Vec::new(),
+            collection: None,
         }),
     );
     assert_eq!(n.status, Status::Ok);
@@ -335,6 +337,7 @@ fn transaction_mixed_doc_edge_vector_rollback() {
             edge_label: Some("LINKED".into()),
             direction: nodedb::engine::graph::edge_store::Direction::Out,
             rls_filters: Vec::new(),
+            collection: None,
         }),
     );
     assert_eq!(n.status, Status::Ok);

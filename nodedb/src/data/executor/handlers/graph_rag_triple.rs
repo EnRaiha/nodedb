@@ -16,8 +16,9 @@ use tracing::debug;
 
 use crate::bridge::envelope::Response;
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::handlers::graph_expansion::{GraphExpansionParams, GraphSeeds};
 use crate::data::executor::handlers::graph_rag::{
-    BfsWithDistancesParams, RagResponseParams, graph_nodes_to_ranked_results,
+    RagResponseParams, graph_nodes_to_ranked_results,
 };
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::edge_store::Direction;
@@ -74,7 +75,7 @@ impl CoreLoop {
 
         let tid_typed = TenantId::new(tenant_id);
 
-        let (vector_results, vector_scores) = match self.vector_search_to_node_scores(
+        let (vector_results, vector_scores, seeds) = match self.vector_search_to_node_scores(
             task,
             tenant_id,
             collection,
@@ -104,19 +105,23 @@ impl CoreLoop {
             )
             .unwrap_or_default();
 
-        // Graph BFS from vector-nearest nodes.
-        let start_ids: Vec<&str> = vector_scores.keys().map(String::as_str).collect();
-        let (expanded_nodes, hop_distances, bfs_truncated) =
-            self.bfs_with_distances(BfsWithDistancesParams {
-                database_id: task.request.database_id.as_u64(),
-                tid: tenant_id,
-                start_nodes: &start_ids,
-                label_filter: edge_label.as_deref(),
-                direction,
-                max_depth: expansion_depth,
-                max_visited,
-                collection,
-            });
+        // Graph expansion seeded directly by the vector hits' surrogates.
+        let expansion = self.expand_graph(GraphExpansionParams {
+            database_id: task.request.database_id.as_u64(),
+            tid: tenant_id,
+            seeds: GraphSeeds::Surrogates(&seeds),
+            label_filter: edge_label.as_deref(),
+            direction,
+            max_depth: expansion_depth,
+            max_visited,
+            collection,
+        });
+        let (expanded_nodes, hop_distances, bfs_truncated, unaddressable) = (
+            expansion.names,
+            expansion.distances,
+            expansion.truncated,
+            expansion.unaddressable,
+        );
 
         let (vector_k, text_k, graph_k) = rrf_k;
 
@@ -158,6 +163,7 @@ impl CoreLoop {
                 vector_candidate_count: vector_results.len(),
                 graph_expanded_count: expanded_nodes.len(),
                 bfs_truncated,
+                graph_unaddressable: unaddressable,
                 op_name: "graph rag fusion triple",
             },
         )

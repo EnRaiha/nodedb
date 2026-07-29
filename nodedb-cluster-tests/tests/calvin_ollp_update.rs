@@ -96,7 +96,7 @@ async fn ollp_implicit_edge_update_moves_edge_cross_node() {
             || {
                 cluster.nodes[idx]
                     .traversed_node_ids(
-                        "GRAPH TRAVERSE FROM 'hub_old' DEPTH 1 LABEL 'l' DIRECTION in",
+                        "GRAPH TRAVERSE IN 'ollp_impl_edge_upd' FROM 'hub_old' DEPTH 1 LABEL 'l' DIRECTION in",
                     )
                     .len()
                     > SOURCES
@@ -142,7 +142,7 @@ async fn ollp_implicit_edge_update_moves_edge_cross_node() {
             Duration::from_millis(100),
             || {
                 let ids = cluster.nodes[idx].traversed_node_ids(
-                    "GRAPH TRAVERSE FROM 'hub_old' DEPTH 1 LABEL 'l' DIRECTION in",
+                    "GRAPH TRAVERSE IN 'ollp_impl_edge_upd' FROM 'hub_old' DEPTH 1 LABEL 'l' DIRECTION in",
                 );
                 // Only the start node `hub_old` itself should remain (or nothing).
                 ids.iter().all(|id| id == "hub_old")
@@ -161,7 +161,7 @@ async fn ollp_implicit_edge_update_moves_edge_cross_node() {
             Duration::from_millis(100),
             || {
                 let ids = cluster.nodes[idx].traversed_node_ids(
-                    "GRAPH TRAVERSE FROM 'hub_new' DEPTH 1 LABEL 'l' DIRECTION in",
+                    "GRAPH TRAVERSE IN 'ollp_impl_edge_upd' FROM 'hub_new' DEPTH 1 LABEL 'l' DIRECTION in",
                 );
                 (0..SOURCES).all(|i| ids.iter().any(|id| id == &format!("src_{i}")))
             },

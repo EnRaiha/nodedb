@@ -105,6 +105,8 @@ impl CoreLoop {
                 right_input,
                 left_bitmap,
                 right_bitmap,
+                left_rls_filters,
+                right_rls_filters,
                 ..
             } => self.execute_hash_join(HashJoinParams {
                 join: JoinParams {
@@ -126,6 +128,8 @@ impl CoreLoop {
                 right_input: right_input.as_deref(),
                 left_bitmap: left_bitmap.as_deref(),
                 right_bitmap: right_bitmap.as_deref(),
+                left_rls_filters,
+                right_rls_filters,
             }),
 
             QueryOp::ShuffleJoinConsume {
@@ -172,6 +176,8 @@ impl CoreLoop {
                 condition,
                 join_type,
                 limit,
+                left_rls_filters,
+                right_rls_filters,
             } => self.execute_nested_loop_join(NestedLoopJoinParams {
                 task,
                 tid,
@@ -180,6 +186,8 @@ impl CoreLoop {
                 condition,
                 join_type,
                 limit: *limit,
+                left_rls_filters,
+                right_rls_filters,
             }),
 
             QueryOp::SortMergeJoin {
@@ -189,6 +197,8 @@ impl CoreLoop {
                 join_type,
                 limit,
                 pre_sorted,
+                left_rls_filters,
+                right_rls_filters,
             } => self.execute_sort_merge_join(SortMergeJoinParams {
                 task,
                 tid,
@@ -198,6 +208,8 @@ impl CoreLoop {
                 join_type,
                 limit: *limit,
                 pre_sorted: *pre_sorted,
+                left_rls_filters,
+                right_rls_filters,
             }),
 
             QueryOp::RecursiveScan {

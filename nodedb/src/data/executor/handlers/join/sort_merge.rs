@@ -49,6 +49,8 @@ impl CoreLoop {
             join_type,
             limit,
             pre_sorted,
+            left_rls_filters,
+            right_rls_filters,
         } = p;
         debug!(
             core = self.core_id,
@@ -69,11 +71,12 @@ impl CoreLoop {
         let scan_limit =
             crate::data::executor::handlers::scan_budget::fetch_limit_for(usize::MAX, 0, budget);
 
-        let left_docs = match self.scan_collection(
+        let left_docs = match self.scan_collection_with_rls(
             task.request.database_id.as_u64(),
             tid,
             left_collection,
             scan_limit,
+            left_rls_filters,
         ) {
             Ok(d) => d,
             Err(e) => {
@@ -94,11 +97,12 @@ impl CoreLoop {
             return err;
         }
 
-        let right_docs = match self.scan_collection(
+        let right_docs = match self.scan_collection_with_rls(
             task.request.database_id.as_u64(),
             tid,
             right_collection,
             scan_limit,
+            right_rls_filters,
         ) {
             Ok(d) => d,
             Err(e) => {

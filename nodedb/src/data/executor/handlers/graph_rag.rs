@@ -3,21 +3,24 @@
 //! GraphRAG fusion handler: vector search, graph expansion, RRF scoring.
 //!
 //! Pipeline:
-//! 1. Vector engine returns top-K semantically similar nodes.
-//! 2. Result node IDs feed into graph traversal as start nodes.
+//! 1. Vector engine returns top-K semantically similar rows.
+//! 2. Their surrogates seed graph expansion directly — the two engines meet on
+//!    global identity, so nothing is translated between the hops.
 //! 3. Graph-expanded result set is scored by hop distance.
 //! 4. RRF fuses vector_score and graph_score into unified ranking.
 //! 5. Final top-N results are materialized.
 //!
-//! BFS expansion is bounded by a per-query memory budget derived from the
-//! node count. If the budget is exceeded, expansion stops early and results
-//! are marked as truncated.
+//! Expansion is bounded by a per-query memory budget derived from the node
+//! count. If the budget is exceeded, expansion stops early and results are
+//! marked as truncated.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 
+use nodedb_types::Surrogate;
 use nodedb_vector::SearchResult;
 use tracing::{debug, warn};
 
+use super::graph_expansion::{GraphExpansionParams, GraphSeeds};
 use crate::bridge::envelope::{ErrorCode, Response};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec::{
@@ -27,11 +30,18 @@ use crate::data::executor::task::ExecutionTask;
 use crate::engine::graph::edge_store::Direction;
 use crate::query::fusion::{FusedResult, RankedResult, reciprocal_rank_fusion_weighted};
 
-/// Result of a successful vector search + node-ID translation.
+/// Result of a successful vector search.
 ///
-/// `Vec<SearchResult>` is the raw HNSW output (for reporting candidate counts).
-/// `HashMap` maps graph node names to `(rank, distance)` pairs.
-type VectorNodeScores = (Vec<SearchResult>, HashMap<String, (usize, f32)>);
+/// - `Vec<SearchResult>` is the raw HNSW output, for reporting candidate counts.
+/// - `HashMap` maps each hit's *reporting key* to `(rank, distance)`. That key
+///   is what RRF fuses on and what the response returns, so it has to be a name.
+/// - `Vec<Surrogate>` is the same hits in the identity currency, ready to seed
+///   graph expansion with no translation.
+type VectorNodeScores = (
+    Vec<SearchResult>,
+    HashMap<String, (usize, f32)>,
+    Vec<Surrogate>,
+);
 
 /// Parameters for `build_rag_response`.
 pub(in crate::data::executor) struct RagResponseParams<'a> {
@@ -41,6 +51,9 @@ pub(in crate::data::executor) struct RagResponseParams<'a> {
     pub vector_candidate_count: usize,
     pub graph_expanded_count: usize,
     pub bfs_truncated: bool,
+    /// Expanded nodes with no surrogate — see
+    /// [`GraphRagMetadata::graph_unaddressable`].
+    pub graph_unaddressable: usize,
     pub op_name: &'a str,
 }
 
@@ -57,18 +70,6 @@ pub(in crate::data::executor) struct GraphRagFusionParams<'a> {
     pub rrf_k: (f64, f64),
     pub vector_field: &'a str,
     pub max_visited: usize,
-}
-
-/// Bundled arguments for [`CoreLoop::bfs_with_distances`].
-pub(in crate::data::executor) struct BfsWithDistancesParams<'a> {
-    pub database_id: u64,
-    pub tid: u64,
-    pub start_nodes: &'a [&'a str],
-    pub label_filter: Option<&'a str>,
-    pub direction: Direction,
-    pub max_depth: usize,
-    pub max_visited: usize,
-    pub collection: &'a str,
 }
 
 impl CoreLoop {
@@ -99,7 +100,7 @@ impl CoreLoop {
             "graph rag fusion"
         );
 
-        let (vector_results, vector_scores) = match self.vector_search_to_node_scores(
+        let (vector_results, vector_scores, seeds) = match self.vector_search_to_node_scores(
             task,
             tenant_id,
             collection,
@@ -111,18 +112,22 @@ impl CoreLoop {
             Err(resp) => return resp,
         };
 
-        let start_ids: Vec<&str> = vector_scores.keys().map(String::as_str).collect();
-        let (expanded_nodes, hop_distances, bfs_truncated) =
-            self.bfs_with_distances(BfsWithDistancesParams {
-                database_id: task.request.database_id.as_u64(),
-                tid: tenant_id,
-                start_nodes: &start_ids,
-                label_filter: edge_label.as_deref(),
-                direction,
-                max_depth: expansion_depth,
-                max_visited,
-                collection,
-            });
+        let expansion = self.expand_graph(GraphExpansionParams {
+            database_id: task.request.database_id.as_u64(),
+            tid: tenant_id,
+            seeds: GraphSeeds::Surrogates(&seeds),
+            label_filter: edge_label.as_deref(),
+            direction,
+            max_depth: expansion_depth,
+            max_visited,
+            collection,
+        });
+        let (expanded_nodes, hop_distances, bfs_truncated, unaddressable) = (
+            expansion.names,
+            expansion.distances,
+            expansion.truncated,
+            expansion.unaddressable,
+        );
 
         let (vector_k, graph_k) = rrf_k;
 
@@ -153,17 +158,17 @@ impl CoreLoop {
                 vector_candidate_count: vector_results.len(),
                 graph_expanded_count: expanded_nodes.len(),
                 bfs_truncated,
+                graph_unaddressable: unaddressable,
                 op_name: "graph rag fusion",
             },
         )
     }
 
-    /// Look up the HNSW index for `collection`, run the search, and translate
-    /// local HNSW IDs to graph node names via surrogate mapping.
+    /// Look up the HNSW index for `collection` and run the search.
     ///
-    /// Returns `Ok((vector_results, vector_scores))` on success, or
-    /// `Err(response)` when the index is missing or the search returned no
-    /// candidates. The caller should forward the pre-built response directly.
+    /// Returns the raw hits, their reporting keys, and their surrogates — see
+    /// [`VectorNodeScores`]. `Err(response)` when the index is missing or the
+    /// search returned no candidates; the caller forwards it directly.
     pub(in crate::data::executor) fn vector_search_to_node_scores(
         &self,
         task: &ExecutionTask,
@@ -190,25 +195,39 @@ impl CoreLoop {
             return Err(self.response_with_payload(task, b"[]".to_vec()));
         }
 
-        // Translate local HNSW IDs to graph node names via the surrogate index.
-        // Path: local_hnsw_id -> Surrogate (vector collection) -> graph node name
-        // (CSR partition reverse map). Vectors without a surrogate binding, or
-        // surrogates not bound to any graph node, emit a non-matching sentinel
-        // that BFS will skip as a missing seed.
+        // Each hit is carried in two forms. The surrogate is the identity the
+        // graph leg seeds from directly — no name is minted to seed a walk that
+        // would only hash it straight back to the same node.
+        //
+        // The reporting key is resolved once per hit: the graph node name when
+        // the surrogate is bound to one, otherwise the document storage key.
+        // Falling back to the document key rather than to an index-local
+        // sentinel is what lets a hit fuse with the *text* leg, which keys on
+        // exactly that; the old `__local_{hnsw_id}` sentinel could match nothing
+        // and leaked an internal index id into the response's `node_id`.
         let csr = self.csr_partition(database_id, tenant_id);
         let mut vector_scores: HashMap<String, (usize, f32)> = HashMap::new();
+        let mut seeds: Vec<Surrogate> = Vec::with_capacity(vector_results.len());
         for (rank, result) in vector_results.iter().enumerate() {
-            let node_id = index
-                .get_surrogate(result.id)
-                .and_then(|s| {
-                    csr.and_then(|c| c.node_id_for_surrogate(s))
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| format!("__local_{}", result.id));
-            vector_scores.insert(node_id, (rank, result.distance));
+            let surrogate = index.get_surrogate(result.id);
+            if let Some(s) = surrogate {
+                seeds.push(s);
+            }
+            let key = match surrogate {
+                Some(s) => csr
+                    .and_then(|c| c.node_id_for_surrogate(s))
+                    .map(str::to_string)
+                    .unwrap_or_else(|| crate::engine::document::store::surrogate_to_doc_id(s)),
+                // No surrogate at all: the vector entry predates surrogate
+                // plumbing, so it has no cross-engine identity. It still ranks
+                // in the vector leg under a key that deliberately matches
+                // nothing else.
+                None => format!("__unbound_{}", result.id),
+            };
+            vector_scores.insert(key, (rank, result.distance));
         }
 
-        Ok((vector_results, vector_scores))
+        Ok((vector_results, vector_scores, seeds))
     }
 
     /// Encode a `GraphRagResponse` from RRF-fused results.
@@ -246,6 +265,7 @@ impl CoreLoop {
                 vector_candidates: p.vector_candidate_count,
                 graph_expanded: p.graph_expanded_count,
                 truncated: p.bfs_truncated,
+                graph_unaddressable: p.graph_unaddressable,
                 watermark_lsn: self.watermark.as_u64(),
             },
         };
@@ -262,87 +282,6 @@ impl CoreLoop {
                 )
             }
         }
-    }
-
-    /// BFS traversal that also tracks hop distances from start nodes.
-    pub(in crate::data::executor) fn bfs_with_distances(
-        &self,
-        params: BfsWithDistancesParams<'_>,
-    ) -> (Vec<String>, HashMap<String, usize>, bool) {
-        let BfsWithDistancesParams {
-            database_id,
-            tid,
-            start_nodes,
-            label_filter,
-            direction,
-            max_depth,
-            max_visited,
-            collection,
-        } = params;
-        let budget_node_limit =
-            self.query_tuning.bfs_memory_budget_bytes / self.query_tuning.bfs_bytes_per_node;
-        let effective_limit = max_visited.min(budget_node_limit);
-
-        let mut visited: HashSet<String> = HashSet::with_capacity(effective_limit.min(1024));
-        let mut distances: HashMap<String, usize> =
-            HashMap::with_capacity(effective_limit.min(1024));
-        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-        let mut truncated = false;
-
-        for &node in start_nodes {
-            let owned = node.to_string();
-            if visited.insert(owned.clone()) {
-                distances.insert(owned.clone(), 0);
-                queue.push_back((owned, 0));
-            }
-        }
-
-        while let Some((node, depth)) = queue.pop_front() {
-            if depth >= max_depth {
-                continue;
-            }
-
-            if visited.len() >= effective_limit {
-                truncated = true;
-                break;
-            }
-
-            let neighbors = match self.csr_partition(database_id, tid) {
-                Some(part) => {
-                    part.neighbors_in_collection(&node, label_filter, direction, collection)
-                }
-                None => Vec::new(),
-            };
-            for (_, neighbor) in &neighbors {
-                if visited.len() >= effective_limit {
-                    truncated = true;
-                    break;
-                }
-                if !visited.contains(neighbor) {
-                    visited.insert(neighbor.clone());
-                    distances.insert(neighbor.clone(), depth + 1);
-                    queue.push_back((neighbor.clone(), depth + 1));
-                }
-            }
-
-            if truncated {
-                break;
-            }
-        }
-
-        if truncated {
-            warn!(
-                core = self.core_id,
-                visited = visited.len(),
-                limit = effective_limit,
-                budget_limit = budget_node_limit,
-                max_visited,
-                "GraphRAG BFS truncated: memory budget or max_visited reached"
-            );
-        }
-
-        let nodes: Vec<String> = visited.into_iter().collect();
-        (nodes, distances, truncated)
     }
 }
 

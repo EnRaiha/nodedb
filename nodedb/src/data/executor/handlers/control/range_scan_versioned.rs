@@ -72,7 +72,26 @@ impl CoreLoop {
             lower,
             upper,
             limit,
+            rls_filters,
         } = args;
+
+        // Decoding the filter set once, before the predicate closure, keeps a
+        // malformed filter from being silently treated as "no policy" per row.
+        let rls: Option<Vec<crate::bridge::scan_filter::ScanFilter>> = if rls_filters.is_empty() {
+            None
+        } else {
+            match zerompk::from_msgpack(rls_filters) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    return self.response_error(
+                        task,
+                        ErrorCode::Internal {
+                            detail: format!("RLS filter deserialization failed: {e}"),
+                        },
+                    );
+                }
+            }
+        };
         // Resolve the strict schema (if any) for strict-safe body decode.
         let config_key = (
             task.request.database_id,
@@ -94,7 +113,25 @@ impl CoreLoop {
             Some(doc) => {
                 let values =
                     crate::engine::document::store::extract_index_values(&doc, field, false);
-                values.iter().any(|v| value_in_bounds(v, lower, upper))
+                if !values.iter().any(|v| value_in_bounds(v, lower, upper)) {
+                    return false;
+                }
+                // Row-level security decides on the same decoded body. A filter
+                // that errors excludes the row: this predicate cannot surface an
+                // error, and admitting the row would leak it.
+                match &rls {
+                    None => true,
+                    // The filters evaluate against the normalized msgpack form,
+                    // the same encoding every other RLS site filters on — a
+                    // strict body is a Binary Tuple until it is decoded here.
+                    Some(filters) => match nodedb_types::json_msgpack::json_to_msgpack(&doc) {
+                        Ok(mp) => {
+                            crate::bridge::scan_filter::ScanFilter::all_match_binary(filters, &mp)
+                                .unwrap_or(false)
+                        }
+                        Err(_) => false,
+                    },
+                }
             }
             None => false,
         };

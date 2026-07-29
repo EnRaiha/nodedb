@@ -104,6 +104,7 @@ fn sparse_range_scan_isolated() {
             lower: None,
             upper: None,
             limit: 100,
+            rls_filters: Vec::new(),
         }),
     );
     assert_eq!(resp_b.status, Status::Ok);

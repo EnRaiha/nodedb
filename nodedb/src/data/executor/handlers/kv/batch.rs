@@ -33,6 +33,7 @@ impl CoreLoop {
         tid: u64,
         collection: &str,
         keys: &[Vec<u8>],
+        rls_filters: &[u8],
     ) -> Response {
         debug!(core = self.core_id, %collection, count = keys.len(), "kv batch get");
         let now_ms = current_ms();
@@ -52,16 +53,30 @@ impl CoreLoop {
             )
             .collect();
 
-        let json_results: Vec<serde_json::Value> = results
-            .into_iter()
-            .map(|opt| match opt {
-                Some(v) => serde_json::Value::String(base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &v,
-                )),
+        // A row the read policy excludes reads as absent — indistinguishable
+        // from a missing key, so a caller cannot probe for keys it may not read.
+        let mut json_results: Vec<serde_json::Value> = Vec::with_capacity(results.len());
+        for opt in results {
+            let entry = match opt {
+                Some(v) => match self.row_passes_rls(&v, rls_filters) {
+                    Ok(true) => serde_json::Value::String(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &v,
+                    )),
+                    Ok(false) => serde_json::Value::Null,
+                    Err(e) => {
+                        return self.response_error(
+                            task,
+                            ErrorCode::Internal {
+                                detail: e.to_string(),
+                            },
+                        );
+                    }
+                },
                 None => serde_json::Value::Null,
-            })
-            .collect();
+            };
+            json_results.push(entry);
+        }
         match response_codec::encode_json_vec(&json_results) {
             Ok(payload) => self.response_with_payload(task, payload),
             Err(e) => self.response_error(

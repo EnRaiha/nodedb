@@ -65,6 +65,7 @@ fn graph_traversal_bounded_under_adversarial_queries() {
             options: Default::default(),
             rls_filters: Vec::new(),
             frontier_bitmap: None,
+            collection: None,
         }),
     );
     let hop1_nodes: Vec<String> = serde_json::from_value(payload_value(&hop1)).unwrap();
@@ -88,6 +89,7 @@ fn graph_traversal_bounded_under_adversarial_queries() {
             options: Default::default(),
             rls_filters: Vec::new(),
             frontier_bitmap: None,
+            collection: None,
         }),
     );
     let hop0_nodes: Vec<String> = serde_json::from_value(payload_value(&hop0)).unwrap();
@@ -107,6 +109,7 @@ fn graph_traversal_bounded_under_adversarial_queries() {
             options: Default::default(),
             rls_filters: Vec::new(),
             frontier_bitmap: None,
+            collection: None,
         }),
     );
     let chain_nodes: Vec<String> = serde_json::from_value(payload_value(&chain)).unwrap();
@@ -131,6 +134,7 @@ fn graph_traversal_bounded_under_adversarial_queries() {
             options: Default::default(),
             rls_filters: Vec::new(),
             frontier_bitmap: None,
+            collection: None,
         }),
     );
     // c0→c50 is 50 hops, depth limit 3 should fail.
@@ -151,6 +155,7 @@ fn graph_traversal_bounded_under_adversarial_queries() {
             depth: 3,
             options: Default::default(),
             rls_filters: Vec::new(),
+            collection: None,
         }),
     );
     let edges: Vec<serde_json::Value> = serde_json::from_value(payload_value(&subgraph)).unwrap();

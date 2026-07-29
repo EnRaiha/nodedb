@@ -150,6 +150,7 @@ fn kv_batch_put_and_get() {
         PhysicalPlan::Kv(KvOp::BatchGet {
             collection: "c".into(),
             keys,
+            rls_filters: Vec::new(),
         }),
     );
 }

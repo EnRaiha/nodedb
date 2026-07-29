@@ -99,7 +99,7 @@ pub(super) async fn dispatch_remote(
                 read_version_lsn: resp.read_version_lsn,
             });
         }
-        crate::control::server::exchange::Resolved::Plan(p) => p,
+        crate::control::server::exchange::Resolved::Plan(p) => *p,
         // Gateway path returns collected bytes: materialize the stream into one
         // merged-array payload. (Single-node streaming never reaches the gateway
         // — `state.gateway.is_none()` gates the Stream branch — but handle it
@@ -243,7 +243,7 @@ pub(super) async fn dispatch_remote_stream(
     ))
     .await?
     {
-        crate::control::server::exchange::Resolved::Plan(p) => p,
+        crate::control::server::exchange::Resolved::Plan(p) => *p,
         // A streamable child whose Exchange resolved at the coordinator into a
         // ready response/stream — re-emit it as a single-batch / forwarded
         // stream. These do not occur for the streamable-scan plans routed here,

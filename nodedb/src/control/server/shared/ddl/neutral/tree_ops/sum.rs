@@ -56,6 +56,9 @@ pub async fn tree_sum(
         state,
         crate::control::server::graph_dispatch::CrossCoreBfsParams {
             tenant_id,
+            // Tree-index BFS walks edges by index label; no catalog record maps
+            // an index name back to the collection it was built on.
+            collection: None,
             database_id,
             start_nodes: vec![root_id.clone()],
             edge_label: Some(graph_index),

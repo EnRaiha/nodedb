@@ -14,7 +14,9 @@ use crate::engine::graph::edge_store::stats::table::{GRAPH_STATS, SummaryRow, su
 use crate::engine::graph::edge_store::stats::update::{
     EdgeStatsKey, decrement_for_delete, increment_for_insert,
 };
-use crate::engine::graph::edge_store::store::{EDGES, EdgeStore, REVERSE_EDGES, redb_err};
+use crate::engine::graph::edge_store::store::{
+    EDGES, EdgeStore, NODE_SURROGATES, REVERSE_EDGES, redb_err,
+};
 
 impl EdgeStore {
     /// Write a new version of an edge at `system_from`. Maintains
@@ -117,6 +119,26 @@ impl EdgeStore {
                         .insert((d, t, key.as_str()), zero.as_slice())
                         .map_err(|e| redb_err("insert zero graph summary", e))?;
                 }
+            }
+
+            // Endpoint identities commit with the edge, not after it: a crash
+            // between two transactions would leave an edge whose nodes have no
+            // global identity, which is exactly the post-restart state this
+            // table exists to prevent.
+            let mut surrogates = write_txn
+                .open_table(NODE_SURROGATES)
+                .map_err(|e| redb_err("open node_surrogates", e))?;
+            for (node, surrogate) in [
+                (edge.src, edge.src_surrogate),
+                (edge.dst, edge.dst_surrogate),
+            ] {
+                let raw = surrogate.as_u32();
+                if raw == 0 {
+                    continue;
+                }
+                surrogates
+                    .insert((d, t, node), raw)
+                    .map_err(|e| redb_err("insert node surrogate", e))?;
             }
         }
         write_txn.commit().map_err(|e| redb_err("commit", e))?;

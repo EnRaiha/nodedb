@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 pub mod cascade;
+pub mod node_identity;
 pub mod purge;
 pub mod query;
 pub mod scan;
@@ -10,6 +11,7 @@ pub mod store;
 pub mod temporal;
 
 pub use cascade::EdgeRestore;
+pub use node_identity::NodeSurrogateRecord;
 pub use stats::CollectionStats;
 pub use store::{Direction, Edge, EdgeRecord, EdgeStore};
 pub use temporal::{

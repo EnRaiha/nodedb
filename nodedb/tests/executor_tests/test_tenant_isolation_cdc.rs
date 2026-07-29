@@ -38,35 +38,26 @@ fn cdc_stream_isolated_between_tenants() {
         after: None,
     });
 
-    // Query recent changes and verify tenant scoping.
-    // query_changes returns all events — we filter by tenant_id manually
-    // to verify that events are tagged correctly for subscription filtering.
-    let all_events = stream.query_changes(Some("orders"), 0, 100);
-    assert!(
-        all_events.len() >= 2,
-        "Should have at least 2 events, got {}",
-        all_events.len()
+    // The ring is shared by every tenant on the node, so the query itself is
+    // tenant-scoped rather than returning everything for the caller to filter:
+    // asking as one tenant returns that tenant's events and nothing else.
+    let a_events = stream.query_changes(TenantId::new(TENANT_A), Some("orders"), 0, 100);
+    assert_eq!(
+        a_events.len(),
+        1,
+        "Tenant A must see exactly its own event: {a_events:?}"
     );
-
-    // Verify Tenant A's event is tagged with Tenant A.
-    let a_events: Vec<_> = all_events
-        .iter()
-        .filter(|e| e.tenant_id == TenantId::new(TENANT_A))
-        .collect();
-    assert_eq!(a_events.len(), 1);
     assert_eq!(a_events[0].document_id, "order_1");
+    assert_eq!(a_events[0].tenant_id, TenantId::new(TENANT_A));
 
-    // Verify Tenant B's event is tagged with Tenant B.
-    let b_events: Vec<_> = all_events
-        .iter()
-        .filter(|e| e.tenant_id == TenantId::new(TENANT_B))
-        .collect();
-    assert_eq!(b_events.len(), 1);
+    let b_events = stream.query_changes(TenantId::new(TENANT_B), Some("orders"), 0, 100);
+    assert_eq!(
+        b_events.len(),
+        1,
+        "Tenant B must see exactly its own event: {b_events:?}"
+    );
     assert_eq!(b_events[0].document_id, "order_2");
-
-    // The subscription filtering (recv_filtered) uses tenant_filter to drop
-    // events from other tenants. Here we verify the events are correctly
-    // tagged so that filtering works.
+    assert_eq!(b_events[0].tenant_id, TenantId::new(TENANT_B));
 }
 
 #[test]
@@ -94,7 +85,7 @@ fn cdc_different_collections_isolated() {
     });
 
     // Query only "orders" — should not include "users".
-    let order_events = stream.query_changes(Some("orders"), 0, 100);
+    let order_events = stream.query_changes(TenantId::new(TENANT_A), Some("orders"), 0, 100);
     for event in &order_events {
         assert_eq!(event.collection, "orders");
     }

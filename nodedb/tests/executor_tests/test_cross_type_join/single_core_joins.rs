@@ -80,6 +80,8 @@ fn single_core_cross_type_hash_join() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -171,6 +173,8 @@ fn single_core_left_join_with_nulls() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -259,6 +263,8 @@ fn single_core_self_join_respects_aliases_in_filter_and_projection() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -321,6 +327,8 @@ fn single_core_self_join_star_keeps_both_sides() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -427,6 +435,8 @@ fn schemaless_self_join_matches_on_canonicalized_object_fields() {
             right_input: None,
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 

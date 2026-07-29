@@ -397,6 +397,7 @@ mod tests {
             edge_label: None,
             direction: Direction::Out,
             rls_filters: vec![],
+            collection: None,
         });
 
         let outcome = super::super::wal_append_if_write(

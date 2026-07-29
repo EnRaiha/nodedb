@@ -176,6 +176,7 @@ pub(crate) fn build_range_scan(
         lower: fields.lower_bound.clone(),
         upper: fields.upper_bound.clone(),
         limit,
+        rls_filters: Vec::new(),
     }))
 }
 

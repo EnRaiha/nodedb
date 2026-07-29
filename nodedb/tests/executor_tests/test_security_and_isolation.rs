@@ -446,6 +446,7 @@ fn mixed_engine_isolation_no_cross_eviction() {
             edge_label: Some("NEXT".into()),
             direction: nodedb::engine::graph::edge_store::Direction::Out,
             rls_filters: Vec::new(),
+            collection: None,
         }),
     );
     assert_eq!(

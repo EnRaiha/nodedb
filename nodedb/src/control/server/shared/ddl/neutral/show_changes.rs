@@ -12,13 +12,19 @@
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use serde_json::{Map, Value as JsonValue};
 
+use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
 
 use super::super::result::{DdlError, DdlResult};
 
 /// Execute `SHOW CHANGES FOR <collection> [SINCE <timestamp>] [LIMIT <n>]`.
-pub fn show_changes(state: &SharedState, sql: &str) -> Result<Vec<DdlResult>, DdlError> {
+pub fn show_changes(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
+    sql: &str,
+) -> Result<Vec<DdlResult>, DdlError> {
     if let Some(coll_name) =
         crate::control::server::shared::ddl::sql_parse::extract_collection_after(sql, " FOR ")
     {
@@ -50,9 +56,51 @@ pub fn show_changes(state: &SharedState, sql: &str) -> Result<Vec<DdlResult>, Dd
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1000);
 
-        let changes = state
-            .change_stream
-            .query_changes(Some(&coll_name), since_ms, limit);
+        // A change row carries the document id, the operation, and — when a
+        // DIFF subscription exists — the post-image body. That is collection
+        // content, so reading it needs the same grant reading the collection
+        // needs.
+        let audit =
+            crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+        crate::control::server::shared::authorization::authorize_collection(
+            identity,
+            database_id,
+            &coll_name,
+            crate::control::security::identity::Permission::Read,
+            &state.permissions,
+            &state.roles,
+            &audit,
+        )
+        .map_err(|error| DdlError {
+            sqlstate: "42501".to_string(),
+            message: format!("permission denied: {}", error.resource()),
+        })?;
+
+        // A read policy governs which rows the caller may see; the change ring
+        // holds only a post-image, and rows whose change predates the policy
+        // evaluation carry no body at all. Neither can be filtered faithfully,
+        // so a policy makes the stream unreadable rather than partially leaked.
+        let auth_ctx = crate::control::server::session_auth::context::build_auth_context(identity);
+        if state
+            .rls
+            .combined_read_predicate_with_auth(identity.tenant_id.as_u64(), &coll_name, &auth_ctx)
+            .is_none_or(|filters| !filters.is_empty())
+        {
+            return Err(DdlError {
+                sqlstate: "0A000".to_string(),
+                message: format!(
+                    "cannot read the change stream for '{coll_name}': it carries a row-level \
+                     security read policy, and recorded changes cannot be filtered by it"
+                ),
+            });
+        }
+
+        let changes = state.change_stream.query_changes(
+            identity.tenant_id,
+            Some(&coll_name),
+            since_ms,
+            limit,
+        );
 
         let columns = vec![
             "collection".to_string(),

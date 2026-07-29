@@ -159,9 +159,16 @@ mod tests {
     #[test]
     fn parse_graph_traverse_keyword_substring_id() {
         let stmt =
-            try_parse("GRAPH TRAVERSE FROM 'node_with_DEPTH_in_name' DEPTH 2 LABEL 'l'").unwrap();
+            try_parse("GRAPH TRAVERSE IN 'kw' FROM 'node_with_DEPTH_in_name' DEPTH 2 LABEL 'l'")
+                .unwrap();
         match stmt {
-            NodedbStatement::Graph(GraphStmt::GraphTraverse { start, depth, .. }) => {
+            NodedbStatement::Graph(GraphStmt::GraphTraverse {
+                collection,
+                start,
+                depth,
+                ..
+            }) => {
+                assert_eq!(collection, "kw");
                 assert_eq!(start, "node_with_DEPTH_in_name");
                 assert_eq!(depth, 2);
             }
@@ -171,14 +178,16 @@ mod tests {
 
     #[test]
     fn parse_graph_path() {
-        let stmt = try_parse("GRAPH PATH FROM 'a' TO 'b' MAX_DEPTH 5 LABEL 'l'").unwrap();
+        let stmt = try_parse("GRAPH PATH IN 'docs' FROM 'a' TO 'b' MAX_DEPTH 5 LABEL 'l'").unwrap();
         match stmt {
             NodedbStatement::Graph(GraphStmt::GraphPath {
+                collection,
                 src,
                 dst,
                 max_depth,
                 edge_label,
             }) => {
+                assert_eq!(collection, "docs");
                 assert_eq!(src, "a");
                 assert_eq!(dst, "b");
                 assert_eq!(max_depth, 5);

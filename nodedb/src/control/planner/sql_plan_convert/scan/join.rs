@@ -221,6 +221,10 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_join(
         right_input,
         left_bitmap,
         right_bitmap,
+        // Populated by `rls_injection` after conversion, per side, and only
+        // when that side is scanned locally (`*_input` is `None`).
+        left_rls_filters: Vec::new(),
+        right_rls_filters: Vec::new(),
     });
 
     let plan = if shuffle_eligible {

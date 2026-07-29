@@ -78,6 +78,9 @@ impl CoreLoop {
             GraphOp::EdgeDeleteBatch { edges } => self.execute_edge_delete_batch(task, tid, edges),
 
             GraphOp::Hop {
+                // Scope is enforced for these at the hop level: they expand
+                // through `NeighborsMulti`, which carries the same collection.
+                collection: _,
                 start_nodes,
                 edge_label,
                 direction,
@@ -98,13 +101,22 @@ impl CoreLoop {
             ),
 
             GraphOp::Neighbors {
+                collection,
                 node_id,
                 edge_label,
                 direction,
                 rls_filters: _,
-            } => self.execute_graph_neighbors(task, tid, node_id, edge_label, *direction),
+            } => self.execute_graph_neighbors(
+                task,
+                tid,
+                node_id,
+                edge_label,
+                *direction,
+                collection.as_deref(),
+            ),
 
             GraphOp::NeighborsMulti {
+                collection,
                 node_ids,
                 edge_label,
                 direction,
@@ -113,13 +125,19 @@ impl CoreLoop {
             } => self.execute_graph_neighbors_multi(
                 task,
                 tid,
-                node_ids,
-                edge_label,
-                *direction,
-                *max_results,
+                super::super::handlers::graph::GraphNeighborsMultiArgs {
+                    node_ids,
+                    edge_label,
+                    direction: *direction,
+                    max_results: *max_results,
+                    collection: collection.as_deref(),
+                },
             ),
 
             GraphOp::Path {
+                // Scope is enforced for these at the hop level: they expand
+                // through `NeighborsMulti`, which carries the same collection.
+                collection: _,
                 src,
                 dst,
                 edge_label,
@@ -140,6 +158,9 @@ impl CoreLoop {
             ),
 
             GraphOp::Subgraph {
+                // Scope is enforced for these at the hop level: they expand
+                // through `NeighborsMulti`, which carries the same collection.
+                collection: _,
                 start_nodes,
                 edge_label,
                 depth,

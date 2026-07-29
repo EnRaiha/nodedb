@@ -199,6 +199,7 @@ impl CoreLoop {
                 lower,
                 upper,
                 limit,
+                rls_filters,
             } => self.execute_range_scan(
                 task,
                 super::super::handlers::control::snapshot::RangeScanArgs {
@@ -208,6 +209,7 @@ impl CoreLoop {
                     lower: lower.as_deref(),
                     upper: upper.as_deref(),
                     limit: *limit,
+                    rls_filters,
                 },
             ),
 

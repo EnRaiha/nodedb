@@ -25,6 +25,8 @@ impl CoreLoop {
             right_input,
             left_bitmap,
             right_bitmap,
+            left_rls_filters,
+            right_rls_filters,
         } = p;
 
         debug!(
@@ -116,6 +118,8 @@ impl CoreLoop {
                     right_collection,
                     left_alias,
                     right_alias,
+                    left_rls_filters,
+                    right_rls_filters,
                 },
                 budget,
             )
@@ -194,7 +198,7 @@ impl CoreLoop {
                         None => return resp,
                     }
                 }
-                None => match self.scan_collection(join.task.request.database_id.as_u64(), tid, left_collection, scan_limit) {
+                None => match self.scan_collection_with_rls(join.task.request.database_id.as_u64(), tid, left_collection, scan_limit, left_rls_filters) {
                     Ok(d) => d,
                     Err(e) => {
                         return self.response_error(
@@ -209,11 +213,12 @@ impl CoreLoop {
             let keys = join.on.iter().map(|(l, _)| l.clone()).collect();
             (docs, keys)
         } else {
-            let docs = match self.scan_collection(
+            let docs = match self.scan_collection_with_rls(
                 join.task.request.database_id.as_u64(),
                 tid,
                 left_collection,
                 scan_limit,
+                left_rls_filters,
             ) {
                 Ok(d) => d,
                 Err(e) => {
@@ -263,11 +268,12 @@ impl CoreLoop {
                         None => return resp,
                     }
                 }
-                None => match self.scan_collection(
+                None => match self.scan_collection_with_rls(
                     join.task.request.database_id.as_u64(),
                     tid,
                     right_collection,
                     scan_limit,
+                    right_rls_filters,
                 ) {
                     Ok(d) => d,
                     Err(e) => {
@@ -281,11 +287,12 @@ impl CoreLoop {
                 },
             }
         } else {
-            match self.scan_collection(
+            match self.scan_collection_with_rls(
                 join.task.request.database_id.as_u64(),
                 tid,
                 right_collection,
                 scan_limit,
+                right_rls_filters,
             ) {
                 Ok(d) => d,
                 Err(e) => {

@@ -10,16 +10,33 @@ use crate::data::executor::response_codec;
 use crate::data::executor::task::ExecutionTask;
 use crate::engine::kv::current_ms;
 
+/// Arguments for [`CoreLoop::execute_kv_field_get`].
+///
+/// Bundled so the handler keeps a readable signature now that the read carries
+/// its row-level-security filters alongside the field selection.
+pub(in crate::data::executor) struct KvFieldGetArgs<'a> {
+    pub did: u64,
+    pub tid: u64,
+    pub collection: &'a str,
+    pub key: &'a [u8],
+    pub fields: &'a [String],
+    pub rls_filters: &'a [u8],
+}
+
 impl CoreLoop {
     pub(in crate::data::executor) fn execute_kv_field_get(
         &self,
         task: &ExecutionTask,
-        did: u64,
-        tid: u64,
-        collection: &str,
-        key: &[u8],
-        fields: &[String],
+        args: KvFieldGetArgs<'_>,
     ) -> Response {
+        let KvFieldGetArgs {
+            did,
+            tid,
+            collection,
+            key,
+            fields,
+            rls_filters,
+        } = args;
         debug!(core = self.core_id, %collection, field_count = fields.len(), "kv field get");
         let now_ms = current_ms();
 
@@ -32,6 +49,22 @@ impl CoreLoop {
         let Some(value) = value else {
             return self.response_error(task, ErrorCode::NotFound);
         };
+
+        // A row the read policy excludes is reported exactly as an absent row:
+        // returning a distinguishable error would let a caller probe for keys
+        // it may not read.
+        match self.row_passes_rls(&value, rls_filters) {
+            Ok(true) => {}
+            Ok(false) => return self.response_error(task, ErrorCode::NotFound),
+            Err(e) => {
+                return self.response_error(
+                    task,
+                    ErrorCode::Internal {
+                        detail: e.to_string(),
+                    },
+                );
+            }
+        }
 
         // Decode as standard msgpack map.
         let doc = match nodedb_types::json_from_msgpack(&value) {

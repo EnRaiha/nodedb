@@ -145,22 +145,22 @@ fn cdc_query_changes_is_unfiltered_callers_must_filter() {
         after: None,
     });
 
-    // query_changes returns all events for the collection regardless of tenant.
-    let all = stream.query_changes(Some("logs"), 0, 100);
+    // The ring is process-wide, so isolation is the query's job, not the
+    // caller's: each tenant sees only its own events.
+    let a_events = stream.query_changes(TenantId::new(TENANT_A), Some("logs"), 0, 100);
+    let b_events = stream.query_changes(TenantId::new(TENANT_B), Some("logs"), 0, 100);
     assert!(
-        all.len() >= 2,
-        "query_changes must return all events across tenants"
+        a_events
+            .iter()
+            .all(|e| e.tenant_id == TenantId::new(TENANT_A)),
+        "Tenant A's query returned another tenant's events"
     );
-
-    // Callers that want per-tenant isolation must filter by tenant_id themselves.
-    let a_events: Vec<_> = all
-        .iter()
-        .filter(|e| e.tenant_id == TenantId::new(TENANT_A))
-        .collect();
-    let b_events: Vec<_> = all
-        .iter()
-        .filter(|e| e.tenant_id == TenantId::new(TENANT_B))
-        .collect();
+    assert!(
+        b_events
+            .iter()
+            .all(|e| e.tenant_id == TenantId::new(TENANT_B)),
+        "Tenant B's query returned another tenant's events"
+    );
 
     assert_eq!(a_events.len(), 1, "should have exactly 1 Tenant A event");
     assert_eq!(b_events.len(), 1, "should have exactly 1 Tenant B event");

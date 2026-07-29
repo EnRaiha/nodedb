@@ -105,5 +105,6 @@ pub fn neighbors(src: &str) -> PhysicalPlan {
         edge_label: Some("REL".into()),
         direction: nodedb::engine::graph::edge_store::Direction::Out,
         rls_filters: Vec::new(),
+        collection: None,
     })
 }

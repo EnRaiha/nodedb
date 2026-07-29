@@ -25,15 +25,33 @@ use super::helpers::{encode_path, ok_response};
 /// reached, the path is reconstructed by walking parents back to
 /// `src`. Returns a JSON array `[src, hop_1, ..., dst]`, or an empty
 /// array when `dst` is unreachable within `max_depth` hops.
+/// Parameters for [`cross_core_shortest_path`].
+pub struct CrossCoreShortestPathParams {
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
+    /// Collection whose edges the path walks. Required: `GRAPH PATH` names one
+    /// so it can be authorized, and the cross-shard hop re-issues the walk as
+    /// SQL on the owning node, which needs the scope to plan the same edges.
+    pub collection: String,
+    pub src: String,
+    pub dst: String,
+    pub edge_label: Option<String>,
+    pub max_depth: usize,
+}
+
 pub async fn cross_core_shortest_path(
     shared: &SharedState,
-    tenant_id: TenantId,
-    database_id: DatabaseId,
-    src: String,
-    dst: String,
-    edge_label: Option<String>,
-    max_depth: usize,
+    params: CrossCoreShortestPathParams,
 ) -> crate::Result<Response> {
+    let CrossCoreShortestPathParams {
+        tenant_id,
+        database_id,
+        collection,
+        src,
+        dst,
+        edge_label,
+        max_depth,
+    } = params;
     let options = GraphTraversalOptions::default();
     let cluster_mode = shared.cluster_routing.is_some();
     // Path semantics only make sense over outgoing edges — the
@@ -67,6 +85,7 @@ pub async fn cross_core_shortest_path(
             .saturating_sub(visited.len())
             .min(u32::MAX as usize) as u32;
         let plan = PhysicalPlan::Graph(GraphOp::NeighborsMulti {
+            collection: Some(collection.clone()),
             node_ids: frontier.clone(),
             edge_label: edge_label.clone(),
             direction,
@@ -121,6 +140,7 @@ pub async fn cross_core_shortest_path(
                         local_nodes,
                         envelope,
                         options: &options,
+                        collection: &collection,
                         edge_label: edge_label.as_deref(),
                         direction,
                         remaining_depth: remaining,

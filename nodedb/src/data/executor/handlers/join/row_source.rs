@@ -45,6 +45,14 @@ pub(super) enum RowSource {
         database_id: u64,
         tenant_id: u64,
         collection: String,
+        /// Row-level-security filters for this side, as the MessagePack
+        /// `Vec<ScanFilter>` the planner injected. Empty = no policy applies.
+        ///
+        /// Applied here rather than at each grace-driver site because this is
+        /// the single dispatch seam every locally-scanned join side passes
+        /// through — a filter applied anywhere else would be one strategy's
+        /// filter, not the join's.
+        rls_filters: Vec<u8>,
     },
     /// Stream rows from a LOCAL staged shuffle file written by a cross-node
     /// exchange. The file is a sequence of `[u32 LE len][row-bytes]` frames,
@@ -79,7 +87,25 @@ impl RowSource {
                 database_id,
                 tenant_id,
                 collection,
-            } => core.scan_collection_for_each(*database_id, *tenant_id, collection, f),
+                rls_filters,
+            } => {
+                if rls_filters.is_empty() {
+                    return core.scan_collection_for_each(*database_id, *tenant_id, collection, f);
+                }
+                // Deserialize once, outside the per-row closure. A filter that
+                // fails to decode is an error, never an empty filter set:
+                // dropping it would stream the unfiltered side into the join.
+                let filters: Vec<crate::bridge::scan_filter::ScanFilter> =
+                    zerompk::from_msgpack(rls_filters).map_err(|e| crate::Error::PlanError {
+                        detail: format!("RLS filter deserialization failed (join side): {e}"),
+                    })?;
+                core.scan_collection_for_each(*database_id, *tenant_id, collection, |id, bytes| {
+                    if crate::bridge::scan_filter::ScanFilter::all_match_binary(&filters, bytes)? {
+                        f(id, bytes)?;
+                    }
+                    Ok(())
+                })
+            }
             RowSource::ShuffleStream { path } => {
                 // One row per frame: `next_row` yields exactly one join row's
                 // bytes, in file order. A truncated/corrupt frame is a HARD

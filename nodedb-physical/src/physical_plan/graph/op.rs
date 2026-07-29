@@ -64,6 +64,19 @@ pub enum GraphOp {
 
     /// Graph hop traversal: BFS from start nodes via label, bounded by depth.
     Hop {
+        /// Collection whose edges this traversal is scoped to.
+        ///
+        /// The CSR partition is keyed `(database, tenant)` with a shared node
+        /// space and per-edge collection ids, so a traversal that names a
+        /// collection reads only that collection's edges — and that name is
+        /// what authorization and RLS resolve against.
+        ///
+        /// `None` means the traversal is scoped by edge label alone: tree-index
+        /// BFS walks edges labelled with an index name, and no catalog record
+        /// maps an index back to the collection it was built on. Such a
+        /// traversal cannot be collection-authorized; the DDL that builds the
+        /// index is authorized instead.
+        collection: Option<String>,
         start_nodes: Vec<String>,
         edge_label: Option<String>,
         direction: Direction,
@@ -78,6 +91,19 @@ pub enum GraphOp {
 
     /// Immediate 1-hop neighbors lookup.
     Neighbors {
+        /// Collection whose edges this traversal is scoped to.
+        ///
+        /// The CSR partition is keyed `(database, tenant)` with a shared node
+        /// space and per-edge collection ids, so a traversal that names a
+        /// collection reads only that collection's edges — and that name is
+        /// what authorization and RLS resolve against.
+        ///
+        /// `None` means the traversal is scoped by edge label alone: tree-index
+        /// BFS walks edges labelled with an index name, and no catalog record
+        /// maps an index back to the collection it was built on. Such a
+        /// traversal cannot be collection-authorized; the DDL that builds the
+        /// index is authorized instead.
+        collection: Option<String>,
         node_id: String,
         edge_label: Option<String>,
         direction: Direction,
@@ -95,6 +121,19 @@ pub enum GraphOp {
     /// wide hop cannot allocate past the caller's budget. `0` means
     /// unbounded (use with care).
     NeighborsMulti {
+        /// Collection whose edges this traversal is scoped to.
+        ///
+        /// The CSR partition is keyed `(database, tenant)` with a shared node
+        /// space and per-edge collection ids, so a traversal that names a
+        /// collection reads only that collection's edges — and that name is
+        /// what authorization and RLS resolve against.
+        ///
+        /// `None` means the traversal is scoped by edge label alone: tree-index
+        /// BFS walks edges labelled with an index name, and no catalog record
+        /// maps an index back to the collection it was built on. Such a
+        /// traversal cannot be collection-authorized; the DDL that builds the
+        /// index is authorized instead.
+        collection: Option<String>,
         node_ids: Vec<String>,
         edge_label: Option<String>,
         direction: Direction,
@@ -105,6 +144,19 @@ pub enum GraphOp {
 
     /// Shortest path between two nodes.
     Path {
+        /// Collection whose edges this traversal is scoped to.
+        ///
+        /// The CSR partition is keyed `(database, tenant)` with a shared node
+        /// space and per-edge collection ids, so a traversal that names a
+        /// collection reads only that collection's edges — and that name is
+        /// what authorization and RLS resolve against.
+        ///
+        /// `None` means the traversal is scoped by edge label alone: tree-index
+        /// BFS walks edges labelled with an index name, and no catalog record
+        /// maps an index back to the collection it was built on. Such a
+        /// traversal cannot be collection-authorized; the DDL that builds the
+        /// index is authorized instead.
+        collection: Option<String>,
         src: String,
         dst: String,
         edge_label: Option<String>,
@@ -119,6 +171,19 @@ pub enum GraphOp {
 
     /// Materialize a subgraph as edge tuples.
     Subgraph {
+        /// Collection whose edges this traversal is scoped to.
+        ///
+        /// The CSR partition is keyed `(database, tenant)` with a shared node
+        /// space and per-edge collection ids, so a traversal that names a
+        /// collection reads only that collection's edges — and that name is
+        /// what authorization and RLS resolve against.
+        ///
+        /// `None` means the traversal is scoped by edge label alone: tree-index
+        /// BFS walks edges labelled with an index name, and no catalog record
+        /// maps an index back to the collection it was built on. Such a
+        /// traversal cannot be collection-authorized; the DDL that builds the
+        /// index is authorized instead.
+        collection: Option<String>,
         start_nodes: Vec<String>,
         edge_label: Option<String>,
         depth: usize,

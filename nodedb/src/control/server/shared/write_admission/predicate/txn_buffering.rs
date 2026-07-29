@@ -646,6 +646,7 @@ mod tests {
                 lower: None,
                 upper: None,
                 limit: 0,
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Document(DocumentOp::Register {
                 collection: "c".into(),
@@ -1063,12 +1064,14 @@ mod tests {
                 options: GraphTraversalOptions::default(),
                 rls_filters: Vec::new(),
                 frontier_bitmap: None,
+                collection: None,
             }),
             PhysicalPlan::Graph(GraphOp::Neighbors {
                 node_id: "n".into(),
                 edge_label: None,
                 direction: Direction::Out,
                 rls_filters: Vec::new(),
+                collection: None,
             }),
             PhysicalPlan::Graph(GraphOp::NeighborsMulti {
                 node_ids: Vec::new(),
@@ -1076,6 +1079,7 @@ mod tests {
                 direction: Direction::Out,
                 max_results: 0,
                 rls_filters: Vec::new(),
+                collection: None,
             }),
             PhysicalPlan::Graph(GraphOp::Path {
                 src: "a".into(),
@@ -1085,6 +1089,7 @@ mod tests {
                 options: GraphTraversalOptions::default(),
                 rls_filters: Vec::new(),
                 frontier_bitmap: None,
+                collection: None,
             }),
             PhysicalPlan::Graph(GraphOp::Subgraph {
                 start_nodes: Vec::new(),
@@ -1092,6 +1097,7 @@ mod tests {
                 depth: 0,
                 options: GraphTraversalOptions::default(),
                 rls_filters: Vec::new(),
+                collection: None,
             }),
             PhysicalPlan::Graph(GraphOp::RagFusion {
                 collection: "c".into(),
@@ -1242,6 +1248,7 @@ mod tests {
             PhysicalPlan::Kv(KvOp::BatchGet {
                 collection: "c".into(),
                 keys: Vec::new(),
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::BatchPut {
                 collection: "c".into(),
@@ -1253,6 +1260,7 @@ mod tests {
                 collection: "c".into(),
                 key: Vec::new(),
                 fields: Vec::new(),
+                rls_filters: Vec::new(),
             }),
             PhysicalPlan::Kv(KvOp::FieldSet {
                 collection: "c".into(),
@@ -1575,6 +1583,8 @@ mod tests {
                 right_input: None,
                 left_bitmap: None,
                 right_bitmap: None,
+                left_rls_filters: Vec::new(),
+                right_rls_filters: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::ShuffleJoinConsume {
                 build_path: String::new(),
@@ -1599,6 +1609,8 @@ mod tests {
                 condition: Vec::new(),
                 join_type: "inner".into(),
                 limit: 0,
+                left_rls_filters: Vec::new(),
+                right_rls_filters: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::SortMergeJoin {
                 left_collection: "l".into(),
@@ -1607,6 +1619,8 @@ mod tests {
                 join_type: "inner".into(),
                 limit: 0,
                 pre_sorted: false,
+                left_rls_filters: Vec::new(),
+                right_rls_filters: Vec::new(),
             }),
             PhysicalPlan::Query(QueryOp::FacetCounts {
                 collection: "c".into(),

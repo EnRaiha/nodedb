@@ -110,7 +110,7 @@ async fn ollp_implicit_edge_pk_delete_cleans_reverse_cross_node() {
             Duration::from_millis(100),
             || {
                 cluster.nodes[idx]
-                    .traversed_node_ids("GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in")
+                    .traversed_node_ids("GRAPH TRAVERSE IN 'ollp_impl_edge_pk_del' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in")
                     .len()
                     > SOURCES
             },
@@ -174,7 +174,7 @@ async fn ollp_implicit_edge_pk_delete_cleans_reverse_cross_node() {
             Duration::from_millis(100),
             || {
                 let ids = cluster.nodes[idx]
-                    .traversed_node_ids("GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in");
+                    .traversed_node_ids("GRAPH TRAVERSE IN 'ollp_impl_edge_pk_del' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in");
                 let src3_gone = !ids.iter().any(|id| id == "src_3");
                 let others_present = (0..SOURCES)
                     .filter(|i| *i != 3)

@@ -313,7 +313,7 @@ async fn dispatch_to_data_plane_inner(
         ) => {
             return Ok(resp);
         }
-        crate::control::server::exchange::Resolved::Plan(p) => p,
+        crate::control::server::exchange::Resolved::Plan(p) => *p,
         // Internal funnel callers want a fully-collected Response, not a lazy
         // stream: materialize the stream into one merged-array Response,
         // preserving the prior gather-then-return behaviour on this path.

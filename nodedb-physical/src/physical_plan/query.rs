@@ -249,6 +249,17 @@ pub enum QueryOp {
         /// Bitmap-producer sub-plan for the right side. Same semantics as
         /// `left_bitmap` but applied to the right (probe) collection.
         right_bitmap: Option<Box<crate::physical_plan::PhysicalPlan>>,
+        /// Row-level-security filters for rows scanned from
+        /// `left_collection` locally — i.e. when `left_input` is `None`.
+        ///
+        /// When `left_input` is `Some`, the child plan carries its own RLS and
+        /// this stays empty. The filters apply per side *before* the join, not
+        /// after it: an excluded row must neither match a partner nor produce a
+        /// null-extended outer row, and a post-join filter can do neither.
+        left_rls_filters: Vec<u8>,
+        /// Row-level-security filters for rows scanned from
+        /// `right_collection` locally. Same semantics as `left_rls_filters`.
+        right_rls_filters: Vec<u8>,
     },
 
     /// Cross-node shuffle-join CONSUMER (E4b): run the node-local grace-hash
@@ -321,6 +332,12 @@ pub enum QueryOp {
         condition: Vec<u8>,
         join_type: String,
         limit: usize,
+        /// Row-level-security filters for rows scanned from `left_collection`.
+        /// Applied per side before the join, for the same reason as
+        /// `QueryOp::HashJoin::left_rls_filters`.
+        left_rls_filters: Vec<u8>,
+        /// Row-level-security filters for rows scanned from `right_collection`.
+        right_rls_filters: Vec<u8>,
     },
 
     /// Sort-merge join: both sides pre-sorted by join key.
@@ -334,6 +351,10 @@ pub enum QueryOp {
         limit: usize,
         /// If true, both sides are assumed pre-sorted by join key (skip sort phase).
         pre_sorted: bool,
+        /// Row-level-security filters for rows scanned from `left_collection`.
+        left_rls_filters: Vec<u8>,
+        /// Row-level-security filters for rows scanned from `right_collection`.
+        right_rls_filters: Vec<u8>,
     },
 
     /// Multi-facet aggregation: compute facet counts for multiple fields

@@ -22,7 +22,16 @@ const RKYV_MAGIC: &[u8; 6] = b"RKCS2\0";
 /// `out_collections` / `in_collections` arrays + collection interning). A v1
 /// snapshot has no collection axis and is rejected; the CSR is instead rebuilt
 /// from the collection-scoped durable edge store.
-pub const CSR_FORMAT_VERSION: u8 = 2;
+///
+/// Bumped to `3` when per-node surrogates joined the snapshot. They were
+/// previously dropped on checkpoint and left at zero on restore, on the theory
+/// that later `EdgePut`s would refill them. That is wrong: the surrogate is the
+/// node's global, WAL-durable identity, and any read keyed on it — a
+/// cross-engine bitmap intersection, a surrogate-seeded traversal — answers
+/// with an empty set until an unrelated write happens to touch the node. A v2
+/// snapshot is rejected for the same reason v1 is, and takes the same recovery
+/// path: rebuild from the durable edge store.
+pub const CSR_FORMAT_VERSION: u8 = 3;
 
 /// Errors during CSR checkpoint operations.
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +66,10 @@ struct CsrSnapshotRkyv {
     /// independently. The v2 snapshot already carries the collection axis, so
     /// widening this key needs no new format version.
     deleted: Vec<(u32, u32, u32, u32)>,
+    /// Per-node global surrogate, parallel to `nodes`. `0` means the node has
+    /// no surrogate bound. The reverse map is rebuilt from this on load rather
+    /// than stored twice.
+    node_surrogates: Vec<u32>,
     has_weights: bool,
     out_weights: Option<Vec<f64>>,
     in_weights: Option<Vec<f64>>,
@@ -89,6 +102,7 @@ impl CsrIndex {
             buffer_out_collections: self.buffer_out_collections.clone(),
             buffer_in_collections: self.buffer_in_collections.clone(),
             deleted: self.deleted_edges.iter().copied().collect(),
+            node_surrogates: self.node_surrogates.clone(),
             has_weights: self.has_weights,
             out_weights: self.out_weights.as_ref().map(|w| w.to_vec()),
             in_weights: self.in_weights.as_ref().map(|w| w.to_vec()),
@@ -241,6 +255,8 @@ impl CsrIndex {
         } else {
             vec![Vec::new(); node_count]
         };
+        let (node_surrogates, surrogate_to_local) =
+            Self::restore_surrogates(snap.node_surrogates, node_count);
 
         Some(Self {
             node_to_id,
@@ -270,10 +286,8 @@ impl CsrIndex {
             node_label_bits: vec![0; node_count],
             node_label_to_id: HashMap::new(),
             node_label_names: Vec::new(),
-            // Surrogates are runtime-only and not persisted. After checkpoint
-            // restore they start at zero and are repopulated by subsequent EdgePuts.
-            node_surrogates: vec![0; node_count],
-            surrogate_to_local: HashMap::new(),
+            node_surrogates,
+            surrogate_to_local,
             access_counts,
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),
@@ -281,6 +295,24 @@ impl CsrIndex {
             // need budget enforcement should call `set_governor` afterwards.
             governor: None,
         })
+    }
+
+    /// Rebuild the surrogate table and its reverse index from a snapshot.
+    ///
+    /// A length mismatch means the snapshot's node table and surrogate table
+    /// disagree, so no binding can be trusted; the table is zeroed rather than
+    /// half-applied, which would silently attach a surrogate to the wrong node.
+    fn restore_surrogates(persisted: Vec<u32>, node_count: usize) -> (Vec<u32>, HashMap<u32, u32>) {
+        if persisted.len() != node_count {
+            return (vec![0; node_count], HashMap::new());
+        }
+        let mut reverse = HashMap::with_capacity(persisted.len());
+        for (local, &raw) in persisted.iter().enumerate() {
+            if raw != 0 {
+                reverse.insert(raw, local as u32);
+            }
+        }
+        (persisted, reverse)
     }
 
     /// Reconstruct CsrIndex from deserialized snapshot fields.
@@ -328,6 +360,8 @@ impl CsrIndex {
         } else {
             vec![Vec::new(); node_count]
         };
+        let (node_surrogates, surrogate_to_local) =
+            Self::restore_surrogates(snap.node_surrogates, node_count);
 
         Self {
             node_to_id,
@@ -357,10 +391,8 @@ impl CsrIndex {
             node_label_bits: vec![0; node_count],
             node_label_to_id: HashMap::new(),
             node_label_names: Vec::new(),
-            // Surrogates are runtime-only and not persisted. After checkpoint
-            // restore they start at zero and are repopulated by subsequent EdgePuts.
-            node_surrogates: vec![0; node_count],
-            surrogate_to_local: HashMap::new(),
+            node_surrogates,
+            surrogate_to_local,
             access_counts,
             query_epoch: 0,
             partition_tag: crate::csr::local_node_id::next_partition_tag(),

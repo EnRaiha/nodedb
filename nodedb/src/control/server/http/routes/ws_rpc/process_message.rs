@@ -94,7 +94,9 @@ pub(super) async fn process_message(
             let effective_lsn = replay_from_lsn.max(last_lsn);
 
             // Replay missed events from ring buffer.
-            let missed = shared.change_stream.query_changes(None, 0, 10_000);
+            let missed = shared
+                .change_stream
+                .query_changes(identity.tenant_id, None, 0, 10_000);
             let replay: Vec<_> = missed
                 .iter()
                 .filter(|event| {

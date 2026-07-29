@@ -388,6 +388,7 @@ async fn dispatch_task(
             return Ok((resp, shard_watermarks, dist_reads));
         }
         Resolved::Plan(resolved_plan) => {
+            let resolved_plan = *resolved_plan;
             task.plan = resolved_plan;
         }
         // Native path materializes the stream into a Response (it streams later

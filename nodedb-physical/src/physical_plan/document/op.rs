@@ -159,6 +159,12 @@ pub enum DocumentOp {
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
         limit: usize,
+        /// Row-level-security filters applied to fetched rows before they are
+        /// returned. This operation has no pushdown filter slot in storage, so
+        /// the filters are evaluated post-fetch — the same shape `KvOp::Get`
+        /// and `DocumentOp::PointGet` already use.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Register collection with secondary indexes and storage mode (DDL).

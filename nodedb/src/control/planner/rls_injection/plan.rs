@@ -152,11 +152,38 @@ fn inject_rls_for_plan(
             }
         }
 
-        // ── Plans that deny if RLS policies exist (unsupported) ──
-        PhysicalPlan::Document(DocumentOp::RangeScan { collection, .. })
-        | PhysicalPlan::Document(DocumentOp::IndexLookup { collection, .. })
-        | PhysicalPlan::Kv(KvOp::BatchGet { collection, .. })
-        | PhysicalPlan::Kv(KvOp::FieldGet { collection, .. }) => {
+        // ── Plans that filter post-fetch (no storage pushdown slot) ──
+        //
+        // These have no filter the storage layer can push down, so the handler
+        // evaluates the policy on the rows it fetched. A row the policy
+        // excludes reads back as absent — indistinguishable from a missing key,
+        // so a caller cannot probe for rows it may not read.
+        PhysicalPlan::Document(DocumentOp::RangeScan {
+            collection,
+            rls_filters,
+            ..
+        })
+        | PhysicalPlan::Kv(KvOp::BatchGet {
+            collection,
+            rls_filters,
+            ..
+        })
+        | PhysicalPlan::Kv(KvOp::FieldGet {
+            collection,
+            rls_filters,
+            ..
+        }) => {
+            let rls = get_rls(rls_store, tenant_id, collection, auth)?;
+            if !rls.is_empty() {
+                *rls_filters = rls;
+            }
+        }
+
+        // ── Plans that still deny if RLS policies exist (unsupported) ──
+        //
+        // `IndexLookup` returns index entries rather than rows, so there is no
+        // row body to evaluate a policy against.
+        PhysicalPlan::Document(DocumentOp::IndexLookup { collection, .. }) => {
             let rls = get_rls(rls_store, tenant_id, collection, auth)?;
             if !rls.is_empty() {
                 return Err(crate::Error::PlanError {
@@ -167,16 +194,39 @@ fn inject_rls_for_plan(
             }
         }
 
-        // ── Graph: per-node RLS deferred to Data Plane handler ──
+        // ── Graph traversal: deny while a policy exists on the collection ──
+        //
+        // A traversal returns node ids and edge labels, not row bodies, so
+        // there is nothing here for a row filter to evaluate — the rows are
+        // fetched later through `DocumentOp::PointGet`, which applies the
+        // policy then. What a traversal *does* disclose is topology: which
+        // nodes exist and how they connect. A read policy says some of those
+        // rows are not the caller's to see, and their edges are equally not,
+        // so the traversal refuses rather than leaking the shape of data whose
+        // contents are protected.
+        //
+        // A traversal with no collection (`None`) is a tree-index walk scoped
+        // by edge label; it has no collection whose policy could be consulted,
+        // and the DDL that builds such an index is authorized separately.
         PhysicalPlan::Graph(
-            GraphOp::Hop { rls_filters, .. }
-            | GraphOp::Neighbors { rls_filters, .. }
-            | GraphOp::Path { rls_filters, .. }
-            | GraphOp::Subgraph { rls_filters, .. },
+            GraphOp::Hop { collection, .. }
+            | GraphOp::Neighbors { collection, .. }
+            | GraphOp::NeighborsMulti { collection, .. }
+            | GraphOp::Path { collection, .. }
+            | GraphOp::Subgraph { collection, .. },
         ) => {
-            // Graph traversal RLS is applied per-node by the Data Plane handler.
-            // Graph nodes accessed as documents get filtered via DocumentOp::PointGet RLS.
-            let _ = rls_filters;
+            if let Some(collection) = collection.as_deref() {
+                let rls = get_rls(rls_store, tenant_id, collection, auth)?;
+                if !rls.is_empty() {
+                    return Err(crate::Error::PlanError {
+                        detail: format!(
+                            "RLS policies on '{collection}' are not supported with graph \
+                             traversal: a traversal returns graph topology, which the row \
+                             filter cannot evaluate"
+                        ),
+                    });
+                }
+            }
         }
 
         // ── Exchange: coordinator wrapper — recurse into the child plan ──
@@ -230,24 +280,70 @@ fn inject_rls_for_plan(
             }
         }
 
-        // ── HashJoin: recurse into resolved child inputs when present ──
+        // ── HashJoin: RLS per side, wherever that side's rows come from ──
         //
         // left_input / right_input hold a resolved sub-plan (e.g. an
         // Exchange-wrapped scan or a ProviderScan) supplied by the coordinator.
-        // When Some, the child is the actual source of rows and must receive RLS.
-        // When None, the executor scans left_collection / right_collection directly
-        // without a filter slot on HashJoin; that gap is a pre-existing limitation
-        // tracked separately — it does not regress here.
+        // When Some, the child is the actual source of rows and receives RLS by
+        // recursion. When None, the executor scans left_collection /
+        // right_collection locally, and the filters go into the join's own
+        // per-side slots — which the handler applies to the scanned rows before
+        // building or probing, so an excluded row neither matches a partner nor
+        // produces a null-extended outer row.
         PhysicalPlan::Query(QueryOp::HashJoin {
+            left_collection,
+            right_collection,
             left_input,
             right_input,
+            left_rls_filters,
+            right_rls_filters,
             ..
         }) => {
-            if let Some(child) = left_input {
-                inject_rls_for_plan(tenant_id, child, rls_store, auth)?;
+            match left_input {
+                Some(child) => inject_rls_for_plan(tenant_id, child, rls_store, auth)?,
+                None => {
+                    let rls = get_rls(rls_store, tenant_id, left_collection, auth)?;
+                    if !rls.is_empty() {
+                        *left_rls_filters = rls;
+                    }
+                }
             }
-            if let Some(child) = right_input {
-                inject_rls_for_plan(tenant_id, child, rls_store, auth)?;
+            match right_input {
+                Some(child) => inject_rls_for_plan(tenant_id, child, rls_store, auth)?,
+                None => {
+                    let rls = get_rls(rls_store, tenant_id, right_collection, auth)?;
+                    if !rls.is_empty() {
+                        *right_rls_filters = rls;
+                    }
+                }
+            }
+        }
+
+        // ── Nested-loop / sort-merge joins: both sides always scan locally ──
+        //
+        // Neither variant takes a resolved child input, so both collections are
+        // read directly by the handler and both slots are always populated.
+        PhysicalPlan::Query(QueryOp::NestedLoopJoin {
+            left_collection,
+            right_collection,
+            left_rls_filters,
+            right_rls_filters,
+            ..
+        })
+        | PhysicalPlan::Query(QueryOp::SortMergeJoin {
+            left_collection,
+            right_collection,
+            left_rls_filters,
+            right_rls_filters,
+            ..
+        }) => {
+            let left = get_rls(rls_store, tenant_id, left_collection, auth)?;
+            if !left.is_empty() {
+                *left_rls_filters = left;
+            }
+            let right = get_rls(rls_store, tenant_id, right_collection, auth)?;
+            if !right.is_empty() {
+                *right_rls_filters = right;
             }
         }
 

@@ -36,5 +36,5 @@ pub use match_broadcast::{
     MatchBroadcastOutcome, broadcast_match_to_all_cores, unwrap_match_envelope,
 };
 pub use match_scatter::{MatchScatterOutcome, scatter_match};
-pub use shortest_path::cross_core_shortest_path;
+pub use shortest_path::{CrossCoreShortestPathParams, cross_core_shortest_path};
 pub use traverse_subgraph::{CrossCoreTraverseSubgraphParams, cross_core_traverse_subgraph};

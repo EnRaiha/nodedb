@@ -151,6 +151,32 @@ impl CsrIndex {
             .unwrap_or(0)
     }
 
+    /// Resolve a node name to its CSR-local id.
+    ///
+    /// The name table is rebuilt from durable storage on every open, so this
+    /// resolution always works; the surrogate table is not, which is why a
+    /// name-seeded read must not be routed through
+    /// [`Self::local_id_for_surrogate`].
+    pub fn local_id_for_node(&self, node: &str) -> Option<u32> {
+        self.node_to_id.get(node).copied()
+    }
+
+    /// Resolve a `Surrogate` to its CSR-local node id without touching the
+    /// node-name table.
+    ///
+    /// This is the entry point for reads that stay in the surrogate domain:
+    /// seeding a traversal through [`Self::node_id_for_surrogate`] would
+    /// materialize a name only to hash it straight back to this same id.
+    /// Returns `None` for `Surrogate::ZERO` and for surrogates never bound
+    /// in this partition.
+    pub fn local_id_for_surrogate(&self, surrogate: nodedb_types::Surrogate) -> Option<u32> {
+        let raw = surrogate.as_u32();
+        if raw == 0 {
+            return None;
+        }
+        self.surrogate_to_local.get(&raw).copied()
+    }
+
     /// Look up the user-visible node name bound to a `Surrogate`.
     ///
     /// Returns `None` for `Surrogate::ZERO` and for surrogates that have

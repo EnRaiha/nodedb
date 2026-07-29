@@ -174,6 +174,12 @@ pub(in crate::data::executor) struct GraphRagMetadata {
     pub vector_candidates: usize,
     pub graph_expanded: usize,
     pub truncated: bool,
+    /// Expanded nodes that carry no surrogate and therefore cannot intersect
+    /// another engine's candidates. They are traversed and returned like any
+    /// other node; what this reports is that the *cross-engine* view of the
+    /// expansion is narrower than the expansion itself. Non-zero alongside a
+    /// low result count means missing identity bindings, not a small graph.
+    pub graph_unaddressable: usize,
     /// Snapshot watermark LSN at the time of query execution.
     /// Consumers can use this to verify they are reading a consistent view.
     pub watermark_lsn: u64,

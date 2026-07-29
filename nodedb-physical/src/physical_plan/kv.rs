@@ -147,6 +147,12 @@ pub enum KvOp {
     BatchGet {
         collection: String,
         keys: Vec<Vec<u8>>,
+        /// Row-level-security filters applied to fetched rows before they are
+        /// returned. This operation has no pushdown filter slot in storage, so
+        /// the filters are evaluated post-fetch — the same shape `KvOp::Get`
+        /// and `DocumentOp::PointGet` already use.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Batch put: insert/update multiple key-value pairs atomically.
@@ -190,6 +196,12 @@ pub enum KvOp {
         key: Vec<u8>,
         /// Field names to extract.
         fields: Vec<String>,
+        /// Row-level-security filters applied to fetched rows before they are
+        /// returned. This operation has no pushdown filter slot in storage, so
+        /// the filters are evaluated post-fetch — the same shape `KvOp::Get`
+        /// and `DocumentOp::PointGet` already use.
+        #[serde(default)]
+        rls_filters: Vec<u8>,
     },
 
     /// Update specific fields in a key's value (HSET).

@@ -120,7 +120,7 @@ async fn graph_traverse_returns_complete_distinct_set_from_any_node() {
                     tokio::runtime::Handle::current().block_on(async {
                         let v = query_graph_json(
                             &cluster.nodes[idx].client,
-                            "GRAPH TRAVERSE FROM 'root' DEPTH 1 LABEL 'l' DIRECTION out",
+                            "GRAPH TRAVERSE IN 'graph_xnode' FROM 'root' DEPTH 1 LABEL 'l' DIRECTION out",
                         )
                         .await;
                         traversed_node_ids(&v).len() > NEIGHBORS
@@ -145,7 +145,7 @@ async fn graph_traverse_returns_complete_distinct_set_from_any_node() {
     for idx in 0..2 {
         let v1 = query_graph_json(
             &cluster.nodes[idx].client,
-            "GRAPH TRAVERSE FROM 'root' DEPTH 1 LABEL 'l' DIRECTION out",
+            "GRAPH TRAVERSE IN 'graph_xnode' FROM 'root' DEPTH 1 LABEL 'l' DIRECTION out",
         )
         .await;
         let ids1 = traversed_node_ids(&v1);
@@ -162,7 +162,7 @@ async fn graph_traverse_returns_complete_distinct_set_from_any_node() {
 
         let v2 = query_graph_json(
             &cluster.nodes[idx].client,
-            "GRAPH TRAVERSE FROM 'root' DEPTH 2 LABEL 'l' DIRECTION out",
+            "GRAPH TRAVERSE IN 'graph_xnode' FROM 'root' DEPTH 2 LABEL 'l' DIRECTION out",
         )
         .await;
         let ids2 = traversed_node_ids(&v2);

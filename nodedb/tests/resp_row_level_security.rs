@@ -8,9 +8,9 @@
 //!
 //! * Reads that can carry a filter (`GET`, `KEYS`, `SCAN`) must have the read
 //!   policy applied before the value leaves the server.
-//! * Reads that cannot carry a filter (`MGET`, `HGET`) must fail closed with a
-//!   client-readable RESP error naming the policy — not succeed, and not read
-//!   as a server fault.
+//! * Reads with no storage pushdown slot (`MGET`, `HGET`) filter post-fetch: an
+//!   excluded row reads back as absent, indistinguishable from a missing key,
+//!   so the reply cannot be used to probe for rows the caller may not read.
 //! * `SELECT` must refuse the internal `_system` collection at the point the
 //!   client names it.
 //! * A failed re-`AUTH` must leave the session's established identity intact
@@ -44,13 +44,6 @@ enum Reply {
 impl Reply {
     fn is_error(&self) -> bool {
         matches!(self, Reply::Error(_))
-    }
-
-    fn error_text(&self) -> String {
-        match self {
-            Reply::Error(e) => e.clone(),
-            other => panic!("expected a RESP error, got {other:?}"),
-        }
     }
 }
 
@@ -203,21 +196,14 @@ async fn create_owner_policy(server: &TestServer, policy: &str, collection: &str
         .unwrap_or_else(|e| panic!("create policy {policy}: {e}"));
 }
 
-/// A fail-closed refusal must name the policy that caused it, so the client can
-/// tell an authorization refusal from a server fault or a transient outage.
-fn assert_policy_refusal(reply: &Reply, command: &str) {
+/// A policy-excluded row must read back as absent, never as an error: an error
+/// distinguishable from "no such key" is itself a probe for keys the caller may
+/// not read.
+fn assert_absent_not_error(reply: &Reply, command: &str) {
     assert!(
-        reply.is_error(),
-        "{command} succeeded on a policy-protected collection: {reply:?}"
-    );
-    let text = reply.error_text().to_lowercase();
-    assert!(
-        text.contains("polic") || text.contains("permission") || text.contains("not supported"),
-        "{command} refusal does not identify the policy as the cause: {text}"
-    );
-    assert!(
-        !text.contains("internal") && !text.contains("busy"),
-        "{command} refusal reads as a server fault rather than a policy refusal: {text}"
+        !reply.is_error(),
+        "{command} returned an error for a policy-excluded row instead of \
+         reporting it absent: {reply:?}"
     );
 }
 
@@ -331,10 +317,10 @@ async fn scan_applies_row_level_security() {
     );
 }
 
-/// `MGET` maps to a batch get, which has no filter slot. With a policy present
-/// it must refuse with a RESP error that names the policy.
+/// `MGET` maps to a batch get, which filters post-fetch: an excluded key comes
+/// back as a nil element, exactly like a key that does not exist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mget_fails_closed_with_a_client_readable_error() {
+async fn mget_reports_policy_excluded_keys_as_absent() {
     let server = TestServer::start().await;
     seed(&server, "resp_rls_mget", "resp_mget_user").await;
     let addr = start_resp_listener(&server).await;
@@ -345,12 +331,17 @@ async fn mget_fails_closed_with_a_client_readable_error() {
     create_owner_policy(&server, "resp_mget_policy", "resp_rls_mget").await;
 
     let reply = client.cmd(&["MGET", "k1", "k2"]).await;
-    assert_policy_refusal(&reply, "MGET");
+    assert_absent_not_error(&reply, "MGET");
+    assert_eq!(
+        reply,
+        Reply::Array(vec![Reply::Bulk(None), Reply::Bulk(None)]),
+        "MGET returned a value the read policy excludes"
+    );
 }
 
-/// `HGET` maps to a field get, which likewise has no filter slot.
+/// `HGET` maps to a field get, which filters the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hget_fails_closed_with_a_client_readable_error() {
+async fn hget_reports_policy_excluded_rows_as_absent() {
     let server = TestServer::start().await;
     seed(&server, "resp_rls_hget", "resp_hget_user").await;
     let addr = start_resp_listener(&server).await;
@@ -366,7 +357,12 @@ async fn hget_fails_closed_with_a_client_readable_error() {
     create_owner_policy(&server, "resp_hget_policy", "resp_rls_hget").await;
 
     let reply = client.cmd(&["HGET", "k1", "field"]).await;
-    assert_policy_refusal(&reply, "HGET");
+    assert_absent_not_error(&reply, "HGET");
+    assert_eq!(
+        reply,
+        Reply::Bulk(None),
+        "HGET returned a field from a row the read policy excludes"
+    );
 }
 
 /// `SELECT` writes client input straight into the session's collection slot.

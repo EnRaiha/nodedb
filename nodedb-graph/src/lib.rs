@@ -21,6 +21,7 @@ pub mod sharded;
 pub mod traversal;
 pub mod traversal_options;
 pub mod traversal_overlay;
+pub mod traversal_surrogate;
 
 pub use bfs_params::BfsParams;
 pub use csr::extract_weight_from_properties;
@@ -32,3 +33,4 @@ pub use params::{AlgoColumnType, AlgoParams, GraphAlgorithm};
 pub use path_params::ShortestPathParams;
 pub use sharded::ShardedCsrIndex;
 pub use traversal_options::{GraphResponseMeta, GraphTraversalOptions, MAX_GRAPH_TRAVERSAL_DEPTH};
+pub use traversal_surrogate::{SurrogateBfsParams, SurrogateHops};

@@ -209,6 +209,10 @@ pub struct CrossShardHopParams<'a> {
     pub local_nodes: Vec<String>,
     pub envelope: ScatterEnvelope,
     pub options: &'a GraphTraversalOptions,
+    /// Collection whose edges the remote hop walks. The owning node re-plans
+    /// the walk from the SQL this builds, and a traversal that names no
+    /// collection cannot be authorized there — so the scope travels with it.
+    pub collection: &'a str,
     pub edge_label: Option<&'a str>,
     pub direction: crate::engine::graph::edge_store::Direction,
     pub remaining_depth: usize,
@@ -218,42 +222,40 @@ pub struct CrossShardHopParams<'a> {
     pub database_id: DatabaseId,
 }
 
-fn build_graph_traverse_sql(
-    node_id: &str,
+/// Fields the remote `GRAPH TRAVERSE` text is built from.
+struct RemoteTraverseSql<'a> {
+    collection: &'a str,
+    node_id: &'a str,
     depth: usize,
-    edge_label: Option<&str>,
+    edge_label: Option<&'a str>,
     direction: crate::engine::graph::edge_store::Direction,
-) -> String {
+}
+
+fn build_graph_traverse_sql(params: RemoteTraverseSql<'_>) -> String {
+    use crate::engine::graph::edge_store::Direction;
+
+    let RemoteTraverseSql {
+        collection,
+        node_id,
+        depth,
+        edge_label,
+        direction,
+    } = params;
     let depth = ::nodedb_types::Value::Integer(if depth == 0 { 0 } else { 1 }).to_sql_literal();
-    match (edge_label, direction) {
-        (Some(label), crate::engine::graph::edge_store::Direction::In) => format!(
-            "GRAPH TRAVERSE FROM {} DEPTH {depth} LABEL {} DIRECTION in",
-            ::nodedb_types::quote_literal(node_id),
-            ::nodedb_types::quote_literal(label)
-        ),
-        (Some(label), crate::engine::graph::edge_store::Direction::Out) => format!(
-            "GRAPH TRAVERSE FROM {} DEPTH {depth} LABEL {} DIRECTION out",
-            ::nodedb_types::quote_literal(node_id),
-            ::nodedb_types::quote_literal(label)
-        ),
-        (Some(label), crate::engine::graph::edge_store::Direction::Both) => format!(
-            "GRAPH TRAVERSE FROM {} DEPTH {depth} LABEL {} DIRECTION both",
-            ::nodedb_types::quote_literal(node_id),
-            ::nodedb_types::quote_literal(label)
-        ),
-        (None, crate::engine::graph::edge_store::Direction::In) => format!(
-            "GRAPH TRAVERSE FROM {} DEPTH {depth} DIRECTION in",
-            ::nodedb_types::quote_literal(node_id)
-        ),
-        (None, crate::engine::graph::edge_store::Direction::Out) => format!(
-            "GRAPH TRAVERSE FROM {} DEPTH {depth} DIRECTION out",
-            ::nodedb_types::quote_literal(node_id)
-        ),
-        (None, crate::engine::graph::edge_store::Direction::Both) => format!(
-            "GRAPH TRAVERSE FROM {} DEPTH {depth} DIRECTION both",
-            ::nodedb_types::quote_literal(node_id)
-        ),
-    }
+    let direction = match direction {
+        Direction::In => "in",
+        Direction::Out => "out",
+        Direction::Both => "both",
+    };
+    let label = match edge_label {
+        Some(label) => format!(" LABEL {}", ::nodedb_types::quote_literal(label)),
+        None => String::new(),
+    };
+    format!(
+        "GRAPH TRAVERSE IN {} FROM {} DEPTH {depth}{label} DIRECTION {direction}",
+        ::nodedb_types::quote_literal(collection),
+        ::nodedb_types::quote_literal(node_id),
+    )
 }
 
 pub async fn coordinate_cross_shard_hop(
@@ -265,6 +267,7 @@ pub async fn coordinate_cross_shard_hop(
         local_nodes,
         envelope: cross_shard_targets,
         options,
+        collection,
         edge_label,
         direction,
         remaining_depth,
@@ -358,14 +361,20 @@ pub async fn coordinate_cross_shard_hop(
         let retention_clone = std::sync::Arc::clone(&shared.retention_policy_registry);
         let tenant_id_u64 = tenant_id.as_u64();
         let edge_label = edge_label.map(str::to_owned);
+        let collection = collection.to_owned();
 
         join_handles.push(tokio::spawn(async move {
             let mut shard_results: Vec<String> = Vec::new();
             let mut any_error = false;
 
             for node_id in batch.node_ids {
-                let sql =
-                    build_graph_traverse_sql(&node_id, hop_depth, edge_label.as_deref(), direction);
+                let sql = build_graph_traverse_sql(RemoteTraverseSql {
+                    collection: &collection,
+                    node_id: &node_id,
+                    depth: hop_depth,
+                    edge_label: edge_label.as_deref(),
+                    direction,
+                });
 
                 let gw_ctx = crate::control::gateway::core::QueryContext {
                     tenant_id: crate::types::TenantId::new(tenant_id_u64),
@@ -490,15 +499,17 @@ mod tests {
 
     #[test]
     fn graph_traverse_sql_quotes_node_and_label_literals() {
-        let sql = build_graph_traverse_sql(
-            "node'; DROP GRAPH audit; --",
-            1,
-            Some("label'; --"),
-            crate::engine::graph::edge_store::Direction::Out,
-        );
+        let sql = build_graph_traverse_sql(RemoteTraverseSql {
+            collection: "audit'; --",
+            node_id: "node'; DROP GRAPH audit; --",
+            depth: 1,
+            edge_label: Some("label'; --"),
+            direction: crate::engine::graph::edge_store::Direction::Out,
+        });
         assert_eq!(
             sql,
-            "GRAPH TRAVERSE FROM 'node''; DROP GRAPH audit; --' DEPTH 1 LABEL 'label''; --' DIRECTION out"
+            "GRAPH TRAVERSE IN 'audit''; --' FROM 'node''; DROP GRAPH audit; --' DEPTH 1 \
+             LABEL 'label''; --' DIRECTION out"
         );
     }
 

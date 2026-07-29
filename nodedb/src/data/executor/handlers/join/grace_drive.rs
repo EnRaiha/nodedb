@@ -98,6 +98,10 @@ pub(super) struct LocalJoinSides<'a> {
     pub(super) left_alias: Option<&'a str>,
     /// Optional build-side column qualifier (defaults to `right_collection`).
     pub(super) right_alias: Option<&'a str>,
+    /// Row-level-security filters for the probe (left) side.
+    pub(super) left_rls_filters: &'a [u8],
+    /// Row-level-security filters for the build (right) side.
+    pub(super) right_rls_filters: &'a [u8],
 }
 
 /// Per-side streaming accumulation state. Starts `Buffering`; transitions to
@@ -143,6 +147,8 @@ impl CoreLoop {
             right_collection,
             left_alias,
             right_alias,
+            left_rls_filters,
+            right_rls_filters,
         } = sides;
         let probe_collection = left_alias.unwrap_or(left_collection);
         let index_collection = right_alias.unwrap_or(right_collection);
@@ -170,11 +176,13 @@ impl CoreLoop {
                 database_id: did,
                 tenant_id: tid,
                 collection: right_collection.to_string(),
+                rls_filters: right_rls_filters.to_vec(),
             },
             probe: RowSource::LocalScan {
                 database_id: did,
                 tenant_id: tid,
                 collection: left_collection.to_string(),
+                rls_filters: left_rls_filters.to_vec(),
             },
         };
 

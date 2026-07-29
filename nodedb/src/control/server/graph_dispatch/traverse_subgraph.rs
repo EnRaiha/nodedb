@@ -61,6 +61,8 @@ struct WireSubGraph<'a> {
 pub struct CrossCoreTraverseSubgraphParams<'a> {
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
+    /// Collection scope, or `None` for a label-only traversal.
+    pub collection: Option<String>,
     pub start: String,
     pub edge_label: Option<String>,
     pub direction: Direction,
@@ -83,6 +85,7 @@ pub async fn cross_core_traverse_subgraph(
 ) -> crate::Result<Response> {
     let CrossCoreTraverseSubgraphParams {
         tenant_id,
+        collection,
         database_id,
         start,
         edge_label,
@@ -112,6 +115,7 @@ pub async fn cross_core_traverse_subgraph(
             tenant_id,
             database_id,
             NeighborHopParams {
+                collection: collection.as_deref(),
                 frontier: &frontier,
                 edge_label: edge_label.as_deref(),
                 direction,

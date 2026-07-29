@@ -117,7 +117,7 @@ async fn graph_reverse_traverse_omits_deleted_sources_from_any_node() {
                     tokio::runtime::Handle::current().block_on(async {
                         let v = query_graph_json(
                             &cluster.nodes[idx].client,
-                            "GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
+                            "GRAPH TRAVERSE IN 'graph_del_xnode' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
                         )
                         .await;
                         traversed_node_ids(&v).len() > SOURCES
@@ -164,7 +164,7 @@ async fn graph_reverse_traverse_omits_deleted_sources_from_any_node() {
                     tokio::runtime::Handle::current().block_on(async {
                         let v = query_graph_json(
                             &cluster.nodes[idx].client,
-                            "GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
+                            "GRAPH TRAVERSE IN 'graph_del_xnode' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
                         )
                         .await;
                         let set: HashSet<String> = traversed_node_ids(&v).into_iter().collect();
@@ -180,7 +180,7 @@ async fn graph_reverse_traverse_omits_deleted_sources_from_any_node() {
     for idx in 0..cluster.nodes.len() {
         let v = query_graph_json(
             &cluster.nodes[idx].client,
-            "GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
+            "GRAPH TRAVERSE IN 'graph_del_xnode' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in",
         )
         .await;
         let ids = traversed_node_ids(&v);

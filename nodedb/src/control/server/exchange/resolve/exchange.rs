@@ -56,7 +56,7 @@ pub enum Resolved {
     Gathered(Response, Vec<(VShardId, Lsn)>, Vec<DistributedReadCapture>),
     /// The plan (possibly mutated by catalog materialization or Broadcast
     /// embedding) is self-contained and should be dispatched normally.
-    Plan(PhysicalPlan),
+    Plan(Box<PhysicalPlan>),
     /// The plan was a single-node, unordered, non-aggregate scan eligible for
     /// streaming. The coordinator has eagerly dispatched it to all cores; the
     /// carried [`ResultStream`] yields row batches as they arrive. The pgwire
@@ -182,7 +182,7 @@ async fn resolve_exchange(
             ))
             .await?
             {
-                Resolved::Plan(p) => p,
+                Resolved::Plan(p) => *p,
                 Resolved::Gathered(resp, wms, caps) => {
                     return Ok(Resolved::Gathered(resp, wms, caps));
                 }
@@ -361,6 +361,8 @@ async fn resolve_exchange(
             right_input,
             left_bitmap,
             right_bitmap,
+            left_rls_filters,
+            right_rls_filters,
         }) => {
             let left_input = resolve_join_input(
                 state,
@@ -416,25 +418,29 @@ async fn resolve_exchange(
                 .await?;
             }
 
-            Ok(Resolved::Plan(PhysicalPlan::Query(QueryOp::HashJoin {
-                left_collection,
-                right_collection,
-                left_alias,
-                right_alias,
-                on,
-                join_type,
-                limit,
-                post_group_by,
-                post_aggregates,
-                projection,
-                computed_projection,
-                join_filters,
-                post_filters,
-                left_input,
-                right_input,
-                left_bitmap,
-                right_bitmap,
-            })))
+            Ok(Resolved::Plan(Box::new(PhysicalPlan::Query(
+                QueryOp::HashJoin {
+                    left_collection,
+                    right_collection,
+                    left_alias,
+                    right_alias,
+                    on,
+                    join_type,
+                    limit,
+                    post_group_by,
+                    post_aggregates,
+                    projection,
+                    computed_projection,
+                    join_filters,
+                    post_filters,
+                    left_input,
+                    right_input,
+                    left_bitmap,
+                    right_bitmap,
+                    left_rls_filters,
+                    right_rls_filters,
+                },
+            ))))
         }
 
         // PostProcess: materialize the child's rows on the coordinator, then
@@ -476,7 +482,7 @@ async fn resolve_exchange(
             ))
             .await?
             {
-                Resolved::Plan(p) => p,
+                Resolved::Plan(p) => *p,
                 // The unwrapped body is not itself a root Gather / stream;
                 // surface these defensively without dropping post-processing.
                 Resolved::Gathered(resp, wms, caps) => {
@@ -568,20 +574,22 @@ async fn resolve_exchange(
                 }
                 HitShape::None => flatten_to_relational_rows(&merged),
             };
-            Ok(Resolved::Plan(PhysicalPlan::Query(QueryOp::ProviderScan {
-                provider: None,
-                rows,
-                filters,
-                projection,
-                sort_keys,
-                limit,
-                offset,
-                distinct,
-            })))
+            Ok(Resolved::Plan(Box::new(PhysicalPlan::Query(
+                QueryOp::ProviderScan {
+                    provider: None,
+                    rows,
+                    filters,
+                    projection,
+                    sort_keys,
+                    limit,
+                    offset,
+                    distinct,
+                },
+            ))))
         }
 
         // All other plan variants: pass through unchanged.
-        other => Ok(Resolved::Plan(other)),
+        other => Ok(Resolved::Plan(Box::new(other))),
     }
 }
 

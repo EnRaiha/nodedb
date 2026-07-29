@@ -117,6 +117,8 @@ fn multi_core_broadcast_inner_join() {
             }))),
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -240,6 +242,8 @@ fn multi_core_broadcast_left_join() {
             }))),
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         }),
     );
 
@@ -392,6 +396,8 @@ fn multi_core_broadcast_merge_simulation() {
             }))),
             left_bitmap: None,
             right_bitmap: None,
+            left_rls_filters: Vec::new(),
+            right_rls_filters: Vec::new(),
         })
     };
 

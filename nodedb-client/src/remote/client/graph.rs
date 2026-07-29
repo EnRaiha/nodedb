@@ -24,21 +24,19 @@ impl NodeDbRemote {
         depth: u8,
         edge_filter: Option<&EdgeFilter>,
     ) -> NodeDbResult<SubGraph> {
-        // Server-side DSL: `GRAPH TRAVERSE FROM '<start>' DEPTH <n>
-        // [LABEL '<l>']`. The Origin graph overlay is tenant-scoped
-        // (the dispatcher routes on `identity.tenant_id`), so the
-        // `collection` argument is accepted for trait symmetry with
-        // `graph_insert_edge` and Lite parity but is not threaded into
-        // the wire DSL — every edge in the tenant participates in the
-        // traversal regardless of which collection it was inserted
-        // into.
-        let _ = collection;
+        // Server-side DSL: `GRAPH TRAVERSE IN '<collection>' FROM '<start>'
+        // DEPTH <n> [LABEL '<l>']`. The collection is not decorative: the
+        // server authorizes the traversal against it, and without it the walk
+        // would cross every collection in the tenant.
         let label_clause = edge_filter
             .and_then(|f| f.labels.first())
             .map(|l| format!(" LABEL {}", quote_string_literal(l)))
             .unwrap_or_default();
+        let collection_lit = quote_string_literal(collection);
         let start_lit = quote_string_literal(start.as_str());
-        let sql = format!("GRAPH TRAVERSE FROM {start_lit} DEPTH {depth}{label_clause}");
+        let sql = format!(
+            "GRAPH TRAVERSE IN {collection_lit} FROM {start_lit} DEPTH {depth}{label_clause}"
+        );
 
         let (columns, rows) = self.simple_query_raw(&sql).await?;
 
@@ -183,17 +181,19 @@ impl NodeDbRemote {
     ) -> NodeDbResult<Option<Vec<NodeId>>> {
         // Use the server's `GRAPH PATH` operator instead of the trait
         // default's per-hop BFS — one round-trip vs O(path_length).
-        // Like `graph_traverse`, the Origin graph overlay is
-        // tenant-scoped, so `collection` is accepted for symmetry but
-        // not threaded into the DSL.
-        let _ = collection;
+        // Like `graph_traverse`, the path is scoped to `collection`: the server
+        // authorizes against it and walks only that collection's edges.
         let label_clause = edge_filter
             .and_then(|f| f.labels.first())
             .map(|l| format!(" LABEL {}", quote_string_literal(l)))
             .unwrap_or_default();
+        let collection_lit = quote_string_literal(collection);
         let from_s = quote_string_literal(from.as_str());
         let to_s = quote_string_literal(to.as_str());
-        let sql = format!("GRAPH PATH FROM {from_s} TO {to_s} MAX_DEPTH {max_depth}{label_clause}");
+        let sql = format!(
+            "GRAPH PATH IN {collection_lit} FROM {from_s} TO {to_s} \
+             MAX_DEPTH {max_depth}{label_clause}"
+        );
 
         let (_columns, rows) = self.simple_query_raw(&sql).await?;
         // Server emits a single `result` column carrying a JSON array

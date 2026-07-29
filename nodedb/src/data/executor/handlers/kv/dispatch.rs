@@ -140,9 +140,11 @@ impl CoreLoop {
             KvOp::Persist { collection, key } => {
                 self.execute_kv_persist(task, did, tid, collection, key)
             }
-            KvOp::BatchGet { collection, keys } => {
-                self.execute_kv_batch_get(task, did, tid, collection, keys)
-            }
+            KvOp::BatchGet {
+                collection,
+                keys,
+                rls_filters,
+            } => self.execute_kv_batch_get(task, did, tid, collection, keys, rls_filters),
             KvOp::BatchPut {
                 collection,
                 entries,
@@ -182,7 +184,18 @@ impl CoreLoop {
                 collection,
                 key,
                 fields,
-            } => self.execute_kv_field_get(task, did, tid, collection, key, fields),
+                rls_filters,
+            } => self.execute_kv_field_get(
+                task,
+                super::field::KvFieldGetArgs {
+                    did,
+                    tid,
+                    collection,
+                    key,
+                    fields,
+                    rls_filters,
+                },
+            ),
             KvOp::FieldSet {
                 collection,
                 key,

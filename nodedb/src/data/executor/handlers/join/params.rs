@@ -48,6 +48,12 @@ pub(crate) struct HashJoinParams<'a> {
     /// Bitmap-producer sub-plan for the right side. Same semantics as
     /// `left_bitmap` but applied to the right collection.
     pub right_bitmap: Option<&'a PhysicalPlan>,
+    /// Row-level-security filters for the left side when it is scanned locally
+    /// (`left_input` is `None`). Empty when the side comes from a child plan,
+    /// which carries its own.
+    pub left_rls_filters: &'a [u8],
+    /// Row-level-security filters for the right side. Same semantics.
+    pub right_rls_filters: &'a [u8],
 }
 
 /// Nested-loop join: O(N×M) fallback for non-equi, theta, and cross joins.
@@ -61,6 +67,10 @@ pub(crate) struct NestedLoopJoinParams<'a> {
     pub condition: &'a [u8],
     pub join_type: &'a str,
     pub limit: usize,
+    /// Row-level-security filters for the locally-scanned left side.
+    pub left_rls_filters: &'a [u8],
+    /// Row-level-security filters for the locally-scanned right side.
+    pub right_rls_filters: &'a [u8],
 }
 
 /// Sort-merge join: O((N+M)·log N) equi-join with optional pre-sorted inputs.
@@ -76,6 +86,10 @@ pub(crate) struct SortMergeJoinParams<'a> {
     pub join_type: &'a str,
     pub limit: usize,
     pub pre_sorted: bool,
+    /// Row-level-security filters for the locally-scanned left side.
+    pub left_rls_filters: &'a [u8],
+    /// Row-level-security filters for the locally-scanned right side.
+    pub right_rls_filters: &'a [u8],
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────────────

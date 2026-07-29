@@ -54,7 +54,7 @@ async fn graph_path_returns_ordered_path_not_bfs_frontier() {
         .unwrap();
 
     let rows = server
-        .query_text("GRAPH PATH FROM 'a' TO 'c' MAX_DEPTH 5 LABEL 'l'")
+        .query_text("GRAPH PATH IN 'path_nodes' FROM 'a' TO 'c' MAX_DEPTH 5 LABEL 'l'")
         .await
         .unwrap();
 
@@ -87,7 +87,7 @@ async fn graph_path_returns_empty_when_dst_unreachable() {
         .unwrap();
 
     let rows = server
-        .query_text("GRAPH PATH FROM 'a' TO 'z' MAX_DEPTH 5 LABEL 'l'")
+        .query_text("GRAPH PATH IN 'path_nodes' FROM 'a' TO 'z' MAX_DEPTH 5 LABEL 'l'")
         .await
         .unwrap();
     let blob = rows.join("");
@@ -186,7 +186,7 @@ async fn graph_traverse_rejects_absurd_depth() {
     // before dispatch, not forwarded to `cross_core_bfs` unchanged.
     server
         .expect_error(
-            "GRAPH TRAVERSE FROM 'a' DEPTH 4294967295 LABEL 'l' DIRECTION both",
+            "GRAPH TRAVERSE IN 'tdocs' FROM 'a' DEPTH 4294967295 LABEL 'l' DIRECTION both",
             "22023",
         )
         .await;
@@ -203,7 +203,7 @@ async fn graph_path_rejects_absurd_max_depth() {
 
     server
         .expect_error(
-            "GRAPH PATH FROM 'a' TO 'b' MAX_DEPTH 4294967295 LABEL 'l'",
+            "GRAPH PATH IN 'pdocs' FROM 'a' TO 'b' MAX_DEPTH 4294967295 LABEL 'l'",
             "22023",
         )
         .await;
@@ -243,7 +243,7 @@ async fn graph_traverse_preserves_colon_containing_user_id() {
         .unwrap();
 
     let rows = server
-        .query_text("GRAPH TRAVERSE FROM 'foo:bar' DEPTH 2 LABEL 'l'")
+        .query_text("GRAPH TRAVERSE IN 'trv_docs' FROM 'foo:bar' DEPTH 2 LABEL 'l'")
         .await
         .expect("TRAVERSE must succeed");
     let blob = rows.join("");
@@ -267,7 +267,7 @@ async fn graph_neighbors_preserves_colon_containing_user_id() {
         .unwrap();
 
     let rows = server
-        .query_text("GRAPH NEIGHBORS OF 'src' LABEL 'l' DIRECTION out")
+        .query_text("GRAPH NEIGHBORS IN 'nbr_docs' OF 'src' LABEL 'l' DIRECTION out")
         .await
         .expect("NEIGHBORS must succeed");
     let blob = rows.join("");
@@ -295,7 +295,7 @@ async fn graph_path_preserves_colon_containing_user_id() {
         .unwrap();
 
     let rows = server
-        .query_text("GRAPH PATH FROM 'src' TO 'dst' MAX_DEPTH 5 LABEL 'l'")
+        .query_text("GRAPH PATH IN 'pp_docs' FROM 'src' TO 'dst' MAX_DEPTH 5 LABEL 'l'")
         .await
         .expect("PATH must succeed");
     let blob = rows.join("");
@@ -328,7 +328,7 @@ async fn graph_insert_edge_with_keyword_shaped_node_ids() {
     // The edge is addressable from its real src 'TO', not the literal
     // 'FROM' that appears later in the statement.
     let neighbors = server
-        .query_text("GRAPH NEIGHBORS OF 'TO' LABEL 'LABEL' DIRECTION out")
+        .query_text("GRAPH NEIGHBORS IN 'kwnodes' OF 'TO' LABEL 'LABEL' DIRECTION out")
         .await
         .unwrap();
     let blob = neighbors.join("");
@@ -356,7 +356,7 @@ async fn graph_insert_edge_properties_with_brace_in_string_value() {
     // And the note value must not have been mis-parsed as a DEPTH
     // argument — the edge still exists with its correct TYPE.
     let rows = server
-        .query_text("GRAPH NEIGHBORS OF 'a' LABEL 'l' DIRECTION out")
+        .query_text("GRAPH NEIGHBORS IN 'bracedocs' OF 'a' LABEL 'l' DIRECTION out")
         .await
         .unwrap();
     let blob = rows.join("");
@@ -441,7 +441,7 @@ async fn graph_traverse_node_id_containing_keyword_substring() {
         .unwrap();
 
     let rows = server
-        .query_text("GRAPH TRAVERSE FROM 'node_with_DEPTH_in_name' DEPTH 2 LABEL 'l'")
+        .query_text("GRAPH TRAVERSE IN 'kwnodes2' FROM 'node_with_DEPTH_in_name' DEPTH 2 LABEL 'l'")
         .await
         .expect("traversal from keyword-substring node id must succeed");
     let blob = rows.join("");

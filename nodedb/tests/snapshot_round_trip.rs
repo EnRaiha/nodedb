@@ -363,7 +363,7 @@ async fn snapshot_round_trip_vector() {
 /// SQL is copied verbatim from `graph_cross_core_bfs.rs`:
 /// - `CREATE COLLECTION <name>`               (e.g. `bfs_nodes`)
 /// - `GRAPH INSERT EDGE IN '<coll>' FROM '<src>' TO '<dst>' TYPE '<label>'`
-/// - `GRAPH TRAVERSE FROM '<src>' DEPTH <n> LABEL '<label>' DIRECTION out`
+/// - `GRAPH TRAVERSE IN '<coll>' FROM '<src>' DEPTH <n> LABEL '<label>' DIRECTION out`
 #[tokio::test]
 async fn snapshot_round_trip_edges() {
     const COLL: &str = "snap_rt_edges";
@@ -448,7 +448,9 @@ async fn snapshot_round_trip_edges() {
     // snapshot and the applier rebuilt the CSR. Without the builder fix the
     // edge section ships empty and this assertion fails.
     let tgt_traverse = target
-        .query_text("GRAPH TRAVERSE FROM 'root' DEPTH 1 LABEL 'l' DIRECTION out")
+        .query_text(&format!(
+            "GRAPH TRAVERSE IN '{COLL}' FROM 'root' DEPTH 1 LABEL 'l' DIRECTION out"
+        ))
         .await
         .expect("GRAPH TRAVERSE on target");
     let tgt_blob = tgt_traverse.join("");

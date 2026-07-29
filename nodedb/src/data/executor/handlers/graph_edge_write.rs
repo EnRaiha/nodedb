@@ -134,7 +134,8 @@ impl CoreLoop {
                 src_id,
                 label,
                 dst_id,
-            ),
+            )
+            .with_surrogates(src_surrogate, dst_surrogate),
             properties,
             ord,
             valid_from_ms,
@@ -243,7 +244,8 @@ impl CoreLoop {
                     &edge.src_id,
                     &edge.label,
                     &edge.dst_id,
-                ),
+                )
+                .with_surrogates(edge.src_surrogate, edge.dst_surrogate),
                 &[],
                 ord,
                 valid_from_ms,
@@ -580,6 +582,7 @@ mod tests {
                 edge_label: None,
                 direction: nodedb_graph::Direction::Out,
                 rls_filters: Vec::new(),
+                collection: None,
             }),
             deadline: Instant::now() + Duration::from_secs(5),
             priority: Priority::Normal,

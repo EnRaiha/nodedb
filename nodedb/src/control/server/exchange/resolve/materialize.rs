@@ -111,6 +111,8 @@ pub(super) async fn materialize_providers(
             right_input,
             left_bitmap,
             right_bitmap,
+            left_rls_filters,
+            right_rls_filters,
         }) => {
             let left_input = match left_input {
                 Some(p) => Some(Box::new(
@@ -154,6 +156,8 @@ pub(super) async fn materialize_providers(
                 right_input,
                 left_bitmap,
                 right_bitmap,
+                left_rls_filters,
+                right_rls_filters,
             }))
         }
 

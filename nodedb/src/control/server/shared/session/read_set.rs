@@ -311,6 +311,7 @@ mod tests {
         PhysicalPlan::Kv(KvOp::BatchGet {
             collection: collection.to_string(),
             keys: vec![b"a".to_vec(), b"b".to_vec()],
+            rls_filters: Vec::new(),
         })
     }
 
@@ -610,6 +611,7 @@ mod tests {
             lower: lower.map(|b| b.to_vec()),
             upper: upper.map(|b| b.to_vec()),
             limit: 0,
+            rls_filters: Vec::new(),
         })
     }
 

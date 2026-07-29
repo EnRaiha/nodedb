@@ -360,7 +360,7 @@ async fn graph_edge_properties_object_literal() {
 
     // Verify edges exist via traversal.
     let rows = server
-        .query_text("GRAPH NEIGHBORS OF 'a' DIRECTION out")
+        .query_text("GRAPH NEIGHBORS IN 'graph_nodes' OF 'a' DIRECTION out")
         .await
         .unwrap();
     assert!(!rows.is_empty(), "node 'a' should have outbound neighbors");

@@ -77,18 +77,78 @@ fn check_tenant_graph_depth(
 /// depth-1 `GraphOp::Hop` dispatch -- merging staged edges into an N-hop
 /// cross-core BFS is out of scope for this single-hop read-your-own-writes
 /// unit (see `graph_txn_merge`'s doc comment).
+/// Fail closed unless `identity` may read the traversal's collection.
+///
+/// A traversal discloses which nodes exist in a collection and how they are
+/// connected, so it carries the same read grant the collection's rows do.
+fn authorize_traversal(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    collection: &str,
+) -> Result<(), DdlError> {
+    let audit =
+        crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+    crate::control::server::shared::authorization::authorize_collection(
+        identity,
+        database_id,
+        collection,
+        crate::control::security::identity::Permission::Read,
+        &state.permissions,
+        &state.roles,
+        &audit,
+    )
+    .map_err(|error| ddl_err("42501", format!("permission denied: {}", error.resource())))?;
+
+    // The traversal reaches the Data Plane through `broadcast_to_all_cores`,
+    // which never runs `inject_rls`, so the policy is consulted here. A
+    // traversal returns topology rather than row bodies — there is nothing for
+    // a row filter to evaluate — and disclosing the shape of rows whose
+    // contents are protected is the leak, so a read policy refuses outright.
+    let auth_ctx = crate::control::server::session_auth::context::build_auth_context(identity);
+    if state
+        .rls
+        .combined_read_predicate_with_auth(identity.tenant_id.as_u64(), collection, &auth_ctx)
+        .is_none_or(|filters| !filters.is_empty())
+    {
+        return Err(ddl_err(
+            "0A000",
+            format!(
+                "RLS policies on '{collection}' are not supported with graph traversal: a \
+                 traversal returns graph topology, which the row filter cannot evaluate"
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+/// `GRAPH TRAVERSE` request fields.
+pub struct TraverseRequest {
+    pub collection: String,
+    pub start: String,
+    pub depth: usize,
+    pub edge_label: Option<String>,
+    pub direction: GraphDirection,
+}
+
 pub async fn traverse(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    start: String,
-    depth: usize,
-    edge_label: Option<String>,
-    direction: GraphDirection,
+    req: TraverseRequest,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    let TraverseRequest {
+        collection,
+        start,
+        depth,
+        edge_label,
+        direction,
+    } = req;
     if start.is_empty() {
         return Err(ddl_err("42601", "missing FROM '<node_id>'"));
     }
+    authorize_traversal(state, identity, database_id, &collection)?;
     let depth = clamp_depth(depth, "DEPTH")?;
     let tenant_id = identity.tenant_id;
     check_tenant_graph_depth(state, tenant_id, depth, "DEPTH")?;
@@ -103,6 +163,7 @@ pub async fn traverse(
         crate::control::server::graph_dispatch::CrossCoreTraverseSubgraphParams {
             tenant_id,
             database_id,
+            collection: Some(collection),
             start,
             edge_label,
             direction: dir,
@@ -122,22 +183,38 @@ pub async fn traverse(
 /// `txn_id` (the caller's active session transaction, if any) is stamped
 /// onto the fan-out request so this read observes the transaction's own
 /// staged edge writes (read-your-own-writes) via `GraphTxnOverlay`.
+/// `GRAPH NEIGHBORS` request fields.
+pub struct NeighborsRequest {
+    pub collection: String,
+    pub node: String,
+    pub edge_label: Option<String>,
+    pub direction: GraphDirection,
+    /// The session's active transaction, for read-your-own-writes overlay merge.
+    pub txn_id: Option<crate::types::TxnId>,
+}
+
 pub async fn neighbors(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    node: String,
-    edge_label: Option<String>,
-    direction: GraphDirection,
-    txn_id: Option<crate::types::TxnId>,
+    req: NeighborsRequest,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    let NeighborsRequest {
+        collection,
+        node,
+        edge_label,
+        direction,
+        txn_id,
+    } = req;
     if node.is_empty() {
         return Err(ddl_err("42601", "missing OF '<node_id>'"));
     }
+    authorize_traversal(state, identity, database_id, &collection)?;
     let dir = to_engine_direction(direction);
     let tenant_id = identity.tenant_id;
 
     let plan = PhysicalPlan::Graph(GraphOp::Neighbors {
+        collection: Some(collection),
         node_id: node,
         edge_label,
         direction: dir,
@@ -166,32 +243,49 @@ pub async fn neighbors(
 /// `cross_core_shortest_path`, which records parent pointers per
 /// hop so the path can be reconstructed across every topology —
 /// single core, single-node multi-core, and clustered.
+/// `GRAPH PATH` request fields.
+pub struct ShortestPathRequest {
+    pub collection: String,
+    pub src: String,
+    pub dst: String,
+    pub max_depth: usize,
+    pub edge_label: Option<String>,
+}
+
 pub async fn shortest_path(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    src: String,
-    dst: String,
-    max_depth: usize,
-    edge_label: Option<String>,
+    req: ShortestPathRequest,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    let ShortestPathRequest {
+        collection,
+        src,
+        dst,
+        max_depth,
+        edge_label,
+    } = req;
     if src.is_empty() || dst.is_empty() {
         return Err(ddl_err(
             "42601",
             "GRAPH PATH requires FROM '<src>' TO '<dst>'",
         ));
     }
+    authorize_traversal(state, identity, database_id, &collection)?;
     let max_depth = clamp_depth(max_depth, "MAX_DEPTH")?;
     let tenant_id = identity.tenant_id;
     check_tenant_graph_depth(state, tenant_id, max_depth, "MAX_DEPTH")?;
     match crate::control::server::graph_dispatch::cross_core_shortest_path(
         state,
-        tenant_id,
-        database_id,
-        src,
-        dst,
-        edge_label,
-        max_depth,
+        crate::control::server::graph_dispatch::CrossCoreShortestPathParams {
+            tenant_id,
+            database_id,
+            collection,
+            src,
+            dst,
+            edge_label,
+            max_depth,
+        },
     )
     .await
     {

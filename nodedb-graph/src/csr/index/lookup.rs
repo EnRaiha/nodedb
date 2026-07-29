@@ -425,6 +425,23 @@ impl CsrIndex {
         &self.id_to_node[id as usize]
     }
 
+    /// Whether a raw dense index names a node of this partition.
+    ///
+    /// Read paths that accept caller-supplied local ids gate on this: an id
+    /// past the end is not a node, and admitting it would put an entry in a
+    /// result set that resolves to no name at all.
+    pub fn is_local_node(&self, id: u32) -> bool {
+        (id as usize) < self.id_to_node.len()
+    }
+
+    /// String name for a raw dense index, or `None` when the index is out of
+    /// range. Same domain as [`Self::node_name_raw`], without the panic: read
+    /// paths that resolve a whole traversal frontier use this so one torn id
+    /// narrows the answer instead of killing the core.
+    pub fn node_name_checked(&self, id: u32) -> Option<&str> {
+        self.id_to_node.get(id as usize).map(String::as_str)
+    }
+
     /// Raw dense index lookup by name. In-partition algorithm use only.
     pub fn node_id_raw(&self, name: &str) -> Option<u32> {
         self.node_to_id.get(name).copied()

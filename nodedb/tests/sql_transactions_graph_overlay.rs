@@ -61,13 +61,13 @@ async fn insert_self_loop(server: &TestServer, node: &str, label: &str) -> Resul
         .map_err(|e| e.to_string())
 }
 
-/// Run `GRAPH NEIGHBORS OF '<node>' LABEL '<label>' DIRECTION out` and return
+/// Run `GRAPH NEIGHBORS IN 'g_tx' OF '<node>' LABEL '<label>' DIRECTION out` and return
 /// the destination node ids from the single-row `[{"label":..,"node":..}, ...]`
 /// JSON payload.
 async fn neighbors_of(server: &TestServer, node: &str, label: &str) -> Vec<String> {
     let rows = server
         .query_text(&format!(
-            "GRAPH NEIGHBORS OF '{node}' LABEL '{label}' DIRECTION out"
+            "GRAPH NEIGHBORS IN 'g_tx' OF '{node}' LABEL '{label}' DIRECTION out"
         ))
         .await
         .unwrap();

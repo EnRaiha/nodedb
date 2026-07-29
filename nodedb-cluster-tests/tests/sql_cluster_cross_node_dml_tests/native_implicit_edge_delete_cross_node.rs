@@ -104,7 +104,7 @@ async fn native_implicit_edge_delete_cleans_reverse_cross_node() {
             Duration::from_millis(100),
             || {
                 cluster.nodes[idx]
-                    .traversed_node_ids("GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in")
+                    .traversed_node_ids("GRAPH TRAVERSE IN 'nat_impl_edge_del' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in")
                     .len()
                     > SOURCES
             },
@@ -175,7 +175,7 @@ async fn native_implicit_edge_delete_cleans_reverse_cross_node() {
             Duration::from_millis(100),
             || {
                 let ids = cluster.nodes[idx]
-                    .traversed_node_ids("GRAPH TRAVERSE FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in");
+                    .traversed_node_ids("GRAPH TRAVERSE IN 'nat_impl_edge_del' FROM 'hub' DEPTH 1 LABEL 'l' DIRECTION in");
                 // Only the start node `hub` should remain reachable (the
                 // traversal includes the start node in its result).
                 ids.iter().all(|id| id == "hub")

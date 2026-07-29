@@ -130,6 +130,7 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
         lower: None,
         upper: None,
         limit: 10_000,
+        rls_filters: Vec::new(),
     });
 
     // The subscriber's own capability, not the system door: the scan is

@@ -88,6 +88,40 @@ pub async fn create_graph_index(
         ));
     }
 
+    // Building the index reads every row of the collection, so the caller must
+    // be allowed to read it.
+    let audit =
+        crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+    crate::control::server::shared::authorization::authorize_collection(
+        identity,
+        database_id,
+        &collection,
+        crate::control::security::identity::Permission::Read,
+        &state.permissions,
+        &state.roles,
+        &audit,
+    )
+    .map_err(|error| ddl_err("42501", format!("permission denied: {}", error.resource())))?;
+
+    // A read policy on the collection makes the index unbuildable rather than
+    // partially built: the index is shared by every reader, so deriving it from
+    // one principal's filtered view would answer other principals' queries from
+    // rows that were never indexed. Refuse instead of silently indexing a
+    // subset.
+    let auth_ctx = crate::control::server::session_auth::context::build_auth_context(identity);
+    if state
+        .rls
+        .combined_read_predicate_with_auth(tenant_id.as_u64(), &collection, &auth_ctx)
+        .is_none_or(|filters| !filters.is_empty())
+    {
+        return Err(ddl_err(
+            "0A000",
+            format!(
+                "cannot build a graph index on '{collection}': it carries a row-level security                  read policy, and an index derived from one principal's visible rows would be                  incomplete for every other principal"
+            ),
+        ));
+    }
+
     // ── Broadcast scan: collect documents from every vshard ──────────
     let scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: collection.clone(),

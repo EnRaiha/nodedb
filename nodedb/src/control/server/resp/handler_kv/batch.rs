@@ -25,6 +25,7 @@ pub(in crate::control::server::resp) async fn handle_mget(
     let plan = PhysicalPlan::Kv(KvOp::BatchGet {
         collection: session.collection.clone(),
         keys: cmd.args.clone(),
+        rls_filters: Vec::new(),
     });
 
     match dispatch_kv(state, session, plan).await {

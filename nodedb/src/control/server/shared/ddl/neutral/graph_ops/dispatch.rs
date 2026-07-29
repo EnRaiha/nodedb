@@ -74,6 +74,7 @@ pub async fn dispatch_graph(
             remove,
         }) => Some(edge::set_node_labels(state, identity, node_id, labels, remove).await),
         NodedbStatement::Graph(GraphStmt::GraphTraverse {
+            collection,
             start,
             depth,
             edge_label,
@@ -83,14 +84,18 @@ pub async fn dispatch_graph(
                 state,
                 identity,
                 database_id,
-                start,
-                depth,
-                edge_label,
-                direction,
+                traverse::TraverseRequest {
+                    collection,
+                    start,
+                    depth,
+                    edge_label,
+                    direction,
+                },
             )
             .await,
         ),
         NodedbStatement::Graph(GraphStmt::GraphNeighbors {
+            collection,
             node,
             edge_label,
             direction,
@@ -105,15 +110,19 @@ pub async fn dispatch_graph(
                     state,
                     identity,
                     database_id,
-                    node,
-                    edge_label,
-                    direction,
-                    txn_id,
+                    traverse::NeighborsRequest {
+                        collection,
+                        node,
+                        edge_label,
+                        direction,
+                        txn_id,
+                    },
                 )
                 .await,
             )
         }
         NodedbStatement::Graph(GraphStmt::GraphPath {
+            collection,
             src,
             dst,
             max_depth,
@@ -123,10 +132,13 @@ pub async fn dispatch_graph(
                 state,
                 identity,
                 database_id,
-                src,
-                dst,
-                max_depth,
-                edge_label,
+                traverse::ShortestPathRequest {
+                    collection,
+                    src,
+                    dst,
+                    max_depth,
+                    edge_label,
+                },
             )
             .await,
         ),

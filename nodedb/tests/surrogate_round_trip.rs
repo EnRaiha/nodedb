@@ -581,6 +581,7 @@ fn surrogate_round_trip_all_engines() {
             options: Default::default(),
             rls_filters: Vec::new(),
             frontier_bitmap: None,
+            collection: None,
         }),
     );
     let hop_all_json = decode_payload_to_json(&hop_all);
@@ -602,6 +603,7 @@ fn surrogate_round_trip_all_engines() {
             options: Default::default(),
             rls_filters: Vec::new(),
             frontier_bitmap: Some(intersection.clone()),
+            collection: None,
         }),
     );
     let hop_filtered_json = decode_payload_to_json(&hop_filtered);

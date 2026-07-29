@@ -123,6 +123,7 @@ fn cross_model_query_vector_graph_relational() {
             options: Default::default(),
             rls_filters: Vec::new(),
             frontier_bitmap: None,
+            collection: None,
         }),
     );
     let graph_nodes: Vec<String> = serde_json::from_value(payload_value(&graph_payload)).unwrap();
