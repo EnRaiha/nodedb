@@ -300,17 +300,21 @@ fn parse_priority_token(tokens_orig: &[&str], tokens_upper: &[String], i: &mut u
     }
 }
 
-fn parse_security_token(tokens_upper: &[String], i: &mut usize) -> String {
+/// Capture the `SECURITY` clause verbatim, or `None` when it is absent.
+///
+/// A missing mode after the keyword yields `Some("")` rather than `None`: the
+/// clause was written, so it is the DDL layer's business to reject it, not the
+/// parser's to pretend it was never there.
+fn parse_security_token(tokens_upper: &[String], i: &mut usize) -> Option<String> {
     if *i >= tokens_upper.len() || tokens_upper[*i] != "SECURITY" {
-        return "INVOKER".to_string();
+        return None;
     }
     *i += 1;
-    if *i >= tokens_upper.len() {
-        return "INVOKER".to_string();
+    let mode = tokens_upper.get(*i).cloned().unwrap_or_default();
+    if *i < tokens_upper.len() {
+        *i += 1;
     }
-    let mode = tokens_upper[*i].clone();
-    *i += 1;
-    mode
+    Some(mode)
 }
 
 #[cfg(test)]

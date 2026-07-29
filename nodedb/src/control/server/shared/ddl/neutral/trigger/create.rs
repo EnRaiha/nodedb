@@ -32,7 +32,7 @@ pub struct CreateTriggerRequest<'a> {
     pub granularity: &'a str,
     pub when_condition: Option<&'a str>,
     pub priority: i32,
-    pub security: &'a str,
+    pub security: Option<&'a str>,
     pub body_sql: &'a str,
 }
 
@@ -80,7 +80,7 @@ pub fn create_trigger(
     let execution_mode_enum = parse_execution_mode(execution_mode);
     let timing_enum = parse_timing(timing);
     let granularity_enum = parse_granularity(granularity);
-    let security_enum = parse_security(security);
+    let security_enum = parse_security(security)?;
 
     if execution_mode_enum == TriggerExecutionMode::Sync {
         tracing::info!(
@@ -238,10 +238,31 @@ fn parse_granularity(s: &str) -> TriggerGranularity {
     }
 }
 
-fn parse_security(s: &str) -> TriggerSecurity {
-    if s.to_uppercase() == "DEFINER" {
-        TriggerSecurity::Definer
-    } else {
-        TriggerSecurity::Invoker
+/// Resolve the `SECURITY` clause, rejecting a mode the execution model cannot
+/// honour.
+///
+/// Trigger bodies run asynchronously on the Event Plane, driven by a
+/// `WriteEvent` that carries a tenant but no user identity — the invoking
+/// session is long gone by the time the body fires. `SECURITY INVOKER` is
+/// therefore not implementable here, and silently storing it while executing as
+/// definer would leave the catalog describing a guarantee that does not exist.
+/// An unspecified clause resolves to `DEFINER`, which is what actually happens.
+fn parse_security(s: Option<&str>) -> Result<TriggerSecurity, DdlError> {
+    let Some(mode) = s else {
+        return Ok(TriggerSecurity::Definer);
+    };
+    match mode.to_uppercase().as_str() {
+        "DEFINER" => Ok(TriggerSecurity::Definer),
+        "INVOKER" => Err(DdlError {
+            sqlstate: "0A000".to_string(),
+            message: "SECURITY INVOKER is not supported for triggers: bodies execute \
+                      asynchronously from a write event that carries no invoking identity. \
+                      Use SECURITY DEFINER (the default)."
+                .to_string(),
+        }),
+        other => Err(DdlError {
+            sqlstate: "42601".to_string(),
+            message: format!("unrecognised trigger SECURITY mode '{other}'"),
+        }),
     }
 }

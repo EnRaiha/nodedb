@@ -112,8 +112,12 @@ impl TriggerGranularity {
 #[repr(u8)]
 #[msgpack(c_enum)]
 pub enum TriggerSecurity {
-    #[default]
+    /// Not selectable at `CREATE TRIGGER`: an asynchronously-fired body has no
+    /// invoking session to adopt. Retained so existing catalog rows that stored
+    /// discriminant 0 still decode; they execute as `Definer`, which is what
+    /// the dispatcher has always done.
     Invoker = 0,
+    #[default]
     Definer = 1,
 }
 

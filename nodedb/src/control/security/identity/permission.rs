@@ -77,7 +77,10 @@ pub fn role_grants_permission(role: &Role, permission: Permission) -> bool {
             Permission::Read | Permission::Write | Permission::Execute
         ),
         Role::ReadOnly => matches!(permission, Permission::Read | Permission::Execute),
-        Role::Monitor => matches!(permission, Permission::Monitor | Permission::Read),
+        // Monitor is metrics/health/audit only. It previously also conferred
+        // `Permission::Read`, which contradicted its own definition and let a
+        // monitoring principal read collection data.
+        Role::Monitor => matches!(permission, Permission::Monitor),
         // Database-scoped roles grant permissions within their database.
         // The database match is enforced at the call site via PermissionTarget.
         Role::DatabaseOwner(_) => true,

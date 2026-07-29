@@ -50,7 +50,7 @@ pub(super) async fn try_typed(
                 granularity,
                 when_condition: when_condition.as_deref(),
                 priority: *priority,
-                security,
+                security: security.as_deref(),
                 body_sql,
             },
         )),

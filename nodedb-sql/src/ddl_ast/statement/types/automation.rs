@@ -20,8 +20,10 @@ pub enum AutomationStmt {
         granularity: String,
         when_condition: Option<String>,
         priority: i32,
-        /// "INVOKER" or "DEFINER".
-        security: String,
+        /// The `SECURITY` clause as written, or `None` when it was omitted.
+        /// The parser does not pick a default — which modes are implementable
+        /// is an engine question, so the DDL layer resolves it.
+        security: Option<String>,
         body_sql: String,
     },
     DropTrigger {
