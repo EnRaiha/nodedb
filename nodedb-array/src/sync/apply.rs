@@ -109,7 +109,8 @@ pub trait ApplyEngine {
 /// Steps:
 /// 1. Shape validation — on error: `Rejected(ShapeInvalid)`.
 /// 2. Schema HLC check — `None` → `Rejected(ArrayUnknown)`;
-///    `op.header.schema_hlc > local` → `Rejected(SchemaTooNew)`.
+///    `op.header.schema_hlc` strictly later on the clock than `local`
+///    → `Rejected(SchemaTooNew)`. Same-instant schemas are admitted.
 /// 3. Idempotency — already seen → `Idempotent`.
 /// 4. Dispatch to `apply_put`/`apply_delete`/`apply_erase`. Engine errors
 ///    that indicate corruption (`SegmentCorruption`, `HlcLockPoisoned`) are
@@ -131,7 +132,11 @@ pub fn apply_op<E: ApplyEngine>(engine: &mut E, op: &ArrayOp) -> ArrayResult<App
                 name: op.header.array.clone(),
             }));
         }
-        Some(local_schema) if op.header.schema_hlc > local_schema => {
+        // Clock-only comparison: an op whose schema was stamped in the SAME
+        // instant as ours is not evidence that ours is stale, so it must be
+        // admitted. Using the full `Ord` here would let the arbitrary
+        // `replica_id` tiebreak decide admission — see `Hlc::is_later_than`.
+        Some(local_schema) if op.header.schema_hlc.is_later_than(&local_schema) => {
             return Ok(ApplyOutcome::Rejected(ApplyRejection::SchemaTooNew {
                 local: local_schema,
                 op: op.header.schema_hlc,
@@ -372,6 +377,32 @@ mod tests {
             ApplyOutcome::Rejected(ApplyRejection::SchemaTooNew { local, op: op_hlc })
             if local == hlc(50) && op_hlc == hlc(100)
         ));
+    }
+
+    /// Two replicas that stamp a schema in the same millisecond must not have
+    /// admission decided by their replica ids. Before `Hlc::is_later_than` the
+    /// gate used the full `Ord`, so an op from a replica with a numerically
+    /// larger id was rejected as `SchemaTooNew` while the identical op from a
+    /// smaller id applied — a coin flip that showed up as a flaky sync test.
+    #[test]
+    fn same_instant_schema_is_admitted_regardless_of_replica_id() {
+        for (local_replica, op_replica) in [(1u64, 9u64), (9, 1)] {
+            let local_schema = Hlc::new(50, 0, ReplicaId::new(local_replica)).unwrap();
+            let op_schema = Hlc::new(50, 0, ReplicaId::new(op_replica)).unwrap();
+
+            let mut engine = MockEngine::new();
+            engine.register_array("a", local_schema);
+            let mut op = put_op("a", 10, 100);
+            op.header.schema_hlc = op_schema;
+
+            let outcome = apply_op(&mut engine, &op).unwrap();
+            assert_eq!(
+                outcome,
+                ApplyOutcome::Applied,
+                "same-instant schema must apply (local replica {local_replica}, \
+                 op replica {op_replica}); the replica_id tiebreak must not gate admission"
+            );
+        }
     }
 
     #[test]

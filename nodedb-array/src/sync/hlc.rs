@@ -77,6 +77,19 @@ impl Hlc {
         })
     }
 
+    /// True when `self` is strictly later than `other` on the clock alone —
+    /// comparing `(physical_ms, logical)` and ignoring `replica_id`.
+    ///
+    /// [`Ord`] breaks same-instant ties with `replica_id` so that the order is
+    /// *total*, which is what deterministic op ordering needs. A freshness test
+    /// must not use it: two replicas that independently stamp the same instant
+    /// would be ranked by an arbitrary identity, so any gate built on `>` would
+    /// admit or reject the same pair of events depending on which replica id
+    /// happened to be larger.
+    pub fn is_later_than(&self, other: &Self) -> bool {
+        (self.physical_ms, self.logical) > (other.physical_ms, other.logical)
+    }
+
     /// Encode as 18 bytes in big-endian order for stable byte-comparable sort.
     ///
     /// Layout: `physical_ms` (8 bytes) | `logical` (2 bytes) | `replica_id` (8 bytes).
