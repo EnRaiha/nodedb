@@ -37,7 +37,12 @@ use common::cluster_harness::TestCluster;
 
 use std::time::{Duration, Instant};
 
-use nodedb::control::server::sync::listener::{SyncListenerConfig, start_sync_listener};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use nodedb::control::server::sync::listener::{
+    SyncListenerConfig, SyncListenerState, start_sync_listener,
+};
 use nodedb_test_support::sync_client::{DeltaOutcome, SyncTestClient};
 use nodedb_types::sync::wire::AckStatus;
 
@@ -129,7 +134,11 @@ async fn row_is_readable(
 
 /// A three-node cluster with both collections created and node 0's sync
 /// listener running.
-async fn cluster_with_sync_listener() -> (TestCluster, std::net::SocketAddr) {
+///
+/// The listener state is returned alongside the cluster because it carries the
+/// delta accounting the close line reports; a test that only had the address
+/// could assert what a client was told but not what the server counted.
+async fn cluster_with_sync_listener() -> (TestCluster, Arc<SyncListenerState>) {
     let cluster = TestCluster::spawn_three()
         .await
         .expect("spawn three-node cluster");
@@ -146,10 +155,10 @@ async fn cluster_with_sync_listener() -> (TestCluster, std::net::SocketAddr) {
         listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         ..Default::default()
     };
-    let state = start_sync_listener(cfg, Some(std::sync::Arc::clone(&cluster.nodes[0].shared)))
+    let state = start_sync_listener(cfg, Some(Arc::clone(&cluster.nodes[0].shared)))
         .await
         .expect("start sync listener");
-    (cluster, state.config.listen_addr)
+    (cluster, state)
 }
 
 fn expect_applied(outcome: DeltaOutcome, what: &str) {
@@ -169,7 +178,8 @@ fn expect_applied(outcome: DeltaOutcome, what: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_replica_claiming_an_owned_peer_id_is_refused_not_absorbed() {
-    let (cluster, addr) = cluster_with_sync_listener().await;
+    let (cluster, listener) = cluster_with_sync_listener().await;
+    let addr = listener.config.listen_addr;
 
     let mut first = SyncTestClient::connect_as_lite(addr, "replica-a", 1)
         .await
@@ -265,7 +275,8 @@ async fn the_owning_replica_keeps_its_peer_id_across_a_reconnect() {
     // zero, and a restarted sequence is deduplicated by the producer gate before
     // the apply is ever reached — neither says anything about peer-id ownership,
     // which is what this test is for.
-    let (cluster, addr) = cluster_with_sync_listener().await;
+    let (cluster, listener) = cluster_with_sync_listener().await;
+    let addr = listener.config.listen_addr;
     let doc = loro::LoroDoc::new();
     doc.set_peer_id(SHARED_PEER).expect("set peer id");
 
@@ -324,7 +335,8 @@ async fn the_same_peer_id_in_another_collection_is_not_a_collision() {
     // Each collection is its own document, so identical peer ids in two of them
     // never share a counter range. Refusing here would break every client that
     // derives one peer id per collection from a single base.
-    let (cluster, addr) = cluster_with_sync_listener().await;
+    let (cluster, listener) = cluster_with_sync_listener().await;
+    let addr = listener.config.listen_addr;
 
     let mut first = SyncTestClient::connect_as_lite(addr, "replica-a", 1)
         .await
@@ -386,7 +398,8 @@ async fn the_same_peer_id_in_another_collection_is_not_a_collision() {
 /// write which exists nowhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reinstalled_replica_reusing_its_own_peer_id_is_not_reported_as_applied() {
-    let (cluster, addr) = cluster_with_sync_listener().await;
+    let (cluster, listener) = cluster_with_sync_listener().await;
+    let addr = listener.config.listen_addr;
 
     let mut client = SyncTestClient::connect_as_lite(addr, "replica-a", 1)
         .await
@@ -437,6 +450,83 @@ async fn a_reinstalled_replica_reusing_its_own_peer_id_is_not_reported_as_applie
         .await
         .expect("read the discarded row"),
         "this test only means something while the row is genuinely absent"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// The trim counter must carry a real, non-zero measurement all the way from
+/// the CRDT merge to the session's close accounting.
+///
+/// Every hop between the two — admission preview, dispatch outcome, delta
+/// outcome, session — copies a `u64`. A break anywhere in that chain still
+/// compiles and still logs a counter; it just always logs zero. That is
+/// indistinguishable from a healthy server, which is the exact failure this
+/// counter exists to make visible, so asserting the plumbing is not enough:
+/// the value itself has to be observed downstream of a delta that really was
+/// trimmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trimmed_delta_is_counted_in_the_listener_totals() {
+    let (cluster, listener) = cluster_with_sync_listener().await;
+    let addr = listener.config.listen_addr;
+
+    assert_eq!(
+        listener.ops_trimmed.load(Ordering::Relaxed),
+        0,
+        "nothing has been synced yet"
+    );
+
+    {
+        let mut client = SyncTestClient::connect_as_lite(addr, "replica-a", 1)
+            .await
+            .expect("handshake");
+        expect_applied(
+            client
+                .push_delta(
+                    COLL,
+                    "first",
+                    SHARED_PEER,
+                    1,
+                    row_snapshot(SHARED_PEER, COLL, "first", "1"),
+                )
+                .await
+                .expect("first push"),
+            "the first write",
+        );
+        // A fresh document under the same peer id: its whole counter range is
+        // already known, so the merge trims every operation it carries.
+        let outcome = client
+            .push_delta(
+                COLL,
+                "second",
+                SHARED_PEER,
+                2,
+                row_snapshot(SHARED_PEER, COLL, "second", "2"),
+            )
+            .await
+            .expect("fully-trimmed push");
+        match outcome {
+            DeltaOutcome::Ack(ack) => assert_ne!(ack.status, AckStatus::Applied),
+            DeltaOutcome::Reject(_) => {}
+        }
+    }
+
+    // The totals are folded when the session closes, so wait for the loop to
+    // notice the dropped socket rather than assuming it already has.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while listener.ops_trimmed.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        listener.ops_trimmed.load(Ordering::Relaxed) > 0,
+        "a delta whose every operation was already known reached the merge, so the trim \
+         count must be non-zero; a zero here means the measurement is lost somewhere \
+         between the merge and the session and the counter can never report a collision"
+    );
+    assert!(
+        listener.deltas_deduplicated.load(Ordering::Relaxed) > 0,
+        "the same delta applied nothing, so it must be counted as deduplicated"
     );
 
     cluster.shutdown().await;

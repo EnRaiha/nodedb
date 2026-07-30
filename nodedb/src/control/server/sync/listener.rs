@@ -54,6 +54,16 @@ pub struct SyncListenerState {
     pub active_sessions: AtomicU64,
     pub connections_accepted: AtomicU64,
     pub connections_rejected: AtomicU64,
+    /// Deltas that applied nothing because every operation they carried was
+    /// already present, summed over all closed sessions.
+    pub deltas_deduplicated: AtomicU64,
+    /// Operations discarded by the CRDT merge as already-known, summed over all
+    /// closed sessions.
+    ///
+    /// The per-session close line reports the same fact for one client; this is
+    /// the same fact for the listener, so a trend is visible without correlating
+    /// log lines by session id.
+    pub ops_trimmed: AtomicU64,
     pub config: SyncListenerConfig,
 }
 
@@ -63,8 +73,20 @@ impl SyncListenerState {
             active_sessions: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             connections_rejected: AtomicU64::new(0),
+            deltas_deduplicated: AtomicU64::new(0),
+            ops_trimmed: AtomicU64::new(0),
             config,
         }
+    }
+
+    /// Fold one finished session's delta accounting into the listener totals.
+    ///
+    /// Called once per session, from the same place that emits the close line,
+    /// so the two can never disagree about what that session did.
+    pub fn fold_closed_session(&self, deltas_deduplicated: u64, ops_trimmed: u64) {
+        self.deltas_deduplicated
+            .fetch_add(deltas_deduplicated, Ordering::Relaxed);
+        self.ops_trimmed.fetch_add(ops_trimmed, Ordering::Relaxed);
     }
 
     pub fn can_accept(&self) -> bool {

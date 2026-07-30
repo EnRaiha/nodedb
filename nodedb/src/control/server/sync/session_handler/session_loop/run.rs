@@ -123,6 +123,8 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
 
     cleanup.finish().await;
 
+    state.fold_closed_session(session.mutations_deduplicated, session.ops_trimmed);
+
     info!(
         session = %session_id,
         admitted = session.mutations_processed,
