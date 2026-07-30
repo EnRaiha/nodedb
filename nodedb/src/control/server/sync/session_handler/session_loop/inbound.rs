@@ -254,7 +254,7 @@ async fn handle_crdt(
         return Flow::Continue;
     };
 
-    let final_response = if response.msg_type == SyncMessageType::DeltaAck
+    let dispatched = if response.msg_type == SyncMessageType::DeltaAck
         && let Some(shared) = shared.as_ref()
         && let Some(delta_msg) = delta_msg.as_ref()
     {
@@ -269,10 +269,20 @@ async fn handle_crdt(
         )
         .await
     } else {
-        Some(response)
+        crate::control::server::sync::async_dispatch::DeltaDispatchOutcome {
+            frame: Some(response),
+            trimmed_ops: 0,
+        }
     };
 
-    let Some(r) = final_response else {
+    // What the delta carried is recorded whether or not it produced a frame: a
+    // dropped frame is exactly the case where the session would otherwise close
+    // with no record that anything was discarded.
+    if delta_msg.is_some() {
+        session.record_delta_admission(dispatched.trimmed_ops);
+    }
+
+    let Some(r) = dispatched.frame else {
         return Flow::Continue;
     };
 

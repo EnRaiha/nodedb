@@ -80,21 +80,22 @@ impl CoreLoop {
                 );
             }
         };
-        let imported_ops = match u64::try_from(preview.imported_ops) {
-            Ok(imported_ops) => imported_ops,
-            Err(_) => {
-                return self.response_error(
-                    task,
-                    ErrorCode::Internal {
-                        detail: "CRDT preview operation count exceeds wire range".into(),
-                    },
-                );
-            }
+        let counts = u64::try_from(preview.imported_ops)
+            .ok()
+            .zip(u64::try_from(preview.trimmed_ops).ok());
+        let Some((imported_ops, trimmed_ops)) = counts else {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: "CRDT preview operation count exceeds wire range".into(),
+                },
+            );
         };
         let result = CrdtPreviewResult {
             post_image_msgpack: preview.post_image_msgpack,
             imported_ops,
             frontier_digest,
+            trimmed_ops,
         };
         match zerompk::to_msgpack_vec(&result) {
             Ok(payload) => self.response_with_payload(task, payload),

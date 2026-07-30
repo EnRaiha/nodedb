@@ -256,6 +256,7 @@ mod tests {
         let preview = zerompk::to_msgpack_vec(&nodedb_types::CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
             imported_ops: 1,
+            trimmed_ops: 0,
             frontier_digest: digest,
         })
         .expect("preview payload");

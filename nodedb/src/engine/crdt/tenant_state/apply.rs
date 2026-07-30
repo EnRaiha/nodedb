@@ -35,6 +35,7 @@ impl TenantCrdtEngine {
     ) -> crate::Result<()> {
         self.state_mut(collection)?
             .import(delta)
+            .map(|_admission| ())
             .map_err(crate::Error::Crdt)
     }
 

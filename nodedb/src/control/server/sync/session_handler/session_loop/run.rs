@@ -129,7 +129,9 @@ pub(in crate::control::server::sync) async fn handle_sync_session(
         applied = session.mutations_applied,
         rejected = session.mutations_rejected,
         not_applied = session.mutations_not_applied,
+        deduplicated = session.mutations_deduplicated,
         silent_dropped = session.mutations_silent_dropped,
+        ops_trimmed = session.ops_trimmed,
         uptime_secs = session.uptime_secs(),
         "sync: session closed"
     );

@@ -159,6 +159,7 @@ mod tests {
         CrdtPreviewResult {
             post_image_msgpack: zerompk::to_msgpack_vec(&post_image).expect("encode post-image"),
             imported_ops: 1,
+            trimmed_ops: 0,
             frontier_digest: [7; 32],
         }
     }
@@ -213,6 +214,7 @@ mod tests {
         let malformed = CrdtPreviewResult {
             post_image_msgpack: vec![0x8f],
             imported_ops: 1,
+            trimmed_ops: 0,
             frontier_digest: [0; 32],
         };
         assert!(matches!(
@@ -300,6 +302,7 @@ mod tests {
                 .evaluate(&CrdtPreviewResult {
                     post_image_msgpack: vec![0; nodedb_crdt::DEFAULT_MAX_POST_IMAGE_BYTES + 1],
                     imported_ops: 1,
+                    trimmed_ops: 0,
                     frontier_digest: [0; 32],
                 })
                 .is_ok()

@@ -50,6 +50,25 @@ pub struct CrdtApplyAdmissionRequest<'a> {
 pub struct CrdtAdmissionOutcome {
     pub payload: Vec<u8>,
     pub write_version: crate::types::Lsn,
+    /// Operations the admitted delta encoded that the target document already
+    /// knew, measured by the preview that fenced this apply.
+    ///
+    /// The apply payload says what the server decided; this says what the delta
+    /// carried. A delta whose operations were all already present produces the
+    /// same successful payload as one that wrote a row, so without this the
+    /// caller has no way to tell a client whose writes are landing from one
+    /// whose writes are being absorbed.
+    pub trimmed_ops: u64,
+}
+
+impl CrdtAdmissionOutcome {
+    /// Attach the trim count measured by the preview that fenced this apply.
+    fn with_trimmed_ops(self, trimmed_ops: u64) -> Self {
+        Self {
+            trimmed_ops,
+            ..self
+        }
+    }
 }
 
 pub struct CrdtRestoreAdmissionRequest<'a> {
@@ -245,7 +264,12 @@ async fn admit_apply_locked(
         let fenced = stamp_fence(plan.clone(), preview.frontier_digest)?;
         match apply_fenced(workflow, fenced).await {
             Err(crate::Error::DataPlane(ErrorCode::CrdtFrontierMismatch { .. })) => {}
-            result => return result,
+            // The trim count belongs to the preview that fenced *this* attempt.
+            // A retry re-previews against the advanced frontier and produces its
+            // own count, so the two are never mixed.
+            result => {
+                return result.map(|outcome| outcome.with_trimmed_ops(preview.trimmed_ops));
+            }
         }
     }
     Err(crate::Error::CrdtAdmissionRetriesExhausted {
@@ -505,6 +529,7 @@ async fn apply_fenced(
         return Ok(CrdtAdmissionOutcome {
             payload: outcome.0,
             write_version: outcome.1,
+            trimmed_ops: 0,
         });
     }
     let response = tokio::time::timeout(
@@ -533,6 +558,7 @@ async fn apply_fenced(
     Ok(CrdtAdmissionOutcome {
         payload: response.payload.to_vec(),
         write_version: response.read_version_lsn,
+        trimmed_ops: 0,
     })
 }
 
@@ -674,6 +700,7 @@ mod tests {
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: post_image.clone(),
             imported_ops: 1,
+            trimmed_ops: 0,
             frontier_digest: digest,
         })
         .expect("preview payload");
@@ -734,6 +761,7 @@ mod tests {
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
             imported_ops: 0,
+            trimmed_ops: 0,
             frontier_digest: [7; 32],
         })
         .expect("preview payload");
@@ -782,6 +810,7 @@ mod tests {
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
             imported_ops: 1,
+            trimmed_ops: 0,
             frontier_digest: digest,
         })
         .expect("preview payload");
@@ -837,6 +866,7 @@ mod tests {
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
             imported_ops: 0,
+            trimmed_ops: 0,
             frontier_digest: digest,
         })
         .expect("preview payload");
@@ -885,6 +915,7 @@ mod tests {
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
             imported_ops: 1,
+            trimmed_ops: 0,
             frontier_digest: [0x84; 32],
         })
         .expect("preview payload");
@@ -962,6 +993,7 @@ mod tests {
         let preview_payload = zerompk::to_msgpack_vec(&CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
             imported_ops: 0,
+            trimmed_ops: 0,
             frontier_digest: digest,
         })
         .expect("preview payload");

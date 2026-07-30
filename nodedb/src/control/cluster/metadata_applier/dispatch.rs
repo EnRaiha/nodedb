@@ -152,6 +152,26 @@ impl MetadataCommitApplier {
             MetadataEntry::SyncProducerFence { lite_id, new_epoch } => {
                 return self.apply_sync_producer_fence(lite_id, *new_epoch, raft_index);
             }
+            MetadataEntry::SyncPeerBind {
+                database_id,
+                tenant_id,
+                collection,
+                peer_id,
+                producer_id,
+                bound_ms,
+            } => {
+                return self.apply_sync_peer_bind(
+                    super::sync_and_routing::SyncPeerBindApply {
+                        database_id: *database_id,
+                        tenant_id: *tenant_id,
+                        collection,
+                        peer_id: *peer_id,
+                        producer_id: *producer_id,
+                        bound_ms: *bound_ms,
+                    },
+                    raft_index,
+                );
+            }
             MetadataEntry::JoinTokenTransition {
                 token_hash,
                 transition,

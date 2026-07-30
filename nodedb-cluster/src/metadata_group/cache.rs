@@ -152,6 +152,10 @@ impl MetadataCache {
                 // host-side only: the production applier calls
                 // `SyncProducerRegistry::apply_fence` on every node.
             }
+            MetadataEntry::SyncPeerBind { .. } => {
+                // host-side only: the production applier calls
+                // `SyncProducerRegistry::apply_bind_peer` on every node.
+            }
             MetadataEntry::SurrogateAlloc { .. } => {
                 // Surrogate HWM advance is host-side only: the production
                 // applier calls `SurrogateRegistry::restore_hwm`. The

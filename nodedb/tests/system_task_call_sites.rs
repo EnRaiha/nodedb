@@ -60,7 +60,7 @@ const ALLOWED: &[&str] = &[
     "event/alert/executor.rs",
     // Legs of a request whose capability was consumed at the entry point.
     "control/crdt_admission.rs",
-    "control/server/sync/raft_dispatch.rs",
+    "control/server/sync/raft_dispatch/write.rs",
 ];
 
 fn src_root() -> PathBuf {

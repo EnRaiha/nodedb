@@ -185,6 +185,7 @@ impl CoreLoop {
                     match applied {
                         crate::engine::crdt::tenant_state::ValidatedApplyOutcome::Clean {
                             write_set,
+                            ..
                         } => {
                             if let Err(detail) =
                                 Self::single_document_write_set(collection, document_id, &write_set)

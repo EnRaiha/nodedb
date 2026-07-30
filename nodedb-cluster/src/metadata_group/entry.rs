@@ -193,6 +193,29 @@ pub enum MetadataEntry {
         new_epoch: u64,
     },
 
+    /// Replicate ownership of one Loro peer id to every node.
+    ///
+    /// A peer id is the identity every CRDT operation is attributed to, so two
+    /// replicas claiming the same one write into overlapping counter ranges and
+    /// the merge silently discards the second. Ownership therefore has to agree
+    /// across the cluster, or a failover hands the same peer id to a different
+    /// producer and the collision returns.
+    ///
+    /// Applied with lowest-producer-id-wins semantics: the rule is commutative
+    /// and idempotent, so out-of-order or duplicate delivery converges to the
+    /// same owner on every node, and a node that optimistically claimed the peer
+    /// id locally before proposing is corrected by the entry that beat it.
+    ///
+    /// Applied host-side only; the cluster cache tracks the applied index.
+    SyncPeerBind {
+        database_id: u64,
+        tenant_id: u64,
+        collection: String,
+        peer_id: u64,
+        producer_id: u64,
+        bound_ms: i64,
+    },
+
     // ── Surrogate identity ────────────────────────────────────────────
     /// Advance the cluster-wide surrogate high-watermark to `hwm`.
     ///

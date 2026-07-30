@@ -45,8 +45,23 @@ pub struct SyncSession {
     /// sequence gaps, and fenced epochs. The sender is expected to re-push
     /// these, so they are neither successes nor dead letters.
     pub mutations_not_applied: u64,
+    /// Mutations whose operations were already present, so the apply moved
+    /// nothing. Counted apart from [`Self::mutations_applied`] because they are
+    /// opposite facts about the database: one says this session's write landed,
+    /// the other says it did not have to. Folding them together is what let a
+    /// session that applied nothing close looking identical to one that applied
+    /// everything.
+    pub mutations_deduplicated: u64,
     /// Mutations silently dropped (security rejections).
     pub mutations_silent_dropped: u64,
+    /// Operations this session's deltas carried that the target document
+    /// already knew, and the CRDT merge therefore discarded.
+    ///
+    /// A resync re-sends a prefix it has already delivered and this rises while
+    /// `mutations_applied` also rises. A session whose every delta trims — the
+    /// peer-id collision shape — shows this rising with nothing applied, which
+    /// before this counter existed was invisible at every log level.
+    pub ops_trimmed: u64,
     /// Last activity timestamp.
     pub last_activity: Instant,
     /// Session creation time.
@@ -101,8 +116,10 @@ impl SyncSession {
             mutations_processed: 0,
             mutations_applied: 0,
             mutations_not_applied: 0,
+            mutations_deduplicated: 0,
             mutations_rejected: 0,
             mutations_silent_dropped: 0,
+            ops_trimmed: 0,
             last_activity: now,
             created_at: now,
             rate_limiter: SyncRateLimiter::new(rate_config),

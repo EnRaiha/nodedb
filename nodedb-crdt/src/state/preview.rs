@@ -65,6 +65,14 @@ pub struct CrdtDeltaPreview {
     /// Number of new operations contributed beyond the fork's prior oplog
     /// version vector.
     pub imported_ops: usize,
+    /// Number of operations the delta encoded that this document already knew.
+    ///
+    /// Loro drops these during merge. A resync trims its replay prefix and then
+    /// advances (`imported_ops > 0`); a delta that trims entirely
+    /// (`imported_ops == 0` with `trimmed_ops > 0`) contributed nothing at all,
+    /// which is both what an idempotent replay looks like and what a peer-id
+    /// collision looks like. Counting it is what makes the second case visible.
+    pub trimmed_ops: usize,
 }
 
 impl CrdtState {
@@ -96,7 +104,7 @@ impl CrdtState {
         // a pre-import admission gate, including for deltas that would otherwise
         // be parked for missing causal dependencies.
         let authoritative_oplog = self.doc.oplog_vv();
-        let predicted_imported_ops = admit_import(
+        let admission = admit_import(
             delta,
             &authoritative_oplog,
             CrdtImportLimits {
@@ -137,7 +145,7 @@ impl CrdtState {
         }
         let after_oplog = fork.oplog_vv();
         let imported_ops = positive_oplog_advance(&before_oplog, &after_oplog)?;
-        if imported_ops != predicted_imported_ops {
+        if imported_ops != admission.new_operations {
             return Err(CrdtError::PreviewInvalidOperationRange);
         }
 
@@ -188,6 +196,7 @@ impl CrdtState {
             post_image_msgpack,
             resulting_frontier_digest: CrdtState::frontier_digest_from(&resulting_frontier),
             imported_ops,
+            trimmed_ops: admission.trimmed_operations(),
         })
     }
 }
@@ -610,6 +619,41 @@ mod tests {
             .expect("already-known snapshot must be idempotent");
         assert_eq!(preview.imported_ops, 0);
         assert!(preview.write_set.is_empty());
+        assert!(
+            preview.trimmed_ops > 0,
+            "a fully-known delta trimmed every operation it carried"
+        );
+    }
+
+    #[test]
+    fn a_resync_prefix_is_trimmed_while_the_new_suffix_still_imports() {
+        // The healthy shape the trim counter must not flag: a client re-pushes
+        // history it already sent, followed by writes the receiver has not seen.
+        let source = CrdtState::new(2).expect("source");
+        source
+            .upsert("docs", "known", &[("value", LoroValue::I64(1))])
+            .expect("first write");
+        let known = source.export_snapshot().expect("known prefix");
+
+        let receiver = CrdtState::new(1).expect("receiver");
+        receiver.import(&known).expect("prefix applies");
+
+        source
+            .upsert("docs", "fresh", &[("value", LoroValue::I64(2))])
+            .expect("second write");
+        let full = source.export_snapshot().expect("prefix + suffix");
+
+        let preview = receiver
+            .preview_delta(&full, "docs", "fresh", CrdtDeltaPreviewLimits::default())
+            .expect("resync preview");
+        assert!(
+            preview.imported_ops > 0,
+            "a resync advances after trimming its replay prefix"
+        );
+        assert!(
+            preview.trimmed_ops > 0,
+            "the replay prefix itself is trimmed"
+        );
     }
 
     #[test]

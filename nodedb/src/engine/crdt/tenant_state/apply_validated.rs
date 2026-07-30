@@ -37,7 +37,18 @@ pub enum ValidatedApplyOutcome {
     /// frame-declared row. A delta that wrote other or additional rows (a
     /// client that coalesced N upserts into one delta) must be rejected
     /// loudly — materializing just one row would silently drop the rest.
-    Clean { write_set: Vec<(String, String)> },
+    ///
+    /// `imported_ops` is how many operations the delta actually contributed.
+    /// Zero means the CRDT merge trimmed the whole delta as already-known: the
+    /// document did not move, so the caller must not report the write as
+    /// applied. That is correct and expected for an idempotent replay, and it
+    /// is also exactly what a peer-id collision looks like — two replicas
+    /// claiming one peer id write into overlapping `(peer, counter)` ranges and
+    /// the second one's operations are discarded as duplicates of the first's.
+    Clean {
+        write_set: Vec<(String, String)>,
+        imported_ops: usize,
+    },
     /// The candidate violated a constraint and was discarded. The violation
     /// has been enqueued to the DLQ and translated for the caller.
     Rejected(ViolationType),
@@ -124,8 +135,8 @@ impl TenantCrdtEngine {
             }
         }
         let before = candidate.frontier();
-        match candidate.import(delta) {
-            Ok(()) => {}
+        let admission = match candidate.import(delta) {
+            Ok(admission) => admission,
             // Well-formed operations that arrived without their causal history
             // (their predecessors live in another collection's document, absent
             // from this candidate). The candidate did not move, so this is NOT a
@@ -136,7 +147,7 @@ impl TenantCrdtEngine {
                 return ValidatedApplyOutcome::PendingDependencies;
             }
             Err(_) => return ValidatedApplyOutcome::Malformed,
-        }
+        };
         let write_set = match candidate.write_set_since(&before) {
             Ok(write_set) => write_set,
             Err(_) => return ValidatedApplyOutcome::Malformed,
@@ -189,7 +200,10 @@ impl TenantCrdtEngine {
             return ValidatedApplyOutcome::Rejected(violation);
         }
 
-        ValidatedApplyOutcome::Clean { write_set }
+        ValidatedApplyOutcome::Clean {
+            write_set,
+            imported_ops: admission.new_operations,
+        }
     }
 
     /// Enqueue a rejected delta to the DLQ and translate the internal violation
@@ -482,7 +496,7 @@ mod tests {
         // Guard against the specific silent-loss shape: reporting
         // `Clean { write_set: [] }` passes every downstream contract check
         // (an empty write-set is a legal no-op delete) while dropping the row.
-        if let ValidatedApplyOutcome::Clean { write_set } = &second {
+        if let ValidatedApplyOutcome::Clean { write_set, .. } = &second {
             assert!(
                 !write_set.is_empty(),
                 "clean apply with an empty write-set silently drops the row"
@@ -554,6 +568,90 @@ mod tests {
              be reported clean",
             engine.row_exists("users", "b")
         );
+    }
+
+    /// Two replicas claiming the same Loro peer id write into overlapping
+    /// `(peer, counter)` ranges. The CRDT merge trims the second replica's
+    /// operations as already-known, so its row is discarded while the import
+    /// itself succeeds.
+    ///
+    /// The apply cannot refuse this — the same trim is what makes an honest
+    /// resync idempotent — but it must not report the delta as having applied
+    /// anything. `imported_ops == 0` is the fact that separates "this delta put
+    /// the operations there" from "they were already there", and it is the only
+    /// thing standing between a collision and an `Applied` ack.
+    #[test]
+    fn a_delta_trimmed_by_a_colliding_peer_reports_no_imported_operations() {
+        let mut engine = unique_engine();
+
+        let delta_a = row_delta(1, "a", "a@y.com", "A");
+        let first = engine.apply_committed_delta_validated(
+            "users",
+            &delta_a,
+            nodedb_types::Surrogate::ZERO,
+            "a",
+            1,
+        );
+        match first {
+            ValidatedApplyOutcome::Clean { imported_ops, .. } => {
+                assert!(imported_ops > 0, "the first delta genuinely applied")
+            }
+            other => panic!("expected a clean apply, got {other:?}"),
+        }
+
+        // A fresh replica reusing peer id 1 restarts its counters at 0.
+        let delta_b = row_delta(1, "b", "b@y.com", "B");
+        let second = engine.apply_committed_delta_validated(
+            "users",
+            &delta_b,
+            nodedb_types::Surrogate::ZERO,
+            "b",
+            1,
+        );
+        match second {
+            ValidatedApplyOutcome::Clean {
+                write_set,
+                imported_ops,
+            } => {
+                assert_eq!(
+                    imported_ops, 0,
+                    "a fully-trimmed delta imported nothing; reporting otherwise is \
+                     what turns a peer-id collision into a silent loss"
+                );
+                assert!(write_set.is_empty());
+            }
+            other => panic!("expected a clean, zero-import apply, got {other:?}"),
+        }
+        assert!(
+            !engine.row_exists("users", "b"),
+            "this test only means something while the row is genuinely lost"
+        );
+    }
+
+    /// The counterpart that keeps the zero-import signal honest: a delta that
+    /// really does write its row must report a non-zero import, so
+    /// `imported_ops == 0` never fires on a healthy apply.
+    #[test]
+    fn a_delta_that_writes_its_row_reports_imported_operations() {
+        let mut engine = unique_engine();
+        let delta = row_delta(4, "solo", "solo@y.com", "S");
+        match engine.apply_committed_delta_validated(
+            "users",
+            &delta,
+            nodedb_types::Surrogate::ZERO,
+            "solo",
+            4,
+        ) {
+            ValidatedApplyOutcome::Clean {
+                write_set,
+                imported_ops,
+            } => {
+                assert!(imported_ops > 0);
+                assert_eq!(write_set, vec![("users".into(), "solo".into())]);
+            }
+            other => panic!("expected a clean apply, got {other:?}"),
+        }
+        assert!(engine.row_exists("users", "solo"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use loro::LoroDoc;
 use crate::error::{CrdtError, Result};
 
 use super::core::CrdtState;
-use super::import_admission::{CrdtImportLimits, admit_import};
+use super::import_admission::{CrdtImportLimits, ImportAdmission, admit_import};
 
 impl CrdtState {
     /// Export the current state as bytes for sync.
@@ -18,7 +18,9 @@ impl CrdtState {
     }
 
     /// Import remote updates under the finite default byte and operation caps.
-    pub fn import(&self, data: &[u8]) -> Result<()> {
+    ///
+    /// Returns the same [`ImportAdmission`] as [`Self::import_with_limits`].
+    pub fn import(&self, data: &[u8]) -> Result<ImportAdmission> {
         self.import_with_limits(data, CrdtImportLimits::default())
     }
 
@@ -33,8 +35,19 @@ impl CrdtState {
     /// success: a caller that took `Ok` here would acknowledge a write that
     /// was never applied. The buffered operations remain queued inside Loro,
     /// so a later import carrying the missing predecessors still converges.
-    pub fn import_with_limits(&self, data: &[u8], limits: CrdtImportLimits) -> Result<()> {
-        admit_import(data, &self.doc.oplog_vv(), limits)?;
+    ///
+    /// The returned [`ImportAdmission`] reports how much of the blob was new
+    /// and how much Loro trimmed as already-known. An `Ok` whose
+    /// `new_operations` is zero means the document did not move: correct for an
+    /// idempotent replay, and the exact shape a peer-id collision takes. A
+    /// caller that treats every `Ok` as "the write landed" cannot tell the two
+    /// apart, which is how a collision discards writes behind a green ack.
+    pub fn import_with_limits(
+        &self,
+        data: &[u8],
+        limits: CrdtImportLimits,
+    ) -> Result<ImportAdmission> {
+        let admission = admit_import(data, &self.doc.oplog_vv(), limits)?;
         let status = self
             .doc
             .import(data)
@@ -42,7 +55,7 @@ impl CrdtState {
         if status.pending.is_some() {
             return Err(CrdtError::ImportPendingDependencies);
         }
-        Ok(())
+        Ok(admission)
     }
 
     /// Compact the CRDT history by replacing the internal LoroDoc with a
@@ -206,6 +219,68 @@ mod tests {
         let before = receiver.frontier();
         receiver.import(&stale).expect("stale replay is idempotent");
         assert_eq!(receiver.frontier(), before);
+    }
+
+    #[test]
+    fn a_first_import_trims_nothing_and_counts_every_operation_as_new() {
+        let delta = source_delta();
+        let state = CrdtState::new(1).expect("state");
+        let admission = state.import(&delta).expect("first import");
+        assert!(admission.new_operations > 0);
+        assert_eq!(admission.trimmed_operations(), 0);
+        assert_eq!(admission.encoded_operations, admission.new_operations);
+    }
+
+    #[test]
+    fn a_replayed_delta_reports_every_operation_trimmed() {
+        let delta = source_delta();
+        let state = CrdtState::new(1).expect("state");
+        let first = state.import(&delta).expect("first import");
+        let replay = state.import(&delta).expect("replay is idempotent");
+
+        // The replay reports `Ok`, exactly as it must — but nothing moved, and
+        // the counts are the only thing that says so.
+        assert_eq!(replay.new_operations, 0);
+        assert_eq!(replay.trimmed_operations(), first.encoded_operations);
+    }
+
+    /// Two replicas that claim the same Loro peer id allocate overlapping
+    /// `(peer, counter)` ranges for *different* writes. Loro trims the second
+    /// replica's operations as already-known and reports a successful import,
+    /// so the row it carried is silently discarded.
+    ///
+    /// The import cannot refuse this — trimming is how idempotent resync works,
+    /// and at the `(peer, counter)` level the two cases are identical. What it
+    /// must do is report the difference: an import that contributed nothing is
+    /// distinguishable from one that advanced the document.
+    #[test]
+    fn a_colliding_peer_id_import_reports_no_new_operations() {
+        let first_replica = CrdtState::new(1).expect("first replica");
+        first_replica
+            .upsert("docs", "from-a", &[("value", LoroValue::I64(1))])
+            .expect("replica A write");
+        let delta_a = first_replica.export_snapshot().expect("replica A delta");
+
+        // A fresh replica claiming the same peer id restarts its counters at 0.
+        let second_replica = CrdtState::new(1).expect("second replica");
+        second_replica
+            .upsert("docs", "from-b", &[("value", LoroValue::I64(2))])
+            .expect("replica B write");
+        let delta_b = second_replica.export_snapshot().expect("replica B delta");
+
+        let origin = CrdtState::new(99).expect("origin");
+        origin.import(&delta_a).expect("replica A applies");
+        let collided = origin.import(&delta_b).expect("replica B is not refused");
+
+        assert_eq!(
+            collided.new_operations, 0,
+            "a colliding peer id contributes no new operations"
+        );
+        assert!(collided.trimmed_operations() > 0);
+        assert!(
+            !origin.row_exists("docs", "from-b"),
+            "this test only means something while the row is genuinely lost"
+        );
     }
 
     /// Loro accepts a delta whose causal predecessors are missing and buffers

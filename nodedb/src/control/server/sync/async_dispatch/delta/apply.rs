@@ -19,7 +19,31 @@ use super::super::super::wire::{
 };
 use super::authorize::{authorize_delta_write, permission_denied_delta_reject};
 use super::outcome::frame_for_dispatch;
+use super::peer_identity::{
+    PeerIdentity, PeerIdentityRequest, admit_peer_identity, peer_collision_reason,
+};
 use super::signature::delta_signature_valid;
+
+/// What one delta's durable dispatch produced.
+///
+/// The frame is what the client is told; `trimmed_ops` is what the delta
+/// actually carried. They are returned together because the session needs both
+/// and neither can be derived from the other: two deltas with opposite
+/// consequences for the client's data can produce the same frame.
+pub(crate) struct DeltaDispatchOutcome {
+    pub(crate) frame: Option<SyncFrame>,
+    pub(crate) trimmed_ops: u64,
+}
+
+impl DeltaDispatchOutcome {
+    /// A refusal decided before any CRDT merge ran, so nothing was trimmed.
+    fn refused(frame: Option<SyncFrame>) -> Self {
+        Self {
+            frame,
+            trimmed_ops: 0,
+        }
+    }
+}
 
 /// Apply a CRDT delta on the Data Plane, converting the outcome into the final
 /// client frame.
@@ -37,7 +61,7 @@ pub(crate) async fn apply_delta_and_finalize(
     session_signing_key: Option<&[u8; 32]>,
     session_producer_id: u64,
     session_epoch: u64,
-) -> Option<SyncFrame> {
+) -> DeltaDispatchOutcome {
     use crate::bridge::envelope::PhysicalPlan;
     use nodedb_physical::physical_plan::CrdtOp;
 
@@ -47,11 +71,15 @@ pub(crate) async fn apply_delta_and_finalize(
     // fallback tenant or reconstructed principal.
     let tenant_id = match authorize_delta_write(shared, identity, &delta_msg.collection) {
         Ok(tenant_id) => tenant_id,
-        Err(_) => return permission_denied_delta_reject(delta_msg),
+        Err(_) => {
+            return DeltaDispatchOutcome::refused(permission_denied_delta_reject(delta_msg));
+        }
     };
     let identity = match identity {
         Some(identity) => identity,
-        None => return permission_denied_delta_reject(delta_msg),
+        None => {
+            return DeltaDispatchOutcome::refused(permission_denied_delta_reject(delta_msg));
+        }
     };
     // Same binding the session's reads use: the principal's database, not the
     // built-in default. A delta must land in the database its subscriber will
@@ -132,6 +160,49 @@ pub(crate) async fn apply_delta_and_finalize(
         );
     }
 
+    // Hold the delta's Loro peer id to this session's producer before a
+    // surrogate is assigned or anything is dispatched. A colliding peer id is
+    // refused here because it cannot be refused later: past this point the
+    // merge absorbs the delta and reports success.
+    let peer_identity = admit_peer_identity(
+        shared,
+        PeerIdentityRequest {
+            database_id,
+            tenant_id,
+            collection: &delta_msg.collection,
+            peer_id: delta_msg.peer_id,
+            producer_id: session_producer_id,
+        },
+    )
+    .await;
+    match peer_identity {
+        Ok(PeerIdentity::Owned | PeerIdentity::Unbound) => {}
+        Ok(PeerIdentity::Collision { owner_producer_id }) => {
+            let reason =
+                peer_collision_reason(&delta_msg.collection, delta_msg.peer_id, owner_producer_id);
+            return terminal_reject(
+                delta_msg,
+                reason.clone(),
+                CompensationHint::Custom {
+                    constraint: "peer_id_collision".into(),
+                    detail: reason,
+                },
+            );
+        }
+        Err(error) => {
+            // The binding could not be established, so whether this peer id is
+            // safe to write under is unknown. Admitting the delta would gamble
+            // the client's write on it; refusing retryably costs a re-push.
+            warn!(
+                %error,
+                collection = %delta_msg.collection,
+                peer_id = delta_msg.peer_id,
+                "sync: peer-id binding unavailable; refusing the delta retryably"
+            );
+            return DeltaDispatchOutcome::refused(retryable_binding_refusal(delta_msg));
+        }
+    }
+
     let surrogate = match shared.surrogate_assigner.assign(
         database_id,
         tenant_id,
@@ -207,7 +278,37 @@ pub(crate) async fn apply_delta_and_finalize(
         Err(error) => Err(error),
     };
 
-    frame_for_dispatch(delta_msg, &ack_frame, dispatch_result)
+    let trimmed_ops = dispatch_result
+        .as_ref()
+        .map(|outcome| outcome.trimmed_ops)
+        .unwrap_or(0);
+    DeltaDispatchOutcome {
+        frame: frame_for_dispatch(
+            delta_msg,
+            &ack_frame,
+            dispatch_result.map(|outcome| outcome.payload),
+        ),
+        trimmed_ops,
+    }
+}
+
+/// Refuse retryably: nothing was applied and the identical delta at the same
+/// sequence should be re-pushed once the binding can be established.
+fn retryable_binding_refusal(delta_msg: &DeltaPushMsg) -> Option<SyncFrame> {
+    use nodedb_types::sync::wire::AckStatus;
+
+    use super::super::super::wire::DeltaAckMsg;
+
+    let ack = DeltaAckMsg {
+        mutation_id: delta_msg.mutation_id,
+        lsn: 0,
+        clock_skew_warning_ms: None,
+        applied_seq: delta_msg.seq.saturating_sub(1),
+        status: AckStatus::Gap {
+            expected: delta_msg.seq,
+        },
+    };
+    SyncFrame::try_encode(SyncMessageType::DeltaAck, &ack)
 }
 
 /// A refusal decided in the Control Plane before the apply was ever attempted.
@@ -219,11 +320,11 @@ fn terminal_reject(
     delta_msg: &DeltaPushMsg,
     reason: impl Into<String>,
     compensation: CompensationHint,
-) -> Option<SyncFrame> {
+) -> DeltaDispatchOutcome {
     let reject = DeltaRejectMsg {
         mutation_id: delta_msg.mutation_id,
         reason: reason.into(),
         compensation: Some(compensation),
     };
-    SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject)
+    DeltaDispatchOutcome::refused(SyncFrame::try_encode(SyncMessageType::DeltaReject, &reject))
 }

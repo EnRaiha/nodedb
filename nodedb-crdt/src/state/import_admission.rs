@@ -30,16 +30,43 @@ impl Default for CrdtImportLimits {
     }
 }
 
+/// What an admitted import will and will not contribute.
+///
+/// Loro's merge silently drops the operations an importing document already
+/// knows (`trim_the_known_part_of_change`), which is how idempotent resync
+/// works — and also how a peer-id collision discards a healthy client's writes
+/// without a trace. The two counts are kept apart here because only their
+/// difference distinguishes "this delta advanced the document" from "every
+/// operation in this delta was already accounted for".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportAdmission {
+    /// Operations encoded in the blob, including ones already known.
+    pub encoded_operations: usize,
+    /// Operations that are new relative to the importing document's oplog.
+    pub new_operations: usize,
+}
+
+impl ImportAdmission {
+    /// Operations the import carries that the document already had.
+    ///
+    /// This is the count Loro trims away during merge. A healthy resync trims
+    /// its replay prefix and then advances; a fully-trimmed import contributes
+    /// nothing at all.
+    pub fn trimmed_operations(&self) -> usize {
+        self.encoded_operations.saturating_sub(self.new_operations)
+    }
+}
+
 /// Validate an encoded Loro import before a fork or Loro import can allocate.
 ///
-/// Returns the exact number of operations that would be new relative to
-/// `current`. Metadata is decoded with Loro's authenticated decoder; malformed
-/// or regressing per-peer ranges are rejected before any state mutation.
+/// Returns the exact encoded and new operation counts relative to `current`.
+/// Metadata is decoded with Loro's authenticated decoder; malformed or
+/// regressing per-peer ranges are rejected before any state mutation.
 pub(crate) fn admit_import(
     bytes: &[u8],
     current: &loro::VersionVector,
     limits: CrdtImportLimits,
-) -> Result<usize> {
+) -> Result<ImportAdmission> {
     if bytes.len() > limits.max_bytes {
         return Err(CrdtError::ImportTooLarge {
             limit: limits.max_bytes,
@@ -70,7 +97,10 @@ pub(crate) fn admit_import(
             actual: imported,
         });
     }
-    Ok(imported)
+    Ok(ImportAdmission {
+        encoded_operations: encoded,
+        new_operations: imported,
+    })
 }
 
 /// Count all operations carried by authenticated import metadata.

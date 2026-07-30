@@ -408,6 +408,7 @@ mod tests {
         let result = CrdtPreviewResult {
             post_image_msgpack: vec![0xc0],
             imported_ops: 17,
+            trimmed_ops: 0,
             frontier_digest: [0x5a; 32],
         };
         let payload = zerompk::to_msgpack_vec(&result).expect("preview result serializes");

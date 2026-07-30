@@ -89,6 +89,7 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     // ── Sync producer registry ──
     "sync_producer_hwm" => super::sync_producer::SYNC_PRODUCER_HWM,
     "sync_producers" => super::sync_producer::SYNC_PRODUCERS,
+    "sync_peer_bindings" => super::sync_producer::SYNC_PEER_BINDINGS,
     "crdt_signing_keys" => super::sync_producer::CRDT_SIGNING_KEYS,
     "crdt_signing_root_metadata" => super::sync_producer::CRDT_SIGNING_ROOT_METADATA,
     "join_token_states" => super::sync_producer::JOIN_TOKEN_STATES,

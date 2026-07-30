@@ -6,7 +6,11 @@
 ///
 /// `post_image_msgpack` encodes `Option<Value>` with zerompk. `None` represents
 /// a target row absent after a valid delete; it is distinct from `Some(Null)`.
+///
+/// Map-encoded so fields can be added with `#[msgpack(default)]` and payloads
+/// written by an older peer still decode without a migration.
 #[derive(Debug, Clone, PartialEq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+#[msgpack(map, allow_unknown_fields)]
 pub struct CrdtPreviewResult {
     /// Canonical zerompk encoding of the validated target post-image.
     pub post_image_msgpack: Vec<u8>,
@@ -14,4 +18,13 @@ pub struct CrdtPreviewResult {
     pub imported_ops: u64,
     /// Domain-bound current frontier digest used to fence the subsequent apply.
     pub frontier_digest: [u8; 32],
+    /// Operations the delta encoded that the target document already knew and
+    /// the CRDT merge therefore discards.
+    ///
+    /// A resync trims its replay prefix and still advances (`imported_ops > 0`).
+    /// A delta that trims entirely contributed nothing — the shape both an
+    /// idempotent replay and a peer-id collision take — and without this count
+    /// the second is indistinguishable from the first at the session boundary.
+    #[msgpack(default)]
+    pub trimmed_ops: u64,
 }

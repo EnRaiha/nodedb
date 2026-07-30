@@ -22,10 +22,13 @@
 //! invoked by `MetadataCommitApplier` on every node (including the leader)
 //! when those Raft entries commit.
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::control::security::catalog::SystemCatalog;
-use crate::control::security::catalog::sync_producer::StoredProducerRegistration;
+use crate::control::security::catalog::sync_producer::{
+    PeerBindingKey, StoredProducerRegistration,
+};
 use crate::control::sync_producer::allocator::{ProducerHwmPersist, ProducerIdAllocator};
 use crate::control::sync_producer::persist::SystemCatalogProducerHwm;
 
@@ -75,9 +78,23 @@ impl From<&ProducerRegistration> for StoredProducerRegistration {
 ///
 /// `Send + Sync` — Control Plane only; no io_uring, no Data Plane types.
 pub struct SyncProducerRegistry {
-    catalog: Arc<SystemCatalog>,
+    pub(super) catalog: Arc<SystemCatalog>,
     alloc: ProducerIdAllocator,
     registration_lock: Mutex<()>,
+    /// Which producer owns each Loro peer id, mirrored from the catalog.
+    ///
+    /// Every inbound delta consults this, so it is answered from memory; the
+    /// catalog rows remain the durable authority and are re-read whenever the
+    /// key is not already known.
+    pub(super) peer_bindings: RwLock<HashMap<PeerBindingKey, u64>>,
+    /// Bindings this process has seen replicated, deliberately not persisted.
+    ///
+    /// A durable row proves this node claimed the peer id, not that the cluster
+    /// agreed: a proposal can fail after the local write, and after a restart
+    /// nothing distinguishes the two. Starting empty makes the first delta of
+    /// each process re-propose an already-durable claim — idempotent, and the
+    /// only thing that keeps an unreplicated claim from being trusted forever.
+    pub(super) converged_peer_bindings: RwLock<std::collections::HashSet<PeerBindingKey>>,
 }
 
 impl SyncProducerRegistry {
@@ -87,10 +104,17 @@ impl SyncProducerRegistry {
     pub fn open(catalog: Arc<SystemCatalog>) -> crate::Result<Self> {
         let hwm = catalog.get_producer_hwm()?;
         let alloc = ProducerIdAllocator::from_persisted_hwm(hwm);
+        let peer_bindings = catalog
+            .list_peer_bindings()?
+            .into_iter()
+            .map(|(key, binding)| (key, binding.producer_id))
+            .collect();
         Ok(Self {
             catalog,
             alloc,
             registration_lock: Mutex::new(()),
+            peer_bindings: RwLock::new(peer_bindings),
+            converged_peer_bindings: RwLock::new(std::collections::HashSet::new()),
         })
     }
 

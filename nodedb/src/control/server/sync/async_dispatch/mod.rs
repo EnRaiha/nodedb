@@ -10,6 +10,7 @@ mod delta;
 mod shape;
 
 pub(super) use delta::{
-    apply_delta_and_finalize, authorize_delta_write, permission_denied_delta_reject,
+    DeltaDispatchOutcome, apply_delta_and_finalize, authorize_delta_write,
+    permission_denied_delta_reject,
 };
 pub(super) use shape::{handle_resync_request_async, handle_shape_subscribe_async};

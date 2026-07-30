@@ -82,7 +82,7 @@ impl CoreLoop {
                 peer_id,
             );
             match outcome {
-                ValidatedApplyOutcome::Clean { write_set } => {
+                ValidatedApplyOutcome::Clean { write_set, .. } => {
                     imported_authoritative = true;
                     // Enforce the one-document-per-delta contract before
                     // materializing: a delta that wrote rows other than the

@@ -7,6 +7,15 @@ use tracing::{debug, warn};
 
 use super::types::MetadataCommitApplier;
 
+pub(super) struct SyncPeerBindApply<'a> {
+    pub(super) database_id: u64,
+    pub(super) tenant_id: u64,
+    pub(super) collection: &'a str,
+    pub(super) peer_id: u64,
+    pub(super) producer_id: u64,
+    pub(super) bound_ms: i64,
+}
+
 pub(super) struct SyncProducerRegistrationApply<'a> {
     pub(super) lite_id: &'a str,
     pub(super) producer_id: u64,
@@ -83,6 +92,56 @@ impl MetadataCommitApplier {
                 });
             }
             debug!(lite_id = %lite_id, new_epoch, raft_index, "sync producer fenced via raft");
+        }
+        Ok(())
+    }
+
+    pub(super) fn apply_sync_peer_bind(
+        &self,
+        binding: SyncPeerBindApply<'_>,
+        raft_index: u64,
+    ) -> Result<(), crate::Error> {
+        let SyncPeerBindApply {
+            database_id,
+            tenant_id,
+            collection,
+            peer_id,
+            producer_id,
+            bound_ms,
+        } = binding;
+        if let Some(weak) = self.shared.get()
+            && let Some(shared) = weak.upgrade()
+        {
+            let Some(registry) = shared.producer_registry.as_deref() else {
+                return Ok(());
+            };
+            let key = crate::control::security::catalog::sync_producer::PeerBindingKey::new(
+                database_id,
+                tenant_id,
+                collection,
+                peer_id,
+            );
+            // Lowest-producer-id-wins, so re-delivery and reordering both
+            // converge; a write failure must not advance the watermark.
+            if let Err(e) = registry.apply_bind_peer(&key, producer_id, bound_ms) {
+                warn!(
+                    collection = %collection,
+                    peer_id,
+                    producer_id,
+                    error = %e,
+                    "sync_peer_bind apply failed — halting watermark for retry"
+                );
+                return Err(crate::Error::Internal {
+                    detail: format!("sync_peer_bind apply failed: {e}"),
+                });
+            }
+            debug!(
+                collection = %collection,
+                peer_id,
+                producer_id,
+                raft_index,
+                "loro peer id bound to producer via raft"
+            );
         }
         Ok(())
     }

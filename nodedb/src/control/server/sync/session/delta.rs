@@ -202,7 +202,12 @@ impl SyncSession {
                     return;
                 };
                 match ack.status {
-                    AckStatus::Applied | AckStatus::Duplicate => self.mutations_applied += 1,
+                    AckStatus::Applied => self.mutations_applied += 1,
+                    // A duplicate applied nothing — its operations were already
+                    // there. Counting it as an apply is what made a session
+                    // whose every delta was discarded close indistinguishable
+                    // from one that landed every write.
+                    AckStatus::Duplicate => self.mutations_deduplicated += 1,
                     // `Gap` is a retryable refusal: nothing applied, and the
                     // client is expected to re-push. It belongs with the other
                     // not-applied outcomes, not with the rejections — counting
@@ -216,6 +221,17 @@ impl SyncSession {
             }
             _ => {}
         }
+    }
+
+    /// Record what the CRDT admission preview measured about one delta before
+    /// it was applied.
+    ///
+    /// The ack says what the server decided; this says what the delta actually
+    /// carried. Only the second can distinguish a client whose writes are being
+    /// discarded from one that is merely re-sending history, because both
+    /// produce the same ack.
+    pub fn record_delta_admission(&mut self, trimmed_ops: u64) {
+        self.ops_trimmed = self.ops_trimmed.saturating_add(trimmed_ops);
     }
 }
 

@@ -42,8 +42,37 @@ pub struct SyncTestClient {
 }
 
 impl SyncTestClient {
-    /// Connect to `addr` and perform the Trust-mode handshake.
+    /// Connect to `addr` and perform the Trust-mode handshake as a non-Lite
+    /// client: no `lite_id`, so the server assigns no durable producer id.
     pub async fn connect(addr: SocketAddr) -> Result<Self, String> {
+        Self::connect_with_lite_id(addr, String::new(), 0).await
+    }
+
+    /// Connect as a Lite client with a durable identity.
+    ///
+    /// A `lite_id` plus a non-zero epoch is what makes the server register a
+    /// producer for this connection. Anything that depends on distinguishing
+    /// one client from another — peer-id ownership, epoch fencing — is inert
+    /// without it, so tests for those must connect this way.
+    pub async fn connect_as_lite(
+        addr: SocketAddr,
+        lite_id: &str,
+        epoch: u64,
+    ) -> Result<Self, String> {
+        Self::connect_with_lite_id(addr, lite_id.to_string(), epoch).await
+    }
+
+    /// The durable producer id the server assigned to this connection, or `0`
+    /// when it connected without a Lite identity.
+    pub fn producer_id(&self) -> u64 {
+        self.producer_id
+    }
+
+    async fn connect_with_lite_id(
+        addr: SocketAddr,
+        lite_id: String,
+        epoch: u64,
+    ) -> Result<Self, String> {
         let url = format!("ws://{addr}");
         let (mut ws, _resp) = connect_async(&url)
             .await
@@ -54,8 +83,8 @@ impl SyncTestClient {
             vector_clock: HashMap::new(),
             subscribed_shapes: Vec::new(),
             client_version: "test".to_string(),
-            lite_id: String::new(),
-            epoch: 0,
+            lite_id,
+            epoch,
             wire_version: nodedb_types::wire_version::WIRE_FORMAT_VERSION,
         };
         let frame = SyncFrame::try_encode(SyncMessageType::Handshake, &handshake)

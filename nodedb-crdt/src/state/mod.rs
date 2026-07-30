@@ -20,7 +20,9 @@ pub mod write_set;
 mod tests;
 
 pub use core::CrdtState;
-pub use import_admission::{CrdtImportLimits, DEFAULT_MAX_IMPORT_BYTES, DEFAULT_MAX_IMPORT_OPS};
+pub use import_admission::{
+    CrdtImportLimits, DEFAULT_MAX_IMPORT_BYTES, DEFAULT_MAX_IMPORT_OPS, ImportAdmission,
+};
 pub use preview::{
     CrdtDeltaPreview, CrdtDeltaPreviewLimits, DEFAULT_MAX_DELTA_BYTES,
     DEFAULT_MAX_ENCODED_DELTA_OPS, DEFAULT_MAX_POST_IMAGE_BYTES,

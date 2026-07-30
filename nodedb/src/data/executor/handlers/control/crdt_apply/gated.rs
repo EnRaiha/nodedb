@@ -34,6 +34,12 @@ use super::params::CrdtApplyParams;
 enum GateDisposition {
     /// The delta is authoritative state now.
     Applied,
+    /// Every operation the delta carried was already in this document, so the
+    /// applied state did not move. The sender may retire the write — the
+    /// operations are present — but calling it `Applied` would claim this
+    /// delta put them there, which is the one thing that makes a peer-id
+    /// collision indistinguishable from an idempotent replay.
+    Deduplicated,
     /// Nothing was applied and the identical delta at the same seq is expected
     /// to succeed later. The high-water-mark is held back so the re-push is
     /// admitted rather than deduplicated.
@@ -136,7 +142,7 @@ impl CoreLoop {
         // applied the identical log prefix and therefore has the identical
         // installed `constraint_versions[collection]` — the gate decision is
         // deterministic across replicas, no divergence.
-        let (outcome, materialized) = {
+        let (outcome, materialized, declared_row_present) = {
             let engine = match self.get_crdt_engine(task.request.database_id, tenant_id) {
                 Ok(e) => e,
                 Err(e) => {
@@ -151,7 +157,7 @@ impl CoreLoop {
             };
             let installed = engine.installed_constraint_version(collection);
             if constraint_version_required > installed {
-                (GateOutcome::Pending { installed }, None)
+                (GateOutcome::Pending { installed }, None, false)
             } else {
                 let applied = engine.apply_committed_delta_authenticated(
                     collection,
@@ -172,17 +178,29 @@ impl CoreLoop {
                         preverified: true,
                     },
                 );
-                // On a Clean apply, read the merged row back and encode it
-                // while the engine borrow is still live so the bytes can be
-                // materialized into the sparse store below.
-                let mat = if matches!(applied, ValidatedApplyOutcome::Clean { .. })
-                    && surrogate != Surrogate::ZERO
-                {
+                // On a Clean apply that actually imported something, read the
+                // merged row back and encode it while the engine borrow is
+                // still live so the bytes can be materialized into the sparse
+                // store below. A delta that imported nothing has nothing new to
+                // materialize.
+                let advanced = matches!(
+                    applied,
+                    ValidatedApplyOutcome::Clean {
+                        imported_ops: 1..,
+                        ..
+                    }
+                );
+                let mat = if advanced && surrogate != Surrogate::ZERO {
                     Self::encode_crdt_row(engine, collection, document_id)
                 } else {
                     None
                 };
-                (GateOutcome::Applied(applied), mat)
+                // Whether the row this frame declared is readable at all. Only
+                // consulted for a delta that imported nothing, where it is the
+                // difference between a replay of a write that is present and a
+                // write that was discarded before it ever landed.
+                let declared_row_present = engine.row_exists(collection, document_id);
+                (GateOutcome::Applied(applied), mat, declared_row_present)
             }
         };
         // engine borrow is dropped here; mark_dirty / sync_commit take
@@ -205,9 +223,10 @@ impl CoreLoop {
                 );
                 GateDisposition::Retryable
             }
-            GateOutcome::Applied(ValidatedApplyOutcome::Clean { write_set }) => {
-                imported_authoritative = true;
-                self.checkpoint_coordinator.mark_dirty("crdt", 1);
+            GateOutcome::Applied(ValidatedApplyOutcome::Clean {
+                write_set,
+                imported_ops,
+            }) => {
                 // Enforce the one-document-per-delta sync contract. A delta
                 // that coalesced multiple documents (or targeted a synthetic
                 // frame id that matches no written row) cannot be materialized
@@ -215,8 +234,9 @@ impl CoreLoop {
                 // re-pushes one delta per document instead of silently losing
                 // rows.
                 match Self::single_document_write_set(collection, document_id, &write_set) {
-                    Ok(()) => GateDisposition::Applied,
                     Err(detail) => {
+                        imported_authoritative = true;
+                        self.checkpoint_coordinator.mark_dirty("crdt", 1);
                         warn!(
                             core = self.core_id,
                             %collection,
@@ -225,6 +245,37 @@ impl CoreLoop {
                             "crdt sync apply rejected: multi-document delta violates one-document-per-delta contract"
                         );
                         GateDisposition::Terminal(ViolationType::ConstraintViolation { detail })
+                    }
+                    // The delta contributed no operations: every one it carried
+                    // was already in this document, so nothing was written and
+                    // nothing is dirty. Reporting `Applied` here is what let a
+                    // peer-id collision retire a write that was discarded.
+                    Ok(()) if imported_ops == 0 => {
+                        if !declared_row_present {
+                            // The delta imported nothing AND the row it declared
+                            // does not exist. A replayed delete looks like this
+                            // and is harmless; so does a delta whose operations
+                            // were consumed by another replica claiming the same
+                            // peer id, and that one lost a write. The peer-id
+                            // binding at the session boundary is what keeps the
+                            // second case from reaching here — if this fires,
+                            // that binding was unavailable for this producer.
+                            warn!(
+                                core = self.core_id,
+                                %collection,
+                                %document_id,
+                                peer_id,
+                                "crdt sync apply imported no operations and its declared row is \
+                                 absent: a replayed delete, or a peer id shared with another \
+                                 replica whose writes consumed this counter range"
+                            );
+                        }
+                        GateDisposition::Deduplicated
+                    }
+                    Ok(()) => {
+                        imported_authoritative = true;
+                        self.checkpoint_coordinator.mark_dirty("crdt", 1);
+                        GateDisposition::Applied
                     }
                 }
             }
@@ -303,6 +354,14 @@ impl CoreLoop {
                 // holding the stream for it buys nothing.
                 self.sync_commit(prov);
                 self.sync_reject_response(task, violation, prov.seq)
+            }
+            GateDisposition::Deduplicated => {
+                // The operations are in the document, so the sender is free to
+                // retire the write and a re-push must dedup rather than be
+                // admitted again: the mark advances exactly as it does for an
+                // apply. Only the reported status differs, and it has to.
+                self.sync_commit(prov);
+                self.sync_ack_response(task, AckStatus::Duplicate, prov.seq)
             }
             GateDisposition::Applied => {
                 self.sync_commit(prov);
