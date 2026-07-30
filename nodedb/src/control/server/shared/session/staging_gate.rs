@@ -21,7 +21,7 @@ use std::future::Future;
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::gateway::RouteDecision;
 use crate::control::server::shared::sql::staging_predicates::{
-    extract_affected_count, is_stageable_write, staged_tag_kind,
+    is_stageable_write, require_affected_count, staged_tag_kind,
 };
 use crate::control::server::shared::write_admission::plan_requires_txn_buffering;
 use crate::control::state::SharedState;
@@ -237,8 +237,21 @@ where
         });
     }
 
-    let affected = extract_affected_count(resp.payload.as_ref()).unwrap_or(1) as usize;
     let kind = staged_tag_kind(&task.plan, resp.payload.as_ref());
+
+    // Every count-bearing stage handler answers with a real count
+    // (`stage_count_response`), so a missing one means a staging handler stopped
+    // reporting — surface it instead of assuming the statement touched a row.
+    //
+    // `RawPayload` is the one outcome with no count to report: the atomic KV ops
+    // (`Incr` / `IncrFloat` / `Cas` / `GetSet` / `Transfer`) answer with a
+    // computed VALUE, which the caller reads from `payload`. `affected` is never
+    // rendered for those, so there is nothing to require and nothing to assume.
+    let affected = if matches!(kind, StagedTagKind::RawPayload) {
+        0
+    } else {
+        require_affected_count(resp.payload.as_ref()).map_err(StagingGateError::Dispatch)? as usize
+    };
     let payload = resp.payload.as_ref().to_vec();
 
     // Durable path unchanged: still buffered, replayed at COMMIT.

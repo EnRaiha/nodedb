@@ -36,11 +36,16 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
             returning: Some(_), ..
         }) => PlanKind::ReturningRows,
 
+        // A CRDT delete can legitimately remove nothing (the document was
+        // already tombstoned), so its affected count is only knowable from the
+        // write's own response — it must render as a DML count, not as a
+        // document-shaped read whose count no consumer ever reads.
+        PhysicalPlan::Crdt(CrdtOp::DocDelete { .. }) => DmlResult("DELETE"),
+
         PhysicalPlan::Document(DocumentOp::PointGet { .. })
         | PhysicalPlan::Crdt(CrdtOp::Read { .. })
         | PhysicalPlan::Crdt(CrdtOp::GetPolicy { .. })
-        | PhysicalPlan::Crdt(CrdtOp::DocUpsert { .. })
-        | PhysicalPlan::Crdt(CrdtOp::DocDelete { .. }) => PlanKind::SingleDocument,
+        | PhysicalPlan::Crdt(CrdtOp::DocUpsert { .. }) => PlanKind::SingleDocument,
 
         PhysicalPlan::Vector(VectorOp::Search { .. })
         | PhysicalPlan::Vector(VectorOp::MultiSearch { .. })
@@ -109,8 +114,15 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         PhysicalPlan::Query(QueryOp::PostProcess { input, .. }) => describe_plan(input),
 
         // DML operations that return affected row count.
+        //
+        // `PointInsert` and `KvOp::InsertIfAbsent` are here because
+        // `ON CONFLICT DO NOTHING` makes them no-op-capable: the count is 0 when
+        // the key was already present, so it has to be read from the write's
+        // response instead of assumed from the plan.
         PhysicalPlan::Document(DocumentOp::PointPut { .. })
+        | PhysicalPlan::Document(DocumentOp::PointInsert { .. })
         | PhysicalPlan::Document(DocumentOp::BatchInsert { .. })
+        | PhysicalPlan::Kv(KvOp::InsertIfAbsent { .. })
         | PhysicalPlan::Columnar(ColumnarOp::Insert { .. }) => DmlResult("INSERT"),
 
         PhysicalPlan::Document(DocumentOp::PointUpdate {
@@ -137,6 +149,12 @@ pub fn describe_plan(plan: &PhysicalPlan) -> PlanKind {
         PhysicalPlan::Document(DocumentOp::UpdateFromJoin { .. }) => DmlResult("UPDATE"),
 
         PhysicalPlan::Document(DocumentOp::Truncate { .. }) => DmlResult("TRUNCATE"),
+
+        // KV delete / truncate count the keys they removed. Classifying them as
+        // opaque `Execution` discarded that count, so a KV delete reported no
+        // rows however many keys it actually removed.
+        PhysicalPlan::Kv(KvOp::Delete { .. }) => DmlResult("DELETE"),
+        PhysicalPlan::Kv(KvOp::Truncate { .. }) => DmlResult("TRUNCATE"),
 
         PhysicalPlan::Document(DocumentOp::InsertSelect { .. }) => DmlResult("INSERT"),
 

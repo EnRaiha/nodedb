@@ -163,6 +163,87 @@ async fn in_tx_rollback_discards_staged_writes() {
     );
 }
 
+/// A staged `DELETE` reports the rows it would remove, so a primary key that
+/// was already deleted before the transaction opened reports 0 — the staged
+/// count is resolved against BASE ∪ OVERLAY exactly like the staged INSERT's
+/// existence check, not assumed from the statement shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_tx_delete_of_already_deleted_pk_reports_zero_rows() {
+    let server = TestServer::start().await;
+    setup(&server).await;
+    server.exec("DELETE FROM t WHERE id = 'a'").await.unwrap();
+
+    server.exec("BEGIN").await.unwrap();
+
+    let msgs = server
+        .client
+        .simple_query("DELETE FROM t WHERE id = 'a'")
+        .await
+        .expect("in-tx delete of an absent row should succeed");
+    assert_eq!(
+        command_count(&msgs),
+        Some(0),
+        "in-tx DELETE of an already-deleted primary key must report 0 rows"
+    );
+
+    server.client.simple_query("COMMIT").await.unwrap();
+
+    // The no-op delete must not have disturbed the rest of the collection.
+    let b = server
+        .query_text("SELECT n FROM t WHERE id = 'b'")
+        .await
+        .unwrap();
+    assert_eq!(
+        b,
+        vec!["2"],
+        "no-op delete must leave other rows, got {b:?}"
+    );
+}
+
+/// Deleting the same primary key twice inside one transaction reports `1` then
+/// `0`: the second statement sees the first statement's tombstone in the
+/// overlay, so it removes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_tx_repeated_delete_of_same_pk_reports_one_then_zero() {
+    let server = TestServer::start().await;
+    setup(&server).await;
+
+    server.exec("BEGIN").await.unwrap();
+
+    let first = server
+        .client
+        .simple_query("DELETE FROM t WHERE id = 'a'")
+        .await
+        .expect("first in-tx delete should succeed");
+    assert_eq!(
+        command_count(&first),
+        Some(1),
+        "the in-tx delete that removed the row must report 1"
+    );
+
+    let second = server
+        .client
+        .simple_query("DELETE FROM t WHERE id = 'a'")
+        .await
+        .expect("second in-tx delete should succeed");
+    assert_eq!(
+        command_count(&second),
+        Some(0),
+        "re-deleting the same primary key in one transaction must report 0 rows"
+    );
+
+    server.client.simple_query("COMMIT").await.unwrap();
+
+    let a = server
+        .query_text("SELECT n FROM t WHERE id = 'a'")
+        .await
+        .unwrap();
+    assert!(
+        a.is_empty(),
+        "committed delete must remove the row, got {a:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn in_tx_insert_on_conflict_do_nothing_reports_zero_rows() {
     let server = TestServer::start().await;

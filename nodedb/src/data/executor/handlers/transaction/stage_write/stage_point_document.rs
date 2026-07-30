@@ -87,6 +87,30 @@ impl CoreLoop {
     }
 
     pub(in crate::data::executor) fn stage_point_delete(&mut self, ctx: &StageCtx<'_>) -> Response {
+        // Resolve the row against BASE ∪ OVERLAY first — the same probe the
+        // staged INSERT runs. A delete only affects a row that is actually
+        // there: the primary key resolves to a surrogate whether or not the row
+        // still exists (a surrogate outlives its row so a re-insert keeps it),
+        // and an earlier statement in this transaction may already have
+        // tombstoned it.
+        let row_key = surrogate_to_doc_id(ctx.surrogate);
+        let bitemporal = self.is_bitemporal(ctx.database_id, ctx.tid, ctx.collection);
+        let overlay_pk = self.stage_overlay_pk(ctx);
+        let present = match self.stage_pk_present(
+            ctx.database_id,
+            ctx.tid,
+            ctx.collection,
+            row_key.as_str(),
+            bitemporal,
+            overlay_pk,
+        ) {
+            Ok(p) => p,
+            Err(e) => return self.response_error(ctx.task, e),
+        };
+        if !present {
+            return self.stage_count_response(ctx.task, 0);
+        }
+
         self.txn_overlay_mut(ctx.txn_id).insert_tombstone(
             ctx.coll_key.clone(),
             ctx.surrogate.0,

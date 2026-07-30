@@ -69,18 +69,11 @@ pub(super) async fn try_edge_recon_dispatch(
             Ok(Some(pair)) => pair,
         };
 
-    // Capture the RETURNING doc task's plan (if any) before `tasks` is moved
-    // into the recon call, so a RETURNING dependent delete/update can surface
-    // its rows from the applied Response the coordinator drains.
-    let returning_plan = tasks
-        .iter()
-        .find(|t| {
-            matches!(
-                crate::control::server::response_shape::types::describe_plan(&t.plan),
-                crate::control::server::response_shape::types::PlanKind::ReturningRows
-            )
-        })
-        .map(|t| t.plan.clone());
+    // Capture the batch's plans before `tasks` is moved into the recon call, so
+    // the response can shape a RETURNING dependent delete/update's rows and read
+    // a plain write's affected count from the applied Response the coordinator
+    // drains.
+    let plans: Vec<_> = tasks.iter().map(|t| t.plan.clone()).collect();
 
     // All three guards passed — run the OLLP/Calvin coordinator. This is the
     // normal multi-shard OLLP path (NOT the contended single-shard route from
@@ -99,13 +92,11 @@ pub(super) async fn try_edge_recon_dispatch(
     EdgeReconResult::Outcome(match outcome {
         Ok(recon) => {
             // A RETURNING dependent write surfaces its deleted/updated rows; a
-            // plain write reports one command tag per original task (matching the
-            // pgwire one-tag-per-task synthesis and the MultiShard Calvin arm).
+            // plain write reports the affected count its own mutation returned.
             resp(super::conversion::calvin_native_response(
                 seq,
                 recon.apply_result,
-                returning_plan.as_ref(),
-                recon.tasks_dispatched,
+                &plans,
                 ctx.state,
                 database_id,
                 ctx.tenant_id(),

@@ -20,7 +20,7 @@ use super::super::super::auth::pgwire_authorization_error;
 use super::super::super::core::NodeDbPgHandler;
 use super::entry::CloneWriteOutcome;
 use super::probes::{fetch_source_row, probe_row_in_target};
-use super::util::{strip_db_prefix, synthetic_ok_response, write_err};
+use super::util::{strip_db_prefix, synthetic_affected_response, write_err};
 
 impl NodeDbPgHandler {
     /// Handle Document CoW write interception (PointUpdate / PointDelete).
@@ -95,6 +95,29 @@ impl NodeDbPgHandler {
         }
 
         if is_delete {
+            // The row is not in the target, so the delete is satisfied by hiding
+            // the source row. Read the source first: it is what decides whether
+            // this statement removed a row (1) or nothing (0). The primary key
+            // resolving to a surrogate is not evidence the row exists — a
+            // surrogate outlives the row it was assigned to.
+            let source_db_id = origin.source_database;
+            let source_coll_qualified =
+                crate::control::planner::sql_plan_convert::convert::db_qualified(
+                    source_db_id,
+                    origin.source_collection.as_str(),
+                );
+            let source_row = fetch_source_row(
+                &self.state,
+                identity,
+                tenant_id,
+                source_db_id,
+                &source_coll_qualified,
+                document_id,
+                surrogate,
+            )
+            .await
+            .map_err(|e| write_err(&format!("clone delete source probe: {e}")))?;
+
             perform_clone_tombstone(TombstoneParams {
                 state: &self.state,
                 target_db_id: db_id,
@@ -103,7 +126,11 @@ impl NodeDbPgHandler {
             })
             .map_err(|e| write_err(&format!("clone tombstone: {e}")))?;
 
-            let synthetic_resp = synthetic_ok_response(self.next_request_id(), Lsn::new(0));
+            let synthetic_resp = synthetic_affected_response(
+                self.next_request_id(),
+                Lsn::new(0),
+                u64::from(source_row.is_some()),
+            );
             return Ok(CloneWriteOutcome::Handled(synthetic_resp));
         }
 

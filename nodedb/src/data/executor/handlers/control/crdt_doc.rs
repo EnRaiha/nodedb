@@ -257,7 +257,9 @@ impl CoreLoop {
                 }
             }
         } else {
-            self.response_ok(task)
+            // No RETURNING: report what the delete actually removed. A tombstone
+            // written over an already-absent document removes nothing.
+            self.response_affected(task, u64::from(outcome.prior_value.is_some()))
         };
         self.checkpoint_coordinator.mark_dirty("crdt", 1);
         response

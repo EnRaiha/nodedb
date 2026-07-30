@@ -45,6 +45,29 @@ impl CoreLoop {
         }
     }
 
+    /// Build the response for a write that reports an affected-row count.
+    ///
+    /// Every handler whose plan renders a DML command tag (`INSERT n` /
+    /// `UPDATE n` / `DELETE n`) MUST return through here, because the count is
+    /// only knowable at the mutation: a point delete against an absent row and
+    /// a point delete that removed a row are the same plan, and the primary key
+    /// resolves to a surrogate either way (surrogate identity survives a delete
+    /// so a later re-insert keeps it). A handler that returns [`response_ok`]
+    /// instead leaves the Control Plane with no count to render, and a renderer
+    /// that substitutes a default there reports a row that was never touched.
+    ///
+    /// [`response_ok`]: Self::response_ok
+    pub(in crate::data::executor) fn response_affected(
+        &self,
+        task: &ExecutionTask,
+        affected: u64,
+    ) -> Response {
+        let mut payload = Vec::with_capacity(16);
+        nodedb_query::msgpack_scan::write_map_header(&mut payload, 1);
+        nodedb_query::msgpack_scan::write_kv_i64(&mut payload, "affected", affected as i64);
+        self.response_with_payload(task, payload)
+    }
+
     pub(in crate::data::executor) fn response_partial(
         &self,
         task: &ExecutionTask,

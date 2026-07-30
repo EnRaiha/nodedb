@@ -332,25 +332,14 @@ async fn execute_planned(
                 .await
                 {
                     // Calvin committed. A RETURNING write surfaces its rows from
-                    // the applied Response; a plain write reports one row-affected
-                    // per task, mirroring pgwire's one-tag-per-task synthesis.
+                    // the applied Response; a plain write reports the affected
+                    // count its own mutation returned.
                     Ok(apply_resp) => {
-                        let returning_plan = tasks
-                            .iter()
-                            .find(|t| {
-                                matches!(
-                                    crate::control::server::response_shape::types::describe_plan(
-                                        &t.plan,
-                                    ),
-                                    crate::control::server::response_shape::types::PlanKind::ReturningRows
-                                )
-                            })
-                            .map(|t| t.plan.clone());
+                        let plans: Vec<_> = tasks.iter().map(|t| t.plan.clone()).collect();
                         resp(super::conversion::calvin_native_response(
                             seq,
                             apply_resp,
-                            returning_plan.as_ref(),
-                            tasks.len() as u64,
+                            &plans,
                             ctx.state,
                             database_id,
                             ctx.tenant_id(),

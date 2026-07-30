@@ -126,7 +126,12 @@ impl CoreLoop {
                 ),
             }
         } else {
-            self.response_ok(task)
+            // No RETURNING: report the count the doc-store write actually
+            // produced. `prior` is `None` when the row was already gone, which
+            // is a genuine no-op — the plan resolved a surrogate for the
+            // primary key (surrogates outlive the row they were assigned to),
+            // so the surrogate is no evidence a row was there to remove.
+            self.response_affected(task, u64::from(prior.is_some()))
         }
     }
 }

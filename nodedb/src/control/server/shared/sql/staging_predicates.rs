@@ -118,7 +118,19 @@ pub fn is_stageable_write(plan: &PhysicalPlan) -> bool {
 
 /// Extract affected row count from a JSON or MessagePack payload.
 ///
-/// Looks for `"affected"`, `"truncated"`, `"inserted"`, or `"accepted"` fields.
+/// Looks for `"affected"`, `"truncated"`, `"inserted"`, `"accepted"`, or
+/// `"deleted"` fields. The alias list exists because several count-bearing
+/// payloads are also read directly by non-SQL entry points under their own name
+/// (RESP `DEL` reads `"deleted"`, ingest paths read `"accepted"`); the count is
+/// the same number under a different key, so every name a write actually emits
+/// MUST appear here. A key that emits a count this function cannot see is
+/// indistinguishable from a write that reported no count at all.
+///
+/// `None` means "this payload carries no count" — it is NEVER a licence to
+/// substitute one. Callers rendering a DML command tag go through
+/// [`require_affected_count`] instead, which turns the absence into a typed
+/// error, because for a count-bearing plan the absence can only mean a handler
+/// stopped reporting.
 pub fn extract_affected_count(payload: &[u8]) -> Option<u64> {
     if payload.is_empty() {
         return None;
@@ -130,7 +142,24 @@ pub fn extract_affected_count(payload: &[u8]) -> Option<u64> {
         .or_else(|| v.get("truncated"))
         .or_else(|| v.get("inserted"))
         .or_else(|| v.get("accepted"))
+        .or_else(|| v.get("deleted"))
         .and_then(|n| n.as_u64())
+}
+
+/// The affected-row count a DML response MUST carry, or a typed error.
+///
+/// Use this wherever an affected count is about to be shown to a client. The
+/// count is a property of the mutation that ran, so a plan classified as
+/// count-bearing whose response has no count is a broken invariant in the
+/// handler that produced it — surfacing that loudly is the only way it stays
+/// fixed. Defaulting to `1` (or to a dispatcher's per-statement estimate) is
+/// what let a delete against an absent row report a removed row.
+pub fn require_affected_count(payload: &[u8]) -> crate::Result<u64> {
+    extract_affected_count(payload).ok_or_else(|| crate::Error::Internal {
+        detail: "write response carried no affected-row count; the handler for this plan must \
+                 report one (see CoreLoop::response_affected)"
+            .to_owned(),
+    })
 }
 
 /// Extract the `"op"` field a staged `KvOp::InsertOnConflictUpdate` response

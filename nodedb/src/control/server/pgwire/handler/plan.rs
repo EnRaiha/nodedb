@@ -14,7 +14,7 @@ use crate::data::executor::response_codec::decode_payload_to_json;
 use nodedb_physical::physical_plan::DocumentOp;
 
 use crate::control::server::shared::sql::staging_predicates::{
-    StagedTagKind, extract_affected_count,
+    StagedTagKind, require_affected_count,
 };
 
 use super::super::types::text_field;
@@ -24,18 +24,26 @@ pub(super) use crate::control::server::response_shape::types::{PlanKind, describ
 /// Returns `true` when a plan can produce a deterministic pgwire tag without
 /// a round-trip to the Data Plane.
 ///
-/// The Calvin multi-shard batch completes as a unit; the Data Plane does not
-/// stream individual row counts back per task. For foldable plans we synthesise
-/// a tag at plan time (INSERT 0 1, UPDATE 1, DELETE 1). Conservative list:
+/// Folding is only sound for a write that CANNOT be a no-op — one that either
+/// applies exactly one row or fails the statement. Any write whose row count
+/// depends on state the plan has not read must get its count from the
+/// mutation's own response (`calvin_execution_response` surfaces it from the
+/// deposited applied `Response`), because a synthesised count is a claim about
+/// rows nobody looked at.
 ///
-/// **Foldable** — plain point writes where the affected row count is always 1:
-///   - `PointPut`, `PointInsert` (Document) → INSERT 0 1
-///   - `PointUpdate` without RETURNING (Document) → UPDATE 1
-///   - `PointDelete` without RETURNING (Document) → DELETE 1
-///   - `KvOp::Put`, `KvOp::Insert`, `KvOp::InsertIfAbsent` → INSERT 0 1
-///   - `KvOp::Delete` → DELETE 1
+/// **Foldable** — writes that unconditionally apply one row:
+///   - `PointPut` (Document) → INSERT 0 1 (upsert: always writes)
+///   - `KvOp::Put` → INSERT 0 1 (upsert: always writes)
 ///
-/// **Not foldable** (conservative defaults — do NOT expand without care):
+/// **Not foldable**:
+///   - `PointDelete`, `PointUpdate`, `KvOp::Delete` — no-op when the target row
+///     is absent, which a resolved primary key does NOT rule out: a surrogate
+///     outlives the row it was assigned to, so a delete of an already-deleted
+///     key reaches the Data Plane looking exactly like a delete of a live row
+///   - `PointInsert`, `KvOp::Insert`, `KvOp::InsertIfAbsent` — an
+///     `ON CONFLICT DO NOTHING` insert onto an existing key applies 0 rows
+///   - `KvOp::InsertOnConflictUpdate` — outcome (insert vs update) is decided
+///     by the handler, not the plan
 ///   - Any plan with `RETURNING` (response stream carries rows, not a tag)
 ///   - `InsertSelect` (row count from source query; unknown at plan time)
 ///   - `BatchInsert`, `BatchPut` (N rows; count in payload)
@@ -50,23 +58,10 @@ pub(super) fn is_calvin_foldable(plan: &PhysicalPlan) -> bool {
     use nodedb_physical::physical_plan::KvOp;
 
     match plan {
-        // Plain point document writes — always affects 1 row, no RETURNING.
+        // Upserts: the row is written whether or not it existed before, so the
+        // count is 1 without consulting state.
         PhysicalPlan::Document(DocumentOp::PointPut { .. })
-        | PhysicalPlan::Document(DocumentOp::PointInsert { .. }) => true,
-
-        // PointUpdate / PointDelete: foldable only when no RETURNING clause.
-        PhysicalPlan::Document(DocumentOp::PointUpdate {
-            returning: None, ..
-        })
-        | PhysicalPlan::Document(DocumentOp::PointDelete {
-            returning: None, ..
-        }) => true,
-
-        // Plain KV point writes.
-        PhysicalPlan::Kv(KvOp::Put { .. })
-        | PhysicalPlan::Kv(KvOp::Insert { .. })
-        | PhysicalPlan::Kv(KvOp::InsertIfAbsent { .. })
-        | PhysicalPlan::Kv(KvOp::Delete { .. }) => true,
+        | PhysicalPlan::Kv(KvOp::Put { .. }) => true,
 
         // Everything else: not foldable. The foldable arms above take
         // precedence; these inner wildcards catch every remaining op of each
@@ -133,19 +128,7 @@ pub(super) fn calvin_tag_for_plan(plan: &PhysicalPlan) -> PgWireResult<Tag> {
 
     match plan {
         PhysicalPlan::Document(DocumentOp::PointPut { .. })
-        | PhysicalPlan::Document(DocumentOp::PointInsert { .. })
-        | PhysicalPlan::Kv(KvOp::Put { .. })
-        | PhysicalPlan::Kv(KvOp::Insert { .. })
-        | PhysicalPlan::Kv(KvOp::InsertIfAbsent { .. }) => Ok(Tag::new("INSERT").with_rows(1)),
-
-        PhysicalPlan::Document(DocumentOp::PointUpdate {
-            returning: None, ..
-        }) => Ok(Tag::new("UPDATE").with_rows(1)),
-
-        PhysicalPlan::Document(DocumentOp::PointDelete {
-            returning: None, ..
-        })
-        | PhysicalPlan::Kv(KvOp::Delete { .. }) => Ok(Tag::new("DELETE").with_rows(1)),
+        | PhysicalPlan::Kv(KvOp::Put { .. }) => Ok(Tag::new("INSERT").with_rows(1)),
 
         other => Err(invalid_plan_shape(format!(
             "calvin_tag_for_plan called on non-foldable plan: {other:?}"
@@ -176,12 +159,14 @@ pub(super) fn payload_to_response(payload: &[u8], kind: PlanKind) -> PgWireResul
     match kind {
         PlanKind::Execution => Ok(Response::Execution(Tag::new("OK")).into()),
         PlanKind::DmlResult(tag) => {
-            let count = if payload.is_empty() {
-                // Point operations with empty payload succeeded on exactly 1 row.
-                1
-            } else {
-                extract_affected_count(payload).unwrap_or(1) as usize
-            };
+            // The count comes from the write, always. There is no "point
+            // operations affected exactly 1 row" shortcut: a point delete or a
+            // conflicting `ON CONFLICT DO NOTHING` insert is the same plan
+            // whether it touched a row or not, so assuming 1 here reported rows
+            // that were never there.
+            let count = require_affected_count(payload).map_err(|e| {
+                invalid_plan_shape(format!("{tag} response is missing its affected count: {e}"))
+            })? as usize;
             Ok(Response::Execution(Tag::new(tag).with_rows(count)).into())
         }
         PlanKind::ArraySlice | PlanKind::ReturningRows | PlanKind::SingleDocument => {
@@ -265,10 +250,48 @@ mod tests {
 
     #[test]
     fn foldable_tag_still_matches_operation() {
-        let plan = PhysicalPlan::Kv(KvOp::Delete {
+        // An upsert applies one row unconditionally, so its tag needs no
+        // round-trip.
+        let plan = PhysicalPlan::Kv(KvOp::Put {
+            collection: "items".into(),
+            key: Vec::new(),
+            value: Vec::new(),
+            ttl_ms: 0,
+            surrogate: nodedb_types::Surrogate::ZERO,
+        });
+        assert!(is_calvin_foldable(&plan));
+        assert!(calvin_tag_for_plan(&plan).is_ok());
+    }
+
+    /// A write that can legitimately touch nothing must NOT be folded: its count
+    /// is only knowable from the mutation's own response. Folding a delete let a
+    /// re-delete of an already-deleted key report a removed row.
+    #[test]
+    fn no_op_capable_writes_are_never_folded() {
+        let delete = PhysicalPlan::Kv(KvOp::Delete {
             collection: "items".into(),
             keys: Vec::new(),
         });
-        assert!(calvin_tag_for_plan(&plan).is_ok());
+        assert!(!is_calvin_foldable(&delete));
+        assert!(calvin_tag_for_plan(&delete).is_err());
+
+        let point_delete = PhysicalPlan::Document(DocumentOp::PointDelete {
+            collection: "items".into(),
+            document_id: "a".into(),
+            surrogate: nodedb_types::Surrogate::ZERO,
+            pk_bytes: Vec::new(),
+            returning: None,
+        });
+        assert!(!is_calvin_foldable(&point_delete));
+        assert!(calvin_tag_for_plan(&point_delete).is_err());
+    }
+
+    /// A count-bearing response with no count is a handler bug, not a `1`.
+    #[test]
+    fn dml_tag_requires_a_reported_count() {
+        assert!(payload_to_response(&[], PlanKind::DmlResult("DELETE")).is_err());
+        let payload = nodedb_types::json_to_msgpack(&serde_json::json!({ "affected": 0 }))
+            .expect("encode count payload");
+        assert!(payload_to_response(&payload, PlanKind::DmlResult("DELETE")).is_ok());
     }
 }

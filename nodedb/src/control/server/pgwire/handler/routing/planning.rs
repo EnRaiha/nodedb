@@ -353,13 +353,25 @@ pub(super) fn calvin_execution_response(
         return Ok(response);
     }
 
-    // Plain (non-RETURNING) write with a deposited applied Response: surface its
-    // ACTUAL affected count from the payload — exactly as the non-Calvin write
-    // path does — rather than a fixed synthesized tag. `None` (multishard,
-    // undeposited) falls through to the synthesized tag below.
-    if let Some(resp) = apply_resp
-        && let PlanKind::DmlResult(_) = describe_plan(&task.plan)
-    {
+    // Plain (non-RETURNING) write: surface its ACTUAL affected count from the
+    // payload — exactly as the non-Calvin write path does.
+    //
+    // Every primary-write participant deposits its applied `Response` before
+    // proposing the completion ack (cross-node it rides back on the routed
+    // submit's RPC reply), so a count-bearing plan ALWAYS has one here. If it
+    // does not, the deposit path regressed: fail loudly rather than synthesise a
+    // count, which is what made a delete of an absent row report a removed row.
+    if let PlanKind::DmlResult(tag) = describe_plan(&task.plan) {
+        let resp = apply_resp.ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "XX000".to_owned(),
+                format!(
+                    "internal: Calvin {tag} completed with no applied response to read its \
+                     affected-row count from"
+                ),
+            )))
+        })?;
         return Ok(super::super::plan::payload_to_response(
             resp.payload.as_bytes(),
             describe_plan(&task.plan),

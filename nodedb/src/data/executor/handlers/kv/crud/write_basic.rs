@@ -184,8 +184,10 @@ impl CoreLoop {
             .get(did, tid, collection, key, now_ms)
             .is_some()
         {
-            // Silent skip — matches the strict/schemaless `if_absent` path.
-            return self.response_ok(task);
+            // Key already present: `ON CONFLICT DO NOTHING` inserts nothing, so
+            // it reports 0 rows — matches the strict/schemaless `if_absent`
+            // path, which reports 0 for the same reason.
+            return self.response_affected(task, 0);
         }
 
         self.kv_engine.put(crate::engine::kv::KvPutParams {
@@ -213,7 +215,7 @@ impl CoreLoop {
         );
 
         self.note_kv_write_lsn(task, did, tid, collection, key);
-        self.response_ok(task)
+        self.response_affected(task, 1)
     }
 
     /// Record a committed KV point write's version, keyed by the raw KV key

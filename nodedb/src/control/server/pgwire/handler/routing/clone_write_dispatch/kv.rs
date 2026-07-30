@@ -21,7 +21,8 @@ use super::super::super::auth::pgwire_authorization_error;
 use super::super::super::core::NodeDbPgHandler;
 use super::entry::CloneWriteOutcome;
 use super::probes::{dispatch_data_plane_raw, fetch_kv_source_value, probe_kv_key_in_target};
-use super::util::{strip_db_prefix, synthetic_ok_response, write_err};
+use super::util::{strip_db_prefix, synthetic_affected_response, write_err};
+use crate::control::server::shared::sql::staging_predicates::require_affected_count;
 
 impl NodeDbPgHandler {
     /// Handle KV CoW write interception (FieldSet / Delete).
@@ -81,7 +82,20 @@ impl NodeDbPgHandler {
                 // Tombstoning unconditionally for target-resident keys is
                 // safe: the source row (if any) must always be hidden in
                 // this clone after the user has issued a DELETE.
+                // `source_only_hidden` counts keys the tombstone alone removed
+                // from this clone's view: absent from the target but present in
+                // the source. Those are rows this DELETE removed just as much as
+                // the target-resident ones, and the tombstone write reports no
+                // count of its own, so the source read is what makes the total
+                // honest. A key in neither target nor source removed nothing.
                 let mut keys_to_dispatch: Vec<Vec<u8>> = Vec::new();
+                let mut source_only_hidden = 0u64;
+                let source_db_id = origin.source_database;
+                let source_coll_qualified =
+                    crate::control::planner::sql_plan_convert::convert::db_qualified(
+                        source_db_id,
+                        origin.source_collection.as_str(),
+                    );
                 for key in keys {
                     let key_str = String::from_utf8_lossy(key).into_owned();
                     let key_in_target = probe_kv_key_in_target(
@@ -94,6 +108,22 @@ impl NodeDbPgHandler {
                     )
                     .await
                     .map_err(|e| write_err(&format!("clone kv delete probe: {e}")))?;
+
+                    if !key_in_target {
+                        let source_value = fetch_kv_source_value(
+                            &self.state,
+                            identity,
+                            tenant_id,
+                            source_db_id,
+                            &source_coll_qualified,
+                            key,
+                        )
+                        .await
+                        .map_err(|e| write_err(&format!("clone kv delete source probe: {e}")))?;
+                        if source_value.is_some() {
+                            source_only_hidden += 1;
+                        }
+                    }
 
                     perform_kv_clone_tombstone(KvTombstoneParams {
                         state: &self.state,
@@ -125,10 +155,24 @@ impl NodeDbPgHandler {
                     )
                     .await
                     .map_err(|e| write_err(&format!("clone kv delete dispatch: {e}")))?;
-                    return Ok(CloneWriteOutcome::Handled(resp));
+
+                    // Total = keys removed from the target + keys the tombstones
+                    // hid in the source. Re-wrap so the client sees one count for
+                    // the one statement it issued.
+                    let dispatched = require_affected_count(resp.payload.as_ref())
+                        .map_err(|e| write_err(&format!("clone kv delete count: {e}")))?;
+                    return Ok(CloneWriteOutcome::Handled(synthetic_affected_response(
+                        self.next_request_id(),
+                        resp.watermark_lsn,
+                        dispatched + source_only_hidden,
+                    )));
                 }
 
-                let synthetic_resp = synthetic_ok_response(self.next_request_id(), Lsn::new(0));
+                let synthetic_resp = synthetic_affected_response(
+                    self.next_request_id(),
+                    Lsn::new(0),
+                    source_only_hidden,
+                );
                 return Ok(CloneWriteOutcome::Handled(synthetic_resp));
             }
             _ => return Ok(CloneWriteOutcome::Passthrough),

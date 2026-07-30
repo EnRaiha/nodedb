@@ -75,8 +75,11 @@ impl CoreLoop {
             Ok(true) => {
                 // Drop the txn without committing — no-op on redb.
                 if if_absent {
-                    // `INSERT ... ON CONFLICT DO NOTHING`: silent skip.
-                    return self.response_ok(task);
+                    // `INSERT ... ON CONFLICT DO NOTHING`: the row already
+                    // exists, so nothing is inserted and the statement affects
+                    // 0 rows. Reporting no count here let the renderer assume
+                    // the default 1 and claim an insert that never happened.
+                    return self.response_affected(task, 0);
                 }
                 return self.response_error(
                     task,
@@ -156,6 +159,7 @@ impl CoreLoop {
 
         self.emit_put_event(task, tid, collection, row_key, value, None);
 
-        self.response_ok(task)
+        // The row was inserted: exactly one row affected.
+        self.response_affected(task, 1)
     }
 }

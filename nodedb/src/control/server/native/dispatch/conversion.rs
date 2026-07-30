@@ -80,17 +80,21 @@ pub(crate) fn ddl_result_to_native(
 /// Build the native response for a completed Calvin transaction, surfacing
 /// RETURNING rows when the write carried them.
 ///
-/// `apply_result` is the applied Data-Plane response drained from the sidecar
-/// (`None` for a plain write) and `returning_plan` is the RETURNING doc task's
-/// plan (used to derive the shaping kind). When both are present and the plan is
-/// a RETURNING write, the payload is shaped into native columns/rows; otherwise
-/// the response falls back to `fallback_affected` rows-affected — matching the
-/// non-Calvin native DML path.
+/// `apply_result` is the applied Data-Plane response drained from the sidecar and
+/// `plans` is the completed batch's plans, in dispatch order. A RETURNING plan
+/// shapes the payload into native columns/rows; otherwise the batch's
+/// count-bearing plan (if any) reports `rows_affected` READ FROM the applied
+/// response.
+///
+/// There is deliberately no per-statement fallback count. The number of
+/// dispatched tasks is not the number of affected rows — a single-row delete
+/// dual-homed with its implicit edge cleanup dispatches two tasks and may affect
+/// zero rows — so a batch whose count-bearing write reported nothing surfaces an
+/// error rather than a plausible number.
 pub(crate) fn calvin_native_response(
     seq: u64,
     apply_result: Option<crate::bridge::envelope::Response>,
-    returning_plan: Option<&crate::bridge::envelope::PhysicalPlan>,
-    fallback_affected: u64,
+    plans: &[crate::bridge::envelope::PhysicalPlan],
     state: &crate::control::state::SharedState,
     database_id: nodedb_types::DatabaseId,
     tenant_id: nodedb_types::TenantId,
@@ -99,6 +103,13 @@ pub(crate) fn calvin_native_response(
         ShapeOutcome, shape_response_materialized,
     };
     use crate::control::server::response_shape::types::{PlanKind, describe_plan};
+
+    let returning_plan = plans
+        .iter()
+        .find(|p| matches!(describe_plan(p), PlanKind::ReturningRows));
+    let dml_plan = plans
+        .iter()
+        .find(|p| matches!(describe_plan(p), PlanKind::DmlResult(_)));
 
     if let (Some(resp), Some(plan)) = (apply_result.as_ref(), returning_plan)
         && matches!(describe_plan(plan), PlanKind::ReturningRows)
@@ -122,20 +133,33 @@ pub(crate) fn calvin_native_response(
         return r;
     }
 
-    // Plain write with a deposited applied Response: surface its ACTUAL affected
-    // count + watermark from the payload rather than the caller's fallback
-    // estimate. `None` (multishard, undeposited) keeps the fallback.
+    // Plain write: surface the affected count the mutation itself reported.
     let mut r = NativeResponse::ok(seq);
     if let Some(resp) = &apply_result {
         r.watermark_lsn = resp.watermark_lsn.as_u64();
-        r.rows_affected = Some(
-            crate::control::server::shared::sql::staging_predicates::extract_affected_count(
-                resp.payload.as_bytes(),
-            )
-            .unwrap_or(fallback_affected),
+    }
+    // A batch with no count-bearing plan (pure graph / vector / DDL work) has no
+    // row count to report, and says so by leaving `rows_affected` unset rather
+    // than inventing one from the task count.
+    if dml_plan.is_some() {
+        let count = apply_result.as_ref().map_or_else(
+            || {
+                Err(crate::Error::Internal {
+                    detail: "native Calvin write completed with no applied response to read its \
+                             affected-row count from"
+                        .to_owned(),
+                })
+            },
+            |resp| {
+                crate::control::server::shared::sql::staging_predicates::require_affected_count(
+                    resp.payload.as_bytes(),
+                )
+            },
         );
-    } else {
-        r.rows_affected = Some(fallback_affected);
+        match count {
+            Ok(n) => r.rows_affected = Some(n),
+            Err(e) => return error_to_native(seq, &e),
+        }
     }
     r
 }

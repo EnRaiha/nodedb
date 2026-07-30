@@ -221,10 +221,23 @@ pub(super) async fn run_dispatch_loop(
 
         last_lsn = task_resp.watermark_lsn.as_u64();
 
-        if task_resp.payload.is_empty() {
+        let plan_kind = describe_plan(&plan_for_response);
+        if let crate::control::server::response_shape::types::PlanKind::DmlResult(_) = plan_kind {
+            // A count-bearing write reports the rows it actually touched. Adding
+            // 1 per dispatched task instead — which is what the empty-payload
+            // branch below used to do — reported a row for a delete that removed
+            // nothing and for an `ON CONFLICT DO NOTHING` insert that skipped.
+            match crate::control::server::shared::sql::staging_predicates::require_affected_count(
+                &task_resp.payload,
+            ) {
+                Ok(n) => total_affected += n,
+                Err(e) => return resp(error_to_native(seq, &e)),
+            }
+        } else if task_resp.payload.is_empty() {
+            // Not a count-bearing plan (graph / vector / index write): one unit
+            // of work per dispatched task, as before.
             total_affected += 1;
         } else {
-            let plan_kind = describe_plan(&plan_for_response);
             match shape_response_materialized(
                 &task_resp.payload,
                 &plan_for_response,

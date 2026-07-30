@@ -266,7 +266,8 @@ impl CoreLoop {
                         // this a WAL-only restart rebuilds the HNSW from the
                         // pre-upsert body and resurrects the old embedding.
                         // `stored_bytes` is moved in as its last use.
-                        let mut response = self.response_ok(task);
+                        // An upsert always writes the row: one row affected.
+                        let mut response = self.response_affected(task, 1);
                         if has_vectors {
                             response.write_set = vec![WriteSetEntry {
                                 surrogate: surrogate.as_u32(),
@@ -351,7 +352,8 @@ impl CoreLoop {
                 // durable post-apply `Put` redo so a WAL-only restart rebuilds the
                 // index with the new embedding. `value` is a borrowed param here,
                 // so the post-image is copied. No-op when `has_vectors` is false.
-                let mut response = self.response_ok(task);
+                // An upsert always writes the row: one row affected.
+                let mut response = self.response_affected(task, 1);
                 if has_vectors {
                     response.write_set = vec![WriteSetEntry {
                         surrogate: surrogate.as_u32(),

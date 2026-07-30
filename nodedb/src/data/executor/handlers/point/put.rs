@@ -106,6 +106,7 @@ impl CoreLoop {
             prior.prior_value.as_deref(),
         );
 
-        self.response_ok(task)
+        // An upsert always writes the row, whether or not one was there before.
+        self.response_affected(task, 1)
     }
 }
