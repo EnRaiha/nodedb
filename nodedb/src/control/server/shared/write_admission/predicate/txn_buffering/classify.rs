@@ -423,7 +423,6 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
 /// ad-hoc oracle over the remaining variants — if a future edit to either
 /// this predicate or the WAL encoder drifts the two apart, one of these
 /// assertions fails.
-
 #[cfg(test)]
 mod tests {
     use super::*;
