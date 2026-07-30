@@ -32,6 +32,12 @@ impl HnswIndex {
     /// When the node's local vector storage is empty (graph-checkpoint-only
     /// restore) and a `backing` is attached, the vector bytes are fetched from
     /// the backing.  This is the Lite cold-load path; Origin never hits it.
+    ///
+    /// A node whose vector cannot be resolved scores [`f32::INFINITY`] — search
+    /// then never selects it — rather than panicking. `with_backing` rejects a
+    /// backing that cannot serve the index, so reaching that branch means a node
+    /// has no vector source at all; aborting a search worker (and poisoning the
+    /// locks it held) is strictly worse than ranking one node last.
     pub(crate) fn dist_to_node(&self, query_bytes: &[u8], node_id: u32) -> f32 {
         let node_bytes = self.nodes[node_id as usize].storage.as_bytes();
         #[cfg(not(target_arch = "wasm32"))]
@@ -57,7 +63,7 @@ impl HnswIndex {
             node_bytes,
             self.dim,
         )
-        .expect("dist_to_node: byte-length mismatch; byte lengths are validated at insert")
+        .unwrap_or(f32::INFINITY)
     }
 
     /// Compute distance between a query given as `&[f32]` and a stored node.

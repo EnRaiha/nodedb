@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use super::*;
 use crate::distance::DistanceMetric;
+use crate::error::VectorError;
 use nodedb_types::vector_dtype::VectorStorageDtype;
 
 fn make_params(dtype: VectorStorageDtype) -> HnswParams {
@@ -170,6 +173,118 @@ fn extractors_reject_an_index_with_no_vector_source() {
         restored.checkpoint_to_bytes().is_err(),
         "a full checkpoint cannot be written from an index with no vector data"
     );
+}
+
+/// A backing is validated before it is attached. An attached-but-unserviceable
+/// backing is the worst case: the graph looks healthy, so search proceeds and
+/// then scores a node that has no vector — which is what made one poisoned
+/// segment panic the daemon on every query.
+#[test]
+fn with_backing_refuses_a_backing_that_cannot_serve_the_index() {
+    use crate::segment_backing::VectorSegmentBacking;
+
+    /// Declares `len`/`dim` in its header but serves `served` vectors, modelling
+    /// a segment whose header claims vectors its payload does not contain.
+    struct LyingBacking {
+        len: usize,
+        dim: usize,
+        served: Vec<Vec<f32>>,
+    }
+    impl VectorSegmentBacking for LyingBacking {
+        fn len(&self) -> usize {
+            self.len
+        }
+        fn dim(&self) -> usize {
+            self.dim
+        }
+        fn get_vector(&self, id: u32) -> Option<&[f32]> {
+            self.served.get(id as usize).map(Vec::as_slice)
+        }
+        fn get_surrogate(&self, _id: u32) -> Option<u64> {
+            None
+        }
+    }
+
+    let mut src = HnswIndex::with_seed(3, make_params(VectorStorageDtype::F32), 1);
+    src.insert(vec![1.0, 2.0, 3.0]).unwrap();
+    src.insert(vec![4.0, 5.0, 6.0]).unwrap();
+    let graph_only = src.graph_checkpoint_to_bytes().unwrap();
+    let restore = || {
+        HnswIndex::from_checkpoint(&graph_only)
+            .unwrap()
+            .expect("graph checkpoint must be recognized")
+    };
+
+    // Header claims 2 vectors of dim 3, payload serves none — the poisoned case.
+    let mut idx = restore();
+    assert!(
+        idx.with_backing(Arc::new(LyingBacking {
+            len: 2,
+            dim: 3,
+            served: Vec::new(),
+        }))
+        .is_err(),
+        "a backing that serves no vectors must be refused"
+    );
+
+    // Fewer vectors than the index has nodes.
+    let mut idx = restore();
+    assert!(
+        idx.with_backing(Arc::new(LyingBacking {
+            len: 1,
+            dim: 3,
+            served: vec![vec![1.0, 2.0, 3.0]],
+        }))
+        .is_err(),
+        "a backing shorter than the node count must be refused"
+    );
+
+    // Right count, wrong dimension.
+    let mut idx = restore();
+    assert!(
+        matches!(
+            idx.with_backing(Arc::new(LyingBacking {
+                len: 2,
+                dim: 4,
+                served: vec![vec![0.0; 4], vec![0.0; 4]],
+            })),
+            Err(VectorError::DimensionMismatch { .. })
+        ),
+        "a backing with the wrong dim must be refused"
+    );
+
+    // A backing that genuinely serves every node IS attached, and search on the
+    // restored index then resolves vectors through it without panicking.
+    let mut idx = restore();
+    idx.with_backing(Arc::new(LyingBacking {
+        len: 2,
+        dim: 3,
+        served: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+    }))
+    .expect("a complete backing must attach");
+    assert_eq!(idx.materialize_vector(0).unwrap(), vec![1.0, 2.0, 3.0]);
+    assert_eq!(idx.materialize_vector(1).unwrap(), vec![4.0, 5.0, 6.0]);
+}
+
+/// A node with no vector source must rank last, not abort the search worker.
+#[test]
+fn search_on_a_vectorless_index_does_not_panic() {
+    let mut src = HnswIndex::with_seed(3, make_params(VectorStorageDtype::F32), 1);
+    src.insert(vec![1.0, 2.0, 3.0]).unwrap();
+    let graph_only = src.graph_checkpoint_to_bytes().unwrap();
+    // No backing attached: every node's storage is an empty placeholder.
+    let idx = HnswIndex::from_checkpoint(&graph_only)
+        .unwrap()
+        .expect("graph checkpoint must be recognized");
+
+    let results = idx.search(&[1.0, 2.0, 3.0], 5, 16);
+    for r in &results {
+        assert!(
+            r.distance.is_infinite(),
+            "a node with no vector source must score infinity, got {}",
+            r.distance
+        );
+    }
 }
 
 #[test]
