@@ -28,7 +28,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.94"
 license = "BUSL-1.1"
@@ -39,27 +39,27 @@ documentation = "https://docs.rs/nodedb"
 
 [workspace.dependencies]
 # Foundation crates (internal)
-nodedb = { path = "nodedb", version = "0.4" }
-nodedb-types = { path = "nodedb-types", version = "0.4" }
-nodedb-client = { path = "nodedb-client", version = "0.4" }
-nodedb-bridge = { path = "nodedb-bridge", version = "0.4" }
-nodedb-wal = { path = "nodedb-wal", version = "0.4" }
-nodedb-mem = { path = "nodedb-mem", version = "0.4" }
-nodedb-crdt = { path = "nodedb-crdt", version = "0.4" }
-nodedb-raft = { path = "nodedb-raft", version = "0.4" }
-nodedb-cluster = { path = "nodedb-cluster", version = "0.4" }
-nodedb-query = { path = "nodedb-query", version = "0.4" }
-nodedb-codec = { path = "nodedb-codec", version = "0.4" }
-nodedb-spatial = { path = "nodedb-spatial", version = "0.4" }
-nodedb-graph = { path = "nodedb-graph", version = "0.4" }
-nodedb-vector = { path = "nodedb-vector", version = "0.4" }
-nodedb-vector-gpu = { path = "nodedb-vector-gpu", version = "0.4" }
-nodedb-fts = { path = "nodedb-fts", version = "0.4" }
-nodedb-strict = { path = "nodedb-strict", version = "0.4" }
-nodedb-columnar = { path = "nodedb-columnar", version = "0.4" }
-nodedb-array = { path = "nodedb-array", version = "0.4" }
-nodedb-sql = { path = "nodedb-sql", version = "0.4" }
-nodedb-physical = { path = "nodedb-physical", version = "0.4" }
+nodedb = { path = "nodedb", version = "0.5" }
+nodedb-types = { path = "nodedb-types", version = "0.5" }
+nodedb-client = { path = "nodedb-client", version = "0.5" }
+nodedb-bridge = { path = "nodedb-bridge", version = "0.5" }
+nodedb-wal = { path = "nodedb-wal", version = "0.5" }
+nodedb-mem = { path = "nodedb-mem", version = "0.5" }
+nodedb-crdt = { path = "nodedb-crdt", version = "0.5" }
+nodedb-raft = { path = "nodedb-raft", version = "0.5" }
+nodedb-cluster = { path = "nodedb-cluster", version = "0.5" }
+nodedb-query = { path = "nodedb-query", version = "0.5" }
+nodedb-codec = { path = "nodedb-codec", version = "0.5" }
+nodedb-spatial = { path = "nodedb-spatial", version = "0.5" }
+nodedb-graph = { path = "nodedb-graph", version = "0.5" }
+nodedb-vector = { path = "nodedb-vector", version = "0.5" }
+nodedb-vector-gpu = { path = "nodedb-vector-gpu", version = "0.5" }
+nodedb-fts = { path = "nodedb-fts", version = "0.5" }
+nodedb-strict = { path = "nodedb-strict", version = "0.5" }
+nodedb-columnar = { path = "nodedb-columnar", version = "0.5" }
+nodedb-array = { path = "nodedb-array", version = "0.5" }
+nodedb-sql = { path = "nodedb-sql", version = "0.5" }
+nodedb-physical = { path = "nodedb-physical", version = "0.5" }
 nodedb-test-support = { path = "nodedb-test-support" }
 
 # Async runtimes

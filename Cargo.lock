@@ -4114,7 +4114,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4220,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-array"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "crc32c",
  "loro",
@@ -4237,7 +4237,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-bridge"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fluxbench",
  "libc",
@@ -4250,7 +4250,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-client"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "nodedb-types",
@@ -4268,7 +4268,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-client-tests"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "nodedb",
  "nodedb-client",
@@ -4281,7 +4281,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-cluster"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4317,7 +4317,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-cluster-tests"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4352,7 +4352,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-codec"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "lz4_flex 0.11.6",
  "nalgebra",
@@ -4369,7 +4369,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-columnar"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "crc32c",
  "nodedb-codec",
@@ -4388,7 +4388,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-crdt"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "getrandom 0.3.4",
  "hkdf",
@@ -4408,7 +4408,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-fts"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "crc32c",
@@ -4428,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-graph"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "nodedb-mem",
@@ -4445,7 +4445,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-mem"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fluxbench",
  "libc",
@@ -4461,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-physical"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "nodedb-array",
  "nodedb-graph",
@@ -4475,7 +4475,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-query"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "nodedb-fts",
  "nodedb-spatial",
@@ -4492,7 +4492,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-raft"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "crc32c",
  "rand 0.9.4",
@@ -4509,7 +4509,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-spatial"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "h3o",
  "nodedb-mem",
@@ -4526,7 +4526,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-sql"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "nodedb-query",
@@ -4540,7 +4540,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-strict"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "nodedb-types",
@@ -4554,7 +4554,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-test-support"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "futures",
@@ -4581,7 +4581,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-types"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "bytemuck",
@@ -4607,7 +4607,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-vector"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -4631,7 +4631,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-vector-gpu"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "nodedb-vector",
  "thiserror 2.0.18",
@@ -4639,7 +4639,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-wal"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "crc32c",
@@ -8689,3 +8689,7 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "pagedb"
+version = "0.1.0"
