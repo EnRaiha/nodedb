@@ -241,22 +241,27 @@ pub(super) async fn try_string(
         return Some(dsl::search_fusion(state, identity, database_id, sql).await);
     }
     if upper.starts_with("CREATE VECTOR INDEX ") {
-        return Some(dsl::create_vector_index(state, identity, sql).await);
+        return Some(dsl::create_vector_index(state, identity, database_id, sql).await);
     }
     if upper.starts_with("CREATE FULLTEXT INDEX ") {
-        return Some(dsl::create_fulltext_index(state, identity, sql).await);
+        return Some(dsl::create_fulltext_index(state, identity, database_id, sql).await);
     }
     if upper.starts_with("CREATE SEARCH INDEX ") {
-        return Some(dsl::create_search_index(state, identity, sql).await);
+        return Some(dsl::create_search_index(state, identity, database_id, sql).await);
     }
     if upper.starts_with("CREATE SPARSE INDEX ") {
-        return Some(dsl::create_sparse_index(state, identity, sql));
+        return Some(dsl::create_sparse_index(state, identity, database_id, sql));
     }
     // CREATE SPATIAL INDEX — string-recognized (no typed AST variant); the pgwire
     // schema string router dispatched it from the raw SQL. Replicate that
     // exactly here, before the parse gate.
     if upper.starts_with("CREATE SPATIAL INDEX ") {
-        return Some(spatial::create_spatial_index(state, identity, sql));
+        return Some(spatial::create_spatial_index(
+            state,
+            identity,
+            database_id,
+            sql,
+        ));
     }
     if upper.starts_with("CRDT MERGE ") {
         if crdt_apply_forbidden_in_transaction(txn_ctx) {

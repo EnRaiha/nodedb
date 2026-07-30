@@ -1,36 +1,32 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Protocol-neutral index DDL: CREATE INDEX, DROP INDEX.
+//! `CREATE [UNIQUE] INDEX` on a collection field.
 //!
-//! CREATE/DROP INDEX mutate the owning [`StoredCollection`]'s `indexes`
-//! vector and commit a `CatalogEntry::PutCollection`. The replicated
-//! applier's `put_async` post-apply hook fans out a fresh `Register` to
-//! every node's Data Plane (including this leader), so `doc_configs`
-//! reflects the new index before the next write arrives. The `indexes`
-//! ownership keys (`permissions.propose_owner("index", ...)`) continue
-//! to back SHOW INDEXES (served by the protocol-neutral DDL router).
+//! CREATE INDEX mutates the owning [`StoredCollection`]'s `indexes` vector and
+//! commits a `CatalogEntry::PutCollection`. The replicated applier's
+//! `put_async` post-apply hook fans out a fresh `Register` to every node's
+//! Data Plane (including this leader), so `doc_configs` reflects the new index
+//! before the next write arrives.
 //!
-//! Ported from the pgwire `ddl::collection::index` handler. The async
-//! data-plane pipeline (two-phase Building→Ready backfill, peer fan-out,
-//! `dispatch_register_from_stored`, owner propose/delete) is preserved
-//! verbatim; only the result construction changed from pgwire `Response`
-//! / `Tag` to the protocol-neutral `DdlResult` / `DdlError`.
+//! The index is also registered in the catalog index registry, which is what
+//! `SHOW INDEXES` lists and `DROP INDEX` resolves. The ownership row backs
+//! authorization and is filed under the collection's own database so a
+//! database-scoped owner lookup finds it.
+//!
+//! [`StoredCollection`]: crate::control::security::catalog::StoredCollection
 
 use crate::control::security::audit::AuditEvent;
-use crate::control::security::catalog::{IndexBuildState, StoredIndex};
+use crate::control::security::catalog::{IndexBuildState, IndexKind, StoredIndex};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::index_registry::{
+    IndexRegistration, propose_index_record,
+};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use crate::types::TraceId;
 
-use super::super::super::result::{DdlError, DdlResult};
-
-fn err(sqlstate: &str, message: impl Into<String>) -> DdlError {
-    DdlError {
-        sqlstate: sqlstate.to_string(),
-        message: message.into(),
-    }
-}
+use super::super::super::super::result::{DdlError, DdlResult};
+use super::commit::{commit_collection_mutation, err};
 
 /// Normalize a user-supplied field reference into the canonical JSON path
 /// used by the sparse-index extraction (`$.field` / `$.nested.field`).
@@ -42,35 +38,6 @@ fn normalize_index_field(field: &str) -> String {
     } else {
         format!("$.{field}")
     }
-}
-
-/// Commit a mutated [`StoredCollection`] through the replicated metadata
-/// Raft group (cluster) or straight to the local `SystemCatalog`
-/// (single-node fallback), then re-dispatch a `Register` to this node's
-/// Data Plane so the new index vector lands in `doc_configs` immediately.
-async fn commit_collection_mutation(
-    state: &SharedState,
-    coll: &crate::control::security::catalog::StoredCollection,
-    database_id: DatabaseId,
-) -> Result<(), DdlError> {
-    let entry = crate::control::catalog_entry::CatalogEntry::PutCollection(Box::new(coll.clone()));
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| err("XX000", e.to_string()))?;
-    if log_index == 0 {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .put_collection(database_id, coll)
-                .map_err(|e| err("XX000", e.to_string()))?;
-        }
-        // Single-node path bypasses the applier post-apply hook, so the
-        // Register refresh has to be fired here. In cluster mode the
-        // applier's `put_async` does it on every node.
-        super::dispatch_register_from_stored(state, coll)
-            .await
-            .map_err(|e| err("XX000", e.to_string()))?;
-    }
-    Ok(())
 }
 
 /// Parsed `CREATE INDEX` request.
@@ -154,6 +121,23 @@ pub async fn create_index(
         ));
     }
 
+    // Reject a name already taken by an index of any kind in this database:
+    // the registry is keyed by name, so two kinds sharing one name would make
+    // exactly one of them droppable.
+    if let Some(existing) = catalog
+        .get_index_record(database_id.as_u64(), tenant_id.as_u64(), &index_name)
+        .map_err(|e| err("XX000", e.to_string()))?
+    {
+        return Err(err(
+            "42710",
+            format!(
+                "index '{index_name}' already exists on '{}' ({})",
+                existing.collection,
+                existing.kind.display_type()
+            ),
+        ));
+    }
+
     let index_owner = coll.owner.clone();
     let canonical_field = normalize_index_field(field);
     let is_array = canonical_field.ends_with("[]");
@@ -229,9 +213,9 @@ pub async fn create_index(
     // this step non-coordinator nodes never populate the index for
     // the rows they host — the silent-miss bug. Single-node and
     // peerless clusters short-circuit inside the helper.
-    super::index_fanout::backfill_on_peers(
+    super::super::index_fanout::backfill_on_peers(
         state,
-        super::index_fanout::PeerBackfill {
+        super::super::index_fanout::PeerBackfill {
             tenant_id,
             database_id,
             collection,
@@ -262,15 +246,28 @@ pub async fn create_index(
         commit_collection_mutation(state, &ready_coll, database_id).await?;
     }
 
-    // Ownership record backs SHOW INDEXES — keep the existing ledger.
-    crate::control::server::shared::ddl::owner::propose_owner(
+    // Identity record: what SHOW INDEXES lists and DROP INDEX resolves.
+    propose_index_record(
         state,
-        "index",
+        &IndexRegistration {
+            database_id,
+            tenant_id,
+            name: &index_name,
+            kind: IndexKind::Secondary,
+            collection,
+            fields: vec![canonical_field.clone()],
+        },
+    )?;
+
+    // Ownership record backs authorization for later ALTER / DROP.
+    crate::control::server::shared::ddl::owner::propose_owner_in_database(
+        state,
+        IndexKind::Secondary.owner_object_type(),
+        database_id.as_u64(),
         tenant_id,
         &index_name,
         &index_owner,
-    )
-    .map_err(|e| err(&e.sqlstate, e.message))?;
+    )?;
 
     let kind = if is_unique { "unique index" } else { "index" };
     let ci = if case_insensitive {
@@ -291,118 +288,6 @@ pub async fn create_index(
 
     Ok(vec![DdlResult::Status {
         command: "CREATE INDEX".to_string(),
-        rows_affected: None,
-    }])
-}
-
-/// DROP INDEX <name>
-pub async fn drop_index(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    parts: &[&str],
-    database_id: DatabaseId,
-) -> Result<Vec<DdlResult>, DdlError> {
-    if parts.len() < 3 {
-        return Err(err("42601", "syntax: DROP INDEX <name>"));
-    }
-
-    let index_name = parts[2].to_string();
-    let tenant_id = identity.tenant_id;
-
-    // Check ownership or admin.
-    let is_owner = state
-        .permissions
-        .get_owner_in_database("index", database_id.as_u64(), tenant_id, &index_name)
-        .as_deref()
-        == Some(&identity.username);
-
-    if !is_owner
-        && !identity.is_superuser
-        && !identity.has_role(&crate::control::security::identity::Role::TenantAdmin)
-    {
-        return Err(err(
-            "42501",
-            "permission denied: must be index owner or admin",
-        ));
-    }
-
-    // Locate the owning collection via catalog scan. Every index lives on
-    // exactly one collection; scanning is cheap relative to Raft commit.
-    let catalog = state.credentials.catalog();
-    let collections = catalog
-        .load_collections_for_tenant(database_id, tenant_id.as_u64())
-        .map_err(|e| err("XX000", e.to_string()))?;
-    let mut owning = collections
-        .into_iter()
-        .find(|c| c.indexes.iter().any(|i| i.name == index_name));
-
-    if let Some(coll) = owning.as_mut() {
-        let dropped_field = coll
-            .indexes
-            .iter()
-            .find(|i| i.name == index_name)
-            .map(|i| i.field.clone());
-        coll.indexes.retain(|i| i.name != index_name);
-        commit_collection_mutation(state, coll, database_id).await?;
-
-        // Purge existing index entries from the sparse engine so stale
-        // rows don't leak into future lookups on a re-created index of
-        // the same name. Best-effort — the Data Plane itself is the
-        // authority, so a failure here is logged rather than propagated.
-        if let Some(field) = dropped_field {
-            let vshard =
-                crate::types::VShardId::from_collection_in_database(database_id, &coll.name);
-            let plan = crate::bridge::envelope::PhysicalPlan::Document(
-                nodedb_physical::physical_plan::DocumentOp::DropIndex {
-                    collection: coll.name.clone(),
-                    field,
-                },
-            );
-            if let Err(e) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
-                state,
-                tenant_id,
-                database_id,
-                vshard,
-                plan,
-                TraceId::ZERO,
-            )
-            .await
-            {
-                tracing::warn!(
-                    index = %index_name,
-                    collection = %coll.name,
-                    error = %e,
-                    "failed to dispatch DropIndex to Data Plane (non-fatal)"
-                );
-            }
-        }
-    } else {
-        // No owning collection found — still tear down the ownership
-        // record so repeated DROP INDEX is idempotent even for legacy
-        // indexes created before catalog-backed storage.
-        tracing::debug!(
-            index = %index_name,
-            "DROP INDEX: no owning collection in catalog, removing ownership record only"
-        );
-    }
-
-    crate::control::server::shared::ddl::owner::propose_delete_owner(
-        state,
-        "index",
-        tenant_id,
-        &index_name,
-    )
-    .map_err(|e| err(&e.sqlstate, e.message))?;
-
-    state.audit_record(
-        AuditEvent::AdminAction,
-        Some(tenant_id),
-        &identity.username,
-        &format!("dropped index '{index_name}'"),
-    );
-
-    Ok(vec![DdlResult::Status {
-        command: "DROP INDEX".to_string(),
         rows_affected: None,
     }])
 }

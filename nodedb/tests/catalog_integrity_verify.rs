@@ -188,6 +188,12 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::PutOwner(_) => VariantClass::Exempt,
         CatalogEntry::DeleteOwner { .. } => VariantClass::Exempt,
 
+        // Index identity records are registry-only: each index's ownership row
+        // is proposed separately by the CREATE / DROP handler as its own
+        // `PutOwner` / `DeleteOwner`, so the applier writes no owner row here.
+        CatalogEntry::PutIndexRecord(_) => VariantClass::Exempt,
+        CatalogEntry::DeleteIndexRecord { .. } => VariantClass::Exempt,
+
         CatalogEntry::PutSequenceState(_) => VariantClass::Exempt,
         CatalogEntry::PutUser(_) => VariantClass::Exempt,
         CatalogEntry::DropUser { .. } => VariantClass::Exempt,

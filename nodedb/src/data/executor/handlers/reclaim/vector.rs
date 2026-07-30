@@ -85,6 +85,46 @@ pub fn reclaim_vector_checkpoints(
     Ok(stats)
 }
 
+/// Unlink the checkpoint of exactly one vector index — the file
+/// `{db}:{tid}:{coll}.ckpt` for the default field, or
+/// `{db}:{tid}:{coll}:{field}.ckpt` for a named one — leaving every other
+/// index of the same collection in place. Idempotent.
+pub fn reclaim_vector_index_checkpoint(
+    data_dir: &Path,
+    database_id: u64,
+    tenant_id: u64,
+    collection: &str,
+    field_name: &str,
+) -> Result<ReclaimStats> {
+    let stem = if field_name.is_empty() {
+        format!("{database_id}:{tenant_id}:{collection}")
+    } else {
+        format!("{database_id}:{tenant_id}:{collection}:{field_name}")
+    };
+    let ckpt_dir = data_dir.join("vector-ckpt");
+    let mut stats = ReclaimStats::default();
+    for extension in ["ckpt", "ckpt.tmp"] {
+        let path = ckpt_dir.join(format!("{stem}.{extension}"));
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                stats.files_unlinked = stats.files_unlinked.saturating_add(1);
+                stats.bytes_freed = stats.bytes_freed.saturating_add(size);
+                debug!(path = %path.display(), size, "vector reclaim: unlinked index ckpt");
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ReclaimError::Io {
+                    operation: "unlink vector index checkpoint",
+                    path,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +176,33 @@ mod tests {
     fn empty_dir_is_noop() {
         let tmp = TempDir::new().unwrap();
         let stats = reclaim_vector_checkpoints(tmp.path(), 0, 1, "x").unwrap();
+        assert_eq!(stats.files_unlinked, 0);
+    }
+
+    #[test]
+    fn index_scoped_reclaim_spares_sibling_indexes() {
+        let tmp = TempDir::new().unwrap();
+        let ckpt = tmp.path().join("vector-ckpt");
+        write(&ckpt.join("0:1:docs.ckpt"), b"default");
+        write(&ckpt.join("0:1:docs:text_emb.ckpt"), b"text");
+        write(&ckpt.join("0:1:docs:image_emb.ckpt"), b"image");
+
+        let stats = reclaim_vector_index_checkpoint(tmp.path(), 0, 1, "docs", "text_emb").unwrap();
+        assert_eq!(stats.files_unlinked, 1);
+        assert!(!ckpt.join("0:1:docs:text_emb.ckpt").exists());
+        assert!(ckpt.join("0:1:docs:image_emb.ckpt").exists());
+        assert!(ckpt.join("0:1:docs.ckpt").exists());
+
+        // The default (unnamed) field targets the bare stem only.
+        reclaim_vector_index_checkpoint(tmp.path(), 0, 1, "docs", "").unwrap();
+        assert!(!ckpt.join("0:1:docs.ckpt").exists());
+        assert!(ckpt.join("0:1:docs:image_emb.ckpt").exists());
+    }
+
+    #[test]
+    fn index_scoped_reclaim_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let stats = reclaim_vector_index_checkpoint(tmp.path(), 0, 1, "docs", "emb").unwrap();
         assert_eq!(stats.files_unlinked, 0);
     }
 

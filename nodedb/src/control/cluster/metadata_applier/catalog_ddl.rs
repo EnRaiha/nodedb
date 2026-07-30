@@ -89,8 +89,8 @@ impl MetadataCommitApplier {
         // payloads remain loud typed errors. A version of `0` (compat mode /
         // unit tests) is applied without version fencing.
         if matches!(
-            catalog_entry::descriptor_stamp::validate(&stamped, catalog)?,
-            catalog_entry::descriptor_stamp::ValidationOutcome::AlreadyApplied
+            catalog_entry::descriptor_validate::validate(&stamped, catalog)?,
+            catalog_entry::descriptor_validate::ValidationOutcome::AlreadyApplied
         ) {
             debug!(
                 kind = stamped.kind(),

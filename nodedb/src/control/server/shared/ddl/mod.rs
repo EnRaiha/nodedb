@@ -4,6 +4,7 @@
 pub mod catalog;
 pub mod dispatch;
 pub mod engine_apply;
+pub mod index_registry;
 pub mod neutral;
 pub mod owner;
 pub mod result;

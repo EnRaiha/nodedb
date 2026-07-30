@@ -32,6 +32,12 @@ pub enum RecordType {
     /// Vector engine: set HNSW index parameters for a collection.
     VectorParams = 12 | 0x8000,
 
+    /// Vector engine: drop one vector index (`DROP INDEX` on a vector index).
+    ///
+    /// Required: skipping it on replay resurrects an index the user dropped,
+    /// because the `VectorParams` record that created it is still in the log.
+    VectorIndexDrop = 18 | 0x8000,
+
     /// Vector engine: direct upsert into a vector-primary collection.
     ///
     /// Distinct from `VectorPut`: a vector-primary insert bypasses the
@@ -306,6 +312,7 @@ impl RecordType {
             x if x == 15 | 0x8000 => Some(Self::SparseVectorDelete),
             x if x == 16 | 0x8000 => Some(Self::MultiVectorPut),
             x if x == 17 | 0x8000 => Some(Self::MultiVectorDelete),
+            x if x == 18 | 0x8000 => Some(Self::VectorIndexDrop),
             x if x == 20 | 0x8000 => Some(Self::CrdtDelta),
             x if x == 21 | 0x8000 => Some(Self::CrdtListOp),
             x if x == 22 | 0x8000 => Some(Self::CrdtDocOp),
@@ -379,6 +386,7 @@ mod tests {
             RecordType::SparseVectorDelete,
             RecordType::MultiVectorPut,
             RecordType::MultiVectorDelete,
+            RecordType::VectorIndexDrop,
             RecordType::CrdtDelta,
             RecordType::CrdtListOp,
             RecordType::CrdtDocOp,

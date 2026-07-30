@@ -83,6 +83,14 @@ pub(super) fn is_dsl_statement(sql: &str) -> bool {
         || upper.starts_with("CREATE FULLTEXT INDEX ")
         || upper.starts_with("CREATE SEARCH INDEX ")
         || upper.starts_with("CREATE SPARSE INDEX ")
+        // Kind-qualified index drops: recognized by the DDL router, rejected by
+        // the SQL parser, so they must bypass Parse-time schema inference the
+        // same way their CREATE counterparts do.
+        || upper.starts_with("DROP VECTOR INDEX ")
+        || upper.starts_with("DROP FULLTEXT INDEX ")
+        || upper.starts_with("DROP SEARCH INDEX ")
+        || upper.starts_with("DROP SPATIAL INDEX ")
+        || upper.starts_with("DROP SPARSE INDEX ")
 }
 
 /// Replace each `$N` placeholder in `sql` with the literal `NULL`.

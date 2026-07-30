@@ -148,6 +148,20 @@ pub enum VectorOp {
         ivf_nprobe: usize,
     },
 
+    /// Tear down one vector index: the materialized graph, its build
+    /// parameters, its declared dimension, and its on-disk checkpoint.
+    ///
+    /// The counterpart of [`VectorOp::SetParams`]. Without it a dropped
+    /// vector index keeps answering searches until the process restarts and
+    /// keeps its `(collection, field)` slot occupied so no replacement index
+    /// can be created.
+    DropIndex {
+        collection: String,
+        /// Named vector field the index covers. Empty string = the default
+        /// (unnamed) vector field.
+        field_name: String,
+    },
+
     /// Query live vector index statistics. Returns `VectorIndexStats` as payload.
     QueryStats {
         collection: String,

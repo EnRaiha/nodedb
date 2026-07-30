@@ -67,6 +67,7 @@ pub(super) mod update_from_join_collect;
 pub(super) mod update_from_join_source_map;
 pub mod upsert;
 pub mod vector;
+pub mod vector_index_drop;
 pub mod vector_lifecycle;
 pub mod vector_multi;
 mod vector_multi_search_exec;

@@ -262,6 +262,8 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
             target_descriptor, ..
         } => (target_descriptor.name.clone(), 0, String::new()),
         E::MoveTenantCutover { tenant_id, .. } => (format!("tenant:{tenant_id}"), 0, String::new()),
+        E::PutIndexRecord(r) => (r.name.clone(), 0, String::new()),
+        E::DeleteIndexRecord { name, .. } => (name.clone(), 0, String::new()),
         E::PutOidcProvider(p) => (p.provider_name.clone(), 0, String::new()),
         E::DeleteOidcProvider { name } => (name.clone(), 0, String::new()),
     }

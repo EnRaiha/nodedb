@@ -137,6 +137,11 @@ impl CoreLoop {
                 },
             ),
 
+            VectorOp::DropIndex {
+                collection,
+                field_name,
+            } => self.execute_drop_vector_index(task, tid, collection, field_name),
+
             VectorOp::QueryStats {
                 collection,
                 field_name,

@@ -15,7 +15,11 @@
 //! next boot to seed.
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::security::catalog::IndexKind;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::index_registry::{
+    IndexRegistration, propose_index_record,
+};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::VectorOp;
@@ -95,6 +99,7 @@ struct VectorIndexParams {
 pub async fn create_vector_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let stmt = parse_index_statement(sql, LEADING, &HEADER, OPTIONS, CONTEXT)?;
@@ -124,16 +129,37 @@ pub async fn create_vector_index(
         ));
     }
 
-    crate::control::server::shared::ddl::owner::propose_owner(
+    // A name already taken by an index of any kind would leave exactly one of
+    // the two droppable, since the registry is keyed by name.
+    if let Some(taken) = state
+        .credentials
+        .catalog()
+        .get_index_record(database_id.as_u64(), tenant_id.as_u64(), index_name)
+        .map_err(|e| ddl_err("XX000", format!("read index registry: {e}")))?
+    {
+        if stmt.header.if_not_exists && taken.kind == IndexKind::Vector {
+            return Ok(vec![status()]);
+        }
+        return Err(ddl_err(
+            "42710",
+            format!(
+                "index '{index_name}' already exists on '{}' ({})",
+                taken.collection,
+                taken.kind.display_type()
+            ),
+        ));
+    }
+
+    crate::control::server::shared::ddl::owner::propose_owner_in_database(
         state,
-        "vector_index",
+        IndexKind::Vector.owner_object_type(),
+        database_id.as_u64(),
         tenant_id,
         index_name,
         &identity.username,
     )?;
 
-    let vshard =
-        crate::types::VShardId::from_collection_in_database(DatabaseId::DEFAULT, collection);
+    let vshard = crate::types::VShardId::from_collection_in_database(database_id, collection);
     let set_params_plan = PhysicalPlan::Vector(VectorOp::SetParams {
         collection: collection.to_string(),
         field_name: field_name.clone(),
@@ -154,7 +180,7 @@ pub async fn create_vector_index(
     crate::control::server::shared::ddl::engine_apply::apply_in_engine(
         state,
         tenant_id,
-        DatabaseId::DEFAULT,
+        database_id,
         collection,
         set_params_plan.clone(),
         "42P16",
@@ -170,7 +196,7 @@ pub async fn create_vector_index(
         &state.wal,
         tenant_id,
         vshard,
-        DatabaseId::DEFAULT,
+        database_id,
         &set_params_plan,
     )
     .map_err(|e| ddl_err("XX000", format!("persist vector index params to WAL: {e}")))?;
@@ -197,6 +223,18 @@ pub async fn create_vector_index(
                 format!("persist vector index params to catalog: {e}"),
             )
         })?;
+
+    propose_index_record(
+        state,
+        &IndexRegistration {
+            database_id,
+            tenant_id,
+            name: index_name,
+            kind: IndexKind::Vector,
+            collection,
+            fields: vec![field_name.clone()],
+        },
+    )?;
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

@@ -28,6 +28,8 @@ pub mod database_types;
 pub mod dependencies;
 pub mod function_types;
 pub mod functions;
+pub mod index_record;
+pub mod index_registry;
 pub mod l2_cleanup_queue;
 pub mod lockout;
 pub mod materialized_view;
@@ -83,6 +85,7 @@ pub use database_types::{DatabaseDescriptor, DatabaseStatus, ParentCloneRef};
 pub use function_types::{
     FunctionLanguage, FunctionParam, FunctionSecurity, FunctionVolatility, StoredFunction,
 };
+pub use index_record::{IndexKind, StoredIndexRecord};
 pub use l2_cleanup_queue::StoredL2CleanupEntry;
 pub use lockout::StoredLockoutRecord;
 pub use oidc_providers::{StoredClaimMappingRule, StoredOidcProvider};

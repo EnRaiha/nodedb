@@ -142,6 +142,13 @@ pub(super) fn encode(op: &VectorOp) -> Option<ReplicatedWrite> {
             storage_dtype: *storage_dtype,
             payload_indexes: payload_indexes.clone(),
         },
+        VectorOp::DropIndex {
+            collection,
+            field_name,
+        } => ReplicatedWrite::DropVectorIndex {
+            collection: collection.to_owned(),
+            field_name: field_name.to_owned(),
+        },
         VectorOp::Search { .. }
         | VectorOp::MultiSearch { .. }
         | VectorOp::QueryStats { .. }

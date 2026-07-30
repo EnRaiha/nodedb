@@ -6,8 +6,12 @@
 //! ```sql
 //! CREATE SPATIAL INDEX [IF NOT EXISTS] [<name>] ON <collection>(<field>)
 //!     [USING RTREE|GEOHASH] [PRECISION <n>]
-//! DROP INDEX <name>   -- handled by existing DROP INDEX path
+//! DROP [SPATIAL] INDEX <name>
 //! ```
+//!
+//! The index registers in the catalog index registry, which is what makes the
+//! drop statements above resolve it — the registry is the only record of a
+//! spatial index's identity, since the R-tree itself is built per collection.
 //!
 //! `ON <collection> FIELDS <field>` is accepted as an equivalent spelling of
 //! the parenthesized column. Parsing goes through the shared index-DDL grammar
@@ -18,8 +22,13 @@
 //! The handler builds [`DdlResult`](super::super::result::DdlResult) directly
 //! and carries no pgwire types.
 
+use crate::control::security::catalog::IndexKind;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::index_registry::{
+    IndexRegistration, propose_index_record,
+};
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::owner;
 use super::super::result::{DdlError, DdlResult};
@@ -33,9 +42,12 @@ const LEADING: &[&str] = &["CREATE", "SPATIAL", "INDEX"];
 const SYNTAX: &str = "CREATE SPATIAL INDEX [IF NOT EXISTS] [<name>] ON <collection>(<field>) \
      [USING RTREE|GEOHASH] [PRECISION <1-12>]";
 
+/// Substituted by the parser when the statement names no index.
+const PLACEHOLDER_NAME: &str = "_auto_spatial";
+
 const HEADER: HeaderSpec = HeaderSpec {
     name: NameMode::Optional {
-        fallback: "_auto_spatial",
+        fallback: PLACEHOLDER_NAME,
     },
     columns: ColumnMode::ExactlyOne,
     syntax: SYNTAX,
@@ -58,6 +70,7 @@ const DEFAULT_GEOHASH_PRECISION: usize = 6;
 pub fn create_spatial_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let stmt = parse_index_statement(sql, LEADING, &HEADER, OPTIONS, CONTEXT)?;
@@ -74,11 +87,56 @@ pub fn create_spatial_index(
     let field = stmt.header.column();
     let tenant_id = identity.tenant_id;
 
-    owner::propose_owner(
+    // The parser substitutes a placeholder when the name is omitted; a
+    // tenant-global placeholder would collide across collections and leave
+    // only one of them droppable, so it resolves per collection and field.
+    let index_name = if index_name == PLACEHOLDER_NAME {
+        format!("{collection}_{field}_spatial_idx")
+    } else {
+        index_name.clone()
+    };
+    if let Some(taken) = state
+        .credentials
+        .catalog()
+        .get_index_record(database_id.as_u64(), tenant_id.as_u64(), &index_name)
+        .map_err(|e| DdlError {
+            sqlstate: "XX000".to_string(),
+            message: format!("{CONTEXT}: read index registry: {e}"),
+        })?
+    {
+        if stmt.header.if_not_exists && taken.kind == IndexKind::Spatial {
+            return Ok(vec![DdlResult::Status {
+                command: CONTEXT.to_string(),
+                rows_affected: None,
+            }]);
+        }
+        return Err(DdlError {
+            sqlstate: "42710".to_string(),
+            message: format!(
+                "{CONTEXT}: index '{index_name}' already exists on '{}' ({})",
+                taken.collection,
+                taken.kind.display_type()
+            ),
+        });
+    }
+
+    propose_index_record(
         state,
-        "spatial_index",
+        &IndexRegistration {
+            database_id,
+            tenant_id,
+            name: &index_name,
+            kind: IndexKind::Spatial,
+            collection,
+            fields: vec![field.to_string()],
+        },
+    )?;
+    owner::propose_owner_in_database(
+        state,
+        IndexKind::Spatial.owner_object_type(),
+        database_id.as_u64(),
         tenant_id,
-        index_name,
+        &index_name,
         &identity.username,
     )?;
 
@@ -147,7 +205,7 @@ mod tests {
         let stmt = parse("CREATE SPATIAL INDEX ON restaurants FIELDS location").unwrap();
         assert_eq!(stmt.header.collection, "restaurants");
         assert_eq!(stmt.header.column(), "location");
-        assert_eq!(stmt.header.name, "_auto_spatial");
+        assert_eq!(stmt.header.name, PLACEHOLDER_NAME);
     }
 
     #[test]

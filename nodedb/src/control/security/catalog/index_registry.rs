@@ -1,0 +1,299 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! Catalog operations on `_system.index_registry`.
+//!
+//! Key format: `"{database_id}:{tenant_id}:{index_name}"`. Every read that
+//! spans more than one index scans the `"{database_id}:{tenant_id}:"` prefix,
+//! so an index is always found under the database that owns its collection —
+//! not under a fixed database 0 the way the legacy per-kind ownership rows
+//! were filed.
+
+use super::index_record::StoredIndexRecord;
+use super::types::{INDEX_REGISTRY, SystemCatalog, catalog_err};
+
+/// Key of one index record.
+fn index_key(database_id: u64, tenant_id: u64, name: &str) -> String {
+    format!("{database_id}:{tenant_id}:{name}")
+}
+
+/// Prefix shared by every index record of one (database, tenant).
+fn tenant_prefix(database_id: u64, tenant_id: u64) -> String {
+    format!("{database_id}:{tenant_id}:")
+}
+
+impl SystemCatalog {
+    /// Upsert one index record.
+    pub fn put_index_record(&self, record: &StoredIndexRecord) -> crate::Result<()> {
+        let key = index_key(record.database_id, record.tenant_id, &record.name);
+        let bytes = zerompk::to_msgpack_vec(record)
+            .map_err(|e| catalog_err("serialize index record", e))?;
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("write txn", e))?;
+        {
+            let mut table = write_txn
+                .open_table(INDEX_REGISTRY)
+                .map_err(|e| catalog_err("open index_registry", e))?;
+            table
+                .insert(key.as_str(), bytes.as_slice())
+                .map_err(|e| catalog_err("insert index record", e))?;
+        }
+        write_txn.commit().map_err(|e| catalog_err("commit", e))
+    }
+
+    /// Read one index record by name.
+    pub fn get_index_record(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<Option<StoredIndexRecord>> {
+        let key = index_key(database_id, tenant_id, name);
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(INDEX_REGISTRY)
+            .map_err(|e| catalog_err("open index_registry", e))?;
+        match table.get(key.as_str()) {
+            Ok(Some(value)) => Ok(Some(
+                zerompk::from_msgpack(value.value())
+                    .map_err(|e| catalog_err("deser index record", e))?,
+            )),
+            Ok(None) => Ok(None),
+            Err(e) => Err(catalog_err("get index record", e)),
+        }
+    }
+
+    /// Remove one index record. Returns whether a record was present.
+    pub fn delete_index_record(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<bool> {
+        let key = index_key(database_id, tenant_id, name);
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("write txn", e))?;
+        let removed = {
+            let mut table = write_txn
+                .open_table(INDEX_REGISTRY)
+                .map_err(|e| catalog_err("open index_registry", e))?;
+            table
+                .remove(key.as_str())
+                .map_err(|e| catalog_err("remove index record", e))?
+                .is_some()
+        };
+        write_txn.commit().map_err(|e| catalog_err("commit", e))?;
+        Ok(removed)
+    }
+
+    /// Every index record of one (database, tenant), in key order.
+    pub fn list_index_records(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+    ) -> crate::Result<Vec<StoredIndexRecord>> {
+        let prefix = tenant_prefix(database_id, tenant_id);
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(INDEX_REGISTRY)
+            .map_err(|e| catalog_err("open index_registry", e))?;
+        let mut out = Vec::new();
+        for item in table
+            .range(prefix.as_str()..)
+            .map_err(|e| catalog_err("range index_registry", e))?
+        {
+            let (key, value) = item.map_err(|e| catalog_err("read index record", e))?;
+            if !key.value().starts_with(prefix.as_str()) {
+                break;
+            }
+            out.push(
+                zerompk::from_msgpack(value.value())
+                    .map_err(|e| catalog_err("deser index record", e))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Every index record attached to one collection.
+    pub fn list_index_records_for_collection(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+    ) -> crate::Result<Vec<StoredIndexRecord>> {
+        Ok(self
+            .list_index_records(database_id, tenant_id)?
+            .into_iter()
+            .filter(|r| r.collection == collection)
+            .collect())
+    }
+
+    /// Every index record in the catalog, across databases and tenants. Used
+    /// by the boot-time registry seeding and by the integrity verifier.
+    pub fn list_all_index_records(&self) -> crate::Result<Vec<StoredIndexRecord>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("read txn", e))?;
+        let table = read_txn
+            .open_table(INDEX_REGISTRY)
+            .map_err(|e| catalog_err("open index_registry", e))?;
+        let mut out = Vec::new();
+        for item in table
+            .range::<&str>(..)
+            .map_err(|e| catalog_err("range index_registry", e))?
+        {
+            let (_, value) = item.map_err(|e| catalog_err("read index record", e))?;
+            out.push(
+                zerompk::from_msgpack(value.value())
+                    .map_err(|e| catalog_err("deser index record", e))?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Flip `is_active` on every index record of one collection, mirroring the
+    /// collection's own soft-delete state. Returns the number of records
+    /// changed.
+    pub fn set_index_records_active_for_collection(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+        is_active: bool,
+    ) -> crate::Result<usize> {
+        let mut changed = 0usize;
+        for mut record in
+            self.list_index_records_for_collection(database_id, tenant_id, collection)?
+        {
+            if record.is_active == is_active {
+                continue;
+            }
+            record.is_active = is_active;
+            self.put_index_record(&record)?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    /// Remove every index record of one collection. Returns the number
+    /// removed.
+    pub fn delete_index_records_for_collection(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        collection: &str,
+    ) -> crate::Result<usize> {
+        let mut removed = 0usize;
+        for record in self.list_index_records_for_collection(database_id, tenant_id, collection)? {
+            if self.delete_index_record(database_id, tenant_id, &record.name)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::index_record::{IndexKind, StoredIndexRecord};
+    use super::*;
+    use tempfile::TempDir;
+
+    fn catalog() -> (SystemCatalog, TempDir) {
+        let tmp = TempDir::new().expect("tempdir");
+        let catalog = SystemCatalog::open(&tmp.path().join("system.redb")).expect("open catalog");
+        (catalog, tmp)
+    }
+
+    fn record(name: &str, collection: &str, kind: IndexKind) -> StoredIndexRecord {
+        StoredIndexRecord {
+            database_id: 0,
+            tenant_id: 1,
+            name: name.to_string(),
+            kind,
+            collection: collection.to_string(),
+            fields: vec!["embedding".to_string()],
+            is_active: true,
+        }
+    }
+
+    #[test]
+    fn put_get_delete_round_trip() {
+        let (catalog, _tmp) = catalog();
+        let rec = record("idx_a", "docs", IndexKind::Vector);
+        catalog.put_index_record(&rec).unwrap();
+        assert_eq!(catalog.get_index_record(0, 1, "idx_a").unwrap(), Some(rec));
+        assert!(catalog.delete_index_record(0, 1, "idx_a").unwrap());
+        assert_eq!(catalog.get_index_record(0, 1, "idx_a").unwrap(), None);
+        assert!(!catalog.delete_index_record(0, 1, "idx_a").unwrap());
+    }
+
+    #[test]
+    fn listing_is_scoped_to_database_and_tenant() {
+        let (catalog, _tmp) = catalog();
+        catalog
+            .put_index_record(&record("idx_a", "docs", IndexKind::Vector))
+            .unwrap();
+        let mut other_tenant = record("idx_b", "docs", IndexKind::Secondary);
+        other_tenant.tenant_id = 2;
+        catalog.put_index_record(&other_tenant).unwrap();
+        let mut other_db = record("idx_c", "docs", IndexKind::Secondary);
+        other_db.database_id = 7;
+        catalog.put_index_record(&other_db).unwrap();
+
+        let listed = catalog.list_index_records(0, 1).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].name, "idx_a");
+        assert_eq!(catalog.list_all_index_records().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn collection_scoped_activation_and_removal() {
+        let (catalog, _tmp) = catalog();
+        catalog
+            .put_index_record(&record("idx_a", "docs", IndexKind::Vector))
+            .unwrap();
+        catalog
+            .put_index_record(&record("idx_b", "docs", IndexKind::FullText))
+            .unwrap();
+        catalog
+            .put_index_record(&record("idx_c", "other", IndexKind::Secondary))
+            .unwrap();
+
+        assert_eq!(
+            catalog
+                .set_index_records_active_for_collection(0, 1, "docs", false)
+                .unwrap(),
+            2
+        );
+        let inactive: Vec<_> = catalog
+            .list_index_records_for_collection(0, 1, "docs")
+            .unwrap();
+        assert!(inactive.iter().all(|r| !r.is_active));
+        assert!(
+            catalog
+                .get_index_record(0, 1, "idx_c")
+                .unwrap()
+                .expect("other collection untouched")
+                .is_active
+        );
+
+        assert_eq!(
+            catalog
+                .delete_index_records_for_collection(0, 1, "docs")
+                .unwrap(),
+            2
+        );
+        assert_eq!(catalog.list_index_records(0, 1).unwrap().len(), 1);
+    }
+}

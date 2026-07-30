@@ -499,4 +499,12 @@ pub enum ReplicatedWrite {
         delta_signature: [u8; 32],
         signing_required: bool,
     },
+
+    /// Tear down one vector index on every replica — the counterpart of
+    /// `SetVectorParams`. Appended last to preserve the positional ABI.
+    DropVectorIndex {
+        collection: String,
+        #[serde(default)]
+        field_name: String,
+    },
 }

@@ -16,6 +16,7 @@ pub mod continuous_aggregate;
 pub mod custom_type;
 pub mod database;
 pub mod function;
+pub mod index_registry;
 pub mod local;
 pub mod materialized_view;
 pub mod oidc_provider;
@@ -167,6 +168,13 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             grantee,
             permission: perm,
         } => permission::delete(target, grantee, perm, catalog),
+        CatalogEntry::PutIndexRecord(record) => index_registry::put(record, catalog),
+        CatalogEntry::DeleteIndexRecord {
+            database_id,
+            tenant_id,
+            name,
+            ..
+        } => index_registry::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutOwner(stored) => owner::put(stored, catalog),
         CatalogEntry::DeleteOwner {
             object_type,

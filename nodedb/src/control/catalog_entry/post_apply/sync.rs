@@ -196,6 +196,11 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
                 Arc::clone(shared),
             );
         }
+        CatalogEntry::PutIndexRecord(_) | CatalogEntry::DeleteIndexRecord { .. } => {
+            // no-op: the index registry has no in-memory mirror — every
+            // reader (SHOW INDEXES, DROP INDEX, collection teardown) goes
+            // to the catalog, which `apply` already wrote on this node.
+        }
         CatalogEntry::PutOwner(stored) => {
             owner::put((**stored).clone(), Arc::clone(shared));
         }

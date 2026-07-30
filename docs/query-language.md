@@ -666,7 +666,26 @@ DROP FULLTEXT INDEX idx_name;
 -- Spatial index
 CREATE SPATIAL INDEX ON locations(geom) USING RTREE;
 DROP SPATIAL INDEX idx_name;
+
+-- Sparse-vector index
+CREATE SPARSE INDEX idx_terms ON docs(terms);
+DROP SPARSE INDEX idx_terms;
 ```
+
+Every index kind shares one namespace per database, so a name identifies
+exactly one index and `DROP INDEX <name>` drops it whatever kind it is. The
+kind-qualified spellings (`DROP VECTOR INDEX`, …) additionally assert the kind
+and fail if the name belongs to another one. Dropping a name that is not
+registered is an error unless `IF EXISTS` is given.
+
+`SHOW INDEXES [ON <collection>]` lists `index_name`, `type`, `collection`,
+`fields`, and `owner`. Statements that allow the index name to be omitted
+(`CREATE SPATIAL INDEX`, `CREATE SPARSE INDEX`, `CREATE FULLTEXT INDEX`) derive
+one from the collection and column — look it up with `SHOW INDEXES` before
+dropping.
+
+Indexes follow their collection's lifecycle: `DROP COLLECTION` hides them,
+`UNDROP COLLECTION` restores them, and a purge removes them for good.
 
 ### Materialized Views (HTAP Bridge)
 

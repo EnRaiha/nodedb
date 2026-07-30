@@ -144,9 +144,11 @@ fn vector_is_write(op: &VectorOp) -> bool {
         | VectorOp::QueryStats { .. }
         | VectorOp::SparseSearch { .. }
         | VectorOp::MultiVectorScoreSearch { .. }
-        // `SetParams`/`Seal`/`CompactIndex`/`Rebuild` are `Permission::Alter`
-        // (not `Write` at all) and `NotAWrite` in `plan_vshard`.
+        // `SetParams`/`DropIndex`/`Seal`/`CompactIndex`/`Rebuild` are
+        // `Permission::Alter` (not `Write` at all) and `NotAWrite` in
+        // `plan_vshard`.
         | VectorOp::SetParams { .. }
+        | VectorOp::DropIndex { .. }
         | VectorOp::Seal { .. }
         | VectorOp::CompactIndex { .. }
         | VectorOp::Rebuild { .. } => false,

@@ -220,6 +220,7 @@ pub fn touched_collections(plan: &PhysicalPlan) -> Vec<String> {
                 | MultiSearch { collection, .. }
                 | Delete { collection, .. }
                 | SetParams { collection, .. }
+                | DropIndex { collection, .. }
                 | QueryStats { collection, .. }
                 | Seal { collection, .. }
                 | CompactIndex { collection, .. }

@@ -79,6 +79,10 @@ pub(super) fn decode_arm(ctx: &DecodeCtx, write: &ReplicatedWrite) -> crate::Res
             ivf_cells: *ivf_cells,
             ivf_nprobe: *ivf_nprobe,
         })),
+        ReplicatedWrite::DropVectorIndex {
+            collection,
+            field_name,
+        } => Ok(drop_index(collection, field_name)),
         ReplicatedWrite::SparseInsert {
             collection,
             field_name,
@@ -280,6 +284,13 @@ pub(super) fn set_params(f: SetParamsFields) -> PhysicalPlan {
         pq_m: f.pq_m,
         ivf_cells: f.ivf_cells,
         ivf_nprobe: f.ivf_nprobe,
+    })
+}
+
+pub(super) fn drop_index(collection: &str, field_name: &str) -> PhysicalPlan {
+    PhysicalPlan::Vector(VectorOp::DropIndex {
+        collection: collection.to_owned(),
+        field_name: field_name.to_owned(),
     })
 }
 

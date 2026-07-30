@@ -9,8 +9,8 @@
 //! matches).
 
 use crate::control::security::catalog::{
-    StoredCollection, StoredContinuousAggregate, StoredCustomType, StoredMaterializedView,
-    StoredOidcProvider, StoredRlsPolicy, StoredSynonymGroup,
+    StoredCollection, StoredContinuousAggregate, StoredCustomType, StoredIndexRecord,
+    StoredMaterializedView, StoredOidcProvider, StoredRlsPolicy, StoredSynonymGroup,
     auth_types::{
         StoredApiKey, StoredOwner, StoredPermission, StoredRole, StoredTenant, StoredUser,
     },
@@ -270,6 +270,25 @@ pub enum CatalogEntry {
         privilege: String,
     },
 
+    // ── Index registry ─────────────────────────────────────────────
+    /// Upsert an index identity record. Written by every
+    /// `CREATE [<kind>] INDEX` path so the index is listable and
+    /// droppable by name on every node, whatever engine backs it.
+    PutIndexRecord(Box<StoredIndexRecord>),
+    /// Delete an index identity record by `(database_id, tenant_id, name)`.
+    /// Paired with the kind-specific teardown the DROP handler performs
+    /// before proposing this entry.
+    DeleteIndexRecord {
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
+        /// The collection the index was attached to. Not needed to locate the
+        /// record (the name is the key) — it lets the post-apply hook
+        /// invalidate exactly the cached plans that could still hold an
+        /// `IndexLookup` against the dropped index.
+        collection: String,
+    },
+
     // ── Object ownership ───────────────────────────────────────────
     /// Upsert an ownership record. Used by handlers whose object
     /// has no replicated parent variant (indexes, spatial indexes,
@@ -386,6 +405,8 @@ impl CatalogEntry {
             Self::DeleteRlsPolicy { .. } => "delete_rls_policy",
             Self::PutPermission(_) => "put_permission",
             Self::DeletePermission { .. } => "delete_permission",
+            Self::PutIndexRecord(_) => "put_index_record",
+            Self::DeleteIndexRecord { .. } => "delete_index_record",
             Self::PutOwner(_) => "put_owner",
             Self::DeleteOwner { .. } => "delete_owner",
             Self::PutDatabase(_) => "put_database",

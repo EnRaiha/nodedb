@@ -369,6 +369,13 @@ pub(super) const VECTOR_MODEL_METADATA: TableDefinition<&str, &[u8]> =
 pub(super) const VECTOR_INDEX_PARAMS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.vector_index_params");
 
+/// Table: "{database_id}:{tenant_id}:{index_name}" -> MessagePack StoredIndexRecord.
+///
+/// The identity registry for every index kind. `SHOW INDEXES` lists it,
+/// `DROP INDEX` resolves against it, and collection teardown enumerates it.
+pub(super) const INDEX_REGISTRY: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("_system.index_registry");
+
 /// Table: "{tenant_id}:{collection}:{doc_id}:{checkpoint_name}" -> MessagePack CheckpointRecord.
 pub(super) const CHECKPOINTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.checkpoints");

@@ -78,7 +78,8 @@ impl CoreLoop {
             let is_vector_put = record_type == Some(RecordType::VectorPut);
             let is_vector_delete = record_type == Some(RecordType::VectorDelete);
             let is_vector_params = record_type == Some(RecordType::VectorParams);
-            if !is_vector_put && !is_vector_delete && !is_vector_params {
+            let is_index_drop = record_type == Some(RecordType::VectorIndexDrop);
+            if !is_vector_put && !is_vector_delete && !is_vector_params && !is_index_drop {
                 continue;
             }
 
@@ -97,6 +98,18 @@ impl CoreLoop {
             let database_id = record.header.database_id;
             let record_lsn = record.header.lsn;
             let tombstones = tombstones.for_database(database_id);
+
+            if is_index_drop {
+                // Applied in LSN order, so it wipes the params / puts that
+                // preceded it and leaves a later re-CREATE to rebuild.
+                self.restore_vector_index_drop_record(
+                    database_id,
+                    tenant_id,
+                    &record.payload,
+                    &mut skipped,
+                );
+                continue;
+            }
 
             if is_vector_params {
                 self.restore_vector_params_record(

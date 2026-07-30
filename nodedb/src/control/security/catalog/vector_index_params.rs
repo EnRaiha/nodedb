@@ -57,6 +57,37 @@ impl SystemCatalog {
         }
     }
 
+    /// Remove the parameters of one vector index. Returns whether an entry
+    /// was present.
+    ///
+    /// Without this the build parameters outlive `DROP INDEX`: the name is
+    /// freed but the collection's vector slot stays occupied, so a re-CREATE
+    /// is refused as a duplicate and the next boot re-seeds an index the user
+    /// dropped.
+    pub fn delete_vector_index_params(
+        &self,
+        tenant_id: u64,
+        collection: &str,
+        field_name: &str,
+    ) -> crate::Result<bool> {
+        let key = vector_index_params_key(tenant_id, collection, field_name);
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("write txn", e))?;
+        let removed = {
+            let mut table = write_txn
+                .open_table(VECTOR_INDEX_PARAMS)
+                .map_err(|e| catalog_err("open vector_index_params", e))?;
+            table
+                .remove(key.as_str())
+                .map_err(|e| catalog_err("remove vector index params", e))?
+                .is_some()
+        };
+        write_txn.commit().map_err(|e| catalog_err("commit", e))?;
+        Ok(removed)
+    }
+
     /// List all vector index parameter entries across all tenants.
     pub fn list_all_vector_index_params(&self) -> crate::Result<Vec<StoredVectorIndexParams>> {
         let read_txn = self

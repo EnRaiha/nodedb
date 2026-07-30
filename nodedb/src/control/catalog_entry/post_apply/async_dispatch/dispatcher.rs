@@ -192,6 +192,8 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::DeleteRlsPolicy { .. }
         | CatalogEntry::PutPermission(_)
         | CatalogEntry::DeletePermission { .. }
+        | CatalogEntry::PutIndexRecord(_)
+        | CatalogEntry::DeleteIndexRecord { .. }
         | CatalogEntry::PutOwner(_)
         | CatalogEntry::DeleteOwner { .. }
         | CatalogEntry::PutSynonymGroup(_)

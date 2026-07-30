@@ -2,20 +2,29 @@
 
 //! `CREATE SPARSE INDEX` DSL handler.
 
+use crate::control::security::catalog::IndexKind;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::index_registry::{
+    IndexRegistration, propose_index_record,
+};
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::options::{ColumnMode, HeaderSpec, NameMode, parse_index_statement};
+use super::support::ddl_err;
 
 const CONTEXT: &str = "CREATE SPARSE INDEX";
 const LEADING: &[&str] = &["CREATE", "SPARSE", "INDEX"];
 
 const SYNTAX: &str = "CREATE SPARSE INDEX [IF NOT EXISTS] [<name>] ON <collection> [(<field>)]";
 
+/// Substituted by the parser when the statement names no index.
+const PLACEHOLDER_NAME: &str = "_auto_sparse";
+
 const HEADER: HeaderSpec = HeaderSpec {
     name: NameMode::Optional {
-        fallback: "_auto_sparse",
+        fallback: PLACEHOLDER_NAME,
     },
     columns: ColumnMode::AtMostOne,
     syntax: SYNTAX,
@@ -28,6 +37,7 @@ const DEFAULT_FIELD: &str = "_sparse";
 pub fn create_sparse_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     // This surface carries no options, so any trailing token is a statement
@@ -42,11 +52,53 @@ pub fn create_sparse_index(
     };
     let tenant_id = identity.tenant_id;
 
-    crate::control::server::shared::ddl::owner::propose_owner(
+    // The parser substitutes a placeholder when the name is omitted; a
+    // tenant-global placeholder would collide across collections and leave
+    // only one of them droppable, so it resolves per collection and field.
+    let index_name = if index_name == PLACEHOLDER_NAME {
+        format!("{collection}_{field}_sparse_idx")
+    } else {
+        index_name.clone()
+    };
+    if let Some(taken) = state
+        .credentials
+        .catalog()
+        .get_index_record(database_id.as_u64(), tenant_id.as_u64(), &index_name)
+        .map_err(|e| ddl_err("XX000", format!("{CONTEXT}: read index registry: {e}")))?
+    {
+        if stmt.header.if_not_exists && taken.kind == IndexKind::Sparse {
+            return Ok(vec![DdlResult::Status {
+                command: CONTEXT.to_string(),
+                rows_affected: None,
+            }]);
+        }
+        return Err(ddl_err(
+            "42710",
+            format!(
+                "{CONTEXT}: index '{index_name}' already exists on '{}' ({})",
+                taken.collection,
+                taken.kind.display_type()
+            ),
+        ));
+    }
+
+    propose_index_record(
         state,
-        "sparse_index",
+        &IndexRegistration {
+            database_id,
+            tenant_id,
+            name: &index_name,
+            kind: IndexKind::Sparse,
+            collection,
+            fields: vec![field.to_string()],
+        },
+    )?;
+    crate::control::server::shared::ddl::owner::propose_owner_in_database(
+        state,
+        IndexKind::Sparse.owner_object_type(),
+        database_id.as_u64(),
         tenant_id,
-        index_name,
+        &index_name,
         &identity.username,
     )?;
 

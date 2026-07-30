@@ -343,20 +343,72 @@ pub(super) async fn try_string(
     }
     if upper.starts_with("SHOW INDEXES") || upper.starts_with("SHOW INDEX") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(collection::show_indexes(state, identity, &parts));
+        return Some(collection::show_indexes(
+            state,
+            identity,
+            &parts,
+            database_id,
+        ));
     }
 
-    // DROP INDEX <name>. Parses into a typed `CollectionStmt::DropIndex`, but
-    // the pgwire schema string router dispatched it by string prefix from the
-    // raw token slice (the pgwire typed guards / sync / async arms all returned
-    // `None` for it), reading `parts[2]` for the name and handling IF EXISTS
-    // inside `drop_index`. Replicate that exactly here, before the parse gate,
-    // so the prefix recognition and `parts`-based name extraction stay
-    // byte-identical.
-    if upper.starts_with("DROP INDEX ") {
-        let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(collection::drop_index(state, identity, &parts, database_id).await);
+    // DROP [VECTOR|FULLTEXT|SPATIAL|SPARSE] INDEX [IF EXISTS] <name>.
+    // Recognized by prefix before the parse gate: only the unqualified form
+    // parses at all (into `CollectionStmt::DropIndex`), and the kind-qualified
+    // spellings the docs advertise are rejected by the SQL parser outright.
+    // Both are parsed here so every documented form reaches one handler.
+    if let Some(request) = parse_drop_index(sql, upper, database_id) {
+        return Some(collection::drop_index(state, identity, &request).await);
     }
 
     None
+}
+
+/// Parse `DROP [<KIND>] INDEX [IF EXISTS] <name>`, returning `None` when the
+/// statement is not a drop-index statement at all.
+///
+/// A trailing `ON <collection>` is accepted and ignored: the index name is
+/// unique per database, so the collection adds nothing to the resolution.
+fn parse_drop_index<'a>(
+    sql: &'a str,
+    upper: &str,
+    database_id: crate::types::DatabaseId,
+) -> Option<collection::DropIndexRequest<'a>> {
+    use crate::control::security::catalog::IndexKind;
+
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    let upper_tokens: Vec<&str> = upper.split_whitespace().collect();
+    if upper_tokens.first() != Some(&"DROP") {
+        return None;
+    }
+
+    // Optional kind qualifier between DROP and INDEX.
+    let (kind, mut cursor) = match upper_tokens.get(1) {
+        Some(&"INDEX") => (None, 2),
+        Some(keyword) => match IndexKind::from_drop_keyword(keyword) {
+            Some(kind) if upper_tokens.get(2) == Some(&"INDEX") => (Some(kind), 3),
+            _ => return None,
+        },
+        None => return None,
+    };
+
+    // Optional IF EXISTS.
+    let if_exists = upper_tokens.get(cursor) == Some(&"IF");
+    if if_exists {
+        if upper_tokens.get(cursor + 1) != Some(&"EXISTS") {
+            return None;
+        }
+        cursor += 2;
+    }
+
+    let index_name = tokens.get(cursor)?.trim_end_matches(';');
+    if index_name.is_empty() {
+        return None;
+    }
+
+    Some(collection::DropIndexRequest {
+        index_name,
+        if_exists,
+        kind,
+        database_id,
+    })
 }

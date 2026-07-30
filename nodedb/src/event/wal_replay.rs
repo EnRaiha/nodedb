@@ -207,6 +207,7 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
         RecordType::VectorPut
         | RecordType::VectorDelete
         | RecordType::VectorParams
+        | RecordType::VectorIndexDrop
         | RecordType::VectorDirectUpsert
         | RecordType::MultiVectorPut
         | RecordType::MultiVectorDelete

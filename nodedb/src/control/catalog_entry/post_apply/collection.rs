@@ -75,13 +75,57 @@ pub fn purge_sync(database_id: u64, tenant_id: u64, name: String, shared: Arc<Sh
     // in the pgwire GRANT handler).
     let grant_target = format!("collection:{tenant_id}:{name}");
     let grants_removed = shared.permissions.remove_grants_for_target(&grant_target);
+    // The indexes go with the collection, so their in-memory ownership entries
+    // go too. Read before `finalize_purge` removes the registry rows (it runs
+    // later, in the async reclaim half).
+    let index_owners_removed = evict_index_owners(database_id, tenant_id, &name, &shared);
     debug!(
         collection = %name,
         tenant = tenant_id,
         owner_removed,
         grants_removed,
-        "catalog_entry: PurgeCollection post-apply sync (owner + grants evicted)"
+        index_owners_removed,
+        "catalog_entry: PurgeCollection post-apply sync (owner + grants + index owners evicted)"
     );
+}
+
+/// Drop the in-memory ownership entry of every index attached to `name`,
+/// returning how many were evicted.
+fn evict_index_owners(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    shared: &Arc<SharedState>,
+) -> usize {
+    let records = match shared
+        .credentials
+        .catalog()
+        .list_index_records_for_collection(database_id, tenant_id, name)
+    {
+        Ok(records) => records,
+        Err(e) => {
+            debug!(
+                collection = %name,
+                tenant = tenant_id,
+                error = %e,
+                "catalog_entry: index owner eviction skipped (registry read failed)"
+            );
+            return 0;
+        }
+    };
+    records
+        .iter()
+        .filter(|record| {
+            shared
+                .permissions
+                .install_replicated_remove_owner_in_database(
+                    record.kind.owner_object_type(),
+                    database_id,
+                    tenant_id,
+                    &record.name,
+                )
+        })
+        .count()
 }
 
 pub fn deactivate(tenant_id: u64, name: String, _shared: Arc<SharedState>) {

@@ -165,6 +165,13 @@ pub(super) fn serialize_vector_op(
                 .to_string(),
         }),
 
+        // Same contract on the teardown side: a DROP INDEX rides its own
+        // autocommit `VectorIndexDrop` record, never a transaction redo.
+        VectorOp::DropIndex { .. } => Err(crate::Error::PlanError {
+            detail: "vector DropIndex (index DDL) is not supported in transaction resolve"
+                .to_string(),
+        }),
+
         // Vector-primary direct upsert: full post-image, replayed via
         // `replay_direct_upsert`.
         VectorOp::DirectUpsert {

@@ -184,6 +184,8 @@ pub fn required_permission(plan: &crate::bridge::envelope::PhysicalPlan) -> Perm
             | DocumentOp::BackfillIndex { .. },
         ) => Permission::Alter,
 
+        PhysicalPlan::Vector(VectorOp::DropIndex { .. }) => Permission::Alter,
+
         PhysicalPlan::Crdt(CrdtOp::SetPolicy { .. } | CrdtOp::CompactAtVersion { .. }) => {
             Permission::Alter
         }

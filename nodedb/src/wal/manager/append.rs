@@ -78,6 +78,18 @@ impl WalManager {
         self.append_record(RecordType::VectorParams, tid, vs, db, p)
     }
 
+    /// Append a `VectorIndexDrop` record. Payload is the
+    /// `(collection, field_name)` tuple the drop targets.
+    pub fn append_vector_index_drop(
+        &self,
+        tid: TenantId,
+        vs: VShardId,
+        db: DatabaseId,
+        p: &[u8],
+    ) -> crate::Result<Lsn> {
+        self.append_record(RecordType::VectorIndexDrop, tid, vs, db, p)
+    }
+
     /// Append a `VectorDirectUpsert` record for a vector-primary insert.
     /// Payload is produced by `encode_vector_direct_upsert_payload`.
     pub fn append_vector_direct_upsert(

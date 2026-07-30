@@ -185,6 +185,7 @@ fn vector_routing(op: &VectorOp, database_id: DatabaseId) -> PlanRouting {
         VectorOp::Search { .. }
         | VectorOp::MultiSearch { .. }
         | VectorOp::SetParams { .. }
+        | VectorOp::DropIndex { .. }
         | VectorOp::QueryStats { .. }
         | VectorOp::Seal { .. }
         | VectorOp::CompactIndex { .. }

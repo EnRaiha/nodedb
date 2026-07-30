@@ -188,6 +188,18 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         CatalogEntry::DeletePermission { .. } => {
             // no-op: same as PutPermission.
         }
+        // ── Index registry: index availability changes plan shape ────────────
+        CatalogEntry::PutIndexRecord(record) => {
+            // A newly registered index makes IndexLookup / vector-search
+            // rewrites reachable for this collection; cached scans predate it.
+            inv.invalidate(&record.collection, 0);
+        }
+        CatalogEntry::DeleteIndexRecord { collection, .. } => {
+            // A cached plan still holding an IndexLookup against the dropped
+            // index would read an index the engine no longer has.
+            inv.invalidate(collection, 0);
+        }
+
         CatalogEntry::PutOwner(_) => {
             // no-op: ownership does not influence plan structure.
         }

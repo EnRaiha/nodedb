@@ -106,6 +106,7 @@ fn to_physical_plan(
         | ReplicatedWrite::VectorBatchInsert { .. }
         | ReplicatedWrite::VectorDelete { .. }
         | ReplicatedWrite::SetVectorParams { .. }
+        | ReplicatedWrite::DropVectorIndex { .. }
         | ReplicatedWrite::SparseInsert { .. }
         | ReplicatedWrite::SparseDelete { .. }
         | ReplicatedWrite::MultiVectorInsert { .. }

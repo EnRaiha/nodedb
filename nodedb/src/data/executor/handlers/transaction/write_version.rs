@@ -238,6 +238,7 @@ impl CoreLoop {
             VectorOp::Search { .. }
             | VectorOp::MultiSearch { .. }
             | VectorOp::SetParams { .. }
+            | VectorOp::DropIndex { .. }
             | VectorOp::QueryStats { .. }
             | VectorOp::Seal { .. }
             | VectorOp::CompactIndex { .. }

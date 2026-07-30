@@ -10,7 +10,11 @@
 //! statement is rejected if any token goes unread.
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::security::catalog::IndexKind;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::index_registry::{
+    IndexRegistration, propose_index_record,
+};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::TextOp;
@@ -35,6 +39,7 @@ const OPTIONS: &[OptionSpec] = &[OptionSpec::quoted("ANALYZER"), OptionSpec::boo
 pub async fn create_search_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     const HEADER: HeaderSpec = HeaderSpec {
@@ -51,7 +56,7 @@ pub async fn create_search_index(
         OPTIONS,
         SEARCH_COMMAND,
     )?;
-    create_text_index(state, identity, stmt, SEARCH_COMMAND).await
+    create_text_index(state, identity, database_id, stmt, SEARCH_COMMAND).await
 }
 
 /// `CREATE FULLTEXT INDEX ...` — the documented alias of
@@ -59,6 +64,7 @@ pub async fn create_search_index(
 pub async fn create_fulltext_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     const HEADER: HeaderSpec = HeaderSpec {
@@ -75,7 +81,7 @@ pub async fn create_fulltext_index(
         OPTIONS,
         FULLTEXT_COMMAND,
     )?;
-    create_text_index(state, identity, stmt, FULLTEXT_COMMAND).await
+    create_text_index(state, identity, database_id, stmt, FULLTEXT_COMMAND).await
 }
 
 /// Record ownership for every named field and bind the collection analyzer.
@@ -88,6 +94,7 @@ pub async fn create_fulltext_index(
 async fn create_text_index(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     stmt: IndexStatement,
     command: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -115,22 +122,60 @@ async fn create_text_index(
     };
     let fuzzy_default = stmt.options.boolean("FUZZY");
 
-    for field in &stmt.header.columns {
-        let index_name = format!("fts_{collection}_{field}");
-        crate::control::server::shared::ddl::owner::propose_owner(
-            state,
-            "fulltext_index",
-            tenant_id,
-            &index_name,
-            &identity.username,
-        )?;
-        state.audit_record(
-            crate::control::security::audit::AuditEvent::AdminAction,
-            Some(tenant_id),
-            &identity.username,
-            &format!("created text index '{index_name}' on '{collection}' ({field})"),
-        );
+    // One index, under the name the statement declared. The name used to be
+    // synthesized per column and the declared one discarded, so
+    // `DROP INDEX <the name I typed>` could never match.
+    let index_name = resolve_index_name(&stmt, &collection);
+    if let Some(taken) = state
+        .credentials
+        .catalog()
+        .get_index_record(database_id.as_u64(), tenant_id.as_u64(), &index_name)
+        .map_err(|e| ddl_err("XX000", format!("{command}: read index registry: {e}")))?
+    {
+        if stmt.header.if_not_exists && taken.kind == IndexKind::FullText {
+            return Ok(vec![DdlResult::Status {
+                command: command.to_string(),
+                rows_affected: None,
+            }]);
+        }
+        return Err(ddl_err(
+            "42710",
+            format!(
+                "{command}: index '{index_name}' already exists on '{}' ({})",
+                taken.collection,
+                taken.kind.display_type()
+            ),
+        ));
     }
+
+    propose_index_record(
+        state,
+        &IndexRegistration {
+            database_id,
+            tenant_id,
+            name: &index_name,
+            kind: IndexKind::FullText,
+            collection: &collection,
+            fields: stmt.header.columns.clone(),
+        },
+    )?;
+    crate::control::server::shared::ddl::owner::propose_owner_in_database(
+        state,
+        IndexKind::FullText.owner_object_type(),
+        database_id.as_u64(),
+        tenant_id,
+        &index_name,
+        &identity.username,
+    )?;
+    state.audit_record(
+        crate::control::security::audit::AuditEvent::AdminAction,
+        Some(tenant_id),
+        &identity.username,
+        &format!(
+            "created text index '{index_name}' on '{collection}' ({})",
+            stmt.header.columns.join(", ")
+        ),
+    );
 
     if analyzer_name.is_some() || fuzzy_default.is_some() {
         let set_config_plan = PhysicalPlan::Text(TextOp::SetTextConfig {
@@ -141,7 +186,7 @@ async fn create_text_index(
         crate::control::server::shared::ddl::engine_apply::apply_in_engine(
             state,
             tenant_id,
-            DatabaseId::DEFAULT,
+            database_id,
             &collection,
             set_config_plan,
             "58000",
@@ -167,6 +212,21 @@ async fn create_text_index(
         command: command.to_string(),
         rows_affected: None,
     }])
+}
+
+/// The name to register this text index under: the one the statement
+/// declared, or a per-collection default when the name was omitted.
+///
+/// The parser substitutes a fixed placeholder for an omitted name; a
+/// placeholder would collide across collections, so it is replaced by a name
+/// derived from the collection.
+fn resolve_index_name(stmt: &IndexStatement, collection: &str) -> String {
+    const PLACEHOLDERS: [&str; 2] = ["_auto_search", "_auto_fulltext"];
+    if PLACEHOLDERS.contains(&stmt.header.name.as_str()) {
+        format!("fts_{collection}")
+    } else {
+        stmt.header.name.clone()
+    }
 }
 
 #[cfg(test)]

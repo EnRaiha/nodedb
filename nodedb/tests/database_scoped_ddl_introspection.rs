@@ -168,12 +168,9 @@ async fn show_collections_lists_it_in_non_default_database() {
     );
 }
 
-/// `SHOW INDEXES` for a collection created in a non-default database must
-/// not error and must reflect indexes on that collection.
-///
-/// Note: index ownership in this codebase is keyed by tenant, not by
-/// database, so this assertion is intentionally lenient (no-error +
-/// well-formed response) rather than asserting database-scoped filtering.
+/// `SHOW INDEXES` in a non-default database must list that database's
+/// indexes, and only those: index records are filed under the database of
+/// the collection they index.
 #[tokio::test]
 async fn show_indexes_works_in_non_default_database() {
     let server = TestServer::start().await;
@@ -185,13 +182,35 @@ async fn show_indexes_works_in_non_default_database() {
         "CREATE COLLECTION t3 (id STRING PRIMARY KEY, v STRING) WITH (engine='document_schemaless')",
     )
     .await;
-    query_ok(&server, "CREATE INDEX ON t3 (v)").await;
+    query_ok(&server, "CREATE INDEX idx_t3_v ON t3 (v)").await;
 
-    server
+    let rows = server
         .client
         .simple_query("SHOW INDEXES")
         .await
         .unwrap_or_else(|e| panic!("SHOW INDEXES must succeed in mydb3: {e}"));
+    let listed = |rows: &[tokio_postgres::SimpleQueryMessage], name: &str| {
+        rows.iter().any(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get("index_name") == Some(name),
+            _ => false,
+        })
+    };
+    assert!(
+        listed(&rows, "idx_t3_v"),
+        "SHOW INDEXES in mydb3 must list mydb3's index, got: {rows:?}"
+    );
+
+    // The same index must not leak into the DEFAULT database's listing.
+    query_ok(&server, "USE DATABASE default").await;
+    let default_rows = server
+        .client
+        .simple_query("SHOW INDEXES")
+        .await
+        .unwrap_or_else(|e| panic!("SHOW INDEXES must succeed in the default database: {e}"));
+    assert!(
+        !listed(&default_rows, "idx_t3_v"),
+        "an index of mydb3 must not appear in the default database, got: {default_rows:?}"
+    );
 }
 
 /// A collection created in a non-default database must NOT be visible to

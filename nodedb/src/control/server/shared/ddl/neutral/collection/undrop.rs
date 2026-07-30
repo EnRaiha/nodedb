@@ -150,13 +150,12 @@ pub fn undrop_collection(
             message: e.to_string(),
         })?;
     if log_index == 0 {
-        // Single-node fallback: write directly.
-        catalog
-            .put_collection(database_id, &stored)
-            .map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: e.to_string(),
-            })?;
+        // Single-node fallback: run the same applier the replicated path runs
+        // on every node, so the restore carries every invariant of a
+        // `PutCollection` apply — the collection row, its owner row, and the
+        // visibility of the indexes the soft-delete hid. Writing the row
+        // directly here restored a collection whose indexes stayed hidden.
+        crate::control::catalog_entry::apply::collection::put(&stored, catalog);
     }
 
     let completion = UndropAuditDetail::new(name, UndropStage::Completed, owner_user_missing)

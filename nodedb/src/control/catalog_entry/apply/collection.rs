@@ -25,6 +25,43 @@ pub fn put(stored: &StoredCollection, catalog: &SystemCatalog) {
         &stored.owner,
         catalog,
     );
+    // An index is only observable while its collection is. `UNDROP COLLECTION`
+    // reaches here with `is_active = true`, which restores the indexes the
+    // soft-delete hid.
+    sync_index_visibility(stored, catalog);
+}
+
+/// Align the collection's index records with its own `is_active` state, so a
+/// soft-dropped collection hides its indexes and an undropped one brings them
+/// back. Indexes are never deleted here — that happens only at purge.
+pub(super) fn sync_index_visibility(stored: &StoredCollection, catalog: &SystemCatalog) {
+    set_index_visibility(
+        stored.database_id.as_u64(),
+        stored.tenant_id,
+        &stored.name,
+        stored.is_active,
+        catalog,
+    );
+}
+
+fn set_index_visibility(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    is_active: bool,
+    catalog: &SystemCatalog,
+) {
+    if let Err(e) =
+        catalog.set_index_records_active_for_collection(database_id, tenant_id, name, is_active)
+    {
+        warn!(
+            collection = %name,
+            tenant = tenant_id,
+            is_active,
+            error = %e,
+            "catalog_entry: index visibility sync failed"
+        );
+    }
 }
 
 /// Create-only variant of [`put`]: writes the collection (and its
@@ -72,6 +109,9 @@ pub fn prepare_purge(
     if let Some(mut stored) = catalog.get_collection(database_id, tenant_id, name)? {
         stored.is_active = false;
         catalog.put_collection(database_id, &stored)?;
+        // Hide the indexes for the window between the fail-closed row write and
+        // `finalize_purge`, which removes their records outright.
+        set_index_visibility(database_id.as_u64(), tenant_id, name, false, catalog);
     }
     Ok(())
 }
@@ -98,12 +138,47 @@ pub fn finalize_purge(
         nodedb_types::TenantId::new(tenant_id),
         name,
     )?;
+    // An index cannot outlive the collection it indexes. Its identity rows,
+    // its ownership rows, and any engine-side build parameters go with the
+    // collection; the Data Plane storage itself is reclaimed by the
+    // `UnregisterCollection` half of the purge.
+    purge_index_records(database_id.as_u64(), tenant_id, name, catalog)?;
     let removed = catalog.delete_collection(database_id, tenant_id, name)?;
     debug!(
         collection = %name,
         tenant = tenant_id,
         removed,
         "catalog_entry: purge_collection finalized"
+    );
+    Ok(())
+}
+
+/// Remove every index record of `name`, along with each index's ownership row
+/// and (for vector indexes) its durable build parameters.
+fn purge_index_records(
+    database_id: u64,
+    tenant_id: u64,
+    name: &str,
+    catalog: &SystemCatalog,
+) -> crate::Result<()> {
+    let records = catalog.list_index_records_for_collection(database_id, tenant_id, name)?;
+    for record in &records {
+        if record.kind == crate::control::security::catalog::IndexKind::Vector {
+            catalog.delete_vector_index_params(tenant_id, name, record.primary_field())?;
+        }
+        catalog.delete_owner(
+            record.kind.owner_object_type(),
+            database_id,
+            tenant_id,
+            &record.name,
+        )?;
+        catalog.delete_index_record(database_id, tenant_id, &record.name)?;
+    }
+    debug!(
+        collection = %name,
+        tenant = tenant_id,
+        indexes = records.len(),
+        "catalog_entry: purge_collection removed index records"
     );
     Ok(())
 }
@@ -121,6 +196,10 @@ pub fn deactivate(database_id: u64, tenant_id: u64, name: &str, catalog: &System
                     "catalog_entry: deactivate_collection put failed"
                 );
             }
+            // Hide the collection's indexes for as long as the collection
+            // itself is hidden. They are retained, not dropped: `UNDROP
+            // COLLECTION` must restore the collection with its indexes.
+            set_index_visibility(database_id.as_u64(), tenant_id, name, false, catalog);
         }
         Ok(None) => {
             debug!(
