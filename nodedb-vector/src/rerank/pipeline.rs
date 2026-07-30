@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::borrow::Cow;
+
 use nodedb_types::vector_ann::VectorAnnOptions;
 use nodedb_types::vector_distance::DistanceMetric;
 
@@ -15,6 +17,9 @@ use super::types::{Candidate, Ranked, RerankError};
 /// When `opts.quantization` is `None` (or `VectorQuantization::None`), the FP32 path is used:
 /// `fetch_vector` is called once per candidate and must return the stored full-precision vector.
 /// Returning `None` for any id is a hard inconsistency error.
+///
+/// `fetch_vector` returns a `Cow` so that an index storing vectors in a narrower dtype
+/// (F16/BF16) can decode to owned f32 on the fly, while an F32 index still borrows.
 ///
 /// When `opts.quantization` is `Some(_)`, a `CodecSidecar` must be provided. The sidecar
 /// encodes query and stored vectors; `fetch_vector` is not called in this path.
@@ -35,7 +40,7 @@ pub fn rerank<'v, F>(
     mut fetch_vector: F,
 ) -> Result<Vec<Ranked>, RerankError>
 where
-    F: FnMut(u32) -> Option<&'v [f32]>,
+    F: FnMut(u32) -> Option<Cow<'v, [f32]>>,
 {
     if k == 0 {
         return Err(RerankError::BadInput("k must be > 0".into()));
@@ -144,7 +149,7 @@ where
                 query_dim,
             )));
         }
-        let vec_slice = crate::matryoshka::truncate(vec, effective_dim);
+        let vec_slice = crate::matryoshka::truncate(&vec, effective_dim);
         let d = crate::distance::distance(query_slice, vec_slice, metric);
         scored.push(Ranked {
             id: c.id,
@@ -205,8 +210,8 @@ mod tests {
         pairs.iter().cloned().collect()
     }
 
-    fn fetch<'a>(store: &'a HashMap<u32, Vec<f32>>) -> impl FnMut(u32) -> Option<&'a [f32]> {
-        move |id| store.get(&id).map(|v| v.as_slice())
+    fn fetch<'a>(store: &'a HashMap<u32, Vec<f32>>) -> impl FnMut(u32) -> Option<Cow<'a, [f32]>> {
+        move |id| store.get(&id).map(|v| Cow::Borrowed(v.as_slice()))
     }
 
     /// Stub codec that encodes as raw LE f32 bytes and computes L2 distance.

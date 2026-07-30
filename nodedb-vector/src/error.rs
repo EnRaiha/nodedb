@@ -12,6 +12,21 @@ pub enum VectorError {
     BudgetExhausted(#[from] MemError),
     #[error("vector dimension mismatch: expected {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
+    /// A node's vector could not be materialized: the node is out of range, or
+    /// its local storage is empty and no segment backing supplies the data.
+    ///
+    /// An empty local storage means the index was restored from a graph-only
+    /// checkpoint; the vectors live in an external segment that must be
+    /// attached with [`crate::HnswIndex::with_backing`] before any caller
+    /// copies vectors out of the index.
+    #[error(
+        "vector for node {id} is unavailable: node storage is empty and no \
+         segment backing provides it (graph-only checkpoint without backing?)"
+    )]
+    VectorUnavailable { id: u32 },
+    /// A node's dtype-encoded bytes could not be decoded to f32.
+    #[error("vector decode failed for node {id}: {detail}")]
+    VectorDecodeFailed { id: u32, detail: String },
     #[error("unsupported HNSW checkpoint version {found}; expected {expected}")]
     UnsupportedVersion { found: u8, expected: u8 },
     #[error("invalid PQ codec magic bytes")]

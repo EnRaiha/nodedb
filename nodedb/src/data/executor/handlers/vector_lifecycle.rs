@@ -240,7 +240,20 @@ impl CoreLoop {
         // before swapping, so a failure leaves the old segment intact.
         let mut rebuilt_count = 0usize;
         for seg in coll.sealed_segments_mut() {
-            let vectors = seg.index.export_vectors();
+            let vectors = match seg.index.export_vectors() {
+                Ok(v) => v,
+                Err(e) => {
+                    // Leave the segment on the old params rather than rebuild
+                    // it from vectors we could not read.
+                    warn!(
+                        core = self.core_id,
+                        key = &index_key.2,
+                        error = %e,
+                        "rebuild: vector export failed, skipping segment"
+                    );
+                    continue;
+                }
+            };
             if vectors.is_empty() {
                 continue;
             }

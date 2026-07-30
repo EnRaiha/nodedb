@@ -67,7 +67,20 @@ impl CoreLoop {
             if key.1 != tid_obj {
                 continue;
             }
-            let vectors = collection.export_snapshot();
+            let vectors = match collection.export_snapshot() {
+                Ok(v) => v,
+                Err(e) => {
+                    // Skipping is consistent with the other per-item failures
+                    // here, but omitting vectors from a snapshot is data loss,
+                    // so it is logged at error level rather than warn.
+                    tracing::error!(
+                        key = &key.2,
+                        error = %e,
+                        "snapshot: vector export failed, collection omitted from snapshot"
+                    );
+                    continue;
+                }
+            };
             let key_str = format!("{}:{}:{}", key.0.as_u64(), key.1.as_u64(), key.2);
             match zerompk::to_msgpack_vec(&vectors) {
                 Ok(bytes) => snapshot.vectors.push((key_str, bytes)),

@@ -6,6 +6,9 @@ use nodedb_types::Surrogate;
 
 use super::lifecycle::VectorCollection;
 
+/// One exported vector: global node id, full-precision data, optional surrogate.
+pub type ExportedVector = (u32, Vec<f32>, Option<Surrogate>);
+
 impl VectorCollection {
     /// Compact sealed segments by removing tombstoned nodes.
     ///
@@ -74,7 +77,13 @@ impl VectorCollection {
     }
 
     /// Export all live vectors for snapshot.
-    pub fn export_snapshot(&self) -> Vec<(u32, Vec<f32>, Option<Surrogate>)> {
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`crate::HnswIndex::export_vectors`] if a sealed segment's
+    /// vectors cannot be materialized. A snapshot that silently dropped or
+    /// zeroed those vectors would restore an index with missing data.
+    pub fn export_snapshot(&self) -> Result<Vec<ExportedVector>, crate::error::VectorError> {
         let mut result = Vec::new();
 
         for i in 0..self.growing.len() as u32 {
@@ -86,7 +95,7 @@ impl VectorCollection {
         }
 
         for seg in &self.sealed {
-            let vectors = seg.index.export_vectors();
+            let vectors = seg.index.export_vectors()?;
             for (i, vec_data) in vectors.into_iter().enumerate() {
                 let vid = seg.base_id + i as u32;
                 let surrogate = self.surrogate_map.get(&vid).copied();
@@ -104,6 +113,6 @@ impl VectorCollection {
             }
         }
 
-        result
+        Ok(result)
     }
 }

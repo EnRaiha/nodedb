@@ -92,7 +92,7 @@ impl HnswIndex {
             entry_point: self.entry_point,
             max_layer: self.max_layer,
             rng_state: self.rng.0,
-            node_vectors: self.export_vectors(),
+            node_vectors: self.export_vectors()?,
             node_neighbors: if let Some(ref flat) = self.flat_neighbors {
                 flat.to_nested(self.nodes.len())
             } else {

@@ -9,6 +9,7 @@ use std::cell::RefCell;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
+use crate::error::VectorError;
 use crate::hnsw::arena::BeamSearchArena;
 use nodedb_types::vector_dtype::VectorStorageDtype;
 
@@ -235,56 +236,121 @@ impl HnswIndex {
         self.nodes.get(id as usize).map(|n| n.storage.as_bytes())
     }
 
-    /// Returns a `&[f32]` view of the stored vector for node `id`, consulting
-    /// the pagedb segment backing when the node's local storage is empty.
+    /// Returns the stored f32 vector for node `id`, consulting the pagedb
+    /// segment backing when the node's local storage is empty.
     ///
-    /// This is the rerank-safe variant for Lite's graph-checkpoint-only restore
-    /// path: after `from_checkpoint` + `with_backing`, per-node vectors are
-    /// empty placeholders and must be fetched through the backing.
+    /// This is the rerank-safe accessor. It covers both cases that reading
+    /// `node.storage` directly gets wrong:
     ///
-    /// Returns `None` when `id` is out of range, the node has no local vector
-    /// and no backing is set, or the backing does not contain `id`.
+    /// - Lite's graph-checkpoint-only restore path: after `from_checkpoint` +
+    ///   `with_backing`, per-node vectors are empty placeholders and the data
+    ///   must be fetched through the backing.
+    /// - A narrower storage dtype (F16/BF16): the node holds encoded bytes, not
+    ///   f32, so the vector is decoded into an owned `Cow`.
+    ///
+    /// Returns `None` when `id` is out of range, or the node has no local vector
+    /// and no backing supplies one. Decode failure also yields `None` — callers
+    /// needing the reason should use [`Self::materialize_vector`].
     ///
     /// Only available on non-WASM targets (the backing type requires mmap).
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn get_vector_or_backing(&self, id: u32) -> Option<&[f32]> {
+    pub fn get_vector_or_backing(&self, id: u32) -> Option<std::borrow::Cow<'_, [f32]>> {
+        use std::borrow::Cow;
         let node = self.nodes.get(id as usize)?;
-        let local = node.storage.as_f32_slice();
-        // If local storage is non-empty, return it directly.
-        if let Some(v) = local
-            && !v.is_empty()
-        {
-            return Some(v);
+        match &node.storage {
+            NodeStorage::F32(v) if !v.is_empty() => Some(Cow::Borrowed(v.as_slice())),
+            NodeStorage::Bytes { bytes, dtype } if !bytes.is_empty() => {
+                crate::dtype::cast_to_f32(bytes, *dtype, self.dim)
+                    .ok()
+                    .map(Cow::Owned)
+            }
+            // Empty local storage — the vector lives in the segment backing.
+            NodeStorage::F32(_) | NodeStorage::Bytes { .. } => self
+                .backing
+                .as_ref()
+                .and_then(|b| b.get_vector(id))
+                .map(Cow::Borrowed),
         }
-        // Local storage is empty — try the segment backing.
-        if let Some(ref b) = self.backing {
-            return b.get_vector(id);
+    }
+
+    /// Materialize node `id`'s vector as an owned `Vec<f32>`, consulting the
+    /// segment backing when the node's local storage is empty.
+    ///
+    /// This is the authoritative accessor for every caller that copies vector
+    /// data out of the index — segment serialization, checkpointing, snapshot
+    /// export, parameter rebuilds. Reading `node.storage` directly is wrong on
+    /// the graph-checkpoint-only restore path, where per-node storage is an
+    /// empty placeholder and the real data lives in the attached backing.
+    ///
+    /// # Errors
+    ///
+    /// - [`VectorError::VectorUnavailable`] if `id` is out of range, or local
+    ///   storage is empty and no backing provides the vector.
+    /// - [`VectorError::VectorDecodeFailed`] if dtype-encoded bytes cannot be
+    ///   decoded to f32.
+    /// - [`VectorError::DimensionMismatch`] if the materialized vector's length
+    ///   is not `self.dim`.
+    pub fn materialize_vector(&self, id: u32) -> Result<Vec<f32>, VectorError> {
+        let node = self
+            .nodes
+            .get(id as usize)
+            .ok_or(VectorError::VectorUnavailable { id })?;
+        let local = match &node.storage {
+            NodeStorage::F32(v) if !v.is_empty() => Some(v.clone()),
+            NodeStorage::Bytes { bytes, dtype } if !bytes.is_empty() => Some(
+                crate::dtype::cast_to_f32(bytes, *dtype, self.dim).map_err(|e| {
+                    VectorError::VectorDecodeFailed {
+                        id,
+                        detail: e.to_string(),
+                    }
+                })?,
+            ),
+            // Empty local storage: the vector must come from the backing.
+            NodeStorage::F32(_) | NodeStorage::Bytes { .. } => None,
+        };
+        let vector = match local {
+            Some(v) => v,
+            None => self.backing_vector(id)?,
+        };
+        if vector.len() != self.dim {
+            return Err(VectorError::DimensionMismatch {
+                expected: self.dim,
+                got: vector.len(),
+            });
         }
-        // No backing and empty local storage: caller gets None.
-        None
+        Ok(vector)
+    }
+
+    /// Fetch node `id`'s vector from the attached segment backing.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn backing_vector(&self, id: u32) -> Result<Vec<f32>, VectorError> {
+        self.backing
+            .as_ref()
+            .and_then(|b| b.get_vector(id))
+            .map(<[f32]>::to_vec)
+            .ok_or(VectorError::VectorUnavailable { id })
+    }
+
+    /// WASM targets have no segment backing (it requires mmap).
+    #[cfg(target_arch = "wasm32")]
+    fn backing_vector(&self, id: u32) -> Result<Vec<f32>, VectorError> {
+        Err(VectorError::VectorUnavailable { id })
     }
 
     /// Extract all node vectors as owned F32 vecs for segment serialization.
     ///
-    /// Non-F32 nodes are decoded to F32 via byte-level reinterpretation or
-    /// dtype conversion.  Nodes whose storage is empty (graph-checkpoint-only
-    /// restore) produce an empty vec for that slot.
-    ///
     /// The second tuple element is always empty — `HnswIndex` has no surrogate
     /// map.  Surrogates live at the `VectorCollection` layer in Origin.  Lite
     /// passes an empty slice so `write_vector_segment` writes no surrogate block.
-    pub fn extract_vectors_and_surrogates(&self) -> (Vec<Vec<f32>>, Vec<u64>) {
-        let vectors = self
-            .nodes
-            .iter()
-            .map(|node| match &node.storage {
-                super::types::NodeStorage::F32(v) => v.clone(),
-                super::types::NodeStorage::Bytes { bytes, dtype } => {
-                    crate::dtype::cast_to_f32(bytes, *dtype, self.dim).unwrap_or_default()
-                }
-            })
-            .collect();
-        (vectors, Vec::new())
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::materialize_vector`] for the first node whose vector
+    /// cannot be materialized. Serializing an empty or partial payload would
+    /// write a segment whose header declares vectors it does not contain, so
+    /// this fails loudly instead.
+    pub fn extract_vectors_and_surrogates(&self) -> Result<(Vec<Vec<f32>>, Vec<u64>), VectorError> {
+        Ok((self.export_vectors()?, Vec::new()))
     }
 
     pub fn params(&self) -> &HnswParams {
@@ -324,17 +390,18 @@ impl HnswIndex {
     /// Export all vectors as F32 for snapshot transfer.
     ///
     /// For F32 indexes this is a clone. For F16/BF16 indexes each vector is
-    /// decoded to F32 on the fly.
-    pub fn export_vectors(&self) -> Vec<Vec<f32>> {
-        self.nodes
-            .iter()
-            .map(|n| match &n.storage {
-                NodeStorage::F32(v) => v.clone(),
-                NodeStorage::Bytes { dtype, bytes } => {
-                    crate::dtype::cast_to_f32(bytes, *dtype, self.dim)
-                        .expect("export_vectors: byte-length invariant violated")
-                }
-            })
+    /// decoded to F32 on the fly. Nodes whose local storage is empty are read
+    /// through the attached segment backing.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::materialize_vector`] for the first node whose vector
+    /// cannot be materialized. A caller copying vectors out of the index cannot
+    /// use an empty placeholder, so this reports the failure rather than
+    /// yielding one.
+    pub fn export_vectors(&self) -> Result<Vec<Vec<f32>>, VectorError> {
+        (0..self.nodes.len() as u32)
+            .map(|id| self.materialize_vector(id))
             .collect()
     }
 
