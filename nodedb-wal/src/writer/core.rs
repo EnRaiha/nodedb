@@ -94,6 +94,27 @@ impl WalWriter {
         })
     }
 
+    /// Resume appending to an existing segment whose filename declares
+    /// `declared_first_lsn` as the lowest LSN it may hold.
+    ///
+    /// [`Self::open`] derives the next LSN from the records it finds, and a
+    /// segment that holds none — created by a rollover that was never written
+    /// to, or one whose every record was torn away — would restart the
+    /// sequence at 1. Those LSNs are already spoken for by the earlier
+    /// segments, so replay would see duplicates and truncation would delete
+    /// the originals. The filename is the authority on where this segment's
+    /// range begins, so the resumed sequence never drops below it.
+    pub fn open_resuming(
+        path: &Path,
+        config: WalWriterConfig,
+        declared_first_lsn: u64,
+    ) -> Result<Self> {
+        let writer = Self::open(path, config)?;
+        let resumed = writer.next_lsn().max(declared_first_lsn);
+        writer.next_lsn.store(resumed, Ordering::Relaxed);
+        Ok(writer)
+    }
+
     pub(crate) fn can_set_encryption_ring(&self) -> bool {
         self.file_offset == 0 && self.buffer.is_empty()
     }

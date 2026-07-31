@@ -106,6 +106,26 @@ pub enum WalError {
         resync_offset: u64,
         resync_lsn: u64,
     },
+
+    /// Two surviving WAL segments are not contiguous: the later segment's
+    /// declared first LSN is above the LSN that follows the end of the earlier
+    /// one, so a whole segment is missing from the middle of the log.
+    ///
+    /// Concatenating the two would hand recovery a record stream with a silent
+    /// hole in it, so replay refuses instead. A missing *prefix* is legal
+    /// (checkpoint truncation deletes whole segments below the checkpoint) and
+    /// does not produce this error.
+    #[error(
+        "WAL segment LSN gap: {path} starts at LSN {found_lsn}, but {previous_path} ends at \
+         LSN {previous_last_lsn} — LSNs {expected_lsn}..{found_lsn} are missing"
+    )]
+    SegmentLsnGap {
+        path: String,
+        previous_path: String,
+        previous_last_lsn: u64,
+        expected_lsn: u64,
+        found_lsn: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, WalError>;

@@ -24,6 +24,7 @@
 
 pub mod atomic_io;
 pub mod checkpoint_frame;
+pub mod continuity;
 pub mod discovery;
 pub mod meta;
 pub mod truncate;
@@ -32,6 +33,7 @@ pub use atomic_io::{
     atomic_swap_dirs_fsync, atomic_write_fsync, fsync_directory, read_checkpoint_dontneed,
 };
 pub use checkpoint_frame::{read_checkpoint_framed, write_checkpoint_framed};
+pub use continuity::SegmentContinuity;
 pub use discovery::discover_segments;
 pub use meta::{DEFAULT_SEGMENT_TARGET_SIZE, SegmentMeta, segment_filename, segment_path};
 pub use truncate::{TruncateResult, truncate_segments};

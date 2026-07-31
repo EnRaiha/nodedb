@@ -80,12 +80,7 @@ pub(crate) fn open_dwb_for(
 /// final batch was torn by a crash mid-write. O_DIRECT cannot write at an
 /// unaligned offset, and the torn block was never fsynced — so it was never
 /// acknowledged to any client — so the block is rewritten from its boundary.
-pub fn resume_offset(
-    end_offset: u64,
-    use_direct_io: bool,
-    alignment: usize,
-    path: &Path,
-) -> u64 {
+pub fn resume_offset(end_offset: u64, use_direct_io: bool, alignment: usize, path: &Path) -> u64 {
     if !use_direct_io {
         return end_offset;
     }

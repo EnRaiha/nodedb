@@ -24,8 +24,8 @@ use tracing::info;
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
 use crate::segment::{
-    DEFAULT_SEGMENT_TARGET_SIZE, SegmentMeta, TruncateResult, discover_segments, segment_path,
-    truncate_segments,
+    DEFAULT_SEGMENT_TARGET_SIZE, SegmentContinuity, SegmentMeta, TruncateResult, discover_segments,
+    segment_path, truncate_segments,
 };
 use crate::writer::{WalWriter, WalWriterConfig};
 
@@ -109,9 +109,14 @@ impl SegmentedWal {
             let writer = WalWriter::open(&path, config.writer_config.clone())?;
             (writer, 1u64)
         } else {
-            // Resume from the last segment.
+            // Resume from the last segment. The filename's first LSN is the
+            // floor for the resumed sequence — a segment that was rolled but
+            // never written to (or whose records were all torn away) holds no
+            // LSN to recover from, and restarting at 1 would re-issue LSNs the
+            // earlier segments already own.
             let last = &segments[segments.len() - 1];
-            let writer = WalWriter::open(&last.path, config.writer_config.clone())?;
+            let writer =
+                WalWriter::open_resuming(&last.path, config.writer_config.clone(), last.first_lsn)?;
             (writer, last.first_lsn)
         };
 
@@ -300,24 +305,11 @@ impl SegmentedWal {
 ///
 /// Segments are read in order of their first_lsn. Within each segment,
 /// records are read sequentially. This produces a globally ordered stream.
+///
+/// This is `replay_from_limit_dir` with no LSN floor and no record cap, so the
+/// per-segment continuity/torn-tail checks live in exactly one place.
 pub fn replay_all_segments(wal_dir: &Path) -> Result<Vec<WalRecord>> {
-    let segments = discover_segments(wal_dir)?;
-    let mut all_records = Vec::new();
-
-    for seg in &segments {
-        let mut reader = crate::reader::WalReader::open(&seg.path)?;
-        let mut last_lsn = 0u64;
-        while let Some(record) = reader.next_record()? {
-            last_lsn = record.header.lsn;
-            all_records.push(record);
-        }
-        // A segment that stops early may be an interrupted final write, or it
-        // may be a hole with committed records behind it. Only the first is a
-        // legal end of the log.
-        crate::torn_tail::verify_committed_prefix(&seg.path, reader.stop_reason(), last_lsn)?;
-    }
-
-    Ok(all_records)
+    Ok(replay_from_limit_dir(wal_dir, 0, usize::MAX)?.0)
 }
 
 /// Paginated replay from a WAL directory: reads at most `max_records` from `from_lsn`.
@@ -334,20 +326,31 @@ pub fn replay_from_limit_dir(
 ) -> Result<(Vec<WalRecord>, bool)> {
     let segments = discover_segments(wal_dir)?;
     let mut records = Vec::with_capacity(max_records.min(4096));
+    let mut continuity = SegmentContinuity::new();
 
     for seg in &segments {
+        continuity.check(seg)?;
         let mut reader = crate::reader::WalReader::open(&seg.path)?;
+        // Tracked over everything the segment contains, not over what survives
+        // the `from_lsn` filter — continuity is a property of the log, not of
+        // the caller's window into it.
         let mut last_lsn = 0u64;
         while let Some(record) = reader.next_record()? {
             last_lsn = record.header.lsn;
             if record.header.lsn >= from_lsn {
                 records.push(record);
                 if records.len() >= max_records {
+                    // Stopping short leaves the rest of this segment unread, so
+                    // its end LSN is unknown and no boundary can be judged.
                     return Ok((records, true));
                 }
             }
         }
+        // A segment that stops early may be an interrupted final write, or it
+        // may be a hole with committed records behind it. Only the first is a
+        // legal end of the log.
         crate::torn_tail::verify_committed_prefix(&seg.path, reader.stop_reason(), last_lsn)?;
+        continuity.completed(seg, last_lsn);
     }
 
     Ok((records, false))
