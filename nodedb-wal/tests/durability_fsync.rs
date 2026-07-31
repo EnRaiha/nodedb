@@ -122,6 +122,50 @@ fn rollover_propagates_a_failed_directory_fsync() {
     }
 }
 
+/// A rollover that fails must not brick the WAL. The old writer stays
+/// installed and unsealed, so the next append retries the roll and lands.
+#[test]
+fn a_failed_rollover_leaves_the_wal_writable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wal = SegmentedWal::open(rolling_config(dir.path().join("wal"))).unwrap();
+
+    append(&mut wal, b"first").unwrap();
+    wal.sync().unwrap();
+
+    {
+        let _g = FailGuard::fail("wal::fsync_directory", "dirent not durable");
+        match append(&mut wal, b"rejected") {
+            Err(WalError::Io(_)) => {}
+            Err(other) => panic!("expected the directory fsync error, got {other:?}"),
+            Ok(lsn) => panic!("append at LSN {lsn} succeeded despite a failed roll"),
+        }
+    }
+
+    // The fail point is disarmed; the WAL must still be usable.
+    let lsn = match append(&mut wal, b"after-failed-roll") {
+        Ok(lsn) => lsn,
+        Err(WalError::Sealed) => panic!("the failed roll left a sealed writer installed"),
+        Err(other) => panic!("append after a failed roll returned {other:?}"),
+    };
+    wal.sync().unwrap();
+
+    let records = wal.replay().unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|r| r.header.lsn == lsn && r.payload == b"after-failed-roll"),
+        "the record written after the failed roll must replay"
+    );
+    assert!(
+        records.iter().any(|r| r.payload == b"first"),
+        "the record written before the failed roll must still replay"
+    );
+    assert!(
+        records.iter().all(|r| r.payload != b"rejected"),
+        "the rejected append must not have reached the log"
+    );
+}
+
 /// The same for truncation: a discarded failure lets deleted segments come
 /// back after a crash and replay below the checkpoint.
 #[test]

@@ -282,24 +282,40 @@ impl SegmentedWal {
         self.roll_segment_with_ring(next_ring)
     }
 
+    /// The new segment is built and validated first, and the old writer is
+    /// sealed only once nothing fallible remains. Sealing earlier would leave
+    /// a writer that rejects every append still installed whenever a later
+    /// step failed — a roll that fails once would shut the WAL down for the
+    /// life of the process. Here a failure returns with the old writer intact
+    /// and still accepting appends; the next append simply retries the roll.
+    ///
+    /// The two ordering constraints the log depends on still hold: the seal
+    /// precedes the install, so no record can land in the old segment past the
+    /// new segment's declared `first_lsn`; and the directory fsync precedes
+    /// the install, so no record is acknowledged into a segment whose name
+    /// might not survive a crash.
     fn roll_segment_with_ring(&mut self, next_ring: Option<crate::crypto::KeyRing>) -> Result<()> {
-        self.writer.seal()?;
+        // Reading the next LSN does not consume it, so this is the same value
+        // the seal below would leave behind — nothing appends in between.
         let new_first_lsn = self.writer.next_lsn();
         let new_path = segment_path(&self.wal_dir, new_first_lsn);
         let mut new_writer =
             WalWriter::open_with_start_lsn(&new_path, self.writer_config.clone(), new_first_lsn)?;
 
-        // The new segment's directory entry must be durable before the writer
-        // is installed. Once it is installed the very next append can be
-        // acknowledged, and a crash that loses the dirent would take the whole
-        // inode — and every record acknowledged into it — with it. Failing
-        // here leaves the sealed old writer in place, so no record is ever
-        // acknowledged into a segment whose name might not survive.
         crate::segment::fsync_directory(&self.wal_dir)?;
 
         if let Some(ref ring) = next_ring {
             new_writer.set_encryption_ring(ring.clone())?;
         }
+
+        // Last fallible step. A seal is a durability barrier over the old
+        // segment's buffered records; if it fails those records were never
+        // made durable, and the writer reports that on every later call — a
+        // real data-loss error, not a bookkeeping state this roll created.
+        self.writer.seal()?;
+
+        // Everything past here is infallible, so no failure can strand a
+        // sealed writer that was never replaced.
         self.encryption_ring = next_ring;
         self.writer = new_writer;
         self.active_first_lsn = new_first_lsn;
