@@ -51,15 +51,20 @@ Thumbs.db
 *~
 
 # Python
+#
+# These are anchored to the repository root on purpose. Unanchored, a bare
+# `env/` or `build/` matches a directory of that name at ANY depth, which
+# silently excludes Rust source — a `config/server/env/` module was already
+# swallowed this way and had to be force-added to be committed at all.
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-env/
-venv/
-ENV/
-build/
+/env/
+/venv/
+/ENV/
+/build/
 develop-eggs/
 dist/
 downloads/
