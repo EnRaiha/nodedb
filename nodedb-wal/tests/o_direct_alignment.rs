@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use nodedb_wal::align::{DEFAULT_ALIGNMENT, is_aligned};
-use nodedb_wal::double_write::{DoubleWriteBuffer, DwbMode};
+use nodedb_wal::double_write::{DoubleWriteBuffer, DwbMirror, DwbMode};
 use nodedb_wal::record::{HEADER_SIZE, RecordType, WalRecord, WalRecordArgs};
 use nodedb_wal::uring_writer::{UringWriter, UringWriterConfig};
 
@@ -145,7 +145,10 @@ fn dwb_direct_mode_write_and_recover() {
             preamble_bytes: None,
         })
         .unwrap();
-        dwb.write_record_deferred(&rec).unwrap();
+        assert_eq!(
+            dwb.write_record_deferred(&rec).unwrap(),
+            DwbMirror::Mirrored
+        );
     }
     dwb.flush().unwrap();
 

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::{File, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt as _;
 
 use crate::align::AlignedBuf;
+use crate::double_write::{DoubleWriteBuffer, DwbProtection};
 use crate::error::{Result, WalError};
 use crate::preamble::SegmentPreamble;
 use crate::record::{HEADER_SIZE, MIN_PADDING_RECORD_SIZE, WalRecord, WalRecordArgs};
@@ -50,7 +51,20 @@ pub struct WalWriter {
 
     /// Optional double-write buffer for torn write protection.
     /// Records are written here before the WAL for crash recovery.
-    double_write: Option<crate::double_write::DoubleWriteBuffer>,
+    pub(super) double_write: Option<DoubleWriteBuffer>,
+
+    /// Where the double-write buffer lives, so a degraded writer can be
+    /// reattached without reopening the segment. `None` when the DWB is
+    /// configured off.
+    pub(super) dwb_path: Option<PathBuf>,
+
+    /// Whether torn-write protection is actually in force. A DWB failure never
+    /// fails the WAL write, so this is the only thing that tells a caller the
+    /// log has stopped being recoverable from a torn tail.
+    pub(super) dwb_protection: DwbProtection,
+
+    /// Records appended to this segment with no double-write copy behind them.
+    pub(super) dwb_unprotected_records: u64,
 }
 
 impl WalWriter {
@@ -85,7 +99,7 @@ impl WalWriter {
             (0, 1)
         };
 
-        let double_write = open_dwb_for(&config, path);
+        let dwb = open_dwb_for(&config, path);
 
         Ok(Self {
             file,
@@ -97,7 +111,10 @@ impl WalWriter {
             config,
             encryption_ring: None,
             segment_preamble: None,
-            double_write,
+            double_write: dwb.buffer,
+            dwb_path: dwb.path,
+            dwb_protection: dwb.protection,
+            dwb_unprotected_records: 0,
         })
     }
 
@@ -191,7 +208,7 @@ impl WalWriter {
         let file = opts.open(path)?;
         let buffer = AlignedBuf::new(config.write_buffer_size, config.alignment)?;
 
-        let double_write = open_dwb_for(&config, path);
+        let dwb = open_dwb_for(&config, path);
 
         Ok(Self {
             file,
@@ -203,7 +220,10 @@ impl WalWriter {
             config,
             encryption_ring: None,
             segment_preamble: None,
-            double_write,
+            double_write: dwb.buffer,
+            dwb_path: dwb.path,
+            dwb_protection: dwb.protection,
+            dwb_unprotected_records: 0,
         })
     }
 
@@ -301,21 +321,7 @@ impl WalWriter {
         //
         // The DWB is fsynced in batch during `sync()`, before the WAL fsync.
         // This amortizes DWB fsync cost across the entire group commit batch.
-        //
-        // DWB failure is non-fatal for the write itself (the WAL is the
-        // authoritative store), but we log a warning because it means
-        // torn-write recovery is degraded. If the DWB is persistently
-        // broken, we detach it to avoid repeated error noise.
-        if let Some(dwb) = &mut self.double_write
-            && let Err(e) = dwb.write_record_deferred(&record)
-        {
-            tracing::warn!(
-                lsn = lsn,
-                error = %e,
-                "DWB write failed — torn-write protection degraded, detaching DWB"
-            );
-            self.double_write = None;
-        }
+        self.mirror_into_dwb(lsn, &record);
 
         self.next_lsn.store(lsn + 1, Ordering::Relaxed);
 
@@ -348,18 +354,7 @@ impl WalWriter {
         ));
 
         // Flush DWB first — records must be durable in DWB before WAL.
-        // If DWB flush fails, torn-write protection is lost for this batch.
-        // We log a warning and detach the DWB rather than silently continuing
-        // as if torn-write protection is active.
-        if let Some(dwb) = &mut self.double_write
-            && let Err(e) = dwb.flush()
-        {
-            tracing::warn!(
-                error = %e,
-                "DWB flush failed — torn-write protection lost for this batch, detaching DWB"
-            );
-            self.double_write = None;
-        }
+        self.flush_dwb();
         self.flush_buffer()?;
 
         // Crash injection: die between the DWB fsync and the WAL fsync — the

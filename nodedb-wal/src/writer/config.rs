@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::align::DEFAULT_ALIGNMENT;
-use crate::double_write::DwbMode;
+use crate::double_write::{DoubleWriteBuffer, DwbDegradation, DwbMode, DwbProtection};
 
 /// Default write buffer size: 2 MiB.
 ///
@@ -50,23 +50,50 @@ pub(crate) fn resolve_dwb_mode(config: &WalWriterConfig) -> DwbMode {
         .unwrap_or_else(|| DwbMode::default_for_parent(config.use_direct_io))
 }
 
-pub(crate) fn open_dwb_for(
-    config: &WalWriterConfig,
-    path: &Path,
-) -> Option<crate::double_write::DoubleWriteBuffer> {
+/// A writer's double-write buffer and the protection standing that goes with
+/// it. Kept together because "no buffer" means two very different things —
+/// deliberately off, or a DWB that failed to open — and only the second one is
+/// a degradation the caller has to know about.
+pub(crate) struct DwbSetup {
+    /// Where the DWB lives, so a degraded writer can reattach later. `None`
+    /// only when the DWB is configured off.
+    pub path: Option<PathBuf>,
+    pub buffer: Option<DoubleWriteBuffer>,
+    pub protection: DwbProtection,
+}
+
+pub(crate) fn open_dwb_for(config: &WalWriterConfig, path: &Path) -> DwbSetup {
     let mode = resolve_dwb_mode(config);
     if mode == DwbMode::Off {
-        return None;
+        return DwbSetup {
+            path: None,
+            buffer: None,
+            protection: DwbProtection::Off,
+        };
     }
     let dwb_path = path.with_extension("dwb");
-    match crate::double_write::DoubleWriteBuffer::open(&dwb_path, mode) {
-        Ok(d) => Some(d),
+    let (buffer, protection) = match open_dwb_at(&dwb_path, mode) {
+        Some(d) => (Some(d), DwbProtection::Active),
+        None => (None, DwbProtection::Degraded(DwbDegradation::OpenFailed)),
+    };
+    DwbSetup {
+        path: Some(dwb_path),
+        buffer,
+        protection,
+    }
+}
+
+/// Open the DWB file itself. A failure is logged and reported as absence — the
+/// caller records the degradation, and the WAL keeps working either way.
+pub(crate) fn open_dwb_at(dwb_path: &Path, mode: DwbMode) -> Option<DoubleWriteBuffer> {
+    match DoubleWriteBuffer::open(dwb_path, mode) {
+        Ok(dwb) => Some(dwb),
         Err(e) => {
             tracing::warn!(
                 path = %dwb_path.display(),
                 error = %e,
                 mode = ?mode,
-                "failed to open DWB — torn-write protection disabled for this writer"
+                "failed to open DWB — torn-write protection lost for this writer"
             );
             None
         }

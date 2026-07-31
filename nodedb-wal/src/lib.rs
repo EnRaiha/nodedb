@@ -47,7 +47,10 @@ pub mod torn_tail;
 pub mod uring_writer;
 pub mod writer;
 
-pub use double_write::{DoubleWriteBuffer, DwbMode, wal_dwb_bytes_written_total};
+pub use double_write::{
+    DoubleWriteBuffer, DwbDegradation, DwbMirror, DwbMode, DwbProtection, DwbSkipReason,
+    wal_dwb_bytes_written_total, wal_dwb_degradations_total, wal_dwb_unprotected_records_total,
+};
 pub use error::{Result, WalError};
 pub use group_commit::GroupCommitter;
 pub use lazy_reader::LazyWalReader;

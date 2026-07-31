@@ -28,6 +28,7 @@ mod core;
 // Crate-visible for the same reason as `config`: the io_uring writer shares
 // the flushed-but-unsynced tracking without going through `WalWriter`.
 pub(crate) mod durability;
+mod dwb;
 mod flush;
 
 pub use config::{DEFAULT_WRITE_BUFFER_SIZE, WalWriterConfig};
