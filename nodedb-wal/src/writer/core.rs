@@ -13,6 +13,7 @@ use crate::preamble::SegmentPreamble;
 use crate::record::{HEADER_SIZE, MIN_PADDING_RECORD_SIZE, WalRecord, WalRecordArgs};
 
 use super::config::{WalWriterConfig, open_dwb_for, resume_offset};
+use super::durability::{DurabilityState, fsync_and_track};
 
 /// Append-only WAL writer.
 pub struct WalWriter {
@@ -30,6 +31,11 @@ pub struct WalWriter {
 
     /// Whether the writer has been sealed (no more writes accepted).
     sealed: bool,
+
+    /// Standing of the file relative to the last successful fsync. The write
+    /// buffer is cleared by the flush, so it cannot answer "is an fsync still
+    /// owed?" on its own.
+    pub(super) durability: DurabilityState,
 
     /// Configuration.
     pub(super) config: WalWriterConfig,
@@ -87,6 +93,7 @@ impl WalWriter {
             file_offset,
             next_lsn: AtomicU64::new(next_lsn),
             sealed: false,
+            durability: DurabilityState::new(),
             config,
             encryption_ring: None,
             segment_preamble: None,
@@ -192,6 +199,7 @@ impl WalWriter {
             file_offset: 0,
             next_lsn: AtomicU64::new(start_lsn),
             sealed: false,
+            durability: DurabilityState::new(),
             config,
             encryption_ring: None,
             segment_preamble: None,
@@ -247,6 +255,7 @@ impl WalWriter {
         if self.sealed {
             return Err(WalError::Sealed);
         }
+        self.durability.check()?;
 
         let lsn = self.next_lsn.load(Ordering::Relaxed);
         let preamble_bytes = self.segment_preamble.as_ref().map(|p| p.to_bytes());
@@ -318,8 +327,16 @@ impl WalWriter {
     /// This issues a single write + fsync for all records accumulated
     /// since the last flush. The DWB is also fsynced (one fsync for all
     /// deferred DWB writes in this batch).
+    ///
+    /// An empty buffer alone does not mean there is nothing to do: a flush
+    /// clears the buffer before the fsync runs, so a batch whose fsync failed
+    /// leaves the writer empty-buffered with its records still only in the
+    /// page cache. Returning early there would report durability the log does
+    /// not have, so the fsync is skipped only when nothing is outstanding.
     pub fn sync(&mut self) -> Result<()> {
-        if self.buffer.is_empty() {
+        self.durability.check()?;
+
+        if self.durability.should_skip_sync(self.buffer.is_empty()) {
             return Ok(());
         }
 
@@ -351,13 +368,15 @@ impl WalWriter {
             std::io::Error::other(format!("failpoint wal::before_wal_fsync: {detail}"))
         ));
 
-        self.file.sync_all()?;
-        Ok(())
+        fsync_and_track(&self.file, &mut self.durability)
     }
 
     /// Seal the WAL — no more writes will be accepted.
     ///
-    /// Flushes any buffered data before sealing.
+    /// Flushes any buffered data before sealing. Sealing is a durability
+    /// boundary — the next segment starts where this one stops — so it goes
+    /// through `sync`, which fsyncs an outstanding flush even when the buffer
+    /// is empty and refuses to succeed on a poisoned writer.
     pub fn seal(&mut self) -> Result<()> {
         self.sync()?;
         self.sealed = true;

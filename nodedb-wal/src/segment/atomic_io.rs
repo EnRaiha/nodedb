@@ -32,6 +32,12 @@ use crate::error::{Result, WalError};
 /// on reboot. Calling fsync on the directory fd ensures the metadata
 /// (filename, inode pointer) is on stable storage.
 pub fn fsync_directory(dir: &Path) -> Result<()> {
+    // Crash injection: the directory entry never reaches stable storage.
+    // Every caller must treat this as a durability failure, not a warning.
+    nodedb_types::fail_point_err!("wal::fsync_directory", |detail: String| WalError::Io(
+        std::io::Error::other(format!("failpoint wal::fsync_directory: {detail}"))
+    ));
+
     let dir_file = fs::File::open(dir).map_err(WalError::Io)?;
     dir_file.sync_all().map_err(WalError::Io)?;
     Ok(())

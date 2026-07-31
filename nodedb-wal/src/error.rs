@@ -89,6 +89,19 @@ pub enum WalError {
     #[error("WAL write failed: no space left on device ({context})")]
     OutOfSpace { context: &'static str },
 
+    /// An fsync of the WAL segment failed, so the writer is poisoned and
+    /// permanently refuses further work.
+    ///
+    /// A failed fsync is terminal, not transient. Linux reports a writeback
+    /// error exactly once (`errseq_t`) and drops the dirty pages that failed,
+    /// so the bytes the writer already handed to the page cache are gone and
+    /// no retry can put them back. Continuing to serve would let a later
+    /// `sync` see an empty buffer, report success, and acknowledge records
+    /// that no longer exist anywhere. The only correct move at this layer is
+    /// to stop: the segment must be re-opened from what is actually on disk.
+    #[error("WAL durability lost, writer poisoned: {detail}")]
+    DurabilityLost { detail: String },
+
     /// A WAL segment is damaged in the middle: a valid record was found
     /// *after* the damaged region, so it cannot be the unfsynced tail of the
     /// last write.

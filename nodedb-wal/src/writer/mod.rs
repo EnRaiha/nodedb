@@ -25,6 +25,9 @@
 // feature is off, and cfg-gating the re-export just duplicates that condition.
 pub(crate) mod config;
 mod core;
+// Crate-visible for the same reason as `config`: the io_uring writer shares
+// the flushed-but-unsynced tracking without going through `WalWriter`.
+pub(crate) mod durability;
 mod flush;
 
 pub use config::{DEFAULT_WRITE_BUFFER_SIZE, WalWriterConfig};

@@ -27,6 +27,7 @@ use io_uring::{IoUring, opcode, types};
 use crate::align::{AlignedBuf, DEFAULT_ALIGNMENT};
 use crate::error::{Result, WalError};
 use crate::record::{HEADER_SIZE, MIN_PADDING_RECORD_SIZE, WalRecord, WalRecordArgs};
+use crate::writer::durability::DurabilityState;
 
 /// io_uring WAL writer configuration.
 #[derive(Debug, Clone)]
@@ -66,6 +67,10 @@ pub struct UringWriter {
     ring: IoUring,
     /// Sealed flag.
     sealed: bool,
+    /// Standing of the file relative to the last successful fsync. The write
+    /// buffer is cleared once the write CQE lands, so it cannot answer "is an
+    /// fsync still owed?" on its own.
+    durability: DurabilityState,
     /// Config.
     config: UringWriterConfig,
     /// Optional encryption key for WAL-at-rest encryption.
@@ -112,6 +117,7 @@ impl UringWriter {
             next_lsn: AtomicU64::new(next_lsn),
             ring,
             sealed: false,
+            durability: DurabilityState::new(),
             config,
             encryption_key: None,
             segment_preamble: None,
@@ -164,6 +170,7 @@ impl UringWriter {
         if self.sealed {
             return Err(WalError::Sealed);
         }
+        self.durability.check()?;
 
         let lsn = self.next_lsn.load(Ordering::Relaxed);
         let preamble_bytes = self.segment_preamble.as_ref().map(|p| p.to_bytes());
@@ -218,8 +225,16 @@ impl UringWriter {
     ///
     /// This is the group commit point: all records appended since the last
     /// `submit_and_sync()` become durable after this returns.
+    ///
+    /// An empty buffer alone does not mean there is nothing to do: the write
+    /// CQE clears the buffer before the fsync is even submitted, so a batch
+    /// whose fsync failed leaves the writer empty-buffered with its records
+    /// still only in the page cache. The fsync is skipped only when nothing
+    /// is outstanding.
     pub fn submit_and_sync(&mut self) -> Result<()> {
-        if self.buffer.is_empty() {
+        self.durability.check()?;
+
+        if self.durability.should_skip_sync(self.buffer.is_empty()) {
             return Ok(());
         }
         self.submit_and_wait_write()?;
@@ -291,11 +306,26 @@ impl UringWriter {
         // See the O_DIRECT alignment invariant on this function's doc comment.
         self.file_offset += write_len;
         self.buffer.clear();
+
+        // The bytes are in the file but not yet fsynced. Recorded before the
+        // buffer's contents are forgotten so a later `submit_and_sync` still
+        // knows an fsync is owed.
+        self.durability.record_flush();
         Ok(())
     }
 
     /// Submit an fsync SQE and wait for the CQE.
+    ///
+    /// A reported failure poisons the writer — see [`WalError::DurabilityLost`].
     fn submit_and_wait_fsync(&mut self) -> Result<()> {
+        // Crash injection: the kernel reports a writeback error at the fsync.
+        #[cfg(feature = "failpoints")]
+        if let Some(detail) = nodedb_types::fail_point::eval_fail("wal::fsync_failure") {
+            return Err(self.durability.poison(format!(
+                "io_uring fsync failed: failpoint wal::fsync_failure: {detail}"
+            )));
+        }
+
         let fd = types::Fd(self.file.as_raw_fd());
         let fsync_op = opcode::Fsync::new(fd).build().user_data(0x02);
 
@@ -313,12 +343,19 @@ impl UringWriter {
                 WalError::Io(std::io::Error::other("io_uring: no CQE after fsync"))
             })?;
 
+        // A negative fsync result is the kernel reporting the writeback error
+        // it will never report again; the dirty pages are already gone.
+        // Submission-side failures above are different — the fsync was never
+        // issued, so the outstanding-flush marker stands and a retry re-issues
+        // it.
         if cqe.result() < 0 {
-            return Err(WalError::Io(std::io::Error::from_raw_os_error(
-                -cqe.result(),
-            )));
+            let err = std::io::Error::from_raw_os_error(-cqe.result());
+            return Err(self
+                .durability
+                .poison(format!("io_uring fsync failed: {err}")));
         }
 
+        self.durability.record_sync_ok();
         Ok(())
     }
 

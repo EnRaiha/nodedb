@@ -107,6 +107,11 @@ impl SegmentedWal {
             // Fresh WAL — create the first segment starting at LSN 1.
             let path = segment_path(&config.wal_dir, 1);
             let writer = WalWriter::open(&path, config.writer_config.clone())?;
+            // Creating the file makes its data durable on the next fsync, but
+            // POSIX promises nothing about the name pointing at that inode.
+            // Without this, a crash can leave the very first segment
+            // unreachable and every record acknowledged into it lost.
+            crate::segment::fsync_directory(&config.wal_dir)?;
             (writer, 1u64)
         } else {
             // Resume from the last segment. The filename's first LSN is the
@@ -284,13 +289,20 @@ impl SegmentedWal {
         let mut new_writer =
             WalWriter::open_with_start_lsn(&new_path, self.writer_config.clone(), new_first_lsn)?;
 
+        // The new segment's directory entry must be durable before the writer
+        // is installed. Once it is installed the very next append can be
+        // acknowledged, and a crash that loses the dirent would take the whole
+        // inode — and every record acknowledged into it — with it. Failing
+        // here leaves the sealed old writer in place, so no record is ever
+        // acknowledged into a segment whose name might not survive.
+        crate::segment::fsync_directory(&self.wal_dir)?;
+
         if let Some(ref ring) = next_ring {
             new_writer.set_encryption_ring(ring.clone())?;
         }
         self.encryption_ring = next_ring;
         self.writer = new_writer;
         self.active_first_lsn = new_first_lsn;
-        let _ = crate::segment::fsync_directory(&self.wal_dir);
 
         info!(
             segment = %new_path.display(),

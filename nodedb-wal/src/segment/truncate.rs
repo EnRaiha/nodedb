@@ -53,8 +53,14 @@ pub fn truncate_segments(
             fs::remove_file(&seg.path).map_err(WalError::Io)?;
 
             let dwb_path = seg.dwb_path();
-            if dwb_path.exists() {
-                let _ = fs::remove_file(&dwb_path);
+            // A segment with no DWB is the normal case, so a missing file is
+            // not a failure — anything else is, and leaving it unreported
+            // would orphan a torn-write side channel for a segment that no
+            // longer exists.
+            if let Err(e) = fs::remove_file(&dwb_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(WalError::Io(e));
             }
 
             tracing::info!(
@@ -79,7 +85,12 @@ pub fn truncate_segments(
     }
 
     if deleted_count > 0 {
-        let _ = fsync_directory(wal_dir);
+        // Until the directory entries are durable the unlinks can be undone by
+        // a crash, resurrecting segments whose records sit below the
+        // checkpoint — replay would then apply them a second time. A failure
+        // here means the truncation did not happen, so the caller must not
+        // advance anything on the strength of it.
+        fsync_directory(wal_dir)?;
     }
 
     Ok(TruncateResult {

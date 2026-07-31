@@ -72,6 +72,11 @@ impl WalWriter {
 
         self.file_offset += data.len() as u64;
         self.buffer.clear();
+
+        // The bytes are in the file but only in the page cache. Recorded
+        // before the buffer's contents are forgotten so a later `sync` still
+        // knows an fsync is owed.
+        self.durability.record_flush();
         Ok(())
     }
 }
