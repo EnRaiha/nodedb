@@ -55,7 +55,7 @@ fn write_batches(writer: &mut WalWriter, payloads: &[&str]) {
 }
 
 fn read_all(path: &Path) -> Vec<Vec<u8>> {
-    let mut reader = WalReader::open(path).unwrap();
+    let mut reader = WalReader::open(path, None).unwrap();
     let mut out = Vec::new();
     while let Some(record) = reader.next_record().unwrap() {
         out.push(record.payload);
@@ -142,7 +142,7 @@ fn mmap_and_lazy_readers_also_cross_batch_boundaries() {
     write_batches(&mut writer, &payloads);
     drop(writer);
 
-    let mut mmap = MmapWalReader::open(&path).unwrap();
+    let mut mmap = MmapWalReader::open(&path, None).unwrap();
     let mut mmap_records = Vec::new();
     while let Some(record) = mmap.next_record().unwrap() {
         mmap_records.push(record.payload);
@@ -180,7 +180,7 @@ fn padding_is_never_surfaced_as_a_record() {
     write_batches(&mut writer, &["x", "y"]);
     drop(writer);
 
-    let mut reader = WalReader::open(&path).unwrap();
+    let mut reader = WalReader::open(&path, None).unwrap();
     while let Some(record) = reader.next_record().unwrap() {
         assert_ne!(
             record.header.record_type,

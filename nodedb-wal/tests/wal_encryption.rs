@@ -70,7 +70,9 @@ fn wal_encryption_restart_roundtrip() {
     let mut recovered: Vec<Vec<u8>> = Vec::new();
 
     for seg in &segments {
-        let reader = WalReader::open(&seg.path).unwrap();
+        // Raw mode on purpose: this step asserts the records really are
+        // ciphertext on disk and then decrypts them by hand.
+        let reader = WalReader::open_raw(&seg.path).unwrap();
         let epoch = *reader
             .segment_preamble()
             .expect("encrypted segment must have a preamble")

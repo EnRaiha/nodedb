@@ -9,10 +9,11 @@
 //! replay consumer re-deriving it — and any consumer that forgot would silently
 //! feed ciphertext into an engine decoder.
 //!
-//! [`SegmentDecryptor`] is therefore constructed once per segment by the replay
-//! drivers and applied to every record before it is handed out. A record that
-//! is marked encrypted with no key ring available is a hard
-//! [`WalError::EncryptedRecordWithoutKey`], never a passthrough and never a skip.
+//! [`SegmentDecryptor`] is therefore constructed once per segment — by the
+//! readers themselves, at open time — and applied to every record before it is
+//! handed out. A record that is marked encrypted with no key ring available is
+//! a hard [`WalError::EncryptedRecordWithoutKey`], never a passthrough and
+//! never a skip.
 
 use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
@@ -28,20 +29,22 @@ struct SegmentAad {
 
 /// Turns the records of one WAL segment back into plaintext.
 ///
-/// Owns copies of the segment's AAD inputs rather than borrowing the reader, so
-/// a driver can keep reading records mutably while decrypting them.
-pub struct SegmentDecryptor<'a> {
-    ring: Option<&'a KeyRing>,
+/// Owns both the segment's AAD inputs and its key ring rather than borrowing
+/// them: a reader builds one at open time and keeps it for as long as the file
+/// handle lives, and borrowing the caller's ring would put a lifetime on every
+/// reader type that outlives the call that constructed it.
+pub struct SegmentDecryptor {
+    ring: Option<KeyRing>,
     aad: Option<SegmentAad>,
 }
 
-impl<'a> SegmentDecryptor<'a> {
+impl SegmentDecryptor {
     /// Build a decryptor for a segment from its preamble (absent on segments
     /// written without encryption) and the replay key ring (absent when the
     /// database is not configured for WAL encryption).
-    pub fn new(preamble: Option<&SegmentPreamble>, ring: Option<&'a KeyRing>) -> Self {
+    pub fn new(preamble: Option<&SegmentPreamble>, ring: Option<&KeyRing>) -> Self {
         Self {
-            ring,
+            ring: ring.cloned(),
             aad: preamble.map(|p| SegmentAad {
                 epoch: *p.epoch(),
                 preamble_bytes: p.to_bytes(),
@@ -74,11 +77,14 @@ impl<'a> SegmentDecryptor<'a> {
     }
 
     /// Resolve the key ring and segment AAD, or explain which one is missing.
-    fn require_keys(&self, lsn: u64) -> Result<(&'a KeyRing, &SegmentAad)> {
-        let ring = self.ring.ok_or(WalError::EncryptedRecordWithoutKey {
-            lsn,
-            context: "WAL segment replay",
-        })?;
+    fn require_keys(&self, lsn: u64) -> Result<(&KeyRing, &SegmentAad)> {
+        let ring = self
+            .ring
+            .as_ref()
+            .ok_or(WalError::EncryptedRecordWithoutKey {
+                lsn,
+                context: "WAL segment replay",
+            })?;
         // An encrypted record can only exist in a segment whose preamble
         // recorded the epoch it was encrypted under. A missing preamble means
         // the segment's leading bytes are gone, not that the record is legible.

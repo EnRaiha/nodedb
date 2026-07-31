@@ -15,6 +15,12 @@
 //!
 //! This reader is used in tier 2: when the Event Plane enters WAL Catchup
 //! Mode, it mmap's the relevant sealed segments and iterates records.
+//!
+//! ## Encryption
+//!
+//! [`MmapWalReader::open`] is the replay constructor: it takes the key ring and
+//! hands out plaintext. [`MmapWalReader::open_raw`] is the opt-in structural
+//! constructor for code that only walks record framing.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,10 +30,12 @@ use std::os::fd::AsRawFd;
 
 use memmap2::Mmap;
 
+use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::preamble::{PREAMBLE_SIZE, SegmentPreamble, WAL_PREAMBLE_MAGIC, parse_leading_preamble};
 use crate::reader::StopReason;
 use crate::record::{HEADER_SIZE, RecordHeader, RecordType, WAL_MAGIC, WalRecord};
+use crate::segment::SegmentDecryptor;
 
 fn checked_range_end(start: usize, len: usize, limit: usize) -> Result<Option<usize>> {
     let end = start.checked_add(len).ok_or_else(|| {
@@ -112,15 +120,39 @@ pub struct MmapWalReader {
     path: std::path::PathBuf,
     madvise_state: Option<libc::c_int>,
     stop_reason: Option<StopReason>,
+    /// Applied to every record before it is surfaced. `None` only in raw
+    /// structural mode, where payloads may still be ciphertext.
+    decryptor: Option<SegmentDecryptor>,
 }
 
 impl MmapWalReader {
-    /// Open a WAL segment file for mmap'd reading.
+    /// Open a WAL segment file for mmap'd replay.
+    ///
+    /// Every record is decrypted on the way out: what the caller receives never
+    /// has `ENCRYPTED_FLAG` set, and its checksum verifies against the
+    /// plaintext. `keys` must be the key ring the segment was written under, or
+    /// `None` for a segment that was never encrypted — an encrypted record met
+    /// with no key is [`WalError::EncryptedRecordWithoutKey`], never ciphertext
+    /// handed to the caller.
+    pub fn open(path: &Path, keys: Option<&KeyRing>) -> Result<Self> {
+        let mut reader = Self::open_raw(path)?;
+        reader.decryptor = Some(SegmentDecryptor::new(
+            reader.segment_preamble.as_ref(),
+            keys,
+        ));
+        Ok(reader)
+    }
+
+    /// Open a WAL segment file for structural scanning only.
+    ///
+    /// **Payloads may be ciphertext.** Records come out exactly as they are on
+    /// disk, `ENCRYPTED_FLAG` and all. Use it only for code that reads record
+    /// framing and never the payload; replay must use [`Self::open`].
     ///
     /// A leading `WALP` preamble is skipped so iteration begins at the first
     /// real record; segments written without encryption have none and start at
     /// offset 0.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open_raw(path: &Path) -> Result<Self> {
         observability::SEGMENTS_OPENED.fetch_add(1, Ordering::Relaxed);
         let file = std::fs::File::open(path)?;
         // SAFETY: The file is a sealed WAL segment (not being written to).
@@ -167,7 +199,17 @@ impl MmapWalReader {
             path: path.to_path_buf(),
             madvise_state,
             stop_reason: None,
+            decryptor: None,
         })
+    }
+
+    /// Hand a record to the caller, decrypting it first unless this reader was
+    /// opened in raw structural mode.
+    fn deliver(&self, record: WalRecord) -> Result<Option<WalRecord>> {
+        match &self.decryptor {
+            Some(decryptor) => decryptor.decrypt_record(record).map(Some),
+            None => Ok(Some(record)),
+        }
     }
 
     /// The preamble read from this segment file, if present.
@@ -315,7 +357,7 @@ impl MmapWalReader {
                 continue;
             }
 
-            return Ok(Some(record));
+            return self.deliver(record);
         }
     }
 
@@ -389,7 +431,7 @@ mod tests {
         }
 
         // Read back with mmap reader.
-        let reader = MmapWalReader::open(&path).unwrap();
+        let reader = MmapWalReader::open(&path, None).unwrap();
         assert!(
             reader.segment_preamble().is_none(),
             "unencrypted segments carry no preamble"
@@ -407,7 +449,7 @@ mod tests {
         let path = dir.path().join("empty.wal");
         std::fs::write(&path, []).unwrap();
 
-        let reader = MmapWalReader::open(&path).unwrap();
+        let reader = MmapWalReader::open(&path, None).unwrap();
         let records: Vec<WalRecord> = reader.records().collect::<Result<Vec<_>>>().unwrap();
         assert!(records.is_empty());
     }
@@ -419,7 +461,7 @@ mod tests {
         // Write 10 bytes — not enough for a header (30 bytes).
         std::fs::write(&path, [0u8; 10]).unwrap();
 
-        let reader = MmapWalReader::open(&path).unwrap();
+        let reader = MmapWalReader::open(&path, None).unwrap();
         let records: Vec<WalRecord> = reader.records().collect::<Result<Vec<_>>>().unwrap();
         assert!(records.is_empty());
     }
@@ -442,7 +484,7 @@ mod tests {
         };
         std::fs::write(&path, header.to_bytes()).unwrap();
 
-        let mut reader = MmapWalReader::open(&path).unwrap();
+        let mut reader = MmapWalReader::open(&path, None).unwrap();
         assert!(reader.next_record().unwrap().is_none());
     }
 
@@ -464,7 +506,7 @@ mod tests {
         };
         std::fs::write(&path, header.to_bytes()).unwrap();
 
-        let mut reader = MmapWalReader::open(&path).unwrap();
+        let mut reader = MmapWalReader::open(&path, None).unwrap();
         assert!(matches!(
             reader.next_record(),
             Err(WalError::PayloadTooLarge { .. })

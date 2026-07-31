@@ -150,7 +150,7 @@ fn parallel_writers_survive_truncation() {
         // returned records have already passed the built-in CRC check.
         // Re-reading through WalReader here confirms the reader is
         // consistent with the recovery scan.
-        let reader = nodedb_wal::reader::WalReader::open(path).unwrap();
+        let reader = nodedb_wal::reader::WalReader::open(path, None).unwrap();
         let records: Vec<_> = reader.records().collect::<Result<_>>().unwrap();
 
         assert_eq!(

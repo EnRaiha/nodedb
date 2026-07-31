@@ -25,8 +25,8 @@ use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
 use crate::segment::{
-    DEFAULT_SEGMENT_TARGET_SIZE, SegmentContinuity, SegmentDecryptor, SegmentMeta, TruncateResult,
-    discover_segments, segment_path, truncate_segments,
+    DEFAULT_SEGMENT_TARGET_SIZE, SegmentContinuity, SegmentMeta, TruncateResult, discover_segments,
+    segment_path, truncate_segments,
 };
 use crate::writer::{WalWriter, WalWriterConfig};
 
@@ -375,8 +375,9 @@ pub fn replay_from_limit_dir(
 
     for seg in &segments {
         continuity.check(seg)?;
-        let mut reader = crate::reader::WalReader::open(&seg.path)?;
-        let decryptor = SegmentDecryptor::new(reader.segment_preamble(), keys);
+        // The reader decrypts: records reach the caller as plaintext or not at
+        // all.
+        let mut reader = crate::reader::WalReader::open(&seg.path, keys)?;
         // Tracked over everything the segment contains, not over what survives
         // the `from_lsn` filter — continuity is a property of the log, not of
         // the caller's window into it.
@@ -384,7 +385,7 @@ pub fn replay_from_limit_dir(
         while let Some(record) = reader.next_record()? {
             last_lsn = record.header.lsn;
             if record.header.lsn >= from_lsn {
-                records.push(decryptor.decrypt_record(record)?);
+                records.push(record);
                 if records.len() >= max_records {
                     // Stopping short leaves the rest of this segment unread, so
                     // its end LSN is unknown and no boundary can be judged.
@@ -655,9 +656,10 @@ mod tests {
 
         let mut all_payloads = Vec::new();
 
-        // Step 4: per-segment read + decrypt.
+        // Step 4: per-segment read + decrypt. Raw mode on purpose — this test
+        // asserts what is actually on disk, then decrypts by hand.
         for seg in &segments {
-            let reader = crate::reader::WalReader::open(&seg.path).unwrap();
+            let reader = crate::reader::WalReader::open_raw(&seg.path).unwrap();
             // Read the epoch from the preamble written at segment open time.
             let epoch = *reader
                 .segment_preamble()
@@ -723,7 +725,7 @@ mod tests {
         let mut payloads = Vec::new();
 
         for seg in &segments {
-            let reader = crate::reader::WalReader::open(&seg.path).unwrap();
+            let reader = crate::reader::WalReader::open_raw(&seg.path).unwrap();
             let epoch = *reader
                 .segment_preamble()
                 .expect("segment must have preamble after encrypted write")
@@ -783,7 +785,7 @@ mod tests {
         let key_read = crate::crypto::WalEncryptionKey::from_bytes(&key_bytes).unwrap();
         let ring_read = crate::crypto::KeyRing::new(key_read);
 
-        let reader = crate::reader::WalReader::open(seg_path).unwrap();
+        let reader = crate::reader::WalReader::open_raw(seg_path).unwrap();
         let epoch = *reader.segment_preamble().unwrap().epoch();
         let preamble_bytes = reader.segment_preamble().unwrap().to_bytes();
 

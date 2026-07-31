@@ -24,7 +24,7 @@ use nodedb_wal::writer::{WalWriter, WalWriterConfig};
 use nodedb_wal::{WalError, WalReader};
 
 fn read_lsns(path: &Path) -> Vec<u64> {
-    let mut reader = WalReader::open(path).unwrap();
+    let mut reader = WalReader::open(path, None).unwrap();
     let mut lsns = Vec::new();
     while let Some(record) = reader.next_record().unwrap() {
         lsns.push(record.header.lsn);

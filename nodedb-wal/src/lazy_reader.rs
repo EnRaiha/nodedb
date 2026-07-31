@@ -60,9 +60,10 @@ pub struct LazyWalReader {
     segment_preamble: Option<SegmentPreamble>,
     double_write: Option<crate::double_write::DoubleWriteBuffer>,
     stop_reason: Option<StopReason>,
-    /// Key ring used to turn encrypted payloads back into plaintext. Held by
-    /// value so the reader carries no borrow of the caller's ring.
-    keys: Option<KeyRing>,
+    /// Turns encrypted payloads back into plaintext. Built once at open so the
+    /// reader carries no borrow of the caller's ring, and so the per-segment
+    /// AAD is derived once rather than on every payload read.
+    decryptor: SegmentDecryptor,
 }
 
 impl LazyWalReader {
@@ -88,6 +89,7 @@ impl LazyWalReader {
         };
         let (segment_preamble, start_offset) =
             read_leading_preamble(&mut file, &WAL_PREAMBLE_MAGIC)?;
+        let decryptor = SegmentDecryptor::new(segment_preamble.as_ref(), keys);
 
         Ok(Self {
             file,
@@ -95,7 +97,7 @@ impl LazyWalReader {
             segment_preamble,
             double_write,
             stop_reason: None,
-            keys: keys.cloned(),
+            decryptor,
         })
     }
 
@@ -189,8 +191,7 @@ impl LazyWalReader {
     /// was called instead).
     pub fn read_payload(&mut self, header: &RecordHeader) -> Result<Vec<u8>> {
         let raw = self.read_raw_payload(header)?;
-        SegmentDecryptor::new(self.segment_preamble.as_ref(), self.keys.as_ref())
-            .decrypt_payload(header, raw)
+        self.decryptor.decrypt_payload(header, raw)
     }
 
     /// Read the on-disk payload bytes, repairing a torn write from the
@@ -266,8 +267,7 @@ impl LazyWalReader {
             header: *header,
             payload: raw,
         };
-        SegmentDecryptor::new(self.segment_preamble.as_ref(), self.keys.as_ref())
-            .decrypt_record(record)
+        self.decryptor.decrypt_record(record)
     }
 
     /// Skip the payload for a header, seeking forward without reading.

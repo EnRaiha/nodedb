@@ -478,7 +478,7 @@ mod tests {
 
         writer.lock().unwrap().sync().unwrap();
 
-        let reader = crate::reader::WalReader::open(&path).unwrap();
+        let reader = crate::reader::WalReader::open(&path, None).unwrap();
         let records: Vec<_> = reader.records().collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(records.len(), 10);
     }

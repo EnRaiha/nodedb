@@ -58,7 +58,7 @@ fn reader_open_advises_sequential() {
     write_n_records(wal_dir, 1);
 
     let segs = nodedb_wal::segment::discover_segments(wal_dir).unwrap();
-    let reader = MmapWalReader::open(&segs[0].path).unwrap();
+    let reader = MmapWalReader::open(&segs[0].path, None).unwrap();
 
     assert_eq!(
         reader.madvise_state(),

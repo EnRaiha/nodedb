@@ -33,7 +33,7 @@ fn write_records(path: &std::path::Path, count: u32) -> Vec<u64> {
 
 /// Helper: read all valid records from a WAL file.
 fn read_all(path: &std::path::Path) -> Vec<WalRecord> {
-    let reader = WalReader::open(path).unwrap();
+    let reader = WalReader::open(path, None).unwrap();
     reader.records().collect::<Result<_>>().unwrap()
 }
 
@@ -158,7 +158,7 @@ fn corrupted_checksum_mid_file_fails_recovery_instead_of_truncating() {
 
     // The raw reader still stops at the damaged record — it reports the
     // committed prefix it could parse and why it stopped.
-    let mut reader = WalReader::open(&path).unwrap();
+    let mut reader = WalReader::open(&path, None).unwrap();
     let mut read = Vec::new();
     while let Some(record) = reader.next_record().unwrap() {
         read.push(record);

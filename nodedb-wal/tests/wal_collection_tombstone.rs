@@ -30,7 +30,7 @@ fn append_record(
 }
 
 fn read_all(path: &std::path::Path) -> Vec<WalRecord> {
-    let reader = WalReader::open(path).unwrap();
+    let reader = WalReader::open(path, None).unwrap();
     reader.records().map(|r| r.unwrap()).collect()
 }
 

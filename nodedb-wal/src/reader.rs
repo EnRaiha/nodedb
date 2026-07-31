@@ -14,14 +14,23 @@
 //!   same effect as replaying it once.
 //! - Unknown optional record types (bit 15 clear) are skipped.
 //! - Unknown required record types (bit 15 set) cause a replay failure.
+//!
+//! ## Encryption
+//!
+//! [`WalReader::open`] is the replay constructor: it takes the key ring and
+//! hands out plaintext, so a consumer cannot act on ciphertext by forgetting to
+//! decrypt. [`WalReader::open_raw`] is the opt-in structural constructor for
+//! code that only walks record framing.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::preamble::{SegmentPreamble, WAL_PREAMBLE_MAGIC, read_leading_preamble};
 use crate::record::{HEADER_SIZE, RecordHeader, RecordType, WalRecord};
+use crate::segment::SegmentDecryptor;
 
 fn checked_offset_add(offset: u64, len: usize) -> Result<u64> {
     let len = u64::try_from(len).map_err(|_| {
@@ -67,10 +76,37 @@ pub struct WalReader {
     stop_reason: Option<StopReason>,
     /// End of the last fully consumed record, padding included.
     committed_end: u64,
+    /// Applied to every record before it is surfaced. `None` only in raw
+    /// structural mode, where payloads may still be ciphertext.
+    decryptor: Option<SegmentDecryptor>,
 }
 
 impl WalReader {
-    /// Open a WAL file for reading.
+    /// Open a WAL file for replay.
+    ///
+    /// Every record is decrypted on the way out: what the caller receives never
+    /// has `ENCRYPTED_FLAG` set, and its checksum verifies against the
+    /// plaintext. `keys` must be the key ring the segment was written under, or
+    /// `None` for a segment that was never encrypted — an encrypted record met
+    /// with no key is [`WalError::EncryptedRecordWithoutKey`], never ciphertext
+    /// handed to the caller.
+    pub fn open(path: &Path, keys: Option<&KeyRing>) -> Result<Self> {
+        let mut reader = Self::open_raw(path)?;
+        reader.decryptor = Some(SegmentDecryptor::new(
+            reader.segment_preamble.as_ref(),
+            keys,
+        ));
+        Ok(reader)
+    }
+
+    /// Open a WAL file for structural scanning only.
+    ///
+    /// **Payloads may be ciphertext.** Records come out exactly as they are on
+    /// disk, `ENCRYPTED_FLAG` and all. This exists for code that reads nothing
+    /// but record framing — LSNs, lengths, offsets — and specifically for
+    /// [`crate::recovery::recover`], which runs from `WalWriter::open` where no
+    /// key ring exists and resuming an encrypted segment for appending must
+    /// still work. Never use it for replay.
     ///
     /// If the file begins with a valid `WALP` preamble (16 bytes), it is
     /// consumed and stored for use as AAD during decryption. Files without a
@@ -78,7 +114,7 @@ impl WalReader {
     ///
     /// Automatically opens the companion double-write buffer file
     /// (`*.dwb`) if it exists alongside the WAL file.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open_raw(path: &Path) -> Result<Self> {
         let mut file = File::open(path)?;
         let dwb_path = path.with_extension("dwb");
         let double_write = if dwb_path.exists() {
@@ -101,7 +137,17 @@ impl WalReader {
             double_write,
             stop_reason: None,
             committed_end: start_offset,
+            decryptor: None,
         })
+    }
+
+    /// Hand a record to the caller, decrypting it first unless this reader was
+    /// opened in raw structural mode.
+    fn deliver(&self, record: WalRecord) -> Result<Option<WalRecord>> {
+        match &self.decryptor {
+            Some(decryptor) => decryptor.decrypt_record(record).map(Some),
+            None => Ok(Some(record)),
+        }
     }
 
     /// Byte offset just past the last fully consumed record.
@@ -215,25 +261,8 @@ impl WalReader {
 
             // Verify checksum.
             if record.verify_checksum().is_err() {
-                if let Some(dwb) = &mut self.double_write
-                    && let Ok(Some(recovered)) = dwb.recover_record(header.lsn)
-                {
-                    tracing::info!(
-                        lsn = header.lsn,
-                        "recovered torn write from double-write buffer"
-                    );
-                    // The torn header's own `payload_len` is not trustworthy,
-                    // so the next record's position is derived from the DWB's
-                    // authoritative copy rather than from wherever the read of
-                    // the damaged bytes happened to leave the cursor.
-                    let resume = checked_offset_add(
-                        checked_offset_add(header_offset, HEADER_SIZE)?,
-                        recovered.payload.len(),
-                    )?;
-                    self.file.seek(SeekFrom::Start(resume))?;
-                    self.offset = resume;
-                    self.committed_end = resume;
-                    return Ok(Some(recovered));
+                if let Some(recovered) = self.repair_torn_record(&header, header_offset)? {
+                    return self.deliver(recovered);
                 }
                 return self.stop(StopReason::Corruption {
                     offset: header_offset,
@@ -262,8 +291,40 @@ impl WalReader {
                 continue;
             }
 
-            return Ok(Some(record));
+            return self.deliver(record);
         }
+    }
+
+    /// Rebuild a record whose on-disk bytes failed CRC from the double-write
+    /// buffer, if it holds an intact copy.
+    ///
+    /// Also re-anchors the read cursor: the torn header's own `payload_len` is
+    /// not trustworthy, so the next record's position is derived from the DWB's
+    /// authoritative copy rather than from wherever the read of the damaged
+    /// bytes happened to leave the cursor.
+    fn repair_torn_record(
+        &mut self,
+        header: &RecordHeader,
+        header_offset: u64,
+    ) -> Result<Option<WalRecord>> {
+        let Some(dwb) = &mut self.double_write else {
+            return Ok(None);
+        };
+        let Ok(Some(recovered)) = dwb.recover_record(header.lsn) else {
+            return Ok(None);
+        };
+        tracing::info!(
+            lsn = header.lsn,
+            "recovered torn write from double-write buffer"
+        );
+        let resume = checked_offset_add(
+            checked_offset_add(header_offset, HEADER_SIZE)?,
+            recovered.payload.len(),
+        )?;
+        self.file.seek(SeekFrom::Start(resume))?;
+        self.offset = resume;
+        self.committed_end = resume;
+        Ok(Some(recovered))
     }
 
     /// Iterator over all valid records in the WAL.
@@ -332,7 +393,7 @@ mod tests {
         }
 
         // Read them back.
-        let reader = WalReader::open(&path).unwrap();
+        let reader = WalReader::open(&path, None).unwrap();
         let records: Vec<_> = reader.records().collect::<Result<_>>().unwrap();
 
         assert_eq!(records.len(), 3);
@@ -361,7 +422,7 @@ mod tests {
             writer.sync().unwrap();
         }
 
-        let reader = WalReader::open(&path).unwrap();
+        let reader = WalReader::open(&path, None).unwrap();
         let records: Vec<_> = reader.records().collect::<Result<_>>().unwrap();
         assert!(records.is_empty());
     }
@@ -391,7 +452,7 @@ mod tests {
         }
 
         // Reader should return only the valid record.
-        let reader = WalReader::open(&path).unwrap();
+        let reader = WalReader::open(&path, None).unwrap();
         let records: Vec<_> = reader.records().collect::<Result<_>>().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].payload, b"good-record");
@@ -415,7 +476,7 @@ mod tests {
         };
         std::fs::write(&path, header.to_bytes()).unwrap();
 
-        let mut reader = WalReader::open(&path).unwrap();
+        let mut reader = WalReader::open(&path, None).unwrap();
         assert!(matches!(
             reader.next_record(),
             Err(WalError::PayloadTooLarge { .. })
@@ -455,7 +516,7 @@ mod tests {
             writer.sync().unwrap();
         }
 
-        let reader = WalReader::open(&path).unwrap();
+        let reader = WalReader::open(&path, None).unwrap();
         let records: Vec<_> = reader.records().collect::<Result<_>>().unwrap();
 
         // Only the single known Put record survives; all unknown optional

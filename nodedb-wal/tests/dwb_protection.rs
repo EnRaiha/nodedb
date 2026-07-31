@@ -20,7 +20,7 @@ fn append(writer: &mut WalWriter, payload: &[u8]) -> u64 {
 }
 
 fn replayed_payloads(path: &std::path::Path) -> Vec<Vec<u8>> {
-    let mut reader = WalReader::open(path).unwrap();
+    let mut reader = WalReader::open(path, None).unwrap();
     let mut out = Vec::new();
     while let Some(record) = reader.next_record().unwrap() {
         out.push(record.payload);

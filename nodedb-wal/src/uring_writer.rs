@@ -399,7 +399,7 @@ mod tests {
             writer.submit_and_sync().unwrap();
         }
 
-        let reader = WalReader::open(&path).unwrap();
+        let reader = WalReader::open(&path, None).unwrap();
         let records: Vec<_> = reader
             .records()
             .collect::<crate::error::Result<_>>()
@@ -427,7 +427,7 @@ mod tests {
             writer.submit_and_sync().unwrap();
         }
 
-        let reader = WalReader::open(&path).unwrap();
+        let reader = WalReader::open(&path, None).unwrap();
         let records: Vec<_> = reader
             .records()
             .collect::<crate::error::Result<_>>()
@@ -462,7 +462,7 @@ mod tests {
             writer.submit_and_sync().unwrap();
         }
 
-        let reader = WalReader::open(&path).unwrap();
+        let reader = WalReader::open(&path, None).unwrap();
         let records: Vec<_> = reader
             .records()
             .collect::<crate::error::Result<_>>()

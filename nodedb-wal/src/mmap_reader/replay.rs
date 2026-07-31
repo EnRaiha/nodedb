@@ -14,7 +14,7 @@ use std::path::Path;
 use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
-use crate::segment::{SegmentContinuity, SegmentDecryptor, SegmentMeta};
+use crate::segment::{SegmentContinuity, SegmentMeta};
 
 use super::reader::MmapWalReader;
 
@@ -94,14 +94,14 @@ fn scan_segment(
     from_lsn: u64,
     keys: Option<&KeyRing>,
 ) -> Result<SegmentScan> {
-    let mut reader = MmapWalReader::open(&segment.path)?;
-    let decryptor = SegmentDecryptor::new(reader.segment_preamble(), keys);
+    // The reader decrypts: records reach the caller as plaintext or not at all.
+    let mut reader = MmapWalReader::open(&segment.path, keys)?;
     let mut records = Vec::new();
     let mut last_lsn = 0u64;
     while let Some(record) = reader.next_record()? {
         last_lsn = record.header.lsn;
         if record.header.lsn >= from_lsn {
-            records.push(decryptor.decrypt_record(record)?);
+            records.push(record);
         }
     }
     // A segment that stops early may be an interrupted final write, or it may
@@ -203,13 +203,12 @@ pub fn replay_segments_mmap_limit(
 
     for seg in live {
         continuity.check(seg)?;
-        let mut reader = MmapWalReader::open(&seg.path)?;
-        let decryptor = SegmentDecryptor::new(reader.segment_preamble(), keys);
+        let mut reader = MmapWalReader::open(&seg.path, keys)?;
         let mut last_lsn = 0u64;
         while let Some(record) = reader.next_record()? {
             last_lsn = record.header.lsn;
             if record.header.lsn >= from_lsn {
-                records.push(decryptor.decrypt_record(record)?);
+                records.push(record);
                 if records.len() >= max_records {
                     // Partial scan — don't release pages for a segment
                     // we'll likely re-open on the next catchup cycle. Stopping

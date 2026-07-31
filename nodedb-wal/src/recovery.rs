@@ -58,7 +58,11 @@ pub fn recover(path: &Path) -> Result<RecoveryInfo> {
         });
     }
 
-    let mut reader = WalReader::open(path)?;
+    // Structural scan only: recovery reads framing (LSN, lengths, offsets) and
+    // never a payload. It runs from `WalWriter::open`, which resumes a segment
+    // for appending and holds no key ring, so demanding keys here would make an
+    // encrypted WAL impossible to reopen for writing.
+    let mut reader = WalReader::open_raw(path)?;
     let mut last_lsn = 0u64;
     let mut record_count = 0u64;
 

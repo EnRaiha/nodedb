@@ -65,7 +65,9 @@ fn mmap_reader_replays_every_record_of_an_encrypted_segment() {
     let payloads: Vec<&[u8]> = vec![b"enc-mmap-0", b"enc-mmap-1", b"enc-mmap-2"];
     let path = write_encrypted_segment(&dir.path().join("wal"), &payloads);
 
-    let reader = MmapWalReader::open(&path).unwrap();
+    // Raw mode on purpose: this test asserts the on-disk records are ciphertext
+    // and then decrypts them by hand.
+    let reader = MmapWalReader::open_raw(&path).unwrap();
     let preamble = *reader
         .segment_preamble()
         .expect("encrypted segment must expose its preamble");
@@ -129,7 +131,7 @@ fn both_readers_still_replay_an_unencrypted_segment() {
     let payloads: Vec<&[u8]> = vec![b"plain-0", b"plain-1", b"plain-2"];
     let path = write_plain_segment(&dir.path().join("wal"), &payloads);
 
-    let reader = MmapWalReader::open(&path).unwrap();
+    let reader = MmapWalReader::open(&path, None).unwrap();
     assert!(
         reader.segment_preamble().is_none(),
         "unencrypted segments carry no preamble"
