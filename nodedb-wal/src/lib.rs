@@ -25,6 +25,7 @@
 
 pub mod align;
 pub mod crypto;
+pub mod diag;
 pub mod double_write;
 pub mod error;
 pub mod lazy_reader;

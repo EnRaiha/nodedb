@@ -80,6 +80,10 @@ impl DurabilityState {
         let err = WalError::DurabilityLost {
             detail: detail.clone(),
         };
+        // The single transition into the terminal state, so one lost-durability
+        // event files one report no matter how many later calls repeat the
+        // error out of [`DurabilityState::check`].
+        crate::diag::durability_lost(&err, &detail);
         *self = Self::Poisoned { detail };
         err
     }

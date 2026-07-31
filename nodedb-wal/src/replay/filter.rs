@@ -144,10 +144,13 @@ pub fn extract_tombstones(records: &[WalRecord]) -> crate::Result<TombstoneSet> 
             continue;
         }
         if record.is_encrypted() {
-            return Err(crate::WalError::EncryptedRecordWithoutKey {
+            const SITE: &str = "collection-tombstone extraction";
+            let err = crate::WalError::EncryptedRecordWithoutKey {
                 lsn: record.header.lsn,
-                context: "collection-tombstone extraction",
-            });
+                context: SITE,
+            };
+            crate::diag::encrypted_record_without_key(&err, record.header.lsn, SITE);
+            return Err(err);
         }
         let payload = CollectionTombstonePayload::from_bytes(&record.payload)?;
         set.insert(

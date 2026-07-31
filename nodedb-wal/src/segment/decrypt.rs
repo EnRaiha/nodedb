@@ -78,13 +78,15 @@ impl SegmentDecryptor {
 
     /// Resolve the key ring and segment AAD, or explain which one is missing.
     fn require_keys(&self, lsn: u64) -> Result<(&KeyRing, &SegmentAad)> {
-        let ring = self
-            .ring
-            .as_ref()
-            .ok_or(WalError::EncryptedRecordWithoutKey {
-                lsn,
-                context: "WAL segment replay",
-            })?;
+        const SITE: &str = "WAL segment replay";
+        let ring = match self.ring.as_ref() {
+            Some(ring) => ring,
+            None => {
+                let err = WalError::EncryptedRecordWithoutKey { lsn, context: SITE };
+                crate::diag::encrypted_record_without_key(&err, lsn, SITE);
+                return Err(err);
+            }
+        };
         // An encrypted record can only exist in a segment whose preamble
         // recorded the epoch it was encrypted under. A missing preamble means
         // the segment's leading bytes are gone, not that the record is legible.

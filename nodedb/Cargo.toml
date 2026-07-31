@@ -29,7 +29,7 @@ nodedb-physical = { workspace = true }
 rust_decimal = { workspace = true, features = ["db-postgres"] }
 nodedb-cluster = { workspace = true }
 nodedb-raft = { workspace = true }
-nodedb-wal = { workspace = true }
+nodedb-wal = { workspace = true, features = ["diagnostics"] }
 nodedb-mem = { workspace = true }
 nodedb-fts = { workspace = true }
 nodedb-query = { workspace = true }
@@ -52,6 +52,10 @@ parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# This crate is the process that owns the recorder: it calls `faultbox::init`,
+# runs the out-of-process crash monitor, and feeds the flight recorder from the
+# tracing events the server already emits.
+faultbox = { workspace = true, features = ["native-crash", "tracing"] }
 
 # Serialization & config
 serde = { workspace = true }

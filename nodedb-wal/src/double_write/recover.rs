@@ -25,10 +25,13 @@ impl DoubleWriteBuffer {
     /// highest slot sequence number wins. Returning the older one would
     /// resurrect a payload that was never acknowledged to any client.
     pub fn recover_record(&mut self, target_lsn: u64) -> Result<Option<WalRecord>> {
+        // Tail expressions, not early returns: exactly one arm compiles per
+        // target, so a `return` here is redundant and `-D warnings` rejects it
+        // on the wasm build.
         #[cfg(target_arch = "wasm32")]
         {
             let _ = target_lsn;
-            return Ok(None);
+            Ok(None)
         }
 
         #[cfg(not(target_arch = "wasm32"))]

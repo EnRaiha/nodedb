@@ -90,6 +90,21 @@ pub struct ServerSection {
     /// minimal deployment that never issues cross-core transactions.
     #[serde(default = "default_single_node_calvin")]
     pub single_node_calvin: bool,
+
+    /// Capture an out-of-process minidump when the server dies to a native
+    /// fault (SIGSEGV, abort, stack overflow) rather than a Rust panic.
+    /// Default `false`.
+    ///
+    /// Structured corruption, invariant, and panic reports are always recorded
+    /// — they carry diagnostic fields that pass through a redactor. A minidump
+    /// cannot: it is a verbatim copy of the whole address space, which for this
+    /// process means decrypted rows, session credentials, and WAL keys still
+    /// resident in memory. Writing that to disk is an operator's decision about
+    /// their own data, not a default, so the handler is armed only on request.
+    ///
+    /// Reports are written under `<data_dir>/diagnostics`, owner-only.
+    #[serde(default)]
+    pub native_crash_dumps: bool,
 }
 
 impl Default for ServerSection {
@@ -104,6 +119,7 @@ impl Default for ServerSection {
             log_format: LogFormat::Text,
             tls: None,
             single_node_calvin: default_single_node_calvin(),
+            native_crash_dumps: false,
         }
     }
 }

@@ -50,13 +50,24 @@ impl SegmentContinuity {
 
         let expected_lsn = previous_last_lsn.saturating_add(1);
         if segment.first_lsn > expected_lsn {
-            return Err(WalError::SegmentLsnGap {
+            let err = WalError::SegmentLsnGap {
                 path: segment.path.display().to_string(),
                 previous_path: previous_path.display().to_string(),
                 previous_last_lsn: *previous_last_lsn,
                 expected_lsn,
                 found_lsn: segment.first_lsn,
-            });
+            };
+            // The boundary check is the only place that can see the hole: a
+            // single segment says nothing about the one that should precede it.
+            crate::diag::segment_lsn_gap(
+                &err,
+                &segment.path,
+                previous_path,
+                *previous_last_lsn,
+                expected_lsn,
+                segment.first_lsn,
+            );
+            return Err(err);
         }
 
         Ok(())

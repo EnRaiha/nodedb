@@ -23,6 +23,7 @@ pub fn init_tracing(config: &ServerConfig) {
                     .flatten_event(true)
                     .with_filter(filter),
             )
+            .with(breadcrumb_layer())
             .init();
     } else {
         tracing_subscriber::registry()
@@ -31,6 +32,22 @@ pub fn init_tracing(config: &ServerConfig) {
                     .with_writer(std::io::stderr)
                     .with_filter(filter),
             )
+            .with(breadcrumb_layer())
             .init();
     }
+}
+
+/// The flight recorder that turns events the server already emits into the
+/// breadcrumb trail attached to every failure report.
+///
+/// Deliberately unfiltered by the log-level filter above: a trail is only
+/// useful if it exists when the log level is `warn`, and it is a bounded
+/// in-memory ring that never touches disk until something fails. The target
+/// filter is a prefix match, so one entry covers every crate in this
+/// workspace (`nodedb`, `nodedb_wal`, `nodedb_sql`, …) while keeping a
+/// dependency's chatter from evicting the events that explain our own failure.
+/// Crumbs from every layer merge into one ring, so a report filed inside the
+/// WAL still carries the query that led to the bad read.
+fn breadcrumb_layer() -> faultbox::BreadcrumbLayer {
+    faultbox::BreadcrumbLayer::new().only_targets(["nodedb"])
 }

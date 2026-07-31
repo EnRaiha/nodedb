@@ -6,6 +6,7 @@ pub mod constraint_reconcile;
 pub mod credentials;
 pub mod data_group_recovery;
 pub mod data_plane;
+pub mod diagnostics;
 pub mod index_registry_seed;
 pub mod listeners;
 pub mod panic_hook;

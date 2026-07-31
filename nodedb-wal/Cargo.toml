@@ -15,6 +15,11 @@ categories = ["database-implementations", "filesystem"]
 [features]
 default = []
 io-uring = ["dep:io-uring"]
+# File structured corruption / invariant / durability reports through the
+# `faultbox` black-box recorder. Inert until the host application calls
+# `faultbox::init`; a no-op on wasm32 regardless. Off by default so the crate
+# stays dependency-light for embedders that report failures their own way.
+diagnostics = ["dep:faultbox"]
 # Arm the crash-injection points used by the durability tests. Without it every
 # `fail_point!` compiles to nothing, so production builds pay no cost.
 failpoints = ["nodedb-types/failpoints"]
@@ -30,6 +35,7 @@ hkdf = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
 zeroize = { workspace = true }
+faultbox = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true, optional = true }
@@ -37,10 +43,24 @@ io-uring = { workspace = true, optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = { workspace = true }
 
+# `getrandom` reaches this crate twice and neither copy picks a backend on its
+# own for `wasm32-unknown-unknown`: 0.3 arrives directly and via sonic-rs/rand,
+# 0.2 via aes-gcm's `rand_core`. Naming both here with their JS-backed features
+# lets Cargo's feature unification apply them to the transitive copies, which is
+# the same approach the WASM bindings crate already uses. Without this the crate
+# does not compile for the target at all, despite carrying wasm32 code paths.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
 [dev-dependencies]
 tokio = { workspace = true }
 fluxbench = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Named again here so the diagnostics integration tests can act as the host —
+# call `init` and read reports back. Same published version as the optional
+# dependency above, so Cargo still resolves a single package.
+faultbox = { workspace = true }
 tempfile = "3"
 rand = { workspace = true }
 

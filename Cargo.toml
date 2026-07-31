@@ -73,6 +73,14 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Black-box recorder for corruption / invariant / durability failures.
+# Declared featureless here on purpose: several crates in this workspace depend
+# on it and Cargo must resolve them all to ONE package, or the host initializes
+# one recorder while every emit through the other silently disappears. Host-only
+# features (`native-crash`) are added by the binary that arms them, never here,
+# so a wasm build of a library crate never pulls the crash toolchain in.
+faultbox = { version = "0.1" }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 

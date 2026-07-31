@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::{Result, WalError};
+use crate::error::Result;
+// Only the unix `pwrite` path constructs an error value directly; elsewhere
+// failures propagate as `Result` from calls that build their own.
+#[cfg(unix)]
+use crate::error::WalError;
 
 use super::core::WalWriter;
 
@@ -18,9 +22,10 @@ impl WalWriter {
         // Fault injection: a full device. The buffer and `file_offset` must
         // survive untouched so the batch can be retried once space is freed.
         nodedb_types::fail_point_err!("wal::flush_out_of_space", |_: String| {
-            WalError::OutOfSpace {
-                context: "WAL segment append (failpoint)",
-            }
+            const SITE: &str = "WAL segment append (failpoint)";
+            let err = WalError::OutOfSpace { context: SITE };
+            crate::diag::out_of_space(&err, SITE, self.file_offset, self.buffer.len() as u64);
+            err
         });
 
         let data = if self.config.use_direct_io {
@@ -54,7 +59,11 @@ impl WalWriter {
                     )
                 };
                 if written < 0 {
-                    return Err(write_error("WAL segment append"));
+                    return Err(write_error(
+                        "WAL segment append",
+                        write_offset,
+                        remaining.len() as u64,
+                    ));
                 }
                 let n = written as usize;
                 if n == 0 {
@@ -85,13 +94,22 @@ impl WalWriter {
 ///
 /// A full device is called out separately from generic I/O failure: it is not
 /// transient, retrying cannot succeed, and the caller must stop acknowledging
-/// writes rather than treat it as a passing error.
-fn write_error(context: &'static str) -> WalError {
+/// writes rather than treat it as a passing error. `offset` and `pending` say
+/// where the batch stalled and how much of it never reached the file, which is
+/// what a report needs to describe the write that could not complete.
+///
+/// Gated to match its only call site: the `pwrite` loop is unix-only, so on
+/// other targets (wasm32) this would be dead code and a `-D warnings` build
+/// would reject it.
+#[cfg(unix)]
+fn write_error(context: &'static str, offset: u64, pending: u64) -> WalError {
     let err = std::io::Error::last_os_error();
     #[cfg(unix)]
     if err.raw_os_error() == Some(libc::ENOSPC) {
-        return WalError::OutOfSpace { context };
+        let out_of_space = WalError::OutOfSpace { context };
+        crate::diag::out_of_space(&out_of_space, context, offset, pending);
+        return out_of_space;
     }
-    let _ = context;
+    let _ = (context, offset, pending);
     WalError::Io(err)
 }

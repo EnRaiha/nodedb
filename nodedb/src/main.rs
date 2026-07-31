@@ -18,6 +18,15 @@ use main_boot::{
 };
 
 fn main() -> anyhow::Result<()> {
+    // Nothing may precede this. The black-box recorder's crash monitor is a
+    // re-exec of this same binary; when this process is the monitor it serves
+    // minidumps here and exits, and any startup work done first would be the
+    // server starting a second time. In a normal process it is one
+    // environment-variable check.
+    if nodedb::bootstrap::diagnostics::run_crash_monitor_if_env() {
+        return Ok(());
+    }
+
     // This is deliberately the first application action: Tokio may create
     // worker threads while building its runtime, and the default panic hook
     // renders arbitrary panic payloads.
@@ -66,6 +75,13 @@ async fn server_main() -> anyhow::Result<()> {
     // The overrides are re-applied silently here; the real log messages
     // will be emitted by the second call after the subscriber is registered.
     apply_env_overrides(&mut config);
+
+    // Own the black-box recorder before the subscriber is built: the panic hook
+    // it installs chains in front of the one above, and the reports directory
+    // has to be resolved from the data dir the overrides just settled. Only
+    // this binary calls `init`, and only once — the WAL and every other library
+    // layer emit into whatever it configures here.
+    nodedb::bootstrap::diagnostics::init(&config);
 
     // Initialize tracing subscriber (format + filter from config / RUST_LOG).
     nodedb::bootstrap::tracing_init::init_tracing(&config);

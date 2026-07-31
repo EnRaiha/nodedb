@@ -66,12 +66,27 @@ pub fn verify_committed_prefix(path: &Path, stop: Option<StopReason>, last_lsn: 
         TailVerdict::MidFileCorruption {
             resync_offset,
             resync_lsn,
-        } => Err(WalError::MidFileCorruption {
-            path: path.display().to_string(),
-            offset,
-            resync_offset,
-            resync_lsn,
-        }),
+        } => {
+            let err = WalError::MidFileCorruption {
+                path: path.display().to_string(),
+                offset,
+                resync_offset,
+                resync_lsn,
+            };
+            // Reported here and only here. This is the layer that knows the
+            // stop point is a hole rather than a torn tail, and it is the last
+            // moment the damaged segment is guaranteed to still be on disk
+            // exactly as recovery found it. Callers propagate the error.
+            crate::diag::mid_file_corruption(
+                &err,
+                path,
+                offset,
+                resync_offset,
+                resync_lsn,
+                last_lsn,
+            );
+            Err(err)
+        }
     }
 }
 
