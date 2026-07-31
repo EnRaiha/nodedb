@@ -11,7 +11,6 @@ use fluxbench::{bench, synthetic, verify};
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 
-use nodedb_wal::group_commit::{GroupCommitter, PendingWrite};
 use nodedb_wal::record::RecordType;
 use nodedb_wal::writer::WalWriter;
 
@@ -54,13 +53,25 @@ fn wal_append_only_10k(b: &mut Bencher) {
     });
 }
 
-/// Group commit — 10 threads each submitting 1000 records through GroupCommitter.
+/// Group commit — 10 threads each appending 1000 records through one shared
+/// `WalWriter`, with a batched fsync amortized over the whole batch.
+///
+/// This is the shape of the live durability barrier: concurrent appenders
+/// serialize on the writer lock, and one `sync()` covers every record they
+/// buffered, so N appends cost one fsync rather than N.
 #[bench(
     id = "wal_group_commit_10t_1k",
     group = "wal_group_commit",
     tags = "core"
 )]
 fn wal_group_commit(b: &mut Bencher) {
+    const THREADS: usize = 10;
+    const RECORDS_PER_THREAD: usize = 1000;
+    /// Records buffered per thread before it asks for a durability barrier.
+    /// Smaller batches mean more fsyncs sharing fewer records, which is what
+    /// makes this measure batching rather than raw buffer speed.
+    const SYNC_EVERY: usize = 100;
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bench_gc.wal");
     let payload = vec![0xCDu8; 128];
@@ -70,26 +81,23 @@ fn wal_group_commit(b: &mut Bencher) {
         let writer = Arc::new(Mutex::new(
             WalWriter::open_without_direct_io(&path).unwrap(),
         ));
-        let committer = Arc::new(GroupCommitter::new());
 
-        let handles: Vec<_> = (0..10)
+        let handles: Vec<_> = (0..THREADS)
             .map(|t| {
-                let c = Arc::clone(&committer);
                 let w = Arc::clone(&writer);
                 let p = payload.clone();
                 std::thread::spawn(move || {
-                    for _ in 0..1000 {
-                        c.submit(
-                            &w,
-                            PendingWrite {
-                                record_type: RecordType::Put as u32,
-                                tenant_id: t,
-                                vshard_id: 0,
-                                database_id: 0,
-                                payload: p.clone(),
-                            },
-                        )
-                        .unwrap();
+                    for i in 0..RECORDS_PER_THREAD {
+                        let mut guard = w.lock().unwrap();
+                        guard
+                            .append(RecordType::Put as u32, t as u64, 0, 0, &p)
+                            .unwrap();
+                        // One fsync covers everything every appender buffered
+                        // since the last barrier, including other threads'
+                        // records — that batching is what is being measured.
+                        if i % SYNC_EVERY == SYNC_EVERY - 1 {
+                            guard.sync().unwrap();
+                        }
                     }
                 })
             })
@@ -99,7 +107,8 @@ fn wal_group_commit(b: &mut Bencher) {
             h.join().unwrap();
         }
 
-        let w = writer.lock().unwrap();
+        let mut w = writer.lock().unwrap();
+        w.sync().unwrap();
         black_box(w.next_lsn())
     });
 }

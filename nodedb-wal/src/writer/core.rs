@@ -444,4 +444,42 @@ mod tests {
             Err(WalError::Sealed)
         ));
     }
+
+    /// The shape the durability barrier actually uses: many threads append
+    /// through one shared writer and a single `sync()` covers the whole batch.
+    /// Every record must survive, exactly once, with no LSN reused.
+    #[test]
+    fn concurrent_appends_through_a_shared_writer_all_land() {
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.wal");
+
+        let writer = Arc::new(Mutex::new(
+            WalWriter::open_without_direct_io(&path).unwrap(),
+        ));
+
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let w = Arc::clone(&writer);
+                std::thread::spawn(move || {
+                    let payload = format!("record-{i}");
+                    let mut guard = w.lock().unwrap();
+                    guard
+                        .append(RecordType::Put as u32, 1, 0, 0, payload.as_bytes())
+                        .unwrap()
+                })
+            })
+            .collect();
+
+        let mut lsns: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        lsns.sort_unstable();
+        assert_eq!(lsns, (1..=10).collect::<Vec<u64>>());
+
+        writer.lock().unwrap().sync().unwrap();
+
+        let reader = crate::reader::WalReader::open(&path).unwrap();
+        let records: Vec<_> = reader.records().collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(records.len(), 10);
+    }
 }

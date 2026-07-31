@@ -27,7 +27,6 @@ pub mod align;
 pub mod crypto;
 pub mod double_write;
 pub mod error;
-pub mod group_commit;
 pub mod lazy_reader;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mmap_reader;
@@ -52,7 +51,6 @@ pub use double_write::{
     wal_dwb_bytes_written_total, wal_dwb_degradations_total, wal_dwb_unprotected_records_total,
 };
 pub use error::{Result, WalError};
-pub use group_commit::GroupCommitter;
 pub use lazy_reader::LazyWalReader;
 pub use preamble::{
     CIPHER_AES_256_GCM, PREAMBLE_SIZE, PREAMBLE_VERSION, SEG_PREAMBLE_MAGIC, SegmentPreamble,
