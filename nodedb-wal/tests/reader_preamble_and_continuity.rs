@@ -96,18 +96,19 @@ fn lazy_reader_replays_every_record_of_an_encrypted_segment() {
 
     let ring = test_ring();
     let mut recovered: Vec<Vec<u8>> = Vec::new();
-    replay_segment_lazy(&path, |reader, header| {
-        let preamble = *reader
-            .segment_preamble()
-            .expect("encrypted segment must expose its preamble");
-        let preamble_bytes = preamble.to_bytes();
-        let record = reader.read_record(header)?;
-        assert!(record.is_encrypted());
-        recovered.push(
-            record
-                .decrypt_payload_ring(preamble.epoch(), Some(&preamble_bytes), Some(&ring))
-                .unwrap(),
+    // The driver owns decryption now: a consumer that is handed the key ring
+    // receives plaintext and cannot accidentally act on ciphertext.
+    replay_segment_lazy(&path, Some(&ring), |reader, header| {
+        assert!(
+            reader.segment_preamble().is_some(),
+            "encrypted segment must expose its preamble"
         );
+        let record = reader.read_record(header)?;
+        assert!(
+            !record.is_encrypted(),
+            "replay must hand the consumer a decrypted record"
+        );
+        recovered.push(record.payload);
         Ok(())
     })
     .unwrap();
@@ -139,7 +140,7 @@ fn both_readers_still_replay_an_unencrypted_segment() {
         assert_eq!(record.payload.as_slice(), *expected);
     }
 
-    let mut lazy = LazyWalReader::open(&path).unwrap();
+    let mut lazy = LazyWalReader::open(&path, None).unwrap();
     assert!(lazy.segment_preamble().is_none());
     assert_eq!(lazy.offset(), 0, "no preamble means no bytes to skip");
     let mut lazy_payloads = Vec::new();
@@ -189,7 +190,7 @@ fn mmap_replay_rejects_mid_file_corruption_instead_of_truncating() {
     let hole = record_header_offset(&path, 1);
     smash(&path, hole, HEADER_SIZE);
 
-    match replay_segments_mmap(&wal_dir, 0) {
+    match replay_segments_mmap(&wal_dir, 0, None) {
         Err(WalError::MidFileCorruption { .. }) => {}
         Ok(records) => panic!(
             "mid-file corruption was silently truncated to {} records",
@@ -234,7 +235,7 @@ fn mmap_replay_rejects_a_missing_middle_segment() {
     );
     std::fs::remove_file(&segments[segments.len() / 2].path).unwrap();
 
-    match replay_segments_mmap(&wal_dir, 0) {
+    match replay_segments_mmap(&wal_dir, 0, None) {
         Err(WalError::SegmentLsnGap { .. }) => {}
         Ok(records) => panic!(
             "a missing middle segment produced {} records and no error",
@@ -258,7 +259,7 @@ fn mmap_replay_accepts_a_truncated_prefix() {
         std::fs::remove_file(&seg.path).unwrap();
     }
 
-    let records = replay_segments_mmap(&wal_dir, 0).expect("a truncated prefix is legal");
+    let records = replay_segments_mmap(&wal_dir, 0, None).expect("a truncated prefix is legal");
     let surviving_first_lsn = segments[2].first_lsn;
     assert!(
         records.iter().all(|r| r.header.lsn >= surviving_first_lsn),

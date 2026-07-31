@@ -64,9 +64,17 @@ impl WalManager {
     }
 
     /// Replay all committed records from the WAL.
+    ///
+    /// Payloads come back as plaintext: the manager's key ring is handed to the
+    /// replay driver, which decrypts each record inside the WAL layer. Every
+    /// record type is encrypted when a key is configured, so replaying without
+    /// the ring would hand ciphertext to every engine's decoder.
     pub fn replay(&self) -> crate::Result<Vec<WalRecord>> {
-        let records =
-            nodedb_wal::segmented::replay_all_segments(&self.wal_dir).map_err(crate::Error::Wal)?;
+        let records = nodedb_wal::segmented::replay_all_segments(
+            &self.wal_dir,
+            self.encryption_ring.as_ref(),
+        )
+        .map_err(crate::Error::Wal)?;
         info!(records = records.len(), "WAL replay complete");
         Ok(records)
     }
@@ -82,9 +90,12 @@ impl WalManager {
 
     /// Replay WAL records from `from_lsn` using mmap (tier-2 catchup).
     pub fn replay_mmap_from(&self, from_lsn: Lsn) -> crate::Result<Vec<WalRecord>> {
-        let records =
-            nodedb_wal::mmap_reader::replay_segments_mmap(self.wal_dir(), from_lsn.as_u64())
-                .map_err(crate::Error::Wal)?;
+        let records = nodedb_wal::mmap_reader::replay_segments_mmap(
+            self.wal_dir(),
+            from_lsn.as_u64(),
+            self.encryption_ring.as_ref(),
+        )
+        .map_err(crate::Error::Wal)?;
         Ok(records)
     }
 
@@ -101,6 +112,7 @@ impl WalManager {
             self.wal_dir(),
             from_lsn.as_u64(),
             max_records,
+            self.encryption_ring.as_ref(),
         )
         .map_err(crate::Error::Wal)
     }
@@ -111,7 +123,12 @@ impl WalManager {
         from_lsn: Lsn,
         max_records: usize,
     ) -> crate::Result<(Vec<WalRecord>, bool)> {
-        nodedb_wal::segmented::replay_from_limit_dir(self.wal_dir(), from_lsn.as_u64(), max_records)
-            .map_err(crate::Error::Wal)
+        nodedb_wal::segmented::replay_from_limit_dir(
+            self.wal_dir(),
+            from_lsn.as_u64(),
+            max_records,
+            self.encryption_ring.as_ref(),
+        )
+        .map_err(crate::Error::Wal)
     }
 }

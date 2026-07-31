@@ -127,6 +127,13 @@ impl std::ops::Deref for DatabaseTombstones<'_> {
 ///
 /// A malformed tombstone fails extraction. Skipping one would replay writes
 /// below an unknown purge boundary and can resurrect a dropped collection.
+///
+/// Records must already be plaintext. Every record type is encrypted when a key
+/// is configured, tombstones included, and the replay drivers in
+/// [`crate::segmented`] / [`crate::mmap_reader`] decrypt before returning. A
+/// record that still carries `ENCRYPTED_FLAG` here means it reached this
+/// function around those drivers; decoding its ciphertext would either error
+/// confusingly or, worse, parse into a bogus purge boundary, so it is rejected.
 pub fn extract_tombstones(records: &[WalRecord]) -> crate::Result<TombstoneSet> {
     let mut set = TombstoneSet::new();
     for record in records {
@@ -136,10 +143,12 @@ pub fn extract_tombstones(records: &[WalRecord]) -> crate::Result<TombstoneSet> 
         if kind != RecordType::CollectionTombstoned {
             continue;
         }
-        // Tombstone records are never encrypted in the current design —
-        // they carry only a collection name and an LSN, no secrets.
-        // If payload-level encryption is later extended to tombstones,
-        // this call site changes to `decrypt_payload_ring` first.
+        if record.is_encrypted() {
+            return Err(crate::WalError::EncryptedRecordWithoutKey {
+                lsn: record.header.lsn,
+                context: "collection-tombstone extraction",
+            });
+        }
         let payload = CollectionTombstonePayload::from_bytes(&record.payload)?;
         set.insert(
             record.header.database_id,

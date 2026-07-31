@@ -387,11 +387,13 @@ mod tests {
         let mut h = make_core();
         let record = redo_record(7, vec![edge_put_sub("knows", "a", "KNOWS", "b")]);
 
-        h.core.replay_transaction_redo_wal(
-            std::slice::from_ref(&record),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        h.core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&record),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         assert_eq!(
             edge_count(&h, "knows", "a"),
@@ -427,11 +429,13 @@ mod tests {
         let mut h = make_core();
         let record = redo_record(7, vec![edge_put_sub("knows", "a", "KNOWS", "b")]);
 
-        h.core.replay_transaction_redo_wal(
-            std::slice::from_ref(&record),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        h.core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&record),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         let write_key = WriteKey {
             db: DatabaseId::new(0),
@@ -459,9 +463,11 @@ mod tests {
         // The edge is keyed by (src, label, dst); re-applying overwrites the
         // same versioned edge and CSR entry, so double replay converges to one.
         h.core
-            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb);
+            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb)
+            .expect("redo replay must succeed");
         h.core
-            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb);
+            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb)
+            .expect("redo replay must succeed");
 
         assert_eq!(
             edge_count(&h, "knows", "a"),

@@ -154,7 +154,7 @@ fn mmap_and_lazy_readers_also_cross_batch_boundaries() {
     );
     assert_eq!(mmap.stop_reason(), Some(StopReason::Eof));
 
-    let mut lazy = LazyWalReader::open(&path).unwrap();
+    let mut lazy = LazyWalReader::open(&path, None).unwrap();
     let mut lazy_payloads = Vec::new();
     while let Some(header) = lazy.next_header().unwrap() {
         lazy_payloads.push(lazy.read_payload(&header).unwrap());

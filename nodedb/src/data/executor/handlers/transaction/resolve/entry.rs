@@ -964,7 +964,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         for s in [1u32, 2u32] {
             let row_key = surrogate_to_doc_id(Surrogate::new(s));
@@ -1143,7 +1144,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         let coll = dst
             .vector_collections
             .get(&vp_index_key())
@@ -1177,7 +1179,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         let coll = dst
             .vector_collections
             .get(&mv_index_key())
@@ -1219,7 +1222,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         let coll = dst
             .vector_collections
             .get(&mv_index_key())
@@ -1250,7 +1254,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         let idx = dst
             .sparse_vector_indexes
             .get(&sparse_index_key())
@@ -1286,7 +1291,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         let doc_count = dst
             .sparse_vector_indexes
             .get(&sparse_index_key())
@@ -1408,7 +1414,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         let stored = dst
             .sparse
@@ -1451,7 +1458,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         let stored = dst
             .sparse
@@ -1512,7 +1520,8 @@ mod tests {
             std::slice::from_ref(&seed),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         assert!(
             dst.sparse
                 .get(DatabaseId::DEFAULT.as_u64(), TID, "notes", row_key.as_str())
@@ -1526,7 +1535,8 @@ mod tests {
             std::slice::from_ref(&del),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         assert!(
             dst.sparse
                 .get(DatabaseId::DEFAULT.as_u64(), TID, "notes", row_key.as_str())
@@ -1582,7 +1592,8 @@ mod tests {
             std::slice::from_ref(&seed),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         let before = core
             .sparse
             .get(DatabaseId::DEFAULT.as_u64(), TID, "notes", row_key.as_str())
@@ -1649,7 +1660,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         let db = DatabaseId::DEFAULT.as_u64();
         let now = crate::engine::kv::current_ms();
@@ -1711,7 +1723,8 @@ mod tests {
             std::slice::from_ref(&wal_record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         let now = crate::engine::kv::current_ms();
         let db = DatabaseId::DEFAULT.as_u64();
@@ -1842,11 +1855,13 @@ mod tests {
         // repopulated from the two trailing surrogates.
         let record = wrap_redo(&redo);
         let (mut dst_core, _dst_dir) = make_core();
-        dst_core.replay_transaction_redo_wal(
-            std::slice::from_ref(&record),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        dst_core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&record),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
         let edges = dst_core
             .edge_store
             .neighbors_out(
@@ -1960,11 +1975,13 @@ mod tests {
         );
 
         let del = wrap_redo(&redo);
-        dst_core.replay_transaction_redo_wal(
-            std::slice::from_ref(&del),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        dst_core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&del),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
         assert!(
             dst_core
                 .edge_store
@@ -2072,11 +2089,13 @@ mod tests {
 
         let record = wrap_redo(&redo);
         let (mut dst_core, _dst_dir) = make_core();
-        dst_core.replay_transaction_redo_wal(
-            std::slice::from_ref(&record),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        dst_core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&record),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         let db = DatabaseId::DEFAULT.as_u64();
         assert!(
@@ -2158,7 +2177,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         assert!(
             has_label(&dst, "n1", "Person"),
             "SetNodeLabels must survive resolve -> redo replay"
@@ -2202,7 +2222,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         assert!(
             !has_label(&dst, "n1", "Person"),
             "RemoveNodeLabels must survive resolve -> redo replay"
@@ -2269,7 +2290,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         assert!(
             has_label(&dst, "n1", "Robot"),
             "the added label must be present after replay"
@@ -2306,7 +2328,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         assert!(has_label(&dst, "ghost", "Person"));
         assert!(has_label(&dst, "ghost", "Agent"));
@@ -2388,7 +2411,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         let key = CoreLoop::vector_index_key(DatabaseId::DEFAULT.as_u64(), TID, "emb", "");
         assert_eq!(
@@ -2480,7 +2504,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         let key = (
             DatabaseId::DEFAULT,
@@ -2543,7 +2568,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         let key = (
             DatabaseId::DEFAULT,
@@ -2595,7 +2621,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         let memtable = dst
             .columnar_memtables
@@ -2735,7 +2762,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         // Flush and scan to observe the replayed cell.
         let flush_resp = dst.handle_array_flush(&task, &aid, 2);
@@ -2812,7 +2840,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         let db = DatabaseId::DEFAULT.as_u64();
         let now = crate::engine::kv::current_ms();
@@ -2919,7 +2948,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         // The geometry is queryable: the R-tree entry and the sparse document
         // body were both rebuilt by replay's `execute_spatial_insert` call.
@@ -2982,7 +3012,8 @@ mod tests {
             std::slice::from_ref(&insert_record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
         let key = (
             DatabaseId::DEFAULT,
             TenantId::new(TID),
@@ -3008,7 +3039,8 @@ mod tests {
             std::slice::from_ref(&del_record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         assert_eq!(
             dst.spatial_indexes
@@ -3130,7 +3162,8 @@ mod tests {
             std::slice::from_ref(&record),
             1,
             &nodedb_wal::TombstoneSet::new(),
-        );
+        )
+        .expect("redo replay must succeed");
 
         let db = DatabaseId::DEFAULT.as_u64();
         let now = crate::engine::kv::current_ms();

@@ -21,11 +21,12 @@ use std::path::{Path, PathBuf};
 
 use tracing::info;
 
+use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
 use crate::segment::{
-    DEFAULT_SEGMENT_TARGET_SIZE, SegmentContinuity, SegmentMeta, TruncateResult, discover_segments,
-    segment_path, truncate_segments,
+    DEFAULT_SEGMENT_TARGET_SIZE, SegmentContinuity, SegmentDecryptor, SegmentMeta, TruncateResult,
+    discover_segments, segment_path, truncate_segments,
 };
 use crate::writer::{WalWriter, WalWriterConfig};
 
@@ -231,9 +232,10 @@ impl SegmentedWal {
 
     /// Replay all committed records across all segments, in LSN order.
     ///
-    /// Used for crash recovery on startup.
+    /// Used for crash recovery on startup. Payloads are returned as plaintext:
+    /// this WAL's own key ring is applied to every encrypted record.
     pub fn replay(&self) -> Result<Vec<WalRecord>> {
-        replay_all_segments(&self.wal_dir)
+        replay_all_segments(&self.wal_dir, self.encryption_ring.as_ref())
     }
 
     /// Replay only records with LSN >= `from_lsn`.
@@ -254,7 +256,12 @@ impl SegmentedWal {
         from_lsn: u64,
         max_records: usize,
     ) -> Result<(Vec<WalRecord>, bool)> {
-        replay_from_limit_dir(&self.wal_dir, from_lsn, max_records)
+        replay_from_limit_dir(
+            &self.wal_dir,
+            from_lsn,
+            max_records,
+            self.encryption_ring.as_ref(),
+        )
     }
 
     /// List all segment metadata (for monitoring / operational tooling).
@@ -336,8 +343,14 @@ impl SegmentedWal {
 ///
 /// This is `replay_from_limit_dir` with no LSN floor and no record cap, so the
 /// per-segment continuity/torn-tail checks live in exactly one place.
-pub fn replay_all_segments(wal_dir: &Path) -> Result<Vec<WalRecord>> {
-    Ok(replay_from_limit_dir(wal_dir, 0, usize::MAX)?.0)
+///
+/// `keys` must be the key ring the directory was written under, or `None` for a
+/// WAL that was never encrypted. It is a required argument rather than an
+/// opt-in so that no caller can reach ciphertext by omission: an encrypted
+/// record met with `keys == None` fails with
+/// [`WalError::EncryptedRecordWithoutKey`].
+pub fn replay_all_segments(wal_dir: &Path, keys: Option<&KeyRing>) -> Result<Vec<WalRecord>> {
+    Ok(replay_from_limit_dir(wal_dir, 0, usize::MAX, keys)?.0)
 }
 
 /// Paginated replay from a WAL directory: reads at most `max_records` from `from_lsn`.
@@ -347,10 +360,14 @@ pub fn replay_all_segments(wal_dir: &Path) -> Result<Vec<WalRecord>> {
 /// segment is read via buffered I/O which sees data after the writer's fsync.
 ///
 /// Returns `(records, has_more)` where `has_more` is `true` if the limit was hit.
+///
+/// Records are returned as plaintext. See [`replay_all_segments`] for why
+/// `keys` is mandatory.
 pub fn replay_from_limit_dir(
     wal_dir: &Path,
     from_lsn: u64,
     max_records: usize,
+    keys: Option<&KeyRing>,
 ) -> Result<(Vec<WalRecord>, bool)> {
     let segments = discover_segments(wal_dir)?;
     let mut records = Vec::with_capacity(max_records.min(4096));
@@ -359,6 +376,7 @@ pub fn replay_from_limit_dir(
     for seg in &segments {
         continuity.check(seg)?;
         let mut reader = crate::reader::WalReader::open(&seg.path)?;
+        let decryptor = SegmentDecryptor::new(reader.segment_preamble(), keys);
         // Tracked over everything the segment contains, not over what survives
         // the `from_lsn` filter — continuity is a property of the log, not of
         // the caller's window into it.
@@ -366,7 +384,7 @@ pub fn replay_from_limit_dir(
         while let Some(record) = reader.next_record()? {
             last_lsn = record.header.lsn;
             if record.header.lsn >= from_lsn {
-                records.push(record);
+                records.push(decryptor.decrypt_record(record)?);
                 if records.len() >= max_records {
                     // Stopping short leaves the rest of this segment unread, so
                     // its end LSN is unknown and no boundary can be judged.

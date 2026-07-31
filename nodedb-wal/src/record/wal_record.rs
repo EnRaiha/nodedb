@@ -167,6 +167,49 @@ impl WalRecord {
         ring.decrypt_aad(epoch, self.header.lsn, &aad, &self.payload)
     }
 
+    /// Consume an encrypted record and return the equivalent plaintext record.
+    ///
+    /// The result is indistinguishable from a record that was written without
+    /// encryption in the first place: `ENCRYPTED_FLAG` is cleared, `payload_len`
+    /// matches the plaintext, and the CRC is recomputed over the new header and
+    /// payload so [`Self::verify_checksum`] still passes and re-serialization
+    /// stays coherent.
+    ///
+    /// Recomputing the CRC does not weaken any integrity check. The on-disk CRC
+    /// was already verified against the on-disk bytes by the reader before this
+    /// call, and the AES-GCM auth tag independently binds the ciphertext to the
+    /// segment preamble and the record header. Keeping the on-disk CRC after
+    /// rewriting two header fields and the payload would leave a record that
+    /// fails its own checksum.
+    ///
+    /// A record that is not encrypted is returned untouched, so this is safe to
+    /// apply to a mixed stream.
+    pub fn into_decrypted(
+        mut self,
+        epoch: &[u8; 4],
+        preamble_bytes: Option<&[u8; PREAMBLE_SIZE]>,
+        ring: Option<&crate::crypto::KeyRing>,
+    ) -> Result<Self> {
+        if !self.is_encrypted() {
+            return Ok(self);
+        }
+
+        let plaintext = self.decrypt_payload_ring(epoch, preamble_bytes, ring)?;
+        // The ciphertext is longer than the plaintext and its length already
+        // fit `u32` in the header this record was read from, so the conversion
+        // cannot overflow; it is still checked rather than asserted.
+        let payload_len = u32::try_from(plaintext.len()).map_err(|_| WalError::CorruptRecord {
+            lsn: self.header.lsn,
+            detail: "decrypted payload length does not fit the record header".into(),
+        })?;
+
+        self.header.record_type &= !ENCRYPTED_FLAG;
+        self.header.payload_len = payload_len;
+        self.payload = plaintext;
+        self.header.crc32c = self.header.compute_checksum(&self.payload);
+        Ok(self)
+    }
+
     /// Whether this record's payload is encrypted.
     pub fn is_encrypted(&self) -> bool {
         self.header.record_type & ENCRYPTED_FLAG != 0

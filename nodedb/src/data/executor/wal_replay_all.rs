@@ -61,7 +61,20 @@ impl CoreLoop {
         // — is already in place. Every redo op is an absolute overwrite
         // or a watermark-gated append, so ordering after the standalone
         // replays (and after the checkpoint restores above) is safe.
-        self.replay_transaction_redo_wal(records, num_cores, tombstones);
+        //
+        // Fatal on error, for the same reason the sync-HWM replay below is: a
+        // redo group that cannot be reconstituted is a committed transaction
+        // that cannot be applied, and continuing would open the database with
+        // a hole in the replayed suffix.
+        if let Err(e) = self.replay_transaction_redo_wal(records, num_cores, tombstones) {
+            error!(
+                core_id,
+                error = %e,
+                "StartupError: committed-transaction redo replay failed — \
+                 refusing to start with an incompletely replayed WAL"
+            );
+            std::process::exit(1);
+        }
 
         // Reconstruct sync HWM maps from SyncSeqAdvance records so
         // post-restart deduplication is correct. Fatal on error —

@@ -11,9 +11,10 @@
 
 use std::path::Path;
 
+use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
-use crate::segment::{SegmentContinuity, SegmentMeta};
+use crate::segment::{SegmentContinuity, SegmentDecryptor, SegmentMeta};
 
 use super::reader::MmapWalReader;
 
@@ -39,15 +40,25 @@ struct SegmentScan {
 /// segments in parallel (one thread per segment). Each thread mmap's its
 /// segment and filters records independently; results are merged in
 /// segment order (already LSN-sorted since segments are monotonic).
-pub fn replay_segments_mmap(wal_dir: &Path, from_lsn: u64) -> Result<Vec<WalRecord>> {
+///
+/// Records are returned as plaintext. `keys` must be the key ring the directory
+/// was written under, or `None` for a WAL that was never encrypted; an
+/// encrypted record met with `keys == None` fails with
+/// [`WalError::EncryptedRecordWithoutKey`] rather than reaching the caller as
+/// ciphertext.
+pub fn replay_segments_mmap(
+    wal_dir: &Path,
+    from_lsn: u64,
+    keys: Option<&KeyRing>,
+) -> Result<Vec<WalRecord>> {
     let segments = crate::segment::discover_segments(wal_dir)?;
     let live = filter_segments_by_lsn(&segments, from_lsn);
 
     if live.len() < PARALLEL_SEGMENT_THRESHOLD {
-        return replay_segments_sequential(live, from_lsn);
+        return replay_segments_sequential(live, from_lsn, keys);
     }
 
-    replay_segments_parallel(live, from_lsn)
+    replay_segments_parallel(live, from_lsn, keys)
 }
 
 /// Return the slice of `segments` whose LSN range may contain records with
@@ -78,14 +89,19 @@ fn filter_segments_by_lsn(segments: &[SegmentMeta], from_lsn: u64) -> &[SegmentM
 }
 
 /// Read one segment end-to-end, keeping records at or above `from_lsn`.
-fn scan_segment(segment: &SegmentMeta, from_lsn: u64) -> Result<SegmentScan> {
+fn scan_segment(
+    segment: &SegmentMeta,
+    from_lsn: u64,
+    keys: Option<&KeyRing>,
+) -> Result<SegmentScan> {
     let mut reader = MmapWalReader::open(&segment.path)?;
+    let decryptor = SegmentDecryptor::new(reader.segment_preamble(), keys);
     let mut records = Vec::new();
     let mut last_lsn = 0u64;
     while let Some(record) = reader.next_record()? {
         last_lsn = record.header.lsn;
         if record.header.lsn >= from_lsn {
-            records.push(record);
+            records.push(decryptor.decrypt_record(record)?);
         }
     }
     // A segment that stops early may be an interrupted final write, or it may
@@ -101,12 +117,16 @@ fn scan_segment(segment: &SegmentMeta, from_lsn: u64) -> Result<SegmentScan> {
 /// `segments` is already the live tail: replay may legitimately start in the
 /// middle of the log, and everything below it is out of scope for continuity
 /// exactly as a checkpoint-truncated prefix would be.
-fn replay_segments_sequential(segments: &[SegmentMeta], from_lsn: u64) -> Result<Vec<WalRecord>> {
+fn replay_segments_sequential(
+    segments: &[SegmentMeta],
+    from_lsn: u64,
+    keys: Option<&KeyRing>,
+) -> Result<Vec<WalRecord>> {
     let mut records = Vec::new();
     let mut continuity = SegmentContinuity::new();
     for seg in segments {
         continuity.check(seg)?;
-        let scan = scan_segment(seg, from_lsn)?;
+        let scan = scan_segment(seg, from_lsn, keys)?;
         records.extend(scan.records);
         continuity.completed(seg, scan.last_lsn);
     }
@@ -120,14 +140,18 @@ fn replay_segments_sequential(segments: &[SegmentMeta], from_lsn: u64) -> Result
 /// segment order produces a globally LSN-ordered result. Continuity is a
 /// property of the sequence, so it is judged after the joins, in segment
 /// order.
-fn replay_segments_parallel(segments: &[SegmentMeta], from_lsn: u64) -> Result<Vec<WalRecord>> {
+fn replay_segments_parallel(
+    segments: &[SegmentMeta],
+    from_lsn: u64,
+    keys: Option<&KeyRing>,
+) -> Result<Vec<WalRecord>> {
     // Collect per-segment results. Index corresponds to segment order.
     let mut per_segment: Vec<Result<SegmentScan>> = Vec::with_capacity(segments.len());
 
     std::thread::scope(|scope| {
         let handles: Vec<_> = segments
             .iter()
-            .map(|seg| scope.spawn(move || scan_segment(seg, from_lsn)))
+            .map(|seg| scope.spawn(move || scan_segment(seg, from_lsn, keys)))
             .collect();
 
         for handle in handles {
@@ -164,10 +188,13 @@ fn replay_segments_parallel(segments: &[SegmentMeta], from_lsn: u64) -> Result<V
 ///
 /// Always uses sequential reading (no parallel threads) since the bounded
 /// record count makes parallel overhead unnecessary.
+///
+/// Records are returned as plaintext; see [`replay_segments_mmap`] for `keys`.
 pub fn replay_segments_mmap_limit(
     wal_dir: &Path,
     from_lsn: u64,
     max_records: usize,
+    keys: Option<&KeyRing>,
 ) -> Result<(Vec<WalRecord>, bool)> {
     let segments = crate::segment::discover_segments(wal_dir)?;
     let live = filter_segments_by_lsn(&segments, from_lsn);
@@ -177,11 +204,12 @@ pub fn replay_segments_mmap_limit(
     for seg in live {
         continuity.check(seg)?;
         let mut reader = MmapWalReader::open(&seg.path)?;
+        let decryptor = SegmentDecryptor::new(reader.segment_preamble(), keys);
         let mut last_lsn = 0u64;
         while let Some(record) = reader.next_record()? {
             last_lsn = record.header.lsn;
             if record.header.lsn >= from_lsn {
-                records.push(record);
+                records.push(decryptor.decrypt_record(record)?);
                 if records.len() >= max_records {
                     // Partial scan — don't release pages for a segment
                     // we'll likely re-open on the next catchup cycle. Stopping
@@ -219,13 +247,13 @@ mod tests {
         wal.sync().unwrap();
 
         // Replay from lsn2 — should get records b and c.
-        let records = replay_segments_mmap(&wal_dir, lsn2).unwrap();
+        let records = replay_segments_mmap(&wal_dir, lsn2, None).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].header.lsn, lsn2);
         assert_eq!(records[1].header.lsn, lsn3);
 
         // Replay from lsn1 — all 3.
-        let all = replay_segments_mmap(&wal_dir, lsn1).unwrap();
+        let all = replay_segments_mmap(&wal_dir, lsn1, None).unwrap();
         assert_eq!(all.len(), 3);
     }
 }

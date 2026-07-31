@@ -60,6 +60,17 @@ pub enum WalError {
     #[error("WAL encryption error: {detail}")]
     EncryptionError { detail: String },
 
+    /// A record still carries `ENCRYPTED_FLAG` at a point where plaintext is
+    /// required, and no key ring is available to turn it back into plaintext.
+    ///
+    /// Passing the ciphertext through would hand every downstream decoder
+    /// bytes it cannot parse: the lucky ones fail with a confusing framing
+    /// error, the unlucky ones decode garbage into engine state. Skipping the
+    /// record would silently drop a committed write. Neither is recoverable at
+    /// this layer, so the only honest outcome is to refuse to replay.
+    #[error("WAL record at LSN {lsn} is encrypted but no decryption key is available ({context})")]
+    EncryptedRecordWithoutKey { lsn: u64, context: &'static str },
+
     /// `DoubleWriteBuffer::open` was called with `DwbMode::Off`. Callers
     /// that want the DWB disabled must not call `open` at all.
     #[error("DoubleWriteBuffer::open called with DwbMode::Off")]

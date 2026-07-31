@@ -416,11 +416,13 @@ mod tests {
         let surrogate = 42u32;
         let record = redo_record(7, 0, vec![doc_put_sub("notes", surrogate, "alice")]);
 
-        h.core.replay_transaction_redo_wal(
-            std::slice::from_ref(&record),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        h.core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&record),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         let row_key = surrogate_to_doc_id(Surrogate::new(surrogate));
         let stored = h
@@ -440,18 +442,22 @@ mod tests {
         let surrogate = 42u32;
         // First materialize the row, then a redo delete removes it.
         let put = redo_record(7, 0, vec![doc_put_sub("notes", surrogate, "alice")]);
-        h.core.replay_transaction_redo_wal(
-            std::slice::from_ref(&put),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        h.core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&put),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         let del = redo_record(7, 0, vec![doc_delete_sub("notes", surrogate)]);
-        h.core.replay_transaction_redo_wal(
-            std::slice::from_ref(&del),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        h.core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&del),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         let row_key = surrogate_to_doc_id(Surrogate::new(surrogate));
         let stored = h
@@ -471,7 +477,8 @@ mod tests {
 
         // Absolute overwrite: replaying twice converges to the same single row.
         h.core
-            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb);
+            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb)
+            .expect("redo replay must succeed");
         let first = h
             .core
             .sparse
@@ -483,7 +490,8 @@ mod tests {
             )
             .expect("get");
         h.core
-            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb);
+            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb)
+            .expect("redo replay must succeed");
         let second = h
             .core
             .sparse
@@ -513,11 +521,13 @@ mod tests {
             vec![kv_put_sub_with_expiry("sessions", b"s1", expire_at_ms)],
         );
 
-        h.core.replay_transaction_redo_wal(
-            std::slice::from_ref(&record),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        h.core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&record),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         let now = crate::engine::kv::current_ms();
         let value = h.core.kv_engine.get(0, 7, "sessions", b"s1", now);
@@ -554,11 +564,13 @@ mod tests {
         let mut h = make_core();
         let record = redo_record(7, 0, vec![vector_put_sub("emb", vec![1.0, 2.0, 3.0])]);
 
-        h.core.replay_transaction_redo_wal(
-            std::slice::from_ref(&record),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        h.core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&record),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         let key = CoreLoop::vector_index_key(0, 7, "emb", "");
         let len = h.core.vector_collections.get(&key).map(|c| c.len());
@@ -587,7 +599,8 @@ mod tests {
         let tomb = nodedb_wal::TombstoneSet::new();
 
         h.core
-            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb);
+            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb)
+            .expect("redo replay must succeed");
 
         // Simulate a checkpoint capture + reboot: saving folds the applied
         // watermark into the persisted gate, and restoring exposes it — so the
@@ -606,7 +619,8 @@ mod tests {
         h.core.vector_collections.insert(key.clone(), restored);
 
         h.core
-            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb);
+            .replay_transaction_redo_wal(std::slice::from_ref(&record), 1, &tomb)
+            .expect("redo replay must succeed");
 
         let len = h.core.vector_collections.get(&key).map(|c| c.len());
         assert_eq!(
@@ -633,11 +647,13 @@ mod tests {
             ],
         );
 
-        h.core.replay_transaction_redo_wal(
-            std::slice::from_ref(&put_record),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        h.core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&put_record),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         let db = DatabaseId::new(0);
         let tenant = TenantId::new(7);
@@ -710,11 +726,13 @@ mod tests {
         })
         .expect("wal record");
 
-        h.core.replay_transaction_redo_wal(
-            std::slice::from_ref(&delete_record),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        h.core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&delete_record),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         assert_eq!(
             h.core.write_index.key_write_lsn(&doc_key),
@@ -737,11 +755,13 @@ mod tests {
             ],
         );
 
-        h.core.replay_transaction_redo_wal(
-            std::slice::from_ref(&record),
-            1,
-            &nodedb_wal::TombstoneSet::new(),
-        );
+        h.core
+            .replay_transaction_redo_wal(
+                std::slice::from_ref(&record),
+                1,
+                &nodedb_wal::TombstoneSet::new(),
+            )
+            .expect("redo replay must succeed");
 
         let row_key = surrogate_to_doc_id(Surrogate::new(doc_surrogate));
         assert!(

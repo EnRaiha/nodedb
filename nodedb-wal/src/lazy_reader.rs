@@ -14,25 +14,33 @@
 //! ## Usage
 //!
 //! ```text
-//! let mut reader = LazyWalReader::open(path)?;
+//! let mut reader = LazyWalReader::open(path, keys)?;
 //! while let Some(header) = reader.next_header()? {
 //!     if header.record_type == RecordType::VectorPut as u32 {
 //!         let payload = reader.read_payload(&header)?;
-//!         // process vector record
+//!         // process vector record — always plaintext
 //!     } else {
 //!         reader.skip_payload(&header)?;
 //!     }
 //! }
 //! ```
+//!
+//! ## Encryption
+//!
+//! The key ring is supplied at `open` time and applied inside `read_payload`,
+//! so a caller that reads a payload can never observe ciphertext: an encrypted
+//! record opened without a ring is a hard error, not a passthrough.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::preamble::{SegmentPreamble, WAL_PREAMBLE_MAGIC, read_leading_preamble};
 use crate::reader::StopReason;
 use crate::record::{HEADER_SIZE, MAX_WAL_PAYLOAD_SIZE, RecordHeader, RecordType, WalRecord};
+use crate::segment::SegmentDecryptor;
 
 fn checked_offset_add(offset: u64, len: u64) -> Result<u64> {
     offset.checked_add(len).ok_or_else(|| {
@@ -52,6 +60,9 @@ pub struct LazyWalReader {
     segment_preamble: Option<SegmentPreamble>,
     double_write: Option<crate::double_write::DoubleWriteBuffer>,
     stop_reason: Option<StopReason>,
+    /// Key ring used to turn encrypted payloads back into plaintext. Held by
+    /// value so the reader carries no borrow of the caller's ring.
+    keys: Option<KeyRing>,
 }
 
 impl LazyWalReader {
@@ -60,7 +71,10 @@ impl LazyWalReader {
     /// A leading `WALP` preamble is consumed so headers are read from the first
     /// real record; segments written without encryption have none and start at
     /// offset 0.
-    pub fn open(path: &Path) -> Result<Self> {
+    ///
+    /// `keys` must be the key ring this segment was written under, or `None`
+    /// for a segment that was never encrypted.
+    pub fn open(path: &Path, keys: Option<&KeyRing>) -> Result<Self> {
         let mut file = File::open(path)?;
         let dwb_path = path.with_extension("dwb");
         let double_write = if dwb_path.exists() {
@@ -81,6 +95,7 @@ impl LazyWalReader {
             segment_preamble,
             double_write,
             stop_reason: None,
+            keys: keys.cloned(),
         })
     }
 
@@ -166,12 +181,23 @@ impl LazyWalReader {
         }
     }
 
-    /// Read the payload for a header that was just returned by `next_header()`.
+    /// Read the payload for a header that was just returned by `next_header()`,
+    /// decrypting it if the record is encrypted.
     ///
     /// Must be called exactly once after `next_header()` returns `Some`,
     /// and before calling `next_header()` again (unless `skip_payload()`
     /// was called instead).
     pub fn read_payload(&mut self, header: &RecordHeader) -> Result<Vec<u8>> {
+        let raw = self.read_raw_payload(header)?;
+        SegmentDecryptor::new(self.segment_preamble.as_ref(), self.keys.as_ref())
+            .decrypt_payload(header, raw)
+    }
+
+    /// Read the on-disk payload bytes, repairing a torn write from the
+    /// double-write buffer when possible. The result is still ciphertext for an
+    /// encrypted record — only [`Self::read_payload`] is public so no caller
+    /// can stop here.
+    fn read_raw_payload(&mut self, header: &RecordHeader) -> Result<Vec<u8>> {
         header.validate(self.offset)?;
         let payload_len =
             usize::try_from(header.payload_len).map_err(|_| WalError::PayloadTooLarge {
@@ -229,13 +255,19 @@ impl LazyWalReader {
         Ok(payload)
     }
 
-    /// Read the payload and return a full WalRecord.
+    /// Read the payload and return a full plaintext WalRecord.
+    ///
+    /// The returned record is indistinguishable from one written without
+    /// encryption: the flag is cleared and the CRC is recomputed, so downstream
+    /// `logical_record_type()` dispatch and `verify_checksum()` both hold.
     pub fn read_record(&mut self, header: &RecordHeader) -> Result<WalRecord> {
-        let payload = self.read_payload(header)?;
-        Ok(WalRecord {
+        let raw = self.read_raw_payload(header)?;
+        let record = WalRecord {
             header: *header,
-            payload,
-        })
+            payload: raw,
+        };
+        SegmentDecryptor::new(self.segment_preamble.as_ref(), self.keys.as_ref())
+            .decrypt_record(record)
     }
 
     /// Skip the payload for a header, seeking forward without reading.
@@ -293,12 +325,13 @@ impl LazyWalReader {
 /// Open a WAL segment for lazy reading and iterate with a callback.
 ///
 /// Convenience function for single-pass replay: the callback receives each
-/// header and decides whether to read or skip the payload.
-pub fn replay_segment_lazy<F>(path: &Path, handler: F) -> Result<()>
+/// header and decides whether to read or skip the payload. Payloads the
+/// callback reads are plaintext; see [`LazyWalReader::open`] for `keys`.
+pub fn replay_segment_lazy<F>(path: &Path, keys: Option<&KeyRing>, handler: F) -> Result<()>
 where
     F: FnMut(&mut LazyWalReader, &RecordHeader) -> Result<()>,
 {
-    replay_one_segment(path, handler).map(|_| ())
+    replay_one_segment(path, keys, handler).map(|_| ())
 }
 
 /// Replay a single segment and report the highest LSN it contains.
@@ -306,11 +339,11 @@ where
 /// A reader stops at the first byte it cannot parse. That is the legal end of
 /// the log only when nothing committed lies behind it, so the stop point is
 /// classified before the segment is accepted as complete.
-fn replay_one_segment<F>(path: &Path, mut handler: F) -> Result<u64>
+fn replay_one_segment<F>(path: &Path, keys: Option<&KeyRing>, mut handler: F) -> Result<u64>
 where
     F: FnMut(&mut LazyWalReader, &RecordHeader) -> Result<()>,
 {
-    let mut reader = LazyWalReader::open(path)?;
+    let mut reader = LazyWalReader::open(path, keys)?;
     let mut last_lsn = 0u64;
     while let Some(header) = reader.next_header()? {
         last_lsn = header.lsn;
@@ -323,8 +356,12 @@ where
 /// Replay all WAL segments in a directory with lazy reading.
 ///
 /// Segments are read in LSN order. The callback decides per-record whether
-/// to read or skip the payload.
-pub fn replay_all_segments_lazy<F>(wal_dir: &Path, mut handler: F) -> Result<()>
+/// to read or skip the payload; payloads it reads are plaintext.
+pub fn replay_all_segments_lazy<F>(
+    wal_dir: &Path,
+    keys: Option<&KeyRing>,
+    mut handler: F,
+) -> Result<()>
 where
     F: FnMut(&mut LazyWalReader, &RecordHeader) -> Result<()>,
 {
@@ -332,7 +369,7 @@ where
     let mut continuity = crate::segment::SegmentContinuity::new();
     for seg in &segments {
         continuity.check(seg)?;
-        let last_lsn = replay_one_segment(&seg.path, &mut handler)?;
+        let last_lsn = replay_one_segment(&seg.path, keys, &mut handler)?;
         continuity.completed(seg, last_lsn);
     }
     Ok(())
@@ -358,7 +395,7 @@ mod tests {
             w.sync().unwrap();
         }
 
-        let mut reader = LazyWalReader::open(&path).unwrap();
+        let mut reader = LazyWalReader::open(&path, None).unwrap();
         let mut records = Vec::new();
         while let Some(header) = reader.next_header().unwrap() {
             let payload = reader.read_payload(&header).unwrap();
@@ -390,7 +427,7 @@ mod tests {
         }
 
         // A "vector core" reads only VectorPut, skips TimeseriesBatch.
-        let mut reader = LazyWalReader::open(&path).unwrap();
+        let mut reader = LazyWalReader::open(&path, None).unwrap();
         let mut vector_payloads = Vec::new();
         let mut skipped = 0;
 
@@ -428,7 +465,7 @@ mod tests {
         };
         std::fs::write(&path, header.to_bytes()).unwrap();
 
-        let mut reader = LazyWalReader::open(&path).unwrap();
+        let mut reader = LazyWalReader::open(&path, None).unwrap();
         assert!(matches!(
             reader.next_header(),
             Err(WalError::PayloadTooLarge { .. })
@@ -453,7 +490,7 @@ mod tests {
             .set_len(length - 1)
             .unwrap();
 
-        let mut reader = LazyWalReader::open(&path).unwrap();
+        let mut reader = LazyWalReader::open(&path, None).unwrap();
         let header = reader.next_header().unwrap().expect("header");
         assert!(
             matches!(reader.skip_payload(&header), Err(WalError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof)
@@ -480,7 +517,7 @@ mod tests {
         }
 
         let mut count = 0;
-        replay_all_segments_lazy(dir.path(), |reader, header| {
+        replay_all_segments_lazy(dir.path(), None, |reader, header| {
             reader.skip_payload(header)?;
             count += 1;
             Ok(())
@@ -499,7 +536,7 @@ mod tests {
             w.sync().unwrap();
         }
 
-        let mut reader = LazyWalReader::open(&path).unwrap();
+        let mut reader = LazyWalReader::open(&path, None).unwrap();
         assert!(reader.next_header().unwrap().is_none());
     }
 }

@@ -43,33 +43,28 @@ use crate::data::executor::core_loop::CoreLoop;
 /// `record_type` and payload, plus the enclosing redo record's header identity
 /// (tenant / vshard / database / lsn).
 ///
-/// Non-`TransactionRedo` records are skipped. A redo record whose payload fails
-/// to decode is logged and skipped rather than aborting recovery — a single
-/// corrupt group must not sink the whole replay; the CRC check upstream already
-/// gates gross corruption.
+/// Non-`TransactionRedo` records are skipped.
+///
+/// A redo record whose payload fails to decode aborts recovery. Its CRC was
+/// already verified when the WAL was read, so a decode failure is not bit-rot
+/// in the bytes — it means a transaction that was acknowledged as committed
+/// cannot be applied. Skipping it would leave a hole in the replayed suffix and
+/// bring the database up silently missing committed writes. The same holds for
+/// a sub-record that cannot be reconstituted: the group's ops are one atomic
+/// unit, so dropping one of them applies a torn transaction.
 ///
 /// Reconstituted records are always plaintext (`encryption_key: None`): the
 /// enclosing record was already decrypted when the WAL was read into memory, so
 /// its sub-payloads are cleartext and these records never touch disk.
-fn reconstitute_redo_records(records: &[WalRecord]) -> Vec<WalRecord> {
+fn reconstitute_redo_records(records: &[WalRecord]) -> crate::Result<Vec<WalRecord>> {
     let mut out = Vec::new();
     for record in records {
         if RecordType::from_raw(record.logical_record_type()) != Some(RecordType::TransactionRedo) {
             continue;
         }
-        let redo = match RedoRecord::from_bytes(&record.payload) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    lsn = record.header.lsn,
-                    error = %e,
-                    "skipping malformed TransactionRedo WAL record"
-                );
-                continue;
-            }
-        };
+        let redo = RedoRecord::from_bytes(&record.payload)?;
         for sub in redo.ops {
-            match WalRecord::new(WalRecordArgs {
+            out.push(WalRecord::new(WalRecordArgs {
                 record_type: sub.record_type,
                 lsn: record.header.lsn,
                 tenant_id: record.header.tenant_id,
@@ -78,18 +73,10 @@ fn reconstitute_redo_records(records: &[WalRecord]) -> Vec<WalRecord> {
                 payload: sub.payload,
                 encryption_key: None,
                 preamble_bytes: None,
-            }) {
-                Ok(wr) => out.push(wr),
-                Err(e) => tracing::warn!(
-                    lsn = record.header.lsn,
-                    sub_record_type = sub.record_type,
-                    error = %e,
-                    "skipping redo sub-record that failed to reconstitute"
-                ),
-            }
+            })?);
         }
     }
-    out
+    Ok(out)
 }
 
 impl CoreLoop {
@@ -115,15 +102,20 @@ impl CoreLoop {
     ///
     /// CRDT is intentionally NOT dispatched here: CRDT deltas ride their own
     /// `CrdtDelta` records via `replay_crdt_wal`, never redo sub-records.
+    ///
+    /// Returns `Err` when a committed redo group cannot be reconstituted; that
+    /// is unrecoverable data loss, not a skippable record, and recovery must
+    /// stop rather than bring the database up with a hole in the replayed
+    /// suffix.
     pub(crate) fn replay_transaction_redo_wal(
         &mut self,
         records: &[WalRecord],
         num_cores: usize,
         tombstones: &nodedb_wal::TombstoneSet,
-    ) {
-        let reconstituted = reconstitute_redo_records(records);
+    ) -> crate::Result<()> {
+        let reconstituted = reconstitute_redo_records(records)?;
         if reconstituted.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Vector params (VectorParams sub-records) register before vector puts,
@@ -156,6 +148,7 @@ impl CoreLoop {
         // `replay_vector_extended_wal`'s role for the vector engine's extended
         // sub-records above.
         self.replay_graph_node_labels_redo(&reconstituted, num_cores);
+        Ok(())
     }
 }
 
@@ -196,7 +189,8 @@ mod tests {
         };
         let outer = redo_wal_record(77, 9, 3, &redo);
 
-        let recon = reconstitute_redo_records(std::slice::from_ref(&outer));
+        let recon =
+            reconstitute_redo_records(std::slice::from_ref(&outer)).expect("well-formed redo");
         assert_eq!(recon.len(), 2);
         assert_eq!(recon[0].logical_record_type(), RecordType::VectorPut as u32);
         assert_eq!(recon[0].payload, vec![1, 2, 3]);
@@ -214,8 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstitute_skips_non_redo_and_malformed() {
-        // A non-redo record is skipped.
+    fn reconstitute_skips_non_redo_records() {
         let put = WalRecord::new(WalRecordArgs {
             record_type: RecordType::Put as u32,
             lsn: 1,
@@ -227,7 +220,16 @@ mod tests {
             preamble_bytes: None,
         })
         .expect("wal record");
-        // A redo-typed record with an undecodable payload is skipped, not fatal.
+
+        let recon = reconstitute_redo_records(&[put]).expect("non-redo records are ignored");
+        assert!(recon.is_empty());
+    }
+
+    /// A `TransactionRedo` record whose payload is structurally invalid but
+    /// CRC-valid represents a committed transaction that cannot be applied.
+    /// Replay must fail rather than skip it and come up missing those writes.
+    #[test]
+    fn malformed_redo_payload_aborts_replay() {
         let bad = WalRecord::new(WalRecordArgs {
             record_type: RecordType::TransactionRedo as u32,
             lsn: 2,
@@ -239,8 +241,12 @@ mod tests {
             preamble_bytes: None,
         })
         .expect("wal record");
+        // The CRC is intact — the payload, not the bytes, is what is wrong.
+        bad.verify_checksum().expect("record bytes are consistent");
 
-        let recon = reconstitute_redo_records(&[put, bad]);
-        assert!(recon.is_empty());
+        assert!(
+            reconstitute_redo_records(&[bad]).is_err(),
+            "a committed redo group that cannot be decoded must abort recovery"
+        );
     }
 }

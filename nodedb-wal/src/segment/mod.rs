@@ -25,6 +25,7 @@
 pub mod atomic_io;
 pub mod checkpoint_frame;
 pub mod continuity;
+pub mod decrypt;
 pub mod discovery;
 pub mod meta;
 pub mod truncate;
@@ -34,6 +35,7 @@ pub use atomic_io::{
 };
 pub use checkpoint_frame::{read_checkpoint_framed, write_checkpoint_framed};
 pub use continuity::SegmentContinuity;
+pub use decrypt::SegmentDecryptor;
 pub use discovery::discover_segments;
 pub use meta::{DEFAULT_SEGMENT_TARGET_SIZE, SegmentMeta, segment_filename, segment_path};
 pub use truncate::{TruncateResult, truncate_segments};

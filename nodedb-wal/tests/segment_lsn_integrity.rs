@@ -49,7 +49,7 @@ fn append_records(wal: &mut SegmentedWal, count: usize) -> Vec<u64> {
 }
 
 fn replayed_lsns(wal_dir: &Path) -> Vec<u64> {
-    replay_all_segments(wal_dir)
+    replay_all_segments(wal_dir, None)
         .expect("replay must succeed")
         .iter()
         .map(|r| r.header.lsn)
@@ -168,7 +168,7 @@ fn missing_middle_segment_fails_replay() {
 
     std::fs::remove_file(&paths[1]).unwrap();
 
-    match replay_all_segments(&wal_dir) {
+    match replay_all_segments(&wal_dir, None) {
         Err(WalError::SegmentLsnGap {
             expected_lsn,
             found_lsn,
@@ -216,8 +216,8 @@ fn limited_replay_stopping_early_reports_no_gap() {
 
     // The limit is reached inside the first segment, so the replay never
     // reaches the boundary it could not have judged anyway.
-    let (records, has_more) =
-        replay_from_limit_dir(&wal_dir, 1, 2).expect("early-exit replay must not report a gap");
+    let (records, has_more) = replay_from_limit_dir(&wal_dir, 1, 2, None)
+        .expect("early-exit replay must not report a gap");
     assert_eq!(records.len(), 2);
     assert!(has_more);
 }

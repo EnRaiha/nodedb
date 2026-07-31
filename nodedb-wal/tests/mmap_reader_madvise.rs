@@ -79,7 +79,8 @@ fn replay_limit_from_last_segment_opens_only_last_segment() {
     let last_first_lsn = segs.last().unwrap().first_lsn;
 
     let before = mmap_reader::observability::segments_opened();
-    let (_records, _more) = replay_segments_mmap_limit(wal_dir, last_first_lsn, 1024).unwrap();
+    let (_records, _more) =
+        replay_segments_mmap_limit(wal_dir, last_first_lsn, 1024, None).unwrap();
     let opened = mmap_reader::observability::segments_opened() - before;
 
     assert_eq!(
@@ -104,7 +105,7 @@ fn replay_skips_segments_entirely_below_from_lsn() {
     let target = segs.last().unwrap().first_lsn;
 
     let before = mmap_reader::observability::segments_opened();
-    let _records = replay_segments_mmap(wal_dir, target).unwrap();
+    let _records = replay_segments_mmap(wal_dir, target, None).unwrap();
     let opened = mmap_reader::observability::segments_opened() - before;
 
     assert_eq!(
@@ -124,7 +125,7 @@ fn replay_limit_returns_only_records_in_range() {
     let lsns = write_n_records(wal_dir, 5);
 
     let threshold = lsns[3];
-    let (records, _) = replay_segments_mmap_limit(wal_dir, threshold, 1024).unwrap();
+    let (records, _) = replay_segments_mmap_limit(wal_dir, threshold, 1024, None).unwrap();
 
     let got: Vec<u64> = records.iter().map(|r| r.header.lsn).collect();
     let expected: Vec<u64> = lsns.iter().copied().filter(|&l| l >= threshold).collect();
@@ -143,7 +144,7 @@ fn fadvise_dontneed_called_after_segment_iteration() {
     write_n_records(wal_dir, 3);
 
     let before = mmap_reader::observability::fadv_dontneed_count();
-    let _ = replay_segments_mmap(wal_dir, 0).unwrap();
+    let _ = replay_segments_mmap(wal_dir, 0, None).unwrap();
     let after = mmap_reader::observability::fadv_dontneed_count();
     assert!(
         after > before,
