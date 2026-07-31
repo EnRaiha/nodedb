@@ -12,6 +12,12 @@ documentation = "https://docs.rs/nodedb-types"
 keywords = ["types", "ids", "errors", "shared", "nodedb"]
 categories = ["data-structures", "no-std"]
 
+[features]
+default = []
+# Arm the crash-injection points used by durability tests. Off by default, so
+# release builds compile every `fail_point!` away to nothing.
+failpoints = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

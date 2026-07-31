@@ -25,6 +25,7 @@ use std::os::fd::AsRawFd;
 use memmap2::Mmap;
 
 use crate::error::{Result, WalError};
+use crate::reader::StopReason;
 use crate::record::{HEADER_SIZE, RecordHeader, RecordType, WAL_MAGIC, WalRecord};
 
 fn checked_range_end(start: usize, len: usize, limit: usize) -> Result<Option<usize>> {
@@ -106,6 +107,7 @@ pub struct MmapWalReader {
     file: std::fs::File,
     path: std::path::PathBuf,
     madvise_state: Option<libc::c_int>,
+    stop_reason: Option<StopReason>,
 }
 
 impl MmapWalReader {
@@ -148,7 +150,21 @@ impl MmapWalReader {
             file,
             path: path.to_path_buf(),
             madvise_state,
+            stop_reason: None,
         })
+    }
+
+    /// Why iteration stopped, or `None` while records are still being read.
+    ///
+    /// Feed this to [`crate::torn_tail::verify_committed_prefix`] to tell an
+    /// unfsynced tail apart from a hole with committed records behind it.
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        self.stop_reason
+    }
+
+    fn stop(&mut self, reason: StopReason) -> Result<Option<WalRecord>> {
+        self.stop_reason = Some(reason);
+        Ok(None)
     }
 
     /// The madvise hint applied to the mapped segment (if any).
@@ -172,8 +188,16 @@ impl MmapWalReader {
         loop {
             // Check if we have enough bytes for a header without unchecked
             // offset arithmetic. A short trailing header is a torn tail.
+            let record_offset = self.offset;
             let Some(header_end) = checked_range_end(self.offset, HEADER_SIZE, data.len())? else {
-                return Ok(None);
+                let reason = if record_offset == data.len() {
+                    StopReason::Eof
+                } else {
+                    StopReason::Corruption {
+                        offset: record_offset as u64,
+                    }
+                };
+                return self.stop(reason);
             };
 
             // Parse header.
@@ -190,7 +214,9 @@ impl MmapWalReader {
 
             // Validate magic — corruption or end of valid data.
             if header.magic != WAL_MAGIC {
-                return Ok(None);
+                return self.stop(StopReason::Corruption {
+                    offset: record_offset as u64,
+                });
             }
 
             // Oversized declarations are explicit errors before allocation;
@@ -204,7 +230,11 @@ impl MmapWalReader {
             match header.validate(header_offset) {
                 Ok(()) => {}
                 Err(error @ WalError::PayloadTooLarge { .. }) => return Err(error),
-                Err(_) => return Ok(None),
+                Err(_) => {
+                    return self.stop(StopReason::Corruption {
+                        offset: header_offset,
+                    });
+                }
             }
 
             let payload_len =
@@ -213,7 +243,10 @@ impl MmapWalReader {
                     max: crate::record::MAX_WAL_PAYLOAD_SIZE,
                 })?;
             let Some(record_end) = checked_range_end(header_end, payload_len, data.len())? else {
-                return Ok(None); // Torn write at segment end.
+                // The header promised more payload than the segment holds.
+                return self.stop(StopReason::Corruption {
+                    offset: header_offset,
+                });
             };
 
             // Extract payload only after the bounded header validation above.
@@ -232,12 +265,14 @@ impl MmapWalReader {
 
             // Verify checksum.
             if record.verify_checksum().is_err() {
-                return Ok(None); // Corruption — end of committed prefix.
+                return self.stop(StopReason::Corruption {
+                    offset: header_offset,
+                });
             }
 
             // Check record type.
             let logical_type = record.logical_record_type();
-            if RecordType::from_raw(logical_type).is_none() {
+            let Some(kind) = RecordType::from_raw(logical_type) else {
                 if RecordType::is_required(logical_type) {
                     return Err(WalError::UnknownRequiredRecordType {
                         record_type: header.record_type,
@@ -245,6 +280,11 @@ impl MmapWalReader {
                     });
                 }
                 // Unknown optional record — skip and continue loop.
+                continue;
+            };
+
+            // Alignment padding is framing, not data — never surface it.
+            if kind == RecordType::Noop {
                 continue;
             }
 

@@ -10,11 +10,11 @@
 
 use std::io::Write;
 
-use nodedb_wal::reader::WalReader;
-use nodedb_wal::record::RecordType;
+use nodedb_wal::reader::{StopReason, WalReader};
+use nodedb_wal::record::{HEADER_SIZE, RecordType};
 use nodedb_wal::recovery::recover;
 use nodedb_wal::writer::WalWriter;
-use nodedb_wal::{Result, WalRecord, WalRecordArgs};
+use nodedb_wal::{Result, WalError, WalRecord, WalRecordArgs};
 
 /// Helper: write N records and sync.
 fn write_records(path: &std::path::Path, count: u32) -> Vec<u64> {
@@ -125,7 +125,7 @@ fn torn_write_mid_payload() {
 }
 
 #[test]
-fn corrupted_checksum_stops_replay() {
+fn corrupted_checksum_mid_file_fails_recovery_instead_of_truncating() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.wal");
 
@@ -136,7 +136,9 @@ fn corrupted_checksum_stops_replay() {
     let dwb_path = path.with_extension("dwb");
     let _ = std::fs::remove_file(&dwb_path);
 
-    // Corrupt a byte in the middle of the file (inside the 3rd record's payload).
+    // Corrupt a byte inside the 3rd record's payload. Records 4 and 5 remain
+    // intact behind it, which is what makes this a hole rather than a tail.
+    let wire_size = HEADER_SIZE + "record-0".len();
     {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::OpenOptions::new()
@@ -145,25 +147,122 @@ fn corrupted_checksum_stops_replay() {
             .open(&path)
             .unwrap();
 
-        // Skip past 2 complete records, flip a byte in the 3rd.
-        // Each record is HEADER_SIZE + payload_len. For "record-N" payloads:
-        // payload = "record-0" = 8 bytes, so wire_size = 50 + 8 = 58.
-        let offset = 2 * 58 + 55; // Into the 3rd record's payload area.
-        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        let offset = (2 * wire_size + HEADER_SIZE + 1) as u64;
+        file.seek(SeekFrom::Start(offset)).unwrap();
         let mut byte = [0u8; 1];
         file.read_exact(&mut byte).unwrap();
         byte[0] ^= 0xFF;
-        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(&byte).unwrap();
     }
 
-    // Replay should stop at record 2 (3rd record has bad checksum, no DWB to recover).
+    // The raw reader still stops at the damaged record — it reports the
+    // committed prefix it could parse and why it stopped.
+    let mut reader = WalReader::open(&path).unwrap();
+    let mut read = Vec::new();
+    while let Some(record) = reader.next_record().unwrap() {
+        read.push(record);
+    }
+    assert_eq!(read.len(), 2);
+    assert_eq!(
+        reader.stop_reason(),
+        Some(StopReason::Corruption {
+            offset: (2 * wire_size) as u64
+        })
+    );
+
+    // Recovery must NOT accept those 2 records as the whole log: records 3-5
+    // were acknowledged, and silently truncating them is the data loss this
+    // check exists to prevent.
+    match recover(&path) {
+        Err(WalError::MidFileCorruption { resync_lsn, .. }) => {
+            assert!(
+                resync_lsn > 2,
+                "resync LSN {resync_lsn} must be a record behind the hole"
+            );
+        }
+        Err(other) => panic!("expected MidFileCorruption, got {other:?}"),
+        Ok(info) => panic!(
+            "recovery silently truncated the log to {} records",
+            info.record_count
+        ),
+    }
+}
+
+#[test]
+fn dwb_recovery_mid_segment_keeps_every_later_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dwb_mid.wal");
+
+    write_records(&path, 5);
+    assert!(
+        path.with_extension("dwb").exists(),
+        "test needs the double-write buffer present"
+    );
+
+    // Tear the 3rd record on disk while leaving records 4 and 5 intact. The
+    // DWB still holds an undamaged copy of record 3, so recovery must splice
+    // it back in AND carry on — the whole point of a mid-segment recovery is
+    // that it is not the end of the log.
+    let wire_size = HEADER_SIZE + "record-0".len();
+    {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start((2 * wire_size + HEADER_SIZE) as u64))
+            .unwrap();
+        file.write_all(b"ZZZZZZZZ").unwrap();
+        file.sync_all().unwrap();
+    }
+
     let records = read_all(&path);
-    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records.len(),
+        5,
+        "records after the DWB-recovered one were dropped"
+    );
+    for (i, record) in records.iter().enumerate() {
+        assert_eq!(record.header.lsn, i as u64 + 1);
+        assert_eq!(record.payload, format!("record-{i}").as_bytes());
+    }
+
+    // The read offset must land exactly at EOF: over-advancing past the
+    // recovered record is what silently swallowed the tail.
+    let info = recover(&path).unwrap();
+    assert_eq!(info.record_count, 5);
+    assert_eq!(info.last_lsn, 5);
+    assert_eq!(info.end_offset, std::fs::metadata(&path).unwrap().len());
+}
+
+#[test]
+fn corrupted_tail_record_is_a_torn_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("torn_tail.wal");
+
+    write_records(&path, 5);
+    let _ = std::fs::remove_file(path.with_extension("dwb"));
+
+    // Corrupt the LAST record only. Nothing valid follows, so this is the
+    // unfsynced tail of an interrupted write — recovery accepts the prefix.
+    let wire_size = HEADER_SIZE + "record-0".len();
+    {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start((4 * wire_size + HEADER_SIZE) as u64))
+            .unwrap();
+        file.write_all(b"XXXXXXXX").unwrap();
+    }
 
     let info = recover(&path).unwrap();
-    assert_eq!(info.record_count, 2);
-    assert_eq!(info.last_lsn, 2);
+    assert_eq!(info.record_count, 4);
+    assert_eq!(info.last_lsn, 4);
 }
 
 #[test]

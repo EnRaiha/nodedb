@@ -7,20 +7,23 @@
 //!
 //! 1. Open the WAL file read-only.
 //! 2. Scan forward, validating each record (magic, checksum).
-//! 3. Stop at first corruption — everything before is the committed prefix.
-//! 4. Return the last valid LSN and the byte offset past the last valid record.
+//! 3. Stop at first corruption.
+//! 4. Classify that stop: an unfsynced torn tail bounds the committed prefix,
+//!    but damage with intact higher-LSN records behind it is a hole and fails
+//!    recovery rather than silently dropping those records.
+//! 5. Return the last valid LSN and the byte offset past the last valid record.
 //!
 //! ## Invariants
 //!
 //! - Recovery is deterministic: same file → same result.
 //! - Recovery is idempotent: running twice gives the same answer.
 //! - Truncated/torn writes are not errors — they're the boundary of committed data.
+//! - Corruption that hides committed records IS an error — see [`crate::torn_tail`].
 
 use std::path::Path;
 
 use crate::error::{Result, WalError};
 use crate::reader::WalReader;
-use crate::record::HEADER_SIZE;
 
 /// Result of scanning a WAL file for recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,16 +61,12 @@ pub fn recover(path: &Path) -> Result<RecoveryInfo> {
     let mut reader = WalReader::open(path)?;
     let mut last_lsn = 0u64;
     let mut record_count = 0u64;
-    let mut last_valid_offset = 0u64;
 
     loop {
-        let offset_before = reader.offset();
         match reader.next_record() {
             Ok(Some(record)) => {
                 last_lsn = record.header.lsn;
                 record_count += 1;
-                last_valid_offset =
-                    offset_before + HEADER_SIZE as u64 + record.header.payload_len as u64;
             }
             Ok(None) => {
                 // End of committed prefix (EOF or corruption).
@@ -81,10 +80,17 @@ pub fn recover(path: &Path) -> Result<RecoveryInfo> {
         }
     }
 
+    // Refuse to call a hole "the end of the log".
+    crate::torn_tail::verify_committed_prefix(path, reader.stop_reason(), last_lsn)?;
+
     Ok(RecoveryInfo {
         last_lsn,
         record_count,
-        end_offset: last_valid_offset,
+        // The reader's own accounting is authoritative: it covers alignment
+        // padding that trails the final record and torn records rebuilt from
+        // the double-write buffer, neither of which can be reconstructed from
+        // the returned records' headers.
+        end_offset: reader.committed_end(),
     })
 }
 

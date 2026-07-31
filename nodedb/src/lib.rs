@@ -20,7 +20,13 @@ pub mod engine;
 pub mod error;
 mod error_from;
 pub mod event;
-pub mod fail_point;
+// The fail-point framework lives in `nodedb-types` so crates below this one
+// (`nodedb-wal` in particular) inject into the same process-wide registry.
+// `nodedb_types::fail_point` resolves in both the type namespace (the module,
+// giving `crate::fail_point::FailAction` / `::set` / `::FailGuard`, ...) and
+// the macro namespace (`crate::fail_point!` / `crate::fail_point_err!`), so
+// this single re-export covers both.
+pub use nodedb_types::{fail_point, fail_point_err};
 pub mod memory;
 pub mod query;
 pub mod storage;

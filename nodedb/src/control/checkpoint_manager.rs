@@ -240,6 +240,12 @@ pub async fn run_checkpoint_cycle(
         return Some(checkpoint_lsn);
     }
 
+    // Crash injection: die after the checkpoint marker is durable but before
+    // any segment is deleted. On restart the marker must not be taken as
+    // proof that truncation happened — replay has to cover everything from
+    // the marker's LSN onward.
+    crate::fail_point!("checkpoint::after_marker_before_truncate");
+
     // 5. Archive eligible WAL segments to cold storage before deletion.
     if let Some(ref cold) = cold_storage {
         archive_wal_segments_before_truncation(wal, global_lsn, cold).await;

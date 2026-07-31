@@ -30,7 +30,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{Result, WalError};
-use crate::record::{HEADER_SIZE, MAX_WAL_PAYLOAD_SIZE, RecordHeader, WalRecord};
+use crate::reader::StopReason;
+use crate::record::{HEADER_SIZE, MAX_WAL_PAYLOAD_SIZE, RecordHeader, RecordType, WalRecord};
 
 fn checked_offset_add(offset: u64, len: u64) -> Result<u64> {
     offset.checked_add(len).ok_or_else(|| {
@@ -46,6 +47,7 @@ pub struct LazyWalReader {
     file: File,
     offset: u64,
     double_write: Option<crate::double_write::DoubleWriteBuffer>,
+    stop_reason: Option<StopReason>,
 }
 
 impl LazyWalReader {
@@ -66,56 +68,83 @@ impl LazyWalReader {
             file,
             offset: 0,
             double_write,
+            stop_reason: None,
         })
     }
 
-    /// Read the next record header (30 bytes) without reading the payload.
+    /// Why iteration stopped, or `None` while headers are still being read.
+    ///
+    /// Feed this to [`crate::torn_tail::verify_committed_prefix`] to tell an
+    /// unfsynced tail apart from a hole with committed records behind it.
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        self.stop_reason
+    }
+
+    fn stop(&mut self, reason: StopReason) -> Result<Option<RecordHeader>> {
+        self.stop_reason = Some(reason);
+        Ok(None)
+    }
+
+    /// Read the next record header (54 bytes) without reading the payload.
     ///
     /// Returns `None` at EOF or first corruption. After this call, use
     /// either `read_payload()` to get the payload or `skip_payload()` to
     /// seek past it.
+    ///
+    /// Alignment padding records are consumed internally — the caller only
+    /// ever sees real records.
     pub fn next_header(&mut self) -> Result<Option<RecordHeader>> {
-        let mut header_buf = [0u8; HEADER_SIZE];
-        match self.read_exact(&mut header_buf) {
-            Ok(()) => {}
-            Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Ok(None);
+        loop {
+            let record_offset = self.offset;
+            let mut header_buf = [0u8; HEADER_SIZE];
+            match self.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    let reason = if record_offset == self.file.metadata()?.len() {
+                        StopReason::Eof
+                    } else {
+                        StopReason::Corruption {
+                            offset: record_offset,
+                        }
+                    };
+                    return self.stop(reason);
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
+
+            let header = RecordHeader::from_bytes(&header_buf);
+
+            match header.validate(record_offset) {
+                Ok(()) => {}
+                Err(error @ WalError::PayloadTooLarge { .. }) => return Err(error),
+                Err(_) => {
+                    return self.stop(StopReason::Corruption {
+                        offset: record_offset,
+                    });
+                }
+            }
+
+            // Check for unknown required record types.
+            let logical_type = header.logical_record_type();
+            match RecordType::from_raw(logical_type) {
+                // Alignment padding is framing, not data: step over it and
+                // keep going so batches after the first stay reachable.
+                Some(RecordType::Noop) => {
+                    self.skip_payload(&header)?;
+                    continue;
+                }
+                Some(_) => {}
+                None if RecordType::is_required(logical_type) => {
+                    return Err(WalError::UnknownRequiredRecordType {
+                        record_type: header.record_type,
+                        lsn: header.lsn,
+                    });
+                }
+                None => {}
+            }
+
+            return Ok(Some(header));
         }
-
-        let header = RecordHeader::from_bytes(&header_buf);
-
-        let header_size = u64::try_from(HEADER_SIZE).map_err(|_| {
-            WalError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "WAL header size does not fit u64",
-            ))
-        })?;
-        let header_offset = self.offset.checked_sub(header_size).ok_or_else(|| {
-            WalError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "WAL header offset underflow",
-            ))
-        })?;
-        match header.validate(header_offset) {
-            Ok(()) => {}
-            Err(error @ WalError::PayloadTooLarge { .. }) => return Err(error),
-            Err(_) => return Ok(None),
-        }
-
-        // Check for unknown required record types.
-        let logical_type = header.logical_record_type();
-        if crate::record::RecordType::from_raw(logical_type).is_none()
-            && crate::record::RecordType::is_required(logical_type)
-        {
-            return Err(WalError::UnknownRequiredRecordType {
-                record_type: header.record_type,
-                lsn: header.lsn,
-            });
-        }
-
-        Ok(Some(header))
     }
 
     /// Read the payload for a header that was just returned by `next_header()`.
@@ -154,6 +183,23 @@ impl LazyWalReader {
             if let Some(dwb) = &mut self.double_write
                 && let Ok(Some(recovered)) = dwb.recover_record(header.lsn)
             {
+                // The torn header's `payload_len` decided how far the read
+                // above advanced, and it cannot be trusted. Re-anchor on the
+                // DWB's authoritative length so the next header is read from
+                // the right place instead of from inside a record body.
+                // `payload_len` and `recovered.payload.len()` are `usize`,
+                // which always fits `u64` on every supported target, so this
+                // widening conversion cannot fail.
+                let payload_start =
+                    self.offset.checked_sub(payload_len as u64).ok_or_else(|| {
+                        WalError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "WAL lazy-reader payload offset underflow",
+                        ))
+                    })?;
+                let resume = checked_offset_add(payload_start, recovered.payload.len() as u64)?;
+                self.file.seek(SeekFrom::Start(resume))?;
+                self.offset = resume;
                 return Ok(recovered.payload);
             }
             return Err(WalError::Io(std::io::Error::new(

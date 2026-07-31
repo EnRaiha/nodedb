@@ -1,25 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! WAL writer with O_DIRECT and group commit.
-//!
-//! The writer accumulates records into an aligned buffer and flushes to disk
-//! when the buffer is full or when an explicit sync is requested.
-//!
-//! ## I/O path
-//!
-//! 1. Caller creates a `WalRecord` and submits it to the writer.
-//! 2. Writer serializes the record into the aligned write buffer.
-//! 3. When the buffer is full or `sync()` is called, the buffer is written
-//!    to the WAL file via `O_DIRECT` + `fsync`.
-//! 4. Group commit: multiple concurrent writers can submit records between
-//!    syncs, and they all share a single `fsync` call.
-//!
-//! ## Future: io_uring
-//!
-//! The current implementation uses standard `pwrite` + `fsync` with O_DIRECT.
-//! io_uring submission can be added once the bridge crate provides the TPC
-//! event loop integration.
-
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,90 +7,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt as _;
 
-use crate::align::{AlignedBuf, DEFAULT_ALIGNMENT};
-use crate::double_write::DwbMode;
+use crate::align::AlignedBuf;
 use crate::error::{Result, WalError};
 use crate::preamble::SegmentPreamble;
-use crate::record::{HEADER_SIZE, WalRecord, WalRecordArgs};
+use crate::record::{HEADER_SIZE, MIN_PADDING_RECORD_SIZE, WalRecord, WalRecordArgs};
 
-/// Default write buffer size: 2 MiB.
-///
-/// This is the batch size for group commit. Records accumulate here until
-/// the buffer is full or `sync()` is called.
-///
-/// Matches `WalTuning::write_buffer_size` default. Override via
-/// `WalWriterConfig::write_buffer_size` at construction time.
-pub const DEFAULT_WRITE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-
-/// Configuration for the WAL writer.
-#[derive(Debug, Clone)]
-pub struct WalWriterConfig {
-    /// Size of the aligned write buffer (rounded up to alignment).
-    pub write_buffer_size: usize,
-
-    /// O_DIRECT alignment (typically 4096 for NVMe).
-    pub alignment: usize,
-
-    /// Whether to use O_DIRECT. Set to `false` for testing on filesystems
-    /// that don't support it (e.g., tmpfs).
-    pub use_direct_io: bool,
-
-    /// Double-write buffer I/O mode. `None` means "mirror the parent" —
-    /// `Direct` when `use_direct_io` is true, `Buffered` otherwise.
-    /// `Some(DwbMode::Off)` disables the DWB entirely.
-    pub dwb_mode: Option<DwbMode>,
-}
-
-impl Default for WalWriterConfig {
-    fn default() -> Self {
-        Self {
-            write_buffer_size: DEFAULT_WRITE_BUFFER_SIZE,
-            alignment: DEFAULT_ALIGNMENT,
-            use_direct_io: true,
-            dwb_mode: None,
-        }
-    }
-}
-
-fn resolve_dwb_mode(config: &WalWriterConfig) -> DwbMode {
-    config
-        .dwb_mode
-        .unwrap_or_else(|| DwbMode::default_for_parent(config.use_direct_io))
-}
-
-fn open_dwb_for(
-    config: &WalWriterConfig,
-    path: &Path,
-) -> Option<crate::double_write::DoubleWriteBuffer> {
-    let mode = resolve_dwb_mode(config);
-    if mode == DwbMode::Off {
-        return None;
-    }
-    let dwb_path = path.with_extension("dwb");
-    match crate::double_write::DoubleWriteBuffer::open(&dwb_path, mode) {
-        Ok(d) => Some(d),
-        Err(e) => {
-            tracing::warn!(
-                path = %dwb_path.display(),
-                error = %e,
-                mode = ?mode,
-                "failed to open DWB — torn-write protection disabled for this writer"
-            );
-            None
-        }
-    }
-}
+use super::config::{WalWriterConfig, open_dwb_for, resume_offset};
 
 /// Append-only WAL writer.
 pub struct WalWriter {
     /// The WAL file handle (opened with O_DIRECT if configured).
-    file: File,
+    pub(super) file: File,
 
     /// Aligned write buffer for batching records before flush.
-    buffer: AlignedBuf,
+    pub(super) buffer: AlignedBuf,
 
     /// Current file write offset (always aligned).
-    file_offset: u64,
+    pub(super) file_offset: u64,
 
     /// Next LSN to assign.
     next_lsn: AtomicU64,
@@ -119,7 +32,7 @@ pub struct WalWriter {
     sealed: bool,
 
     /// Configuration.
-    config: WalWriterConfig,
+    pub(super) config: WalWriterConfig,
 
     /// Optional key ring for payload encryption (supports key rotation).
     encryption_ring: Option<crate::crypto::KeyRing>,
@@ -153,7 +66,15 @@ impl WalWriter {
         // Scan existing WAL for recovery if the file has data.
         let (file_offset, next_lsn) = if path.exists() && std::fs::metadata(path)?.len() > 0 {
             let info = crate::recovery::recover(path)?;
-            (info.end_offset, info.next_lsn())
+            (
+                resume_offset(
+                    info.end_offset,
+                    config.use_direct_io,
+                    config.alignment,
+                    path,
+                ),
+                info.next_lsn(),
+            )
         } else {
             (0, 1)
         };
@@ -268,6 +189,20 @@ impl WalWriter {
         )
     }
 
+    /// Bytes reserved at the tail of the write buffer for the alignment
+    /// padding record `flush_buffer` appends under O_DIRECT.
+    ///
+    /// The worst case is a batch that ends one byte short of a boundary: the
+    /// remaining gap cannot hold a header, so the padding record borrows a
+    /// whole extra block.
+    pub(super) fn padding_reserve(&self) -> usize {
+        if self.config.use_direct_io {
+            self.config.alignment + MIN_PADDING_RECORD_SIZE
+        } else {
+            0
+        }
+    }
+
     /// Append a record to the WAL. Returns the assigned LSN.
     ///
     /// The record is written to the in-memory buffer. Call `sync()` to
@@ -275,6 +210,11 @@ impl WalWriter {
     ///
     /// `database_id` is stored in header bytes 34-41. Pass `0` for the
     /// default database (backward-compatible with pre-existing records).
+    ///
+    /// The LSN is committed only once the record is in the write buffer. An
+    /// append that fails — a full device, an oversized payload — leaves the
+    /// LSN sequence untouched, so the next append reuses it rather than
+    /// leaving a hole that replay would have to reason about.
     pub fn append(
         &mut self,
         record_type: u32,
@@ -287,7 +227,7 @@ impl WalWriter {
             return Err(WalError::Sealed);
         }
 
-        let lsn = self.next_lsn.fetch_add(1, Ordering::Relaxed);
+        let lsn = self.next_lsn.load(Ordering::Relaxed);
         let preamble_bytes = self.segment_preamble.as_ref().map(|p| p.to_bytes());
         let record = WalRecord::new(WalRecordArgs {
             record_type,
@@ -300,7 +240,35 @@ impl WalWriter {
             preamble_bytes: preamble_bytes.as_ref(),
         })?;
 
-        // Write to double-write buffer (deferred — no fsync yet).
+        let header_bytes = record.header.to_bytes();
+        let total_size = HEADER_SIZE + record.payload.len();
+        let reserve = self.padding_reserve();
+
+        // If the record cannot fit in an empty buffer alongside its padding,
+        // no amount of flushing will make room.
+        let usable = self.buffer.capacity().saturating_sub(reserve);
+        if total_size > usable {
+            return Err(WalError::PayloadTooLarge {
+                size: record.payload.len(),
+                max: usable.saturating_sub(HEADER_SIZE),
+            });
+        }
+
+        // If this record doesn't fit in the remaining buffer, flush first.
+        // A failed flush propagates before the LSN is committed.
+        if self.buffer.remaining() < total_size + reserve {
+            self.flush_buffer()?;
+        }
+
+        self.buffer.write(&header_bytes);
+        self.buffer.write(&record.payload);
+
+        // Mirror into the double-write buffer (deferred — no fsync yet) only
+        // once the record is committed to the write buffer. The DWB is keyed
+        // by LSN, so a record that failed to land in the WAL must not leave a
+        // phantom entry behind: this LSN goes to the next append, and torn-
+        // write recovery would then resurrect the wrong record for it.
+        //
         // The DWB is fsynced in batch during `sync()`, before the WAL fsync.
         // This amortizes DWB fsync cost across the entire group commit batch.
         //
@@ -319,25 +287,7 @@ impl WalWriter {
             self.double_write = None;
         }
 
-        let header_bytes = record.header.to_bytes();
-        let total_size = HEADER_SIZE + record.payload.len();
-
-        // If this record doesn't fit in the remaining buffer, flush first.
-        if self.buffer.remaining() < total_size {
-            self.flush_buffer()?;
-        }
-
-        // If the record is larger than the entire buffer, we have a problem.
-        // This shouldn't happen with MAX_WAL_PAYLOAD_SIZE checks, but guard anyway.
-        if total_size > self.buffer.capacity() {
-            return Err(WalError::PayloadTooLarge {
-                size: record.payload.len(),
-                max: self.buffer.capacity() - HEADER_SIZE,
-            });
-        }
-
-        self.buffer.write(&header_bytes);
-        self.buffer.write(&record.payload);
+        self.next_lsn.store(lsn + 1, Ordering::Relaxed);
 
         Ok(lsn)
     }
@@ -351,6 +301,14 @@ impl WalWriter {
         if self.buffer.is_empty() {
             return Ok(());
         }
+
+        // Crash injection: die before the DWB is made durable. Recovery must
+        // still produce the committed prefix — the DWB is a torn-write side
+        // channel, never a source of records the WAL itself lacks.
+        nodedb_types::fail_point_err!("wal::before_dwb_flush", |detail: String| WalError::Io(
+            std::io::Error::other(format!("failpoint wal::before_dwb_flush: {detail}"))
+        ));
+
         // Flush DWB first — records must be durable in DWB before WAL.
         // If DWB flush fails, torn-write protection is lost for this batch.
         // We log a warning and detach the DWB rather than silently continuing
@@ -365,6 +323,13 @@ impl WalWriter {
             self.double_write = None;
         }
         self.flush_buffer()?;
+
+        // Crash injection: die between the DWB fsync and the WAL fsync — the
+        // window where the DWB holds records the WAL has not yet committed.
+        nodedb_types::fail_point_err!("wal::before_wal_fsync", |detail: String| WalError::Io(
+            std::io::Error::other(format!("failpoint wal::before_wal_fsync: {detail}"))
+        ));
+
         self.file.sync_all()?;
         Ok(())
     }
@@ -386,50 +351,6 @@ impl WalWriter {
     /// Current file size (bytes written to disk).
     pub fn file_offset(&self) -> u64 {
         self.file_offset
-    }
-
-    /// Flush the aligned buffer to the file.
-    fn flush_buffer(&mut self) -> Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-
-        let data = if self.config.use_direct_io {
-            // O_DIRECT requires aligned I/O size.
-            self.buffer.as_aligned_slice()
-        } else {
-            // Without O_DIRECT, write only the actual data.
-            self.buffer.as_slice()
-        };
-
-        // Use pwrite to write at the exact offset, retrying on short writes.
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = self.file.as_raw_fd();
-            let mut remaining = data;
-            let mut write_offset = self.file_offset;
-            while !remaining.is_empty() {
-                let written = unsafe {
-                    libc::pwrite(
-                        fd,
-                        remaining.as_ptr() as *const libc::c_void,
-                        remaining.len(),
-                        write_offset as libc::off_t,
-                    )
-                };
-                if written < 0 {
-                    return Err(WalError::Io(std::io::Error::last_os_error()));
-                }
-                let n = written as usize;
-                remaining = &remaining[n..];
-                write_offset += n as u64;
-            }
-        }
-
-        self.file_offset += data.len() as u64;
-        self.buffer.clear();
-        Ok(())
     }
 }
 

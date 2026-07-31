@@ -136,11 +136,31 @@ impl CrashHarness {
 
     /// Spawn (or respawn) the `nodedb` binary against this harness's data
     /// directory and ports.
+    /// Path the server's stdout/stderr is appended to across every spawn.
+    pub fn server_log_path(&self) -> std::path::PathBuf {
+        self.tempdir.path().join("server.log")
+    }
+
+    /// The server output captured so far, or empty if nothing was written.
+    pub fn server_log(&self) -> String {
+        std::fs::read_to_string(self.server_log_path()).unwrap_or_default()
+    }
+
     pub fn spawn(&mut self) {
         let mut cmd = std::process::Command::new(self.bin);
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
+        // Capture the server's output instead of discarding it. When a crash
+        // test fails, the reason is almost always in the server's own log —
+        // discarding it leaves nothing to debug but the timeout itself.
+        // Appended, not truncated, so a `reopen` keeps the pre-crash half.
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.server_log_path())
+            .expect("open server log");
+        let log_err = log.try_clone().expect("clone server log handle");
         let child = cmd
             .env("NODEDB_DATA_DIR", self.tempdir.path())
             .env("NODEDB_DATA_PLANE_CORES", "1")
@@ -153,9 +173,19 @@ impl CrashHarness {
             // `<data_dir>/.superuser_password` (default auth mode is Password),
             // which the client would not know. The same value is used on reopen.
             .env("NODEDB_SUPERUSER_PASSWORD", "nodedb")
-            .env("RUST_LOG", "error")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            // A test that needs server diagnostics overrides this via
+            // `with_env`, so it is set only when the test did not ask for
+            // something else.
+            .env(
+                "RUST_LOG",
+                self.extra_env
+                    .iter()
+                    .find(|(k, _)| k == "RUST_LOG")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("error"),
+            )
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(log_err))
             .spawn()
             .expect("failed to spawn nodedb binary");
         self.child = Some(child);
@@ -231,6 +261,54 @@ impl CrashHarness {
             let _ = child.kill();
         }
         let _ = child.wait();
+    }
+
+    /// Wait for the server to die on its own and reap it.
+    ///
+    /// Used with an armed `NODEDB_FAILPOINTS` abort: the crash happens inside
+    /// the server, at an exact point the test could never hit from outside
+    /// with `kill -9`. A timeout here means the injection never fired, so the
+    /// test must fail rather than go on to prove nothing.
+    pub fn await_self_crash(&mut self, timeout: Duration) {
+        let mut child = match self.child.take() {
+            Some(c) => c,
+            None => panic!("no server process to wait on"),
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait().expect("try_wait on server") {
+                Some(_status) => return,
+                None if Instant::now() >= deadline => {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(child.id() as i32, libc::SIGKILL);
+                    }
+                    let _ = child.wait();
+                    let log = self.server_log();
+                    let lines: Vec<&str> = log.lines().collect();
+                    // Both ends matter: boot decides whether the subsystem
+                    // under test even came up, the tail shows what it was
+                    // doing when the wait expired.
+                    let excerpt = if lines.len() <= 400 {
+                        lines.join("\n")
+                    } else {
+                        format!(
+                            "{}\n… {} lines elided …\n{}",
+                            lines[..30].join("\n"),
+                            lines.len() - 60,
+                            lines[lines.len() - 30..].join("\n")
+                        )
+                    };
+                    panic!(
+                        "server was still alive after {timeout:?} — the injected fail point never \
+                         fired, so this test proves NOTHING about crashing at that point.\n\
+                         Server output ({} lines):\n{excerpt}",
+                        lines.len()
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
     }
 
     /// Spawn a fresh process on the same data directory (WAL replay on

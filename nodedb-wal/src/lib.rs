@@ -42,6 +42,7 @@ mod segment_envelope;
 pub mod segmented;
 pub mod temporal_purge;
 pub mod tombstone;
+pub mod torn_tail;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 pub mod uring_writer;
 pub mod writer;
@@ -54,6 +55,7 @@ pub use preamble::{
     CIPHER_AES_256_GCM, PREAMBLE_SIZE, PREAMBLE_VERSION, SEG_PREAMBLE_MAGIC, SegmentPreamble,
     WAL_PREAMBLE_MAGIC,
 };
+pub use reader::{StopReason, WalReader};
 pub use record::{
     CalvinAppliedPayload, FtsDeletePayload, FtsIndexPayload, RecordHeader, RecordType,
     SpatialDeletePayload, SpatialPutPayload, WalRecord, WalRecordArgs,
@@ -64,4 +66,5 @@ pub use secure_mem::SecureKey;
 pub use segmented::{SegmentedWal, SegmentedWalConfig};
 pub use temporal_purge::{TemporalPurgeEngine, TemporalPurgePayload};
 pub use tombstone::{CollectionTombstonePayload, MAX_COLLECTION_NAME_LEN};
+pub use torn_tail::{TailVerdict, verify_committed_prefix};
 pub use writer::WalWriter;

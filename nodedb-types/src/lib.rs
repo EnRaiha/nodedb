@@ -31,6 +31,7 @@ pub mod diagnostic;
 pub mod document;
 pub mod dropped_collection;
 pub mod error;
+pub mod fail_point;
 pub mod filter;
 pub mod geometry;
 pub mod graph;

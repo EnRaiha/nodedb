@@ -26,7 +26,7 @@ use io_uring::{IoUring, opcode, types};
 
 use crate::align::{AlignedBuf, DEFAULT_ALIGNMENT};
 use crate::error::{Result, WalError};
-use crate::record::{HEADER_SIZE, WalRecord, WalRecordArgs};
+use crate::record::{HEADER_SIZE, MIN_PADDING_RECORD_SIZE, WalRecord, WalRecordArgs};
 
 /// io_uring WAL writer configuration.
 #[derive(Debug, Clone)]
@@ -90,7 +90,15 @@ impl UringWriter {
         // Recovery: scan existing WAL for last LSN.
         let (file_offset, next_lsn) = if path.exists() && std::fs::metadata(path)?.len() > 0 {
             let info = crate::recovery::recover(path)?;
-            (info.end_offset, info.next_lsn())
+            (
+                crate::writer::config::resume_offset(
+                    info.end_offset,
+                    config.use_direct_io,
+                    config.alignment,
+                    path,
+                ),
+                info.next_lsn(),
+            )
         } else {
             (0, 1)
         };
@@ -157,7 +165,7 @@ impl UringWriter {
             return Err(WalError::Sealed);
         }
 
-        let lsn = self.next_lsn.fetch_add(1, Ordering::Relaxed);
+        let lsn = self.next_lsn.load(Ordering::Relaxed);
         let preamble_bytes = self.segment_preamble.as_ref().map(|p| p.to_bytes());
         let record = WalRecord::new(WalRecordArgs {
             record_type,
@@ -172,22 +180,38 @@ impl UringWriter {
 
         let header_bytes = record.header.to_bytes();
         let total_size = HEADER_SIZE + record.payload.len();
+        let reserve = self.padding_reserve();
 
-        if self.buffer.remaining() < total_size {
-            self.submit_and_wait_write()?;
-        }
-
-        if total_size > self.buffer.capacity() {
+        let usable = self.buffer.capacity().saturating_sub(reserve);
+        if total_size > usable {
             return Err(WalError::PayloadTooLarge {
                 size: record.payload.len(),
-                max: self.buffer.capacity() - HEADER_SIZE,
+                max: usable.saturating_sub(HEADER_SIZE),
             });
+        }
+
+        if self.buffer.remaining() < total_size + reserve {
+            self.submit_and_wait_write()?;
         }
 
         self.buffer.write(&header_bytes);
         self.buffer.write(&record.payload);
 
+        // The LSN is committed only once the record is buffered, so a failed
+        // append leaves no hole in the sequence.
+        self.next_lsn.store(lsn + 1, Ordering::Relaxed);
+
         Ok(lsn)
+    }
+
+    /// Bytes reserved at the tail of the write buffer for the alignment
+    /// padding record that closes each O_DIRECT batch.
+    fn padding_reserve(&self) -> usize {
+        if self.config.use_direct_io {
+            self.config.alignment + MIN_PADDING_RECORD_SIZE
+        } else {
+            0
+        }
     }
 
     /// Submit the buffered data via io_uring write + fsync, and wait for completion.
@@ -207,8 +231,9 @@ impl UringWriter {
     ///
     /// ## O_DIRECT alignment invariant
     ///
-    /// When `use_direct_io` is true, the submission slice (`data`) is
-    /// zero-padded up to the alignment boundary via `as_aligned_slice`.
+    /// When `use_direct_io` is true, the batch is first padded out to the
+    /// alignment boundary with a framed `Noop` record (see
+    /// [`crate::record::padding`]) and submitted via `as_aligned_slice`.
     /// The kernel writes exactly `data.len()` bytes, so `file_offset` MUST
     /// advance by `data.len()` — the padded length, not the unpadded
     /// buffer content length. Advancing by the unpadded length leaves the
@@ -221,6 +246,11 @@ impl UringWriter {
         }
 
         let data = if self.config.use_direct_io {
+            crate::record::pad_buffer_to_alignment(
+                &mut self.buffer,
+                self.config.alignment,
+                "io_uring write buffer has no room for its alignment padding record",
+            )?;
             self.buffer.as_aligned_slice()
         } else {
             self.buffer.as_slice()

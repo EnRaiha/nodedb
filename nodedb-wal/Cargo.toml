@@ -15,6 +15,9 @@ categories = ["database-implementations", "filesystem"]
 [features]
 default = []
 io-uring = ["dep:io-uring"]
+# Arm the crash-injection points used by the durability tests. Without it every
+# `fail_point!` compiles to nothing, so production builds pay no cost.
+failpoints = ["nodedb-types/failpoints"]
 
 [dependencies]
 nodedb-types = { workspace = true }

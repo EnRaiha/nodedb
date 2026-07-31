@@ -305,10 +305,16 @@ pub fn replay_all_segments(wal_dir: &Path) -> Result<Vec<WalRecord>> {
     let mut all_records = Vec::new();
 
     for seg in &segments {
-        let reader = crate::reader::WalReader::open(&seg.path)?;
-        for record_result in reader.records() {
-            all_records.push(record_result?);
+        let mut reader = crate::reader::WalReader::open(&seg.path)?;
+        let mut last_lsn = 0u64;
+        while let Some(record) = reader.next_record()? {
+            last_lsn = record.header.lsn;
+            all_records.push(record);
         }
+        // A segment that stops early may be an interrupted final write, or it
+        // may be a hole with committed records behind it. Only the first is a
+        // legal end of the log.
+        crate::torn_tail::verify_committed_prefix(&seg.path, reader.stop_reason(), last_lsn)?;
     }
 
     Ok(all_records)
@@ -330,9 +336,10 @@ pub fn replay_from_limit_dir(
     let mut records = Vec::with_capacity(max_records.min(4096));
 
     for seg in &segments {
-        let reader = crate::reader::WalReader::open(&seg.path)?;
-        for record_result in reader.records() {
-            let record = record_result?;
+        let mut reader = crate::reader::WalReader::open(&seg.path)?;
+        let mut last_lsn = 0u64;
+        while let Some(record) = reader.next_record()? {
+            last_lsn = record.header.lsn;
             if record.header.lsn >= from_lsn {
                 records.push(record);
                 if records.len() >= max_records {
@@ -340,6 +347,7 @@ pub fn replay_from_limit_dir(
                 }
             }
         }
+        crate::torn_tail::verify_committed_prefix(&seg.path, reader.stop_reason(), last_lsn)?;
     }
 
     Ok((records, false))

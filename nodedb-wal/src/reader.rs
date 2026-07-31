@@ -16,7 +16,7 @@
 //! - Unknown required record types (bit 15 set) cause a replay failure.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{Result, WalError};
@@ -38,6 +38,22 @@ fn checked_offset_add(offset: u64, len: usize) -> Result<u64> {
     })
 }
 
+/// Why a reader stopped producing records.
+///
+/// `Ok(None)` alone cannot distinguish "the segment ends here" from "the bytes
+/// here are damaged". The difference decides whether the records that were
+/// read are the whole committed prefix or only the part before a hole, so
+/// readers record it and callers classify it via [`crate::torn_tail`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The segment ended cleanly on a record boundary.
+    Eof,
+
+    /// A record at this offset failed structural validation (bad magic,
+    /// unsupported version, short read, or checksum mismatch).
+    Corruption { offset: u64 },
+}
+
 /// Sequential WAL reader.
 pub struct WalReader {
     file: File,
@@ -47,6 +63,10 @@ pub struct WalReader {
     segment_preamble: Option<SegmentPreamble>,
     /// Optional double-write buffer for torn write recovery.
     double_write: Option<crate::double_write::DoubleWriteBuffer>,
+    /// Why iteration stopped, once it has.
+    stop_reason: Option<StopReason>,
+    /// End of the last fully consumed record, padding included.
+    committed_end: u64,
 }
 
 impl WalReader {
@@ -81,7 +101,34 @@ impl WalReader {
             offset: start_offset,
             segment_preamble,
             double_write,
+            stop_reason: None,
+            committed_end: start_offset,
         })
+    }
+
+    /// Byte offset just past the last fully consumed record.
+    ///
+    /// This is where a writer resumes appending. It is not the same as
+    /// [`Self::offset`]: it includes any alignment padding that followed the
+    /// final record, and it excludes a partially-read damaged record whose
+    /// header the reader had to consume before rejecting it.
+    pub fn committed_end(&self) -> u64 {
+        self.committed_end
+    }
+
+    /// Why iteration stopped, or `None` while records are still being read.
+    ///
+    /// [`StopReason::Corruption`] does not by itself mean data was lost — it
+    /// is the input to [`crate::torn_tail::verify_committed_prefix`], which
+    /// decides whether the damage is an unfsynced tail or a hole with
+    /// committed records behind it.
+    pub fn stop_reason(&self) -> Option<StopReason> {
+        self.stop_reason
+    }
+
+    fn stop(&mut self, reason: StopReason) -> Result<Option<WalRecord>> {
+        self.stop_reason = Some(reason);
+        Ok(None)
     }
 
     /// The preamble read from this segment file, if present.
@@ -98,11 +145,21 @@ impl WalReader {
     pub fn next_record(&mut self) -> Result<Option<WalRecord>> {
         loop {
             // Read header.
+            let record_offset = self.offset;
             let mut header_buf = [0u8; HEADER_SIZE];
             match self.read_exact(&mut header_buf) {
                 Ok(()) => {}
                 Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Ok(None); // Clean EOF.
+                    // A short trailing header is either a clean end or a torn
+                    // tail; both are the boundary of the committed prefix.
+                    let reason = if record_offset == self.file_len()? {
+                        StopReason::Eof
+                    } else {
+                        StopReason::Corruption {
+                            offset: record_offset,
+                        }
+                    };
+                    return self.stop(reason);
                 }
                 Err(e) => return Err(e),
             }
@@ -129,7 +186,11 @@ impl WalReader {
             match header.validate(header_offset) {
                 Ok(()) => {}
                 Err(error @ WalError::PayloadTooLarge { .. }) => return Err(error),
-                Err(_) => return Ok(None),
+                Err(_) => {
+                    return self.stop(StopReason::Corruption {
+                        offset: header_offset,
+                    });
+                }
             }
 
             // Read payload only after the bounded header validation above.
@@ -143,7 +204,10 @@ impl WalReader {
                 match self.read_exact(&mut payload) {
                     Ok(()) => {}
                     Err(WalError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        return Ok(None);
+                        // The header promised more payload than the file holds.
+                        return self.stop(StopReason::Corruption {
+                            offset: header_offset,
+                        });
                     }
                     Err(e) => return Err(e),
                 }
@@ -160,15 +224,31 @@ impl WalReader {
                         lsn = header.lsn,
                         "recovered torn write from double-write buffer"
                     );
-                    self.offset = checked_offset_add(self.offset, recovered.payload.len())?;
+                    // The torn header's own `payload_len` is not trustworthy,
+                    // so the next record's position is derived from the DWB's
+                    // authoritative copy rather than from wherever the read of
+                    // the damaged bytes happened to leave the cursor.
+                    let resume = checked_offset_add(
+                        checked_offset_add(header_offset, HEADER_SIZE)?,
+                        recovered.payload.len(),
+                    )?;
+                    self.file.seek(SeekFrom::Start(resume))?;
+                    self.offset = resume;
+                    self.committed_end = resume;
                     return Ok(Some(recovered));
                 }
-                return Ok(None);
+                return self.stop(StopReason::Corruption {
+                    offset: header_offset,
+                });
             }
+
+            // The record is intact, so the bytes it occupies are committed
+            // whether or not it is surfaced to the caller.
+            self.committed_end = self.offset;
 
             // Check if the record type is known (strip encrypted flag for lookup).
             let logical_type = record.logical_record_type();
-            if RecordType::from_raw(logical_type).is_none() {
+            let Some(kind) = RecordType::from_raw(logical_type) else {
                 if RecordType::is_required(logical_type) {
                     return Err(WalError::UnknownRequiredRecordType {
                         record_type: header.record_type,
@@ -176,6 +256,11 @@ impl WalReader {
                     });
                 }
                 // Unknown optional record — skip and continue loop.
+                continue;
+            };
+
+            // Alignment padding is framing, not data — never surface it.
+            if kind == RecordType::Noop {
                 continue;
             }
 
@@ -191,6 +276,10 @@ impl WalReader {
     /// Current read offset in the file.
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    fn file_len(&self) -> Result<u64> {
+        Ok(self.file.metadata()?.len())
     }
 
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {

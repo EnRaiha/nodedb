@@ -65,6 +65,16 @@ pub fn truncate_segments(
             );
 
             deleted_count += 1;
+
+            // Crash injection: die partway through a multi-segment deletion.
+            // The surviving segments must still form a replayable log — the
+            // deletion order is oldest-first, so an interrupted truncate can
+            // only ever leave a suffix, never a hole.
+            nodedb_types::fail_point_err!("wal::mid_truncate_segments", |detail: String| {
+                WalError::Io(std::io::Error::other(format!(
+                    "failpoint wal::mid_truncate_segments: {detail}"
+                )))
+            });
         }
     }
 

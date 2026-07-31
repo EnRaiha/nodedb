@@ -80,6 +80,32 @@ pub enum WalError {
     /// Operation is not supported on the current platform (e.g. wasm32).
     #[error("WAL operation not supported on this platform: {detail}")]
     Unsupported { detail: &'static str },
+
+    /// The filesystem ran out of space while appending to the WAL (ENOSPC).
+    ///
+    /// Distinct from a generic [`WalError::Io`] so callers can stop
+    /// acknowledging writes and surface a specific operator action instead of
+    /// retrying a write that cannot succeed.
+    #[error("WAL write failed: no space left on device ({context})")]
+    OutOfSpace { context: &'static str },
+
+    /// A WAL segment is damaged in the middle: a valid record was found
+    /// *after* the damaged region, so it cannot be the unfsynced tail of the
+    /// last write.
+    ///
+    /// Stopping at the damage point and calling everything before it "the
+    /// committed prefix" would silently discard the committed records that
+    /// follow, so recovery refuses to proceed instead.
+    #[error(
+        "mid-file WAL corruption in {path} at offset {offset}: a valid record (LSN {resync_lsn}) \
+         follows the damaged region at offset {resync_offset}"
+    )]
+    MidFileCorruption {
+        path: String,
+        offset: u64,
+        resync_offset: u64,
+        resync_lsn: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, WalError>;

@@ -114,7 +114,11 @@ impl AlignedBuf {
     /// Get the written portion padded up to the next alignment boundary.
     ///
     /// O_DIRECT requires the I/O size to be a multiple of the block size.
-    /// The padding bytes are zeroed (from `alloc_zeroed`).
+    /// The padding bytes are only zeroed on the buffer's first use (from
+    /// `alloc_zeroed`); after a `clear()` they are stale content left over
+    /// from whatever was previously written there. Callers that write under
+    /// O_DIRECT must frame the padding region as a real record (see
+    /// `crate::record::padding`) rather than relying on it reading as zero.
     pub fn as_aligned_slice(&self) -> &[u8] {
         let aligned_len = round_up(self.len, self.alignment);
         let actual_len = aligned_len.min(self.capacity);
