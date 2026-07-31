@@ -20,7 +20,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{Result, WalError};
-use crate::preamble::{PREAMBLE_SIZE, SegmentPreamble, WAL_PREAMBLE_MAGIC};
+use crate::preamble::{SegmentPreamble, WAL_PREAMBLE_MAGIC, read_leading_preamble};
 use crate::record::{HEADER_SIZE, RecordHeader, RecordType, WalRecord};
 
 fn checked_offset_add(offset: u64, len: usize) -> Result<u64> {
@@ -91,10 +91,8 @@ impl WalReader {
             None
         };
 
-        // Attempt to read the preamble at offset 0.
-        // If the first 4 bytes match WAL_PREAMBLE_MAGIC, consume the full
-        // 16-byte preamble and validate it. Otherwise rewind to 0.
-        let (segment_preamble, start_offset) = try_read_preamble(&mut file)?;
+        let (segment_preamble, start_offset) =
+            read_leading_preamble(&mut file, &WAL_PREAMBLE_MAGIC)?;
 
         Ok(Self {
             file,
@@ -287,43 +285,6 @@ impl WalReader {
         self.file.read_exact(buf)?;
         self.offset = next_offset;
         Ok(())
-    }
-}
-
-/// Attempt to read a WAL segment preamble from the start of a file.
-///
-/// Returns `(Some(preamble), PREAMBLE_SIZE)` if a valid `WALP` preamble is
-/// found, or `(None, 0)` if the file does not start with the preamble magic
-/// (unencrypted segment — seek back to 0).
-fn try_read_preamble(file: &mut File) -> Result<(Option<SegmentPreamble>, u64)> {
-    use std::io::Seek;
-
-    let mut buf = [0u8; PREAMBLE_SIZE];
-    match file.read_exact(&mut buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            // File is too short to hold a preamble — no preamble present.
-            file.seek(std::io::SeekFrom::Start(0))?;
-            return Ok((None, 0));
-        }
-        Err(e) => return Err(WalError::Io(e)),
-    }
-
-    if buf[0..4] == WAL_PREAMBLE_MAGIC {
-        // Parse and validate the preamble. An unsupported version is a hard
-        // error — do not silently fall through to record scanning.
-        let preamble = SegmentPreamble::from_bytes(&buf, &WAL_PREAMBLE_MAGIC)?;
-        let preamble_size = u64::try_from(PREAMBLE_SIZE).map_err(|_| {
-            WalError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "WAL preamble size does not fit u64",
-            ))
-        })?;
-        Ok((Some(preamble), preamble_size))
-    } else {
-        // First bytes are not the preamble magic — rewind and read as records.
-        file.seek(std::io::SeekFrom::Start(0))?;
-        Ok((None, 0))
     }
 }
 

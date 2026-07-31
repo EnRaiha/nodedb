@@ -25,6 +25,7 @@ use std::os::fd::AsRawFd;
 use memmap2::Mmap;
 
 use crate::error::{Result, WalError};
+use crate::preamble::{PREAMBLE_SIZE, SegmentPreamble, WAL_PREAMBLE_MAGIC, parse_leading_preamble};
 use crate::reader::StopReason;
 use crate::record::{HEADER_SIZE, RecordHeader, RecordType, WAL_MAGIC, WalRecord};
 
@@ -104,6 +105,9 @@ fn fadv_dontneed(fd: &std::fs::File, len: usize, path: &Path) {
 pub struct MmapWalReader {
     mmap: Mmap,
     offset: usize,
+    /// Preamble mapped at offset 0 of this segment (present when encryption is
+    /// active). The epoch is part of the AAD used to decrypt payloads.
+    segment_preamble: Option<SegmentPreamble>,
     file: std::fs::File,
     path: std::path::PathBuf,
     madvise_state: Option<libc::c_int>,
@@ -112,6 +116,10 @@ pub struct MmapWalReader {
 
 impl MmapWalReader {
     /// Open a WAL segment file for mmap'd reading.
+    ///
+    /// A leading `WALP` preamble is skipped so iteration begins at the first
+    /// real record; segments written without encryption have none and start at
+    /// offset 0.
     pub fn open(path: &Path) -> Result<Self> {
         observability::SEGMENTS_OPENED.fetch_add(1, Ordering::Relaxed);
         let file = std::fs::File::open(path)?;
@@ -144,14 +152,29 @@ impl MmapWalReader {
             }
         }
 
+        let segment_preamble = parse_leading_preamble(&mmap, &WAL_PREAMBLE_MAGIC)?;
+        let offset = if segment_preamble.is_some() {
+            PREAMBLE_SIZE
+        } else {
+            0
+        };
+
         Ok(Self {
             mmap,
-            offset: 0,
+            offset,
+            segment_preamble,
             file,
             path: path.to_path_buf(),
             madvise_state,
             stop_reason: None,
         })
+    }
+
+    /// The preamble read from this segment file, if present.
+    ///
+    /// Returns `None` for unencrypted segments (no preamble written).
+    pub fn segment_preamble(&self) -> Option<&SegmentPreamble> {
+        self.segment_preamble.as_ref()
     }
 
     /// Why iteration stopped, or `None` while records are still being read.
@@ -181,7 +204,11 @@ impl MmapWalReader {
     /// Read the next record from the mmap'd region.
     ///
     /// Returns `None` at EOF or at the first corruption point.
-    /// Zero-copy: payload bytes reference the mmap'd region directly.
+    /// Header parsing avoids extra copies, but the payload is copied out of
+    /// the mmap'd region into an owned `Vec<u8>` on `WalRecord`: records must
+    /// outlive the reader (they cross thread boundaries in parallel replay
+    /// and get mutated in place during decryption), which a borrow of the
+    /// mapping cannot support.
     pub fn next_record(&mut self) -> Result<Option<WalRecord>> {
         let data = &self.mmap[..];
 
@@ -330,164 +357,6 @@ impl Iterator for MmapRecordIter {
     }
 }
 
-/// Minimum number of segments to justify parallel replay overhead.
-const PARALLEL_SEGMENT_THRESHOLD: usize = 4;
-
-/// Replay WAL segments from a directory using mmap, starting from `from_lsn`.
-///
-/// Discovers all sealed segments, mmap's each, and returns records with
-/// LSN >= `from_lsn`. This is the Event Plane's tier-2 catchup path.
-///
-/// When 4+ segments need scanning, uses `std::thread::scope` to read
-/// segments in parallel (one thread per segment). Each thread mmap's its
-/// segment and filters records independently; results are merged in
-/// segment order (already LSN-sorted since segments are monotonic).
-pub fn replay_segments_mmap(wal_dir: &Path, from_lsn: u64) -> Result<Vec<WalRecord>> {
-    let segments = crate::segment::discover_segments(wal_dir)?;
-    let live = filter_segments_by_lsn(&segments, from_lsn);
-
-    if live.len() < PARALLEL_SEGMENT_THRESHOLD {
-        return replay_segments_sequential(live, from_lsn);
-    }
-
-    replay_segments_parallel(live, from_lsn)
-}
-
-/// Return the slice of `segments` whose LSN range may contain records with
-/// lsn >= `from_lsn`. A segment at index `i` is skippable iff the next
-/// segment's `first_lsn` is `<= from_lsn` — meaning segment `i`'s entire
-/// range is strictly below the cutoff. The last segment is never skipped
-/// on this criterion because its upper bound is unknown.
-fn filter_segments_by_lsn(
-    segments: &[crate::segment::SegmentMeta],
-    from_lsn: u64,
-) -> &[crate::segment::SegmentMeta] {
-    // Find the first segment whose next-segment first_lsn > from_lsn, OR
-    // the last segment (always live). Since segments are LSN-sorted, the
-    // live tail starts at the largest i such that segments[i].first_lsn
-    // <= from_lsn.
-    let mut start = 0;
-    for i in 0..segments.len() {
-        // Segment i covers [first_lsn_i, first_lsn_{i+1}).
-        let upper = segments.get(i + 1).map(|s| s.first_lsn).unwrap_or(u64::MAX);
-        if upper > from_lsn {
-            start = i;
-            break;
-        }
-        start = i + 1;
-    }
-    if start >= segments.len() {
-        // All segments strictly below from_lsn; nothing to replay.
-        return &[];
-    }
-    &segments[start..]
-}
-
-/// Sequential segment replay (used for small segment counts).
-fn replay_segments_sequential(
-    segments: &[crate::segment::SegmentMeta],
-    from_lsn: u64,
-) -> Result<Vec<WalRecord>> {
-    let mut records = Vec::new();
-    for seg in segments {
-        let mut reader = MmapWalReader::open(&seg.path)?;
-        while let Some(record) = reader.next_record()? {
-            if record.header.lsn >= from_lsn {
-                records.push(record);
-            }
-        }
-        reader.release_pages();
-    }
-    Ok(records)
-}
-
-/// Parallel segment replay using scoped threads.
-///
-/// Each segment is read in its own thread via mmap. Since segments are
-/// monotonically ordered by LSN, concatenating per-segment results in
-/// segment order produces a globally LSN-ordered result.
-fn replay_segments_parallel(
-    segments: &[crate::segment::SegmentMeta],
-    from_lsn: u64,
-) -> Result<Vec<WalRecord>> {
-    // Collect per-segment results. Index corresponds to segment order.
-    let mut per_segment: Vec<Result<Vec<WalRecord>>> = Vec::with_capacity(segments.len());
-
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = segments
-            .iter()
-            .map(|seg| {
-                scope.spawn(move || -> Result<Vec<WalRecord>> {
-                    let mut reader = MmapWalReader::open(&seg.path)?;
-                    let mut seg_records = Vec::new();
-                    while let Some(record) = reader.next_record()? {
-                        if record.header.lsn >= from_lsn {
-                            seg_records.push(record);
-                        }
-                    }
-                    reader.release_pages();
-                    Ok(seg_records)
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            per_segment.push(handle.join().unwrap_or_else(|_| {
-                Err(WalError::Io(std::io::Error::other(
-                    "segment replay thread panicked",
-                )))
-            }));
-        }
-    });
-
-    // Merge in segment order (preserves LSN ordering).
-    let total_estimate: usize = per_segment
-        .iter()
-        .map(|r| r.as_ref().map(|v| v.len()).unwrap_or(0))
-        .sum();
-    let mut records = Vec::with_capacity(total_estimate);
-    for seg_result in per_segment {
-        records.extend(seg_result?);
-    }
-
-    Ok(records)
-}
-
-/// Paginated mmap replay: reads at most `max_records` from `from_lsn`.
-///
-/// Returns `(records, has_more)` where `has_more` is `true` if the limit
-/// was reached before all segments were exhausted. This bounds memory
-/// usage per catch-up cycle to O(max_records) instead of O(all WAL data).
-///
-/// Always uses sequential reading (no parallel threads) since the bounded
-/// record count makes parallel overhead unnecessary.
-pub fn replay_segments_mmap_limit(
-    wal_dir: &Path,
-    from_lsn: u64,
-    max_records: usize,
-) -> Result<(Vec<WalRecord>, bool)> {
-    let segments = crate::segment::discover_segments(wal_dir)?;
-    let live = filter_segments_by_lsn(&segments, from_lsn);
-    let mut records = Vec::with_capacity(max_records.min(4096));
-
-    for seg in live {
-        let mut reader = MmapWalReader::open(&seg.path)?;
-        while let Some(record) = reader.next_record()? {
-            if record.header.lsn >= from_lsn {
-                records.push(record);
-                if records.len() >= max_records {
-                    // Partial scan — don't release pages for a segment
-                    // we'll likely re-open on the next catchup cycle.
-                    return Ok((records, true));
-                }
-            }
-        }
-        reader.release_pages();
-    }
-
-    Ok((records, false))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,6 +390,10 @@ mod tests {
 
         // Read back with mmap reader.
         let reader = MmapWalReader::open(&path).unwrap();
+        assert!(
+            reader.segment_preamble().is_none(),
+            "unencrypted segments carry no preamble"
+        );
         let records: Vec<WalRecord> = reader.records().collect::<Result<Vec<_>>>().unwrap();
 
         assert_eq!(records.len(), 2);
@@ -602,30 +475,5 @@ mod tests {
     fn checked_range_end_rejects_overflow_and_short_ranges() {
         assert!(checked_range_end(usize::MAX, 1, usize::MAX).is_err());
         assert_eq!(checked_range_end(5, 2, 6).unwrap(), None);
-    }
-
-    #[test]
-    fn replay_mmap_from_lsn() {
-        let dir = tempfile::tempdir().unwrap();
-        let wal_dir = dir.path().join("wal");
-        std::fs::create_dir_all(&wal_dir).unwrap();
-
-        let config = crate::segmented::SegmentedWalConfig::for_testing(wal_dir.clone());
-        let mut wal = crate::segmented::SegmentedWal::open(config).unwrap();
-
-        let lsn1 = wal.append(RecordType::Put as u32, 1, 0, 0, b"a").unwrap();
-        let lsn2 = wal.append(RecordType::Put as u32, 1, 0, 0, b"b").unwrap();
-        let lsn3 = wal.append(RecordType::Put as u32, 1, 0, 0, b"c").unwrap();
-        wal.sync().unwrap();
-
-        // Replay from lsn2 — should get records b and c.
-        let records = replay_segments_mmap(&wal_dir, lsn2).unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].header.lsn, lsn2);
-        assert_eq!(records[1].header.lsn, lsn3);
-
-        // Replay from lsn1 — all 3.
-        let all = replay_segments_mmap(&wal_dir, lsn1).unwrap();
-        assert_eq!(all.len(), 3);
     }
 }

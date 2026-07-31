@@ -30,6 +30,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{Result, WalError};
+use crate::preamble::{SegmentPreamble, WAL_PREAMBLE_MAGIC, read_leading_preamble};
 use crate::reader::StopReason;
 use crate::record::{HEADER_SIZE, MAX_WAL_PAYLOAD_SIZE, RecordHeader, RecordType, WalRecord};
 
@@ -46,14 +47,21 @@ fn checked_offset_add(offset: u64, len: u64) -> Result<u64> {
 pub struct LazyWalReader {
     file: File,
     offset: u64,
+    /// Preamble read from offset 0 of this segment (present when encryption is
+    /// active). The epoch is part of the AAD used to decrypt payloads.
+    segment_preamble: Option<SegmentPreamble>,
     double_write: Option<crate::double_write::DoubleWriteBuffer>,
     stop_reason: Option<StopReason>,
 }
 
 impl LazyWalReader {
     /// Open a WAL file for lazy reading.
+    ///
+    /// A leading `WALP` preamble is consumed so headers are read from the first
+    /// real record; segments written without encryption have none and start at
+    /// offset 0.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
+        let mut file = File::open(path)?;
         let dwb_path = path.with_extension("dwb");
         let double_write = if dwb_path.exists() {
             crate::double_write::DoubleWriteBuffer::open(
@@ -64,12 +72,23 @@ impl LazyWalReader {
         } else {
             None
         };
+        let (segment_preamble, start_offset) =
+            read_leading_preamble(&mut file, &WAL_PREAMBLE_MAGIC)?;
+
         Ok(Self {
             file,
-            offset: 0,
+            offset: start_offset,
+            segment_preamble,
             double_write,
             stop_reason: None,
         })
+    }
+
+    /// The preamble read from this segment file, if present.
+    ///
+    /// Returns `None` for unencrypted segments (no preamble written).
+    pub fn segment_preamble(&self) -> Option<&SegmentPreamble> {
+        self.segment_preamble.as_ref()
     }
 
     /// Why iteration stopped, or `None` while headers are still being read.
@@ -173,12 +192,11 @@ impl LazyWalReader {
             }
         }
 
-        // Verify checksum.
-        let record = WalRecord {
-            header: *header,
-            payload: payload.clone(),
-        };
-        if record.verify_checksum().is_err() {
+        // Verify checksum without cloning the payload: constructing a WalRecord
+        // just to call verify_checksum would allocate a duplicate buffer that
+        // is thrown away immediately after.
+        let checksum_ok = header.crc32c == header.compute_checksum(&payload);
+        if !checksum_ok {
             // Try double-write buffer recovery.
             if let Some(dwb) = &mut self.double_write
                 && let Ok(Some(recovered)) = dwb.recover_record(header.lsn)
@@ -276,15 +294,30 @@ impl LazyWalReader {
 ///
 /// Convenience function for single-pass replay: the callback receives each
 /// header and decides whether to read or skip the payload.
-pub fn replay_segment_lazy<F>(path: &Path, mut handler: F) -> Result<()>
+pub fn replay_segment_lazy<F>(path: &Path, handler: F) -> Result<()>
+where
+    F: FnMut(&mut LazyWalReader, &RecordHeader) -> Result<()>,
+{
+    replay_one_segment(path, handler).map(|_| ())
+}
+
+/// Replay a single segment and report the highest LSN it contains.
+///
+/// A reader stops at the first byte it cannot parse. That is the legal end of
+/// the log only when nothing committed lies behind it, so the stop point is
+/// classified before the segment is accepted as complete.
+fn replay_one_segment<F>(path: &Path, mut handler: F) -> Result<u64>
 where
     F: FnMut(&mut LazyWalReader, &RecordHeader) -> Result<()>,
 {
     let mut reader = LazyWalReader::open(path)?;
+    let mut last_lsn = 0u64;
     while let Some(header) = reader.next_header()? {
+        last_lsn = header.lsn;
         handler(&mut reader, &header)?;
     }
-    Ok(())
+    crate::torn_tail::verify_committed_prefix(path, reader.stop_reason(), last_lsn)?;
+    Ok(last_lsn)
 }
 
 /// Replay all WAL segments in a directory with lazy reading.
@@ -296,8 +329,11 @@ where
     F: FnMut(&mut LazyWalReader, &RecordHeader) -> Result<()>,
 {
     let segments = crate::segment::discover_segments(wal_dir)?;
+    let mut continuity = crate::segment::SegmentContinuity::new();
     for seg in &segments {
-        replay_segment_lazy(&seg.path, &mut handler)?;
+        continuity.check(seg)?;
+        let last_lsn = replay_one_segment(&seg.path, &mut handler)?;
+        continuity.completed(seg, last_lsn);
     }
     Ok(())
 }

@@ -29,6 +29,9 @@
 //! Any preamble with `version != PREAMBLE_VERSION` is rejected at open time.
 //! Pre-launch: no migration path. Hard error, not a warning.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+
 use crate::error::{Result, WalError};
 
 /// Size of the preamble in bytes.
@@ -141,6 +144,74 @@ impl SegmentPreamble {
     }
 }
 
+/// [`PREAMBLE_SIZE`] as an offset, without a lossy cast.
+fn preamble_size_offset() -> Result<u64> {
+    u64::try_from(PREAMBLE_SIZE).map_err(|_| {
+        WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WAL preamble size does not fit u64",
+        ))
+    })
+}
+
+/// Parse a preamble sitting at the start of a segment image.
+///
+/// Returns `Ok(None)` when the bytes do not begin with `expected_magic`:
+/// segments written without encryption carry no preamble and start with a
+/// record header instead. A preamble this binary cannot interpret is a hard
+/// error — scanning its bytes as a record header would make every record in
+/// the segment invisible rather than surfacing the version mismatch.
+///
+/// This is the single detection point shared by the file-based and mmap-based
+/// readers so they can never disagree about where records begin.
+pub fn parse_leading_preamble(
+    bytes: &[u8],
+    expected_magic: &[u8; 4],
+) -> Result<Option<SegmentPreamble>> {
+    let Some(head) = bytes.get(..PREAMBLE_SIZE) else {
+        // Too short to hold a preamble.
+        return Ok(None);
+    };
+    if head.get(..4) != Some(&expected_magic[..]) {
+        return Ok(None);
+    }
+    let buf: &[u8; PREAMBLE_SIZE] = head.try_into().map_err(|_| {
+        WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "WAL preamble slice conversion failed",
+        ))
+    })?;
+    Ok(Some(SegmentPreamble::from_bytes(buf, expected_magic)?))
+}
+
+/// Consume a leading preamble from an open segment file.
+///
+/// Returns the parsed preamble (if any) and the offset the first record starts
+/// at. When no preamble is present the cursor is rewound to 0 so the caller can
+/// read records straight away.
+pub fn read_leading_preamble(
+    file: &mut File,
+    expected_magic: &[u8; 4],
+) -> Result<(Option<SegmentPreamble>, u64)> {
+    let mut buf = [0u8; PREAMBLE_SIZE];
+    match file.read_exact(&mut buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            file.seek(SeekFrom::Start(0))?;
+            return Ok((None, 0));
+        }
+        Err(e) => return Err(WalError::Io(e)),
+    }
+
+    match parse_leading_preamble(&buf, expected_magic)? {
+        Some(preamble) => Ok((Some(preamble), preamble_size_offset()?)),
+        None => {
+            file.seek(SeekFrom::Start(0))?;
+            Ok((None, 0))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +273,36 @@ mod tests {
         let parsed = SegmentPreamble::from_bytes(&bytes, &WAL_PREAMBLE_MAGIC).unwrap();
         assert_eq!(parsed.kid, 3);
         assert_eq!(parsed.epoch, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn leading_preamble_detected_only_on_matching_magic() {
+        let bytes = SegmentPreamble::new_wal([9, 9, 9, 9]).to_bytes();
+        let parsed = parse_leading_preamble(&bytes, &WAL_PREAMBLE_MAGIC).unwrap();
+        assert_eq!(parsed.map(|p| p.epoch), Some([9, 9, 9, 9]));
+
+        // A record header (different magic) is not a preamble.
+        assert!(
+            parse_leading_preamble(&[0xABu8; PREAMBLE_SIZE], &WAL_PREAMBLE_MAGIC)
+                .unwrap()
+                .is_none()
+        );
+        // Too short to hold a preamble.
+        assert!(
+            parse_leading_preamble(&bytes[..4], &WAL_PREAMBLE_MAGIC)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn leading_preamble_version_mismatch_is_an_error() {
+        let mut bytes = SegmentPreamble::new_wal([0u8; 4]).to_bytes();
+        bytes[4] = 7;
+        assert!(matches!(
+            parse_leading_preamble(&bytes, &WAL_PREAMBLE_MAGIC),
+            Err(WalError::UnsupportedVersion { version: 7, .. })
+        ));
     }
 
     #[test]
