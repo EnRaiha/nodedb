@@ -12,6 +12,7 @@ pub mod frontier_digest;
 pub mod history;
 pub(crate) mod import_admission;
 pub mod preview;
+pub mod rekey;
 pub(crate) mod restore_containers;
 pub mod snapshot;
 pub mod write_set;

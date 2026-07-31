@@ -39,7 +39,7 @@ pub fn archive_key(collection: &str, row_id: &str, sys_ms: i64) -> String {
 
 /// Parse an archive key; returns `None` when the key does not have the
 /// three NUL-separated segments produced by [`archive_key`].
-fn parse_archive_key(key: &str) -> Option<(&str, &str, i64)> {
+pub(super) fn parse_archive_key(key: &str) -> Option<(&str, &str, i64)> {
     let mut parts = key.splitn(3, '\u{0}');
     let collection = parts.next()?;
     let row_id = parts.next()?;

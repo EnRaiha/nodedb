@@ -91,6 +91,25 @@ pub enum CompensationHint {
 }
 
 impl CompensationHint {
+    /// Constraint name carried by [`Self::Custom`] when a delta's Loro peer id
+    /// is already owned by another replica.
+    ///
+    /// Unlike every other refusal, nothing about the row is wrong and no
+    /// conflict policy can resolve it: the producer's identity is unusable, and
+    /// only the producer can replace it. Defined here so the server that emits
+    /// the refusal and the client that acts on it cannot drift apart on the
+    /// spelling of a string that is the difference between a replica healing
+    /// itself and one that is permanently refused.
+    pub const PEER_ID_COLLISION: &'static str = "peer_id_collision";
+
+    /// Whether this refusal says the producer's Loro peer id is unusable.
+    pub fn is_peer_id_collision(&self) -> bool {
+        matches!(
+            self,
+            Self::Custom { constraint, .. } if constraint == Self::PEER_ID_COLLISION
+        )
+    }
+
     /// Returns a short, machine-readable code for the hint type.
     pub fn code(&self) -> &'static str {
         match self {

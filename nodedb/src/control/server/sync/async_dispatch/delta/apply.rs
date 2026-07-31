@@ -184,7 +184,7 @@ pub(crate) async fn apply_delta_and_finalize(
                 delta_msg,
                 reason.clone(),
                 CompensationHint::Custom {
-                    constraint: "peer_id_collision".into(),
+                    constraint: CompensationHint::PEER_ID_COLLISION.into(),
                     detail: reason,
                 },
             );
