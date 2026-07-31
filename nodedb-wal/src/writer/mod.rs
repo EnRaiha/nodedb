@@ -30,6 +30,7 @@ mod core;
 pub(crate) mod durability;
 mod dwb;
 mod flush;
+mod open;
 
 pub use config::{DEFAULT_WRITE_BUFFER_SIZE, WalWriterConfig};
 pub use core::WalWriter;

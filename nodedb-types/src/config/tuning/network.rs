@@ -114,6 +114,16 @@ pub struct WalTuning {
     pub alignment: usize,
     #[serde(default = "default_dwb_capacity")]
     pub dwb_capacity: usize,
+    /// Open WAL segments with `O_DIRECT`, keeping WAL traffic out of the page
+    /// cache so it cannot evict mmapped indexes and so durability does not
+    /// depend on kernel writeback.
+    ///
+    /// Turning this off is a deliberate weakening of the durability path and
+    /// is only correct where the filesystem cannot do direct I/O at all
+    /// (tmpfs, most overlayfs setups, most network filesystems). Startup fails
+    /// with an actionable error rather than downgrading on its own.
+    #[serde(default = "default_wal_direct_io")]
+    pub direct_io: bool,
 }
 
 impl Default for WalTuning {
@@ -122,6 +132,7 @@ impl Default for WalTuning {
             write_buffer_size: default_wal_write_buffer_size(),
             alignment: default_wal_alignment(),
             dwb_capacity: default_dwb_capacity(),
+            direct_io: default_wal_direct_io(),
         }
     }
 }
@@ -134,6 +145,9 @@ fn default_wal_alignment() -> usize {
 }
 fn default_dwb_capacity() -> usize {
     64
+}
+fn default_wal_direct_io() -> bool {
+    true
 }
 
 /// Cluster transport tuning for QUIC connections and Raft consensus.

@@ -21,13 +21,11 @@ pub fn init_wal(
     nodedb_wal::TombstoneSet,
 )> {
     let wal_segment_target = config.checkpoint.wal_segment_target_bytes();
+    let wal_dir = config.wal_dir();
     let wal = {
-        let mut mgr = WalManager::open_with_tuning(
-            &config.wal_dir(),
-            false,
-            wal_segment_target,
-            &config.tuning.wal,
-        )?;
+        let mut mgr =
+            WalManager::open_with_tuning(&wal_dir, wal_segment_target, &config.tuning.wal)
+                .map_err(|error| wal_open_error(&wal_dir, error))?;
         if let Some(ref enc) = config.encryption {
             let key = nodedb_wal::crypto::WalEncryptionKey::from_file(&enc.key_path)
                 .map_err(crate::Error::Wal)?;
@@ -72,6 +70,37 @@ pub fn init_wal(
     Ok((wal, wal_records, tombstones))
 }
 
+/// Translate a WAL open failure into a startup error.
+///
+/// A filesystem that cannot do direct I/O gets its own message: the WAL is
+/// `O_DIRECT` by design, the server will not downgrade itself to buffered
+/// writes to get past this, and the operator is the only one who can decide
+/// between the two ways out.
+fn wal_open_error(wal_dir: &std::path::Path, error: crate::Error) -> anyhow::Error {
+    if let crate::Error::Wal(nodedb_wal::WalError::DirectIoUnsupported { .. }) = error {
+        return anyhow::Error::new(nodedb_types::NodeDbError::wal_at(
+            "open",
+            direct_io_unsupported_message(wal_dir),
+        ));
+    }
+    anyhow::Error::new(error)
+}
+
+/// The operator-facing text for an unsupported filesystem: what failed, where,
+/// and both ways to resolve it.
+fn direct_io_unsupported_message(wal_dir: &std::path::Path) -> String {
+    format!(
+        "the filesystem holding the WAL directory {} does not support O_DIRECT, and the WAL \
+         will not fall back to buffered I/O because that silently weakens durability. \
+         Either move the data directory onto a filesystem that supports O_DIRECT here (most \
+         local filesystems, such as ext4, XFS, or a raw NVMe mount, do; some overlayfs \
+         configurations, many network filesystems, and older kernels do not), or opt out \
+         explicitly by setting NODEDB_WAL_DIRECT_IO=false (equivalently `direct_io = false` \
+         under [tuning.wal] in the config file) and accepting page-cached WAL writes",
+        wal_dir.display()
+    )
+}
+
 fn load_tombstones(
     config: &ServerConfig,
     wal_records: &Arc<[nodedb_wal::WalRecord]>,
@@ -93,4 +122,40 @@ fn load_tombstones(
     }
     set.extend(persisted);
     Ok(set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The operator reading this line in the startup log must learn where the
+    /// WAL lives and both ways out — otherwise the only fix they can guess is
+    /// the wrong one (deleting the data directory).
+    #[test]
+    fn direct_io_message_names_the_directory_and_both_remedies() {
+        let msg = direct_io_unsupported_message(&PathBuf::from("/srv/nodedb/data/wal"));
+        assert!(msg.contains("/srv/nodedb/data/wal"), "{msg}");
+        assert!(msg.contains("O_DIRECT"), "{msg}");
+        assert!(msg.contains("NODEDB_WAL_DIRECT_IO=false"), "{msg}");
+        assert!(msg.contains("direct_io = false"), "{msg}");
+    }
+
+    /// The unsupported-filesystem case is the only one that gets the
+    /// relocate-or-opt-out message; every other WAL failure keeps its own.
+    #[test]
+    fn only_direct_io_unsupported_is_translated() {
+        let dir = PathBuf::from("/srv/nodedb/data/wal");
+
+        let unsupported = wal_open_error(
+            &dir,
+            crate::Error::Wal(nodedb_wal::WalError::DirectIoUnsupported {
+                path: dir.display().to_string(),
+            }),
+        );
+        assert!(unsupported.to_string().contains("NODEDB_WAL_DIRECT_IO"));
+
+        let other = wal_open_error(&dir, crate::Error::Wal(nodedb_wal::WalError::Sealed));
+        assert!(!other.to_string().contains("NODEDB_WAL_DIRECT_IO"));
+    }
 }

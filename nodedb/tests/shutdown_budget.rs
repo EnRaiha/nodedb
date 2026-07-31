@@ -8,9 +8,18 @@
 //!
 //! Real process. Real signal. Real timer. No mocks.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
+
+/// How long to wait for the spawned server to report ready.
+///
+/// Generous on purpose: this is test setup, not a measured property. The server
+/// boots while the rest of the suite saturates every core, so a tight budget
+/// fails on machine load rather than on anything the test is checking.
+const READY_BUDGET: Duration = Duration::from_secs(60);
 
 /// Allocate an ephemeral port by binding, recording the port, then releasing.
 fn free_port() -> u16 {
@@ -70,7 +79,11 @@ fn real_nodedb_binary_exits_within_1_second_of_sigterm() {
     // processes must not share the default sync port.
     let sync_port = free_port();
 
-    let mut child = std::process::Command::new(bin)
+    let mut cmd = std::process::Command::new(bin);
+    // The shutdown budget must hold for the WAL a deployment actually runs, so
+    // direct I/O stays on wherever the data directory supports it.
+    support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
+    let mut child = cmd
         .env("NODEDB_DATA_DIR", dir.path())
         .env("NODEDB_DATA_PLANE_CORES", "1")
         .env("NODEDB_PORT_HTTP", http_port.to_string())
@@ -83,10 +96,14 @@ fn real_nodedb_binary_exits_within_1_second_of_sigterm() {
         .spawn()
         .expect("failed to spawn nodedb binary");
 
-    let ready = wait_for_healthz(http_port, Duration::from_secs(15));
+    // Setup, not the property under test — the SIGTERM budget below is what
+    // this test measures. Boot competes with the rest of the suite for cores,
+    // and a 15s budget lost that race often enough to fail runs that had
+    // nothing wrong with them; the shutdown assertions are unchanged.
+    let ready = wait_for_healthz(http_port, READY_BUDGET);
     assert!(
         ready,
-        "nodedb did not become ready within 15s — startup failure"
+        "nodedb did not become ready within {READY_BUDGET:?} — startup failure"
     );
 
     // Send SIGTERM and start the timer.

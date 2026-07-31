@@ -88,6 +88,18 @@ pub enum WalError {
     #[error("invalid WAL payload: {detail}")]
     InvalidPayload { detail: String },
 
+    /// The filesystem holding the WAL cannot open files with `O_DIRECT`.
+    ///
+    /// Most overlayfs configurations, many network filesystems, and tmpfs
+    /// before Linux 6.1 reject `O_DIRECT` at `open(2)` with `EINVAL`. Kept
+    /// distinct from a generic [`WalError::Io`] because the operator action
+    /// is specific — relocate the data directory or opt out of direct I/O
+    /// deliberately — and because silently continuing with buffered I/O
+    /// would downgrade the WAL's durability guarantee without anyone being
+    /// told.
+    #[error("filesystem holding {path} does not support O_DIRECT")]
+    DirectIoUnsupported { path: String },
+
     /// Operation is not supported on the current platform (e.g. wasm32).
     #[error("WAL operation not supported on this platform: {detail}")]
     Unsupported { detail: &'static str },

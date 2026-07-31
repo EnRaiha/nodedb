@@ -87,12 +87,12 @@ impl WalManager {
 
     /// Open with explicit segment target size and WAL tuning from `TuningConfig`.
     ///
-    /// Uses `tuning.write_buffer_size` and `tuning.alignment` from [`WalTuning`]
-    /// to configure the underlying `WalWriterConfig`, instead of the hardcoded
-    /// defaults. `segment_target_size` of 0 uses the default (64 MiB).
+    /// Every writer setting — buffer size, alignment, and whether the segments
+    /// are opened with `O_DIRECT` — comes from [`WalTuning`], so there is no
+    /// second place a deployment's direct-I/O decision could be contradicted.
+    /// `segment_target_size` of 0 uses the default (64 MiB).
     pub fn open_with_tuning(
         path: &Path,
-        use_direct_io: bool,
         segment_target_size: u64,
         tuning: &WalTuning,
     ) -> crate::Result<Self> {
@@ -102,7 +102,7 @@ impl WalManager {
             WalWriterConfig {
                 write_buffer_size: tuning.write_buffer_size,
                 alignment: tuning.alignment,
-                use_direct_io,
+                use_direct_io: tuning.direct_io,
                 dwb_mode: None,
             },
         )
@@ -131,9 +131,13 @@ impl WalManager {
 
         let wal = SegmentedWal::open(config).map_err(crate::Error::Wal)?;
 
+        // `direct_io` is logged because a WAL running buffered is a weaker
+        // durability posture than the default, and the log is the only place
+        // an operator can confirm which one this process actually got.
         info!(
             wal_dir = %wal_dir.display(),
             next_lsn = wal.next_lsn(),
+            direct_io = use_direct_io,
             "WAL opened"
         );
 
@@ -161,7 +165,13 @@ impl WalManager {
         })
     }
 
-    /// Open without O_DIRECT (for testing on tmpfs).
+    /// Open without `O_DIRECT`.
+    ///
+    /// The in-process test harnesses put their data directories in tempdirs,
+    /// whose filesystem is whatever `TMPDIR` happens to point at and is not
+    /// guaranteed to accept `O_DIRECT`. Production opens through
+    /// [`WalManager::open_with_tuning`], where direct I/O is the default and a
+    /// filesystem that cannot provide it fails startup instead of downgrading.
     pub fn open_for_testing(path: &Path) -> crate::Result<Self> {
         Self::open(path, false)
     }

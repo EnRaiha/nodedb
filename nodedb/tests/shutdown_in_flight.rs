@@ -7,9 +7,18 @@
 //! a network error (server closed connection). The server must NEVER hang
 //! indefinitely and must exit cleanly.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
+
+/// How long to wait for the spawned server to report ready.
+///
+/// Generous on purpose: this is test setup, not a measured property. The server
+/// boots while the rest of the suite saturates every core, so a tight budget
+/// fails on machine load rather than on anything the test is checking.
+const READY_BUDGET: Duration = Duration::from_secs(60);
 
 fn free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
@@ -64,7 +73,11 @@ async fn sigterm_during_in_flight_query_does_not_hang() {
     // processes must not share the default sync port.
     let sync_port = free_port();
 
-    let mut child = std::process::Command::new(bin)
+    let mut cmd = std::process::Command::new(bin);
+    // Runs the production O_DIRECT WAL wherever the data directory supports it,
+    // so shutdown is exercised against the write path a deployment uses.
+    support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
+    let mut child = cmd
         .env("NODEDB_DATA_DIR", dir.path())
         .env("NODEDB_DATA_PLANE_CORES", "1")
         .env("NODEDB_PORT_HTTP", http_port.to_string())
@@ -77,8 +90,8 @@ async fn sigterm_during_in_flight_query_does_not_hang() {
         .spawn()
         .expect("failed to spawn nodedb binary");
 
-    let ready = wait_for_healthz(http_port, Duration::from_secs(15));
-    assert!(ready, "nodedb did not become ready within 15s");
+    let ready = wait_for_healthz(http_port, READY_BUDGET);
+    assert!(ready, "nodedb did not become ready within {READY_BUDGET:?}");
 
     let pgwire_addr = format!("127.0.0.1:{pgwire_port}");
 

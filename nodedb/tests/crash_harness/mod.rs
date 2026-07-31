@@ -21,6 +21,14 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
+#[path = "../support/mod.rs"]
+mod support;
+
+/// Re-exported so a crash test can state its own filesystem precondition
+/// without pulling the support module in a second time.
+#[allow(unused_imports)]
+pub use support::direct_io::direct_io_supported;
+
 pub fn free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
     l.local_addr().expect("local_addr").port()
@@ -84,11 +92,33 @@ pub struct CrashHarness {
     /// killed, or the recovery half runs against a differently configured
     /// server than the crash half did.
     extra_env: Vec<(String, String)>,
+    /// `NODEDB_WAL_DIRECT_IO` value forced on every spawn, or `None` to boot
+    /// the server on its shipped default.
+    ///
+    /// Decided once at construction by probing the real data directory, and
+    /// reused for `reopen` so a restarted process runs the same WAL mode as the
+    /// one it replaces — a recovery half booting differently from the crash
+    /// half would be testing a configuration no deployment ever runs.
+    wal_direct_io: Option<&'static str>,
 }
 
 impl CrashHarness {
     pub fn new() -> CrashHarness {
         let tempdir = tempfile::tempdir().expect("tempdir");
+        Self::from_tempdir(tempdir)
+    }
+
+    /// Like [`CrashHarness::new`], but the data directory is created under
+    /// `parent` — used to place it on a filesystem chosen by the test rather
+    /// than on whatever `TMPDIR` points at.
+    pub fn new_in(parent: &std::path::Path) -> CrashHarness {
+        let tempdir = tempfile::tempdir_in(parent).expect("tempdir in parent");
+        Self::from_tempdir(tempdir)
+    }
+
+    fn from_tempdir(tempdir: tempfile::TempDir) -> CrashHarness {
+        // Probed once, against the directory the server will actually write to.
+        let wal_direct_io = support::direct_io::wal_direct_io_override(tempdir.path());
         CrashHarness {
             bin: env!("CARGO_BIN_EXE_nodedb"),
             tempdir,
@@ -98,7 +128,29 @@ impl CrashHarness {
             sync_port: free_port(),
             child: None,
             extra_env: Vec::new(),
+            wal_direct_io,
         }
+    }
+
+    /// Demand direct I/O even if the probe says the filesystem cannot provide
+    /// it.
+    ///
+    /// Direct I/O is already the default wherever the data directory supports
+    /// it, so this is for the two tests whose subject *is* the direct-I/O path:
+    /// they must never be quietly downgraded into proving nothing.
+    pub fn with_direct_io_wal(mut self) -> CrashHarness {
+        self.wal_direct_io = Some("true");
+        self
+    }
+
+    /// Force the WAL open buffered instead of using direct I/O.
+    ///
+    /// Only for a test whose subject is buffered I/O itself — everything else
+    /// runs the production configuration so the suite covers the write path a
+    /// deployment actually takes.
+    pub fn with_buffered_wal(mut self) -> CrashHarness {
+        self.wal_direct_io = Some("false");
+        self
     }
 
     /// Add a server env override applied on every spawn. Call before `spawn`.
@@ -161,6 +213,12 @@ impl CrashHarness {
             .open(self.server_log_path())
             .expect("open server log");
         let log_err = log.try_clone().expect("clone server log handle");
+        // Left unset in the common case so the child boots the same WAL mode a
+        // deployment does; set only where the probe found no direct-I/O support
+        // or a test asked for a specific mode.
+        if let Some(value) = self.wal_direct_io {
+            cmd.env("NODEDB_WAL_DIRECT_IO", value);
+        }
         let child = cmd
             .env("NODEDB_DATA_DIR", self.tempdir.path())
             .env("NODEDB_DATA_PLANE_CORES", "1")
@@ -201,8 +259,9 @@ impl CrashHarness {
 
     /// Spawn the server and assert that boot FAILS-STOP rather than coming up.
     ///
-    /// Used by corruption tests that plant an unreadable checkpoint before boot:
-    /// the server must NEVER report `/healthz`-ready, and must exit non-zero
+    /// Used by tests that make boot impossible before spawning — an unreadable
+    /// checkpoint on disk, a WAL open the filesystem must refuse. The server
+    /// must NEVER report `/healthz`-ready, and must exit non-zero
     /// within `timeout` (the fail-stop path aborts boot, `main` returns `Err`,
     /// and the process exits with a failure code). Panics if the server becomes
     /// ready, exits cleanly, or neither exits nor becomes ready in time.
@@ -213,15 +272,15 @@ impl CrashHarness {
             // A fail-stopped boot must never open the gateway / report ready.
             assert!(
                 !check_healthz(self.http_port),
-                "server became ready despite a corrupt checkpoint; fail-stop did not trigger"
+                "server became ready despite a boot condition it must fail-stop on"
             );
             if let Some(child) = self.child.as_mut() {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         assert!(
                             !status.success(),
-                            "server exited cleanly (0) on a corrupt checkpoint; \
-                             expected a non-zero fail-stop exit (status: {status:?})"
+                            "server exited cleanly (0) on a boot condition it must fail-stop on; \
+                             expected a non-zero exit (status: {status:?})"
                         );
                         return;
                     }

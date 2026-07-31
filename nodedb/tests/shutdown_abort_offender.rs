@@ -10,9 +10,18 @@
 //!
 //! Uses real binary + stderr capture.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
+
+/// How long to wait for the spawned server to report ready.
+///
+/// Generous on purpose: this is test setup, not a measured property. The server
+/// boots while the rest of the suite saturates every core, so a tight budget
+/// fails on machine load rather than on anything the test is checking.
+const READY_BUDGET: Duration = Duration::from_secs(60);
 
 fn free_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
@@ -67,7 +76,11 @@ fn offender_task_aborted_at_500ms_budget() {
     // processes must not share the default sync port.
     let sync_port = free_port();
 
-    let child = std::process::Command::new(bin)
+    let mut cmd = std::process::Command::new(bin);
+    // Offender detection has to hold for the production WAL, so direct I/O
+    // stays on wherever the data directory supports it.
+    support::direct_io::apply_wal_direct_io(&mut cmd, dir.path());
+    let child = cmd
         .env("NODEDB_DATA_DIR", dir.path())
         .env("NODEDB_DATA_PLANE_CORES", "1")
         .env("NODEDB_PORT_HTTP", http_port.to_string())
@@ -83,8 +96,8 @@ fn offender_task_aborted_at_500ms_budget() {
         .spawn()
         .expect("failed to spawn nodedb binary");
 
-    let ready = wait_for_healthz(http_port, Duration::from_secs(15));
-    assert!(ready, "nodedb did not become ready within 15s");
+    let ready = wait_for_healthz(http_port, READY_BUDGET);
+    assert!(ready, "nodedb did not become ready within {READY_BUDGET:?}");
 
     // Send SIGTERM.
     let start = Instant::now();

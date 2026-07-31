@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt as _;
-
+use super::open::open_segment_file;
 use crate::align::AlignedBuf;
 use crate::double_write::{DoubleWriteBuffer, DwbProtection};
 use crate::error::{Result, WalError};
@@ -70,16 +68,7 @@ pub struct WalWriter {
 impl WalWriter {
     /// Open or create a WAL file at the given path.
     pub fn open(path: &Path, config: WalWriterConfig) -> Result<Self> {
-        let mut opts = OpenOptions::new();
-        opts.create(true).write(true).append(false);
-
-        #[cfg(target_os = "linux")]
-        if config.use_direct_io {
-            // O_DIRECT: bypass page cache.
-            opts.custom_flags(libc::O_DIRECT);
-        }
-
-        let file = opts.open(path)?;
+        let file = open_segment_file(path, config.use_direct_io)?;
 
         let buffer = AlignedBuf::new(config.write_buffer_size, config.alignment)?;
 
@@ -197,15 +186,7 @@ impl WalWriter {
         config: WalWriterConfig,
         start_lsn: u64,
     ) -> Result<Self> {
-        let mut opts = OpenOptions::new();
-        opts.create(true).write(true).append(false);
-
-        #[cfg(target_os = "linux")]
-        if config.use_direct_io {
-            opts.custom_flags(libc::O_DIRECT);
-        }
-
-        let file = opts.open(path)?;
+        let file = open_segment_file(path, config.use_direct_io)?;
         let buffer = AlignedBuf::new(config.write_buffer_size, config.alignment)?;
 
         let dwb = open_dwb_for(&config, path);
@@ -227,7 +208,8 @@ impl WalWriter {
         })
     }
 
-    /// Open a WAL writer with O_DIRECT disabled (for testing on tmpfs, etc.).
+    /// Open a WAL writer with O_DIRECT disabled, for a test whose subject is
+    /// buffered I/O or which runs on a filesystem that refuses the flag.
     pub fn open_without_direct_io(path: &Path) -> Result<Self> {
         Self::open(
             path,
