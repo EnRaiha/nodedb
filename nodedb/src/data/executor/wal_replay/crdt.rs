@@ -345,6 +345,12 @@ impl CoreLoop {
             replayed += 1;
         }
 
+        // Replay is the longest run of deltas the engine ever sees, and each
+        // apply validates into a copy of its collection. Holding that copy
+        // across the run is what keeps recovery linear in the number of
+        // deltas instead of quadratic; it has no reason to outlive the run.
+        self.release_crdt_apply_candidates();
+
         if replayed > 0 {
             tracing::info!(core = self.core_id, replayed, "WAL CRDT replay complete");
         }

@@ -121,26 +121,9 @@ impl TenantCrdtEngine {
         {
             return ValidatedApplyOutcome::Malformed;
         }
-        // Seeding the candidate replays this collection's own snapshot, exported
-        // on the line above. It is admitted as local: judged against the peer
-        // ceilings, a collection that outgrew them would fail to seed and every
-        // subsequent delta would be reported as `Malformed` — the collection
-        // silently unwritable, and the sender blamed for it.
-        let candidate = match self.collections.get(collection) {
-            Some(current) => {
-                let snapshot = match current.export_snapshot() {
-                    Ok(snapshot) => snapshot,
-                    Err(_) => return ValidatedApplyOutcome::Malformed,
-                };
-                match CrdtState::from_local_snapshot(self.peer_id, &snapshot) {
-                    Ok(state) => state,
-                    Err(_) => return ValidatedApplyOutcome::Malformed,
-                }
-            }
-            None => match CrdtState::new(self.peer_id) {
-                Ok(state) => state,
-                Err(_) => return ValidatedApplyOutcome::Malformed,
-            },
+        let candidate = match self.take_apply_candidate(collection) {
+            Ok(candidate) => candidate,
+            Err(()) => return ValidatedApplyOutcome::Malformed,
         };
         let before = candidate.frontier();
         let admission = match candidate.import(delta) {
@@ -208,10 +191,94 @@ impl TenantCrdtEngine {
             return ValidatedApplyOutcome::Rejected(violation);
         }
 
+        // The candidate is now authoritative. Bring the doc it displaced up to
+        // the same version and keep it as the next delta's candidate: it starts
+        // identical to authoritative, so the next apply pays the delta rather
+        // than another full copy of the collection.
+        //
+        // Both docs held the same state and take the same delta, so the CRDT
+        // merge leaves them identical. If that second import somehow does not
+        // land, no candidate is retained and the next apply rebuilds one —
+        // slower, never wrong.
+        if let Some(previous) = previous
+            && previous.import(delta).is_ok()
+        {
+            self.apply_candidates
+                .insert(collection.to_owned(), previous);
+        }
+
         ValidatedApplyOutcome::Clean {
             write_set,
             imported_ops: admission.new_operations,
         }
+    }
+
+    /// A document identical to `collection`'s authoritative state, to import a
+    /// delta into before deciding whether to keep it.
+    ///
+    /// Reuses the candidate left behind by the previous apply when there is
+    /// one. Building it costs a full encode and decode of the collection —
+    /// Loro's own `fork` is implemented the same way, so there is no cheaper
+    /// copy available — and a run of deltas (WAL replay, a committed batch, a
+    /// sync burst) would otherwise pay that per delta rather than once.
+    ///
+    /// The candidate is only ever returned to the pool after a clean apply. A
+    /// delta that was refused for any reason leaves its operations in the
+    /// candidate — Loro buffers even causally-pending ones — so a poisoned
+    /// candidate is dropped rather than reused.
+    fn take_apply_candidate(&mut self, collection: &str) -> Result<CrdtState, ()> {
+        if let Some(candidate) = self.apply_candidates.remove(collection) {
+            // A candidate is only usable while it still matches the state it
+            // was cloned from. Anything else that touches this collection — a
+            // local write through `state_mut`, a transaction rollback, a
+            // snapshot import, a purge — leaves it behind, and installing a
+            // behind candidate as authoritative would silently discard those
+            // writes. Checking the frontier here means no other mutation site
+            // has to remember this one exists; a stale candidate is simply
+            // rebuilt.
+            let current_frontier = self.collections.get(collection).map(|s| s.frontier());
+            if current_frontier.is_some_and(|frontier| frontier == candidate.frontier()) {
+                return Ok(candidate);
+            }
+        }
+        // The candidate becomes authoritative on a clean apply, so it must be
+        // born with the same derived peer id `state_mut` would have given the
+        // collection. The node's base peer id would mint operation ids that
+        // collide across collections — the silent row-drop `collection_peer_id`
+        // exists to prevent.
+        let peer_id = Self::collection_peer_id(self.peer_id, collection);
+        match self.collections.get(collection) {
+            // Its own snapshot, exported on the line above: admitted as local,
+            // because under the peer ceilings a collection that outgrew them
+            // would fail to seed and every subsequent delta would report
+            // `Malformed` — silently unwritable, with the sender blamed for it.
+            Some(current) => {
+                let snapshot = current.export_snapshot().map_err(|_| ())?;
+                CrdtState::from_local_snapshot(peer_id, &snapshot).map_err(|_| ())
+            }
+            None => CrdtState::new(peer_id).map_err(|_| ()),
+        }
+    }
+
+    /// Drop every retained apply candidate.
+    ///
+    /// Callers that apply a run of deltas — WAL replay, a committed batch —
+    /// call this when the run ends, so the second document per collection does
+    /// not outlive the work it accelerates.
+    pub fn clear_apply_candidates(&mut self) {
+        self.apply_candidates.clear();
+    }
+
+    /// How many collections are currently holding a retained candidate.
+    #[cfg(test)]
+    pub(crate) fn apply_candidate_count(&self) -> usize {
+        self.apply_candidates.len()
+    }
+
+    /// The Loro peer id of a collection's authoritative document.
+    #[cfg(test)]
+    pub(crate) fn collection_peer_id_for_test(&self, collection: &str) -> Option<u64> {
+        self.collections.get(collection).map(|s| s.peer_id())
     }
 
     /// Enqueue a rejected delta to the DLQ and translate the internal violation
@@ -696,6 +763,176 @@ mod tests {
         assert!(
             engine.read_row("users", "b").is_none(),
             "constraint-rejected delta must not mutate authoritative state"
+        );
+    }
+
+    /// The load-bearing safety property of retaining a candidate across
+    /// applies: the candidate becomes authoritative on a clean apply, so a
+    /// candidate that missed a local write would silently erase it.
+    ///
+    /// Nothing tells the candidate a local write happened — `doc_upsert` goes
+    /// straight to `state_mut`. It is caught by the candidate no longer
+    /// matching the state it was cloned from.
+    #[test]
+    fn a_local_write_between_applies_is_not_erased_by_the_candidate() {
+        let mut engine = unique_engine();
+
+        // The first apply creates the collection, so there is no displaced
+        // document to keep; the second leaves a candidate behind.
+        let delta_a = row_delta(2, "a", "a@y.com", "A");
+        engine.apply_committed_delta_validated(
+            "users",
+            &delta_a,
+            nodedb_types::Surrogate::ZERO,
+            "a",
+            2,
+        );
+        let delta_seed = row_delta(9, "seed", "seed@y.com", "S");
+        engine.apply_committed_delta_validated(
+            "users",
+            &delta_seed,
+            nodedb_types::Surrogate::ZERO,
+            "seed",
+            9,
+        );
+        assert_eq!(engine.apply_candidate_count(), 1, "candidate is retained");
+
+        // A local write the candidate knows nothing about.
+        engine
+            .doc_upsert(
+                "users",
+                "local",
+                &[("email", LoroValue::String("local@y.com".into()))],
+            )
+            .expect("local write");
+
+        // Second apply must not install a candidate that predates it.
+        let delta_b = row_delta(3, "b", "b@y.com", "B");
+        let outcome = engine.apply_committed_delta_validated(
+            "users",
+            &delta_b,
+            nodedb_types::Surrogate::ZERO,
+            "b",
+            3,
+        );
+
+        assert!(matches!(outcome, ValidatedApplyOutcome::Clean { .. }));
+        assert!(
+            engine.row_exists("users", "local"),
+            "the local write was erased by a stale validation candidate"
+        );
+        assert!(engine.row_exists("users", "a"));
+        assert!(engine.row_exists("users", "b"));
+    }
+
+    /// A refused delta leaves its operations inside the candidate — Loro
+    /// buffers even causally-pending ones — so the candidate must be discarded
+    /// rather than handed to the next delta.
+    #[test]
+    fn a_rejected_delta_does_not_poison_the_next_apply() {
+        let mut engine = unique_engine();
+        let seed = row_delta(2, "a", "x@y.com", "A");
+        engine.apply_committed_delta_validated(
+            "users",
+            &seed,
+            nodedb_types::Surrogate::ZERO,
+            "a",
+            2,
+        );
+
+        // Rejected: reuses row a's email under a strict UNIQUE policy.
+        let dup = row_delta(3, "b", "x@y.com", "B");
+        let rejected = engine.apply_committed_delta_validated(
+            "users",
+            &dup,
+            nodedb_types::Surrogate::ZERO,
+            "b",
+            3,
+        );
+        assert!(matches!(rejected, ValidatedApplyOutcome::Rejected(_)));
+        assert_eq!(
+            engine.apply_candidate_count(),
+            0,
+            "a candidate holding refused operations must not be kept"
+        );
+
+        // The next delta must see a clean base: neither row b nor its email.
+        let next = row_delta(4, "c", "c@y.com", "C");
+        let outcome = engine.apply_committed_delta_validated(
+            "users",
+            &next,
+            nodedb_types::Surrogate::ZERO,
+            "c",
+            4,
+        );
+        assert!(matches!(outcome, ValidatedApplyOutcome::Clean { .. }));
+        assert!(engine.row_exists("users", "c"));
+        assert!(
+            !engine.row_exists("users", "b"),
+            "the refused row resurfaced through a reused candidate"
+        );
+    }
+
+    /// A run of applies reuses one candidate rather than copying the
+    /// collection per delta, and releasing it is what stops the second
+    /// document outliving the run.
+    #[test]
+    fn a_run_of_applies_reuses_one_candidate() {
+        let mut engine = unique_engine();
+        for i in 0..8 {
+            let delta = row_delta(
+                10 + i,
+                &format!("r{i}"),
+                &format!("r{i}@y.com"),
+                &format!("R{i}"),
+            );
+            let outcome = engine.apply_committed_delta_validated(
+                "users",
+                &delta,
+                nodedb_types::Surrogate::ZERO,
+                &format!("r{i}"),
+                10 + i,
+            );
+            assert!(
+                matches!(outcome, ValidatedApplyOutcome::Clean { .. }),
+                "delta {i} should apply cleanly, got {outcome:?}"
+            );
+        }
+        for i in 0..8 {
+            assert!(engine.row_exists("users", &format!("r{i}")));
+        }
+        assert_eq!(
+            engine.apply_candidate_count(),
+            1,
+            "one candidate serves the whole run"
+        );
+
+        engine.clear_apply_candidates();
+        assert_eq!(engine.apply_candidate_count(), 0);
+    }
+
+    /// A collection first created by a delta apply must get the same derived
+    /// peer id `state_mut` would have given it. The node's base peer id mints
+    /// operation identities that collide across collections, which is the
+    /// silent row-drop `collection_peer_id` exists to prevent.
+    #[test]
+    fn a_collection_created_by_apply_gets_the_derived_peer_id() {
+        let mut engine = unique_engine();
+        let delta = row_delta(5, "a", "a@y.com", "A");
+        engine.apply_committed_delta_validated(
+            "users",
+            &delta,
+            nodedb_types::Surrogate::ZERO,
+            "a",
+            5,
+        );
+
+        let expected = TenantCrdtEngine::collection_peer_id(engine.peer_id(), "users");
+        assert_eq!(
+            engine.collection_peer_id_for_test("users"),
+            Some(expected),
+            "a collection born from a delta apply must carry the derived peer \
+             id, not the node's base id"
         );
     }
 

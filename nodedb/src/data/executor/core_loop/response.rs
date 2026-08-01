@@ -193,4 +193,16 @@ impl CoreLoop {
         }
         Ok(self.crdt_engines.get_mut(&key).expect("just inserted"))
     }
+
+    /// Release the per-collection validation candidates every CRDT engine on
+    /// this core is holding.
+    ///
+    /// Called when a run of delta applies ends. The candidates make a run cost
+    /// one collection copy instead of one per delta; keeping them past the run
+    /// would just be a second document per collection sitting idle.
+    pub(in crate::data::executor) fn release_crdt_apply_candidates(&mut self) {
+        for engine in self.crdt_engines.values_mut() {
+            engine.clear_apply_candidates();
+        }
+    }
 }
