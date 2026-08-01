@@ -2,7 +2,7 @@
 
 //! CrdtState core: document handle, row CRUD, uniqueness probes.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::marker::PhantomData;
 
@@ -46,6 +46,13 @@ pub struct CrdtState {
     /// Loro auto-commit state must stay single-owner. This makes accidental
     /// cross-thread sharing of a `CrdtState` a compile error.
     pub(super) _single_owner: PhantomData<Cell<()>>,
+    /// Last memory estimate and the frontier it was taken at.
+    ///
+    /// The estimate is a snapshot export, which costs O(document). Callers
+    /// poll it to decide when to compact, and a document that is not being
+    /// written has the same estimate every time, so it is computed once per
+    /// frontier rather than once per call.
+    pub(super) memory_estimate: RefCell<Option<(loro::VersionVector, usize)>>,
 }
 
 impl CrdtState {
@@ -58,6 +65,7 @@ impl CrdtState {
             doc,
             peer_id,
             _single_owner: PhantomData,
+            memory_estimate: RefCell::new(None),
         })
     }
 
@@ -284,9 +292,13 @@ impl CrdtState {
     }
 
     /// List all collection names (top-level map keys in the Loro doc).
+    ///
+    /// Reads the shallow value: the keys are at the top level, and
+    /// `get_deep_value` would materialise every row and field of every
+    /// collection to reach them — O(document) for a list whose size is the
+    /// number of collections. Name resolution calls this per query.
     pub fn collection_names(&self) -> Vec<String> {
-        let root = self.doc.get_deep_value();
-        match root {
+        match self.doc.get_value() {
             LoroValue::Map(map) => map.keys().map(|k| k.to_string()).collect(),
             _ => Vec::new(),
         }

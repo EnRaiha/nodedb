@@ -401,3 +401,23 @@ fn snapshot_roundtrip() {
 
     assert!(state2.row_exists("users", "u1"));
 }
+
+#[test]
+fn collection_names_lists_top_level_keys_only() {
+    let state = CrdtState::new(1).unwrap();
+    state
+        .upsert("users", "u1", &[("name", LoroValue::String("Bob".into()))])
+        .unwrap();
+    state
+        .upsert("orders", "o1", &[("total", LoroValue::I64(42))])
+        .unwrap();
+
+    let mut names = state.collection_names();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["orders".to_string(), "users".to_string()],
+        "the collections are the top-level keys; row ids and fields belong to \
+         the collections, not to this list"
+    );
+}

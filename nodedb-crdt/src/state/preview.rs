@@ -154,6 +154,7 @@ impl CrdtState {
             doc: fork,
             peer_id: self.peer_id,
             _single_owner: std::marker::PhantomData,
+            memory_estimate: std::cell::RefCell::new(None),
         };
         // Loro exposes diffs only as a complete DiffBatch. This runs after
         // byte and imported-operation caps have bounded the fork/import work;

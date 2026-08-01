@@ -134,14 +134,26 @@ impl CrdtState {
     ///
     /// Includes operation history, current state, and internal caches.
     /// Use this to decide when to trigger `compact_history()`.
+    /// Cached per frontier: the proxy is a full snapshot export, so polling it
+    /// on an unchanged document would re-serialize the whole document to learn
+    /// a number that cannot have moved.
     pub fn estimated_memory_bytes(&self) -> usize {
+        let version = self.doc.oplog_vv();
+        if let Some((cached_at, bytes)) = self.memory_estimate.borrow().as_ref()
+            && *cached_at == version
+        {
+            return *bytes;
+        }
         // Loro doesn't expose a direct memory metric.
         // Use snapshot size as a proxy — it's proportional to state size.
         // This is not precise but good enough for pressure monitoring.
-        self.doc
+        let bytes = self
+            .doc
             .export(loro::ExportMode::Snapshot)
             .map(|s| s.len())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        *self.memory_estimate.borrow_mut() = Some((version, bytes));
+        bytes
     }
 }
 
