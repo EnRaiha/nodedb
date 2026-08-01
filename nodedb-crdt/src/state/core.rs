@@ -345,17 +345,20 @@ impl CrdtState {
             if exclude_row_id == Some(key.as_ref()) {
                 continue;
             }
-            let path = format!("{collection}/{key}/{field}");
-            if let Some(voc) = self.doc.get_by_str_path(&path) {
-                let field_val = match voc {
-                    ValueOrContainer::Value(v) => v,
-                    ValueOrContainer::Container(_) => {
-                        continue;
-                    }
-                };
-                if &field_val == value {
-                    return true;
-                }
+            // Reached through the row container rather than a built path.
+            // `get_by_str_path` formats a `collection/row/field` string and
+            // re-resolves it from the document root for every row, which turns
+            // one UNIQUE probe into a per-row allocation plus a path parse and
+            // walk — the dominant cost of validating a single row against a
+            // large collection. The containers here are already in hand.
+            let Some(ValueOrContainer::Container(loro::Container::Map(row))) = coll.get(&key)
+            else {
+                continue;
+            };
+            if let Some(ValueOrContainer::Value(field_val)) = row.get(field)
+                && &field_val == value
+            {
+                return true;
             }
         }
         false
