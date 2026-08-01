@@ -222,6 +222,55 @@ fn estimated_memory_follows_compaction() {
 }
 
 #[test]
+fn estimated_memory_does_not_re_encode_on_every_write() {
+    let state = CrdtState::new(1).unwrap();
+    for i in 0..2_000 {
+        state
+            .upsert("items", &format!("i-{i}"), &[("v", LoroValue::I64(i))])
+            .unwrap();
+        state.estimated_memory_bytes();
+    }
+
+    // The estimate is called after every write by the memory governor. Paying
+    // a full document re-encode per call is what made a large store take
+    // ~0.5 s per record; the calibrated ratio has to make that logarithmic in
+    // the number of writes, not linear.
+    let exports = state.export_count_for_test();
+    assert!(
+        exports < 32,
+        "{exports} full exports for 2000 writes — the estimate is re-encoding \
+         the document per write again"
+    );
+}
+
+#[test]
+fn estimated_memory_stays_close_to_the_real_encoded_size() {
+    let state = CrdtState::new(1).unwrap();
+    for i in 0..2_000 {
+        state
+            .upsert(
+                "items",
+                &format!("i-{i}"),
+                &[("v", LoroValue::String("payload".repeat(4).into()))],
+            )
+            .unwrap();
+        state.estimated_memory_bytes();
+    }
+
+    // Interpolating between calibrations trades exactness for cost. It is a
+    // pressure signal, so it may drift — but it has to stay the same order as
+    // the truth, or the thresholds built on it mean nothing.
+    let estimate = state.estimated_memory_bytes() as f64;
+    let actual = state.export_snapshot().unwrap().len() as f64;
+    let ratio = estimate / actual;
+    assert!(
+        (0.5..=2.0).contains(&ratio),
+        "estimate {estimate} vs actual {actual} (ratio {ratio:.2}) — drifted \
+         beyond what a pressure signal can carry"
+    );
+}
+
+#[test]
 fn oplog_version_counts_uncommitted_operations() {
     let state = CrdtState::new(1).unwrap();
     state
