@@ -93,6 +93,15 @@ pub struct TenantCrdtEngine {
     /// stale set re-proposed at a higher data-log index can never clobber a
     /// newer one. Collections absent from the map are treated as version `0`.
     pub(super) constraint_versions: HashMap<String, u64>,
+
+    /// Per-collection validation candidate retained between applies.
+    ///
+    /// A delta is validated by importing it into a copy of the collection, so
+    /// a rejection can be dropped without touching authoritative state. Copying
+    /// costs a full encode and decode of the collection, so the copy is kept
+    /// alive across a run of deltas and rebuilt only when a delta is refused.
+    /// Cleared by `clear_apply_candidates` when the run ends.
+    pub(super) apply_candidates: HashMap<String, CrdtState>,
 }
 
 impl TenantCrdtEngine {
@@ -109,6 +118,7 @@ impl TenantCrdtEngine {
             validator: Validator::new(constraints, 1000),
             collections: HashMap::new(),
             constraint_versions: HashMap::new(),
+            apply_candidates: HashMap::new(),
         })
     }
 
