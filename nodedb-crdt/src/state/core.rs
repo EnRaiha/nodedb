@@ -2,7 +2,7 @@
 
 //! CrdtState core: document handle, row CRUD, uniqueness probes.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::marker::PhantomData;
 
@@ -11,6 +11,8 @@ use loro::{LoroDoc, LoroMap, LoroValue, ValueOrContainer};
 use crate::error::{CrdtError, Result};
 use crate::row_lookup::RowLookup;
 use crate::validator::bitemporal::{VALID_UNTIL, VALID_UNTIL_OPEN};
+
+use super::document_cell::DocumentCell;
 
 /// A row is live when its `_ts_valid_until` field is absent, null, or the
 /// open sentinel (`i64::MAX`). Rows with any finite `_ts_valid_until` are
@@ -41,32 +43,47 @@ fn key_is_container(row: &LoroMap, key: &str) -> bool {
 pub struct CrdtState {
     /// Kept private to this state module so callers cannot clone or share a
     /// raw Loro handle around the preview's pending-check/fork critical section.
-    pub(in crate::state) doc: LoroDoc,
+    pub(in crate::state) doc: DocumentCell,
     pub(super) peer_id: u64,
     /// Loro auto-commit state must stay single-owner. This makes accidental
     /// cross-thread sharing of a `CrdtState` a compile error.
     pub(super) _single_owner: PhantomData<Cell<()>>,
-    /// Last memory estimate and the frontier it was taken at.
-    ///
-    /// The estimate is a snapshot export, which costs O(document). Callers
-    /// poll it to decide when to compact, and a document that is not being
-    /// written has the same estimate every time, so it is computed once per
-    /// frontier rather than once per call.
-    pub(super) memory_estimate: RefCell<Option<(loro::VersionVector, usize)>>,
 }
 
 impl CrdtState {
     /// Create a new empty state for the given peer.
     pub fn new(peer_id: u64) -> Result<Self> {
+        Ok(Self {
+            doc: DocumentCell::new(Self::new_doc(peer_id)?),
+            peer_id,
+            _single_owner: PhantomData,
+        })
+    }
+
+    /// Load a state from an encoded document this process produced itself — a
+    /// snapshot read back from durable storage, or a pre-image exported moments
+    /// earlier for transaction rollback.
+    ///
+    /// Pairs `new` with [`CrdtState::import_local`], because those two steps
+    /// belong together: a caller that assembles them by hand has to know that
+    /// its own bytes must not go through the peer ceilings, and a caller that
+    /// gets that wrong writes a document it can no longer open. See
+    /// `import_local` for why the ceilings do not apply here.
+    pub fn from_local_snapshot(peer_id: u64, snapshot: &[u8]) -> Result<Self> {
+        let state = Self::new(peer_id)?;
+        state.import_local(snapshot)?;
+        Ok(state)
+    }
+
+    /// A fresh Loro document bound to `peer_id`.
+    ///
+    /// Shared by `new` and by the compaction paths, which need the same
+    /// peer-bound document before loading a shallow snapshot into it.
+    pub(in crate::state) fn new_doc(peer_id: u64) -> Result<LoroDoc> {
         let doc = LoroDoc::new();
         doc.set_peer_id(peer_id)
             .map_err(|e| CrdtError::Loro(format!("failed to set peer_id {peer_id}: {e}")))?;
-        Ok(Self {
-            doc,
-            peer_id,
-            _single_owner: PhantomData,
-            memory_estimate: RefCell::new(None),
-        })
+        Ok(doc)
     }
 
     /// Fetch a row's existing `LoroMap` container, or create one if absent.

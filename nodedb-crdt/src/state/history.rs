@@ -9,7 +9,6 @@ use loro::{LoroDoc, LoroMap, LoroValue, ValueOrContainer};
 use crate::error::{CrdtError, Result};
 
 use super::core::CrdtState;
-use super::import_admission::admit_local_import;
 use super::restore_containers;
 
 impl CrdtState {
@@ -95,24 +94,7 @@ impl CrdtState {
     /// Discards oplog entries before the target version. Current state and
     /// all versions after the target are preserved.
     pub fn compact_at_version(&mut self, version: &loro::VersionVector) -> Result<()> {
-        let frontiers = self.doc.vv_to_frontiers(version);
-        let snapshot = self
-            .doc
-            .export(loro::ExportMode::shallow_snapshot(&frontiers))
-            .map_err(|e| CrdtError::Loro(format!("shallow snapshot export: {e}")))?;
-
-        let new_doc = LoroDoc::new();
-        new_doc
-            .set_peer_id(self.peer_id)
-            .map_err(|e| CrdtError::Loro(format!("set peer_id on compacted doc: {e}")))?;
-        // Locally generated — see `compact_history`.
-        admit_local_import(&snapshot, &new_doc.oplog_vv())?;
-        new_doc
-            .import(&snapshot)
-            .map_err(|e| CrdtError::Loro(format!("shallow snapshot import: {e}")))?;
-
-        self.doc = new_doc;
-        Ok(())
+        self.compact_to_frontiers(&self.doc.vv_to_frontiers(version))
     }
 
     /// Generate a forward restore delta without changing authoritative state.
