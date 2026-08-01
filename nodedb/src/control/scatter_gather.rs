@@ -231,9 +231,32 @@ struct RemoteTraverseSql<'a> {
     direction: crate::engine::graph::edge_store::Direction,
 }
 
-fn build_graph_traverse_sql(params: RemoteTraverseSql<'_>) -> String {
+/// The traversal direction as its SQL keyword.
+///
+/// The value comes from a closed enum, never from caller text, so every arm is
+/// a fixed keyword and there is nothing to escape.
+fn canonical_direction_sql(direction: crate::engine::graph::edge_store::Direction) -> &'static str {
     use crate::engine::graph::edge_store::Direction;
 
+    match direction {
+        Direction::In => "in",
+        Direction::Out => "out",
+        Direction::Both => "both",
+    }
+}
+
+/// The optional edge label as a ` LABEL <literal>` clause, or empty.
+///
+/// The label is caller-supplied text, so it goes through the shared literal
+/// quoter — this is the only place the clause is built.
+fn canonical_label_sql(edge_label: Option<&str>) -> String {
+    match edge_label {
+        Some(label) => format!(" LABEL {}", ::nodedb_types::quote_literal(label)),
+        None => String::new(),
+    }
+}
+
+fn build_graph_traverse_sql(params: RemoteTraverseSql<'_>) -> String {
     let RemoteTraverseSql {
         collection,
         node_id,
@@ -241,20 +264,13 @@ fn build_graph_traverse_sql(params: RemoteTraverseSql<'_>) -> String {
         edge_label,
         direction,
     } = params;
-    let depth = ::nodedb_types::Value::Integer(if depth == 0 { 0 } else { 1 }).to_sql_literal();
-    let direction = match direction {
-        Direction::In => "in",
-        Direction::Out => "out",
-        Direction::Both => "both",
-    };
-    let label = match edge_label {
-        Some(label) => format!(" LABEL {}", ::nodedb_types::quote_literal(label)),
-        None => String::new(),
-    };
     format!(
-        "GRAPH TRAVERSE IN {} FROM {} DEPTH {depth}{label} DIRECTION {direction}",
+        "GRAPH TRAVERSE IN {} FROM {} DEPTH {}{} DIRECTION {}",
         ::nodedb_types::quote_literal(collection),
         ::nodedb_types::quote_literal(node_id),
+        ::nodedb_types::Value::Integer(if depth == 0 { 0 } else { 1 }).to_sql_literal(),
+        canonical_label_sql(edge_label),
+        canonical_direction_sql(direction),
     )
 }
 
@@ -366,8 +382,13 @@ pub async fn coordinate_cross_shard_hop(
         // owns its descriptor lease scope, so the spawned closure does not
         // need to retain or reconstruct SharedState.
         for node_id in batch.node_ids {
-            let sql =
-                build_graph_traverse_sql(&node_id, hop_depth, edge_label.as_deref(), direction);
+            let sql = build_graph_traverse_sql(RemoteTraverseSql {
+                collection: &collection,
+                node_id: &node_id,
+                depth: hop_depth,
+                edge_label: edge_label.as_deref(),
+                direction,
+            });
             let gw_ctx = crate::control::gateway::core::QueryContext {
                 tenant_id: crate::types::TenantId::new(tenant_id_u64),
                 trace_id: TraceId::generate(),
