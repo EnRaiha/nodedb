@@ -8,6 +8,7 @@
 
 pub mod bitemporal_archive;
 pub mod core;
+pub(crate) mod document_cell;
 pub mod frontier_digest;
 pub mod history;
 pub(crate) mod import_admission;

@@ -30,9 +30,17 @@ impl TenantCrdtEngine {
         // Same per-collection derivation as `state_mut`: a rollback must not
         // hand the collection back a document whose operation identities
         // collide with a sibling collection's.
-        let replacement = CrdtState::new(Self::collection_peer_id(self.peer_id, collection))
-            .map_err(crate::Error::Crdt)?;
-        replacement.import(snapshot).map_err(crate::Error::Crdt)?;
+        //
+        // The pre-image is a snapshot this process exported when the
+        // transaction opened, so it is admitted as local: under the peer
+        // ceilings a collection that grew past them could be written but never
+        // rolled back, and the transaction driver would be handed a failure it
+        // has no way to act on.
+        let replacement = CrdtState::from_local_snapshot(
+            Self::collection_peer_id(self.peer_id, collection),
+            snapshot,
+        )
+        .map_err(crate::Error::Crdt)?;
         self.collections.insert(collection.to_owned(), replacement);
         Ok(())
     }

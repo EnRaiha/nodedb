@@ -2,12 +2,12 @@
 
 //! Snapshot export/import, history compaction, memory estimation.
 
-use loro::LoroDoc;
-
 use crate::error::{CrdtError, Result};
 
 use super::core::CrdtState;
-use super::import_admission::{CrdtImportLimits, ImportAdmission, admit_import};
+use super::import_admission::{
+    CrdtImportLimits, ImportAdmission, admit_import, admit_local_import,
+};
 
 impl CrdtState {
     /// Export the current state as bytes for sync.
@@ -22,6 +22,35 @@ impl CrdtState {
     /// Returns the same [`ImportAdmission`] as [`Self::import_with_limits`].
     pub fn import(&self, data: &[u8]) -> Result<ImportAdmission> {
         self.import_with_limits(data, CrdtImportLimits::default())
+    }
+
+    /// Import bytes this process produced itself — a snapshot read back from
+    /// durable storage, or a shallow snapshot taken during compaction.
+    ///
+    /// Keeps every structural check [`Self::import`] performs: metadata is
+    /// decoded with Loro's authenticated decoder, and per-peer ranges that
+    /// regress are rejected before any state mutation. What it drops is the
+    /// size ceilings, which bound how much work an untrusted peer may cause
+    /// and have no meaning for bytes this library just wrote.
+    ///
+    /// Without this split the ceilings apply to reloading as well as to
+    /// receiving, and since `export_snapshot` has no bound at all, a document a
+    /// healthy process wrote can exceed what the same binary will re-import.
+    /// Past that point the document neither opens nor compacts — compaction
+    /// being the operation that would bring it back under the limit.
+    ///
+    /// This is not a way to raise the peer limits: `import_with_limits` is the
+    /// knob for that, and bytes off the wire must go through it.
+    pub fn import_local(&self, data: &[u8]) -> Result<ImportAdmission> {
+        let admission = admit_local_import(data, &self.doc.oplog_vv())?;
+        let status = self
+            .doc
+            .import(data)
+            .map_err(|e| CrdtError::DeltaApplyFailed(e.to_string()))?;
+        if status.pending.is_some() {
+            return Err(CrdtError::ImportPendingDependencies);
+        }
+        Ok(admission)
     }
 
     /// Import remote updates after bounded authenticated metadata admission.
@@ -75,26 +104,41 @@ impl CrdtState {
     /// Call this periodically (e.g., every 30 minutes or when memory
     /// pressure exceeds threshold) to prevent unbounded history growth.
     pub fn compact_history(&mut self) -> Result<()> {
-        // Export a shallow snapshot at the current frontiers.
-        let frontiers = self.doc.oplog_frontiers();
+        self.compact_to_frontiers(&self.doc.oplog_frontiers())
+    }
+
+    /// Replace this document with a shallow snapshot taken at `frontiers`.
+    ///
+    /// The whole of compaction, shared by `compact_history` (current
+    /// frontiers) and `compact_at_version` (a chosen version), so the two
+    /// cannot drift apart on how the snapshot is admitted or how the document
+    /// is swapped in.
+    ///
+    /// The snapshot is admitted through [`admit_local_import`]: this process
+    /// exported it one line earlier. Under the peer ceilings, compaction would
+    /// be refused for precisely the documents large enough to need it — the
+    /// operation that would bring a document back under the limit gated by
+    /// that limit.
+    pub(in crate::state) fn compact_to_frontiers(
+        &mut self,
+        frontiers: &loro::Frontiers,
+    ) -> Result<()> {
         let snapshot = self
             .doc
-            .export(loro::ExportMode::shallow_snapshot(&frontiers))
+            .export(loro::ExportMode::shallow_snapshot(frontiers))
             .map_err(|e| CrdtError::Loro(format!("shallow snapshot export: {e}")))?;
 
-        // Replace the doc with a fresh one loaded from the snapshot.
-        let new_doc = LoroDoc::new();
-        new_doc
-            .set_peer_id(self.peer_id)
-            .map_err(|e| CrdtError::Loro(format!("failed to set peer_id on compacted doc: {e}")))?;
-        // This snapshot is generated locally, but it remains finite and goes
-        // through the same metadata/range admission before import.
-        admit_import(&snapshot, &new_doc.oplog_vv(), CrdtImportLimits::default())?;
-        new_doc
+        let compacted = Self::new_doc(self.peer_id)?;
+        admit_local_import(&snapshot, &compacted.oplog_vv())?;
+        compacted
             .import(&snapshot)
             .map_err(|e| CrdtError::Loro(format!("shallow snapshot import: {e}")))?;
 
-        self.doc = new_doc;
+        // `replace` also drops everything cached from the outgoing document. A
+        // shallow snapshot keeps the version vector, so a derived value keyed
+        // on the version alone would look current while describing bytes that
+        // no longer exist.
+        self.doc.replace(compacted);
         Ok(())
     }
 
@@ -102,14 +146,13 @@ impl CrdtState {
     ///
     /// Includes operation history, current state, and internal caches.
     /// Use this to decide when to trigger `compact_history()`.
+    ///
+    /// The proxy is a full snapshot export, so it is measured once per version
+    /// rather than once per call: a document nobody is writing cannot have
+    /// changed size. Compaction discards the measurement along with the
+    /// document it described.
     pub fn estimated_memory_bytes(&self) -> usize {
-        // Loro doesn't expose a direct memory metric.
-        // Use snapshot size as a proxy — it's proportional to state size.
-        // This is not precise but good enough for pressure monitoring.
-        self.doc
-            .export(loro::ExportMode::Snapshot)
-            .map(|s| s.len())
-            .unwrap_or(0)
+        self.doc.estimated_bytes()
     }
 }
 
@@ -145,6 +188,72 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(CrdtError::ImportTooLarge { .. })));
+        assert_eq!(state.frontier(), before);
+    }
+
+    #[test]
+    fn local_import_admits_what_the_peer_ceilings_would_reject() {
+        let delta = source_delta();
+        let capped = CrdtState::new(1).expect("capped state");
+        let tight = CrdtImportLimits {
+            max_bytes: delta.len(),
+            max_encoded_operations: 0,
+            max_new_operations: 0,
+        };
+        assert!(
+            matches!(
+                capped.import_with_limits(&delta, tight),
+                Err(CrdtError::ImportOperationLimitExceeded { .. })
+            ),
+            "the peer path must stay capped"
+        );
+
+        let local = CrdtState::new(1).expect("local state");
+        local.import_local(&delta).expect("local import");
+        assert!(
+            local.row_exists("docs", "row"),
+            "bytes this process wrote must be reloadable whatever the peer ceilings are; a \
+             document large enough to trip them can otherwise neither be opened nor compacted"
+        );
+    }
+
+    #[test]
+    fn from_local_snapshot_loads_without_the_peer_ceilings() {
+        let source = CrdtState::new(3).expect("source state");
+        source
+            .upsert("docs", "row", &[("title", LoroValue::String("v".into()))])
+            .expect("source write");
+        let snapshot = source.export_snapshot().expect("snapshot");
+
+        let reloaded = CrdtState::from_local_snapshot(3, &snapshot).expect("reload");
+        assert!(
+            reloaded.row_exists("docs", "row"),
+            "a state loaded from our own snapshot must carry its rows"
+        );
+    }
+
+    #[test]
+    fn from_local_snapshot_rejects_malformed_bytes() {
+        assert!(
+            matches!(
+                CrdtState::from_local_snapshot(1, &[0xff]),
+                Err(CrdtError::ImportMalformed { .. })
+            ),
+            "the convenience constructor keeps every structural check"
+        );
+    }
+
+    #[test]
+    fn local_import_still_rejects_malformed_metadata() {
+        let state = CrdtState::new(1).expect("state");
+        let before = state.frontier();
+        assert!(
+            matches!(
+                state.import_local(&[0xff]),
+                Err(CrdtError::ImportMalformed { .. })
+            ),
+            "dropping the size ceilings must not drop the structural checks"
+        );
         assert_eq!(state.frontier(), before);
     }
 

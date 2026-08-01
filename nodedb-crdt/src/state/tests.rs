@@ -191,6 +191,55 @@ fn estimated_memory_grows_with_data() {
 }
 
 #[test]
+fn estimated_memory_follows_compaction() {
+    let mut state = CrdtState::new(1).unwrap();
+    // History, not breadth: compaction discards the operations, so the same
+    // row rewritten many times is what shrinks when it runs.
+    for i in 0..512 {
+        state
+            .upsert("items", "hot", &[("value", LoroValue::I64(i))])
+            .unwrap();
+    }
+    let before = state.estimated_memory_bytes();
+
+    state.compact_history().unwrap();
+    let after = state.estimated_memory_bytes();
+
+    assert_eq!(
+        after,
+        state.export_snapshot().unwrap().len(),
+        "the estimate must describe the document that exists now, not the one \
+         compaction replaced; a shallow snapshot keeps the version vector, so a \
+         measurement keyed on the version alone still looks current after the \
+         bytes it measured are gone"
+    );
+    assert!(
+        after < before,
+        "compaction dropped 512 operations and the estimate did not move: \
+         before={before}, after={after} — a caller polling this to decide when \
+         to compact would compact forever"
+    );
+}
+
+#[test]
+fn oplog_version_counts_uncommitted_operations() {
+    let state = CrdtState::new(1).unwrap();
+    state
+        .upsert("items", "a", &[("value", LoroValue::I64(1))])
+        .unwrap();
+
+    // The memory estimate is cached against this version vector. That is only
+    // sound because Loro advances it when the operation is written rather than
+    // when its transaction commits — otherwise a write could land while the
+    // key stood still, and the estimate would answer from before it. If this
+    // assertion ever fails, the cache in `document_cell` is what breaks.
+    assert!(
+        state.oplog_version_vector().get(&1).copied().unwrap_or(0) > 0,
+        "an operation that has not committed yet must still move the version"
+    );
+}
+
+#[test]
 fn restore_to_version_produces_forward_delta() {
     let state = CrdtState::new(1).unwrap();
     state
@@ -400,4 +449,24 @@ fn snapshot_roundtrip() {
     state2.import(&snapshot).unwrap();
 
     assert!(state2.row_exists("users", "u1"));
+}
+
+#[test]
+fn collection_names_lists_top_level_keys_only() {
+    let state = CrdtState::new(1).unwrap();
+    state
+        .upsert("users", "u1", &[("name", LoroValue::String("Bob".into()))])
+        .unwrap();
+    state
+        .upsert("orders", "o1", &[("total", LoroValue::I64(42))])
+        .unwrap();
+
+    let mut names = state.collection_names();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["orders".to_string(), "users".to_string()],
+        "the collections are the top-level keys; row ids and fields belong to \
+         the collections, not to this list"
+    );
 }

@@ -16,6 +16,7 @@ use crate::error::{CrdtError, Result};
 use crate::loro_value::loro_to_value;
 
 use super::core::CrdtState;
+use super::document_cell::DocumentCell;
 use super::import_admission::{CrdtImportLimits, admit_import};
 
 /// Maximum raw CRDT delta bytes accepted by the default authoritative preview.
@@ -151,7 +152,7 @@ impl CrdtState {
 
         let resulting_frontier = fork.state_frontiers();
         let fork_state = CrdtState {
-            doc: fork,
+            doc: DocumentCell::new(fork),
             peer_id: self.peer_id,
             _single_owner: std::marker::PhantomData,
         };

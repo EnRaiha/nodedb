@@ -121,19 +121,27 @@ impl TenantCrdtEngine {
         {
             return ValidatedApplyOutcome::Malformed;
         }
-        let candidate = match CrdtState::new(self.peer_id) {
-            Ok(state) => state,
-            Err(_) => return ValidatedApplyOutcome::Malformed,
-        };
-        if let Some(current) = self.collections.get(collection) {
-            let snapshot = match current.export_snapshot() {
-                Ok(snapshot) => snapshot,
-                Err(_) => return ValidatedApplyOutcome::Malformed,
-            };
-            if candidate.import(&snapshot).is_err() {
-                return ValidatedApplyOutcome::Malformed;
+        // Seeding the candidate replays this collection's own snapshot, exported
+        // on the line above. It is admitted as local: judged against the peer
+        // ceilings, a collection that outgrew them would fail to seed and every
+        // subsequent delta would be reported as `Malformed` — the collection
+        // silently unwritable, and the sender blamed for it.
+        let candidate = match self.collections.get(collection) {
+            Some(current) => {
+                let snapshot = match current.export_snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => return ValidatedApplyOutcome::Malformed,
+                };
+                match CrdtState::from_local_snapshot(self.peer_id, &snapshot) {
+                    Ok(state) => state,
+                    Err(_) => return ValidatedApplyOutcome::Malformed,
+                }
             }
-        }
+            None => match CrdtState::new(self.peer_id) {
+                Ok(state) => state,
+                Err(_) => return ValidatedApplyOutcome::Malformed,
+            },
+        };
         let before = candidate.frontier();
         let admission = match candidate.import(delta) {
             Ok(admission) => admission,
