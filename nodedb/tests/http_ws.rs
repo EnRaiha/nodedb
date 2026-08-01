@@ -403,8 +403,19 @@ async fn ws_auth_replay_isolates_events_by_selected_database() {
     );
 }
 
+/// A LIVE SELECT flooded past its buffers must never silently skip events: the
+/// client either receives every change in order, or is told to reset.
+///
+/// This deliberately does NOT assert that a reset always happens. Whether the
+/// broadcast channel actually overflows depends on how much the WS socket and
+/// the forwarder absorb before backpressure reaches it, and socket buffer sizes
+/// are a property of the machine, not of this code — on an idle host the
+/// subscriber keeps up and delivering all 4608 events is the correct outcome.
+/// Asserting the reset unconditionally made this fail on fast machines while
+/// the server was behaving perfectly. The invariant that always holds, and the
+/// one a client depends on, is the absence of a silent gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ws_live_lag_notifies_client_to_reset() {
+async fn ws_live_lag_never_silently_skips_events() {
     let srv = start_http(AuthMode::Trust).await;
     let mut ws = connect_ws(&srv).await;
     ws.send(Message::Text(
@@ -429,7 +440,8 @@ async fn ws_live_lag_notifies_client_to_reset() {
     // the socket sender applies backpressure before the broadcast receiver
     // observes its lag.
     let document_suffix = "x".repeat(2_048);
-    for sequence in 0..(4_096 + 512) {
+    const PUBLISHED: u64 = 4_096 + 512;
+    for sequence in 0..PUBLISHED {
         srv.shared.change_stream.publish(ChangeEvent {
             lsn: Lsn::new(10_000 + sequence),
             tenant_id: TenantId::new(1),
@@ -444,45 +456,72 @@ async fn ws_live_lag_notifies_client_to_reset() {
         }
     }
 
-    // Drain until the reset arrives, bounded by total time rather than by a
-    // message count: how many buffered notifications precede the lag notice
-    // depends on socket and forwarder buffering, which varies with machine
-    // load, so a fixed read budget fails on a busy host while the behaviour is
-    // correct. Reads are not individually timed here for the same reason — a
-    // stall mid-stream is only a failure if the whole drain overruns.
-    let mut drained = 0usize;
-    let mut last_seen: Option<serde_json::Value> = None;
-    let reset = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
+    // Drain until either a reset arrives or every published event has been
+    // seen. Bounded by total elapsed time, not by a per-read timeout or a
+    // message budget: how much arrives before backpressure reaches the
+    // broadcast channel varies with machine load, and a stall mid-stream is
+    // only a failure if the whole drain overruns.
+    let mut delivered: Vec<u64> = Vec::with_capacity(PUBLISHED as usize);
+    let mut reset: Option<serde_json::Value> = None;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while reset.is_none() && (delivered.len() as u64) < PUBLISHED {
             let Some(message) = ws.next().await else {
-                return Err(format!(
-                    "WS stream ended after {drained} notifications without reset_required \
-                     (last: {last_seen:?})"
-                ));
+                panic!(
+                    "WS stream ended after {} notifications with neither a reset nor the \
+                     full event set",
+                    delivered.len()
+                );
             };
             let message = match message {
                 Ok(Message::Text(text)) => serde_json::from_str::<serde_json::Value>(&text)
                     .unwrap_or_else(|e| panic!("invalid JSON in live notification: {e}")),
                 Ok(other) => panic!("expected Text frame in live stream, got {other:?}"),
-                Err(e) => return Err(format!("WS error after {drained} notifications: {e}")),
+                Err(e) => panic!("WS error after {} notifications: {e}", delivered.len()),
             };
             if message["method"] == "reset_required" {
-                return Ok(message);
+                reset = Some(message);
+                continue;
             }
-            drained += 1;
-            last_seen = Some(message);
+            let document_id = message["params"]["document_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("live notification without document_id: {message}"));
+            let sequence: u64 = document_id
+                .trim_start_matches("lagged-order-")
+                .split('-')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| panic!("unexpected document_id shape: {document_id}"));
+            delivered.push(sequence);
         }
     })
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "LIVE SELECT never reported reset_required: drained {drained} notifications \
-             (last: {last_seen:?})"
+            "LIVE SELECT stalled: {} of {PUBLISHED} events delivered, no reset",
+            delivered.len()
         )
-    })
-    .unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(reset["params"]["subscription_id"], subscription_id);
-    assert_eq!(reset["params"]["reason"], "change stream lagged");
+    });
+
+    match reset {
+        // Events were dropped, and the client was told so — the whole point of
+        // the reset. Which events were lost is not asserted: that is exactly
+        // the information the reset exists to say is unavailable.
+        Some(reset) => {
+            assert_eq!(reset["params"]["subscription_id"], subscription_id);
+            assert_eq!(reset["params"]["reason"], "change stream lagged");
+        }
+        // No reset, so the stream claims to be complete — hold it to that.
+        // A gap here is the silent-loss bug: the client would have no way to
+        // know it missed a change.
+        None => {
+            let expected: Vec<u64> = (0..PUBLISHED).collect();
+            assert_eq!(
+                delivered, expected,
+                "LIVE SELECT delivered no reset_required, so every published event must have \
+                 arrived exactly once and in publication order"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
