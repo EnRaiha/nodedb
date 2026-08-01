@@ -41,7 +41,7 @@ pub(in crate::control::server::sync) fn build_collection_schema_frame(
     let stored = shared
         .credentials
         .catalog()
-        .get_collection(session.database_id(), tenant_id, collection)
+        .get_collection(database_id, tenant_id, collection)
         .ok()
         .flatten();
 

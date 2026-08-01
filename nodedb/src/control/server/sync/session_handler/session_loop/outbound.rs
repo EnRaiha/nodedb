@@ -32,6 +32,11 @@ pub(super) async fn register_channels(
         return;
     };
 
+    // Every fanout below is registered under the session's authenticated
+    // database, so a server push is only ever routed to sessions holding that
+    // database — the session ID alone does not scope delivery.
+    let database_id = session.database_id();
+
     if !channels.crdt_registered {
         let tenant_id = session.tenant_id.map(|t| t.as_u64()).unwrap_or(0);
         let peer_id = session.device_metadata.peer_id;
@@ -40,6 +45,7 @@ pub(super) async fn register_channels(
             session_id.to_string(),
             peer_id,
             tenant_id,
+            database_id,
             Vec::new(),
             &config,
         );
@@ -54,11 +60,11 @@ pub(super) async fn register_channels(
     }
 
     if !channels.definition_sync_registered {
-        channels.definition_sync_rx = Some(
-            shared
-                .definition_sync_fanout
-                .register(session_id.to_string()),
-        );
+        channels.definition_sync_rx = Some(shared.definition_sync_fanout.register(
+            session_id.to_string(),
+            session.tenant_id.map(|t| t.as_u64()).unwrap_or(0),
+            database_id,
+        ));
         channels.definition_sync_registered = true;
     }
 
@@ -140,6 +146,7 @@ async fn pump_crdt_deltas(
                 shared,
                 session,
                 delta.tenant_id,
+                session.database_id(),
                 &delta.collection,
             )
         {

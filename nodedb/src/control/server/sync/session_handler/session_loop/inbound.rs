@@ -71,10 +71,16 @@ pub(super) async fn handle_frame(ws: &mut Ws, ctx: InboundCtx<'_>, frame: &SyncF
         && session.authenticated
         && let Some(shared) = shared.as_ref()
     {
-        if let Some(msg) = frame.decode_body::<PresenceUpdateMsg>() {
+        if let Some(msg) = frame.decode_body::<PresenceUpdateMsg>()
+            && let Some(tenant_id) = session.tenant_id
+        {
+            // Presence channels are keyed by the authenticated tenant and
+            // database, so peers in one database never observe another's
+            // presence under the same channel name.
+            let database_id = session.database_id();
             let user_id = session.username.as_deref().unwrap_or("anonymous");
             let mut mgr = shared.presence.write().await;
-            let outbound = mgr.handle_update(session_id, user_id, &msg);
+            let outbound = mgr.handle_update(session_id, user_id, tenant_id, database_id, &msg);
             let senders = mgr.senders().clone();
             drop(mgr);
             outbound.send_all(&senders);
@@ -135,25 +141,33 @@ async fn handle_shape_subscribe(
     let shape_sub_msg =
         frame.decode_body::<crate::control::server::sync::wire::ShapeSubscribeMsg>();
 
+    let database_id = session.database_id();
     if let Some(sub_msg) = shape_sub_msg.as_ref()
         && let Some(coll) = sub_msg.shape.collection()
     {
-        if channels.presence_registered {
+        if channels.presence_registered
+            && let Some(tenant) = session.tenant_id
+        {
             let channel = format!("shape:{coll}");
-            shared
-                .presence
-                .write()
-                .await
-                .subscribe_to_channel(session_id, &channel);
+            shared.presence.write().await.subscribe_to_channel(
+                session_id,
+                tenant,
+                database_id,
+                &channel,
+            );
         }
 
         // Announce the collection descriptor before the shape snapshot so
         // schema strictly precedes data on the subscription path. Idempotent
         // per session; skips shape variants that carry no single collection.
         let tenant_id = session.tenant_id.map(|t| t.as_u64()).unwrap_or(0);
-        if let Some(schema_frame) =
-            super::super::announce::build_collection_schema_frame(shared, session, tenant_id, coll)
-        {
+        if let Some(schema_frame) = super::super::announce::build_collection_schema_frame(
+            shared,
+            session,
+            tenant_id,
+            database_id,
+            coll,
+        ) {
             if !send(ws, &schema_frame).await {
                 return Flow::Break;
             }
@@ -172,6 +186,18 @@ async fn handle_array(
     session_id: &str,
     frame: &SyncFrame,
 ) -> Flow {
+    // Refuse before any engine is constructed or reused, so an unauthenticated
+    // frame cannot touch catalog, data, or fan-out state. The rejection is
+    // explicit rather than a silent drop: a client whose handshake never landed
+    // otherwise waits on a reply that is never coming.
+    if let Some(reject) = super::super::array::unauthenticated_array_reject(
+        frame,
+        session.authenticated,
+        session.identity.is_some(),
+    ) {
+        return Flow::from_send(send(ws, &reject).await);
+    }
+
     // Bind the inbound array engine to the session's authenticated tenant,
     // lazily, on first use. The gate is the tenant itself (not `authenticated`):
     // the handshake sets `tenant_id = Some(..)` in the same step it marks the
@@ -234,16 +260,19 @@ async fn handle_crdt(
         }
     }
 
+    // The audit log and DLQ are deliberately NOT locked here. With `shared`
+    // present, `process_frame` authorizes the delta first and only then takes
+    // those two mutexes, scoped to the synchronous call. Locking them out here
+    // as well deadlocks that re-acquisition — they are plain non-reentrant
+    // mutexes — and every delta push hangs until the client's frame timeout.
+    // The `shared`-absent path has no store to lock and keeps the old shape.
     let response = if let Some(shared) = shared.as_ref() {
-        let rls_store = &shared.rls;
-        let mut audit = shared.audit.lock().unwrap_or_else(|p| p.into_inner());
-        let mut dlq = shared.sync_dlq.lock().unwrap_or_else(|p| p.into_inner());
         session.process_frame(
             frame,
             jwt_validator,
-            Some(rls_store),
-            Some(&mut audit),
-            Some(&mut dlq),
+            Some(&shared.rls),
+            None,
+            None,
             Some(shared),
         )
     } else {

@@ -67,10 +67,12 @@ pub fn delete(database_id: u64, tenant_id: u64, name: String, shared: Arc<Shared
         }
     }
 
-    shared.permissions.install_replicated_remove_owner_in_database(
-        "change_stream",
-        database_id.as_u64(),
-        tenant_id,
-        &name,
-    );
+    shared
+        .permissions
+        .install_replicated_remove_owner_in_database(
+            "change_stream",
+            database_id.as_u64(),
+            tenant_id,
+            &name,
+        );
 }

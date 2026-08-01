@@ -7,6 +7,7 @@ use tracing::{info, warn};
 use crate::control::server::sync::session::SyncSession;
 use crate::control::state::SharedState;
 
+use super::super::super::shape::ShapeScope;
 use super::super::super::wire::{SyncFrame, SyncMessageType};
 use super::authorize::{ShapeAuthorizationFailure, authorize_shape_subscription};
 use super::snapshot::{SnapshotRequest, take_shape_snapshot};
@@ -59,6 +60,7 @@ pub(in crate::control::server::sync) async fn handle_shape_subscribe_async(
     let response = super::super::super::shape::handler::handle_subscribe(
         &session.session_id,
         tenant_id.as_u64(),
+        database_id,
         &msg,
         &shared.shape_registry,
         current_lsn,
@@ -101,9 +103,25 @@ pub(in crate::control::server::sync) async fn handle_resync_request_async(
         return None;
     }
 
+    // Session IDs are reusable across reconnects, so the registry lookup is
+    // scoped to the authenticated tenant and database. A session with no
+    // established identity has no scope and therefore nothing to resync.
+    let Some(identity) = session.identity.as_ref() else {
+        log_refusal(
+            &session.session_id,
+            &msg.shape_id,
+            ShapeAuthorizationFailure::IdentityNotEstablished,
+        );
+        return None;
+    };
+    let scope = ShapeScope {
+        tenant_id: identity.tenant_id.as_u64(),
+        database_id: session.database_id(),
+    };
+
     let shape = match shared
         .shape_registry
-        .get_shape(&session.session_id, &msg.shape_id)
+        .get_shape(&session.session_id, scope, &msg.shape_id)
     {
         Some(s) => s,
         None => {
