@@ -245,6 +245,9 @@ impl From<Error> for NodeDbError {
             } => NodeDbError::dispatch(format!(
                 "raft leader change overwrote entry at group {group_id} index {log_index}; retry exhausted"
             )),
+            Error::MetadataLeaderUnavailable => NodeDbError::dispatch(
+                "metadata raft group has no elected leader yet; retry exhausted".to_string(),
+            ),
             Error::ExecutionLimitExceeded { detail } => NodeDbError::bad_request(detail),
             Error::LimitExceeded {
                 limit_name,

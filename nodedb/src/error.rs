@@ -230,6 +230,13 @@ pub enum Error {
     )]
     RetryableLeaderChange { group_id: u64, log_index: u64 },
 
+    /// No leader is elected on the metadata group yet, so a proposal cannot be
+    /// routed. Transient by construction — an election is in progress, most
+    /// often right after a restart — and distinct from a durable failure so
+    /// callers can wait it out instead of failing the statement.
+    #[error("metadata raft group has no elected leader yet; retry needed")]
+    MetadataLeaderUnavailable,
+
     #[error("execution limit exceeded: {detail}")]
     ExecutionLimitExceeded { detail: String },
 

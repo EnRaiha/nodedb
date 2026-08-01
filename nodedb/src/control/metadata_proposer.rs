@@ -117,8 +117,18 @@ impl MetadataRaftHandle for RaftLoopProposerHandle {
             tokio::runtime::Handle::current()
                 .block_on(raft_loop.propose_to_metadata_group_via_leader(bytes))
         })
-        .map_err(|e| Error::Config {
-            detail: format!("metadata propose: {e}"),
+        .map_err(|e| match e {
+            // An election in progress is transient, not a failure of this
+            // proposal. Keep it typed rather than flattening it into a generic
+            // config error, so callers can wait the election out instead of
+            // failing the statement — a node that has just restarted answers
+            // every metadata proposal this way for a moment.
+            nodedb_cluster::ClusterError::Raft(nodedb_raft::RaftError::NotLeader {
+                leader_hint: None,
+            }) => Error::MetadataLeaderUnavailable,
+            other => Error::Config {
+                detail: format!("metadata propose: {other}"),
+            },
         })
     }
 }
