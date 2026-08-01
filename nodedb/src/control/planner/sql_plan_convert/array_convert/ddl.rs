@@ -87,6 +87,24 @@ pub(in super::super) fn convert_create_array(
         })?;
     let schema_hash = stable_schema_hash(&schema.content_msgpack());
 
+    // Retention is carried as `u64` from the parser and stored signed, because
+    // downstream it is subtracted from a wall-clock millisecond
+    // (`now_ms - audit_retain_ms`) to place the purge horizon. Both parsers
+    // reject a negative, so today every value arrives inside `i64`; this is
+    // checked rather than cast so that a future entry point which skips that
+    // validation fails here instead of wrapping to a negative retention, which
+    // would put the horizon in the future and purge every version the array has.
+    let audit_retain_ms = audit_retain_ms
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| crate::Error::PlanError {
+            detail: format!(
+                "CREATE ARRAY {name}: audit_retain_ms exceeds the maximum supported \
+                 retention of {} ms",
+                i64::MAX
+            ),
+        })?;
+
     // 3. Build DDL metadata only. Catalog and retention mutations happen at
     // the authorized dispatch boundary, never while converting a SQL plan.
     let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
@@ -97,7 +115,7 @@ pub(in super::super) fn convert_create_array(
         schema_hash,
         created_at_ms: now_epoch_ms(),
         prefix_bits,
-        audit_retain_ms: audit_retain_ms.map(|ms| ms as i64),
+        audit_retain_ms,
         minimum_audit_retain_ms,
     };
     {
