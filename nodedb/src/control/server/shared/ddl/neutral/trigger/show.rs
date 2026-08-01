@@ -13,6 +13,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 
@@ -20,6 +21,7 @@ use super::super::super::result::{DdlError, DdlResult};
 pub fn show_triggers(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
@@ -43,7 +45,9 @@ pub fn show_triggers(
         "owner".to_string(),
     ];
 
-    let triggers = state.trigger_registry.list_for_tenant(tenant_id);
+    let triggers = state
+        .trigger_registry
+        .list_for_tenant(database_id, tenant_id);
     let mut sorted = triggers;
     sorted.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
 

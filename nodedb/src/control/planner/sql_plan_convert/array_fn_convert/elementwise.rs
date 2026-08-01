@@ -21,8 +21,8 @@ pub(crate) fn convert_elementwise(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    let lschema = load_schema(left_name, ctx)?;
-    let rschema = load_schema(right_name, ctx)?;
+    let lschema = load_schema(left_name, tenant_id, ctx)?;
+    let rschema = load_schema(right_name, tenant_id, ctx)?;
     if lschema.dims.len() != rschema.dims.len() || lschema.attrs.len() != rschema.attrs.len() {
         return Err(crate::Error::PlanError {
             detail: format!(
@@ -42,8 +42,8 @@ pub(crate) fn convert_elementwise(
             detail: format!("ARRAY_ELEMENTWISE: array '{right_name}' has no attr '{attr}'"),
         });
     }
-    let left = ArrayId::new(tenant_id, left_name);
-    let right = ArrayId::new(tenant_id, right_name);
+    let left = ArrayId::in_database(tenant_id, ctx.database_id, left_name);
+    let right = ArrayId::in_database(tenant_id, ctx.database_id, right_name);
     let vshard = VShardId::from_collection_in_database(ctx.database_id, left_name);
     Ok(vec![PhysicalTask {
         tenant_id,

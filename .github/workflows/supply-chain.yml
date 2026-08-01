@@ -1,0 +1,50 @@
+name: Supply Chain
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - supply-chain/**
+      - deny.toml
+      - scripts/ci/check_advisory_ignores.py
+      - .github/workflows/supply-chain.yml
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - supply-chain/**
+      - deny.toml
+      - scripts/ci/check_advisory_ignores.py
+      - .github/workflows/supply-chain.yml
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-vet:
+    name: cargo vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Verify advisory-ignore policy
+        run: |
+          python3 scripts/ci/check_advisory_ignores.py --self-test
+          python3 scripts/ci/check_advisory_ignores.py
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Install cargo-vet
+        run: cargo install cargo-vet --version 0.10.2 --locked
+
+      # The fuzz harness is a dev-only tool that ships no artifact, so it does
+      # not carry its own supply-chain baseline.
+      - name: Verify dependency audits
+        run: cargo vet --locked

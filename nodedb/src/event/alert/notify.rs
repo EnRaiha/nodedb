@@ -52,21 +52,43 @@ pub async fn dispatch_notifications(
     for target in &alert.notify_targets {
         match target {
             NotifyTarget::Topic { name } => {
-                notify_topic(state, alert.tenant_id, name, &event);
+                notify_topic(
+                    state,
+                    crate::types::DatabaseId::new(alert.database_id),
+                    alert.tenant_id,
+                    name,
+                    &event,
+                )
+                .await;
             }
             NotifyTarget::Webhook { url } => {
                 let timeout = Duration::from_secs(state.tuning.scheduler.webhook_timeout_secs);
                 notify_webhook_with_client(state.http_client(), url, &event, timeout).await;
             }
             NotifyTarget::InsertInto { table, columns } => {
-                notify_insert(state, alert.tenant_id, &alert.owner, table, columns, &event).await;
+                notify_insert(
+                    state,
+                    crate::types::DatabaseId::new(alert.database_id),
+                    alert.tenant_id,
+                    &alert.owner,
+                    table,
+                    columns,
+                    &event,
+                )
+                .await;
             }
         }
     }
 }
 
 /// Publish alert event to a CDC topic.
-fn notify_topic(state: &SharedState, tenant_id: u64, topic_name: &str, event: &AlertEvent) {
+async fn notify_topic(
+    state: &SharedState,
+    database_id: crate::types::DatabaseId,
+    tenant_id: u64,
+    topic_name: &str,
+    event: &AlertEvent,
+) {
     let payload = match sonic_rs::to_string(event) {
         Ok(p) => p,
         Err(e) => {
@@ -75,7 +97,15 @@ fn notify_topic(state: &SharedState, tenant_id: u64, topic_name: &str, event: &A
         }
     };
 
-    match crate::event::topic::publish::publish_to_topic(state, tenant_id, topic_name, &payload) {
+    match crate::event::topic::publish::publish_to_topic(
+        state,
+        database_id,
+        tenant_id,
+        topic_name,
+        &payload,
+    )
+    .await
+    {
         Ok(seq) => {
             info!(
                 alert = event.alert_name,
@@ -222,6 +252,7 @@ fn build_alert_insert_sql(table: &str, columns: &[String], event: &AlertEvent) -
 /// INSERT alert event into a history table via StatementExecutor.
 async fn notify_insert(
     state: &SharedState,
+    database_id: crate::types::DatabaseId,
     tenant_id: u64,
     owner: &str,
     table: &str,
@@ -253,7 +284,14 @@ async fn notify_insert(
         }
     };
 
-    let executor = StatementExecutor::new(state, identity, TenantId::new(tenant_id), 0);
+    let executor = StatementExecutor::with_source_in_database(
+        state,
+        identity,
+        TenantId::new(tenant_id),
+        database_id,
+        0,
+        crate::event::EventSource::User,
+    );
     let bindings = RowBindings::empty();
 
     if let Err(e) = executor.execute_block(&block, &bindings).await {

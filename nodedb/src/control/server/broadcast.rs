@@ -195,7 +195,10 @@ pub async fn broadcast_count_to_all_cores(
         total += decode_count_field(&resp.payload, count_key).unwrap_or(0);
     }
 
-    if had_error && total == 0 {
+    // A broadcast is an all-core barrier. Returning success after even one
+    // error would let callers finalize control-plane state while that core
+    // still retains the old Array store.
+    if had_error {
         return Err(crate::Error::Dispatch { detail: error_msg });
     }
 

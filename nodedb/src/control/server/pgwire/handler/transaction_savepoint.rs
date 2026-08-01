@@ -8,8 +8,6 @@
 //! marker capture/decode and the COMMIT OFFSET parsing live in the neutral
 //! core.
 
-use std::collections::HashMap;
-
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
@@ -17,7 +15,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::savepoint_ops::{
     self, DeferredOffsetCmd, SavepointError,
 };
-use crate::control::server::shared::session::{SessionId, TransactionState};
+use crate::control::server::shared::session::{PendingOffsetCommit, SessionId, TransactionState};
 
 use super::core::NodeDbPgHandler;
 use super::transaction_cmds::PgwireTxnDp;
@@ -50,47 +48,75 @@ impl NodeDbPgHandler {
         sql_trimmed: &str,
         upper: &str,
     ) -> Option<PgWireResult<Vec<Response>>> {
-        let cmd = savepoint_ops::parse_deferred_offset(sql_trimmed, upper)?;
+        let cmd = match savepoint_ops::parse_deferred_offset(sql_trimmed, upper) {
+            Ok(Some(cmd)) => cmd,
+            Ok(None) => return None,
+            Err(message) => {
+                return Some(Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42601".to_owned(),
+                    message,
+                )))));
+            }
+        };
         if self.sessions.transaction_state(session_id) != TransactionState::InBlock {
             return None;
         }
         let tenant_id = identity.tenant_id.as_u64();
+        let database_id = self
+            .sessions
+            .get_current_database(session_id)
+            .or(identity.default_database)?;
 
         match cmd {
             DeferredOffsetCmd::Single {
                 stream,
                 group,
                 partition_id,
-                lsn,
+                offset,
             } => {
+                let stream = crate::control::server::shared::ddl::neutral::consumer_group::identity::canonical_stream_name(
+                    &self.state,
+                    database_id,
+                    tenant_id,
+                    &stream,
+                );
                 self.sessions.defer_offset_commit(
                     session_id,
-                    tenant_id,
-                    stream,
-                    group,
-                    partition_id,
-                    lsn,
+                    PendingOffsetCommit {
+                        database_id,
+                        tenant_id,
+                        stream,
+                        group,
+                        partition_id,
+                        offset,
+                    },
                 );
                 Some(Ok(vec![Response::Execution(Tag::new("COMMIT OFFSET"))]))
             }
             DeferredOffsetCmd::Batch { stream, group } => {
-                if let Some(buffer) = self.state.cdc_router.get_buffer(tenant_id, &stream) {
-                    let events = buffer.read_from_lsn(0, usize::MAX);
-                    let mut latest: HashMap<u32, u64> = HashMap::new();
-                    for e in &events {
-                        let entry = latest.entry(e.partition).or_insert(0);
-                        if e.lsn > *entry {
-                            *entry = e.lsn;
-                        }
-                    }
-                    for (pid, lsn) in latest {
+                let stream = crate::control::server::shared::ddl::neutral::consumer_group::identity::canonical_stream_name(
+                    &self.state,
+                    database_id,
+                    tenant_id,
+                    &stream,
+                );
+                if let Some(buffer) =
+                    self.state
+                        .cdc_router
+                        .get_buffer(database_id, tenant_id, &stream)
+                {
+                    for (pid, offset) in buffer.partition_tails() {
                         self.sessions.defer_offset_commit(
                             session_id,
-                            tenant_id,
-                            stream.clone(),
-                            group.clone(),
-                            pid,
-                            lsn,
+                            PendingOffsetCommit {
+                                database_id,
+                                tenant_id,
+                                stream: stream.clone(),
+                                group: group.clone(),
+                                partition_id: pid,
+                                offset,
+                            },
                         );
                     }
                 }

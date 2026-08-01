@@ -17,9 +17,14 @@ use std::collections::HashMap;
 
 use sonic_rs;
 
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::auth_context::AuthContext;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::server::shared::authorization::{authorize_collection, authorize_task_set};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, TraceId, VShardId};
 use nodedb_physical::physical_plan::DocumentOp;
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::registry::DmlEvent;
 
@@ -264,23 +269,48 @@ pub fn patch_task_with_mutated_fields(
 
 /// Fetch the current document as a field map (for OLD row bindings).
 ///
-/// Issues a PointGet to the Data Plane and deserializes the response.
-/// Returns an empty map if the document doesn't exist or can't be read.
+/// This is a user-derived read, even when it is performed as part of a write
+/// hook. It therefore authorizes `READ` before touching surrogate/catalog state,
+/// injects the session's RLS predicate, and dispatches only an exact authorized
+/// task. An empty map means the surrogate or row is genuinely absent; all other
+/// failures propagate so callers cannot misclassify them as an absent OLD row.
 pub async fn fetch_old_row(
     state: &SharedState,
+    identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
-    tenant_id: TenantId,
+    auth: &AuthContext,
     collection: &str,
     document_id: &str,
-) -> HashMap<String, nodedb_types::Value> {
+) -> crate::Result<HashMap<String, nodedb_types::Value>> {
+    let tenant_id = identity.tenant_id;
+    if auth.tenant_id != tenant_id || auth.database_id != Some(database_id) {
+        return Err(crate::Error::RejectedAuthz {
+            tenant_id,
+            resource: "OLD-row fetch auth context is not aligned to the selected database"
+                .to_owned(),
+        });
+    }
+
+    let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+    authorize_collection(
+        identity,
+        database_id,
+        collection,
+        Permission::Read,
+        &state.permissions,
+        &state.roles,
+        &audit,
+    )?;
+
     let pk_bytes = document_id.as_bytes().to_vec();
-    let surrogate = state
-        .surrogate_assigner
-        .lookup(database_id, tenant_id, collection, &pk_bytes)
-        .ok()
-        .flatten()
-        .unwrap_or(nodedb_types::Surrogate::ZERO);
-    let plan = crate::bridge::envelope::PhysicalPlan::Document(DocumentOp::PointGet {
+    let Some(surrogate) =
+        state
+            .surrogate_assigner
+            .lookup(database_id, tenant_id, collection, &pk_bytes)?
+    else {
+        return Ok(HashMap::new());
+    };
+    let mut plan = crate::bridge::envelope::PhysicalPlan::Document(DocumentOp::PointGet {
         collection: collection.to_string(),
         document_id: document_id.to_string(),
         surrogate,
@@ -289,59 +319,228 @@ pub async fn fetch_old_row(
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
-    let vshard_id = VShardId::from_key(document_id.as_bytes());
+    crate::control::planner::rls_injection::inject_rls_for_single_plan(
+        tenant_id.as_u64(),
+        &mut plan,
+        &state.rls,
+        auth,
+    )?;
 
-    let resp = match crate::control::server::dispatch_utils::dispatch_to_data_plane(
-        state,
+    let task = PhysicalTask {
         tenant_id,
         database_id,
-        vshard_id,
+        vshard_id: VShardId::from_key(document_id.as_bytes()),
         plan,
+        post_set_op: PostSetOp::None,
+        txn_id: None,
+    };
+    let authorized = authorize_task_set(
+        identity,
+        std::slice::from_ref(&task),
+        &state.permissions,
+        &state.roles,
+        &audit,
+    )?
+    .into_tasks()
+    .into_iter()
+    .next()
+    .ok_or_else(|| crate::Error::Internal {
+        detail: "authorization returned no task capability for OLD-row fetch".into(),
+    })?;
+    let resp = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
+        state,
+        authorized,
         TraceId::ZERO,
     )
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => return HashMap::new(),
-    };
+    .await?;
 
     if resp.payload.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
 
-    // Decode the response payload (MessagePack or JSON).
+    // Decode the response payload (MessagePack or JSON). A non-object payload
+    // is a transport/protocol failure, not evidence that the row is absent.
     let bytes = resp.payload.as_ref();
     if let Ok(serde_json::Value::Object(map)) = nodedb_types::json_from_msgpack(bytes) {
-        return map
+        return Ok(map
             .into_iter()
             .map(|(k, v)| (k, nodedb_types::Value::from(v)))
-            .collect();
+            .collect());
     }
     if let Ok(serde_json::Value::Object(map)) = sonic_rs::from_slice::<serde_json::Value>(bytes) {
-        return map
+        return Ok(map
             .into_iter()
             .map(|(k, v)| (k, nodedb_types::Value::from(v)))
-            .collect();
+            .collect());
     }
 
-    HashMap::new()
+    Err(crate::Error::PlanError {
+        detail: format!("invalid OLD-row response payload for collection '{collection}'"),
+    })
 }
 
 /// Check if any triggers exist for this collection+event combination.
 ///
 /// Quick check to avoid fetch_old_row and other overhead when no triggers are defined.
-pub fn has_triggers(state: &SharedState, tenant_id: TenantId, collection: &str) -> bool {
+pub fn has_triggers(
+    state: &SharedState,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    collection: &str,
+) -> bool {
     let tid = tenant_id.as_u64();
     !state
         .trigger_registry
-        .get_matching(tid, collection, DmlEvent::Insert)
+        .get_matching(database_id, tid, collection, DmlEvent::Insert)
         .is_empty()
         || !state
             .trigger_registry
-            .get_matching(tid, collection, DmlEvent::Update)
+            .get_matching(database_id, tid, collection, DmlEvent::Update)
             .is_empty()
         || !state
             .trigger_registry
-            .get_matching(tid, collection, DmlEvent::Delete)
+            .get_matching(database_id, tid, collection, DmlEvent::Delete)
             .is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::security::auth_context::AuthContext;
+    use crate::control::security::identity::{
+        AuthMethod, AuthenticatedIdentity, DatabaseSet, Role,
+    };
+    use crate::control::state::SharedState;
+    use crate::types::{DatabaseId, TenantId};
+    use crate::wal::WalManager;
+
+    use super::fetch_old_row;
+
+    fn regular_identity(database_id: DatabaseId) -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_regular(
+            42,
+            "trigger-reader",
+            TenantId::new(7),
+            AuthMethod::Trust,
+            vec![Role::Custom("trigger_observer".into())],
+            Some(database_id),
+            DatabaseSet::Some(smallvec::smallvec![database_id]),
+        )
+    }
+
+    #[tokio::test]
+    async fn fetch_old_row_denies_unreadable_collection_before_lookup_or_dispatch() {
+        let directory = tempfile::tempdir().expect("create trigger hook test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("trigger-hook.wal"))
+                .expect("open trigger hook test WAL"),
+        );
+        let (dispatcher, mut data_sides) = Dispatcher::new(1, 1);
+        let state = SharedState::new(dispatcher, wal).expect("construct trigger hook state");
+        let database_id = DatabaseId::new(17);
+        let identity = regular_identity(database_id);
+        let mut auth = AuthContext::from_identity(&identity, "trigger-hook-session".into());
+        auth.database_id = Some(database_id);
+        let collection = "orders";
+        let document_id = "order-42";
+        let initial_hwm = state
+            .surrogate_registry
+            .read()
+            .expect("read surrogate registry")
+            .current_hwm();
+
+        let error = fetch_old_row(
+            &state,
+            &identity,
+            database_id,
+            &auth,
+            collection,
+            document_id,
+        )
+        .await
+        .expect_err("custom role without READ grant must not fetch OLD row");
+
+        assert!(matches!(
+            error,
+            crate::Error::RejectedAuthz { tenant_id, resource }
+                if tenant_id == TenantId::new(7)
+                    && resource == "permission denied: user 'trigger-reader' lacks Read permission on 'orders'"
+        ));
+        assert_eq!(
+            state
+                .surrogate_registry
+                .read()
+                .expect("read surrogate registry")
+                .current_hwm(),
+            initial_hwm,
+            "authorization denial must not allocate a surrogate"
+        );
+        assert_eq!(
+            state
+                .surrogate_assigner
+                .lookup(
+                    database_id,
+                    identity.tenant_id,
+                    collection,
+                    document_id.as_bytes()
+                )
+                .expect("inspect surrogate binding after denial"),
+            None,
+            "authorization denial must not create a surrogate binding"
+        );
+        assert!(
+            data_sides.remove(0).request_rx.try_pop().is_err(),
+            "authorization denial must not dispatch an OLD-row read"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_old_row_rejects_misaligned_auth_context_before_authorization() {
+        let directory = tempfile::tempdir().expect("create trigger hook test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("trigger-hook.wal"))
+                .expect("open trigger hook test WAL"),
+        );
+        let (dispatcher, mut data_sides) = Dispatcher::new(1, 1);
+        let state = SharedState::new(dispatcher, wal).expect("construct trigger hook state");
+        let database_id = DatabaseId::new(17);
+        let identity = regular_identity(database_id);
+        let mut auth = AuthContext::from_identity(&identity, "trigger-hook-session".into());
+        auth.database_id = Some(DatabaseId::new(18));
+        let initial_hwm = state
+            .surrogate_registry
+            .read()
+            .expect("read surrogate registry")
+            .current_hwm();
+
+        let error = fetch_old_row(&state, &identity, database_id, &auth, "orders", "order-42")
+            .await
+            .expect_err("misaligned auth context must be rejected before authorization");
+
+        assert!(matches!(
+            error,
+            crate::Error::RejectedAuthz { tenant_id, resource }
+                if tenant_id == TenantId::new(7)
+                    && resource == "OLD-row fetch auth context is not aligned to the selected database"
+        ));
+        assert_eq!(
+            state
+                .surrogate_registry
+                .read()
+                .expect("read surrogate registry")
+                .current_hwm(),
+            initial_hwm,
+            "misaligned context must not allocate a surrogate"
+        );
+        assert!(
+            state.audit.lock().expect("read audit log").is_empty(),
+            "context rejection must occur before collection authorization"
+        );
+        assert!(
+            data_sides.remove(0).request_rx.try_pop().is_err(),
+            "context rejection must not dispatch an OLD-row read"
+        );
+    }
 }

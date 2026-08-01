@@ -15,6 +15,7 @@ use crate::control::state::SharedState;
 pub(super) async fn fire_sync_after_triggers(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: nodedb_types::DatabaseId,
     tenant_id: nodedb_types::TenantId,
     coll_name: &str,
     fields: &std::collections::HashMap<String, nodedb_types::Value>,
@@ -24,6 +25,7 @@ pub(super) async fn fire_sync_after_triggers(
         crate::control::trigger::fire::FireAfterInsertParams {
             state,
             identity,
+            database_id,
             tenant_id,
             collection: coll_name,
             new_fields: fields,
@@ -50,6 +52,7 @@ pub(super) async fn fire_sync_after_triggers(
 pub(super) async fn fire_sync_after_update_triggers(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: nodedb_types::DatabaseId,
     tenant_id: nodedb_types::TenantId,
     coll_name: &str,
     old_fields: &std::collections::HashMap<String, nodedb_types::Value>,
@@ -60,6 +63,7 @@ pub(super) async fn fire_sync_after_update_triggers(
         crate::control::trigger::fire_after::FireAfterUpdateParams {
             state,
             identity,
+            database_id,
             tenant_id,
             collection: coll_name,
             old_fields,
@@ -83,13 +87,20 @@ pub(super) async fn fire_sync_after_update_triggers(
 pub(super) async fn fire_instead_triggers(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: nodedb_types::DatabaseId,
     tenant_id: nodedb_types::TenantId,
     coll_name: &str,
     fields: &std::collections::HashMap<String, nodedb_types::Value>,
     tag: &str,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     match crate::control::trigger::fire_instead::fire_instead_of_insert(
-        state, identity, tenant_id, coll_name, fields, 0,
+        state,
+        identity,
+        database_id,
+        tenant_id,
+        coll_name,
+        fields,
+        0,
     )
     .await
     {
@@ -108,13 +119,20 @@ pub(super) async fn fire_instead_triggers(
 pub(super) async fn fire_before_triggers(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: nodedb_types::DatabaseId,
     tenant_id: nodedb_types::TenantId,
     coll_name: &str,
     fields: &std::collections::HashMap<String, nodedb_types::Value>,
 ) -> Result<std::collections::HashMap<String, nodedb_types::Value>, Result<Vec<DdlResult>, DdlError>>
 {
     match crate::control::trigger::fire_before::fire_before_insert(
-        state, identity, tenant_id, coll_name, fields, 0,
+        state,
+        identity,
+        database_id,
+        tenant_id,
+        coll_name,
+        fields,
+        0,
     )
     .await
     {

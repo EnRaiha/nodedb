@@ -1,0 +1,53 @@
+# Static security/architecture gates. Text-only checks — no toolchain, no
+# compile, a few seconds total — so they run on every PR rather than sitting
+# behind the `run-ci` label that gates the ~10-minute compile suite.
+#
+# Also run inside test.yml, which covers the release path.
+
+name: Static gates
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: static-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: Static gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Warm-storage ObjectStore gate
+        run: bash scripts/ci/check_warm_storage_gate.sh
+      - name: Format-path .expect() gate
+        run: bash scripts/ci/check_format_expects.sh
+      - name: Calvin determinism gate
+        run: bash scripts/ci/check_calvin_determinism.sh
+      - name: Plane-separation gate
+        run: bash scripts/ci/check_plane_separation.sh
+      - name: Raft transport-boundary gate
+        run: python3 scripts/ci/check_raft_transport_boundary.py
+      - name: Reconstructed-SQL gate
+        run: |
+          python3 scripts/ci/check_reconstructed_sql.py --self-test
+          python3 scripts/ci/check_reconstructed_sql.py
+      - name: Authorized-dispatch gate
+        run: |
+          python3 scripts/ci/check_authorized_dispatch.py --self-test
+          python3 scripts/ci/check_authorized_dispatch.py
+      - name: Robust-parsing gate
+        run: |
+          python3 scripts/ci/check_robust_parsing.py --self-test
+          python3 scripts/ci/check_robust_parsing.py
+      - name: Advisory-ignore policy gate
+        run: |
+          python3 scripts/ci/check_advisory_ignores.py --self-test
+          python3 scripts/ci/check_advisory_ignores.py

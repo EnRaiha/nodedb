@@ -44,6 +44,7 @@ fn ctx_with_catalog() -> (ConvertContext, tempfile::TempDir) {
     }
 
     let ctx = ConvertContext {
+        purpose: crate::control::planner::sql_plan_convert::PlanningPurpose::Execute,
         retention_registry: None,
         array_catalog: None,
         credentials: Some(Arc::new(store)),

@@ -1,208 +1,221 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Change Data Capture (CDC) API endpoints.
-//!
-//! Two modes:
-//!
-//! 1. **SSE streaming** (`GET /cdc/{collection}`) — Server-Sent Events stream
-//!    that pushes changes in real-time. Connection stays open. Supports
-//!    `Last-Event-ID` header for reconnection replay.
-//!
-//! 2. **Pull-based polling** (`GET /cdc/{collection}/poll`) — Returns a batch
-//!    of changes since a cursor. Non-streaming, returns immediately. For
-//!    Kafka Connect / Debezium-style integration.
+//! Change Data Capture SSE and polling endpoints.
 
 use std::convert::Infallible;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
 use serde::Deserialize;
 
 use super::super::auth::{ApiError, AppState, ResolvedIdentity};
-use crate::control::change_stream::ChangeEvent;
-use crate::types::TenantId;
+use super::query::{DatabaseQueryParam, resolve_database_id};
+use crate::control::change_stream::{ChangeCursor, ReplayError, ReplayStart, SequencedChangeEvent};
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::Permission;
+use crate::control::server::shared::authorization::{authorize_collection, authorize_database};
 
-/// Query parameters for the SSE endpoint.
-///
-/// `tenant_id` is intentionally removed — callers must not control which
-/// tenant they act as via a query-string parameter.
 #[derive(Deserialize, Default)]
 pub struct SseParams {
-    /// Start streaming from this timestamp (epoch ms). Default: now.
     pub since_ms: Option<u64>,
-    /// If a caller passes `tenant_id`, we detect and reject it to prevent
-    /// cross-tenant escalation. The field is present only for rejection.
     pub tenant_id: Option<u64>,
+    pub database: Option<String>,
 }
 
-/// Query parameters for the poll endpoint.
 #[derive(Deserialize, Default)]
 pub struct PollParams {
-    /// Return changes since this timestamp (epoch ms). Default: 0 (all).
     pub since_ms: Option<u64>,
-    /// Return changes since this LSN. Overrides since_ms if set.
-    pub since_lsn: Option<u64>,
-    /// Maximum changes to return. Default: 100.
+    pub cursor: Option<String>,
+    /// Retained as a string solely so it produces the explicit migration error.
+    pub since_lsn: Option<String>,
     pub limit: Option<usize>,
-    /// Detected and rejected — never honoured.
     pub tenant_id: Option<u64>,
+    pub database: Option<String>,
 }
 
-/// SSE streaming endpoint: `GET /cdc/{collection}`
 pub async fn sse_stream(
     identity: ResolvedIdentity,
     Path(collection): Path<String>,
     Query(params): Query<SseParams>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    // Reject any attempt to override the caller's tenant via query string.
-    if params.tenant_id.is_some() {
-        return Err(ApiError::Forbidden(
-            "tenant_id must not be supplied as a query parameter; \
-             tenant is determined from the bearer token"
-                .into(),
-        ));
-    }
-
+    reject_tenant_override(params.tenant_id)?;
     let collection = collection.to_lowercase();
     let tenant_id = identity.tenant_id();
-    let since_ms = params.since_ms.unwrap_or(0);
+    let database_id = resolve_database_id(
+        &headers,
+        &DatabaseQueryParam {
+            database: params.database.clone(),
+        },
+        &state,
+    )?;
+    authorize(&identity, &state, database_id, &collection)?;
+    let cursor = parse_last_event_id(&headers)?;
+    if cursor.is_some() && params.since_ms.is_some() {
+        return Err(ApiError::BadRequest(
+            "since_ms is allowed only for an initial CDC stream".into(),
+        ));
+    }
+    let start = cursor
+        .map(ReplayStart::Cursor)
+        .unwrap_or(ReplayStart::Timestamp(params.since_ms.unwrap_or(0)));
     let shared = Arc::clone(&state.shared);
-
-    // First, replay any missed events from the ring buffer. The ring is shared
-    // by every tenant on the node, so the query is tenant-scoped at the source.
-    let backlog =
-        shared
-            .change_stream
-            .query_changes(tenant_id, Some(&collection), since_ms, 10_000);
-
-    // Then subscribe for new events going forward.
-    let mut subscription = shared
+    let mut subscription = shared.change_stream.subscribe_in_database(
+        Some(collection.clone()),
+        Some(tenant_id),
+        database_id,
+    );
+    let snapshot = shared
         .change_stream
-        .subscribe(Some(collection.clone()), Some(tenant_id));
-
+        .query_changes_in_database(tenant_id, database_id, Some(&collection), start, 10_000)
+        .map_err(reset_error)?;
+    let snapshot_cursor = snapshot.snapshot_cursor;
     let stream = async_stream::stream! {
-        // Phase 1: replay backlog.
-        for event in backlog {
-            yield Ok(format_sse_event(&event));
-        }
-
-        // Phase 2: stream new events as they arrive.
+        for event in snapshot.events { yield Ok(format_sse_event(&event)); }
         loop {
-            match subscription.recv_filtered().await {
+            match subscription.recv_sequenced().await {
                 Ok(event) => {
+                    if !event.cursor().same_epoch(snapshot_cursor) {
+                        yield Ok(Event::default().event("reset_required").data("change stream epoch changed; reconnect with a fresh snapshot"));
+                        break;
+                    }
+                    if !event.cursor().is_after_in_same_epoch(snapshot_cursor) { continue; }
                     yield Ok(format_sse_event(&event));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    yield Ok(Event::default()
-                        .event("warning")
-                        .data(format!("lagged {n} events")));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    yield Ok(Event::default().event("reset_required").data("change stream lagged; reconnect with a fresh snapshot"));
                     break;
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     };
-
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
-/// Poll endpoint: `GET /cdc/{collection}/poll`
 pub async fn poll_changes(
     identity: ResolvedIdentity,
     Path(collection): Path<String>,
     Query(params): Query<PollParams>,
     State(state): State<AppState>,
-) -> impl IntoResponse {
-    // Reject any attempt to override the caller's tenant via query string.
-    if params.tenant_id.is_some() {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "tenant_id must not be supplied as a query parameter"
-            })),
-        )
-            .into_response();
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    reject_tenant_override(params.tenant_id)?;
+    if params.since_lsn.is_some() {
+        return Err(ApiError::BadRequest(
+            "since_lsn is no longer supported; use the opaque cursor parameter".into(),
+        ));
     }
-
-    let tenant_id: TenantId = identity.tenant_id();
     let collection = collection.to_lowercase();
-    let since_ms = params.since_ms.unwrap_or(0);
-    let limit = params.limit.unwrap_or(100).min(10_000);
-
-    // A change row exposes the collection's document ids and post-images, so
-    // reading the stream needs the same grant reading the collection needs.
-    if let Err(error) = crate::control::server::shared::authorization::authorize_collection(
-        &identity.0,
-        crate::types::DatabaseId::DEFAULT,
-        &collection,
-        crate::control::security::identity::Permission::Read,
-        &state.shared.permissions,
-        &state.shared.roles,
-        &crate::control::security::audit::NoopAuditEmitter,
-    ) {
-        return (
-            axum::http::StatusCode::FORBIDDEN,
-            format!("permission denied: {}", error.resource()),
-        )
-            .into_response();
+    let tenant_id = identity.tenant_id();
+    let database_id = resolve_database_id(
+        &headers,
+        &DatabaseQueryParam {
+            database: params.database.clone(),
+        },
+        &state,
+    )?;
+    authorize(&identity, &state, database_id, &collection)?;
+    let cursor = params.cursor.as_deref().map(parse_cursor).transpose()?;
+    if cursor.is_some() && params.since_ms.is_some() {
+        return Err(ApiError::BadRequest(
+            "since_ms is allowed only for an initial CDC poll".into(),
+        ));
     }
-
-    let changes =
-        state
-            .shared
-            .change_stream
-            .query_changes(tenant_id, Some(&collection), since_ms, limit);
-
-    let change_json: Vec<serde_json::Value> = changes
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "operation": e.operation.as_str(),
-                "document_id": e.document_id,
-                "timestamp_ms": e.timestamp_ms,
-                "lsn": e.lsn.as_u64(),
-                "collection": e.collection,
-            })
-        })
-        .collect();
-
-    let next_cursor = changes.last().map(|last| {
-        serde_json::json!({
-            "since_ms": last.timestamp_ms + 1,
-            "since_lsn": last.lsn.as_u64() + 1,
-        })
-    });
-
-    let has_more = changes.len() >= limit;
-
-    Json(serde_json::json!({
-        "changes": change_json,
-        "next_cursor": next_cursor,
-        "has_more": has_more,
-        "count": changes.len(),
-    }))
-    .into_response()
+    let start = cursor
+        .map(ReplayStart::Cursor)
+        .unwrap_or(ReplayStart::Timestamp(params.since_ms.unwrap_or(0)));
+    let limit = params.limit.unwrap_or(100).clamp(1, 10_000);
+    let mut snapshot = state
+        .shared
+        .change_stream
+        .query_changes_in_database(tenant_id, database_id, Some(&collection), start, limit + 1)
+        .map_err(reset_error)?;
+    let has_more = snapshot.events.len() > limit;
+    if has_more {
+        snapshot.events.truncate(limit);
+    }
+    let changes: Vec<_> = snapshot.events.iter().map(change_json).collect();
+    let next_cursor = snapshot
+        .events
+        .last()
+        .map(|event| serde_json::json!({"cursor": event.cursor().to_string()}));
+    Ok(Json(serde_json::json!({ "changes": changes, "next_cursor": next_cursor, "has_more": has_more, "count": snapshot.events.len() })).into_response())
 }
 
-/// Format a ChangeEvent as an SSE Event.
-fn format_sse_event(event: &ChangeEvent) -> Event {
-    let data = serde_json::json!({
-        "collection": event.collection,
-        "operation": event.operation.as_str(),
-        "document_id": event.document_id,
-        "timestamp_ms": event.timestamp_ms,
-        "lsn": event.lsn.as_u64(),
-    });
+fn reject_tenant_override(tenant_id: Option<u64>) -> Result<(), ApiError> {
+    if tenant_id.is_some() {
+        Err(ApiError::Forbidden("tenant_id must not be supplied as a query parameter; tenant is determined from the bearer token".into()))
+    } else {
+        Ok(())
+    }
+}
 
+fn authorize(
+    identity: &ResolvedIdentity,
+    state: &AppState,
+    database_id: nodedb_types::DatabaseId,
+    collection: &str,
+) -> Result<(), ApiError> {
+    let emitter = ArcAuditEmitter(Arc::clone(&state.shared.audit));
+    authorize_database(&identity.0, database_id, &emitter)
+        .map_err(crate::Error::from)
+        .map_err(ApiError::from)?;
+    authorize_collection(
+        &identity.0,
+        database_id,
+        collection,
+        Permission::Read,
+        &state.shared.permissions,
+        &state.shared.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)
+    .map_err(ApiError::from)
+}
+
+fn parse_cursor(token: &str) -> Result<ChangeCursor, ApiError> {
+    ChangeCursor::from_str(token)
+        .map_err(|_| ApiError::BadRequest("cursor must be a valid opaque change cursor".into()))
+}
+
+fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<ChangeCursor>, ApiError> {
+    let Some(value) = headers.get("last-event-id") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest("Last-Event-ID must be an opaque change cursor".into()))?
+        .trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        parse_cursor(value).map(Some)
+    }
+}
+
+fn reset_error(_: ReplayError) -> ApiError {
+    ApiError::HttpStatus(
+        410,
+        "reset_required: cursor is expired, from a different stream epoch, or ahead of the stream"
+            .into(),
+    )
+}
+
+fn change_json(event: &SequencedChangeEvent) -> serde_json::Value {
+    serde_json::json!({ "operation": event.operation.as_str(), "document_id": event.document_id, "timestamp_ms": event.timestamp_ms, "lsn": event.lsn.as_u64(), "collection": event.collection, "cursor": event.cursor().to_string() })
+}
+
+fn format_sse_event(event: &SequencedChangeEvent) -> Event {
     Event::default()
-        .id(event.lsn.as_u64().to_string())
+        .id(event.cursor().to_string())
         .event(event.operation.as_str().to_lowercase())
-        .data(data.to_string())
+        .data(change_json(event).to_string())
 }

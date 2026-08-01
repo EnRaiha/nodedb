@@ -17,7 +17,7 @@ use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::security::catalog::trigger_types::TriggerTiming;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 use super::fire_common::{FireTriggersParams, check_cascade_depth, fire_triggers};
 use super::registry::DmlEvent;
@@ -38,15 +38,18 @@ pub enum InsteadOfResult {
 pub async fn fire_instead_of_insert(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     tenant_id: TenantId,
     collection: &str,
     new_fields: &HashMap<String, nodedb_types::Value>,
     cascade_depth: u32,
 ) -> crate::Result<InsteadOfResult> {
-    let triggers =
-        state
-            .trigger_registry
-            .get_matching(tenant_id.as_u64(), collection, DmlEvent::Insert);
+    let triggers = state.trigger_registry.get_matching(
+        database_id,
+        tenant_id.as_u64(),
+        collection,
+        DmlEvent::Insert,
+    );
 
     let instead_triggers: Vec<_> = triggers
         .into_iter()
@@ -84,6 +87,8 @@ pub struct InsteadOfUpdateParams<'a> {
     pub state: &'a SharedState,
     /// Caller identity (used unless a trigger is SECURITY DEFINER).
     pub identity: &'a AuthenticatedIdentity,
+    /// Database scope for trigger lookup and execution.
+    pub database_id: DatabaseId,
     /// Tenant scope for trigger lookup and execution.
     pub tenant_id: TenantId,
     /// Target collection name.
@@ -103,6 +108,7 @@ pub async fn fire_instead_of_update(
     let InsteadOfUpdateParams {
         state,
         identity,
+        database_id,
         tenant_id,
         collection,
         old_fields,
@@ -110,10 +116,12 @@ pub async fn fire_instead_of_update(
         cascade_depth,
     } = params;
 
-    let triggers =
-        state
-            .trigger_registry
-            .get_matching(tenant_id.as_u64(), collection, DmlEvent::Update);
+    let triggers = state.trigger_registry.get_matching(
+        database_id,
+        tenant_id.as_u64(),
+        collection,
+        DmlEvent::Update,
+    );
 
     let instead_triggers: Vec<_> = triggers
         .into_iter()
@@ -149,15 +157,18 @@ pub async fn fire_instead_of_update(
 pub async fn fire_instead_of_delete(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     tenant_id: TenantId,
     collection: &str,
     old_fields: &HashMap<String, nodedb_types::Value>,
     cascade_depth: u32,
 ) -> crate::Result<InsteadOfResult> {
-    let triggers =
-        state
-            .trigger_registry
-            .get_matching(tenant_id.as_u64(), collection, DmlEvent::Delete);
+    let triggers = state.trigger_registry.get_matching(
+        database_id,
+        tenant_id.as_u64(),
+        collection,
+        DmlEvent::Delete,
+    );
 
     let instead_triggers: Vec<_> = triggers
         .into_iter()

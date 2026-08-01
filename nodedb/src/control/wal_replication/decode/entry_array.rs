@@ -75,7 +75,7 @@ fn cell_put(
         }
     }
     Ok(PhysicalPlan::Array(ArrayOp::Put {
-        array_id: ArrayId::new(ctx.tenant_id, array),
+        array_id: ArrayId::in_database(ctx.tenant_id, ctx.database_id, array),
         cells_msgpack: cells_msgpack.to_vec(),
         wal_lsn: 0,
         provenance: decode_provenance(provenance)?,
@@ -92,7 +92,7 @@ fn cell_delete(
     provenance: &Option<Vec<u8>>,
 ) -> crate::Result<PhysicalPlan> {
     Ok(PhysicalPlan::Array(ArrayOp::Delete {
-        array_id: ArrayId::new(ctx.tenant_id, array),
+        array_id: ArrayId::in_database(ctx.tenant_id, ctx.database_id, array),
         coords_msgpack: coords_msgpack.to_vec(),
         wal_lsn: 0,
         provenance: decode_provenance(provenance)?,

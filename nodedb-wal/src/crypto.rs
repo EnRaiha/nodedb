@@ -505,6 +505,59 @@ mod tests {
     }
 
     #[test]
+    fn nonce_construction_is_injective_for_bounded_generated_wal_pairs() {
+        use std::collections::HashSet;
+
+        const GENERATED_PAIR_BUDGET: usize = 4_096;
+
+        // Exercise the endpoints and the 32-bit transition in the LSN space,
+        // then add a fixed-size deterministic corpus. The production domain is
+        // the full u64 LSN space; this bounded test corpus makes the injective
+        // [epoch || lsn.to_le_bytes()] construction executable in unit tests.
+        let mut pairs = vec![
+            ([0x00; 4], 0),
+            ([0x00; 4], 1),
+            ([0x00; 4], u32::MAX as u64),
+            ([0x00; 4], u32::MAX as u64 + 1),
+            ([0x00; 4], u64::MAX),
+            ([0xff; 4], 0),
+            ([0xff; 4], u64::MAX),
+            ([0x01, 0x00, 0x00, 0x00], 0),
+            ([0x00, 0x01, 0x00, 0x00], 0),
+        ];
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        for _ in 0..GENERATED_PAIR_BUDGET {
+            // A fixed arithmetic/xorshift sequence produces a deterministic,
+            // well-distributed corpus; pair uniqueness is asserted below rather
+            // than assumed.
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let epoch = (state ^ (state >> 32)).to_le_bytes()[..4]
+                .try_into()
+                .expect("four-byte epoch");
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let lsn = state ^ (state >> 30);
+            pairs.push((epoch, lsn));
+        }
+
+        let mut distinct_pairs = HashSet::with_capacity(pairs.len());
+        let mut distinct_nonces = HashSet::with_capacity(pairs.len());
+        for (epoch, lsn) in pairs {
+            assert!(
+                distinct_pairs.insert((epoch, lsn)),
+                "generated corpus must contain only distinct (epoch, LSN) pairs"
+            );
+            let nonce = lsn_to_nonce(&epoch, lsn);
+            let mut nonce_bytes = [0u8; 12];
+            nonce_bytes.copy_from_slice(&nonce);
+            assert!(
+                distinct_nonces.insert(nonce_bytes),
+                "distinct (epoch, LSN) pairs must not share a 96-bit nonce"
+            );
+        }
+        assert_eq!(distinct_nonces.len(), distinct_pairs.len());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn from_file_0o600_accepted() {
         use std::io::Write as _;

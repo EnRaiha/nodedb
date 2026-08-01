@@ -177,6 +177,7 @@ pub async fn spawn_protocol_listeners(
         sync_listener,
         sync_config,
         Some(Arc::clone(&shared)),
+        shutdown_bus.clone(),
     )
     .await;
     info!(

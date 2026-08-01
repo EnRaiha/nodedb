@@ -96,6 +96,8 @@ ALLOWED_REFERENCES = {
     ),
     ("control/array_sync/inbound.rs", "into_scope"),
     ("control/array_sync/inbound_propose.rs", "into_scope"),
+    ("control/array_sync/snapshot_assembly.rs", "into_scope"),
+    ("control/server/native/dispatch/sql_loop.rs", "into_physical_task"),
     ("control/server/sync/raft_dispatch.rs", "propose_sync_write"),
     (
         "control/server/pgwire/handler/dispatch.rs",

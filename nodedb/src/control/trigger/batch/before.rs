@@ -16,7 +16,7 @@ use crate::control::planner::procedural::executor::core::StatementExecutor;
 use crate::control::security::catalog::trigger_types::TriggerTiming;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 use super::collector::TriggerBatchRow;
 use super::error_blame::ErrorAccumulator;
@@ -38,6 +38,8 @@ pub struct BeforeBatchParams<'a> {
     pub state: &'a SharedState,
     /// Caller identity (used unless a trigger is SECURITY DEFINER).
     pub identity: &'a AuthenticatedIdentity,
+    /// Database scope for trigger lookup and execution.
+    pub database_id: DatabaseId,
     /// Tenant scope for trigger lookup and execution.
     pub tenant_id: TenantId,
     /// Target collection name.
@@ -65,6 +67,7 @@ pub async fn execute_before_batch(
     let BeforeBatchParams {
         state,
         identity,
+        database_id,
         tenant_id,
         collection,
         event,
@@ -72,9 +75,10 @@ pub async fn execute_before_batch(
         cascade_depth,
     } = params;
 
-    let triggers = state
-        .trigger_registry
-        .get_matching(tenant_id.as_u64(), collection, event);
+    let triggers =
+        state
+            .trigger_registry
+            .get_matching(database_id, tenant_id.as_u64(), collection, event);
 
     let before_triggers: Vec<_> = triggers
         .into_iter()
@@ -123,10 +127,11 @@ pub async fn execute_before_batch(
 
             let bindings = build_before_bindings(row, collection, op_str);
 
-            let executor = StatementExecutor::with_source(
+            let executor = StatementExecutor::with_source_in_database(
                 state,
                 effective_identity.clone(),
                 tenant_id,
+                trigger.database_id,
                 cascade_depth + 1,
                 crate::event::EventSource::Trigger,
             );

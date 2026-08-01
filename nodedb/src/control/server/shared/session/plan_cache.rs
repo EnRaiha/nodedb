@@ -191,7 +191,7 @@ mod tests {
     }
 
     fn collection_id(name: &str) -> DescriptorId {
-        DescriptorId::new(1, DescriptorKind::Collection, name.to_string())
+        DescriptorId::new(0, 1, DescriptorKind::Collection, name.to_string())
     }
 
     fn versions_for(pairs: &[(&str, u64)]) -> DescriptorVersionSet {

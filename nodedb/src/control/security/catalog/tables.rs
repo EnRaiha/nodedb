@@ -161,7 +161,8 @@ pub(super) const CHANGE_STREAMS: TableDefinition<&str, &[u8]> =
 pub(super) const CONSUMER_GROUPS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.consumer_groups");
 
-/// Table: "{tenant_id}:{schedule_name}" -> MessagePack-serialized ScheduleDef.
+/// Table: v2 `"v2:{tenant_id}:{database_id}:{schedule_name}"` (or legacy
+/// `"{tenant_id}:{schedule_name}"`) -> MessagePack-serialized ScheduleDef.
 pub(super) const SCHEDULES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.schedules");
 
@@ -176,6 +177,14 @@ pub(super) const ALERT_RULES: TableDefinition<(u64, &str), &[u8]> =
 /// Table: "{tenant_id}:{topic_name}" -> MessagePack-serialized TopicDef.
 pub(super) const TOPICS_EP: TableDefinition<&str, &[u8]> =
     TableDefinition::new("_system.topics_ep");
+
+/// Table: `[database_id: be u64][tenant_id: be u64][name_len: be u16]
+/// [topic_name bytes][sequence: be u64]` -> MessagePack-serialized TopicMessage.
+///
+/// The big-endian fixed-width components keep messages for one scoped topic
+/// contiguous and ordered by sequence in redb's bytewise key order.
+pub(super) const TOPIC_MESSAGES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("_system.topic_messages");
 
 /// Table: "{tenant_id}:{mv_name}" -> MessagePack-serialized StreamingMvDef.
 pub(super) const STREAMING_MVS: TableDefinition<&str, &[u8]> =

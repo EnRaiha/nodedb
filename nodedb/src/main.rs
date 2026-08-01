@@ -172,16 +172,18 @@ async fn server_main() -> anyhow::Result<()> {
 
     post_open::run(&shared, &wal_records, &config, &catalog_gate).await?;
 
-    let (shutdown_rx, shutdown_bus) = shutdown_wiring::wire_shutdown_bus(&shared, &system_metrics);
+    let (shutdown_rx, shutdown_bus, _loop_registry_shutdown) =
+        shutdown_wiring::wire_shutdown_bus(&shared, &system_metrics);
 
     let background::BackgroundLoops {
         raft_ready_rx,
         _lease_renewal,
-        _event_plane,
+        _event_plane_shutdown,
     } = background::spawn(
         &shared,
         &config,
         shutdown_rx.clone(),
+        shutdown_bus.clone(),
         background::BackgroundLoopsInputs {
             cluster_handle: cluster_handle.as_deref(),
             wal: Arc::clone(&wal),

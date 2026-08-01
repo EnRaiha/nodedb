@@ -12,11 +12,11 @@ use crate::control::security::catalog::trigger_types::StoredTrigger;
 
 /// In-memory trigger registry for fast lookup during DML.
 ///
-/// Triggers are indexed by `(tenant_id, collection)` for efficient matching.
+/// Triggers are indexed by `(database_id, tenant_id, collection)` for efficient matching.
 /// Thread-safe (RwLock) — reads are concurrent, writes are exclusive.
 pub struct TriggerRegistry {
-    /// (tenant_id, collection_name) → sorted list of triggers.
-    by_collection: RwLock<HashMap<(u64, String), Vec<StoredTrigger>>>,
+    /// (database_id, tenant_id, collection_name) → sorted list of triggers.
+    by_collection: RwLock<HashMap<(nodedb_types::DatabaseId, u64, String), Vec<StoredTrigger>>>,
 }
 
 impl Default for TriggerRegistry {
@@ -49,7 +49,11 @@ impl TriggerRegistry {
             Err(p) => p.into_inner(),
         };
         for trigger in triggers {
-            let key = (trigger.tenant_id, trigger.collection.clone());
+            let key = (
+                trigger.database_id,
+                trigger.tenant_id,
+                trigger.collection.clone(),
+            );
             map.entry(key).or_default().push(trigger);
         }
         for list in map.values_mut() {
@@ -79,7 +83,11 @@ impl TriggerRegistry {
         };
 
         for trigger in triggers {
-            let key = (trigger.tenant_id, trigger.collection.clone());
+            let key = (
+                trigger.database_id,
+                trigger.tenant_id,
+                trigger.collection.clone(),
+            );
             map.entry(key).or_default().push(trigger);
         }
 
@@ -95,46 +103,66 @@ impl TriggerRegistry {
             Ok(m) => m,
             Err(p) => p.into_inner(),
         };
-        let key = (trigger.tenant_id, trigger.collection.clone());
+        // CREATE OR REPLACE may move a trigger between collections. Remove
+        // the database-scoped identity from every collection before indexing
+        // the replacement so it cannot fire from its former collection.
+        for list in map.values_mut() {
+            list.retain(|t| {
+                !(t.database_id == trigger.database_id
+                    && t.tenant_id == trigger.tenant_id
+                    && t.name == trigger.name)
+            });
+        }
+        let key = (
+            trigger.database_id,
+            trigger.tenant_id,
+            trigger.collection.clone(),
+        );
         let list = map.entry(key).or_default();
-
-        // Remove existing trigger with same name (for CREATE OR REPLACE).
-        list.retain(|t| t.name != trigger.name);
         list.push(trigger);
         list.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
     }
 
     /// Unregister a trigger (called by DROP TRIGGER DDL).
-    pub fn unregister(&self, tenant_id: u64, name: &str) {
+    pub fn unregister(&self, database_id: nodedb_types::DatabaseId, tenant_id: u64, name: &str) {
         let mut map = match self.by_collection.write() {
             Ok(m) => m,
             Err(p) => p.into_inner(),
         };
         for list in map.values_mut() {
-            list.retain(|t| !(t.tenant_id == tenant_id && t.name == name));
+            list.retain(|t| {
+                !(t.database_id == database_id && t.tenant_id == tenant_id && t.name == name)
+            });
         }
     }
 
     /// Enable or disable a trigger.
-    pub fn set_enabled(&self, tenant_id: u64, name: &str, enabled: bool) {
+    pub fn set_enabled(
+        &self,
+        database_id: nodedb_types::DatabaseId,
+        tenant_id: u64,
+        name: &str,
+        enabled: bool,
+    ) {
         let mut map = match self.by_collection.write() {
             Ok(m) => m,
             Err(p) => p.into_inner(),
         };
         for list in map.values_mut() {
             for t in list.iter_mut() {
-                if t.tenant_id == tenant_id && t.name == name {
+                if t.database_id == database_id && t.tenant_id == tenant_id && t.name == name {
                     t.enabled = enabled;
                 }
             }
         }
     }
 
-    /// Get all enabled triggers for a (tenant, collection) matching an event.
+    /// Get all enabled triggers for a (database, tenant, collection) matching an event.
     ///
     /// Returns triggers sorted by (priority, name) — deterministic execution order.
     pub fn get_matching(
         &self,
+        database_id: nodedb_types::DatabaseId,
         tenant_id: u64,
         collection: &str,
         event: DmlEvent,
@@ -143,7 +171,7 @@ impl TriggerRegistry {
             Ok(m) => m,
             Err(p) => p.into_inner(),
         };
-        let key = (tenant_id, collection.to_string());
+        let key = (database_id, tenant_id, collection.to_string());
         match map.get(&key) {
             Some(list) => list
                 .iter()
@@ -165,7 +193,11 @@ impl TriggerRegistry {
         };
         map.clear();
         for trigger in rows {
-            let key = (trigger.tenant_id, trigger.collection.clone());
+            let key = (
+                trigger.database_id,
+                trigger.tenant_id,
+                trigger.collection.clone(),
+            );
             map.entry(key).or_default().push(trigger);
         }
         for list in map.values_mut() {
@@ -174,7 +206,7 @@ impl TriggerRegistry {
     }
 
     /// Deterministic snapshot of every trigger across every
-    /// tenant, sorted by `(tenant_id, collection, name)` so the
+    /// tenant, sorted by `(database_id, tenant_id, collection, name)` so the
     /// recovery sanity checker can diff against
     /// `catalog.load_all_triggers()` without caring about
     /// HashMap iteration order.
@@ -190,17 +222,22 @@ impl TriggerRegistry {
             }
         }
         result.sort_by(|a, b| {
-            (a.tenant_id, a.collection.clone(), a.name.clone()).cmp(&(
+            (a.database_id.as_u64(), a.tenant_id, &a.collection, &a.name).cmp(&(
+                b.database_id.as_u64(),
                 b.tenant_id,
-                b.collection.clone(),
-                b.name.clone(),
+                &b.collection,
+                &b.name,
             ))
         });
         result
     }
 
-    /// List all triggers for a tenant (for SHOW TRIGGERS).
-    pub fn list_for_tenant(&self, tenant_id: u64) -> Vec<StoredTrigger> {
+    /// List all triggers for a database and tenant (for SHOW TRIGGERS).
+    pub fn list_for_tenant(
+        &self,
+        database_id: nodedb_types::DatabaseId,
+        tenant_id: u64,
+    ) -> Vec<StoredTrigger> {
         let map = match self.by_collection.read() {
             Ok(m) => m,
             Err(p) => p.into_inner(),
@@ -208,7 +245,7 @@ impl TriggerRegistry {
         let mut result = Vec::new();
         for list in map.values() {
             for t in list {
-                if t.tenant_id == tenant_id {
+                if t.database_id == database_id && t.tenant_id == tenant_id {
                     result.push(t.clone());
                 }
             }
@@ -247,10 +284,12 @@ fn matches_event(trigger: &StoredTrigger, event: DmlEvent) -> bool {
 mod tests {
     use super::*;
     use crate::control::security::catalog::trigger_types::*;
+    use nodedb_types::DatabaseId;
 
     fn sample(name: &str, coll: &str, timing: TriggerTiming, insert: bool) -> StoredTrigger {
         StoredTrigger {
             tenant_id: 1,
+            database_id: nodedb_types::id::DatabaseId::DEFAULT,
             name: name.to_string(),
             collection: coll.to_string(),
             timing,
@@ -278,7 +317,7 @@ mod tests {
     fn register_and_match() {
         let reg = TriggerRegistry::new();
         reg.register(sample("t1", "orders", TriggerTiming::After, true));
-        let matched = reg.get_matching(1, "orders", DmlEvent::Insert);
+        let matched = reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Insert);
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].name, "t1");
     }
@@ -287,22 +326,31 @@ mod tests {
     fn no_match_wrong_event() {
         let reg = TriggerRegistry::new();
         reg.register(sample("t1", "orders", TriggerTiming::After, true));
-        assert!(reg.get_matching(1, "orders", DmlEvent::Delete).is_empty());
+        assert!(
+            reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Delete)
+                .is_empty()
+        );
     }
 
     #[test]
     fn no_match_wrong_collection() {
         let reg = TriggerRegistry::new();
         reg.register(sample("t1", "orders", TriggerTiming::After, true));
-        assert!(reg.get_matching(1, "users", DmlEvent::Insert).is_empty());
+        assert!(
+            reg.get_matching(DatabaseId::DEFAULT, 1, "users", DmlEvent::Insert)
+                .is_empty()
+        );
     }
 
     #[test]
     fn disabled_not_matched() {
         let reg = TriggerRegistry::new();
         reg.register(sample("t1", "orders", TriggerTiming::After, true));
-        reg.set_enabled(1, "t1", false);
-        assert!(reg.get_matching(1, "orders", DmlEvent::Insert).is_empty());
+        reg.set_enabled(DatabaseId::DEFAULT, 1, "t1", false);
+        assert!(
+            reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Insert)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -314,16 +362,59 @@ mod tests {
         t1.priority = 5;
         reg.register(t2);
         reg.register(t1);
-        let matched = reg.get_matching(1, "c", DmlEvent::Insert);
-        assert_eq!(matched[0].name, "a_trigger"); // priority 5 first
-        assert_eq!(matched[1].name, "b_trigger"); // priority 10 second
+        let matched = reg.get_matching(DatabaseId::DEFAULT, 1, "c", DmlEvent::Insert);
+        assert_eq!(matched[0].name, "a_trigger");
+        assert_eq!(matched[1].name, "b_trigger");
     }
 
     #[test]
     fn unregister() {
         let reg = TriggerRegistry::new();
         reg.register(sample("t1", "c", TriggerTiming::After, true));
-        reg.unregister(1, "t1");
-        assert!(reg.get_matching(1, "c", DmlEvent::Insert).is_empty());
+        reg.unregister(DatabaseId::DEFAULT, 1, "t1");
+        assert!(
+            reg.get_matching(DatabaseId::DEFAULT, 1, "c", DmlEvent::Insert)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn replacement_moved_to_another_collection_is_removed_from_the_old_one() {
+        let reg = TriggerRegistry::new();
+        reg.register(sample("t", "orders", TriggerTiming::After, true));
+        reg.register(sample("t", "users", TriggerTiming::After, true));
+
+        assert!(
+            reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Insert)
+                .is_empty()
+        );
+        let moved = reg.get_matching(DatabaseId::DEFAULT, 1, "users", DmlEvent::Insert);
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].name, "t");
+    }
+
+    #[test]
+    fn database_scope_isolates_matching_replacement_and_listing() {
+        let reg = TriggerRegistry::new();
+        let mut other = sample("t", "orders", TriggerTiming::After, true);
+        other.database_id = DatabaseId::new(2);
+        reg.register(sample("t", "orders", TriggerTiming::After, true));
+        reg.register(other.clone());
+
+        let mut replacement = sample("t", "orders", TriggerTiming::After, false);
+        replacement.database_id = DatabaseId::new(2);
+        reg.register(replacement);
+
+        assert_eq!(
+            reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Insert)
+                .len(),
+            1
+        );
+        assert!(
+            reg.get_matching(DatabaseId::new(2), 1, "orders", DmlEvent::Insert)
+                .is_empty()
+        );
+        assert_eq!(reg.list_for_tenant(DatabaseId::DEFAULT, 1).len(), 1);
+        assert_eq!(reg.list_for_tenant(DatabaseId::new(2), 1).len(), 1);
     }
 }

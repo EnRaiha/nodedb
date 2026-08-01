@@ -98,10 +98,7 @@ pub(super) fn assign_for_pk(
     collection: &str,
     pk_bytes: &[u8],
 ) -> crate::Result<Surrogate> {
-    match ctx.surrogate_assigner.as_ref() {
-        Some(a) => a.assign(ctx.database_id, ctx.tenant_id, collection, pk_bytes),
-        None => Ok(Surrogate::ZERO),
-    }
+    ctx.surrogate_for_pk(collection, pk_bytes)
 }
 
 /// Allocate a fresh, unique surrogate for a row whose primary key is the
@@ -109,10 +106,7 @@ pub(super) fn assign_for_pk(
 /// empty pk here would collapse every such row onto one surrogate — a
 /// duplicate-key violation on the second insert.
 pub(super) fn assign_fresh(ctx: &ConvertContext, collection: &str) -> crate::Result<Surrogate> {
-    match ctx.surrogate_assigner.as_ref() {
-        Some(a) => a.assign_fresh(ctx.database_id, ctx.tenant_id, collection),
-        None => Ok(Surrogate::ZERO),
-    }
+    ctx.fresh_surrogate(collection)
 }
 
 /// Whether a collection's declared primary key is the auto-generated `_rowid`

@@ -17,14 +17,14 @@ impl CoreLoop {
                 .map_err(|_| crate::Error::Internal {
                     detail: "array catalog lock poisoned during WAL replay".into(),
                 })?;
-            let entry =
-                cat.lookup_by_name(&array_id.name)
-                    .ok_or_else(|| crate::Error::Internal {
-                        detail: format!(
-                            "array '{}' missing from catalog during WAL replay",
-                            array_id.name
-                        ),
-                    })?;
+            let entry = cat
+                .lookup_by_id(array_id)
+                .ok_or_else(|| crate::Error::Internal {
+                    detail: format!(
+                        "array '{}' missing from catalog during WAL replay",
+                        array_id.name
+                    ),
+                })?;
             (entry.schema_msgpack.clone(), entry.schema_hash)
         };
         let schema = zerompk::from_msgpack::<nodedb_array::schema::ArraySchema>(&schema_msgpack)

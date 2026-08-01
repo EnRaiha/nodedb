@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use crate::common::cluster_harness::{TestCluster, wait_for};
+use nodedb_types::DatabaseId;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn create_on_any_node_is_visible_on_every_node() {
@@ -289,7 +290,7 @@ async fn change_stream_create_visible_on_every_node() {
             cluster
                 .nodes
                 .iter()
-                .all(|n| n.has_change_stream(1, "event_feed"))
+                .all(|n| n.has_change_stream(DatabaseId::DEFAULT, 1, "event_feed"))
         },
     )
     .await;
@@ -307,7 +308,7 @@ async fn change_stream_create_visible_on_every_node() {
             cluster
                 .nodes
                 .iter()
-                .all(|n| !n.has_change_stream(1, "event_feed"))
+                .all(|n| !n.has_change_stream(DatabaseId::DEFAULT, 1, "event_feed"))
         },
     )
     .await;

@@ -18,6 +18,8 @@ arrow = { workspace = true, features = ["ffi"] }
 thiserror = { workspace = true }
 rust_decimal = { workspace = true }
 uuid = { workspace = true }
+ulid = { workspace = true }
+zerompk = { workspace = true }
 serde_json = { workspace = true }
 sonic-rs = { workspace = true }
 tracing = { workspace = true }

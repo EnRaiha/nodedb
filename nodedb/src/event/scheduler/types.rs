@@ -65,9 +65,12 @@ impl ScheduleScope {
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 #[msgpack(map, allow_unknown_fields)]
 pub struct ScheduleDef {
+    /// Database that owns this schedule and its procedural body.
+    #[msgpack(default)]
+    pub database_id: u64,
     /// Tenant that owns this schedule.
     pub tenant_id: u64,
-    /// Schedule name (unique per tenant).
+    /// Schedule name (unique per database and tenant).
     pub name: String,
     /// Cron expression (5-field: minute hour day_of_month month day_of_week).
     pub cron_expr: String,
@@ -93,8 +96,16 @@ pub struct ScheduleDef {
 }
 
 /// A completed job execution record.
+///
+/// New records use a named map encoding so fields may be added without
+/// invalidating persisted history. The history reader separately accepts the
+/// exact pre-database positional representation.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+#[msgpack(map, allow_unknown_fields)]
 pub struct JobRun {
+    /// Database that owns the schedule. Legacy history defaults to `DEFAULT`.
+    #[msgpack(default)]
+    pub database_id: u64,
     /// Schedule name.
     pub schedule_name: String,
     /// Tenant ID.

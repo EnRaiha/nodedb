@@ -22,7 +22,7 @@ use nodedb_array::types::ArrayId;
 use nodedb_array::types::cell_value::value::CellValue;
 use nodedb_array::types::coord::value::CoordValue;
 use nodedb_array::types::domain::{Domain, DomainBound};
-use nodedb_types::{Surrogate, TenantId};
+use nodedb_types::{DatabaseId, Surrogate, TenantId};
 use tempfile::TempDir;
 
 // ── shared fixtures ────────────────────────────────────────────────────────────
@@ -44,6 +44,7 @@ fn schema() -> Arc<nodedb_array::schema::ArraySchema> {
 
 const SCHEMA_HASH: u64 = 0xA5_A5_A5_A5_A5_A5_A5_A5;
 const TENANT: TenantId = TenantId::new(0);
+const DATABASE: DatabaseId = DatabaseId::DEFAULT;
 const ARRAY_NAME: &str = "purge";
 
 fn aid() -> ArrayId {
@@ -131,7 +132,7 @@ fn temporal_purge_drops_superseded_versions_end_to_end() {
     // Purge with cutoff=250: T=100 and T=200 are outside the horizon,
     // T=300 is inside (300 >= 250). The planner collapses T=100 and T=200
     // into a single ceiling tile containing the value from T=200 (newest).
-    let dropped = e.temporal_purge(TENANT, ARRAY_NAME, 250).unwrap();
+    let dropped = e.temporal_purge(TENANT, DATABASE, ARRAY_NAME, 250).unwrap();
     assert!(
         dropped >= 1,
         "at least one tile-version must be dropped; got {dropped}"
@@ -203,7 +204,7 @@ fn temporal_purge_preserves_cells_with_no_newer_version() {
         "setup: expected 2 segments"
     );
 
-    let dropped = e.temporal_purge(TENANT, ARRAY_NAME, 250).unwrap();
+    let dropped = e.temporal_purge(TENANT, DATABASE, ARRAY_NAME, 250).unwrap();
     // Two tile-versions exist (T=100 and T=200), both outside horizon=250.
     // Both are dropped and replaced by a single ceiling tile.
     assert!(
@@ -242,7 +243,7 @@ fn temporal_purge_drops_gdpr_erased_cells_outright() {
     erase(&mut e, 0, 200, 2); // GdprErased(x=0) at T=200
     e.flush(&aid(), 3).unwrap(); // ensure erasure tile-version lands in a segment
 
-    let dropped = e.temporal_purge(TENANT, ARRAY_NAME, 250).unwrap();
+    let dropped = e.temporal_purge(TENANT, DATABASE, ARRAY_NAME, 250).unwrap();
     // Both tile-versions are outside horizon=250 and are candidates for
     // dropping. The GdprErased version is the newest → ceiling for x=0
     // is empty. The entire segment(s) may be removed if no other cells
@@ -311,14 +312,18 @@ fn temporal_purge_idempotent_on_re_run() {
     let cutoff = 500_i64;
 
     // First run: drops the two outside-horizon tile-versions.
-    let d1 = e.temporal_purge(TENANT, ARRAY_NAME, cutoff).unwrap();
+    let d1 = e
+        .temporal_purge(TENANT, DATABASE, ARRAY_NAME, cutoff)
+        .unwrap();
     assert!(d1 >= 1, "first purge must drop ≥1 tile-version; got {d1}");
 
     // Snapshot the ceiling state after first purge.
     let after_first = live_val(&ceiling(&e, 0, i64::MAX));
 
     // Second run: nothing left to drop.
-    let d2 = e.temporal_purge(TENANT, ARRAY_NAME, cutoff).unwrap();
+    let d2 = e
+        .temporal_purge(TENANT, DATABASE, ARRAY_NAME, cutoff)
+        .unwrap();
     assert_eq!(d2, 0, "second purge with same cutoff must drop nothing");
 
     // State unchanged.
@@ -340,6 +345,8 @@ fn temporal_purge_no_op_when_array_missing() {
     // Engine with no arrays open.
     let mut e = ArrayEngine::new(ArrayEngineConfig::new(dir.path().to_path_buf())).unwrap();
 
-    let count = e.temporal_purge(TENANT, "nonexistent", 99_999).unwrap();
+    let count = e
+        .temporal_purge(TENANT, DATABASE, "nonexistent", 99_999)
+        .unwrap();
     assert_eq!(count, 0, "purge on missing array must return Ok(0)");
 }

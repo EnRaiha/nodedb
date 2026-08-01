@@ -20,13 +20,18 @@ use crate::control::security::catalog::SystemCatalog;
 /// by construction — callers that need them must use CASCADE FORCE.
 pub fn find_schedules_referencing(
     catalog: &SystemCatalog,
+    database_id: crate::types::DatabaseId,
     tenant_id: u64,
     collection: &str,
 ) -> crate::Result<Vec<String>> {
     let all = catalog.load_all_schedules()?;
     let mut out: Vec<String> = all
         .into_iter()
-        .filter(|s| s.tenant_id == tenant_id && s.target_collection.as_deref() == Some(collection))
+        .filter(|s| {
+            s.database_id == database_id.as_u64()
+                && s.tenant_id == tenant_id
+                && s.target_collection.as_deref() == Some(collection)
+        })
         .map(|s| s.name)
         .collect();
     out.sort();

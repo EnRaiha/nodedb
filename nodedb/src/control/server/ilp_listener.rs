@@ -69,10 +69,11 @@ impl IlpListener {
         startup_gate: Arc<crate::control::startup::StartupGate>,
         bus: crate::control::shutdown::ShutdownBus,
     ) -> crate::Result<()> {
-        let drain_guard = bus.register_task(
+        // This JoinSet owns active ILP connection tasks until their graceful
+        // drain (or forced abort) completes, so it gates later shutdown phases.
+        let drain_guard = bus.register_critical_task(
             crate::control::shutdown::ShutdownPhase::DrainingListeners,
             "ilp",
-            None,
         );
         let mut shutdown_handle = bus.handle();
 

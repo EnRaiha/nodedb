@@ -19,7 +19,7 @@ use nodedb_types::sync::wire::SyncProvenance;
 use tracing::warn;
 
 use crate::event::types::{EventSource, RowId, WriteEvent, WriteOp};
-use crate::types::{Lsn, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 
 /// `(op, new_value, old_value)` for a node-label CDC event — the op tag plus
 /// the label-delta payload placed on whichever side its `WriteOp` implies.
@@ -29,6 +29,7 @@ type LabelEventFields = (WriteOp, Option<Arc<[u8]>>, Option<Arc<[u8]>>);
 /// graph edge put — distinguished by the MessagePack structure.
 pub(super) fn parse_put_record(
     payload: &[u8],
+    database_id: DatabaseId,
     tenant_id: TenantId,
     vshard_id: VShardId,
     lsn: Lsn,
@@ -52,6 +53,7 @@ pub(super) fn parse_put_record(
             op: WriteOp::Insert,
             row_id: RowId::new(key_str.as_ref()),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,
@@ -79,6 +81,7 @@ pub(super) fn parse_put_record(
             },
             row_id: RowId::new("_batch"),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,
@@ -107,6 +110,7 @@ pub(super) fn parse_put_record(
             op: WriteOp::Insert,
             row_id: RowId::new(document_id.as_str()),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,
@@ -132,6 +136,7 @@ pub(super) fn parse_put_record(
             op: WriteOp::Insert,
             row_id: RowId::new(document_id.as_str()),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,
@@ -160,6 +165,7 @@ pub(super) fn parse_put_record(
             op: WriteOp::Insert,
             row_id: RowId::new(document_id.as_str()),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,
@@ -193,6 +199,7 @@ pub(super) fn parse_put_record(
                 crate::event::graph_cdc::edge_row_id(&src_id, &label, &dst_id).as_str(),
             ),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,
@@ -227,6 +234,7 @@ pub(super) fn parse_put_record(
 pub(super) fn parse_graph_node_label_record(
     payload: &[u8],
     is_set: bool,
+    database_id: DatabaseId,
     tenant_id: TenantId,
     vshard_id: VShardId,
     lsn: Lsn,
@@ -256,6 +264,7 @@ pub(super) fn parse_graph_node_label_record(
         op,
         row_id: RowId::new(node_id.as_str()),
         lsn,
+        database_id,
         tenant_id,
         vshard_id,
         source: EventSource::User,
@@ -271,6 +280,7 @@ pub(super) fn parse_graph_node_label_record(
 /// Parse a `RecordType::Delete` payload. May be a document delete or KV delete.
 pub(super) fn parse_delete_record(
     payload: &[u8],
+    database_id: DatabaseId,
     tenant_id: TenantId,
     vshard_id: VShardId,
     lsn: Lsn,
@@ -290,6 +300,7 @@ pub(super) fn parse_delete_record(
             },
             row_id: RowId::new("_batch"),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,
@@ -315,6 +326,7 @@ pub(super) fn parse_delete_record(
             op: WriteOp::Delete,
             row_id: RowId::new(document_id.as_str()),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,
@@ -338,6 +350,7 @@ pub(super) fn parse_delete_record(
             op: WriteOp::Delete,
             row_id: RowId::new(document_id.as_str()),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,
@@ -359,6 +372,7 @@ pub(super) fn parse_delete_record(
             op: WriteOp::Delete,
             row_id: RowId::new(document_id.as_str()),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,
@@ -388,6 +402,7 @@ pub(super) fn parse_delete_record(
                 crate::event::graph_cdc::edge_row_id(&src_id, &label, &dst_id).as_str(),
             ),
             lsn,
+            database_id,
             tenant_id,
             vshard_id,
             source: EventSource::User,

@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use nodedb::event::cdc::CdcOffset;
 use nodedb::event::cdc::buffer::StreamBuffer;
 use nodedb::event::cdc::event::CdcEvent;
 use nodedb::event::cdc::registry::StreamRegistry;
@@ -22,10 +23,11 @@ use nodedb::event::cdc::stream_def::{
 };
 use nodedb::event::types::{EventSource, RowId, WriteEvent, WriteOp};
 use nodedb::event::watermark_tracker::WatermarkTracker;
-use nodedb::types::{Lsn, TenantId, VShardId};
+use nodedb::types::{DatabaseId, Lsn, TenantId, VShardId};
 
 fn stream_def(name: &str, collection: &str) -> ChangeStreamDef {
     ChangeStreamDef {
+        database_id: DatabaseId::new(7),
         tenant_id: 1,
         name: name.into(),
         collection: collection.into(),
@@ -55,6 +57,7 @@ fn write_event(seq: u64) -> WriteEvent {
         op: WriteOp::Insert,
         row_id: RowId::new(format!("r-{seq}")),
         lsn: Lsn::new(seq * 10),
+        database_id: DatabaseId::new(7),
         tenant_id: TenantId::new(1),
         vshard_id: VShardId::new(0),
         source: EventSource::User,
@@ -81,10 +84,10 @@ fn router_fanout_shares_event_allocation_across_streams() {
     let mut per_stream: Vec<Arc<CdcEvent>> = Vec::new();
     for i in 0..5 {
         let buf = router
-            .get_buffer(1, &format!("stream_{i}"))
+            .get_buffer(DatabaseId::new(7), 1, &format!("stream_{i}"))
             .expect("buffer must exist after route_event");
         let first: Arc<CdcEvent> = buf
-            .read_from_lsn(0, 10)
+            .read_from(CdcOffset::ZERO, 10)
             .into_iter()
             .next()
             .expect("event routed");
@@ -102,7 +105,7 @@ fn router_fanout_shares_event_allocation_across_streams() {
 }
 
 #[test]
-fn buffer_read_from_lsn_shares_event_allocation_across_polls() {
+fn buffer_composite_read_shares_event_allocation_across_polls() {
     let buf = StreamBuffer::new("s".into(), RetentionConfig::default());
     let ev = CdcEvent {
         sequence: 1,
@@ -110,8 +113,11 @@ fn buffer_read_from_lsn_shares_event_allocation_across_polls() {
         collection: "orders".into(),
         op: "INSERT".into(),
         row_id: "r1".into(),
-        event_time: 0,
+        // Retention evicts anything older than `max_age_secs`; epoch 0 is
+        // always past that cutoff under a real clock.
+        event_time: u64::MAX,
         lsn: 10,
+        database_id: DatabaseId::new(7),
         tenant_id: 1,
         new_value: Some(serde_json::json!({"id": 1, "pad": "y".repeat(2048)})),
         old_value: None,
@@ -125,12 +131,12 @@ fn buffer_read_from_lsn_shares_event_allocation_across_polls() {
     // Webhook delivery and Kafka producer both poll the same buffer repeatedly.
     // Each poll must return Arc<CdcEvent> so they share one allocation.
     let poll1: Arc<CdcEvent> = buf
-        .read_from_lsn(0, 10)
+        .read_from(CdcOffset::ZERO, 10)
         .into_iter()
         .next()
         .expect("event present");
     let poll2: Arc<CdcEvent> = buf
-        .read_from_lsn(0, 10)
+        .read_from(CdcOffset::ZERO, 10)
         .into_iter()
         .next()
         .expect("event present");
@@ -144,8 +150,8 @@ fn buffer_read_from_lsn_shares_event_allocation_across_polls() {
 
 #[test]
 fn buffer_partition_read_shares_event_allocation() {
-    // read_partition_from_lsn is called on the same hot path by Kafka
-    // producer batches. It must share allocations with read_from_lsn.
+    // Partition composite reads are called on the same hot path by Kafka
+    // producer batches. They must share allocations with general reads.
     let buf = StreamBuffer::new("s".into(), RetentionConfig::default());
     let ev = CdcEvent {
         sequence: 1,
@@ -153,8 +159,11 @@ fn buffer_partition_read_shares_event_allocation() {
         collection: "orders".into(),
         op: "INSERT".into(),
         row_id: "r1".into(),
-        event_time: 0,
+        // Retention evicts anything older than `max_age_secs`; epoch 0 is
+        // always past that cutoff under a real clock.
+        event_time: u64::MAX,
         lsn: 10,
+        database_id: DatabaseId::new(7),
         tenant_id: 1,
         new_value: Some(serde_json::json!({"id": 1})),
         old_value: None,
@@ -166,18 +175,18 @@ fn buffer_partition_read_shares_event_allocation() {
     buf.push(ev);
 
     let a: Arc<CdcEvent> = buf
-        .read_from_lsn(0, 10)
+        .read_from(CdcOffset::ZERO, 10)
         .into_iter()
         .next()
         .expect("event present");
     let b: Arc<CdcEvent> = buf
-        .read_partition_from_lsn(3, 0, 10)
+        .read_partition_from(3, CdcOffset::ZERO, 10)
         .into_iter()
         .next()
         .expect("event present");
 
     assert!(
         Arc::ptr_eq(&a, &b),
-        "read_partition_from_lsn must share the same Arc<CdcEvent> as read_from_lsn"
+        "partition composite reads must share the same Arc<CdcEvent> as general reads"
     );
 }

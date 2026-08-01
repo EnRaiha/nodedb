@@ -52,33 +52,34 @@ impl<'a> StatementExecutor<'a> {
         // topic/consumer-group DDL, etc.). If the SQL is not an extension,
         // `dispatch_sql` returns None and we fall through to plan_sql with
         // transaction-buffer semantics preserved exactly as before.
-        if let Some(result) = crate::control::sql_dispatch::dispatch_sql(
+        if let Some(_outcome) = crate::control::sql_dispatch::dispatch_sql_in_database(
             self.state,
             &self.identity_for_dispatch(),
+            self.database_id,
             &bound_sql,
         )
-        .await
+        .await?
         {
-            result?;
             return Ok(());
         }
 
-        // Not a NodeDB extension: route through plan_sql with transaction buffering.
+        // Not a NodeDB extension: plan with descriptor versions so admission
+        // occurs before this internal path buffers, WAL-appends, or dispatches.
+        // Stored procedures are trusted internal execution, so this deliberately
+        // does not add user authorization beyond their existing semantics.
         let ctx = crate::control::planner::context::QueryContext::for_state(self.state);
-        let (tasks, _output_schema) = ctx
-            .plan_sql(
-                &bound_sql,
-                self.tenant_id,
-                crate::types::DatabaseId::DEFAULT,
-            )
+        let (tasks, _output_schema, versions) = ctx
+            .plan_sql_and_versions(&bound_sql, self.tenant_id, self.database_id)
             .await?;
+        let lease_scope = self.state.acquire_plan_lease_scope(&versions)?;
 
         if let Some(ref tx_ctx) = self.tx_ctx {
             let mut guard = tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
-            for task in tasks {
-                guard.buffer_task(task);
-            }
+            guard.buffer_statement(tasks, lease_scope);
         } else {
+            // Keep the scope through every route decision, WAL append, and
+            // Data-Plane dispatch; errors also release it via Drop.
+            let _lease_scope = lease_scope;
             for task in tasks {
                 // Cross-shard trigger origination: when this executor carries a
                 // source-write origin (Event-Plane AFTER-trigger fire path) AND
@@ -188,6 +189,7 @@ impl<'a> StatementExecutor<'a> {
         let request = crate::event::cross_shard::types::CrossShardWriteRequest {
             sql: bound_sql.to_string(),
             tenant_id: self.tenant_id.as_u64(),
+            database_id: self.database_id.as_u64(),
             source_vshard: origin.source_vshard,
             source_lsn: origin.source_lsn,
             source_sequence: origin.source_sequence,
@@ -265,13 +267,16 @@ impl<'a> StatementExecutor<'a> {
 
     /// Flush the procedure transaction buffer: WAL append + dispatch as batch.
     pub(super) async fn flush_transaction_buffer(&self) -> crate::Result<()> {
-        let tasks = if let Some(ref tx_ctx) = self.tx_ctx {
+        let (tasks, _lease_scopes) = if let Some(ref tx_ctx) = self.tx_ctx {
             let mut guard = tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
-            guard.take_buffered_tasks()
+            guard.take_buffered()
         } else {
             return Ok(());
         };
 
+        // `_lease_scopes` owns every statement's descriptor admission through
+        // all WAL appends and the complete batch dispatch below. It is dropped
+        // only after this function returns, including on an execution error.
         if tasks.is_empty() {
             return Ok(());
         }
@@ -449,6 +454,90 @@ mod cross_shard_origination_tests {
             .unwrap_or_else(|e| panic!("create_collection({coll_name}) failed: {e:?}"));
 
         state
+    }
+
+    /// Build an unclustered state with a collection in an explicit database.
+    /// This keeps procedural DML buffered while the test verifies planning
+    /// scope, and lets procedural PUBLISH complete locally.
+    async fn build_unrouted_state_with_collection(
+        dir: &tempfile::TempDir,
+        coll_name: &str,
+        database_id: DatabaseId,
+    ) -> Arc<SharedState> {
+        let wal_path = dir.path().join("test-unrouted.wal");
+        let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
+        let (dispatcher, _data_sides) = crate::bridge::dispatch::Dispatcher::new(1, 16);
+        let state = SharedState::new(dispatcher, wal).unwrap();
+        let identity = test_identity();
+        let columns = vec![
+            ("id".to_string(), "TEXT PRIMARY KEY".to_string()),
+            ("val".to_string(), "INT".to_string()),
+        ];
+        let req = CreateCollectionRequest {
+            name: coll_name,
+            engine: Some("document_strict"),
+            columns: &columns,
+            options: &[],
+            flags: &[],
+            balanced_raw: None,
+        };
+        create_collection(&state, &identity, &req, database_id)
+            .await
+            .unwrap_or_else(|e| panic!("create_collection({coll_name}) failed: {e:?}"));
+        state
+    }
+
+    /// Procedural PUBLISH and DML must both retain the executor's explicit
+    /// database instead of falling back to `DatabaseId::DEFAULT`.
+    #[tokio::test]
+    async fn procedural_publish_and_dml_use_explicit_non_default_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_id = DatabaseId::new(9);
+        let state = build_unrouted_state_with_collection(&dir, "scoped_orders", database_id).await;
+        let topic = crate::event::topic::TopicDef {
+            tenant_id: 1,
+            name: "scoped_events".into(),
+            retention: crate::event::cdc::stream_def::RetentionConfig::default(),
+            owner: "cross_shard_origin_test".into(),
+            created_at: 0,
+            database_id,
+            last_sequence: 0,
+            last_lsn: 0,
+        };
+        // A topic exists only once it is durable: PUBLISH revalidates the
+        // catalog row under the lifecycle lock before it accepts a message,
+        // so registering the runtime definition alone is not a live topic.
+        state
+            .credentials
+            .catalog()
+            .put_ep_topic(&topic)
+            .expect("persist topic");
+        state.ep_topic_registry.register(topic);
+
+        let executor = StatementExecutor::with_source_in_database(
+            &state,
+            test_identity(),
+            TenantId::new(1),
+            database_id,
+            0,
+            crate::event::EventSource::User,
+        )
+        .with_transaction_context();
+
+        executor
+            .execute_sql(
+                "PUBLISH TO scoped_events '{\"kind\":\"created\"}'",
+                &RowBindings::empty(),
+            )
+            .await
+            .expect("PUBLISH must resolve the topic in the executor database");
+        executor
+            .execute_sql(
+                "INSERT INTO scoped_orders (id, val) VALUES ('scoped', 1)",
+                &RowBindings::empty(),
+            )
+            .await
+            .expect("DML must plan against the executor database");
     }
 
     /// Find a `{prefix}_<i>` collection name whose vShard is homed on

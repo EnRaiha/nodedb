@@ -22,6 +22,8 @@ use crate::control::state::SharedState;
 pub struct AppState {
     pub shared: Arc<SharedState>,
     pub auth_mode: AuthMode,
+    /// Shared phased coordinator for graceful shutdown requests.
+    pub shutdown_bus: crate::control::shutdown::ShutdownBus,
     /// DataFusion query context for SQL planning (Send + Sync).
     pub query_ctx: Arc<crate::control::planner::context::QueryContext>,
 }
@@ -94,6 +96,31 @@ pub fn resolve_identity(
     ))
 }
 
+/// Require tenant administration authority for an operation in `database_id`.
+///
+/// Tenant-admin actions are still bound to the identity's selected database;
+/// a tenant administrator cannot use an HTTP endpoint to bypass its database
+/// access scope.
+pub fn require_tenant_admin_for_database(
+    identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
+) -> Result<(), ApiError> {
+    use crate::control::security::identity::Role;
+
+    if !identity.has_role(&Role::TenantAdmin) {
+        return Err(ApiError::Forbidden(
+            "WASM uploads require tenant_admin privileges".into(),
+        ));
+    }
+    if !identity.can_access_database(database_id) {
+        return Err(ApiError::Forbidden(format!(
+            "permission denied for selected database {}",
+            database_id.as_u64()
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve both authenticated identity and auth context from HTTP headers.
 ///
 /// Uses `AuthContext::from_verified_jwt()` for JWTs so rich claims are retained
@@ -132,15 +159,37 @@ pub fn resolve_auth(
     Ok((identity, auth_ctx))
 }
 
-/// Check `X-On-Deny` header and set the `on_deny_override` on AuthContext.
+/// Check `X-On-Deny` header and set the bounded presentation-only override.
+///
+/// HTTP accepts only the trimmed, case-insensitive tokens `SILENT` and `ERROR`.
+/// `ERROR` always uses this server-owned generic RLS response; DDL's richer
+/// `ON DENY ERROR` syntax must not let an HTTP client control response content.
 fn apply_on_deny_header(
     headers: &HeaderMap,
     mut auth_ctx: crate::control::security::auth_context::AuthContext,
 ) -> crate::control::security::auth_context::AuthContext {
-    if let Some(val) = headers.get("x-on-deny")
-        && let Ok(s) = val.to_str()
-        && let Ok(mode) = crate::control::security::deny::parse_on_deny(&[s])
-    {
+    use crate::control::security::deny::{DenyCodes, DenyError, DenyMode};
+
+    let Some(value) = headers
+        .get("x-on-deny")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return auth_ctx;
+    };
+
+    let mode = if value.trim().eq_ignore_ascii_case("SILENT") {
+        Some(DenyMode::Silent)
+    } else if value.trim().eq_ignore_ascii_case("ERROR") {
+        Some(DenyMode::Error(DenyError {
+            code: DenyCodes::RLS_READ_DENIED.to_string(),
+            message: "Access denied by row-level security policy".to_string(),
+            detail: None,
+        }))
+    } else {
+        None
+    };
+
+    if let Some(mode) = mode {
         auth_ctx.on_deny_override = Some(mode);
     }
     auth_ctx
@@ -272,5 +321,110 @@ impl From<crate::Error> for ApiError {
             }
             _ => Self::Internal(e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::security::auth_context::{AuthContext, AuthStatus};
+    use crate::control::security::deny::{DenyCodes, DenyMode};
+    use crate::control::security::identity::{
+        AuthMethod, AuthenticatedIdentity, DatabaseSet, Role,
+    };
+    use crate::types::TenantId;
+
+    fn auth_context() -> AuthContext {
+        let identity = AuthenticatedIdentity::new_regular(
+            42,
+            "alice",
+            TenantId::new(7),
+            AuthMethod::ScramSha256,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::All,
+        );
+        let mut context = AuthContext::from_identity(&identity, "s_http_test".into());
+        context.email = Some("alice@example.test".into());
+        context.org_id = Some("org-7".into());
+        context.org_ids = vec!["org-7".into()];
+        context.groups = vec!["engineering".into()];
+        context.permissions = vec!["documents:read".into()];
+        context.status = AuthStatus::Restricted;
+        context.metadata.insert("plan".into(), "pro".into());
+        context.auth_time = Some(1_700_000_000);
+        context.database_id = Some(nodedb_types::id::DatabaseId::new(9));
+        context
+    }
+
+    fn headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-on-deny", value.parse().expect("valid header value"));
+        headers
+    }
+
+    fn assert_authorization_fields_unchanged(before: &AuthContext, after: &AuthContext) {
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.username, before.username);
+        assert_eq!(after.email, before.email);
+        assert_eq!(after.tenant_id, before.tenant_id);
+        assert_eq!(after.org_id, before.org_id);
+        assert_eq!(after.org_ids, before.org_ids);
+        assert_eq!(after.roles, before.roles);
+        assert_eq!(after.groups, before.groups);
+        assert_eq!(after.permissions, before.permissions);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.metadata, before.metadata);
+        assert_eq!(after.auth_method, before.auth_method);
+        assert_eq!(after.auth_time, before.auth_time);
+        assert_eq!(after.session_id, before.session_id);
+        assert_eq!(after.database_id, before.database_id);
+    }
+
+    #[test]
+    fn x_on_deny_silent_accepts_trimmed_case_insensitive_token() {
+        let context = auth_context();
+        let result = apply_on_deny_header(&headers("  sIlEnT  "), context.clone());
+
+        assert_eq!(result.on_deny_override, Some(DenyMode::Silent));
+        assert_authorization_fields_unchanged(&context, &result);
+    }
+
+    #[test]
+    fn x_on_deny_error_uses_server_owned_generic_rls_response() {
+        let context = auth_context();
+        let result = apply_on_deny_header(&headers("  ErRoR  "), context.clone());
+
+        match result.on_deny_override {
+            Some(DenyMode::Error(ref error)) => {
+                assert_eq!(error.code, DenyCodes::RLS_READ_DENIED);
+                assert_eq!(error.message, "Access denied by row-level security policy");
+                assert_eq!(error.detail, None);
+            }
+            other => panic!("expected generic error override, got {other:?}"),
+        }
+        assert_authorization_fields_unchanged(&context, &result);
+    }
+
+    #[test]
+    fn x_on_deny_parameterized_error_cannot_inject_response_content() {
+        let mut context = auth_context();
+        context.on_deny_override = Some(DenyMode::Silent);
+        let result = apply_on_deny_header(
+            &headers("ERROR 'CLIENT_CODE' MESSAGE 'client-controlled message'"),
+            context.clone(),
+        );
+
+        assert_eq!(result.on_deny_override, context.on_deny_override);
+        assert_authorization_fields_unchanged(&context, &result);
+    }
+
+    #[test]
+    fn x_on_deny_malformed_value_is_ignored() {
+        let context = auth_context();
+        let result = apply_on_deny_header(&headers("ERROR=custom"), context.clone());
+
+        assert_eq!(result.on_deny_override, None);
+        assert_authorization_fields_unchanged(&context, &result);
     }
 }

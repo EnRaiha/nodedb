@@ -53,6 +53,7 @@ Welcome to the NodeDB docs. These guides explain what each engine does, when to 
   - [Row-Level Security](security/rls.md) — Per-row filtering with `$auth.*` context
   - [Audit & Change Tracking](security/audit.md) — Hash-chained audit log, SIEM export, `updated_at` patterns
   - [Multi-Tenancy](security/tenants.md) — Isolation, quotas, backup, GDPR purge
+  - [Threat Model](security/threat-model.md) — Trust boundaries, entry points, and security invariants
 - [Real-Time](real-time.md) — LIVE SELECT, CDC change streams, consumer groups, webhook delivery, durable topics, cron scheduler
 - [CLI (`ndb`)](https://github.com/NodeDB-Lab/nodedb-cli) — Terminal client usage and configuration (separate repo)
 - [Studio](https://github.com/NodeDB-Lab/nodedb-studio) — GUI client (Dioxus desktop + web) (separate repo)

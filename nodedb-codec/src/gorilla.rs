@@ -68,8 +68,8 @@ impl GorillaEncoder {
         }
 
         // Timestamp: delta-of-delta.
-        let delta = timestamp_ms - self.prev_ts;
-        let dod = delta - self.prev_delta;
+        let delta = timestamp_ms.wrapping_sub(self.prev_ts);
+        let dod = delta.wrapping_sub(self.prev_delta);
         self.encode_timestamp_dod(dod);
         self.prev_ts = timestamp_ms;
         self.prev_delta = delta;
@@ -257,8 +257,8 @@ impl<'a> GorillaDecoder<'a> {
             }
         };
 
-        let delta = self.prev_delta + dod;
-        let ts = self.prev_ts + delta;
+        let delta = self.prev_delta.wrapping_add(dod);
+        let ts = self.prev_ts.wrapping_add(delta);
         self.prev_ts = ts;
         self.prev_delta = delta;
         Ok(ts)
@@ -278,7 +278,15 @@ impl<'a> GorillaDecoder<'a> {
         } else {
             let leading = self.reader.read_bits(6)? as u8;
             let meaningful_bits = self.reader.read_bits(6)? as u8 + 1;
-            let trailing = 64 - leading - meaningful_bits;
+            let window_bits = leading + meaningful_bits;
+            if window_bits > 64 {
+                return Err(CodecError::Corrupt {
+                    detail: format!(
+                        "invalid Gorilla value window: {leading} leading + {meaningful_bits} meaningful bits"
+                    ),
+                });
+            }
+            let trailing = 64 - window_bits;
             let bits = self.reader.read_bits(meaningful_bits as usize)?;
             self.prev_leading = leading;
             self.prev_trailing = trailing;
@@ -444,6 +452,54 @@ mod tests {
         let encoded = encode_timestamps(&timestamps);
         let decoded = decode_timestamps(&encoded).unwrap();
         assert_eq!(timestamps, decoded);
+    }
+
+    #[test]
+    fn timestamp_arithmetic_wraps_across_i64_bounds() {
+        let timestamps = [i64::MIN, i64::MAX, 0, i64::MIN, i64::MAX];
+        let encoded = encode_timestamps(&timestamps);
+        let decoded = decode_timestamps(&encoded).expect("extreme timestamps must decode");
+        assert_eq!(decoded, timestamps);
+    }
+
+    #[test]
+    fn decoded_timestamp_arithmetic_wraps_without_panicking() {
+        let mut decoder = GorillaDecoder {
+            reader: BitReader::new(&[0]),
+            prev_ts: i64::MAX,
+            prev_delta: 1,
+            prev_value: 0,
+            prev_leading: 0,
+            prev_trailing: 0,
+            count: 0,
+            total: 1,
+            first: false,
+        };
+
+        let timestamp = decoder
+            .decode_timestamp()
+            .expect("zero delta-of-delta must decode");
+        assert_eq!(timestamp, i64::MIN);
+    }
+
+    #[test]
+    fn invalid_value_window_returns_corrupt_error() {
+        let mut decoder = GorillaDecoder {
+            reader: BitReader::new(&[0xff, 0xfc]),
+            prev_ts: 0,
+            prev_delta: 0,
+            prev_value: 0,
+            prev_leading: 0,
+            prev_trailing: 0,
+            count: 0,
+            total: 1,
+            first: false,
+        };
+
+        let error = decoder
+            .decode_value()
+            .expect_err("an oversized Gorilla value window must fail");
+        assert!(matches!(error, CodecError::Corrupt { .. }));
     }
 
     #[test]

@@ -200,6 +200,7 @@ impl CoreLoop {
             op,
             row_id: crate::event::types::RowId::new(row_id),
             lsn: self.watermark,
+            database_id: task.request.database_id,
             tenant_id: task.request.tenant_id,
             vshard_id: task.request.vshard_id,
             source: task.request.event_source,
@@ -235,6 +236,9 @@ impl CoreLoop {
             // watermark = last committed LSN. Correct for heartbeats: uncommitted
             // writes should NOT advance the Event Plane's watermark.
             lsn: self.watermark,
+            // Heartbeats are synthetic core-liveness markers rather than data writes,
+            // so they have no database owner and are excluded from CDC routing.
+            database_id: crate::types::DatabaseId::DEFAULT,
             // Default tenant; vshard derived from core_id for partition routing.
             tenant_id: crate::types::TenantId::new(0),
             vshard_id: crate::types::VShardId::new(

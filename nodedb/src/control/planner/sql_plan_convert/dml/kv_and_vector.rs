@@ -168,6 +168,7 @@ mod tests {
 
     fn make_ctx(max_vector_dim: u32) -> ConvertContext {
         ConvertContext {
+            purpose: super::super::super::convert::PlanningPurpose::Execute,
             retention_registry: None,
             array_catalog: None,
             credentials: None,

@@ -6,11 +6,14 @@
 //! from storage to process the event.
 
 use nodedb_types::json_msgpack::JsonValue;
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use sonic_rs;
 
+use crate::types::DatabaseId;
+
 /// A formatted CDC event ready for consumer delivery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CdcEvent {
     /// Monotonic sequence within this stream's partition.
     pub sequence: u64,
@@ -27,6 +30,10 @@ pub struct CdcEvent {
     pub event_time: u64,
     /// WAL LSN for this event. Used for offset tracking and ordering.
     pub lsn: u64,
+    /// Database that owns the collection. Missing legacy payloads decode to
+    /// the built-in default database.
+    #[serde(default)]
+    pub database_id: DatabaseId,
     /// Tenant ID.
     pub tenant_id: u64,
     /// New row value (for INSERT and UPDATE). JSON bytes.
@@ -57,6 +64,16 @@ pub struct CdcEvent {
 }
 
 impl CdcEvent {
+    /// Lossless offset for this event.
+    pub const fn position(&self) -> super::offset::CdcOffset {
+        super::offset::CdcOffset::new(self.lsn, self.sequence)
+    }
+
+    /// Canonical `<lsn>:<sequence>` token accepted by `COMMIT OFFSET`.
+    pub fn offset_token(&self) -> String {
+        self.position().token()
+    }
+
     /// Serialize to JSON bytes.
     pub fn to_json_bytes(&self) -> Vec<u8> {
         sonic_rs::to_vec(self).unwrap_or_default()
@@ -68,11 +85,56 @@ impl CdcEvent {
     }
 }
 
+/// JSON consumers receive the canonical offset alongside the position fields.
+/// The token is derived at serialization time so it cannot drift from `lsn` or
+/// `sequence` in memory or over the cluster MessagePack payload.
+impl Serialize for CdcEvent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let field_count = 11
+            + usize::from(self.new_value.is_some())
+            + usize::from(self.old_value.is_some())
+            + usize::from(self.field_diffs.is_some())
+            + usize::from(self.system_time_ms.is_some())
+            + usize::from(self.valid_time_ms.is_some());
+        let mut state = serializer.serialize_struct("CdcEvent", field_count)?;
+        state.serialize_field("sequence", &self.sequence)?;
+        state.serialize_field("partition", &self.partition)?;
+        state.serialize_field("collection", &self.collection)?;
+        state.serialize_field("op", &self.op)?;
+        state.serialize_field("row_id", &self.row_id)?;
+        state.serialize_field("event_time", &self.event_time)?;
+        state.serialize_field("lsn", &self.lsn)?;
+        state.serialize_field("offset", &self.offset_token())?;
+        state.serialize_field("database_id", &self.database_id)?;
+        state.serialize_field("tenant_id", &self.tenant_id)?;
+        state.serialize_field("schema_version", &self.schema_version)?;
+        if let Some(value) = &self.new_value {
+            state.serialize_field("new_value", value)?;
+        }
+        if let Some(value) = &self.old_value {
+            state.serialize_field("old_value", value)?;
+        }
+        if let Some(diffs) = &self.field_diffs {
+            state.serialize_field("field_diffs", diffs)?;
+        }
+        if let Some(time) = self.system_time_ms {
+            state.serialize_field("system_time_ms", &time)?;
+        }
+        if let Some(time) = self.valid_time_ms {
+            state.serialize_field("valid_time_ms", &time)?;
+        }
+        state.end()
+    }
+}
+
 // ─── zerompk impls for CdcEvent ───────────────────────────────────────────
 
 impl zerompk::ToMessagePack for CdcEvent {
     fn write<W: zerompk::Write>(&self, writer: &mut W) -> zerompk::Result<()> {
-        let field_count = 9
+        let field_count = 10
             + usize::from(self.new_value.is_some())
             + usize::from(self.old_value.is_some())
             + usize::from(self.field_diffs.is_some())
@@ -95,6 +157,8 @@ impl zerompk::ToMessagePack for CdcEvent {
         writer.write_u64(self.lsn)?;
         writer.write_string("tenant_id")?;
         writer.write_u64(self.tenant_id)?;
+        writer.write_string("database_id")?;
+        writer.write_u64(self.database_id.as_u64())?;
         writer.write_string("schema_version")?;
         writer.write_u64(self.schema_version)?;
         if let Some(ref v) = self.new_value {
@@ -132,6 +196,7 @@ impl<'a> zerompk::FromMessagePack<'a> for CdcEvent {
         let mut event_time: u64 = 0;
         let mut lsn: u64 = 0;
         let mut tenant_id: u64 = 0;
+        let mut database_id = DatabaseId::DEFAULT;
         let mut schema_version: u64 = 0;
         let mut new_value: Option<serde_json::Value> = None;
         let mut old_value: Option<serde_json::Value> = None;
@@ -149,6 +214,7 @@ impl<'a> zerompk::FromMessagePack<'a> for CdcEvent {
                 "event_time" => event_time = reader.read_u64()?,
                 "lsn" => lsn = reader.read_u64()?,
                 "tenant_id" => tenant_id = reader.read_u64()?,
+                "database_id" => database_id = DatabaseId::new(reader.read_u64()?),
                 "schema_version" => schema_version = reader.read_u64()?,
                 "new_value" => new_value = Some(JsonValue::read(reader)?.0),
                 "old_value" => old_value = Some(JsonValue::read(reader)?.0),
@@ -171,6 +237,7 @@ impl<'a> zerompk::FromMessagePack<'a> for CdcEvent {
             event_time,
             lsn,
             tenant_id,
+            database_id,
             schema_version,
             new_value,
             old_value,
@@ -196,6 +263,7 @@ mod tests {
             event_time: 1700000000000,
             lsn: 100,
             tenant_id: 1,
+            database_id: DatabaseId::DEFAULT,
             new_value: Some(serde_json::json!({"id": 1, "total": 99.99})),
             old_value: None,
             schema_version: 0,
@@ -208,11 +276,14 @@ mod tests {
         let parsed: CdcEvent = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.collection, "orders");
         assert_eq!(parsed.sequence, 1);
+        assert_eq!(event.offset_token(), "100:1");
+        let json: serde_json::Value = sonic_rs::from_slice(&bytes).unwrap();
+        assert_eq!(json["offset"], "100:1");
         assert!(parsed.old_value.is_none());
     }
 
     #[test]
-    fn cdc_event_msgpack_roundtrip() {
+    fn remote_payload_preserves_composite_position() {
         let event = CdcEvent {
             sequence: 2,
             partition: 10,
@@ -222,6 +293,7 @@ mod tests {
             event_time: 1700000001000,
             lsn: 200,
             tenant_id: 1,
+            database_id: DatabaseId::DEFAULT,
             new_value: Some(serde_json::json!({"name": "Alice"})),
             old_value: Some(serde_json::json!({"name": "Bob"})),
             schema_version: 0,
@@ -233,6 +305,10 @@ mod tests {
         let bytes = event.to_msgpack_bytes();
         let parsed: CdcEvent = zerompk::from_msgpack(&bytes).unwrap();
         assert_eq!(parsed.op, "UPDATE");
+        assert_eq!(
+            parsed.position(),
+            super::super::offset::CdcOffset::new(200, 2)
+        );
         assert!(parsed.old_value.is_some());
     }
 
@@ -247,6 +323,7 @@ mod tests {
             event_time: 1700000002000,
             lsn: 300,
             tenant_id: 1,
+            database_id: DatabaseId::DEFAULT,
             new_value: Some(serde_json::json!({"name": "Carol"})),
             old_value: None,
             schema_version: 0,

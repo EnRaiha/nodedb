@@ -183,3 +183,128 @@ async fn pgwire_interceptors_authorize_before_plan_or_dispatch() {
             .await,
     );
 }
+
+#[tokio::test]
+async fn explain_typed_ddl_does_not_mutate_catalog() {
+    let server = TestServer::start().await;
+    let collection = "explain_catalog_unchanged";
+
+    let plan = server
+        .query_text(&format!("EXPLAIN CREATE COLLECTION {collection}"))
+        .await
+        .expect("EXPLAIN CREATE COLLECTION must return a DDL plan");
+    assert!(
+        plan.iter().any(|row| row.contains("DDL: Collection")),
+        "typed DDL EXPLAIN must identify the parsed statement: {plan:?}"
+    );
+
+    let query_error = server
+        .query_text(&format!("SELECT * FROM {collection}"))
+        .await
+        .expect_err("EXPLAIN CREATE COLLECTION must not create the collection");
+    assert!(
+        query_error.contains(collection),
+        "the catalog lookup must still report the uncreated collection: {query_error}"
+    );
+}
+
+#[tokio::test]
+async fn explain_object_insert_does_not_mutate_collection() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE COLLECTION explain_object_insert_rows")
+        .await
+        .expect("create collection");
+
+    // Object-literal INSERT is normally owned by the DDL dispatcher's
+    // string-recognized DML path. EXPLAIN must instead plan or reject it
+    // without reaching that mutating dispatcher.
+    let _ = server
+        .query_text(
+            "EXPLAIN INSERT INTO explain_object_insert_rows \
+             {\"id\": \"explained\", \"content\": \"must not persist\"}",
+        )
+        .await;
+
+    let rows = server
+        .query_text("SELECT * FROM explain_object_insert_rows")
+        .await
+        .expect("read collection after EXPLAIN object insert");
+    assert!(
+        rows.is_empty(),
+        "EXPLAIN object INSERT must not persist a document: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn pgwire_custom_role_denies_system_audit_log() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE ROLE pgwire_audit_denied_role")
+        .await
+        .expect("create custom role");
+    server
+        .exec(
+            "CREATE USER pgwire_audit_denied WITH PASSWORD 'x' \
+             ROLE pgwire_audit_denied_role",
+        )
+        .await
+        .expect("create non-superuser");
+    server
+        .exec("GRANT SELECT ON _system.audit_log TO pgwire_audit_denied")
+        .await
+        .expect("grant ordinary audit-log read permission");
+
+    let (client, _connection) = server
+        .connect_as("pgwire_audit_denied", "x")
+        .await
+        .expect("authenticate non-superuser");
+
+    assert_insufficient_privilege(client.simple_query("SELECT * FROM _system.audit_log").await);
+}
+
+#[tokio::test]
+async fn pgwire_ungranted_collection_write_is_denied_without_mutation() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE ROLE pgwire_write_denied_role")
+        .await
+        .expect("create custom role");
+    server
+        .exec(
+            "CREATE USER pgwire_write_denied WITH PASSWORD 'x' \
+             ROLE pgwire_write_denied_role",
+        )
+        .await
+        .expect("create ungranted user");
+    server
+        .exec(
+            "CREATE COLLECTION pgwire_write_denied_rows \
+             (id TEXT PRIMARY KEY, content TEXT NOT NULL) \
+             WITH (engine='document_strict')",
+        )
+        .await
+        .expect("create existing collection");
+
+    let (client, _connection) = server
+        .connect_as("pgwire_write_denied", "x")
+        .await
+        .expect("authenticate ungranted user");
+    assert_insufficient_privilege(
+        client
+            .simple_query(
+                "INSERT INTO pgwire_write_denied_rows (id, content) \
+                 VALUES ('forbidden', 'must not persist')",
+            )
+            .await,
+    );
+
+    let rows = server
+        .query_text("SELECT id FROM pgwire_write_denied_rows")
+        .await
+        .expect("privileged harness reads denied-write collection");
+    assert!(
+        rows.is_empty(),
+        "an unauthorized pgwire write must not mutate the collection: {rows:?}"
+    );
+}

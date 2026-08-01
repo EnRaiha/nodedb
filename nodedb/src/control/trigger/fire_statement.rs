@@ -11,16 +11,15 @@
 //! - ASYNC: fires in the Event Plane after statement commits
 //! - DEFERRED: fires at COMMIT time, batched
 
+use super::TriggerScope;
+use super::fire_common::{FireTriggersParams, check_cascade_depth, fire_triggers};
+use super::registry::DmlEvent;
 use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::security::catalog::trigger_types::{
     TriggerExecutionMode, TriggerGranularity, TriggerTiming,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
-
-use super::fire_common::{FireTriggersParams, check_cascade_depth, fire_triggers};
-use super::registry::DmlEvent;
 
 /// Fire AFTER STATEMENT triggers for the given operation.
 ///
@@ -36,15 +35,18 @@ use super::registry::DmlEvent;
 pub async fn fire_after_statement(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
+    scope: TriggerScope,
     collection: &str,
     event: DmlEvent,
     cascade_depth: u32,
     mode_filter: Option<TriggerExecutionMode>,
 ) -> crate::Result<()> {
-    let triggers = state
-        .trigger_registry
-        .get_matching(tenant_id.as_u64(), collection, event);
+    let triggers = state.trigger_registry.get_matching(
+        scope.database_id,
+        scope.tenant_id.as_u64(),
+        collection,
+        event,
+    );
 
     let statement_triggers: Vec<_> = triggers
         .into_iter()
@@ -65,7 +67,7 @@ pub async fn fire_after_statement(
     fire_triggers(FireTriggersParams {
         state,
         identity,
-        tenant_id,
+        tenant_id: scope.tenant_id,
         collection,
         triggers: &statement_triggers,
         bindings: &bindings,

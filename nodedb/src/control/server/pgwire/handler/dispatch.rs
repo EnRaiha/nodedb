@@ -269,13 +269,18 @@ impl NodeDbPgHandler {
                 nodedb_physical::physical_plan::ArrayOp::DropArray { .. }
             )
         ) {
-            return crate::control::server::broadcast::broadcast_count_to_all_cores(
+            // Broadcast bypasses the normal write funnel, so it must acquire
+            // the same authorization capability before applying the Array DDL
+            // catalog transition. In particular, a denied DROP must not delete
+            // catalog rows or surrogate bindings.
+            let authorized = self.authorize_for_dispatch(identity, &task)?;
+            let task = authorized.into_physical_task();
+            return crate::control::array_catalog::ddl::run_authorized_drop(
                 &self.state,
                 task.tenant_id,
                 task.database_id,
                 task.plan,
                 TraceId::ZERO,
-                "dropped",
             )
             .await;
         }

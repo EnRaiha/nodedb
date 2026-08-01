@@ -50,21 +50,42 @@ impl SyncSession {
                     };
                     return SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack);
                 }
-                if let Some(current) = self.identity.as_ref()
-                    && new_identity.user_id != current.user_id
-                {
-                    warn!(
-                        session = %self.session_id,
-                        current_user_id = current.user_id,
-                        new_user_id = new_identity.user_id,
-                        "token refresh rejected: user mismatch"
-                    );
-                    let ack = TokenRefreshAckMsg {
-                        success: false,
-                        error: Some("user mismatch".into()),
-                        expires_in_secs: 0,
-                    };
-                    return SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack);
+                if let Some(current) = self.identity.as_ref() {
+                    if new_identity.user_id != current.user_id {
+                        warn!(
+                            session = %self.session_id,
+                            current_user_id = current.user_id,
+                            new_user_id = new_identity.user_id,
+                            "token refresh rejected: user mismatch"
+                        );
+                        let ack = TokenRefreshAckMsg {
+                            success: false,
+                            error: Some("user mismatch".into()),
+                            expires_in_secs: 0,
+                        };
+                        return SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack);
+                    }
+
+                    let current_database = current
+                        .default_database
+                        .unwrap_or(nodedb_types::DatabaseId::DEFAULT);
+                    let new_database = new_identity
+                        .default_database
+                        .unwrap_or(nodedb_types::DatabaseId::DEFAULT);
+                    if new_database != current_database {
+                        warn!(
+                            session = %self.session_id,
+                            current_database = current_database.as_u64(),
+                            new_database = new_database.as_u64(),
+                            "token refresh rejected: database mismatch"
+                        );
+                        let ack = TokenRefreshAckMsg {
+                            success: false,
+                            error: Some("database mismatch".into()),
+                            expires_in_secs: 0,
+                        };
+                        return SyncFrame::try_encode(SyncMessageType::TokenRefreshAck, &ack);
+                    }
                 }
                 self.username = Some(new_identity.username.clone());
                 self.identity = Some(new_identity);

@@ -9,6 +9,46 @@ use redb::{Database, ReadableTable, TableDefinition};
 use tracing::debug;
 
 use super::types::JobRun;
+use crate::types::DatabaseId;
+
+/// Exact pre-database positional history layout.
+///
+/// This is intentionally private: new writes always use `JobRun`'s map
+/// encoding, while only the history loader recognizes persisted legacy rows.
+#[derive(zerompk::ToMessagePack, zerompk::FromMessagePack)]
+struct LegacyJobRun {
+    schedule_name: String,
+    tenant_id: u64,
+    started_at: u64,
+    duration_ms: u64,
+    success: bool,
+    error: Option<String>,
+}
+
+impl From<LegacyJobRun> for JobRun {
+    fn from(legacy: LegacyJobRun) -> Self {
+        Self {
+            database_id: DatabaseId::DEFAULT.as_u64(),
+            schedule_name: legacy.schedule_name,
+            tenant_id: legacy.tenant_id,
+            started_at: legacy.started_at,
+            duration_ms: legacy.duration_ms,
+            success: legacy.success,
+            error: legacy.error,
+        }
+    }
+}
+
+/// Decode the current map encoding, falling back only to the exact legacy
+/// positional layout.
+fn decode_job_run(bytes: &[u8]) -> Option<JobRun> {
+    match zerompk::from_msgpack(bytes) {
+        Ok(run) => Some(run),
+        Err(_) => zerompk::from_msgpack::<LegacyJobRun>(bytes)
+            .ok()
+            .map(JobRun::from),
+    }
+}
 
 /// redb table: monotonic run_id → MessagePack-serialized JobRun.
 const JOB_HISTORY: TableDefinition<u64, &[u8]> = TableDefinition::new("job_history");
@@ -66,7 +106,7 @@ impl JobHistoryStore {
                     if id > max_id {
                         max_id = id;
                     }
-                    if let Ok(run) = zerompk::from_msgpack::<JobRun>(value_guard.value()) {
+                    if let Some(run) = decode_job_run(value_guard.value()) {
                         runs.push_back(run);
                     }
                 }
@@ -135,22 +175,41 @@ impl JobHistoryStore {
     }
 
     /// Get the last N runs for a specific schedule.
-    pub fn last_runs(&self, tenant_id: u64, schedule_name: &str, limit: usize) -> Vec<JobRun> {
+    pub fn last_runs(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        schedule_name: &str,
+        limit: usize,
+    ) -> Vec<JobRun> {
         let runs = self.runs.read().unwrap_or_else(|p| p.into_inner());
         runs.iter()
             .rev()
-            .filter(|r| r.tenant_id == tenant_id && r.schedule_name == schedule_name)
+            .filter(|r| {
+                r.database_id == database_id
+                    && r.tenant_id == tenant_id
+                    && r.schedule_name == schedule_name
+            })
             .take(limit.min(MAX_HISTORY_PER_SCHEDULE))
             .cloned()
             .collect()
     }
 
     /// Get the most recent run for a schedule (for SHOW SCHEDULES).
-    pub fn last_run(&self, tenant_id: u64, schedule_name: &str) -> Option<JobRun> {
+    pub fn last_run(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        schedule_name: &str,
+    ) -> Option<JobRun> {
         let runs = self.runs.read().unwrap_or_else(|p| p.into_inner());
         runs.iter()
             .rev()
-            .find(|r| r.tenant_id == tenant_id && r.schedule_name == schedule_name)
+            .find(|r| {
+                r.database_id == database_id
+                    && r.tenant_id == tenant_id
+                    && r.schedule_name == schedule_name
+            })
             .cloned()
     }
 }
@@ -160,11 +219,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn current_job_run_roundtrip() {
+        let run = JobRun {
+            database_id: 42,
+            schedule_name: "cleanup".into(),
+            tenant_id: 7,
+            started_at: 1_700_000_000_000,
+            duration_ms: 150,
+            success: false,
+            error: Some("timeout".into()),
+        };
+        let bytes = zerompk::to_msgpack_vec(&run).unwrap();
+        let decoded = decode_job_run(&bytes).unwrap();
+
+        assert_eq!(decoded.database_id, 42);
+        assert_eq!(decoded.schedule_name, "cleanup");
+        assert_eq!(decoded.tenant_id, 7);
+        assert_eq!(decoded.started_at, 1_700_000_000_000);
+        assert_eq!(decoded.duration_ms, 150);
+        assert!(!decoded.success);
+        assert_eq!(decoded.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn legacy_job_run_roundtrip_defaults_database() {
+        let legacy = LegacyJobRun {
+            schedule_name: "cleanup".into(),
+            tenant_id: 7,
+            started_at: 1_700_000_000_000,
+            duration_ms: 150,
+            success: false,
+            error: Some("timeout".into()),
+        };
+        let bytes = zerompk::to_msgpack_vec(&legacy).unwrap();
+        let decoded = decode_job_run(&bytes).unwrap();
+
+        assert_eq!(decoded.database_id, DatabaseId::DEFAULT.as_u64());
+        assert_eq!(decoded.schedule_name, "cleanup");
+        assert_eq!(decoded.tenant_id, 7);
+        assert_eq!(decoded.started_at, 1_700_000_000_000);
+        assert_eq!(decoded.duration_ms, 150);
+        assert!(!decoded.success);
+        assert_eq!(decoded.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
     fn record_and_retrieve() {
         let dir = tempfile::tempdir().unwrap();
         let store = JobHistoryStore::open(dir.path()).unwrap();
 
         let run = JobRun {
+            database_id: 0,
             schedule_name: "cleanup".into(),
             tenant_id: 1,
             started_at: 1700000000000,
@@ -174,7 +279,7 @@ mod tests {
         };
         store.record(run).unwrap();
 
-        let last = store.last_run(1, "cleanup").unwrap();
+        let last = store.last_run(0, 1, "cleanup").unwrap();
         assert_eq!(last.schedule_name, "cleanup");
         assert!(last.success);
     }
@@ -187,6 +292,7 @@ mod tests {
         for i in 0..5 {
             store
                 .record(JobRun {
+                    database_id: 0,
                     schedule_name: "a".into(),
                     tenant_id: 1,
                     started_at: i,
@@ -198,6 +304,7 @@ mod tests {
         }
         store
             .record(JobRun {
+                database_id: 0,
                 schedule_name: "b".into(),
                 tenant_id: 1,
                 started_at: 100,
@@ -207,11 +314,32 @@ mod tests {
             })
             .unwrap();
 
-        let a_runs = store.last_runs(1, "a", 3);
+        let a_runs = store.last_runs(0, 1, "a", 3);
         assert_eq!(a_runs.len(), 3);
 
-        let b_runs = store.last_runs(1, "b", 10);
+        let b_runs = store.last_runs(0, 1, "b", 10);
         assert_eq!(b_runs.len(), 1);
         assert!(!b_runs[0].success);
+    }
+
+    #[test]
+    fn same_schedule_name_history_is_database_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JobHistoryStore::open(dir.path()).unwrap();
+        for database_id in [1, 2] {
+            store
+                .record(JobRun {
+                    database_id,
+                    schedule_name: "cleanup".into(),
+                    tenant_id: 1,
+                    started_at: database_id,
+                    duration_ms: 1,
+                    success: true,
+                    error: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(store.last_runs(1, 1, "cleanup", 10).len(), 1);
+        assert_eq!(store.last_runs(2, 1, "cleanup", 10).len(), 1);
     }
 }

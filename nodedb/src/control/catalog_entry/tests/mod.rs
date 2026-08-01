@@ -8,6 +8,7 @@ mod continuous_aggregate;
 mod invalidation;
 mod kind_labels;
 mod sequence;
+mod streaming_materialized_view;
 
 use std::sync::Arc;
 

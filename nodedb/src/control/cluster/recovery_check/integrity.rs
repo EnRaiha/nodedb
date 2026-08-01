@@ -101,6 +101,8 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
     let procedures = load_table!("procedures", catalog.load_all_procedures());
     let materialized_views =
         load_table!("materialized_views", catalog.load_all_materialized_views());
+    let streaming_materialized_views =
+        load_table!("streaming_mvs", catalog.load_all_streaming_mvs());
     let sequences = load_table!("sequences", catalog.load_all_sequences());
     let schedules = load_table!("schedules", catalog.load_all_schedules());
     let change_streams = load_table!("change_streams", catalog.load_all_change_streams());
@@ -112,7 +114,14 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
 
     // Build lookup sets once — every referential check is a
     // HashSet membership probe.
-    let collection_keys: HashSet<(u64, String)> = collections
+    let collection_keys: HashSet<(u64, u64, String)> = collections
+        .iter()
+        .map(|c| (c.database_id.as_u64(), c.tenant_id, c.name.clone()))
+        .collect();
+    // These legacy object families do not yet carry a database scope, so keep
+    // their existing tenant/name relationship checks separate from the
+    // database-scoped trigger check.
+    let legacy_collection_keys: HashSet<(u64, String)> = collections
         .iter()
         .map(|c| (c.tenant_id, c.name.clone()))
         .collect();
@@ -135,7 +144,7 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
     // row added here plus its `apply/<type>.rs::put` call to
     // `owner::put_parent_owner`. Omitting either half trips an
     // OrphanRow on the next restart.
-    let parent_replicated: [ParentOwnerRows; 9] = [
+    let parent_replicated: [ParentOwnerRows; 10] = [
         (
             object_type::COLLECTION,
             // Active AND soft-deleted collections both require an
@@ -152,21 +161,21 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             object_type::FUNCTION,
             functions
                 .iter()
-                .map(|f| (0, f.tenant_id, f.name.clone()))
+                .map(|f| (f.database_id.as_u64(), f.tenant_id, f.name.clone()))
                 .collect(),
         ),
         (
             object_type::PROCEDURE,
             procedures
                 .iter()
-                .map(|p| (0, p.tenant_id, p.name.clone()))
+                .map(|p| (p.database_id.as_u64(), p.tenant_id, p.name.clone()))
                 .collect(),
         ),
         (
             object_type::TRIGGER,
             triggers
                 .iter()
-                .map(|t| (0, t.tenant_id, t.name.clone()))
+                .map(|t| (t.database_id.as_u64(), t.tenant_id, t.name.clone()))
                 .collect(),
         ),
         (
@@ -174,6 +183,13 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             materialized_views
                 .iter()
                 .map(|m| (0, m.tenant_id, m.name.clone()))
+                .collect(),
+        ),
+        (
+            object_type::STREAMING_MATERIALIZED_VIEW,
+            streaming_materialized_views
+                .iter()
+                .map(|m| (m.database_id.as_u64(), m.tenant_id, m.name.clone()))
                 .collect(),
         ),
         (
@@ -187,14 +203,14 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             object_type::SCHEDULE,
             schedules
                 .iter()
-                .map(|s| (0, s.tenant_id, s.name.clone()))
+                .map(|s| (s.database_id, s.tenant_id, s.name.clone()))
                 .collect(),
         ),
         (
             object_type::CHANGE_STREAM,
             change_streams
                 .iter()
-                .map(|c| (0, c.tenant_id, c.name.clone()))
+                .map(|c| (c.database_id.as_u64(), c.tenant_id, c.name.clone()))
                 .collect(),
         ),
         (
@@ -264,13 +280,14 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
 
     // ── Check 4: every trigger.collection exists. ──
     for t in &triggers {
-        let key = (t.tenant_id, t.collection.clone());
+        let database_id = t.database_id.as_u64();
+        let key = (database_id, t.tenant_id, t.collection.clone());
         if !collection_keys.contains(&key) {
             violations.push(Divergence::new(DivergenceKind::DanglingReference {
                 from_kind: "trigger",
-                from_key: format!("{}:{}", t.tenant_id, t.name),
+                from_key: format!("{database_id}:{}:{}", t.tenant_id, t.name),
                 to_kind: "collection",
-                to_key: format!("{}:{}", t.tenant_id, t.collection),
+                to_key: format!("{database_id}:{}:{}", t.tenant_id, t.collection),
             }));
         }
     }
@@ -278,7 +295,7 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
     // ── Check 5: every rls_policy.collection exists. ──
     for p in &rls {
         let key = (p.tenant_id, p.collection.clone());
-        if !collection_keys.contains(&key) {
+        if !legacy_collection_keys.contains(&key) {
             violations.push(Divergence::new(DivergenceKind::DanglingReference {
                 from_kind: "rls_policy",
                 from_key: format!("{}:{}", p.tenant_id, p.name),
@@ -298,7 +315,7 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
     // preventive path; this check is the detective path.
     for mv in &materialized_views {
         let key = (mv.tenant_id, mv.source.clone());
-        if !collection_keys.contains(&key) {
+        if !legacy_collection_keys.contains(&key) {
             violations.push(Divergence::new(DivergenceKind::DanglingReference {
                 from_kind: "materialized_view",
                 from_key: format!("{}:{}", mv.tenant_id, mv.name),
@@ -316,7 +333,7 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
             continue;
         }
         let key = (cs.tenant_id, cs.collection.clone());
-        if !collection_keys.contains(&key) {
+        if !legacy_collection_keys.contains(&key) {
             violations.push(Divergence::new(DivergenceKind::DanglingReference {
                 from_kind: "change_stream",
                 from_key: format!("{}:{}", cs.tenant_id, cs.name),
@@ -334,13 +351,13 @@ pub fn verify_redb_integrity(catalog: &SystemCatalog) -> Vec<Divergence> {
         let Some(target) = &sch.target_collection else {
             continue;
         };
-        let key = (sch.tenant_id, target.clone());
+        let key = (sch.database_id, sch.tenant_id, target.clone());
         if !collection_keys.contains(&key) {
             violations.push(Divergence::new(DivergenceKind::DanglingReference {
                 from_kind: "schedule",
-                from_key: format!("{}:{}", sch.tenant_id, sch.name),
+                from_key: format!("{}:{}:{}", sch.database_id, sch.tenant_id, sch.name),
                 to_kind: "collection",
-                to_key: format!("{}:{}", sch.tenant_id, target),
+                to_key: format!("{}:{}:{}", sch.database_id, sch.tenant_id, target),
             }));
         }
     }
@@ -363,6 +380,64 @@ fn is_builtin_role(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::security::catalog::trigger_types::{
+        TriggerBatchMode, TriggerEvents, TriggerExecutionMode, TriggerGranularity, TriggerSecurity,
+        TriggerTiming,
+    };
+    use crate::control::security::catalog::{StoredCollection, StoredTrigger};
+    use crate::control::security::credential::CredentialStore;
+    use nodedb_types::DatabaseId;
+
+    #[test]
+    fn trigger_collection_relationship_is_scoped_to_trigger_database() {
+        let directory = tempfile::tempdir().expect("create integrity catalog directory");
+        let store = CredentialStore::open(&directory.path().join("system.redb"))
+            .expect("open integrity catalog");
+        let catalog = store.catalog();
+
+        let collection = StoredCollection::new(1, "orders", "owner");
+        catalog
+            .put_collection(DatabaseId::DEFAULT, &collection)
+            .expect("store default database collection");
+        let trigger = StoredTrigger {
+            tenant_id: 1,
+            database_id: DatabaseId::new(55),
+            name: "audit_orders".into(),
+            collection: "orders".into(),
+            timing: TriggerTiming::After,
+            events: TriggerEvents {
+                on_insert: true,
+                on_update: false,
+                on_delete: false,
+            },
+            granularity: TriggerGranularity::Row,
+            when_condition: None,
+            body_sql: "BEGIN END".into(),
+            priority: 0,
+            enabled: true,
+            execution_mode: TriggerExecutionMode::Async,
+            security: TriggerSecurity::Invoker,
+            batch_mode: TriggerBatchMode::BatchSafe,
+            owner: "owner".into(),
+            created_at: 0,
+            descriptor_version: 1,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+        };
+        catalog.put_trigger(&trigger).expect("store trigger");
+
+        let violations = verify_redb_integrity(catalog);
+        assert!(violations.iter().any(|violation| {
+            matches!(
+                &violation.kind,
+                DivergenceKind::DanglingReference {
+                    from_kind: "trigger",
+                    from_key,
+                    to_kind: "collection",
+                    to_key,
+                } if from_key == "55:1:audit_orders" && to_key == "55:1:orders"
+            )
+        }));
+    }
 
     #[test]
     fn builtin_role_detection() {

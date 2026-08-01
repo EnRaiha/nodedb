@@ -8,6 +8,7 @@
 use nodedb::event::streaming_mv::persist::MvPersistence;
 use nodedb::event::streaming_mv::state::{GroupState, MvState};
 use nodedb::event::streaming_mv::types::{AggDef, AggFunction};
+use nodedb::types::DatabaseId;
 
 #[test]
 fn incremental_count() {
@@ -194,8 +195,13 @@ fn persistence_save_and_load() {
         ),
     ];
 
-    persist.save(1, "order_stats", &snapshot).unwrap();
-    let loaded = persist.load(1, "order_stats").unwrap().unwrap();
+    persist
+        .save(DatabaseId::DEFAULT, 1, "order_stats", &snapshot)
+        .unwrap();
+    let loaded = persist
+        .load(DatabaseId::DEFAULT, 1, "order_stats")
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.len(), 2);
     assert_eq!(loaded[0].1[0].count, 5);
     assert!(loaded[1].1[0].finalized);
@@ -207,10 +213,17 @@ fn persistence_survives_reopen() {
     {
         let persist = MvPersistence::open(dir.path()).unwrap();
         let snapshot = vec![("k".to_string(), vec![GroupState::default()])];
-        persist.save(1, "mv1", &snapshot).unwrap();
+        persist
+            .save(DatabaseId::DEFAULT, 1, "mv1", &snapshot)
+            .unwrap();
     }
     let persist = MvPersistence::open(dir.path()).unwrap();
-    assert!(persist.load(1, "mv1").unwrap().is_some());
+    assert!(
+        persist
+            .load(DatabaseId::DEFAULT, 1, "mv1")
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -218,7 +231,14 @@ fn persistence_delete() {
     let dir = tempfile::tempdir().unwrap();
     let persist = MvPersistence::open(dir.path()).unwrap();
     let snapshot = vec![("k".to_string(), vec![GroupState::default()])];
-    persist.save(1, "mv1", &snapshot).unwrap();
-    persist.delete(1, "mv1").unwrap();
-    assert!(persist.load(1, "mv1").unwrap().is_none());
+    persist
+        .save(DatabaseId::DEFAULT, 1, "mv1", &snapshot)
+        .unwrap();
+    persist.delete(DatabaseId::DEFAULT, 1, "mv1").unwrap();
+    assert!(
+        persist
+            .load(DatabaseId::DEFAULT, 1, "mv1")
+            .unwrap()
+            .is_none()
+    );
 }

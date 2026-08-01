@@ -52,7 +52,7 @@ pub fn log_mirror_restart_decisions(shared: &Arc<crate::control::state::SharedSt
 
 /// Spawn all persistent background subsystems.
 ///
-/// Includes: Event Plane consumers, event trigger processor, webhook manager wiring,
+/// Includes: Event Plane consumers, webhook manager wiring,
 /// collection GC, L2 cleanup, tenant rate/audit/memory timers, checkpoint manager,
 /// usage metering flush, and cold tier task.
 ///
@@ -63,6 +63,7 @@ pub fn log_mirror_restart_decisions(shared: &Arc<crate::control::state::SharedSt
 #[must_use = "EventPlane must be held for the server's lifetime; dropping it stops all event consumers"]
 pub fn spawn_background_loops(
     shared: &Arc<SharedState>,
+    shutdown_bus: crate::control::shutdown::ShutdownBus,
     components: EventPlaneComponents,
     config: &ServerConfig,
     num_cores: usize,
@@ -78,9 +79,6 @@ pub fn spawn_background_loops(
     // and log the decisions. The cluster layer processes these asynchronously
     // via the mirror_link_registry once QUIC transport is available.
     log_mirror_restart_decisions(shared);
-
-    // Event trigger processor.
-    crate::control::event_trigger::spawn_event_trigger_processor(Arc::clone(shared));
 
     // Mirror lag monitor (5-second interval).
     // Reads `_system.mirror_lag` for every active mirror and updates
@@ -143,22 +141,25 @@ pub fn spawn_background_loops(
         info!("mirror lag monitor running");
     }
 
-    // Wire webhook manager.
+    // Wire stream delivery managers before Event Plane creation can admit
+    // CREATE CHANGE STREAM delivery tasks.
     shared.webhook_manager.set_state(Arc::clone(shared));
+    shared.kafka_manager.set_state(Arc::clone(shared));
 
     // Event Plane: one consumer Tokio task per Data Plane core.
     // Returned to the caller — must outlive the server, otherwise its
     // Drop impl aborts every consumer and the Data Plane producers
     // start dropping every WriteEvent they emit.
-    let event_plane = crate::event::EventPlane::spawn(
-        event_consumers,
-        Arc::clone(&wal),
+    let event_plane = crate::event::EventPlane::spawn(crate::event::EventPlaneConfig {
+        consumers_rx: event_consumers,
+        wal: Arc::clone(&wal),
         watermark_store,
-        Arc::clone(shared),
+        shared_state: Arc::clone(shared),
         trigger_dlq,
-        Arc::clone(&shared.cdc_router),
-        Arc::clone(&shared.shutdown),
-    );
+        cdc_router: Arc::clone(&shared.cdc_router),
+        shutdown: Arc::clone(&shared.shutdown),
+        shutdown_bus,
+    });
     info!(num_cores, "event plane running");
 
     // Collection hard-delete retention GC.

@@ -10,7 +10,7 @@ use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::config::auth::AuthMode;
 use nodedb::control::server::pgwire::listener::PgListener;
 use nodedb::control::state::SharedState;
-use nodedb::event::{EventPlane, create_event_bus};
+use nodedb::event::{EventPlane, EventPlaneConfig, create_event_bus};
 use nodedb::wal::WalManager;
 
 use super::support::{bind_http_listener, bind_native_listener, init_test_memory_governor};
@@ -249,15 +249,20 @@ impl TestServer {
         let trigger_dlq = Arc::new(std::sync::Mutex::new(
             nodedb::event::trigger::TriggerDlq::open(dir.path()).unwrap(),
         ));
-        let event_plane = EventPlane::spawn(
-            event_consumers,
-            Arc::clone(&wal),
+        // Create the canonical bus before the Event Plane so every consumer
+        // and listener observes the same shutdown phases.
+        let (shutdown_bus, _) =
+            nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
+        let event_plane = EventPlane::spawn(EventPlaneConfig {
+            consumers_rx: event_consumers,
+            wal: Arc::clone(&wal),
             watermark_store,
-            Arc::clone(&shared),
+            shared_state: Arc::clone(&shared),
             trigger_dlq,
-            Arc::clone(&shared.cdc_router),
-            Arc::clone(&shared.shutdown),
-        );
+            cdc_router: Arc::clone(&shared.cdc_router),
+            shutdown: Arc::clone(&shared.shutdown),
+            shutdown_bus: shutdown_bus.clone(),
+        });
 
         // PgWire listener.
         let pg_listener = PgListener::bind("127.0.0.1:0".parse().unwrap())
@@ -265,10 +270,6 @@ impl TestServer {
             .unwrap();
         let pg_addr = pg_listener.local_addr();
 
-        // Create a shutdown bus wrapping the shared.shutdown watch so that
-        // bus.initiate() also signals the flat ShutdownWatch.
-        let (shutdown_bus, _) =
-            nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
         let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(128));
         let shared_pg = Arc::clone(&shared);
         // Use the startup gate already on SharedState (a pre-fired placeholder

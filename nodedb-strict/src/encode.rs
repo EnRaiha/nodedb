@@ -121,7 +121,12 @@ impl TupleEncoder {
             // Write fixed-size value.
             if let Some(offset) = self.fixed_offsets[i] {
                 let dst = fixed_start + offset;
-                encode_fixed(&mut buf[dst..], &col.column_type, val);
+                encode_fixed(&mut buf[dst..], &col.column_type, val).map_err(|()| {
+                    StrictError::TypeMismatch {
+                        column: col.name.clone(),
+                        expected: col.column_type,
+                    }
+                })?;
             }
             // Variable-length values are handled in the offset table pass below.
         }
@@ -142,7 +147,11 @@ impl TupleEncoder {
                     &mut var_data,
                     &self.schema.columns[col_idx].column_type,
                     val,
-                );
+                )
+                .map_err(|()| StrictError::TypeMismatch {
+                    column: self.schema.columns[col_idx].name.clone(),
+                    expected: self.schema.columns[col_idx].column_type,
+                })?;
             }
             // If null: offset stays the same as next entry → zero length.
         }
@@ -201,7 +210,7 @@ impl TupleEncoder {
 /// Encode a fixed-size value into the buffer at the given position.
 ///
 /// Handles both native Value types and SQL coercion sources.
-fn encode_fixed(dst: &mut [u8], col_type: &ColumnType, value: &Value) {
+fn encode_fixed(dst: &mut [u8], col_type: &ColumnType, value: &Value) -> Result<(), ()> {
     match (col_type, value) {
         // Int64: native.
         (ColumnType::Int64, Value::Integer(v)) => {
@@ -244,6 +253,29 @@ fn encode_fixed(dst: &mut [u8], col_type: &ColumnType, value: &Value) {
                 .unwrap_or(0);
             dst[..8].copy_from_slice(&micros.to_le_bytes());
         }
+        // System timestamp: UTC micros, decoded canonically as DateTime.
+        (ColumnType::SystemTimestamp, Value::DateTime(dt)) => {
+            dst[..8].copy_from_slice(&dt.micros.to_le_bytes());
+        }
+        (ColumnType::SystemTimestamp, Value::Integer(micros)) => {
+            dst[..8].copy_from_slice(&micros.to_le_bytes());
+        }
+        // ULID: parse its textual representation and retain the canonical 16-byte ID.
+        (ColumnType::Ulid, Value::Ulid(s) | Value::String(s)) => {
+            let id = ulid::Ulid::from_string(s).map_err(|_| ())?;
+            dst[..16].copy_from_slice(&id.to_bytes());
+        }
+        // Duration: native duration, microseconds, or a human-readable literal.
+        (ColumnType::Duration, Value::Duration(duration)) => {
+            dst[..8].copy_from_slice(&duration.micros.to_le_bytes());
+        }
+        (ColumnType::Duration, Value::Integer(micros)) => {
+            dst[..8].copy_from_slice(&micros.to_le_bytes());
+        }
+        (ColumnType::Duration, Value::String(s)) => {
+            let duration = nodedb_types::NdbDuration::parse(s).ok_or(())?;
+            dst[..8].copy_from_slice(&duration.micros.to_le_bytes());
+        }
         // Decimal: native Decimal + String/Float/Integer coercion.
         (ColumnType::Decimal { .. }, Value::Decimal(d)) => {
             dst[..16].copy_from_slice(&d.serialize());
@@ -285,12 +317,13 @@ fn encode_fixed(dst: &mut [u8], col_type: &ColumnType, value: &Value) {
         }
         _ => {} // Type mismatch caught earlier by accepts().
     }
+    Ok(())
 }
 
 /// Encode a variable-length value, appending to the data buffer.
 ///
 /// Handles both native Value types and SQL coercion sources.
-fn encode_variable(var_data: &mut Vec<u8>, col_type: &ColumnType, value: &Value) {
+fn encode_variable(var_data: &mut Vec<u8>, col_type: &ColumnType, value: &Value) -> Result<(), ()> {
     match (col_type, value) {
         (ColumnType::String, Value::String(s)) => {
             var_data.extend_from_slice(s.as_bytes());
@@ -333,8 +366,44 @@ fn encode_variable(var_data: &mut Vec<u8>, col_type: &ColumnType, value: &Value)
         (ColumnType::SparseVector, Value::Bytes(b)) => {
             var_data.extend_from_slice(b);
         }
-        _ => {}
+        // Typed variable columns use tagged NodeDB MessagePack so their Value
+        // variant survives storage. Coercion inputs are converted first.
+        (ColumnType::Array, Value::Array(_))
+        | (ColumnType::Set, Value::Set(_))
+        | (ColumnType::Regex, Value::Regex(_))
+        | (ColumnType::Range, Value::Range { .. })
+        | (ColumnType::Record, Value::Record { .. }) => {
+            append_msgpack(var_data, value)?;
+        }
+        (ColumnType::Set, Value::Array(items)) => {
+            append_msgpack(var_data, &Value::Set(items.clone()))?;
+        }
+        (ColumnType::Regex, Value::String(pattern)) => {
+            append_msgpack(var_data, &Value::Regex(pattern.clone()))?;
+        }
+        (ColumnType::Record, Value::String(reference)) => {
+            let (table, id) = reference.split_once(':').ok_or(())?;
+            if table.is_empty() || id.is_empty() {
+                return Err(());
+            }
+            append_msgpack(
+                var_data,
+                &Value::Record {
+                    table: table.to_owned(),
+                    id: id.to_owned(),
+                },
+            )?;
+        }
+        _ => {} // Type mismatch caught earlier by accepts().
     }
+    Ok(())
+}
+
+/// Append a lossless NodeDB MessagePack representation.
+fn append_msgpack(var_data: &mut Vec<u8>, value: &Value) -> Result<(), ()> {
+    let bytes = zerompk::to_msgpack_vec(value).map_err(|_| ())?;
+    var_data.extend_from_slice(&bytes);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -625,6 +694,104 @@ mod tests {
         let f1 = f32::from_le_bytes(tuple[14..18].try_into().unwrap());
         let f2 = f32::from_le_bytes(tuple[18..22].try_into().unwrap());
         assert_eq!((f0, f1, f2), (1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn canonical_strict_types_roundtrip_through_decoder() {
+        let schema = StrictSchema::new(vec![
+            ColumnDef::required("system_ts", ColumnType::SystemTimestamp),
+            ColumnDef::required("ulid", ColumnType::Ulid),
+            ColumnDef::required("duration_native", ColumnType::Duration),
+            ColumnDef::required("duration_integer", ColumnType::Duration),
+            ColumnDef::required("duration_string", ColumnType::Duration),
+            ColumnDef::required("array", ColumnType::Array),
+            ColumnDef::required("set", ColumnType::Set),
+            ColumnDef::required("regex", ColumnType::Regex),
+            ColumnDef::required("range", ColumnType::Range),
+            ColumnDef::required("record", ColumnType::Record),
+        ])
+        .unwrap();
+        let encoder = TupleEncoder::new(&schema);
+        let timestamp = NdbDateTime::from_micros(1_700_000_000_000_000);
+        let range = Value::Range {
+            start: Some(Box::new(Value::Integer(10))),
+            end: Some(Box::new(Value::Integer(20))),
+            inclusive: true,
+        };
+        let values = vec![
+            Value::DateTime(timestamp),
+            Value::String("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
+            Value::Duration(nodedb_types::NdbDuration::from_micros(42)),
+            Value::Integer(-1_500),
+            Value::String("1h30m".into()),
+            Value::Array(vec![Value::Integer(1), Value::String("two".into())]),
+            Value::Array(vec![Value::Integer(3)]),
+            Value::String("^node.*$".into()),
+            range.clone(),
+            Value::String("users:42".into()),
+        ];
+
+        let tuple = encoder.encode(&values).unwrap();
+        let decoder = crate::decode::TupleDecoder::new(&schema);
+        let expected = vec![
+            Value::DateTime(timestamp),
+            Value::Ulid("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
+            Value::Duration(nodedb_types::NdbDuration::from_micros(42)),
+            Value::Duration(nodedb_types::NdbDuration::from_micros(-1_500)),
+            Value::Duration(nodedb_types::NdbDuration::from_micros(5_400_000_000)),
+            Value::Array(vec![Value::Integer(1), Value::String("two".into())]),
+            Value::Set(vec![Value::Integer(3)]),
+            Value::Regex("^node.*$".into()),
+            range,
+            Value::Record {
+                table: "users".into(),
+                id: "42".into(),
+            },
+        ];
+
+        assert_eq!(decoder.extract_all(&tuple).unwrap(), expected);
+        assert_eq!(decoder.extract_value(&tuple, 9).unwrap(), expected[9]);
+    }
+
+    #[test]
+    fn typed_variable_columns_reject_wrong_msgpack_variants() {
+        let typed_columns = [
+            ColumnType::Array,
+            ColumnType::Set,
+            ColumnType::Regex,
+            ColumnType::Range,
+            ColumnType::Record,
+        ];
+
+        for column_type in typed_columns {
+            let schema =
+                StrictSchema::new(vec![ColumnDef::required("value", column_type)]).unwrap();
+            let encoder = TupleEncoder::new(&schema);
+            let input = match column_type {
+                ColumnType::Array => Value::Array(vec![]),
+                ColumnType::Set => Value::Set(vec![]),
+                ColumnType::Regex => Value::Regex("pattern".into()),
+                ColumnType::Range => Value::Range {
+                    start: None,
+                    end: None,
+                    inclusive: false,
+                },
+                ColumnType::Record => Value::Record {
+                    table: "table".into(),
+                    id: "id".into(),
+                },
+                _ => unreachable!(),
+            };
+            let mut tuple = encoder.encode(&[input]).unwrap();
+            let wrong = zerompk::to_msgpack_vec(&Value::String("wrong".into())).unwrap();
+            let variable_data_start = 10 + 8;
+            tuple.truncate(variable_data_start);
+            tuple.extend_from_slice(&wrong);
+            tuple[14..18].copy_from_slice(&(wrong.len() as u32).to_le_bytes());
+
+            let decoder = crate::decode::TupleDecoder::new(&schema);
+            assert_eq!(decoder.extract_value(&tuple, 0).unwrap(), Value::Null);
+        }
     }
 
     /// Asserts NDST magic at [0..4], FORMAT_VERSION == 1 at [4], and

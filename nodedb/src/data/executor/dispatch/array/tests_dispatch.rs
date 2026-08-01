@@ -127,6 +127,8 @@ impl Harness {
             schema_msgpack: bytes,
             schema_hash,
             prefix_bits: 8,
+            audit_retain_ms: None,
+            minimum_audit_retain_ms: None,
         });
         assert_eq!(r.status, Status::Ok, "open failed: {r:?}");
     }

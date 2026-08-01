@@ -13,12 +13,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
 use serde::Deserialize;
 use sonic_rs;
 
 use super::super::auth::{ApiError, AppState, ResolvedIdentity};
+use super::query::{DatabaseQueryParam, resolve_database_id};
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::Permission;
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
 use crate::event::cdc::consume::{ConsumeError, ConsumeParams, consume_stream};
 
@@ -32,12 +37,15 @@ pub struct SseParams {
     /// Detected and rejected — callers must not supply `tenant_id` as a
     /// query parameter. Tenant is always sourced from the bearer token.
     pub tenant_id: Option<u64>,
+    /// Optional database selector. The header takes precedence when present.
+    pub database: Option<String>,
 }
 
 /// Drop guard that deregisters a consumer from partition assignment
 /// on ALL exit paths (normal close, error, panic, task cancellation).
 struct ConsumerGuard {
     shared: Arc<SharedState>,
+    database_id: crate::types::DatabaseId,
     tenant_id: u64,
     stream_name: String,
     group: String,
@@ -47,6 +55,7 @@ struct ConsumerGuard {
 impl Drop for ConsumerGuard {
     fn drop(&mut self) {
         self.shared.consumer_assignments.leave(
+            self.database_id,
             self.tenant_id,
             &self.stream_name,
             &self.group,
@@ -61,6 +70,7 @@ pub async fn stream_events(
     Path(stream_name): Path<String>,
     Query(params): Query<SseParams>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     // Reject any attempt to override the caller's tenant via query string.
     if params.tenant_id.is_some() {
@@ -73,8 +83,52 @@ pub async fn stream_events(
 
     let group = params.group.unwrap_or_default().to_lowercase();
     let tenant_id = identity.tenant_id().as_u64();
+    let database_id = resolve_database_id(
+        &headers,
+        &DatabaseQueryParam {
+            database: params.database.clone(),
+        },
+        &state,
+    )?;
     let stream_name = stream_name.to_lowercase();
     let partition = params.partition;
+
+    // Authorize the source collection before constructing the SSE body. This
+    // ensures a denied request cannot claim a consumer-group assignment while
+    // waiting for the stream to be polled. Topics are authorized against
+    // their logical topic resources instead of a source collection.
+    if let Some(topic_name) = stream_name.strip_prefix("topic:") {
+        let emitter = ArcAuditEmitter(Arc::clone(&state.shared.audit));
+        authorize_collection(
+            &identity.0,
+            database_id,
+            &format!("topic:{topic_name}"),
+            Permission::Read,
+            &state.shared.permissions,
+            &state.shared.roles,
+            &emitter,
+        )
+        .map_err(crate::Error::from)
+        .map_err(ApiError::from)?;
+    } else if let Some(stream_def) =
+        state
+            .shared
+            .stream_registry
+            .get(database_id, tenant_id, &stream_name)
+    {
+        let emitter = ArcAuditEmitter(Arc::clone(&state.shared.audit));
+        authorize_collection(
+            &identity.0,
+            database_id,
+            &stream_def.collection,
+            Permission::Read,
+            &state.shared.permissions,
+            &state.shared.roles,
+            &emitter,
+        )
+        .map_err(crate::Error::from)
+        .map_err(ApiError::from)?;
+    }
 
     let stream = async_stream::stream! {
         if group.is_empty() {
@@ -89,6 +143,7 @@ pub async fn stream_events(
 
         // Register consumer and create a Drop guard for guaranteed cleanup.
         state.shared.consumer_assignments.join(
+            database_id,
             tenant_id,
             &stream_name,
             &group,
@@ -96,6 +151,7 @@ pub async fn stream_events(
         );
         let _guard = ConsumerGuard {
             shared: Arc::clone(&state.shared),
+            database_id,
             tenant_id,
             stream_name: stream_name.clone(),
             group: group.clone(),
@@ -104,6 +160,7 @@ pub async fn stream_events(
 
         loop {
             let consume_params = ConsumeParams {
+                database_id,
                 tenant_id,
                 stream_name: &stream_name,
                 group_name: &group,
@@ -147,7 +204,7 @@ pub async fn stream_events(
                     let json = sonic_rs::to_string(event).unwrap_or_default();
                     yield Ok(Event::default()
                         .event("change")
-                        .id(format!("{}:{}", event.partition, event.lsn))
+                        .id(event.offset_token())
                         .data(json));
                 }
             }

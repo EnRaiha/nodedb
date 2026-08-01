@@ -410,7 +410,14 @@ impl CrashHarness {
                 {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                Err(e) => panic!("exec: {e}"),
+                // `tokio_postgres::Error` renders as a bare "db error"; the
+                // server's message only lives on the DbError payload.
+                Err(e) => panic!(
+                    "exec: {e}{}",
+                    e.as_db_error()
+                        .map(|db| format!(" — {}: {}", db.code().code(), db.message()))
+                        .unwrap_or_default()
+                ),
             }
         }
     }

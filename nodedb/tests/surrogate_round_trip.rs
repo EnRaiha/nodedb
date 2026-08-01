@@ -333,6 +333,8 @@ fn surrogate_round_trip_all_engines() {
                 schema_msgpack: schema_bytes,
                 schema_hash: 1,
                 prefix_bits: 8,
+                audit_retain_ms: None,
+                minimum_audit_retain_ms: None,
             }),
         );
 

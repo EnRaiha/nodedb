@@ -115,6 +115,7 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "retention_policies" => RETENTION_POLICIES,
     "alert_rules" => ALERT_RULES,
     "topics_ep" => TOPICS_EP,
+    "topic_messages" => TOPIC_MESSAGES,
     "streaming_mvs" => STREAMING_MVS,
     // ── Database catalog + quotas ──
     "databases" => DATABASES,

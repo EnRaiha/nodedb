@@ -10,14 +10,15 @@
 
 use crate::control::security::catalog::SystemCatalog;
 
-/// Enumerate triggers bound to `(tenant_id, collection)`.
+/// Enumerate triggers bound to `(database_id, tenant_id, collection)`.
 /// Returns trigger names only.
 pub fn find_triggers_on(
     catalog: &SystemCatalog,
+    database_id: nodedb_types::DatabaseId,
     tenant_id: u64,
     collection: &str,
 ) -> crate::Result<Vec<String>> {
-    let all = catalog.load_triggers_for_tenant(tenant_id)?;
+    let all = catalog.load_triggers_in_database(database_id, tenant_id)?;
     let mut out: Vec<String> = all
         .into_iter()
         .filter(|t| t.collection == collection)
@@ -46,6 +47,7 @@ mod tests {
         };
         StoredTrigger {
             tenant_id: tenant,
+            database_id: nodedb_types::id::DatabaseId::DEFAULT,
             name: name.to_string(),
             collection: collection.to_string(),
             timing: TriggerTiming::After,
@@ -75,7 +77,7 @@ mod tests {
         c.put_trigger(&trig(1, "t_users_insert", "users")).unwrap();
         c.put_trigger(&trig(1, "t_users_update", "users")).unwrap();
         c.put_trigger(&trig(1, "t_orders", "orders")).unwrap();
-        let found = find_triggers_on(&c, 1, "users").unwrap();
+        let found = find_triggers_on(&c, nodedb_types::DatabaseId::DEFAULT, 1, "users").unwrap();
         assert_eq!(found, vec!["t_users_insert", "t_users_update"]);
     }
 
@@ -84,6 +86,27 @@ mod tests {
         let (c, _t) = cat();
         c.put_trigger(&trig(1, "t_a", "users")).unwrap();
         c.put_trigger(&trig(2, "t_b", "users")).unwrap();
-        assert_eq!(find_triggers_on(&c, 1, "users").unwrap(), vec!["t_a"]);
+        assert_eq!(
+            find_triggers_on(&c, nodedb_types::DatabaseId::DEFAULT, 1, "users").unwrap(),
+            vec!["t_a"]
+        );
+    }
+
+    #[test]
+    fn skips_same_tenant_trigger_in_another_database() {
+        let (c, _t) = cat();
+        c.put_trigger(&trig(1, "t_default", "users")).unwrap();
+        let mut other = trig(1, "t_other", "users");
+        other.database_id = nodedb_types::DatabaseId::new(2);
+        c.put_trigger(&other).unwrap();
+
+        assert_eq!(
+            find_triggers_on(&c, nodedb_types::DatabaseId::DEFAULT, 1, "users").unwrap(),
+            vec!["t_default"]
+        );
+        assert_eq!(
+            find_triggers_on(&c, nodedb_types::DatabaseId::new(2), 1, "users").unwrap(),
+            vec!["t_other"]
+        );
     }
 }

@@ -20,7 +20,7 @@ pub(super) fn init_security_buses(
 ) -> (
     SessionInvalidationBus,
     UserChangeBus,
-    tokio::task::JoinHandle<()>,
+    Option<tokio::task::JoinHandle<()>>,
 ) {
     let (si_bus, si_rx) = SessionInvalidationBus::new();
     let (uc_bus, uc_rx) = UserChangeBus::new();

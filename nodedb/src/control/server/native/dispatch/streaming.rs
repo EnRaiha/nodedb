@@ -69,6 +69,26 @@ pub(crate) struct SqlStream {
     /// each batch only needs decode + scan-envelope unwrap + this
     /// projection; no `apply_kv_wrap` / `translate_search_response` applies here.
     pub projection: Option<OutputSchema>,
+    /// Descriptor leases acquired after planning. The session loop owns this
+    /// stream, so retaining the scope here holds leases until final emission
+    /// or connection teardown drops the stream.
+    pub(crate) lease_scope: Option<crate::control::lease::QueryLeaseScope>,
+}
+
+impl SqlStream {
+    /// Attach the descriptor leases for this stream exactly once.
+    pub(crate) fn attach_lease_scope(
+        &mut self,
+        lease_scope: crate::control::lease::QueryLeaseScope,
+    ) -> crate::Result<()> {
+        if self.lease_scope.is_some() {
+            return Err(crate::Error::Internal {
+                detail: "SQL stream already owns a query lease scope".into(),
+            });
+        }
+        self.lease_scope = Some(lease_scope);
+        Ok(())
+    }
 }
 
 /// If `task`-list is an eligible streamable SELECT, open its row stream.
@@ -141,5 +161,6 @@ pub(crate) async fn try_open_sql_stream(
         limit,
         stream,
         projection: output_schema.cloned(),
+        lease_scope: None,
     }))
 }

@@ -18,6 +18,7 @@ use crate::control::planner::procedural::executor::core::CrossShardOrigin;
 use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::control::trigger::TriggerScope;
 use crate::control::trigger::fire;
 use crate::control::trigger::row_identity::inject_row_identity;
 use crate::event::types::{EventSource, WriteEvent, WriteOp, deserialize_event_payload};
@@ -98,7 +99,10 @@ pub async fn dispatch_triggers(
             crate::control::trigger::fire_statement::fire_after_statement(
                 state,
                 &identity,
-                event.tenant_id,
+                TriggerScope {
+                    database_id: event.database_id,
+                    tenant_id: event.tenant_id,
+                },
                 &event.collection,
                 dml_event,
                 0,
@@ -111,6 +115,7 @@ pub async fn dispatch_triggers(
                 operation: &op_str,
                 state,
                 identity: &identity,
+                database_id: event.database_id,
                 tenant_id: event.tenant_id,
                 collection: &event.collection,
                 new_fields: new_fields.as_ref(),
@@ -138,7 +143,10 @@ pub async fn dispatch_triggers(
                 if let Err(e) = crate::control::trigger::fire_statement::fire_after_statement(
                     state,
                     &identity,
-                    event.tenant_id,
+                    TriggerScope {
+                        database_id: event.database_id,
+                        tenant_id: event.tenant_id,
+                    },
                     &event.collection,
                     dml_event,
                     0,
@@ -153,6 +161,7 @@ pub async fn dispatch_triggers(
                         "AFTER STATEMENT trigger failed, enqueuing for retry"
                     );
                     retry_queue.enqueue(RetryEntry {
+                        database_id: event.database_id,
                         tenant_id: event.tenant_id.as_u64(),
                         collection: event.collection.to_string(),
                         row_id: String::new(),
@@ -183,6 +192,7 @@ pub async fn dispatch_triggers(
             "trigger execution failed, enqueuing for retry"
         );
         retry_queue.enqueue(RetryEntry {
+            database_id: event.database_id,
             tenant_id: event.tenant_id.as_u64(),
             collection: event.collection.to_string(),
             row_id: event.row_id.as_str().to_string(),
@@ -235,6 +245,7 @@ async fn retry_fire(
         operation: entry.operation.as_str(),
         state,
         identity,
+        database_id: entry.database_id,
         tenant_id: TenantId::new(entry.tenant_id),
         collection: &entry.collection,
         new_fields: entry.new_fields.as_ref(),
@@ -259,6 +270,8 @@ pub(super) struct FireForOperationParams<'a> {
     pub state: &'a Arc<SharedState>,
     /// Effective identity used to fire the trigger.
     pub identity: &'a AuthenticatedIdentity,
+    /// Database scope for trigger lookup and execution.
+    pub database_id: crate::types::DatabaseId,
     /// Tenant scope for trigger lookup and execution.
     pub tenant_id: TenantId,
     /// Target collection name.
@@ -285,6 +298,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> cr
         operation,
         state,
         identity,
+        database_id,
         tenant_id,
         collection,
         new_fields,
@@ -300,6 +314,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> cr
                 fire::fire_after_insert(fire::FireAfterInsertParams {
                     state,
                     identity,
+                    database_id,
                     tenant_id,
                     collection,
                     new_fields: new,
@@ -317,6 +332,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> cr
                 fire::fire_after_update(fire::FireAfterUpdateParams {
                     state,
                     identity,
+                    database_id,
                     tenant_id,
                     collection,
                     old_fields: old,
@@ -335,6 +351,7 @@ pub(super) async fn fire_for_operation(params: FireForOperationParams<'_>) -> cr
                 fire::fire_after_delete(fire::FireAfterDeleteParams {
                     state,
                     identity,
+                    database_id,
                     tenant_id,
                     collection,
                     old_fields: old,

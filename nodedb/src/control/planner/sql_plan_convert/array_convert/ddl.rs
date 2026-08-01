@@ -57,19 +57,13 @@ pub(in super::super) fn convert_create_array(
         tenant_id,
         ctx,
     } = args;
+    ctx.require_execute("CREATE ARRAY")?;
     let array_catalog = ctx
         .array_catalog
         .as_ref()
         .ok_or_else(|| crate::Error::PlanError {
             detail: "CREATE ARRAY: no array catalog wired into convert context".into(),
         })?;
-    let credentials = ctx
-        .credentials
-        .as_ref()
-        .ok_or_else(|| crate::Error::PlanError {
-            detail: "CREATE ARRAY: no credential store wired into convert context".into(),
-        })?;
-
     // 1a. Validate retention policy before touching shared state.
     if audit_retain_ms.is_some() || minimum_audit_retain_ms.is_some() {
         let retention = BitemporalRetention {
@@ -93,8 +87,9 @@ pub(in super::super) fn convert_create_array(
         })?;
     let schema_hash = stable_schema_hash(&schema.content_msgpack());
 
-    // 3. Persist + register. Reject duplicates with a typed error.
-    let aid = ArrayId::new(tenant_id, name);
+    // 3. Build DDL metadata only. Catalog and retention mutations happen at
+    // the authorized dispatch boundary, never while converting a SQL plan.
+    let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let entry = ArrayCatalogEntry {
         array_id: aid.clone(),
         name: name.to_string(),
@@ -106,51 +101,18 @@ pub(in super::super) fn convert_create_array(
         minimum_audit_retain_ms,
     };
     {
-        let mut cat = array_catalog.write().map_err(|_| crate::Error::PlanError {
+        let cat = array_catalog.read().map_err(|_| crate::Error::PlanError {
             detail: "array catalog lock poisoned".into(),
         })?;
-        if cat.lookup_by_name(name).is_some() {
+        if cat.lookup_by_id(&aid).is_some() {
             return Err(crate::Error::PlanError {
                 detail: format!("CREATE ARRAY {name}: already exists"),
             });
         }
-        cat.register(entry.clone())
-            .map_err(|e| crate::Error::PlanError {
-                detail: format!("array catalog register: {e}"),
-            })?;
-    }
-    {
-        let catalog = credentials.catalog();
-        crate::control::array_catalog::persist::persist(catalog, &entry).map_err(|e| {
-            crate::Error::PlanError {
-                detail: format!("array catalog persist: {e}"),
-            }
-        })?;
     }
 
-    // Register with the bitemporal retention registry.
-    if let Some(registry) = &ctx.bitemporal_retention_registry
-        && let Some(retain_ms) = audit_retain_ms
-    {
-        let retention = BitemporalRetention {
-            data_retain_ms: 0,
-            audit_retain_ms: retain_ms,
-            minimum_audit_retain_ms: minimum_audit_retain_ms.unwrap_or(0),
-        };
-        registry
-            .register(
-                ctx.database_id,
-                TenantId::new(0),
-                name,
-                crate::engine::bitemporal::BitemporalEngineKind::Array,
-                retention,
-            )
-            .map_err(|e| crate::Error::PlanError {
-                detail: format!("CREATE ARRAY {name}: registry register: {e}"),
-            })?;
-    }
-
-    // 4. Emit OpenArray so the Data Plane opens the engine side.
+    // 4. Emit OpenArray so the authorized execution boundary can durably
+    // register it immediately before opening the engine side.
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
     Ok(vec![PhysicalTask {
         tenant_id,
@@ -161,6 +123,8 @@ pub(in super::super) fn convert_create_array(
             schema_msgpack,
             schema_hash,
             prefix_bits,
+            audit_retain_ms: entry.audit_retain_ms,
+            minimum_audit_retain_ms: entry.minimum_audit_retain_ms,
         }),
         post_set_op: PostSetOp::None,
         txn_id: None,
@@ -173,50 +137,27 @@ pub(in super::super) fn convert_drop_array(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    ctx.require_execute("DROP ARRAY")?;
     let array_catalog = ctx
         .array_catalog
         .as_ref()
         .ok_or_else(|| crate::Error::PlanError {
             detail: "DROP ARRAY: no array catalog wired into convert context".into(),
         })?;
-    let credentials = ctx
-        .credentials
-        .as_ref()
-        .ok_or_else(|| crate::Error::PlanError {
-            detail: "DROP ARRAY: no credential store wired into convert context".into(),
-        })?;
     let removed_array_id: Option<ArrayId> = {
-        let mut cat = array_catalog.write().map_err(|_| crate::Error::PlanError {
+        let cat = array_catalog.read().map_err(|_| crate::Error::PlanError {
             detail: "array catalog lock poisoned".into(),
         })?;
-        let aid = cat.lookup_by_name(name).map(|e| e.array_id.clone());
-        if aid.is_some() {
-            cat.unregister(name);
-        }
-        aid
+        cat.lookup_by_name_in_database(tenant_id, ctx.database_id, name)
+            .map(|entry| entry.array_id)
     };
-    if removed_array_id.is_none() && !if_exists {
+    let Some(aid) = removed_array_id else {
+        if if_exists {
+            return Ok(Vec::new());
+        }
         return Err(crate::Error::PlanError {
             detail: format!("DROP ARRAY {name}: not found"),
         });
-    }
-    {
-        let catalog = credentials.catalog();
-        if let Err(e) = crate::control::array_catalog::persist::remove(catalog, name) {
-            return Err(crate::Error::PlanError {
-                detail: format!("array catalog remove: {e}"),
-            });
-        }
-        if let Err(e) =
-            catalog.delete_all_surrogates_for_collection(ctx.database_id, ctx.tenant_id, name)
-        {
-            return Err(crate::Error::PlanError {
-                detail: format!("array surrogate-map cleanup: {e}"),
-            });
-        }
-    }
-    let Some(aid) = removed_array_id else {
-        return Ok(Vec::new());
     };
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
     Ok(vec![PhysicalTask {

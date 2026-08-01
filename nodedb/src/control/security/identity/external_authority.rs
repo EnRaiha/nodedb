@@ -114,6 +114,8 @@ fn parse_role_infallible(name: &str) -> Role {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
@@ -134,5 +136,46 @@ mod tests {
         assert!(!identity.roles.contains(&Role::Superuser));
         assert!(identity.roles.contains(&Role::ReadWrite));
         assert!(identity.roles.contains(&Role::Custom("custom".into())));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn external_claims_never_control_superuser_or_tenant(
+            role_names in prop::collection::vec(
+                prop::string::string_regex("[A-Za-z0-9_-]{0,24}")
+                    .expect("bounded role-name regex must be valid"),
+                0..16,
+            ),
+            asserted_superuser in any::<bool>(),
+            claim_tenant in 0_u64..=1_000_000,
+            provider_tenant in 0_u64..=1_000_000,
+        ) {
+            // `claim_tenant` represents the legacy tenant assertion decoded
+            // before this conversion boundary. It is deliberately absent from
+            // `ExternalClaims`; include it in an otherwise untrusted claim
+            // field to exercise arbitrary claim values without giving it
+            // tenant authority.
+            let subject = format!("external-{claim_tenant}");
+            let identity = identity_from_external_claims(
+                ExternalClaims {
+                    user_id: 7,
+                    subject: &subject,
+                    role_names: &role_names,
+                    asserted_superuser,
+                },
+                ExternalProviderBinding::default_database(TenantId::new(provider_tenant)),
+            );
+
+            prop_assert!(!identity.is_superuser());
+            prop_assert!(!identity.roles.contains(&Role::Superuser));
+            prop_assert_eq!(
+                identity.tenant_id,
+                TenantId::new(provider_tenant),
+                "claim tenant {} must not control the identity tenant",
+                claim_tenant
+            );
+        }
     }
 }

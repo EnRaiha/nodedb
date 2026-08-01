@@ -20,6 +20,12 @@ impl MetadataCommitApplier {
         if let Some(weak) = self.shared.get()
             && let Some(shared) = weak.upgrade()
         {
+            // This exact gate also covers plan admission's drain check,
+            // refcount increment, and first-holder acquire.
+            let _admission_gate = shared
+                .lease_admission_gate
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             shared
                 .lease_drain
                 .install_start(descriptor_id.clone(), up_to_version, expires_at);

@@ -8,20 +8,30 @@
 //! cores and builds a lazy `QueryResponse` that pulls row batches as they
 //! arrive, instead of materializing and merging the whole result first.
 
-use pgwire::api::results::{FieldFormat, Response};
+use std::sync::Arc;
+
+use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, QueryOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::shared::session::SessionId;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
 use super::super::plan::PlanKind;
 use super::super::stream_response;
+use super::result_shaping::ResultShaping;
+
+pub(super) struct StreamSelectContext<'a> {
+    pub(super) identity: &'a AuthenticatedIdentity,
+    pub(super) plan_kind: PlanKind,
+    pub(super) session_id: SessionId,
+    pub(super) shaping: ResultShaping<'a>,
+    pub(super) lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
+}
 
 impl NodeDbPgHandler {
     /// Build a streaming `Response` for an eligible autocommit SELECT, or
@@ -41,12 +51,15 @@ impl NodeDbPgHandler {
     pub(super) async fn maybe_stream_select(
         &self,
         task: &PhysicalTask,
-        identity: &AuthenticatedIdentity,
-        plan_kind: PlanKind,
-        session_id: SessionId,
-        projection: Option<&OutputSchema>,
-        result_formats: &[FieldFormat],
+        context: StreamSelectContext<'_>,
     ) -> PgWireResult<Option<Response>> {
+        let StreamSelectContext {
+            identity,
+            plan_kind,
+            session_id,
+            shaping,
+            lease_scope,
+        } = context;
         if task.post_set_op != PostSetOp::None
             || !matches!(plan_kind, PlanKind::MultiRow)
             || self.sessions.transaction_state(session_id)
@@ -122,12 +135,18 @@ impl NodeDbPgHandler {
         //   - named columns  -> lazy per-batch shaping + projection
         //   - `SELECT *`      -> materialize, then id-first column union
         //   - anything else   -> raw single-column envelope passthrough
-        let response = match projection {
+        let response = match shaping.projection {
             Some(s) if !s.is_star && !s.columns.is_empty() => {
-                stream_response::streaming_shaped_response(stream, limit, s.clone(), result_formats)
+                stream_response::streaming_shaped_response(
+                    stream,
+                    limit,
+                    s.clone(),
+                    shaping.formats,
+                    lease_scope,
+                )
             }
             Some(s) if s.is_star => stream_response::streaming_star_response(stream, limit).await,
-            _ => stream_response::streaming_multirow_response(stream, limit),
+            _ => stream_response::streaming_multirow_response(stream, limit, lease_scope),
         };
 
         Ok(Some(response))

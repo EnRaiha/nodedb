@@ -27,6 +27,7 @@ use nodedb::control::security::catalog::trigger_types::{
 use nodedb::control::security::catalog::{StoredCollection, StoredMaterializedView, SystemCatalog};
 use nodedb::event::cdc::stream_def::{ChangeStreamDef, OpFilter, RetentionConfig, StreamFormat};
 use nodedb::event::scheduler::types::{MissedPolicy, ScheduleDef, ScheduleScope};
+use nodedb::types::DatabaseId;
 
 pub const ADMIN: &str = "admin";
 pub const TENANT: u64 = 1;
@@ -68,6 +69,7 @@ pub fn make_collection(name: &str) -> StoredCollection {
 pub fn make_function(name: &str) -> StoredFunction {
     StoredFunction {
         tenant_id: TENANT,
+        database_id: DatabaseId::DEFAULT,
         name: name.to_string(),
         parameters: vec![FunctionParam {
             name: "x".into(),
@@ -80,6 +82,8 @@ pub fn make_function(name: &str) -> StoredFunction {
         security: Default::default(),
         language: Default::default(),
         wasm_hash: None,
+        wasm_module: None,
+        dependencies: vec![],
         wasm_fuel: 1_000_000,
         wasm_memory: 16 * 1024 * 1024,
         owner: ADMIN.into(),
@@ -92,6 +96,7 @@ pub fn make_function(name: &str) -> StoredFunction {
 pub fn make_procedure(name: &str) -> StoredProcedure {
     StoredProcedure {
         tenant_id: TENANT,
+        database_id: DatabaseId::DEFAULT,
         name: name.into(),
         parameters: vec![ProcedureParam {
             name: "cutoff".into(),
@@ -112,6 +117,7 @@ pub fn make_procedure(name: &str) -> StoredProcedure {
 pub fn make_trigger(name: &str, collection: &str) -> StoredTrigger {
     StoredTrigger {
         tenant_id: TENANT,
+        database_id: DatabaseId::DEFAULT,
         collection: collection.into(),
         name: name.into(),
         timing: TriggerTiming::After,
@@ -160,6 +166,7 @@ pub fn make_sequence(name: &str) -> StoredSequence {
 pub fn make_schedule(name: &str) -> ScheduleDef {
     ScheduleDef {
         tenant_id: TENANT,
+        database_id: DatabaseId::DEFAULT.as_u64(),
         name: name.into(),
         cron_expr: "*/5 * * * *".into(),
         body_sql: "SELECT 1".into(),
@@ -175,6 +182,7 @@ pub fn make_schedule(name: &str) -> ScheduleDef {
 
 pub fn make_stream(name: &str) -> ChangeStreamDef {
     ChangeStreamDef {
+        database_id: nodedb::types::DatabaseId::new(7),
         tenant_id: TENANT,
         name: name.into(),
         collection: "*".into(),

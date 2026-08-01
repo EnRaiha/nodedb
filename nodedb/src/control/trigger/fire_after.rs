@@ -17,7 +17,7 @@ use crate::control::planner::procedural::executor::core::CrossShardOrigin;
 use crate::control::security::catalog::trigger_types::{TriggerExecutionMode, TriggerTiming};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 use std::collections::HashMap;
 
@@ -30,6 +30,8 @@ pub struct FireAfterInsertParams<'a> {
     pub state: &'a SharedState,
     /// Caller identity (used unless a trigger is SECURITY DEFINER).
     pub identity: &'a AuthenticatedIdentity,
+    /// Database scope for trigger lookup and execution.
+    pub database_id: DatabaseId,
     /// Tenant scope for trigger lookup and execution.
     pub tenant_id: TenantId,
     /// Target collection name.
@@ -58,6 +60,7 @@ pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> crate::Resu
     let FireAfterInsertParams {
         state,
         identity,
+        database_id,
         tenant_id,
         collection,
         new_fields,
@@ -66,10 +69,12 @@ pub async fn fire_after_insert(params: FireAfterInsertParams<'_>) -> crate::Resu
         cross_shard_origin,
     } = params;
 
-    let triggers =
-        state
-            .trigger_registry
-            .get_matching(tenant_id.as_u64(), collection, DmlEvent::Insert);
+    let triggers = state.trigger_registry.get_matching(
+        database_id,
+        tenant_id.as_u64(),
+        collection,
+        DmlEvent::Insert,
+    );
 
     let after_triggers: Vec<_> = triggers
         .into_iter()
@@ -104,6 +109,8 @@ pub struct FireAfterUpdateParams<'a> {
     pub state: &'a SharedState,
     /// Caller identity (used unless a trigger is SECURITY DEFINER).
     pub identity: &'a AuthenticatedIdentity,
+    /// Database scope for trigger lookup and execution.
+    pub database_id: DatabaseId,
     /// Tenant scope for trigger lookup and execution.
     pub tenant_id: TenantId,
     /// Target collection name.
@@ -128,6 +135,7 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> crate::Resu
     let FireAfterUpdateParams {
         state,
         identity,
+        database_id,
         tenant_id,
         collection,
         old_fields,
@@ -137,10 +145,12 @@ pub async fn fire_after_update(params: FireAfterUpdateParams<'_>) -> crate::Resu
         cross_shard_origin,
     } = params;
 
-    let triggers =
-        state
-            .trigger_registry
-            .get_matching(tenant_id.as_u64(), collection, DmlEvent::Update);
+    let triggers = state.trigger_registry.get_matching(
+        database_id,
+        tenant_id.as_u64(),
+        collection,
+        DmlEvent::Update,
+    );
 
     let after_triggers: Vec<_> = triggers
         .into_iter()
@@ -175,6 +185,8 @@ pub struct FireAfterDeleteParams<'a> {
     pub state: &'a SharedState,
     /// Caller identity (used unless a trigger is SECURITY DEFINER).
     pub identity: &'a AuthenticatedIdentity,
+    /// Database scope for trigger lookup and execution.
+    pub database_id: DatabaseId,
     /// Tenant scope for trigger lookup and execution.
     pub tenant_id: TenantId,
     /// Target collection name.
@@ -196,6 +208,7 @@ pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> crate::Resu
     let FireAfterDeleteParams {
         state,
         identity,
+        database_id,
         tenant_id,
         collection,
         old_fields,
@@ -204,10 +217,12 @@ pub async fn fire_after_delete(params: FireAfterDeleteParams<'_>) -> crate::Resu
         cross_shard_origin,
     } = params;
 
-    let triggers =
-        state
-            .trigger_registry
-            .get_matching(tenant_id.as_u64(), collection, DmlEvent::Delete);
+    let triggers = state.trigger_registry.get_matching(
+        database_id,
+        tenant_id.as_u64(),
+        collection,
+        DmlEvent::Delete,
+    );
 
     let after_triggers: Vec<_> = triggers
         .into_iter()
@@ -245,6 +260,7 @@ pub async fn fire_sql(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     sql: &str,
     cascade_depth: u32,
 ) -> crate::Result<()> {
@@ -265,10 +281,11 @@ pub async fn fire_sql(
         }
     })?;
 
-    let executor = StatementExecutor::with_source(
+    let executor = StatementExecutor::with_source_in_database(
         state,
         identity.clone(),
         tenant_id,
+        database_id,
         cascade_depth,
         crate::event::EventSource::Trigger,
     );

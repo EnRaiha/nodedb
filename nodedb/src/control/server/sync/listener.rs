@@ -11,10 +11,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::net::TcpListener;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
 use crate::control::security::jwt::JwtConfig;
 use crate::control::server::shared::{ConnectionFutureOutcome, isolate_connection_future};
+use crate::control::shutdown::{ShutdownBus, ShutdownPhase};
 use crate::control::state::SharedState;
 
 use super::rate_limit::RateLimitConfig;
@@ -170,25 +172,28 @@ impl SyncRegistrationCleanup {
     }
 
     async fn run(self: Arc<Self>) {
-        self.shared.shape_registry.remove_session(&self.session_id);
-        self.shared.crdt_sync_delivery.unregister(&self.session_id);
-        self.shared.array_delivery.unregister(&self.session_id);
-        self.shared
-            .array_subscriber_cursors
-            .remove_session(&self.session_id);
-        self.shared
-            .array_merger_registry
-            .remove_session(&self.session_id);
-        self.shared
-            .definition_sync_fanout
-            .unregister(&self.session_id);
-
-        let mut presence = self.shared.presence.write().await;
-        let outbound = presence.unregister_session(&self.session_id);
-        let senders = presence.senders().clone();
-        drop(presence);
-        outbound.send_all(&senders);
+        unregister_sync_session(&self.shared, &self.session_id).await;
     }
+}
+
+/// Remove every registry binding associated with a sync connection.
+///
+/// This is idempotent so a new handshake can revoke its previous binding
+/// before it authenticates a replacement identity, and final connection
+/// cleanup can safely run afterward.
+pub(super) async fn unregister_sync_session(shared: &SharedState, session_id: &str) {
+    shared.shape_registry.remove_session(session_id);
+    shared.crdt_sync_delivery.unregister(session_id);
+    shared.array_delivery.unregister(session_id);
+    shared.array_subscriber_cursors.remove_session(session_id);
+    shared.array_merger_registry.remove_session(session_id);
+    shared.definition_sync_fanout.unregister(session_id);
+
+    let mut presence = shared.presence.write().await;
+    let outbound = presence.unregister_session(session_id);
+    let senders = presence.senders().clone();
+    drop(presence);
+    outbound.send_all(&senders);
 }
 
 /// Ensures normal completion awaits registry cleanup while cancellation and
@@ -267,23 +272,27 @@ pub async fn bind_sync_listener(addr: SocketAddr) -> crate::Result<TcpListener> 
 ///
 /// Binds and serves in one step. Boot uses [`bind_sync_listener`] +
 /// [`serve_sync_listener`] instead so the bind is fail-fast; this is the
-/// convenience path for callers that own the whole lifecycle (tests, tools).
+/// convenience path for callers that own the whole lifecycle (tests, tools)
+/// and can provide that lifecycle's canonical shutdown bus.
 pub async fn start_sync_listener(
     config: SyncListenerConfig,
     shared: Option<Arc<SharedState>>,
+    shutdown_bus: ShutdownBus,
 ) -> crate::Result<Arc<SyncListenerState>> {
     let listener = bind_sync_listener(config.listen_addr).await?;
-    Ok(serve_sync_listener(listener, config, shared).await)
+    Ok(serve_sync_listener(listener, config, shared, shutdown_bus).await)
 }
 
 /// Serve sync sessions on an already-bound listener.
 ///
-/// Infallible: the only failure mode is the bind, which the caller has
-/// already cleared.
+/// The caller supplies the process's canonical shutdown bus. The listener
+/// holds a critical drain guard until its accept loop, presence sweeper, and
+/// every admitted connection task have stopped.
 pub async fn serve_sync_listener(
     listener: TcpListener,
     config: SyncListenerConfig,
     shared: Option<Arc<SharedState>>,
+    shutdown_bus: ShutdownBus,
 ) -> Arc<SyncListenerState> {
     // Surface the actually-bound address. For a fixed port this is a no-op; for
     // an ephemeral port (`:0`) it records the OS-assigned port so the caller can
@@ -294,92 +303,137 @@ pub async fn serve_sync_listener(
     }
 
     let state = Arc::new(SyncListenerState::new(config));
-
-    info!(addr = %state.config.listen_addr, "sync WebSocket listener started");
-
-    // Spawn presence TTL sweep timer (before moving `shared` into accept loop).
-    if let Some(ref shared) = shared {
-        let presence = Arc::clone(&shared.presence);
-        let sweep_interval_ms = presence.read().await.sweep_interval_ms();
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_millis(sweep_interval_ms));
-            loop {
-                interval.tick().await;
-                let mut mgr = presence.write().await;
-                let outbound = mgr.sweep_expired();
-                let senders = mgr.senders().clone();
-                drop(mgr); // Release lock before fan-out.
-                outbound.send_all(&senders);
-            }
-        });
-    }
-
+    let drain_guard = shutdown_bus.register_critical_task(ShutdownPhase::DrainingListeners, "sync");
     let state_clone = Arc::clone(&state);
     tokio::spawn(async move {
-        accept_loop(listener, state_clone, shared).await;
+        run_sync_listener(listener, state_clone, shared, shutdown_bus, drain_guard).await;
     });
 
     state
 }
 
-async fn accept_loop(
+async fn run_sync_listener(
     listener: TcpListener,
     state: Arc<SyncListenerState>,
     shared: Option<Arc<SharedState>>,
+    shutdown_bus: ShutdownBus,
+    drain_guard: crate::control::shutdown::DrainGuard,
 ) {
+    let mut shutdown_handle = shutdown_bus.handle();
+    let mut connections = JoinSet::new();
+    let mut presence_sweeper = spawn_presence_sweeper(shared.as_ref()).await;
+
+    info!(addr = %state.config.listen_addr, "sync WebSocket listener started");
+
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                if !state.can_accept() {
-                    state.session_rejected();
-                    warn!(%addr, "sync: max sessions reached, rejecting");
-                    continue;
-                }
-
-                // Create the guard after admission and move it into the task
-                // before WebSocket upgrade or session processing can panic.
-                let Some(guard) = SyncSessionGuard::open(Arc::clone(&state)) else {
-                    state.session_rejected();
-                    warn!(%addr, "sync: accepted-session identity exhausted, rejecting");
-                    continue;
-                };
-                let session_id = guard.session_id(addr);
-                let state_clone = Arc::clone(&state);
-                let shared_clone = shared.clone();
-
-                tokio::spawn(async move {
-                    let outcome = run_accepted_session(guard, async {
-                        match tokio_tungstenite::accept_async(stream).await {
-                            Ok(ws) => {
-                                info!(%addr, "sync: WebSocket connection established");
-                                handle_sync_session(
-                                    ws,
-                                    addr,
-                                    session_id,
-                                    &state_clone,
-                                    shared_clone,
-                                )
-                                .await;
-                            }
-                            Err(error) => {
-                                warn!(%addr, error = %error, "sync: WebSocket upgrade failed");
-                            }
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, addr)) => {
+                        if !state.can_accept() {
+                            state.session_rejected();
+                            warn!(%addr, "sync: max sessions reached, rejecting");
+                            continue;
                         }
-                    })
-                    .await;
-                    if matches!(outcome, ConnectionFutureOutcome::Panicked) {
-                        // Do not inspect a panic payload: it may contain client
-                        // data or application internals.
-                        warn!(%addr, "sync connection panicked; closing connection");
+
+                        // Create the guard after admission and move it into the task
+                        // before WebSocket upgrade or session processing can panic.
+                        let Some(guard) = SyncSessionGuard::open(Arc::clone(&state)) else {
+                            state.session_rejected();
+                            warn!(%addr, "sync: accepted-session identity exhausted, rejecting");
+                            continue;
+                        };
+                        let session_id = guard.session_id(addr);
+                        let state_clone = Arc::clone(&state);
+                        let shared_clone = shared.clone();
+
+                        connections.spawn(async move {
+                            let outcome = run_accepted_session(guard, async {
+                                match tokio_tungstenite::accept_async(stream).await {
+                                    Ok(ws) => {
+                                        info!(%addr, "sync: WebSocket connection established");
+                                        handle_sync_session(
+                                            ws,
+                                            addr,
+                                            session_id,
+                                            &state_clone,
+                                            shared_clone,
+                                        )
+                                        .await;
+                                    }
+                                    Err(error) => {
+                                        warn!(%addr, error = %error, "sync: WebSocket upgrade failed");
+                                    }
+                                }
+                            })
+                            .await;
+                            if matches!(outcome, ConnectionFutureOutcome::Panicked) {
+                                // Do not inspect a panic payload: it may contain client
+                                // data or application internals.
+                                warn!(%addr, "sync connection panicked; closing connection");
+                            }
+                        });
                     }
-                });
+                    Err(error) => warn!(%error, "sync: accept failed"),
+                }
             }
-            Err(e) => {
-                warn!(error = %e, "sync: accept failed");
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    warn!(%error, "sync connection task ended unexpectedly");
+                }
+            }
+            _ = shutdown_handle.await_phase(ShutdownPhase::DrainingListeners) => {
+                info!(
+                    addr = %state.config.listen_addr,
+                    active = connections.len(),
+                    "shutdown signal, draining sync connections"
+                );
+                break;
             }
         }
     }
+
+    if let Some(sweeper) = presence_sweeper.take() {
+        sweeper.abort();
+        let _ = sweeper.await;
+    }
+
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    if !connections.is_empty()
+        && tokio::time::timeout(DRAIN_TIMEOUT, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+    {
+        warn!(
+            remaining = connections.len(),
+            "sync drain timeout exceeded, aborting remaining connections"
+        );
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
+
+    info!(addr = %state.config.listen_addr, "sync listener stopped");
+    drain_guard.report_drained();
+}
+
+async fn spawn_presence_sweeper(shared: Option<&Arc<SharedState>>) -> Option<JoinHandle<()>> {
+    let shared = shared?;
+    let presence = Arc::clone(&shared.presence);
+    let sweep_interval_ms = presence.read().await.sweep_interval_ms();
+    Some(tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(sweep_interval_ms));
+        loop {
+            interval.tick().await;
+            let mut mgr = presence.write().await;
+            let outbound = mgr.sweep_expired();
+            let senders = mgr.senders().clone();
+            drop(mgr);
+            outbound.send_all(&senders);
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -393,7 +447,8 @@ mod tests {
     use super::*;
     use crate::bridge::dispatch::Dispatcher;
     use crate::control::server::sync::presence::SessionSender;
-    use crate::control::server::sync::shape::definition::{ShapeDefinition, ShapeType};
+    use crate::control::server::sync::shape::definition::{ShapeDefinition, ShapeScope, ShapeType};
+    use crate::control::shutdown::{ShutdownPhase, ShutdownWatch};
     use crate::event::crdt_sync::types::DeliveryConfig;
     use crate::wal::WalManager;
 
@@ -435,8 +490,9 @@ mod tests {
             ..Default::default()
         };
 
+        let (bus, _) = ShutdownBus::new(Arc::new(ShutdownWatch::new()));
         assert!(
-            start_sync_listener(cfg, None).await.is_err(),
+            start_sync_listener(cfg, None, bus).await.is_err(),
             "expected start_sync_listener to return Err when the address is already bound"
         );
     }
@@ -466,11 +522,49 @@ mod tests {
             listen_addr: "0.0.0.0:9090".parse().unwrap(),
             ..SyncListenerConfig::default()
         };
-        let error = match start_sync_listener(config, None).await {
+        let (bus, _) = ShutdownBus::new(Arc::new(ShutdownWatch::new()));
+        let error = match start_sync_listener(config, None, bus).await {
             Ok(_) => panic!("public plaintext listener unexpectedly started"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("TLS-terminating proxy"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_critical_barrier_stops_admitted_sync_tasks() {
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .expect("bind sync listener");
+        let addr = listener.local_addr().expect("sync listener address");
+        let (bus, _) = ShutdownBus::new(Arc::new(ShutdownWatch::new()));
+        let state = serve_sync_listener(
+            listener,
+            SyncListenerConfig {
+                listen_addr: addr,
+                ..SyncListenerConfig::default()
+            },
+            None,
+            bus.clone(),
+        )
+        .await;
+
+        let _client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect a stalled sync handshake");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.active_sessions.load(Ordering::Relaxed) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sync listener must own the admitted connection task");
+
+        let mut shutdown = bus.handle();
+        let sequencer = bus.initiate();
+        shutdown.await_phase(ShutdownPhase::Closed).await;
+        sequencer.await.expect("shutdown sequencer must complete");
+
+        assert_eq!(state.active_sessions.load(Ordering::Relaxed), 0);
     }
 
     fn listener_state() -> Arc<SyncListenerState> {
@@ -566,7 +660,10 @@ mod tests {
 
         shared.shape_registry.subscribe(
             &session_id,
-            1,
+            ShapeScope {
+                tenant_id: 1,
+                database_id: crate::types::DatabaseId::DEFAULT,
+            },
             ShapeDefinition {
                 shape_id: "cleanup-shape".into(),
                 tenant_id: 1,
@@ -582,6 +679,7 @@ mod tests {
             session_id.clone(),
             7,
             1,
+            crate::types::DatabaseId::DEFAULT,
             Vec::new(),
             &DeliveryConfig::default(),
         );
@@ -589,10 +687,17 @@ mod tests {
         shared
             .array_subscriber_cursors
             .register(&session_id, "cleanup_array", None);
-        let merger = shared
-            .array_merger_registry
-            .get_or_create(&session_id, "cleanup_array");
-        let definition_rx = shared.definition_sync_fanout.register(session_id.clone());
+        let merger = shared.array_merger_registry.get_or_create(
+            &session_id,
+            crate::types::DatabaseId::DEFAULT,
+            1,
+            "cleanup_array",
+        );
+        let definition_rx = shared.definition_sync_fanout.register(
+            session_id.clone(),
+            1,
+            crate::types::DatabaseId::DEFAULT,
+        );
         let (presence_tx, _presence_rx) = mpsc::channel(1);
         shared
             .presence
@@ -655,9 +760,12 @@ mod tests {
                 && definition_rx.is_closed()
         })
         .await;
-        let replacement_merger = shared
-            .array_merger_registry
-            .get_or_create(&session_id, "cleanup_array");
+        let replacement_merger = shared.array_merger_registry.get_or_create(
+            &session_id,
+            crate::types::DatabaseId::DEFAULT,
+            1,
+            "cleanup_array",
+        );
         assert!(
             !Arc::ptr_eq(&merger, &replacement_merger),
             "cleanup must remove the prior session-scoped array merger"
@@ -677,6 +785,95 @@ mod tests {
         })
         .await
         .expect("detached cleanup must unregister presence promptly");
+    }
+
+    #[tokio::test]
+    async fn handshake_reset_unregisters_prior_session_bindings() {
+        let (shared, _dir) = test_shared_state();
+        let session_id = "sync-handshake-reset-regression".to_owned();
+
+        shared.shape_registry.subscribe(
+            &session_id,
+            ShapeScope {
+                tenant_id: 1,
+                database_id: crate::types::DatabaseId::DEFAULT,
+            },
+            ShapeDefinition {
+                shape_id: "reset-shape".into(),
+                tenant_id: 1,
+                shape_type: ShapeType::Document {
+                    collection: "reset_collection".into(),
+                    predicate: Vec::new(),
+                },
+                description: "handshake reset regression shape".into(),
+                field_filter: Vec::new(),
+            },
+        );
+        let (crdt_rx, crdt_control_rx) = shared.crdt_sync_delivery.register(
+            session_id.clone(),
+            7,
+            1,
+            crate::types::DatabaseId::DEFAULT,
+            Vec::new(),
+            &DeliveryConfig::default(),
+        );
+        let array_delivery_rx = shared.array_delivery.register(session_id.clone());
+        shared
+            .array_subscriber_cursors
+            .register(&session_id, "reset_array", None);
+        let merger = shared.array_merger_registry.get_or_create(
+            &session_id,
+            crate::types::DatabaseId::DEFAULT,
+            1,
+            "reset_array",
+        );
+        let definition_rx = shared.definition_sync_fanout.register(
+            session_id.clone(),
+            1,
+            crate::types::DatabaseId::DEFAULT,
+        );
+        let (presence_tx, _presence_rx) = mpsc::channel(1);
+        shared
+            .presence
+            .write()
+            .await
+            .register_session(session_id.clone(), SessionSender::new(presence_tx));
+
+        unregister_sync_session(&shared, &session_id).await;
+
+        assert_eq!(shared.shape_registry.active_sessions(), 0);
+        assert_eq!(shared.crdt_sync_delivery.session_count(), 0);
+        assert!(crdt_rx.is_closed());
+        assert!(crdt_control_rx.is_closed());
+        assert_eq!(shared.array_delivery.active_sessions(), 0);
+        assert!(array_delivery_rx.is_closed());
+        assert!(
+            shared
+                .array_subscriber_cursors
+                .get(&session_id, "reset_array")
+                .is_none()
+        );
+        let replacement_merger = shared.array_merger_registry.get_or_create(
+            &session_id,
+            crate::types::DatabaseId::DEFAULT,
+            1,
+            "reset_array",
+        );
+        assert!(
+            !Arc::ptr_eq(&merger, &replacement_merger),
+            "handshake reset must remove the old array merger"
+        );
+        shared.array_merger_registry.remove_session(&session_id);
+        assert_eq!(shared.definition_sync_fanout.active_sessions(), 0);
+        assert!(definition_rx.is_closed());
+        assert!(
+            !shared
+                .presence
+                .read()
+                .await
+                .senders()
+                .contains_key(&session_id)
+        );
     }
 
     #[tokio::test]

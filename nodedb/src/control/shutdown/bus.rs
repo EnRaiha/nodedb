@@ -507,11 +507,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn critical_task_blocks_later_shutdown_phases_until_drained() {
+    async fn connection_listener_drain_barrier_blocks_later_phases_until_drained() {
         let watch = Arc::new(ShutdownWatch::new());
         let (bus, mut handle) = ShutdownBus::new(Arc::clone(&watch));
-        let guard =
-            bus.register_critical_task(ShutdownPhase::DrainingListeners, "native_cleanup_barrier");
+        // Connection-owning listeners (pgwire, HTTP, ILP, RESP) can exceed
+        // the normal 500ms task budget while they finish their own drain.
+        let guard = bus.register_critical_task(
+            ShutdownPhase::DrainingListeners,
+            "connection_listener_drain_barrier",
+        );
 
         bus.initiate();
         handle.await_phase(ShutdownPhase::DrainingListeners).await;
@@ -521,11 +525,11 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(50),
-                handle.await_phase(ShutdownPhase::DrainingControlPlane),
+                handle.await_phase(ShutdownPhase::DrainingDataPlane),
             )
             .await
             .is_err(),
-            "critical cleanup must block control-plane and Data-Plane shutdown"
+            "an over-budget listener drain must block Data-Plane shutdown"
         );
 
         guard.report_drained();

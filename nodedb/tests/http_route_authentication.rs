@@ -94,6 +94,8 @@ async fn http_trust_auth_uses_configured_durable_identity() {
     let app_state = nodedb::control::server::http::auth::AppState {
         shared: Arc::clone(&srv.shared),
         auth_mode: AuthMode::Trust,
+        shutdown_bus: nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&srv.shared.shutdown))
+            .0,
         query_ctx: Arc::new(nodedb::control::planner::context::QueryContext::for_state(
             &srv.shared,
         )),
@@ -122,6 +124,7 @@ async fn http_trust_auth_rejects_without_configured_identity() {
     let app_state = nodedb::control::server::http::auth::AppState {
         shared: Arc::clone(&shared),
         auth_mode: AuthMode::Trust,
+        shutdown_bus: nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown)).0,
         query_ctx: Arc::new(nodedb::control::planner::context::QueryContext::for_state(
             &shared,
         )),
@@ -196,9 +199,12 @@ async fn stream_sse_rejects_cross_tenant_tenant_id_parameter() {
         resp.status()
     );
     assert_eq!(
-        srv.shared
-            .consumer_assignments
-            .consumer_count(42, "s1", "g1"),
+        srv.shared.consumer_assignments.consumer_count(
+            nodedb::types::DatabaseId::DEFAULT,
+            42,
+            "s1",
+            "g1"
+        ),
         0,
         "stream_sse must not register a consumer for a tenant the caller cannot act as"
     );
@@ -219,9 +225,12 @@ async fn stream_sse_unauthenticated_request_does_not_claim_consumer_slot() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     assert_eq!(
-        srv.shared
-            .consumer_assignments
-            .consumer_count(42, "s1", "g1"),
+        srv.shared.consumer_assignments.consumer_count(
+            nodedb::types::DatabaseId::DEFAULT,
+            42,
+            "s1",
+            "g1"
+        ),
         0,
         "an unauthenticated SSE request must not register a consumer — DoS guard"
     );
@@ -398,18 +407,11 @@ mod promql {
 
 // ─── Latent handlers (bug baked into source, currently unmounted) ────────────
 //
-// `wasm_upload::upload_wasm` hardcodes `tenant_id = 0u32` (line 39) and
-// `subscribe.rs` hardcodes `TenantId::new(1)` in its default subscription
-// sites (lines 188, 205). Both handlers violate the same invariant as the
-// mounted routes above; they are simply not yet wired into the production
-// router. The spec these tests pin: neither handler may contain a
-// hardcoded tenant literal — `tenant_id` must come from a resolved
-// identity.
+// The WASM upload and subscription handlers must never use hardcoded tenant
+// identities. Their tenant scope must come from authenticated request state.
 //
-// These tests inspect the source text because the handlers aren't
-// reachable through the production HTTP stack. If they are ever wired in
-// without fixing the hardcoded identity, the mounted-route tests above
-// and these source-level guards fire together.
+// These source-level guards complement mounted-route tests and ensure the
+// handler continues to derive tenant scope from authenticated request state.
 
 #[test]
 fn wasm_upload_handler_does_not_hardcode_tenant_identity() {
@@ -423,7 +425,9 @@ fn wasm_upload_handler_does_not_hardcode_tenant_identity() {
         "upload_wasm must source tenant_id from a resolved identity, not a hardcoded 0u32"
     );
     assert!(
-        src.contains("resolve_identity") || src.contains("resolve_auth"),
-        "upload_wasm must call resolve_identity/resolve_auth before writing to the catalog"
+        src.contains("ResolvedIdentity(identity)")
+            || src.contains("resolve_identity")
+            || src.contains("resolve_auth"),
+        "upload_wasm must extract or resolve authenticated identity before catalog access"
     );
 }

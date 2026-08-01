@@ -2,6 +2,8 @@
 
 //! Type definitions for trigger catalog storage.
 
+use nodedb_types::id::DatabaseId;
+
 /// When the trigger fires relative to the DML operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 #[repr(u8)]
@@ -164,6 +166,9 @@ impl TriggerBatchMode {
 #[msgpack(map, allow_unknown_fields)]
 pub struct StoredTrigger {
     pub tenant_id: u64,
+    /// Database namespace. Missing in legacy records means `default`.
+    #[msgpack(default)]
+    pub database_id: DatabaseId,
     pub name: String,
     /// Collection this trigger is attached to.
     pub collection: String,

@@ -19,6 +19,7 @@
 //! [N bytes] compressed data (lz4 over transformed f32 bytes)
 //! ```
 
+use crate::bounds::{checked_mul, decoded_len, encode_u32_len, u32_to_usize};
 use crate::error::CodecError;
 
 /// Encode f32 embeddings using spherical coordinate transformation + lz4.
@@ -26,18 +27,9 @@ use crate::error::CodecError;
 /// Input: flat array of f32 values, `vectors * dims` total elements.
 /// Each consecutive `dims` values form one embedding vector.
 pub fn encode(data: &[f32], dims: usize, vectors: usize) -> Result<Vec<u8>, CodecError> {
+    let (dims_header, vectors_header) = validate_shape(data.len(), dims, vectors)?;
     if data.is_empty() || dims == 0 {
-        return Ok(build_header(dims as u32, 0, 0, &[]));
-    }
-
-    if data.len() != vectors * dims {
-        return Err(CodecError::Corrupt {
-            detail: format!(
-                "expected {} elements ({vectors} vectors × {dims} dims), got {}",
-                vectors * dims,
-                data.len()
-            ),
-        });
+        return Ok(build_header(dims_header, vectors_header, 0, &[]));
     }
 
     // Transform each vector from Cartesian to spherical coordinates.
@@ -54,8 +46,8 @@ pub fn encode(data: &[f32], dims: usize, vectors: usize) -> Result<Vec<u8>, Code
     let compressed = crate::lz4::encode(&raw_bytes)?;
 
     Ok(build_header(
-        dims as u32,
-        vectors as u32,
+        dims_header,
+        vectors_header,
         1, // spherical transform
         &compressed,
     ))
@@ -66,10 +58,36 @@ pub fn encode(data: &[f32], dims: usize, vectors: usize) -> Result<Vec<u8>, Code
 /// Fallback for non-normalized embeddings where spherical transform
 /// doesn't help.
 pub fn encode_raw(data: &[f32], dims: usize, vectors: usize) -> Result<Vec<u8>, CodecError> {
+    let (dims_header, vectors_header) = validate_shape(data.len(), dims, vectors)?;
     let raw_bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
     let compressed = crate::lz4::encode(&raw_bytes)?;
 
-    Ok(build_header(dims as u32, vectors as u32, 0, &compressed))
+    Ok(build_header(dims_header, vectors_header, 0, &compressed))
+}
+
+fn validate_shape(
+    actual_elements: usize,
+    dims: usize,
+    vectors: usize,
+) -> Result<(u32, u32), CodecError> {
+    if dims == 0 && vectors != 0 {
+        return Err(CodecError::Corrupt {
+            detail: "zero-dimensional spherical data must have zero vectors".to_owned(),
+        });
+    }
+
+    let expected_elements = checked_mul(vectors, dims, "spherical vector element count")?;
+    if actual_elements != expected_elements {
+        return Err(CodecError::Corrupt {
+            detail: format!(
+                "expected {expected_elements} elements ({vectors} vectors × {dims} dims), got {actual_elements}"
+            ),
+        });
+    }
+
+    let dims_header = encode_u32_len(dims, "spherical dimensions")?;
+    let vectors_header = encode_u32_len(vectors, "spherical vector count")?;
+    Ok((dims_header, vectors_header))
 }
 
 /// Decode spherical-compressed embeddings back to f32 Cartesian coordinates.
@@ -81,20 +99,39 @@ pub fn decode(data: &[u8]) -> Result<(Vec<f32>, usize, usize), CodecError> {
         });
     }
 
-    let dims = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let vectors = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let dims = u32_to_usize(
+        u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        "spherical dimensions",
+    )?;
+    let vectors = u32_to_usize(
+        u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+        "spherical vector count",
+    )?;
     let transform = data[8];
+    if transform > 1 {
+        return Err(CodecError::Corrupt {
+            detail: format!("unknown spherical transform type {transform}"),
+        });
+    }
 
+    if dims == 0 && vectors != 0 {
+        return Err(CodecError::Corrupt {
+            detail: "zero-dimensional spherical data declares nonzero vectors".to_owned(),
+        });
+    }
     if vectors == 0 || dims == 0 {
         return Ok((Vec::new(), dims, 0));
     }
+
+    let elements = checked_mul(vectors, dims, "spherical vector element count")?;
+    let expected_bytes = checked_mul(elements, size_of::<f32>(), "spherical decoded bytes")?;
+    decoded_len(expected_bytes, "spherical")?;
 
     let compressed = &data[9..];
     let raw_bytes = crate::lz4::decode(compressed).map_err(|e| CodecError::DecompressFailed {
         detail: format!("spherical lz4: {e}"),
     })?;
 
-    let expected_bytes = vectors * dims * 4;
     if raw_bytes.len() != expected_bytes {
         return Err(CodecError::Corrupt {
             detail: format!("expected {expected_bytes} bytes, got {}", raw_bytes.len()),
@@ -331,5 +368,43 @@ mod tests {
     fn truncated_error() {
         assert!(decode(&[]).is_err());
         assert!(decode(&[0; 5]).is_err());
+    }
+
+    #[test]
+    fn hostile_dimensions_are_rejected_before_size_arithmetic_or_decompression() {
+        let mut encoded = encode_raw(&[1.0], 1, 1).expect("fixture must encode");
+        encoded[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        encoded[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let error = decode(&encoded).expect_err("hostile dimensions must fail");
+        assert!(matches!(
+            error,
+            CodecError::Corrupt { .. } | CodecError::ResourceLimit { .. }
+        ));
+    }
+
+    #[test]
+    fn encoders_reject_overflowed_or_mismatched_shapes() {
+        assert!(encode(&[1.0], usize::MAX, 2).is_err());
+        assert!(encode_raw(&[1.0], usize::MAX, 2).is_err());
+        assert!(encode_raw(&[1.0, 2.0], 1, 1).is_err());
+        assert!(encode(&[], 0, 1).is_err());
+        assert!(encode_raw(&[], 0, 1).is_err());
+    }
+
+    #[test]
+    fn zero_dimension_zero_vector_shape_roundtrips_canonically() {
+        let encoded = encode(&[], 0, 0).expect("canonical empty shape must encode");
+        let (decoded, dims, vectors) = decode(&encoded).expect("canonical empty shape must decode");
+        assert!(decoded.is_empty());
+        assert_eq!((dims, vectors), (0, 0));
+    }
+
+    #[test]
+    fn decoder_rejects_zero_dimensions_with_nonzero_vectors() {
+        let mut encoded = [0u8; 9];
+        encoded[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let error = decode(&encoded).expect_err("noncanonical empty shape must fail");
+        assert!(matches!(error, CodecError::Corrupt { .. }));
     }
 }

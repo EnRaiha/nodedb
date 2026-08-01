@@ -16,11 +16,11 @@ pub(crate) fn convert_flush(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    let _ = super::helpers::load_entry(name, ctx)?;
+    let _ = super::helpers::load_entry(name, tenant_id, ctx)?;
     let wal = ctx.wal.as_ref().ok_or_else(|| crate::Error::PlanError {
         detail: "ARRAY_FLUSH: no WAL wired into convert context".into(),
     })?;
-    let aid = ArrayId::new(tenant_id, name);
+    let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
     // A frontier read, not an allocation: `Flush` appends no WAL record, and
     // this LSN becomes the flushed segment's watermark — every cell it contains
@@ -45,8 +45,8 @@ pub(crate) fn convert_compact(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    let entry = super::helpers::load_entry(name, ctx)?;
-    let aid = ArrayId::new(tenant_id, name);
+    let entry = super::helpers::load_entry(name, tenant_id, ctx)?;
+    let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
     Ok(vec![PhysicalTask {
         tenant_id,

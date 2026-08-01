@@ -7,6 +7,7 @@
 //! The Data Plane never touches this directly — dispatch handlers
 //! consult the in-memory registry via the shared [`ArrayCatalogHandle`].
 
+pub(crate) mod ddl;
 pub mod entry;
 pub mod persist;
 pub mod registry;

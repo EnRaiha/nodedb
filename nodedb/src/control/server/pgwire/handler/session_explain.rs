@@ -35,44 +35,41 @@ impl NodeDbPgHandler {
                 ))));
             };
 
+        match nodedb_sql::ddl_ast::parse(inner_sql) {
+            Some(Ok(stmt)) => {
+                let schema = Arc::new(vec![text_field("QUERY PLAN")]);
+                let plan_text = format!("DDL: {stmt:?}");
+                let mut encoder = DataRowEncoder::new(schema.clone());
+                encoder.encode_field(&plan_text)?;
+                let row = encoder.take_row();
+                return Ok(vec![Response::Query(QueryResponse::new(
+                    schema,
+                    futures::stream::iter(vec![Ok(row)]),
+                ))]);
+            }
+            Some(Err(error)) => {
+                let sqlstate = match error {
+                    nodedb_sql::SqlError::UnsupportedConstraint { .. }
+                    | nodedb_sql::SqlError::ConflictingEngineClause { .. } => "0A000",
+                    _ => "42601",
+                };
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    sqlstate.to_owned(),
+                    error.to_string(),
+                ))));
+            }
+            None => {}
+        }
+
         let database_id = self
             .sessions
             .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
-        let txn_ctx = crate::control::server::shared::session::DmlTxnCtx {
-            sessions: &self.sessions,
-            session_id,
-        };
-        if crate::control::server::shared::ddl::dispatch(
-            &self.state,
-            identity,
-            inner_sql,
-            database_id,
-            &txn_ctx,
-        )
-        .await
-        .is_some()
-        {
-            let schema = Arc::new(vec![text_field("QUERY PLAN")]);
-            let plan_text = format!(
-                "DDL: {}",
-                inner_sql
-                    .split_whitespace()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            let mut encoder = DataRowEncoder::new(schema.clone());
-            encoder.encode_field(&plan_text)?;
-            let row = encoder.take_row();
-            return Ok(vec![Response::Query(QueryResponse::new(
-                schema,
-                futures::stream::iter(vec![Ok(row)]),
-            ))]);
-        }
-
         let tenant_id = identity.tenant_id;
-        let auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
+        let mut auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
+        // EXPLAIN must resolve RLS variables in the selected database context.
+        auth_ctx.database_id = Some(database_id);
         let perm_cache = self.state.permission_cache.read().await;
         let sec = crate::control::planner::context::PlanSecurityContext {
             identity,
@@ -84,7 +81,7 @@ impl NodeDbPgHandler {
         };
         let (tasks, _output_schema) = self
             .query_ctx
-            .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
+            .plan_sql_with_rls_metadata(crate::control::planner::context::PlanSqlWithRlsParams {
                 sql: inner_sql,
                 tenant_id,
                 database_id,

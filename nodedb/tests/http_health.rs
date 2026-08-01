@@ -13,38 +13,74 @@ use std::time::Duration;
 
 use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::config::auth::AuthMode;
+use nodedb::control::security::apikey::CreateKeyParams;
+use nodedb::control::security::identity::Role;
+use nodedb::control::shutdown::{ShutdownHandle, ShutdownPhase};
 use nodedb::control::state::SharedState;
+use nodedb::types::{DatabaseId, TenantId};
 use nodedb::wal::WalManager;
 
 struct TestServer {
     local_addr: std::net::SocketAddr,
+    shared: Arc<SharedState>,
+    shutdown_handle: ShutdownHandle,
     _server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
 
-async fn start_http() -> TestServer {
+fn create_readonly_api_key(shared: &SharedState) -> String {
+    let username = "health_drain_readonly";
+    let user_id = shared
+        .credentials
+        .create_service_account(
+            username,
+            TenantId::new(1),
+            vec![Role::ReadOnly],
+            vec![DatabaseId::DEFAULT],
+        )
+        .expect("create read-only service account");
+    shared
+        .api_keys
+        .create_key(
+            CreateKeyParams {
+                username,
+                user_id,
+                tenant_id: TenantId::new(1),
+                expires_secs: 0,
+                scope: vec![],
+                accessible_databases: vec![DatabaseId::DEFAULT],
+            },
+            Some(shared.credentials.catalog()),
+        )
+        .expect("create read-only API key")
+}
+
+async fn start_http(auth_mode: AuthMode) -> TestServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let wal =
         Arc::new(WalManager::open_for_testing(&dir.path().join("health.wal")).expect("open wal"));
     let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
     let shared = SharedState::new(dispatcher, wal).unwrap();
-    shared
-        .credentials
-        .bootstrap_trust_superuser("nodedb")
-        .expect("bootstrap trust superuser");
+    if auth_mode == AuthMode::Trust {
+        shared
+            .credentials
+            .bootstrap_trust_superuser("nodedb")
+            .expect("bootstrap trust superuser");
+    }
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let local_addr = listener.local_addr().expect("local addr");
 
-    let (bus, _) = nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
+    let (bus, shutdown_handle) =
+        nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
     let shared_http = Arc::clone(&shared);
     let handle = tokio::spawn(async move {
         nodedb::control::server::http::server::run_with_listener(
             listener,
             shared_http,
-            AuthMode::Trust,
+            auth_mode,
             None,
             bus,
         )
@@ -59,6 +95,8 @@ async fn start_http() -> TestServer {
 
     TestServer {
         local_addr,
+        shared,
+        shutdown_handle,
         _server: handle,
         _dir: dir,
     }
@@ -68,7 +106,7 @@ async fn start_http() -> TestServer {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn healthz_returns_json_with_status_field() {
-    let srv = start_http().await;
+    let srv = start_http(AuthMode::Trust).await;
     let url = format!("http://{}/healthz", srv.local_addr);
     let resp = reqwest::Client::new()
         .get(&url)
@@ -93,7 +131,7 @@ async fn healthz_returns_json_with_status_field() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn healthz_404_not_served_on_wrong_path() {
-    let srv = start_http().await;
+    let srv = start_http(AuthMode::Trust).await;
     let url = format!("http://{}/health", srv.local_addr);
     let resp = reqwest::Client::new()
         .get(&url)
@@ -111,7 +149,7 @@ async fn healthz_404_not_served_on_wrong_path() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_live_always_200() {
-    let srv = start_http().await;
+    let srv = start_http(AuthMode::Trust).await;
     let url = format!("http://{}/health/live", srv.local_addr);
     let resp = reqwest::Client::new()
         .get(&url)
@@ -132,7 +170,7 @@ async fn health_live_always_200() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_live_wrong_method_405() {
-    let srv = start_http().await;
+    let srv = start_http(AuthMode::Trust).await;
     let url = format!("http://{}/health/live", srv.local_addr);
     let resp = reqwest::Client::new()
         .post(&url)
@@ -150,7 +188,7 @@ async fn health_live_wrong_method_405() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_ready_returns_json_with_status_and_wal_lsn() {
-    let srv = start_http().await;
+    let srv = start_http(AuthMode::Trust).await;
     let url = format!("http://{}/health/ready", srv.local_addr);
     let resp = reqwest::Client::new()
         .get(&url)
@@ -183,7 +221,7 @@ async fn health_ready_returns_json_with_status_and_wal_lsn() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_drain_returns_draining_status() {
-    let srv = start_http().await;
+    let mut srv = start_http(AuthMode::Trust).await;
     let url = format!("http://{}/health/drain", srv.local_addr);
     let resp = reqwest::Client::new()
         .post(&url)
@@ -204,11 +242,23 @@ async fn health_drain_returns_draining_status() {
         body.get("node_id").is_some(),
         "/health/drain body must contain node_id"
     );
+    assert!(
+        srv.shared.shutdown.is_shutdown(),
+        "a successful Trust-superuser /health/drain response must signal SharedState shutdown"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        srv.shutdown_handle.await_phase(ShutdownPhase::Closed),
+    )
+    .await
+    .expect(
+        "a successful Trust-superuser /health/drain response must close the phased shutdown bus",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_drain_wrong_method_405() {
-    let srv = start_http().await;
+    let srv = start_http(AuthMode::Trust).await;
     let url = format!("http://{}/health/drain", srv.local_addr);
     let resp = reqwest::Client::new()
         .get(&url)
@@ -219,5 +269,50 @@ async fn health_drain_wrong_method_405() {
         resp.status(),
         reqwest::StatusCode::METHOD_NOT_ALLOWED,
         "/health/drain GET must be 405 (only POST is registered)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_drain_rejects_authenticated_readonly_api_key_without_signaling_shutdown() {
+    let srv = start_http(AuthMode::Password).await;
+    let token = create_readonly_api_key(&srv.shared);
+    let url = format!("http://{}/health/drain", srv.local_addr);
+    let response = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("authenticated read-only POST /health/drain");
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "an authenticated non-superuser must not drain the server"
+    );
+    assert!(
+        !srv.shared.shutdown.is_shutdown(),
+        "an unauthorized /health/drain request must not signal SharedState shutdown"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn health_drain_requires_auth_under_password_mode_without_signaling_shutdown() {
+    let srv = start_http(AuthMode::Password).await;
+    let url = format!("http://{}/health/drain", srv.local_addr);
+    let response = reqwest::Client::new()
+        .post(&url)
+        .send()
+        .await
+        .expect("unauthenticated POST /health/drain");
+
+    assert!(
+        response.status() == reqwest::StatusCode::UNAUTHORIZED
+            || response.status() == reqwest::StatusCode::FORBIDDEN,
+        "unauthenticated /health/drain must be rejected under Password mode; got {}",
+        response.status()
+    );
+    assert!(
+        !srv.shared.shutdown.is_shutdown(),
+        "an unauthenticated /health/drain request must not signal SharedState shutdown"
     );
 }

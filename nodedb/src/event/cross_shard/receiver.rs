@@ -20,7 +20,53 @@ use super::metrics::CrossShardMetrics;
 use super::types::{CrossShardWriteRequest, CrossShardWriteResponse};
 use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
+
+/// Exact pre-database positional wire layout.
+///
+/// This type is intentionally private so only the receiver accepts the legacy
+/// representation; all newly emitted requests use `CrossShardWriteRequest`'s
+/// current versioned map encoding.
+#[derive(zerompk::ToMessagePack, zerompk::FromMessagePack)]
+struct LegacyCrossShardWriteRequest {
+    sql: String,
+    tenant_id: u64,
+    source_vshard: u32,
+    source_lsn: u64,
+    source_sequence: u64,
+    cascade_depth: u32,
+    source_collection: String,
+    target_vshard: u32,
+}
+
+impl From<LegacyCrossShardWriteRequest> for CrossShardWriteRequest {
+    fn from(legacy: LegacyCrossShardWriteRequest) -> Self {
+        Self {
+            sql: legacy.sql,
+            tenant_id: legacy.tenant_id,
+            database_id: DatabaseId::DEFAULT.as_u64(),
+            source_vshard: legacy.source_vshard,
+            source_lsn: legacy.source_lsn,
+            source_sequence: legacy.source_sequence,
+            cascade_depth: legacy.cascade_depth,
+            source_collection: legacy.source_collection,
+            target_vshard: legacy.target_vshard,
+        }
+    }
+}
+
+/// Decode the current map encoding, falling back only to the exact legacy
+/// positional layout. Payloads that fit neither representation fail closed.
+fn decode_write_request(payload: &[u8]) -> Result<CrossShardWriteRequest, String> {
+    match zerompk::from_msgpack(payload) {
+        Ok(request) => Ok(request),
+        Err(current_error) => zerompk::from_msgpack::<LegacyCrossShardWriteRequest>(payload)
+            .map(CrossShardWriteRequest::from)
+            .map_err(|legacy_error| {
+                format!("current encoding: {current_error}; legacy encoding: {legacy_error}")
+            }),
+    }
+}
 
 /// Handles incoming cross-shard event writes.
 pub struct CrossShardReceiver {
@@ -68,14 +114,14 @@ impl CrossShardReceiver {
 
     /// Process a CrossShardEvent write request.
     async fn handle_write(&self, envelope: VShardEnvelope) -> Vec<u8> {
-        let request: CrossShardWriteRequest = match zerompk::from_msgpack(&envelope.payload) {
+        let request = match decode_write_request(&envelope.payload) {
             Ok(req) => req,
-            Err(e) => {
+            Err(error) => {
                 return self.error_response(
                     envelope.source_node,
                     envelope.vshard_id,
                     0,
-                    &format!("deserialize request: {e}"),
+                    &format!("deserialize request: {error}"),
                 );
             }
         };
@@ -188,6 +234,7 @@ impl CrossShardReceiver {
             &self.shared_state,
             &identity,
             TenantId::new(request.tenant_id),
+            crate::types::DatabaseId::new(request.database_id),
             &request.sql,
             request.cascade_depth.saturating_add(1),
         )
@@ -249,6 +296,34 @@ mod tests {
         assert!(id.is_superuser());
         assert_eq!(id.tenant_id, TenantId::new(5));
         assert_eq!(id.username, "_system_cross_shard");
+    }
+
+    #[test]
+    fn legacy_request_decode_uses_default_database() {
+        let legacy = LegacyCrossShardWriteRequest {
+            sql: "INSERT INTO audit VALUES (1)".into(),
+            tenant_id: 7,
+            source_vshard: 3,
+            source_lsn: 1500,
+            source_sequence: 42,
+            cascade_depth: 1,
+            source_collection: "orders".into(),
+            target_vshard: 9,
+        };
+
+        let payload = zerompk::to_msgpack_vec(&legacy).unwrap();
+        let decoded = decode_write_request(&payload).unwrap();
+
+        assert_eq!(decoded.database_id, DatabaseId::DEFAULT.as_u64());
+        assert_eq!(decoded.sql, legacy.sql);
+        assert_eq!(decoded.tenant_id, legacy.tenant_id);
+        assert_eq!(decoded.source_lsn, legacy.source_lsn);
+        assert_eq!(decoded.target_vshard, legacy.target_vshard);
+    }
+
+    #[test]
+    fn malformed_request_fails_closed() {
+        assert!(decode_write_request(&[0xc1]).is_err());
     }
 
     #[test]

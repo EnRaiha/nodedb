@@ -62,9 +62,12 @@ pub(super) async fn try_typed(
                 identity,
                 source,
                 path,
-                format.as_ref(),
-                *delimiter,
-                *header,
+                collection::CopyToOptions {
+                    format: format.as_ref(),
+                    delimiter: *delimiter,
+                    header: *header,
+                },
+                database_id,
             )
             .await,
         ),

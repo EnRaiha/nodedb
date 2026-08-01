@@ -9,11 +9,15 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use super::super::auth::{AppState, ResolvedIdentity};
+use super::super::auth::{ApiError, AppState, ResolvedIdentity};
+use super::query::{DatabaseQueryParam, resolve_database_id};
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::Permission;
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::event::cdc::consume::{ConsumeError, ConsumeParams, ConsumeResult, consume_stream};
 
 /// Query parameters.
@@ -28,30 +32,31 @@ pub struct PollParams {
     /// Detected and rejected — callers must not supply `tenant_id` as a
     /// query parameter. Tenant is always sourced from the bearer token.
     pub tenant_id: Option<u64>,
+    /// Optional database selector. The header takes precedence when present.
+    pub database: Option<String>,
 }
 
 /// Response body.
 ///
 /// All fields that were present before v1.0 remain. `evicted_since_last_poll`
-/// and `oldest_available_lsn` are additive — HTTP clients and ORMs that ignore
+/// and `oldest_available_offset` are additive — HTTP clients and ORMs that ignore
 /// unknown JSON fields will not break.
 #[derive(Serialize)]
 pub struct PollResponse {
     /// Events in this batch.
     pub events: Vec<serde_json::Value>,
-    /// Per-partition latest LSN in this batch.
-    pub partition_offsets: std::collections::BTreeMap<String, u64>,
+    /// Per-partition latest canonical `<lsn>:<sequence>` offset in this batch.
+    pub partition_offsets: std::collections::BTreeMap<String, String>,
     /// Total events returned.
     pub count: usize,
     /// Events dropped from this stream's buffer since the previous poll for
     /// this consumer group. Zero on the first poll or when the buffer has not
     /// overflowed. A non-zero value means the consumer has a gap: events
-    /// between the last committed LSN and `oldest_available_lsn` are gone.
+    /// between the last committed offset and `oldest_available_offset` are gone.
     pub evicted_since_last_poll: u64,
-    /// Oldest LSN still available in the stream buffer. Zero when the buffer
-    /// is empty. If `evicted_since_last_poll > 0`, seek here to resume
-    /// consumption (events before this LSN are permanently lost).
-    pub oldest_available_lsn: u64,
+    /// Oldest canonical offset still available in the stream buffer. If
+    /// `evicted_since_last_poll > 0`, seek here to resume consumption.
+    pub oldest_available_offset: String,
 }
 
 /// `GET /v1/streams/{stream}/poll`
@@ -60,6 +65,7 @@ pub async fn poll_stream(
     Path(stream_name): Path<String>,
     Query(params): Query<PollParams>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     // Reject any attempt to override the caller's tenant via query string.
     if params.tenant_id.is_some() {
@@ -85,10 +91,58 @@ pub async fn poll_stream(
     };
 
     let tenant_id = identity.tenant_id().as_u64();
+    let database_id = match resolve_database_id(
+        &headers,
+        &DatabaseQueryParam {
+            database: params.database.clone(),
+        },
+        &state,
+    ) {
+        Ok(database_id) => database_id,
+        Err(error) => return error.into_response(),
+    };
     let limit = params.limit.unwrap_or(100).min(10_000);
     let stream_name = stream_name.to_lowercase();
 
+    // A change stream exposes events from its source collection. Resolve the
+    // definition in the caller's selected database and tenant before either a
+    // local consume or remote forwarding can expose those events. Durable
+    // topics are protected by the corresponding logical topic resource.
+    if let Some(topic_name) = stream_name.strip_prefix("topic:") {
+        let emitter = ArcAuditEmitter(std::sync::Arc::clone(&state.shared.audit));
+        if let Err(error) = authorize_collection(
+            &identity.0,
+            database_id,
+            &format!("topic:{topic_name}"),
+            Permission::Read,
+            &state.shared.permissions,
+            &state.shared.roles,
+            &emitter,
+        ) {
+            return ApiError::from(crate::Error::from(error)).into_response();
+        }
+    } else if let Some(stream_def) =
+        state
+            .shared
+            .stream_registry
+            .get(database_id, tenant_id, &stream_name)
+    {
+        let emitter = ArcAuditEmitter(std::sync::Arc::clone(&state.shared.audit));
+        if let Err(error) = authorize_collection(
+            &identity.0,
+            database_id,
+            &stream_def.collection,
+            Permission::Read,
+            &state.shared.permissions,
+            &state.shared.roles,
+            &emitter,
+        ) {
+            return ApiError::from(crate::Error::from(error)).into_response();
+        }
+    }
+
     let consume_params = ConsumeParams {
+        database_id,
         tenant_id,
         stream_name: &stream_name,
         group_name: &group,
@@ -121,7 +175,7 @@ pub async fn poll_stream(
             events: Vec::new(),
             partition_offsets: Vec::new(),
             evicted_since_last_poll: 0,
-            oldest_available_lsn: 0,
+            oldest_available_offset: crate::event::cdc::CdcOffset::ZERO,
         },
         Err(e) => {
             return (
@@ -138,10 +192,10 @@ pub async fn poll_stream(
         .map(|e| serde_json::to_value(e).unwrap_or_default())
         .collect();
     let count = events.len();
-    let partition_offsets: std::collections::BTreeMap<String, u64> = result
+    let partition_offsets: std::collections::BTreeMap<String, String> = result
         .partition_offsets
         .into_iter()
-        .map(|(pid, lsn)| (pid.to_string(), lsn))
+        .map(|(pid, offset)| (pid.to_string(), offset.token()))
         .collect();
 
     Json(PollResponse {
@@ -149,7 +203,7 @@ pub async fn poll_stream(
         partition_offsets,
         count,
         evicted_since_last_poll: result.evicted_since_last_poll,
-        oldest_available_lsn: result.oldest_available_lsn,
+        oldest_available_offset: result.oldest_available_offset.token(),
     })
     .into_response()
 }

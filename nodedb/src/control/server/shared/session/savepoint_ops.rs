@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::event::cdc::CdcOffset;
 use crate::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::MetaOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -181,12 +182,12 @@ pub async fn run_rollback_to_savepoint(
 
 /// A parsed deferred COMMIT OFFSET / COMMIT OFFSETS command.
 pub enum DeferredOffsetCmd {
-    /// `COMMIT OFFSET PARTITION <p> AT <lsn> ON <stream> CONSUMER GROUP <name>`.
+    /// `COMMIT OFFSET PARTITION <p> AT <lsn>:<sequence> ON <stream> CONSUMER GROUP <name>`.
     Single {
         stream: String,
         group: String,
         partition_id: u32,
-        lsn: u64,
+        offset: CdcOffset,
     },
     /// `COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>` — the caller resolves
     /// the latest LSN per partition from the CDC buffer.
@@ -195,11 +196,12 @@ pub enum DeferredOffsetCmd {
 
 /// Parse a `COMMIT OFFSET` / `COMMIT OFFSETS` statement into a neutral command.
 ///
-/// Returns `None` when `sql` is not a deferred-offset commit. `upper` is the
-/// caller's uppercased form of `sql`, passed in to avoid re-allocating it.
-pub fn parse_deferred_offset(sql: &str, upper: &str) -> Option<DeferredOffsetCmd> {
+/// Returns `Ok(None)` when `sql` is not a deferred-offset commit. `upper` is
+/// the caller's uppercased form of `sql`, passed in to avoid re-allocating it.
+/// A bare LSN uses the documented legacy whole-LSN acknowledgement semantics.
+pub fn parse_deferred_offset(sql: &str, upper: &str) -> Result<Option<DeferredOffsetCmd>, String> {
     if !(upper.starts_with("COMMIT OFFSET ") || upper.starts_with("COMMIT OFFSETS ")) {
-        return None;
+        return Ok(None);
     }
     let parts: Vec<&str> = sql.split_whitespace().collect();
 
@@ -209,14 +211,18 @@ pub fn parse_deferred_offset(sql: &str, upper: &str) -> Option<DeferredOffsetCmd
         && parts[4].eq_ignore_ascii_case("AT")
         && parts[6].eq_ignore_ascii_case("ON")
     {
-        let partition_id: u32 = parts[3].parse().unwrap_or(0);
-        let lsn: u64 = parts[5].parse().unwrap_or(0);
-        return Some(DeferredOffsetCmd::Single {
+        let partition_id: u32 = parts[3]
+            .parse()
+            .map_err(|_| format!("invalid partition: '{}'", parts[3]))?;
+        let offset: CdcOffset = parts[5]
+            .parse()
+            .map_err(|error: crate::event::cdc::offset::ParseCdcOffsetError| error.to_string())?;
+        return Ok(Some(DeferredOffsetCmd::Single {
             stream: parts[7].to_lowercase(),
             group: parts[10].to_lowercase(),
             partition_id,
-            lsn,
-        });
+            offset,
+        }));
     }
 
     // Batch: COMMIT OFFSETS ON <stream> CONSUMER GROUP <name>
@@ -224,11 +230,41 @@ pub fn parse_deferred_offset(sql: &str, upper: &str) -> Option<DeferredOffsetCmd
         && parts[1].eq_ignore_ascii_case("OFFSETS")
         && parts[2].eq_ignore_ascii_case("ON")
     {
-        return Some(DeferredOffsetCmd::Batch {
+        return Ok(Some(DeferredOffsetCmd::Batch {
             stream: parts[3].to_lowercase(),
             group: parts[6].to_lowercase(),
-        });
+        }));
     }
 
-    None
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_commit_offset_accepts_emitted_and_legacy_tokens() {
+        let canonical = parse_deferred_offset(
+            "COMMIT OFFSET PARTITION 2 AT 42:7 ON orders CONSUMER GROUP analytics",
+            "COMMIT OFFSET PARTITION 2 AT 42:7 ON ORDERS CONSUMER GROUP ANALYTICS",
+        )
+        .unwrap()
+        .unwrap();
+        let DeferredOffsetCmd::Single { offset, .. } = canonical else {
+            panic!("expected single offset commit");
+        };
+        assert_eq!(offset, CdcOffset::new(42, 7));
+
+        let legacy = parse_deferred_offset(
+            "COMMIT OFFSET PARTITION 2 AT 42 ON orders CONSUMER GROUP analytics",
+            "COMMIT OFFSET PARTITION 2 AT 42 ON ORDERS CONSUMER GROUP ANALYTICS",
+        )
+        .unwrap()
+        .unwrap();
+        let DeferredOffsetCmd::Single { offset, .. } = legacy else {
+            panic!("expected single offset commit");
+        };
+        assert_eq!(offset, CdcOffset::legacy_lsn(42));
+    }
 }

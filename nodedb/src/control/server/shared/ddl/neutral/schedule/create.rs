@@ -41,6 +41,7 @@ pub struct CreateScheduleRequest<'a> {
 pub fn create_schedule(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     req: &CreateScheduleRequest<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let CreateScheduleRequest {
@@ -68,7 +69,11 @@ pub fn create_schedule(
     })?;
 
     // Check for duplicate.
-    if state.schedule_registry.get(tenant_id, name).is_some() {
+    if state
+        .schedule_registry
+        .get(database_id, tenant_id, name)
+        .is_some()
+    {
         return Err(DdlError {
             sqlstate: "42710".to_string(),
             message: format!("schedule '{name}' already exists"),
@@ -95,6 +100,7 @@ pub fn create_schedule(
         MissedPolicy::from_str_opt(missed_policy).unwrap_or(MissedPolicy::Skip);
 
     let def = ScheduleDef {
+        database_id: database_id.as_u64(),
         tenant_id,
         name: name.to_string(),
         cron_expr: cron_expr.to_string(),
@@ -117,8 +123,9 @@ pub fn create_schedule(
     {
         let delta_payload = zerompk::to_msgpack_vec(&def).unwrap_or_default();
         let delta = crate::event::crdt_sync::types::OutboundDelta {
+            database_id,
             collection: "_schedules".into(),
-            document_id: def.name.clone(),
+            document_id: format!("{}:{}", database_id.as_u64(), def.name),
             payload: delta_payload,
             op: crate::event::crdt_sync::types::DeltaOp::Upsert,
             lsn: 0,
@@ -126,7 +133,7 @@ pub fn create_schedule(
             peer_id: state.node_id,
             sequence: 0,
         };
-        state.crdt_sync_delivery.enqueue(tenant_id, delta);
+        state.crdt_sync_delivery.enqueue(delta);
     }
 
     state.audit_record(

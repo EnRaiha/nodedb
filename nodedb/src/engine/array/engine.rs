@@ -107,6 +107,12 @@ impl ArrayEngine {
             });
         }
         let dir = array_dir(&self.cfg.root, &id);
+        let tombstone = drop_tombstone_dir(&dir);
+        if tombstone.exists() {
+            return Err(ArrayEngineError::Io {
+                detail: format!("array {id:?} has an unpurged drop tombstone at {tombstone:?}"),
+            });
+        }
         let mut store = ArrayStore::open(dir, schema, schema_hash)?;
         if let Some(kek) = &self.cfg.kek {
             store.set_kek(kek.clone());
@@ -130,25 +136,67 @@ impl ArrayEngine {
         }
     }
 
-    /// Drop the per-core store for `id` and best-effort remove the
-    /// on-disk segment directory. Called by the `DropArray` dispatch
-    /// handler during `DROP ARRAY` broadcast so a follow-up
-    /// `CREATE ARRAY` of the same name (potentially with a different
-    /// schema) doesn't carry stale memtable / segment state.
-    ///
-    /// Idempotent: returns `Ok(())` when no store is open and no
-    /// directory exists. Directory-removal errors are surfaced as
-    /// `ArrayEngineError::Io` so the broadcast's status reflects the
-    /// failure.
-    pub fn drop_array(&mut self, id: &ArrayId) -> ArrayEngineResult<()> {
+    /// Close an array store and atomically rename its directory to a
+    /// deterministic tombstone. A tombstone is intentionally retained until
+    /// catalog/surrogate deletion has committed on the Control Plane.
+    pub fn stage_drop_array(&mut self, id: &ArrayId) -> ArrayEngineResult<()> {
         let _ = self.arrays.remove(id);
         let dir = array_dir(&self.cfg.root, id);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).map_err(|e| ArrayEngineError::Io {
-                detail: format!("rmdir {dir:?}: {e}"),
+        let tombstone = drop_tombstone_dir(&dir);
+        match (dir.exists(), tombstone.exists()) {
+            (true, false) => std::fs::rename(&dir, &tombstone).map_err(|e| ArrayEngineError::Io {
+                detail: format!("stage array drop {dir:?} -> {tombstone:?}: {e}"),
+            }),
+            (false, true) | (false, false) => Ok(()),
+            (true, true) => Err(ArrayEngineError::Io {
+                detail: format!(
+                    "array drop has both live and tombstone directories: {dir:?}, {tombstone:?}"
+                ),
+            }),
+        }
+    }
+
+    /// Restore a staged drop. Idempotent when this core had no array store.
+    pub fn restore_drop_array(&mut self, id: &ArrayId) -> ArrayEngineResult<()> {
+        let dir = array_dir(&self.cfg.root, id);
+        let tombstone = drop_tombstone_dir(&dir);
+        match (dir.exists(), tombstone.exists()) {
+            (false, true) => std::fs::rename(&tombstone, &dir).map_err(|e| ArrayEngineError::Io {
+                detail: format!("restore array drop {tombstone:?} -> {dir:?}: {e}"),
+            }),
+            (true, false) | (false, false) => Ok(()),
+            (true, true) => Err(ArrayEngineError::Io {
+                detail: format!(
+                    "array restore has both live and tombstone directories: {dir:?}, {tombstone:?}"
+                ),
+            }),
+        }
+    }
+
+    /// Permanently remove a staged drop tombstone. A live directory is an
+    /// invariant violation: purging it could destroy a recreated array.
+    pub fn purge_drop_array(&mut self, id: &ArrayId) -> ArrayEngineResult<()> {
+        let dir = array_dir(&self.cfg.root, id);
+        let tombstone = drop_tombstone_dir(&dir);
+        if dir.exists() && tombstone.exists() {
+            return Err(ArrayEngineError::Io {
+                detail: format!("refusing to purge tombstone while live array exists: {dir:?}"),
+            });
+        }
+        if tombstone.exists() {
+            std::fs::remove_dir_all(&tombstone).map_err(|e| ArrayEngineError::Io {
+                detail: format!("purge array tombstone {tombstone:?}: {e}"),
             })?;
         }
         Ok(())
+    }
+
+    /// Clear a deterministic tombstone left by a *finalized* prior DROP before
+    /// an authorized CREATE opens the replacement store. The caller is
+    /// responsible for proving catalog absence before installing the new entry;
+    /// this method only enforces the filesystem half of that invariant.
+    pub fn purge_finalized_drop_before_open(&mut self, id: &ArrayId) -> ArrayEngineResult<()> {
+        self.purge_drop_array(id)
     }
 
     pub fn store(&self, id: &ArrayId) -> ArrayEngineResult<&ArrayStore> {
@@ -166,8 +214,7 @@ impl ArrayEngine {
     /// Drop superseded tile-versions older than `cutoff_system_ms` for the
     /// array named `array_id`.
     ///
-    /// `tenant_id` is accepted for forward-compatibility. Arrays are currently
-    /// global (not tenant-scoped), so the catalog lookup uses only `array_id`.
+    /// `tenant_id` and `database_id` identify the array's catalog namespace.
     ///
     /// Returns the number of tile-versions dropped. Returns `Ok(0)` when the
     /// array is not open (idempotent — array may have been dropped between
@@ -175,10 +222,11 @@ impl ArrayEngine {
     pub fn temporal_purge(
         &mut self,
         tenant_id: nodedb_types::TenantId,
+        database_id: nodedb_types::DatabaseId,
         array_id: &str,
         cutoff_system_ms: i64,
     ) -> ArrayEngineResult<u64> {
-        let aid = ArrayId::new(tenant_id, array_id);
+        let aid = ArrayId::in_database(tenant_id, database_id, array_id);
         // Idempotent: array may not be open on this core.
         if !self.arrays.contains_key(&aid) {
             return Ok(0);
@@ -204,8 +252,39 @@ impl ArrayEngine {
     }
 }
 
+fn drop_tombstone_dir(dir: &std::path::Path) -> PathBuf {
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    dir.with_file_name(format!(".{name}.drop-pending"))
+}
+
 pub(super) fn array_dir(root: &std::path::Path, id: &ArrayId) -> PathBuf {
-    root.join(format!("t{}-{}", id.tenant_id.as_u64(), id.name))
+    // Keep legacy DEFAULT-database stores readable only for the historical
+    // identifier subset. Never interpolate separators or traversal components
+    // into a filesystem path, even for compatibility lookup.
+    let legacy_name_is_safe = !id.name.is_empty()
+        && id.name != "."
+        && id.name != ".."
+        && id
+            .name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+    if id.database_id == nodedb_types::DatabaseId::DEFAULT && legacy_name_is_safe {
+        let legacy = root.join(format!("t{}-{}", id.tenant_id.as_u64(), id.name));
+        if legacy.exists() || drop_tombstone_dir(&legacy).exists() {
+            return legacy;
+        }
+    }
+
+    let encoded_name: String = id
+        .name
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    root.join("arrays-v2")
+        .join(format!("d{}", id.database_id.as_u64()))
+        .join(format!("t{}", id.tenant_id.as_u64()))
+        .join(encoded_name)
 }
 
 #[cfg(test)]
@@ -257,6 +336,36 @@ mod tests {
             ArrayEngineError::SchemaMismatch { name } => assert_eq!(name, "g"),
             other => panic!("expected SchemaMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn staged_drop_restores_or_purges_without_exposing_stale_data() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let id = aid();
+        let mut engine =
+            ArrayEngine::new(ArrayEngineConfig::new(dir.path().to_path_buf())).unwrap();
+        engine.open_array(id.clone(), schema(), 0xBEEF).unwrap();
+        let live = array_dir(dir.path(), &id);
+        let tombstone = drop_tombstone_dir(&live);
+
+        engine.stage_drop_array(&id).unwrap();
+        assert!(!live.exists());
+        assert!(tombstone.exists());
+        assert!(engine.open_array(id.clone(), schema(), 0xBEEF).is_err());
+
+        engine.restore_drop_array(&id).unwrap();
+        assert!(live.exists());
+        assert!(!tombstone.exists());
+
+        engine.stage_drop_array(&id).unwrap();
+        // This is the authorized CREATE retry path after the prior DROP has
+        // finalized its catalog deletion but its all-core purge was interrupted.
+        engine.purge_finalized_drop_before_open(&id).unwrap();
+        engine.open_array(id.clone(), schema(), 0xCAFE).unwrap();
+        assert!(live.exists());
+        assert!(!tombstone.exists());
     }
 
     #[test]

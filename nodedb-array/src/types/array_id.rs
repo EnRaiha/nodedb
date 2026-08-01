@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stable array identifier — tenant-scoped logical name.
+//! Stable array identifier — tenant- and database-scoped logical name.
 
 use serde::{Deserialize, Serialize};
 
-use nodedb_types::TenantId;
+use nodedb_types::{DatabaseId, TenantId};
 
-/// Logical handle to an array within a tenant. The pair
-/// `(tenant_id, name)` is the canonical key used by storage and the
-/// catalog; `name` is the user-visible identifier.
+fn default_database_id() -> DatabaseId {
+    DatabaseId::DEFAULT
+}
+
+/// Logical handle to an array within a tenant and database. The tuple
+/// `(tenant_id, database_id, name)` is the canonical storage/catalog key;
+/// `name` remains the user-visible identifier.
 #[derive(
     Debug,
     Clone,
@@ -22,13 +26,28 @@ use nodedb_types::TenantId;
 )]
 pub struct ArrayId {
     pub tenant_id: TenantId,
+    /// Database scope. Missing fields in legacy persisted descriptors decode
+    /// as the built-in default database.
+    #[serde(default = "default_database_id")]
+    pub database_id: DatabaseId,
     pub name: String,
 }
 
 impl ArrayId {
+    /// Construct a legacy/default-database identifier.
     pub fn new(tenant_id: TenantId, name: impl Into<String>) -> Self {
+        Self::in_database(tenant_id, DatabaseId::DEFAULT, name)
+    }
+
+    /// Construct an identifier in an explicit database scope.
+    pub fn in_database(
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        name: impl Into<String>,
+    ) -> Self {
         Self {
             tenant_id,
+            database_id,
             name: name.into(),
         }
     }
@@ -43,5 +62,9 @@ mod tests {
         let a = ArrayId::new(TenantId::new(1), "genome");
         let b = ArrayId::new(TenantId::new(1), "genome");
         assert_eq!(a, b);
+        assert_ne!(
+            a,
+            ArrayId::in_database(TenantId::new(1), DatabaseId::new(7), "genome")
+        );
     }
 }

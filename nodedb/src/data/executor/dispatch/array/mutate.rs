@@ -153,26 +153,53 @@ impl CoreLoop {
         encode_count_response(self, task, "flushed", 1)
     }
 
-    /// `ArrayOp::DropArray` handler — broadcast on `DROP ARRAY` after
-    /// the Control-Plane catalog mutation. Releases the per-core store
-    /// and removes the on-disk segment directory so a subsequent
-    /// `CREATE ARRAY` with the same name (and possibly a different
-    /// schema) starts from a clean slate. Idempotent: silently
-    /// succeeds when this core never opened the array.
+    /// Stage, restore, and purge form the reversible physical side of DROP.
     pub(in crate::data::executor) fn handle_array_drop(
         &mut self,
         task: &ExecutionTask,
         array_id: &ArrayId,
     ) -> Response {
-        if let Err(e) = self.array_engine.drop_array(array_id) {
+        if let Err(e) = self.array_engine.stage_drop_array(array_id) {
             return self.response_error(
                 task,
                 ErrorCode::Internal {
-                    detail: format!("array drop: {e}"),
+                    detail: format!("array drop stage: {e}"),
                 },
             );
         }
         encode_count_response(self, task, "dropped", 1)
+    }
+
+    pub(in crate::data::executor) fn handle_array_drop_restore(
+        &mut self,
+        task: &ExecutionTask,
+        array_id: &ArrayId,
+    ) -> Response {
+        if let Err(e) = self.array_engine.restore_drop_array(array_id) {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("array drop restore: {e}"),
+                },
+            );
+        }
+        encode_count_response(self, task, "restored", 1)
+    }
+
+    pub(in crate::data::executor) fn handle_array_drop_purge(
+        &mut self,
+        task: &ExecutionTask,
+        array_id: &ArrayId,
+    ) -> Response {
+        if let Err(e) = self.array_engine.purge_drop_array(array_id) {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("array drop purge: {e}"),
+                },
+            );
+        }
+        encode_count_response(self, task, "purged", 1)
     }
 
     pub(in crate::data::executor) fn handle_array_compact(
@@ -305,6 +332,8 @@ mod tests {
                         schema_msgpack: schema_bytes.clone(),
                         schema_hash,
                         prefix_bits: 8,
+                        audit_retain_ms: None,
+                        minimum_audit_retain_ms: None,
                     }),
                     1,
                 ),
@@ -419,6 +448,8 @@ mod tests {
                         schema_msgpack: v1_bytes.clone(),
                         schema_hash: 0xAAAA,
                         prefix_bits: 8,
+                        audit_retain_ms: None,
+                        minimum_audit_retain_ms: None,
                     }),
                     1,
                 ),
@@ -479,9 +510,24 @@ mod tests {
             cat.unregister("recyc");
         }
 
-        // 4) Re-open with a DIFFERENT schema_hash. Without the drop, this
-        //    would fail with `SchemaMismatch`. The post-drop state must
-        //    accept the new hash.
+        // Finalization purges the reversible tombstone before recreation.
+        req_tx
+            .try_push(BridgeRequest {
+                inner: make_request(
+                    PhysicalPlan::Array(ArrayOp::PurgeArrayDrop {
+                        array_id: aid.clone(),
+                    }),
+                    4,
+                ),
+            })
+            .unwrap();
+        core.tick();
+        let resp = resp_rx.try_pop().unwrap();
+        assert_eq!(resp.inner.status, Status::Ok, "purge: {:?}", resp.inner);
+
+        // 5) Re-open with a DIFFERENT schema_hash. Without the drop, this
+        //    would fail with `SchemaMismatch`. The finalized post-drop state
+        //    must accept the new hash.
         req_tx
             .try_push(BridgeRequest {
                 inner: make_request(
@@ -490,8 +536,10 @@ mod tests {
                         schema_msgpack: v1_bytes,
                         schema_hash: 0xBBBB,
                         prefix_bits: 8,
+                        audit_retain_ms: None,
+                        minimum_audit_retain_ms: None,
                     }),
-                    4,
+                    5,
                 ),
             })
             .unwrap();
@@ -500,7 +548,7 @@ mod tests {
         assert_eq!(
             resp.inner.status,
             Status::Ok,
-            "re-open after drop: {:?}",
+            "re-open after finalized drop: {:?}",
             resp.inner
         );
     }

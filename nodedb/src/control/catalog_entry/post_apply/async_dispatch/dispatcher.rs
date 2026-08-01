@@ -183,6 +183,8 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::PutApiKey(_)
         | CatalogEntry::RevokeApiKey { .. }
         | CatalogEntry::PutMaterializedView(_)
+        | CatalogEntry::PutStreamingMaterializedView(_)
+        | CatalogEntry::DeleteStreamingMaterializedView { .. }
         // PutContinuousAggregate / DeleteContinuousAggregate have their
         // own async branches above; they do not appear here.
         | CatalogEntry::PutTenant(_)

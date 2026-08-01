@@ -27,6 +27,7 @@ pub mod rls;
 pub mod role;
 pub mod schedule;
 pub mod sequence;
+pub mod streaming_materialized_view;
 pub mod synonym_group;
 pub mod tenant;
 pub mod trigger;
@@ -115,25 +116,35 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
         }
         CatalogEntry::PutSequenceState(state) => sequence::put_state(state, catalog),
         CatalogEntry::PutTrigger(stored) => trigger::put(stored, catalog),
-        CatalogEntry::DeleteTrigger { tenant_id, name } => {
-            trigger::delete(*tenant_id, name, catalog)
-        }
+        CatalogEntry::DeleteTrigger {
+            database_id,
+            tenant_id,
+            name,
+        } => trigger::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutFunction(stored) => function::put(stored, catalog),
-        CatalogEntry::DeleteFunction { tenant_id, name } => {
-            function::delete(*tenant_id, name, catalog)
-        }
+        CatalogEntry::DeleteFunction {
+            database_id,
+            tenant_id,
+            name,
+        } => function::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutProcedure(stored) => procedure::put(stored, catalog),
-        CatalogEntry::DeleteProcedure { tenant_id, name } => {
-            procedure::delete(*tenant_id, name, catalog)
-        }
+        CatalogEntry::DeleteProcedure {
+            database_id,
+            tenant_id,
+            name,
+        } => procedure::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutSchedule(stored) => schedule::put(stored, catalog),
-        CatalogEntry::DeleteSchedule { tenant_id, name } => {
-            schedule::delete(*tenant_id, name, catalog)
-        }
+        CatalogEntry::DeleteSchedule {
+            database_id,
+            tenant_id,
+            name,
+        } => schedule::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutChangeStream(stored) => change_stream::put(stored, catalog),
-        CatalogEntry::DeleteChangeStream { tenant_id, name } => {
-            change_stream::delete(*tenant_id, name, catalog)
-        }
+        CatalogEntry::DeleteChangeStream {
+            database_id,
+            tenant_id,
+            name,
+        } => change_stream::delete(*database_id, *tenant_id, name, catalog),
         CatalogEntry::PutUser(stored) => user::put(stored, catalog),
         CatalogEntry::DropUser { username } => user::delete(username, catalog),
         CatalogEntry::PutRole(stored) => role::put(stored, catalog),
@@ -144,6 +155,20 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
         CatalogEntry::DeleteMaterializedView { tenant_id, name } => {
             if let Err(error) = materialized_view::delete(*tenant_id, name, catalog) {
                 panic!("materialized-view catalog deletion failed: {error}");
+            }
+        }
+        CatalogEntry::PutStreamingMaterializedView(definition) => {
+            streaming_materialized_view::put(definition, catalog)
+        }
+        CatalogEntry::DeleteStreamingMaterializedView {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            if let Err(error) =
+                streaming_materialized_view::delete(*database_id, *tenant_id, name, catalog)
+            {
+                panic!("streaming materialized-view catalog deletion failed: {error}");
             }
         }
         CatalogEntry::PutContinuousAggregate(stored) => continuous_aggregate::put(stored, catalog),

@@ -23,11 +23,22 @@ pub(super) fn decode_fixed_value(col_type: &ColumnType, raw: &[u8]) -> Value {
             ]);
             Value::NaiveDateTime(NdbDateTime::from_micros(micros))
         }
-        ColumnType::Timestamptz => {
+        ColumnType::Timestamptz | ColumnType::SystemTimestamp => {
             let micros = i64::from_le_bytes([
                 raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
             ]);
             Value::DateTime(NdbDateTime::from_micros(micros))
+        }
+        ColumnType::Ulid => {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&raw[..16]);
+            Value::Ulid(ulid::Ulid::from_bytes(bytes).to_string())
+        }
+        ColumnType::Duration => {
+            let micros = i64::from_le_bytes([
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            ]);
+            Value::Duration(nodedb_types::NdbDuration::from_micros(micros))
         }
         ColumnType::Decimal { .. } => {
             let mut bytes = [0u8; 16];
@@ -90,7 +101,26 @@ pub(super) fn decode_variable_value(col_type: &ColumnType, raw: &[u8]) -> Value 
                 Value::Null
             }
         },
+        ColumnType::Array => decode_typed_msgpack(raw, |value| matches!(value, Value::Array(_))),
+        ColumnType::Set => decode_typed_msgpack(raw, |value| matches!(value, Value::Set(_))),
+        ColumnType::Regex => decode_typed_msgpack(raw, |value| matches!(value, Value::Regex(_))),
+        ColumnType::Range => {
+            decode_typed_msgpack(raw, |value| matches!(value, Value::Range { .. }))
+        }
+        ColumnType::Record => {
+            decode_typed_msgpack(raw, |value| matches!(value, Value::Record { .. }))
+        }
         _ => Value::Null,
+    }
+}
+
+/// Decode MessagePack only when it carries the exact Value variant required
+/// by the typed column. Corrupt or mismatched payloads never leak as another
+/// dynamic value kind.
+fn decode_typed_msgpack(raw: &[u8], accepts: impl FnOnce(&Value) -> bool) -> Value {
+    match zerompk::from_msgpack::<Value>(raw) {
+        Ok(value) if accepts(&value) => value,
+        Ok(_) | Err(_) => Value::Null,
     }
 }
 

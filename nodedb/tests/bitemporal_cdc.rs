@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use nodedb::event::bitemporal_extract::extract_stamps;
+use nodedb::event::cdc::CdcOffset;
 use nodedb::event::cdc::registry::StreamRegistry;
 use nodedb::event::cdc::router::CdcRouter;
 use nodedb::event::cdc::stream_def::{
@@ -22,7 +23,7 @@ use nodedb::event::cdc::stream_def::{
 };
 use nodedb::event::types::{EventSource, RowId, WriteEvent, WriteOp};
 use nodedb::event::watermark_tracker::WatermarkTracker;
-use nodedb::types::{Lsn, TenantId, VShardId};
+use nodedb::types::{DatabaseId, Lsn, TenantId, VShardId};
 
 fn payload(name: &str, sys_ms: i64, valid_from_ms: i64) -> Vec<u8> {
     let json = serde_json::json!({
@@ -42,6 +43,7 @@ fn write_event(seq: u64, op: WriteOp, payload_bytes: Vec<u8>, is_delete: bool) -
         op,
         row_id: RowId::new("u-1"),
         lsn: Lsn::new(seq * 10),
+        database_id: DatabaseId::new(7),
         tenant_id: TenantId::new(1),
         vshard_id: VShardId::new(0),
         source: EventSource::User,
@@ -56,6 +58,7 @@ fn write_event(seq: u64, op: WriteOp, payload_bytes: Vec<u8>, is_delete: bool) -
 
 fn stream_def() -> ChangeStreamDef {
     ChangeStreamDef {
+        database_id: DatabaseId::new(7),
         tenant_id: 1,
         name: "users_stream".into(),
         collection: "users".into(),
@@ -94,9 +97,9 @@ fn cdc_event_carries_bitemporal_stamps_through_router() {
     }
 
     let buf = router
-        .get_buffer(1, "users_stream")
+        .get_buffer(DatabaseId::new(7), 1, "users_stream")
         .expect("stream buffer present");
-    let cdc = buf.read_from_lsn(0, 100);
+    let cdc = buf.read_from(CdcOffset::ZERO, 100);
     assert_eq!(cdc.len(), 4, "all four events routed");
 
     let stamps: Vec<(i64, i64)> = cdc
@@ -130,8 +133,10 @@ fn non_bitemporal_payload_yields_none_stamps() {
     let plain = nodedb_types::json_to_msgpack(&serde_json::json!({"name": "alice"})).unwrap();
     router.route_event(&write_event(1, WriteOp::Insert, plain, false), &wt);
 
-    let buf = router.get_buffer(1, "users_stream").unwrap();
-    let cdc = buf.read_from_lsn(0, 10);
+    let buf = router
+        .get_buffer(DatabaseId::new(7), 1, "users_stream")
+        .unwrap();
+    let cdc = buf.read_from(CdcOffset::ZERO, 10);
     assert_eq!(cdc.len(), 1);
     assert_eq!(cdc[0].system_time_ms, None);
     assert_eq!(cdc[0].valid_time_ms, None);

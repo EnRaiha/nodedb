@@ -12,6 +12,7 @@ NodeDB has a defense-in-depth security model covering authentication, authorizat
 - [Audit Log](audit.md) — Hash-chained audit trail, database-scoped events, DML audit, SIEM export
 - [Multi-Tenancy](tenants.md) — Database vs Tenant, tenant isolation, quotas, purge
 - [Encryption](encryption.md) — At-rest cipher per storage tier, key management, TLS
+- [Threat Model](threat-model.md) — Trust boundaries, entry points, invariants, and operational assumptions
 
 ## Database Scoping
 

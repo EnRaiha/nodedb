@@ -85,6 +85,7 @@ fn job_history_record_and_query() {
 
     store
         .record(JobRun {
+            database_id: 0,
             schedule_name: "cleanup".into(),
             tenant_id: 1,
             started_at: 1000,
@@ -96,6 +97,7 @@ fn job_history_record_and_query() {
 
     store
         .record(JobRun {
+            database_id: 0,
             schedule_name: "cleanup".into(),
             tenant_id: 1,
             started_at: 2000,
@@ -105,7 +107,7 @@ fn job_history_record_and_query() {
         })
         .unwrap();
 
-    let runs = store.last_runs(1, "cleanup", 10);
+    let runs = store.last_runs(0, 1, "cleanup", 10);
     assert_eq!(runs.len(), 2);
     // last_runs returns most recent first.
     assert!(!runs[0].success); // Most recent = the failing run.
@@ -200,6 +202,7 @@ fn job_history_persists_across_reopen() {
         let store = JobHistoryStore::open(dir.path()).unwrap();
         store
             .record(JobRun {
+                database_id: 0,
                 schedule_name: "s1".into(),
                 tenant_id: 1,
                 started_at: 1000,
@@ -210,6 +213,6 @@ fn job_history_persists_across_reopen() {
             .unwrap();
     }
     let store = JobHistoryStore::open(dir.path()).unwrap();
-    let runs = store.last_runs(1, "s1", 10);
+    let runs = store.last_runs(0, 1, "s1", 10);
     assert_eq!(runs.len(), 1);
 }

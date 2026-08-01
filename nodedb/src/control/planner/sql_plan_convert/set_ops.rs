@@ -351,6 +351,7 @@ mod tests {
             &source,
             TenantId::new(1),
             &ConvertContext {
+                purpose: crate::control::planner::sql_plan_convert::PlanningPurpose::Execute,
                 retention_registry: None,
                 array_catalog: None,
                 credentials: None,
@@ -408,6 +409,7 @@ mod tests {
             &source,
             TenantId::new(1),
             &ConvertContext {
+                purpose: crate::control::planner::sql_plan_convert::PlanningPurpose::Execute,
                 retention_registry: None,
                 array_catalog: None,
                 credentials: None,

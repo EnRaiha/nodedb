@@ -17,7 +17,9 @@ use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-use super::identity::{configured_trust_identity, trust_identity, verify_api_key_identity};
+use super::identity::{
+    configured_trust_identity, stored_user_identity, trust_identity, verify_api_key_identity,
+};
 
 /// Minimum wall-clock time for any authentication attempt that ends in failure.
 ///
@@ -221,9 +223,7 @@ pub async fn authenticate(
 
             state.credentials.record_login_success(username);
 
-            let identity = state
-                .credentials
-                .to_identity(username, AuthMethod::CleartextPassword)
+            let identity = stored_user_identity(state, username, AuthMethod::CleartextPassword)
                 .ok_or_else(|| crate::Error::BadRequest {
                     detail: format!("user '{username}' not found after password verification"),
                 })?;

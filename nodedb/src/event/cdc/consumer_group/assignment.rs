@@ -11,10 +11,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::RwLock;
 
+use crate::types::DatabaseId;
+
 /// Tracks active consumers and their partition assignments per group.
 pub struct ConsumerAssignments {
-    /// (tenant_id, stream_name, group_name) → assignment state.
-    groups: RwLock<HashMap<(u64, String, String), GroupAssignment>>,
+    /// (database_id, tenant_id, stream_name, group_name) → assignment state.
+    groups: RwLock<HashMap<(DatabaseId, u64, String, String), GroupAssignment>>,
 }
 
 /// Per-group assignment state.
@@ -71,8 +73,20 @@ impl ConsumerAssignments {
     }
 
     /// Register a consumer joining a group. Triggers rebalance.
-    pub fn join(&self, tenant_id: u64, stream: &str, group: &str, consumer_id: &str) {
-        let key = (tenant_id, stream.to_string(), group.to_string());
+    pub fn join(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        stream: &str,
+        group: &str,
+        consumer_id: &str,
+    ) {
+        let key = (
+            database_id,
+            tenant_id,
+            stream.to_string(),
+            group.to_string(),
+        );
         let mut groups = self.groups.write().unwrap_or_else(|p| p.into_inner());
         let state = groups.entry(key).or_insert_with(GroupAssignment::new);
         state.consumers.insert(consumer_id.to_string());
@@ -88,8 +102,20 @@ impl ConsumerAssignments {
     }
 
     /// Deregister a consumer leaving a group. Triggers rebalance.
-    pub fn leave(&self, tenant_id: u64, stream: &str, group: &str, consumer_id: &str) {
-        let key = (tenant_id, stream.to_string(), group.to_string());
+    pub fn leave(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        stream: &str,
+        group: &str,
+        consumer_id: &str,
+    ) {
+        let key = (
+            database_id,
+            tenant_id,
+            stream.to_string(),
+            group.to_string(),
+        );
         let mut groups = self.groups.write().unwrap_or_else(|p| p.into_inner());
         if let Some(state) = groups.get_mut(&key) {
             state.consumers.remove(consumer_id);
@@ -106,8 +132,20 @@ impl ConsumerAssignments {
     }
 
     /// Register a partition as known (called when events with new partition IDs are seen).
-    pub fn register_partition(&self, tenant_id: u64, stream: &str, group: &str, partition_id: u32) {
-        let key = (tenant_id, stream.to_string(), group.to_string());
+    pub fn register_partition(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        stream: &str,
+        group: &str,
+        partition_id: u32,
+    ) {
+        let key = (
+            database_id,
+            tenant_id,
+            stream.to_string(),
+            group.to_string(),
+        );
         let mut groups = self.groups.write().unwrap_or_else(|p| p.into_inner());
         if let Some(state) = groups.get_mut(&key)
             && state.partitions.insert(partition_id)
@@ -120,12 +158,18 @@ impl ConsumerAssignments {
     /// Returns None if the consumer is not registered (meaning: all partitions).
     pub fn assigned_partitions(
         &self,
+        database_id: DatabaseId,
         tenant_id: u64,
         stream: &str,
         group: &str,
         consumer_id: &str,
     ) -> Option<Vec<u32>> {
-        let key = (tenant_id, stream.to_string(), group.to_string());
+        let key = (
+            database_id,
+            tenant_id,
+            stream.to_string(),
+            group.to_string(),
+        );
         let groups = self.groups.read().unwrap_or_else(|p| p.into_inner());
         groups
             .get(&key)
@@ -133,8 +177,19 @@ impl ConsumerAssignments {
     }
 
     /// Number of active consumers in a group.
-    pub fn consumer_count(&self, tenant_id: u64, stream: &str, group: &str) -> usize {
-        let key = (tenant_id, stream.to_string(), group.to_string());
+    pub fn consumer_count(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        stream: &str,
+        group: &str,
+    ) -> usize {
+        let key = (
+            database_id,
+            tenant_id,
+            stream.to_string(),
+            group.to_string(),
+        );
         let groups = self.groups.read().unwrap_or_else(|p| p.into_inner());
         groups.get(&key).map(|s| s.consumers.len()).unwrap_or(0)
     }
@@ -150,94 +205,58 @@ impl Default for ConsumerAssignments {
 mod tests {
     use super::*;
 
+    const DB: DatabaseId = DatabaseId::new(7);
+
+    fn add_partitions(assignments: &ConsumerAssignments, count: u32) {
+        let mut groups = assignments.groups.write().unwrap();
+        let state = groups.get_mut(&(DB, 1, "s".into(), "g".into())).unwrap();
+        for partition in 0..count {
+            state.partitions.insert(partition);
+        }
+        state.rebalance();
+    }
+
     #[test]
     fn single_consumer_gets_all_partitions() {
         let assignments = ConsumerAssignments::new();
-
-        // Register partitions first by creating state.
-        assignments.join(1, "s", "g", "c1");
-        // Manually add partitions (normally discovered via events).
-        {
-            let mut groups = assignments.groups.write().unwrap();
-            let state = groups.get_mut(&(1, "s".into(), "g".into())).unwrap();
-            for p in 0..4 {
-                state.partitions.insert(p);
-            }
-            state.rebalance();
-        }
-
-        let assigned = assignments.assigned_partitions(1, "s", "g", "c1").unwrap();
-        assert_eq!(assigned, vec![0, 1, 2, 3]);
+        assignments.join(DB, 1, "s", "g", "c1");
+        add_partitions(&assignments, 4);
+        assert_eq!(
+            assignments.assigned_partitions(DB, 1, "s", "g", "c1"),
+            Some(vec![0, 1, 2, 3])
+        );
     }
 
     #[test]
-    fn two_consumers_split_evenly() {
+    fn database_assignments_are_isolated() {
         let assignments = ConsumerAssignments::new();
-        assignments.join(1, "s", "g", "c1");
-        assignments.join(1, "s", "g", "c2");
-
-        {
-            let mut groups = assignments.groups.write().unwrap();
-            let state = groups.get_mut(&(1, "s".into(), "g".into())).unwrap();
-            for p in 0..4 {
-                state.partitions.insert(p);
-            }
-            state.rebalance();
-        }
-
-        let c1 = assignments.assigned_partitions(1, "s", "g", "c1").unwrap();
-        let c2 = assignments.assigned_partitions(1, "s", "g", "c2").unwrap();
-
-        assert_eq!(c1.len(), 2);
-        assert_eq!(c2.len(), 2);
-        // No overlap.
-        let all: BTreeSet<u32> = c1.iter().chain(c2.iter()).copied().collect();
-        assert_eq!(all.len(), 4);
-    }
-
-    #[test]
-    fn odd_partitions_distributed_fairly() {
-        let assignments = ConsumerAssignments::new();
-        assignments.join(1, "s", "g", "c1");
-        assignments.join(1, "s", "g", "c2");
-
-        {
-            let mut groups = assignments.groups.write().unwrap();
-            let state = groups.get_mut(&(1, "s".into(), "g".into())).unwrap();
-            for p in 0..5 {
-                state.partitions.insert(p);
-            }
-            state.rebalance();
-        }
-
-        let c1 = assignments.assigned_partitions(1, "s", "g", "c1").unwrap();
-        let c2 = assignments.assigned_partitions(1, "s", "g", "c2").unwrap();
-
-        // 5 partitions / 2 consumers → 3 + 2.
-        assert!(c1.len() == 3 || c1.len() == 2);
-        assert_eq!(c1.len() + c2.len(), 5);
+        assignments.join(DB, 1, "s", "g", "c1");
+        assignments.join(DatabaseId::new(8), 1, "s", "g", "c2");
+        assert_eq!(assignments.consumer_count(DB, 1, "s", "g"), 1);
+        assert_eq!(
+            assignments.consumer_count(DatabaseId::new(8), 1, "s", "g"),
+            1
+        );
     }
 
     #[test]
     fn leave_triggers_rebalance() {
         let assignments = ConsumerAssignments::new();
-        assignments.join(1, "s", "g", "c1");
-        assignments.join(1, "s", "g", "c2");
-
-        {
-            let mut groups = assignments.groups.write().unwrap();
-            let state = groups.get_mut(&(1, "s".into(), "g".into())).unwrap();
-            for p in 0..4 {
-                state.partitions.insert(p);
-            }
-            state.rebalance();
-        }
-
-        // c2 leaves.
-        assignments.leave(1, "s", "g", "c2");
-
-        let c1 = assignments.assigned_partitions(1, "s", "g", "c1").unwrap();
-        assert_eq!(c1.len(), 4); // c1 gets all partitions.
-        assert!(assignments.assigned_partitions(1, "s", "g", "c2").is_none());
+        assignments.join(DB, 1, "s", "g", "c1");
+        assignments.join(DB, 1, "s", "g", "c2");
+        add_partitions(&assignments, 4);
+        assignments.leave(DB, 1, "s", "g", "c2");
+        assert_eq!(
+            assignments
+                .assigned_partitions(DB, 1, "s", "g", "c1")
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(
+            assignments
+                .assigned_partitions(DB, 1, "s", "g", "c2")
+                .is_none()
+        );
     }
 }

@@ -38,12 +38,12 @@ jobs:
     # on this ISA.
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: workspace
       - name: Install system deps
@@ -78,10 +78,14 @@ jobs:
         run: |
           python3 scripts/ci/check_robust_parsing.py --self-test
           python3 scripts/ci/check_robust_parsing.py
+      - name: Advisory-ignore policy gate
+        run: |
+          python3 scripts/ci/check_advisory_ignores.py --self-test
+          python3 scripts/ci/check_advisory_ignores.py
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny@0.20.2
       - name: Dependency audit
         run: cargo deny check
 
@@ -99,7 +103,7 @@ jobs:
     # Free ARM64 runner — see the lint job for rationale.
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Reclaim disk and record resources
         # Building the workspace's test binaries with --all-features writes on
         # the order of 100 GB into target/: every test binary statically links
@@ -125,8 +129,8 @@ jobs:
           echo "== filesystems =="; df -h / /tmp /dev/shm
           echo "== cpus =="; nproc
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: workspace
       - name: Install system deps
@@ -136,9 +140,9 @@ jobs:
             cmake clang libclang-dev pkg-config protobuf-compiler perl \
             libcurl4-openssl-dev libsasl2-dev mold
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@065d6a08a14e61e89fb0a4c10eecdbdef39c7d8e # v2
         with:
-          tool: nextest
+          tool: nextest@0.9.140
       - name: Run fast tests
         run: |
           cargo nextest run \
@@ -164,7 +168,7 @@ jobs:
           echo "== target/ =="; du -sh target 2>/dev/null || true
       - name: Upload JUnit report
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: junit-report
           path: target/nextest/ci/junit.xml

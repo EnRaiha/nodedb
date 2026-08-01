@@ -24,15 +24,15 @@ use super::parens::find_matching_paren;
 pub async fn call_procedure(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let (name, args) = parse_call(sql)?;
     let tenant_id = identity.tenant_id;
-
     let catalog = state.credentials.catalog();
 
     let proc = catalog
-        .get_procedure(tenant_id.as_u64(), &name)
+        .get_procedure_in_database(database_id, tenant_id.as_u64(), &name)
         .map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: e.to_string(),
@@ -77,8 +77,15 @@ pub async fn call_procedure(
 
     // Execute with fuel metering, timeout, and transaction context.
     let mut budget = ExecutionBudget::new(proc.max_iterations, proc.timeout_secs);
-    let executor =
-        StatementExecutor::new(state, identity.clone(), tenant_id, 0).with_transaction_context();
+    let executor = StatementExecutor::with_source_in_database(
+        state,
+        identity.clone(),
+        tenant_id,
+        database_id,
+        0,
+        crate::event::EventSource::User,
+    )
+    .with_transaction_context();
 
     executor
         .execute_block_with_budget(&block, &bindings, &mut budget)

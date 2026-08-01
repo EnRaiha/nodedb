@@ -26,6 +26,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// A trigger execution that failed and needs retry.
 #[derive(Debug, Clone)]
 pub struct RetryEntry {
+    /// Database context.
+    pub database_id: nodedb_types::DatabaseId,
     /// Tenant context.
     pub tenant_id: u64,
     /// Collection that triggered the event.
@@ -158,6 +160,7 @@ mod tests {
 
     fn make_entry(trigger: &str) -> RetryEntry {
         RetryEntry {
+            database_id: nodedb_types::DatabaseId::DEFAULT,
             tenant_id: 1,
             collection: "orders".into(),
             row_id: "order-1".into(),

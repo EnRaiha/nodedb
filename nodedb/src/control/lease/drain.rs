@@ -150,7 +150,7 @@ mod tests {
     use nodedb_cluster::DescriptorKind;
 
     fn id(name: &str) -> DescriptorId {
-        DescriptorId::new(1, DescriptorKind::Collection, name.to_string())
+        DescriptorId::new(0, 1, DescriptorKind::Collection, name.to_string())
     }
 
     fn hlc(wall_ns: u64) -> Hlc {

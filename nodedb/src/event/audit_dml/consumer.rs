@@ -53,14 +53,10 @@ pub fn audit_dml_event(event: &WriteEvent, state: &Arc<SharedState>) {
         WriteOp::Heartbeat => return,
     }
 
-    // Look up which database owns this collection.
-    let db_id = match state
-        .collection_to_database
-        .lookup(event.tenant_id, &event.collection)
-    {
-        Some(id) => id,
-        None => return, // Collection not yet registered — skip.
-    };
+    // The Data Plane propagates the request database with every write; do not
+    // reverse-map by collection because a tenant may use the same name in more
+    // than one database.
+    let db_id = event.database_id;
 
     // Check the per-database audit mode.
     let mode = state.audit_dml_cache.get(db_id);
@@ -105,6 +101,7 @@ mod tests {
             op,
             row_id: RowId::new("o-1"),
             lsn: Lsn::new(100),
+            database_id: DatabaseId::new(42),
             tenant_id: TenantId::new(1),
             vshard_id: VShardId::new(0),
             source,

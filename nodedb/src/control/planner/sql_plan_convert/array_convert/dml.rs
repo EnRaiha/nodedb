@@ -28,19 +28,11 @@ pub(in super::super) fn convert_insert_array(
         .ok_or_else(|| crate::Error::PlanError {
             detail: "INSERT INTO ARRAY: no array catalog wired into convert context".into(),
         })?;
-    let surrogate_assigner =
-        ctx.surrogate_assigner
-            .as_ref()
-            .ok_or_else(|| crate::Error::PlanError {
-                detail: "INSERT INTO ARRAY: no surrogate assigner wired into convert context"
-                    .into(),
-            })?;
-
     let entry = {
         let cat = array_catalog.read().map_err(|_| crate::Error::PlanError {
             detail: "array catalog lock poisoned".into(),
         })?;
-        cat.lookup_by_name(name)
+        cat.lookup_by_name_in_database(tenant_id, ctx.database_id, name)
             .ok_or_else(|| crate::Error::PlanError {
                 detail: format!("INSERT INTO ARRAY {name}: not found"),
             })?
@@ -51,7 +43,7 @@ pub(in super::super) fn convert_insert_array(
             detail: format!("array schema decode: {e}"),
         })?;
 
-    let aid = ArrayId::new(tenant_id, name);
+    let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
     let system_now_ms = chrono::Utc::now().timestamp_millis();
 
@@ -65,8 +57,7 @@ pub(in super::super) fn convert_insert_array(
                     format: "msgpack".into(),
                     detail: format!("array coord pk encode: {e}"),
                 })?;
-            let surrogate =
-                surrogate_assigner.assign(ctx.database_id, tenant_id, name, &pk_bytes)?;
+            let surrogate = ctx.surrogate_for_pk(name, &pk_bytes)?;
             let hilbert =
                 encode_hilbert_prefix(&schema, &coord).map_err(|e| crate::Error::PlanError {
                     detail: format!("INSERT INTO ARRAY {name}: Hilbert prefix: {e}"),
@@ -120,7 +111,7 @@ pub(in super::super) fn convert_insert_array(
                 format: "msgpack".into(),
                 detail: format!("array coord pk encode: {e}"),
             })?;
-        let surrogate = surrogate_assigner.assign(ctx.database_id, tenant_id, name, &pk_bytes)?;
+        let surrogate = ctx.surrogate_for_pk(name, &pk_bytes)?;
         cells.push(ArrayPutCell {
             coord,
             attrs,
@@ -172,7 +163,7 @@ pub(in super::super) fn convert_delete_array(
         let cat = array_catalog.read().map_err(|_| crate::Error::PlanError {
             detail: "array catalog lock poisoned".into(),
         })?;
-        cat.lookup_by_name(name)
+        cat.lookup_by_name_in_database(tenant_id, ctx.database_id, name)
             .ok_or_else(|| crate::Error::PlanError {
                 detail: format!("DELETE FROM ARRAY {name}: not found"),
             })?
@@ -183,7 +174,7 @@ pub(in super::super) fn convert_delete_array(
             detail: format!("array schema decode: {e}"),
         })?;
 
-    let aid = ArrayId::new(tenant_id, name);
+    let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
     let system_now_ms = chrono::Utc::now().timestamp_millis();
 

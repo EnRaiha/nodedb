@@ -23,8 +23,8 @@ impl NodeDbPgHandler {
     /// This is the single planning code path shared by both the simple-query
     /// (`execute_planned_sql_inner`) and any future callers that need typed
     /// physical plans without driving the dispatch loop. Returns the ready-to-
-    /// dispatch task list and the plan-lease scope that must be kept alive until
-    /// dispatch completes.
+    /// dispatch task list and the descriptor versions to admit after execution
+    /// has expanded and authorized every implicit task.
     pub(in crate::control::server::pgwire::handler) async fn plan_statement_to_tasks(
         &self,
         identity: &AuthenticatedIdentity,
@@ -35,7 +35,8 @@ impl NodeDbPgHandler {
     ) -> PgWireResult<(
         Vec<PhysicalTask>,
         crate::control::server::response_shape::schema::OutputSchema,
-        crate::control::lease::QueryLeaseScope,
+        crate::control::planner::descriptor_set::DescriptorVersionSet,
+        crate::control::security::auth_context::AuthContext,
     )> {
         // Resolve opaque session handle if SET LOCAL nodedb.auth_session is set.
         // Network provenance is immutable accept-time metadata; all mutable
@@ -130,10 +131,19 @@ impl NodeDbPgHandler {
             .sessions
             .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        // A resolved opaque auth-session can predate `USE DATABASE`; the
+        // selected database for this statement is authoritative for RLS.
+        auth_ctx.database_id = Some(database_id);
 
         // Enforce general CHECK constraints for INSERT/UPDATE before planning.
-        self.enforce_check_constraints_if_needed(&clean_sql, identity, tenant_id, database_id)
-            .await?;
+        self.enforce_check_constraints_if_needed(
+            &clean_sql,
+            identity,
+            tenant_id,
+            database_id,
+            &auth_ctx,
+        )
+        .await?;
 
         // Validate enum-typed column values for INSERT/UPDATE before planning.
         self.enforce_enum_labels_if_needed(&clean_sql, tenant_id, database_id)
@@ -160,7 +170,7 @@ impl NodeDbPgHandler {
                 })
         };
 
-        let (tasks, output_schema, lease_scope) = if !params.is_empty() {
+        let (tasks, output_schema, versions) = if !params.is_empty() {
             let perm_cache = self.state.permission_cache.read().await;
             let sec = crate::control::planner::context::PlanSecurityContext {
                 identity,
@@ -170,9 +180,15 @@ impl NodeDbPgHandler {
                 roles: &self.state.roles,
                 permission_cache: Some(&*perm_cache),
             };
-            let (tasks, output_schema) = self
+            let (tasks, output_schema, versions) = self
                 .query_ctx
-                .plan_sql_with_params_and_rls(&clean_sql, params, tenant_id, database_id, &sec)
+                .plan_sql_with_params_and_rls_and_versions(
+                    &clean_sql,
+                    params,
+                    tenant_id,
+                    database_id,
+                    &sec,
+                )
                 .await
                 .map_err(|e| {
                     let (severity, code, message) = error_to_sqlstate(&e);
@@ -182,14 +198,9 @@ impl NodeDbPgHandler {
                         message,
                     )))
                 })?;
-            (
-                tasks,
-                output_schema,
-                crate::control::lease::QueryLeaseScope::empty(),
-            )
+            (tasks, output_schema, versions)
         } else if let Some((tasks, versions, output_schema)) = cached_tasks {
-            let scope = self.state.acquire_plan_lease_scope(&versions);
-            (tasks, output_schema, scope)
+            (tasks, output_schema, versions)
         } else {
             let (planned, output_schema, versions, cache_eligibility) =
                 super::super::retry::retry_on_schema_change(|| async {
@@ -222,7 +233,6 @@ impl NodeDbPgHandler {
                     )))
                 })?;
 
-            let scope = self.state.acquire_plan_lease_scope(&versions);
             // Strategy overrides and data-dependent identity lowering are not
             // represented by the cache key. Document point plans resolve a
             // mutable PK→surrogate binding while lowering, so caching either a
@@ -233,11 +243,11 @@ impl NodeDbPgHandler {
                     session_id,
                     &clean_sql,
                     planned.clone(),
-                    versions,
+                    versions.clone(),
                     output_schema.clone(),
                 );
             }
-            (planned, output_schema, scope)
+            (planned, output_schema, versions)
         };
 
         // Inject RETURNING spec into DML plans.
@@ -253,7 +263,13 @@ impl NodeDbPgHandler {
             tasks
         };
 
-        Ok((tasks, output_schema, lease_scope))
+        // Preauthorize the originally planned tasks before execution expands
+        // implicit edges. Expansion can mark catalog state and allocate
+        // surrogates, while descriptor admission must wait until the expanded
+        // task set has received final authorization in the execute path.
+        let _preauthorized_tasks = self.authorize_tasks(identity, &tasks)?;
+
+        Ok((tasks, output_schema, versions, auth_ctx))
     }
 }
 

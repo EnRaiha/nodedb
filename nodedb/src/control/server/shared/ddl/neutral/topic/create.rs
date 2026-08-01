@@ -4,9 +4,10 @@
 //!
 //! Ported from the pgwire `ddl::topic::create` handler. The tenant-admin gate,
 //! the duplicate-topic check, the optional `WITH (RETENTION = '…')` parse, the
-//! `TopicDef` build, the direct `catalog.put_ep_topic` + `ep_topic_registry`
-//! registration path (NOT `propose_and_apply` — this family writes the catalog
-//! directly), and the `audit_record` call are preserved verbatim; only the
+//! `TopicDef` build, the durable insert-if-absent catalog write +
+//! `ep_topic_registry` registration path (NOT `propose_and_apply` — this
+//! family writes the catalog directly), and the `audit_record` call are
+//! preserved; only the
 //! result construction changed from pgwire `Response` / `PgWireError` to the
 //! protocol-neutral [`DdlResult`] / [`DdlError`].
 //!
@@ -15,15 +16,17 @@
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 use crate::event::cdc::stream_def::RetentionConfig;
-use crate::event::topic::TopicDef;
+use crate::event::topic::{TopicDef, validate_topic_name};
+use crate::types::DatabaseId;
 use nodedb_sql::parser::preprocess::lex::{find_ascii_case_insensitive, find_ascii_keyword};
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
 
-pub fn create_topic(
+pub async fn create_topic(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -38,14 +41,15 @@ pub fn create_topic(
     }
 
     let name = parts[2].to_lowercase();
+    validate_topic_name(&name).map_err(|message| DdlError {
+        sqlstate: "42601".to_string(),
+        message: message.to_string(),
+    })?;
     let tenant_id = identity.tenant_id.as_u64();
-
-    if state.ep_topic_registry.get(tenant_id, &name).is_some() {
-        return Err(DdlError {
-            sqlstate: "42710".to_string(),
-            message: format!("topic '{name}' already exists"),
-        });
-    }
+    let lifecycle_lock = state
+        .ep_topic_registry
+        .lifecycle_lock(database_id, tenant_id, &name);
+    let _guard = lifecycle_lock.lock().await;
 
     // Parse optional retention from WITH clause.
     let mut retention = RetentionConfig {
@@ -80,19 +84,27 @@ pub fn create_topic(
         .as_secs();
 
     let def = TopicDef {
+        database_id,
         tenant_id,
         name: name.clone(),
         retention,
         owner: identity.username.clone(),
         created_at: now,
+        last_sequence: 0,
+        last_lsn: 0,
     };
 
     let catalog = state.credentials.catalog();
 
-    catalog.put_ep_topic(&def).map_err(|e| DdlError {
+    if !catalog.create_ep_topic(&def).map_err(|e| DdlError {
         sqlstate: "XX000".to_string(),
         message: format!("catalog write: {e}"),
-    })?;
+    })? {
+        return Err(DdlError {
+            sqlstate: "42710".to_string(),
+            message: format!("topic '{name}' already exists"),
+        });
+    }
 
     state.ep_topic_registry.register(def);
 

@@ -154,15 +154,17 @@ pub async fn run_commit(
     )
     .await;
     // Transition the session out of the block NOW — this drains the write buffer
-    // and clears snapshot/txn state, moving the session to `Idle`.
-    match sessions.commit(session_id) {
-        Ok(_) => {}
+    // and clears snapshot/txn state, moving the session to `Idle`. Keep the
+    // aligned descriptor-lease scope holders owned here through every remaining
+    // cleanup step and response construction below.
+    let (_drained_tasks, _lease_scopes) = match sessions.commit(session_id) {
+        Ok(drained) => drained,
         Err(_msg) => {
             return CommitOutcome::Aborted {
                 reason: AbortReason::NoTransaction,
             };
         }
-    }
+    };
 
     // Release the per-transaction staging overlay on every vShard that hosted a
     // staged write, now that the durable batch(es) have flushed. Uses the peeked
@@ -197,15 +199,19 @@ pub async fn run_commit(
 
     // Flush pending offset commits (deferred from COMMIT OFFSET inside transaction).
     let pending_offsets = sessions.take_pending_offsets(session_id);
-    for (tid, stream, group, partition_id, lsn) in pending_offsets {
-        if let Err(e) = state
-            .offset_store
-            .commit_offset(tid, &stream, &group, partition_id, lsn)
-        {
+    for pending_offset in pending_offsets {
+        if let Err(e) = state.offset_store.commit_offset(
+            pending_offset.database_id,
+            pending_offset.tenant_id,
+            &pending_offset.stream,
+            &pending_offset.group,
+            pending_offset.partition_id,
+            pending_offset.offset,
+        ) {
             tracing::warn!(
-                stream = %stream,
-                group = %group,
-                partition = partition_id,
+                stream = %pending_offset.stream,
+                group = %pending_offset.group,
+                partition = pending_offset.partition_id,
                 error = %e,
                 "failed to commit deferred offset"
             );

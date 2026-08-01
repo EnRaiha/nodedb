@@ -80,12 +80,11 @@ impl PgListener {
         let absolute_timeout_secs = conn_state.session_absolute_timeout_secs();
         let factory = Arc::new(NodeDbPgHandlerFactory::new(state, auth_mode));
 
-        // Register with the shutdown bus so the sequencer waits for us to drain
-        // before advancing past DrainingListeners.
-        let drain_guard = bus.register_task(
+        // Active pgwire sessions can drain for up to 30 seconds. Their cleanup
+        // must finish before Data/Event/WAL shutdown begins.
+        let drain_guard = bus.register_critical_task(
             crate::control::shutdown::ShutdownPhase::DrainingListeners,
             "pgwire",
-            None,
         );
         let mut shutdown_handle = bus.handle();
 

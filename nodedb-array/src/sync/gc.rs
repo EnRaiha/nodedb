@@ -41,8 +41,8 @@ pub struct GcReport {
 /// 3. For each such array, call `snapshot_for_array(name, frontier)`.
 ///    - `Some(snap)` → write via `sink.write_snapshot(&snap)` and increment
 ///      `snapshots_written`.
-///    - `None` → the caller signals "no live state for this array"; skip the
-///      snapshot write (ops will still be dropped).
+///    - `None` → fail without pruning: no operation may be discarded unless
+///      a snapshot represents that array through the frontier.
 ///    - `Err` → propagate immediately; the log is **not** mutated.
 /// 4. After all snapshots succeed, call `log.drop_below(frontier)` and record
 ///    the count in `ops_dropped`.
@@ -76,10 +76,31 @@ pub fn collapse_below(
     // Write snapshots — abort on the first error; do NOT mutate the log yet.
     let mut snapshots_written: u64 = 0;
     for array in &arrays_to_snapshot {
-        if let Some(snap) = snapshot_for_array(array, frontier)? {
-            sink.write_snapshot(&snap)?;
-            snapshots_written += 1;
+        let snap = snapshot_for_array(array, frontier)?.ok_or_else(|| {
+            crate::error::ArrayError::SegmentCorruption {
+                detail: format!(
+                    "array GC refused to prune '{array}' without a snapshot through {frontier:?}"
+                ),
+            }
+        })?;
+        if snap.array != *array {
+            return Err(crate::error::ArrayError::SegmentCorruption {
+                detail: format!(
+                    "array GC snapshot array mismatch: expected '{array}', got '{}'",
+                    snap.array
+                ),
+            });
         }
+        if snap.snapshot_hlc < frontier {
+            return Err(crate::error::ArrayError::SegmentCorruption {
+                detail: format!(
+                    "array GC snapshot for '{array}' is stale: {:?} < {frontier:?}",
+                    snap.snapshot_hlc
+                ),
+            });
+        }
+        sink.write_snapshot(&snap)?;
+        snapshots_written += 1;
     }
 
     // All snapshots succeeded — now prune the log.
@@ -233,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn gc_skips_arrays_with_no_live_state() {
+    fn gc_refuses_to_prune_when_any_array_has_no_live_snapshot() {
         let log = InMemoryOpLog::new();
         log.append(&make_op("alive", 10)).unwrap();
         log.append(&make_op("dead", 10)).unwrap();
@@ -242,19 +263,16 @@ mod tests {
         acks.record(replica(), hlc(50));
 
         let sink = MockSnapshotSink::new();
-        let report = collapse_below(&log, &acks, &sink, |array, frontier| {
+        let result = collapse_below(&log, &acks, &sink, |array, frontier| {
             if array == "alive" {
                 Ok(Some(dummy_snapshot(array, frontier)))
             } else {
                 Ok(None)
             }
-        })
-        .unwrap();
+        });
 
-        // Only "alive" gets a snapshot; "dead" is skipped.
-        assert_eq!(report.snapshots_written, 1);
-        // Both ops are dropped.
-        assert_eq!(report.ops_dropped, 2);
+        assert!(result.is_err());
+        assert_eq!(log.len().unwrap(), 2);
     }
 
     #[test]
@@ -275,6 +293,23 @@ mod tests {
         assert!(result.is_err());
         // Log must be unchanged.
         assert_eq!(log.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn gc_rejects_snapshot_for_wrong_array_without_pruning() {
+        let log = InMemoryOpLog::new();
+        log.append(&make_op("arr", 10)).unwrap();
+        let mut acks = AckVector::new();
+        acks.record(replica(), hlc(50));
+        let sink = MockSnapshotSink::new();
+
+        let result = collapse_below(&log, &acks, &sink, |_, frontier| {
+            Ok(Some(dummy_snapshot("other", frontier)))
+        });
+
+        assert!(matches!(result, Err(ArrayError::SegmentCorruption { .. })));
+        assert_eq!(log.len().unwrap(), 1);
+        assert_eq!(sink.snapshot_count(), 0);
     }
 
     #[test]

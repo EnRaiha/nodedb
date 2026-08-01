@@ -24,14 +24,16 @@ pub enum Error {
 
     #[error(
         "offset regression on stream '{stream}' group '{group}' partition {partition_id}: \
-         attempted LSN {attempted_lsn} < current committed LSN {current_lsn}"
+         attempted position {attempted_lsn}:{attempted_sequence} < current committed position {current_lsn}:{current_sequence}"
     )]
     OffsetRegression {
         stream: String,
         group: String,
         partition_id: u32,
         current_lsn: u64,
+        current_sequence: u64,
         attempted_lsn: u64,
+        attempted_sequence: u64,
     },
 
     #[error("request {request_id} exceeded deadline")]

@@ -92,7 +92,7 @@ async fn scheduler_loop(
 
     // Track currently running jobs (for ALLOW_OVERLAP = false enforcement).
     // Shared with spawned job tasks so they remove themselves on completion.
-    let running: Arc<std::sync::Mutex<HashSet<(u64, String)>>> =
+    let running: Arc<std::sync::Mutex<HashSet<(u64, u64, String)>>> =
         Arc::new(std::sync::Mutex::new(HashSet::new()));
 
     // Bounded job dispatcher — caps concurrency (from SchedulerTuning)
@@ -112,7 +112,7 @@ async fn scheduler_loop(
     // `pending_minute_ticks` returns at most the current minute. That
     // bounded catch-up is what prevents a cold start from replaying
     // ticks from epoch.
-    let mut last_fired_minute: HashMap<(u64, String), u64> = HashMap::new();
+    let mut last_fired_minute: HashMap<(u64, u64, String), u64> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -161,7 +161,7 @@ async fn scheduler_loop(
             // tolerates tick jitter past a minute boundary; the old code
             // gated on `now_secs % 60 == 0` and silently dropped any
             // minute whose tick landed at second != 0.
-            let sched_key = (sched.tenant_id, sched.name.clone());
+            let sched_key = (sched.database_id, sched.tenant_id, sched.name.clone());
             let last = last_fired_minute.get(&sched_key).copied();
             let tz_offset = state.scheduler_config.cron_timezone.offset_seconds();
             let pending = pending_minute_ticks(last, now_secs, &cron, tz_offset);
@@ -199,7 +199,7 @@ async fn scheduler_loop(
             }
 
             // Check overlap policy.
-            let key = (sched.tenant_id, sched.name.clone());
+            let key = (sched.database_id, sched.tenant_id, sched.name.clone());
             if !sched.allow_overlap {
                 let guard = running.lock().unwrap_or_else(|p| p.into_inner());
                 if guard.contains(&key) {
@@ -242,6 +242,7 @@ async fn scheduler_loop(
 
                 let run = match result {
                     Ok(duration_ms) => JobRun {
+                        database_id: sched_clone.database_id,
                         schedule_name: sched_clone.name.clone(),
                         tenant_id: sched_clone.tenant_id,
                         started_at: now_ms.saturating_sub(duration_ms),
@@ -256,6 +257,7 @@ async fn scheduler_loop(
                             "scheduled job failed"
                         );
                         JobRun {
+                            database_id: sched_clone.database_id,
                             schedule_name: sched_clone.name.clone(),
                             tenant_id: sched_clone.tenant_id,
                             started_at: now_ms,
@@ -270,7 +272,7 @@ async fn scheduler_loop(
                     warn!(error = %e, "failed to record job history");
                 }
 
-                let key = (sched_clone.tenant_id, sched_clone.name.clone());
+                let key = (sched_clone.database_id, sched_clone.tenant_id, sched_clone.name.clone());
                 let mut guard = running_clone.lock().unwrap_or_else(|p| p.into_inner());
                 guard.remove(&key);
                 Ok(())
@@ -312,11 +314,10 @@ fn should_fire_on_this_node(sched: &ScheduleDef, state: &SharedState) -> bool {
     let node_id = state.node_id;
 
     if let Some(ref collection) = sched.target_collection {
-        // Collection-targeted schedule: fire only on the shard leader.
-        // Schedules are scoped to `DatabaseId::DEFAULT` today; when
-        // ScheduleDef gains a database_id field, plumb it through here.
+        // Collection-targeted schedule: fire only on the shard leader in
+        // the database that owns the schedule definition.
         let vshard_id = nodedb_cluster::routing::vshard_for_collection(
-            nodedb_types::id::DatabaseId::DEFAULT,
+            nodedb_types::id::DatabaseId::new(sched.database_id),
             collection,
         );
         let routing = routing_lock.read().unwrap_or_else(|p| p.into_inner());
@@ -364,9 +365,10 @@ fn is_raft_group_healthy(sched: &ScheduleDef, state: &SharedState) -> bool {
         .target_collection
         .as_ref()
         .map(|c| {
-            // Schedules are scoped to `DatabaseId::DEFAULT` today; when
-            // ScheduleDef gains a database_id field, plumb it through here.
-            nodedb_cluster::routing::vshard_for_collection(nodedb_types::id::DatabaseId::DEFAULT, c)
+            nodedb_cluster::routing::vshard_for_collection(
+                nodedb_types::id::DatabaseId::new(sched.database_id),
+                c,
+            )
         })
         .unwrap_or(0); // Cross-collection → coordinator vShard 0.
 
@@ -437,8 +439,14 @@ async fn execute_job(
         }
     })?;
 
-    let executor =
-        StatementExecutor::new(state, identity.clone(), TenantId::new(sched.tenant_id), 0);
+    let executor = StatementExecutor::with_source_in_database(
+        state,
+        identity.clone(),
+        TenantId::new(sched.tenant_id),
+        crate::types::DatabaseId::new(sched.database_id),
+        0,
+        crate::event::EventSource::User,
+    );
     let bindings = RowBindings::empty();
     // One budget for the whole job — retries consume the same wall-clock
     // and fuel pool as the first attempt so a runaway job can't double
@@ -456,8 +464,14 @@ async fn execute_job(
                 error = %first_err,
                 "scheduled job failed, retrying once (possible vShard migration)"
             );
-            let retry_executor =
-                StatementExecutor::new(state, identity, TenantId::new(sched.tenant_id), 0);
+            let retry_executor = StatementExecutor::with_source_in_database(
+                state,
+                identity,
+                TenantId::new(sched.tenant_id),
+                crate::types::DatabaseId::new(sched.database_id),
+                0,
+                crate::event::EventSource::User,
+            );
             retry_executor
                 .execute_block_with_budget(&block, &bindings, &mut budget)
                 .await?;
@@ -492,6 +506,7 @@ mod tests {
 
     fn make_schedule(name: &str, target: Option<&str>, scope: ScheduleScope) -> ScheduleDef {
         ScheduleDef {
+            database_id: 0,
             tenant_id: 1,
             name: name.into(),
             cron_expr: "* * * * *".into(),

@@ -22,7 +22,10 @@ pub fn verify_triggers(
         .load_all_triggers()?
         .into_iter()
         .map(|t| {
-            let key = format!("{}|{}|{}", t.tenant_id, t.collection, t.name);
+            let key = format!(
+                "{}|{}|{}|{}",
+                t.database_id, t.tenant_id, t.collection, t.name
+            );
             let value = format!(
                 "v={},en={},pri={}",
                 t.descriptor_version, t.enabled, t.priority
@@ -36,7 +39,10 @@ pub fn verify_triggers(
         .snapshot_all()
         .into_iter()
         .map(|t| {
-            let key = format!("{}|{}|{}", t.tenant_id, t.collection, t.name);
+            let key = format!(
+                "{}|{}|{}|{}",
+                t.database_id, t.tenant_id, t.collection, t.name
+            );
             let value = format!(
                 "v={},en={},pri={}",
                 t.descriptor_version, t.enabled, t.priority

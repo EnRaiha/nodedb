@@ -8,10 +8,12 @@
 //! the same code that used to run inline in the per-task dispatch loop.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
+use crate::control::security::auth_context::AuthContext;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::SessionId;
 use crate::control::trigger::dml_hook::DmlWriteInfo;
@@ -43,6 +45,7 @@ impl NodeDbPgHandler {
         session_id: SessionId,
         identity: &AuthenticatedIdentity,
         task: PhysicalTask,
+        plan_lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
     ) -> PgWireResult<TxnRouteOutcome> {
         use crate::control::server::shared::session::expander_stage::{
             ExpanderOutcome, route_in_tx_expander,
@@ -59,6 +62,7 @@ impl NodeDbPgHandler {
         // statements in the same txn); every other task falls through to the
         // neutral staging gate. The expander dispatches each derived point op via
         // the SAME closure, so it must be `Fn` — hence `user_id.clone()` per call.
+        let buffer_start = self.sessions.buffered_task_count(session_id);
         let routed = match route_in_tx_expander(
             &self.state,
             &self.sessions,
@@ -83,6 +87,21 @@ impl NodeDbPgHandler {
             }
             Err(e) => Err(e),
         };
+
+        if self.sessions.buffered_task_count(session_id) > buffer_start
+            && !self.sessions.attach_tx_lease_scope_since(
+                session_id,
+                buffer_start,
+                plan_lease_scope,
+            )
+        {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "XX000".to_owned(),
+                "internal error: failed to retain descriptor leases for buffered transaction tasks"
+                    .to_owned(),
+            ))));
+        }
 
         match routed {
             Ok(InTxnRoute::Read(routed_task)) => Ok(TxnRouteOutcome::Proceed(routed_task)),
@@ -145,6 +164,7 @@ impl NodeDbPgHandler {
     pub(super) async fn run_pre_dispatch_hooks(
         &self,
         identity: &AuthenticatedIdentity,
+        auth: &AuthContext,
         tenant_id: TenantId,
         session_id: SessionId,
         plan_kind: PlanKind,
@@ -153,10 +173,9 @@ impl NodeDbPgHandler {
         // --- Trigger interception for DML writes ---
         let mut dml_info = crate::control::trigger::dml_hook::classify_dml_write(&task.plan);
 
-        let database_id = self
-            .sessions
-            .get_current_database(session_id)
-            .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        // The OLD read must retain the exact database identity of the task,
+        // rather than re-resolving mutable session state.
+        let database_id = task.database_id;
 
         // Fetch OLD row and fire BEFORE/INSTEAD OF triggers if applicable.
         let old_row = if let Some(ref info) = dml_info
@@ -170,12 +189,21 @@ impl NodeDbPgHandler {
             let doc_id = info.document_id.as_deref().unwrap_or("");
             let row = crate::control::trigger::dml_hook::fetch_old_row(
                 &self.state,
+                identity,
                 database_id,
-                tenant_id,
+                auth,
                 &info.collection,
                 doc_id,
             )
-            .await;
+            .await
+            .map_err(|error| {
+                let (severity, code, message) = error_to_sqlstate(&error);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            })?;
             if !row.is_empty() { Some(row) } else { None }
         } else {
             None
@@ -198,6 +226,7 @@ impl NodeDbPgHandler {
                 crate::control::trigger::dml_hook_fire::DispatchTriggerParams {
                     state: &self.state,
                     identity,
+                    database_id,
                     tenant_id,
                     info,
                     old_row: &old_row,

@@ -53,10 +53,11 @@ impl NodeDbPgHandler {
         .map_err(pgwire_authorization_error)?;
 
         let tenant_id = identity.tenant_id;
-        let sub = self
-            .state
-            .change_stream
-            .subscribe(Some(coll_name.clone()), Some(tenant_id));
+        let sub = self.state.change_stream.subscribe_in_database(
+            Some(coll_name.clone()),
+            Some(tenant_id),
+            database_id,
+        );
         let sub_id = sub.id;
         let channel = format!("live_{coll_name}");
 

@@ -87,7 +87,10 @@ impl SharedState {
                 crate::control::array_sync::OriginSnapshotStore::open(data_dir)?
             },
             array_snapshot_hlcs: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
+                std::collections::HashMap::<
+                    (nodedb_types::DatabaseId, u64, String),
+                    nodedb_array::sync::hlc::Hlc,
+                >::new(),
             )),
             array_gc_handle: None,
             session_invalidation_bus: si_bus,
@@ -253,8 +256,6 @@ impl SharedState {
             audit_max_entries: auth_config.audit_max_entries,
             idle_timeout_secs: auth_config.idle_timeout_secs,
             session_absolute_timeout_secs: auth_config.session_absolute_timeout_secs,
-            ws_sessions: std::sync::RwLock::new(std::collections::HashMap::new()),
-            topic_registry: crate::control::pubsub::TopicRegistry::new(10_000),
             shape_registry: Arc::new(crate::control::server::sync::shape::ShapeRegistry::new()),
             change_stream: crate::control::change_stream::ChangeStream::new(4096),
             notify_bus: crate::control::notify_bus::NotifyBus::default(),
@@ -284,6 +285,8 @@ impl SharedState {
             quarantine_storage: Arc::new(object_store::memory::InMemory::new()),
             hlc_clock: Arc::new(nodedb_types::HlcClock::new()),
             tenant_write_hlc: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            lease_admission_gate: Mutex::new(()),
+            lease_grant_gate: Arc::new(Mutex::new(())),
             lease_drain: Arc::new(crate::control::lease::DescriptorDrainTracker::new()),
             lease_refcount: Arc::new(crate::control::lease::LeaseRefCount::new()),
             sequencer_inbox: std::sync::OnceLock::new(),
@@ -355,6 +358,7 @@ impl SharedState {
             startup: Arc::clone(&startup_gate),
         });
 
+        crate::event::topic::hydrate_topic_buffers(&state)?;
         super::post_init::hydrate_caches(&state);
         super::post_init::spawn_array_gc(&state);
 

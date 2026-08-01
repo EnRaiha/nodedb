@@ -86,7 +86,9 @@ pub(super) fn wal_append_array_op(
         | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
-        | ArrayOp::DropArray { .. } => None,
+        | ArrayOp::DropArray { .. }
+        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::PurgeArrayDrop { .. } => None,
         // DurableElsewhere — the flushed / compacted segment is rebuilt on replay
         // from the already-durable Put/Delete WAL records; Flush and Compact only
         // reorganize on-disk tile layout, creating no new logical cell.

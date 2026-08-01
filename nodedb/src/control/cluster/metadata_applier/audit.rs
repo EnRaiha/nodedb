@@ -211,6 +211,8 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
         E::RevokeApiKey { key_id, .. } => (key_id.clone(), 0, String::new()),
         E::PutMaterializedView(m) => (m.name.clone(), 0, String::new()),
         E::DeleteMaterializedView { name, .. } => (name.clone(), 0, String::new()),
+        E::PutStreamingMaterializedView(m) => (m.name.clone(), 0, String::new()),
+        E::DeleteStreamingMaterializedView { name, .. } => (name.clone(), 0, String::new()),
         E::PutContinuousAggregate(c) => (
             c.name.clone(),
             c.descriptor_version,

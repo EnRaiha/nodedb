@@ -208,9 +208,9 @@ fn gc_snapshot_contains_ops_for_new_peer_catchup() {
     }
 }
 
-/// Arrays with no live state after GC skip snapshot write but still drop ops.
+/// Missing live state blocks GC so no array loses its only recoverable ops.
 #[test]
-fn gc_skips_snapshot_for_arrays_with_no_live_state() {
+fn gc_refuses_to_prune_when_an_array_has_no_live_state() {
     let log = InMemoryOpLog::new();
     log.append(&make_op("gone", 10, 1)).expect("append");
     log.append(&make_op("alive", 20, 1)).expect("append");
@@ -219,18 +219,16 @@ fn gc_skips_snapshot_for_arrays_with_no_live_state() {
     acks.record(rep(1), hlc(50, 1));
 
     let sink = MockSnapshotSink::new();
-    let report = collapse_below(&log, &acks, &sink, |array, frontier| {
+    let result = collapse_below(&log, &acks, &sink, |array, frontier| {
         if array == "alive" {
             Ok(Some(dummy_snapshot(array, frontier)))
         } else {
-            Ok(None) // "gone" has no live state
+            Ok(None) // "gone" has no durable recovery snapshot
         }
-    })
-    .expect("collapse_below");
+    });
 
-    assert_eq!(report.snapshots_written, 1, "only 'alive' gets a snapshot");
-    assert_eq!(report.ops_dropped, 2, "both ops are dropped regardless");
-    assert_eq!(log.len().expect("len"), 0, "log must be empty");
+    assert!(result.is_err());
+    assert_eq!(log.len().expect("len"), 2, "no operation may be pruned");
 }
 
 /// GC propagates snapshot errors without mutating the log.

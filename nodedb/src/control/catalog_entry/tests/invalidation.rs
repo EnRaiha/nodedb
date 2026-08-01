@@ -199,6 +199,7 @@ async fn no_op_variants_do_not_evict_plan_cache() {
         &shared,
         &cache,
         CatalogEntry::DeleteTrigger {
+            database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: 1,
             name: "trig".into(),
         },
@@ -210,6 +211,7 @@ async fn no_op_variants_do_not_evict_plan_cache() {
         &shared,
         &cache,
         CatalogEntry::DeleteFunction {
+            database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: 1,
             name: "fn_".into(),
         },
@@ -221,6 +223,7 @@ async fn no_op_variants_do_not_evict_plan_cache() {
         &shared,
         &cache,
         CatalogEntry::DeleteProcedure {
+            database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: 1,
             name: "proc".into(),
         },
@@ -232,6 +235,7 @@ async fn no_op_variants_do_not_evict_plan_cache() {
         &shared,
         &cache,
         CatalogEntry::DeleteSchedule {
+            database_id: crate::types::DatabaseId::DEFAULT,
             tenant_id: 1,
             name: "sched".into(),
         },
@@ -243,6 +247,7 @@ async fn no_op_variants_do_not_evict_plan_cache() {
         &shared,
         &cache,
         CatalogEntry::DeleteChangeStream {
+            database_id: crate::types::DatabaseId::DEFAULT.as_u64(),
             tenant_id: 1,
             name: "stream".into(),
         },

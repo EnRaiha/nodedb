@@ -15,9 +15,8 @@
 //!   - Check `cursor::should_send` (skips already-delivered ops).
 //!   - Check `snapshot_trigger::check_and_trigger` (pivots to catch-up if
 //!     cursor is below the GC boundary).
-//!   - Encode the op as `ArrayDeltaMsg` and enqueue to the session's
-//!     delivery channel.
-//!   - Advance the cursor via `cursor::mark_sent`.
+//!   - Route the op through the merger, which encodes and enqueues it.
+//!   - The merger advances the cursor only after its frame is queued.
 //!
 //! # Thread safety
 //!
@@ -25,14 +24,13 @@
 //! `Arc` and shared between the inbound session task and the post-apply
 //! observer.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use nodedb_array::sync::hlc::Hlc;
 use nodedb_array::sync::op::ArrayOp;
 use tracing::debug;
 
-use crate::control::server::sync::shape::registry::ShapeRegistry;
+use crate::control::server::sync::shape::{ShapeScope, registry::ShapeRegistry};
 
 use super::cursor;
 use super::delivery::ArrayDeliveryRegistry;
@@ -50,15 +48,15 @@ pub trait ArrayApplyObserver: Send + Sync {
 
 /// Fan-out coordinator for applied array ops.
 pub struct ArrayFanout {
-    /// Shape registry: maps (tenant, array, coord) → matched sessions.
+    /// Shape registry: maps (authenticated scope, array, coord) → matched sessions.
     shapes: Arc<ShapeRegistry>,
     /// Per-session outbound frame channels.
     delivery: Arc<ArrayDeliveryRegistry>,
     /// Per-subscriber HLC cursors.
     cursors: Arc<SubscriberMap>,
-    /// Per-array GC boundary HLC. Updated by the GC task; read here to
-    /// decide when to trigger catch-up for lagging subscribers.
-    snapshot_hlcs: Arc<RwLock<HashMap<String, Hlc>>>,
+    /// Per-database/tenant/array GC boundary HLC. Updated by the GC task;
+    /// read here to decide when to trigger catch-up for lagging subscribers.
+    snapshot_hlcs: crate::control::array_sync::ArraySnapshotHlcs,
     /// Cross-shard merger registry for HLC-ordered multi-shard delivery.
     ///
     /// When a subscriber's `coord_range` spans multiple vShards, each shard
@@ -70,14 +68,8 @@ pub struct ArrayFanout {
     ///
     /// Passed to the merger so it can track per-shard watermarks.
     shard_id: u16,
-    /// Tenant scope for this fanout instance.
-    ///
-    /// Carries the same limitation as `OriginArrayInbound`: the tenant is
-    /// resolved post-auth but the fanout is constructed pre-auth (to share
-    /// the snapshot-assembly buffer lifetime). Until Phase I wires per-tenant
-    /// fanout instances, `tenant_id = 0` means only tenant-0 array shape
-    /// subscriptions receive fan-out. Single-tenant deployments are unaffected.
-    tenant_id: u64,
+    /// Authenticated tenant and database scope for this fanout instance.
+    scope: ShapeScope,
 }
 
 impl ArrayFanout {
@@ -86,10 +78,10 @@ impl ArrayFanout {
         shapes: Arc<ShapeRegistry>,
         delivery: Arc<ArrayDeliveryRegistry>,
         cursors: Arc<SubscriberMap>,
-        snapshot_hlcs: Arc<RwLock<HashMap<String, Hlc>>>,
+        snapshot_hlcs: crate::control::array_sync::ArraySnapshotHlcs,
         mergers: Arc<MergerRegistry>,
         shard_id: u16,
-        tenant_id: u64,
+        scope: ShapeScope,
     ) -> Self {
         Self {
             shapes,
@@ -98,7 +90,7 @@ impl ArrayFanout {
             snapshot_hlcs,
             mergers,
             shard_id,
-            tenant_id,
+            scope,
         }
     }
 
@@ -114,9 +106,9 @@ impl ArrayFanout {
     /// Fan out a single applied op to all subscribed sessions.
     fn fan_out_op(&self, op: &ArrayOp) {
         let coord_u64 = coord_to_u64(&op.coord);
-        let matches =
-            self.shapes
-                .evaluate_array_mutation(self.tenant_id, &op.header.array, &coord_u64);
+        let matches = self
+            .shapes
+            .evaluate_array_mutation(self.scope, &op.header.array, &coord_u64);
 
         if matches.is_empty() {
             return;
@@ -135,7 +127,12 @@ impl ArrayFanout {
     /// ensuring subscribers see a consistent stream regardless of which shard
     /// the op originated from.
     fn deliver_to_session(&self, session_id: &str, op: &ArrayOp, op_hlc: Hlc, _op_payload: &[u8]) {
-        let cursor = match self.cursors.get(session_id, &op.header.array) {
+        let cursor = match self.cursors.get_in_database(
+            session_id,
+            self.scope.database_id,
+            self.scope.tenant_id,
+            &op.header.array,
+        ) {
             Some(c) => c,
             None => {
                 // Session has not registered for this array yet — skip.
@@ -159,7 +156,14 @@ impl ArrayFanout {
             .snapshot_hlcs
             .read()
             .ok()
-            .and_then(|m| m.get(&op.header.array).copied())
+            .and_then(|m| {
+                m.get(&(
+                    self.scope.database_id,
+                    self.scope.tenant_id,
+                    op.header.array.clone(),
+                ))
+                .copied()
+            })
             .unwrap_or(Hlc::ZERO);
 
         if snapshot_trigger::check_and_trigger(
@@ -174,12 +178,14 @@ impl ArrayFanout {
         }
 
         // Route through the multi-shard merger for HLC-ordered delivery.
-        let merger = self.mergers.get_or_create(session_id, &op.header.array);
+        let merger = self.mergers.get_or_create_with_cursors(
+            session_id,
+            self.scope.database_id,
+            self.scope.tenant_id,
+            &op.header.array,
+            Arc::clone(&self.cursors),
+        );
         merger.push_op(self.shard_id, op.clone(), &self.delivery);
-
-        // Advance the cursor so subsequent ops from any shard know the
-        // current frontier.
-        cursor::mark_sent(&self.cursors, session_id, &op.header.array, op_hlc);
     }
 }
 
@@ -215,8 +221,10 @@ mod tests {
     use nodedb_array::sync::op::{ArrayOpHeader, ArrayOpKind};
     use nodedb_array::sync::replica_id::ReplicaId;
     use nodedb_array::types::coord::value::CoordValue;
+    use nodedb_types::DatabaseId;
     use nodedb_types::sync::shape::{ArrayCoordRange, ShapeDefinition, ShapeType};
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
 
     use crate::control::server::sync::shape::registry::ShapeRegistry;
 
@@ -250,13 +258,24 @@ mod tests {
         Arc<ArrayDeliveryRegistry>,
         Arc<SubscriberMap>,
     ) {
+        make_fanout_with_delivery(Arc::new(ArrayDeliveryRegistry::new()))
+    }
+
+    fn make_fanout_with_delivery(
+        delivery: Arc<ArrayDeliveryRegistry>,
+    ) -> (
+        ArrayFanout,
+        Arc<ShapeRegistry>,
+        Arc<ArrayDeliveryRegistry>,
+        Arc<SubscriberMap>,
+    ) {
         use super::super::merge::MergerRegistry;
         use super::super::subscriber_state::SubscriberStore;
         let shapes = Arc::new(ShapeRegistry::new());
-        let delivery = Arc::new(ArrayDeliveryRegistry::new());
         let store = SubscriberStore::in_memory().unwrap();
         let cursors = Arc::new(SubscriberMap::new(store));
-        let snapshot_hlcs = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let snapshot_hlcs: crate::control::array_sync::ArraySnapshotHlcs =
+            Arc::new(RwLock::new(HashMap::new()));
         let mergers = Arc::new(MergerRegistry::new());
         let fanout = ArrayFanout::new(
             Arc::clone(&shapes),
@@ -265,7 +284,10 @@ mod tests {
             snapshot_hlcs,
             mergers,
             0,
-            1,
+            ShapeScope {
+                tenant_id: 1,
+                database_id: nodedb_types::DatabaseId::DEFAULT,
+            },
         );
         (fanout, shapes, delivery, cursors)
     }
@@ -275,13 +297,16 @@ mod tests {
         let (fanout, shapes, delivery, cursors) = make_fanout();
 
         // Register subscriber.
-        cursors.register("s1", "prices", None);
+        cursors.register_in_database("s1", DatabaseId::DEFAULT, 1, "prices", None);
         let mut rx = delivery.register("s1".into());
 
         // Register shape subscription.
         shapes.subscribe(
             "s1",
-            1,
+            ShapeScope {
+                tenant_id: 1,
+                database_id: nodedb_types::DatabaseId::DEFAULT,
+            },
             ShapeDefinition {
                 shape_id: "sh1".into(),
                 tenant_id: 1,
@@ -303,15 +328,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_database_named_array_frontier_is_isolated_by_tenant() {
+        use super::super::merge::MergerRegistry;
+        use super::super::subscriber_state::SubscriberStore;
+        use nodedb_types::sync::wire::{SyncFrame, SyncMessageType};
+
+        let database_id = DatabaseId::new(1);
+        let shapes = Arc::new(ShapeRegistry::new());
+        let delivery = Arc::new(ArrayDeliveryRegistry::new());
+        let store = SubscriberStore::in_memory().expect("in-memory subscriber store");
+        let cursors = Arc::new(SubscriberMap::new(store));
+        let snapshot_hlcs: crate::control::array_sync::ArraySnapshotHlcs = Arc::new(RwLock::new(
+            HashMap::from([((database_id, 1, "prices".to_string()), hlc(100))]),
+        ));
+        let fanout = ArrayFanout::new(
+            Arc::clone(&shapes),
+            Arc::clone(&delivery),
+            Arc::clone(&cursors),
+            snapshot_hlcs,
+            Arc::new(MergerRegistry::new()),
+            0,
+            ShapeScope {
+                tenant_id: 2,
+                database_id,
+            },
+        );
+
+        cursors.register_in_database("s1", database_id, 2, "prices", None);
+        let mut rx = delivery.register("s1".into());
+        shapes.subscribe(
+            "s1",
+            ShapeScope {
+                tenant_id: 2,
+                database_id,
+            },
+            ShapeDefinition {
+                shape_id: "sh1".into(),
+                tenant_id: 2,
+                shape_type: ShapeType::Array {
+                    array_name: "prices".into(),
+                    coord_range: None,
+                },
+                description: "same database/name in another tenant".into(),
+                field_filter: vec![],
+            },
+        );
+
+        fanout.on_op_applied(&make_op("prices", 50));
+
+        let frame = SyncFrame::from_bytes(&rx.try_recv().expect("delta should be delivered"))
+            .expect("decode delta frame");
+        assert_eq!(frame.msg_type, SyncMessageType::ArrayDelta);
+    }
+
+    #[tokio::test]
     async fn op_not_delivered_to_wrong_array() {
         let (fanout, shapes, delivery, cursors) = make_fanout();
 
-        cursors.register("s1", "prices", None);
+        cursors.register_in_database("s1", DatabaseId::DEFAULT, 1, "prices", None);
         let mut rx = delivery.register("s1".into());
 
         shapes.subscribe(
             "s1",
-            1,
+            ShapeScope {
+                tenant_id: 1,
+                database_id: nodedb_types::DatabaseId::DEFAULT,
+            },
             ShapeDefinition {
                 shape_id: "sh1".into(),
                 tenant_id: 1,
@@ -334,12 +416,15 @@ mod tests {
     async fn op_not_delivered_when_coord_outside_range() {
         let (fanout, shapes, delivery, cursors) = make_fanout();
 
-        cursors.register("s1", "mat", None);
+        cursors.register_in_database("s1", DatabaseId::DEFAULT, 1, "mat", None);
         let mut rx = delivery.register("s1".into());
 
         shapes.subscribe(
             "s1",
-            1,
+            ShapeScope {
+                tenant_id: 1,
+                database_id: nodedb_types::DatabaseId::DEFAULT,
+            },
             ShapeDefinition {
                 shape_id: "sh1".into(),
                 tenant_id: 1,
@@ -375,15 +460,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_delivery_channel_does_not_skip_cursor_and_lags_session() {
+        let (fanout, shapes, delivery, cursors) =
+            make_fanout_with_delivery(Arc::new(ArrayDeliveryRegistry::with_test_capacity(1)));
+        cursors.register_in_database("s1", DatabaseId::DEFAULT, 1, "prices", None);
+        let mut rx = delivery.register("s1".into());
+        shapes.subscribe(
+            "s1",
+            ShapeScope {
+                tenant_id: 1,
+                database_id: nodedb_types::DatabaseId::DEFAULT,
+            },
+            ShapeDefinition {
+                shape_id: "sh1".into(),
+                tenant_id: 1,
+                shape_type: ShapeType::Array {
+                    array_name: "prices".into(),
+                    coord_range: None,
+                },
+                description: "all".into(),
+                field_filter: vec![],
+            },
+        );
+
+        fanout.on_op_applied(&make_op("prices", 100));
+        fanout.on_op_applied(&make_op("prices", 200));
+        assert_eq!(
+            cursors
+                .get_in_database("s1", DatabaseId::DEFAULT, 1, "prices")
+                .expect("cursor")
+                .last_pushed_hlc,
+            hlc(100),
+            "a rejected frame must not advance past the missing op"
+        );
+        assert!(rx.try_recv().is_ok(), "the first frame was queued");
+
+        fanout.on_op_applied(&make_op("prices", 300));
+        assert!(
+            rx.try_recv().is_err(),
+            "lagged session rejects later frames"
+        );
+        assert_eq!(
+            cursors
+                .get_in_database("s1", DatabaseId::DEFAULT, 1, "prices")
+                .expect("cursor")
+                .last_pushed_hlc,
+            hlc(100)
+        );
+    }
+
+    #[tokio::test]
     async fn duplicate_op_not_redelivered() {
         let (fanout, shapes, delivery, cursors) = make_fanout();
 
-        cursors.register("s1", "prices", None);
+        cursors.register_in_database("s1", DatabaseId::DEFAULT, 1, "prices", None);
         let mut rx = delivery.register("s1".into());
 
         shapes.subscribe(
             "s1",
-            1,
+            ShapeScope {
+                tenant_id: 1,
+                database_id: nodedb_types::DatabaseId::DEFAULT,
+            },
             ShapeDefinition {
                 shape_id: "sh1".into(),
                 tenant_id: 1,

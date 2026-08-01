@@ -24,9 +24,10 @@ use crate::control::state::SharedState;
 /// at most twice. On the second call the lease for the affected descriptor
 /// has been refreshed so the catalog adapter should return a fresh version.
 ///
-/// `tenant_id` — used when acquiring the descriptor lease.
+/// `database_id` and `tenant_id` — used when acquiring the descriptor lease.
 pub async fn plan_with_cache_miss_retry<F, P>(
     shared: &SharedState,
+    database_id: nodedb_types::DatabaseId,
     tenant_id: u64,
     plan_fn: F,
 ) -> Result<P, Error>
@@ -41,7 +42,7 @@ where
                 tenant_id,
                 "gateway: descriptor cache miss — fetching fresh lease and retrying plan"
             );
-            refresh_descriptor_lease(shared, tenant_id, &descriptor).await?;
+            refresh_descriptor_lease(shared, database_id, tenant_id, &descriptor).await?;
             // Single retry — if this also fails, propagate.
             plan_fn()
         }
@@ -56,6 +57,7 @@ where
 /// catalog is always fresh.
 async fn refresh_descriptor_lease(
     shared: &SharedState,
+    database_id: nodedb_types::DatabaseId,
     tenant_id: u64,
     descriptor: &str,
 ) -> Result<(), Error> {
@@ -64,11 +66,12 @@ async fn refresh_descriptor_lease(
         return Ok(());
     }
 
-    let descriptor_id = nodedb_cluster::DescriptorId {
-        kind: nodedb_cluster::DescriptorKind::Collection,
+    let descriptor_id = nodedb_cluster::DescriptorId::new(
+        database_id.as_u64(),
         tenant_id,
-        name: descriptor.to_owned(),
-    };
+        nodedb_cluster::DescriptorKind::Collection,
+        descriptor,
+    );
 
     // `acquire_lease` is synchronous (parks on a Condvar internally) and
     // must be wrapped in `block_in_place` so the Tokio reactor is not

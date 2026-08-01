@@ -3,6 +3,8 @@
 //! Dispatch context: holds references needed by all per-opcode handlers.
 //! Split out of `mod.rs` to keep that file declarations/re-exports only.
 
+use std::sync::Arc;
+
 use crate::control::planner::context::QueryContext;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::SessionStore;
@@ -11,7 +13,7 @@ use crate::types::{TenantId, VShardId};
 
 /// Dispatch context: holds references needed by all handlers.
 pub(crate) struct DispatchCtx<'a> {
-    pub state: &'a SharedState,
+    pub state: &'a Arc<SharedState>,
     pub identity: &'a AuthenticatedIdentity,
     pub auth_context: &'a crate::control::security::auth_context::AuthContext,
     pub query_ctx: &'a QueryContext,

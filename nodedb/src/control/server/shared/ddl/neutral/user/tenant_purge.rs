@@ -70,6 +70,13 @@ pub(super) fn purge_owned_for_tenant_teardown(
             })?;
         }
         if log_index == 0 {
+            if kind == OwnerKind::StreamingMaterializedView {
+                state.mv_registry.unregister(
+                    crate::types::DatabaseId::new(owner.database_id),
+                    tenant.as_u64(),
+                    &owner.object_name,
+                );
+            }
             state
                 .permissions
                 .install_replicated_remove_owner_in_database(
@@ -125,13 +132,38 @@ fn teardown_delete_entry(kind: OwnerKind, tenant: TenantId, owner: &StoredOwner)
             tenant_id,
             name,
         },
-        OwnerKind::Function => CatalogEntry::DeleteFunction { tenant_id, name },
-        OwnerKind::Procedure => CatalogEntry::DeleteProcedure { tenant_id, name },
-        OwnerKind::Trigger => CatalogEntry::DeleteTrigger { tenant_id, name },
+        OwnerKind::Function => CatalogEntry::DeleteFunction {
+            database_id: crate::types::DatabaseId::new(owner.database_id),
+            tenant_id,
+            name,
+        },
+        OwnerKind::Procedure => CatalogEntry::DeleteProcedure {
+            database_id: crate::types::DatabaseId::new(owner.database_id),
+            tenant_id,
+            name,
+        },
+        OwnerKind::Trigger => CatalogEntry::DeleteTrigger {
+            database_id: crate::types::DatabaseId::new(owner.database_id),
+            tenant_id,
+            name,
+        },
         OwnerKind::MaterializedView => CatalogEntry::DeleteMaterializedView { tenant_id, name },
+        OwnerKind::StreamingMaterializedView => CatalogEntry::DeleteStreamingMaterializedView {
+            database_id: owner.database_id,
+            tenant_id,
+            name,
+        },
         OwnerKind::Sequence => CatalogEntry::DeleteSequence { tenant_id, name },
-        OwnerKind::Schedule => CatalogEntry::DeleteSchedule { tenant_id, name },
-        OwnerKind::ChangeStream => CatalogEntry::DeleteChangeStream { tenant_id, name },
+        OwnerKind::Schedule => CatalogEntry::DeleteSchedule {
+            database_id: crate::types::DatabaseId::new(owner.database_id),
+            tenant_id,
+            name,
+        },
+        OwnerKind::ChangeStream => CatalogEntry::DeleteChangeStream {
+            database_id: owner.database_id,
+            tenant_id,
+            name,
+        },
         OwnerKind::ContinuousAggregate => CatalogEntry::DeleteContinuousAggregate {
             database_id: owner.database_id,
             tenant_id,

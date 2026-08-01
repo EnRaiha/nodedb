@@ -23,6 +23,8 @@ pub struct SystemCatalog {
     pub(super) crdt_signing_root: Arc<std::sync::RwLock<Option<[u8; 32]>>>,
     #[cfg(test)]
     pub(super) fail_next_user_counter_write: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pub(super) fail_next_function_wasm_write: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SystemCatalog {
@@ -40,12 +42,16 @@ impl SystemCatalog {
             info!(path = %path.display(), "system catalog opened");
         }
 
-        Ok(Self {
+        let catalog = Self {
             db: Arc::new(db),
             crdt_signing_root: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
             fail_next_user_counter_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        })
+            #[cfg(test)]
+            fail_next_function_wasm_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        catalog.bootstrap_default_database()?;
+        Ok(catalog)
     }
 
     /// Open a non-persistent system catalog backed by an in-memory redb
@@ -56,17 +62,27 @@ impl SystemCatalog {
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .map_err(|e| catalog_err("open in-memory", e))?;
         Self::ensure_bootstrapped(&db)?;
-        Ok(Self {
+        let catalog = Self {
             db: Arc::new(db),
             crdt_signing_root: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
             fail_next_user_counter_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        })
+            #[cfg(test)]
+            fail_next_function_wasm_write: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        catalog.bootstrap_default_database()?;
+        Ok(catalog)
     }
 
     #[cfg(test)]
     pub(crate) fn fail_next_user_counter_write_for_test(&self) {
         self.fail_next_user_counter_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_function_wasm_write_for_test(&self) {
+        self.fail_next_function_wasm_write
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 

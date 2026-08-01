@@ -16,8 +16,9 @@ use crate::control::planner::procedural::executor::bindings::RowBindings;
 use crate::control::security::catalog::trigger_types::TriggerTiming;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
+use super::TriggerScope;
 use super::fire_common::{
     BeforeTriggersMutationParams, FireTriggersParams, check_cascade_depth,
     fire_before_triggers_with_mutation, fire_triggers,
@@ -34,15 +35,18 @@ use super::registry::DmlEvent;
 pub async fn fire_before_insert(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     tenant_id: TenantId,
     collection: &str,
     new_fields: &HashMap<String, nodedb_types::Value>,
     cascade_depth: u32,
 ) -> crate::Result<HashMap<String, nodedb_types::Value>> {
-    let triggers =
-        state
-            .trigger_registry
-            .get_matching(tenant_id.as_u64(), collection, DmlEvent::Insert);
+    let triggers = state.trigger_registry.get_matching(
+        database_id,
+        tenant_id.as_u64(),
+        collection,
+        DmlEvent::Insert,
+    );
 
     let before_triggers: Vec<_> = triggers
         .into_iter()
@@ -82,16 +86,18 @@ pub async fn fire_before_insert(
 pub async fn fire_before_update(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
-    tenant_id: TenantId,
+    scope: TriggerScope,
     collection: &str,
     old_fields: &HashMap<String, nodedb_types::Value>,
     new_fields: &HashMap<String, nodedb_types::Value>,
     cascade_depth: u32,
 ) -> crate::Result<HashMap<String, nodedb_types::Value>> {
-    let triggers =
-        state
-            .trigger_registry
-            .get_matching(tenant_id.as_u64(), collection, DmlEvent::Update);
+    let triggers = state.trigger_registry.get_matching(
+        scope.database_id,
+        scope.tenant_id.as_u64(),
+        collection,
+        DmlEvent::Update,
+    );
 
     let before_triggers: Vec<_> = triggers
         .into_iter()
@@ -109,7 +115,7 @@ pub async fn fire_before_update(
     let result = fire_before_triggers_with_mutation(BeforeTriggersMutationParams {
         state,
         identity,
-        tenant_id,
+        tenant_id: scope.tenant_id,
         collection,
         triggers: &before_triggers,
         bindings: &bindings,
@@ -130,15 +136,18 @@ pub async fn fire_before_update(
 pub async fn fire_before_delete(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     tenant_id: TenantId,
     collection: &str,
     old_fields: &HashMap<String, nodedb_types::Value>,
     cascade_depth: u32,
 ) -> crate::Result<()> {
-    let triggers =
-        state
-            .trigger_registry
-            .get_matching(tenant_id.as_u64(), collection, DmlEvent::Delete);
+    let triggers = state.trigger_registry.get_matching(
+        database_id,
+        tenant_id.as_u64(),
+        collection,
+        DmlEvent::Delete,
+    );
 
     let before_triggers: Vec<_> = triggers
         .into_iter()

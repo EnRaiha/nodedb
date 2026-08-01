@@ -30,6 +30,7 @@ fn webhook_group_name(stream_name: &str) -> String {
 /// Returns a handle that can be used to abort the task.
 pub fn spawn_delivery_task(
     state: Arc<SharedState>,
+    database_id: crate::types::DatabaseId,
     tenant_id: u64,
     stream_name: String,
     config: WebhookConfig,
@@ -40,10 +41,11 @@ pub fn spawn_delivery_task(
     // Register the internal consumer group (if not already present).
     if state
         .group_registry
-        .get(tenant_id, &stream_name, &group_name)
+        .get(database_id, tenant_id, &stream_name, &group_name)
         .is_none()
     {
         let def = crate::event::cdc::consumer_group::ConsumerGroupDef {
+            database_id,
             tenant_id,
             name: group_name.clone(),
             stream_name: stream_name.clone(),
@@ -54,13 +56,23 @@ pub fn spawn_delivery_task(
     }
 
     tokio::spawn(async move {
-        delivery_loop(state, tenant_id, stream_name, group_name, config, shutdown).await;
+        delivery_loop(
+            state,
+            database_id,
+            tenant_id,
+            stream_name,
+            group_name,
+            config,
+            shutdown,
+        )
+        .await;
     })
 }
 
 /// The main delivery loop.
 async fn delivery_loop(
     state: Arc<SharedState>,
+    database_id: crate::types::DatabaseId,
     tenant_id: u64,
     stream_name: String,
     group_name: String,
@@ -86,6 +98,7 @@ async fn delivery_loop(
 
         // Read events from the buffer using the internal consumer group.
         let consume_params = crate::event::cdc::consume::ConsumeParams {
+            database_id,
             tenant_id,
             stream_name: &stream_name,
             group_name: &group_name,
@@ -119,23 +132,26 @@ async fn delivery_loop(
 
                 // Commit offsets for successfully delivered events.
                 if delivered > 0 {
-                    // Find the max LSN per partition among delivered events.
+                    // Commit the exact composite position of the last
+                    // successfully delivered event in each partition.
                     let delivered_events = &consume_result.events[..delivered as usize];
-                    let mut partition_max: std::collections::HashMap<u32, u64> =
-                        std::collections::HashMap::new();
-                    for e in delivered_events {
-                        let entry = partition_max.entry(e.partition).or_insert(0);
-                        if e.lsn > *entry {
-                            *entry = e.lsn;
+                    let mut partition_max = std::collections::HashMap::new();
+                    for event in delivered_events {
+                        let entry = partition_max
+                            .entry(event.partition)
+                            .or_insert(crate::event::cdc::CdcOffset::ZERO);
+                        if event.position() > *entry {
+                            *entry = event.position();
                         }
                     }
-                    for (partition_id, lsn) in partition_max {
+                    for (partition_id, offset) in partition_max {
                         if let Err(e) = state.offset_store.commit_offset(
+                            database_id,
                             tenant_id,
                             &stream_name,
                             &group_name,
                             partition_id,
-                            lsn,
+                            offset,
                         ) {
                             warn!(
                                 stream = %stream_name,
@@ -201,7 +217,7 @@ async fn deliver_event(
             return false;
         }
     };
-    let idempotency_key = format!("{}:{}", event.partition, event.lsn);
+    let idempotency_key = format!("{}:{}", event.partition, event.offset_token());
 
     for attempt in 0..=config.max_retries {
         let mut request = client
@@ -211,7 +227,8 @@ async fn deliver_event(
             .header("X-Event-Sequence", event.sequence.to_string())
             .header("X-Stream-Name", stream_name)
             .header("X-Partition", event.partition.to_string())
-            .header("X-LSN", event.lsn.to_string());
+            .header("X-LSN", event.lsn.to_string())
+            .header("X-CDC-Offset", event.offset_token());
 
         // Add custom headers.
         for (key, value) in &config.headers {

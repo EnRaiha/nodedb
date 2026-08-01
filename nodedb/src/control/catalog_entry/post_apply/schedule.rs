@@ -10,8 +10,9 @@ use crate::control::state::SharedState;
 use crate::event::scheduler::types::ScheduleDef;
 
 pub fn put(stored: ScheduleDef, shared: Arc<SharedState>) {
-    super::owner::install_from_parent(
+    super::owner::install_from_parent_in_database(
         "schedule",
+        stored.database_id,
         stored.tenant_id,
         &stored.name,
         &stored.owner,
@@ -20,9 +21,21 @@ pub fn put(stored: ScheduleDef, shared: Arc<SharedState>) {
     shared.schedule_registry.register(stored);
 }
 
-pub fn delete(tenant_id: u64, name: String, shared: Arc<SharedState>) {
-    shared.schedule_registry.unregister(tenant_id, &name);
+pub fn delete(
+    database_id: crate::types::DatabaseId,
+    tenant_id: u64,
+    name: String,
+    shared: Arc<SharedState>,
+) {
+    shared
+        .schedule_registry
+        .unregister(database_id, tenant_id, &name);
     shared
         .permissions
-        .install_replicated_remove_owner("schedule", tenant_id, &name);
+        .install_replicated_remove_owner_in_database(
+            "schedule",
+            database_id.as_u64(),
+            tenant_id,
+            &name,
+        );
 }

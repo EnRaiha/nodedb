@@ -14,6 +14,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 
@@ -27,6 +28,7 @@ fn err(sqlstate: &str, message: String) -> DdlError {
 pub fn show_materialized_views(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id;
@@ -71,6 +73,26 @@ pub fn show_materialized_views(
             "query".to_string(),
             JsonValue::String(view.query_sql.clone()),
         );
+        rows.push(row);
+    }
+    for view in state
+        .mv_registry
+        .list_for_tenant(database_id, tenant_id.as_u64())
+    {
+        if let Some(ref filter) = source_filter
+            && view.source_stream != *filter
+        {
+            continue;
+        }
+        let mut row = Map::new();
+        row.insert("name".to_string(), JsonValue::String(view.name));
+        row.insert("source".to_string(), JsonValue::String(view.source_stream));
+        row.insert(
+            "refresh_mode".to_string(),
+            JsonValue::String("STREAMING".to_string()),
+        );
+        row.insert("owner".to_string(), JsonValue::String(view.owner));
+        row.insert("query".to_string(), JsonValue::Null);
         rows.push(row);
     }
 

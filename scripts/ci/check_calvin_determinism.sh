@@ -25,6 +25,7 @@
 #   - Lines whose first non-whitespace characters are `//` (pure comment).
 #   - Lines whose first non-whitespace characters are `*`  (doc-comment cont).
 #   - Bodies of inline `#[cfg(test)] mod tests { ... }` blocks.
+#   - Rust test-only source files named `tests.rs`.
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -70,6 +71,9 @@ for rel in "${scan_paths[@]}"; do
         file="${match%%:*}"
         rest="${match#*:}"
         lineno="${rest%%:*}"
+
+        # Separate Rust test modules are test-only, like inline cfg(test) bodies.
+        [[ "$file" == */tests.rs ]] && continue
 
         # Skip pure comment lines (first non-whitespace is //).
         line_content=$(sed -n "${lineno}p" "$file")

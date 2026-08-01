@@ -375,10 +375,12 @@ impl CoreLoop {
         cutoff_system_ms: i64,
     ) -> Response {
         let tenant = TenantId::new(tenant_id);
-        match self
-            .array_engine
-            .temporal_purge(tenant, array_id, cutoff_system_ms)
-        {
+        match self.array_engine.temporal_purge(
+            tenant,
+            task.request.database_id,
+            array_id,
+            cutoff_system_ms,
+        ) {
             Ok(count) => {
                 if count > 0 {
                     tracing::info!(

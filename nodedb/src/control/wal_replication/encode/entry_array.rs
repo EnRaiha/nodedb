@@ -48,6 +48,8 @@ pub(super) fn array_write(op: &ArrayOp) -> Option<ReplicatedWrite> {
         ArrayOp::OpenArray { .. }
         | ArrayOp::Compact { .. }
         | ArrayOp::DropArray { .. }
+        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Slice { .. }
         | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }

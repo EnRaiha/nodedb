@@ -41,6 +41,7 @@ pub(super) use wall_time::wall_now_ns;
 pub use drain::{DescriptorDrainTracker, DrainEntry};
 pub use drain_propose::{descriptor_id_and_prior_version, drain_for_ddl};
 pub use propose::{DEFAULT_LEASE_DURATION, acquire_lease, compute_expires_at, force_refresh_lease};
+pub(crate) use propose::{acquire_lease_after_admission, ensure_not_draining};
 pub use refcount::{LeaseRefCount, QueryLeaseScope};
 pub use release::release_leases;
 pub use renewal::{LeaseRenewalConfig, LeaseRenewalLoop};

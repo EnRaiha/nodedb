@@ -1,142 +1,172 @@
 // SPDX-License-Identifier: BUSL-1.1
-
 //! Trigger metadata operations for the system catalog.
 
 use super::trigger_types::StoredTrigger;
 use super::types::{SystemCatalog, TRIGGERS, catalog_err};
+use nodedb_types::id::DatabaseId;
+use std::collections::HashMap;
 
 impl SystemCatalog {
-    /// Store a trigger definition.
-    ///
-    /// Key format: `"{tenant_id}:{trigger_name}"`.
     pub fn put_trigger(&self, trigger: &StoredTrigger) -> crate::Result<()> {
-        let key = trigger_key(trigger.tenant_id, &trigger.name);
+        let key = trigger_key(trigger.tenant_id, trigger.database_id, &trigger.name);
         let bytes =
             zerompk::to_msgpack_vec(trigger).map_err(|e| catalog_err("serialize trigger", e))?;
-        let write_txn = self
+        let txn = self
             .db
             .begin_write()
             .map_err(|e| catalog_err("write txn", e))?;
         {
-            let mut table = write_txn
+            let mut table = txn
                 .open_table(TRIGGERS)
                 .map_err(|e| catalog_err("open triggers", e))?;
             table
                 .insert(key.as_str(), bytes.as_slice())
                 .map_err(|e| catalog_err("insert trigger", e))?;
+            if trigger.database_id == DatabaseId::DEFAULT {
+                table
+                    .remove(legacy_trigger_key(trigger.tenant_id, &trigger.name).as_str())
+                    .map_err(|e| catalog_err("remove legacy trigger", e))?;
+            }
         }
-        write_txn.commit().map_err(|e| catalog_err("commit", e))
+        txn.commit().map_err(|e| catalog_err("commit", e))
     }
-
-    /// Get a single trigger by tenant_id + name.
     pub fn get_trigger(&self, tenant_id: u64, name: &str) -> crate::Result<Option<StoredTrigger>> {
-        let key = trigger_key(tenant_id, name);
-        let read_txn = self
+        self.get_trigger_in_database(DatabaseId::DEFAULT, tenant_id, name)
+    }
+    pub fn get_trigger_in_database(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<Option<StoredTrigger>> {
+        let txn = self
             .db
             .begin_read()
             .map_err(|e| catalog_err("read txn", e))?;
-        let table = read_txn
+        let table = txn
             .open_table(TRIGGERS)
             .map_err(|e| catalog_err("open triggers", e))?;
-        match table.get(key.as_str()) {
-            Ok(Some(value)) => {
-                let t: StoredTrigger = zerompk::from_msgpack(value.value())
-                    .map_err(|e| catalog_err("deser trigger", e))?;
-                Ok(Some(t))
+        for key in [
+            Some(trigger_key(tenant_id, database_id, name)),
+            (database_id == DatabaseId::DEFAULT).then(|| legacy_trigger_key(tenant_id, name)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(value) = table
+                .get(key.as_str())
+                .map_err(|e| catalog_err("get trigger", e))?
+            {
+                return zerompk::from_msgpack(value.value())
+                    .map(Some)
+                    .map_err(|e| catalog_err("deser trigger", e));
             }
-            Ok(None) => Ok(None),
-            Err(e) => Err(catalog_err("get trigger", e)),
         }
+        Ok(None)
     }
-
-    /// Delete a trigger by tenant_id + name. Returns true if it existed.
     pub fn delete_trigger(&self, tenant_id: u64, name: &str) -> crate::Result<bool> {
-        let key = trigger_key(tenant_id, name);
-        let write_txn = self
+        self.delete_trigger_in_database(DatabaseId::DEFAULT, tenant_id, name)
+    }
+    pub fn delete_trigger_in_database(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: &str,
+    ) -> crate::Result<bool> {
+        let txn = self
             .db
             .begin_write()
             .map_err(|e| catalog_err("write txn", e))?;
         let existed;
         {
-            let mut table = write_txn
+            let mut table = txn
                 .open_table(TRIGGERS)
                 .map_err(|e| catalog_err("open triggers", e))?;
-            existed = table
-                .remove(key.as_str())
+            let v2 = table
+                .remove(trigger_key(tenant_id, database_id, name).as_str())
                 .map_err(|e| catalog_err("remove trigger", e))?
                 .is_some();
+            let legacy = if database_id == DatabaseId::DEFAULT {
+                table
+                    .remove(legacy_trigger_key(tenant_id, name).as_str())
+                    .map_err(|e| catalog_err("remove legacy trigger", e))?
+                    .is_some()
+            } else {
+                false
+            };
+            existed = v2 || legacy;
         }
-        write_txn.commit().map_err(|e| catalog_err("commit", e))?;
+        txn.commit().map_err(|e| catalog_err("commit", e))?;
         Ok(existed)
     }
-
-    /// Load all triggers for a tenant.
+    pub fn load_all_triggers(&self) -> crate::Result<Vec<StoredTrigger>> {
+        self.load_triggers_matching(|_| true)
+    }
     pub fn load_triggers_for_tenant(&self, tenant_id: u64) -> crate::Result<Vec<StoredTrigger>> {
-        let prefix = format!("{tenant_id}:");
-        let read_txn = self
+        self.load_triggers_matching(|t| t.tenant_id == tenant_id)
+    }
+    pub fn load_triggers_in_database(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+    ) -> crate::Result<Vec<StoredTrigger>> {
+        self.load_triggers_matching(|t| t.database_id == database_id && t.tenant_id == tenant_id)
+    }
+    fn load_triggers_matching(
+        &self,
+        include: impl Fn(&StoredTrigger) -> bool,
+    ) -> crate::Result<Vec<StoredTrigger>> {
+        let txn = self
             .db
             .begin_read()
             .map_err(|e| catalog_err("read txn", e))?;
-        let table = read_txn
+        let table = txn
             .open_table(TRIGGERS)
             .map_err(|e| catalog_err("open triggers", e))?;
-        let mut triggers = Vec::new();
+        let mut rows = HashMap::new();
         for entry in table
             .range::<&str>(..)
             .map_err(|e| catalog_err("range triggers", e))?
         {
-            let (key, value) = entry.map_err(|e| catalog_err("read trigger", e))?;
-            if key.value().starts_with(&prefix) {
-                let t: StoredTrigger = zerompk::from_msgpack(value.value())
-                    .map_err(|e| catalog_err("deser trigger", e))?;
-                triggers.push(t);
+            let (_key, value) = entry.map_err(|e| catalog_err("read trigger", e))?;
+            let trigger: StoredTrigger = zerompk::from_msgpack(value.value())
+                .map_err(|e| catalog_err("deser trigger", e))?;
+            if include(&trigger) {
+                rows.insert(
+                    (trigger.tenant_id, trigger.database_id, trigger.name.clone()),
+                    trigger,
+                );
             }
         }
-        Ok(triggers)
-    }
-
-    /// Load all triggers across all tenants.
-    pub fn load_all_triggers(&self) -> crate::Result<Vec<StoredTrigger>> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| catalog_err("read txn", e))?;
-        let table = read_txn
-            .open_table(TRIGGERS)
-            .map_err(|e| catalog_err("open triggers", e))?;
-        let mut triggers = Vec::new();
-        for entry in table
-            .range::<&str>(..)
-            .map_err(|e| catalog_err("range triggers", e))?
-        {
-            let (_, value) = entry.map_err(|e| catalog_err("read trigger", e))?;
-            let t: StoredTrigger = zerompk::from_msgpack(value.value())
-                .map_err(|e| catalog_err("deser trigger", e))?;
-            triggers.push(t);
-        }
-        Ok(triggers)
+        Ok(rows.into_values().collect())
     }
 }
-
-fn trigger_key(tenant_id: u64, name: &str) -> String {
+fn trigger_key(tenant_id: u64, database_id: DatabaseId, name: &str) -> String {
+    format!("v2:{tenant_id}:{}:{name}", database_id.as_u64())
+}
+fn legacy_trigger_key(tenant_id: u64, name: &str) -> String {
     format!("{tenant_id}:{name}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::security::catalog::trigger_types::*;
+    use crate::control::security::catalog::trigger_types::{
+        TriggerBatchMode, TriggerEvents, TriggerExecutionMode, TriggerGranularity, TriggerSecurity,
+        TriggerTiming,
+    };
 
-    fn make_catalog() -> SystemCatalog {
+    fn catalog() -> SystemCatalog {
         let dir = tempfile::tempdir().unwrap();
         SystemCatalog::open(&dir.path().join("system.redb")).unwrap()
     }
 
-    fn sample_trigger(tenant_id: u64, name: &str, collection: &str) -> StoredTrigger {
+    fn trigger(database_id: DatabaseId, body_sql: &str) -> StoredTrigger {
         StoredTrigger {
-            tenant_id,
-            name: name.to_string(),
-            collection: collection.to_string(),
+            tenant_id: 1,
+            database_id,
+            name: "same_name".into(),
+            collection: "items".into(),
             timing: TriggerTiming::After,
             events: TriggerEvents {
                 on_insert: true,
@@ -145,44 +175,145 @@ mod tests {
             },
             granularity: TriggerGranularity::Row,
             when_condition: None,
-            body_sql: "BEGIN INSERT INTO audit (id) VALUES (NEW.id); END".into(),
+            body_sql: body_sql.into(),
             priority: 0,
             enabled: true,
-            execution_mode: TriggerExecutionMode::default(),
-            security: TriggerSecurity::default(),
-            batch_mode: TriggerBatchMode::default(),
+            execution_mode: TriggerExecutionMode::Async,
+            security: TriggerSecurity::Invoker,
+            batch_mode: TriggerBatchMode::BatchSafe,
             owner: "admin".into(),
-            created_at: 1000,
+            created_at: 0,
             descriptor_version: 0,
-            modification_hlc: nodedb_types::Hlc::ZERO,
+            modification_hlc: Default::default(),
         }
     }
 
     #[test]
-    fn put_and_get() {
-        let catalog = make_catalog();
-        let t = sample_trigger(1, "audit_insert", "orders");
-        catalog.put_trigger(&t).unwrap();
-        let loaded = catalog.get_trigger(1, "audit_insert").unwrap().unwrap();
-        assert_eq!(loaded.name, "audit_insert");
-        assert_eq!(loaded.collection, "orders");
+    fn triggers_are_isolated_by_database() {
+        let catalog = catalog();
+        let db1 = DatabaseId::new(1);
+        let db2 = DatabaseId::new(2);
+        catalog
+            .put_trigger(&trigger(db1, "BEGIN SELECT 1; END"))
+            .unwrap();
+        catalog
+            .put_trigger(&trigger(db2, "BEGIN SELECT 2; END"))
+            .unwrap();
+
+        assert_eq!(
+            catalog
+                .get_trigger_in_database(db1, 1, "same_name")
+                .unwrap()
+                .unwrap()
+                .body_sql,
+            "BEGIN SELECT 1; END"
+        );
+        assert_eq!(
+            catalog
+                .get_trigger_in_database(db2, 1, "same_name")
+                .unwrap()
+                .unwrap()
+                .body_sql,
+            "BEGIN SELECT 2; END"
+        );
+        assert_eq!(catalog.load_triggers_in_database(db1, 1).unwrap().len(), 1);
+        assert_eq!(catalog.load_triggers_in_database(db2, 1).unwrap().len(), 1);
+        assert!(
+            catalog
+                .delete_trigger_in_database(db1, 1, "same_name")
+                .unwrap()
+        );
+        assert!(
+            catalog
+                .get_trigger_in_database(db1, 1, "same_name")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            catalog
+                .get_trigger_in_database(db2, 1, "same_name")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[derive(zerompk::ToMessagePack)]
+    #[msgpack(map)]
+    struct LegacyTrigger {
+        tenant_id: u64,
+        name: String,
+        collection: String,
+        timing: TriggerTiming,
+        events: TriggerEvents,
+        granularity: TriggerGranularity,
+        body_sql: String,
+        owner: String,
+        created_at: u64,
     }
 
     #[test]
-    fn delete_trigger() {
-        let catalog = make_catalog();
-        catalog.put_trigger(&sample_trigger(1, "t", "c")).unwrap();
-        assert!(catalog.delete_trigger(1, "t").unwrap());
-        assert!(!catalog.delete_trigger(1, "t").unwrap());
-    }
+    fn legacy_default_trigger_is_migrated_and_v2_wins_deduplication() {
+        let catalog = catalog();
+        let legacy = LegacyTrigger {
+            tenant_id: 1,
+            name: "same_name".into(),
+            collection: "items".into(),
+            timing: TriggerTiming::After,
+            events: TriggerEvents {
+                on_insert: true,
+                on_update: false,
+                on_delete: false,
+            },
+            granularity: TriggerGranularity::Row,
+            body_sql: "legacy".into(),
+            owner: "admin".into(),
+            created_at: 0,
+        };
+        let bytes = zerompk::to_msgpack_vec(&legacy).unwrap();
+        let decoded: StoredTrigger = zerompk::from_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.database_id, DatabaseId::DEFAULT);
+        let txn = catalog.db.begin_write().unwrap();
+        {
+            txn.open_table(TRIGGERS)
+                .unwrap()
+                .insert("1:same_name", bytes.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        assert_eq!(
+            catalog
+                .get_trigger(1, "same_name")
+                .unwrap()
+                .unwrap()
+                .body_sql,
+            "legacy"
+        );
 
-    #[test]
-    fn load_for_tenant() {
-        let catalog = make_catalog();
-        catalog.put_trigger(&sample_trigger(1, "a", "c1")).unwrap();
-        catalog.put_trigger(&sample_trigger(1, "b", "c2")).unwrap();
-        catalog.put_trigger(&sample_trigger(2, "c", "c3")).unwrap();
-        assert_eq!(catalog.load_triggers_for_tenant(1).unwrap().len(), 2);
-        assert_eq!(catalog.load_triggers_for_tenant(2).unwrap().len(), 1);
+        catalog
+            .put_trigger(&trigger(DatabaseId::DEFAULT, "v2"))
+            .unwrap();
+        let txn = catalog.db.begin_read().unwrap();
+        assert!(
+            txn.open_table(TRIGGERS)
+                .unwrap()
+                .get("1:same_name")
+                .unwrap()
+                .is_none()
+        );
+        drop(txn);
+
+        let txn = catalog.db.begin_write().unwrap();
+        {
+            txn.open_table(TRIGGERS)
+                .unwrap()
+                .insert("1:same_name", bytes.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        let loaded = catalog
+            .load_triggers_in_database(DatabaseId::DEFAULT, 1)
+            .unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].body_sql, "v2");
     }
 }

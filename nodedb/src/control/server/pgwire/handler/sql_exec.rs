@@ -369,13 +369,16 @@ impl NodeDbPgHandler {
         if upper.starts_with("USE DATABASE ") {
             let parts: Vec<&str> = sql_trimmed.split_whitespace().collect();
             let name = parts.get(2).copied().unwrap_or("").trim_matches('"');
+            let dp = super::transaction_cmds::PgwireTxnDp { handler: self };
             return super::super::ddl::database::use_database::handle_use_database(
                 &self.state,
                 identity,
                 &self.sessions,
                 session_id,
                 name,
-            );
+                &dp,
+            )
+            .await;
         }
 
         // ── DDL / Temp tables ─────────────────────────────────────────

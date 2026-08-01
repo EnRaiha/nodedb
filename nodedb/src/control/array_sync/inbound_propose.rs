@@ -16,7 +16,7 @@ use nodedb_types::sync::wire::array::{ArrayRejectMsg, ArrayRejectReason};
 use tracing::{error, warn};
 
 use crate::control::wal_replication::ReplicatedEntry;
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{TraceId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use super::inbound::{InboundOutcome, OriginArrayInbound};
@@ -31,7 +31,7 @@ impl OriginArrayInbound {
     ) -> Result<(), Option<ArrayRejectMsg>> {
         let (tenant_id, database_id, collection, permission) = authorization.into_scope();
         if tenant_id != self.tenant_id()
-            || database_id != DatabaseId::DEFAULT
+            || database_id != self.database_id()
             || collection != array
             || permission != crate::control::security::identity::Permission::Write
         {
@@ -58,7 +58,7 @@ impl OriginArrayInbound {
     ) -> Result<(), Option<ArrayRejectMsg>> {
         self.consume_array_write_authorization(authorization, array, hlc)?;
         if entry.tenant_id != self.tenant_id().as_u64()
-            || entry.database_id != DatabaseId::DEFAULT.as_u64()
+            || entry.database_id != self.database_id().as_u64()
         {
             return Err(Some(build_reject(
                 array,
@@ -172,7 +172,7 @@ impl OriginArrayInbound {
         let vshard = self.vshard_for_op(&op);
         let task = PhysicalTask {
             tenant_id: self.tenant_id(),
-            database_id: DatabaseId::DEFAULT,
+            database_id: self.database_id(),
             vshard_id: vshard,
             plan: data_plane_op,
             post_set_op: PostSetOp::None,
@@ -244,7 +244,11 @@ impl OriginArrayInbound {
             )));
         }
 
-        if let Err(e) = self.engine().record_applied(&op) {
+        if let Err(e) = self.engine().record_applied_in_database(
+            self.database_id(),
+            self.tenant_id().as_u64(),
+            &op,
+        ) {
             error!(
                 array = %op.header.array,
                 hlc = ?op.header.hlc,
@@ -268,7 +272,11 @@ impl OriginArrayInbound {
     pub(super) fn vshard_for_op(&self, op: &ArrayOp) -> VShardId {
         use nodedb_array::types::coord::value::CoordValue;
 
-        let tile_extents = self.schemas().tile_extents(&op.header.array);
+        let tile_extents = self.schemas().tile_extents_in_database(
+            self.database_id(),
+            self.tenant_id().as_u64(),
+            &op.header.array,
+        );
 
         let Some(tile_extents) = tile_extents else {
             warn!(
@@ -309,7 +317,11 @@ impl OriginArrayInbound {
         use nodedb_array::sync::op::ArrayOpKind;
         use nodedb_physical::physical_plan::ArrayOp as DataArrayOp;
 
-        let array_id = nodedb_array::types::ArrayId::new(self.tenant_id(), &op.header.array);
+        let array_id = nodedb_array::types::ArrayId::in_database(
+            self.tenant_id(),
+            self.database_id(),
+            &op.header.array,
+        );
 
         let data_op = match op.kind {
             ArrayOpKind::Put => {

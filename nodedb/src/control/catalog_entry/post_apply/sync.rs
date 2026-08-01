@@ -20,8 +20,8 @@ use std::sync::Arc;
 use super::gateway_invalidation::invalidate_gateway_cache_for_entry;
 use super::{
     api_key, change_stream, collection, continuous_aggregate, custom_type, database, function,
-    materialized_view, owner, permission, procedure, rls, role, schedule, sequence, synonym_group,
-    tenant, trigger, user,
+    materialized_view, owner, permission, procedure, rls, role, schedule, sequence,
+    streaming_materialized_view, synonym_group, tenant, trigger, user,
 };
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::state::SharedState;
@@ -85,34 +85,54 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
             sequence::put_state((**state).clone(), Arc::clone(shared));
         }
         CatalogEntry::PutTrigger(stored) => {
-            trigger::put((**stored).clone(), Arc::clone(shared));
+            trigger::put((**stored).clone(), shared);
         }
-        CatalogEntry::DeleteTrigger { tenant_id, name } => {
-            trigger::delete(*tenant_id, name.clone(), Arc::clone(shared));
+        CatalogEntry::DeleteTrigger {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            trigger::delete(*database_id, *tenant_id, name.clone(), shared);
         }
         CatalogEntry::PutFunction(stored) => {
-            function::put((**stored).clone(), Arc::clone(shared));
+            function::put((**stored).clone(), shared);
         }
-        CatalogEntry::DeleteFunction { tenant_id, name } => {
-            function::delete(*tenant_id, name.clone(), Arc::clone(shared));
+        CatalogEntry::DeleteFunction {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            function::delete(*database_id, *tenant_id, name.clone(), shared);
         }
         CatalogEntry::PutProcedure(stored) => {
             procedure::put((**stored).clone(), Arc::clone(shared));
         }
-        CatalogEntry::DeleteProcedure { tenant_id, name } => {
-            procedure::delete(*tenant_id, name.clone(), Arc::clone(shared));
+        CatalogEntry::DeleteProcedure {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            procedure::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
         CatalogEntry::PutSchedule(stored) => {
             schedule::put((**stored).clone(), Arc::clone(shared));
         }
-        CatalogEntry::DeleteSchedule { tenant_id, name } => {
-            schedule::delete(*tenant_id, name.clone(), Arc::clone(shared));
+        CatalogEntry::DeleteSchedule {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            schedule::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
         CatalogEntry::PutChangeStream(stored) => {
             change_stream::put((**stored).clone(), Arc::clone(shared));
         }
-        CatalogEntry::DeleteChangeStream { tenant_id, name } => {
-            change_stream::delete(*tenant_id, name.clone(), Arc::clone(shared));
+        CatalogEntry::DeleteChangeStream {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            change_stream::delete(*database_id, *tenant_id, name.clone(), Arc::clone(shared));
         }
         CatalogEntry::PutUser(stored) => {
             user::put(
@@ -141,6 +161,21 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         }
         CatalogEntry::DeleteMaterializedView { tenant_id, name } => {
             materialized_view::delete(*tenant_id, name.clone(), Arc::clone(shared));
+        }
+        CatalogEntry::PutStreamingMaterializedView(definition) => {
+            streaming_materialized_view::put((**definition).clone(), Arc::clone(shared));
+        }
+        CatalogEntry::DeleteStreamingMaterializedView {
+            database_id,
+            tenant_id,
+            name,
+        } => {
+            streaming_materialized_view::delete(
+                *database_id,
+                *tenant_id,
+                name.clone(),
+                Arc::clone(shared),
+            );
         }
         CatalogEntry::PutContinuousAggregate(stored) => {
             continuous_aggregate::put((**stored).clone(), Arc::clone(shared));

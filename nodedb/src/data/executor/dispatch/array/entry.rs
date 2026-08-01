@@ -33,6 +33,7 @@ impl CoreLoop {
                 schema_msgpack,
                 schema_hash,
                 prefix_bits,
+                ..
             } => self.handle_array_open(task, array_id, schema_msgpack, *schema_hash, *prefix_bits),
             ArrayOp::Put {
                 array_id,
@@ -62,6 +63,10 @@ impl CoreLoop {
                 audit_retain_ms,
             } => self.handle_array_compact(task, array_id, *audit_retain_ms),
             ArrayOp::DropArray { array_id } => self.handle_array_drop(task, array_id),
+            ArrayOp::RestoreArrayDrop { array_id } => {
+                self.handle_array_drop_restore(task, array_id)
+            }
+            ArrayOp::PurgeArrayDrop { array_id } => self.handle_array_drop_purge(task, array_id),
             ArrayOp::Slice {
                 array_id,
                 slice_msgpack,
@@ -153,7 +158,7 @@ impl CoreLoop {
                     },
                 )
             })?;
-            let entry = cat.lookup_by_name(&array_id.name).ok_or_else(|| {
+            let entry = cat.lookup_by_id(array_id).ok_or_else(|| {
                 self.response_error(
                     task,
                     ErrorCode::Internal {

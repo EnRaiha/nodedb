@@ -445,6 +445,7 @@ impl CoreLoop {
         if !deferred_writes.is_empty() {
             self.emit_deferred_events(
                 deferred_writes,
+                task.request.database_id,
                 task.request.tenant_id,
                 task.request.vshard_id,
             );

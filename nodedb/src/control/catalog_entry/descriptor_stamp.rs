@@ -114,7 +114,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutFunction(mut stored) => {
             let prior = catalog
-                .get_function(stored.tenant_id, &stored.name)
+                .get_function_in_database(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|f| f.descriptor_version)
@@ -125,7 +125,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutProcedure(mut stored) => {
             let prior = catalog
-                .get_procedure(stored.tenant_id, &stored.name)
+                .get_procedure_in_database(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|p| p.descriptor_version)
@@ -136,7 +136,7 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         }
         CatalogEntry::PutTrigger(mut stored) => {
             let prior = catalog
-                .get_trigger(stored.tenant_id, &stored.name)
+                .get_trigger_in_database(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|t| t.descriptor_version)
@@ -176,6 +176,8 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteProcedure { .. }
         | CatalogEntry::DeleteTrigger { .. }
         | CatalogEntry::DeleteMaterializedView { .. }
+        | CatalogEntry::PutStreamingMaterializedView(_)
+        | CatalogEntry::DeleteStreamingMaterializedView { .. }
         | CatalogEntry::DeleteContinuousAggregate { .. }
         | CatalogEntry::DeleteSequence { .. }
         | CatalogEntry::PutSequenceState(_)
@@ -249,13 +251,13 @@ fn same_descriptor(prior: &CatalogEntry, current: &CatalogEntry) -> bool {
             a.tenant_id == b.tenant_id && a.name == b.name
         }
         (CatalogEntry::PutFunction(a), CatalogEntry::PutFunction(b)) => {
-            a.tenant_id == b.tenant_id && a.name == b.name
+            a.database_id == b.database_id && a.tenant_id == b.tenant_id && a.name == b.name
         }
         (CatalogEntry::PutProcedure(a), CatalogEntry::PutProcedure(b)) => {
-            a.tenant_id == b.tenant_id && a.name == b.name
+            a.database_id == b.database_id && a.tenant_id == b.tenant_id && a.name == b.name
         }
         (CatalogEntry::PutTrigger(a), CatalogEntry::PutTrigger(b)) => {
-            a.tenant_id == b.tenant_id && a.name == b.name
+            a.database_id == b.database_id && a.tenant_id == b.tenant_id && a.name == b.name
         }
         (CatalogEntry::PutSequence(a), CatalogEntry::PutSequence(b)) => {
             a.tenant_id == b.tenant_id && a.name == b.name
@@ -331,10 +333,231 @@ fn advance_collection(
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationOutcome {
+    Apply,
+    AlreadyApplied,
+}
+
+/// Validate every descriptor-bearing `Put*` entry against the locally
+/// persisted version before applying it. Historical replay is idempotent for
+/// all descriptor families, while equal-version conflicts and forward gaps
+/// remain loud anomalies.
+pub fn validate(
+    entry: &CatalogEntry,
+    catalog: &SystemCatalog,
+) -> Result<ValidationOutcome, crate::Error> {
+    match entry {
+        CatalogEntry::PutCollection(stored) => {
+            let current = catalog
+                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutCollectionIfAbsent(stored) => {
+            let current = catalog
+                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            if current.is_some() {
+                Ok(ValidationOutcome::AlreadyApplied)
+            } else {
+                validate_one(
+                    &stored.name,
+                    stored.descriptor_version,
+                    stored.as_ref(),
+                    None,
+                    0,
+                    stored.modification_hlc,
+                    nodedb_types::Hlc::ZERO,
+                )
+            }
+        }
+        CatalogEntry::PutMaterializedView(stored) => {
+            let current = catalog
+                .get_materialized_view(stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutFunction(stored) => {
+            let current = catalog
+                .get_function_in_database(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutProcedure(stored) => {
+            let current = catalog
+                .get_procedure_in_database(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutTrigger(stored) => {
+            let current = catalog
+                .get_trigger_in_database(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutSequence(stored) => {
+            let current = catalog
+                .get_sequence(stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        CatalogEntry::PutContinuousAggregate(stored) => {
+            let current = catalog
+                .get_continuous_aggregate(stored.database_id, stored.tenant_id, &stored.name)
+                .ok()
+                .flatten();
+            validate_one(
+                &stored.name,
+                stored.descriptor_version,
+                stored.as_ref(),
+                current.as_ref(),
+                current.as_ref().map_or(0, |value| value.descriptor_version),
+                stored.modification_hlc,
+                current
+                    .as_ref()
+                    .map_or(nodedb_types::Hlc::ZERO, |value| value.modification_hlc),
+            )
+        }
+        _ => Ok(ValidationOutcome::Apply),
+    }
+}
+
+fn validate_one<T: zerompk::ToMessagePack>(
+    name: &str,
+    carried: u64,
+    incoming: &T,
+    current: Option<&T>,
+    prior: u64,
+    incoming_hlc: nodedb_types::Hlc,
+    current_hlc: nodedb_types::Hlc,
+) -> Result<ValidationOutcome, crate::Error> {
+    if carried == 0 {
+        return Ok(ValidationOutcome::Apply);
+    }
+    // A recreated descriptor restarts its numeric version namespace. Once a
+    // newer lifecycle is persisted, every older-HLC record is historical even
+    // if its old numeric version is greater than the recreated version.
+    if current.is_some() && incoming_hlc < current_hlc {
+        return Ok(ValidationOutcome::AlreadyApplied);
+    }
+    // A lower carried version is a stale historical replay only when its clock
+    // is not ahead of the persisted record (older or equal — legacy records
+    // predating HLC stamping share the ZERO clock). A regressed version paired
+    // with a strictly newer HLC is a genuine anomaly (a corrupted or misordered
+    // proposal, a stamping race) and must fall through to be rejected loudly.
+    if carried < prior && incoming_hlc <= current_hlc {
+        return Ok(ValidationOutcome::AlreadyApplied);
+    }
+    if carried == prior {
+        let same_payload = current
+            .map(|persisted| {
+                let incoming = zerompk::to_msgpack_vec(incoming);
+                let persisted = zerompk::to_msgpack_vec(persisted);
+                matches!((incoming, persisted), (Ok(a), Ok(b)) if a == b)
+            })
+            .unwrap_or(false);
+        return if same_payload {
+            Ok(ValidationOutcome::AlreadyApplied)
+        } else {
+            Err(crate::Error::DescriptorVersionAnomaly {
+                descriptor: name.to_string(),
+                carried,
+                prior,
+            })
+        };
+    }
+    if carried == prior.saturating_add(1) {
+        return Ok(ValidationOutcome::Apply);
+    }
+    Err(crate::Error::DescriptorVersionAnomaly {
+        descriptor: name.to_string(),
+        carried,
+        prior,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::security::catalog::{StoredCollection, StoredSequence};
+    use crate::control::security::catalog::procedure_types::{
+        ParamDirection, ProcedureParam, ProcedureRoutability,
+    };
+    use crate::control::security::catalog::trigger_types::{
+        TriggerBatchMode, TriggerEvents, TriggerExecutionMode, TriggerGranularity, TriggerSecurity,
+        TriggerTiming,
+    };
+    use crate::control::security::catalog::{
+        FunctionLanguage, FunctionSecurity, FunctionVolatility, StoredCollection, StoredFunction,
+        StoredProcedure, StoredSequence, StoredTrigger,
+    };
     use crate::control::security::credential::CredentialStore;
     use nodedb_types::DatabaseId;
     use std::sync::Arc;
@@ -411,6 +634,102 @@ mod tests {
         catalog
             .put_collection(DatabaseId::DEFAULT, &stored)
             .expect("put_collection");
+    }
+
+    fn function(database_id: DatabaseId) -> StoredFunction {
+        StoredFunction {
+            tenant_id: 1,
+            database_id,
+            name: "same_name".into(),
+            parameters: vec![],
+            return_type: "INT".into(),
+            body_sql: "1".into(),
+            compiled_body_sql: None,
+            volatility: FunctionVolatility::Immutable,
+            security: FunctionSecurity::Invoker,
+            language: FunctionLanguage::Sql,
+            wasm_hash: None,
+            wasm_module: None,
+            dependencies: vec![],
+            wasm_fuel: 1_000_000,
+            wasm_memory: 16 * 1024 * 1024,
+            owner: "tester".into(),
+            created_at: 0,
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+        }
+    }
+
+    fn procedure(database_id: DatabaseId) -> StoredProcedure {
+        StoredProcedure {
+            tenant_id: 1,
+            database_id,
+            name: "same_name".into(),
+            parameters: vec![ProcedureParam {
+                name: "input".into(),
+                data_type: "INT".into(),
+                direction: ParamDirection::In,
+            }],
+            body_sql: "BEGIN END".into(),
+            max_iterations: 1_000_000,
+            timeout_secs: 60,
+            routability: ProcedureRoutability::MultiCollection,
+            owner: "tester".into(),
+            created_at: 0,
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+        }
+    }
+
+    fn trigger(database_id: DatabaseId) -> StoredTrigger {
+        StoredTrigger {
+            tenant_id: 1,
+            database_id,
+            name: "same_name".into(),
+            collection: "orders".into(),
+            timing: TriggerTiming::After,
+            events: TriggerEvents {
+                on_insert: true,
+                on_update: false,
+                on_delete: false,
+            },
+            granularity: TriggerGranularity::Row,
+            when_condition: None,
+            body_sql: "BEGIN END".into(),
+            priority: 0,
+            enabled: true,
+            execution_mode: TriggerExecutionMode::Async,
+            security: TriggerSecurity::Invoker,
+            batch_mode: TriggerBatchMode::BatchSafe,
+            owner: "tester".into(),
+            created_at: 0,
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+        }
+    }
+
+    #[test]
+    fn same_named_cross_database_routines_do_not_coalesce() {
+        let database_a = DatabaseId::new(11);
+        let database_b = DatabaseId::new(12);
+        let pairs = [
+            (
+                CatalogEntry::PutFunction(Box::new(function(database_a))),
+                CatalogEntry::PutFunction(Box::new(function(database_b))),
+            ),
+            (
+                CatalogEntry::PutProcedure(Box::new(procedure(database_a))),
+                CatalogEntry::PutProcedure(Box::new(procedure(database_b))),
+            ),
+            (
+                CatalogEntry::PutTrigger(Box::new(trigger(database_a))),
+                CatalogEntry::PutTrigger(Box::new(trigger(database_b))),
+            ),
+        ];
+
+        for (first, second) in pairs {
+            assert!(!same_descriptor(&first, &second));
+        }
     }
 
     #[test]

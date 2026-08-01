@@ -44,7 +44,8 @@ pub(super) async fn enforce_subquery_check(
         return Ok(());
     }
 
-    let (tasks, _) = plan_authorized_sql(state, identity, &check.match_sql, database_id).await?;
+    let (tasks, _, _lease_scope) =
+        plan_authorized_sql(state, identity, &check.match_sql, database_id).await?;
     if tasks.len() != 1 {
         return Err(evaluation_error(
             constraint,

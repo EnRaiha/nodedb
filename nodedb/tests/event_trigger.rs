@@ -15,7 +15,7 @@ use nodedb::control::trigger::{DmlEvent, TriggerRegistry};
 use nodedb::event::trigger::dlq::{DlqEnqueueParams, TriggerDlq};
 use nodedb::event::trigger::retry::{RetryEntry, TriggerRetryQueue};
 use nodedb::event::types::{EventSource, RowId, WriteEvent, WriteOp};
-use nodedb::types::{Lsn, TenantId, VShardId};
+use nodedb::types::{DatabaseId, Lsn, TenantId, VShardId};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -28,6 +28,7 @@ fn make_event(source: EventSource, op: WriteOp, collection: &str) -> WriteEvent 
         op,
         row_id: RowId::new("row-1"),
         lsn: Lsn::new(100),
+        database_id: DatabaseId::new(7),
         tenant_id: TenantId::new(1),
         vshard_id: VShardId::new(0),
         source,
@@ -50,6 +51,7 @@ fn make_trigger(
 ) -> StoredTrigger {
     StoredTrigger {
         tenant_id: 1,
+        database_id: DatabaseId::new(7),
         name: name.to_string(),
         collection: collection.to_string(),
         timing: TriggerTiming::After,
@@ -145,16 +147,25 @@ fn registry_matches_by_collection_and_event() {
         TriggerExecutionMode::Async,
     ));
 
-    let matched = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let matched = reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Insert);
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].name, "t1");
 
     // Wrong event type.
-    assert!(reg.get_matching(1, "orders", DmlEvent::Delete).is_empty());
+    assert!(
+        reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Delete)
+            .is_empty()
+    );
     // Wrong collection.
-    assert!(reg.get_matching(1, "products", DmlEvent::Insert).is_empty());
+    assert!(
+        reg.get_matching(DatabaseId::new(7), 1, "products", DmlEvent::Insert)
+            .is_empty()
+    );
     // Wrong tenant.
-    assert!(reg.get_matching(2, "orders", DmlEvent::Insert).is_empty());
+    assert!(
+        reg.get_matching(DatabaseId::new(7), 2, "orders", DmlEvent::Insert)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -168,12 +179,19 @@ fn registry_filters_disabled_triggers() {
         false,
         TriggerExecutionMode::Async,
     ));
-    reg.set_enabled(1, "t1", false);
-    assert!(reg.get_matching(1, "orders", DmlEvent::Insert).is_empty());
+    reg.set_enabled(DatabaseId::new(7), 1, "t1", false);
+    assert!(
+        reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Insert)
+            .is_empty()
+    );
 
     // Re-enable.
-    reg.set_enabled(1, "t1", true);
-    assert_eq!(reg.get_matching(1, "orders", DmlEvent::Insert).len(), 1);
+    reg.set_enabled(DatabaseId::new(7), 1, "t1", true);
+    assert_eq!(
+        reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Insert)
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -183,7 +201,7 @@ fn registry_sorts_by_priority_then_name() {
     reg.register(make_trigger_with_priority("a_trigger", "c", 5));
     reg.register(make_trigger_with_priority("m_trigger", "c", 5));
 
-    let matched = reg.get_matching(1, "c", DmlEvent::Insert);
+    let matched = reg.get_matching(DatabaseId::new(7), 1, "c", DmlEvent::Insert);
     assert_eq!(matched.len(), 3);
     assert_eq!(matched[0].name, "a_trigger"); // priority 5, alpha first
     assert_eq!(matched[1].name, "m_trigger"); // priority 5, alpha second
@@ -214,8 +232,11 @@ fn registry_replace_on_same_name() {
     reg.register(t);
 
     // Should match UPDATE now, not INSERT.
-    assert!(reg.get_matching(1, "orders", DmlEvent::Insert).is_empty());
-    let matched = reg.get_matching(1, "orders", DmlEvent::Update);
+    assert!(
+        reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Insert)
+            .is_empty()
+    );
+    let matched = reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Update);
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].execution_mode, TriggerExecutionMode::Sync);
 }
@@ -231,8 +252,11 @@ fn registry_unregister() {
         false,
         TriggerExecutionMode::Async,
     ));
-    reg.unregister(1, "t1");
-    assert!(reg.get_matching(1, "orders", DmlEvent::Insert).is_empty());
+    reg.unregister(DatabaseId::new(7), 1, "t1");
+    assert!(
+        reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Insert)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -263,11 +287,11 @@ fn registry_multiple_triggers_same_collection() {
         TriggerExecutionMode::Sync,
     ));
 
-    let insert_triggers = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let insert_triggers = reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Insert);
     assert_eq!(insert_triggers.len(), 3);
 
     // Only "audit" matches UPDATE.
-    let update_triggers = reg.get_matching(1, "orders", DmlEvent::Update);
+    let update_triggers = reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Update);
     assert_eq!(update_triggers.len(), 1);
     assert_eq!(update_triggers[0].name, "audit");
 }
@@ -304,7 +328,7 @@ fn mode_filter_async_only() {
         TriggerExecutionMode::Deferred,
     ));
 
-    let all = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let all = reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Insert);
     assert_eq!(all.len(), 3);
 
     // Filter for ASYNC only (what Event Plane does for User events).
@@ -391,6 +415,7 @@ fn retry_queue_exponential_backoff() {
     let mut queue = TriggerRetryQueue::new();
 
     let entry = RetryEntry {
+        database_id: DatabaseId::new(7),
         tenant_id: 1,
         collection: "orders".into(),
         row_id: "r1".into(),
@@ -423,6 +448,7 @@ fn retry_queue_multiple_entries_fifo() {
 
     for i in 0..3 {
         queue.enqueue(RetryEntry {
+            database_id: DatabaseId::new(7),
             tenant_id: 1,
             collection: "orders".into(),
             row_id: format!("r-{i}"),
@@ -589,7 +615,7 @@ fn only_after_triggers_matched_for_event_plane() {
         TriggerExecutionMode::Async,
     ));
 
-    let matched = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let matched = reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Insert);
     // Registry returns both — timing filter happens in fire_after_* functions.
     assert_eq!(matched.len(), 2);
 
@@ -618,9 +644,21 @@ fn trigger_on_multiple_events() {
         TriggerExecutionMode::Async,
     ));
 
-    assert_eq!(reg.get_matching(1, "orders", DmlEvent::Insert).len(), 1);
-    assert_eq!(reg.get_matching(1, "orders", DmlEvent::Update).len(), 1);
-    assert_eq!(reg.get_matching(1, "orders", DmlEvent::Delete).len(), 1);
+    assert_eq!(
+        reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Insert)
+            .len(),
+        1
+    );
+    assert_eq!(
+        reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Update)
+            .len(),
+        1
+    );
+    assert_eq!(
+        reg.get_matching(DatabaseId::new(7), 1, "orders", DmlEvent::Delete)
+            .len(),
+        1
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -647,9 +685,9 @@ fn list_for_tenant_returns_all() {
         TriggerExecutionMode::Sync,
     ));
 
-    let list = reg.list_for_tenant(1);
+    let list = reg.list_for_tenant(DatabaseId::new(7), 1);
     assert_eq!(list.len(), 2);
 
     // Other tenant sees nothing.
-    assert!(reg.list_for_tenant(2).is_empty());
+    assert!(reg.list_for_tenant(DatabaseId::new(7), 2).is_empty());
 }

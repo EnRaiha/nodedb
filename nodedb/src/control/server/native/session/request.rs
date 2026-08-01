@@ -3,7 +3,7 @@
 //! Request routing: maps a decoded [`NativeRequest`](nodedb_types::protocol::NativeRequest)
 //! to the appropriate handler by opcode.
 
-use nodedb_types::protocol::{NativeResponse, OpCode, RequestFields};
+use nodedb_types::protocol::{AuthMethod, NativeResponse, OpCode, RequestFields, TextFields};
 
 use super::NativeSession;
 use super::dispatch::{self, DispatchCtx};
@@ -56,11 +56,25 @@ impl NativeSession {
                         "configured trust identity is unavailable",
                     )));
                 };
-                self.auth_context = Some(super::super::super::session_auth::build_auth_context(
-                    &trust_id,
-                ));
-                self.cleanup.publish_identity(trust_id.clone());
-                self.identity = Some(trust_id);
+
+                // Auto-authenticate through the normal Auth path so trust-mode
+                // requests receive the same database selection, authorization,
+                // admission permits, session binding, and AuthContext as an
+                // explicit Auth frame. The successful internal response is not
+                // sent: this request receives only its own operation response.
+                let auth_fields = RequestFields::Text(TextFields {
+                    auth: Some(AuthMethod::Trust {
+                        username: trust_id.username,
+                    }),
+                    ..Default::default()
+                });
+                let auth_response = self.handle_auth(seq, &auth_fields).await;
+                if !matches!(
+                    auth_response.status,
+                    nodedb_types::protocol::opcodes::ResponseStatus::Ok
+                ) {
+                    return SqlOutcome::Response(Box::new(auth_response));
+                }
             } else {
                 return SqlOutcome::Response(Box::new(NativeResponse::error(
                     seq,
@@ -81,20 +95,22 @@ impl NativeSession {
             }
         };
 
-        // Build a default AuthContext if not yet set (shouldn't happen but be safe).
-        let default_auth_ctx;
-        let auth_ctx = match self.auth_context.as_ref() {
-            Some(ctx) => ctx,
-            None => {
-                default_auth_ctx = super::super::super::session_auth::build_auth_context(identity);
-                &default_auth_ctx
-            }
-        };
+        // Retain authenticated/session enrichment, but bind RLS to the database
+        // selected for this request (including a later `USE DATABASE`).
+        let mut auth_ctx = self
+            .auth_context
+            .clone()
+            .unwrap_or_else(|| super::super::super::session_auth::build_auth_context(identity));
+        auth_ctx.database_id = Some(
+            self.sessions
+                .get_current_database(self.peer_addr)
+                .unwrap_or(crate::types::DatabaseId::DEFAULT),
+        );
 
         let ctx = DispatchCtx {
             state: &self.state,
             identity,
-            auth_context: auth_ctx,
+            auth_context: &auth_ctx,
             query_ctx: &self.query_ctx,
             sessions: &self.sessions,
             peer_addr: &self.peer_addr,

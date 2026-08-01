@@ -3,14 +3,8 @@
 //! `CREATE FUNCTION ... LANGUAGE WASM AS <base64>` DDL handler.
 //!
 //! Parses WASM function DDL, decodes the base64 binary, validates it,
-//! stores it in the WASM module store, and registers the function.
-//!
-//! Ported from the pgwire `ddl::function::wasm_create` handler. The catalog
-//! path is preserved verbatim — a WASM function is written with a direct
-//! `catalog.put_function` (NOT through the metadata-raft propose path), and the
-//! `audit_record` call is retained. Only the result construction changed from
-//! pgwire `Response` / `PgWireError` to the protocol-neutral [`DdlResult`] /
-//! [`DdlError`].
+//! carries it in the replicated function proposal, and registers the function
+//! through the catalog-entry path.
 
 use crate::control::planner::wasm;
 use crate::control::security::catalog::{
@@ -19,8 +13,10 @@ use crate::control::security::catalog::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
+use super::super::super::catalog::propose_and_apply;
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
+use super::create::emit_function_put;
 use super::parse::parse_function_header;
 
 /// Handle `CREATE [OR REPLACE] FUNCTION ... LANGUAGE WASM AS '<base64>'`
@@ -33,11 +29,14 @@ pub fn create_wasm_function(
 
     let parsed = parse_wasm_create(sql)?;
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 
     if !parsed.or_replace
-        && let Ok(Some(_)) = catalog.get_function(tenant_id, &parsed.name)
+        && let Ok(Some(_)) = catalog.get_function_in_database(database_id, tenant_id, &parsed.name)
     {
         return Err(DdlError {
             sqlstate: "42723".to_string(),
@@ -54,12 +53,14 @@ pub fn create_wasm_function(
             message: format!("invalid base64: {e}"),
         })?;
 
-    // Store the WASM binary (validates magic header + size limit).
+    // Validate before proposal; the applier stores the blob on every node.
     let config = wasm::WasmConfig::default();
-    let hash = wasm::store::store_wasm_binary(catalog, &wasm_bytes, config.max_binary_size)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: e.to_string(),
+    let hash =
+        wasm::store::validate_wasm_binary(&wasm_bytes, config.max_binary_size).map_err(|e| {
+            DdlError {
+                sqlstate: "42601".to_string(),
+                message: e.to_string(),
+            }
         })?;
 
     let now = std::time::SystemTime::now()
@@ -72,6 +73,7 @@ pub fn create_wasm_function(
 
     let stored = StoredFunction {
         tenant_id,
+        database_id,
         name: parsed.name.clone(),
         parameters: parsed.parameters,
         return_type: parsed.return_type,
@@ -81,6 +83,8 @@ pub fn create_wasm_function(
         security: FunctionSecurity::Invoker,
         language: FunctionLanguage::Wasm,
         wasm_hash: Some(hash),
+        wasm_module: Some(wasm_bytes),
+        dependencies: vec![],
         wasm_fuel: parsed.fuel.unwrap_or(config.default_fuel),
         wasm_memory: parsed.memory.unwrap_or(config.default_memory_bytes),
         owner: identity.username.clone(),
@@ -89,10 +93,12 @@ pub fn create_wasm_function(
         modification_hlc: nodedb_types::Hlc::ZERO,
     };
 
-    catalog.put_function(&stored).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: format!("catalog write: {e}"),
-    })?;
+    let entry = crate::control::catalog_entry::CatalogEntry::PutFunction(Box::new(stored.clone()));
+    let log_index = propose_and_apply(state, &entry)?;
+    if log_index == 0 {
+        crate::control::catalog_entry::post_apply::function::put(stored.clone(), state);
+    }
+    emit_function_put(state, &stored);
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

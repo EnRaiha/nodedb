@@ -16,8 +16,9 @@ use tracing::{debug, info, trace, warn};
 
 use super::registry::MvRegistry;
 use super::state::GroupState;
+use crate::types::DatabaseId;
 
-/// redb table: "{tenant_id}:{mv_name}" → MessagePack-serialized MvSnapshot.
+/// redb table: "v2:{database_id}:{tenant_id}:{mv_name}" → MessagePack-serialized MvSnapshot.
 const MV_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("mv_state");
 
 /// Serialized MV state: Vec of (group_key, per-aggregate GroupState list).
@@ -25,6 +26,10 @@ pub type MvSnapshot = Vec<(String, Vec<GroupState>)>;
 
 /// How often to persist MV state to redb.
 const PERSIST_INTERVAL: Duration = Duration::from_secs(30);
+
+fn state_key(database_id: DatabaseId, tenant_id: u64, mv_name: &str) -> String {
+    format!("v2:{}:{tenant_id}:{mv_name}", database_id.as_u64())
+}
 
 /// Manages persistence of streaming MV state.
 pub struct MvPersistence {
@@ -69,11 +74,12 @@ impl MvPersistence {
     /// Persist a single MV's state snapshot.
     pub fn save(
         &self,
+        database_id: DatabaseId,
         tenant_id: u64,
         mv_name: &str,
         snapshot: &[(String, Vec<GroupState>)],
     ) -> crate::Result<()> {
-        let key = format!("{tenant_id}:{mv_name}");
+        let key = state_key(database_id, tenant_id, mv_name);
         let bytes = zerompk::to_msgpack_vec(&snapshot.to_vec()).map_err(|e| {
             crate::Error::Serialization {
                 format: "msgpack".into(),
@@ -108,8 +114,13 @@ impl MvPersistence {
     }
 
     /// Load a persisted MV state snapshot.
-    pub fn load(&self, tenant_id: u64, mv_name: &str) -> crate::Result<Option<MvSnapshot>> {
-        let key = format!("{tenant_id}:{mv_name}");
+    pub fn load(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        mv_name: &str,
+    ) -> crate::Result<Option<MvSnapshot>> {
+        let key = state_key(database_id, tenant_id, mv_name);
         let txn = self.db.begin_read().map_err(|e| crate::Error::Storage {
             engine: "event_plane".into(),
             detail: format!("begin_read: {e}"),
@@ -140,8 +151,13 @@ impl MvPersistence {
     }
 
     /// Delete persisted state for a dropped MV.
-    pub fn delete(&self, tenant_id: u64, mv_name: &str) -> crate::Result<()> {
-        let key = format!("{tenant_id}:{mv_name}");
+    pub fn delete(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        mv_name: &str,
+    ) -> crate::Result<()> {
+        let key = state_key(database_id, tenant_id, mv_name);
         let txn = self.db.begin_write().map_err(|e| crate::Error::Storage {
             engine: "event_plane".into(),
             detail: format!("begin_write: {e}"),
@@ -165,10 +181,17 @@ impl MvPersistence {
     /// Flush all MV states from the registry to redb.
     pub fn flush_all(&self, registry: &MvRegistry) {
         for mv_def in registry.list_all() {
-            if let Some(state) = registry.get_state(mv_def.tenant_id, &mv_def.name) {
+            if let Some(state) =
+                registry.get_state(mv_def.database_id, mv_def.tenant_id, &mv_def.name)
+            {
                 let snapshot = state.snapshot();
                 if !snapshot.is_empty()
-                    && let Err(e) = self.save(mv_def.tenant_id, &mv_def.name, &snapshot)
+                    && let Err(e) = self.save(
+                        mv_def.database_id,
+                        mv_def.tenant_id,
+                        &mv_def.name,
+                        &snapshot,
+                    )
                 {
                     warn!(
                         mv = %mv_def.name,
@@ -184,9 +207,11 @@ impl MvPersistence {
     pub fn restore_all(&self, registry: &MvRegistry) {
         let mut restored = 0u32;
         for mv_def in registry.list_all() {
-            match self.load(mv_def.tenant_id, &mv_def.name) {
+            match self.load(mv_def.database_id, mv_def.tenant_id, &mv_def.name) {
                 Ok(Some(snapshot)) if !snapshot.is_empty() => {
-                    if let Some(state) = registry.get_state(mv_def.tenant_id, &mv_def.name) {
+                    if let Some(state) =
+                        registry.get_state(mv_def.database_id, mv_def.tenant_id, &mv_def.name)
+                    {
                         state.restore(snapshot);
                         restored += 1;
                     }
@@ -224,7 +249,7 @@ pub fn spawn_persist_task(
                     if cutoff > 0 {
                         let mut total_finalized = 0u32;
                         for mv_def in registry.list_all() {
-                            if let Some(state) = registry.get_state(mv_def.tenant_id, &mv_def.name) {
+                            if let Some(state) = registry.get_state(mv_def.database_id, mv_def.tenant_id, &mv_def.name) {
                                 total_finalized += state.finalize_buckets(cutoff);
                             }
                         }
@@ -287,9 +312,14 @@ mod tests {
             ),
         ];
 
-        persist.save(1, "order_stats", &snapshot).unwrap();
+        persist
+            .save(DatabaseId::new(1), 1, "order_stats", &snapshot)
+            .unwrap();
 
-        let loaded = persist.load(1, "order_stats").unwrap().unwrap();
+        let loaded = persist
+            .load(DatabaseId::new(1), 1, "order_stats")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].0, "INSERT");
         assert_eq!(loaded[0].1[0].count, 5);
@@ -299,7 +329,12 @@ mod tests {
     fn load_nonexistent_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let persist = MvPersistence::open(dir.path()).unwrap();
-        assert!(persist.load(1, "nonexistent").unwrap().is_none());
+        assert!(
+            persist
+                .load(DatabaseId::new(1), 1, "nonexistent")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -308,8 +343,15 @@ mod tests {
         let persist = MvPersistence::open(dir.path()).unwrap();
 
         let snapshot = vec![("k".to_string(), vec![GroupState::default()])];
-        persist.save(1, "mv1", &snapshot).unwrap();
-        persist.delete(1, "mv1").unwrap();
-        assert!(persist.load(1, "mv1").unwrap().is_none());
+        persist
+            .save(DatabaseId::new(1), 1, "mv1", &snapshot)
+            .unwrap();
+        persist.delete(DatabaseId::new(1), 1, "mv1").unwrap();
+        assert!(
+            persist
+                .load(DatabaseId::new(1), 1, "mv1")
+                .unwrap()
+                .is_none()
+        );
     }
 }

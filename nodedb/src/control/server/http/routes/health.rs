@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::json;
 
-use super::super::auth::AppState;
+use super::super::auth::{ApiError, AppState, ResolvedIdentity};
 
 /// GET /health/live — unconditional liveness probe.
 ///
@@ -33,6 +33,17 @@ pub async fn live() -> impl IntoResponse {
 /// `503 Service Unavailable` during startup, after startup failure,
 /// or when the node is being decommissioned.
 pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    // The coordinator signals this canonical watch before progressing drain
+    // phases, so readiness must fail immediately even before lifecycle state
+    // has been updated by other shutdown participants.
+    if state.shared.shutdown.is_shutdown() {
+        let body = json!({
+            "status": "draining",
+            "reason": "shutdown_signaled",
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
+    }
+
     // Check decommission state via the cluster observer (if present).
     if let Some(obs) = state.shared.cluster_observer.get() {
         let snap = obs.snapshot();
@@ -69,28 +80,45 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 
 /// POST /health/drain — trigger graceful connection drain.
 ///
-/// Signals the canonical `ShutdownWatch` so every background loop
-/// begins its cooperative exit. Subsequent `/healthz` calls return
-/// 503, which causes the k8s readiness probe to fail and the
-/// service mesh to stop routing new connections to this node.
+/// Initiates the shared phased shutdown coordinator. It signals the canonical
+/// `ShutdownWatch` and then drives every registered drain phase. Subsequent
+/// `/healthz` calls return 503, which causes the k8s readiness probe to fail
+/// and the service mesh to stop routing new connections to this node.
 ///
-/// Designed for use as a k8s `preStop` hook:
+/// Designed for use as an authenticated Kubernetes `preStop` hook. In
+/// password mode, inject `NODEDB_DRAIN_TOKEN` from a Secret containing a
+/// superuser credential:
 ///
 /// ```yaml
 /// lifecycle:
 ///   preStop:
-///     httpGet:
-///       path: /health/drain
-///       port: http
+///     exec:
+///       command:
+///         - /bin/sh
+///         - -c
+///         - >-
+///           curl -fsS -X POST
+///           -H "Authorization: Bearer ${NODEDB_DRAIN_TOKEN}"
+///           http://127.0.0.1:8080/health/drain
 /// ```
-pub async fn drain(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn drain(
+    identity: ResolvedIdentity,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
+    // State-changing administrative health actions require authenticated superuser authority.
+    if !identity.0.is_superuser() {
+        return Err(ApiError::Forbidden("superuser role required".into()));
+    }
+
     tracing::info!(node_id = state.shared.node_id, "drain requested via HTTP");
-    state.shared.shutdown.signal();
-    (
+    // Dropping a Tokio JoinHandle detaches the coordinator task; shutdown
+    // progress remains observable through the shared bus.
+    drop(state.shutdown_bus.initiate());
+    Ok((
         StatusCode::OK,
         axum::Json(json!({
             "status": "draining",
             "node_id": state.shared.node_id,
         })),
-    )
+    ))
 }

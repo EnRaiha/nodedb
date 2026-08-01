@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use crate::helpers::{TENANT_A, TENANT_B};
-use nodedb::control::change_stream::{ChangeEvent, ChangeOperation, ChangeStream};
+use nodedb::control::change_stream::{ChangeEvent, ChangeOperation, ChangeStream, ReplayStart};
 use nodedb::types::{Lsn, TenantId};
 
 /// A subscription scoped to Tenant B must never deliver Tenant A's events,
@@ -118,52 +118,50 @@ async fn cdc_unfiltered_subscription_receives_all_tenants() {
     );
 }
 
-/// query_changes always returns all events (raw ring buffer); the tenant filter
-/// is applied by recv_filtered, not by query_changes.  This test documents
-/// the distinction: callers that use query_changes must apply tenant filtering
-/// themselves.
+/// query_changes filters by tenant before applying the caller's result limit.
 #[test]
-fn cdc_query_changes_is_unfiltered_callers_must_filter() {
+fn cdc_query_changes_scopes_the_requested_tenant_before_limit() {
     let stream = ChangeStream::new(1024);
 
+    // Two matching Tenant B events arrive before the caller's Tenant A event.
+    // A limit applied before tenant filtering would consume the result budget
+    // and return no event to Tenant A.
+    for (lsn, document_id) in [(Lsn::new(1), "l_b_1"), (Lsn::new(2), "l_b_2")] {
+        stream.publish(ChangeEvent {
+            collection: "logs".into(),
+            document_id: document_id.into(),
+            operation: ChangeOperation::Insert,
+            timestamp_ms: 1_000,
+            tenant_id: TenantId::new(TENANT_B),
+            lsn,
+            after: None,
+        });
+    }
     stream.publish(ChangeEvent {
         collection: "logs".into(),
         document_id: "l_a".into(),
         operation: ChangeOperation::Insert,
-        timestamp_ms: 1000,
+        timestamp_ms: 1_000,
         tenant_id: TenantId::new(TENANT_A),
-        lsn: Lsn::new(1),
-        after: None,
-    });
-    stream.publish(ChangeEvent {
-        collection: "logs".into(),
-        document_id: "l_b".into(),
-        operation: ChangeOperation::Insert,
-        timestamp_ms: 2000,
-        tenant_id: TenantId::new(TENANT_B),
-        lsn: Lsn::new(2),
+        lsn: Lsn::new(3),
         after: None,
     });
 
-    // The ring is process-wide, so isolation is the query's job, not the
-    // caller's: each tenant sees only its own events.
-    let a_events = stream.query_changes(TenantId::new(TENANT_A), Some("logs"), 0, 100);
-    let b_events = stream.query_changes(TenantId::new(TENANT_B), Some("logs"), 0, 100);
-    assert!(
-        a_events
-            .iter()
-            .all(|e| e.tenant_id == TenantId::new(TENANT_A)),
-        "Tenant A's query returned another tenant's events"
-    );
-    assert!(
-        b_events
-            .iter()
-            .all(|e| e.tenant_id == TenantId::new(TENANT_B)),
-        "Tenant B's query returned another tenant's events"
-    );
+    let a_events = stream
+        .query_changes(
+            TenantId::new(TENANT_A),
+            Some("logs"),
+            ReplayStart::Timestamp(0),
+            1,
+        )
+        .expect("timestamp replay cannot expire")
+        .events;
 
-    assert_eq!(a_events.len(), 1, "should have exactly 1 Tenant A event");
-    assert_eq!(b_events.len(), 1, "should have exactly 1 Tenant B event");
+    assert_eq!(
+        a_events.len(),
+        1,
+        "tenant filtering must precede limit so Tenant A receives its matching event"
+    );
+    assert_eq!(a_events[0].tenant_id, TenantId::new(TENANT_A));
     assert_eq!(a_events[0].document_id, "l_a");
-    assert_eq!(b_events[0].document_id, "l_b");
 }

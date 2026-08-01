@@ -253,17 +253,27 @@ impl LocalPlanExecutor {
 
         if let PhysicalPlan::ClusterEvent(
             nodedb_physical::physical_plan::ClusterEventOp::PublishTopic {
+                database_id: topic_database_id,
                 topic_name,
                 payload,
             },
         ) = &plan
         {
+            if *topic_database_id != database_id {
+                return ExecuteResponse::err(TypedClusterError::Internal {
+                    code: PLAN_DECODE_FAILED,
+                    message: "topic publish database does not match RPC database".into(),
+                });
+            }
             return match crate::event::topic::publish::publish_to_topic(
                 &self.state,
+                database_id,
                 req.tenant_id,
                 topic_name,
                 payload,
-            ) {
+            )
+            .await
+            {
                 Ok(sequence) => match zerompk::to_msgpack_vec(&sequence) {
                     Ok(payload) => ExecuteResponse::ok(vec![payload], 0, 0),
                     Err(error) => ExecuteResponse::err(TypedClusterError::Internal {
@@ -280,13 +290,18 @@ impl LocalPlanExecutor {
 
         if let PhysicalPlan::ClusterEvent(
             nodedb_physical::physical_plan::ClusterEventOp::ConsumeStream {
+                database_id: stream_database_id,
                 stream_name,
                 group_name,
                 partition,
                 limit,
+                committed_offsets,
             },
         ) = &plan
         {
+            if let Err(error) = reject_consume_database_mismatch(*stream_database_id, database_id) {
+                return ExecuteResponse::err(error);
+            }
             let limit = match usize::try_from(*limit) {
                 Ok(limit) => limit,
                 Err(_) => {
@@ -297,13 +312,37 @@ impl LocalPlanExecutor {
                 }
             };
             let params = crate::event::cdc::consume::ConsumeParams {
+                database_id: *stream_database_id,
                 tenant_id: req.tenant_id,
                 stream_name,
                 group_name,
-                partition: Some(*partition),
+                partition: *partition,
                 limit,
             };
-            return match crate::event::cdc::consume::consume_local(&self.state, &params) {
+            if let Err(error) =
+                crate::event::cdc::consume::validate_consume_identity(&self.state, &params)
+            {
+                return ExecuteResponse::err(TypedClusterError::Internal {
+                    code: PLAN_DECODE_FAILED,
+                    message: error.to_string(),
+                });
+            }
+            let committed_offsets =
+                match crate::event::cdc::consume::decode_remote_committed_offsets(committed_offsets)
+                {
+                    Ok(offsets) => offsets,
+                    Err(error) => {
+                        return ExecuteResponse::err(TypedClusterError::Internal {
+                            code: PLAN_DECODE_FAILED,
+                            message: error.to_string(),
+                        });
+                    }
+                };
+            return match crate::event::cdc::consume::consume_local_with_offsets(
+                &self.state,
+                &params,
+                Some(&committed_offsets),
+            ) {
                 Ok(result) => {
                     let events = result
                         .events
@@ -499,10 +538,52 @@ impl LocalPlanExecutor {
     }
 }
 
+fn reject_consume_database_mismatch(
+    stream_database_id: crate::types::DatabaseId,
+    envelope_database_id: crate::types::DatabaseId,
+) -> Result<(), TypedClusterError> {
+    if stream_database_id == envelope_database_id {
+        Ok(())
+    } else {
+        Err(TypedClusterError::Internal {
+            code: PLAN_DECODE_FAILED,
+            message: "CDC consume database does not match RPC database".into(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nodedb_physical::physical_plan::CrdtOp;
+
+    #[test]
+    fn consume_stream_rejects_database_mismatch() {
+        let op = nodedb_physical::physical_plan::ClusterEventOp::ConsumeStream {
+            database_id: crate::types::DatabaseId::new(7),
+            stream_name: "topic:orders".into(),
+            group_name: "analytics".into(),
+            partition: Some(0),
+            limit: 1,
+            committed_offsets: vec![(0, 0, 0)],
+        };
+        let nodedb_physical::physical_plan::ClusterEventOp::ConsumeStream { database_id, .. } = op
+        else {
+            panic!("expected typed consume operation");
+        };
+        assert!(matches!(
+            reject_consume_database_mismatch(database_id, crate::types::DatabaseId::new(8)),
+            Err(TypedClusterError::Internal { .. })
+        ));
+    }
+
+    #[test]
+    fn consume_stream_rejects_duplicate_caller_offsets() {
+        assert!(matches!(
+            crate::event::cdc::consume::decode_remote_committed_offsets(&[(3, 7, 1), (3, 8, 1)]),
+            Err(crate::event::cdc::consume::ConsumeError::InvalidRemoteOffsets(_))
+        ));
+    }
 
     #[test]
     fn every_remote_execution_mode_rejects_unadmitted_crdt_apply() {

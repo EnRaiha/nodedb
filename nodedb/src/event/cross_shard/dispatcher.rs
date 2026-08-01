@@ -372,6 +372,7 @@ mod tests {
         CrossShardWriteRequest {
             sql: "INSERT INTO audit VALUES (1)".into(),
             tenant_id: 1,
+            database_id: 0,
             source_vshard: 3,
             source_lsn: lsn,
             source_sequence: lsn,

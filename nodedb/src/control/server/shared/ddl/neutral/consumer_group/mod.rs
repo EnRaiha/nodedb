@@ -5,6 +5,7 @@
 pub mod commit;
 pub mod create;
 pub mod drop;
+pub mod identity;
 pub mod show;
 
 pub use commit::commit_offset;

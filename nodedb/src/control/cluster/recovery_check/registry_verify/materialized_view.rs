@@ -31,7 +31,7 @@ pub fn verify_mvs(
         .load_all_streaming_mvs()?
         .into_iter()
         .map(|m| {
-            let key = format!("{}|{}", m.tenant_id, m.name);
+            let key = format!("{}|{}|{}", m.database_id.as_u64(), m.tenant_id, m.name);
             let value = format!("src={}", m.source_stream);
             (key, value)
         })
@@ -42,7 +42,7 @@ pub fn verify_mvs(
         .list_all()
         .into_iter()
         .map(|m| {
-            let key = format!("{}|{}", m.tenant_id, m.name);
+            let key = format!("{}|{}|{}", m.database_id.as_u64(), m.tenant_id, m.name);
             let value = format!("src={}", m.source_stream);
             (key, value)
         })

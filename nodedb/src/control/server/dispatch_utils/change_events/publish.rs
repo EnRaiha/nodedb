@@ -84,6 +84,7 @@ fn publish_change_event(
         static NOTIFY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let seq = NOTIFY_SEQ.fetch_add(1, Ordering::Relaxed);
         crate::control::change_stream::broadcast_notify_to_cluster(
+            database_id,
             &event,
             shared.node_id,
             seq,
@@ -92,7 +93,7 @@ fn publish_change_event(
         );
     }
 
-    shared.change_stream.publish(event);
+    shared.change_stream.publish_in_database(database_id, event);
 }
 
 /// The Control-Plane change events one write plan yields.

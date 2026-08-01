@@ -4,7 +4,7 @@
 
 use super::connection::SessionId;
 use crate::control::notify_bus::{ListenHandle, Notification, NotifyBus, normalize_channel};
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 use super::store::SessionStore;
 
@@ -15,6 +15,7 @@ impl SessionStore {
     pub fn listen_channel<I: Into<SessionId> + Copy>(
         &self,
         addr: I,
+        database_id: DatabaseId,
         tenant_id: TenantId,
         channel: &str,
         bus: &NotifyBus,
@@ -22,7 +23,9 @@ impl SessionStore {
         let normalized = normalize_channel(channel);
         let already = self
             .read_session(addr, |s| {
-                s.listen_handles.iter().any(|h| h.channel == normalized)
+                s.listen_handles
+                    .iter()
+                    .any(|h| h.database_id == database_id && h.channel == normalized)
             })
             .unwrap_or(false);
 
@@ -30,8 +33,9 @@ impl SessionStore {
             return;
         }
 
-        let (session_id, rx) = bus.listen(tenant_id, &normalized);
+        let (session_id, rx) = bus.listen(database_id, tenant_id, &normalized);
         let handle = ListenHandle {
+            database_id,
             tenant_id,
             channel: normalized,
             session_id,
@@ -41,13 +45,7 @@ impl SessionStore {
     }
 
     /// Unregister a LISTEN subscription for a specific channel.
-    pub fn unlisten_channel(
-        &self,
-        addr: impl Into<SessionId>,
-        _tenant_id: TenantId,
-        channel: &str,
-        bus: &NotifyBus,
-    ) {
+    pub fn unlisten_channel(&self, addr: impl Into<SessionId>, channel: &str, bus: &NotifyBus) {
         let normalized = normalize_channel(channel);
         let maybe_sid = self.write_session(addr, |s| {
             if let Some(pos) = s
@@ -56,13 +54,18 @@ impl SessionStore {
                 .position(|h| h.channel == normalized)
             {
                 let handle = s.listen_handles.remove(pos);
-                Some((handle.tenant_id, handle.session_id))
+                Some((
+                    handle.database_id,
+                    handle.tenant_id,
+                    handle.channel,
+                    handle.session_id,
+                ))
             } else {
                 None
             }
         });
-        if let Some(Some((stored_tenant_id, session_id))) = maybe_sid {
-            bus.unlisten(stored_tenant_id, &normalized, session_id);
+        if let Some(Some((database_id, stored_tenant_id, stored_channel, session_id))) = maybe_sid {
+            bus.unlisten(database_id, stored_tenant_id, &stored_channel, session_id);
         }
     }
 
@@ -71,7 +74,12 @@ impl SessionStore {
         let handles = self.write_session(addr, |s| std::mem::take(&mut s.listen_handles));
         if let Some(handles) = handles {
             for handle in handles {
-                bus.unlisten(handle.tenant_id, &handle.channel, handle.session_id);
+                bus.unlisten(
+                    handle.database_id,
+                    handle.tenant_id,
+                    &handle.channel,
+                    handle.session_id,
+                );
             }
         }
     }
@@ -109,9 +117,15 @@ impl SessionStore {
     }
 
     /// Buffer a NOTIFY for deferred delivery (inside a transaction).
-    pub fn buffer_notify(&self, addr: impl Into<SessionId>, channel: String, payload: String) {
+    pub fn buffer_notify(
+        &self,
+        addr: impl Into<SessionId>,
+        database_id: DatabaseId,
+        channel: String,
+        payload: String,
+    ) {
         self.write_session(addr, |s| {
-            s.pending_notifies.push((channel, payload));
+            s.pending_notifies.push((database_id, channel, payload));
         });
     }
 
@@ -125,8 +139,8 @@ impl SessionStore {
         let notifies = self
             .write_session(addr, |s| std::mem::take(&mut s.pending_notifies))
             .unwrap_or_default();
-        for (channel, payload) in notifies {
-            bus.notify(tenant_id, &channel, &payload);
+        for (database_id, channel, payload) in notifies {
+            bus.notify(database_id, tenant_id, &channel, &payload);
         }
     }
 
@@ -184,8 +198,9 @@ mod tests {
                 )
                 .is_ok()
         );
-        sessions.listen_channel(first, TenantId::new(10), "orders", &bus);
-        sessions.listen_channel(second, TenantId::new(20), "orders", &bus);
+        let database = DatabaseId::new(1);
+        sessions.listen_channel(first, database, TenantId::new(10), "orders", &bus);
+        sessions.listen_channel(second, database, TenantId::new(20), "orders", &bus);
         assert_eq!(bus.subscription_count(), 2);
         sessions.cleanup_listen_on_disconnect(first.into(), &bus);
         assert_eq!(bus.subscription_count(), 1);

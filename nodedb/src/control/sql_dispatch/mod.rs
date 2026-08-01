@@ -3,5 +3,5 @@
 pub mod dispatch;
 pub mod outcome;
 
-pub use dispatch::dispatch_sql;
+pub use dispatch::{dispatch_sql, dispatch_sql_in_database};
 pub use outcome::DispatchOutcome;

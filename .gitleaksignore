@@ -1,0 +1,5 @@
+# Historical documentation placeholder (`$TOKEN`), not a credential.
+3b95adfac466b607d3c59677e4d4bde4dfd67122:docs/security/oidc.md:curl-auth-header:212
+
+# Historical ILP fixture value, not an API credential.
+8bcdfa07bdfceb0ee7e7947f28476b7628f1ee99:nodedb/src/engine/timeseries/ilp_ingest.rs:generic-api-key:295

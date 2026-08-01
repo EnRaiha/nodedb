@@ -117,7 +117,10 @@ pub(super) fn serialize_array_op(op: &ArrayOp, ops: &mut Vec<RedoSubRecord>) -> 
 
         // Catalog DDL: no row-level post-image and no redo sub-record shape.
         // Rejected like the KV / document index/DDL ops.
-        ArrayOp::OpenArray { .. } | ArrayOp::DropArray { .. } => Err(crate::Error::PlanError {
+        ArrayOp::OpenArray { .. }
+        | ArrayOp::DropArray { .. }
+        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::PurgeArrayDrop { .. } => Err(crate::Error::PlanError {
             detail: "array OPEN/DROP (catalog DDL) is not supported in transaction resolve"
                 .to_string(),
         }),

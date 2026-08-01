@@ -94,6 +94,11 @@ impl OneShotDataKey {
 }
 
 /// Encrypt a segment using a full random seed and a one-use derived data key.
+///
+/// Every public call obtains a fresh 128-bit salt and 96-bit nonce from the OS
+/// RNG. Those values are serialized in the authenticated preamble and feed the
+/// HKDF derivation, so each envelope receives a distinct data-key derivation
+/// context. The data key is intentionally internal and is never exposed.
 pub fn encrypt_segment_envelope(
     key: &WalEncryptionKey,
     magic: &[u8; 4],
@@ -337,14 +342,50 @@ mod tests {
     }
 
     #[test]
-    fn data_key_budget_rejects_second_encryption() {
+    fn data_key_budget_rejects_second_encryption_without_ciphertext() {
         let key = key(0x42);
         let derived =
             derive_data_key(&key, &MAGIC, &[1; SALT_SIZE], &[2; NONCE_SIZE]).expect("derive");
         let mut one_shot = OneShotDataKey::new(&derived);
         let nonce = [2; NONCE_SIZE];
-        assert!(one_shot.encrypt(&nonce, b"aad", b"one").is_ok());
-        assert!(one_shot.encrypt(&nonce, b"aad", b"two").is_err());
+        let first = one_shot
+            .encrypt(&nonce, b"aad", b"one")
+            .expect("the one permitted encryption succeeds");
+        assert!(
+            !first.is_empty(),
+            "successful encryption returns ciphertext"
+        );
+
+        // A second call has no cipher to invoke: the budget check returns the
+        // typed encryption error before AES-GCM can produce any ciphertext.
+        let second = one_shot.encrypt(&nonce, b"aad", b"two");
+        assert!(
+            matches!(
+                second,
+                Err(WalError::EncryptionError { ref detail })
+                    if detail == "segment data-key encryption budget exhausted"
+            ),
+            "second encryption must return the typed budget-exhausted error"
+        );
+    }
+
+    #[test]
+    fn public_envelopes_use_fresh_random_salt_and_nonce_per_call() {
+        let key = key(0x42);
+        let first = encrypt_segment_envelope(&key, &MAGIC, b"same plaintext")
+            .expect("first public envelope encryption");
+        let second = encrypt_segment_envelope(&key, &MAGIC, b"same plaintext")
+            .expect("second public envelope encryption");
+
+        // The serialized salt and nonce are the public, authenticated inputs
+        // to HKDF; unequal seeds therefore mean different data-key derivation
+        // contexts. Roundtrip and tamper rejection remain covered above by the
+        // existing current-format and authenticated-region tests.
+        assert_ne!(
+            &first[SALT_START..SEGMENT_ENVELOPE_PREAMBLE_SIZE],
+            &second[SALT_START..SEGMENT_ENVELOPE_PREAMBLE_SIZE],
+            "each public envelope must receive a fresh random salt and nonce"
+        );
     }
 
     #[test]

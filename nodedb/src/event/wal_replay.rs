@@ -34,7 +34,7 @@ use crate::event::types::WriteEvent;
 use crate::event::wal_replay_parse::{
     parse_delete_record, parse_graph_node_label_record, parse_put_record,
 };
-use crate::types::{Lsn, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 use crate::wal::WalManager;
 
 /// Replay WAL records from `from_lsn` forward and convert to WriteEvents.
@@ -138,17 +138,21 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
     };
 
     let tenant_id = TenantId::new(record.header.tenant_id);
+    // `database_id` is part of the WAL envelope. A zero value is the named
+    // pre-database-header compatibility encoding and maps to the built-in
+    // default database; current WAL writers always stamp the request database.
+    let database_id = DatabaseId::new(record.header.database_id);
     let vshard_id = VShardId::new(record.header.vshard_id);
     let lsn = Lsn::new(record.header.lsn);
 
     match record_type {
         RecordType::Put => {
-            parse_put_record(&record.payload, tenant_id, vshard_id, lsn, sequence)
+            parse_put_record(&record.payload, database_id, tenant_id, vshard_id, lsn, sequence)
                 .into_iter()
                 .collect()
         }
         RecordType::Delete => {
-            parse_delete_record(&record.payload, tenant_id, vshard_id, lsn, sequence)
+            parse_delete_record(&record.payload, database_id, tenant_id, vshard_id, lsn, sequence)
                 .into_iter()
                 .collect()
         }
@@ -167,6 +171,7 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
         RecordType::GraphNodeLabelSet => parse_graph_node_label_record(
             &record.payload,
             true,
+            database_id,
             tenant_id,
             vshard_id,
             lsn,
@@ -177,6 +182,7 @@ fn record_to_events(record: &WalRecord, sequence: &mut u64) -> Vec<WriteEvent> {
         RecordType::GraphNodeLabelRemove => parse_graph_node_label_record(
             &record.payload,
             false,
+            database_id,
             tenant_id,
             vshard_id,
             lsn,

@@ -382,7 +382,9 @@ pub fn plan_requires_txn_buffering(plan: &PhysicalPlan) -> bool {
             | ArrayOp::Flush { .. }
             | ArrayOp::Compact { .. }
             | ArrayOp::SurrogateBitmapScan { .. }
-            | ArrayOp::DropArray { .. },
+            | ArrayOp::DropArray { .. }
+            | ArrayOp::RestoreArrayDrop { .. }
+            | ArrayOp::PurgeArrayDrop { .. },
         ) => false,
         // Buffered AND encoded — matches the oracle. `to_replicated_entry` now
         // emits the Raft-native `ArrayCellPut` / `ArrayCellDelete` for these
@@ -1806,6 +1808,8 @@ mod tests {
                 schema_msgpack: Vec::new(),
                 schema_hash: 0,
                 prefix_bits: 0,
+                audit_retain_ms: None,
+                minimum_audit_retain_ms: None,
             }),
             PhysicalPlan::Array(ArrayOp::Slice {
                 array_id: array_id.clone(),

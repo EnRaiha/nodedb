@@ -18,6 +18,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::notify_bus::normalize_channel;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::types::DatabaseId;
 
 use super::core::NodeDbPgHandler;
 use crate::control::server::shared::session::{SessionId, TransactionState};
@@ -43,8 +44,13 @@ impl NodeDbPgHandler {
         let channel = normalize_channel(&channel);
         validate_channel_name(&channel)?;
 
+        let database_id = self
+            .sessions
+            .get_current_database(session_id)
+            .unwrap_or(DatabaseId::DEFAULT);
         self.sessions.listen_channel(
             session_id,
+            database_id,
             identity.tenant_id,
             &channel,
             &self.state.notify_bus,
@@ -74,15 +80,20 @@ impl NodeDbPgHandler {
         let channel = normalize_channel(&channel);
         validate_channel_name(&channel)?;
 
+        let database_id = self
+            .sessions
+            .get_current_database(session_id)
+            .unwrap_or(DatabaseId::DEFAULT);
         let tx_state = self.sessions.transaction_state(session_id);
         if tx_state == TransactionState::InBlock {
-            // Buffer until COMMIT.
-            self.sessions.buffer_notify(session_id, channel, payload);
+            // Buffer the database binding with the notification until COMMIT.
+            self.sessions
+                .buffer_notify(session_id, database_id, channel, payload);
         } else {
-            // Fire immediately.
+            // Fire immediately in the currently selected database.
             self.state
                 .notify_bus
-                .notify(identity.tenant_id, &channel, &payload);
+                .notify(database_id, identity.tenant_id, &channel, &payload);
         }
         Ok(vec![Response::Execution(Tag::new("NOTIFY"))])
     }
@@ -90,7 +101,7 @@ impl NodeDbPgHandler {
     /// Handle `UNLISTEN <channel>` or `UNLISTEN *`.
     pub(super) fn handle_unlisten(
         &self,
-        identity: &AuthenticatedIdentity,
+        _identity: &AuthenticatedIdentity,
         session_id: SessionId,
         sql: &str,
     ) -> PgWireResult<Vec<Response>> {
@@ -108,12 +119,8 @@ impl NodeDbPgHandler {
             })?;
             let channel = normalize_channel(&channel);
             validate_channel_name(&channel)?;
-            self.sessions.unlisten_channel(
-                session_id,
-                identity.tenant_id,
-                &channel,
-                &self.state.notify_bus,
-            );
+            self.sessions
+                .unlisten_channel(session_id, &channel, &self.state.notify_bus);
         }
         Ok(vec![Response::Execution(Tag::new("UNLISTEN"))])
     }

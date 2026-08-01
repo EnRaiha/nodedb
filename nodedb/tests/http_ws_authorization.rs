@@ -10,12 +10,16 @@ use std::time::Duration;
 use common::pgwire_harness::TestServer;
 use futures::{SinkExt, StreamExt};
 use nodedb::config::auth::AuthMode;
+use nodedb::control::change_stream::{ChangeEvent, ChangeOperation};
 use nodedb::control::security::apikey::CreateKeyParams;
 use nodedb::control::security::identity::Role;
 use nodedb::control::state::SharedState;
-use nodedb::types::{DatabaseId, TenantId};
+use nodedb::types::{DatabaseId, Lsn, TenantId};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Message, http};
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct AuthenticatedWsEndpoint {
     local_addr: std::net::SocketAddr,
@@ -47,14 +51,31 @@ async fn start_authenticated_ws(shared: Arc<SharedState>) -> AuthenticatedWsEndp
 }
 
 fn create_ws_api_key(shared: &SharedState, username: &str) -> String {
+    create_ws_api_key_with_roles(
+        shared,
+        username,
+        TenantId::new(1),
+        vec![Role::Custom(format!("{username}_role"))],
+    )
+}
+
+fn create_ws_api_key_for_tenant(
+    shared: &SharedState,
+    username: &str,
+    tenant_id: TenantId,
+) -> String {
+    create_ws_api_key_with_roles(shared, username, tenant_id, vec![Role::ReadOnly])
+}
+
+fn create_ws_api_key_with_roles(
+    shared: &SharedState,
+    username: &str,
+    tenant_id: TenantId,
+    roles: Vec<Role>,
+) -> String {
     let user_id = shared
         .credentials
-        .create_service_account(
-            username,
-            TenantId::new(1),
-            vec![Role::Custom(format!("{username}_role"))],
-            vec![DatabaseId::DEFAULT],
-        )
+        .create_service_account(username, tenant_id, roles, vec![DatabaseId::DEFAULT])
         .expect("create WebSocket service account");
     shared
         .api_keys
@@ -62,7 +83,7 @@ fn create_ws_api_key(shared: &SharedState, username: &str) -> String {
             CreateKeyParams {
                 username,
                 user_id,
-                tenant_id: TenantId::new(1),
+                tenant_id,
                 expires_secs: 0,
                 scope: vec![],
                 accessible_databases: vec![DatabaseId::DEFAULT],
@@ -70,6 +91,61 @@ fn create_ws_api_key(shared: &SharedState, username: &str) -> String {
             Some(shared.credentials.catalog()),
         )
         .expect("create WebSocket API key")
+}
+
+async fn connect_authenticated_ws(endpoint: &AuthenticatedWsEndpoint, token: &str) -> WsStream {
+    let mut request = format!("ws://{}/v1/ws", endpoint.local_addr)
+        .into_client_request()
+        .expect("WebSocket request");
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(&format!("Bearer {token}")).expect("authorization header"),
+    );
+    tokio_tungstenite::connect_async(request)
+        .await
+        .expect("authenticated WebSocket connect")
+        .0
+}
+
+async fn read_auth_exchange(
+    ws: &mut WsStream,
+    auth_id: u64,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let mut notifications = Vec::new();
+    for _ in 0..3 {
+        let message = tokio::time::timeout(Duration::from_millis(500), ws.next())
+            .await
+            .expect("bounded wait for auth exchange")
+            .expect("WebSocket stream ended during auth exchange")
+            .expect("WebSocket error during auth exchange");
+        let Message::Text(text) = message else {
+            panic!("expected WebSocket text frame during auth exchange, got {message:?}");
+        };
+        let value: serde_json::Value = sonic_rs::from_str(&text).expect("valid auth exchange JSON");
+        if value["id"] == auth_id {
+            return (value, notifications);
+        }
+        assert_eq!(
+            value["method"], "change",
+            "only change notifications may precede an auth response: {value}"
+        );
+        notifications.push(value);
+    }
+    panic!("auth response was not received within the bounded exchange");
+}
+
+async fn send_auth(ws: &mut WsStream, id: u64, session_id: &str, cursor: Option<&str>) {
+    let mut params = serde_json::json!({"session_id": session_id});
+    if let Some(cursor) = cursor {
+        params["cursor"] = serde_json::Value::String(cursor.to_owned());
+    }
+    ws.send(Message::Text(
+        serde_json::json!({"id": id, "method": "auth", "params": params})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .expect("send auth");
 }
 
 async fn ws_request(
@@ -122,6 +198,68 @@ fn assert_permission_denied(response: &serde_json::Value, context: &str) {
     assert!(
         error.to_ascii_lowercase().contains("permission denied"),
         "{context} must return an authorization denial: {response}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_resume_session_id_is_not_shared_across_authenticated_identities() {
+    let srv = TestServer::start().await;
+    let tenant_a = TenantId::new(101);
+    let tenant_b = TenantId::new(202);
+    let token_a = create_ws_api_key_for_tenant(&srv.shared, "ws_resume_tenant_a", tenant_a);
+    let token_b = create_ws_api_key_for_tenant(&srv.shared, "ws_resume_tenant_b", tenant_b);
+    let endpoint = start_authenticated_ws(Arc::clone(&srv.shared)).await;
+    let session_id = "arbitrary-client-session-id";
+
+    for (lsn, tenant_id, document_id) in [
+        (Lsn::new(901), tenant_a, "tenant-a-order"),
+        (Lsn::new(902), tenant_b, "tenant-b-order"),
+    ] {
+        srv.shared.change_stream.publish(ChangeEvent {
+            lsn,
+            tenant_id,
+            collection: "orders".into(),
+            document_id: document_id.into(),
+            operation: ChangeOperation::Insert,
+            timestamp_ms: 1_000,
+            after: None,
+        });
+    }
+
+    let mut first_a = connect_authenticated_ws(&endpoint, &token_a).await;
+    send_auth(&mut first_a, 1, session_id, None).await;
+    let (_first_a_response, first_a_notifications) = read_auth_exchange(&mut first_a, 1).await;
+    assert_eq!(first_a_notifications.len(), 1);
+    assert_eq!(
+        first_a_notifications[0]["params"]["document_id"],
+        "tenant-a-order"
+    );
+    let a_cursor = first_a_notifications[0]["params"]["cursor"]
+        .as_str()
+        .expect("tenant A replay cursor")
+        .to_owned();
+    drop(first_a);
+
+    let mut resumed_a = connect_authenticated_ws(&endpoint, &token_a).await;
+    send_auth(&mut resumed_a, 2, session_id, Some(&a_cursor)).await;
+    let (resumed_a_response, resumed_a_notifications) = read_auth_exchange(&mut resumed_a, 2).await;
+    assert_eq!(resumed_a_response["result"]["replayed"], 0);
+    assert!(resumed_a_notifications.is_empty());
+    drop(resumed_a);
+
+    let mut first_b = connect_authenticated_ws(&endpoint, &token_b).await;
+    send_auth(&mut first_b, 3, session_id, None).await;
+    let (first_b_response, first_b_notifications) = read_auth_exchange(&mut first_b, 3).await;
+    assert_eq!(first_b_response["result"]["replayed"], 1);
+    assert_eq!(
+        first_b_notifications
+            .iter()
+            .map(|notification| notification["params"]["document_id"]
+                .as_str()
+                .expect("document id"))
+            .collect::<Vec<_>>(),
+        vec!["tenant-b-order"],
+        "a shared arbitrary session_id must neither reveal tenant A data nor fast-forward tenant B"
     );
 }
 

@@ -216,17 +216,17 @@ fn primary_row_owner(
             .flatten()
             .map(|stored| stored.owner),
         object_type::FUNCTION => catalog
-            .get_function(tenant_id, name)
+            .get_function_in_database(nodedb_types::DatabaseId::new(database_id), tenant_id, name)
             .ok()
             .flatten()
             .map(|stored| stored.owner),
         object_type::PROCEDURE => catalog
-            .get_procedure(tenant_id, name)
+            .get_procedure_in_database(nodedb_types::DatabaseId::new(database_id), tenant_id, name)
             .ok()
             .flatten()
             .map(|stored| stored.owner),
         object_type::TRIGGER => catalog
-            .get_trigger(tenant_id, name)
+            .get_trigger_in_database(nodedb_types::DatabaseId::new(database_id), tenant_id, name)
             .ok()
             .flatten()
             .map(|stored| stored.owner),
@@ -234,6 +234,16 @@ fn primary_row_owner(
             .get_materialized_view(tenant_id, name)
             .ok()
             .flatten()
+            .map(|stored| stored.owner),
+        object_type::STREAMING_MATERIALIZED_VIEW => catalog
+            .load_all_streaming_mvs()
+            .ok()?
+            .into_iter()
+            .find(|stored| {
+                stored.database_id.as_u64() == database_id
+                    && stored.tenant_id == tenant_id
+                    && stored.name == name
+            })
             .map(|stored| stored.owner),
         object_type::SEQUENCE => catalog
             .get_sequence(tenant_id, name)
@@ -244,10 +254,14 @@ fn primary_row_owner(
             .load_all_schedules()
             .ok()?
             .into_iter()
-            .find(|stored| stored.tenant_id == tenant_id && stored.name == name)
+            .find(|stored| {
+                stored.database_id == database_id
+                    && stored.tenant_id == tenant_id
+                    && stored.name == name
+            })
             .map(|stored| stored.owner),
         object_type::CHANGE_STREAM => catalog
-            .get_change_stream(tenant_id, name)
+            .get_change_stream(crate::types::DatabaseId::new(database_id), tenant_id, name)
             .ok()
             .flatten()
             .map(|stored| stored.owner),

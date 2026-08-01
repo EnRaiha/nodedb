@@ -21,6 +21,7 @@ use super::super::super::result::{DdlError, DdlResult};
 pub fn show_schedules(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
@@ -37,7 +38,9 @@ pub fn show_schedules(
         "owner".to_string(),
     ];
 
-    let schedules = state.schedule_registry.list_for_tenant(tenant_id);
+    let schedules = state
+        .schedule_registry
+        .list_for_tenant(database_id, tenant_id);
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -45,7 +48,9 @@ pub fn show_schedules(
 
     let mut rows = Vec::new();
     for s in &schedules {
-        let last_run = state.job_history.last_run(tenant_id, &s.name);
+        let last_run = state
+            .job_history
+            .last_run(database_id.as_u64(), tenant_id, &s.name);
         let last_status = match last_run {
             Some(ref r) if r.success => "ok".to_string(),
             Some(ref r) => format!("error: {}", r.error.as_deref().unwrap_or("unknown")),
@@ -103,13 +108,18 @@ pub fn show_schedules(
 pub fn show_schedule_history(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     name: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
     let name = name.to_lowercase();
 
     // Verify the schedule exists.
-    if state.schedule_registry.get(tenant_id, &name).is_none() {
+    if state
+        .schedule_registry
+        .get(database_id, tenant_id, &name)
+        .is_none()
+    {
         return Err(DdlError {
             sqlstate: "42704".to_string(),
             message: format!("schedule \"{name}\" does not exist"),
@@ -124,7 +134,9 @@ pub fn show_schedule_history(
         "error".to_string(),
     ];
 
-    let runs = state.job_history.last_runs(tenant_id, &name, 50);
+    let runs = state
+        .job_history
+        .last_runs(database_id.as_u64(), tenant_id, &name, 50);
 
     let mut rows = Vec::with_capacity(runs.len());
     for r in &runs {

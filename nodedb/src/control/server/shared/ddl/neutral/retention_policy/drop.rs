@@ -58,6 +58,7 @@ pub async fn drop_retention_policy(
     // Emit CRDT tombstone delta.
     {
         let delta = crate::event::crdt_sync::types::OutboundDelta {
+            database_id,
             collection: super::RETENTION_POLICIES_CRDT_COLLECTION.into(),
             document_id: name.clone(),
             payload: Vec::new(),
@@ -67,7 +68,7 @@ pub async fn drop_retention_policy(
             peer_id: state.node_id,
             sequence: 0,
         };
-        state.crdt_sync_delivery.enqueue(tenant_id, delta);
+        state.crdt_sync_delivery.enqueue(delta);
     }
 
     // Unregister auto-created continuous aggregates.

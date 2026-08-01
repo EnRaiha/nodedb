@@ -74,11 +74,11 @@ async fn streaming_mv_incrementally_aggregates_source_writes() {
     // deterministic convergence poll, not a blind fixed sleep.
     let mut results: Vec<(String, Vec<(String, f64)>)> = Vec::new();
     for _ in 0..80 {
-        if let Some(state) = server
-            .shared
-            .mv_registry
-            .get_state(TENANT_ID, "smv_order_stats")
-        {
+        if let Some(state) = server.shared.mv_registry.get_state(
+            nodedb::types::DatabaseId::DEFAULT,
+            TENANT_ID,
+            "smv_order_stats",
+        ) {
             results = state.read_results();
             if results.len() >= 2 {
                 break;

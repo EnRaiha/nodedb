@@ -8,6 +8,7 @@ use nodedb::control::trigger::batch::BatchConfig;
 use nodedb::control::trigger::batch::classify::classify_trigger_body;
 use nodedb::control::trigger::batch::collector::{TriggerBatchCollector, TriggerBatchRow};
 use nodedb::control::trigger::batch::when_filter::{count_passing, filter_batch_by_when};
+use nodedb::types::DatabaseId;
 
 // ---------------------------------------------------------------------------
 // BatchConfig
@@ -29,9 +30,17 @@ fn row(id: &str) -> TriggerBatchRow {
 #[test]
 fn collector_batches_at_threshold() {
     let mut c = TriggerBatchCollector::new(3);
-    assert!(c.push("orders", "INSERT", 1, row("a")).is_none());
-    assert!(c.push("orders", "INSERT", 1, row("b")).is_none());
-    let batch = c.push("orders", "INSERT", 1, row("c")).unwrap();
+    assert!(
+        c.push("orders", "INSERT", DatabaseId::DEFAULT, 1, row("a"))
+            .is_none()
+    );
+    assert!(
+        c.push("orders", "INSERT", DatabaseId::DEFAULT, 1, row("b"))
+            .is_none()
+    );
+    let batch = c
+        .push("orders", "INSERT", DatabaseId::DEFAULT, 1, row("c"))
+        .unwrap();
     assert_eq!(batch.rows.len(), 3);
     assert_eq!(batch.collection, "orders");
     assert_eq!(batch.operation, "INSERT");
@@ -40,8 +49,8 @@ fn collector_batches_at_threshold() {
 #[test]
 fn collector_flush_partial() {
     let mut c = TriggerBatchCollector::new(100);
-    c.push("t", "INSERT", 1, row("a"));
-    c.push("t", "INSERT", 1, row("b"));
+    c.push("t", "INSERT", DatabaseId::DEFAULT, 1, row("a"));
+    c.push("t", "INSERT", DatabaseId::DEFAULT, 1, row("b"));
     let batch = c.flush().unwrap();
     assert_eq!(batch.rows.len(), 2);
     assert!(!c.has_pending());
@@ -50,9 +59,11 @@ fn collector_flush_partial() {
 #[test]
 fn collector_flushes_on_collection_change() {
     let mut c = TriggerBatchCollector::new(100);
-    c.push("orders", "INSERT", 1, row("1"));
-    c.push("orders", "INSERT", 1, row("2"));
-    let flushed = c.push("users", "INSERT", 1, row("3")).unwrap();
+    c.push("orders", "INSERT", DatabaseId::DEFAULT, 1, row("1"));
+    c.push("orders", "INSERT", DatabaseId::DEFAULT, 1, row("2"));
+    let flushed = c
+        .push("users", "INSERT", DatabaseId::DEFAULT, 1, row("3"))
+        .unwrap();
     assert_eq!(flushed.collection, "orders");
     assert_eq!(flushed.rows.len(), 2);
     let remaining = c.flush().unwrap();
@@ -62,8 +73,10 @@ fn collector_flushes_on_collection_change() {
 #[test]
 fn collector_flushes_on_operation_change() {
     let mut c = TriggerBatchCollector::new(100);
-    c.push("t", "INSERT", 1, row("1"));
-    let flushed = c.push("t", "DELETE", 1, row("2")).unwrap();
+    c.push("t", "INSERT", DatabaseId::DEFAULT, 1, row("1"));
+    let flushed = c
+        .push("t", "DELETE", DatabaseId::DEFAULT, 1, row("2"))
+        .unwrap();
     assert_eq!(flushed.operation, "INSERT");
 }
 

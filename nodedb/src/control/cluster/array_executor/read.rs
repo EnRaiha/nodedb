@@ -10,6 +10,8 @@ use nodedb_cluster::distributed_array::{ArrayAggExec, ArraySliceExec};
 use nodedb_cluster::error::{ClusterError, Result};
 use nodedb_query::msgpack_scan;
 use nodedb_types::Surrogate;
+
+use crate::types::VShardId;
 use nodedb_types::SurrogateBitmap;
 
 use super::executor::DataPlaneArrayExecutor;
@@ -19,6 +21,7 @@ use nodedb_physical::physical_plan::{ArrayOp, ArrayReducer, PhysicalPlan};
 impl DataPlaneArrayExecutor {
     pub(super) async fn slice(
         &self,
+        local_vshard_id: u32,
         req: &nodedb_cluster::distributed_array::wire::ArrayShardSliceReq,
     ) -> Result<ArraySliceExec> {
         let array_id: ArrayId =
@@ -39,7 +42,7 @@ impl DataPlaneArrayExecutor {
         };
 
         let plan = PhysicalPlan::Array(ArrayOp::Slice {
-            array_id,
+            array_id: array_id.clone(),
             slice_msgpack: req.slice_msgpack.clone(),
             attr_projection: req.attr_projection.clone(),
             limit: req.limit,
@@ -49,7 +52,9 @@ impl DataPlaneArrayExecutor {
             valid_at_ms: req.valid_at_ms,
         });
 
-        let resp = self.dispatch_and_await(plan).await?;
+        let resp = self
+            .dispatch_and_await(&array_id, VShardId::new(local_vshard_id), plan)
+            .await?;
 
         if resp.status == crate::bridge::envelope::Status::Error {
             let detail = resp
@@ -78,7 +83,11 @@ impl DataPlaneArrayExecutor {
         })
     }
 
-    pub(super) async fn agg(&self, req: &ArrayShardAggReq) -> Result<ArrayAggExec> {
+    pub(super) async fn agg(
+        &self,
+        local_vshard_id: u32,
+        req: &ArrayShardAggReq,
+    ) -> Result<ArrayAggExec> {
         let array_id: ArrayId =
             zerompk::from_msgpack(&req.array_id_msgpack).map_err(|e| ClusterError::Codec {
                 detail: format!("array_id decode in exec_agg: {e}"),
@@ -102,7 +111,7 @@ impl DataPlaneArrayExecutor {
         };
 
         let plan = PhysicalPlan::Array(ArrayOp::Aggregate {
-            array_id,
+            array_id: array_id.clone(),
             attr_idx: req.attr_idx,
             reducer,
             group_by_dim: req.group_by_dim,
@@ -113,7 +122,9 @@ impl DataPlaneArrayExecutor {
             valid_at_ms: req.valid_at_ms,
         });
 
-        let resp = self.dispatch_and_await(plan).await?;
+        let resp = self
+            .dispatch_and_await(&array_id, VShardId::new(local_vshard_id), plan)
+            .await?;
 
         if resp.status == crate::bridge::envelope::Status::Error {
             let detail = resp
@@ -149,6 +160,7 @@ impl DataPlaneArrayExecutor {
 
     pub(super) async fn surrogate_bitmap_scan(
         &self,
+        local_vshard_id: u32,
         array_id_msgpack: &[u8],
         slice_msgpack: &[u8],
     ) -> Result<Vec<u8>> {
@@ -158,11 +170,13 @@ impl DataPlaneArrayExecutor {
             })?;
 
         let plan = PhysicalPlan::Array(ArrayOp::SurrogateBitmapScan {
-            array_id,
+            array_id: array_id.clone(),
             slice_msgpack: slice_msgpack.to_vec(),
         });
 
-        let resp = self.dispatch_and_await(plan).await?;
+        let resp = self
+            .dispatch_and_await(&array_id, VShardId::new(local_vshard_id), plan)
+            .await?;
 
         if resp.status == crate::bridge::envelope::Status::Error {
             let detail = resp

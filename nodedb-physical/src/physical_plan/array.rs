@@ -83,6 +83,11 @@ pub enum ArrayOp {
         schema_hash: u64,
         /// Hilbert-prefix bits for vShard routing. Immutable post-create.
         prefix_bits: u8,
+        /// Array audit retention selected by CREATE ARRAY. This stays on the
+        /// authorized task so planning remains read-only.
+        audit_retain_ms: Option<i64>,
+        /// Immutable lower bound for `audit_retain_ms`.
+        minimum_audit_retain_ms: Option<u64>,
     },
 
     /// Insert one or more cells. `cells_msgpack` is an zerompk
@@ -241,13 +246,18 @@ pub enum ArrayOp {
         slice_msgpack: Vec<u8>,
     },
 
-    /// Drop the per-core array store. Broadcast on `DROP ARRAY` after
-    /// the Control-Plane catalog has been mutated so each Data-Plane
-    /// core releases its local store; otherwise a follow-up
-    /// `CREATE ARRAY` of the same name could carry stale memtable /
-    /// segment state. Idempotent: silently succeeds when no store is
-    /// open on the receiving core.
+    /// Reversibly stage a per-core array drop. The store is closed and its
+    /// directory atomically renamed to a deterministic tombstone. This is the
+    /// externally planned `DROP ARRAY` operation and is idempotent.
     DropArray { array_id: ArrayId },
+
+    /// Undo a staged array drop by restoring its deterministic tombstone.
+    /// This is an internal all-core compensation operation.
+    RestoreArrayDrop { array_id: ArrayId },
+
+    /// Permanently purge a successfully dropped array's tombstone. This is an
+    /// internal all-core operation; failures must be retried before recreation.
+    PurgeArrayDrop { array_id: ArrayId },
 }
 
 impl ArrayOp {
@@ -265,7 +275,9 @@ impl ArrayOp {
             | ArrayOp::Aggregate { array_id, .. }
             | ArrayOp::Flush { array_id, .. }
             | ArrayOp::Compact { array_id, .. }
-            | ArrayOp::DropArray { array_id } => array_id,
+            | ArrayOp::DropArray { array_id }
+            | ArrayOp::RestoreArrayDrop { array_id }
+            | ArrayOp::PurgeArrayDrop { array_id } => array_id,
             ArrayOp::Elementwise { left, .. } => left,
         }
     }

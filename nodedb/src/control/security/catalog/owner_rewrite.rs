@@ -28,21 +28,33 @@ impl SystemCatalog {
             }
             object_type::FUNCTION => {
                 let mut stored = self
-                    .get_function(tenant_id, name)?
+                    .get_function_in_database(
+                        nodedb_types::DatabaseId::new(database_id),
+                        tenant_id,
+                        name,
+                    )?
                     .ok_or_else(|| missing(kind, tenant_id, name))?;
                 stored.owner = new_owner.to_string();
                 self.put_function(&stored)?;
             }
             object_type::PROCEDURE => {
                 let mut stored = self
-                    .get_procedure(tenant_id, name)?
+                    .get_procedure_in_database(
+                        nodedb_types::DatabaseId::new(database_id),
+                        tenant_id,
+                        name,
+                    )?
                     .ok_or_else(|| missing(kind, tenant_id, name))?;
                 stored.owner = new_owner.to_string();
                 self.put_procedure(&stored)?;
             }
             object_type::TRIGGER => {
                 let mut stored = self
-                    .get_trigger(tenant_id, name)?
+                    .get_trigger_in_database(
+                        nodedb_types::DatabaseId::new(database_id),
+                        tenant_id,
+                        name,
+                    )?
                     .ok_or_else(|| missing(kind, tenant_id, name))?;
                 stored.owner = new_owner.to_string();
                 self.put_trigger(&stored)?;
@@ -65,14 +77,18 @@ impl SystemCatalog {
                 let mut stored = self
                     .load_all_schedules()?
                     .into_iter()
-                    .find(|stored| stored.tenant_id == tenant_id && stored.name == name)
+                    .find(|stored| {
+                        stored.database_id == database_id
+                            && stored.tenant_id == tenant_id
+                            && stored.name == name
+                    })
                     .ok_or_else(|| missing(kind, tenant_id, name))?;
                 stored.owner = new_owner.to_string();
                 self.put_schedule(&stored)?;
             }
             object_type::CHANGE_STREAM => {
                 let mut stored = self
-                    .get_change_stream(tenant_id, name)?
+                    .get_change_stream(crate::types::DatabaseId::new(database_id), tenant_id, name)?
                     .ok_or_else(|| missing(kind, tenant_id, name))?;
                 stored.owner = new_owner.to_string();
                 self.put_change_stream(&stored)?;

@@ -20,7 +20,7 @@ pub(super) async fn try_string(
     identity: &AuthenticatedIdentity,
     sql: &str,
     upper: &str,
-    _database_id: DatabaseId,
+    database_id: DatabaseId,
 ) -> Option<Result<Vec<DdlResult>, DdlError>> {
     // Stored procedures. None of `CREATE [OR REPLACE] PROCEDURE`, `DROP
     // PROCEDURE`, `SHOW PROCEDURES`, or `CALL <procedure>(...)` parse into any
@@ -36,10 +36,10 @@ pub(super) async fn try_string(
         return Some(procedure::drop_procedure(state, identity, &parts));
     }
     if upper == "SHOW PROCEDURES" || upper.starts_with("SHOW PROCEDURES") {
-        return Some(procedure::show_procedures(state, identity));
+        return Some(procedure::show_procedures(state, identity, database_id));
     }
     if upper.starts_with("CALL ") {
-        return Some(procedure::call_procedure(state, identity, sql).await);
+        return Some(procedure::call_procedure(state, identity, database_id, sql).await);
     }
 
     // User-defined functions. None of `CREATE [OR REPLACE] [AGGREGATE] FUNCTION`,
@@ -68,7 +68,7 @@ pub(super) async fn try_string(
         return Some(function::alter_function(state, identity, &parts));
     }
     if upper == "SHOW FUNCTIONS" || upper.starts_with("SHOW FUNCTIONS") {
-        return Some(function::show_functions(state, identity));
+        return Some(function::show_functions(state, identity, database_id));
     }
 
     // Constraint DDL. `ALTER COLLECTION ... ADD CONSTRAINT` / `ADD TRANSITION

@@ -40,6 +40,10 @@ pub struct ArrayAggExec {
 
 /// Execute array operations against the local Data Plane.
 ///
+/// `local_vshard_id` is the destination vShard from the validated RPC envelope.
+/// Implementations must preserve it when selecting a Data Plane core and when
+/// constructing write/WAL requests.
+///
 /// The implementor (in `nodedb`) routes the call through the SPSC bridge
 /// to the appropriate TPC core and returns the serialised zerompk result
 /// rows or bitmap bytes.
@@ -61,7 +65,11 @@ pub trait ArrayLocalExecutor: Send + Sync + 'static {
     /// Returns the per-row bytes (one element per matching row, each the
     /// native-msgpack encoding of that row) plus the `truncated_before_horizon`
     /// signal from the Data Plane.
-    async fn exec_slice(&self, req: &ArrayShardSliceReq) -> Result<ArraySliceExec>;
+    async fn exec_slice(
+        &self,
+        local_vshard_id: u32,
+        req: &ArrayShardSliceReq,
+    ) -> Result<ArraySliceExec>;
 
     /// Execute a surrogate-bitmap scan and return the zerompk-encoded
     /// `SurrogateBitmap` bytes for matching cells.
@@ -70,6 +78,7 @@ pub trait ArrayLocalExecutor: Send + Sync + 'static {
     /// `slice_msgpack` — zerompk encoding of `nodedb_array::query::Slice`.
     async fn exec_surrogate_bitmap_scan(
         &self,
+        local_vshard_id: u32,
         array_id_msgpack: &[u8],
         slice_msgpack: &[u8],
     ) -> Result<Vec<u8>>;
@@ -80,7 +89,7 @@ pub trait ArrayLocalExecutor: Send + Sync + 'static {
     /// returns partial states (plus the `truncated_before_horizon` signal)
     /// rather than finalized scalars. The coordinator merges partials from all
     /// shards before finalizing.
-    async fn exec_agg(&self, req: &ArrayShardAggReq) -> Result<ArrayAggExec>;
+    async fn exec_agg(&self, local_vshard_id: u32, req: &ArrayShardAggReq) -> Result<ArrayAggExec>;
 
     /// Apply a cell-batch write to the local array engine.
     ///
@@ -89,16 +98,14 @@ pub trait ArrayLocalExecutor: Send + Sync + 'static {
     /// the same Hilbert-prefix tile. The shard handler has already validated
     /// that this shard owns the tile; the executor dispatches directly to the
     /// Data Plane without further routing checks.
-    async fn exec_put(&self, req: &ArrayShardPutReq) -> Result<u64>;
+    async fn exec_put(&self, local_vshard_id: u32, req: &ArrayShardPutReq) -> Result<u64>;
 
     /// Delete cells by exact coordinates from the local array engine.
     ///
-    /// Takes the full `ArrayShardDeleteReq` (not just the coord bytes) because
-    /// the implementor needs the request's Hilbert routing metadata
-    /// (`representative_hilbert_prefix` / `prefix_bits`) to derive the owning
-    /// vShard when it replicates the delete to that shard's data Raft group,
-    /// mirroring [`Self::exec_put`].
+    /// Takes the full `ArrayShardDeleteReq` (not just the coord bytes) so the
+    /// local executor can apply the original delete payload on the validated
+    /// `local_vshard_id`, mirroring [`Self::exec_put`].
     ///
     /// Returns the `applied_lsn` (equal to `req.wal_lsn` on success).
-    async fn exec_delete(&self, req: &ArrayShardDeleteReq) -> Result<u64>;
+    async fn exec_delete(&self, local_vshard_id: u32, req: &ArrayShardDeleteReq) -> Result<u64>;
 }

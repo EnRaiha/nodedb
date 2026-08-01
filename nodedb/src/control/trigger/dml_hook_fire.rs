@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::control::security::catalog::trigger_types::TriggerExecutionMode;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 use super::dml_hook::DmlWriteInfo;
 use super::fire_after;
@@ -33,6 +33,8 @@ pub struct DispatchTriggerParams<'a> {
     pub state: &'a SharedState,
     /// Caller identity (used unless a trigger is SECURITY DEFINER).
     pub identity: &'a AuthenticatedIdentity,
+    /// Database scope for trigger lookup and execution.
+    pub database_id: DatabaseId,
     /// Tenant scope for trigger lookup and execution.
     pub tenant_id: TenantId,
     /// The DML write being dispatched.
@@ -59,6 +61,7 @@ pub async fn fire_pre_dispatch_triggers(
     let DispatchTriggerParams {
         state,
         identity,
+        database_id,
         tenant_id,
         info,
         old_row,
@@ -72,6 +75,7 @@ pub async fn fire_pre_dispatch_triggers(
                 match super::fire_instead::fire_instead_of_insert(
                     state,
                     identity,
+                    database_id,
                     tenant_id,
                     &info.collection,
                     new_fields,
@@ -92,6 +96,7 @@ pub async fn fire_pre_dispatch_triggers(
                 super::fire_instead::InsteadOfUpdateParams {
                     state,
                     identity,
+                    database_id,
                     tenant_id,
                     collection: &info.collection,
                     old_fields,
@@ -111,6 +116,7 @@ pub async fn fire_pre_dispatch_triggers(
             match super::fire_instead::fire_instead_of_delete(
                 state,
                 identity,
+                database_id,
                 tenant_id,
                 &info.collection,
                 old_fields,
@@ -131,6 +137,7 @@ pub async fn fire_pre_dispatch_triggers(
                 let mutated = fire_before::fire_before_insert(
                     state,
                     identity,
+                    database_id,
                     tenant_id,
                     &info.collection,
                     new_fields,
@@ -153,7 +160,10 @@ pub async fn fire_pre_dispatch_triggers(
             let mutated = fire_before::fire_before_update(
                 state,
                 identity,
-                tenant_id,
+                super::TriggerScope {
+                    database_id,
+                    tenant_id,
+                },
                 &info.collection,
                 old_fields,
                 new_fields,
@@ -172,6 +182,7 @@ pub async fn fire_pre_dispatch_triggers(
             fire_before::fire_before_delete(
                 state,
                 identity,
+                database_id,
                 tenant_id,
                 &info.collection,
                 old_fields,
@@ -193,6 +204,7 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
     let DispatchTriggerParams {
         state,
         identity,
+        database_id,
         tenant_id,
         info,
         old_row,
@@ -208,6 +220,7 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
                 fire_after::fire_after_insert(fire_after::FireAfterInsertParams {
                     state,
                     identity,
+                    database_id,
                     tenant_id,
                     collection: &info.collection,
                     new_fields,
@@ -227,6 +240,7 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
             fire_after::fire_after_update(fire_after::FireAfterUpdateParams {
                 state,
                 identity,
+                database_id,
                 tenant_id,
                 collection: &info.collection,
                 old_fields,
@@ -242,6 +256,7 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
             fire_after::fire_after_delete(fire_after::FireAfterDeleteParams {
                 state,
                 identity,
+                database_id,
                 tenant_id,
                 collection: &info.collection,
                 old_fields,
@@ -257,7 +272,10 @@ pub async fn fire_post_dispatch_triggers(params: DispatchTriggerParams<'_>) -> c
     fire_statement::fire_after_statement(
         state,
         identity,
-        tenant_id,
+        super::TriggerScope {
+            database_id,
+            tenant_id,
+        },
         &info.collection,
         info.event,
         cascade_depth,

@@ -27,7 +27,7 @@ pub(crate) fn convert_slice(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    let entry = load_entry(name, ctx)?;
+    let entry = load_entry(name, tenant_id, ctx)?;
     let schema: ArraySchema =
         zerompk::from_msgpack(&entry.schema_msgpack).map_err(|e| crate::Error::Serialization {
             format: "msgpack".into(),
@@ -58,7 +58,7 @@ pub(crate) fn convert_slice(
     let (system_time, valid_at_ms) =
         super::helpers::resolve_array_temporal_scope(temporal, "ARRAY_SLICE")?;
     let attr_indices = resolve_attr_indices(name, attr_projection, &schema)?;
-    let aid = ArrayId::new(tenant_id, name);
+    let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
 
     let plan = if ctx.cluster_enabled {
@@ -240,6 +240,7 @@ mod tests {
             cat.register(entry).expect("register");
         }
         let ctx = ConvertContext {
+            purpose: super::super::super::convert::PlanningPurpose::Execute,
             retention_registry: None,
             array_catalog: Some(handle.clone()),
             credentials: None,

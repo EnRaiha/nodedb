@@ -112,10 +112,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_timeseries_ingest(
         // occupies its own transaction-overlay slot for statement-time
         // read-your-own-writes staging. Content-addressing an empty PK would
         // collapse every row onto `Surrogate::ZERO` and merge distinct rows.
-        let s = match ctx.surrogate_assigner.as_ref() {
-            Some(a) => a.assign_fresh(ctx.database_id, ctx.tenant_id, collection)?,
-            None => nodedb_types::Surrogate::ZERO,
-        };
+        let s = ctx.fresh_surrogate(collection)?;
         surrogates.push(s);
     }
     Ok(vec![PhysicalTask {

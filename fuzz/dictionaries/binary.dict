@@ -1,0 +1,13 @@
+# Common NodeDB binary-format magic and MessagePack markers
+"NDBS"
+"NDST"
+"SYNW"
+"WALP"
+"NDBBQ"
+"NDRBQ"
+"\x80"
+"\x90"
+"\xdc"
+"\xdd"
+"\xde"
+"\xdf"

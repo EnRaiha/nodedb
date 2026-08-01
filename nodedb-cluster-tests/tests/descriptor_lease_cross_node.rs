@@ -21,7 +21,7 @@ const WAIT_BUDGET: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
 
 fn coll_id(name: &str) -> DescriptorId {
-    DescriptorId::new(TENANT, DescriptorKind::Collection, name.to_string())
+    DescriptorId::new(0, TENANT, DescriptorKind::Collection, name.to_string())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]

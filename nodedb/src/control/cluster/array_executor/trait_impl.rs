@@ -20,29 +20,31 @@ use super::executor::DataPlaneArrayExecutor;
 impl ArrayLocalExecutor for DataPlaneArrayExecutor {
     async fn exec_slice(
         &self,
+        local_vshard_id: u32,
         req: &nodedb_cluster::distributed_array::wire::ArrayShardSliceReq,
     ) -> Result<ArraySliceExec> {
-        self.slice(req).await
+        self.slice(local_vshard_id, req).await
     }
 
-    async fn exec_agg(&self, req: &ArrayShardAggReq) -> Result<ArrayAggExec> {
-        self.agg(req).await
+    async fn exec_agg(&self, local_vshard_id: u32, req: &ArrayShardAggReq) -> Result<ArrayAggExec> {
+        self.agg(local_vshard_id, req).await
     }
 
-    async fn exec_put(&self, req: &ArrayShardPutReq) -> Result<u64> {
-        self.put(req).await
+    async fn exec_put(&self, local_vshard_id: u32, req: &ArrayShardPutReq) -> Result<u64> {
+        self.put(local_vshard_id, req).await
     }
 
-    async fn exec_delete(&self, req: &ArrayShardDeleteReq) -> Result<u64> {
-        self.delete(req).await
+    async fn exec_delete(&self, local_vshard_id: u32, req: &ArrayShardDeleteReq) -> Result<u64> {
+        self.delete(local_vshard_id, req).await
     }
 
     async fn exec_surrogate_bitmap_scan(
         &self,
+        local_vshard_id: u32,
         array_id_msgpack: &[u8],
         slice_msgpack: &[u8],
     ) -> Result<Vec<u8>> {
-        self.surrogate_bitmap_scan(array_id_msgpack, slice_msgpack)
+        self.surrogate_bitmap_scan(local_vshard_id, array_id_msgpack, slice_msgpack)
             .await
     }
 }

@@ -5,6 +5,8 @@
 //! that file under the file-size limit; behavior is unchanged — this is
 //! the same code that used to run inline in `execute_planned`.
 
+use std::sync::Arc;
+
 use nodedb_types::TraceId;
 use nodedb_types::protocol::NativeResponse;
 use nodedb_types::value::Value;
@@ -26,7 +28,6 @@ use nodedb_physical::physical_task::PhysicalTask;
 use super::sql_gateway::dispatch_task_via_gateway;
 use super::streaming::SqlOutcome;
 use super::{DispatchCtx, error_to_native, shape_error_to_native, to_native_columns_rows};
-use crate::control::server::broadcast::broadcast_count_to_all_cores;
 use crate::control::server::exchange::DistributedReadCapture;
 use crate::control::server::exchange::resolve::{Resolved, resolve_and_materialize};
 
@@ -49,6 +50,7 @@ pub(super) async fn run_dispatch_loop(
     tasks: Vec<PhysicalTask>,
     output_schema: Option<&OutputSchema>,
     database_id: DatabaseId,
+    plan_lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
 ) -> SqlOutcome {
     let mut all_columns: Option<Vec<String>> = None;
     let mut all_rows: Vec<Vec<Value>> = Vec::new();
@@ -84,6 +86,7 @@ pub(super) async fn run_dispatch_loop(
         // STATEMENT time by the expander (read-your-own-writes for later
         // statements in the same txn); every other task falls through to the
         // neutral staging gate.
+        let buffer_start = ctx.sessions.buffered_task_count(ctx.peer_addr);
         let routed = match route_in_tx_expander(
             ctx.state,
             ctx.sessions,
@@ -114,6 +117,19 @@ pub(super) async fn run_dispatch_loop(
             }
             Err(e) => Err(e),
         };
+        if ctx.sessions.buffered_task_count(ctx.peer_addr) > buffer_start
+            && !ctx.sessions.attach_tx_lease_scope_since(
+                ctx.peer_addr,
+                buffer_start,
+                Arc::clone(&plan_lease_scope),
+            )
+        {
+            return resp(NativeResponse::error(
+                seq,
+                "XX000",
+                "internal error: failed to retain descriptor leases for buffered transaction tasks",
+            ));
+        }
         let task = match routed {
             Ok(InTxnRoute::Read(routed_task)) => *routed_task,
             Ok(InTxnRoute::Buffered) => {
@@ -365,20 +381,22 @@ async fn dispatch_task(
         return Ok((resp, Vec::new(), Vec::new()));
     }
 
-    // `DROP ARRAY` fans out to every core so per-core stores are released.
+    // Native DROP uses the same authorization and reversible all-core
+    // protocol as pgwire; it must never bypass the catalog transition.
     if matches!(
         task.plan,
         crate::bridge::envelope::PhysicalPlan::Array(
             nodedb_physical::physical_plan::ArrayOp::DropArray { .. }
         )
     ) {
-        let resp = broadcast_count_to_all_cores(
+        let authorized = super::sql_gateway::authorize_native_task(ctx, &task)?;
+        let task = authorized.into_physical_task();
+        let resp = crate::control::array_catalog::ddl::run_authorized_drop(
             ctx.state,
             task.tenant_id,
             task.database_id,
             task.plan,
             TraceId::ZERO,
-            "dropped",
         )
         .await?;
         return Ok((resp, Vec::new(), Vec::new()));

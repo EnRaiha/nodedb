@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::DatabaseId;
 use crate::sync::compensation::CompensationHint;
 use crate::sync::shape::{ShapeDefinition, ShapeType};
 use crate::sync::wire::{
@@ -167,6 +168,7 @@ fn presence_leave_roundtrip() {
 fn collection_purged_roundtrip() {
     let msg = CollectionPurgedMsg {
         tenant_id: 7,
+        database_id: DatabaseId::new(42),
         name: "embeddings".into(),
         purge_lsn: 987_654_321,
     };
@@ -179,6 +181,7 @@ fn collection_purged_roundtrip() {
         .decode_body()
         .unwrap();
     assert_eq!(decoded.tenant_id, 7);
+    assert_eq!(decoded.database_id, DatabaseId::new(42));
     assert_eq!(decoded.name, "embeddings");
     assert_eq!(decoded.purge_lsn, 987_654_321);
 }

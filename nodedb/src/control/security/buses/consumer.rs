@@ -40,14 +40,23 @@ use super::user_change::UserChanged;
 /// - `audit`: shared audit log.
 /// - `session_registry`: active session registry; used for hard-revoke.
 ///
-/// Returns a `JoinHandle` suitable for storing in `SharedState::bus_consumer_handle`.
+/// Returns a `JoinHandle` suitable for storing in `SharedState::bus_consumer_handle`,
+/// or `None` when there is no Tokio runtime to spawn onto — a `SharedState` built
+/// from a synchronous test or tooling context has no reactor, and constructing one
+/// must not panic. Production startup always runs inside the Control Plane runtime.
 pub fn spawn_bus_consumer(
     si_rx: broadcast::Receiver<SessionInvalidated>,
     uc_rx: broadcast::Receiver<UserChanged>,
     audit: Arc<Mutex<AuditLog>>,
     session_registry: Arc<SessionRegistry>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_bus_consumer(si_rx, uc_rx, audit, session_registry))
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!(
+            "bus_consumer: no tokio runtime; skipping spawn (test or non-async context)"
+        );
+        return None;
+    };
+    Some(handle.spawn(run_bus_consumer(si_rx, uc_rx, audit, session_registry)))
 }
 
 async fn run_bus_consumer(
@@ -217,7 +226,10 @@ mod tests {
 
         drop(si_bus);
         drop(uc_bus);
-        handle.await.expect("consumer task panicked");
+        handle
+            .expect("bus consumer spawns under #[tokio::test]")
+            .await
+            .expect("consumer task panicked");
 
         let log = audit.lock().unwrap();
         let rows = log.query_by_event(&AuditEvent::SessionRevoked);
@@ -257,7 +269,10 @@ mod tests {
 
         drop(si_bus);
         drop(uc_bus);
-        handle.await.expect("consumer task panicked");
+        handle
+            .expect("bus consumer spawns under #[tokio::test]")
+            .await
+            .expect("consumer task panicked");
 
         // Audit row must be present.
         {
@@ -291,7 +306,10 @@ mod tests {
 
         drop(si_bus);
         drop(uc_bus);
-        handle.await.expect("consumer task panicked");
+        handle
+            .expect("bus consumer spawns under #[tokio::test]")
+            .await
+            .expect("consumer task panicked");
 
         let log = audit.lock().unwrap();
         let rows = log.query_by_event(&AuditEvent::PrivilegeChange);
@@ -316,7 +334,10 @@ mod tests {
 
         drop(si_bus);
         drop(uc_bus);
-        handle.await.expect("consumer task panicked");
+        handle
+            .expect("bus consumer spawns under #[tokio::test]")
+            .await
+            .expect("consumer task panicked");
 
         let log = audit.lock().unwrap();
         assert_eq!(log.query_by_event(&AuditEvent::SessionRevoked).len(), 1);

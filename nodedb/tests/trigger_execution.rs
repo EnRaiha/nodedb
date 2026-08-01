@@ -11,6 +11,7 @@ use nodedb::control::trigger::TriggerRegistry;
 use nodedb::control::trigger::dml_hook::classify_dml_write;
 use nodedb::control::trigger::registry::DmlEvent;
 use nodedb::event::types::EventSource;
+use nodedb::types::DatabaseId;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -30,6 +31,7 @@ fn make_trigger_full(
 ) -> StoredTrigger {
     StoredTrigger {
         tenant_id: 1,
+        database_id: DatabaseId::DEFAULT,
         name: name.to_string(),
         collection: collection.to_string(),
         timing,
@@ -245,7 +247,7 @@ fn registry_matches_before_triggers() {
         DmlEvent::Insert,
     ));
 
-    let matched = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let matched = reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Insert);
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].timing, TriggerTiming::Before);
     assert_eq!(matched[0].name, "validate_order");
@@ -265,16 +267,19 @@ fn registry_matches_before_update_and_delete() {
         DmlEvent::Delete,
     ));
 
-    let update_matched = reg.get_matching(1, "users", DmlEvent::Update);
+    let update_matched = reg.get_matching(DatabaseId::DEFAULT, 1, "users", DmlEvent::Update);
     assert_eq!(update_matched.len(), 1);
     assert_eq!(update_matched[0].name, "validate_update");
 
-    let delete_matched = reg.get_matching(1, "users", DmlEvent::Delete);
+    let delete_matched = reg.get_matching(DatabaseId::DEFAULT, 1, "users", DmlEvent::Delete);
     assert_eq!(delete_matched.len(), 1);
     assert_eq!(delete_matched[0].name, "validate_delete");
 
     // INSERT should not match.
-    assert!(reg.get_matching(1, "users", DmlEvent::Insert).is_empty());
+    assert!(
+        reg.get_matching(DatabaseId::DEFAULT, 1, "users", DmlEvent::Insert)
+            .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +295,7 @@ fn registry_matches_instead_of_triggers() {
         DmlEvent::Insert,
     ));
 
-    let matched = reg.get_matching(1, "view_orders", DmlEvent::Insert);
+    let matched = reg.get_matching(DatabaseId::DEFAULT, 1, "view_orders", DmlEvent::Insert);
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].timing, TriggerTiming::InsteadOf);
 }
@@ -305,7 +310,7 @@ fn instead_of_does_not_match_wrong_event() {
     ));
 
     assert!(
-        reg.get_matching(1, "view_orders", DmlEvent::Delete)
+        reg.get_matching(DatabaseId::DEFAULT, 1, "view_orders", DmlEvent::Delete)
             .is_empty()
     );
 }
@@ -324,7 +329,7 @@ fn registry_matches_statement_triggers() {
         TriggerExecutionMode::Async,
     ));
 
-    let matched = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let matched = reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Insert);
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].granularity, TriggerGranularity::Statement);
 }
@@ -352,7 +357,7 @@ fn statement_and_row_triggers_coexist() {
         TriggerExecutionMode::Async,
     ));
 
-    let matched = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let matched = reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Insert);
     assert_eq!(matched.len(), 2);
     // Both returned — caller filters by granularity.
 }
@@ -379,7 +384,7 @@ fn definer_trigger_registered_and_matched() {
     let reg = TriggerRegistry::new();
     reg.register(make_definer_trigger("admin_trigger", "orders", "root"));
 
-    let matched = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let matched = reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Insert);
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].security, TriggerSecurity::Definer);
     assert_eq!(matched[0].owner, "root");
@@ -573,7 +578,7 @@ fn before_after_instead_of_coexist() {
         TriggerSecurity::Invoker,
     ));
 
-    let all = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let all = reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Insert);
     assert_eq!(all.len(), 3);
 
     let before_count = all
@@ -623,7 +628,7 @@ fn triggers_sorted_by_priority_across_timings() {
     reg.register(t2);
     reg.register(t3);
 
-    let matched = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let matched = reg.get_matching(DatabaseId::DEFAULT, 1, "orders", DmlEvent::Insert);
     assert_eq!(matched.len(), 3);
     // Sorted by (priority, name): 1, 5, 10
     assert_eq!(matched[0].priority, 1);

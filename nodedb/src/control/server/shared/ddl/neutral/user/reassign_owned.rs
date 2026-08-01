@@ -47,6 +47,7 @@ pub(super) enum OwnerKind {
     Procedure,
     Trigger,
     MaterializedView,
+    StreamingMaterializedView,
     Sequence,
     Schedule,
     ChangeStream,
@@ -66,6 +67,7 @@ impl OwnerKind {
             object_type::PROCEDURE => Self::Procedure,
             object_type::TRIGGER => Self::Trigger,
             object_type::MATERIALIZED_VIEW => Self::MaterializedView,
+            object_type::STREAMING_MATERIALIZED_VIEW => Self::StreamingMaterializedView,
             object_type::SEQUENCE => Self::Sequence,
             object_type::SCHEDULE => Self::Schedule,
             object_type::CHANGE_STREAM => Self::ChangeStream,
@@ -82,6 +84,7 @@ impl OwnerKind {
             Self::Procedure => object_type::PROCEDURE,
             Self::Trigger => object_type::TRIGGER,
             Self::MaterializedView => object_type::MATERIALIZED_VIEW,
+            Self::StreamingMaterializedView => object_type::STREAMING_MATERIALIZED_VIEW,
             Self::Sequence => object_type::SEQUENCE,
             Self::Schedule => object_type::SCHEDULE,
             Self::ChangeStream => object_type::CHANGE_STREAM,
@@ -185,7 +188,11 @@ fn reassign_one(
         }
         OwnerKind::Function => {
             let mut s = catalog
-                .get_function(tenant_id, name)
+                .get_function_in_database(
+                    nodedb_types::DatabaseId::new(database_id),
+                    tenant_id,
+                    name,
+                )
                 .map_err(|e| ddl_err(format!("get function '{name}': {e}")))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
@@ -194,12 +201,24 @@ fn reassign_one(
                 catalog
                     .put_function(&s)
                     .map_err(|e| ddl_err(format!("put function '{name}': {e}")))?;
-                persist_owner_local(state, catalog, object_type, tenant_id, name, admin_name)?;
+                persist_owner_local_in_database(
+                    state,
+                    catalog,
+                    object_type,
+                    database_id,
+                    tenant_id,
+                    name,
+                    admin_name,
+                )?;
             }
         }
         OwnerKind::Procedure => {
             let mut s = catalog
-                .get_procedure(tenant_id, name)
+                .get_procedure_in_database(
+                    nodedb_types::DatabaseId::new(database_id),
+                    tenant_id,
+                    name,
+                )
                 .map_err(|e| ddl_err(format!("get procedure '{name}': {e}")))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
@@ -208,12 +227,24 @@ fn reassign_one(
                 catalog
                     .put_procedure(&s)
                     .map_err(|e| ddl_err(format!("put procedure '{name}': {e}")))?;
-                persist_owner_local(state, catalog, object_type, tenant_id, name, admin_name)?;
+                persist_owner_local_in_database(
+                    state,
+                    catalog,
+                    object_type,
+                    database_id,
+                    tenant_id,
+                    name,
+                    admin_name,
+                )?;
             }
         }
         OwnerKind::Trigger => {
             let mut s = catalog
-                .get_trigger(tenant_id, name)
+                .get_trigger_in_database(
+                    nodedb_types::DatabaseId::new(database_id),
+                    tenant_id,
+                    name,
+                )
                 .map_err(|e| ddl_err(format!("get trigger '{name}': {e}")))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
@@ -222,7 +253,15 @@ fn reassign_one(
                 catalog
                     .put_trigger(&s)
                     .map_err(|e| ddl_err(format!("put trigger '{name}': {e}")))?;
-                persist_owner_local(state, catalog, object_type, tenant_id, name, admin_name)?;
+                persist_owner_local_in_database(
+                    state,
+                    catalog,
+                    object_type,
+                    database_id,
+                    tenant_id,
+                    name,
+                    admin_name,
+                )?;
             }
         }
         OwnerKind::MaterializedView => {
@@ -237,6 +276,33 @@ fn reassign_one(
                     .put_materialized_view(&s)
                     .map_err(|e| ddl_err(format!("put materialized_view '{name}': {e}")))?;
                 persist_owner_local(state, catalog, object_type, tenant_id, name, admin_name)?;
+            }
+        }
+        OwnerKind::StreamingMaterializedView => {
+            let mut s = catalog
+                .load_all_streaming_mvs()
+                .map_err(|e| ddl_err(format!("load streaming materialized views: {e}")))?
+                .into_iter()
+                .find(|mv| {
+                    mv.database_id.as_u64() == database_id
+                        && mv.tenant_id == tenant_id
+                        && mv.name == name
+                })
+                .ok_or_else(|| missing(object_type, name))?;
+            s.owner = admin_name.to_string();
+            let entry = CatalogEntry::PutStreamingMaterializedView(Box::new(s.clone()));
+            if propose(state, &entry)? == 0 {
+                crate::control::catalog_entry::apply::apply_to(&entry, catalog);
+                state.mv_registry.register(s);
+                persist_owner_local_in_database(
+                    state,
+                    catalog,
+                    object_type,
+                    database_id,
+                    tenant_id,
+                    name,
+                    admin_name,
+                )?;
             }
         }
         OwnerKind::Sequence => {
@@ -259,7 +325,9 @@ fn reassign_one(
                 .load_all_schedules()
                 .map_err(|e| ddl_err(format!("load schedules: {e}")))?
                 .into_iter()
-                .find(|d| d.tenant_id == tenant_id && d.name == name)
+                .find(|d| {
+                    d.database_id == database_id && d.tenant_id == tenant_id && d.name == name
+                })
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
             let entry = CatalogEntry::PutSchedule(Box::new(s.clone()));
@@ -267,12 +335,20 @@ fn reassign_one(
                 catalog
                     .put_schedule(&s)
                     .map_err(|e| ddl_err(format!("put schedule '{name}': {e}")))?;
-                persist_owner_local(state, catalog, object_type, tenant_id, name, admin_name)?;
+                persist_owner_local_in_database(
+                    state,
+                    catalog,
+                    object_type,
+                    database_id,
+                    tenant_id,
+                    name,
+                    admin_name,
+                )?;
             }
         }
         OwnerKind::ChangeStream => {
             let mut s = catalog
-                .get_change_stream(tenant_id, name)
+                .get_change_stream(crate::types::DatabaseId::new(database_id), tenant_id, name)
                 .map_err(|e| ddl_err(format!("get change_stream '{name}': {e}")))?
                 .ok_or_else(|| missing(object_type, name))?;
             s.owner = admin_name.to_string();
@@ -281,7 +357,15 @@ fn reassign_one(
                 catalog
                     .put_change_stream(&s)
                     .map_err(|e| ddl_err(format!("put change_stream '{name}': {e}")))?;
-                persist_owner_local(state, catalog, object_type, tenant_id, name, admin_name)?;
+                persist_owner_local_in_database(
+                    state,
+                    catalog,
+                    object_type,
+                    database_id,
+                    tenant_id,
+                    name,
+                    admin_name,
+                )?;
             }
         }
         OwnerKind::ContinuousAggregate => {

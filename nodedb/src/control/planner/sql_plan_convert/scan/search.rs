@@ -124,7 +124,7 @@ fn build_array_prefilter_plan(
         let cat = array_catalog.read().map_err(|_| crate::Error::PlanError {
             detail: "array catalog lock poisoned".into(),
         })?;
-        cat.lookup_by_name(&prefilter.array_name)
+        cat.lookup_by_name_in_database(tenant_id, ctx.database_id, &prefilter.array_name)
             .ok_or_else(|| crate::Error::PlanError {
                 detail: format!(
                     "array prefilter: array '{}' not found",
@@ -162,7 +162,7 @@ fn build_array_prefilter_plan(
             detail: format!("array slice encode: {e}"),
         })?;
 
-    let aid = ArrayId::new(tenant_id, &prefilter.array_name);
+    let aid = ArrayId::in_database(tenant_id, ctx.database_id, &prefilter.array_name);
     Ok(PhysicalPlan::Array(
         nodedb_physical::physical_plan::ArrayOp::SurrogateBitmapScan {
             array_id: aid,

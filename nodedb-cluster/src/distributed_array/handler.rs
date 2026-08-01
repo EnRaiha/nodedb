@@ -70,7 +70,7 @@ async fn handle_slice(
 
     validate_slice_routing(&req, local_vshard_id)?;
 
-    let exec = executor.exec_slice(&req).await?;
+    let exec = executor.exec_slice(local_vshard_id, &req).await?;
 
     let truncated = req.limit > 0 && exec.rows.len() >= req.limit as usize;
     let resp = ArrayShardSliceResp {
@@ -92,7 +92,7 @@ async fn handle_agg(
             detail: format!("ArrayShardAggReq decode: {e}"),
         })?;
 
-    let exec = executor.exec_agg(&req).await?;
+    let exec = executor.exec_agg(local_vshard_id, &req).await?;
 
     let resp = ArrayShardAggResp {
         shard_id: local_vshard_id,
@@ -119,7 +119,7 @@ async fn handle_put(
     // wrong shard.
     validate_put_routing(&req, local_vshard_id)?;
 
-    let applied_lsn = executor.exec_put(&req).await?;
+    let applied_lsn = executor.exec_put(local_vshard_id, &req).await?;
     let resp = ArrayShardPutResp {
         shard_id: local_vshard_id,
         applied_lsn,
@@ -139,7 +139,7 @@ async fn handle_delete(
 
     validate_delete_routing(&req, local_vshard_id)?;
 
-    let applied_lsn = executor.exec_delete(&req).await?;
+    let applied_lsn = executor.exec_delete(local_vshard_id, &req).await?;
     let resp = ArrayShardDeleteResp {
         shard_id: local_vshard_id,
         applied_lsn,
@@ -158,7 +158,7 @@ async fn handle_surrogate_bitmap(
         })?;
 
     let bitmap_msgpack = executor
-        .exec_surrogate_bitmap_scan(&req.array_id_msgpack, &req.slice_msgpack)
+        .exec_surrogate_bitmap_scan(local_vshard_id, &req.array_id_msgpack, &req.slice_msgpack)
         .await?;
 
     let resp = ArrayShardSurrogateBitmapResp {
@@ -273,6 +273,7 @@ mod tests {
     impl ArrayLocalExecutor for StubExecutor {
         async fn exec_slice(
             &self,
+            _local_vshard_id: u32,
             _req: &super::super::wire::ArrayShardSliceReq,
         ) -> Result<ArraySliceExec> {
             Ok(ArraySliceExec {
@@ -283,24 +284,33 @@ mod tests {
 
         async fn exec_surrogate_bitmap_scan(
             &self,
+            _local_vshard_id: u32,
             _array_id_msgpack: &[u8],
             _slice_msgpack: &[u8],
         ) -> Result<Vec<u8>> {
             Ok(self.bitmap.clone())
         }
 
-        async fn exec_agg(&self, _req: &ArrayShardAggReq) -> Result<ArrayAggExec> {
+        async fn exec_agg(
+            &self,
+            _local_vshard_id: u32,
+            _req: &ArrayShardAggReq,
+        ) -> Result<ArrayAggExec> {
             Ok(ArrayAggExec {
                 partials: self.partials.clone(),
                 truncated_before_horizon: self.truncated_before_horizon,
             })
         }
 
-        async fn exec_put(&self, req: &ArrayShardPutReq) -> Result<u64> {
+        async fn exec_put(&self, _local_vshard_id: u32, req: &ArrayShardPutReq) -> Result<u64> {
             Ok(req.wal_lsn)
         }
 
-        async fn exec_delete(&self, req: &ArrayShardDeleteReq) -> Result<u64> {
+        async fn exec_delete(
+            &self,
+            _local_vshard_id: u32,
+            req: &ArrayShardDeleteReq,
+        ) -> Result<u64> {
             Ok(req.wal_lsn)
         }
     }

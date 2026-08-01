@@ -21,6 +21,7 @@ use crate::control::security::catalog::{
 };
 use crate::event::cdc::stream_def::ChangeStreamDef;
 use crate::event::scheduler::types::ScheduleDef;
+use crate::types::DatabaseId;
 
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub enum CatalogEntry {
@@ -86,17 +87,24 @@ pub enum CatalogEntry {
     /// updated record.
     PutTrigger(Box<StoredTrigger>),
     /// Delete a trigger record.
-    DeleteTrigger { tenant_id: u64, name: String },
+    DeleteTrigger {
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: String,
+    },
 
     // ── Function ───────────────────────────────────────────────────
     /// Upsert a function record. Used by CREATE [OR REPLACE]
-    /// FUNCTION. WASM binaries still live in their separate
-    /// wasm-store redb table and are written directly on the
-    /// proposing node; replicated wasm binary distribution is its
-    /// own future batch.
+    /// FUNCTION. WASM module bytes, when present, travel in the
+    /// transient `StoredFunction::wasm_module` proposal payload and
+    /// are installed by every local applier before metadata persists.
     PutFunction(Box<StoredFunction>),
     /// Delete a function record.
-    DeleteFunction { tenant_id: u64, name: String },
+    DeleteFunction {
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: String,
+    },
 
     // ── Procedure ──────────────────────────────────────────────────
     /// Upsert a stored procedure. Same body-cache invalidation
@@ -104,7 +112,11 @@ pub enum CatalogEntry {
     /// the next CALL re-parses the new body.
     PutProcedure(Box<StoredProcedure>),
     /// Delete a stored procedure.
-    DeleteProcedure { tenant_id: u64, name: String },
+    DeleteProcedure {
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: String,
+    },
 
     // ── Schedule ───────────────────────────────────────────────────
     /// Upsert a scheduled-job definition. Post-apply syncs the
@@ -112,7 +124,11 @@ pub enum CatalogEntry {
     /// node picks up the new / updated schedule immediately.
     PutSchedule(Box<ScheduleDef>),
     /// Delete a scheduled-job definition.
-    DeleteSchedule { tenant_id: u64, name: String },
+    DeleteSchedule {
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: String,
+    },
 
     // ── Synonym group ──────────────────────────────────────────────
     /// Upsert a synonym group. Post-apply syncs the in-memory `synonym_registry`.
@@ -134,7 +150,11 @@ pub enum CatalogEntry {
     PutChangeStream(Box<ChangeStreamDef>),
     /// Delete a CDC change-stream definition + tear down its
     /// buffer via `cdc_router.remove_buffer`.
-    DeleteChangeStream { tenant_id: u64, name: String },
+    DeleteChangeStream {
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
+    },
 
     // ── User ───────────────────────────────────────────────────────
     /// Upsert a user record. The leader builds the full `StoredUser`
@@ -179,7 +199,6 @@ pub enum CatalogEntry {
     /// for collection-wide Data Plane reclaim before advancing the applied
     /// index, so a same-name re-CREATE starts from a fresh incarnation.
     DeleteMaterializedView { tenant_id: u64, name: String },
-
     // ── Continuous Aggregate ───────────────────────────────────────
     /// Upsert a continuous-aggregate definition. The applier writes
     /// the catalog row plus the owner row; the post-apply sync
@@ -364,6 +383,19 @@ pub enum CatalogEntry {
         /// Numeric id of the source database (for lineage update).
         source_db_id: u64,
     },
+
+    // Appended to preserve MessagePack enum discriminants for existing
+    // metadata-raft entries during rolling upgrades.
+    /// Upsert a streaming MV definition and its database-scoped owner row.
+    PutStreamingMaterializedView(Box<crate::event::streaming_mv::StreamingMvDef>),
+    /// Delete a streaming materialized-view definition. Streaming MVs are
+    /// Event-Plane objects, so this removes both the database-scoped catalog
+    /// record and the matching in-memory registry entry on every replica.
+    DeleteStreamingMaterializedView {
+        database_id: u64,
+        tenant_id: u64,
+        name: String,
+    },
 }
 
 impl CatalogEntry {
@@ -396,6 +428,8 @@ impl CatalogEntry {
             Self::RevokeApiKey { .. } => "revoke_api_key",
             Self::PutMaterializedView(_) => "put_materialized_view",
             Self::DeleteMaterializedView { .. } => "delete_materialized_view",
+            Self::PutStreamingMaterializedView(_) => "put_streaming_materialized_view",
+            Self::DeleteStreamingMaterializedView { .. } => "delete_streaming_materialized_view",
             Self::PutContinuousAggregate(_) => "put_continuous_aggregate",
             Self::DeleteContinuousAggregate { .. } => "delete_continuous_aggregate",
             Self::PutTenant(_) => "put_tenant",

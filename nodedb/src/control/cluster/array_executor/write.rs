@@ -17,15 +17,15 @@ use nodedb_array::types::ArrayId;
 use nodedb_cluster::distributed_array::wire::{ArrayShardDeleteReq, ArrayShardPutReq};
 use nodedb_cluster::error::{ClusterError, Result};
 
-use super::executor::{DataPlaneArrayExecutor, LOCAL_DISPATCH_VSHARD};
+use super::executor::DataPlaneArrayExecutor;
 use crate::control::server::dispatch_utils::{
     ChangeFeedOwner, SubmitOutcome, SubmitWrite, WalDurability, WriteOrdering, submit_write,
 };
-use crate::types::{DatabaseId, TraceId, VShardId};
+use crate::types::{TraceId, VShardId};
 use nodedb_physical::physical_plan::{ArrayOp, PhysicalPlan};
 
 impl DataPlaneArrayExecutor {
-    pub(super) async fn put(&self, req: &ArrayShardPutReq) -> Result<u64> {
+    pub(super) async fn put(&self, local_vshard_id: u32, req: &ArrayShardPutReq) -> Result<u64> {
         let array_id: ArrayId =
             zerompk::from_msgpack(&req.array_id_msgpack).map_err(|e| ClusterError::Codec {
                 detail: format!("array_id decode in exec_put: {e}"),
@@ -60,18 +60,15 @@ impl DataPlaneArrayExecutor {
             provenance: None,
         });
 
-        self.propose_or_dispatch(
-            &array_id,
-            plan,
-            req.representative_hilbert_prefix,
-            req.prefix_bits,
-            req.wal_lsn,
-            "array put",
-        )
-        .await
+        self.propose_or_dispatch(&array_id, local_vshard_id, plan, req.wal_lsn, "array put")
+            .await
     }
 
-    pub(super) async fn delete(&self, req: &ArrayShardDeleteReq) -> Result<u64> {
+    pub(super) async fn delete(
+        &self,
+        local_vshard_id: u32,
+        req: &ArrayShardDeleteReq,
+    ) -> Result<u64> {
         let array_id: ArrayId =
             zerompk::from_msgpack(&req.array_id_msgpack).map_err(|e| ClusterError::Codec {
                 detail: format!("array_id decode in exec_delete: {e}"),
@@ -86,9 +83,8 @@ impl DataPlaneArrayExecutor {
 
         self.propose_or_dispatch(
             &array_id,
+            local_vshard_id,
             plan,
-            req.representative_hilbert_prefix,
-            req.prefix_bits,
             req.wal_lsn,
             "array delete",
         )
@@ -100,34 +96,22 @@ impl DataPlaneArrayExecutor {
     /// Control-Plane write funnel. Returns the `applied_lsn` the coordinator
     /// acks with.
     ///
-    /// The two branches derive their vShard from different things, and both are
-    /// right for what they address. The PROPOSE branch addresses a Raft data
-    /// group, so it uses the batch's Hilbert-tile placement — the SAME routing
-    /// the coordinator used to reach this owner and the handler validated
-    /// against `local_vshard_id`; proposing under any other vShard would land
-    /// the entry in the wrong group. The LOCAL branch addresses a Data Plane
-    /// core on this node, where placement is already settled (the RPC arrived
-    /// here), so it uses `LOCAL_DISPATCH_VSHARD` — the one this executor's reads
-    /// dispatch under, and hence the one core holding this array's engine state.
+    /// Both branches use the vShard from the validated RPC envelope. The Raft
+    /// entry, the single-node bridge request, and WAL replay must retain this
+    /// identity so they all select the same Data Plane core.
     async fn propose_or_dispatch(
         &self,
         array_id: &ArrayId,
+        local_vshard_id: u32,
         plan: PhysicalPlan,
-        representative_hilbert_prefix: u64,
-        prefix_bits: u8,
         wal_lsn: u64,
         op_label: &str,
     ) -> Result<u64> {
         if let Some(proposer) = self.state.async_raft_proposer() {
-            let vshard = derive_vshard(array_id, representative_hilbert_prefix, prefix_bits)?;
-            // Array writes are database-scoped by convention to the default
-            // database on the apply path (the wire req carries no database and
-            // arrays route by name); the follower rebinds each carried surrogate
-            // under this same scope, so identity is preserved regardless.
             let entry = crate::control::wal_replication::to_replicated_entry(
                 array_id.tenant_id,
-                DatabaseId::DEFAULT,
-                VShardId::new(vshard),
+                array_id.database_id,
+                VShardId::new(local_vshard_id),
                 &plan,
             )
             .ok_or_else(|| ClusterError::Storage {
@@ -156,36 +140,7 @@ impl DataPlaneArrayExecutor {
         // ordering is decided HERE by the gate.
         let outcome: SubmitOutcome = submit_write(
             &self.state,
-            SubmitWrite {
-                tenant_id: array_id.tenant_id,
-                // Arrays are database-scoped by convention to the default
-                // database on the apply path (the wire req carries no database
-                // and arrays route by name); the redo record must be appended
-                // under that same scope or replay lands it in the wrong
-                // catalog namespace.
-                database_id: DatabaseId::DEFAULT,
-                vshard_id: LOCAL_DISPATCH_VSHARD,
-                plan,
-                trace_id: TraceId::generate(),
-                // The coordinator RPC-routed an originating user write here; no
-                // sync op-log or CRDT delta is involved, so this keeps the
-                // `User` source its cluster counterpart applies under — the one
-                // source that lets AFTER triggers and CDC fire for it.
-                event_source: crate::event::EventSource::User,
-                txn_id: None,
-                // Auth ran on the coordinator before the fan-out; the shard
-                // request carries no session user.
-                user_id: None,
-                durability: WalDurability::AppendHere { now_override: None },
-                ordering: WriteOrdering::Gate,
-                // Single-node: this node is the only one that handles and
-                // applies the array write, so the funnel publishes its change
-                // event once, here. The propose branch above returned before
-                // reaching this point — its event is published by the node that
-                // proposed the entry, not by each replica that applies it (see
-                // [`ChangeFeedOwner`]).
-                change_feed: ChangeFeedOwner::Funnel,
-            },
+            single_node_submit(array_id, VShardId::new(local_vshard_id), plan),
         )
         .await
         .map_err(|e| ClusterError::Storage {
@@ -219,25 +174,47 @@ impl DataPlaneArrayExecutor {
     }
 }
 
-/// Derive the owning vShard from the batch's Hilbert-tile placement. Uses the
-/// Hilbert-prefix routing (`array_vshard_for_tile`) that the coordinator + shard
-/// handler already agree on; falls back to name-based routing only when routing
-/// metadata is absent (`prefix_bits == 0`, pre-routing clients).
-fn derive_vshard(
+/// Build the single-node write-funnel request using the envelope's validated
+/// vShard. The funnel carries this through to both the bridge request and the
+/// WAL record, whose replay uses the same vShard-to-core mapping.
+fn single_node_submit(
     array_id: &ArrayId,
-    representative_hilbert_prefix: u64,
-    prefix_bits: u8,
-) -> Result<u32> {
-    if prefix_bits == 0 {
-        return Ok(nodedb_cluster::array_routing::array_vshard_for_name(
-            &array_id.name,
-        ));
+    local_vshard_id: VShardId,
+    plan: PhysicalPlan,
+) -> SubmitWrite {
+    SubmitWrite {
+        tenant_id: array_id.tenant_id,
+        database_id: array_id.database_id,
+        vshard_id: local_vshard_id,
+        plan,
+        trace_id: TraceId::generate(),
+        event_source: crate::event::EventSource::User,
+        txn_id: None,
+        user_id: None,
+        durability: WalDurability::AppendHere { now_override: None },
+        ordering: WriteOrdering::Gate,
+        change_feed: ChangeFeedOwner::Funnel,
     }
-    nodedb_cluster::distributed_array::routing::array_vshard_for_tile(
-        representative_hilbert_prefix,
-        prefix_bits,
-    )
-    .map_err(|e| ClusterError::Storage {
-        detail: format!("array vshard derive: {e}"),
-    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::TenantId;
+
+    #[test]
+    fn single_node_write_preserves_nonzero_vshard() {
+        let array_id = ArrayId::new(TenantId::new(41), "measurements");
+        let vshard_id = VShardId::new(19);
+        let plan = PhysicalPlan::Array(ArrayOp::Delete {
+            array_id: array_id.clone(),
+            coords_msgpack: Vec::new(),
+            wal_lsn: 0,
+            provenance: None,
+        });
+
+        let request = single_node_submit(&array_id, vshard_id, plan);
+
+        assert_eq!(request.vshard_id, vshard_id);
+    }
 }

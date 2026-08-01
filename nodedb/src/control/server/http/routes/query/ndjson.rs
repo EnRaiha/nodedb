@@ -12,7 +12,8 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::authorization::{authorize_database, authorize_task_set};
 
-use super::super::super::auth::{ApiError, AppState, resolve_identity};
+use super::super::super::auth::{ApiError, AppState, resolve_auth};
+use super::super::query_stream::{ndjson_body_stream, try_open_stream};
 use super::super::result_shape::{HttpShaped, passthrough_to_ndjson, shape_http_payload};
 use super::{DatabaseQueryParam, resolve_database_id};
 
@@ -31,8 +32,8 @@ pub async fn query_ndjson(
 ) -> impl IntoResponse {
     use axum::response::Response;
 
-    let identity = match resolve_identity(&headers, &state, "http") {
-        Ok(id) => id,
+    let (identity, mut auth_ctx) = match resolve_auth(&headers, &state, "http") {
+        Ok(auth) => auth,
         Err(e) => return e.into_response(),
     };
     let database_id = match resolve_database_id(&headers, &db_param, &state) {
@@ -67,7 +68,9 @@ pub async fn query_ndjson(
 
     let query_ctx = &state.query_ctx;
 
-    let auth_ctx = crate::control::server::session_auth::build_auth_context(&identity);
+    // The request-selected database is authoritative for RLS variables while
+    // retaining verified JWT/session enrichment from authentication.
+    auth_ctx.database_id = Some(database_id);
     let perm_cache = state.shared.permission_cache.read().await;
     let sec = crate::control::planner::context::PlanSecurityContext {
         identity: &identity,
@@ -77,18 +80,25 @@ pub async fn query_ndjson(
         roles: &state.shared.roles,
         permission_cache: Some(&*perm_cache),
     };
-    let (mut tasks, output_schema) = match query_ctx
-        .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
-            sql,
-            tenant_id,
-            database_id,
-            sec: &sec,
-        })
+    let (mut tasks, output_schema, versions, _) = match query_ctx
+        .plan_sql_with_rls_and_versions(sql, tenant_id, database_id, &sec, false)
         .await
     {
         Ok(t) => t,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+
+    // Implicit-edge extraction marks catalog state and allocates surrogates,
+    // so reject unauthorized original tasks before it can run.
+    if let Err(error) = authorize_task_set(
+        &identity,
+        &tasks,
+        &state.shared.permissions,
+        &state.shared.roles,
+        &emitter,
+    ) {
+        return ApiError::from(crate::Error::from(error)).into_response();
+    }
 
     if let Err(error) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
         &state.shared,
@@ -104,43 +114,6 @@ pub async fn query_ndjson(
 
     let trace_id = crate::control::trace_context::generate_trace_id();
 
-    // Lazy fast path: an eligible single-task, unordered, multi-row SELECT
-    // streams its rows straight off a `ResultStream` as NDJSON lines instead
-    // of materializing the whole result first. HTTP is stateless, so there is
-    // no autocommit / transaction-block gate (cf. native + pgwire). The
-    // streaming body outlives this handler, so request-accounting is not
-    // bracketed around it — admission was already gated by `check_tenant_quota`
-    // above, matching the pgwire lazy path which also does not request-account
-    // the streamed `QueryResponse`.
-    match super::super::query_stream::try_open_stream(
-        &state,
-        &tasks,
-        &identity,
-        database_id,
-        trace_id,
-    )
-    .await
-    {
-        Ok(Some((stream, limit))) => {
-            let body =
-                axum::body::Body::from_stream(super::super::query_stream::ndjson_body_stream(
-                    stream,
-                    limit,
-                    Some(output_schema.clone()),
-                ));
-            return Response::builder()
-                .header("Content-Type", "application/x-ndjson")
-                .body(body)
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "encoding error").into_response()
-                });
-        }
-        Ok(None) => {
-            // Not streamable — fall through to the materialized path below.
-        }
-        Err(error) => return ApiError::from(error).into_response(),
-    }
-
     let authorized_tasks = match authorize_task_set(
         &identity,
         &tasks,
@@ -152,8 +125,47 @@ pub async fn query_ndjson(
         Err(error) => return ApiError::from(crate::Error::from(error)).into_response(),
     };
 
+    // Admission follows authorization so denied requests never acquire a
+    // descriptor lease. A lazy body takes ownership below; the materialized
+    // path retains it lexically through all dispatch and NDJSON shaping.
+    let mut lease_scope = Some(
+        match Arc::clone(&state.shared).acquire_plan_lease_scope(&versions) {
+            Ok(scope) => scope,
+            Err(error) => return ApiError::from(error).into_response(),
+        },
+    );
+
     let _request = state.shared.tenant_request_guard(tenant_id);
 
+    // Authorization and admission above intentionally precede stream dispatch.
+    // `Body::from_stream` then polls the data-plane stream under normal HTTP
+    // backpressure while its captured lease scope remains alive until body
+    // completion or client disconnect.
+    match try_open_stream(&state, &tasks, &identity, database_id, trace_id).await {
+        Ok(Some((stream, limit))) => {
+            let Some(lease_scope) = lease_scope.take() else {
+                return ApiError::from(crate::Error::Internal {
+                    detail: "query lease scope missing before NDJSON stream dispatch".into(),
+                })
+                .into_response();
+            };
+            return Response::builder()
+                .header("Content-Type", "application/x-ndjson")
+                .body(axum::body::Body::from_stream(ndjson_body_stream(
+                    stream,
+                    limit,
+                    Some(output_schema.clone()),
+                    lease_scope,
+                )))
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "encoding error").into_response()
+                });
+        }
+        Ok(None) => {}
+        Err(error) => return ApiError::from(error).into_response(),
+    }
+
+    let _lease_scope = lease_scope;
     let mut ndjson = String::new();
     for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
         // Captured before dispatch moves `task.plan` — needed by the

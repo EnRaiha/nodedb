@@ -6,6 +6,7 @@
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::pgwire::types::error_to_sqlstate;
 use crate::control::server::shared::session::SessionId;
 use crate::types::TraceId;
 
@@ -32,7 +33,9 @@ impl NodeDbPgHandler {
             .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
-        let auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
+        let mut auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
+        // Cursor plans must resolve RLS variables in the selected database context.
+        auth_ctx.database_id = Some(database_id);
         let perm_cache = self.state.permission_cache.read().await;
         let sec = crate::control::planner::context::PlanSecurityContext {
             identity,
@@ -42,13 +45,8 @@ impl NodeDbPgHandler {
             roles: &self.state.roles,
             permission_cache: Some(&*perm_cache),
         };
-        let (tasks, _output_schema) = query_ctx
-            .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
-                sql,
-                tenant_id,
-                database_id,
-                sec: &sec,
-            })
+        let (tasks, _output_schema, versions, _) = query_ctx
+            .plan_sql_with_rls_and_versions(sql, tenant_id, database_id, &sec, false)
             .await
             .map_err(|e| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -59,6 +57,21 @@ impl NodeDbPgHandler {
             })?;
 
         let authorized_tasks = self.authorize_tasks(identity, &tasks)?.into_tasks();
+
+        // Acquire after the explicit authorization boundary so rejected cursor
+        // declarations do not consume descriptor leases. The scope remains
+        // live while every cursor-materialization task is dispatched.
+        let _lease_scope = self
+            .state
+            .acquire_plan_lease_scope(&versions)
+            .map_err(|error| {
+                let (severity, code, message) = error_to_sqlstate(&error);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            })?;
 
         let mut rows = Vec::new();
         for authorized in authorized_tasks {

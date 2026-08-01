@@ -17,7 +17,7 @@ use crate::types::{DatabaseId, TraceId};
 /// falls back to direct local SPSC dispatch on single-node boot before
 /// the gateway is initialised.
 pub async fn execute_sql(
-    shared: &SharedState,
+    shared: &Arc<SharedState>,
     query_ctx: &crate::control::planner::context::QueryContext,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
@@ -32,6 +32,8 @@ pub async fn execute_sql(
     shared.check_tenant_quota(tenant_id)?;
 
     let mut auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
+    // The RPC-selected database is authoritative for RLS variables.
+    auth_ctx.database_id = Some(database_id);
     let clean_sql =
         crate::control::server::session_auth::extract_and_apply_on_deny(sql, &mut auth_ctx);
     let permission_cache = shared.permission_cache.read().await;
@@ -43,15 +45,20 @@ pub async fn execute_sql(
         roles: &shared.roles,
         permission_cache: Some(&*permission_cache),
     };
-    let (mut tasks, _output_schema) = query_ctx
-        .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
-            sql: &clean_sql,
-            tenant_id,
-            database_id,
-            sec: &security,
-        })
+    let (mut tasks, _output_schema, versions, _) = query_ctx
+        .plan_sql_with_rls_and_versions(&clean_sql, tenant_id, database_id, &security, false)
         .await?;
     drop(permission_cache);
+
+    // Extraction can mark the catalog and allocate surrogates. Authorize the
+    // original tasks first so denied requests have no implicit-edge side effects.
+    let _preauthorized_tasks = authorize_task_set(
+        identity,
+        &tasks,
+        &shared.permissions,
+        &shared.roles,
+        &emitter,
+    )?;
 
     crate::control::planner::implicit_edges::append_implicit_edge_tasks(
         shared,
@@ -69,6 +76,10 @@ pub async fn execute_sql(
         &emitter,
     )?
     .into_tasks();
+
+    // Authorization must precede admission; retain the scope through every
+    // orchestrated or Data-Plane execution and response decode below.
+    let _lease_scope = Arc::clone(shared).acquire_plan_lease_scope(&versions)?;
 
     let _request = shared.tenant_request_guard(tenant_id);
 

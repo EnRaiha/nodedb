@@ -67,6 +67,9 @@ impl SharedState {
                 wal_appender,
             ));
             s.credentials = credentials;
+            s.ep_topic_registry
+                .load_from_catalog(s.credentials.catalog())?;
+            crate::event::topic::hydrate_topic_buffers(s)?;
         }
         Ok(state)
     }
@@ -106,7 +109,7 @@ impl SharedState {
             Arc::clone(&shared_audit),
             Arc::clone(&test_session_registry),
         );
-        let bus_consumer_handle = Some(bus_consumer_task);
+        let bus_consumer_handle = bus_consumer_task;
         // Wire buses into the credential store so test mutations publish events.
         test_credentials.set_buses(
             Arc::new(
@@ -193,8 +196,6 @@ impl SharedState {
             audit_max_entries: 0,
             idle_timeout_secs: 0,
             session_absolute_timeout_secs: 0,
-            ws_sessions: std::sync::RwLock::new(std::collections::HashMap::new()),
-            topic_registry: crate::control::pubsub::TopicRegistry::new(10_000),
             shape_registry: Arc::new(crate::control::server::sync::shape::ShapeRegistry::new()),
             change_stream: crate::control::change_stream::ChangeStream::new(4096),
             notify_bus: crate::control::notify_bus::NotifyBus::default(),
@@ -215,7 +216,10 @@ impl SharedState {
                     .expect("failed to open test snapshot store")
             },
             array_snapshot_hlcs: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
+                std::collections::HashMap::<
+                    (nodedb_types::DatabaseId, u64, String),
+                    nodedb_array::sync::hlc::Hlc,
+                >::new(),
             )),
             array_gc_handle: None,
             session_invalidation_bus: si_bus,
@@ -341,6 +345,8 @@ impl SharedState {
             quarantine_storage: Arc::new(object_store::memory::InMemory::new()),
             hlc_clock: Arc::new(nodedb_types::HlcClock::new()),
             tenant_write_hlc: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            lease_admission_gate: Mutex::new(()),
+            lease_grant_gate: Arc::new(Mutex::new(())),
             lease_drain: Arc::new(crate::control::lease::DescriptorDrainTracker::new()),
             lease_refcount: Arc::new(crate::control::lease::LeaseRefCount::new()),
             sequencer_inbox: std::sync::OnceLock::new(),

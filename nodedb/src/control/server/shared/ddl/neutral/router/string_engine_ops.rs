@@ -172,12 +172,17 @@ pub(super) async fn try_string(
     // extraction stay byte-identical. `CREATE` / `DROP MATERIALIZED VIEW` are
     // handled in the typed match below (they parse into typed StreamView variants).
     if upper.starts_with("REFRESH MATERIALIZED VIEW") {
-        return Some(materialized_view::refresh_materialized_view(state, identity, sql).await);
+        return Some(
+            materialized_view::refresh_materialized_view(state, identity, database_id, sql).await,
+        );
     }
     if upper.starts_with("SHOW MATERIALIZED VIEW") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(materialized_view::show_materialized_views(
-            state, identity, &parts,
+            state,
+            identity,
+            database_id,
+            &parts,
         ));
     }
 
@@ -313,10 +318,10 @@ pub(super) async fn try_string(
     // variant); the pgwire schema string router dispatched both from the raw
     // SQL. Replicate that exactly here, before the parse gate.
     if upper.starts_with("DEFINE FIELD ") {
-        return Some(field_def::define_field(state, identity, sql));
+        return Some(field_def::define_field(state, identity, database_id, sql));
     }
     if upper.starts_with("DEFINE EVENT ") {
-        return Some(field_def::define_event(state, identity, sql));
+        return Some(field_def::define_event(state, identity, database_id, sql));
     }
 
     // `EXPLAIN TIERS ON <collection> [RANGE …]` — string-recognized (no typed

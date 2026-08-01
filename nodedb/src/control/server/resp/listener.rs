@@ -63,10 +63,11 @@ impl RespListener {
         startup_gate: Arc<crate::control::startup::StartupGate>,
         bus: crate::control::shutdown::ShutdownBus,
     ) -> crate::Result<()> {
-        let drain_guard = bus.register_task(
+        // This JoinSet owns active RESP connection tasks until their graceful
+        // drain (or forced abort) completes, so it gates later shutdown phases.
+        let drain_guard = bus.register_critical_task(
             crate::control::shutdown::ShutdownPhase::DrainingListeners,
             "resp",
-            None,
         );
         let mut shutdown_handle = bus.handle();
 
@@ -197,7 +198,14 @@ async fn handle_connection(
             }
         };
 
-        parser.feed(&read_buf[..n]);
+        if let Err(e) = parser.feed(&read_buf[..n]) {
+            warn!(%peer, error = %e, "RESP frame exceeds parser limits");
+            let resp = super::codec::RespValue::err(format!("ERR protocol error: {e}"));
+            write_buf.clear();
+            resp.serialize(&mut write_buf);
+            let _ = stream.write_all(&write_buf).await;
+            return Ok(());
+        }
 
         // Process all complete frames in the buffer.
         loop {
@@ -227,22 +235,30 @@ async fn handle_connection(
 
                     // SUBSCRIBE/PSUBSCRIBE take over the connection (enter push mode).
                     if cmd.name == "SUBSCRIBE" {
-                        return super::handler_pubsub::handle_subscribe(
+                        if super::handler_pubsub::handle_subscribe(
                             &cmd,
                             &session,
                             state,
                             &mut stream,
                         )
-                        .await;
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                        continue;
                     }
                     if cmd.name == "PSUBSCRIBE" {
-                        return super::handler_pubsub::handle_psubscribe(
+                        if super::handler_pubsub::handle_psubscribe(
                             &cmd,
                             &session,
                             state,
                             &mut stream,
                         )
-                        .await;
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                        continue;
                     }
 
                     // Execute the command with timing for slow-log.

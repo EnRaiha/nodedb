@@ -14,13 +14,16 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::identity::canonical_stream_name;
 
 /// Handle `SHOW CONSUMER GROUPS ON <stream>`
 pub fn show_consumer_groups(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     // parts: ["SHOW", "CONSUMER", "GROUPS", "ON", "<stream>"]
@@ -31,8 +34,8 @@ pub fn show_consumer_groups(
         });
     }
 
-    let stream_name = parts[4].to_lowercase();
     let tenant_id = identity.tenant_id.as_u64();
+    let stream_name = canonical_stream_name(state, database_id, tenant_id, parts[4]);
 
     let columns = vec![
         "group_name".to_string(),
@@ -43,13 +46,14 @@ pub fn show_consumer_groups(
 
     let groups = state
         .group_registry
-        .list_for_stream(tenant_id, &stream_name);
+        .list_for_stream(database_id, tenant_id, &stream_name);
 
     let mut rows = Vec::with_capacity(groups.len());
     for g in &groups {
-        let offsets = state
-            .offset_store
-            .get_all_offsets(tenant_id, &stream_name, &g.name);
+        let offsets =
+            state
+                .offset_store
+                .get_all_offsets(database_id, tenant_id, &stream_name, &g.name);
         let committed_count = offsets.len();
 
         let mut row = Map::new();
@@ -78,10 +82,11 @@ pub fn show_consumer_groups(
 /// Handle `SHOW PARTITIONS ON <stream>`
 ///
 /// Lists all vShard partitions that have events in the stream's buffer,
-/// with earliest/latest LSN for each partition.
+/// with earliest/latest composite offset for each partition.
 pub fn show_partitions(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     // parts: ["SHOW", "PARTITIONS", "ON", "<stream>"]
@@ -92,31 +97,41 @@ pub fn show_partitions(
         });
     }
 
-    let stream_name = parts[3].to_lowercase();
     let tenant_id = identity.tenant_id.as_u64();
+    let stream_name = canonical_stream_name(state, database_id, tenant_id, parts[3]);
 
     // Get the stream's buffer from the CdcRouter.
-    let buffer = state.cdc_router.get_buffer(tenant_id, &stream_name);
+    let buffer = state
+        .cdc_router
+        .get_buffer(database_id, tenant_id, &stream_name);
 
     let columns = vec![
         "partition_id".to_string(),
-        "earliest_lsn".to_string(),
-        "latest_lsn".to_string(),
+        "earliest_offset".to_string(),
+        "latest_offset".to_string(),
         "event_count".to_string(),
     ];
 
     let mut rows = Vec::new();
     if let Some(buf) = buffer {
         // Scan the buffer and collect per-partition stats.
-        let events = buf.read_from_lsn(0, usize::MAX);
-        let mut partition_stats: std::collections::BTreeMap<u32, (u64, u64, usize)> =
-            std::collections::BTreeMap::new();
-        for e in &events {
-            let entry = partition_stats
-                .entry(e.partition)
-                .or_insert((u64::MAX, 0, 0));
-            entry.0 = entry.0.min(e.lsn);
-            entry.1 = entry.1.max(e.lsn);
+        let events = buf.read_from(crate::event::cdc::CdcOffset::ZERO, usize::MAX);
+        let mut partition_stats: std::collections::BTreeMap<
+            u32,
+            (
+                crate::event::cdc::CdcOffset,
+                crate::event::cdc::CdcOffset,
+                usize,
+            ),
+        > = std::collections::BTreeMap::new();
+        for event in &events {
+            let entry = partition_stats.entry(event.partition).or_insert((
+                event.position(),
+                event.position(),
+                0,
+            ));
+            entry.0 = entry.0.min(event.position());
+            entry.1 = entry.1.max(event.position());
             entry.2 += 1;
         }
         for (pid, (earliest, latest, count)) in &partition_stats {
@@ -126,12 +141,12 @@ pub fn show_partitions(
                 JsonValue::String(pid.to_string()),
             );
             row.insert(
-                "earliest_lsn".to_string(),
-                JsonValue::String(earliest.to_string()),
+                "earliest_offset".to_string(),
+                JsonValue::String(earliest.token()),
             );
             row.insert(
-                "latest_lsn".to_string(),
-                JsonValue::String(latest.to_string()),
+                "latest_offset".to_string(),
+                JsonValue::String(latest.token()),
             );
             row.insert(
                 "event_count".to_string(),

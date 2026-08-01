@@ -34,13 +34,21 @@ use super::shape_encode::{encode_shaped_row, shaped_query_response};
 /// `crate::Error` (over-budget, dispatch failure) is mapped to a pgwire
 /// `ErrorResponse` via `error_to_sqlstate`, so the client sees a proper error
 /// instead of a silently-truncated result.
-pub(crate) fn streaming_multirow_response(stream: ResultStream, limit: usize) -> Response {
+pub(crate) fn streaming_multirow_response(
+    stream: ResultStream,
+    limit: usize,
+    lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
+) -> Response {
     use futures::StreamExt;
 
     let schema = Arc::new(vec![text_field("result")]);
     let row_schema = schema.clone();
 
     let row_stream = async_stream::try_stream! {
+        // QueryResponse outlives the pgwire handler. Its row stream owns this
+        // scope so descriptor leases remain held while the client polls rows,
+        // including on a mid-stream error, until completion or disconnect.
+        let _lease_scope = lease_scope;
         let mut emitted: usize = 0;
         let mut batches = stream;
         while let Some(batch) = batches.next().await {
@@ -99,6 +107,7 @@ pub(crate) fn streaming_shaped_response(
     limit: usize,
     schema_out: OutputSchema,
     formats: &[FieldFormat],
+    lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
 ) -> Response {
     use futures::StreamExt;
 
@@ -134,6 +143,10 @@ pub(crate) fn streaming_shaped_response(
     let row_schema = schema.clone();
 
     let row_stream = async_stream::try_stream! {
+        // The lazy QueryResponse owns the admission scope rather than the
+        // handler stack frame; dropping it on wire completion or disconnect
+        // releases the descriptor leases.
+        let _lease_scope = lease_scope;
         let mut emitted: usize = 0;
         let mut batches = stream;
         while let Some(batch) = batches.next().await {

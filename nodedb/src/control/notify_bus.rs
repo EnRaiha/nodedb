@@ -3,14 +3,14 @@
 //! PostgreSQL-compatible LISTEN/NOTIFY notification bus.
 //!
 //! Lives entirely on the Control Plane (`Send + Sync`, Tokio).
-//! The bus is keyed by `(tenant_id, channel_name)`. Each session that
-//! executes `LISTEN <channel>` registers a bounded mpsc sender. When any
+//! The bus is keyed by `(database_id, tenant_id, channel_name)`. Each session
+//! that executes `LISTEN <channel>` registers a bounded mpsc sender. When any
 //! session executes `NOTIFY <channel> [, '<payload>']`, the bus delivers
-//! the notification to all listeners in the same tenant.
+//! the notification only to listeners in the same database and tenant.
 //!
 //! Backpressure policy: if a session's queue is full (configurable cap,
-//! default 1024), the **oldest** pending notification is silently dropped
-//! and a per-bus counter is incremented. The sender is never blocked.
+//! default 1024), the new notification is dropped and a per-bus counter is
+//! incremented. The sender is never blocked.
 //!
 //! Transaction semantics: the bus exposes `notify` for immediate delivery
 //! (outside a transaction) and `notify_deferred` whose payload the caller
@@ -22,7 +22,7 @@ use std::sync::{Arc, RwLock};
 
 use tracing::{debug, warn};
 
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 /// Default maximum pending notifications per session channel.
 pub const DEFAULT_QUEUE_CAP: usize = 1024;
@@ -41,6 +41,7 @@ pub struct Notification {
 /// Key used to shard the subscriber map.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BusKey {
+    database_id: DatabaseId,
     tenant_id: u64,
     channel: String,
 }
@@ -58,7 +59,7 @@ struct SessionSink {
 
 /// The notification bus.  One instance per server, stored in `SharedState`.
 pub struct NotifyBus {
-    /// `(tenant, channel) → Vec<SessionSink>`.
+    /// `(database, tenant, channel) → Vec<SessionSink>`.
     subscribers: RwLock<HashMap<BusKey, Vec<(u64 /* session_id */, SessionSink)>>>,
     /// Monotonic session ID counter.
     next_session_id: AtomicU64,
@@ -84,17 +85,19 @@ impl NotifyBus {
         }
     }
 
-    /// Register a session as a listener for `(tenant_id, channel)`.
+    /// Register a session as a listener for `(database_id, tenant_id, channel)`.
     ///
     /// Returns a `(session_id, Receiver)` pair.  The caller must poll the
     /// receiver between queries to drain notifications, and call
     /// `unlisten` / `unlisten_all` on session disconnect.
     pub fn listen(
         &self,
+        database_id: DatabaseId,
         tenant_id: TenantId,
         channel: &str,
     ) -> (u64, tokio::sync::mpsc::Receiver<Notification>) {
         let key = BusKey {
+            database_id,
             tenant_id: tenant_id.as_u64(),
             channel: normalize_channel(channel),
         };
@@ -109,6 +112,7 @@ impl NotifyBus {
         map.entry(key.clone()).or_default().push((session_id, sink));
         debug!(
             session_id,
+            database = database_id.as_u64(),
             tenant = tenant_id.as_u64(),
             channel = key.channel.as_str(),
             "LISTEN registered"
@@ -117,8 +121,15 @@ impl NotifyBus {
     }
 
     /// Unregister a specific session from a channel.
-    pub fn unlisten(&self, tenant_id: TenantId, channel: &str, session_id: u64) {
+    pub fn unlisten(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        channel: &str,
+        session_id: u64,
+    ) {
         let key = BusKey {
+            database_id,
             tenant_id: tenant_id.as_u64(),
             channel: normalize_channel(channel),
         };
@@ -131,6 +142,7 @@ impl NotifyBus {
         }
         debug!(
             session_id,
+            database = database_id.as_u64(),
             tenant = tenant_id.as_u64(),
             channel = key.channel.as_str(),
             "UNLISTEN"
@@ -139,15 +151,16 @@ impl NotifyBus {
 
     /// Unregister a session from all channels it has subscribed to.
     ///
-    /// `session_ids` is the slice of (channel, session_id) pairs held by the
-    /// session.  This is called on session disconnect.
-    pub fn unlisten_all(&self, tenant_id: TenantId, session_ids: &[(String, u64)]) {
-        if session_ids.is_empty() {
+    /// `handles` is the slice of immutable `(database, tenant, channel,
+    /// session_id)` entries held by the session. This is called on disconnect.
+    pub fn unlisten_all(&self, handles: &[(DatabaseId, TenantId, String, u64)]) {
+        if handles.is_empty() {
             return;
         }
         let mut map = self.subscribers.write().unwrap_or_else(|p| p.into_inner());
-        for (channel, session_id) in session_ids {
+        for (database_id, tenant_id, channel, session_id) in handles {
             let key = BusKey {
+                database_id: *database_id,
                 tenant_id: tenant_id.as_u64(),
                 channel: normalize_channel(channel),
             };
@@ -158,20 +171,22 @@ impl NotifyBus {
                 }
             }
         }
-        debug!(
-            tenant = tenant_id.as_u64(),
-            count = session_ids.len(),
-            "UNLISTEN * (session disconnect)"
-        );
+        debug!(count = handles.len(), "UNLISTEN * (session disconnect)");
     }
 
-    /// Publish a notification to all listeners on `(tenant_id, channel)`.
+    /// Publish a notification to all listeners on `(database_id, tenant_id, channel)`.
     ///
-    /// Non-blocking: uses `try_send`. When a session's queue is full,
-    /// the oldest pending notification is dropped via a `recv().ok()` drain
-    /// and the new one is re-sent, then the drop counter is incremented.
-    pub fn notify(&self, tenant_id: TenantId, channel: &str, payload: &str) {
+    /// Non-blocking: uses `try_send`. When a session's queue is full, the new
+    /// notification is dropped and the drop counter is incremented.
+    pub fn notify(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: TenantId,
+        channel: &str,
+        payload: &str,
+    ) {
         let key = BusKey {
+            database_id,
             tenant_id: tenant_id.as_u64(),
             channel: normalize_channel(channel),
         };
@@ -192,17 +207,14 @@ impl NotifyBus {
             match sink.tx.try_send(notification.clone()) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Queue is full — drain one entry to make room, then retry.
-                    // We don't have a mutable ref so we can't drain directly here.
-                    // Use a blocking_recv in a non-async context isn't available,
-                    // but try_recv on the sender side isn't accessible.
-                    // Instead: increment the drop counter and skip.
+                    // Queue is full. The sender cannot remove an older item,
+                    // so retain the bounded backlog and drop this new item.
                     self.dropped.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         session_id,
                         channel = key.channel.as_str(),
                         cap = sink.cap,
-                        "NOTIFY queue full — dropping oldest (metric incremented)"
+                        "NOTIFY queue full — dropping new notification (metric incremented)"
                     );
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -229,7 +241,7 @@ impl NotifyBus {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// Number of distinct (tenant, channel) subscriptions currently active.
+    /// Number of active `(database, tenant, channel)` subscriptions.
     pub fn subscription_count(&self) -> usize {
         let map = self.subscribers.read().unwrap_or_else(|p| p.into_inner());
         map.values().map(|v| v.len()).sum()
@@ -247,10 +259,11 @@ pub fn normalize_channel(channel: &str) -> String {
 
 /// Handle for a session's LISTEN subscriptions.
 ///
-/// Stores the immutable subscription tenant together with `(channel,
-/// session_id, receiver)` so disconnect cleanup cannot be redirected by a
-/// later session-identity change.
+/// Stores the immutable subscription database and tenant together with
+/// `(channel, session_id, receiver)` so disconnect cleanup cannot be redirected
+/// by a later session-binding or identity change.
 pub struct ListenHandle {
+    pub database_id: DatabaseId,
     pub tenant_id: TenantId,
     pub channel: String,
     pub session_id: u64,
@@ -268,12 +281,17 @@ mod tests {
         TenantId::new(n)
     }
 
+    fn database(n: u64) -> DatabaseId {
+        DatabaseId::new(n)
+    }
+
     #[tokio::test]
     async fn basic_listen_notify() {
         let bus = NotifyBus::new(64);
         let t = tenant(1);
-        let (_, mut rx) = bus.listen(t, "orders");
-        bus.notify(t, "orders", "hello");
+        let db = database(1);
+        let (_, mut rx) = bus.listen(db, t, "orders");
+        bus.notify(db, t, "orders", "hello");
         let n = rx.try_recv().unwrap();
         assert_eq!(n.channel, "orders");
         assert_eq!(n.payload, "hello");
@@ -283,11 +301,12 @@ mod tests {
     async fn unlisten_stops_delivery() {
         let bus = NotifyBus::new(64);
         let t = tenant(1);
-        let (sid, mut rx) = bus.listen(t, "orders");
-        bus.notify(t, "orders", "first");
+        let db = database(1);
+        let (sid, mut rx) = bus.listen(db, t, "orders");
+        bus.notify(db, t, "orders", "first");
         assert!(rx.try_recv().is_ok());
-        bus.unlisten(t, "orders", sid);
-        bus.notify(t, "orders", "second");
+        bus.unlisten(db, t, "orders", sid);
+        bus.notify(db, t, "orders", "second");
         assert!(rx.try_recv().is_err());
     }
 
@@ -296,9 +315,10 @@ mod tests {
         let bus = NotifyBus::new(64);
         let t1 = tenant(1);
         let t2 = tenant(2);
-        let (_, mut rx1) = bus.listen(t1, "ch");
-        let (_, mut rx2) = bus.listen(t2, "ch");
-        bus.notify(t1, "ch", "for-t1");
+        let db = database(1);
+        let (_, mut rx1) = bus.listen(db, t1, "ch");
+        let (_, mut rx2) = bus.listen(db, t2, "ch");
+        bus.notify(db, t1, "ch", "for-t1");
         // t1 receives; t2 does not.
         assert!(rx1.try_recv().is_ok());
         assert!(rx2.try_recv().is_err());
@@ -308,10 +328,11 @@ mod tests {
     async fn queue_full_increments_dropped() {
         let bus = NotifyBus::new(2); // tiny cap
         let t = tenant(1);
-        let (_, _rx) = bus.listen(t, "ch"); // don't drain
-        bus.notify(t, "ch", "a");
-        bus.notify(t, "ch", "b"); // fills the queue
-        bus.notify(t, "ch", "c"); // should drop
+        let db = database(1);
+        let (_, _rx) = bus.listen(db, t, "ch"); // don't drain
+        bus.notify(db, t, "ch", "a");
+        bus.notify(db, t, "ch", "b"); // fills the queue
+        bus.notify(db, t, "ch", "c"); // should drop
         assert_eq!(bus.total_dropped(), 1);
     }
 
@@ -319,13 +340,32 @@ mod tests {
     async fn unlisten_all() {
         let bus = NotifyBus::new(64);
         let t = tenant(1);
-        let (sid1, mut rx1) = bus.listen(t, "ch1");
-        let (sid2, mut rx2) = bus.listen(t, "ch2");
-        bus.unlisten_all(t, &[("ch1".to_string(), sid1), ("ch2".to_string(), sid2)]);
-        bus.notify(t, "ch1", "msg");
-        bus.notify(t, "ch2", "msg");
+        let db = database(1);
+        let (sid1, mut rx1) = bus.listen(db, t, "ch1");
+        let (sid2, mut rx2) = bus.listen(db, t, "ch2");
+        bus.unlisten_all(&[
+            (db, t, "ch1".to_string(), sid1),
+            (db, t, "ch2".to_string(), sid2),
+        ]);
+        bus.notify(db, t, "ch1", "msg");
+        bus.notify(db, t, "ch2", "msg");
         assert!(rx1.try_recv().is_err());
         assert!(rx2.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn database_isolation() {
+        let bus = NotifyBus::new(64);
+        let tenant = tenant(1);
+        let database_a = database(1);
+        let database_b = database(2);
+        let (_, mut receiver_a) = bus.listen(database_a, tenant, "orders");
+        let (_, mut receiver_b) = bus.listen(database_b, tenant, "orders");
+
+        bus.notify(database_a, tenant, "orders", "only-a");
+
+        assert!(receiver_a.try_recv().is_ok());
+        assert!(receiver_b.try_recv().is_err());
     }
 
     #[test]

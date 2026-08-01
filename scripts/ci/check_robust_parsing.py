@@ -24,6 +24,17 @@ APPROVED_CAPACITY_HELPERS = {
 APPROVED_CAPACITY_NAMES = {name for _, name in APPROVED_CAPACITY_HELPERS}
 PROTECTED_PATH = re.compile(r"(?:parser|parse|wire|ddl|trigger|check)", re.I)
 BYTE_TYPES = {"u8", "i8", "c_uchar", "c_char"}
+# Source roots under these directory names belong to vendored dependencies or build output,
+# rather than to the first-party Cargo workspace.
+EXCLUDED_SOURCE_PATH_PARTS = frozenset({
+    "vendor",
+    "target",
+    "deps",
+    "build",
+    "node_modules",
+    "third_party",
+    "third-party",
+})
 
 
 def mask_rust(source: str) -> str:
@@ -223,6 +234,10 @@ def violations(rel: str, source: str):
 
 
 def self_test() -> None:
+    assert is_first_party_source_path(ROOT / "fuzz/src/target.rs")
+    assert not is_first_party_source_path(ROOT / "fuzz/vendor/sonic-rs/src/value.rs")
+    assert not is_first_party_source_path(ROOT / "target/debug/build/generated/src/lib.rs")
+    assert not is_first_party_source_path(ROOT / "nodedb/deps/example/src/lib.rs")
     assert not violations("nodedb/src/parser/x.rs", '// let u = s.to_uppercase();\n')
     assert violations("nodedb/src/parser/x.rs", 'fn f(s: &str) { let u = s.to_uppercase(); let x = s[0..1]; }')
     assert not violations("nodedb/src/parser/x.rs", 'fn f(s: &str) { let u = r#"s[0..1]"#; }')
@@ -238,8 +253,23 @@ def self_test() -> None:
     print("OK: robust-parsing gate self-tests passed.")
 
 
+def is_first_party_source_path(path: Path) -> bool:
+    """Return whether a path is in a workspace source tree, not dependency output."""
+    try:
+        parts = path.relative_to(ROOT).parts
+    except ValueError:
+        return False
+    return not any(part in EXCLUDED_SOURCE_PATH_PARTS for part in parts)
+
+
 def workspace_sources():
-    return sorted(path for src in ROOT.rglob("src") if src.is_dir() for path in src.rglob("*.rs"))
+    return sorted(
+        path
+        for src in ROOT.rglob("src")
+        if src.is_dir() and is_first_party_source_path(src)
+        for path in src.rglob("*.rs")
+        if is_first_party_source_path(path)
+    )
 
 
 def main() -> int:

@@ -17,15 +17,23 @@ use super::super::auth_support::{require_tenant_admin, status};
 
 /// Existence check used by the `DROP SCHEDULE IF EXISTS` short-circuit in the
 /// neutral router. Mirrors the pgwire `exists::schedule_exists` helper.
-pub fn schedule_exists(state: &SharedState, identity: &AuthenticatedIdentity, name: &str) -> bool {
-    let tid = identity.tenant_id.as_u64();
-    state.schedule_registry.get(tid, name).is_some()
+pub fn schedule_exists(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
+    name: &str,
+) -> bool {
+    state
+        .schedule_registry
+        .get(database_id, identity.tenant_id.as_u64(), name)
+        .is_some()
 }
 
 /// Handle `DROP SCHEDULE [IF EXISTS] <name>`
 pub fn drop_schedule(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop schedules")?;
@@ -52,7 +60,10 @@ pub fn drop_schedule(
     // Pre-check existence: `IF EXISTS` + missing is a no-op that
     // doesn't touch raft. Check via the in-memory registry since
     // `schedules.rs` has no `get_schedule` method today.
-    let existed_before = state.schedule_registry.get(tenant_id, &name).is_some();
+    let existed_before = state
+        .schedule_registry
+        .get(database_id, tenant_id, &name)
+        .is_some();
     if !existed_before && !if_exists {
         return Err(DdlError {
             sqlstate: "42704".to_string(),
@@ -64,6 +75,7 @@ pub fn drop_schedule(
     }
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteSchedule {
+        database_id,
         tenant_id,
         name: name.clone(),
     };
@@ -74,19 +86,36 @@ pub fn drop_schedule(
         })?;
     if log_index == 0 {
         let _ = catalog
-            .delete_schedule(tenant_id, &name)
+            .delete_schedule_in_database(database_id, tenant_id, &name)
             .map_err(|e| DdlError {
                 sqlstate: "XX000".to_string(),
                 message: format!("catalog delete: {e}"),
             })?;
-        state.schedule_registry.unregister(tenant_id, &name);
+        catalog
+            .delete_owner("schedule", database_id.as_u64(), tenant_id, &name)
+            .map_err(|e| DdlError {
+                sqlstate: "XX000".to_string(),
+                message: format!("catalog owner delete: {e}"),
+            })?;
+        state
+            .schedule_registry
+            .unregister(database_id, tenant_id, &name);
+        state
+            .permissions
+            .install_replicated_remove_owner_in_database(
+                "schedule",
+                database_id.as_u64(),
+                tenant_id,
+                &name,
+            );
     }
 
     // Emit tombstone delta for Lite visibility (removes schedule from Lite catalog).
     {
         let delta = crate::event::crdt_sync::types::OutboundDelta {
+            database_id,
             collection: "_schedules".into(),
-            document_id: name.clone(),
+            document_id: format!("{}:{name}", database_id.as_u64()),
             payload: Vec::new(),
             op: crate::event::crdt_sync::types::DeltaOp::Delete,
             lsn: 0,
@@ -94,7 +123,7 @@ pub fn drop_schedule(
             peer_id: state.node_id,
             sequence: 0,
         };
-        state.crdt_sync_delivery.enqueue(tenant_id, delta);
+        state.crdt_sync_delivery.enqueue(delta);
     }
 
     state.audit_record(

@@ -19,6 +19,7 @@ fn make_request(collection: &str, lsn: u64) -> CrossShardWriteRequest {
     CrossShardWriteRequest {
         sql: format!("INSERT INTO audit VALUES ({lsn})"),
         tenant_id: 1,
+        database_id: 0,
         source_vshard: 3,
         source_lsn: lsn,
         source_sequence: lsn,

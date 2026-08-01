@@ -7,7 +7,10 @@
 //! the announce-precedes-data invariant: any peer that receives a delta or
 //! snapshot for a collection has already received its descriptor.
 
-use nodedb_types::sync::wire::{CollectionDescriptor, CollectionSchemaSyncMsg};
+use nodedb_types::{
+    DatabaseId,
+    sync::wire::{CollectionDescriptor, CollectionSchemaSyncMsg},
+};
 
 use tracing::warn;
 
@@ -28,6 +31,7 @@ pub(in crate::control::server::sync) fn build_collection_schema_frame(
     shared: &SharedState,
     session: &SyncSession,
     tenant_id: u64,
+    database_id: DatabaseId,
     collection: &str,
 ) -> Option<SyncFrame> {
     if session.announced_collections.contains(collection) {

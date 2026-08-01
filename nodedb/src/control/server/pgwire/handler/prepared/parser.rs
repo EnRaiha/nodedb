@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use pgwire::api::results::{FieldFormat, FieldInfo};
 use pgwire::api::stmt::QueryParser;
 use pgwire::api::{ClientInfo, Type};
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::error::PgWireResult;
 
 use crate::config::auth::AuthMode;
 use crate::control::security::audit::ArcAuditEmitter;
@@ -200,7 +200,9 @@ impl NodeDbQueryParser {
         let sql_for_planning = substitute_placeholders_with_null(&sql_without_returning);
         let query_ctx =
             crate::control::planner::context::QueryContext::for_state_with_lease(&self.state);
-        let auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
+        let mut auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
+        // Parse plans against this selected database, including RLS variables.
+        auth_ctx.database_id = Some(database_id);
         let permission_cache = self.state.permission_cache.read().await;
         let security = crate::control::planner::context::PlanSecurityContext {
             identity,
@@ -210,8 +212,8 @@ impl NodeDbQueryParser {
             roles: &self.state.roles,
             permission_cache: Some(&*permission_cache),
         };
-        let Ok((mut tasks, _)) = query_ctx
-            .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
+        let Ok((tasks, _)) = query_ctx
+            .plan_sql_with_rls_metadata(crate::control::planner::context::PlanSqlWithRlsParams {
                 sql: &sql_for_planning,
                 tenant_id: identity.tenant_id,
                 database_id,
@@ -223,21 +225,8 @@ impl NodeDbQueryParser {
         };
         drop(permission_cache);
 
-        crate::control::planner::implicit_edges::append_implicit_edge_tasks(
-            &self.state,
-            &mut tasks,
-            identity.tenant_id,
-            database_id,
-            crate::types::TraceId::ZERO,
-        )
-        .await
-        .map_err(|error| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_owned(),
-                "XX000".to_owned(),
-                error.to_string(),
-            )))
-        })?;
+        // Parse/Describe is metadata-only: authorize the original task set,
+        // but do not materialize implicit graph edges while describing it.
         let _authorized_tasks = authorize_task_set(
             identity,
             &tasks,

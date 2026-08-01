@@ -53,7 +53,7 @@ use nodedb_cluster::array_routing::array_vshard_for_name;
 
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{ReplicatedEntry, ReplicatedWrite};
-use crate::types::{TenantId, VShardId};
+use crate::types::{DatabaseId, TenantId, VShardId};
 
 use super::apply::OriginApplyEngine;
 use super::outbound::ArrayApplyObserver;
@@ -95,6 +95,7 @@ pub struct OriginArrayInbound {
     pub(super) schemas: Arc<OriginSchemaRegistry>,
     pub(super) shared: Arc<SharedState>,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     identity: crate::control::security::identity::AuthenticatedIdentity,
     /// Post-apply observer for fan-out to subscribed Lite peers.
     ///
@@ -131,14 +132,22 @@ impl OriginArrayInbound {
         self.tenant_id
     }
 
+    /// Database selected by the authenticated sync session. This is captured
+    /// once at engine construction and is the sole database scope for every
+    /// inbound array authorization, Raft entry, and Data-Plane task.
+    pub(crate) fn database_id(&self) -> DatabaseId {
+        self.database_id
+    }
+
     pub(super) fn identity(&self) -> &crate::control::security::identity::AuthenticatedIdentity {
         &self.identity
     }
 
-    fn authorize_array_write(
+    pub(super) fn authorize_array(
         &self,
         array: &str,
         hlc: Hlc,
+        permission: crate::control::security::identity::Permission,
     ) -> Result<
         crate::control::server::shared::authorization::AuthorizedCollection,
         Option<ArrayRejectMsg>,
@@ -147,9 +156,9 @@ impl OriginArrayInbound {
             crate::control::security::audit::ArcAuditEmitter(Arc::clone(&self.shared.audit));
         crate::control::server::shared::authorization::authorize_collection_capability(
             &self.identity,
-            crate::types::DatabaseId::DEFAULT,
+            self.database_id,
             array,
-            crate::control::security::identity::Permission::Write,
+            permission,
             &self.shared.permissions,
             &self.shared.roles,
             &emitter,
@@ -186,11 +195,13 @@ impl OriginArrayInbound {
         identity: crate::control::security::identity::AuthenticatedIdentity,
     ) -> Self {
         let tenant_id = identity.tenant_id;
+        let database_id = identity.default_database.unwrap_or(DatabaseId::DEFAULT);
         Self {
             engine,
             schemas,
             shared,
             tenant_id,
+            database_id,
             identity,
             apply_observer: None,
             snapshots: Mutex::new(HashMap::new()),
@@ -303,15 +314,22 @@ impl OriginArrayInbound {
     ) -> Result<InboundOutcome, Option<ArrayRejectMsg>> {
         let hlc_arr: [u8; 18] = msg.schema_hlc_bytes;
         let remote_hlc = Hlc::from_bytes(&hlc_arr);
-        let authorization = self.authorize_array_write(&msg.array, remote_hlc)?;
+        let authorization = self.authorize_array(
+            &msg.array,
+            remote_hlc,
+            crate::control::security::identity::Permission::Write,
+        )?;
 
         // In single-node mode (no raft_proposer) fall back to direct import.
         if self.shared.raft_proposer.get().is_none() {
             let _authorized_scope = authorization.into_scope();
-            if let Err(e) =
-                self.schemas
-                    .import_snapshot(&msg.array, &msg.snapshot_payload, remote_hlc)
-            {
+            if let Err(e) = self.schemas.import_snapshot_in_database(
+                self.database_id,
+                self.tenant_id.as_u64(),
+                &msg.array,
+                &msg.snapshot_payload,
+                remote_hlc,
+            ) {
                 warn!(array = %msg.array, error = %e, "array_inbound: schema import failed");
                 return Err(Some(build_reject(
                     &msg.array,
@@ -331,9 +349,12 @@ impl OriginArrayInbound {
             // propagated rather than swallowed: reporting `SchemaImported`
             // while the array stays unregistered would be a silent
             // catalog-visibility inconsistency.
-            if let Err(e) =
-                super::catalog_register::register_array_catalog_entry(&self.shared, &msg.array)
-            {
+            if let Err(e) = super::catalog_register::register_array_catalog_entry(
+                &self.shared,
+                self.tenant_id,
+                self.database_id,
+                &msg.array,
+            ) {
                 warn!(array = %msg.array, error = %e, "array_inbound: catalog registration failed");
                 return Err(Some(build_reject(
                     &msg.array,
@@ -351,11 +372,9 @@ impl OriginArrayInbound {
             snapshot_payload: msg.snapshot_payload.clone(),
             schema_hlc_bytes: hlc_arr,
         };
-        // Array sync is single-database (an edge maps to one embedded DB), so
-        // replicated array schema binds under the default database.
         let entry = ReplicatedEntry::new(
             self.tenant_id.as_u64(),
-            crate::types::DatabaseId::DEFAULT.as_u64(),
+            self.database_id.as_u64(),
             vshard_id.as_u32(),
             write,
         );
@@ -398,10 +417,18 @@ impl OriginArrayInbound {
             )));
         }
 
-        let authorization = self.authorize_array_write(&op.header.array, op.header.hlc)?;
+        let authorization = self.authorize_array(
+            &op.header.array,
+            op.header.hlc,
+            crate::control::security::identity::Permission::Write,
+        )?;
 
         // 2. Schema HLC gating.
-        match self.engine.schema_hlc(&op.header.array) {
+        match self.engine.schema_hlc_in_database(
+            self.database_id,
+            self.tenant_id.as_u64(),
+            &op.header.array,
+        ) {
             None => {
                 return Err(Some(build_reject(
                     &op.header.array,
@@ -425,7 +452,12 @@ impl OriginArrayInbound {
         }
 
         // 3. Fast-path idempotency check (before proposing).
-        if self.engine.already_seen(&op.header.array, op.header.hlc) {
+        if self.engine.already_seen_in_database(
+            self.database_id,
+            self.tenant_id.as_u64(),
+            &op.header.array,
+            op.header.hlc,
+        ) {
             let _authorized_scope = authorization.into_scope();
             return Ok(InboundOutcome::Idempotent);
         }
@@ -449,11 +481,9 @@ impl OriginArrayInbound {
                 .and_then(|p| zerompk::to_msgpack_vec(p).ok()),
         };
         let vshard = self.vshard_for_op(&op);
-        // Array sync is single-database (an edge maps to one embedded DB), so
-        // replicated array ops bind under the default database.
         let entry = ReplicatedEntry::new(
             self.tenant_id.as_u64(),
-            crate::types::DatabaseId::DEFAULT.as_u64(),
+            self.database_id.as_u64(),
             vshard.as_u32(),
             write,
         );

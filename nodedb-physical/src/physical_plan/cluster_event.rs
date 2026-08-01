@@ -5,6 +5,14 @@
 //! These plans are cluster-RPC envelopes only. They must never cross the
 //! Control Plane → Data Plane bridge.
 
+use nodedb_types::DatabaseId;
+
+/// Hard cap for committed CDC cursors supplied in one cluster consume request.
+///
+/// This bounds a caller-controlled wire vector while still allowing one cursor
+/// for every partition in a reasonably sized routed stream.
+pub const MAX_REMOTE_CDC_COMMITTED_OFFSETS: usize = 4_096;
+
 /// Cluster-routed Event-Plane operation.
 #[derive(
     Debug,
@@ -16,29 +24,42 @@
     zerompk::FromMessagePack,
 )]
 pub enum ClusterEventOp {
-    /// Consume one CDC partition from the leader node's local event buffer.
+    /// Consume CDC events from the leader node's local event buffer.
+    ///
+    /// `committed_offsets` belongs to the caller node: each tuple is
+    /// `(partition_id, lsn, sequence)`. The receiver must use these cursors
+    /// rather than its own consumer-group offset store. Missing partitions
+    /// start at the initial `(0, 0)` position.
     ConsumeStream {
+        database_id: DatabaseId,
         stream_name: String,
         group_name: String,
-        partition: u32,
+        partition: Option<u32>,
         limit: u64,
+        committed_offsets: Vec<(u32, u64, u64)>,
     },
     /// Publish one durable-topic message on the topic's home node.
-    PublishTopic { topic_name: String, payload: String },
+    PublishTopic {
+        database_id: DatabaseId,
+        topic_name: String,
+        payload: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ClusterEventOp;
+    use super::{ClusterEventOp, DatabaseId};
     use crate::physical_plan::{PhysicalPlan, wire};
 
     #[test]
     fn cluster_event_plan_roundtrips_over_cluster_wire() {
         let plan = PhysicalPlan::ClusterEvent(ClusterEventOp::ConsumeStream {
+            database_id: DatabaseId::new(7),
             stream_name: "orders; no SQL".into(),
             group_name: "Analytics".into(),
-            partition: 7,
+            partition: Some(7),
             limit: 128,
+            committed_offsets: vec![(7, 42, 3)],
         });
         let encoded = wire::encode(&plan).expect("encode typed cluster event");
         assert_eq!(

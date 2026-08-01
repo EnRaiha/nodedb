@@ -11,9 +11,11 @@ pub mod fire_instead;
 pub mod fire_statement;
 pub mod registry;
 pub mod row_identity;
+pub mod scope;
 pub mod when_parse;
 
 pub use registry::{DmlEvent, TriggerRegistry};
+pub use scope::TriggerScope;
 
 /// Evaluate a simple boolean condition without DataFusion.
 ///

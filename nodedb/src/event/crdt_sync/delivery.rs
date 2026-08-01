@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, trace, warn};
 
 use super::types::{DeliveryConfig, LiteSessionHandle, OutboundDelta};
+use crate::types::DatabaseId;
 
 /// Registry of connected Lite sessions for delta delivery.
 ///
@@ -60,6 +61,7 @@ impl CrdtSyncDelivery {
         session_id: String,
         peer_id: u64,
         tenant_id: u64,
+        database_id: DatabaseId,
         subscribed_collections: Vec<String>,
         config: &DeliveryConfig,
     ) -> (
@@ -77,6 +79,7 @@ impl CrdtSyncDelivery {
             session_id: session_id.clone(),
             peer_id,
             tenant_id,
+            database_id,
             subscribed_collections,
             sender: tx,
             control_sender: control_tx,
@@ -91,6 +94,7 @@ impl CrdtSyncDelivery {
             session = %session_id,
             peer_id,
             tenant_id,
+            database_id = database_id.as_u64(),
             "registered Lite session for CRDT sync delivery"
         );
 
@@ -98,14 +102,21 @@ impl CrdtSyncDelivery {
     }
 
     /// Broadcast a `CollectionPurged` control frame to every session
-    /// currently subscribed to `(tenant_id, collection)`. Runs when the
-    /// per-node reclaim barrier finishes, so every online
-    /// Lite client learns about the hard-delete within one network
-    /// round-trip and can drop local state. Offline clients pick it
-    /// up on reconnect via the `last_seen_lsn` replay path.
-    pub fn broadcast_collection_purged(&self, tenant_id: u64, collection: &str, purge_lsn: u64) {
+    /// currently subscribed to `(tenant_id, database_id, collection)`. Runs
+    /// when the per-node reclaim barrier finishes, so every online Lite client
+    /// learns about the hard-delete within one network round-trip and can drop
+    /// local state. Offline clients pick it up on reconnect via the
+    /// `last_seen_lsn` replay path.
+    pub fn broadcast_collection_purged(
+        &self,
+        tenant_id: u64,
+        database_id: DatabaseId,
+        collection: &str,
+        purge_lsn: u64,
+    ) {
         let msg = nodedb_types::sync::wire::CollectionPurgedMsg {
             tenant_id,
+            database_id,
             name: collection.to_string(),
             purge_lsn,
         };
@@ -115,7 +126,10 @@ impl CrdtSyncDelivery {
         ) else {
             warn!(
                 tenant_id,
-                collection, purge_lsn, "failed to encode CollectionPurgedMsg — skipping broadcast"
+                database_id = database_id.as_u64(),
+                collection,
+                purge_lsn,
+                "failed to encode CollectionPurgedMsg — skipping broadcast"
             );
             return;
         };
@@ -124,12 +138,12 @@ impl CrdtSyncDelivery {
         let mut sent = 0usize;
         let mut dropped = 0usize;
         for session in sessions.values() {
-            if session.tenant_id != tenant_id {
+            if session.tenant_id != tenant_id || session.database_id != database_id {
                 continue;
             }
             // Collection filter: if the session declared a subscription
             // list, the collection must be in it. Empty list = "all
-            // collections for this tenant" = always notify.
+            // collections for this tenant and database" = always notify.
             if !session.subscribed_collections.is_empty()
                 && !session
                     .subscribed_collections
@@ -145,7 +159,12 @@ impl CrdtSyncDelivery {
         }
         info!(
             tenant_id,
-            collection, purge_lsn, sent, dropped, "broadcast CollectionPurged to sync sessions"
+            database_id = database_id.as_u64(),
+            collection,
+            purge_lsn,
+            sent,
+            dropped,
+            "broadcast CollectionPurged to sync sessions"
         );
     }
 
@@ -159,11 +178,17 @@ impl CrdtSyncDelivery {
         }
     }
 
-    /// Check if any connected Lite session subscribes to this collection.
-    pub fn has_subscribers(&self, tenant_id: u64, collection: &str) -> bool {
+    /// Check if any connected Lite session subscribes to this exact scope.
+    pub fn has_subscribers(
+        &self,
+        tenant_id: u64,
+        database_id: DatabaseId,
+        collection: &str,
+    ) -> bool {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
         sessions.values().any(|s| {
             s.tenant_id == tenant_id
+                && s.database_id == database_id
                 && (s.subscribed_collections.is_empty()
                     || s.subscribed_collections.iter().any(|c| c == collection))
         })
@@ -171,14 +196,14 @@ impl CrdtSyncDelivery {
 
     /// Enqueue an outbound delta for delivery to all matching sessions.
     ///
-    /// Sends to each session whose tenant_id matches and that subscribes
-    /// to the delta's collection. Uses `try_send` (non-blocking) — if the
-    /// channel is full, the delta is dropped with a warning (backpressure).
-    pub fn enqueue(&self, tenant_id: u64, delta: OutboundDelta) {
+    /// Sends only to each session whose tenant, database, and collection all
+    /// match the delta. Uses `try_send` (non-blocking) — if the channel is
+    /// full, the delta is dropped with a warning (backpressure).
+    pub fn enqueue(&self, delta: OutboundDelta) {
         let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
 
         for session in sessions.values() {
-            if session.tenant_id != tenant_id {
+            if session.tenant_id != delta.tenant_id || session.database_id != delta.database_id {
                 continue;
             }
 
@@ -277,6 +302,7 @@ mod tests {
 
     fn make_delta(collection: &str, lsn: u64) -> OutboundDelta {
         OutboundDelta {
+            database_id: DatabaseId::new(7),
             collection: collection.into(),
             document_id: "doc-1".into(),
             payload: vec![1, 2, 3],
@@ -293,11 +319,19 @@ mod tests {
         let delivery = CrdtSyncDelivery::new();
         let config = DeliveryConfig::default();
 
-        let (_rx, _crx) = delivery.register("s1".into(), 42, 1, vec!["orders".into()], &config);
+        let (_rx, _crx) = delivery.register(
+            "s1".into(),
+            42,
+            1,
+            DatabaseId::new(7),
+            vec!["orders".into()],
+            &config,
+        );
         assert_eq!(delivery.session_count(), 1);
-        assert!(delivery.has_subscribers(1, "orders"));
-        assert!(!delivery.has_subscribers(1, "users"));
-        assert!(!delivery.has_subscribers(2, "orders"));
+        assert!(delivery.has_subscribers(1, DatabaseId::new(7), "orders"));
+        assert!(!delivery.has_subscribers(1, DatabaseId::new(7), "users"));
+        assert!(!delivery.has_subscribers(2, DatabaseId::new(7), "orders"));
+        assert!(!delivery.has_subscribers(1, DatabaseId::new(8), "orders"));
 
         delivery.unregister("s1");
         assert_eq!(delivery.session_count(), 0);
@@ -309,10 +343,11 @@ mod tests {
         let config = DeliveryConfig::default();
 
         // Empty subscribed_collections = all collections.
-        let (_rx, _crx) = delivery.register("s1".into(), 42, 1, vec![], &config);
-        assert!(delivery.has_subscribers(1, "orders"));
-        assert!(delivery.has_subscribers(1, "users"));
-        assert!(delivery.has_subscribers(1, "anything"));
+        let (_rx, _crx) =
+            delivery.register("s1".into(), 42, 1, DatabaseId::new(7), vec![], &config);
+        assert!(delivery.has_subscribers(1, DatabaseId::new(7), "orders"));
+        assert!(delivery.has_subscribers(1, DatabaseId::new(7), "users"));
+        assert!(delivery.has_subscribers(1, DatabaseId::new(7), "anything"));
     }
 
     #[tokio::test]
@@ -320,10 +355,17 @@ mod tests {
         let delivery = CrdtSyncDelivery::new();
         let config = DeliveryConfig::default();
 
-        let (mut rx, _crx) = delivery.register("s1".into(), 42, 1, vec!["orders".into()], &config);
+        let (mut rx, _crx) = delivery.register(
+            "s1".into(),
+            42,
+            1,
+            DatabaseId::new(7),
+            vec!["orders".into()],
+            &config,
+        );
 
-        delivery.enqueue(1, make_delta("orders", 100));
-        delivery.enqueue(1, make_delta("users", 200)); // Should NOT deliver.
+        delivery.enqueue(make_delta("orders", 100));
+        delivery.enqueue(make_delta("users", 200)); // Should NOT deliver.
 
         let delta = rx.try_recv().unwrap();
         assert_eq!(delta.collection, "orders");
@@ -341,13 +383,14 @@ mod tests {
             ..Default::default()
         };
 
-        let (_rx, _crx) = delivery.register("s1".into(), 42, 1, vec![], &config);
+        let (_rx, _crx) =
+            delivery.register("s1".into(), 42, 1, DatabaseId::new(7), vec![], &config);
 
         // Fill the channel (capacity 2).
-        delivery.enqueue(1, make_delta("a", 1));
-        delivery.enqueue(1, make_delta("b", 2));
+        delivery.enqueue(make_delta("a", 1));
+        delivery.enqueue(make_delta("b", 2));
         // Third should be dropped (backpressure).
-        delivery.enqueue(1, make_delta("c", 3));
+        delivery.enqueue(make_delta("c", 3));
 
         assert_eq!(
             delivery
@@ -358,11 +401,70 @@ mod tests {
     }
 
     #[test]
+    fn same_tenant_other_database_does_not_receive_collection_purged() {
+        let delivery = CrdtSyncDelivery::new();
+        let config = DeliveryConfig::default();
+        let (_source_delta_rx, mut source_control_rx) = delivery.register(
+            "source-database".into(),
+            1,
+            1,
+            DatabaseId::new(7),
+            vec!["orders".into()],
+            &config,
+        );
+        let (_other_delta_rx, mut other_control_rx) = delivery.register(
+            "other-database".into(),
+            2,
+            1,
+            DatabaseId::new(8),
+            vec!["orders".into()],
+            &config,
+        );
+
+        delivery.broadcast_collection_purged(1, DatabaseId::new(7), "orders", 100);
+
+        let frame = source_control_rx
+            .try_recv()
+            .expect("source database is notified");
+        let msg: nodedb_types::sync::wire::CollectionPurgedMsg =
+            frame.decode_body().expect("purge frame decodes");
+        assert_eq!(msg.database_id, DatabaseId::new(7));
+        assert!(other_control_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn same_tenant_other_database_does_not_receive_delta() {
+        let delivery = CrdtSyncDelivery::new();
+        let config = DeliveryConfig::default();
+        let (mut source_database_rx, _source_control_rx) = delivery.register(
+            "source-database".into(),
+            1,
+            1,
+            DatabaseId::new(7),
+            vec!["orders".into()],
+            &config,
+        );
+        let (mut other_database_rx, _other_control_rx) = delivery.register(
+            "other-database".into(),
+            2,
+            1,
+            DatabaseId::new(8),
+            vec!["orders".into()],
+            &config,
+        );
+
+        delivery.enqueue(make_delta("orders", 100));
+
+        assert!(source_database_rx.try_recv().is_ok());
+        assert!(other_database_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn prune_removes_closed_sessions() {
         let delivery = CrdtSyncDelivery::new();
         let config = DeliveryConfig::default();
 
-        let (rx, _crx) = delivery.register("s1".into(), 42, 1, vec![], &config);
+        let (rx, _crx) = delivery.register("s1".into(), 42, 1, DatabaseId::new(7), vec![], &config);
         assert_eq!(delivery.session_count(), 1);
 
         // Drop receiver → channel closed.
@@ -376,10 +478,12 @@ mod tests {
         let delivery = CrdtSyncDelivery::new();
         let config = DeliveryConfig::default();
 
-        let (mut rx1, _c1) = delivery.register("s1".into(), 1, 1, vec![], &config);
-        let (mut rx2, _c2) = delivery.register("s2".into(), 2, 1, vec![], &config);
+        let (mut rx1, _c1) =
+            delivery.register("s1".into(), 1, 1, DatabaseId::new(7), vec![], &config);
+        let (mut rx2, _c2) =
+            delivery.register("s2".into(), 2, 1, DatabaseId::new(7), vec![], &config);
 
-        delivery.enqueue(1, make_delta("orders", 100));
+        delivery.enqueue(make_delta("orders", 100));
 
         assert!(rx1.try_recv().is_ok());
         assert!(rx2.try_recv().is_ok());

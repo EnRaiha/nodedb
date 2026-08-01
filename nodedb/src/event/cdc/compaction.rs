@@ -61,13 +61,15 @@ pub fn spawn_compaction_task(
                     let Some(stat) = streams.get(round) else {
                         continue;
                     };
-                    let def = registry.get(stat.tenant_id, &stat.stream_name);
+                    let def = registry.get(stat.database_id, stat.tenant_id, &stat.stream_name);
                     let def = match def {
                         Some(d) if d.compaction.enabled => d,
                         _ => continue,
                     };
 
-                    if let Some(buffer) = router.get_buffer(stat.tenant_id, &stat.stream_name) {
+                    if let Some(buffer) =
+                        router.get_buffer(stat.database_id, stat.tenant_id, &stat.stream_name)
+                    {
                         let removed = buffer.compact(
                             &def.compaction.key_field,
                             def.compaction.tombstone_grace_secs,
@@ -110,6 +112,7 @@ mod tests {
             row_id: format!("row-{seq}"),
             event_time: now_ms,
             lsn: seq * 10,
+            database_id: crate::types::DatabaseId::new(7),
             tenant_id: 1,
             new_value: Some(serde_json::json!({"id": key_val, "name": format!("v{seq}")})),
             old_value: None,
@@ -143,7 +146,7 @@ mod tests {
         assert_eq!(removed, 2); // Two older "alice" events removed.
         assert_eq!(buf.len(), 2); // Latest "alice" + "bob" remain.
 
-        let events = buf.read_from_lsn(0, 10);
+        let events = buf.read_from(super::super::offset::CdcOffset::ZERO, 10);
         // Latest alice (seq 3) and bob (seq 4) remain.
         assert_eq!(events.len(), 2);
     }

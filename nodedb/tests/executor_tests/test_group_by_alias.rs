@@ -58,6 +58,7 @@ fn plan_sql(sql: &str) -> SqlPlan {
 fn sql_to_physical(sql: &str) -> PhysicalPlan {
     let plans = nodedb_sql::plan_sql(sql, &TimeseriesCatalog).unwrap();
     let ctx = ConvertContext {
+        purpose: nodedb::control::planner::sql_plan_convert::PlanningPurpose::Execute,
         retention_registry: None,
         array_catalog: None,
         credentials: None,

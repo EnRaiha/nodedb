@@ -202,6 +202,97 @@ async fn query_rejects_schemaless_write_without_permission_or_mutation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_from_rejects_ungranted_write_before_missing_path_error() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION denied_copy_from_writes")
+        .await
+        .expect("create COPY FROM target collection");
+
+    let token = create_api_key(
+        &srv.shared,
+        "http_ungranted_copy_from_writer",
+        vec![Role::Custom("http_ungranted_copy_from_writer_role".into())],
+    );
+    let http = start_authenticated_http(Arc::clone(&srv.shared)).await;
+    let missing_path_parent = tempfile::tempdir().expect("create missing COPY FROM path parent");
+    let missing_path = missing_path_parent.path().join("missing.ndjson");
+    let response = post_query(
+        &http,
+        &token,
+        &format!(
+            "COPY denied_copy_from_writes FROM '{}'",
+            missing_path.display()
+        ),
+    )
+    .await;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .expect("read denied COPY FROM response")
+        .to_lowercase();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "COPY FROM must authorize the target before inspecting the input path; response: {body}"
+    );
+    assert!(
+        body.contains("permission denied"),
+        "COPY FROM must report target-write denial, got: {body}"
+    );
+    assert!(
+        !body.contains("cannot stat") && !body.contains("no such file"),
+        "COPY FROM inspected the missing path before authorization: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crdt_apply_rejects_ungranted_custom_role_before_surrogate_assignment() {
+    let srv = TestServer::start().await;
+    let collection = "denied_crdt_apply_surrogate";
+    let doc_id = "forbidden-crdt-doc";
+    let token = create_api_key(
+        &srv.shared,
+        "http_ungranted_crdt_writer",
+        vec![Role::Custom("http_ungranted_crdt_writer_role".into())],
+    );
+    let http = start_authenticated_http(Arc::clone(&srv.shared)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/v1/collections/{collection}/crdt/apply",
+            http.local_addr
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        // Task authorization runs before CRDT semantic validation; this is a
+        // bounded, syntactically valid hex payload.
+        .json(&serde_json::json!({"doc_id": doc_id, "delta": "00"}))
+        .send()
+        .await
+        .expect("POST unauthorized CRDT apply");
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "ungranted CRDT writes must be rejected before dispatch"
+    );
+    assert_eq!(
+        srv.shared
+            .surrogate_assigner
+            .lookup(
+                DatabaseId::DEFAULT,
+                TenantId::new(1),
+                collection,
+                doc_id.as_bytes(),
+            )
+            .expect("look up CRDT document surrogate"),
+        None,
+        "authorization denial must precede surrogate assignment"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_authorizes_schemaless_write_before_firing_triggers() {
     let srv = TestServer::start().await;
     srv.exec("CREATE COLLECTION trigger_guarded_writes")
@@ -248,6 +339,40 @@ async fn query_rejects_system_catalog_for_non_superuser() {
         response.status(),
         reqwest::StatusCode::FORBIDDEN,
         "system catalog access must require a superuser on every SQL transport"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn query_rejects_collection_read_without_custom_role_grant() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION denied_read_rows")
+        .await
+        .expect("create denied read collection");
+    srv.exec("INSERT INTO denied_read_rows { id: 'private-row', value: 23 }")
+        .await
+        .expect("seed denied read collection");
+
+    let token = create_api_key(
+        &srv.shared,
+        "http_ungranted_reader",
+        vec![Role::Custom("http_ungranted_reader_role".into())],
+    );
+    let http = start_authenticated_http(Arc::clone(&srv.shared)).await;
+    let response = post_query(&http, &token, "SELECT * FROM denied_read_rows").await;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .expect("read denied collection authorization response");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "ungranted custom-role reads must be rejected; response: {body}"
+    );
+    assert!(
+        body.contains("permission denied") && !body.contains("private-row"),
+        "the existing collection must be denied by authorization without leaking its row: {body}"
     );
 }
 

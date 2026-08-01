@@ -44,10 +44,12 @@ pub async fn dispatch_trigger_batch(
         _ => return,
     };
 
-    let triggers =
-        state
-            .trigger_registry
-            .get_matching(batch.tenant_id, &batch.collection, dml_event);
+    let triggers = state.trigger_registry.get_matching(
+        batch.database_id,
+        batch.tenant_id,
+        &batch.collection,
+        dml_event,
+    );
 
     let after_row_triggers: Vec<_> = triggers
         .iter()
@@ -122,6 +124,7 @@ pub async fn dispatch_trigger_batch(
                     "batch trigger fire failed, enqueuing row for retry"
                 );
                 retry_queue.enqueue(RetryEntry {
+                    database_id: batch.database_id,
                     tenant_id: batch.tenant_id,
                     collection: batch.collection.clone(),
                     row_id: row.row_id.clone(),

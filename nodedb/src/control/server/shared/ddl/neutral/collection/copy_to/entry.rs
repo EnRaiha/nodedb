@@ -20,6 +20,14 @@ use crate::types::TraceId;
 
 use super::format::serialize_rows;
 
+/// COPY TO format and serialization options.
+#[derive(Clone, Copy, Debug)]
+pub struct CopyToOptions<'a> {
+    pub format: Option<&'a CopyFormat>,
+    pub delimiter: Option<char>,
+    pub header: bool,
+}
+
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError {
@@ -34,10 +42,15 @@ pub async fn copy_to_file(
     identity: &AuthenticatedIdentity,
     source: &CopyToSource,
     path: &str,
-    format: Option<&CopyFormat>,
-    delimiter: Option<char>,
-    header: bool,
+    options: CopyToOptions<'_>,
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    let CopyToOptions {
+        format,
+        delimiter,
+        header,
+    } = options;
+
     validate_path(path)?;
 
     // Resolve format (caller has already auto-detected from extension).
@@ -56,11 +69,11 @@ pub async fn copy_to_file(
 
     // Validate collection existence (for table-form sources) and engine support.
     if let CopyToSource::Collection(coll) = source {
-        check_collection_exists(state, identity, coll)?;
+        check_collection_exists(state, identity, database_id, coll)?;
     }
 
     // Execute the query and collect all JSON rows.
-    let rows = execute_and_collect(state, identity, &select_sql).await?;
+    let rows = execute_and_collect(state, identity, database_id, &select_sql).await?;
 
     // Serialize to the requested format.
     let bytes = serialize_rows(&rows, resolved_format, delimiter.unwrap_or(','), header)?;
@@ -104,10 +117,11 @@ fn build_select_sql(source: &CopyToSource) -> Result<String, DdlError> {
 fn check_collection_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: &str,
 ) -> Result<(), DdlError> {
     let catalog = state.credentials.catalog();
-    match catalog.get_collection(DatabaseId::DEFAULT, identity.tenant_id.as_u64(), collection) {
+    match catalog.get_collection(database_id, identity.tenant_id.as_u64(), collection) {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(ddl_err(
             "42P01",
@@ -124,14 +138,15 @@ fn check_collection_exists(
 async fn execute_and_collect(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     select_sql: &str,
 ) -> Result<Vec<serde_json::Value>, DdlError> {
-    let (tasks, _output_schema) =
+    let (tasks, _output_schema, _lease_scope) =
         crate::control::server::shared::ddl::neutral::planning::plan_authorized_sql(
             state,
             identity,
             select_sql,
-            DatabaseId::DEFAULT,
+            database_id,
         )
         .await
         .map_err(|error| DdlError {

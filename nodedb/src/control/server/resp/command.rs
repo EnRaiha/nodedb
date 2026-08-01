@@ -24,17 +24,19 @@ impl RespCommand {
         };
 
         let name = match &items[0] {
-            RespValue::BulkString(Some(data)) => String::from_utf8_lossy(data).to_uppercase(),
+            RespValue::BulkString(Some(data)) if data.is_ascii() => {
+                std::str::from_utf8(data).ok()?.to_ascii_uppercase()
+            }
             _ => return None,
         };
 
-        let args: Vec<Vec<u8>> = items[1..]
+        let args = items[1..]
             .iter()
-            .filter_map(|item| match item {
+            .map(|item| match item {
                 RespValue::BulkString(Some(data)) => Some(data.clone()),
                 _ => None,
             })
-            .collect();
+            .collect::<Option<Vec<_>>>()?;
 
         Some(Self { name, args })
     }
@@ -104,5 +106,25 @@ mod tests {
     fn parse_non_array_returns_none() {
         let value = RespValue::ok();
         assert!(RespCommand::parse(&value).is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_or_non_ascii_command_name() {
+        for name in [vec![b'G', b'E', 0xff], "GÉT".as_bytes().to_vec()] {
+            let value = RespValue::array(vec![RespValue::bulk(name)]);
+            assert!(RespCommand::parse(&value).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_mixed_type_or_nil_arguments() {
+        for argument in [
+            RespValue::integer(1),
+            RespValue::array(vec![RespValue::bulk_str("nested")]),
+            RespValue::nil(),
+        ] {
+            let value = RespValue::array(vec![RespValue::bulk_str("GET"), argument]);
+            assert!(RespCommand::parse(&value).is_none());
+        }
     }
 }

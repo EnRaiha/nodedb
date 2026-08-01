@@ -2,6 +2,8 @@
 
 //! Type definitions for stored procedure catalog storage.
 
+use nodedb_types::id::DatabaseId;
+
 /// Parameter direction for stored procedures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 #[repr(u8)]
@@ -59,6 +61,9 @@ pub enum ProcedureRoutability {
 #[msgpack(map, allow_unknown_fields)]
 pub struct StoredProcedure {
     pub tenant_id: u64,
+    /// Database namespace. Missing in legacy records means `default`.
+    #[msgpack(default)]
+    pub database_id: DatabaseId,
     pub name: String,
     pub parameters: Vec<ProcedureParam>,
     /// Procedural SQL body (BEGIN ... END).

@@ -82,10 +82,7 @@ pub(in crate::control::planner::sql_plan_convert) fn convert_update(
             // Content-addressed cross-engine identity so the merged row keeps
             // the surrogate its original insert assigned. `Surrogate::ZERO`
             // only when no assigner is wired (test / embedded-without-catalog).
-            let surrogate = match ctx.surrogate_assigner.as_ref() {
-                Some(a) => a.assign(ctx.database_id, ctx.tenant_id, collection, &key_bytes)?,
-                None => Surrogate::ZERO,
-            };
+            let surrogate = ctx.surrogate_for_pk(collection, &key_bytes)?;
             tasks.push(PhysicalTask {
                 tenant_id,
                 vshard_id: vshard,

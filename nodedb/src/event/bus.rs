@@ -214,7 +214,7 @@ pub fn create_event_bus_with_capacity(
 mod tests {
     use super::*;
     use crate::event::types::{EventSource, RowId, WriteOp};
-    use crate::types::{Lsn, TenantId, VShardId};
+    use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
     use std::sync::Arc;
 
     fn make_event(seq: u64) -> WriteEvent {
@@ -224,6 +224,7 @@ mod tests {
             op: WriteOp::Insert,
             row_id: RowId::new("row-1"),
             lsn: Lsn::new(seq),
+            database_id: DatabaseId::new(7),
             tenant_id: TenantId::new(1),
             vshard_id: VShardId::new(0),
             source: EventSource::User,

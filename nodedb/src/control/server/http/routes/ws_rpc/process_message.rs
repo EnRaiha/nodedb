@@ -2,10 +2,11 @@
 
 //! Single WebSocket message processing for the JSON-RPC protocol.
 
-use tracing::debug;
+use std::str::FromStr;
+use std::sync::Arc;
 
-use crate::control::change_stream::LiveSubscriptionSet;
-use crate::control::security::audit::{ArcAuditEmitter, NoopAuditEmitter};
+use crate::control::change_stream::{ChangeCursor, LiveSubscriptionSet, ReplayStart};
+use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
@@ -13,21 +14,20 @@ use crate::types::{DatabaseId, TraceId};
 
 use super::execute_sql::execute_sql;
 use super::format::{
-    error_response, extract_collection_from_sql, format_live_notification, ws_error_from_gateway,
+    error_response, extract_collection_from_sql, format_resume_notification,
+    format_sequenced_live_notification, ws_error_from_gateway,
 };
-use super::handler::save_ws_session;
 
-/// Extract session_id from an auth request's params.
 pub fn extract_session_id(req: &serde_json::Value) -> Option<String> {
     req.get("params")
-        .and_then(|p| p.get("session_id"))
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty())
+        .and_then(|params| params.get("session_id"))
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
         .map(String::from)
 }
 
 pub(super) struct MessageContext<'a> {
-    pub(super) shared: &'a SharedState,
+    pub(super) shared: Arc<SharedState>,
     pub(super) query_ctx: &'a crate::control::planner::context::QueryContext,
     pub(super) identity: &'a AuthenticatedIdentity,
     pub(super) database_id: DatabaseId,
@@ -35,15 +35,21 @@ pub(super) struct MessageContext<'a> {
     pub(super) live_tx: &'a tokio::sync::mpsc::Sender<String>,
 }
 
-/// Process a single JSON-RPC message.
-///
-/// Returns `(response_json, Option<authenticated_session_id>)`.
-/// The session_id is `Some` only when an "auth" request succeeds.
+struct ResumeContext<'a> {
+    shared: Arc<SharedState>,
+    identity: &'a AuthenticatedIdentity,
+    database_id: DatabaseId,
+    live_tx: &'a tokio::sync::mpsc::Sender<String>,
+}
+
+/// Returns whether the connection has completed its one permitted resume auth.
 pub(super) async fn process_message(
     context: MessageContext<'_>,
     text: &str,
     live_set: &mut LiveSubscriptionSet,
-) -> (String, Option<String>) {
+    resume_set: &mut LiveSubscriptionSet,
+    resume_authenticated: bool,
+) -> (String, bool) {
     let MessageContext {
         shared,
         query_ctx,
@@ -53,128 +59,69 @@ pub(super) async fn process_message(
         live_tx,
     } = context;
     let req: serde_json::Value = match crate::util::bounded_json::from_str(text) {
-        Ok(v) => v,
-        Err(e) => {
+        Ok(value) => value,
+        Err(error) => {
             return (
-                error_response(serde_json::Value::Null, &format!("invalid JSON: {e}")),
-                None,
+                error_response(serde_json::Value::Null, &format!("invalid JSON: {error}")),
+                false,
             );
         }
     };
-
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = req
         .get("method")
-        .and_then(|v| v.as_str())
+        .and_then(|value| value.as_str())
         .unwrap_or("unknown");
-
     match method {
         "ping" => (
             serde_json::json!({"id": id, "result": "pong"}).to_string(),
-            None,
+            false,
         ),
-
         "auth" => {
-            let session_id = match extract_session_id(&req) {
-                Some(sid) => sid,
-                None => return (error_response(id, "missing params.session_id"), None),
-            };
-            let last_lsn = req
-                .get("params")
-                .and_then(|p| p.get("last_lsn"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-
-            // Look up previous session's last LSN for replay.
-            let replay_from_lsn = {
-                let sessions = shared.ws_sessions.read().unwrap_or_else(|p| p.into_inner());
-                sessions.get(&session_id).copied().unwrap_or(0)
-            };
-
-            let effective_lsn = replay_from_lsn.max(last_lsn);
-
-            // Replay missed events from ring buffer.
-            let missed = shared
-                .change_stream
-                .query_changes(identity.tenant_id, None, 0, 10_000);
-            let replay: Vec<_> = missed
-                .iter()
-                .filter(|event| {
-                    event.lsn.as_u64() > effective_lsn
-                        && event.tenant_id == identity.tenant_id
-                        && authorize_collection(
-                            identity,
-                            database_id,
-                            &event.collection,
-                            Permission::Read,
-                            &shared.permissions,
-                            &shared.roles,
-                            &NoopAuditEmitter,
-                        )
-                        .is_ok()
-                })
-                .collect();
-
-            for event in &replay {
-                let notification = format_live_notification(0, event);
-                if live_tx.send(notification).await.is_err() {
-                    break;
-                }
-            }
-
-            // Register/update session with bounded eviction.
-            save_ws_session(shared, &session_id);
-
-            let response = serde_json::json!({
-                "id": id,
-                "result": {
-                    "session_id": session_id,
-                    "replayed": replay.len(),
-                    "current_lsn": shared.change_stream.last_lsn(),
-                }
-            })
-            .to_string();
-
-            // Return session_id to confirm auth succeeded.
-            (response, Some(session_id))
+            resume_auth(
+                ResumeContext {
+                    shared,
+                    identity,
+                    database_id,
+                    live_tx,
+                },
+                &id,
+                &req,
+                resume_set,
+                resume_authenticated,
+            )
+            .await
         }
-
         "query" => {
             let sql = req
                 .get("params")
-                .and_then(|p| p.get("sql"))
-                .and_then(|s| s.as_str())
+                .and_then(|params| params.get("sql"))
+                .and_then(|sql| sql.as_str())
                 .unwrap_or("");
-
             if sql.is_empty() {
-                return (error_response(id, "missing params.sql"), None);
+                return (error_response(id, "missing params.sql"), false);
             }
-
             let response =
-                match execute_sql(shared, query_ctx, identity, database_id, sql, trace_id).await {
+                match execute_sql(&shared, query_ctx, identity, database_id, sql, trace_id).await {
                     Ok(result) => serde_json::json!({"id": id, "result": result}).to_string(),
-                    Err(e) => ws_error_from_gateway(&id, &e),
+                    Err(error) => ws_error_from_gateway(&id, &error),
                 };
-            (response, None)
+            (response, false)
         }
-
         "live" => {
             let sql = req
                 .get("params")
-                .and_then(|p| p.get("sql"))
-                .and_then(|s| s.as_str())
+                .and_then(|params| params.get("sql"))
+                .and_then(|sql| sql.as_str())
                 .unwrap_or("");
-
             let collection = extract_collection_from_sql(sql);
-
             if collection.is_empty() {
                 return (
                     error_response(id, "missing collection in LIVE SELECT"),
-                    None,
+                    false,
                 );
             }
-
-            let emitter = ArcAuditEmitter(std::sync::Arc::clone(&shared.audit));
+            let emitter = ArcAuditEmitter(Arc::clone(&shared.audit));
             if let Err(error) = authorize_collection(
                 identity,
                 database_id,
@@ -186,44 +133,202 @@ pub(super) async fn process_message(
             ) {
                 return (
                     error_response(id, &crate::Error::from(error).to_string()),
-                    None,
+                    false,
                 );
             }
-
-            let mut sub = shared
-                .change_stream
-                .subscribe(Some(collection.clone()), Some(identity.tenant_id));
+            let mut sub = shared.change_stream.subscribe_in_database(
+                Some(collection.clone()),
+                Some(identity.tenant_id),
+                database_id,
+            );
             let sub_id = sub.id;
             let live_tx = live_tx.clone();
-
-            // The forwarder owns the `Subscription`; aborting the task on
-            // disconnect drops the Subscription, whose `Drop` decrements
-            // `active_subscriptions`. No detached leak.
             live_set.spawn_task(async move {
-                while let Ok(event) = sub.recv_filtered().await {
-                    let notification = format_live_notification(sub_id, &event);
-                    if let Err(e) = live_tx.send(notification).await {
-                        debug!(sub_id, "live subscription channel closed: {e}");
-                        break;
+                let mut last_cursor = None;
+                loop {
+                    match sub.recv_sequenced().await {
+                        Ok(event) => {
+                            if !advance_live_cursor(&mut last_cursor, event.cursor()) {
+                                let _ = live_tx.send(serde_json::json!({"method":"reset_required","params":{"subscription_id":sub_id,"reason":"change stream epoch changed"}}).to_string()).await;
+                                break;
+                            }
+                            if live_tx
+                                .send(format_sequenced_live_notification(sub_id, &event))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let _ = live_tx.send(serde_json::json!({"method":"reset_required","params":{"subscription_id":sub_id,"reason":"change stream lagged"}}).to_string()).await;
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             });
-
-            let response = serde_json::json!({
-                "id": id,
-                "result": {
-                    "subscription_id": sub_id,
-                    "collection": collection,
-                    "status": "active"
-                }
-            })
-            .to_string();
-            (response, None)
+            (serde_json::json!({"id": id, "result": {"subscription_id": sub_id, "collection": collection, "status": "active"}}).to_string(), false)
         }
-
         _ => (
             error_response(id, &format!("unknown method: {method}")),
-            None,
+            false,
         ),
+    }
+}
+
+fn advance_live_cursor(last_cursor: &mut Option<ChangeCursor>, cursor: ChangeCursor) -> bool {
+    match *last_cursor {
+        Some(previous) if !cursor.is_after_in_same_epoch(previous) => false,
+        _ => {
+            *last_cursor = Some(cursor);
+            true
+        }
+    }
+}
+
+async fn resume_auth(
+    context: ResumeContext<'_>,
+    id: &serde_json::Value,
+    req: &serde_json::Value,
+    resume_set: &mut LiveSubscriptionSet,
+    already_authenticated: bool,
+) -> (String, bool) {
+    let ResumeContext {
+        shared,
+        identity,
+        database_id,
+        live_tx,
+    } = context;
+    if already_authenticated {
+        return (
+            error_response(
+                id.clone(),
+                "resume auth is permitted only once per connection",
+            ),
+            false,
+        );
+    }
+    let Some(session_id) = extract_session_id(req) else {
+        return (
+            error_response(id.clone(), "missing params.session_id"),
+            false,
+        );
+    };
+    let params = req.get("params").unwrap_or(&serde_json::Value::Null);
+    if params.get("last_lsn").is_some() {
+        return (
+            error_response(
+                id.clone(),
+                "last_lsn is no longer supported; use the opaque cursor",
+            ),
+            false,
+        );
+    }
+    let cursor = match params.get("cursor") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => match value
+            .as_str()
+            .and_then(|value| ChangeCursor::from_str(value).ok())
+        {
+            Some(cursor) => Some(cursor),
+            None => {
+                return (
+                    error_response(id.clone(), "cursor must be a valid opaque change cursor"),
+                    false,
+                );
+            }
+        },
+    };
+    let mut subscription =
+        shared
+            .change_stream
+            .subscribe_in_database(None, Some(identity.tenant_id), database_id);
+    let start = cursor
+        .map(ReplayStart::Cursor)
+        .unwrap_or(ReplayStart::Timestamp(0));
+    let snapshot = match shared.change_stream.query_changes_in_database(
+        identity.tenant_id,
+        database_id,
+        None,
+        start,
+        10_000,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return (
+                error_response(
+                    id.clone(),
+                    "reset_required: cursor cannot resume this stream",
+                ),
+                false,
+            );
+        }
+    };
+    let emitter = ArcAuditEmitter(Arc::clone(&shared.audit));
+    let mut replayed = 0usize;
+    for event in &snapshot.events {
+        if authorize_collection(
+            identity,
+            database_id,
+            &event.collection,
+            Permission::Read,
+            &shared.permissions,
+            &shared.roles,
+            &emitter,
+        )
+        .is_ok()
+        {
+            if live_tx
+                .send(format_resume_notification(event))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            replayed += 1;
+        }
+    }
+    let snapshot_cursor = snapshot.snapshot_cursor;
+    let live_tx = live_tx.clone();
+    let shared = Arc::clone(&shared);
+    let identity = identity.clone();
+    resume_set.spawn_task(async move {
+        loop {
+            match subscription.recv_sequenced().await {
+                Ok(event) => {
+                    if !event.cursor().same_epoch(snapshot_cursor) {
+                        let _ = live_tx.send(serde_json::json!({"method":"reset_required","params":{"reason":"change stream epoch changed"}}).to_string()).await;
+                        break;
+                    }
+                    if !event.cursor().is_after_in_same_epoch(snapshot_cursor) { continue; }
+                    let emitter = ArcAuditEmitter(Arc::clone(&shared.audit));
+                    if authorize_collection(&identity, database_id, &event.collection, Permission::Read, &shared.permissions, &shared.roles, &emitter).is_ok()
+                        && live_tx.send(format_resume_notification(&event)).await.is_err() { break; }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = live_tx.send(serde_json::json!({"method":"reset_required","params":{"reason":"change stream lagged"}}).to_string()).await;
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    let response = serde_json::json!({"id": id, "result": {"session_id": session_id, "replayed": replayed, "snapshot_cursor": snapshot_cursor.to_string()}}).to_string();
+    (response, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_cursor_requires_reset_after_epoch_rotation() {
+        let mut last = None;
+        assert!(advance_live_cursor(
+            &mut last,
+            ChangeCursor::new(u128::MAX, u64::MAX)
+        ));
+        assert!(!advance_live_cursor(&mut last, ChangeCursor::new(1, 1)));
     }
 }

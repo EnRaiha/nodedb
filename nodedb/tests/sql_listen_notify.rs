@@ -226,21 +226,64 @@ async fn test_multi_channel() {
     server.graceful_shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_listen_notify_isolated_across_databases() {
+    let server = TestServer::start().await;
+    server
+        .exec("CREATE DATABASE notify_other_database")
+        .await
+        .expect("create second notification database");
+
+    let mut default_listener = ListenerConn::connect(server.pg_port).await;
+    let mut other_listener = ListenerConn::connect(server.pg_port).await;
+    default_listener.exec("LISTEN database_events").await;
+    // This pre-switch handle must be unregistered by USE DATABASE; otherwise
+    // the connection would retain authority to receive default-DB messages.
+    other_listener.exec("LISTEN database_events").await;
+    other_listener
+        .exec("USE DATABASE notify_other_database")
+        .await;
+    other_listener.exec("LISTEN database_events").await;
+
+    server
+        .exec("NOTIFY database_events, 'default-only'")
+        .await
+        .expect("notify default database");
+    let default_notification = default_listener
+        .recv_one()
+        .await
+        .expect("default listener receives default notification");
+    assert_eq!(default_notification.payload(), "default-only");
+    other_listener.assert_none().await;
+
+    other_listener
+        .exec("NOTIFY database_events, 'other-only'")
+        .await;
+    let other_notification = other_listener
+        .recv_one()
+        .await
+        .expect("other listener receives other-database notification");
+    assert_eq!(other_notification.payload(), "other-only");
+    default_listener.assert_none().await;
+
+    server.graceful_shutdown().await;
+}
+
 /// Tenant isolation at the bus level: NOTIFY from tenant 1 does not arrive at
 /// a session subscribed under tenant 2.
 #[tokio::test]
 async fn test_tenant_isolation_bus_level() {
     use nodedb::control::notify_bus::NotifyBus;
-    use nodedb::types::TenantId;
+    use nodedb::types::{DatabaseId, TenantId};
 
     let bus = NotifyBus::new(64);
     let t1 = TenantId::new(1);
     let t2 = TenantId::new(2);
 
-    let (_, mut rx1) = bus.listen(t1, "alerts");
-    let (_, mut rx2) = bus.listen(t2, "alerts");
+    let (_, mut rx1) = bus.listen(DatabaseId::DEFAULT, t1, "alerts");
+    let (_, mut rx2) = bus.listen(DatabaseId::DEFAULT, t2, "alerts");
 
-    bus.notify(t1, "alerts", "for-t1");
+    bus.notify(DatabaseId::DEFAULT, t1, "alerts", "for-t1");
 
     assert!(rx1.try_recv().is_ok(), "t1 should receive");
     assert!(rx2.try_recv().is_err(), "t2 must not receive t1's notify");
@@ -251,16 +294,16 @@ async fn test_tenant_isolation_bus_level() {
 #[tokio::test]
 async fn test_queue_full_drop_metric() {
     use nodedb::control::notify_bus::NotifyBus;
-    use nodedb::types::TenantId;
+    use nodedb::types::{DatabaseId, TenantId};
 
     let bus = NotifyBus::new(2); // tiny cap
     let t = TenantId::new(1);
-    let (_, _rx) = bus.listen(t, "flood"); // deliberately not draining
+    let (_, _rx) = bus.listen(DatabaseId::DEFAULT, t, "flood"); // deliberately not draining
 
-    bus.notify(t, "flood", "a");
-    bus.notify(t, "flood", "b"); // fills queue (cap=2)
-    bus.notify(t, "flood", "c"); // queue full → drop
-    bus.notify(t, "flood", "d"); // queue full → drop
+    bus.notify(DatabaseId::DEFAULT, t, "flood", "a");
+    bus.notify(DatabaseId::DEFAULT, t, "flood", "b"); // fills queue (cap=2)
+    bus.notify(DatabaseId::DEFAULT, t, "flood", "c"); // queue full → drop
+    bus.notify(DatabaseId::DEFAULT, t, "flood", "d"); // queue full → drop
 
     assert!(
         bus.total_dropped() >= 2,

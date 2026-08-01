@@ -31,8 +31,16 @@ pub type ArrayFrame = Vec<u8>;
 ///
 /// Thread-safe: `register` / `unregister` from the sync listener task;
 /// `enqueue` from `ArrayFanout` after an op is applied.
+struct SessionDelivery {
+    sender: mpsc::Sender<ArrayFrame>,
+    /// Once a frame is rejected for back-pressure, this session cannot safely
+    /// advance its cursor again until it reconnects and registers anew.
+    lagged: bool,
+}
+
 pub struct ArrayDeliveryRegistry {
-    sessions: RwLock<HashMap<String, mpsc::Sender<ArrayFrame>>>,
+    sessions: RwLock<HashMap<String, SessionDelivery>>,
+    channel_capacity: usize,
     /// Monotonic count of sessions registered since startup.
     pub sessions_registered: AtomicU64,
     /// Monotonic count of frames dropped due to back-pressure.
@@ -48,19 +56,35 @@ impl Default for ArrayDeliveryRegistry {
 impl ArrayDeliveryRegistry {
     /// Construct an empty registry.
     pub fn new() -> Self {
+        Self::with_capacity(CHANNEL_CAPACITY)
+    }
+
+    fn with_capacity(channel_capacity: usize) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            channel_capacity,
             sessions_registered: AtomicU64::new(0),
             frames_dropped: AtomicU64::new(0),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_capacity(channel_capacity: usize) -> Self {
+        Self::with_capacity(channel_capacity)
+    }
+
     /// Register a session and return the `Receiver` end of its delivery
     /// channel.  The sync listener drains this in its send loop.
     pub fn register(&self, session_id: String) -> mpsc::Receiver<ArrayFrame> {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel(self.channel_capacity);
         let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
-        sessions.insert(session_id.clone(), tx);
+        sessions.insert(
+            session_id.clone(),
+            SessionDelivery {
+                sender: tx,
+                lagged: false,
+            },
+        );
         self.sessions_registered.fetch_add(1, Ordering::Relaxed);
         info!(session = %session_id, "array_delivery: session registered");
         rx
@@ -76,24 +100,33 @@ impl ArrayDeliveryRegistry {
 
     /// Enqueue a frame for delivery to `session_id`.
     ///
-    /// Uses `try_send` so callers are never blocked. If the channel is
-    /// full, the frame is dropped and `frames_dropped` is incremented.
-    /// The Lite device recovers via snapshot catch-up on reconnect.
-    pub fn enqueue(&self, session_id: &str, frame: ArrayFrame) {
-        let sessions = self.sessions.read().unwrap_or_else(|p| p.into_inner());
-        if let Some(tx) = sessions.get(session_id) {
-            match tx.try_send(frame) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.frames_dropped.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        session = %session_id,
-                        "array_delivery: channel full — frame dropped; Lite will catch up via snapshot"
-                    );
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    debug!(session = %session_id, "array_delivery: session channel closed (disconnected)");
-                }
+    /// Uses `try_send` so callers are never blocked. A full channel marks the
+    /// session lagged: every later frame is rejected until unregister/register
+    /// creates a fresh channel. This prevents a later successful enqueue from
+    /// advancing a cursor past a frame that was not queued.
+    pub fn enqueue(&self, session_id: &str, frame: ArrayFrame) -> bool {
+        let mut sessions = self.sessions.write().unwrap_or_else(|p| p.into_inner());
+        let Some(session) = sessions.get_mut(session_id) else {
+            return false;
+        };
+        if session.lagged {
+            return false;
+        }
+
+        match session.sender.try_send(frame) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                session.lagged = true;
+                self.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    session = %session_id,
+                    "array_delivery: channel full — session marked lagged until reconnect"
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                debug!(session = %session_id, "array_delivery: session channel closed (disconnected)");
+                false
             }
         }
     }
@@ -113,7 +146,7 @@ mod tests {
     async fn register_and_receive() {
         let reg = ArrayDeliveryRegistry::new();
         let mut rx = reg.register("s1".into());
-        reg.enqueue("s1", vec![1, 2, 3]);
+        assert!(reg.enqueue("s1", vec![1, 2, 3]));
         let frame = rx.recv().await.expect("should receive frame");
         assert_eq!(frame, vec![1, 2, 3]);
     }
@@ -124,15 +157,32 @@ mod tests {
         let mut rx = reg.register("s1".into());
         reg.unregister("s1");
         // After unregister, the sender is dropped; channel is closed.
-        reg.enqueue("s1", vec![9]); // No-op: session gone.
+        assert!(!reg.enqueue("s1", vec![9])); // Session is gone.
         // rx.recv() returns None because sender was dropped on unregister.
         assert_eq!(rx.recv().await, None);
     }
 
     #[test]
-    fn enqueue_unknown_session_is_noop() {
+    fn enqueue_unknown_session_fails() {
         let reg = ArrayDeliveryRegistry::new();
-        reg.enqueue("ghost", vec![0]); // Should not panic.
+        assert!(!reg.enqueue("ghost", vec![0]));
         assert_eq!(reg.frames_dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn full_channel_lags_session_and_rejects_later_frames() {
+        let reg = ArrayDeliveryRegistry::with_test_capacity(1);
+        let mut rx = reg.register("s1".into());
+
+        assert!(reg.enqueue("s1", vec![1]));
+        assert!(!reg.enqueue("s1", vec![2]));
+        assert_eq!(rx.recv().await, Some(vec![1]));
+        assert!(!reg.enqueue("s1", vec![3]));
+        assert!(rx.try_recv().is_err());
+
+        reg.unregister("s1");
+        let mut rx = reg.register("s1".into());
+        assert!(reg.enqueue("s1", vec![4]));
+        assert_eq!(rx.recv().await, Some(vec![4]));
     }
 }

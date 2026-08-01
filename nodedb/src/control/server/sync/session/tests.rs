@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::control::security::audit::AuditLog;
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::audit::{AuditEvent, AuditLog};
+use crate::control::security::identity::{AuthenticatedIdentity, Role};
 use crate::control::security::jwt::{JwtConfig, JwtValidator};
 use crate::control::security::rls::{PolicyType, RlsPolicy, RlsPolicyStore};
+use crate::control::state::SharedState;
 use crate::types::TenantId;
+use crate::wal::WalManager;
 
 use super::super::dlq::{DlqConfig, SyncDlq};
 use super::super::rate_limit::RateLimitConfig;
@@ -84,6 +87,83 @@ fn delta_push_rejected_before_auth() {
     let frame = response.unwrap();
     assert_eq!(frame.msg_type, SyncMessageType::DeltaReject);
     assert_eq!(session.mutations_rejected, 1);
+}
+
+#[tokio::test]
+async fn production_process_frame_denies_unauthorized_delta_before_provisional_ack() {
+    // Retain the WAL and Data-Plane dispatcher endpoints for the complete
+    // SharedState lifetime, matching the production-backed test fixture.
+    let _tempdir = tempfile::tempdir().expect("temporary WAL directory");
+    let wal = Arc::new(
+        WalManager::open_for_testing(&_tempdir.path().join("sync-session.wal"))
+            .expect("open test WAL"),
+    );
+    let (dispatcher, _data_sides) = crate::bridge::dispatch::Dispatcher::new(1, 64);
+    let shared = SharedState::new(dispatcher, wal).expect("construct shared state");
+
+    let mut session = make_session();
+    session.authenticated = true;
+    session.tenant_id = Some(TenantId::new(1));
+    session.username = Some("collection-reader".into());
+    session.identity = Some(AuthenticatedIdentity::new_regular(
+        7,
+        "collection-reader",
+        TenantId::new(1),
+        crate::control::security::identity::AuthMethod::ApiKey,
+        vec![Role::Custom("sync-reader".into())],
+        None,
+        AuthenticatedIdentity::default_database_set(false),
+    ));
+
+    let msg = DeltaPushMsg {
+        collection: "orders".into(),
+        document_id: "o1".into(),
+        delta: nodedb_types::json_to_msgpack(&serde_json::json!({"status": "active"}))
+            .expect("encode delta"),
+        peer_id: 1,
+        mutation_id: 77,
+        device_id: 0,
+        delta_signature: [0; 32],
+        checksum: 0,
+        device_valid_time_ms: None,
+        producer_id: 0,
+        epoch: 0,
+        seq: 0,
+    };
+    let frame = SyncFrame::try_encode(SyncMessageType::DeltaPush, &msg).expect("encode frame");
+    let validator = JwtValidator::new(JwtConfig::default());
+
+    // This is the production process_frame path: shared state is supplied,
+    // while audit/DLQ are deliberately not pre-locked by the caller.
+    let response = session
+        .process_frame(
+            &frame,
+            &validator,
+            Some(&shared.rls),
+            None,
+            None,
+            Some(&shared),
+        )
+        .expect("permission denial response");
+
+    assert_eq!(response.msg_type, SyncMessageType::DeltaReject);
+    assert_ne!(response.msg_type, SyncMessageType::DeltaAck);
+    let reject: DeltaRejectMsg = response.decode_body().expect("decode rejection");
+    assert_eq!(
+        reject.compensation,
+        Some(CompensationHint::PermissionDenied)
+    );
+    assert_eq!(session.mutations_processed, 0);
+    assert_eq!(
+        shared
+            .audit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_by_event(&AuditEvent::PermissionDenied)
+            .len(),
+        1,
+        "the production authorization gate records exactly one denial"
+    );
 }
 
 #[test]

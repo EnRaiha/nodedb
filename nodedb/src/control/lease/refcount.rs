@@ -4,11 +4,11 @@
 //!
 //! Descriptor leases are acquired at plan time and held
 //! through execute. Two concurrent queries touching the same
-//! descriptor share a single underlying raft lease — we track
-//! a per-node refcount so only the first query pays the
-//! acquire round-trip and only the last query to finish pays
-//! the release round-trip. Intermediate queries hit the
-//! fast-path increment / decrement with no raft traffic.
+//! descriptor version share a single underlying raft lease — we track
+//! per-node exact-version refcounts so only a missing or lower-version lease
+//! pays an acquire round-trip and only the last query across every version to
+//! finish pays the release round-trip. Intermediate queries hit the fast-path
+//! increment / decrement with no raft traffic.
 //!
 //! The DDL drain path relies on this: when every in-flight
 //! query using a descriptor finishes, the refcount hits zero,
@@ -25,9 +25,9 @@
 //! single query accumulated during planning. The scope drops
 //! when the query's pgwire handler finishes executing (after
 //! every response has been returned). Drop walks the scope,
-//! decrements each refcount, and — for any entry whose count
-//! hits zero — spawns a background task to propose the
-//! release entry. The spawn is mandatory because `Drop` cannot
+//! decrements each exact-version refcount, and — when no version of a
+//! descriptor remains held — spawns a background task to propose the release
+//! entry. The spawn is mandatory because `Drop` cannot
 //! be async; the drop handler itself returns immediately.
 //!
 //! A dropped `QueryLeaseScope` therefore schedules (but does
@@ -36,19 +36,20 @@
 //! sub-10ms in a healthy cluster.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
 use nodedb_cluster::DescriptorId;
 use tracing::warn;
 
+use super::release::LeaseReleaseHandle;
 use crate::control::state::SharedState;
 
-/// Host-side lease reference counts. One entry per descriptor
-/// id this node currently holds a lease on; the value is the
-/// number of in-flight queries holding the lease.
+/// Host-side lease reference counts. One entry per descriptor id and
+/// descriptor version this node currently holds; the value is the number of
+/// in-flight queries or admissions holding that exact version.
 #[derive(Debug, Default)]
 pub struct LeaseRefCount {
-    counts: Mutex<HashMap<DescriptorId, u32>>,
+    counts: Mutex<HashMap<(DescriptorId, u64), u32>>,
 }
 
 impl LeaseRefCount {
@@ -56,43 +57,50 @@ impl LeaseRefCount {
         Self::default()
     }
 
-    /// Increment the refcount for `id`. Returns the new count.
-    /// If the returned count is `1`, the caller is the first
-    /// holder and must perform the actual raft acquire. Higher
-    /// values mean the lease is already held and the caller
-    /// hit the fast path.
-    pub fn increment(&self, id: &DescriptorId) -> u32 {
+    /// Increment the refcount for exact `(id, version)`. Returns the new
+    /// exact-version count, saturating rather than overflowing.
+    pub fn increment(&self, id: &DescriptorId, version: u64) -> u32 {
         let mut map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        let entry = map.entry(id.clone()).or_insert(0);
-        *entry += 1;
+        let entry = map.entry((id.clone(), version)).or_insert(0);
+        *entry = entry.saturating_add(1);
         *entry
     }
 
-    /// Decrement the refcount for `id`. Returns the new count.
-    /// If the returned count is `0`, the caller was the last
-    /// holder and must perform the actual raft release. The
-    /// entry is removed from the map on the same call.
-    pub fn decrement(&self, id: &DescriptorId) -> u32 {
+    /// Decrement the refcount for exact `(id, version)`. Returns the new
+    /// exact-version count and removes its entry when it reaches zero.
+    pub fn decrement(&self, id: &DescriptorId, version: u64) -> u32 {
         let mut map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(entry) = map.get_mut(id) {
+        let key = (id.clone(), version);
+        if let Some(entry) = map.get_mut(&key) {
             *entry = entry.saturating_sub(1);
-            let c = *entry;
-            if c == 0 {
-                map.remove(id);
+            let count = *entry;
+            if count == 0 {
+                map.remove(&key);
             }
-            c
+            count
         } else {
             0
         }
     }
 
-    /// Read the current refcount for `id` (for tests / diagnostics).
+    /// Read the total refcount across every held version of `id`.
     pub fn current(&self, id: &DescriptorId) -> u32 {
         let map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(id).copied().unwrap_or(0)
+        map.iter()
+            .filter(|((held_id, _), _)| held_id == id)
+            .fold(0_u32, |total, (_, count)| total.saturating_add(*count))
     }
 
-    /// Total number of descriptors with a non-zero refcount.
+    /// Read the total refcount for `id` at versions no greater than
+    /// `up_to_version`.
+    pub fn current_at_or_below(&self, id: &DescriptorId, up_to_version: u64) -> u32 {
+        let map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        map.iter()
+            .filter(|((held_id, version), _)| held_id == id && *version <= up_to_version)
+            .fold(0_u32, |total, (_, count)| total.saturating_add(*count))
+    }
+
+    /// Total number of exact descriptor-version entries with a non-zero refcount.
     pub fn distinct_count(&self) -> usize {
         let map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
         map.len()
@@ -105,12 +113,12 @@ impl LeaseRefCount {
 /// planning finishes; held by the pgwire handler through the
 /// execute phase; released on drop.
 pub struct QueryLeaseScope {
-    /// Descriptors this query held a refcount on.
-    descriptor_ids: Vec<DescriptorId>,
-    /// Weak reference to the process-wide shared state so drop
-    /// can reach the refcount map and the raft propose path
-    /// without keeping the state alive past normal shutdown.
-    shared: Weak<SharedState>,
+    /// Exact descriptor-version refcounts this query holds.
+    descriptor_versions: Vec<(DescriptorId, u64)>,
+    /// Refcount state shared independently of the process-wide state.
+    refcounts: Option<Arc<LeaseRefCount>>,
+    /// Minimal owned capability needed to release the underlying lease.
+    releaser: Option<LeaseReleaseHandle>,
 }
 
 impl QueryLeaseScope {
@@ -119,118 +127,126 @@ impl QueryLeaseScope {
     /// not need lease tracking (e.g., internal sub-planners).
     pub fn empty() -> Self {
         Self {
-            descriptor_ids: Vec::new(),
-            shared: Weak::new(),
+            descriptor_versions: Vec::new(),
+            refcounts: None,
+            releaser: None,
         }
     }
 
-    /// Build a scope from a list of descriptor ids already
-    /// incremented on the node's `lease_refcount`.
-    pub fn new(descriptor_ids: Vec<DescriptorId>, shared: &Arc<SharedState>) -> Self {
+    /// Build a scope from exact descriptor-version holds already incremented
+    /// on the node's `lease_refcount`. Only cloneable release capabilities are
+    /// retained, so the scope neither owns nor weak-references `SharedState`.
+    pub fn new(descriptor_versions: Vec<(DescriptorId, u64)>, shared: &SharedState) -> Self {
         Self {
-            descriptor_ids,
-            shared: Arc::downgrade(shared),
+            descriptor_versions,
+            refcounts: Some(Arc::clone(&shared.lease_refcount)),
+            releaser: Some(LeaseReleaseHandle::from_shared(shared)),
         }
     }
 
     /// Number of descriptors held in this scope.
     pub fn len(&self) -> usize {
-        self.descriptor_ids.len()
+        self.descriptor_versions.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.descriptor_ids.is_empty()
+        self.descriptor_versions.is_empty()
     }
 }
 
 impl Drop for QueryLeaseScope {
     fn drop(&mut self) {
-        if self.descriptor_ids.is_empty() {
+        if self.descriptor_versions.is_empty() {
             return;
         }
-        let Some(shared) = self.shared.upgrade() else {
+        let Some(refcounts) = self.refcounts.take() else {
             return;
         };
-        // Decrement each refcount and collect the ids whose
-        // count just hit zero — those need the actual raft
-        // release.
+        let Some(releaser) = self.releaser.take() else {
+            return;
+        };
+        // Decrement exact-version refcounts and collect ids whose total across
+        // every version just hit zero — only those need metadata release.
         let mut to_release = Vec::new();
-        for id in self.descriptor_ids.drain(..) {
-            let new_count = shared.lease_refcount.decrement(&id);
-            if new_count == 0 {
+        for (id, version) in self.descriptor_versions.drain(..) {
+            refcounts.decrement(&id, version);
+            if refcounts.current(&id) == 0 {
                 to_release.push(id);
             }
         }
         if to_release.is_empty() {
             return;
         }
-        // Release is sync + uses `block_in_place`; spawning to
-        // the tokio runtime lets `Drop` return immediately
-        // while the release propose proceeds in the background.
-        // This is best-effort: if the runtime is already shut
-        // down (e.g., test teardown race) the spawn fails
-        // silently and the lease drains via TTL.
+        // Release is synchronous, so run it on Tokio's blocking pool when a
+        // runtime owns this drop. Drops can also occur on non-Tokio threads
+        // (notably teardown paths); then use an independent OS thread rather
+        // than silently retaining the metadata lease. Both paths call the same
+        // conditional release, which serializes with admissions on grant_gate.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let shared = Arc::clone(&shared);
             handle.spawn(async move {
-                let shared_inner = Arc::clone(&shared);
-                let descriptor_ids = to_release.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    shared_inner.release_descriptor_leases(descriptor_ids)
-                })
-                .await;
+                let result =
+                    tokio::task::spawn_blocking(move || releaser.release_if_unheld(to_release))
+                        .await;
                 match result {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        warn!(
-                            error = %e,
-                            count = to_release.len(),
-                            "QueryLeaseScope drop: background release failed"
-                        );
+                    Ok(Err(error)) => {
+                        warn!(error = %error, "QueryLeaseScope drop: background release failed");
                     }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            count = to_release.len(),
-                            "QueryLeaseScope drop: spawn_blocking panicked"
-                        );
+                    Err(error) => {
+                        warn!(error = %error, "QueryLeaseScope drop: spawn_blocking panicked");
                     }
                 }
             });
+        } else if let Err(error) = std::thread::Builder::new()
+            .name("nodedb-lease-release".into())
+            .spawn(move || {
+                if let Err(error) = releaser.release_if_unheld(to_release) {
+                    warn!(error = %error, "QueryLeaseScope drop: fallback release failed");
+                }
+            })
+        {
+            warn!(error = %error, "QueryLeaseScope drop: failed to spawn fallback release");
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use super::*;
     use nodedb_cluster::DescriptorKind;
 
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::lease::{DEFAULT_LEASE_DURATION, acquire_lease_after_admission};
+    use crate::wal::WalManager;
+
     fn id(name: &str) -> DescriptorId {
-        DescriptorId::new(1, DescriptorKind::Collection, name.to_string())
+        DescriptorId::new(0, 1, DescriptorKind::Collection, name.to_string())
     }
 
     #[test]
     fn first_increment_returns_one() {
         let rc = LeaseRefCount::new();
         let a = id("a");
-        assert_eq!(rc.increment(&a), 1);
+        assert_eq!(rc.increment(&a, 1), 1);
     }
 
     #[test]
     fn second_increment_returns_two() {
         let rc = LeaseRefCount::new();
         let a = id("a");
-        rc.increment(&a);
-        assert_eq!(rc.increment(&a), 2);
+        rc.increment(&a, 1);
+        assert_eq!(rc.increment(&a, 1), 2);
     }
 
     #[test]
     fn decrement_to_zero_removes_entry() {
         let rc = LeaseRefCount::new();
         let a = id("a");
-        rc.increment(&a);
-        assert_eq!(rc.decrement(&a), 0);
+        rc.increment(&a, 1);
+        assert_eq!(rc.decrement(&a, 1), 0);
         assert_eq!(rc.current(&a), 0);
         assert_eq!(rc.distinct_count(), 0);
     }
@@ -239,9 +255,9 @@ mod tests {
     fn decrement_preserves_shared_lease() {
         let rc = LeaseRefCount::new();
         let a = id("a");
-        rc.increment(&a);
-        rc.increment(&a);
-        assert_eq!(rc.decrement(&a), 1);
+        rc.increment(&a, 1);
+        rc.increment(&a, 1);
+        assert_eq!(rc.decrement(&a, 1), 1);
         assert_eq!(rc.current(&a), 1);
         assert_eq!(rc.distinct_count(), 1);
     }
@@ -251,10 +267,10 @@ mod tests {
         let rc = LeaseRefCount::new();
         let a = id("a");
         let b = id("b");
-        rc.increment(&a);
-        rc.increment(&b);
+        rc.increment(&a, 1);
+        rc.increment(&b, 1);
         assert_eq!(rc.distinct_count(), 2);
-        rc.decrement(&a);
+        rc.decrement(&a, 1);
         assert_eq!(rc.distinct_count(), 1);
         assert_eq!(rc.current(&a), 0);
         assert_eq!(rc.current(&b), 1);
@@ -263,12 +279,70 @@ mod tests {
     #[test]
     fn decrement_on_unknown_id_is_safe() {
         let rc = LeaseRefCount::new();
-        assert_eq!(rc.decrement(&id("nothing")), 0);
+        assert_eq!(rc.decrement(&id("nothing"), 1), 0);
+    }
+
+    #[test]
+    fn exact_version_decrement_preserves_other_version() {
+        let rc = LeaseRefCount::new();
+        let a = id("a");
+        rc.increment(&a, 1);
+        rc.increment(&a, 2);
+
+        assert_eq!(rc.decrement(&a, 2), 0);
+        assert_eq!(rc.current(&a), 1);
+        assert_eq!(rc.current_at_or_below(&a, 1), 1);
+        assert_eq!(rc.current_at_or_below(&a, 2), 1);
     }
 
     #[test]
     fn empty_scope_drops_cleanly() {
         let scope = QueryLeaseScope::empty();
         drop(scope); // should not panic even without a runtime
+    }
+
+    #[test]
+    fn no_runtime_drop_releases_last_unheld_lease() {
+        let (state, descriptor, scope, _directory) = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build temporary runtime");
+            let values = runtime.block_on(async {
+                let directory = tempfile::tempdir().expect("create lease release test directory");
+                let wal = Arc::new(
+                    WalManager::open_for_testing(&directory.path().join("lease-release.wal"))
+                        .expect("open lease release test WAL"),
+                );
+                let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+                let state = crate::control::state::SharedState::new(dispatcher, wal)
+                    .expect("construct lease release state");
+                let descriptor = id("no-runtime-drop");
+                state.lease_refcount.increment(&descriptor, 1);
+                acquire_lease_after_admission(
+                    &state,
+                    descriptor.clone(),
+                    1,
+                    DEFAULT_LEASE_DURATION,
+                )
+                .expect("install single-node lease");
+                let scope = QueryLeaseScope::new(vec![(descriptor.clone(), 1)], &state);
+
+                (state, descriptor, scope, directory)
+            });
+            drop(runtime);
+            values
+        };
+        assert!(tokio::runtime::Handle::try_current().is_err());
+
+        drop(scope);
+
+        for _ in 0..100 {
+            if state.lookup_lease_for_self(&descriptor).is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("no-runtime fallback did not release the unheld descriptor lease");
     }
 }

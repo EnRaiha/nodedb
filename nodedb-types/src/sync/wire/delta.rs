@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::DatabaseId;
 use crate::sync::compensation::CompensationHint;
 use crate::sync::wire::ack_status::AckStatus;
 
@@ -116,6 +117,8 @@ pub struct DeltaRejectMsg {
 pub struct CollectionPurgedMsg {
     /// Numeric tenant ID the collection belonged to.
     pub tenant_id: u64,
+    /// Database containing the purged collection.
+    pub database_id: DatabaseId,
     /// Collection name.
     pub name: String,
     /// Origin WAL LSN at which the hard-delete was committed.

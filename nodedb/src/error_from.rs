@@ -28,14 +28,6 @@ impl From<nodedb_query::EvalError> for Error {
     }
 }
 
-impl From<crate::control::pubsub::TopicError> for Error {
-    fn from(e: crate::control::pubsub::TopicError) -> Self {
-        Self::BadRequest {
-            detail: e.to_string(),
-        }
-    }
-}
-
 impl From<crate::engine::timeseries::ilp::IlpError> for Error {
     fn from(e: crate::engine::timeseries::ilp::IlpError) -> Self {
         Self::BadRequest {

@@ -10,7 +10,6 @@ mod cursor_query;
 mod dispatch;
 mod facet;
 mod in_flight;
-pub mod listen_notify;
 mod listen_notify_exec;
 mod live_select;
 mod plan;
@@ -34,4 +33,3 @@ mod trust_auth;
 
 pub use self::copy_handler::NodeDbCopyHandler;
 pub use self::core::NodeDbPgHandler;
-pub use self::listen_notify::ListenNotifyManager;

@@ -7,10 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::metadata_group::state::DescriptorState;
 
-/// Globally unique, tenant-scoped identifier for a schema descriptor.
+/// Globally unique, database- and tenant-scoped identifier for a schema descriptor.
 ///
-/// `kind` disambiguates object types sharing the same `(tenant_id, name)`
-/// (e.g. a collection and an index can both be named `orders`).
+/// `kind` disambiguates object types sharing the same
+/// `(database_id, tenant_id, name)` (e.g. a collection and an index can both
+/// be named `orders`).
 #[derive(
     Debug,
     Clone,
@@ -23,18 +24,48 @@ use crate::metadata_group::state::DescriptorState;
     zerompk::FromMessagePack,
 )]
 pub struct DescriptorId {
+    pub database_id: u64,
     pub tenant_id: u64,
     pub kind: DescriptorKind,
     pub name: String,
 }
 
 impl DescriptorId {
-    pub fn new(tenant_id: u64, kind: DescriptorKind, name: impl Into<String>) -> Self {
+    pub fn new(
+        database_id: u64,
+        tenant_id: u64,
+        kind: DescriptorKind,
+        name: impl Into<String>,
+    ) -> Self {
         Self {
+            database_id,
             tenant_id,
             kind,
             name: name.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn database_id_participates_in_equality_hash_and_wire_format() {
+        let alpha = DescriptorId::new(7, 1, DescriptorKind::Collection, "orders");
+        let beta = DescriptorId::new(8, 1, DescriptorKind::Collection, "orders");
+
+        assert_ne!(alpha, beta);
+        let mut ids = HashSet::new();
+        ids.insert(alpha.clone());
+        ids.insert(beta.clone());
+        assert_eq!(ids.len(), 2);
+
+        let encoded = zerompk::to_msgpack_vec(&alpha).expect("encode descriptor id");
+        let decoded: DescriptorId = zerompk::from_msgpack(&encoded).expect("decode descriptor id");
+        assert_eq!(decoded, alpha);
+        assert_eq!(decoded.database_id, 7);
     }
 }
 

@@ -2,15 +2,13 @@
 
 //! D-δ integration test 5: Event Plane watermarks persisted through shutdown.
 //!
-//! Verifies the `PersistingWatermarks` shutdown phase end-to-end:
+//! Verifies the `DrainingEventPlane` shutdown barrier end-to-end:
 //!
 //! 1. Spawn an `EventPlane` with a real `WatermarkStore` backed by redb.
 //! 2. Process 100 WriteEvents so consumer watermarks advance.
-//! 3. Signal shutdown (via the node-wide `ShutdownWatch`).
-//! 4. Drop the `EventPlane` (simulates process exit).
-//! 5. Open a new `WatermarkStore` from the same redb file.
-//! 6. Assert the loaded watermarks match the LSN that was reached before
-//!    shutdown — no lost events, no duplicate replay required.
+//! 3. Hold an Event Plane auxiliary-loop drain guard beyond the 500ms phase
+//!    budget and prove watermark persistence cannot start early.
+//! 4. Release the guard, await `Closed`, and reload the final watermark.
 //!
 //! This is an in-process test because watermark verification requires direct
 //! access to `WatermarkStore` APIs that are not observable through the binary's
@@ -23,14 +21,14 @@ use std::time::Duration;
 
 use nodedb::bridge::dispatch::Dispatcher;
 use nodedb::config::auth::AuthConfig;
-use nodedb::control::shutdown::ShutdownWatch;
+use nodedb::control::shutdown::{PHASE_BUDGET, ShutdownBus, ShutdownPhase, ShutdownWatch};
 use nodedb::control::state::SharedState;
-use nodedb::event::EventPlane;
 use nodedb::event::bus::create_event_bus_with_capacity;
 use nodedb::event::trigger::TriggerDlq;
 use nodedb::event::types::{EventSource, RowId, WriteEvent, WriteOp};
 use nodedb::event::watermark::WatermarkStore;
-use nodedb::types::{Lsn, TenantId, VShardId};
+use nodedb::event::{EventPlane, EventPlaneConfig};
+use nodedb::types::{DatabaseId, Lsn, TenantId, VShardId};
 use nodedb::wal::WalManager;
 
 fn make_write_event(seq: u64, lsn_val: u64) -> WriteEvent {
@@ -40,6 +38,7 @@ fn make_write_event(seq: u64, lsn_val: u64) -> WriteEvent {
         op: WriteOp::Insert,
         row_id: RowId::new("row-1"),
         lsn: Lsn::new(lsn_val),
+        database_id: DatabaseId::DEFAULT,
         tenant_id: TenantId::new(1),
         vshard_id: VShardId::new(0),
         source: EventSource::User,
@@ -80,50 +79,84 @@ async fn event_plane_watermarks_persisted_through_shutdown() {
         .expect("shared_state");
         let cdc_router = Arc::clone(&shared.cdc_router);
         let shutdown = Arc::new(ShutdownWatch::new());
+        let (shutdown_bus, mut shutdown_handle) = ShutdownBus::new(Arc::clone(&shutdown));
 
         let (mut producers, consumers) = create_event_bus_with_capacity(1, 256);
         let core_count = consumers.len();
 
-        let plane = EventPlane::spawn(
-            consumers,
-            Arc::clone(&wal),
-            Arc::clone(&watermark_store),
-            shared,
+        let plane = EventPlane::spawn(EventPlaneConfig {
+            consumers_rx: consumers,
+            wal: Arc::clone(&wal),
+            watermark_store: Arc::clone(&watermark_store),
+            shared_state: shared,
             trigger_dlq,
             cdc_router,
-            Arc::clone(&shutdown),
-        );
+            shutdown: Arc::clone(&shutdown),
+            shutdown_bus: shutdown_bus.clone(),
+        });
 
         // Emit 100 events with increasing LSNs.
         for i in 1u64..=100 {
             producers[0].emit(make_write_event(i, i * 10));
         }
 
-        // Wait for events to be processed.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Signal shutdown — this is what the unified bus does before
-        // the PersistingWatermarks phase.
-        shutdown.signal();
-
-        // Give the plane time to flush watermarks on shutdown signal.
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        let events_processed = plane.total_events_processed();
-        assert!(
-            events_processed >= 50,
-            "expected at least 50 events processed before shutdown, got {events_processed}"
-        );
+        // Wait for every event so the final persisted watermark is
+        // deterministic rather than dependent on scheduler timing.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while plane.total_events_processed() < 100 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Event Plane must process every emitted event before shutdown");
+        assert_eq!(plane.total_events_processed(), 100);
 
         // The final LSN we expect to see persisted.
         let final_lsn = 100 * 10; // seq 100 → LSN 1000
 
-        // Await consumer task termination so every Arc<WatermarkStore> clone
-        // they hold is definitely dropped before we reopen the redb file
-        // below. `drop(plane)` would only abort — under parallel load the
-        // abort propagation can lag the reopen and redb refuses to
-        // re-acquire the file lock.
-        plane.shutdown_and_join().await;
+        // Model an Event Plane auxiliary loop that cannot finish until its
+        // current work is released. It is critical, so exceeding the normal
+        // phase budget must hold the sequencer rather than permit watermark
+        // persistence or WAL fsync to race it.
+        let mut aux_guard = shutdown_bus.register_critical_task(
+            ShutdownPhase::DrainingEventPlane,
+            "event_plane::test_held_aux_loop",
+        );
+        let (release_aux_tx, release_aux_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            aux_guard.await_signal().await;
+            let _ = release_aux_rx.await;
+            aux_guard.report_drained();
+        });
+
+        let supervisor =
+            plane.spawn_shutdown_supervisor(shutdown_bus.clone(), Duration::from_secs(2));
+        let sequencer = shutdown_bus.initiate();
+        shutdown_handle
+            .await_phase(ShutdownPhase::DrainingEventPlane)
+            .await;
+        tokio::time::sleep(PHASE_BUDGET + Duration::from_millis(50)).await;
+        assert_eq!(
+            shutdown_bus.current_phase(),
+            ShutdownPhase::DrainingEventPlane
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                shutdown_handle.await_phase(ShutdownPhase::PersistingWatermarks),
+            )
+            .await
+            .is_err(),
+            "watermark persistence advanced while an Event Plane auxiliary loop was held"
+        );
+
+        release_aux_tx
+            .send(())
+            .expect("release held auxiliary loop");
+        shutdown_handle.await_phase(ShutdownPhase::Closed).await;
+        sequencer.await.expect("shutdown sequencer");
+        supervisor.await.expect("event plane supervisor");
+
         drop(watermark_store); // release this scope's own Arc clone
         (final_lsn, core_count)
     };
@@ -133,37 +166,16 @@ async fn event_plane_watermarks_persisted_through_shutdown() {
     // Open a fresh WatermarkStore from the same redb file.
     let watermark_store_reload = WatermarkStore::open(dir.path()).expect("reload watermark_store");
 
-    // Check that at least one core's watermark advanced past 0.
-    // We can't assert exact final LSN because event processing is concurrent
-    // and may not have reached event 100 before flush, but we assert it
-    // advanced well past 0 (proving persistence works).
-    let mut any_advanced = false;
+    // The supervisor joined consumers only after their shutdown path flushed
+    // its safe final watermark, so the exact final LSN must be observable.
     for core_id in 0..core_count {
         let lsn = watermark_store_reload
             .load(core_id)
             .expect("load watermark");
-        if lsn > Lsn::new(0) {
-            any_advanced = true;
-        }
-    }
-
-    assert!(
-        any_advanced,
-        "no core watermark advanced past 0 after processing events and reloading — \
-         watermarks were not persisted through simulated shutdown. \
-         Expected at least one core to have lsn > 0 in the reloaded store."
-    );
-
-    // Verify the watermark is less than or equal to our final emitted LSN —
-    // ensures no phantom events were recorded.
-    for core_id in 0..core_count {
-        let lsn = watermark_store_reload
-            .load(core_id)
-            .expect("load watermark");
-        assert!(
-            lsn <= Lsn::new(final_lsn),
-            "core {core_id} watermark LSN {lsn:?} exceeds the maximum emitted LSN {final_lsn} \
-             — phantom events recorded"
+        assert_eq!(
+            lsn,
+            Lsn::new(final_lsn),
+            "core {core_id} did not persist the final safe Event Plane watermark"
         );
     }
 }

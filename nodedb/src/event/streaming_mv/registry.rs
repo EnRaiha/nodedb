@@ -7,13 +7,14 @@ use std::sync::RwLock;
 
 use super::state::MvState;
 use super::types::StreamingMvDef;
+use crate::types::DatabaseId;
 
 /// In-memory streaming MV registry.
 pub struct MvRegistry {
-    /// (tenant_id, mv_name) → definition.
-    defs: RwLock<HashMap<(u64, String), StreamingMvDef>>,
-    /// (tenant_id, mv_name) → live aggregate state.
-    states: RwLock<HashMap<(u64, String), std::sync::Arc<MvState>>>,
+    /// (database_id, tenant_id, mv_name) → definition.
+    defs: RwLock<HashMap<(DatabaseId, u64, String), StreamingMvDef>>,
+    /// (database_id, tenant_id, mv_name) → live aggregate state.
+    states: RwLock<HashMap<(DatabaseId, u64, String), std::sync::Arc<MvState>>>,
 }
 
 impl MvRegistry {
@@ -26,7 +27,7 @@ impl MvRegistry {
 
     /// Register a streaming MV and create its state.
     pub fn register(&self, def: StreamingMvDef) {
-        let key = (def.tenant_id, def.name.clone());
+        let key = (def.database_id, def.tenant_id, def.name.clone());
         let state = std::sync::Arc::new(MvState::new(
             def.name.clone(),
             def.group_by_columns.clone(),
@@ -41,8 +42,8 @@ impl MvRegistry {
     }
 
     /// Unregister a streaming MV. Returns true if it existed.
-    pub fn unregister(&self, tenant_id: u64, name: &str) -> bool {
-        let key = (tenant_id, name.to_string());
+    pub fn unregister(&self, database_id: DatabaseId, tenant_id: u64, name: &str) -> bool {
+        let key = (database_id, tenant_id, name.to_string());
         let mut defs = self.defs.write().unwrap_or_else(|p| p.into_inner());
         let existed = defs.remove(&key).is_some();
 
@@ -53,15 +54,25 @@ impl MvRegistry {
     }
 
     /// Get the definition of a streaming MV.
-    pub fn get_def(&self, tenant_id: u64, name: &str) -> Option<StreamingMvDef> {
-        let key = (tenant_id, name.to_string());
+    pub fn get_def(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: &str,
+    ) -> Option<StreamingMvDef> {
+        let key = (database_id, tenant_id, name.to_string());
         let defs = self.defs.read().unwrap_or_else(|p| p.into_inner());
         defs.get(&key).cloned()
     }
 
     /// Get the live state of a streaming MV.
-    pub fn get_state(&self, tenant_id: u64, name: &str) -> Option<std::sync::Arc<MvState>> {
-        let key = (tenant_id, name.to_string());
+    pub fn get_state(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: &str,
+    ) -> Option<std::sync::Arc<MvState>> {
+        let key = (database_id, tenant_id, name.to_string());
         let states = self.states.read().unwrap_or_else(|p| p.into_inner());
         states.get(&key).cloned()
     }
@@ -69,6 +80,7 @@ impl MvRegistry {
     /// Find all MVs that source from a given stream.
     pub fn find_by_source(
         &self,
+        database_id: DatabaseId,
         tenant_id: u64,
         stream_name: &str,
     ) -> Vec<std::sync::Arc<MvState>> {
@@ -76,7 +88,9 @@ impl MvRegistry {
         let states = self.states.read().unwrap_or_else(|p| p.into_inner());
 
         defs.iter()
-            .filter(|((tid, _), def)| *tid == tenant_id && def.source_stream == stream_name)
+            .filter(|((dbid, tid, _), def)| {
+                *dbid == database_id && *tid == tenant_id && def.source_stream == stream_name
+            })
             .filter_map(|(key, _)| states.get(key).cloned())
             .collect()
     }
@@ -93,7 +107,7 @@ impl MvRegistry {
         defs.clear();
         states.clear();
         for mv in fresh {
-            let key = (mv.tenant_id, mv.name.clone());
+            let key = (mv.database_id, mv.tenant_id, mv.name.clone());
             let state = std::sync::Arc::new(crate::event::streaming_mv::state::MvState::new(
                 mv.name.clone(),
                 mv.group_by_columns.clone(),
@@ -111,11 +125,11 @@ impl MvRegistry {
         defs.values().cloned().collect()
     }
 
-    /// List all MV definitions for a tenant.
-    pub fn list_for_tenant(&self, tenant_id: u64) -> Vec<StreamingMvDef> {
+    /// List all MV definitions for a database tenant.
+    pub fn list_for_tenant(&self, database_id: DatabaseId, tenant_id: u64) -> Vec<StreamingMvDef> {
         let defs = self.defs.read().unwrap_or_else(|p| p.into_inner());
         defs.values()
-            .filter(|d| d.tenant_id == tenant_id)
+            .filter(|d| d.database_id == database_id && d.tenant_id == tenant_id)
             .cloned()
             .collect()
     }
@@ -141,5 +155,38 @@ impl MvRegistry {
 impl Default for MvRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn definition(database_id: DatabaseId) -> StreamingMvDef {
+        StreamingMvDef {
+            database_id,
+            tenant_id: 7,
+            name: "orders_mv".to_string(),
+            source_stream: "orders".to_string(),
+            group_by_columns: Vec::new(),
+            aggregates: Vec::new(),
+            filter_expr: None,
+            owner: "admin".to_string(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn source_matching_is_database_scoped() {
+        let registry = MvRegistry::new();
+        let first = DatabaseId::new(1);
+        let second = DatabaseId::new(2);
+        registry.register(definition(first));
+        registry.register(definition(second));
+
+        assert_eq!(registry.find_by_source(first, 7, "orders").len(), 1);
+        assert_eq!(registry.find_by_source(second, 7, "orders").len(), 1);
+        assert!(registry.get_def(first, 7, "orders_mv").is_some());
+        assert!(registry.get_def(second, 7, "orders_mv").is_some());
     }
 }

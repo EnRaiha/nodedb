@@ -10,8 +10,9 @@ use crate::control::state::SharedState;
 
 pub fn put(proc: StoredProcedure, shared: Arc<SharedState>) {
     shared.block_cache.clear();
-    super::owner::install_from_parent(
+    super::owner::install_from_parent_in_database(
         "procedure",
+        proc.database_id.as_u64(),
         proc.tenant_id,
         &proc.name,
         &proc.owner,
@@ -19,9 +20,19 @@ pub fn put(proc: StoredProcedure, shared: Arc<SharedState>) {
     );
 }
 
-pub fn delete(tenant_id: u64, name: String, shared: Arc<SharedState>) {
+pub fn delete(
+    database_id: crate::types::DatabaseId,
+    tenant_id: u64,
+    name: String,
+    shared: Arc<SharedState>,
+) {
     shared.block_cache.clear();
     shared
         .permissions
-        .install_replicated_remove_owner("procedure", tenant_id, &name);
+        .install_replicated_remove_owner_in_database(
+            "procedure",
+            database_id.as_u64(),
+            tenant_id,
+            &name,
+        );
 }

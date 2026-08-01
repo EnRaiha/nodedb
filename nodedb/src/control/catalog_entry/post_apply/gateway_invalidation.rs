@@ -152,6 +152,11 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         CatalogEntry::DeleteMaterializedView { .. } => {
             // no-op: same as PutMaterializedView.
         }
+        CatalogEntry::PutStreamingMaterializedView(_)
+        | CatalogEntry::DeleteStreamingMaterializedView { .. } => {
+            // no-op: streaming MV definitions are consumed by the Event Plane
+            // and never alter a PhysicalPlan's shape.
+        }
 
         // ── Continuous aggregate: definition is its own catalog object ────────
         CatalogEntry::PutContinuousAggregate(_) => {

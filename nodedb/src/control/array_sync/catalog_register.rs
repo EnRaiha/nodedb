@@ -33,16 +33,21 @@ use crate::control::state::SharedState;
 /// Raft-apply and the single-node direct-import path report success to a caller
 /// that treats it as durable, so both must make it durable here.
 ///
-/// Returns `Ok(())` when an entry already exists (benign no-op) or was freshly
-/// registered and persisted. Returns `Err` on a genuine registration failure
-/// (schema not readable back, encode failure, or catalog write error).
+/// Returns `Ok(())` when an entry already exists or was freshly registered.
+/// Every successful return guarantees that the entry is persisted, so a retry
+/// repairs a row that was lost after an earlier in-memory registration.
+/// Returns `Err` on a genuine registration failure (schema not readable back,
+/// encode failure, or catalog write error).
 pub(crate) fn register_array_catalog_entry(
     state: &Arc<SharedState>,
+    tenant_id: crate::types::TenantId,
+    database_id: crate::types::DatabaseId,
     array: &str,
 ) -> crate::Result<()> {
-    use nodedb_types::TenantId as NdTenantId;
-
-    let schema = state.array_sync_schemas.to_array_schema(array).ok_or_else(|| {
+    let schema = state
+        .array_sync_schemas
+        .to_array_schema_in_database(database_id, tenant_id.as_u64(), array)
+        .ok_or_else(|| {
         crate::Error::Internal {
             detail: format!(
                 "register_array_catalog_entry: to_array_schema returned None for '{array}' after import"
@@ -53,9 +58,9 @@ pub(crate) fn register_array_catalog_entry(
         detail: format!("register_array_catalog_entry: schema_msgpack encode failed: {e}"),
     })?;
 
-    let array_id = nodedb_array::types::ArrayId::new(NdTenantId::new(0), array);
+    let array_id = nodedb_array::types::ArrayId::in_database(tenant_id, database_id, array);
     let entry = ArrayCatalogEntry {
-        array_id,
+        array_id: array_id.clone(),
         name: array.to_string(),
         schema_msgpack,
         schema_hash: 0,
@@ -64,29 +69,77 @@ pub(crate) fn register_array_catalog_entry(
         audit_retain_ms: None,
         minimum_audit_retain_ms: None,
     };
-    {
-        let mut cat = state
-            .array_catalog
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        if cat.lookup_by_name(array).is_some() {
-            return Ok(());
-        }
-        cat.register(entry.clone())
+    // Persist first, including the duplicate/retry case. A previous attempt
+    // may have registered this entry in memory but failed before its durable
+    // write; treating that state as a no-op would make the array disappear on
+    // restart. Keep the lock through the write so concurrent callers cannot
+    // observe a durable/in-memory split.
+    let mut cat = state
+        .array_catalog
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    persist_then_register_if_missing(&mut cat, entry, |entry| {
+        crate::control::array_catalog::persist::persist(state.credentials.catalog(), entry).map_err(
+            |e| crate::Error::Internal {
+                detail: format!("register_array_catalog_entry: catalog persist failed: {e}"),
+            },
+        )
+    })
+}
+
+fn persist_then_register_if_missing<F>(
+    catalog: &mut crate::control::array_catalog::ArrayCatalog,
+    entry: ArrayCatalogEntry,
+    persist: F,
+) -> crate::Result<()>
+where
+    F: FnOnce(&ArrayCatalogEntry) -> crate::Result<()>,
+{
+    persist(&entry)?;
+    if catalog.lookup_by_id(&entry.array_id).is_none() {
+        catalog
+            .register(entry)
             .map_err(|e| crate::Error::Internal {
                 detail: format!("register_array_catalog_entry: catalog register failed: {e}"),
             })?;
     }
-
-    // Persist under the same ordering `CREATE ARRAY` uses (register, then
-    // persist), so a synced array survives a restart exactly as a locally
-    // created one does. The lock is released first: the redb commit fsyncs, and
-    // holding the catalog write lock across it would block every concurrent
-    // array lookup for the duration.
-    crate::control::array_catalog::persist::persist(state.credentials.catalog(), &entry).map_err(
-        |e| crate::Error::Internal {
-            detail: format!("register_array_catalog_entry: catalog persist failed: {e}"),
-        },
-    )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_array::types::ArrayId;
+    use nodedb_types::{DatabaseId, TenantId};
+
+    fn entry() -> ArrayCatalogEntry {
+        ArrayCatalogEntry {
+            array_id: ArrayId::in_database(TenantId::new(9), DatabaseId::new(4), "synced"),
+            name: "synced".into(),
+            schema_msgpack: vec![0x80],
+            schema_hash: 0,
+            created_at_ms: 0,
+            prefix_bits: 8,
+            audit_retain_ms: None,
+            minimum_audit_retain_ms: None,
+        }
+    }
+
+    #[test]
+    fn retry_repairs_missing_durable_entry_already_in_memory() {
+        let entry = entry();
+        let mut catalog = crate::control::array_catalog::ArrayCatalog::new();
+        catalog.register(entry.clone()).unwrap();
+        let mut persisted = false;
+        assert!(!persisted, "fixture begins with the durable row missing");
+
+        persist_then_register_if_missing(&mut catalog, entry.clone(), |_| {
+            persisted = true;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(persisted);
+        assert_eq!(catalog.lookup_by_id(&entry.array_id), Some(entry));
+    }
 }

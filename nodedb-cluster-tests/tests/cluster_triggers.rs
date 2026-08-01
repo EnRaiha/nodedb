@@ -73,6 +73,7 @@ fn cross_shard_request_carries_cascade_depth() {
     let req = CrossShardWriteRequest {
         sql: "INSERT INTO audit (id) VALUES ('doc-1')".into(),
         tenant_id: 1,
+        database_id: 0,
         source_vshard: 0,
         target_vshard: 1,
         source_lsn: 100,
@@ -91,6 +92,7 @@ fn cross_shard_request_serialization_roundtrip() {
     let req = CrossShardWriteRequest {
         sql: "INSERT INTO vectors (id) VALUES ('v1')".into(),
         tenant_id: 1,
+        database_id: 0,
         source_vshard: 0,
         target_vshard: 2,
         source_lsn: 500,
@@ -119,6 +121,7 @@ fn trigger_definitions_stored_in_catalog() {
     let reg = TriggerRegistry::new();
     reg.register(StoredTrigger {
         tenant_id: 1,
+        database_id: nodedb::types::DatabaseId::DEFAULT,
         name: "cluster_audit".into(),
         collection: "orders".into(),
         timing: TriggerTiming::After,
@@ -141,7 +144,12 @@ fn trigger_definitions_stored_in_catalog() {
         modification_hlc: nodedb_types::Hlc::ZERO,
     });
 
-    let matched = reg.get_matching(1, "orders", DmlEvent::Insert);
+    let matched = reg.get_matching(
+        nodedb::types::DatabaseId::DEFAULT,
+        1,
+        "orders",
+        DmlEvent::Insert,
+    );
     assert_eq!(matched.len(), 1);
     assert_eq!(matched[0].name, "cluster_audit");
 }
@@ -156,6 +164,7 @@ fn event_source_preserved_through_write_event() {
     // This ensures the Event Plane sees the correct source after replay.
     let event = WriteEvent {
         sequence: 1,
+        database_id: nodedb::types::DatabaseId::DEFAULT,
         collection: Arc::from("orders"),
         op: WriteOp::Insert,
         row_id: RowId::new("doc-1"),

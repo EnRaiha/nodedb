@@ -87,6 +87,10 @@ pub struct TimeseriesAckMsg {
     Debug, Clone, Serialize, Deserialize, zerompk::ToMessagePack, zerompk::FromMessagePack,
 )]
 pub struct DefinitionSyncMsg {
+    /// Authenticated tenant that owns this definition.
+    pub tenant_id: u64,
+    /// Database namespace that owns this definition.
+    pub database_id: u64,
     /// Type of definition: "function", "trigger", "procedure".
     pub definition_type: String,
     /// The definition name.

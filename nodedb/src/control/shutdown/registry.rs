@@ -4,10 +4,10 @@
 //!
 //! Holds the join handles so `shutdown_all` can actually
 //! observe "did loop X exit?" rather than hoping the watch
-//! signal was honored. Async laggards are aborted after the
-//! deadline; blocking laggards are loudly logged (tokio cannot
-//! abort a blocking thread — that's a platform fact, not a
-//! shortcut).
+//! signal was honored. The bounded `shutdown_all` API reports
+//! laggards after its deadline; the canonical Event Plane path
+//! uses `shutdown_all_strict`, which retains and joins every
+//! correctness-critical handle before allowing shutdown to advance.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -24,18 +24,18 @@ pub enum LoopHandle {
     /// Tokio task that MUST NOT be `.abort()`'d — it advances a
     /// replicated / durable state machine and a mid-flight
     /// cancellation would leave it diverged from its peers or
-    /// strand committed-but-unapplied work. Joined on shutdown
-    /// exactly like [`Self::Async`], but a laggard past the
-    /// deadline is reported and LEFT RUNNING rather than
-    /// force-cancelled. The loop is responsible for observing
+    /// strand committed-but-unapplied work. A laggard is never
+    /// force-cancelled. The bounded shutdown path reports it as
+    /// still running; the strict canonical path retains and joins
+    /// it at its safe termination boundary. The loop is responsible for observing
     /// shutdown promptly at a safe internal boundary (e.g. a
     /// Calvin scheduler breaking at an epoch boundary, or the
     /// raft apply loop finishing its current drain batch).
     AsyncNoAbort(JoinHandle<()>),
     /// `spawn_blocking` task. The join handle still exists,
     /// but aborting is a no-op — it only cancels scheduling,
-    /// not the running thread. Laggards are logged, not
-    /// aborted.
+    /// not the running thread. The bounded path reports laggards;
+    /// the strict path waits for them to terminate.
     Blocking(JoinHandle<()>),
 }
 
@@ -130,7 +130,8 @@ impl LoopRegistry {
     }
 
     /// Close the registry and await every registered handle
-    /// with a shared `deadline`. Handles that do not complete
+    /// with a shared `deadline`. This is the bounded API for
+    /// noncritical and test callers. Handles that do not complete
     /// by the deadline:
     ///
     /// - Async handles are `.abort()`'d and recorded as
@@ -195,6 +196,82 @@ impl LoopRegistry {
                         abort_and_report_laggard(&mut join, name, registered_at, start, can_abort)
                             .await,
                     );
+                }
+            }
+        }
+
+        ShutdownReport {
+            exited_clean,
+            laggards,
+            total: start.elapsed(),
+        }
+    }
+
+    /// Signal every registered loop, then close and drain the registry for
+    /// the canonical shutdown path.
+    ///
+    /// The configured deadline bounds only abortable async work. An
+    /// [`LoopHandle::AsyncNoAbort`] or [`LoopHandle::Blocking`] loop that
+    /// passes the deadline is recorded as a laggard but remains owned and is
+    /// awaited to actual termination. This makes those loops correctness
+    /// barriers: callers must not report a later shutdown phase as drained
+    /// while either can still hold durable or replicated state. A second OS
+    /// signal is the process-level force-exit path.
+    pub async fn shutdown_all_strict(
+        &self,
+        shutdown: &super::ShutdownWatch,
+        deadline: Duration,
+    ) -> ShutdownReport {
+        shutdown.signal();
+        let start = Instant::now();
+        let entries: Vec<LoopEntry> = {
+            let mut guard = lock_inner(&self.inner, "shutdown_all_strict");
+            guard.closed = true;
+            std::mem::take(&mut guard.handles)
+        };
+
+        let mut exited_clean = Vec::with_capacity(entries.len());
+        let mut laggards = Vec::new();
+
+        for entry in entries {
+            let LoopEntry {
+                name,
+                handle,
+                registered_at,
+            } = entry;
+            let (mut join, can_abort) = handle.take_handle();
+            let elapsed_budget = deadline.saturating_sub(start.elapsed());
+
+            let joined = if elapsed_budget.is_zero() {
+                None
+            } else {
+                tokio::time::timeout(elapsed_budget, &mut join).await.ok()
+            };
+            match joined {
+                Some(Ok(())) => exited_clean.push(name),
+                Some(Err(join_err)) => {
+                    tracing::warn!(
+                        loop_name = name,
+                        error = %join_err,
+                        "background loop exited with error during strict shutdown"
+                    );
+                    exited_clean.push(name);
+                }
+                None => {
+                    if can_abort {
+                        join.abort();
+                    }
+                    // This await is intentionally unbounded. For abortable
+                    // work it confirms cancellation; for no-abort and
+                    // blocking work it preserves ownership until the loop has
+                    // reached its own safe termination boundary.
+                    let _ = join.await;
+                    laggards.push(LaggardReport {
+                        name,
+                        uptime: registered_at.elapsed(),
+                        wait_elapsed: start.elapsed(),
+                        aborted: can_abort,
+                    });
                 }
             }
         }
@@ -334,5 +411,130 @@ mod tests {
         assert_eq!(report.exited_clean, vec!["quick"]);
         assert_eq!(report.laggards.len(), 1);
         assert_eq!(report.laggards[0].name, "slow");
+    }
+
+    #[tokio::test]
+    async fn strict_shutdown_keeps_event_plane_blocked_for_no_abort_laggard() {
+        use tokio::sync::{Notify, oneshot};
+
+        let watch = Arc::new(ShutdownWatch::new());
+        let registry = Arc::new(LoopRegistry::new());
+        let (bus, mut shutdown_handle) = super::super::ShutdownBus::new(Arc::clone(&watch));
+        let guard = bus.register_critical_task(
+            super::super::ShutdownPhase::DrainingEventPlane,
+            "strict-no-abort",
+        );
+        let release = Arc::new(Notify::new());
+        let (started_tx, started_rx) = oneshot::channel();
+        let mut loop_shutdown = watch.subscribe();
+        let loop_release = Arc::clone(&release);
+        registry
+            .register(
+                "no-abort",
+                LoopHandle::AsyncNoAbort(tokio::spawn(async move {
+                    loop_shutdown.wait_cancelled().await;
+                    let _ = started_tx.send(());
+                    loop_release.notified().await;
+                })),
+            )
+            .expect("register no-abort loop");
+
+        let sequencer = bus.initiate();
+        let strict_registry = Arc::clone(&registry);
+        let strict_watch = Arc::clone(&watch);
+        let strict = tokio::spawn(async move {
+            let report = strict_registry
+                .shutdown_all_strict(&strict_watch, Duration::from_millis(20))
+                .await;
+            guard.report_drained();
+            report
+        });
+        started_rx
+            .await
+            .expect("loop should receive shutdown signal");
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(100),
+            shutdown_handle.await_phase(super::super::ShutdownPhase::PersistingWatermarks),
+        )
+        .await
+        .is_err();
+        release.notify_one();
+        let report = strict.await.expect("strict shutdown task should not panic");
+        sequencer
+            .await
+            .expect("shutdown sequencer should not panic");
+
+        assert!(
+            blocked,
+            "later shutdown phases advanced before no-abort exit"
+        );
+        assert_eq!(report.laggards.len(), 1);
+        assert!(!report.laggards[0].aborted);
+    }
+
+    #[tokio::test]
+    async fn strict_shutdown_keeps_event_plane_blocked_for_blocking_laggard() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::oneshot;
+
+        let watch = Arc::new(ShutdownWatch::new());
+        let registry = Arc::new(LoopRegistry::new());
+        let (bus, mut shutdown_handle) = super::super::ShutdownBus::new(Arc::clone(&watch));
+        let guard = bus.register_critical_task(
+            super::super::ShutdownPhase::DrainingEventPlane,
+            "strict-blocking",
+        );
+        let release = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = oneshot::channel();
+        let loop_shutdown = watch.subscribe();
+        let loop_release = Arc::clone(&release);
+        registry
+            .register(
+                "blocking",
+                LoopHandle::Blocking(tokio::task::spawn_blocking(move || {
+                    while !loop_shutdown.is_cancelled() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let _ = started_tx.send(());
+                    while !loop_release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                })),
+            )
+            .expect("register blocking loop");
+
+        let sequencer = bus.initiate();
+        let strict_registry = Arc::clone(&registry);
+        let strict_watch = Arc::clone(&watch);
+        let strict = tokio::spawn(async move {
+            let report = strict_registry
+                .shutdown_all_strict(&strict_watch, Duration::from_millis(20))
+                .await;
+            guard.report_drained();
+            report
+        });
+        started_rx
+            .await
+            .expect("blocking loop should receive shutdown signal");
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(100),
+            shutdown_handle.await_phase(super::super::ShutdownPhase::PersistingWatermarks),
+        )
+        .await
+        .is_err();
+        release.store(true, Ordering::SeqCst);
+        let report = strict.await.expect("strict shutdown task should not panic");
+        sequencer
+            .await
+            .expect("shutdown sequencer should not panic");
+
+        assert!(
+            blocked,
+            "later shutdown phases advanced before blocking loop exit"
+        );
+        assert_eq!(report.laggards.len(), 1);
+        assert!(!report.laggards[0].aborted);
     }
 }

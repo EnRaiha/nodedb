@@ -55,7 +55,7 @@ pub async fn handle_analyze(
 
     // Dispatch a scan to the Data Plane to collect all rows.
     let scan_sql = format!("SELECT * FROM {}", ::nodedb_types::quote_ident(&collection));
-    let (tasks, _output_schema) =
+    let (tasks, _output_schema, _lease_scope) =
         crate::control::server::shared::ddl::neutral::planning::plan_authorized_sql(
             state,
             identity,

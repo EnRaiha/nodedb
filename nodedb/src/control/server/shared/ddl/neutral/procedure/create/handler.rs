@@ -29,11 +29,14 @@ pub fn create_procedure(
 
     let parsed = parse_create_procedure(sql)?;
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 
     if !parsed.or_replace
-        && let Ok(Some(_)) = catalog.get_procedure(tenant_id, &parsed.name)
+        && let Ok(Some(_)) = catalog.get_procedure_in_database(database_id, tenant_id, &parsed.name)
     {
         return Err(DdlError {
             sqlstate: "42723".to_string(),
@@ -59,6 +62,7 @@ pub fn create_procedure(
 
     let stored = StoredProcedure {
         tenant_id,
+        database_id,
         name: parsed.name.clone(),
         parameters: parsed.parameters,
         body_sql: parsed.body_sql,
@@ -123,6 +127,8 @@ fn emit_procedure_put(
     match sonic_rs::to_vec(&payload_json) {
         Ok(payload) => {
             let msg = DefinitionSyncMsg {
+                tenant_id: stored.tenant_id,
+                database_id: stored.database_id.as_u64(),
                 definition_type: "procedure".into(),
                 name: stored.name.clone(),
                 action: "put".into(),

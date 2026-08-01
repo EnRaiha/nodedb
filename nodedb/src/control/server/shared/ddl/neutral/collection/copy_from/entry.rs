@@ -15,6 +15,7 @@ use nodedb_sql::ddl_ast::statement::CopyFormat;
 use nodedb_types::CollectionType;
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::ddl::neutral::collection::dml::authorize_write_target;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
@@ -49,6 +50,8 @@ pub async fn copy_from_file(
         delimiter,
         header,
     } = options;
+
+    authorize_write_target(state, identity, database_id, collection)?;
     validate_path(path)?;
 
     // Check file size before reading.
@@ -78,7 +81,7 @@ pub async fn copy_from_file(
     })?;
 
     // Validate engine: reject Timeseries and Spatial.
-    check_engine_support(state, identity, collection)?;
+    check_engine_support(state, identity, database_id, collection)?;
 
     let tenant_id = identity.tenant_id;
 
@@ -144,11 +147,12 @@ fn validate_path(path: &str) -> Result<(), DdlError> {
 fn check_engine_support(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     collection: &str,
 ) -> Result<(), DdlError> {
     let tenant_id = identity.tenant_id;
     let catalog = state.credentials.catalog();
-    let stored = match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), collection) {
+    let stored = match catalog.get_collection(database_id, tenant_id.as_u64(), collection) {
         Ok(Some(c)) => c,
         Ok(None) => return Ok(()), // Collection doesn't exist yet — will fail at INSERT.
         Err(e) => {

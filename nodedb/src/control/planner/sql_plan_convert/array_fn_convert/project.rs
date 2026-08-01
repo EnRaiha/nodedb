@@ -18,14 +18,14 @@ pub(crate) fn convert_project(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
-    let schema = load_schema(name, ctx)?;
+    let schema = load_schema(name, tenant_id, ctx)?;
     let attr_indices = resolve_attr_indices(name, attr_projection, &schema)?;
     if attr_indices.is_empty() {
         return Err(crate::Error::PlanError {
             detail: format!("ARRAY_PROJECT: array '{name}': attr list must not be empty"),
         });
     }
-    let aid = ArrayId::new(tenant_id, name);
+    let aid = ArrayId::in_database(tenant_id, ctx.database_id, name);
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
     Ok(vec![PhysicalTask {
         tenant_id,

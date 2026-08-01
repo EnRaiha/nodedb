@@ -4,8 +4,9 @@
 //!
 //! Ported from the pgwire `ddl::function::create` handler. All non-return logic
 //! (privilege gate, parsing, body compilation/validation, StoredFunction build,
-//! catalog propose-and-apply, dependency extraction, Lite definition-sync
-//! broadcast, and the `audit_record` call) is preserved verbatim; only the
+//! catalog propose-and-apply, dependency extraction into the replicated
+//! definition, Lite definition-sync broadcast, and the `audit_record` call)
+//! is preserved verbatim; only the
 //! result construction changed from pgwire `Response` / `PgWireError` to the
 //! protocol-neutral [`DdlResult`] / [`DdlError`].
 
@@ -35,11 +36,14 @@ pub fn create_function(
 
     let parsed = parse_create_function(sql)?;
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 
     if !parsed.or_replace
-        && let Ok(Some(_)) = catalog.get_function(tenant_id, &parsed.name)
+        && let Ok(Some(_)) = catalog.get_function_in_database(database_id, tenant_id, &parsed.name)
     {
         return Err(DdlError {
             sqlstate: "42723".to_string(),
@@ -98,8 +102,9 @@ pub fn create_function(
         })?
         .as_secs();
 
-    let stored = StoredFunction {
+    let mut stored = StoredFunction {
         tenant_id,
+        database_id,
         name: parsed.name.clone(),
         parameters: parsed.parameters,
         return_type: parsed.return_type,
@@ -109,6 +114,8 @@ pub fn create_function(
         security: crate::control::security::catalog::FunctionSecurity::default(),
         language: crate::control::security::catalog::function_types::FunctionLanguage::Sql,
         wasm_hash: None,
+        wasm_module: None,
+        dependencies: vec![],
         wasm_fuel: 1_000_000,
         wasm_memory: 16 * 1024 * 1024,
         owner: identity.username.clone(),
@@ -116,6 +123,10 @@ pub fn create_function(
         descriptor_version: 0,
         modification_hlc: nodedb_types::Hlc::ZERO,
     };
+
+    // The complete dependency list is part of the replicated definition so
+    // followers replace the same catalog row atomically with the function.
+    stored.dependencies = extract_dependencies(&stored);
 
     // Propose through the metadata raft group. Every node's applier
     // writes the function record to local redb and clears the
@@ -129,12 +140,12 @@ pub fn create_function(
     // `propose_and_apply` runs the same applier locally so the
     // OWNERS row lands too.
     let entry = crate::control::catalog_entry::CatalogEntry::PutFunction(Box::new(stored.clone()));
-    propose_and_apply(state, &entry)?;
-
-    // Extract and store dependencies (referenced functions in the body).
-    let deps = extract_dependencies(&stored);
-    if !deps.is_empty() {
-        let _ = catalog.put_dependencies("function", tenant_id, &stored.name, &deps);
+    let log_index = propose_and_apply(state, &entry)?;
+    if log_index == 0 {
+        // The no-Raft fallback still uses the CatalogEntry applier for the
+        // durable row. Run the matching post-apply hook so its owner and
+        // function-cache effects match a replicated apply.
+        crate::control::catalog_entry::post_apply::function::put(stored.clone(), state);
     }
 
     // Broadcast to connected Lite sessions after the catalog commit is durable.
@@ -156,7 +167,7 @@ pub fn create_function(
 /// Called after `propose_and_apply` succeeds — the catalog mutation is
 /// durable before this runs, so no Lite client can receive a definition
 /// that gets rolled back.
-fn emit_function_put(
+pub(crate) fn emit_function_put(
     state: &crate::control::state::SharedState,
     stored: &crate::control::security::catalog::StoredFunction,
 ) {
@@ -183,6 +194,8 @@ fn emit_function_put(
     match sonic_rs::to_vec(&payload_json) {
         Ok(payload) => {
             let msg = DefinitionSyncMsg {
+                tenant_id: stored.tenant_id,
+                database_id: stored.database_id.as_u64(),
                 definition_type: "function".into(),
                 name: stored.name.clone(),
                 action: "put".into(),

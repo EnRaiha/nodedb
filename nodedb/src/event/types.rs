@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use sonic_rs;
 
-use crate::types::{Lsn, TenantId, VShardId};
+use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 
 /// Identifies a row within a collection. Wraps the document/row ID string.
 ///
@@ -58,6 +58,10 @@ pub struct WriteEvent {
 
     /// WAL LSN for this write. Enables replay from WAL on Event Plane restart.
     pub lsn: Lsn,
+
+    /// Database context. Producers will propagate the selected database in the
+    /// next CDC scoping slice; existing construction sites use `DEFAULT`.
+    pub database_id: DatabaseId,
 
     /// Tenant context.
     pub tenant_id: TenantId,
@@ -224,6 +228,7 @@ mod tests {
             op: WriteOp::Insert,
             row_id: RowId::new("order-1"),
             lsn: Lsn::new(100),
+            database_id: DatabaseId::DEFAULT,
             tenant_id: TenantId::new(1),
             vshard_id: VShardId::new(0),
             source: EventSource::User,

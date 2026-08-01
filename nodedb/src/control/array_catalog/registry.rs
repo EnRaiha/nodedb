@@ -2,9 +2,9 @@
 
 //! In-memory registry of all arrays, mirrored to the system catalog.
 //!
-//! The registry is keyed by logical array name and maintains a reverse
-//! map `ArrayId -> name` so Data-Plane dispatch can
-//! resolve either direction without scanning. All public methods return
+//! The registry is keyed by the full [`ArrayId`].  A name is only unique
+//! within its tenant/database scope; never use a bare name to address catalog
+//! state outside the legacy default-database compatibility methods. All public methods return
 //! cloned [`ArrayCatalogEntry`] values — the handle is an `Arc<RwLock>`
 //! shared between Control and the Data Plane, and callers must not
 //! hold the internal lock across engine calls.
@@ -25,8 +25,7 @@ pub type ArrayCatalogHandle = Arc<RwLock<ArrayCatalog>>;
 /// [`super::persist`]).
 #[derive(Debug, Default)]
 pub struct ArrayCatalog {
-    entries_by_name: HashMap<String, ArrayCatalogEntry>,
-    name_by_id: HashMap<ArrayId, String>,
+    entries: HashMap<ArrayId, ArrayCatalogEntry>,
 }
 
 impl ArrayCatalog {
@@ -41,50 +40,69 @@ impl ArrayCatalog {
     /// Insert a new entry. Duplicate name or id is rejected — DDL must
     /// drop the existing array first.
     pub fn register(&mut self, entry: ArrayCatalogEntry) -> Result<(), NodeDbError> {
-        if self.entries_by_name.contains_key(&entry.name) {
+        if self.entries.contains_key(&entry.array_id) {
             return Err(NodeDbError::array(
                 entry.name.clone(),
-                "array already registered",
+                "array id already registered",
             ));
         }
-        if self.name_by_id.contains_key(&entry.array_id) {
-            return Err(NodeDbError::array(
-                entry.name.clone(),
-                "array id already registered under a different name",
-            ));
-        }
-        self.name_by_id
-            .insert(entry.array_id.clone(), entry.name.clone());
-        self.entries_by_name.insert(entry.name.clone(), entry);
+        self.entries.insert(entry.array_id.clone(), entry);
         Ok(())
     }
 
+    /// Look up a name in its explicit tenant/database namespace.
+    pub fn lookup_by_name_in_database(
+        &self,
+        tenant_id: nodedb_types::TenantId,
+        database_id: nodedb_types::DatabaseId,
+        name: &str,
+    ) -> Option<ArrayCatalogEntry> {
+        self.lookup_by_id(&ArrayId::in_database(tenant_id, database_id, name))
+    }
+
+    /// Legacy decoder/lookup for pre-database catalog callers. It is exactly
+    /// the DEFAULT database namespace and must not be used by production paths.
     pub fn lookup_by_name(&self, name: &str) -> Option<ArrayCatalogEntry> {
-        self.entries_by_name.get(name).cloned()
+        self.entries
+            .iter()
+            .find(|(id, _)| id.database_id == nodedb_types::DatabaseId::DEFAULT && id.name == name)
+            .map(|(_, entry)| entry.clone())
     }
 
     pub fn lookup_by_id(&self, id: &ArrayId) -> Option<ArrayCatalogEntry> {
-        let name = self.name_by_id.get(id)?;
-        self.entries_by_name.get(name).cloned()
+        self.entries.get(id).cloned()
     }
 
-    /// Remove an entry by name. Returns the removed entry if it existed.
+    pub fn unregister_in_database(
+        &mut self,
+        tenant_id: nodedb_types::TenantId,
+        database_id: nodedb_types::DatabaseId,
+        name: &str,
+    ) -> Option<ArrayCatalogEntry> {
+        self.entries
+            .remove(&ArrayId::in_database(tenant_id, database_id, name))
+    }
+
+    /// Legacy DEFAULT-database removal retained for old persisted callers.
     pub fn unregister(&mut self, name: &str) -> Option<ArrayCatalogEntry> {
-        let entry = self.entries_by_name.remove(name)?;
-        self.name_by_id.remove(&entry.array_id);
-        Some(entry)
+        let id = self
+            .entries
+            .keys()
+            .find(|id| id.database_id == nodedb_types::DatabaseId::DEFAULT && id.name == name)
+            .cloned()?;
+        self.entries.remove(&id)
     }
 
     pub fn all_entries(&self) -> Vec<ArrayCatalogEntry> {
-        self.entries_by_name.values().cloned().collect()
+        self.entries.values().cloned().collect()
     }
 
     pub fn len(&self) -> usize {
-        self.entries_by_name.len()
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries_by_name.is_empty()
+        self.entries.is_empty()
     }
 }
 
@@ -116,6 +134,22 @@ mod tests {
         assert_eq!(cat.lookup_by_id(&e.array_id), Some(e.clone()));
         assert_eq!(cat.all_entries(), vec![e]);
         assert_eq!(cat.len(), 1);
+    }
+
+    #[test]
+    fn same_name_in_different_databases_is_isolated() {
+        let mut cat = ArrayCatalog::new();
+        let mut db1 = entry("same");
+        db1.array_id =
+            ArrayId::in_database(TenantId::new(1), nodedb_types::DatabaseId::new(1), "same");
+        let mut db2 = entry("same");
+        db2.array_id =
+            ArrayId::in_database(TenantId::new(1), nodedb_types::DatabaseId::new(2), "same");
+        cat.register(db1.clone()).unwrap();
+        cat.register(db2.clone()).unwrap();
+        assert_eq!(cat.lookup_by_id(&db1.array_id), Some(db1));
+        assert_eq!(cat.lookup_by_id(&db2.array_id), Some(db2));
+        assert_eq!(cat.len(), 2);
     }
 
     #[test]

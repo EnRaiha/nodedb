@@ -9,12 +9,21 @@
 ///
 /// Packaged by the source Event Plane, sent via `VShardEnvelope(CrossShardEvent)`,
 /// received and executed by the target Event Plane's `CrossShardReceiver`.
+///
+/// The current wire encoding is a versioned MessagePack map: receivers accept
+/// unknown fields so later versions remain forward-compatible. The receiver
+/// separately recognizes the exact legacy positional encoding; malformed
+/// payloads that match neither representation are rejected.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
+#[msgpack(map, allow_unknown_fields)]
 pub struct CrossShardWriteRequest {
     /// SQL statement to execute on the target shard.
     pub sql: String,
     /// Tenant context for the execution.
     pub tenant_id: u64,
+    /// Database context for the trigger body execution.
+    #[msgpack(default)]
+    pub database_id: u64,
     /// Source vShard that generated this event (for HWM dedup).
     pub source_vshard: u32,
     /// Source LSN — used for high-water-mark dedup on the target.
@@ -86,6 +95,8 @@ pub struct NotifyBroadcastMsg {
     pub sequence: u64,
     /// Tenant that published the NOTIFY.
     pub tenant_id: u64,
+    /// Database containing the affected collection.
+    pub database_id: u64,
     /// Collection affected.
     pub collection: String,
     /// Document ID affected.
@@ -103,10 +114,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_roundtrip() {
+    fn current_request_roundtrip() {
         let req = CrossShardWriteRequest {
             sql: "INSERT INTO audit_log (event) VALUES ('created')".into(),
             tenant_id: 1,
+            database_id: 42,
             source_vshard: 3,
             source_lsn: 1500,
             source_sequence: 42,
@@ -119,6 +131,7 @@ mod tests {
         assert_eq!(decoded.sql, req.sql);
         assert_eq!(decoded.source_lsn, 1500);
         assert_eq!(decoded.source_vshard, 3);
+        assert_eq!(decoded.database_id, 42);
     }
 
     #[test]
@@ -149,6 +162,7 @@ mod tests {
             source_node: 1,
             sequence: 42,
             tenant_id: 5,
+            database_id: 1024,
             collection: "orders".into(),
             document_id: "o-123".into(),
             operation: "INSERT".into(),
@@ -158,6 +172,7 @@ mod tests {
         let bytes = zerompk::to_msgpack_vec(&msg).unwrap();
         let decoded: NotifyBroadcastMsg = zerompk::from_msgpack(&bytes).unwrap();
         assert_eq!(decoded.source_node, 1);
+        assert_eq!(decoded.database_id, 1024);
         assert_eq!(decoded.collection, "orders");
         assert_eq!(decoded.lsn, 500);
     }

@@ -22,7 +22,8 @@ use super::types::AggFunction;
 /// Converts the WriteEvent's raw payload to JSON for field extraction,
 /// then updates each matching MV's aggregate state.
 pub fn process_write_event_for_mvs(event: &WriteEvent, registry: &MvRegistry, stream_name: &str) {
-    let mv_states = registry.find_by_source(event.tenant_id.as_u64(), stream_name);
+    let mv_states =
+        registry.find_by_source(event.database_id, event.tenant_id.as_u64(), stream_name);
     if mv_states.is_empty() {
         return;
     }
@@ -45,6 +46,7 @@ pub fn process_write_event_for_mvs(event: &WriteEvent, registry: &MvRegistry, st
         row_id: event.row_id.as_str().to_string(),
         event_time: 0,
         lsn: event.lsn.as_u64(),
+        database_id: event.database_id,
         tenant_id: event.tenant_id.as_u64(),
         new_value,
         old_value: None,
@@ -61,7 +63,7 @@ pub fn process_write_event_for_mvs(event: &WriteEvent, registry: &MvRegistry, st
 
 /// Process a CDC event against all streaming MVs sourced from its stream.
 pub fn process_event_for_mvs(event: &CdcEvent, registry: &MvRegistry, stream_name: &str) {
-    let mv_states = registry.find_by_source(event.tenant_id, stream_name);
+    let mv_states = registry.find_by_source(event.database_id, event.tenant_id, stream_name);
     if mv_states.is_empty() {
         return;
     }
@@ -80,7 +82,7 @@ pub fn backfill_from_buffer(
     mv_state: &MvState,
     buffer: &crate::event::cdc::buffer::StreamBuffer,
 ) -> u64 {
-    let events = buffer.read_from_lsn(0, usize::MAX);
+    let events = buffer.read_from(crate::event::cdc::CdcOffset::ZERO, usize::MAX);
     let mut processed = 0u64;
 
     for event in &events {
@@ -202,6 +204,7 @@ mod tests {
             row_id: "o-1".into(),
             event_time: 0,
             lsn: 100,
+            database_id: crate::types::DatabaseId::new(7),
             tenant_id: 1,
             new_value: Some(serde_json::json!({"total": total, "status": "active"})),
             old_value: None,
@@ -249,6 +252,7 @@ mod tests {
     fn process_event_updates_mv() {
         let registry = MvRegistry::new();
         let def = crate::event::streaming_mv::types::StreamingMvDef {
+            database_id: crate::types::DatabaseId::new(7),
             tenant_id: 1,
             name: "order_stats".into(),
             source_stream: "orders_stream".into(),
@@ -279,7 +283,9 @@ mod tests {
         process_event_for_mvs(&e2, &registry, "orders_stream");
         process_event_for_mvs(&e3, &registry, "orders_stream");
 
-        let state = registry.get_state(1, "order_stats").unwrap();
+        let state = registry
+            .get_state(crate::types::DatabaseId::new(7), 1, "order_stats")
+            .unwrap();
         let results = state.read_results();
 
         let insert_row = results.iter().find(|(k, _)| k == "INSERT").unwrap();

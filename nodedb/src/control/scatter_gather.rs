@@ -356,65 +356,75 @@ pub async fn coordinate_cross_shard_hop(
             continue;
         }
 
-        let gateway_clone = gateway.clone();
-        let credentials_clone = std::sync::Arc::clone(&shared.credentials);
-        let retention_clone = std::sync::Arc::clone(&shared.retention_policy_registry);
         let tenant_id_u64 = tenant_id.as_u64();
         let edge_label = edge_label.map(str::to_owned);
         let collection = collection.to_owned();
+        let mut any_error = false;
+        let mut work = Vec::with_capacity(batch.node_ids.len());
 
+        // Plan and admit every traversal before spawning. The resulting work
+        // owns its descriptor lease scope, so the spawned closure does not
+        // need to retain or reconstruct SharedState.
+        for node_id in batch.node_ids {
+            let sql =
+                build_graph_traverse_sql(&node_id, hop_depth, edge_label.as_deref(), direction);
+            let gw_ctx = crate::control::gateway::core::QueryContext {
+                tenant_id: crate::types::TenantId::new(tenant_id_u64),
+                trace_id: TraceId::generate(),
+                database_id,
+                txn_id: None,
+            };
+            let plan_ctx = crate::control::planner::context::QueryContext::for_state(shared);
+            let (tasks, _output_schema, versions) = match plan_ctx
+                .plan_sql_and_versions(
+                    &sql,
+                    crate::types::TenantId::new(tenant_id_u64),
+                    database_id,
+                )
+                .await
+            {
+                Ok(planned) => planned,
+                Err(e) => {
+                    warn!(
+                        shard = %shard_id,
+                        error = %e,
+                        "remote graph traverse plan failed"
+                    );
+                    any_error = true;
+                    continue;
+                }
+            };
+            // Each planned remote query gets an independent scope. Keep it
+            // through gateway execution and response payload consumption;
+            // do not retain it across the next node in this batch.
+            let lease_scope = match shared.acquire_plan_lease_scope(&versions) {
+                Ok(scope) => scope,
+                Err(e) => {
+                    warn!(
+                        shard = %shard_id,
+                        error = %e,
+                        "remote graph traverse rejected by descriptor lease admission"
+                    );
+                    any_error = true;
+                    continue;
+                }
+            };
+            let physical_plan = match tasks.into_iter().next().map(|task| task.plan) {
+                Some(plan) => plan,
+                None => {
+                    any_error = true;
+                    continue;
+                }
+            };
+
+            work.push((gw_ctx, physical_plan, lease_scope));
+        }
+
+        let gateway_clone = gateway.clone();
         join_handles.push(tokio::spawn(async move {
             let mut shard_results: Vec<String> = Vec::new();
-            let mut any_error = false;
 
-            for node_id in batch.node_ids {
-                let sql = build_graph_traverse_sql(RemoteTraverseSql {
-                    collection: &collection,
-                    node_id: &node_id,
-                    depth: hop_depth,
-                    edge_label: edge_label.as_deref(),
-                    direction,
-                });
-
-                let gw_ctx = crate::control::gateway::core::QueryContext {
-                    tenant_id: crate::types::TenantId::new(tenant_id_u64),
-                    trace_id: TraceId::generate(),
-                    database_id,
-                    txn_id: None,
-                };
-
-                // Build a fresh QueryContext per traversal using cloned inputs
-                // (same pattern as QueryContext::for_state but without &SharedState).
-                let plan_ctx = crate::control::planner::context::QueryContext::with_catalog(
-                    std::sync::Arc::clone(&credentials_clone),
-                    Some(std::sync::Arc::clone(&retention_clone)),
-                );
-
-                let sql_for_plan = sql.clone();
-                let plan_result = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(plan_ctx.plan_sql(
-                        &sql_for_plan,
-                        crate::types::TenantId::new(tenant_id_u64),
-                        database_id,
-                    ))
-                });
-
-                let physical_plan = match plan_result {
-                    Ok((tasks, _output_schema)) => match tasks.into_iter().next().map(|t| t.plan) {
-                        Some(p) => p,
-                        None => continue,
-                    },
-                    Err(e) => {
-                        warn!(
-                            shard = %shard_id,
-                            error = %e,
-                            "remote graph traverse plan failed"
-                        );
-                        any_error = true;
-                        continue;
-                    }
-                };
-
+            for (gw_ctx, physical_plan, lease_scope) in work {
                 match gateway_clone.execute_internal(&gw_ctx, physical_plan).await {
                     Ok(payloads) => {
                         for payload in payloads {
@@ -432,6 +442,7 @@ pub async fn coordinate_cross_shard_hop(
                         any_error = true;
                     }
                 }
+                drop(lease_scope);
             }
 
             (shard_results, any_error)

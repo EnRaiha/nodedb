@@ -150,10 +150,6 @@ pub struct SharedState {
     pub debug_endpoints_enabled: bool,
     /// Migration tracker for observability (None in single-node mode).
     pub migration_tracker: Option<Arc<nodedb_cluster::MigrationTracker>>,
-    /// WebSocket session registry: tracks last-seen LSN per client session.
-    pub ws_sessions: RwLock<std::collections::HashMap<String, u64>>,
-    /// Pub/Sub topic registry with persistent message storage.
-    pub topic_registry: crate::control::pubsub::TopicRegistry,
     /// Shape subscription registry for Lite client sync.
     pub shape_registry: Arc<crate::control::server::sync::shape::ShapeRegistry>,
     /// Change stream bus: broadcasts committed mutations to subscribers.
@@ -172,10 +168,8 @@ pub struct SharedState {
     pub array_ack_registry: std::sync::Arc<crate::control::array_sync::ArrayAckRegistry>,
     /// Tile snapshot store for array CRDT sync.
     pub array_snapshot_store: std::sync::Arc<crate::control::array_sync::OriginSnapshotStore>,
-    /// Per-array GC boundary HLC. `Hlc::ZERO` means no GC has occurred.
-    pub array_snapshot_hlcs: std::sync::Arc<
-        std::sync::RwLock<std::collections::HashMap<String, nodedb_array::sync::hlc::Hlc>>,
-    >,
+    /// Per-database/tenant/array GC boundary HLC. `Hlc::ZERO` means no GC has occurred.
+    pub array_snapshot_hlcs: crate::control::array_sync::ArraySnapshotHlcs,
     /// GC background task handle for shutdown await.
     pub array_gc_handle: Option<tokio::task::JoinHandle<()>>,
     /// Session-invalidation broadcast bus.  Dropping the sender shuts down the consumer.
@@ -321,6 +315,17 @@ pub struct SharedState {
     pub hlc_clock: Arc<nodedb_types::HlcClock>,
     /// Per-tenant monotonic HLC high-water used by RESTORE for write-order safety.
     pub tenant_write_hlc: Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
+    /// Serializes descriptor plan admission with local drain-start installation.
+    ///
+    /// Hold this std mutex while checking drain state and changing lease
+    /// refcounts. Drain starts hold the same gate while publishing their local
+    /// replicated state, so neither path can observe a partially admitted query.
+    /// Lease grants happen later under `lease_grant_gate`.
+    pub lease_admission_gate: Mutex<()>,
+    /// Serializes raft/local descriptor lease grants and releases after
+    /// admission has completed. It is independent of `lease_admission_gate`,
+    /// so it may be held while a metadata proposal waits for apply.
+    pub lease_grant_gate: Arc<Mutex<()>>,
     /// Replicated descriptor lease drain state (written by metadata applier).
     pub lease_drain: Arc<crate::control::lease::DescriptorDrainTracker>,
     /// Host-side refcount for descriptor leases (enables drain after last query).

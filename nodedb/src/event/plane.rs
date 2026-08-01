@@ -11,8 +11,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use super::bus::EventConsumerRx;
 use super::cdc::CdcRouter;
@@ -35,6 +36,25 @@ use crate::wal::WalManager;
 pub struct EventPlane {
     consumers: Vec<ConsumerHandle>,
     watermark_store: Arc<WatermarkStore>,
+    /// Owns the exact manager instances whose delivery handles must drain
+    /// before the Event Plane barrier can advance.
+    shared_state: Arc<SharedState>,
+}
+
+/// Dependencies required to start the Event Plane.
+///
+/// `shutdown` and `shutdown_bus` must be the canonical node-wide shutdown
+/// pair owned by the caller. The Event Plane only subscribes to and clones
+/// that bus for its consumers; it never creates a private shutdown channel.
+pub struct EventPlaneConfig {
+    pub consumers_rx: Vec<EventConsumerRx>,
+    pub wal: Arc<WalManager>,
+    pub watermark_store: Arc<WatermarkStore>,
+    pub shared_state: Arc<SharedState>,
+    pub trigger_dlq: Arc<std::sync::Mutex<TriggerDlq>>,
+    pub cdc_router: Arc<CdcRouter>,
+    pub shutdown: Arc<ShutdownWatch>,
+    pub shutdown_bus: crate::control::shutdown::ShutdownBus,
 }
 
 impl EventPlane {
@@ -48,15 +68,17 @@ impl EventPlane {
     /// All Event Plane subsystems subscribe to this watch instead of a
     /// private channel, so the unified shutdown bus controls all drain
     /// signalling.
-    pub fn spawn(
-        consumers_rx: Vec<EventConsumerRx>,
-        wal: Arc<WalManager>,
-        watermark_store: Arc<WatermarkStore>,
-        shared_state: Arc<SharedState>,
-        trigger_dlq: Arc<std::sync::Mutex<TriggerDlq>>,
-        cdc_router: Arc<CdcRouter>,
-        shutdown: Arc<ShutdownWatch>,
-    ) -> Self {
+    pub fn spawn(config: EventPlaneConfig) -> Self {
+        let EventPlaneConfig {
+            consumers_rx,
+            wal,
+            watermark_store,
+            shared_state,
+            trigger_dlq,
+            cdc_router,
+            shutdown,
+            shutdown_bus,
+        } = config;
         let num_cores = consumers_rx.len();
 
         let slab_budget = Arc::new(super::slab_budget::SlabBudget::for_cores(num_cores));
@@ -71,6 +93,7 @@ impl EventPlane {
                 spawn_consumer(ConsumerConfig {
                     rx,
                     shutdown: shutdown.raw_receiver(),
+                    shutdown_bus: shutdown_bus.clone(),
                     wal: Arc::clone(&wal),
                     watermark_store: Arc::clone(&watermark_store),
                     shared_state: Arc::clone(&shared_state),
@@ -223,6 +246,7 @@ impl EventPlane {
         let plane = Self {
             consumers,
             watermark_store,
+            shared_state,
         };
 
         info!(num_cores, "event plane started");
@@ -270,13 +294,50 @@ impl EventPlane {
         &self.watermark_store
     }
 
+    /// Register and spawn the Event Plane shutdown supervisor.
+    ///
+    /// Registration happens synchronously, before this method returns, so the
+    /// canonical bus cannot enter `DrainingEventPlane` without this plane
+    /// being a barrier. The supervisor waits for the flat shutdown signal
+    /// indirectly through the phase transition, then lets consumers and the
+    /// manager-owned delivery tasks finish their own shutdown paths (including
+    /// final watermark flushing). Each drain only aborts remaining work after
+    /// the configured shutdown deadline.
+    pub fn spawn_shutdown_supervisor(
+        self,
+        shutdown_bus: crate::control::shutdown::ShutdownBus,
+        deadline: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut guard = shutdown_bus.register_critical_task(
+            crate::control::shutdown::ShutdownPhase::DrainingEventPlane,
+            "event_plane::consumers",
+        );
+        tokio::spawn(async move {
+            guard.await_signal().await;
+            self.shutdown_after_flat_signal(deadline).await;
+            guard.report_drained();
+            info!("event plane consumers and delivery managers drained");
+        })
+    }
+
+    async fn shutdown_after_flat_signal(mut self, deadline: Duration) {
+        // Start all three drains together. They share the configured deadline
+        // rather than serially consuming it, and the guard below is not
+        // reported until consumers and both manager-owned task maps finish.
+        let shared_state = Arc::clone(&self.shared_state);
+        tokio::join!(
+            shutdown_consumers_after_flat_signal(&mut self.consumers, deadline),
+            shared_state.webhook_manager.shutdown_and_join(deadline),
+            shared_state.kafka_manager.shutdown_and_join(deadline),
+        );
+    }
+
     /// Abort every consumer task and await its termination, consuming the
     /// plane so all `Arc<WatermarkStore>` / `Arc<WalManager>` clones held
     /// by the consumer futures are dropped by the time this returns.
     ///
-    /// Use this instead of `drop(plane)` when the caller needs to reopen a
-    /// resource the consumers held (e.g. the watermark redb file) without
-    /// racing against Tokio's abort propagation.
+    /// This is retained for explicit test and abnormal-teardown callers. The
+    /// normal server path uses [`Self::spawn_shutdown_supervisor`].
     pub async fn shutdown_and_join(mut self) {
         let consumers = std::mem::take(&mut self.consumers);
         for consumer in consumers {
@@ -284,6 +345,31 @@ impl EventPlane {
         }
         debug!("event plane shutdown_and_join complete");
     }
+}
+
+async fn shutdown_consumers_after_flat_signal(
+    consumers: &mut Vec<ConsumerHandle>,
+    deadline: Duration,
+) {
+    let mut consumers = std::mem::take(consumers);
+    let deadline_at = tokio::time::Instant::now() + deadline;
+
+    for index in 0..consumers.len() {
+        if tokio::time::timeout_at(deadline_at, consumers[index].wait_for_exit())
+            .await
+            .is_err()
+        {
+            error!(
+                deadline_ms = deadline.as_millis(),
+                "event plane consumer shutdown deadline expired; aborting remaining consumers"
+            );
+            for consumer in consumers.drain(index..) {
+                consumer.abort_and_join().await;
+            }
+            return;
+        }
+    }
+    debug!("event plane consumers exited naturally after flat shutdown");
 }
 
 impl Drop for EventPlane {
@@ -302,7 +388,7 @@ mod tests {
     use super::*;
     use crate::event::bus::create_event_bus_with_capacity;
     use crate::event::types::{EventSource, RowId, WriteEvent, WriteOp};
-    use crate::types::{Lsn, TenantId, VShardId};
+    use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 
     fn make_event(seq: u64) -> WriteEvent {
         WriteEvent {
@@ -311,6 +397,7 @@ mod tests {
             op: WriteOp::Insert,
             row_id: RowId::new("row-1"),
             lsn: Lsn::new(seq * 10),
+            database_id: DatabaseId::new(7),
             tenant_id: TenantId::new(1),
             vshard_id: VShardId::new(0),
             source: EventSource::User,
@@ -330,16 +417,18 @@ mod tests {
         let (wal, watermark_store, shared_state, trigger_dlq, cdc_router) =
             crate::event::test_utils::event_test_deps(&dir);
         let shutdown = Arc::new(crate::control::shutdown::ShutdownWatch::new());
+        let (shutdown_bus, _) = crate::control::shutdown::ShutdownBus::new(Arc::clone(&shutdown));
 
-        let plane = EventPlane::spawn(
-            consumers,
+        let plane = EventPlane::spawn(EventPlaneConfig {
+            consumers_rx: consumers,
             wal,
             watermark_store,
             shared_state,
             trigger_dlq,
             cdc_router,
             shutdown,
-        );
+            shutdown_bus,
+        });
         assert_eq!(plane.num_consumers(), 2);
 
         // Emit events on both cores.
@@ -363,16 +452,18 @@ mod tests {
         let (wal, watermark_store, shared_state, trigger_dlq, cdc_router) =
             crate::event::test_utils::event_test_deps(&dir);
         let shutdown = Arc::new(crate::control::shutdown::ShutdownWatch::new());
+        let (shutdown_bus, _) = crate::control::shutdown::ShutdownBus::new(Arc::clone(&shutdown));
 
-        let plane = EventPlane::spawn(
-            consumers,
+        let plane = EventPlane::spawn(EventPlaneConfig {
+            consumers_rx: consumers,
             wal,
             watermark_store,
             shared_state,
             trigger_dlq,
             cdc_router,
             shutdown,
-        );
+            shutdown_bus,
+        });
         drop(plane); // Should not panic.
     }
 }

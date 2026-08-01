@@ -15,14 +15,17 @@
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
+use super::identity::canonical_stream_name;
 
 /// Handle `DROP CONSUMER GROUP <name> ON <stream>`
-pub fn drop_consumer_group(
+pub async fn drop_consumer_group(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop consumer groups")?;
@@ -36,13 +39,50 @@ pub fn drop_consumer_group(
     }
 
     let group_name = parts[3].to_lowercase();
-    let stream_name = parts[5].to_lowercase();
     let tenant_id = identity.tenant_id.as_u64();
+    let requested_stream = parts[5];
+    let mut stream_name = canonical_stream_name(state, database_id, tenant_id, requested_stream);
+    let topic_lock = stream_name.strip_prefix("topic:").map(|topic| {
+        state
+            .ep_topic_registry
+            .lifecycle_lock(database_id, tenant_id, topic)
+    });
+    let _topic_guard = match topic_lock {
+        Some(lock) => Some(lock.lock_owned().await),
+        None => None,
+    };
+    stream_name = canonical_stream_name(state, database_id, tenant_id, requested_stream);
+    let lifecycle_lock =
+        state
+            .group_registry
+            .lifecycle_lock(database_id, tenant_id, &stream_name, &group_name);
+    let _group_guard = lifecycle_lock.lock().await;
+    let legacy_group_lock = stream_name.strip_prefix("topic:").map(|legacy_stream| {
+        state
+            .group_registry
+            .lifecycle_lock(database_id, tenant_id, legacy_stream, &group_name)
+    });
+    let _legacy_group_guard = match legacy_group_lock {
+        Some(lock) => Some(lock.lock_owned().await),
+        None => None,
+    };
+    if let Err(error) = super::identity::migrate_legacy_topic_group(
+        state,
+        database_id,
+        tenant_id,
+        &stream_name,
+        &group_name,
+    ) {
+        return Err(DdlError {
+            sqlstate: "XX000".to_string(),
+            message: format!("consumer-group migration: {error}"),
+        });
+    }
 
     let catalog = state.credentials.catalog();
 
     let existed = catalog
-        .delete_consumer_group(tenant_id, &stream_name, &group_name)
+        .delete_consumer_group(database_id, tenant_id, &stream_name, &group_name)
         .map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: format!("catalog delete: {e}"),
@@ -59,12 +99,13 @@ pub fn drop_consumer_group(
 
     state
         .group_registry
-        .unregister(tenant_id, &stream_name, &group_name);
+        .unregister(database_id, tenant_id, &stream_name, &group_name);
 
     // Delete committed offsets for this group.
-    if let Err(e) = state
-        .offset_store
-        .delete_group(tenant_id, &stream_name, &group_name)
+    if let Err(e) =
+        state
+            .offset_store
+            .delete_group(database_id, tenant_id, &stream_name, &group_name)
     {
         tracing::warn!(
             error = %e,

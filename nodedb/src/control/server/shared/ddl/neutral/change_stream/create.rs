@@ -21,6 +21,7 @@ use crate::event::cdc::stream_def::{
     ChangeStreamDef, CompactionConfig, LateDataPolicy, OpFilter, RetentionConfig, StreamFormat,
 };
 use crate::event::webhook::WebhookConfig;
+use crate::types::DatabaseId;
 
 use super::super::super::catalog::propose_and_apply;
 use super::super::super::result::{DdlError, DdlResult};
@@ -32,6 +33,7 @@ use super::super::auth_support::{require_tenant_admin, status};
 pub fn create_change_stream(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     collection: &str,
     with_clause_raw: &str,
@@ -51,7 +53,7 @@ pub fn create_change_stream(
 
     let catalog = state.credentials.catalog();
 
-    if let Ok(Some(_)) = catalog.get_change_stream(tenant_id, name) {
+    if let Ok(Some(_)) = catalog.get_change_stream(database_id, tenant_id, name) {
         return Err(DdlError {
             sqlstate: "42710".to_string(),
             message: format!("change stream '{name}' already exists"),
@@ -135,6 +137,7 @@ pub fn create_change_stream(
         .as_secs();
 
     let def = ChangeStreamDef {
+        database_id,
         tenant_id,
         name: name.to_string(),
         collection: collection.to_string(),
@@ -162,10 +165,12 @@ pub fn create_change_stream(
     if has_webhook {
         state
             .webhook_manager
-            .start_task(tenant_id, name, webhook_config);
+            .start_task(database_id, tenant_id, name, webhook_config);
     }
     if kafka_config.enabled {
-        state.kafka_manager.start(tenant_id, name, kafka_config);
+        state
+            .kafka_manager
+            .start(database_id, tenant_id, name, kafka_config);
     }
 
     state.audit_record(

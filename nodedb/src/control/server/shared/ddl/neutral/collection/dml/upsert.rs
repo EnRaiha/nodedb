@@ -48,6 +48,7 @@ pub async fn upsert_document(
     if let Some(result) = fire_instead_triggers(
         state,
         identity,
+        database_id,
         tenant_id,
         &parsed.coll_name,
         &parsed.fields,
@@ -62,6 +63,7 @@ pub async fn upsert_document(
     let mut fields = match fire_before_triggers(
         state,
         identity,
+        database_id,
         tenant_id,
         &parsed.coll_name,
         &parsed.fields,
@@ -148,15 +150,36 @@ pub async fn upsert_document(
             other => format!("{other:?}"),
         });
     let old_fields = if let Some(ref pk) = pk_for_probe {
+        let mut auth = crate::control::server::session_auth::build_auth_context_with_session(
+            identity,
+            txn_ctx.sessions,
+            txn_ctx.session_id,
+        );
+        // The neutral DDL entry point receives an explicit selected database;
+        // keep `$auth.database_id` identical to the task being probed.
+        auth.database_id = Some(database_id);
         let row = crate::control::trigger::dml_hook::fetch_old_row(
             state,
+            identity,
             database_id,
-            tenant_id,
+            &auth,
             &parsed.coll_name,
             pk,
         )
-        .await;
-        if row.is_empty() { None } else { Some(row) }
+        .await
+        .map_err(|error| {
+            let (_, sqlstate, message) =
+                crate::control::server::pgwire::types::error_to_sqlstate(&error);
+            DdlError {
+                sqlstate: sqlstate.to_owned(),
+                message,
+            }
+        });
+        match row {
+            Ok(row) if row.is_empty() => None,
+            Ok(row) => Some(row),
+            Err(error) => return Some(Err(error)),
+        }
     } else {
         None
     };
@@ -185,6 +208,7 @@ pub async fn upsert_document(
         if let Some(err) = fire_sync_after_update_triggers(
             state,
             identity,
+            database_id,
             tenant_id,
             &parsed.coll_name,
             old,
@@ -194,8 +218,15 @@ pub async fn upsert_document(
         {
             return Some(err);
         }
-    } else if let Some(err) =
-        fire_sync_after_triggers(state, identity, tenant_id, &parsed.coll_name, &fields).await
+    } else if let Some(err) = fire_sync_after_triggers(
+        state,
+        identity,
+        database_id,
+        tenant_id,
+        &parsed.coll_name,
+        &fields,
+    )
+    .await
     {
         return Some(err);
     }

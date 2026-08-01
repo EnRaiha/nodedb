@@ -222,6 +222,107 @@ async fn query_stream_rejects_collection_without_permission() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_stream_consumption_requires_read_on_its_source_collection() {
+    let srv = TestServer::start().await;
+    srv.exec("CREATE COLLECTION protected_stream_rows")
+        .await
+        .expect("create protected stream source");
+    srv.exec("CREATE CHANGE STREAM protected_stream ON protected_stream_rows")
+        .await
+        .expect("create protected change stream");
+    srv.exec("CREATE CONSUMER GROUP protected_group ON protected_stream")
+        .await
+        .expect("create consumer group for protected stream");
+
+    let username = "http_change_stream_reader";
+    let token = create_api_key(
+        &srv.shared,
+        username,
+        vec![Role::Custom("http_change_stream_reader_role".into())],
+    );
+    let http = start_authenticated_http(Arc::clone(&srv.shared)).await;
+    let client = reqwest::Client::new();
+
+    let poll = client
+        .get(format!(
+            "http://{}/v1/streams/protected_stream/poll?group=protected_group",
+            http.local_addr
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("poll protected change stream");
+    assert_eq!(
+        poll.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a valid stream and group must not expose a source collection without Read"
+    );
+
+    let sse = client
+        .get(format!(
+            "http://{}/v1/streams/protected_stream/events?group=protected_group",
+            http.local_addr
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("open protected change stream SSE");
+    assert_eq!(
+        sse.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "SSE must reject before opening a consumer assignment"
+    );
+    assert_eq!(
+        srv.shared.consumer_assignments.consumer_count(
+            DatabaseId::DEFAULT,
+            1,
+            "protected_stream",
+            "protected_group",
+        ),
+        0,
+        "a denied SSE request must not claim a consumer assignment"
+    );
+
+    let stream_select = post_query(
+        &http,
+        &token,
+        "/v1/query",
+        "SELECT * FROM STREAM protected_stream CONSUMER GROUP protected_group LIMIT 1",
+    )
+    .await;
+    assert_eq!(
+        stream_select.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "protocol-neutral stream selection must not expose a source collection without Read"
+    );
+
+    srv.shared
+        .permissions
+        .grant(
+            &collection_target(TenantId::new(1), "protected_stream_rows"),
+            &format!("user:{username}"),
+            Permission::Read,
+            "nodedb",
+            Some(srv.shared.credentials.catalog()),
+        )
+        .expect("grant source collection Read");
+    let allowed_poll = client
+        .get(format!(
+            "http://{}/v1/streams/protected_stream/poll?group=protected_group",
+            http.local_addr
+        ))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("poll source-authorized change stream");
+    assert_eq!(
+        allowed_poll.status(),
+        reqwest::StatusCode::OK,
+        "Read on the source collection must permit stream consumption"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_stream_rejects_write_without_permission_or_mutation() {
     let srv = TestServer::start().await;
     srv.exec("CREATE COLLECTION denied_stream_writes")

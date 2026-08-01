@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use crate::control::planner::procedural::ast::*;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 
 use super::bindings::RowBindings;
 use super::exception::exception_matches;
@@ -52,6 +52,8 @@ pub struct StatementExecutor<'a> {
     #[allow(dead_code)]
     pub(super) identity: AuthenticatedIdentity,
     pub(super) tenant_id: TenantId,
+    /// Database scope fixed for this executor's lifetime.
+    pub(super) database_id: DatabaseId,
     cascade_depth: u32,
     pub(super) event_source: crate::event::EventSource,
     /// Arc<Mutex> required (not RefCell) because execute_statement returns `+ Send` futures.
@@ -77,10 +79,12 @@ impl<'a> StatementExecutor<'a> {
         tenant_id: TenantId,
         cascade_depth: u32,
     ) -> Self {
-        Self::with_source(
+        let database_id = identity.default_database.unwrap_or(DatabaseId::DEFAULT);
+        Self::with_source_in_database(
             state,
             identity,
             tenant_id,
+            database_id,
             cascade_depth,
             crate::event::EventSource::User,
         )
@@ -93,10 +97,32 @@ impl<'a> StatementExecutor<'a> {
         cascade_depth: u32,
         event_source: crate::event::EventSource,
     ) -> Self {
+        let database_id = identity.default_database.unwrap_or(DatabaseId::DEFAULT);
+        Self::with_source_in_database(
+            state,
+            identity,
+            tenant_id,
+            database_id,
+            cascade_depth,
+            event_source,
+        )
+    }
+
+    /// Construct an executor in an explicit database scope when the caller
+    /// carries definition or event database context independent of identity.
+    pub fn with_source_in_database(
+        state: &'a SharedState,
+        identity: AuthenticatedIdentity,
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        cascade_depth: u32,
+        event_source: crate::event::EventSource,
+    ) -> Self {
         Self {
             state,
             identity,
             tenant_id,
+            database_id,
             cascade_depth,
             event_source,
             new_mutations: Arc::new(Mutex::new(HashMap::new())),

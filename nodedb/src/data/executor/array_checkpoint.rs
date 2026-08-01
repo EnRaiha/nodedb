@@ -244,6 +244,8 @@ mod tests {
                 schema_msgpack: zerompk::to_msgpack_vec(&schema()).expect("encode schema"),
                 schema_hash: SCHEMA_HASH,
                 prefix_bits: 8,
+                audit_retain_ms: None,
+                minimum_audit_retain_ms: None,
             });
             assert_eq!(r.status, Status::Ok, "open array: {r:?}");
         }

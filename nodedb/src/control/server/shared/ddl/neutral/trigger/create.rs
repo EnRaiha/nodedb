@@ -60,11 +60,16 @@ pub fn create_trigger(
     require_tenant_admin(identity, "create triggers")?;
 
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 
     // Check for existing trigger.
-    if !or_replace && let Ok(Some(_)) = catalog.get_trigger(tenant_id, name) {
+    if !or_replace
+        && let Ok(Some(_)) = catalog.get_trigger_in_database(database_id, tenant_id, name)
+    {
         return Err(DdlError {
             sqlstate: "42710".to_string(),
             message: format!("trigger '{name}' already exists"),
@@ -115,6 +120,7 @@ pub fn create_trigger(
 
     let stored = crate::control::security::catalog::trigger_types::StoredTrigger {
         tenant_id,
+        database_id,
         name: name.to_string(),
         collection: collection.to_string(),
         timing: timing_enum,
@@ -136,9 +142,10 @@ pub fn create_trigger(
     let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(stored.clone()));
     let log_index = super::super::super::catalog::propose_and_apply(state, &entry)?;
     if log_index == 0 {
-        // Registry update is local-only — the Raft applier handles
-        // the cluster-wide registry refresh on remote nodes.
-        state.trigger_registry.register(stored.clone());
+        // The local fallback has already applied the durable CatalogEntry.
+        // Mirror the applier's registry and ownership effects through its
+        // post-apply hook rather than writing the registry directly.
+        crate::control::catalog_entry::post_apply::trigger::put(stored.clone(), state);
     }
 
     // Broadcast to connected Lite sessions after the catalog commit is durable.
@@ -162,7 +169,7 @@ pub fn create_trigger(
 
 /// Encode the stored trigger and broadcast a `DefinitionSyncMsg` to all
 /// connected Lite sessions after the catalog commit is durable.
-fn emit_trigger_put(
+pub(super) fn emit_trigger_put(
     state: &crate::control::state::SharedState,
     stored: &crate::control::security::catalog::trigger_types::StoredTrigger,
 ) {
@@ -197,6 +204,8 @@ fn emit_trigger_put(
     match sonic_rs::to_vec(&payload_json) {
         Ok(payload) => {
             let msg = DefinitionSyncMsg {
+                tenant_id: stored.tenant_id,
+                database_id: stored.database_id.as_u64(),
                 definition_type: "trigger".into(),
                 name: stored.name.clone(),
                 action: "put".into(),

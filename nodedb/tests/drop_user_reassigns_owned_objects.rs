@@ -466,7 +466,16 @@ async fn drop_user_reassigns_every_owner_bearing_kind_and_sweeps_grants() {
     let mut stream = make_stream("victim_stream");
     stream.owner = VICTIM.to_string();
     catalog.put_change_stream(&stream).unwrap();
-    plant_owner(&catalog, "change_stream", "victim_stream", VICTIM);
+    // `make_stream` keys the stream to database 7, and change streams are
+    // looked up by their full (database, tenant, name) identity — an owner row
+    // planted in database 0 would point at nothing.
+    plant_owner_in_database(
+        &catalog,
+        "change_stream",
+        stream.database_id.as_u64(),
+        "victim_stream",
+        VICTIM,
+    );
 
     let aggregate = StoredContinuousAggregate {
         database_id: 11,

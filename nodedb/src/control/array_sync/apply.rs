@@ -20,11 +20,9 @@
 
 use std::sync::Arc;
 
-use nodedb_array::sync::hlc::Hlc;
-use nodedb_array::sync::op_log::OpLog;
-
 use super::op_log::OriginOpLog;
 use super::schema_registry::OriginSchemaRegistry;
+use nodedb_array::sync::hlc::Hlc;
 
 /// Control-Plane facing checks for Origin array op application.
 ///
@@ -47,12 +45,46 @@ impl OriginApplyEngine {
         self.schemas.schema_hlc(array)
     }
 
+    /// Return the schema HLC in an explicit database scope.
+    pub fn schema_hlc_in_database(
+        &self,
+        database_id: crate::types::DatabaseId,
+        tenant_id: u64,
+        array: &str,
+    ) -> Option<Hlc> {
+        self.schemas
+            .schema_hlc_in_database(database_id, tenant_id, array)
+    }
+
     /// Return `true` if an op with `hlc` has already been applied to `array`.
     ///
     /// Performs a point scan on the op-log: if the key `(array, hlc)` exists,
     /// the op was previously applied.
     pub fn already_seen(&self, array: &str, hlc: Hlc) -> bool {
-        match self.op_log.scan_range(array, hlc, hlc) {
+        match self.op_log.scan_range_in_database(
+            crate::types::DatabaseId::DEFAULT,
+            0,
+            array,
+            hlc,
+            hlc,
+        ) {
+            Ok(mut iter) => iter.next().is_some(),
+            Err(_) => false,
+        }
+    }
+
+    /// Check idempotency in an explicit database scope.
+    pub fn already_seen_in_database(
+        &self,
+        database_id: crate::types::DatabaseId,
+        tenant_id: u64,
+        array: &str,
+        hlc: Hlc,
+    ) -> bool {
+        match self
+            .op_log
+            .scan_range_in_database(database_id, tenant_id, array, hlc, hlc)
+        {
             Ok(mut iter) => iter.next().is_some(),
             Err(_) => false,
         }
@@ -66,6 +98,18 @@ impl OriginApplyEngine {
         &self,
         op: &nodedb_array::sync::op::ArrayOp,
     ) -> nodedb_array::error::ArrayResult<()> {
-        self.op_log.append(op)
+        self.op_log
+            .append_in_database(crate::types::DatabaseId::DEFAULT, 0, op)
+    }
+
+    /// Record an op under an explicit database scope while preserving the
+    /// wire-visible array name in the caller's original operation.
+    pub fn record_applied_in_database(
+        &self,
+        database_id: crate::types::DatabaseId,
+        tenant_id: u64,
+        op: &nodedb_array::sync::op::ArrayOp,
+    ) -> nodedb_array::error::ArrayResult<()> {
+        self.op_log.append_in_database(database_id, tenant_id, op)
     }
 }

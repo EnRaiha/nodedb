@@ -7,17 +7,20 @@
 mod common;
 
 use common::now_ms;
+use nodedb::event::cdc::CdcOffset;
 use nodedb::event::cdc::buffer::StreamBuffer;
 use nodedb::event::cdc::event::CdcEvent;
 use nodedb::event::cdc::stream_def::RetentionConfig;
 use nodedb::event::topic::registry::EpTopicRegistry;
 use nodedb::event::topic::types::TopicDef;
+use nodedb::types::DatabaseId;
 
 #[test]
 fn topic_registry_crud() {
     let registry = EpTopicRegistry::new();
 
     let def = TopicDef {
+        database_id: DatabaseId::new(7),
         tenant_id: 1,
         name: "events".into(),
         retention: RetentionConfig {
@@ -26,15 +29,17 @@ fn topic_registry_crud() {
         },
         owner: "admin".into(),
         created_at: 1000,
+        last_sequence: 0,
+        last_lsn: 0,
     };
     registry.register(def);
 
-    assert!(registry.get(1, "events").is_some());
-    assert!(registry.get(1, "nonexistent").is_none());
-    assert!(registry.get(2, "events").is_none()); // Different tenant.
+    assert!(registry.get(DatabaseId::new(7), 1, "events").is_some());
+    assert!(registry.get(DatabaseId::new(7), 1, "nonexistent").is_none());
+    assert!(registry.get(DatabaseId::new(7), 2, "events").is_none()); // Different tenant.
 
-    registry.unregister(1, "events");
-    assert!(registry.get(1, "events").is_none());
+    registry.unregister(DatabaseId::new(7), 1, "events");
+    assert!(registry.get(DatabaseId::new(7), 1, "events").is_none());
 }
 
 #[test]
@@ -55,6 +60,7 @@ fn topic_buffer_publish_and_consume() {
             row_id: format!("msg-{i}"),
             event_time: now_ms(),
             lsn: i,
+            database_id: DatabaseId::new(7),
             tenant_id: 1,
             new_value: Some(serde_json::json!({"data": format!("message {i}")})),
             old_value: None,
@@ -65,14 +71,14 @@ fn topic_buffer_publish_and_consume() {
         });
     }
 
-    // Consume all from LSN 0.
-    let events = buf.read_from_lsn(0, 100);
+    // Consume all from the initial composite position.
+    let events = buf.read_from(CdcOffset::ZERO, 100);
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].row_id, "msg-1");
     assert_eq!(events[2].row_id, "msg-3");
 
-    // Consume from LSN 1 (skip first message, get events with lsn > 1).
-    let events = buf.read_from_lsn(1, 100);
+    // A legacy LSN cursor acknowledges the complete first LSN.
+    let events = buf.read_from(CdcOffset::legacy_lsn(1), 100);
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].lsn, 2);
 }
@@ -94,6 +100,7 @@ fn topic_retention_eviction() {
             row_id: format!("msg-{i}"),
             event_time: now_ms(),
             lsn: i,
+            database_id: DatabaseId::new(7),
             tenant_id: 1,
             new_value: None,
             old_value: None,
@@ -104,7 +111,7 @@ fn topic_retention_eviction() {
         });
     }
 
-    let events = buf.read_from_lsn(0, 100);
+    let events = buf.read_from(CdcOffset::ZERO, 100);
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].sequence, 4);
     assert_eq!(events[1].sequence, 5);
@@ -116,14 +123,17 @@ fn topic_list_all() {
 
     for name in ["t1", "t2", "t3"] {
         registry.register(TopicDef {
+            database_id: DatabaseId::new(7),
             tenant_id: 1,
             name: name.into(),
             retention: RetentionConfig::default(),
             owner: "admin".into(),
             created_at: 0,
+            last_sequence: 0,
+            last_lsn: 0,
         });
     }
 
-    let all = registry.list_for_tenant(1);
+    let all = registry.list_for_database_tenant(DatabaseId::new(7), 1);
     assert_eq!(all.len(), 3);
 }

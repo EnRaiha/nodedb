@@ -88,7 +88,7 @@ pub(super) async fn try_typed(
 
         NodedbStatement::Automation(AutomationStmt::ShowTriggers { .. }) => {
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(trigger::show_triggers(state, identity, &parts))
+            Some(trigger::show_triggers(state, identity, database_id, &parts))
         }
 
         NodedbStatement::Automation(AutomationStmt::CreateSchedule {
@@ -101,6 +101,7 @@ pub(super) async fn try_typed(
         }) => Some(schedule::create_schedule(
             state,
             identity,
+            database_id,
             &CreateScheduleRequest {
                 name,
                 cron_expr,
@@ -118,6 +119,7 @@ pub(super) async fn try_typed(
         }) => Some(schedule::alter_schedule(
             state,
             identity,
+            database_id,
             name,
             action,
             cron_expr.as_deref(),
@@ -130,14 +132,19 @@ pub(super) async fn try_typed(
             // the existing-schedule case fall through to `drop_schedule`, which
             // re-derives the name / IF EXISTS from `parts` exactly as the pgwire
             // admin string dispatch did.
-            if *if_exists && !schedule::schedule_exists(state, identity, name) {
+            if *if_exists && !schedule::schedule_exists(state, identity, database_id, name) {
                 return Some(Ok(vec![DdlResult::Status {
                     command: "DROP SCHEDULE".to_string(),
                     rows_affected: None,
                 }]));
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(schedule::drop_schedule(state, identity, &parts))
+            Some(schedule::drop_schedule(
+                state,
+                identity,
+                database_id,
+                &parts,
+            ))
         }
 
         NodedbStatement::Automation(AutomationStmt::CreateAlert {

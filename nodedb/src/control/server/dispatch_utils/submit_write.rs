@@ -27,6 +27,25 @@ use crate::types::{DatabaseId, Lsn, ReadConsistency, TenantId, TraceId, TxnId, V
 use super::change_events::{extract_write_change_set, publish_change_set};
 use super::collect::{DispatchCollectError, collect_bounded_response};
 
+/// An enqueued Array CREATE/ALTER has an ambiguous outcome if the response
+/// times out, closes, or overflows collection. Its Data-Plane mutation may
+/// already exist, so rolling back the catalog would manufacture a ghost engine.
+/// Preserve the transition and stop the node through the canonical watch; boot
+/// recovery will reconcile from the durable catalog and WAL rather than serving
+/// a potentially split Control/Data-plane view.
+fn preserve_ambiguous_array_ddl(
+    shared: &SharedState,
+    transition: &crate::control::array_catalog::ddl::AuthorizedDdlTransition,
+) {
+    if !transition.preserves_on_ambiguous_apply() {
+        return;
+    }
+    if let Err(error) = transition.finalize(shared) {
+        tracing::error!(error = %error, "array DDL ambiguous after enqueue; finalization failed before fail-stop");
+    }
+    shared.shutdown.signal();
+}
+
 /// Who owns this write's durable redo record.
 pub(crate) enum WalDurability {
     /// The funnel appends the redo itself — under the write-admission guard,
@@ -229,11 +248,33 @@ pub(crate) async fn submit_write(
         },
     };
 
+    // Array DDL conversion is intentionally read-only. Once this task has
+    // passed authorization and admission, install its durable catalog state
+    // immediately before the Data-Plane dispatch. The mirror is changed only
+    // after the redb transaction commits.
+    let ddl_transition = crate::control::array_catalog::ddl::apply_authorized_ddl(
+        shared,
+        tenant_id,
+        database_id,
+        &plan,
+    )?;
+    macro_rules! rollback_ddl {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = ddl_transition.rollback(shared);
+                    return Err(error.into());
+                }
+            }
+        };
+    }
+
     // Durability, under the guard, immediately before the enqueue: the LSN is
     // minted in the same order the request is about to be enqueued.
     let (wal_lsn, resolved_now_ms) = match durability {
         WalDurability::AppendHere { now_override } => {
-            let outcome = wal_dispatch::wal_append(WalAppendRequest {
+            let outcome = rollback_ddl!(wal_dispatch::wal_append(WalAppendRequest {
                 wal: &shared.wal,
                 tenant_id,
                 vshard_id,
@@ -241,7 +282,7 @@ pub(crate) async fn submit_write(
                 plan: &plan,
                 credentials: None,
                 now_override,
-            })?;
+            }));
             (outcome.lsn, outcome.resolved_now_ms)
         }
         WalDurability::CallerSupplied {
@@ -298,8 +339,8 @@ pub(crate) async fn submit_write(
     let mut rx = shared.tracker.register(request_id);
 
     match shared.dispatcher.lock() {
-        Ok(mut d) => d.dispatch(request)?,
-        Err(poisoned) => poisoned.into_inner().dispatch(request)?,
+        Ok(mut d) => rollback_ddl!(d.dispatch(request)),
+        Err(poisoned) => rollback_ddl!(poisoned.into_inner().dispatch(request)),
     };
 
     // Release the write-admission guards immediately after the enqueue, before
@@ -332,21 +373,37 @@ pub(crate) async fn submit_write(
     // `tuning.network.max_query_result_bytes` is cancelled with a typed
     // `ExecutionLimitExceeded` error.
     let max_result_bytes = shared.tuning.network.max_query_result_bytes as usize;
-    let response = tokio::time::timeout(
+    let response = match tokio::time::timeout(
         Duration::from_secs(shared.tuning.network.default_deadline_secs),
         collect_bounded_response(&mut rx, max_result_bytes),
     )
     .await
-    .map_err(|_| {
-        observe(shared);
-        crate::Error::DeadlineExceeded { request_id }
-    })?;
+    {
+        Ok(response) => response,
+        Err(_) => {
+            observe(shared);
+            // Dispatch completed, but the Data Plane may have applied CREATE
+            // or ALTER before this deadline. Never roll that catalog state
+            // back on an ambiguous post-enqueue outcome.
+            preserve_ambiguous_array_ddl(shared, &ddl_transition);
+            if !ddl_transition.preserves_on_ambiguous_apply() {
+                let _ = ddl_transition.rollback(shared);
+            }
+            return Err(crate::Error::DeadlineExceeded { request_id });
+        }
+    };
 
     let response = match response {
         Ok(r) => r,
         Err(DispatchCollectError::OverBudget { bytes }) => {
             shared.tracker.cancel(&request_id);
             observe(shared);
+            // A partial response proves dispatch began but not whether an
+            // Array DDL completed; preserve CREATE/ALTER and fail-stop.
+            preserve_ambiguous_array_ddl(shared, &ddl_transition);
+            if !ddl_transition.preserves_on_ambiguous_apply() {
+                let _ = ddl_transition.rollback(shared);
+            }
             return Err(crate::Error::ExecutionLimitExceeded {
                 detail: format!(
                     "query result exceeded max_query_result_bytes \
@@ -356,11 +413,21 @@ pub(crate) async fn submit_write(
         }
         Err(DispatchCollectError::ChannelClosed) => {
             observe(shared);
+            // The producer can close after applying but before sending its
+            // response. CREATE/ALTER must remain catalog-finalized here.
+            preserve_ambiguous_array_ddl(shared, &ddl_transition);
+            if !ddl_transition.preserves_on_ambiguous_apply() {
+                let _ = ddl_transition.rollback(shared);
+            }
             return Err(crate::Error::Dispatch {
                 detail: "response channel closed".into(),
             });
         }
     };
+
+    if response.status != Status::Ok {
+        let _ = ddl_transition.rollback(shared);
+    }
 
     // Mint the post-apply redo record while the guards are still held, then
     // release them. A PointUpdate whose collection carries a secondary vector
@@ -371,14 +438,14 @@ pub(crate) async fn submit_write(
         && appends_here
         && response.status == Status::Ok
     {
-        wal_dispatch::append_write_set_redo(
+        rollback_ddl!(wal_dispatch::append_write_set_redo(
             &shared.wal,
             tenant_id,
             vshard_id,
             database_id,
             collection,
             &response.write_set,
-        )?
+        ))
     } else {
         None
     };
@@ -406,8 +473,12 @@ pub(crate) async fn submit_write(
             (a, b) => a.or(b),
         };
         if let Some(lsn) = durable_target {
-            shared.wal.wait_durable(lsn).await?;
+            rollback_ddl!(shared.wal.wait_durable(lsn).await);
         }
+    }
+
+    if response.status == Status::Ok {
+        ddl_transition.finalize(shared)?;
     }
 
     // Publish change events for successful writes whose change feed this funnel

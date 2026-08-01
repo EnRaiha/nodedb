@@ -38,7 +38,7 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>, CodecError> {
 
     if payload.len() < expected_len {
         return Err(CodecError::Truncated {
-            expected: 4 + expected_len,
+            expected: expected_len.saturating_add(4),
             actual: data.len(),
         });
     }
@@ -62,7 +62,7 @@ pub fn decode_ref(data: &[u8]) -> Result<&[u8], CodecError> {
 
     if payload.len() < expected_len {
         return Err(CodecError::Truncated {
-            expected: 4 + expected_len,
+            expected: expected_len.saturating_add(4),
             actual: data.len(),
         });
     }
@@ -183,5 +183,31 @@ mod tests {
     fn truncated_errors() {
         assert!(decode(&[]).is_err());
         assert!(decode(&[10, 0, 0, 0, 1, 2]).is_err()); // claims 10 bytes, only 2
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn maximal_length_header_returns_decode_error() {
+        let error = decode(&u32::MAX.to_le_bytes()).expect_err("truncated input must fail");
+        assert!(matches!(
+            error,
+            CodecError::Truncated {
+                expected: usize::MAX,
+                actual: 4
+            }
+        ));
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn maximal_length_header_returns_decode_ref_error() {
+        let error = decode_ref(&u32::MAX.to_le_bytes()).expect_err("truncated input must fail");
+        assert!(matches!(
+            error,
+            CodecError::Truncated {
+                expected: usize::MAX,
+                actual: 4
+            }
+        ));
     }
 }

@@ -10,16 +10,16 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use nodedb_query::metadata_filter::matches_metadata_filter;
-use nodedb_types::filter::MetadataFilter;
+use nodedb_types::{DatabaseId, filter::MetadataFilter};
 
-use super::definition::{ShapeDefinition, ShapeId, ShapeType};
+use super::definition::{ShapeDefinition, ShapeId, ShapeScope, ShapeType};
 
 /// Per-session shape subscription state.
 struct ClientShapes {
     /// Active shape subscriptions: shape_id → definition.
     shapes: HashMap<ShapeId, ShapeDefinition>,
-    /// Tenant ID.
-    tenant_id: u64,
+    /// Authenticated tenant and database binding for this session.
+    scope: ShapeScope,
     /// When shapes were last modified.
     last_modified: Instant,
 }
@@ -47,17 +47,24 @@ impl ShapeRegistry {
         }
     }
 
-    /// Register a shape subscription for a session.
-    pub fn subscribe(&self, session_id: &str, tenant_id: u64, shape: ShapeDefinition) {
+    /// Register a shape subscription for a session in its authenticated scope.
+    pub fn subscribe(&self, session_id: &str, scope: ShapeScope, shape: ShapeDefinition) {
         let mut sessions =
             crate::control::lock_utils::write_or_recover(self.sessions.write(), "shape_sessions");
         let client = sessions
             .entry(session_id.to_string())
             .or_insert_with(|| ClientShapes {
                 shapes: HashMap::new(),
-                tenant_id,
+                scope,
                 last_modified: Instant::now(),
             });
+        if client.scope != scope {
+            warn!(
+                session = session_id,
+                "refusing shape subscription with a different tenant or database binding"
+            );
+            return;
+        }
         info!(
             session = session_id,
             shape_id = %shape.shape_id,
@@ -121,7 +128,7 @@ impl ShapeRegistry {
     /// logged as a warning and treated as non-matching (fail-closed).
     pub fn evaluate_mutation(
         &self,
-        tenant_id: u64,
+        scope: ShapeScope,
         collection: &str,
         doc_id: &str,
         doc_json: &serde_json::Value,
@@ -131,7 +138,7 @@ impl ShapeRegistry {
         let mut matches = Vec::new();
 
         for (session_id, client) in sessions.iter() {
-            if client.tenant_id != tenant_id {
+            if client.scope != scope {
                 continue;
             }
             for (shape_id, shape) in &client.shapes {
@@ -164,13 +171,36 @@ impl ShapeRegistry {
         matches
     }
 
+    /// Evaluate an array operation against shapes in its tenant and database.
+    pub fn evaluate_array_mutation(
+        &self,
+        scope: ShapeScope,
+        array_name: &str,
+        coord: &[u64],
+    ) -> Vec<(String, ShapeId)> {
+        let sessions =
+            crate::control::lock_utils::read_or_recover(self.sessions.read(), "shape_sessions");
+        let mut matches = Vec::new();
+        for (session_id, client) in sessions.iter() {
+            if client.scope != scope {
+                continue;
+            }
+            for (shape_id, shape) in &client.shapes {
+                if shape.matches_array_op(array_name, coord) {
+                    matches.push((session_id.clone(), shape_id.clone()));
+                }
+            }
+        }
+        matches
+    }
+
     /// Get the session ID for a session's shape state.
     pub fn session_info(&self, session_id: &str) -> Option<(u64, usize)> {
         let sessions =
             crate::control::lock_utils::read_or_recover(self.sessions.read(), "shape_sessions");
         sessions
             .get(session_id)
-            .map(|c| (c.tenant_id, c.shapes.len()))
+            .map(|c| (c.scope.tenant_id, c.shapes.len()))
     }
 
     /// Total active shape subscriptions across all sessions.
@@ -187,45 +217,23 @@ impl ShapeRegistry {
         sessions.len()
     }
 
-    /// Evaluate an array op against all active shapes.
+    /// Get a shape definition only when the session remains bound to `scope`.
     ///
-    /// Returns a list of `(session_id, shape_id)` pairs for `ShapeType::Array`
-    /// shapes that match the mutation. The caller then pushes `ArrayDeltaMsg`
-    /// frames to the matching sessions.
-    ///
-    /// This is a sibling of [`evaluate_mutation`] rather than a refactor so
-    /// that the existing document/vector matching path is not disturbed.
-    pub fn evaluate_array_mutation(
+    /// A session ID can be reused after reconnecting, so callers must provide
+    /// the authenticated tenant and database scope rather than relying on the
+    /// session ID alone.
+    pub fn get_shape(
         &self,
-        tenant_id: u64,
-        array_name: &str,
-        coord: &[u64],
-    ) -> Vec<(String, ShapeId)> {
-        let sessions =
-            crate::control::lock_utils::read_or_recover(self.sessions.read(), "shape_sessions");
-        let mut matches = Vec::new();
-
-        for (session_id, client) in sessions.iter() {
-            if client.tenant_id != tenant_id {
-                continue;
-            }
-            for (shape_id, shape) in &client.shapes {
-                if shape.matches_array_op(array_name, coord) {
-                    matches.push((session_id.clone(), shape_id.clone()));
-                }
-            }
-        }
-
-        matches
-    }
-
-    /// Get a shape definition by session + shape_id.
-    pub fn get_shape(&self, session_id: &str, shape_id: &str) -> Option<ShapeDefinition> {
+        session_id: &str,
+        scope: ShapeScope,
+        shape_id: &str,
+    ) -> Option<ShapeDefinition> {
         let sessions =
             crate::control::lock_utils::read_or_recover(self.sessions.read(), "shape_sessions");
         sessions
             .get(session_id)
-            .and_then(|c| c.shapes.get(shape_id).cloned())
+            .filter(|client| client.scope == scope)
+            .and_then(|client| client.shapes.get(shape_id).cloned())
     }
 
     /// Export all shapes for persistence (serializable snapshot).
@@ -235,7 +243,7 @@ impl ShapeRegistry {
         let mut result = Vec::new();
         for (session_id, client) in sessions.iter() {
             for shape in client.shapes.values() {
-                result.push((session_id.clone(), client.tenant_id, shape.clone()));
+                result.push((session_id.clone(), client.scope.tenant_id, shape.clone()));
             }
         }
         result
@@ -248,7 +256,10 @@ impl ShapeRegistry {
         for (session_id, tenant_id, shape) in shapes {
             let client = sessions.entry(session_id).or_insert_with(|| ClientShapes {
                 shapes: HashMap::new(),
-                tenant_id,
+                scope: ShapeScope {
+                    tenant_id,
+                    database_id: DatabaseId::DEFAULT,
+                },
                 last_modified: Instant::now(),
             });
             client
@@ -275,6 +286,13 @@ mod tests {
     use super::super::definition::ShapeType;
     use super::*;
 
+    fn scope(tenant_id: u64) -> ShapeScope {
+        ShapeScope {
+            tenant_id,
+            database_id: DatabaseId::DEFAULT,
+        }
+    }
+
     fn make_doc_shape(id: &str, collection: &str) -> ShapeDefinition {
         ShapeDefinition {
             shape_id: id.into(),
@@ -291,8 +309,8 @@ mod tests {
     #[test]
     fn subscribe_and_query() {
         let reg = ShapeRegistry::new();
-        reg.subscribe("s1", 1, make_doc_shape("sh1", "orders"));
-        reg.subscribe("s1", 1, make_doc_shape("sh2", "users"));
+        reg.subscribe("s1", scope(1), make_doc_shape("sh1", "orders"));
+        reg.subscribe("s1", scope(1), make_doc_shape("sh2", "users"));
 
         assert_eq!(reg.total_shapes(), 2);
         assert_eq!(reg.active_sessions(), 1);
@@ -302,19 +320,53 @@ mod tests {
     #[test]
     fn evaluate_mutation_matches() {
         let reg = ShapeRegistry::new();
-        reg.subscribe("s1", 1, make_doc_shape("sh1", "orders"));
-        reg.subscribe("s2", 1, make_doc_shape("sh2", "orders"));
-        reg.subscribe("s3", 2, make_doc_shape("sh3", "orders")); // Different tenant.
+        reg.subscribe("s1", scope(1), make_doc_shape("sh1", "orders"));
+        reg.subscribe("s2", scope(1), make_doc_shape("sh2", "orders"));
+        reg.subscribe("s3", scope(2), make_doc_shape("sh3", "orders")); // Different tenant.
 
         let doc = serde_json::json!({"status": "open"});
-        let matches = reg.evaluate_mutation(1, "orders", "o1", &doc);
+        let matches = reg.evaluate_mutation(scope(1), "orders", "o1", &doc);
         assert_eq!(matches.len(), 2); // s1 and s2, not s3 (wrong tenant).
+    }
+
+    #[test]
+    fn get_shape_requires_exact_session_scope() {
+        let reg = ShapeRegistry::new();
+        let subscribed_scope = ShapeScope {
+            tenant_id: 1,
+            database_id: DatabaseId::new(7),
+        };
+        reg.subscribe("s1", subscribed_scope, make_doc_shape("sh1", "orders"));
+
+        assert!(reg.get_shape("s1", subscribed_scope, "sh1").is_some());
+        assert!(
+            reg.get_shape(
+                "s1",
+                ShapeScope {
+                    tenant_id: 1,
+                    database_id: DatabaseId::new(8),
+                },
+                "sh1",
+            )
+            .is_none()
+        );
+        assert!(
+            reg.get_shape(
+                "s1",
+                ShapeScope {
+                    tenant_id: 2,
+                    database_id: DatabaseId::new(7),
+                },
+                "sh1",
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn unsubscribe() {
         let reg = ShapeRegistry::new();
-        reg.subscribe("s1", 1, make_doc_shape("sh1", "orders"));
+        reg.subscribe("s1", scope(1), make_doc_shape("sh1", "orders"));
         assert_eq!(reg.total_shapes(), 1);
 
         assert!(reg.unsubscribe("s1", "sh1"));
@@ -326,8 +378,8 @@ mod tests {
     #[test]
     fn remove_session() {
         let reg = ShapeRegistry::new();
-        reg.subscribe("s1", 1, make_doc_shape("sh1", "orders"));
-        reg.subscribe("s1", 1, make_doc_shape("sh2", "users"));
+        reg.subscribe("s1", scope(1), make_doc_shape("sh1", "orders"));
+        reg.subscribe("s1", scope(1), make_doc_shape("sh2", "users"));
 
         reg.remove_session("s1");
         assert_eq!(reg.total_shapes(), 0);
@@ -337,10 +389,10 @@ mod tests {
     #[test]
     fn no_match_wrong_collection() {
         let reg = ShapeRegistry::new();
-        reg.subscribe("s1", 1, make_doc_shape("sh1", "orders"));
+        reg.subscribe("s1", scope(1), make_doc_shape("sh1", "orders"));
 
         let doc = serde_json::json!({});
-        let matches = reg.evaluate_mutation(1, "users", "u1", &doc);
+        let matches = reg.evaluate_mutation(scope(1), "users", "u1", &doc);
         assert!(matches.is_empty());
     }
 
@@ -369,17 +421,17 @@ mod tests {
         let predicate = zerompk::to_msgpack_vec(&filter).expect("encode");
         reg.subscribe(
             "s1",
-            1,
+            scope(1),
             make_doc_shape_with_predicate("sh1", "entries", predicate),
         );
 
         let matching = serde_json::json!({"kind": "Rule", "name": "test"});
         let non_matching = serde_json::json!({"kind": "Note", "name": "test"});
 
-        let m1 = reg.evaluate_mutation(1, "entries", "doc1", &matching);
+        let m1 = reg.evaluate_mutation(scope(1), "entries", "doc1", &matching);
         assert_eq!(m1.len(), 1, "matching doc must route to shape");
 
-        let m2 = reg.evaluate_mutation(1, "entries", "doc2", &non_matching);
+        let m2 = reg.evaluate_mutation(scope(1), "entries", "doc2", &non_matching);
         assert!(m2.is_empty(), "non-matching doc must not route to shape");
     }
 
@@ -394,7 +446,7 @@ mod tests {
         let predicate = zerompk::to_msgpack_vec(&filter).expect("encode");
         reg.subscribe(
             "s1",
-            1,
+            scope(1),
             make_doc_shape_with_predicate("sh1", "entries", predicate),
         );
 
@@ -402,11 +454,12 @@ mod tests {
         let partial = serde_json::json!({"kind": "Rule", "share": "personal"});
 
         assert_eq!(
-            reg.evaluate_mutation(1, "entries", "d1", &both_match).len(),
+            reg.evaluate_mutation(scope(1), "entries", "d1", &both_match)
+                .len(),
             1
         );
         assert!(
-            reg.evaluate_mutation(1, "entries", "d2", &partial)
+            reg.evaluate_mutation(scope(1), "entries", "d2", &partial)
                 .is_empty()
         );
     }
@@ -414,10 +467,10 @@ mod tests {
     #[test]
     fn empty_predicate_matches_all() {
         let reg = ShapeRegistry::new();
-        reg.subscribe("s1", 1, make_doc_shape("sh1", "entries"));
+        reg.subscribe("s1", scope(1), make_doc_shape("sh1", "entries"));
 
         let any_doc = serde_json::json!({"anything": "goes"});
-        let matches = reg.evaluate_mutation(1, "entries", "d1", &any_doc);
+        let matches = reg.evaluate_mutation(scope(1), "entries", "d1", &any_doc);
         assert_eq!(matches.len(), 1);
     }
 
@@ -428,12 +481,12 @@ mod tests {
         let bad_predicate = vec![0xFF, 0xFE, 0x01, 0x02];
         reg.subscribe(
             "s1",
-            1,
+            scope(1),
             make_doc_shape_with_predicate("sh1", "entries", bad_predicate),
         );
 
         let doc = serde_json::json!({"kind": "Rule"});
-        let matches = reg.evaluate_mutation(1, "entries", "d1", &doc);
+        let matches = reg.evaluate_mutation(scope(1), "entries", "d1", &doc);
         assert!(
             matches.is_empty(),
             "bad predicate must be non-matching (fail-closed)"
@@ -456,16 +509,58 @@ mod tests {
     #[test]
     fn evaluate_array_mutation_matches() {
         let reg = ShapeRegistry::new();
-        reg.subscribe("s1", 1, make_array_shape("ah1", "prices"));
-        reg.subscribe("s2", 1, make_array_shape("ah2", "prices"));
-        reg.subscribe("s3", 2, make_array_shape("ah3", "prices")); // Different tenant.
-        reg.subscribe("s4", 1, make_array_shape("ah4", "other")); // Different array.
+        reg.subscribe("s1", scope(1), make_array_shape("ah1", "prices"));
+        reg.subscribe("s2", scope(1), make_array_shape("ah2", "prices"));
+        reg.subscribe("s3", scope(2), make_array_shape("ah3", "prices")); // Different tenant.
+        reg.subscribe("s4", scope(1), make_array_shape("ah4", "other")); // Different array.
 
-        let matches = reg.evaluate_array_mutation(1, "prices", &[5, 5]);
+        let matches = reg.evaluate_array_mutation(scope(1), "prices", &[5, 5]);
         assert_eq!(matches.len(), 2);
         let session_ids: Vec<&str> = matches.iter().map(|(s, _)| s.as_str()).collect();
         assert!(session_ids.contains(&"s1"));
         assert!(session_ids.contains(&"s2"));
+    }
+
+    #[test]
+    fn database_scoped_shapes_do_not_cross_deliver() {
+        let reg = ShapeRegistry::new();
+        reg.subscribe(
+            "db-one",
+            ShapeScope {
+                tenant_id: 1,
+                database_id: DatabaseId::new(1),
+            },
+            make_doc_shape("one", "orders"),
+        );
+        reg.subscribe(
+            "db-two",
+            ShapeScope {
+                tenant_id: 1,
+                database_id: DatabaseId::new(2),
+            },
+            make_doc_shape("two", "orders"),
+        );
+        let doc = serde_json::json!({});
+        let one = reg.evaluate_mutation(
+            ShapeScope {
+                tenant_id: 1,
+                database_id: DatabaseId::new(1),
+            },
+            "orders",
+            "o1",
+            &doc,
+        );
+        let two = reg.evaluate_mutation(
+            ShapeScope {
+                tenant_id: 1,
+                database_id: DatabaseId::new(2),
+            },
+            "orders",
+            "o1",
+            &doc,
+        );
+        assert_eq!(one[0].0, "db-one");
+        assert_eq!(two[0].0, "db-two");
     }
 
     #[test]
@@ -486,15 +581,15 @@ mod tests {
             field_filter: vec![],
         };
         let all = make_array_shape("ar2", "mat");
-        reg.subscribe("s1", 1, in_range);
-        reg.subscribe("s2", 1, all);
+        reg.subscribe("s1", scope(1), in_range);
+        reg.subscribe("s2", scope(1), all);
 
         // coord = [5] — in range for both.
-        let matches = reg.evaluate_array_mutation(1, "mat", &[5]);
+        let matches = reg.evaluate_array_mutation(scope(1), "mat", &[5]);
         assert_eq!(matches.len(), 2);
 
         // coord = [50] — only the unbounded shape matches.
-        let matches = reg.evaluate_array_mutation(1, "mat", &[50]);
+        let matches = reg.evaluate_array_mutation(scope(1), "mat", &[50]);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0, "s2");
     }

@@ -12,12 +12,14 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 
 pub fn show_topics(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
@@ -28,14 +30,16 @@ pub fn show_topics(
         "owner".to_string(),
     ];
 
-    let topics = state.ep_topic_registry.list_for_tenant(tenant_id);
+    let topics = state
+        .ep_topic_registry
+        .list_for_database_tenant(database_id, tenant_id);
     let mut rows = Vec::with_capacity(topics.len());
 
     for t in &topics {
         let buffer_key = format!("topic:{}", t.name);
         let buffered = state
             .cdc_router
-            .get_buffer(tenant_id, &buffer_key)
+            .get_buffer(database_id, tenant_id, &buffer_key)
             .map(|b| b.len())
             .unwrap_or(0);
 

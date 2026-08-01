@@ -95,8 +95,14 @@ pub fn drop_collection(
     let dependents: Vec<crate::control::cascade::Dependent> = {
         let catalog = state.credentials.catalog();
         let mut visited = std::collections::HashSet::new();
-        crate::control::cascade::collect_dependents(catalog, tenant_id.as_u64(), name, &mut visited)
-            .map_err(|e| err("XX000", e.to_string()))?
+        crate::control::cascade::collect_dependents(
+            catalog,
+            database_id,
+            tenant_id.as_u64(),
+            name,
+            &mut visited,
+        )
+        .map_err(|e| err("XX000", e.to_string()))?
     };
 
     // Implicit SERIAL/BIGSERIAL sequences (`{collection}_{field}_seq`)

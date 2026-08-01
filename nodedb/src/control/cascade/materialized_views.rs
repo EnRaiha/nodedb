@@ -16,6 +16,7 @@
 use std::collections::HashSet;
 
 use crate::control::security::catalog::SystemCatalog;
+use crate::types::DatabaseId;
 
 /// Safety bound on MV-of-MV chain depth.
 pub const MAX_DEPTH: usize = 32;
@@ -70,6 +71,72 @@ pub fn find_mvs_sourcing(
     }
 
     let mut out: Vec<String> = found.into_iter().collect();
+    out.sort();
+    Ok(out)
+}
+
+/// Enumerate streaming MVs whose source stream is attached to
+/// `(database_id, tenant_id, root_collection)`, including any MV-of-MV chain.
+///
+/// Streaming definitions name a CDC stream rather than a collection. Seed the
+/// graph with every stream on the collection, then walk source-stream → MV-name
+/// edges. The database filter is essential: identical stream and MV names are
+/// valid in different databases for the same tenant.
+pub fn find_streaming_mvs_sourcing(
+    catalog: &SystemCatalog,
+    database_id: DatabaseId,
+    tenant_id: u64,
+    root_collection: &str,
+) -> crate::Result<Vec<String>> {
+    let streams = catalog.load_all_change_streams()?;
+    let mut frontier: Vec<String> = streams
+        .into_iter()
+        .filter(|stream| {
+            stream.database_id == database_id
+                && stream.tenant_id == tenant_id
+                && stream.collection == root_collection
+        })
+        .map(|stream| stream.name)
+        .collect();
+    // Preserve compatibility with definitions whose source stream reused the
+    // collection name before explicit stream lineage was recorded.
+    frontier.push(root_collection.to_string());
+
+    let mut by_source: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for mv in catalog
+        .load_all_streaming_mvs()?
+        .into_iter()
+        .filter(|mv| mv.database_id == database_id && mv.tenant_id == tenant_id)
+    {
+        by_source.entry(mv.source_stream).or_default().push(mv.name);
+    }
+
+    let mut found = HashSet::new();
+    let mut depth = 0usize;
+    while !frontier.is_empty() {
+        depth += 1;
+        if depth > MAX_DEPTH {
+            return Err(crate::Error::CascadeCycle {
+                tenant_id,
+                root: root_collection.to_string(),
+                depth: MAX_DEPTH,
+            });
+        }
+        let mut next = Vec::new();
+        for source in frontier {
+            if let Some(mvs) = by_source.get(&source) {
+                for name in mvs {
+                    if found.insert(name.clone()) {
+                        next.push(name.clone());
+                    }
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    let mut out: Vec<_> = found.into_iter().collect();
     out.sort();
     Ok(out)
 }

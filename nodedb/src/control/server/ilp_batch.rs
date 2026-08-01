@@ -306,17 +306,75 @@ fn build_ilp_calvin_tasks(
 
 #[cfg(test)]
 mod tests {
-    use super::{IlpPreflightFailure, preflight_ilp_batch};
-    use crate::control::security::audit::NoopAuditEmitter;
+    use super::{IlpPreflightFailure, flush_authenticated_ilp_batch, preflight_ilp_batch};
+    use std::sync::{Arc, Mutex};
+
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::state::SharedState;
+
     use crate::control::security::audit::emitter::test_helpers::CapturingEmitter;
+    use crate::control::security::audit::{
+        AuditEmitContext, AuditEmitter, AuditEvent, NoopAuditEmitter,
+    };
     use crate::control::security::identity::{
         AuthMethod, AuthenticatedIdentity, DatabaseSet, Permission,
     };
     use crate::control::security::permission::PermissionStore;
     use crate::control::security::role::RoleStore;
     use crate::types::{DatabaseId, TenantId, VShardId};
+    use crate::wal::WalManager;
     use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
     use nodedb_types::Surrogate;
+
+    #[derive(Clone, Debug)]
+    struct CapturedAuditEvent {
+        event: AuditEvent,
+        source: String,
+        auth_user_id: String,
+        auth_user_name: String,
+        tenant_id: Option<TenantId>,
+    }
+
+    struct ContextCapturingEmitter {
+        events: Mutex<Vec<CapturedAuditEvent>>,
+    }
+
+    impl ContextCapturingEmitter {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded(&self) -> Vec<CapturedAuditEvent> {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl AuditEmitter for ContextCapturingEmitter {
+        fn emit(
+            &self,
+            event: AuditEvent,
+            source: &str,
+            _detail: &str,
+            context: AuditEmitContext<'_>,
+        ) {
+            let mut events = self
+                .events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            events.push(CapturedAuditEvent {
+                event,
+                source: source.into(),
+                auth_user_id: context.auth_user_id.into(),
+                auth_user_name: context.auth_user_name.into(),
+                tenant_id: context.tenant_id,
+            });
+        }
+    }
 
     fn identity(database_id: DatabaseId) -> AuthenticatedIdentity {
         AuthenticatedIdentity::new_regular(
@@ -349,6 +407,42 @@ mod tests {
             &RoleStore::new(),
             &NoopAuditEmitter,
         )
+    }
+
+    #[tokio::test]
+    async fn authenticated_flush_rejects_unwritable_measurement_before_dispatch_or_catalog_projection()
+     {
+        let directory = tempfile::tempdir().expect("create ILP batch test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("ilp-batch.wal"))
+                .expect("open ILP batch test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("construct ILP batch state");
+        let database_id = DatabaseId::new(7);
+
+        let error = flush_authenticated_ilp_batch(
+            &state,
+            &identity(database_id),
+            database_id,
+            "cpu value=1i\n",
+        )
+        .await
+        .expect_err("regular identity without write permission is rejected during preflight");
+
+        assert!(matches!(
+            error,
+            crate::Error::BadRequest { detail } if detail == "ILP batch rejected"
+        ));
+        assert!(
+            state
+                .credentials
+                .catalog()
+                .get_collection(database_id, 9, "cpu")
+                .expect("read catalog collection projection")
+                .is_none(),
+            "early authorization denial must not create a collection/schema projection"
+        );
     }
 
     #[test]
@@ -445,6 +539,7 @@ mod tests {
 
     #[test]
     fn read_only_collection_is_not_sufficient_for_ilp_ingest() {
+        // ILP is write-only; read access is not applicable to ingestion.
         let permissions = PermissionStore::new();
         permissions
             .grant(
@@ -463,12 +558,58 @@ mod tests {
     }
 
     #[test]
+    fn system_audit_log_measurement_is_denied_to_regular_ingester() {
+        let permissions = PermissionStore::new();
+        grant_write(&permissions, "_system.audit_log");
+        let audit = ContextCapturingEmitter::new();
+
+        assert_eq!(
+            preflight_ilp_batch(
+                &identity(DatabaseId::new(7)),
+                DatabaseId::new(7),
+                "_system.audit_log value=1i\n",
+                &permissions,
+                &RoleStore::new(),
+                &audit,
+            ),
+            Err(IlpPreflightFailure::PermissionDenied)
+        );
+        let events = audit.recorded();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, AuditEvent::PermissionDenied);
+        assert_eq!(events[0].source, "ingester");
+        assert_eq!(events[0].auth_user_id, "7");
+        assert_eq!(events[0].auth_user_name, "ingester");
+        assert_eq!(events[0].tenant_id, Some(TenantId::new(9)));
+    }
+
+    #[test]
+    fn tenant_ten_write_grant_does_not_authorize_tenant_nine_ilp_ingest() {
+        let permissions = PermissionStore::new();
+        permissions
+            .grant(
+                "collection:10:cpu",
+                "user:ingester",
+                Permission::Write,
+                "admin",
+                None,
+            )
+            .expect("in-memory grant succeeds");
+
+        assert_eq!(
+            preflight("cpu value=1i\n", &permissions),
+            Err(IlpPreflightFailure::PermissionDenied)
+        );
+    }
+
+    #[test]
     fn non_default_database_is_used_for_collection_authorization() {
         let permissions = PermissionStore::new();
         grant_write(&permissions, "cpu");
         let database_id = DatabaseId::new(7);
         let roles = RoleStore::new();
 
+        // Database selection is handshake-bound; ILP payload does not select it.
         assert_eq!(
             preflight_ilp_batch(
                 &identity(DatabaseId::DEFAULT),

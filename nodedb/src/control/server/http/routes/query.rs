@@ -30,7 +30,7 @@ pub struct DatabaseQueryParam {
 /// (`3D000 database '<name>' does not exist`). Silently falling back to
 /// DEFAULT would mask client mistakes and run queries against the wrong
 /// database; that is a correctness bug, not a usability convenience.
-pub(super) fn resolve_database_id(
+pub(crate) fn resolve_database_id(
     headers: &HeaderMap,
     param: &DatabaseQueryParam,
     state: &AppState,

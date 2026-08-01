@@ -30,6 +30,7 @@ impl CoreLoop {
     pub(in crate::data::executor) fn emit_deferred_events(
         &mut self,
         writes: Vec<DeferredWrite>,
+        database_id: crate::types::DatabaseId,
         tenant_id: crate::types::TenantId,
         vshard_id: crate::types::VShardId,
     ) {
@@ -50,6 +51,7 @@ impl CoreLoop {
                 op: write.op,
                 row_id: RowId::new(write.row_id.as_str()),
                 lsn: self.watermark,
+                database_id,
                 tenant_id,
                 vshard_id,
                 source: EventSource::Deferred,

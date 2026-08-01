@@ -13,10 +13,10 @@ use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::staging_gate::{
     InTxnRoute, StagingGateError, route_in_tx_write,
 };
-use crate::types::{Lsn, RequestId, TenantId, TraceId, TxnId, VShardId};
+use crate::types::{Lsn, RequestId, TraceId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use super::raw_dispatch::{authorize_single_task, dispatch_authorized_single_task};
+use super::raw_dispatch::dispatch_authorized_single_task;
 use super::response::data_plane_response_to_native;
 use super::{DispatchCtx, error_to_native};
 
@@ -199,6 +199,20 @@ pub(crate) async fn handle_direct_op(
         post_set_op: PostSetOp::None,
         txn_id,
     }];
+    // Implicit-edge extraction marks catalog state and allocates surrogates.
+    // Authorize the original direct-op task before those side effects.
+    let emitter =
+        crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&ctx.state.audit));
+    if let Err(error) = crate::control::server::shared::authorization::authorize_task_set(
+        ctx.identity,
+        &tasks,
+        &ctx.state.permissions,
+        &ctx.state.roles,
+        &emitter,
+    ) {
+        return error_to_native(seq, &crate::Error::from(error));
+    }
+
     if let Err(e) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
         ctx.state,
         &mut tasks,
@@ -211,14 +225,35 @@ pub(crate) async fn handle_direct_op(
         return error_to_native(seq, &e);
     }
 
-    if tasks.len() == 1
-        && let Some(task) = tasks.pop()
-    {
+    // The expanded set is the dispatch authorization boundary. The no-edge
+    // path retains its existing per-task capability consumption below.
+    let authorized_tasks = match crate::control::server::shared::authorization::authorize_task_set(
+        ctx.identity,
+        &tasks,
+        &ctx.state.permissions,
+        &ctx.state.roles,
+        &emitter,
+    ) {
+        Ok(authorized) => authorized,
+        Err(error) => return error_to_native(seq, &crate::Error::from(error)),
+    };
+
+    if tasks.len() == 1 {
         // No-edge fast path — behaviorally identical to the pre-migration
         // single-plan dispatch. The local-path WAL append now lives inside
         // `dispatch_single_task` so it is shared with the single-shard edge loop.
+        let task = match authorized_tasks.into_tasks().into_iter().next() {
+            Some(task) => task,
+            None => {
+                return NativeResponse::error(
+                    seq,
+                    "XX000",
+                    "authorization returned no task capability",
+                );
+            }
+        };
         let _request = ctx.state.tenant_request_guard(tenant_id);
-        return dispatch_single_task(ctx, seq, tenant_id, vshard_id, task.plan, task.txn_id).await;
+        return dispatch_single_task(ctx, seq, task).await;
     }
 
     // Edge-bearing insert: route the augmented task set the same way native SQL
@@ -231,22 +266,9 @@ pub(crate) async fn handle_direct_op(
     // Autocommit direct-ops dispatch: no session read-set to widen with.
     match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
         DispatchClass::MultiShard { .. } => {
-            let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
-                &ctx.state.audit,
-            ));
-            let authorized = match crate::control::server::shared::authorization::authorize_task_set(
-                ctx.identity,
-                &tasks,
-                &ctx.state.permissions,
-                &ctx.state.roles,
-                &emitter,
-            ) {
-                Ok(authorized) => authorized,
-                Err(error) => return error_to_native(seq, &crate::Error::from(error)),
-            };
             match dispatch_authorized_tasks_to_calvin(
                 ctx.state,
-                authorized,
+                authorized_tasks,
                 tenant_id,
                 CrossShardTxnMode::Strict,
                 TxnDispatchPosition::Autocommit,
@@ -271,12 +293,8 @@ pub(crate) async fn handle_direct_op(
             // the caller. Edge tasks dispatch after it in order.
             let mut doc_response: Option<NativeResponse> = None;
             let mut error: Option<NativeResponse> = None;
-            for task in tasks {
-                let task_vshard = task.vshard_id;
-                let task_txn_id = task.txn_id;
-                let resp =
-                    dispatch_single_task(ctx, seq, tenant_id, task_vshard, task.plan, task_txn_id)
-                        .await;
+            for task in authorized_tasks.into_tasks() {
+                let resp = dispatch_single_task(ctx, seq, task).await;
                 if resp.status == nodedb_types::protocol::ResponseStatus::Error {
                     error = Some(resp);
                     break;
@@ -313,29 +331,14 @@ pub(crate) async fn handle_direct_op(
 async fn dispatch_single_task(
     ctx: &DispatchCtx<'_>,
     seq: u64,
-    tenant_id: TenantId,
-    vshard_id: VShardId,
-    plan: PhysicalPlan,
-    txn_id: Option<TxnId>,
+    authorized: crate::control::server::shared::authorization::AuthorizedTask,
 ) -> NativeResponse {
-    let task = PhysicalTask {
-        tenant_id,
-        vshard_id,
-        database_id: ctx.database_id(),
-        plan,
-        post_set_op: PostSetOp::None,
-        txn_id,
-    };
-
     // Authorization must precede the staging decision. Non-stageable writes
     // are buffered without invoking the stage-dispatch closure, so authorizing
     // only inside that closure would let an ungranted task reach trusted
-    // COMMIT replay. Consuming the exact-task capability here makes every
-    // branch below originate from a successful authorization decision.
-    let task = match authorize_single_task(ctx, task) {
-        Ok(authorized) => authorized.into_staging_task(),
-        Err(error) => return error_to_native(seq, &error),
-    };
+    // COMMIT replay. Consume the expanded-set capability here so every branch
+    // below originates from the final authorization decision.
+    let task = authorized.into_staging_task();
 
     // Cloned before `route_in_tx_write` consumes `task`, so a staged write
     // whose outcome carries a real affected-count/computed-value payload

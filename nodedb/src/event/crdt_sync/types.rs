@@ -5,12 +5,17 @@
 //! Types for the Event Plane's role as intermediary between Origin writes
 //! and Lite device delta delivery.
 
+use crate::types::DatabaseId;
+
 /// An outbound CRDT delta ready for delivery to connected Lite instances.
 ///
 /// Packaged by the Event Plane's packager from a `WriteEvent`. Contains
 /// the full row data serialized as the CRDT delta payload (MessagePack).
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct OutboundDelta {
+    /// Database containing the source collection. Used exclusively for Origin
+    /// session routing and is not added to the RowPush wire payload.
+    pub database_id: DatabaseId,
     /// Collection the delta applies to.
     pub collection: String,
     /// Document/row ID.
@@ -26,7 +31,7 @@ pub struct OutboundDelta {
     pub tenant_id: u64,
     /// Origin node's peer ID for CRDT identity attribution.
     pub peer_id: u64,
-    /// Monotonic sequence per (collection) for ordering enforcement.
+    /// Monotonic sequence per collection for ordering enforcement.
     pub sequence: u64,
 }
 
@@ -51,8 +56,10 @@ pub struct LiteSessionHandle {
     pub peer_id: u64,
     /// Tenant this session belongs to.
     pub tenant_id: u64,
+    /// Database this session is authorized to receive deltas from.
+    pub database_id: DatabaseId,
     /// Collections this Lite device has subscribed to (via shape subscriptions).
-    /// Empty = all collections for the tenant.
+    /// Empty = all collections for this tenant and database.
     pub subscribed_collections: Vec<String>,
     /// Channel for pushing deltas to the session writer task.
     pub sender: tokio::sync::mpsc::Sender<OutboundDelta>,
@@ -88,6 +95,7 @@ mod tests {
     #[test]
     fn outbound_delta_roundtrip() {
         let delta = OutboundDelta {
+            database_id: DatabaseId::new(7),
             collection: "orders".into(),
             document_id: "o-123".into(),
             payload: vec![1, 2, 3, 4],
@@ -99,6 +107,7 @@ mod tests {
         };
         let bytes = zerompk::to_msgpack_vec(&delta).unwrap();
         let decoded: OutboundDelta = zerompk::from_msgpack(&bytes).unwrap();
+        assert_eq!(decoded.database_id, DatabaseId::new(7));
         assert_eq!(decoded.collection, "orders");
         assert_eq!(decoded.lsn, 1500);
         assert_eq!(decoded.op, DeltaOp::Upsert);

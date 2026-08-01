@@ -7,7 +7,7 @@
 //!
 //! Thread-safe (RwLock) — reads are concurrent, writes are exclusive.
 //!
-//! Streams are indexed by `(tenant_id, collection)` so the CDC router's
+//! Streams are indexed by `(database_id, tenant_id, collection)` so the CDC router's
 //! hot path scans only the matching bucket rather than the full fleet.
 //! Wildcard (`*`) streams live in a per-tenant wildcard bucket and are
 //! merged into every lookup for that tenant.
@@ -16,16 +16,17 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use super::stream_def::ChangeStreamDef;
+use crate::types::DatabaseId;
 
 /// Wildcard collection literal — matches every collection in the tenant.
 const WILDCARD: &str = "*";
 
 struct Inner {
-    /// Canonical store, keyed by `(tenant_id, stream_name)`.
-    by_name: HashMap<(u64, String), Arc<ChangeStreamDef>>,
-    /// Routing index: `(tenant_id, collection)` → matching streams.
-    /// Wildcard streams are stored under `(tenant_id, "*")`.
-    by_collection: HashMap<(u64, String), Vec<Arc<ChangeStreamDef>>>,
+    /// Canonical store, keyed by `(database_id, tenant_id, stream_name)`.
+    by_name: HashMap<(DatabaseId, u64, String), Arc<ChangeStreamDef>>,
+    /// Routing index: `(database_id, tenant_id, collection)` → matching streams.
+    /// Wildcard streams are stored under `(database_id, tenant_id, "*")`.
+    by_collection: HashMap<(DatabaseId, u64, String), Vec<Arc<ChangeStreamDef>>>,
 }
 
 impl Inner {
@@ -37,13 +38,13 @@ impl Inner {
     }
 
     fn insert(&mut self, def: ChangeStreamDef) {
-        let key_name = (def.tenant_id, def.name.clone());
-        let key_coll = (def.tenant_id, def.collection.clone());
+        let key_name = (def.database_id, def.tenant_id, def.name.clone());
+        let key_coll = (def.database_id, def.tenant_id, def.collection.clone());
         let def_arc = Arc::new(def);
 
         // Replace any prior entry under this name — removes its collection-index entry first.
         if let Some(prev) = self.by_name.remove(&key_name) {
-            let prev_coll_key = (prev.tenant_id, prev.collection.clone());
+            let prev_coll_key = (prev.database_id, prev.tenant_id, prev.collection.clone());
             if let Some(bucket) = self.by_collection.get_mut(&prev_coll_key) {
                 bucket.retain(|d| d.name != prev.name);
                 if bucket.is_empty() {
@@ -59,12 +60,12 @@ impl Inner {
         self.by_name.insert(key_name, def_arc);
     }
 
-    fn remove(&mut self, tenant_id: u64, name: &str) -> bool {
-        let key_name = (tenant_id, name.to_string());
+    fn remove(&mut self, database_id: DatabaseId, tenant_id: u64, name: &str) -> bool {
+        let key_name = (database_id, tenant_id, name.to_string());
         let Some(prev) = self.by_name.remove(&key_name) else {
             return false;
         };
-        let key_coll = (prev.tenant_id, prev.collection.clone());
+        let key_coll = (prev.database_id, prev.tenant_id, prev.collection.clone());
         if let Some(bucket) = self.by_collection.get_mut(&key_coll) {
             bucket.retain(|d| d.name != prev.name);
             if bucket.is_empty() {
@@ -100,30 +101,44 @@ impl StreamRegistry {
     }
 
     /// Unregister a change stream by name. Returns true if it existed.
-    pub fn unregister(&self, tenant_id: u64, name: &str) -> bool {
-        self.write().remove(tenant_id, name)
+    pub fn unregister(&self, database_id: DatabaseId, tenant_id: u64, name: &str) -> bool {
+        self.write().remove(database_id, tenant_id, name)
     }
 
     /// Get a stream definition by name.
-    pub fn get(&self, tenant_id: u64, name: &str) -> Option<ChangeStreamDef> {
-        let key = (tenant_id, name.to_string());
+    pub fn get(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        name: &str,
+    ) -> Option<ChangeStreamDef> {
+        let key = (database_id, tenant_id, name.to_string());
         self.read().by_name.get(&key).map(|a| (**a).clone())
     }
 
-    /// Find all streams matching `(tenant_id, collection)`. Returns shared
+    /// Find all streams matching `(database_id, tenant_id, collection)`. Returns shared
     /// `Arc<ChangeStreamDef>` handles so the router hot path is
     /// O(matching_streams refcount bumps), not a deep clone per match.
-    pub fn find_matching(&self, tenant_id: u64, collection: &str) -> Vec<Arc<ChangeStreamDef>> {
+    pub fn find_matching(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        collection: &str,
+    ) -> Vec<Arc<ChangeStreamDef>> {
         let inner = self.read();
         let mut out: Vec<Arc<ChangeStreamDef>> = Vec::new();
-        if let Some(bucket) = inner
-            .by_collection
-            .get(&(tenant_id, collection.to_string()))
+        if let Some(bucket) =
+            inner
+                .by_collection
+                .get(&(database_id, tenant_id, collection.to_string()))
         {
             out.extend(bucket.iter().cloned());
         }
         if collection != WILDCARD
-            && let Some(bucket) = inner.by_collection.get(&(tenant_id, WILDCARD.to_string()))
+            && let Some(bucket) =
+                inner
+                    .by_collection
+                    .get(&(database_id, tenant_id, WILDCARD.to_string()))
         {
             out.extend(bucket.iter().cloned());
         }
@@ -154,11 +169,15 @@ impl StreamRegistry {
     }
 
     /// List all streams for a tenant.
-    pub fn list_for_tenant(&self, tenant_id: u64) -> Vec<ChangeStreamDef> {
+    pub fn list_for_database_tenant(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+    ) -> Vec<ChangeStreamDef> {
         self.read()
             .by_name
             .iter()
-            .filter(|((tid, _), _)| *tid == tenant_id)
+            .filter(|((db, tid, _), _)| *db == database_id && *tid == tenant_id)
             .map(|(_, a)| (**a).clone())
             .collect()
     }
@@ -209,9 +228,11 @@ impl Default for StreamRegistry {
 mod tests {
     use super::*;
     use crate::event::cdc::stream_def::*;
+    use crate::types::DatabaseId;
 
     fn sample_def(name: &str, collection: &str) -> ChangeStreamDef {
         ChangeStreamDef {
+            database_id: DatabaseId::new(7),
             tenant_id: 1,
             name: name.into(),
             collection: collection.into(),
@@ -232,9 +253,9 @@ mod tests {
         let reg = StreamRegistry::new();
         reg.register(sample_def("orders_stream", "orders"));
 
-        assert!(reg.get(1, "orders_stream").is_some());
-        assert!(reg.get(1, "nonexistent").is_none());
-        assert!(reg.get(2, "orders_stream").is_none());
+        assert!(reg.get(DatabaseId::new(7), 1, "orders_stream").is_some());
+        assert!(reg.get(DatabaseId::new(7), 1, "nonexistent").is_none());
+        assert!(reg.get(DatabaseId::new(7), 2, "orders_stream").is_none());
     }
 
     #[test]
@@ -244,10 +265,10 @@ mod tests {
         reg.register(sample_def("s2", "orders"));
         reg.register(sample_def("s3", "users"));
 
-        let matches = reg.find_matching(1, "orders");
+        let matches = reg.find_matching(DatabaseId::new(7), 1, "orders");
         assert_eq!(matches.len(), 2);
 
-        let matches = reg.find_matching(1, "users");
+        let matches = reg.find_matching(DatabaseId::new(7), 1, "users");
         assert_eq!(matches.len(), 1);
     }
 
@@ -256,17 +277,20 @@ mod tests {
         let reg = StreamRegistry::new();
         reg.register(sample_def("all", "*"));
 
-        assert_eq!(reg.find_matching(1, "orders").len(), 1);
-        assert_eq!(reg.find_matching(1, "users").len(), 1);
-        assert_eq!(reg.find_matching(1, "anything").len(), 1);
+        assert_eq!(reg.find_matching(DatabaseId::new(7), 1, "orders").len(), 1);
+        assert_eq!(reg.find_matching(DatabaseId::new(7), 1, "users").len(), 1);
+        assert_eq!(
+            reg.find_matching(DatabaseId::new(7), 1, "anything").len(),
+            1
+        );
     }
 
     #[test]
     fn unregister() {
         let reg = StreamRegistry::new();
         reg.register(sample_def("s1", "orders"));
-        assert!(reg.unregister(1, "s1"));
-        assert!(!reg.unregister(1, "s1"));
+        assert!(reg.unregister(DatabaseId::new(7), 1, "s1"));
+        assert!(!reg.unregister(DatabaseId::new(7), 1, "s1"));
         assert!(reg.is_empty());
     }
 }

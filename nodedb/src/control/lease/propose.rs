@@ -31,33 +31,67 @@ pub fn compute_expires_at(now: Hlc, duration: Duration) -> Hlc {
 /// Acquire (or re-confirm) a lease on `descriptor_id` at the given
 /// `version`, valid for `duration` from the moment this call returns.
 ///
-/// **Fast path**: if `MetadataCache.leases` already contains a
-/// non-expired lease for `(descriptor_id, this_node_id)` whose
-/// `version >= version`, return it immediately without any raft
-/// round-trip. The planner will hit this on every query after the
-/// first one in a 5-minute window.
-///
-/// **Slow path**: build a `DescriptorLease`, wrap it in
-/// `MetadataEntry::DescriptorLeaseGrant`, encode via `zerompk`,
-/// propose through the metadata raft group, block on the applied
-/// index watcher, then re-read the cache and return the lease.
-///
-/// **Single-node fallback**: if no metadata raft handle is wired
-/// (single-node Origin), write the lease directly into the local
-/// `MetadataCache.leases` map and return. This matches
-/// `propose_catalog_entry`'s `Ok(0)` sentinel pattern — every node
-/// that lacks cluster mode has the same in-memory cache, just
-/// updated locally.
+/// Admission is linearized under `lease_admission_gate`, but the gate is never
+/// held while proposing or waiting for raft. A slow-path caller reserves its
+/// exact descriptor version under the gate before releasing it; that reservation
+/// is visible to a drain that applies while the grant is in flight.
 pub fn acquire_lease(
     shared: &SharedState,
     descriptor_id: DescriptorId,
     version: u64,
     duration: Duration,
 ) -> Result<DescriptorLease, Error> {
+    {
+        let _admission_gate = shared
+            .lease_admission_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        ensure_not_draining(shared, &descriptor_id, version)?;
+
+        let now = shared.hlc_clock.now();
+        let cache_key = (descriptor_id.clone(), shared.node_id);
+        let cache = shared
+            .metadata_cache
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        // A cached metadata lease itself keeps a drain from clearing, so it
+        // needs no temporary reservation after the gate is released.
+        if let Some(existing) = cache.leases.get(&cache_key)
+            && existing.version >= version
+            && existing.expires_at > now
+        {
+            return Ok(existing.clone());
+        }
+
+        // Keep this reservation live until the grant path has either installed
+        // a metadata lease or returned an error.
+        shared.lease_refcount.increment(&descriptor_id, version);
+    }
+
+    let result = acquire_lease_after_admission(shared, descriptor_id.clone(), version, duration);
+    shared.lease_refcount.decrement(&descriptor_id, version);
+    result
+}
+
+/// Acquire a descriptor lease after plan admission has already checked drain
+/// state and reserved a refcount for `descriptor_id`. This helper deliberately
+/// takes neither the admission gate nor another drain snapshot: the existing
+/// reservation is the linearized admission record while its raft grant is in
+/// flight.
+pub(crate) fn acquire_lease_after_admission(
+    shared: &SharedState,
+    descriptor_id: DescriptorId,
+    version: u64,
+    duration: Duration,
+) -> Result<DescriptorLease, Error> {
+    // This gate is intentionally independent from admission: it serializes
+    // first-holder and version-upgrade grants while raft applies metadata.
+    let _grant_gate = shared
+        .lease_grant_gate
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let now = shared.hlc_clock.now();
     let cache_key = (descriptor_id.clone(), shared.node_id);
-
-    // Fast path: existing non-expired lease covers this version.
     {
         let cache = shared
             .metadata_cache
@@ -71,7 +105,27 @@ pub fn acquire_lease(
         }
     }
 
-    force_refresh_lease(shared, descriptor_id, version, duration)
+    refresh_lease_after_admission(shared, descriptor_id, version, duration)
+}
+
+/// Reject an acquisition covered by an active descriptor drain.
+pub(crate) fn ensure_not_draining(
+    shared: &SharedState,
+    descriptor_id: &DescriptorId,
+    version: u64,
+) -> Result<(), Error> {
+    let now_wall_ns = super::wall_now_ns();
+    if shared
+        .lease_drain
+        .is_draining(descriptor_id, version, now_wall_ns)
+    {
+        return Err(Error::Config {
+            detail: format!(
+                "descriptor lease drain in progress: {descriptor_id:?} at version {version}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Unconditionally propose a fresh lease grant, skipping the
@@ -89,28 +143,40 @@ pub fn force_refresh_lease(
     version: u64,
     duration: Duration,
 ) -> Result<DescriptorLease, Error> {
-    // Drain gate: reject new acquires at versions being drained
-    // by an in-flight DDL. The caller is supposed to retry with
-    // the bumped version once the DDL commits and publishes the
-    // new descriptor_version.
-    //
-    // Wall-clock comparison, not `hlc_clock.peek()`, for the
-    // same reason the renewal loop uses wall clock: peek is
-    // frozen between HLC-advancing events, and the drain's
-    // `expires_at` is a real wall timestamp.
-    let now_wall_ns = super::wall_now_ns();
-    if shared
-        .lease_drain
-        .is_draining(&descriptor_id, version, now_wall_ns)
     {
-        return Err(Error::Config {
-            detail: format!(
-                "descriptor lease drain in progress: \
-                 {descriptor_id:?} at version {version}"
-            ),
-        });
+        let _admission_gate = shared
+            .lease_admission_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        ensure_not_draining(shared, &descriptor_id, version)?;
+        // The existing metadata lease plus this reservation keeps drain safe
+        // until the renewal's raft grant has completed.
+        shared.lease_refcount.increment(&descriptor_id, version);
     }
 
+    // Force refresh bypasses the cache fast path, but serializes its raw
+    // proposal with all first-holder and version-upgrade grants.
+    let result = {
+        let _grant_gate = shared
+            .lease_grant_gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        refresh_lease_after_admission(shared, descriptor_id.clone(), version, duration)
+    };
+    shared.lease_refcount.decrement(&descriptor_id, version);
+    result
+}
+
+/// Unconditionally refresh after the caller has already linearized admission.
+/// This raw helper must not lock the admission gate or re-check drain state:
+/// doing either while its raft operation is in flight would reintroduce the
+/// drain/applier deadlock.
+fn refresh_lease_after_admission(
+    shared: &SharedState,
+    descriptor_id: DescriptorId,
+    version: u64,
+    duration: Duration,
+) -> Result<DescriptorLease, Error> {
     let now = shared.hlc_clock.now();
     let cache_key = (descriptor_id.clone(), shared.node_id);
     let expires_at = compute_expires_at(now, duration);

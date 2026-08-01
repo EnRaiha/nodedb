@@ -21,10 +21,11 @@ pub(crate) struct BackgroundLoops {
     /// Held only so the join handle isn't dropped before shutdown; the
     /// loop itself subscribes to `shutdown_rx` and exits on signal.
     pub(crate) _lease_renewal: Option<tokio::task::JoinHandle<()>>,
-    /// MUST be held for the server's lifetime — dropping it shuts down
-    /// every event consumer and the Data Plane will silently drop every
-    /// WriteEvent it emits afterward.
-    pub(crate) _event_plane: nodedb::event::EventPlane,
+    /// Owns the Event Plane shutdown supervisor. It is registered with the
+    /// canonical shutdown bus before signal handling is armed, and owns all
+    /// consumer join handles until they drain or the configured deadline
+    /// requires an abort.
+    pub(crate) _event_plane_shutdown: tokio::task::JoinHandle<()>,
 }
 
 /// Inputs this phase needs, bundled to keep the call site to one struct
@@ -49,6 +50,7 @@ pub(crate) fn spawn(
     shared: &Arc<SharedState>,
     config: &ServerConfig,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_bus: nodedb::control::shutdown::ShutdownBus,
     inputs: BackgroundLoopsInputs<'_>,
 ) -> anyhow::Result<BackgroundLoops> {
     let BackgroundLoopsInputs {
@@ -96,12 +98,13 @@ pub(crate) fn spawn(
     // Start response poller (routes Data Plane responses to waiting sessions).
     bootstrap::background_loops::spawn_response_poller(shared);
 
-    // Spawn all persistent background loops and subsystems.
-    // The returned EventPlane handle MUST be held for the server's lifetime —
-    // dropping it shuts down every event consumer and the Data Plane will
-    // silently drop every WriteEvent it emits afterward.
-    let _event_plane = bootstrap::background_loops::spawn_background_loops(
+    // Spawn all persistent background loops and subsystems, then transfer
+    // Event Plane ownership to its shutdown supervisor. The supervisor's
+    // critical guard is registered now, before signal handling can initiate
+    // the canonical shutdown bus.
+    let event_plane = bootstrap::background_loops::spawn_background_loops(
         shared,
+        shutdown_bus.clone(),
         bootstrap::background_loops::EventPlaneComponents {
             wal: Arc::clone(&wal),
             event_consumers,
@@ -112,10 +115,12 @@ pub(crate) fn spawn(
         num_cores,
         shutdown_rx.clone(),
     );
+    let _event_plane_shutdown =
+        event_plane.spawn_shutdown_supervisor(shutdown_bus, config.tuning.shutdown.deadline());
 
     Ok(BackgroundLoops {
         raft_ready_rx,
         _lease_renewal,
-        _event_plane,
+        _event_plane_shutdown,
     })
 }

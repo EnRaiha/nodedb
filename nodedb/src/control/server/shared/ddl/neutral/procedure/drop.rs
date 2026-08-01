@@ -49,13 +49,16 @@ pub fn drop_procedure(
     }
     let name = parts[idx].to_lowercase().trim_end_matches(';').to_string();
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 
     // Pre-check existence so `IF EXISTS` on a missing procedure is
     // a clean no-op that never touches raft.
     let exists_before = catalog
-        .get_procedure(tenant_id, &name)
+        .get_procedure_in_database(database_id, tenant_id, &name)
         .map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: format!("catalog read: {e}"),
@@ -72,6 +75,7 @@ pub fn drop_procedure(
     }
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteProcedure {
+        database_id,
         tenant_id,
         name: name.clone(),
     };
@@ -82,7 +86,7 @@ pub fn drop_procedure(
         })?;
     if log_index == 0 {
         let _ = catalog
-            .delete_procedure(tenant_id, &name)
+            .delete_procedure_in_database(database_id, tenant_id, &name)
             .map_err(|e| DdlError {
                 sqlstate: "XX000".to_string(),
                 message: format!("catalog write: {e}"),
@@ -93,6 +97,8 @@ pub fn drop_procedure(
     {
         use nodedb_types::sync::wire::DefinitionSyncMsg;
         let msg = DefinitionSyncMsg {
+            tenant_id,
+            database_id: database_id.as_u64(),
             definition_type: "procedure".into(),
             name: name.clone(),
             action: "delete".into(),

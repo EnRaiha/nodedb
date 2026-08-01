@@ -372,6 +372,7 @@ pub fn validate_auth_refs(predicate: &RlsPredicate) -> crate::Result<()> {
         "auth_method",
         "auth_time",
         "session_id",
+        "database_id",
     ];
 
     fn check(pred: &RlsPredicate, known: &[&str]) -> crate::Result<()> {

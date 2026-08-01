@@ -90,7 +90,11 @@ impl DeltaPackager {
         }
 
         // Check if any connected Lite session cares about this collection.
-        if !delivery.has_subscribers(event.tenant_id.as_u64(), &event.collection) {
+        if !delivery.has_subscribers(
+            event.tenant_id.as_u64(),
+            event.database_id,
+            &event.collection,
+        ) {
             self.deltas_skipped.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -122,6 +126,7 @@ impl DeltaPackager {
         let sequence = self.sequences.next(&event.collection);
 
         let delta = OutboundDelta {
+            database_id: event.database_id,
             collection: event.collection.to_string(),
             document_id: event.row_id.as_str().to_string(),
             payload,
@@ -132,7 +137,7 @@ impl DeltaPackager {
             sequence,
         };
 
-        delivery.enqueue(event.tenant_id.as_u64(), delta);
+        delivery.enqueue(delta);
         self.deltas_packaged.fetch_add(1, Ordering::Relaxed);
 
         trace!(
@@ -156,7 +161,7 @@ impl Default for DeltaPackager {
 mod tests {
     use super::*;
     use crate::event::types::RowId;
-    use crate::types::{Lsn, TenantId, VShardId};
+    use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
     use std::sync::Arc;
 
     fn make_event(source: EventSource, op: WriteOp) -> WriteEvent {
@@ -166,6 +171,7 @@ mod tests {
             op,
             row_id: RowId::new("o-1"),
             lsn: Lsn::new(100),
+            database_id: DatabaseId::new(7),
             tenant_id: TenantId::new(1),
             vshard_id: VShardId::new(0),
             source,

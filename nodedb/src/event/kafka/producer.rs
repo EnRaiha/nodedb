@@ -30,6 +30,7 @@ use crate::event::cdc::consume::{ConsumeParams, consume_local};
 ///
 /// Returns the `JoinHandle` for lifecycle management (abort on DROP CHANGE STREAM).
 pub fn spawn_kafka_task(
+    database_id: crate::types::DatabaseId,
     stream_name: String,
     tenant_id: u64,
     config: KafkaDeliveryConfig,
@@ -75,6 +76,7 @@ pub fn spawn_kafka_task(
             tokio::select! {
                 _ = tokio::time::sleep(poll_interval) => {
                     let consume_params = ConsumeParams {
+                        database_id,
                         tenant_id,
                         stream_name: &stream_name,
                         group_name: &group_name,
@@ -104,11 +106,11 @@ pub fn spawn_kafka_task(
                             Ok(p) => p,
                             Err(e) => {
                                 warn!(error = %e, "failed to serialize event for Kafka");
-                                continue;
+                                break;
                             }
                         };
 
-                        let key = format!("{}:{}", event.partition, event.lsn);
+                        let key = format!("{}:{}", event.partition, event.offset_token());
                         let record = rdkafka::producer::FutureRecord::to(&config.topic)
                             .key(&key)
                             .payload(&payload);
@@ -138,13 +140,23 @@ pub fn spawn_kafka_task(
 
                     // Commit consumer offsets for successfully published events.
                     if published > 0 {
-                        for (partition_id, lsn) in &events.partition_offsets {
+                        let mut tails = std::collections::HashMap::new();
+                        for event in events.events.iter().take(published as usize) {
+                            let entry = tails
+                                .entry(event.partition)
+                                .or_insert(crate::event::cdc::CdcOffset::ZERO);
+                            if event.position() > *entry {
+                                *entry = event.position();
+                            }
+                        }
+                        for (partition_id, offset) in tails {
                             let _ = shared_state.offset_store.commit_offset(
+                                database_id,
                                 tenant_id,
                                 &stream_name,
                                 &group_name,
-                                *partition_id,
-                                *lsn,
+                                partition_id,
+                                offset,
                             );
                         }
                         trace!(

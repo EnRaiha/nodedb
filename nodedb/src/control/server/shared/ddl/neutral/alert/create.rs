@@ -141,6 +141,7 @@ pub fn create_alert(
     {
         let delta_payload = zerompk::to_msgpack_vec(&def).unwrap_or_default();
         let delta = crate::event::crdt_sync::types::OutboundDelta {
+            database_id,
             collection: ALERT_RULES_CRDT_COLLECTION.into(),
             document_id: def.name.clone(),
             payload: delta_payload,
@@ -150,7 +151,7 @@ pub fn create_alert(
             peer_id: state.node_id,
             sequence: 0,
         };
-        state.crdt_sync_delivery.enqueue(tenant_id, delta);
+        state.crdt_sync_delivery.enqueue(delta);
     }
 
     state.alert_registry.register(def);

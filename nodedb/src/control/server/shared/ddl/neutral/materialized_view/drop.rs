@@ -10,6 +10,7 @@
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 
@@ -25,15 +26,17 @@ fn err(sqlstate: &str, message: String) -> DdlError {
 pub fn materialized_view_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
 ) -> bool {
     let tid = identity.tenant_id.as_u64();
-    state.mv_registry.get_def(tid, name).is_some()
+    state.mv_registry.get_def(database_id, tid, name).is_some()
 }
 
 pub fn drop_materialized_view(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     if parts.len() < 4 {
@@ -60,16 +63,30 @@ pub fn drop_materialized_view(
     // below when no streaming MV of this name exists, preserving IF EXISTS.
     if state
         .mv_registry
-        .get_def(tenant_id.as_u64(), &name)
+        .get_def(database_id, tenant_id.as_u64(), &name)
         .is_some()
     {
-        {
-            let catalog = state.credentials.catalog();
-            catalog
-                .delete_streaming_mv(tenant_id.as_u64(), &name)
-                .map_err(|e| err("XX000", e.to_string()))?;
+        let entry = crate::control::catalog_entry::CatalogEntry::DeleteStreamingMaterializedView {
+            database_id: database_id.as_u64(),
+            tenant_id: tenant_id.as_u64(),
+            name: name.clone(),
+        };
+        let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+            .map_err(|error| err("XX000", format!("metadata propose: {error}")))?;
+        crate::control::catalog_entry::apply::local::apply_locally_if_needed(
+            state, &entry, log_index,
+        );
+        if log_index == 0 {
+            state
+                .mv_registry
+                .unregister(database_id, tenant_id.as_u64(), &name);
+            state.permissions.install_replicated_remove_owner_in_database(
+                crate::control::security::catalog::auth_types::object_type::STREAMING_MATERIALIZED_VIEW,
+                database_id.as_u64(),
+                tenant_id.as_u64(),
+                &name,
+            );
         }
-        state.mv_registry.unregister(tenant_id.as_u64(), &name);
         tracing::info!(view = name, "streaming materialized view dropped");
         return Ok(vec![DdlResult::Status {
             command: "DROP MATERIALIZED VIEW".to_string(),

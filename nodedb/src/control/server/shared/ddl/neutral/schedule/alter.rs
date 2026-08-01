@@ -24,6 +24,7 @@ use super::super::auth_support::status;
 pub fn alter_schedule(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     name: &str,
     action: &str,
     cron_expr: Option<&str>,
@@ -33,7 +34,7 @@ pub fn alter_schedule(
     // Look up the schedule in the registry.
     let mut def = state
         .schedule_registry
-        .get(tenant_id, name)
+        .get(database_id, tenant_id, name)
         .ok_or_else(|| DdlError {
             sqlstate: "42704".to_string(),
             message: format!("schedule \"{name}\" does not exist"),

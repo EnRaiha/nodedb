@@ -14,7 +14,10 @@ use nodedb_sql::parser::preprocess::lex::{
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::auth_context::AuthContext;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::types::TenantId;
 
 use super::super::core::NodeDbPgHandler;
@@ -51,10 +54,26 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         tenant_id: TenantId,
         database_id: DatabaseId,
+        auth: &AuthContext,
     ) -> PgWireResult<()> {
         let Some((coll_name, is_insert)) = extract_collection_from_sql(sql) else {
             return Ok(());
         };
+
+        // CHECK evaluation is on the write path. Authorize its target before
+        // catalog lookup or an OLD-row read so unauthorized SQL cannot probe
+        // collection metadata or row existence.
+        let audit = ArcAuditEmitter(std::sync::Arc::clone(&self.state.audit));
+        authorize_collection(
+            identity,
+            database_id,
+            &coll_name,
+            Permission::Write,
+            &self.state.permissions,
+            &self.state.roles,
+            &audit,
+        )
+        .map_err(|error| pgwire_err("42501", error.resource()))?;
 
         // Look up collection and its CHECK constraints.
         let catalog = self.state.credentials.catalog();
@@ -81,12 +100,18 @@ impl NodeDbPgHandler {
         if !is_insert && let Some(doc_id) = extract_where_id(sql) {
             let old = crate::control::trigger::dml_hook::fetch_old_row(
                 &self.state,
+                identity,
                 database_id,
-                tenant_id,
+                auth,
                 &coll_name,
                 &doc_id,
             )
-            .await;
+            .await
+            .map_err(|error| {
+                let (_, sqlstate, message) =
+                    crate::control::server::pgwire::types::error_to_sqlstate(&error);
+                pgwire_err(sqlstate, &message)
+            })?;
             let mut merged = old;
             for (k, v) in &fields {
                 merged.insert(k.clone(), v.clone());

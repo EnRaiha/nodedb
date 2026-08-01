@@ -14,7 +14,9 @@ use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::session::{SessionId, SessionStore};
+use crate::control::server::shared::session::{
+    SessionId, SessionStore, TransactionState, TxnDataPlane, lifecycle,
+};
 use crate::control::state::SharedState;
 
 use super::super::super::types::sqlstate_error;
@@ -23,12 +25,13 @@ use super::super::super::types::sqlstate_error;
 ///
 /// `sessions` must be the per-handler `SessionStore` so the transaction and
 /// prepared-statement state for this connection can be reset atomically.
-pub fn handle_use_database(
+pub async fn handle_use_database(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     sessions: &SessionStore,
     session_id: SessionId,
     name: &str,
+    dp: &impl TxnDataPlane,
 ) -> PgWireResult<Vec<Response>> {
     let catalog = state.credentials.catalog();
 
@@ -55,7 +58,20 @@ pub fn handle_use_database(
         ));
     }
 
-    // Session reset: abort open transaction, invalidate prepared statements.
+    // Validation above intentionally precedes every cleanup operation: an
+    // invalid or unauthorized target must leave the current session untouched.
+    // Use the neutral rollback lifecycle while its transaction identity remains
+    // available so reservations, GAP_FREE handles, overlays, buffered NOTIFYs,
+    // and ordinary transaction cursors receive their established cleanup.
+    if sessions.transaction_state(session_id) != TransactionState::Idle {
+        lifecycle::run_rollback(sessions, session_id, identity, state, dp).await;
+    }
+
+    // LISTEN handles are database-scoped authority. Remove their receivers from
+    // the bus before changing the mutable database binding.
+    sessions.unlisten_all_channels(session_id, &state.notify_bus);
+
+    // Clear remaining session-local state and bind the validated database.
     sessions.reset_for_database_switch(session_id, db_id);
 
     state.audit_record_with_db(

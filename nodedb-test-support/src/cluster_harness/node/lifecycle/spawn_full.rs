@@ -16,7 +16,7 @@ use nodedb::config::auth::AuthMode;
 use nodedb::config::server::ClusterSettings;
 use nodedb::control::server::pgwire::listener::PgListener;
 use nodedb::control::state::SharedState;
-use nodedb::event::{EventPlane, create_event_bus};
+use nodedb::event::{EventPlane, EventPlaneConfig, create_event_bus};
 use nodedb::wal::WalManager;
 
 use crate::cluster_harness::cluster::ClusterSpawnConfig;
@@ -270,15 +270,18 @@ impl TestClusterNode {
         let trigger_dlq = Arc::new(std::sync::Mutex::new(
             nodedb::event::trigger::TriggerDlq::open(&data_dir_path)?,
         ));
-        let event_plane = EventPlane::spawn(
-            event_consumers,
-            Arc::clone(&wal),
+        let (pg_shutdown_bus, _) =
+            nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
+        let event_plane = EventPlane::spawn(EventPlaneConfig {
+            consumers_rx: event_consumers,
+            wal: Arc::clone(&wal),
             watermark_store,
-            Arc::clone(&shared),
+            shared_state: Arc::clone(&shared),
             trigger_dlq,
-            Arc::clone(&shared.cdc_router),
-            Arc::clone(&shared.shutdown),
-        );
+            cdc_router: Arc::clone(&shared.cdc_router),
+            shutdown: Arc::clone(&shared.shutdown),
+            shutdown_bus: pg_shutdown_bus.clone(),
+        });
 
         // Start Raft + install MetadataCommitApplier.
         let (cluster_shutdown_tx, cluster_shutdown_rx) = tokio::sync::watch::channel(false);
@@ -339,8 +342,6 @@ impl TestClusterNode {
         // accepts immediately without a startup-phase delay.
         let pg_listener = PgListener::bind("127.0.0.1:0".parse()?).await?;
         let pg_addr = pg_listener.local_addr();
-        let (pg_shutdown_bus, _) =
-            nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
         let shared_pg = Arc::clone(&shared);
         let test_startup_gate = Arc::clone(&shared.startup);
         let bus_pg = pg_shutdown_bus.clone();

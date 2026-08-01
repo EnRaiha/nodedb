@@ -311,6 +311,7 @@ impl CoreLoop {
             }
 
             if accepted > 0 {
+                // no-determinism: Instant::now runs only for the operational idle/checkpoint timer in Immediate mode and is skipped in Calvin staged apply.
                 self.last_ts_ingest = Some(std::time::Instant::now());
             }
 

@@ -13,10 +13,10 @@
 //! is re-planned. Unrelated DDLs no longer invalidate unrelated
 //! cached plans the way a global schema counter would.
 //!
-//! The set is ordered and de-duped by `(object_type, tenant_id,
-//! name)` so two plans that touch the same descriptors in the
-//! same version produce byte-identical cache keys regardless of
-//! resolution order.
+//! The set is ordered and de-duped by `(object_type, database_id,
+//! tenant_id, name)` so two plans that touch the same descriptors
+//! in the same version produce byte-identical cache keys regardless
+//! of resolution order.
 
 use nodedb_cluster::DescriptorId;
 
@@ -24,8 +24,8 @@ use nodedb_cluster::DescriptorId;
 /// the planner read while compiling a plan.
 ///
 /// Stable == entries are sorted by the
-/// `(kind, tenant_id, name)` tuple so equality comparisons
-/// between two sets are insertion-order independent. De-duped
+/// `(kind, database_id, tenant_id, name)` tuple so equality
+/// comparisons between two sets are insertion-order independent. De-duped
 /// == a second insertion of the same descriptor id with the
 /// same version is a no-op; a second insertion with a
 /// different version panics (in debug) / replaces (in release)
@@ -33,7 +33,7 @@ use nodedb_cluster::DescriptorId;
 /// different versions of the same descriptor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DescriptorVersionSet {
-    /// Sorted by `(kind, tenant_id, name)`.
+    /// Sorted by `(kind, database_id, tenant_id, name)`.
     entries: Vec<(DescriptorId, u64)>,
 }
 
@@ -99,9 +99,14 @@ impl DescriptorVersionSet {
 
 /// Total-order comparison for `DescriptorId` since the cluster
 /// type does not derive `Ord` (only `Hash + Eq`). We define our
-/// own by `(kind discriminant, tenant_id, name)`.
+/// own by `(kind discriminant, database_id, tenant_id, name)`.
 fn cmp_id(a: &DescriptorId, b: &DescriptorId) -> std::cmp::Ordering {
-    (a.kind as u8, a.tenant_id, &a.name).cmp(&(b.kind as u8, b.tenant_id, &b.name))
+    (a.kind as u8, a.database_id, a.tenant_id, &a.name).cmp(&(
+        b.kind as u8,
+        b.database_id,
+        b.tenant_id,
+        &b.name,
+    ))
 }
 
 #[cfg(test)]
@@ -110,7 +115,7 @@ mod tests {
     use nodedb_cluster::DescriptorKind;
 
     fn id(name: &str) -> DescriptorId {
-        DescriptorId::new(1, DescriptorKind::Collection, name.to_string())
+        DescriptorId::new(0, 1, DescriptorKind::Collection, name.to_string())
     }
 
     #[test]
@@ -131,10 +136,29 @@ mod tests {
         let mut set = DescriptorVersionSet::new();
         set.record(id("orders"), 1);
         set.record(
-            DescriptorId::new(1, DescriptorKind::Function, "orders".to_string()),
+            DescriptorId::new(0, 1, DescriptorKind::Function, "orders".to_string()),
             1,
         );
         assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn same_name_in_different_databases_coexist_in_stable_order() {
+        let mut set = DescriptorVersionSet::new();
+        set.record(
+            DescriptorId::new(9, 1, DescriptorKind::Collection, "orders"),
+            2,
+        );
+        set.record(
+            DescriptorId::new(3, 1, DescriptorKind::Collection, "orders"),
+            1,
+        );
+
+        let entries: Vec<_> = set
+            .iter()
+            .map(|(id, version)| (id.database_id, version))
+            .collect();
+        assert_eq!(entries, vec![(3, 1), (9, 2)]);
     }
 
     #[test]

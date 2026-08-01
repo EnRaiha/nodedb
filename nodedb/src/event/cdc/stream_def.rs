@@ -2,6 +2,8 @@
 
 //! Change stream definition: persistent configuration for a CDC stream.
 
+use crate::types::DatabaseId;
+
 /// Which operations to include in the stream.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct OpFilter {
@@ -165,6 +167,10 @@ impl CompactionConfig {
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 #[msgpack(map, allow_unknown_fields)]
 pub struct ChangeStreamDef {
+    /// Database that owns this stream. Legacy MessagePack definitions without
+    /// this field decode into the built-in default database.
+    #[msgpack(default)]
+    pub database_id: DatabaseId,
     /// Tenant that owns this stream.
     pub tenant_id: u64,
     /// Stream name (unique per tenant).
@@ -226,6 +232,7 @@ mod tests {
     #[test]
     fn wildcard_matches_all() {
         let def = ChangeStreamDef {
+            database_id: DatabaseId::new(7),
             tenant_id: 1,
             name: "all".into(),
             collection: "*".into(),
@@ -247,6 +254,7 @@ mod tests {
     #[test]
     fn specific_collection_filter() {
         let def = ChangeStreamDef {
+            database_id: DatabaseId::new(7),
             tenant_id: 1,
             name: "orders_stream".into(),
             collection: "orders".into(),

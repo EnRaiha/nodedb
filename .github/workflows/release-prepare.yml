@@ -41,10 +41,48 @@ jobs:
     needs: validate-version
     uses: ./.github/workflows/test.yml
 
+  sbom:
+    name: Generate release SBOM
+    needs: validate-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Stamp release source and generate CycloneDX SBOM
+        env:
+          VERSION: ${{ needs.validate-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct "$GITHUB_SHA")"
+          bash scripts/ci/stamp_version.sh "$VERSION"
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx \
+            --manifest-path nodedb/Cargo.toml \
+            --format json \
+            --spec-version 1.5 \
+            --all-features \
+            --target all \
+            --override-filename nodedb-${VERSION}-sbom.cdx
+          test -f nodedb/nodedb-${VERSION}-sbom.cdx.json
+          python3 -m json.tool nodedb/nodedb-${VERSION}-sbom.cdx.json > /dev/null
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nodedb-sbom
+          path: nodedb/nodedb-${{ needs.validate-version.outputs.version }}-sbom.cdx.json
+          retention-days: 14
+
   build-server:
     name: Build server (${{ matrix.label }})
     needs: [validate-version, ci]
     runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -56,14 +94,14 @@ jobs:
             target: aarch64-unknown-linux-gnu
             label: linux-arm64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: server-${{ matrix.target }}
 
@@ -87,15 +125,22 @@ jobs:
           tar czf nodedb-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.tar.gz nodedb
           ls -lh nodedb-*.tar.gz
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            target/${{ matrix.target }}/release/nodedb
+            target/${{ matrix.target }}/release/nodedb-${{ needs.validate-version.outputs.version }}-${{ matrix.label }}.tar.gz
+
       # Two artifacts per arch: the tarball ships in the GitHub Release, the
       # bare binary is the Docker build context. Same bytes, different shape.
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: server-${{ matrix.label }}
           path: target/${{ matrix.target }}/release/nodedb-*.tar.gz
           retention-days: 14
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: binary-${{ matrix.label }}
           path: target/${{ matrix.target }}/release/nodedb
@@ -103,7 +148,7 @@ jobs:
 
   summary:
     name: Release instructions
-    needs: [validate-version, build-server]
+    needs: [validate-version, build-server, sbom]
     runs-on: ubuntu-latest
     steps:
       - name: Write summary

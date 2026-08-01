@@ -12,6 +12,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 
@@ -19,6 +20,7 @@ use super::super::super::result::{DdlError, DdlResult};
 pub fn show_change_streams(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
@@ -31,7 +33,9 @@ pub fn show_change_streams(
         "created_at".to_string(),
     ];
 
-    let streams = state.stream_registry.list_for_tenant(tenant_id);
+    let streams = state
+        .stream_registry
+        .list_for_database_tenant(database_id, tenant_id);
 
     let mut rows = Vec::with_capacity(streams.len());
     for s in &streams {

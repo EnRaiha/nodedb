@@ -2,6 +2,10 @@
 
 //! Type definitions for user-defined function catalog storage.
 
+use nodedb_types::id::DatabaseId;
+
+use super::dependencies::Dependency;
+
 /// Parameter definition for a user-defined function.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 pub struct FunctionParam {
@@ -100,6 +104,9 @@ impl FunctionLanguage {
 #[msgpack(map, allow_unknown_fields)]
 pub struct StoredFunction {
     pub tenant_id: u64,
+    /// Database namespace. Missing in legacy records means `default`.
+    #[msgpack(default)]
+    pub database_id: DatabaseId,
     pub name: String,
     pub parameters: Vec<FunctionParam>,
     /// SQL return type name (e.g. "TEXT", "FLOAT", "BOOLEAN").
@@ -122,6 +129,15 @@ pub struct StoredFunction {
     /// Used to look up the binary in the `_system.wasm_modules` table.
     #[msgpack(default)]
     pub wasm_hash: Option<String>,
+    /// WASM bytes carried only in a replicated `PutFunction` proposal.
+    /// Catalog persistence clears this field after the content-addressed blob
+    /// has been installed locally by the entry applier.
+    #[msgpack(default)]
+    pub wasm_module: Option<Vec<u8>>,
+    /// Complete dependency list carried with every replicated function
+    /// definition. Missing from legacy proposals and catalog rows means none.
+    #[msgpack(default)]
+    pub dependencies: Vec<Dependency>,
     /// Fuel budget for WASM functions (default 1_000_000).
     #[msgpack(default = "default_wasm_fuel")]
     pub wasm_fuel: u64,

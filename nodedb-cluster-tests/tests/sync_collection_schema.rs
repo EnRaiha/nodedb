@@ -24,6 +24,7 @@ use common::cluster_harness::{TestCluster, TestClusterNode};
 use std::time::{Duration, Instant};
 
 use nodedb::control::server::sync::listener::{SyncListenerConfig, start_sync_listener};
+use nodedb::control::shutdown::{ShutdownBus, ShutdownWatch};
 use nodedb_test_support::sync_client::SyncTestClient;
 use nodedb_types::collection_config::{PartitionStrategy, PrimaryEngine};
 use nodedb_types::columnar::{ColumnDef, ColumnType, StrictSchema};
@@ -101,9 +102,15 @@ async fn announced_schema_materializes_on_every_node() {
         listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         ..Default::default()
     };
-    let state = start_sync_listener(cfg, Some(std::sync::Arc::clone(&cluster.nodes[0].shared)))
-        .await
-        .expect("start sync listener on node 0");
+    let (shutdown_bus, _shutdown_handle) =
+        ShutdownBus::new(std::sync::Arc::new(ShutdownWatch::new()));
+    let state = start_sync_listener(
+        cfg,
+        Some(std::sync::Arc::clone(&cluster.nodes[0].shared)),
+        shutdown_bus,
+    )
+    .await
+    .expect("start sync listener on node 0");
     let addr = state.config.listen_addr;
 
     let mut client = SyncTestClient::connect(addr)

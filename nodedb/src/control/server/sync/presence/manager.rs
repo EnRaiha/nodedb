@@ -18,6 +18,8 @@ use tracing::{debug, info, warn};
 
 use nodedb_types::sync::wire::{PresenceUpdateMsg, SyncFrame, SyncMessageType};
 
+use crate::types::{DatabaseId, TenantId};
+
 use super::channel::ChannelState;
 use super::types::{PeerState, PresenceConfig};
 
@@ -99,10 +101,29 @@ impl OutboundFrames {
     }
 }
 
-/// Central presence manager for all channels on this node.
+/// Internal channel identity. The client-visible name stays on `ChannelState`
+/// and its outbound payloads, while membership is always tenant/database scoped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ChannelKey {
+    tenant_id: TenantId,
+    database_id: DatabaseId,
+    name: String,
+}
+
+impl ChannelKey {
+    fn new(tenant_id: TenantId, database_id: DatabaseId, name: &str) -> Self {
+        Self {
+            tenant_id,
+            database_id,
+            name: name.to_owned(),
+        }
+    }
+}
+
+/// Central presence manager for all scoped channels on this node.
 pub struct PresenceManager {
-    channels: HashMap<String, ChannelState>,
-    session_channels: HashMap<String, HashSet<String>>,
+    channels: HashMap<ChannelKey, ChannelState>,
+    session_channels: HashMap<String, HashSet<ChannelKey>>,
     /// Senders are public so `OutboundFrames::send_all` can access them
     /// after the caller drops the write lock.
     senders: HashMap<String, SessionSender>,
@@ -140,26 +161,26 @@ impl PresenceManager {
         self.senders.remove(session_id);
         let mut outbound = OutboundFrames::new();
 
-        let channel_names = match self.session_channels.remove(session_id) {
-            Some(names) => names,
+        let channel_keys = match self.session_channels.remove(session_id) {
+            Some(keys) => keys,
             None => return outbound,
         };
 
         let mut empty_channels = Vec::new();
-        for channel_name in &channel_names {
-            if let Some(channel) = self.channels.get_mut(channel_name) {
+        for channel_key in &channel_keys {
+            if let Some(channel) = self.channels.get_mut(channel_key) {
                 if let Some(leave) = channel.remove_peer(session_id)
                     && let Some(bytes) = serialize_frame(SyncMessageType::PresenceLeave, &leave)
                 {
                     outbound.add_broadcast_all(channel, bytes);
                 }
                 if channel.is_empty() {
-                    empty_channels.push(channel_name.clone());
+                    empty_channels.push(channel_key.clone());
                 }
             }
         }
-        for name in &empty_channels {
-            self.channels.remove(name);
+        for key in &empty_channels {
+            self.channels.remove(key);
         }
 
         outbound
@@ -171,15 +192,18 @@ impl PresenceManager {
         &mut self,
         session_id: &str,
         user_id: &str,
+        tenant_id: TenantId,
+        database_id: DatabaseId,
         msg: &PresenceUpdateMsg,
     ) -> OutboundFrames {
         let mut outbound = OutboundFrames::new();
+        let channel_key = ChannelKey::new(tenant_id, database_id, &msg.channel);
 
         let session_channel_count = self.session_channels.get(session_id).map_or(0, |s| s.len());
         let is_new_channel = !self
             .session_channels
             .get(session_id)
-            .is_some_and(|s| s.contains(&msg.channel));
+            .is_some_and(|s| s.contains(&channel_key));
 
         if is_new_channel && session_channel_count >= self.config.max_channels_per_session {
             warn!(
@@ -192,7 +216,7 @@ impl PresenceManager {
         }
 
         if is_new_channel
-            && let Some(ch) = self.channels.get(&msg.channel)
+            && let Some(ch) = self.channels.get(&channel_key)
             && ch.peer_count() >= self.config.max_subscribers_per_channel
         {
             warn!(
@@ -213,14 +237,14 @@ impl PresenceManager {
 
         let channel = self
             .channels
-            .entry(msg.channel.clone())
+            .entry(channel_key.clone())
             .or_insert_with(|| ChannelState::new(msg.channel.clone()));
         let broadcast = channel.upsert_peer(session_id, peer);
 
         self.session_channels
             .entry(session_id.to_owned())
             .or_default()
-            .insert(msg.channel.clone());
+            .insert(channel_key);
 
         if let Some(bytes) = serialize_frame(SyncMessageType::PresenceBroadcast, &broadcast) {
             outbound.add_broadcast(channel, session_id, bytes);
@@ -241,21 +265,30 @@ impl PresenceManager {
     /// Called from ShapeSubscribe to auto-join the presence channel for the
     /// shape's collection+doc. The session will receive broadcasts from other
     /// peers but won't appear as present until it sends a PresenceUpdate.
-    pub fn subscribe_to_channel(&mut self, session_id: &str, channel: &str) {
-        let session_channel_count = self.session_channels.get(session_id).map_or(0, |s| s.len());
-        if session_channel_count >= self.config.max_channels_per_session {
+    pub fn subscribe_to_channel(
+        &mut self,
+        session_id: &str,
+        tenant_id: TenantId,
+        database_id: DatabaseId,
+        channel: &str,
+    ) {
+        let channel_key = ChannelKey::new(tenant_id, database_id, channel);
+        let session_channels = self
+            .session_channels
+            .entry(session_id.to_owned())
+            .or_default();
+        if !session_channels.contains(&channel_key)
+            && session_channels.len() >= self.config.max_channels_per_session
+        {
             return;
         }
 
-        // Ensure channel exists.
+        // Ensure this authenticated scope's channel exists.
         self.channels
-            .entry(channel.to_owned())
+            .entry(channel_key.clone())
             .or_insert_with(|| ChannelState::new(channel.to_owned()));
 
-        self.session_channels
-            .entry(session_id.to_owned())
-            .or_default()
-            .insert(channel.to_owned());
+        session_channels.insert(channel_key);
     }
 
     /// Sweep expired peers. Returns outbound leave frames.
@@ -269,7 +302,7 @@ impl PresenceManager {
         // We have `channel` from the iterator — use it directly for targets.
         let mut pending_leaves: Vec<(Vec<String>, SharedBytes)> = Vec::new();
 
-        for (channel_name, channel) in &mut self.channels {
+        for (channel_key, channel) in &mut self.channels {
             let leaves = channel.sweep_expired(ttl);
             total_evicted += leaves.len();
             for leave in &leaves {
@@ -281,7 +314,7 @@ impl PresenceManager {
                 }
             }
             if channel.is_empty() {
-                empty_channels.push(channel_name.clone());
+                empty_channels.push(channel_key.clone());
             }
         }
 
@@ -292,16 +325,16 @@ impl PresenceManager {
             }
         }
 
-        for name in &empty_channels {
-            self.channels.remove(name);
+        for key in &empty_channels {
+            self.channels.remove(key);
         }
 
         if total_evicted > 0 {
             let channels_ref = &self.channels;
             self.session_channels.retain(|sid, session_chs| {
-                session_chs.retain(|ch_name| {
+                session_chs.retain(|channel_key| {
                     channels_ref
-                        .get(ch_name)
+                        .get(channel_key)
                         .is_some_and(|ch| ch.has_session(sid))
                 });
                 !session_chs.is_empty()
@@ -355,23 +388,24 @@ mod tests {
     fn update_broadcasts_to_others() {
         let (mut mgr, _rx1, mut rx2) = setup();
 
-        // s1 joins channel.
         let outbound = mgr.handle_update(
             "s1",
             "alice",
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
             &PresenceUpdateMsg {
                 channel: "doc:d1".into(),
                 state: vec![0x01],
             },
         );
-        // s2 not in channel yet, no targets.
         outbound.send_all(mgr.senders());
         assert!(rx2.try_recv().is_err());
 
-        // s2 joins.
         let outbound = mgr.handle_update(
             "s2",
             "bob",
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
             &PresenceUpdateMsg {
                 channel: "doc:d1".into(),
                 state: vec![0x02],
@@ -379,10 +413,11 @@ mod tests {
         );
         outbound.send_all(mgr.senders());
 
-        // s1 updates — s2 receives broadcast.
         let outbound = mgr.handle_update(
             "s1",
             "alice",
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
             &PresenceUpdateMsg {
                 channel: "doc:d1".into(),
                 state: vec![0x01],
@@ -404,6 +439,8 @@ mod tests {
         let out = mgr.handle_update(
             "s1",
             "alice",
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
             &PresenceUpdateMsg {
                 channel: "doc:d1".into(),
                 state: vec![],
@@ -413,6 +450,8 @@ mod tests {
         let out = mgr.handle_update(
             "s2",
             "bob",
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
             &PresenceUpdateMsg {
                 channel: "doc:d1".into(),
                 state: vec![],
@@ -441,30 +480,18 @@ mod tests {
         let (tx, _rx) = mpsc::channel(64);
         mgr.register_session("s1".into(), SessionSender::new(tx));
 
-        mgr.handle_update(
-            "s1",
-            "alice",
-            &PresenceUpdateMsg {
-                channel: "ch1".into(),
-                state: vec![],
-            },
-        );
-        mgr.handle_update(
-            "s1",
-            "alice",
-            &PresenceUpdateMsg {
-                channel: "ch2".into(),
-                state: vec![],
-            },
-        );
-        mgr.handle_update(
-            "s1",
-            "alice",
-            &PresenceUpdateMsg {
-                channel: "ch3".into(),
-                state: vec![],
-            },
-        );
+        for channel in ["ch1", "ch2", "ch3"] {
+            mgr.handle_update(
+                "s1",
+                "alice",
+                TenantId::new(1),
+                DatabaseId::DEFAULT,
+                &PresenceUpdateMsg {
+                    channel: channel.into(),
+                    state: vec![],
+                },
+            );
+        }
 
         assert_eq!(mgr.session_channels.get("s1").unwrap().len(), 2);
     }
@@ -481,7 +508,11 @@ mod tests {
 
         let channel = mgr
             .channels
-            .entry("doc:d1".into())
+            .entry(ChannelKey::new(
+                TenantId::new(1),
+                DatabaseId::DEFAULT,
+                "doc:d1",
+            ))
             .or_insert_with(|| ChannelState::new("doc:d1".into()));
         channel.upsert_peer(
             "s1",
@@ -495,7 +526,11 @@ mod tests {
         mgr.session_channels
             .entry("s1".into())
             .or_default()
-            .insert("doc:d1".into());
+            .insert(ChannelKey::new(
+                TenantId::new(1),
+                DatabaseId::DEFAULT,
+                "doc:d1",
+            ));
 
         assert_eq!(mgr.total_peers(), 1);
         let outbound = mgr.sweep_expired();
@@ -511,9 +546,15 @@ mod tests {
         let (tx, _rx) = mpsc::channel(64);
         mgr.register_session("s1".into(), SessionSender::new(tx));
 
-        mgr.subscribe_to_channel("s1", "doc:d1");
-        assert!(mgr.channels.contains_key("doc:d1"));
-        assert!(mgr.session_channels.get("s1").unwrap().contains("doc:d1"));
+        let channel_key = ChannelKey::new(TenantId::new(1), DatabaseId::DEFAULT, "doc:d1");
+        mgr.subscribe_to_channel("s1", TenantId::new(1), DatabaseId::DEFAULT, "doc:d1");
+        assert!(mgr.channels.contains_key(&channel_key));
+        assert!(
+            mgr.session_channels
+                .get("s1")
+                .unwrap()
+                .contains(&channel_key)
+        );
     }
 
     #[test]
@@ -522,6 +563,8 @@ mod tests {
         let out = mgr.handle_update(
             "s1",
             "alice",
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
             &PresenceUpdateMsg {
                 channel: "ch1".into(),
                 state: vec![],
@@ -531,6 +574,8 @@ mod tests {
         let out = mgr.handle_update(
             "s2",
             "bob",
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
             &PresenceUpdateMsg {
                 channel: "ch1".into(),
                 state: vec![],
@@ -543,5 +588,67 @@ mod tests {
 
         assert_eq!(mgr.channel_count(), 0);
         assert_eq!(mgr.total_peers(), 0);
+    }
+
+    #[test]
+    fn same_channel_is_isolated_between_tenants() {
+        let (mut mgr, mut rx1, mut rx2) = setup();
+        let update = || PresenceUpdateMsg {
+            channel: "doc:shared".into(),
+            state: vec![],
+        };
+
+        let outbound = mgr.handle_update(
+            "s1",
+            "alice",
+            TenantId::new(1),
+            DatabaseId::DEFAULT,
+            &update(),
+        );
+        outbound.send_all(mgr.senders());
+        let outbound = mgr.handle_update(
+            "s2",
+            "bob",
+            TenantId::new(2),
+            DatabaseId::DEFAULT,
+            &update(),
+        );
+        outbound.send_all(mgr.senders());
+
+        assert!(rx1.try_recv().is_err());
+        assert!(rx2.try_recv().is_err());
+        assert_eq!(mgr.channel_count(), 2);
+        assert_eq!(mgr.total_peers(), 2);
+    }
+
+    #[test]
+    fn same_channel_is_isolated_between_databases() {
+        let (mut mgr, mut rx1, mut rx2) = setup();
+        let update = |channel: &str| PresenceUpdateMsg {
+            channel: channel.into(),
+            state: vec![],
+        };
+
+        let outbound = mgr.handle_update(
+            "s1",
+            "alice",
+            TenantId::new(1),
+            DatabaseId::new(7),
+            &update("doc:shared"),
+        );
+        outbound.send_all(mgr.senders());
+        let outbound = mgr.handle_update(
+            "s2",
+            "bob",
+            TenantId::new(1),
+            DatabaseId::new(8),
+            &update("doc:shared"),
+        );
+        outbound.send_all(mgr.senders());
+
+        assert!(rx1.try_recv().is_err());
+        assert!(rx2.try_recv().is_err());
+        assert_eq!(mgr.channel_count(), 2);
+        assert_eq!(mgr.total_peers(), 2);
     }
 }

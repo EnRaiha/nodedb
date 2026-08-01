@@ -11,6 +11,7 @@
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
@@ -21,16 +22,18 @@ use super::super::auth_support::{require_tenant_admin, status};
 pub fn change_stream_exists(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
 ) -> bool {
     let tid = identity.tenant_id.as_u64();
-    state.stream_registry.get(tid, name).is_some()
+    state.stream_registry.get(database_id, tid, name).is_some()
 }
 
 /// Handle `DROP CHANGE STREAM [IF EXISTS] <name>`
 pub fn drop_change_stream(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     require_tenant_admin(identity, "drop change streams")?;
@@ -58,7 +61,7 @@ pub fn drop_change_stream(
     // method — use `load_all_change_streams` + filter, the set is
     // small and this is a DDL path so cost is irrelevant).
     let existed_before = catalog
-        .get_change_stream(tenant_id, &name)
+        .get_change_stream(database_id, tenant_id, &name)
         .map(|opt| opt.is_some())
         .unwrap_or(false);
     if !existed_before && !if_exists {
@@ -72,6 +75,7 @@ pub fn drop_change_stream(
     }
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteChangeStream {
+        database_id: database_id.as_u64(),
         tenant_id,
         name: name.clone(),
     };
@@ -82,19 +86,26 @@ pub fn drop_change_stream(
         })?;
     if log_index == 0 {
         let _ = catalog
-            .delete_change_stream(tenant_id, &name)
+            .delete_change_stream(database_id, tenant_id, &name)
             .map_err(|e| DdlError {
                 sqlstate: "XX000".to_string(),
                 message: format!("catalog delete: {e}"),
             })?;
-        state.stream_registry.unregister(tenant_id, &name);
-        state.cdc_router.remove_buffer(tenant_id, &name);
+        state
+            .stream_registry
+            .unregister(database_id, tenant_id, &name);
+        state
+            .cdc_router
+            .remove_buffer(database_id, tenant_id, &name);
     }
 
     // Stop webhook delivery task if one was running for this stream.
     // Only the proposing node had a webhook task active; followers
     // never started one. This is the local-only cleanup.
-    state.webhook_manager.stop_task(tenant_id, &name);
+    state
+        .webhook_manager
+        .stop_task(database_id, tenant_id, &name);
+    state.kafka_manager.stop(database_id, tenant_id, &name);
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

@@ -2,24 +2,15 @@
 
 //! `SqlPlan::AlterArray` → `PhysicalTask` lowering.
 //!
-//! All state mutations happen on the Control Plane:
-//! 1. Load current catalog entry (error if not found).
-//! 2. Compute updated fields (apply `minimum_audit_retain_ms` first so the
-//!    floor is current before the re-register step).
-//! 3. Floor validation rejects new `audit_retain_ms` values below the floor.
-//! 4. Update in-memory `ArrayCatalog` (unregister + register).
-//! 5. Persist to `_system.arrays` via redb.
-//! 6. Update `BitemporalRetentionRegistry`.
-//! 7. Emit `MetaOp::AlterArray` — a lightweight ack op so the task travels
-//!    through standard dispatch with `Permission::Admin` classification.
-
-use nodedb_types::config::retention::BitemporalRetention;
+//! Conversion only reads the current catalog entry and validates the requested
+//! change. The authorized dispatch boundary persists the new entry and updates
+//! the runtime retention mirror immediately around execution.
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::array_catalog::ArrayCatalogEntry;
-use crate::engine::bitemporal::registry::BitemporalEngineKind;
 use crate::types::{TenantId, VShardId};
 use nodedb_physical::physical_plan::MetaOp;
+use nodedb_types::config::retention::BitemporalRetention;
 
 use super::convert::ConvertContext;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -37,25 +28,19 @@ pub(super) fn convert_alter_array(
     tenant_id: TenantId,
     ctx: &ConvertContext,
 ) -> crate::Result<Vec<PhysicalTask>> {
+    ctx.require_execute("ALTER ARRAY")?;
     let array_catalog = ctx
         .array_catalog
         .as_ref()
         .ok_or_else(|| crate::Error::PlanError {
             detail: "ALTER ARRAY: no array catalog wired into convert context".into(),
         })?;
-    let credentials = ctx
-        .credentials
-        .as_ref()
-        .ok_or_else(|| crate::Error::PlanError {
-            detail: "ALTER ARRAY: no credential store wired into convert context".into(),
-        })?;
-
     // 1. Load current entry.
     let current: ArrayCatalogEntry = {
         let cat = array_catalog.read().map_err(|_| crate::Error::PlanError {
             detail: "array catalog lock poisoned".into(),
         })?;
-        cat.lookup_by_name(name)
+        cat.lookup_by_name_in_database(tenant_id, ctx.database_id, name)
             .ok_or_else(|| crate::Error::PlanError {
                 detail: format!("ALTER ARRAY {name}: not found"),
             })?
@@ -91,76 +76,9 @@ pub(super) fn convert_alter_array(
         ..current.clone()
     };
 
-    // 4. Update in-memory catalog.
-    {
-        let mut cat = array_catalog.write().map_err(|_| crate::Error::PlanError {
-            detail: "array catalog lock poisoned".into(),
-        })?;
-        cat.unregister(name);
-        cat.register(updated.clone())
-            .map_err(|e| crate::Error::PlanError {
-                detail: format!("ALTER ARRAY {name}: catalog re-register: {e}"),
-            })?;
-    }
-
-    // 5. Persist to system catalog.
-    {
-        let catalog = credentials.catalog();
-        crate::control::array_catalog::persist::persist(catalog, &updated).map_err(|e| {
-            crate::Error::PlanError {
-                detail: format!("ALTER ARRAY {name}: catalog persist: {e}"),
-            }
-        })?;
-    }
-
-    // 6. Update bitemporal retention registry.
-    if let Some(registry) = &ctx.bitemporal_retention_registry {
-        let array_tid = TenantId::new(0);
-        match audit_retain_ms {
-            Some(None) => {
-                registry.unregister(ctx.database_id, array_tid, name);
-            }
-            Some(Some(retain_ms)) => {
-                let retention = BitemporalRetention {
-                    data_retain_ms: 0,
-                    audit_retain_ms: retain_ms as u64,
-                    minimum_audit_retain_ms: new_min,
-                };
-                registry
-                    .register(
-                        ctx.database_id,
-                        array_tid,
-                        name,
-                        BitemporalEngineKind::Array,
-                        retention,
-                    )
-                    .map_err(|e| crate::Error::PlanError {
-                        detail: format!("ALTER ARRAY {name}: registry register: {e}"),
-                    })?;
-            }
-            None => {
-                // audit_retain_ms unchanged; re-register with updated floor if set.
-                if let Some(retain_ms) = updated.audit_retain_ms {
-                    let retention = BitemporalRetention {
-                        data_retain_ms: 0,
-                        audit_retain_ms: retain_ms as u64,
-                        minimum_audit_retain_ms: new_min,
-                    };
-                    registry
-                        .register(
-                            ctx.database_id,
-                            array_tid,
-                            name,
-                            BitemporalEngineKind::Array,
-                            retention,
-                        )
-                        .map_err(|e| crate::Error::PlanError {
-                            detail: format!("ALTER ARRAY {name}: registry re-register: {e}"),
-                        })?;
-                }
-            }
-        }
-    }
+    // `updated` is intentionally not installed here. It is reconstructed and
+    // durably installed by the authorized dispatch boundary.
+    let _updated = updated;
 
     let vshard = VShardId::from_collection_in_database(ctx.database_id, name);
     Ok(vec![PhysicalTask {

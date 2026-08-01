@@ -33,10 +33,15 @@ pub(super) async fn try_string(
     if upper.starts_with("SHOW SCHEDULE HISTORY ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         let name = parts.get(3).copied().unwrap_or("");
-        return Some(schedule::show_schedule_history(state, identity, name));
+        return Some(schedule::show_schedule_history(
+            state,
+            identity,
+            database_id,
+            name,
+        ));
     }
     if upper.starts_with("SHOW SCHEDULE") {
-        return Some(schedule::show_schedules(state, identity));
+        return Some(schedule::show_schedules(state, identity, database_id));
     }
 
     // Alert SHOW. `SHOW ALERT STATUS <name>` parses into a typed
@@ -63,7 +68,11 @@ pub(super) async fn try_string(
     // input). Replicate that exactly here, before the parse gate, so the prefix
     // recognition stays byte-identical.
     if upper.starts_with("SHOW CHANGE STREAM") {
-        return Some(change_stream::show_change_streams(state, identity));
+        return Some(change_stream::show_change_streams(
+            state,
+            identity,
+            database_id,
+        ));
     }
 
     // Consumer groups: `SHOW CONSUMER GROUPS ON <stream>`, `SHOW PARTITIONS ON
@@ -79,16 +88,24 @@ pub(super) async fn try_string(
     if upper.starts_with("SHOW CONSUMER GROUPS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
         return Some(consumer_group::show_consumer_groups(
-            state, identity, &parts,
+            state,
+            identity,
+            database_id,
+            &parts,
         ));
     }
     if upper.starts_with("SHOW PARTITIONS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(consumer_group::show_partitions(state, identity, &parts));
+        return Some(consumer_group::show_partitions(
+            state,
+            identity,
+            database_id,
+            &parts,
+        ));
     }
     if upper.starts_with("COMMIT OFFSET ") || upper.starts_with("COMMIT OFFSETS ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(consumer_group::commit_offset(state, identity, &parts));
+        return Some(consumer_group::commit_offset(state, identity, database_id, &parts).await);
     }
 
     // Topics: `CREATE TOPIC`, `DROP TOPIC`, `SHOW TOPIC(S)`, and `PUBLISH TO`.
@@ -100,17 +117,17 @@ pub(super) async fn try_string(
     // `parts`-based syntax messages stay byte-identical.
     if upper.starts_with("CREATE TOPIC ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(topic::create_topic(state, identity, &parts, sql));
+        return Some(topic::create_topic(state, identity, database_id, &parts, sql).await);
     }
     if upper.starts_with("DROP TOPIC ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(topic::drop_topic(state, identity, &parts));
+        return Some(topic::drop_topic(state, identity, database_id, &parts).await);
     }
     if upper.starts_with("SHOW TOPIC") {
-        return Some(topic::show_topics(state, identity));
+        return Some(topic::show_topics(state, identity, database_id));
     }
     if upper.starts_with("PUBLISH TO ") {
-        return Some(topic::handle_publish(state, identity, sql).await);
+        return Some(topic::handle_publish(state, identity, database_id, sql).await);
     }
 
     // Stream consumption: `SELECT * FROM STREAM <name> CONSUMER GROUP <group>
@@ -123,7 +140,7 @@ pub(super) async fn try_string(
         && upper.contains("CONSUMER GROUP")
     {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(stream_select::select_from_stream(state, identity, &parts).await);
+        return Some(stream_select::select_from_stream(state, identity, database_id, &parts).await);
     }
 
     // Stream/Topic consumption: `SELECT * FROM TOPIC <name> CONSUMER GROUP
@@ -156,17 +173,22 @@ pub(super) async fn try_string(
                 _ => rewritten.push(p),
             }
         }
-        return Some(stream_select::select_from_stream(state, identity, &rewritten).await);
+        return Some(
+            stream_select::select_from_stream(state, identity, database_id, &rewritten).await,
+        );
     }
 
-    // Pub/Sub: `SUBSCRIBE TO <topic> [GROUP <group>] [SINCE <seq>]` (legacy).
-    // Parses into no typed AST variant — the pgwire collaborative router
-    // recognized it by string prefix from the raw token slice. Replicate that
-    // exactly here, before the parse gate, so the prefix recognition stays
-    // byte-identical.
+    // Durable topics: `SUBSCRIBE TO <topic> [GROUP <group>] [SINCE <seq>]`.
+    // Parses into no typed AST variant, so route it before the parse gate.
     if upper.starts_with("SUBSCRIBE TO ") {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        return Some(topic_subscribe::subscribe_to(state, identity, sql, &parts));
+        return Some(topic_subscribe::subscribe_to(
+            state,
+            identity,
+            database_id,
+            sql,
+            &parts,
+        ));
     }
 
     None

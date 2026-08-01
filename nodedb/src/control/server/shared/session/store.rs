@@ -266,7 +266,9 @@ impl SessionStore {
     pub fn reset_for_database_switch(&self, id: impl Into<SessionId>, new_db: DatabaseId) {
         self.write_session(id, |session| {
             session.tx_state = TransactionState::Idle;
+            debug_assert_eq!(session.tx_buffer.len(), session.tx_lease_scopes.len());
             session.tx_buffer.clear();
+            session.tx_lease_scopes.clear();
             session.tx_snapshot_lsn = None;
             session.tx_snapshot_epoch = None;
             session.tx_id = None;
@@ -277,6 +279,13 @@ impl SessionStore {
             session.savepoints.clear();
             session.pending_offset_commits.clear();
             session.pending_notifies.clear();
+            // Cursors may retain rows from the previous database, including
+            // WITH HOLD cursors, so no cursor can survive a database switch.
+            session.cursors.clear();
+            // LIVE subscriptions are bound to the database selected when they
+            // are created. Retaining them across USE DATABASE would deliver
+            // events from the previous database on the new session binding.
+            session.live_subscriptions.clear();
             session.prepared_stmts.clear();
             session.plan_cache.clear();
             session.effective_tenant_id = None;
@@ -311,6 +320,27 @@ mod tests {
 
     fn address(port: u16) -> std::net::SocketAddr {
         std::net::SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn database_switch_clears_all_cursors() {
+        let store = SessionStore::new();
+        let session = address(4998);
+        store.ensure_session(session);
+        store.declare_cursor(
+            session,
+            "previous_database_cursor".into(),
+            vec!["old row".into()],
+            false,
+            true,
+        );
+
+        store.reset_for_database_switch(session, DatabaseId::new(2));
+
+        assert!(matches!(
+            store.fetch_cursor(session, "previous_database_cursor", 1),
+            Err(crate::Error::BadRequest { detail }) if detail == "cursor \"previous_database_cursor\" does not exist"
+        ));
     }
 
     #[test]

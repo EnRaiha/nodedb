@@ -13,7 +13,7 @@ use nodedb::config::auth::AuthMode;
 use nodedb::control::server::listener::Listener;
 use nodedb::control::state::SharedState;
 use nodedb::data::executor::core_loop::CoreLoop;
-use nodedb::event::{EventPlane, create_event_bus};
+use nodedb::event::{EventPlane, EventPlaneConfig, create_event_bus};
 use nodedb::wal::WalManager;
 
 /// A minimal NodeDB server with the native protocol listener running.
@@ -87,23 +87,24 @@ impl NativeTestServer {
         let trigger_dlq = Arc::new(std::sync::Mutex::new(
             nodedb::event::trigger::TriggerDlq::open(dir.path()).unwrap(),
         ));
-        let _event_plane = EventPlane::spawn(
-            event_consumers,
-            Arc::clone(&wal),
+        let (shutdown_bus, _) =
+            nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
+        let _event_plane = EventPlane::spawn(EventPlaneConfig {
+            consumers_rx: event_consumers,
+            wal: Arc::clone(&wal),
             watermark_store,
-            Arc::clone(&shared),
+            shared_state: Arc::clone(&shared),
             trigger_dlq,
-            Arc::clone(&shared.cdc_router),
-            Arc::clone(&shared.shutdown),
-        );
+            cdc_router: Arc::clone(&shared.cdc_router),
+            shutdown: Arc::clone(&shared.shutdown),
+            shutdown_bus: shutdown_bus.clone(),
+        });
 
         let listener = Listener::bind("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
         let addr = listener.local_addr();
 
-        let (shutdown_bus, _) =
-            nodedb::control::shutdown::ShutdownBus::new(Arc::clone(&shared.shutdown));
         let shared_listener = Arc::clone(&shared);
         let test_startup_gate = Arc::clone(&shared.startup);
         let bus_listener = shutdown_bus.clone();

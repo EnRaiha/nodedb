@@ -13,6 +13,7 @@ pub mod outbound;
 pub mod raft_apply;
 pub mod reject;
 pub mod schema_registry;
+pub mod scope;
 pub mod snapshot_assembly;
 pub mod snapshot_store;
 
@@ -28,4 +29,5 @@ pub use outbound::{
 };
 pub use reject::build_reject;
 pub use schema_registry::OriginSchemaRegistry;
+pub use scope::{ArrayOpTarget, ArrayScopeKey, ArrayServerScope, ArraySnapshotHlcs};
 pub use snapshot_store::OriginSnapshotStore;

@@ -17,8 +17,9 @@ pub fn put(stored: &ScheduleDef, catalog: &SystemCatalog) {
             "catalog_entry: put_schedule failed"
         );
     }
-    super::owner::put_parent_owner(
+    super::owner::put_parent_owner_in_database(
         object_type::SCHEDULE,
+        stored.database_id,
         stored.tenant_id,
         &stored.name,
         &stored.owner,
@@ -26,8 +27,13 @@ pub fn put(stored: &ScheduleDef, catalog: &SystemCatalog) {
     );
 }
 
-pub fn delete(tenant_id: u64, name: &str, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_schedule(tenant_id, name) {
+pub fn delete(
+    database_id: nodedb_types::DatabaseId,
+    tenant_id: u64,
+    name: &str,
+    catalog: &SystemCatalog,
+) {
+    if let Err(e) = catalog.delete_schedule_in_database(database_id, tenant_id, name) {
         warn!(
             schedule = %name,
             tenant = tenant_id,
@@ -35,5 +41,11 @@ pub fn delete(tenant_id: u64, name: &str, catalog: &SystemCatalog) {
             "catalog_entry: delete_schedule failed"
         );
     }
-    super::owner::delete_parent_owner(object_type::SCHEDULE, tenant_id, name, catalog);
+    super::owner::delete_parent_owner_in_database(
+        object_type::SCHEDULE,
+        database_id.as_u64(),
+        tenant_id,
+        name,
+        catalog,
+    );
 }

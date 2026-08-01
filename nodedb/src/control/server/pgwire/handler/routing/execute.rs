@@ -3,7 +3,9 @@
 //! Plan-and-dispatch entry points for SQL queries on the simple-query and
 //! extended-query (prepared-statement) paths.
 
-use pgwire::api::results::{FieldFormat, Response, Tag};
+use std::sync::Arc;
+
+use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::planner::calvin::{DispatchClass, classify_dispatch};
@@ -19,7 +21,16 @@ use super::super::plan::{describe_plan, payload_to_response};
 use super::super::shape_encode;
 use super::result_shaping::ResultShaping;
 use super::set_ops;
-use crate::control::server::response_shape::schema::OutputSchema;
+use super::streaming::StreamSelectContext;
+
+struct DispatchTaskContext<'a> {
+    plan_lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
+    tenant_id: TenantId,
+    identity: &'a AuthenticatedIdentity,
+    auth_ctx: &'a crate::control::security::auth_context::AuthContext,
+    session_id: SessionId,
+    shaping: ResultShaping<'a>,
+}
 
 impl NodeDbPgHandler {
     pub(super) async fn execute_planned_sql_inner(
@@ -31,7 +42,7 @@ impl NodeDbPgHandler {
         params: &[nodedb_sql::ParamValue],
         shaping: ResultShaping<'_>,
     ) -> PgWireResult<Vec<Response>> {
-        let (mut tasks, output_schema, _plan_lease_scope) = self
+        let (mut tasks, output_schema, versions, auth_ctx) = self
             .plan_statement_to_tasks(identity, sql, tenant_id, session_id, params)
             .await?;
 
@@ -43,6 +54,10 @@ impl NodeDbPgHandler {
         // phase) wins; otherwise use the planner's fresh output schema for this
         // statement.
         let effective_schema = shaping.projection.or(Some(&output_schema));
+
+        // Extraction marks catalog state and allocates surrogates. Authorize
+        // the original planned tasks before it can perform either side effect.
+        let _preauthorized_tasks = self.authorize_tasks(identity, &tasks)?;
 
         // Implicit graph-edge extraction: a schemaless document carrying
         // `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task, homed and
@@ -70,8 +85,20 @@ impl NodeDbPgHandler {
         })?;
 
         // The final task set must be authorized before any clone interception,
-        // orchestration, staging, or dispatch path can observe it.
+        // orchestration, staging, or dispatch path can observe it. Descriptor
+        // admission follows this check so an implicit-edge denial consumes no
+        // descriptor lease.
         let _authorized_tasks = self.authorize_tasks(identity, &tasks)?;
+        let plan_lease_scope = Arc::new(self.state.acquire_plan_lease_scope(&versions).map_err(
+            |e| {
+                let (severity, code, message) = error_to_sqlstate(&e);
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                )))
+            },
+        )?);
 
         // Clone CoW read-path interception: for Shadowed/Materializing clones,
         // augment tasks with source-database reads and merge results.
@@ -161,11 +188,17 @@ impl NodeDbPgHandler {
 
         self.dispatch_task_loop(
             tasks,
-            tenant_id,
-            identity,
-            session_id,
-            effective_schema,
-            shaping.formats,
+            DispatchTaskContext {
+                plan_lease_scope: Arc::clone(&plan_lease_scope),
+                tenant_id,
+                identity,
+                auth_ctx: &auth_ctx,
+                session_id,
+                shaping: ResultShaping {
+                    projection: effective_schema,
+                    formats: shaping.formats,
+                },
+            },
         )
         .await
     }
@@ -174,12 +207,18 @@ impl NodeDbPgHandler {
     async fn dispatch_task_loop(
         &self,
         tasks: Vec<PhysicalTask>,
-        tenant_id: TenantId,
-        identity: &AuthenticatedIdentity,
-        session_id: SessionId,
-        projection: Option<&OutputSchema>,
-        result_formats: &[FieldFormat],
+        context: DispatchTaskContext<'_>,
     ) -> PgWireResult<Vec<Response>> {
+        let DispatchTaskContext {
+            plan_lease_scope,
+            tenant_id,
+            identity,
+            auth_ctx,
+            session_id,
+            shaping,
+        } = context;
+        let projection = shaping.projection;
+        let result_formats = shaping.formats;
         let needs_set_op = tasks.iter().any(|t| t.post_set_op != PostSetOp::None);
         let mut dedup_payloads: Vec<Vec<u8>> = Vec::new();
         let mut dedup_set_op = PostSetOp::None;
@@ -230,7 +269,10 @@ impl NodeDbPgHandler {
             // every other dispatch loop (native, DSL/UPSERT). Moved to
             // `execute_dml_hooks.rs` to keep this file under the size limit;
             // behavior is unchanged.
-            match self.route_task_in_txn(session_id, identity, task).await? {
+            match self
+                .route_task_in_txn(session_id, identity, task, Arc::clone(&plan_lease_scope))
+                .await?
+            {
                 super::execute_dml_hooks::TxnRouteOutcome::Proceed(routed_task) => {
                     task = *routed_task;
                 }
@@ -257,11 +299,16 @@ impl NodeDbPgHandler {
                 && let Some(stream_response) = self
                     .maybe_stream_select(
                         &task,
-                        identity,
-                        plan_kind,
-                        session_id,
-                        projection,
-                        result_formats,
+                        StreamSelectContext {
+                            identity,
+                            plan_kind,
+                            session_id,
+                            shaping: ResultShaping {
+                                projection,
+                                formats: result_formats,
+                            },
+                            lease_scope: Arc::clone(&plan_lease_scope),
+                        },
                     )
                     .await?
             {
@@ -273,7 +320,7 @@ impl NodeDbPgHandler {
             // interception (moved to execute_dml_hooks.rs to keep this file
             // under the size limit; behavior is unchanged).
             let (dml_info, old_row, truncate_restart_collection) = match self
-                .run_pre_dispatch_hooks(identity, tenant_id, session_id, plan_kind, task)
+                .run_pre_dispatch_hooks(identity, auth_ctx, tenant_id, session_id, plan_kind, task)
                 .await?
             {
                 super::execute_dml_hooks::PreDispatchOutcome::Handled(resp) => {
@@ -393,6 +440,7 @@ impl NodeDbPgHandler {
                     crate::control::trigger::dml_hook_fire::DispatchTriggerParams {
                         state: &self.state,
                         identity,
+                        database_id: task_database_id,
                         tenant_id,
                         info,
                         old_row: &old_row,

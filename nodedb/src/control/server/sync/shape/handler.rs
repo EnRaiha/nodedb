@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use zerompk::{FromMessagePack, ToMessagePack};
 
-use super::definition::{ShapeDefinition, ShapeId};
+use super::definition::{ShapeDefinition, ShapeId, ShapeScope};
 use super::registry::ShapeRegistry;
 use crate::control::server::sync::wire::*;
 
@@ -97,6 +97,7 @@ impl ShapeSnapshotData {
 pub fn handle_subscribe<F>(
     session_id: &str,
     tenant_id: u64,
+    database_id: nodedb_types::DatabaseId,
     msg: &ShapeSubscribeMsg,
     registry: &ShapeRegistry,
     current_lsn: u64,
@@ -108,7 +109,14 @@ where
     let shape = msg.shape.clone();
     let shape_id = shape.shape_id.clone();
 
-    registry.subscribe(session_id, tenant_id, shape.clone());
+    registry.subscribe(
+        session_id,
+        ShapeScope {
+            tenant_id,
+            database_id,
+        },
+        shape.clone(),
+    );
 
     // Query the Data Plane for the initial dataset matching this shape.
     let snapshot_data = snapshot_provider(&shape, current_lsn);
@@ -164,7 +172,7 @@ pub(in crate::control::server::sync) fn decode_document_or_empty(
 /// The payload bytes are decoded to JSON for shape predicate evaluation.
 /// Undecodable payloads become an empty object and cannot satisfy field filters.
 pub fn evaluate_and_generate_deltas(
-    tenant_id: u64,
+    scope: ShapeScope,
     collection: &str,
     doc_id: &str,
     operation: &str,
@@ -173,7 +181,7 @@ pub fn evaluate_and_generate_deltas(
     registry: &ShapeRegistry,
 ) -> Vec<(String, SyncFrame)> {
     let doc_json = decode_document_or_empty(delta);
-    let matches = registry.evaluate_mutation(tenant_id, collection, doc_id, &doc_json);
+    let matches = registry.evaluate_mutation(scope, collection, doc_id, &doc_json);
 
     matches
         .into_iter()
@@ -311,12 +319,18 @@ mod tests {
             shape: make_shape("sh1"),
         };
 
-        let frame = handle_subscribe("s1", 1, &msg, &registry, 100, |_shape, _lsn| {
-            ShapeSnapshotData {
+        let frame = handle_subscribe(
+            "s1",
+            1,
+            nodedb_types::DatabaseId::DEFAULT,
+            &msg,
+            &registry,
+            100,
+            |_shape, _lsn| ShapeSnapshotData {
                 data: zerompk::to_msgpack_vec(&vec!["doc1", "doc2"]).unwrap_or_default(),
                 doc_count: 2,
-            }
-        })
+            },
+        )
         .expect("encode");
         assert_eq!(frame.msg_type, SyncMessageType::ShapeSnapshot);
 
@@ -331,7 +345,14 @@ mod tests {
     #[test]
     fn unsubscribe_removes() {
         let registry = ShapeRegistry::new();
-        registry.subscribe("s1", 1, make_shape("sh1"));
+        registry.subscribe(
+            "s1",
+            ShapeScope {
+                tenant_id: 1,
+                database_id: nodedb_types::DatabaseId::DEFAULT,
+            },
+            make_shape("sh1"),
+        );
         assert_eq!(registry.total_shapes(), 1);
 
         handle_unsubscribe(
@@ -347,10 +368,20 @@ mod tests {
     #[test]
     fn evaluate_generates_deltas() {
         let registry = ShapeRegistry::new();
-        registry.subscribe("s1", 1, make_shape("sh1"));
+        registry.subscribe(
+            "s1",
+            ShapeScope {
+                tenant_id: 1,
+                database_id: nodedb_types::DatabaseId::DEFAULT,
+            },
+            make_shape("sh1"),
+        );
 
         let deltas = evaluate_and_generate_deltas(
-            1,
+            ShapeScope {
+                tenant_id: 1,
+                database_id: nodedb_types::DatabaseId::DEFAULT,
+            },
             "orders",
             "o42",
             "INSERT",

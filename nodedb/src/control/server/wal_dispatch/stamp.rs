@@ -62,6 +62,8 @@ fn stamp_array_op(op: &mut ArrayOp, lsn: Lsn) {
         | ArrayOp::Aggregate { .. }
         | ArrayOp::Elementwise { .. }
         | ArrayOp::DropArray { .. }
+        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Compact { .. } => {}
     }
 }

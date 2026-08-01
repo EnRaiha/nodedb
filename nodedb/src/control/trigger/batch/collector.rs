@@ -221,6 +221,8 @@ pub struct TriggerBatch {
     pub operation: String,
     /// Accumulated rows.
     pub rows: Vec<TriggerBatchRow>,
+    /// Database ID.
+    pub database_id: nodedb_types::DatabaseId,
     /// Tenant ID.
     pub tenant_id: u64,
 }
@@ -238,6 +240,7 @@ pub struct TriggerBatchCollector {
 struct PendingBatch {
     collection: String,
     operation: String,
+    database_id: nodedb_types::DatabaseId,
     tenant_id: u64,
     rows: Vec<TriggerBatchRow>,
 }
@@ -258,12 +261,17 @@ impl TriggerBatchCollector {
         &mut self,
         collection: &str,
         operation: &str,
+        database_id: nodedb_types::DatabaseId,
         tenant_id: u64,
         row: TriggerBatchRow,
     ) -> Option<TriggerBatch> {
         // If the pending batch targets a different collection/operation, flush it first.
         let flushed = if let Some(ref pending) = self.pending {
-            if pending.collection != collection || pending.operation != operation {
+            if pending.collection != collection
+                || pending.operation != operation
+                || pending.database_id != database_id
+                || pending.tenant_id != tenant_id
+            {
                 self.flush()
             } else {
                 None
@@ -277,6 +285,7 @@ impl TriggerBatchCollector {
             self.pending = Some(PendingBatch {
                 collection: collection.to_string(),
                 operation: operation.to_string(),
+                database_id,
                 tenant_id,
                 rows: Vec::with_capacity(self.batch_size),
             });
@@ -308,6 +317,7 @@ impl TriggerBatchCollector {
                     collection: p.collection,
                     operation: p.operation,
                     rows: p.rows,
+                    database_id: p.database_id,
                     tenant_id: p.tenant_id,
                 })
             }
@@ -351,7 +361,13 @@ pub fn push_write_event(
         event.row_id.as_str().to_string(),
     );
 
-    collector.push(&event.collection, op_str, event.tenant_id.as_u64(), row)
+    collector.push(
+        &event.collection,
+        op_str,
+        event.database_id,
+        event.tenant_id.as_u64(),
+        row,
+    )
 }
 
 #[cfg(test)]
@@ -365,10 +381,34 @@ mod tests {
     #[test]
     fn collect_up_to_batch_size() {
         let mut c = TriggerBatchCollector::new(3);
-        assert!(c.push("orders", "INSERT", 1, row("1")).is_none());
-        assert!(c.push("orders", "INSERT", 1, row("2")).is_none());
+        assert!(
+            c.push(
+                "orders",
+                "INSERT",
+                nodedb_types::DatabaseId::DEFAULT,
+                1,
+                row("1")
+            )
+            .is_none()
+        );
+        assert!(
+            c.push(
+                "orders",
+                "INSERT",
+                nodedb_types::DatabaseId::DEFAULT,
+                1,
+                row("2")
+            )
+            .is_none()
+        );
         // Third push fills the batch.
-        let batch = c.push("orders", "INSERT", 1, row("3"));
+        let batch = c.push(
+            "orders",
+            "INSERT",
+            nodedb_types::DatabaseId::DEFAULT,
+            1,
+            row("3"),
+        );
         assert!(batch.is_some());
         let b = batch.unwrap();
         assert_eq!(b.rows.len(), 3);
@@ -378,8 +418,20 @@ mod tests {
     #[test]
     fn flush_partial_batch() {
         let mut c = TriggerBatchCollector::new(10);
-        c.push("orders", "INSERT", 1, row("1"));
-        c.push("orders", "INSERT", 1, row("2"));
+        c.push(
+            "orders",
+            "INSERT",
+            nodedb_types::DatabaseId::DEFAULT,
+            1,
+            row("1"),
+        );
+        c.push(
+            "orders",
+            "INSERT",
+            nodedb_types::DatabaseId::DEFAULT,
+            1,
+            row("2"),
+        );
         let batch = c.flush();
         assert!(batch.is_some());
         assert_eq!(batch.unwrap().rows.len(), 2);
@@ -389,10 +441,28 @@ mod tests {
     #[test]
     fn different_collection_flushes_old() {
         let mut c = TriggerBatchCollector::new(10);
-        c.push("orders", "INSERT", 1, row("1"));
-        c.push("orders", "INSERT", 1, row("2"));
+        c.push(
+            "orders",
+            "INSERT",
+            nodedb_types::DatabaseId::DEFAULT,
+            1,
+            row("1"),
+        );
+        c.push(
+            "orders",
+            "INSERT",
+            nodedb_types::DatabaseId::DEFAULT,
+            1,
+            row("2"),
+        );
         // Different collection → flushes "orders" batch.
-        let flushed = c.push("users", "INSERT", 1, row("3"));
+        let flushed = c.push(
+            "users",
+            "INSERT",
+            nodedb_types::DatabaseId::DEFAULT,
+            1,
+            row("3"),
+        );
         assert!(flushed.is_some());
         let b = flushed.unwrap();
         assert_eq!(b.collection, "orders");
@@ -407,8 +477,20 @@ mod tests {
     #[test]
     fn different_operation_flushes_old() {
         let mut c = TriggerBatchCollector::new(10);
-        c.push("orders", "INSERT", 1, row("1"));
-        let flushed = c.push("orders", "DELETE", 1, row("2"));
+        c.push(
+            "orders",
+            "INSERT",
+            nodedb_types::DatabaseId::DEFAULT,
+            1,
+            row("1"),
+        );
+        let flushed = c.push(
+            "orders",
+            "DELETE",
+            nodedb_types::DatabaseId::DEFAULT,
+            1,
+            row("2"),
+        );
         assert!(flushed.is_some());
         assert_eq!(flushed.unwrap().operation, "INSERT");
     }

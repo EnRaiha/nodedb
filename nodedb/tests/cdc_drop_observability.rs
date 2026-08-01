@@ -4,7 +4,7 @@
 //!
 //! Covers:
 //! - `StreamBuffer::push` returns eviction count per call.
-//! - `oldest_available_lsn` reflects buffer head after eviction.
+//! - `oldest_available_offset` reflects buffer head after eviction.
 //! - Per-consumer-group `evicted_since_last_poll` delta is correct across
 //!   multiple polls.
 //! - `SystemMetrics::record_cdc_stream_drop` / `prometheus_cdc_stream_drops`
@@ -15,10 +15,12 @@ mod common;
 
 use common::make_cdc_event;
 use nodedb::control::metrics::system::SystemMetrics;
+use nodedb::event::cdc::CdcOffset;
 use nodedb::event::cdc::buffer::StreamBuffer;
 use nodedb::event::cdc::consumer_group::state::OffsetStore;
 use nodedb::event::cdc::lag_warner::CdcLagWarner;
 use nodedb::event::cdc::stream_def::RetentionConfig;
+use nodedb::types::DatabaseId;
 
 // ── StreamBuffer ──────────────────────────────────────────────────────────────
 
@@ -32,7 +34,13 @@ fn push_returns_zero_when_no_eviction() {
         },
     );
     for i in 1..=5 {
-        let evicted = buf.push(make_cdc_event(i, 0, "orders", "INSERT"));
+        let evicted = buf.push(make_cdc_event(
+            DatabaseId::DEFAULT,
+            i,
+            0,
+            "orders",
+            "INSERT",
+        ));
         assert_eq!(evicted, 0, "no eviction expected for event {i}");
     }
 }
@@ -48,18 +56,36 @@ fn push_returns_eviction_count_at_capacity() {
     );
     // Fill to capacity — no evictions yet.
     for i in 1..=3 {
-        let evicted = buf.push(make_cdc_event(i, 0, "orders", "INSERT"));
+        let evicted = buf.push(make_cdc_event(
+            DatabaseId::DEFAULT,
+            i,
+            0,
+            "orders",
+            "INSERT",
+        ));
         assert_eq!(
             evicted, 0,
             "event {i}: should not evict while under capacity"
         );
     }
     // Push 4th: causes 1 eviction (the oldest event).
-    let evicted = buf.push(make_cdc_event(4, 0, "orders", "INSERT"));
+    let evicted = buf.push(make_cdc_event(
+        DatabaseId::DEFAULT,
+        4,
+        0,
+        "orders",
+        "INSERT",
+    ));
     assert_eq!(evicted, 1, "4th push must evict exactly 1 event");
 
     // Push 5th: another eviction.
-    let evicted = buf.push(make_cdc_event(5, 0, "orders", "INSERT"));
+    let evicted = buf.push(make_cdc_event(
+        DatabaseId::DEFAULT,
+        5,
+        0,
+        "orders",
+        "INSERT",
+    ));
     assert_eq!(evicted, 1, "5th push must evict exactly 1 event");
 
     assert_eq!(buf.total_evicted(), 2);
@@ -67,7 +93,7 @@ fn push_returns_eviction_count_at_capacity() {
 }
 
 #[test]
-fn oldest_available_lsn_reflects_head_after_eviction() {
+fn oldest_available_offset_reflects_head_after_eviction() {
     let buf = StreamBuffer::new(
         "s1".into(),
         RetentionConfig {
@@ -75,18 +101,36 @@ fn oldest_available_lsn_reflects_head_after_eviction() {
             max_age_secs: 3600,
         },
     );
-    buf.push(make_cdc_event(1, 0, "orders", "INSERT")); // lsn = 10
-    buf.push(make_cdc_event(2, 0, "orders", "INSERT")); // lsn = 20
+    buf.push(make_cdc_event(
+        DatabaseId::DEFAULT,
+        1,
+        0,
+        "orders",
+        "INSERT",
+    )); // lsn = 10
+    buf.push(make_cdc_event(
+        DatabaseId::DEFAULT,
+        2,
+        0,
+        "orders",
+        "INSERT",
+    )); // lsn = 20
 
     // Buffer full, no eviction yet.
-    assert_eq!(buf.earliest_lsn(), Some(10));
+    assert_eq!(buf.earliest_offset(), Some(CdcOffset::new(10, 1)));
 
     // Push 3rd — evicts lsn=10.
-    buf.push(make_cdc_event(3, 0, "orders", "INSERT")); // lsn = 30
+    buf.push(make_cdc_event(
+        DatabaseId::DEFAULT,
+        3,
+        0,
+        "orders",
+        "INSERT",
+    )); // lsn = 30
     assert_eq!(
-        buf.earliest_lsn(),
-        Some(20),
-        "oldest_available_lsn must advance to the new head after eviction"
+        buf.earliest_offset(),
+        Some(CdcOffset::new(20, 2)),
+        "oldest_available_offset must advance to the new head after eviction"
     );
 }
 
@@ -98,7 +142,7 @@ fn eviction_baseline_zero_on_first_poll() {
     let store = OffsetStore::open(dir.path()).unwrap();
 
     // First call: baseline is 0, delta = current_total − 0.
-    let delta = store.swap_eviction_baseline(1, "orders_stream", "grp", 42);
+    let delta = store.swap_eviction_baseline(DatabaseId::DEFAULT, 1, "orders_stream", "grp", 42);
     assert_eq!(delta, 42, "first poll: delta should equal current_total");
 }
 
@@ -108,15 +152,15 @@ fn eviction_baseline_delta_across_polls() {
     let store = OffsetStore::open(dir.path()).unwrap();
 
     // Poll 1: baseline=0, current=10 → delta=10.
-    let d1 = store.swap_eviction_baseline(1, "orders_stream", "grp", 10);
+    let d1 = store.swap_eviction_baseline(DatabaseId::DEFAULT, 1, "orders_stream", "grp", 10);
     assert_eq!(d1, 10);
 
     // Poll 2: baseline=10, current=10 → delta=0 (no new evictions).
-    let d2 = store.swap_eviction_baseline(1, "orders_stream", "grp", 10);
+    let d2 = store.swap_eviction_baseline(DatabaseId::DEFAULT, 1, "orders_stream", "grp", 10);
     assert_eq!(d2, 0);
 
     // Poll 3: baseline=10, current=25 → delta=15.
-    let d3 = store.swap_eviction_baseline(1, "orders_stream", "grp", 25);
+    let d3 = store.swap_eviction_baseline(DatabaseId::DEFAULT, 1, "orders_stream", "grp", 25);
     assert_eq!(d3, 15);
 }
 
@@ -126,18 +170,18 @@ fn eviction_baseline_independent_per_group() {
     let store = OffsetStore::open(dir.path()).unwrap();
 
     // Group A sees 10 evictions.
-    let da = store.swap_eviction_baseline(1, "orders_stream", "group_a", 10);
+    let da = store.swap_eviction_baseline(DatabaseId::DEFAULT, 1, "orders_stream", "group_a", 10);
     assert_eq!(da, 10);
 
     // Group B first poll — should start from 0 independently.
-    let db = store.swap_eviction_baseline(1, "orders_stream", "group_b", 10);
+    let db = store.swap_eviction_baseline(DatabaseId::DEFAULT, 1, "orders_stream", "group_b", 10);
     assert_eq!(
         db, 10,
         "group_b baseline starts at 0, independent from group_a"
     );
 
     // Group A second poll — no new evictions since last.
-    let da2 = store.swap_eviction_baseline(1, "orders_stream", "group_a", 10);
+    let da2 = store.swap_eviction_baseline(DatabaseId::DEFAULT, 1, "orders_stream", "group_a", 10);
     assert_eq!(da2, 0);
 }
 

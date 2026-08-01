@@ -125,8 +125,15 @@ async fn handle_sql_inner(
         return resp(NativeResponse::status_row(seq, "RESET"));
     }
     if upper == "DISCARD ALL" {
+        // Recreate only disposable session state. The authenticated database
+        // binding belongs to the connection and must survive the reset.
+        let database_id = ctx.sessions.get_current_database(ctx.peer_addr);
         ctx.sessions.remove(ctx.peer_addr);
         ctx.sessions.ensure_session(*ctx.peer_addr);
+        if let Some(database_id) = database_id {
+            ctx.sessions
+                .set_current_database(ctx.peer_addr, database_id);
+        }
         return resp(NativeResponse::status_row(seq, "DISCARD ALL"));
     }
 
@@ -235,14 +242,9 @@ async fn execute_planned(
         ctx.tenant_id(),
     );
 
-    let (mut tasks, output_schema) = match ctx
+    let (mut tasks, output_schema, versions, _) = match ctx
         .query_ctx
-        .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
-            sql: &clean_sql,
-            tenant_id: ctx.tenant_id(),
-            database_id,
-            sec: &sec,
-        })
+        .plan_sql_with_rls_and_versions(&clean_sql, ctx.tenant_id(), database_id, &sec, false)
         .await
     {
         Ok(t) => t,
@@ -251,6 +253,20 @@ async fn execute_planned(
 
     if tasks.is_empty() {
         return resp(NativeResponse::status_row(seq, "OK"));
+    }
+
+    // Authorize the caller-supplied plan before implicit-edge extraction.
+    // Extraction marks catalog state and allocates surrogates, so a denied
+    // original document task must not reach it.
+    let emitter = ArcAuditEmitter(Arc::clone(&ctx.state.audit));
+    if let Err(error) = authorize_task_set(
+        ctx.identity,
+        &tasks,
+        &ctx.state.permissions,
+        &ctx.state.roles,
+        &emitter,
+    ) {
+        return resp(error_to_native(seq, &crate::Error::from(error)));
     }
 
     // Implicit graph-edge extraction (pgwire parity): a schemaless document
@@ -280,6 +296,16 @@ async fn execute_planned(
         Ok(authorized) => authorized,
         Err(error) => return resp(error_to_native(seq, &crate::Error::from(error))),
     };
+
+    // Admission follows authorization so denied requests cannot consume
+    // descriptor leases. Keep the scope alive through all dispatch and response
+    // shaping below.
+    let mut lease_scope = Some(
+        match Arc::clone(ctx.state).acquire_plan_lease_scope(&versions) {
+            Ok(scope) => scope,
+            Err(error) => return resp(error_to_native(seq, &error)),
+        },
+    );
 
     // Implicit-edge DELETE/UPDATE routing gate (native-protocol parity with
     // pgwire). See `edge_recon_gate` for the full invariant and guard
@@ -352,18 +378,49 @@ async fn execute_planned(
         }
     }
 
-    // Streaming fast path: an eligible autocommit, single-task, unordered
-    // multi-row SELECT streams its rows as multiple frames. The complete final
-    // task set was authorized above before this stream can be opened.
+    // A native lazy stream outlives this handler, so transfer its descriptor
+    // leases to the session-owned `SqlStream` before returning it. The session
+    // loop retains that owner through final emission or connection teardown.
     if allow_stream {
         match try_open_sql_stream(ctx, seq, &tasks, database_id, Some(&output_schema)).await {
-            Ok(Some(stream)) => return SqlOutcome::Stream(stream),
+            Ok(Some(mut stream)) => {
+                let Some(scope) = lease_scope.take() else {
+                    return resp(NativeResponse::error(
+                        seq,
+                        "XX000",
+                        "internal error: query lease scope missing before SQL stream dispatch",
+                    ));
+                };
+                if let Err(error) = stream.attach_lease_scope(scope) {
+                    return resp(error_to_native(seq, &error));
+                }
+                return SqlOutcome::Stream(stream);
+            }
             Ok(None) => {}
-            Err(e) => return resp(error_to_native(seq, &e)),
+            Err(error) => return resp(error_to_native(seq, &error)),
         }
     }
 
-    run_dispatch_loop(ctx, seq, tasks, Some(&output_schema), database_id).await
+    // Materialized statements retain their admitted scope in an Arc so any
+    // writes buffered during this statement keep the same descriptor leases
+    // after this local owner is dropped. Lazy streams above retain the raw
+    // scope directly in their stream owner.
+    let Some(lease_scope) = lease_scope.take() else {
+        return resp(NativeResponse::error(
+            seq,
+            "XX000",
+            "internal error: query lease scope missing before materialized SQL dispatch",
+        ));
+    };
+    run_dispatch_loop(
+        ctx,
+        seq,
+        tasks,
+        Some(&output_schema),
+        database_id,
+        Arc::new(lease_scope),
+    )
+    .await
 }
 
 // ─── Bound parameter substitution ────────────────────────────────────

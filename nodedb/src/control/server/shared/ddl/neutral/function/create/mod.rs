@@ -14,6 +14,7 @@ pub mod parse;
 mod tests;
 
 pub use handler::create_function;
+pub(super) use handler::emit_function_put;
 // Re-export so `super::create::ParsedCreateFunction` continues to
 // work for `validate.rs` and other callers.
 pub use parse::ParsedCreateFunction;

@@ -40,6 +40,7 @@ fn make_schedule_def(tenant_id: u64, name: &str) -> nodedb::event::scheduler::ty
     use nodedb::event::scheduler::types::{MissedPolicy, ScheduleDef, ScheduleScope};
     ScheduleDef {
         tenant_id,
+        database_id: nodedb::types::DatabaseId::DEFAULT.as_u64(),
         name: name.to_string(),
         cron_expr: "*/5 * * * *".to_string(),
         body_sql: "SELECT 1".to_string(),
@@ -88,6 +89,7 @@ fn make_stream_def(tenant_id: u64, name: &str) -> nodedb::event::cdc::stream_def
         ChangeStreamDef, OpFilter, RetentionConfig, StreamFormat,
     };
     ChangeStreamDef {
+        database_id: nodedb::types::DatabaseId::new(7),
         tenant_id,
         name: name.to_string(),
         collection: "*".to_string(),
@@ -110,6 +112,7 @@ fn make_consumer_group(
 ) -> nodedb::event::cdc::consumer_group::types::ConsumerGroupDef {
     use nodedb::event::cdc::consumer_group::types::ConsumerGroupDef;
     ConsumerGroupDef {
+        database_id: nodedb::types::DatabaseId::new(7),
         tenant_id,
         name: group.to_string(),
         stream_name: stream.to_string(),
@@ -151,6 +154,7 @@ fn make_mv_def(
 ) -> nodedb::event::streaming_mv::types::StreamingMvDef {
     use nodedb::event::streaming_mv::types::StreamingMvDef;
     StreamingMvDef {
+        database_id: nodedb::types::DatabaseId::DEFAULT,
         tenant_id,
         name: name.to_string(),
         source_stream: source_stream.to_string(),
@@ -443,6 +447,7 @@ async fn triggers_verifier_still_fires() {
 
     let trigger = StoredTrigger {
         tenant_id: 1,
+        database_id: nodedb::types::DatabaseId::DEFAULT,
         collection: "orders".to_string(),
         name: "send_email".to_string(),
         timing: TriggerTiming::After,

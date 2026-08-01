@@ -20,9 +20,11 @@ use nodedb::event::cdc::registry::StreamRegistry;
 use nodedb::event::cdc::stream_def::{
     ChangeStreamDef, CompactionConfig, LateDataPolicy, OpFilter, RetentionConfig, StreamFormat,
 };
+use nodedb::types::DatabaseId;
 
 fn stream_def(tenant: u64, name: &str, collection: &str) -> ChangeStreamDef {
     ChangeStreamDef {
+        database_id: DatabaseId::new(7),
         tenant_id: tenant,
         name: name.into(),
         collection: collection.into(),
@@ -47,12 +49,12 @@ fn find_matching_returns_shared_refs_not_deep_clones() {
     // The router calls find_matching on every WriteEvent. Returning
     // `Vec<Arc<ChangeStreamDef>>` keeps the hot path O(match_count refcount
     // bumps) instead of O(match_count * sizeof(ChangeStreamDef)) clones.
-    let matches: Vec<Arc<ChangeStreamDef>> = reg.find_matching(1, "orders");
+    let matches: Vec<Arc<ChangeStreamDef>> = reg.find_matching(DatabaseId::new(7), 1, "orders");
     assert_eq!(matches.len(), 2);
 
     // Repeat lookups should hand out refcount-equal handles to the same
     // underlying definition — no fresh clone per call.
-    let again: Vec<Arc<ChangeStreamDef>> = reg.find_matching(1, "orders");
+    let again: Vec<Arc<ChangeStreamDef>> = reg.find_matching(DatabaseId::new(7), 1, "orders");
     let a0 = matches
         .iter()
         .find(|d| d.name == "orders_stream_a")
@@ -78,7 +80,7 @@ fn find_matching_scales_with_match_count_not_total_streams() {
     reg.register(stream_def(1, "hot_a", "orders"));
     reg.register(stream_def(1, "hot_b", "orders"));
 
-    let matches: Vec<Arc<ChangeStreamDef>> = reg.find_matching(1, "orders");
+    let matches: Vec<Arc<ChangeStreamDef>> = reg.find_matching(DatabaseId::new(7), 1, "orders");
     assert_eq!(
         matches.len(),
         2,
@@ -89,7 +91,8 @@ fn find_matching_scales_with_match_count_not_total_streams() {
     // indexed on a separate wildcard bucket and still scanned, but only
     // that small bucket (not the full 10k).
     reg.register(stream_def(1, "firehose", "*"));
-    let with_wildcard: Vec<Arc<ChangeStreamDef>> = reg.find_matching(1, "orders");
+    let with_wildcard: Vec<Arc<ChangeStreamDef>> =
+        reg.find_matching(DatabaseId::new(7), 1, "orders");
     assert_eq!(
         with_wildcard.len(),
         3,
@@ -105,11 +108,11 @@ fn find_matching_isolates_by_tenant() {
     reg.register(stream_def(1, "t1_stream", "orders"));
     reg.register(stream_def(2, "t2_stream", "orders"));
 
-    let t1: Vec<Arc<ChangeStreamDef>> = reg.find_matching(1, "orders");
+    let t1: Vec<Arc<ChangeStreamDef>> = reg.find_matching(DatabaseId::new(7), 1, "orders");
     assert_eq!(t1.len(), 1);
     assert_eq!(t1[0].tenant_id, 1);
 
-    let t2: Vec<Arc<ChangeStreamDef>> = reg.find_matching(2, "orders");
+    let t2: Vec<Arc<ChangeStreamDef>> = reg.find_matching(DatabaseId::new(7), 2, "orders");
     assert_eq!(t2.len(), 1);
     assert_eq!(t2[0].tenant_id, 2);
 }

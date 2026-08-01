@@ -133,12 +133,18 @@ pub(super) async fn submit_array_write(
 /// each concern (op / cell) routes identically.
 pub(super) fn vshard_for_array_op(
     state: &Arc<SharedState>,
+    tenant_id: TenantId,
+    database_id: DatabaseId,
     op: &nodedb_array::sync::op::ArrayOp,
 ) -> VShardId {
     use nodedb_array::types::coord::value::CoordValue;
     use nodedb_cluster::array_routing::{array_vshard_for_name, vshard_for_array_coord};
 
-    let tile_extents = state.array_sync_schemas.tile_extents(&op.header.array);
+    let tile_extents = state.array_sync_schemas.tile_extents_in_database(
+        database_id,
+        tenant_id.as_u64(),
+        &op.header.array,
+    );
     if let Some(extents) = tile_extents {
         let coord_u64: Vec<u64> = op
             .coord
@@ -172,13 +178,14 @@ pub(super) async fn ensure_array_open(
     array_id: &nodedb_array::types::ArrayId,
     vshard: crate::types::VShardId,
     tenant_id: crate::types::TenantId,
+    database_id: DatabaseId,
 ) -> crate::Result<()> {
     let (schema_msgpack, schema_hash, prefix_bits) = {
         let cat = state
             .array_catalog
             .read()
             .unwrap_or_else(|p| p.into_inner());
-        match cat.lookup_by_name(&array_id.name) {
+        match cat.lookup_by_id(array_id) {
             Some(entry) => (
                 entry.schema_msgpack.clone(),
                 entry.schema_hash,
@@ -201,9 +208,11 @@ pub(super) async fn ensure_array_open(
             schema_msgpack,
             schema_hash,
             prefix_bits,
+            audit_retain_ms: None,
+            minimum_audit_retain_ms: None,
         },
     );
-    let open_request = build_array_request(state, tenant_id, vshard, open_plan);
+    let open_request = build_array_request(state, tenant_id, database_id, vshard, open_plan);
     let open_request_id = open_request.request_id;
     let mut open_rx = state.tracker.register(open_request_id);
 
@@ -230,13 +239,14 @@ pub(super) async fn ensure_array_open(
 pub(super) fn build_array_request(
     state: &Arc<SharedState>,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     vshard_id: VShardId,
     plan: crate::bridge::envelope::PhysicalPlan,
 ) -> Request {
     Request {
         request_id: state.next_request_id(),
         tenant_id,
-        database_id: DatabaseId::DEFAULT,
+        database_id,
         vshard_id,
         plan,
         deadline: std::time::Instant::now() + Duration::from_secs(30),

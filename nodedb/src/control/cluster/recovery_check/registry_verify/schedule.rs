@@ -32,7 +32,7 @@ pub fn verify_schedules(
         .load_all_schedules()?
         .into_iter()
         .map(|s| {
-            let key = format!("{}|{}", s.tenant_id, s.name);
+            let key = format!("{}|{}|{}", s.database_id, s.tenant_id, s.name);
             let value = format!("en={},cron={}", s.enabled, s.cron_expr);
             (key, value)
         })
@@ -43,7 +43,7 @@ pub fn verify_schedules(
         .list_all()
         .into_iter()
         .map(|s| {
-            let key = format!("{}|{}", s.tenant_id, s.name);
+            let key = format!("{}|{}|{}", s.database_id, s.tenant_id, s.name);
             let value = format!("en={},cron={}", s.enabled, s.cron_expr);
             (key, value)
         })

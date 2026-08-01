@@ -59,7 +59,12 @@ impl TestClusterNode {
         min_version: u64,
     ) -> bool {
         let now = self.shared.hlc_clock.peek();
-        let id = nodedb_cluster::DescriptorId::new(tenant_id, kind, name);
+        let id = nodedb_cluster::DescriptorId::new(
+            nodedb_types::DatabaseId::DEFAULT.as_u64(),
+            tenant_id,
+            kind,
+            name,
+        );
         let cache = self
             .shared
             .metadata_cache
@@ -79,7 +84,12 @@ impl TestClusterNode {
         tenant_id: u64,
         name: &str,
     ) -> Vec<nodedb_cluster::DescriptorLease> {
-        let id = nodedb_cluster::DescriptorId::new(tenant_id, kind, name);
+        let id = nodedb_cluster::DescriptorId::new(
+            nodedb_types::DatabaseId::DEFAULT.as_u64(),
+            tenant_id,
+            kind,
+            name,
+        );
         let cache = self
             .shared
             .metadata_cache
@@ -107,7 +117,12 @@ impl TestClusterNode {
         version: u64,
         duration: std::time::Duration,
     ) -> Result<nodedb_cluster::DescriptorLease, String> {
-        let id = nodedb_cluster::DescriptorId::new(tenant_id, kind, name.to_string());
+        let id = nodedb_cluster::DescriptorId::new(
+            nodedb_types::DatabaseId::DEFAULT.as_u64(),
+            tenant_id,
+            kind,
+            name.to_string(),
+        );
         self.shared
             .acquire_descriptor_lease(id, version, duration)
             .map_err(|e| format!("acquire failed: {e}"))

@@ -16,7 +16,11 @@ use super::super::convert::ConvertContext;
 ///
 /// Used by converters that need both the schema *and* catalog metadata
 /// (e.g. `prefix_bits` for cluster routing).
-pub(super) fn load_entry(name: &str, ctx: &ConvertContext) -> crate::Result<ArrayCatalogEntry> {
+pub(super) fn load_entry(
+    name: &str,
+    tenant_id: nodedb_types::TenantId,
+    ctx: &ConvertContext,
+) -> crate::Result<ArrayCatalogEntry> {
     let array_catalog = ctx
         .array_catalog
         .as_ref()
@@ -26,14 +30,18 @@ pub(super) fn load_entry(name: &str, ctx: &ConvertContext) -> crate::Result<Arra
     let cat = array_catalog.read().map_err(|_| crate::Error::PlanError {
         detail: "array catalog lock poisoned".into(),
     })?;
-    cat.lookup_by_name(name)
+    cat.lookup_by_name_in_database(tenant_id, ctx.database_id, name)
         .ok_or_else(|| crate::Error::PlanError {
             detail: format!("ARRAY_*: array '{name}' not found"),
         })
 }
 
-pub(super) fn load_schema(name: &str, ctx: &ConvertContext) -> crate::Result<ArraySchema> {
-    let entry = load_entry(name, ctx)?;
+pub(super) fn load_schema(
+    name: &str,
+    tenant_id: nodedb_types::TenantId,
+    ctx: &ConvertContext,
+) -> crate::Result<ArraySchema> {
+    let entry = load_entry(name, tenant_id, ctx)?;
     zerompk::from_msgpack(&entry.schema_msgpack).map_err(|e| crate::Error::Serialization {
         format: "msgpack".into(),
         detail: format!("array schema decode: {e}"),

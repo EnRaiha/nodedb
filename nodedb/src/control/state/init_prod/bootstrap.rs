@@ -154,7 +154,7 @@ pub(super) fn run(
             retention_policy_registry.load(rp_defs);
         }
         alert_registry.load_from_catalog(catalog);
-        ep_topic_registry.load_from_catalog(catalog);
+        ep_topic_registry.load_from_catalog(catalog)?;
         mv_registry.load_from_catalog(catalog);
         sequence_registry.load_from_catalog(catalog);
         match catalog.load_all_rls_policies() {
@@ -265,7 +265,7 @@ pub(super) fn run(
         Arc::clone(&shared_audit),
         Arc::clone(&prod_session_registry),
     );
-    let bus_consumer_handle = Some(bus_consumer_task);
+    let bus_consumer_handle = bus_consumer_task;
 
     // Wire the security buses into the credential store so mutations
     // automatically publish to the in-process channels.

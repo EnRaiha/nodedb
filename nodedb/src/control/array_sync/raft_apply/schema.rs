@@ -9,9 +9,12 @@ use tracing::warn;
 use super::common::AppliedPosition;
 use crate::control::distributed_applier::{AppliedWrite, ProposeTracker};
 use crate::control::state::SharedState;
+use crate::types::{DatabaseId, TenantId};
 
 /// Payload extracted from a `ReplicatedWrite::ArraySchema` entry.
 pub(crate) struct ArraySchemaPayload<'a> {
+    pub tenant_id: TenantId,
+    pub database_id: DatabaseId,
     pub array: &'a str,
     pub snapshot_payload: &'a [u8],
     pub schema_hlc_bytes: [u8; 18],
@@ -46,6 +49,8 @@ pub(crate) fn apply_array_schema(
     use nodedb_array::sync::hlc::Hlc;
 
     let ArraySchemaPayload {
+        tenant_id,
+        database_id,
         array,
         snapshot_payload,
         schema_hlc_bytes,
@@ -55,10 +60,15 @@ pub(crate) fn apply_array_schema(
     // Use the replicated import path so every replica converges to the same
     // schema_hlc (the one committed in the Raft log entry) rather than each
     // bumping independently via their local HLC generator.
-    if let Err(e) =
-        state
-            .array_sync_schemas
-            .import_snapshot_replicated(array, snapshot_payload, remote_hlc)
+    if let Err(e) = state
+        .array_sync_schemas
+        .import_snapshot_replicated_in_database(
+            database_id,
+            tenant_id.as_u64(),
+            array,
+            snapshot_payload,
+            remote_hlc,
+        )
     {
         warn!(
             group_id, index = log_index, array = %array, error = %e,
@@ -90,9 +100,12 @@ pub(crate) fn apply_array_schema(
     // floor behind and keeps the entry replayable; both steps are idempotent
     // (the import re-imports the same committed HLC, the register no-ops on an
     // existing entry), so a redelivery converges.
-    if let Err(e) =
-        crate::control::array_sync::catalog_register::register_array_catalog_entry(state, array)
-    {
+    if let Err(e) = crate::control::array_sync::catalog_register::register_array_catalog_entry(
+        state,
+        tenant_id,
+        database_id,
+        array,
+    ) {
         warn!(
             group_id, index = log_index, array = %array, error = %e,
             "apply_array_schema: register_array_catalog_entry failed"

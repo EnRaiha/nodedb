@@ -1,0 +1,101 @@
+# Seven jobs on a nightly toolchain — only worth running when a change can
+# reach a decoder. The weekly cron runs unconditionally, so a too-narrow path
+# filter costs coverage for a week, not forever.
+
+name: ASan fuzz + 32-bit corpus/property
+
+on:
+  pull_request:
+    branches: [main]
+    # The crates the six targets reach.
+    paths:
+      - fuzz/**
+      - nodedb-codec/**
+      - nodedb-columnar/**
+      - nodedb-strict/**
+      - nodedb-wal/**
+      - nodedb-types/**
+      - nodedb-sql/**
+      - .github/workflows/fuzz.yml
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  asan-fuzz:
+    name: ASan libFuzzer x86_64 / ${{ matrix.target.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: codec_decoders
+            dictionary: fuzz/dictionaries/binary.dict
+          - name: columnar_segment
+            dictionary: fuzz/dictionaries/binary.dict
+          - name: strict_tuple
+            dictionary: fuzz/dictionaries/binary.dict
+          - name: wal_readers
+            dictionary: fuzz/dictionaries/binary.dict
+          - name: msgpack_document
+            dictionary: fuzz/dictionaries/binary.dict
+          - name: sql_preprocess
+            dictionary: fuzz/dictionaries/sql.dict
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2
+        with:
+          toolchain: nightly
+      # All six matrix jobs install the same pinned binary; build it once.
+      - name: Cache cargo-fuzz
+        id: cache-cargo-fuzz
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-0.13.2-${{ runner.os }}
+      - name: Install cargo-fuzz
+        if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Run bounded ASan fuzzing
+        run: |
+          cargo fuzz run --sanitizer address --target x86_64-unknown-linux-gnu "${{ matrix.target.name }}" -- \
+            -max_total_time=60 -runs=0 -max_len=1048576 -timeout=10 \
+            -rss_limit_mb=2048 -dict="${{ matrix.target.dictionary }}"
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crashes-x86_64-${{ matrix.target.name }}
+          path: fuzz/artifacts/${{ matrix.target.name }}
+          if-no-files-found: ignore
+
+  # 32-bit coverage on the target that actually ships 32-bit: wasm32, via
+  # nodedb-lite-wasm. Guards the same class the decoders check with
+  # checked_mul/checked_add — size math that only overflows where usize is 32
+  # bits. A build check, not a fuzz run: the decode invariants are asserted by
+  # the crates' own unit tests, which the main suite runs.
+  wasm32-decoders:
+    name: 32-bit build check (wasm32)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4fd1da8b0805d2d2e936788875a7d65dbd677dc2
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: wasm32-decoders
+      - name: Check decoders build for wasm32
+        run: |
+          cargo check --target wasm32-unknown-unknown \
+            -p nodedb-codec -p nodedb-columnar -p nodedb-strict

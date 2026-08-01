@@ -23,7 +23,6 @@ use std::sync::Arc;
 
 use nodedb_array::sync::hlc::Hlc;
 use nodedb_array::sync::op_codec;
-use nodedb_array::sync::op_log::OpLog;
 use nodedb_array::sync::snapshot::split_into_chunks;
 use nodedb_types::sync::wire::SyncMessageType;
 use nodedb_types::sync::wire::array::{
@@ -47,6 +46,8 @@ const CHUNK_BYTES: usize = 256 * 1024; // 256 KiB
 /// Catch-up server: turns an `ArrayCatchupRequestMsg` into a sequence of
 /// outbound frames sent via `ArrayDeliveryRegistry`.
 pub struct OriginCatchupServer {
+    database_id: crate::types::DatabaseId,
+    tenant_id: u64,
     op_log: Arc<OriginOpLog>,
     schemas: Arc<OriginSchemaRegistry>,
     snapshots: Arc<OriginSnapshotStore>,
@@ -57,7 +58,11 @@ pub struct OriginCatchupServer {
 
 impl OriginCatchupServer {
     /// Construct from shared server components.
+    ///
+    /// `scope` is the authenticated `(database, tenant)` this server serves;
+    /// every catch-up it answers is confined to it.
     pub fn new(
+        scope: super::scope::ArrayServerScope,
         op_log: Arc<OriginOpLog>,
         schemas: Arc<OriginSchemaRegistry>,
         snapshots: Arc<OriginSnapshotStore>,
@@ -66,6 +71,8 @@ impl OriginCatchupServer {
         ack_registry: Arc<ArrayAckRegistry>,
     ) -> Self {
         Self {
+            database_id: scope.database_id,
+            tenant_id: scope.tenant_id,
             op_log,
             schemas,
             snapshots,
@@ -79,11 +86,15 @@ impl OriginCatchupServer {
     ///
     /// Validates the array, selects the delivery path (op-stream vs snapshot +
     /// op-stream), and enqueues all resulting frames into the session's delivery
-    /// channel. Returns `Ok(())` even when the channel is full (frames are
-    /// silently dropped; the Lite peer will retry on next reconnect).
+    /// channel. Delivery stops at the first encoding or enqueue failure; the
+    /// subscriber cursor remains at the last successfully queued frontier.
     pub fn serve(&self, req: &ArrayCatchupRequestMsg, session_id: &str) -> crate::Result<()> {
         // 1. Validate the array exists.
-        if self.schemas.schema_hlc(&req.array).is_none() {
+        if self
+            .schemas
+            .schema_hlc_in_database(self.database_id, self.tenant_id, &req.array)
+            .is_none()
+        {
             warn!(
                 session = %session_id,
                 array = %req.array,
@@ -95,10 +106,16 @@ impl OriginCatchupServer {
         let from_hlc = Hlc::from_bytes(&req.from_hlc_bytes);
 
         // 2. Determine whether the request falls below the GC boundary.
-        let gc_boundary = self.ack_registry.min_ack_hlc(&req.array);
-        let snapshot_hlc_opt = gc_boundary
-            .filter(|gc| from_hlc < *gc)
-            .and_then(|_| self.snapshots.latest_for_array(&req.array));
+        let gc_boundary =
+            self.ack_registry
+                .min_ack_hlc_in_database(self.database_id, self.tenant_id, &req.array);
+        let snapshot_hlc_opt = gc_boundary.filter(|gc| from_hlc < *gc).and_then(|_| {
+            self.snapshots.latest_for_array_in_database(
+                self.database_id,
+                self.tenant_id,
+                &req.array,
+            )
+        });
 
         if let Some(snapshot) = snapshot_hlc_opt {
             // Snapshot path: send snapshot, then op-stream from snapshot_hlc.
@@ -122,7 +139,9 @@ impl OriginCatchupServer {
                 header_payload,
             };
 
-            self.send_frame(session_id, SyncMessageType::ArraySnapshot, &snap_msg);
+            if !self.send_frame(session_id, SyncMessageType::ArraySnapshot, &snap_msg) {
+                return Ok(());
+            }
 
             for chunk in &chunks {
                 let chunk_msg = ArraySnapshotChunkMsg {
@@ -132,15 +151,24 @@ impl OriginCatchupServer {
                     payload: chunk.payload.clone(),
                     snapshot_hlc_bytes: chunk.snapshot_hlc.to_bytes(),
                 };
-                self.send_frame(session_id, SyncMessageType::ArraySnapshotChunk, &chunk_msg);
+                if !self.send_frame(session_id, SyncMessageType::ArraySnapshotChunk, &chunk_msg) {
+                    return Ok(());
+                }
             }
+
+            // All snapshot frames are queued, so this is now the confirmed
+            // frontier even if a later op batch cannot be enqueued.
+            self.cursors.mark_sent_in_database(
+                session_id,
+                self.database_id,
+                self.tenant_id,
+                &req.array,
+                snap_hlc,
+            );
 
             // Continue with ops from snapshot_hlc onward (the subscriber
             // is now caught up to snap_hlc; needs ops above it).
             self.stream_ops(session_id, &req.array, snap_hlc)?;
-
-            // Advance the subscriber cursor to the snapshot HLC.
-            self.cursors.mark_sent(session_id, &req.array, snap_hlc);
         } else {
             // Op-stream path: subscriber still has all ops.
             self.stream_ops(session_id, &req.array, from_hlc)?;
@@ -151,15 +179,23 @@ impl OriginCatchupServer {
 
     /// Stream all ops for `array` with `hlc >= from_hlc` as batched delta
     /// frames, advancing the subscriber cursor after each batch.
-    fn stream_ops(&self, session_id: &str, array: &str, from_hlc: Hlc) -> crate::Result<()> {
-        // scan_from returns all ops with hlc >= from_hlc across all arrays;
-        // we filter to the target array here.
+    fn stream_ops(&self, session_id: &str, array: &str, from_hlc: Hlc) -> crate::Result<bool> {
         let ops_all = self
             .op_log
-            .scan_from(from_hlc)
+            .scan_range_in_database(
+                self.database_id,
+                self.tenant_id,
+                array,
+                from_hlc,
+                Hlc {
+                    physical_ms: nodedb_array::sync::hlc::MAX_PHYSICAL_MS,
+                    logical: u16::MAX,
+                    replica_id: nodedb_array::sync::replica_id::ReplicaId::new(u64::MAX),
+                },
+            )
             .map_err(|e| crate::Error::Storage {
                 engine: "array_sync".into(),
-                detail: format!("catchup_server scan_from: {e}"),
+                detail: format!("catchup_server scan_range: {e}"),
             })?;
 
         let mut batch_payloads: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
@@ -168,12 +204,8 @@ impl OriginCatchupServer {
         for op_result in ops_all {
             let op = op_result.map_err(|e| crate::Error::Storage {
                 engine: "array_sync".into(),
-                detail: format!("catchup_server scan_from iter: {e}"),
+                detail: format!("catchup_server scan_range iter: {e}"),
             })?;
-            if op.header.array != array {
-                continue;
-            }
-
             match op_codec::encode_op(&op) {
                 Ok(payload) => {
                     last_hlc = op.header.hlc;
@@ -184,9 +216,9 @@ impl OriginCatchupServer {
                         session = %session_id,
                         array = %array,
                         error = %e,
-                        "catchup_server: encode_op failed — skipping op"
+                        "catchup_server: encode_op failed — stopping catch-up"
                     );
-                    continue;
+                    return Ok(false);
                 }
             }
 
@@ -195,8 +227,16 @@ impl OriginCatchupServer {
                     array: array.to_owned(),
                     op_payloads: std::mem::take(&mut batch_payloads),
                 };
-                self.send_frame(session_id, SyncMessageType::ArrayDeltaBatch, &batch);
-                self.cursors.mark_sent(session_id, array, last_hlc);
+                if !self.send_frame(session_id, SyncMessageType::ArrayDeltaBatch, &batch) {
+                    return Ok(false);
+                }
+                self.cursors.mark_sent_in_database(
+                    session_id,
+                    self.database_id,
+                    self.tenant_id,
+                    array,
+                    last_hlc,
+                );
                 debug!(
                     session = %session_id,
                     array = %array,
@@ -212,23 +252,32 @@ impl OriginCatchupServer {
                 array: array.to_owned(),
                 op_payloads: batch_payloads,
             };
-            self.send_frame(session_id, SyncMessageType::ArrayDeltaBatch, &batch);
-            self.cursors.mark_sent(session_id, array, last_hlc);
+            if !self.send_frame(session_id, SyncMessageType::ArrayDeltaBatch, &batch) {
+                return Ok(false);
+            }
+            self.cursors.mark_sent_in_database(
+                session_id,
+                self.database_id,
+                self.tenant_id,
+                array,
+                last_hlc,
+            );
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// Encode `msg` and enqueue to the session's delivery channel.
     ///
-    /// Errors are logged and discarded — the delivery channel's own
-    /// back-pressure logic drops frames when full.
+    /// Returns whether the frame encoded and was accepted by the delivery
+    /// channel. Callers stop at the first failure so they never advance a
+    /// cursor past a missing batch.
     fn send_frame<T: serde::Serialize + zerompk::ToMessagePack>(
         &self,
         session_id: &str,
         msg_type: SyncMessageType,
         msg: &T,
-    ) {
+    ) -> bool {
         match nodedb_types::sync::wire::SyncFrame::try_encode(msg_type, msg) {
             Some(frame) => self.delivery.enqueue(session_id, frame.to_bytes()),
             None => {
@@ -237,6 +286,7 @@ impl OriginCatchupServer {
                     "catchup_server: SyncFrame encode failed for {:?}",
                     msg_type
                 );
+                false
             }
         }
     }
@@ -285,6 +335,7 @@ mod tests {
         );
 
         let server = OriginCatchupServer::new(
+            crate::control::array_sync::ArrayServerScope::new(crate::types::DatabaseId::DEFAULT, 0),
             Arc::clone(&op_log),
             Arc::clone(&schemas),
             snapshots,

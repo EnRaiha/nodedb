@@ -2,40 +2,27 @@
 
 //! Bounded per-stream event retention buffer.
 //!
-//! Each change stream has its own buffer that holds recent events for
-//! consumer consumption. Oldest events are evicted when the buffer
-//! exceeds its capacity (max_events) or age limit (max_age_secs).
-//!
-//! Events are stored as `Arc<CdcEvent>` so fan-out across matching streams
-//! and repeated consumer polls (webhook, Kafka, SHOW, commit) share one
-//! allocation per event — deep-cloning a `CdcEvent` (with its
-//! `serde_json::Value` payload and field diffs) per subscriber or poll is
-//! the hot-path cost the Arc layer exists to eliminate.
+//! Events are shared `Arc<CdcEvent>` values so fan-out and repeated polls do
+//! not deep-clone JSON payloads. Consumer cursors are [`CdcOffset`] values,
+//! not bare LSNs: sibling events at one LSN remain independently consumable.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::event::CdcEvent;
+use super::offset::CdcOffset;
 use super::stream_def::RetentionConfig;
 
 /// Per-stream bounded event retention buffer.
 pub struct StreamBuffer {
-    /// Stream name (for logging).
     name: String,
-    /// Buffered events (oldest at front, newest at back).
+    /// Oldest at front, newest at back. Events are appended in source order.
     events: RwLock<VecDeque<Arc<CdcEvent>>>,
-    /// Per-partition high-water-mark LSN observed since buffer creation.
-    /// Survives retention eviction — the source of truth for
-    /// `COMMIT OFFSETS` auto-commit, which would otherwise miss
-    /// partitions whose events have aged out of the ring.
-    partition_tails: RwLock<HashMap<u32, u64>>,
-    /// Retention config.
+    /// Per-partition high-water-mark position, retained after eviction.
+    partition_tails: RwLock<HashMap<u32, CdcOffset>>,
     retention: RetentionConfig,
-    /// Total events ever pushed (monotonic counter).
     total_pushed: std::sync::atomic::AtomicU64,
-    /// Total events evicted due to overflow.
     total_evicted: std::sync::atomic::AtomicU64,
 }
 
@@ -53,147 +40,188 @@ impl StreamBuffer {
         }
     }
 
-    /// Push a new event into the buffer. Evicts oldest if at capacity.
+    /// Push an event, preserving its supplied composite position.
     ///
-    /// Accepts anything that can be turned into an `Arc<CdcEvent>`. The
-    /// router hands the SAME `Arc` to every matching stream's buffer so
-    /// fan-out across N subscribers is N refcount bumps, not N deep clones.
-    ///
-    /// Returns the number of events evicted as a result of this push (0 or
-    /// more). Callers may use the return value to increment per-stream drop
-    /// counters without an extra atomic read.
+    /// Exact `(partition, position)` duplicates are ignored. This makes
+    /// durable-topic startup hydration race-safe: a just-committed publication
+    /// and its concurrent hydration replay cannot appear twice.
     pub fn push(&self, event: impl Into<Arc<CdcEvent>>) -> u64 {
         let event = event.into();
-        let mut events = self.events.write().unwrap_or_else(|p| {
+        let mut events = self.events.write().unwrap_or_else(|poisoned| {
             tracing::warn!(stream = %self.name, "StreamBuffer RwLock poisoned, recovering");
-            p.into_inner()
+            poisoned.into_inner()
         });
+        match self.push_locked(&mut events, event) {
+            Some(evicted) => {
+                self.total_pushed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                evicted
+            }
+            None => 0,
+        }
+    }
 
-        let mut evicted_this_push: u64 = 0;
-
-        // Evict by count.
-        while events.len() as u64 >= self.retention.max_events {
-            events.pop_front();
-            evicted_this_push += 1;
-            self.total_evicted
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    /// Insert an event in composite-position order, returning `None` if that
+    /// exact partition position already exists.
+    fn push_locked(
+        &self,
+        events: &mut VecDeque<Arc<CdcEvent>>,
+        event: Arc<CdcEvent>,
+    ) -> Option<u64> {
+        let position = event.position();
+        if events
+            .iter()
+            .any(|current| current.partition == event.partition && current.position() == position)
+        {
+            return None;
         }
 
-        // Evict by age.
+        let mut tails = self
+            .partition_tails
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tail = tails.entry(event.partition).or_insert(CdcOffset::ZERO);
+        if position > *tail {
+            *tail = position;
+        }
+        drop(tails);
+
+        let insertion_index = events
+            .iter()
+            .position(|current| current.position() > position)
+            .unwrap_or(events.len());
+        events.insert(insertion_index, event);
+
+        // Evict after ordered insertion. Hydrating an older committed event
+        // must not displace a newer one merely because it arrived later.
+        let mut evicted_this_push = 0;
+        while events.len() as u64 > self.retention.max_events {
+            events.pop_front();
+            evicted_this_push += 1;
+        }
+
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         let cutoff_ms = now_ms.saturating_sub(self.retention.max_age_secs * 1000);
-        while events.front().is_some_and(|e| e.event_time < cutoff_ms) {
+        while events
+            .front()
+            .is_some_and(|current| current.event_time < cutoff_ms)
+        {
             events.pop_front();
             evicted_this_push += 1;
+        }
+        if evicted_this_push > 0 {
             self.total_evicted
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(evicted_this_push, std::sync::atomic::Ordering::Relaxed);
         }
-
-        // Update per-partition tail tracker *before* appending: this runs
-        // regardless of whether the ring has space, so partitions whose
-        // events get evicted still keep an advancing tail.
-        {
-            let mut tails = self
-                .partition_tails
-                .write()
-                .unwrap_or_else(|p| p.into_inner());
-            let entry = tails.entry(event.partition).or_insert(0);
-            if event.lsn > *entry {
-                *entry = event.lsn;
-            }
-        }
-
-        events.push_back(event);
-        self.total_pushed
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        evicted_this_push
+        Some(evicted_this_push)
     }
 
-    /// Latest observed LSN per partition, across the entire lifetime of
-    /// the buffer — NOT bounded by retention. This is the correct source
-    /// of truth for `COMMIT OFFSETS` auto-commit; scanning the retention
-    /// ring loses partitions whose events have been evicted.
-    pub fn partition_tails(&self) -> HashMap<u32, u64> {
+    /// Latest observed composite position per partition, including evicted
+    /// events. This is the source of truth for `COMMIT OFFSETS`.
+    pub fn partition_tails(&self) -> HashMap<u32, CdcOffset> {
         self.partition_tails
             .read()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    /// Read events from a given LSN forward (for consumer polling).
-    /// Returns shared `Arc<CdcEvent>` handles so repeated polls by webhook
-    /// and Kafka producers share the underlying allocation.
-    pub fn read_from_lsn(&self, from_lsn: u64, limit: usize) -> Vec<Arc<CdcEvent>> {
-        let events = self.events.read().unwrap_or_else(|p| p.into_inner());
+    /// Read events strictly after one composite position.
+    pub fn read_from(&self, from: CdcOffset, limit: usize) -> Vec<Arc<CdcEvent>> {
+        let events = self
+            .events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         events
             .iter()
-            .filter(|e| e.lsn > from_lsn)
+            .filter(|event| event.position() > from)
             .take(limit)
             .cloned()
             .collect()
     }
 
-    /// Read events from a specific partition, starting after `from_lsn`.
-    /// Partition = vShard ID. Scans the buffer and filters by partition.
-    pub fn read_partition_from_lsn(
+    /// Read a partition strictly after its committed composite position.
+    pub fn read_partition_from(
         &self,
         partition_id: u32,
-        from_lsn: u64,
+        from: CdcOffset,
         limit: usize,
     ) -> Vec<Arc<CdcEvent>> {
-        let events = self.events.read().unwrap_or_else(|p| p.into_inner());
+        let events = self
+            .events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         events
             .iter()
-            .filter(|e| e.partition == partition_id && e.lsn > from_lsn)
+            .filter(|event| event.partition == partition_id && event.position() > from)
             .take(limit)
             .cloned()
             .collect()
     }
 
-    /// Compact the buffer: deduplicate by key field, keeping only the latest
-    /// event per key value. DELETE events are retained as tombstones until
-    /// they exceed `tombstone_grace_secs` age, then removed.
+    /// Read across partitions, applying each partition's committed position
+    /// independently. A global minimum cursor would redeliver already-acked
+    /// events from other partitions and can starve a sibling behind `LIMIT`.
+    pub fn read_after_partition_offsets(
+        &self,
+        offsets: &HashMap<u32, CdcOffset>,
+        limit: usize,
+    ) -> Vec<Arc<CdcEvent>> {
+        let events = self
+            .events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        events
+            .iter()
+            .filter(|event| {
+                event.position()
+                    > offsets
+                        .get(&event.partition)
+                        .copied()
+                        .unwrap_or(CdcOffset::ZERO)
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Compact by key field, retaining the latest event for every key.
     pub fn compact(&self, key_field: &str, tombstone_grace_secs: u64) -> u32 {
-        let mut events = self.events.write().unwrap_or_else(|p| {
+        let mut events = self.events.write().unwrap_or_else(|poisoned| {
             tracing::warn!(stream = %self.name, "StreamBuffer RwLock poisoned during compact, recovering");
-            p.into_inner()
+            poisoned.into_inner()
         });
         let before = events.len();
-
-        let now_ms = SystemTime::now()
+        let cutoff_ms = (SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
-        let tombstone_cutoff_ms = now_ms.saturating_sub(tombstone_grace_secs * 1000);
-
-        let mut latest: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for (idx, event) in events.iter().enumerate() {
-            let key_value = extract_key_value(event, key_field);
-            latest.insert(key_value, idx);
+            .as_millis() as u64)
+            .saturating_sub(tombstone_grace_secs * 1000);
+        let mut latest: HashMap<String, (usize, CdcOffset)> = HashMap::new();
+        for (index, event) in events.iter().enumerate() {
+            let position = event.position();
+            latest
+                .entry(extract_key_value(event, key_field))
+                .and_modify(|current| {
+                    if position > current.1 {
+                        *current = (index, position);
+                    }
+                })
+                .or_insert((index, position));
         }
-
-        let mut keep = vec![false; events.len()];
-        for (idx, event) in events.iter().enumerate() {
-            let key_value = extract_key_value(event, key_field);
-            let is_latest = latest.get(&key_value) == Some(&idx);
-            let is_tombstone = event.op == "DELETE";
-            if is_latest && !(is_tombstone && event.event_time < tombstone_cutoff_ms) {
-                keep[idx] = true;
+        let mut kept = VecDeque::with_capacity(events.len());
+        for (index, event) in events.drain(..).enumerate() {
+            let key = extract_key_value(&event, key_field);
+            let is_latest = latest
+                .get(&key)
+                .is_some_and(|(latest_index, _)| *latest_index == index);
+            if is_latest && !(event.op == "DELETE" && event.event_time < cutoff_ms) {
+                kept.push_back(event);
             }
         }
-
-        let mut new_events = VecDeque::with_capacity(events.len());
-        for (idx, event) in events.drain(..).enumerate() {
-            if keep[idx] {
-                new_events.push_back(event);
-            }
-        }
-        *events = new_events;
-
+        *events = kept;
         let removed = (before - events.len()) as u32;
         if removed > 0 {
             self.total_evicted
@@ -203,21 +231,32 @@ impl StreamBuffer {
     }
 
     pub fn len(&self) -> usize {
-        self.events.read().unwrap_or_else(|p| p.into_inner()).len()
+        self.events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub fn earliest_lsn(&self) -> Option<u64> {
-        let events = self.events.read().unwrap_or_else(|p| p.into_inner());
-        events.front().map(|e| e.lsn)
+    pub fn earliest_offset(&self) -> Option<CdcOffset> {
+        self.events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|event| event.position())
+            .min()
     }
 
-    pub fn latest_lsn(&self) -> Option<u64> {
-        let events = self.events.read().unwrap_or_else(|p| p.into_inner());
-        events.back().map(|e| e.lsn)
+    pub fn latest_offset(&self) -> Option<CdcOffset> {
+        self.events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|event| event.position())
+            .max()
     }
 
     pub fn total_pushed(&self) -> u64 {
@@ -235,23 +274,19 @@ impl StreamBuffer {
 }
 
 fn extract_key_value(event: &CdcEvent, key_field: &str) -> String {
-    let value = event.new_value.as_ref().or(event.old_value.as_ref());
-
-    if let Some(obj) = value.and_then(|v| v.as_object())
-        && let Some(val) = obj.get(key_field)
+    if let Some(object) = event
+        .new_value
+        .as_ref()
+        .or(event.old_value.as_ref())
+        .and_then(serde_json::Value::as_object)
+        && let Some(value) = object.get(key_field)
     {
-        return match val {
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
+        return match value {
+            serde_json::Value::String(value) => value.clone(),
+            value => value.to_string(),
         };
     }
-
-    tracing::warn!(
-        collection = %event.collection,
-        row_id = %event.row_id,
-        key_field,
-        "compaction key field not found in event, falling back to row_id"
-    );
+    tracing::warn!(collection = %event.collection, row_id = %event.row_id, key_field, "compaction key field not found in event, falling back to row_id");
     event.row_id.clone()
 }
 
@@ -259,19 +294,16 @@ fn extract_key_value(event: &CdcEvent, key_field: &str) -> String {
 mod tests {
     use super::*;
 
-    fn make_event(seq: u64, lsn: u64) -> CdcEvent {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+    fn event(sequence: u64, lsn: u64) -> CdcEvent {
         CdcEvent {
-            sequence: seq,
+            sequence,
             partition: 0,
             collection: "test".into(),
             op: "INSERT".into(),
-            row_id: format!("row-{seq}"),
-            event_time: now_ms + seq * 1000,
+            row_id: format!("row-{sequence}"),
+            event_time: u64::MAX,
             lsn,
+            database_id: crate::types::DatabaseId::new(7),
             tenant_id: 1,
             new_value: None,
             old_value: None,
@@ -283,111 +315,61 @@ mod tests {
     }
 
     #[test]
-    fn push_and_read() {
-        let buf = StreamBuffer::new(
+    fn transaction_siblings_at_one_lsn_remain_independently_readable() {
+        let buffer = StreamBuffer::new("test".into(), RetentionConfig::default());
+        buffer.push(event(1, 10));
+        buffer.push(event(2, 10));
+        assert_eq!(buffer.read_from(CdcOffset::new(10, 1), 1)[0].sequence, 2);
+        assert!(buffer.read_from(CdcOffset::new(10, 2), 1).is_empty());
+    }
+
+    #[test]
+    fn partition_tails_keep_the_exact_position_after_eviction() {
+        let buffer = StreamBuffer::new(
             "test".into(),
             RetentionConfig {
-                max_events: 100,
-                max_age_secs: 3600,
+                max_events: 1,
+                max_age_secs: u64::MAX / 1000,
             },
         );
+        buffer.push(event(1, 10));
+        buffer.push(event(2, 10));
+        assert_eq!(buffer.partition_tails()[&0], CdcOffset::new(10, 2));
+    }
 
-        for i in 1..=5 {
-            buf.push(make_event(i, i * 10));
-        }
+    #[test]
+    fn positions_are_ordered_and_exact_positions_are_deduplicated() {
+        let buffer = StreamBuffer::new("topic:test".into(), RetentionConfig::default());
+        buffer.push(event(3, 30));
+        buffer.push(event(1, 10));
+        buffer.push(event(2, 20));
+        buffer.push(event(2, 20));
 
-        assert_eq!(buf.len(), 5);
-        assert_eq!(buf.earliest_lsn(), Some(10));
-        assert_eq!(buf.latest_lsn(), Some(50));
-
-        let events = buf.read_from_lsn(20, 10);
+        let events = buffer.read_from(CdcOffset::ZERO, 16);
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].lsn, 30);
-    }
-
-    #[test]
-    fn evicts_at_capacity() {
-        let buf = StreamBuffer::new(
-            "test".into(),
-            RetentionConfig {
-                max_events: 3,
-                max_age_secs: 3600,
-            },
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.position())
+                .collect::<Vec<_>>(),
+            vec![
+                CdcOffset::new(10, 1),
+                CdcOffset::new(20, 2),
+                CdcOffset::new(30, 3)
+            ]
         );
-
-        for i in 1..=5 {
-            buf.push(make_event(i, i * 10));
-        }
-
-        assert_eq!(buf.len(), 3);
-        assert_eq!(buf.earliest_lsn(), Some(30));
-        assert_eq!(buf.total_evicted(), 2);
+        assert_eq!(buffer.total_pushed(), 3);
     }
 
     #[test]
-    fn read_from_lsn_with_limit() {
-        let buf = StreamBuffer::new("test".into(), RetentionConfig::default());
-
-        for i in 1..=10 {
-            buf.push(make_event(i, i * 10));
-        }
-
-        let events = buf.read_from_lsn(0, 3);
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0].lsn, 10);
-        assert_eq!(events[2].lsn, 30);
-    }
-
-    fn make_event_on_partition(seq: u64, partition: u32, lsn: u64) -> CdcEvent {
-        let mut e = make_event(seq, lsn);
-        e.partition = partition;
-        e
-    }
-
-    /// The `COMMIT OFFSETS` pgwire handler derives per-partition tail LSNs
-    /// by scanning `read_from_lsn(0, usize::MAX)`. After buffer eviction
-    /// removes a partition's events, that scan misses the partition
-    /// entirely — no offset is committed for it, even though downstream
-    /// consumers have already processed those events. The buffer (or a
-    /// sibling tail tracker) must retain the latest LSN observed per
-    /// partition across eviction so auto-commit can advance every
-    /// partition, not just those whose events are still in the ring.
-    #[test]
-    fn partition_tails_survive_eviction() {
-        let buf = StreamBuffer::new(
-            "test".into(),
-            RetentionConfig {
-                max_events: 2,
-                max_age_secs: 3600,
-            },
-        );
-
-        // Partition 0: two early events. These will be evicted.
-        buf.push(make_event_on_partition(1, 0, 10));
-        buf.push(make_event_on_partition(2, 0, 20));
-        // Partition 1: two later events. Eviction kicks in on push 3,
-        // pop_front drops partition 0's entries first.
-        buf.push(make_event_on_partition(3, 1, 30));
-        buf.push(make_event_on_partition(4, 1, 40));
-        assert!(
-            buf.total_evicted() >= 1,
-            "expected eviction to have removed partition 0 events"
-        );
-
-        // `partition_tails()` is the source of truth for `COMMIT OFFSETS`.
-        // It must retain each partition's high-water-mark LSN even when
-        // the underlying event has been evicted from the retention ring.
-        let tails = buf.partition_tails();
-        assert_eq!(tails.get(&0).copied(), Some(20));
-        assert_eq!(tails.get(&1).copied(), Some(40));
-    }
-
-    #[test]
-    fn push_arc_shares_identity_with_read() {
-        let buf = StreamBuffer::new("test".into(), RetentionConfig::default());
-        let shared = Arc::new(make_event(1, 10));
-        buf.push(Arc::clone(&shared));
-        let read = buf.read_from_lsn(0, 10).into_iter().next().unwrap();
+    fn partition_reads_share_event_arcs() {
+        let buffer = StreamBuffer::new("test".into(), RetentionConfig::default());
+        let shared = Arc::new(event(1, 10));
+        buffer.push(Arc::clone(&shared));
+        let read = buffer
+            .read_partition_from(0, CdcOffset::ZERO, 1)
+            .pop()
+            .unwrap();
         assert!(Arc::ptr_eq(&shared, &read));
     }
 }

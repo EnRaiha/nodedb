@@ -644,6 +644,45 @@ mod tests {
     }
 
     #[test]
+    fn signed_hs256_token_without_expiration_is_rejected() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let secret = b"shared-secret";
+        let issued_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock must be after epoch")
+            .as_secs();
+        let header = base64_url_encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = base64_url_encode(
+            format!(
+                r#"{{"sub":"alice","iss":"https://issuer.example/","aud":"nodedb-api","iat":{issued_at},"user_id":7}}"#
+            )
+            .as_bytes(),
+        );
+        let signing_input = format!("{header}.{payload}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("valid HMAC fixture key");
+        mac.update(signing_input.as_bytes());
+        let token = format!(
+            "{signing_input}.{}",
+            base64_url_encode(&mac.finalize().into_bytes())
+        );
+        let validator = JwtValidator::new(JwtConfig {
+            algorithm: Some(JwtAlgorithm::Hs256),
+            hmac_secret: secret.to_vec(),
+            expected_issuer: "https://issuer.example/".into(),
+            expected_audience: "nodedb-api".into(),
+            tenant_id: Some(42),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            validator.validate(&token).err(),
+            Some(JwtError::MissingExpiration)
+        );
+    }
+
+    #[test]
     fn none_algorithm_rejected() {
         let header = base64_url_encode(br#"{"alg":"none"}"#);
         let payload = base64_url_encode(br#"{"sub":"x","iat":1,"exp":2}"#);

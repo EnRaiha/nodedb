@@ -141,7 +141,7 @@ pub(super) async fn handle_explain(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -
     let database_id = ctx.database_id();
     match ctx
         .query_ctx
-        .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
+        .plan_sql_with_rls_metadata(crate::control::planner::context::PlanSqlWithRlsParams {
             sql: inner_sql,
             tenant_id: ctx.tenant_id(),
             database_id,
@@ -149,19 +149,10 @@ pub(super) async fn handle_explain(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -
         })
         .await
     {
-        Ok((mut tasks, _output_schema)) => {
+        Ok((tasks, _output_schema)) => {
             drop(perm_cache);
-            if let Err(error) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
-                ctx.state,
-                &mut tasks,
-                ctx.tenant_id(),
-                database_id,
-                crate::types::TraceId::ZERO,
-            )
-            .await
-            {
-                return error_to_native(seq, &error);
-            }
+            // EXPLAIN is metadata-only. Authorize the original plan to protect
+            // metadata, but never materialize implicit edges while describing it.
             let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
                 &ctx.state.audit,
             ));

@@ -11,11 +11,15 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 
 use crate::bridge::envelope::PhysicalPlan;
-use crate::control::security::audit::ArcAuditEmitter;
-use crate::control::security::identity::Permission;
+use crate::control::security::audit::{ArcAuditEmitter, AuditEmitter};
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::security::permission::PermissionStore;
+use crate::control::security::role::RoleStore;
 use crate::control::server::http::auth::{ApiError, AppState, resolve_identity};
 use crate::control::server::http::types::{HttpCrdtApplyRequest, HttpCrdtApplyResponse};
-use crate::control::server::shared::authorization::{authorize_collection, authorize_task_set};
+use crate::control::server::shared::authorization::{
+    AuthorizationError, authorize_collection, authorize_task_set,
+};
 use crate::control::server::shared::ddl::sql_parse::hex_decode;
 use nodedb_physical::physical_plan::CrdtOp;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -45,11 +49,9 @@ pub async fn crdt_apply(
     let identity = resolve_identity(&headers, &state, "http")?;
 
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.shared.audit));
-    authorize_collection(
+    preflight_crdt_apply(
         &identity,
-        crate::types::DatabaseId::DEFAULT,
         &collection,
-        Permission::Write,
         &state.shared.permissions,
         &state.shared.roles,
         &audit,
@@ -147,6 +149,25 @@ pub async fn crdt_apply(
     )))
 }
 
+/// Authorize the fixed DEFAULT-database write before any CRDT apply work.
+fn preflight_crdt_apply(
+    identity: &AuthenticatedIdentity,
+    collection: &str,
+    permissions: &PermissionStore,
+    roles: &RoleStore,
+    audit: &dyn AuditEmitter,
+) -> Result<(), AuthorizationError> {
+    authorize_collection(
+        identity,
+        crate::types::DatabaseId::DEFAULT,
+        collection,
+        Permission::Write,
+        permissions,
+        roles,
+        audit,
+    )
+}
+
 fn decode_bounded_delta(encoded: &str) -> Result<Vec<u8>, ApiError> {
     let delta = hex_decode(encoded)
         .ok_or_else(|| ApiError::BadRequest("invalid hex in 'delta' field".into()))?;
@@ -162,6 +183,95 @@ fn decode_bounded_delta(encoded: &str) -> Result<Vec<u8>, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::security::audit::AuditEvent;
+    use crate::control::security::audit::emitter::test_helpers::CapturingEmitter;
+    use crate::control::security::identity::{AuthMethod, DatabaseSet};
+    use crate::types::TenantId;
+
+    fn regular_identity() -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_regular(
+            7,
+            "writer",
+            TenantId::new(9),
+            AuthMethod::ApiKey,
+            Vec::new(),
+            None,
+            DatabaseSet::Some(smallvec::smallvec![crate::types::DatabaseId::DEFAULT]),
+        )
+    }
+
+    fn assert_one_audit_denial(audit: &CapturingEmitter) {
+        let events = audit.recorded();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, AuditEvent::PermissionDenied);
+    }
+
+    #[test]
+    fn ungranted_regular_identity_is_denied_before_authorized_work_runs() {
+        // This endpoint has no read action or caller-selectable database, so
+        // those authorization-matrix cells are N/A.
+        let identity = regular_identity();
+        let permissions = PermissionStore::new();
+        let roles = RoleStore::new();
+        let audit = CapturingEmitter::new();
+        let mut authorized_work_runs = 0;
+        let preflight = preflight_crdt_apply(&identity, "orders", &permissions, &roles, &audit);
+
+        if preflight.is_ok() {
+            authorized_work_runs += 1;
+        }
+
+        assert!(preflight.is_err());
+        assert_eq!(authorized_work_runs, 0);
+        assert_one_audit_denial(&audit);
+    }
+
+    #[test]
+    fn regular_identity_cannot_write_system_audit_log_even_with_grant() {
+        // This endpoint has no read action or caller-selectable database, so
+        // those authorization-matrix cells are N/A.
+        let identity = regular_identity();
+        let permissions = PermissionStore::new();
+        permissions
+            .grant(
+                "collection:9:_system.audit_log",
+                "user:writer",
+                Permission::Write,
+                "admin",
+                None,
+            )
+            .expect("in-memory grant succeeds");
+        let roles = RoleStore::new();
+        let audit = CapturingEmitter::new();
+
+        assert!(
+            preflight_crdt_apply(&identity, "_system.audit_log", &permissions, &roles, &audit,)
+                .is_err()
+        );
+        assert_one_audit_denial(&audit);
+    }
+
+    #[test]
+    fn tenant_ten_grant_does_not_authorize_tenant_nine_identity() {
+        // This endpoint has no read action or caller-selectable database, so
+        // those authorization-matrix cells are N/A.
+        let identity = regular_identity();
+        let permissions = PermissionStore::new();
+        permissions
+            .grant(
+                "collection:10:orders",
+                "user:writer",
+                Permission::Write,
+                "admin",
+                None,
+            )
+            .expect("in-memory grant succeeds");
+        let roles = RoleStore::new();
+        let audit = CapturingEmitter::new();
+
+        assert!(preflight_crdt_apply(&identity, "orders", &permissions, &roles, &audit).is_err());
+        assert_one_audit_denial(&audit);
+    }
 
     #[test]
     fn decoded_delta_limit_is_exact_and_invalid_hex_is_bad_request() {

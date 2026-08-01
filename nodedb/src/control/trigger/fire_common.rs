@@ -107,10 +107,11 @@ pub async fn fire_triggers(params: FireTriggersParams<'_>) -> crate::Result<()> 
             "trigger invoked"
         );
 
-        let mut executor = StatementExecutor::with_source(
+        let mut executor = StatementExecutor::with_source_in_database(
             state,
             effective_identity,
             tenant_id,
+            trigger.database_id,
             cascade_depth + 1,
             crate::event::EventSource::Trigger,
         );
@@ -248,10 +249,11 @@ pub async fn fire_before_triggers_with_mutation(
             "BEFORE trigger invoked"
         );
 
-        let executor = StatementExecutor::with_source(
+        let executor = StatementExecutor::with_source_in_database(
             state,
             effective_identity,
             tenant_id,
+            trigger.database_id,
             cascade_depth + 1,
             crate::event::EventSource::Trigger,
         );

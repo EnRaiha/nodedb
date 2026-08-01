@@ -13,6 +13,7 @@ pub mod sync_client;
 pub mod tx_batch_helpers;
 
 use nodedb::event::cdc::event::CdcEvent;
+use nodedb_types::DatabaseId;
 
 /// Current time in milliseconds since UNIX epoch.
 #[allow(dead_code)]
@@ -25,7 +26,13 @@ pub fn now_ms() -> u64 {
 
 /// Create a [`CdcEvent`] with sensible test defaults.
 #[allow(dead_code)]
-pub fn make_cdc_event(seq: u64, partition: u32, collection: &str, op: &str) -> CdcEvent {
+pub fn make_cdc_event(
+    database_id: DatabaseId,
+    seq: u64,
+    partition: u32,
+    collection: &str,
+    op: &str,
+) -> CdcEvent {
     CdcEvent {
         sequence: seq,
         partition,
@@ -34,6 +41,7 @@ pub fn make_cdc_event(seq: u64, partition: u32, collection: &str, op: &str) -> C
         row_id: format!("r-{seq}"),
         event_time: now_ms(),
         lsn: seq * 10,
+        database_id,
         tenant_id: 1,
         new_value: Some(serde_json::json!({"id": seq})),
         old_value: None,

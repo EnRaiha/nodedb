@@ -31,7 +31,6 @@ pub mod notify_bus;
 pub mod otel;
 pub mod planner;
 pub mod promql;
-pub mod pubsub;
 pub mod request_tracker;
 pub mod rolling_upgrade;
 pub mod router;
@@ -55,7 +54,6 @@ pub mod vshard_admission;
 pub mod wal_catchup;
 pub mod wal_replication;
 
-pub use event_trigger::spawn_event_trigger_processor;
 pub use exec_receiver::LocalPlanExecutor;
 pub use request_tracker::RequestTracker;
 pub use rolling_upgrade::ClusterVersionView;

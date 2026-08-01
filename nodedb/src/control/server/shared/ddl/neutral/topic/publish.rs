@@ -13,8 +13,9 @@
 //! Syntax: `PUBLISH TO <topic> '<payload>'`
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::sql_dispatch::dispatch_sql;
+use crate::control::sql_dispatch::dispatch_sql_in_database;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::status;
@@ -26,11 +27,12 @@ use super::super::auth_support::status;
 pub async fn handle_publish(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
-    match dispatch_sql(state, identity, sql).await {
-        Some(Ok(_)) => Ok(status("PUBLISH")),
-        Some(Err(e)) => {
+    match dispatch_sql_in_database(state, identity, database_id, sql).await {
+        Ok(Some(_)) => Ok(status("PUBLISH")),
+        Err(e) => {
             let sqlstate = match &e {
                 crate::Error::CollectionNotFound { .. } => "42704",
                 crate::Error::BadRequest { .. } => "42601",
@@ -42,7 +44,7 @@ pub async fn handle_publish(
                 message: e.to_string(),
             })
         }
-        None => Err(DdlError {
+        Ok(None) => Err(DdlError {
             sqlstate: "42601".to_string(),
             message: "expected PUBLISH TO <topic> '<payload>'".to_string(),
         }),

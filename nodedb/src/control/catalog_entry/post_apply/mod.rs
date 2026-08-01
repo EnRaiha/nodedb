@@ -31,6 +31,7 @@ pub mod rls;
 pub mod role;
 pub mod schedule;
 pub mod sequence;
+pub mod streaming_materialized_view;
 pub mod synonym_group;
 pub mod tenant;
 pub mod trigger;

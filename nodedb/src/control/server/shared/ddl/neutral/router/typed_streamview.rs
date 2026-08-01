@@ -30,6 +30,7 @@ pub(super) async fn try_typed(
         }) => Some(change_stream::create_change_stream(
             state,
             identity,
+            database_id,
             name,
             collection,
             with_clause_raw,
@@ -46,25 +47,36 @@ pub(super) async fn try_typed(
             // case fall through to `drop_change_stream`, which re-derives the
             // name / IF EXISTS from `parts` exactly as the pgwire streaming
             // string dispatch did.
-            if *if_exists && !change_stream::change_stream_exists(state, identity, name) {
+            if *if_exists
+                && !change_stream::change_stream_exists(state, identity, database_id, name)
+            {
                 return Some(Ok(vec![DdlResult::Status {
                     command: "DROP CHANGE STREAM".to_string(),
                     rows_affected: None,
                 }]));
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(change_stream::drop_change_stream(state, identity, &parts))
+            Some(change_stream::drop_change_stream(
+                state,
+                identity,
+                database_id,
+                &parts,
+            ))
         }
 
         NodedbStatement::StreamView(StreamViewStmt::CreateConsumerGroup {
             group_name,
             stream_name,
-        }) => Some(consumer_group::create_consumer_group(
-            state,
-            identity,
-            group_name,
-            stream_name,
-        )),
+        }) => Some(
+            consumer_group::create_consumer_group(
+                state,
+                identity,
+                database_id,
+                group_name,
+                stream_name,
+            )
+            .await,
+        ),
 
         NodedbStatement::StreamView(StreamViewStmt::DropConsumerGroup {
             name,
@@ -79,14 +91,21 @@ pub(super) async fn try_typed(
             // dispatch did. The guard checks the in-memory group registry for the
             // identity tenant using the parsed name / stream verbatim.
             let tid = identity.tenant_id.as_u64();
-            if *if_exists && state.group_registry.get(tid, stream, name).is_none() {
+            let stream =
+                consumer_group::identity::canonical_stream_name(state, database_id, tid, stream);
+            if *if_exists
+                && state
+                    .group_registry
+                    .get(database_id, tid, &stream, name)
+                    .is_none()
+            {
                 return Some(Ok(vec![DdlResult::Status {
                     command: "DROP CONSUMER GROUP".to_string(),
                     rows_affected: None,
                 }]));
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
-            Some(consumer_group::drop_consumer_group(state, identity, &parts))
+            Some(consumer_group::drop_consumer_group(state, identity, database_id, &parts).await)
         }
 
         NodedbStatement::StreamView(StreamViewStmt::CreateMaterializedView {
@@ -98,6 +117,7 @@ pub(super) async fn try_typed(
             materialized_view::create_materialized_view(
                 state,
                 identity,
+                database_id,
                 name,
                 source,
                 query_sql,
@@ -115,7 +135,9 @@ pub(super) async fn try_typed(
             // through to `drop_materialized_view`, which re-derives the name / IF
             // EXISTS from `parts` (and runs its own catalog-based existence check)
             // exactly as the pgwire admin string dispatch did.
-            if *if_exists && !materialized_view::materialized_view_exists(state, identity, name) {
+            if *if_exists
+                && !materialized_view::materialized_view_exists(state, identity, database_id, name)
+            {
                 return Some(Ok(vec![DdlResult::Status {
                     command: "DROP MATERIALIZED VIEW".to_string(),
                     rows_affected: None,
@@ -123,7 +145,10 @@ pub(super) async fn try_typed(
             }
             let parts: Vec<&str> = sql.split_whitespace().collect();
             Some(materialized_view::drop_materialized_view(
-                state, identity, &parts,
+                state,
+                identity,
+                database_id,
+                &parts,
             ))
         }
 

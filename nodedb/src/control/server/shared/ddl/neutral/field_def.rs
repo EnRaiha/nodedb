@@ -13,8 +13,10 @@
 
 use nodedb_types::DatabaseId;
 
+use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::catalog::types::FieldDefinition;
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::server::shared::ddl::sql_parse::extract_clause;
 use crate::control::state::SharedState;
 
@@ -35,6 +37,7 @@ fn err(sqlstate: &str, message: &str) -> DdlError {
 pub fn define_field(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     // Parse: DEFINE FIELD <name> ON <collection> ...
@@ -49,6 +52,18 @@ pub fn define_field(
     let field_name = parts[2].to_lowercase();
     let collection = parts[4].to_lowercase();
     let tenant_id = identity.tenant_id;
+
+    let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+    authorize_collection(
+        identity,
+        database_id,
+        &collection,
+        Permission::Alter,
+        &state.permissions,
+        &state.roles,
+        &audit,
+    )
+    .map_err(|error| err("42501", &format!("permission denied: {}", error.resource())))?;
 
     // Parse optional clauses from the remaining SQL.
     let remainder = if sql.len() > parts[..5].iter().map(|p| p.len() + 1).sum::<usize>() {
@@ -79,7 +94,7 @@ pub fn define_field(
     // Store in catalog.
     {
         let catalog = state.credentials.catalog();
-        match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection) {
+        match catalog.get_collection(database_id, tenant_id.as_u64(), &collection) {
             Ok(Some(mut coll)) => {
                 // Remove existing definition for this field if any.
                 coll.field_defs.retain(|f| f.name != field_name);
@@ -103,7 +118,7 @@ pub fn define_field(
                     coll.fields.push((field_name.clone(), resolved_type));
                 }
 
-                if let Err(e) = catalog.put_collection(DatabaseId::DEFAULT, &coll) {
+                if let Err(e) = catalog.put_collection(database_id, &coll) {
                     return Err(err("XX000", &format!("save collection: {e}")));
                 }
             }
@@ -135,6 +150,7 @@ pub fn define_field(
 pub fn define_event(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     use crate::control::security::catalog::types::EventDefinition;
@@ -150,6 +166,18 @@ pub fn define_event(
     let event_name = parts[2].to_lowercase();
     let collection = parts[4].to_lowercase();
     let tenant_id = identity.tenant_id;
+
+    let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+    authorize_collection(
+        identity,
+        database_id,
+        &collection,
+        Permission::Alter,
+        &state.permissions,
+        &state.roles,
+        &audit,
+    )
+    .map_err(|error| err("42501", &format!("permission denied: {}", error.resource())))?;
 
     // Extract WHEN and THEN clauses using the shared keyword parser.
     let remainder = if sql.len() > parts[..5].iter().map(|p| p.len() + 1).sum::<usize>() {
@@ -181,11 +209,11 @@ pub fn define_event(
 
     {
         let catalog = state.credentials.catalog();
-        match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &collection) {
+        match catalog.get_collection(database_id, tenant_id.as_u64(), &collection) {
             Ok(Some(mut coll)) => {
                 coll.event_defs.retain(|e| e.name != event_name);
                 coll.event_defs.push(def);
-                if let Err(e) = catalog.put_collection(DatabaseId::DEFAULT, &coll) {
+                if let Err(e) = catalog.put_collection(database_id, &coll) {
                     return Err(err("XX000", &format!("save collection: {e}")));
                 }
             }

@@ -13,7 +13,7 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::authorization::{authorize_database, authorize_task_set};
 
-use super::super::super::auth::{ApiError, AppState, resolve_identity};
+use super::super::super::auth::{ApiError, AppState, resolve_auth};
 use super::super::super::types::{HttpQueryRequest, HttpQueryResponse};
 use super::super::result_shape::{
     HttpShaped, ddl_results_to_json, passthrough_json_row, shape_http_payload,
@@ -34,7 +34,7 @@ pub async fn query(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<HttpQueryRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let identity = resolve_identity(&headers, &state, "http")?;
+    let (identity, mut auth_ctx) = resolve_auth(&headers, &state, "http")?;
     let database_id = resolve_database_id(&headers, &db_param, &state)?;
     let trace_id = crate::control::trace_context::extract_from_headers(&headers);
     let emitter = ArcAuditEmitter(Arc::clone(&state.shared.audit));
@@ -81,7 +81,9 @@ pub async fn query(
             retry_after_secs: 1,
         })?;
 
-    let mut auth_ctx = crate::control::server::session_auth::build_auth_context(&identity);
+    // The request-selected database is authoritative for RLS variables while
+    // retaining verified JWT/session enrichment from authentication.
+    auth_ctx.database_id = Some(database_id);
     let clean_sql =
         crate::control::server::session_auth::extract_and_apply_on_deny(sql, &mut auth_ctx);
     let perm_cache = state.shared.permission_cache.read().await;
@@ -93,16 +95,22 @@ pub async fn query(
         roles: &state.shared.roles,
         permission_cache: Some(&*perm_cache),
     };
-    let (mut tasks, output_schema) = state
+    let (mut tasks, output_schema, versions, _) = state
         .query_ctx
-        .plan_sql_with_rls(crate::control::planner::context::PlanSqlWithRlsParams {
-            sql: &clean_sql,
-            tenant_id,
-            database_id,
-            sec: &sec,
-        })
+        .plan_sql_with_rls_and_versions(&clean_sql, tenant_id, database_id, &sec, false)
         .await
         .map_err(|e| ApiError::BadRequest(format!("SQL planning failed: {e}")))?;
+
+    // Implicit-edge extraction marks catalog state and allocates surrogates,
+    // so the original planned tasks must be authorized first.
+    let _preauthorized_tasks = authorize_task_set(
+        &identity,
+        &tasks,
+        &state.shared.permissions,
+        &state.shared.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?;
 
     crate::control::planner::implicit_edges::append_implicit_edge_tasks(
         &state.shared,
@@ -127,6 +135,12 @@ pub async fn query(
     if tasks.is_empty() {
         return Ok(axum::Json(HttpQueryResponse::ok(vec![])));
     }
+
+    // Acquire only after authorization, and retain the scope through every
+    // dispatch and response-shaping operation below.
+    let _lease_scope = Arc::clone(&state.shared)
+        .acquire_plan_lease_scope(&versions)
+        .map_err(ApiError::from)?;
 
     // Track active request for quota accounting.
     let _request = state.shared.tenant_request_guard(tenant_id);

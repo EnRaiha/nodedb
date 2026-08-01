@@ -35,6 +35,7 @@ use nodedb_types::sync::wire::array::ArrayDeltaMsg;
 use tracing::warn;
 
 use super::delivery::ArrayDeliveryRegistry;
+use super::subscriber_state::SubscriberMap;
 
 /// Number of buffered ops that triggers an immediate drain regardless of the
 /// timer.
@@ -72,17 +73,49 @@ impl MergerInner {
 pub struct MultiShardMerger {
     /// Session this merger serves.
     session_id: String,
+    /// Explicit database namespace of this merger's array.
+    database_id: nodedb_types::DatabaseId,
+    /// Authenticated tenant namespace of this merger's array.
+    tenant_id: u64,
     /// Array name this merger serves.
     array: String,
+    /// Cursor map for fanout-created mergers. Standalone mergers used in
+    /// ordering tests do not own cursors.
+    cursors: Option<Arc<SubscriberMap>>,
     inner: Mutex<MergerInner>,
 }
 
 impl MultiShardMerger {
     /// Construct a new merger for `(session_id, array)`.
-    pub fn new(session_id: impl Into<String>, array: impl Into<String>) -> Self {
+    pub fn new(
+        session_id: impl Into<String>,
+        database_id: nodedb_types::DatabaseId,
+        tenant_id: u64,
+        array: impl Into<String>,
+    ) -> Self {
         Self {
             session_id: session_id.into(),
+            database_id,
+            tenant_id,
             array: array.into(),
+            cursors: None,
+            inner: Mutex::new(MergerInner::new()),
+        }
+    }
+
+    fn with_cursors(
+        session_id: impl Into<String>,
+        database_id: nodedb_types::DatabaseId,
+        tenant_id: u64,
+        array: impl Into<String>,
+        cursors: Arc<SubscriberMap>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            database_id,
+            tenant_id,
+            array: array.into(),
+            cursors: Some(cursors),
             inner: Mutex::new(MergerInner::new()),
         }
     }
@@ -190,29 +223,29 @@ impl MultiShardMerger {
     }
 
     /// Deliver one op to the session's delivery channel.
-    fn deliver_op(&self, op: &ArrayOp, delivery: &ArrayDeliveryRegistry) {
+    ///
+    /// A cursor is advanced only after both encoding and channel enqueue have
+    /// succeeded. A rejected enqueue leaves the cursor behind the op so the
+    /// lagged session must catch up after it reconnects.
+    fn deliver_op(&self, op: &ArrayOp, delivery: &ArrayDeliveryRegistry) -> bool {
         let op_payload = match op_codec::encode_op(op) {
             Ok(b) => b,
             Err(e) => {
                 warn!(
                     session = %self.session_id,
+                    database_id = self.database_id.as_u64(),
+                    tenant_id = self.tenant_id,
                     array = %self.array,
                     error = %e,
                     "multi_shard_merger: encode_op failed — skipping op"
                 );
-                return;
+                return false;
             }
         };
 
         let msg = ArrayDeltaMsg {
             array: op.header.array.clone(),
             op_payload,
-            // Merged ops are Origin's authoritative state being fanned out to
-            // Lite, not client-originated writes, so they carry no producer
-            // identity. The wire message keeps these fields for protocol
-            // uniformity; the receiver derives producer_id/epoch from its
-            // session identity, never from an inbound delta, so zeroing here is
-            // both safe and the correct "no attributed producer" value.
             producer_id: 0,
             epoch: 0,
             seq: 0,
@@ -229,11 +262,24 @@ impl MultiShardMerger {
                     array = %self.array,
                     "multi_shard_merger: SyncFrame encode failed — skipping op"
                 );
-                return;
+                return false;
             }
         };
 
-        delivery.enqueue(&self.session_id, frame);
+        if !delivery.enqueue(&self.session_id, frame) {
+            return false;
+        }
+
+        if let Some(cursors) = &self.cursors {
+            cursors.mark_sent_in_database(
+                &self.session_id,
+                self.database_id,
+                self.tenant_id,
+                &self.array,
+                op.header.hlc,
+            );
+        }
+        true
     }
 }
 
@@ -242,11 +288,13 @@ impl MultiShardMerger {
 /// Per-session, per-array merger registry.
 ///
 /// `ArrayFanout` holds one of these to look up the right `MultiShardMerger`
-/// for each (session, array) pair. The registry creates mergers on first use
+/// for each `(session, database, tenant, array)` scope. The registry creates mergers on first use
 /// and drops them when sessions disconnect via [`MergerRegistry::remove_session`].
+/// Key identifying one merger: `(session_id, database_id, tenant_id, array_name)`.
+pub type MergerKey = (String, nodedb_types::DatabaseId, u64, String);
+
 pub struct MergerRegistry {
-    /// Key: (session_id, array_name).
-    mergers: Mutex<HashMap<(String, String), Arc<MultiShardMerger>>>,
+    mergers: Mutex<HashMap<MergerKey, Arc<MultiShardMerger>>>,
 }
 
 impl MergerRegistry {
@@ -257,18 +305,82 @@ impl MergerRegistry {
         }
     }
 
-    /// Look up or create the merger for `(session_id, array)`.
-    pub fn get_or_create(&self, session_id: &str, array: &str) -> Arc<MultiShardMerger> {
+    /// Look up or create the merger for `(session_id, database, tenant, array)`.
+    pub fn get_or_create(
+        &self,
+        session_id: &str,
+        database_id: nodedb_types::DatabaseId,
+        tenant_id: u64,
+        array: &str,
+    ) -> Arc<MultiShardMerger> {
         let mut mergers = match self.mergers.lock() {
             Ok(g) => g,
             Err(e) => {
                 warn!("merger_registry: lock poisoned — returning fresh merger: {e}");
-                return Arc::new(MultiShardMerger::new(session_id, array));
+                return Arc::new(MultiShardMerger::new(
+                    session_id,
+                    database_id,
+                    tenant_id,
+                    array,
+                ));
             }
         };
         mergers
-            .entry((session_id.to_owned(), array.to_owned()))
-            .or_insert_with(|| Arc::new(MultiShardMerger::new(session_id, array)))
+            .entry((
+                session_id.to_owned(),
+                database_id,
+                tenant_id,
+                array.to_owned(),
+            ))
+            .or_insert_with(|| {
+                Arc::new(MultiShardMerger::new(
+                    session_id,
+                    database_id,
+                    tenant_id,
+                    array,
+                ))
+            })
+            .clone()
+    }
+
+    /// Look up or create a merger that owns cursor advancement for fanout.
+    pub fn get_or_create_with_cursors(
+        &self,
+        session_id: &str,
+        database_id: nodedb_types::DatabaseId,
+        tenant_id: u64,
+        array: &str,
+        cursors: Arc<SubscriberMap>,
+    ) -> Arc<MultiShardMerger> {
+        let mut mergers = match self.mergers.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("merger_registry: lock poisoned — returning fresh merger: {e}");
+                return Arc::new(MultiShardMerger::with_cursors(
+                    session_id,
+                    database_id,
+                    tenant_id,
+                    array,
+                    cursors,
+                ));
+            }
+        };
+        mergers
+            .entry((
+                session_id.to_owned(),
+                database_id,
+                tenant_id,
+                array.to_owned(),
+            ))
+            .or_insert_with(|| {
+                Arc::new(MultiShardMerger::with_cursors(
+                    session_id,
+                    database_id,
+                    tenant_id,
+                    array,
+                    cursors,
+                ))
+            })
             .clone()
     }
 
@@ -278,7 +390,7 @@ impl MergerRegistry {
             Ok(g) => g,
             Err(_) => return,
         };
-        mergers.retain(|(sid, _), _| sid != session_id);
+        mergers.retain(|(sid, _, _, _), _| sid != session_id);
     }
 }
 
@@ -361,7 +473,7 @@ mod tests {
 
     #[test]
     fn ops_delivered_in_hlc_order() {
-        let merger = MultiShardMerger::new("s1", "mat");
+        let merger = MultiShardMerger::new("s1", nodedb_types::DatabaseId::DEFAULT, 0, "mat");
         let delivery = ArrayDeliveryRegistry::new();
         let mut rx = delivery.register("s1".into());
 
@@ -384,7 +496,7 @@ mod tests {
 
     #[test]
     fn drain_threshold_triggers_immediate_drain() {
-        let merger = MultiShardMerger::new("s1", "mat");
+        let merger = MultiShardMerger::new("s1", nodedb_types::DatabaseId::DEFAULT, 0, "mat");
         let delivery = ArrayDeliveryRegistry::new();
         let mut rx = delivery.register("s1".into());
 
@@ -405,11 +517,24 @@ mod tests {
     }
 
     #[test]
+    fn same_database_and_array_use_distinct_mergers_per_tenant() {
+        let registry = MergerRegistry::new();
+        let database_id = nodedb_types::DatabaseId::new(7);
+        let tenant_one = registry.get_or_create("s1", database_id, 1, "same");
+        let tenant_two = registry.get_or_create("s1", database_id, 2, "same");
+
+        assert!(
+            !Arc::ptr_eq(&tenant_one, &tenant_two),
+            "same database/name mergers must not cross tenant boundaries"
+        );
+    }
+
+    #[test]
     fn remove_session_clears_mergers() {
         let reg = MergerRegistry::new();
-        let _ = reg.get_or_create("s1", "arr");
-        let _ = reg.get_or_create("s1", "arr2");
-        let _ = reg.get_or_create("s2", "arr");
+        let _ = reg.get_or_create("s1", nodedb_types::DatabaseId::DEFAULT, 0, "arr");
+        let _ = reg.get_or_create("s1", nodedb_types::DatabaseId::DEFAULT, 0, "arr2");
+        let _ = reg.get_or_create("s2", nodedb_types::DatabaseId::DEFAULT, 0, "arr");
 
         reg.remove_session("s1");
 

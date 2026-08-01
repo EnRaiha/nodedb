@@ -81,6 +81,7 @@ impl SqlCatalog for OriginCatalog {
         // valid; if it bumps to 2+, the cache correctly
         // invalidates.
         let descriptor_id = DescriptorId::new(
+            self.database_id.as_u64(),
             self.tenant_id,
             DescriptorKind::Collection,
             stored.name.clone(),
@@ -190,6 +191,7 @@ impl SqlCatalog for OriginCatalog {
         // the relation. Record it so dropping or altering the target invalidates
         // a cached physical plan that embeds its OID.
         let descriptor_id = DescriptorId::new(
+            self.database_id.as_u64(),
             self.tenant_id,
             DescriptorKind::Collection,
             stored.name.clone(),
@@ -223,7 +225,11 @@ impl SqlCatalog for OriginCatalog {
         let handle = self.array_catalog.as_ref()?;
         let entry = {
             let cat = handle.read().ok()?;
-            cat.lookup_by_name(name)?
+            cat.lookup_by_name_in_database(
+                nodedb_types::TenantId::new(self.tenant_id),
+                self.database_id,
+                name,
+            )?
         };
         let schema: ArraySchema = zerompk::from_msgpack(&entry.schema_msgpack).ok()?;
 

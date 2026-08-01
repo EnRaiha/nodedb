@@ -9,9 +9,10 @@
 //! Event Plane MUST spawn via [`spawn_loop`] / [`spawn_blocking_loop`]
 //! and subscribe to the canonical [`ShutdownWatch`] held on
 //! `SharedState`. On `main.rs`'s ctrl-c path, the watch is
-//! signaled and [`LoopRegistry::shutdown_all`] awaits every
-//! registered handle with a shared deadline, aborting async
-//! laggards and logging blocking laggards.
+//! signaled and [`LoopRegistry::shutdown_all_strict`] awaits every
+//! registered handle. The bounded [`LoopRegistry::shutdown_all`] API
+//! remains available for noncritical callers, aborting async laggards
+//! and logging blocking laggards.
 
 pub mod bus;
 pub mod phase;
@@ -21,7 +22,7 @@ pub mod report;
 pub mod spawn;
 pub mod watch;
 
-pub use bus::{DrainGuard, ShutdownBus, ShutdownHandle, TaskId, spawn_drainable};
+pub use bus::{DrainGuard, PHASE_BUDGET, ShutdownBus, ShutdownHandle, TaskId, spawn_drainable};
 pub use phase::ShutdownPhase;
 pub use receiver::ShutdownReceiver;
 pub use registry::{LoopHandle, LoopRegistry, RegistryClosed};

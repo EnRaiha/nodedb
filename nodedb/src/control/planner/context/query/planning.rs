@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::QueryContext;
 use crate::control::planner::context::security::PlanSecurityContext;
+use crate::control::planner::sql_plan_convert::PlanningPurpose;
 use crate::control::server::response_shape::schema::OutputSchema;
 
 /// Bundled arguments for [`QueryContext::plan_sql_with_rls`].
@@ -41,6 +42,24 @@ impl QueryContext {
             .map(|(t, schema, _, _)| (t, schema))
     }
 
+    /// Plan SQL and return the descriptor versions observed during planning.
+    ///
+    /// Internal dispatchers without an RLS security context use this variant so
+    /// they can acquire descriptor leases before sending work to the Data Plane.
+    pub async fn plan_sql_and_versions(
+        &self,
+        sql: &str,
+        tenant_id: crate::types::TenantId,
+        database_id: crate::types::DatabaseId,
+    ) -> crate::Result<(
+        Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
+        crate::control::planner::descriptor_set::DescriptorVersionSet,
+    )> {
+        self.plan_with_nodedb_sql(sql, tenant_id, database_id)
+            .map(|(tasks, schema, versions, _)| (tasks, schema, versions))
+    }
+
     /// Core planning via nodedb-sql: parse → plan → optimize → convert.
     ///
     /// Returns the compiled physical tasks and the
@@ -60,6 +79,21 @@ impl QueryContext {
         crate::control::planner::descriptor_set::DescriptorVersionSet,
         nodedb_sql::types::PlanCacheEligibility,
     )> {
+        self.plan_with_nodedb_sql_for_purpose(sql, tenant_id, database_id, PlanningPurpose::Execute)
+    }
+
+    fn plan_with_nodedb_sql_for_purpose(
+        &self,
+        sql: &str,
+        tenant_id: crate::types::TenantId,
+        database_id: crate::types::DatabaseId,
+        purpose: PlanningPurpose,
+    ) -> crate::Result<(
+        Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
+        crate::control::planner::descriptor_set::DescriptorVersionSet,
+        nodedb_sql::types::PlanCacheEligibility,
+    )> {
         let inputs = match &self.catalog_inputs {
             Some(i) => i,
             None => {
@@ -72,7 +106,19 @@ impl QueryContext {
         // `recorded_versions` field is per-plan state, and
         // two concurrent plans through a shared QueryContext
         // would otherwise interleave their recorded sets.
-        let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
+        let catalog = if purpose == PlanningPurpose::Metadata {
+            // Metadata requests intentionally do not participate in descriptor
+            // lease admission; they only need a stable catalog snapshot for
+            // authorization and response shaping.
+            crate::control::planner::catalog_adapter::OriginCatalog::new(
+                Arc::clone(&inputs.credentials),
+                tenant_id.as_u64(),
+                database_id,
+                inputs.retention_policy_registry.clone(),
+            )
+        } else {
+            inputs.build_adapter(tenant_id.as_u64(), database_id)
+        };
         let plans = nodedb_sql::plan_sql(sql, &catalog).map_err(|e| match e {
             nodedb_sql::SqlError::RetryableSchemaChanged { descriptor } => {
                 crate::Error::RetryableSchemaChanged { descriptor }
@@ -125,6 +171,7 @@ impl QueryContext {
             })?;
         let version_set = catalog.take_recorded_versions();
         let ctx = crate::control::planner::sql_plan_convert::ConvertContext {
+            purpose,
             retention_registry: self.retention_registry.clone(),
             array_catalog: self.array_catalog.clone(),
             credentials: self
@@ -227,7 +274,60 @@ impl QueryContext {
         tenant_id: crate::types::TenantId,
         database_id: crate::types::DatabaseId,
         sec: &PlanSecurityContext<'_>,
+        returning: bool,
+    ) -> crate::Result<(
+        Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
+        crate::control::planner::descriptor_set::DescriptorVersionSet,
+        nodedb_sql::types::PlanCacheEligibility,
+    )> {
+        self.plan_sql_with_rls_and_versions_for_purpose(
+            sql,
+            tenant_id,
+            database_id,
+            sec,
+            returning,
+            PlanningPurpose::Execute,
+        )
+        .await
+    }
+
+    /// Plan only the metadata required to authorize a Parse/Describe or
+    /// EXPLAIN request. Returned tasks are descriptive and must never be
+    /// cached, leased, expanded, or dispatched.
+    pub async fn plan_sql_with_rls_metadata(
+        &self,
+        params: PlanSqlWithRlsParams<'_>,
+    ) -> crate::Result<(
+        Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
+    )> {
+        let PlanSqlWithRlsParams {
+            sql,
+            tenant_id,
+            database_id,
+            sec,
+        } = params;
+        self.plan_sql_with_rls_and_versions_for_purpose(
+            sql,
+            tenant_id,
+            database_id,
+            sec,
+            false,
+            PlanningPurpose::Metadata,
+        )
+        .await
+        .map(|(tasks, schema, _, _)| (tasks, schema))
+    }
+
+    async fn plan_sql_with_rls_and_versions_for_purpose(
+        &self,
+        sql: &str,
+        tenant_id: crate::types::TenantId,
+        database_id: crate::types::DatabaseId,
+        sec: &PlanSecurityContext<'_>,
         _returning: bool,
+        purpose: PlanningPurpose,
     ) -> crate::Result<(
         Vec<nodedb_physical::physical_task::PhysicalTask>,
         OutputSchema,
@@ -235,7 +335,7 @@ impl QueryContext {
         nodedb_sql::types::PlanCacheEligibility,
     )> {
         let (mut tasks, output_schema, version_set, cache_eligibility) =
-            self.plan_with_nodedb_sql(sql, tenant_id, database_id)?;
+            self.plan_with_nodedb_sql_for_purpose(sql, tenant_id, database_id, purpose)?;
 
         // Inject RLS predicates.
         crate::control::planner::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
@@ -265,6 +365,26 @@ impl QueryContext {
         Vec<nodedb_physical::physical_task::PhysicalTask>,
         OutputSchema,
     )> {
+        self.plan_sql_with_params_and_rls_and_versions(sql, params, tenant_id, database_id, sec)
+            .await
+            .map(|(tasks, schema, _)| (tasks, schema))
+    }
+
+    /// Parameterized RLS planning plus the descriptor versions observed by its
+    /// fresh catalog adapter. Prepared statements require the same fail-closed
+    /// descriptor lease admission as fresh and cached simple-query plans.
+    pub async fn plan_sql_with_params_and_rls_and_versions(
+        &self,
+        sql: &str,
+        params: &[nodedb_sql::ParamValue],
+        tenant_id: crate::types::TenantId,
+        database_id: crate::types::DatabaseId,
+        sec: &PlanSecurityContext<'_>,
+    ) -> crate::Result<(
+        Vec<nodedb_physical::physical_task::PhysicalTask>,
+        OutputSchema,
+        crate::control::planner::descriptor_set::DescriptorVersionSet,
+    )> {
         let inputs = match &self.catalog_inputs {
             Some(i) => i,
             None => {
@@ -274,12 +394,8 @@ impl QueryContext {
             }
         };
         // Fresh adapter per plan call: same rationale as
-        // `plan_with_nodedb_sql`. The params-and-rls path does
-        // not currently surface the recorded version set to
-        // callers (prepared statements with bound parameters go
-        // through a different cache key), but constructing the
-        // adapter fresh keeps the adapter's state per-plan and
-        // allows future extension.
+        // `plan_with_nodedb_sql`. Its recorded version set is returned to the
+        // caller so parameterized plans participate in descriptor admission.
         let catalog = inputs.build_adapter(tenant_id.as_u64(), database_id);
         let raw_plans = nodedb_sql::plan_sql_with_params(sql, params, &catalog).map_err(
             |error| match error {
@@ -319,6 +435,7 @@ impl QueryContext {
                 },
             })?;
         let ctx = crate::control::planner::sql_plan_convert::ConvertContext {
+            purpose: PlanningPurpose::Execute,
             retention_registry: self.retention_registry.clone(),
             array_catalog: self.array_catalog.clone(),
             credentials: self
@@ -372,6 +489,7 @@ impl QueryContext {
             )?;
         }
 
-        Ok((tasks, output_schema))
+        let version_set = catalog.take_recorded_versions();
+        Ok((tasks, output_schema, version_set))
     }
 }

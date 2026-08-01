@@ -18,4 +18,4 @@ pub mod set_ops;
 pub mod value;
 pub mod visitor;
 
-pub use convert::{ConvertContext, convert};
+pub use convert::{ConvertContext, PlanningPurpose, convert};

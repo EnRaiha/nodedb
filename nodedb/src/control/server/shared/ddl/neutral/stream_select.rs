@@ -21,10 +21,13 @@
 use serde_json::{Map, Value as JsonValue};
 use sonic_rs;
 
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::response_shape::types::ShapedRows;
+use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
 use crate::event::cdc::consume::{ConsumeError, ConsumeParams, consume_stream};
+use crate::types::DatabaseId;
 
 use super::super::result::{DdlError, DdlResult};
 
@@ -51,6 +54,7 @@ fn parse_stream_identifier(token: &str) -> Result<String, DdlError> {
 pub async fn select_from_stream(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     parts: &[&str],
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
@@ -94,7 +98,43 @@ pub async fn select_from_stream(
         }
     }
 
+    // A change stream's events are protected by Read access to its source
+    // collection. Resolve it in the selected database and caller tenant before
+    // consumption can be forwarded to a remote partition. `topic:` names have
+    // no source collection and intentionally retain their existing semantics.
+    if let Some(topic_name) = stream_name.strip_prefix("topic:") {
+        let emitter = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+        authorize_collection(
+            identity,
+            database_id,
+            &format!("topic:{topic_name}"),
+            Permission::Read,
+            &state.permissions,
+            &state.roles,
+            &emitter,
+        )
+        .map_err(crate::Error::from)
+        .map_err(|error| err("42501", error.to_string()))?;
+    } else if let Some(stream_def) = state
+        .stream_registry
+        .get(database_id, tenant_id, &stream_name)
+    {
+        let emitter = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+        authorize_collection(
+            identity,
+            database_id,
+            &stream_def.collection,
+            Permission::Read,
+            &state.permissions,
+            &state.roles,
+            &emitter,
+        )
+        .map_err(crate::Error::from)
+        .map_err(|error| err("42501", error.to_string()))?;
+    }
+
     let consume_params = ConsumeParams {
+        database_id,
         tenant_id,
         stream_name: &stream_name,
         group_name: &group_name,
@@ -155,6 +195,10 @@ pub async fn select_from_stream(
         );
         row.insert("lsn".to_string(), JsonValue::String(event.lsn.to_string()));
         row.insert(
+            "offset".to_string(),
+            JsonValue::String(event.offset_token()),
+        );
+        row.insert(
             "event_time".to_string(),
             JsonValue::String(event.event_time.to_string()),
         );
@@ -191,6 +235,7 @@ fn result_columns() -> Vec<String> {
         "event_type".to_string(),
         "row_id".to_string(),
         "lsn".to_string(),
+        "offset".to_string(),
         "event_time".to_string(),
         "new_value".to_string(),
         "old_value".to_string(),

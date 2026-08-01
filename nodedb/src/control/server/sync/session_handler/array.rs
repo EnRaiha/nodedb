@@ -13,7 +13,7 @@ use tracing::warn;
 
 use nodedb_types::sync::wire::array::{
     ArrayAckMsg, ArrayCatchupRequestMsg, ArrayDeltaBatchMsg, ArrayDeltaMsg, ArrayRejectMsg,
-    ArraySchemaSyncMsg, ArraySnapshotChunkMsg, ArraySnapshotMsg,
+    ArrayRejectReason, ArraySchemaSyncMsg, ArraySnapshotChunkMsg, ArraySnapshotMsg,
 };
 
 use super::super::wire::{SyncFrame, SyncMessageType};
@@ -32,6 +32,9 @@ pub(super) fn build_array_inbound(
     identity: crate::control::security::identity::AuthenticatedIdentity,
 ) -> Option<Arc<crate::control::array_sync::OriginArrayInbound>> {
     let tenant_id = identity.tenant_id;
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
     shared.as_ref().map(|s| {
         let engine = Arc::new(crate::control::array_sync::OriginApplyEngine::new(
             Arc::clone(&s.array_sync_schemas),
@@ -44,7 +47,10 @@ pub(super) fn build_array_inbound(
             Arc::clone(&s.array_snapshot_hlcs),
             Arc::clone(&s.array_merger_registry),
             0,
-            tenant_id.as_u64(),
+            crate::control::server::sync::shape::ShapeScope {
+                tenant_id: tenant_id.as_u64(),
+                database_id,
+            },
         ));
         let inbound = crate::control::array_sync::OriginArrayInbound::new(
             engine,
@@ -70,6 +76,31 @@ pub(super) fn is_array_frame(msg_type: SyncMessageType) -> bool {
             | SyncMessageType::ArrayReject
             | SyncMessageType::ArrayCatchupRequest
     )
+}
+
+/// Return a bounded rejection when an array frame lacks the current
+/// authenticated handshake binding.
+///
+/// The caller invokes this before constructing or reusing an inbound engine,
+/// so an unauthenticated frame cannot affect catalog, data, or fan-out state.
+pub(super) fn unauthenticated_array_reject(
+    frame: &SyncFrame,
+    authenticated: bool,
+    identity_present: bool,
+) -> Option<SyncFrame> {
+    if !is_array_frame(frame.msg_type) || (authenticated && identity_present) {
+        return None;
+    }
+
+    let reject = ArrayRejectMsg {
+        // Do not reflect untrusted frame contents into the response: this
+        // keeps the rejection bounded even for a deliberately oversized body.
+        array: String::new(),
+        op_hlc_bytes: [0; 18],
+        reason: ArrayRejectReason::EngineRejected,
+        detail: "unauthenticated array frame".into(),
+    };
+    SyncFrame::try_encode(SyncMessageType::ArrayReject, &reject)
 }
 
 /// Route one inbound array frame to the inbound engine, returning a reject
@@ -175,7 +206,8 @@ mod tests {
     /// Regression guard for the tenant-isolation bug: `build_array_inbound`
     /// must bind the inbound array engine to the tenant it is GIVEN, never a
     /// hardcoded placeholder. The engine's tenant flows into every replicated
-    /// array write (`ReplicatedEntry`) and into `ArrayId::new(tenant, array)`,
+    /// array write (`ReplicatedEntry`) and into
+    /// `ArrayId::in_database(tenant, database, array)`,
     /// so a reverted-to-0 tenant here silently routes one tenant's array
     /// writes under another. Building a real `SharedState` (no cluster) is
     /// enough — the tenant threading is entirely local to this function.
@@ -207,10 +239,80 @@ mod tests {
             tenant,
             "inbound array engine must bind the session tenant, not a placeholder"
         );
+        assert_eq!(
+            inbound.database_id(),
+            crate::types::DatabaseId::DEFAULT,
+            "an identity without an explicit database remains compatible with default"
+        );
 
         // No SharedState (the no-op listener path) => no engine.
         assert!(build_array_inbound(&None, identity).is_none());
 
         drop(dir);
+    }
+
+    #[tokio::test]
+    async fn build_array_inbound_binds_non_default_session_database() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test wal"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let shared = SharedState::new(dispatcher, wal).expect("shared state");
+        let database_id = crate::types::DatabaseId::new(4_096);
+        let identity = AuthenticatedIdentity::new_regular(
+            8,
+            "non-default-array-writer",
+            crate::types::TenantId::new(8),
+            AuthMethod::ApiKey,
+            Vec::new(),
+            Some(database_id),
+            crate::control::security::identity::DatabaseSet::Some(smallvec::smallvec![database_id]),
+        );
+
+        let inbound = build_array_inbound(&Some(shared), identity)
+            .expect("SharedState present => engine built");
+        assert_eq!(inbound.database_id(), database_id);
+    }
+
+    #[test]
+    fn unauthenticated_array_schema_and_delta_are_rejected_before_inbound_dispatch() {
+        let delta = SyncFrame::try_encode(
+            SyncMessageType::ArrayDelta,
+            &ArrayDeltaMsg {
+                array: "never-dispatched".into(),
+                op_payload: vec![1, 2, 3],
+                producer_id: 1,
+                epoch: 1,
+                seq: 1,
+            },
+        )
+        .expect("encode delta");
+        let schema = SyncFrame::try_encode(
+            SyncMessageType::ArraySchema,
+            &ArraySchemaSyncMsg {
+                array: "never-dispatched".into(),
+                replica_id: 1,
+                schema_hlc_bytes: [1; 18],
+                snapshot_payload: vec![1],
+            },
+        )
+        .expect("encode schema");
+
+        for frame in [&delta, &schema] {
+            for (authenticated, identity_present) in [(false, false), (true, false)] {
+                let reject = unauthenticated_array_reject(frame, authenticated, identity_present)
+                    .expect("unauthenticated array frame must be rejected before inbound dispatch");
+                assert_eq!(reject.msg_type, SyncMessageType::ArrayReject);
+                let body: ArrayRejectMsg = reject.decode_body().expect("decode rejection");
+                assert_eq!(body.reason, ArrayRejectReason::EngineRejected);
+                assert_eq!(body.detail, "unauthenticated array frame");
+                assert!(body.array.is_empty(), "rejection must remain bounded");
+            }
+            assert!(
+                unauthenticated_array_reject(frame, true, true).is_none(),
+                "a current authenticated identity must reach normal array dispatch"
+            );
+        }
     }
 }

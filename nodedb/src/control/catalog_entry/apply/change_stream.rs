@@ -26,8 +26,10 @@ pub fn put(stored: &ChangeStreamDef, catalog: &SystemCatalog) {
     );
 }
 
-pub fn delete(tenant_id: u64, name: &str, catalog: &SystemCatalog) {
-    if let Err(e) = catalog.delete_change_stream(tenant_id, name) {
+pub fn delete(database_id: u64, tenant_id: u64, name: &str, catalog: &SystemCatalog) {
+    if let Err(e) =
+        catalog.delete_change_stream(crate::types::DatabaseId::new(database_id), tenant_id, name)
+    {
         warn!(
             stream = %name,
             tenant = tenant_id,

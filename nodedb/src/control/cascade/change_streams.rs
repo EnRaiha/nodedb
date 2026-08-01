@@ -9,11 +9,13 @@
 //! cascade.
 
 use crate::control::security::catalog::SystemCatalog;
+use crate::types::DatabaseId;
 
 /// Enumerate change streams targeting `(tenant_id, collection)`.
 /// Returns stream names only, sorted.
 pub fn find_change_streams_on(
     catalog: &SystemCatalog,
+    database_id: DatabaseId,
     tenant_id: u64,
     collection: &str,
 ) -> crate::Result<Vec<String>> {
@@ -21,7 +23,10 @@ pub fn find_change_streams_on(
     let mut out: Vec<String> = all
         .into_iter()
         .filter(|s| {
-            s.tenant_id == tenant_id && s.collection == collection && !s.collection.is_empty()
+            s.database_id == database_id
+                && s.tenant_id == tenant_id
+                && s.collection == collection
+                && !s.collection.is_empty()
         })
         .map(|s| s.name)
         .collect();

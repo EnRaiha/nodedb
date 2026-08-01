@@ -3,6 +3,7 @@
 //! Per-connection session state types.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,13 +16,16 @@ pub(crate) fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+use crate::control::lease::QueryLeaseScope;
+use crate::event::cdc::CdcOffset;
 use crate::types::{DatabaseId, Lsn, TenantId, TxnId, VShardId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 /// One entry on the transaction's savepoint stack.
 ///
-/// A savepoint captures the write buffer length AND, for each vShard that had
-/// staged writes when the savepoint was established, that vShard's value/TTL and
+/// A savepoint captures the write-buffer and deferred-offset lengths AND, for
+/// each vShard that had staged writes when the savepoint was established, that
+/// vShard's value/TTL and
 /// graph overlay undo-journal markers. On ROLLBACK TO, the buffer is truncated
 /// to `buffer_len` and every currently-staged vShard's overlays are rewound —
 /// to its saved marker if present, else to `(0, 0)` (a vShard first staged
@@ -31,6 +35,8 @@ pub struct SavepointEntry {
     pub name: String,
     /// `tx_buffer` length captured when the savepoint was established.
     pub buffer_len: usize,
+    /// `pending_offset_commits` length captured when the savepoint was established.
+    pub pending_offset_len: usize,
     /// Per-vShard `(value_marker, graph_marker)` overlay journal markers.
     pub markers: BTreeMap<VShardId, (usize, usize)>,
 }
@@ -44,6 +50,17 @@ pub enum TransactionState {
     InBlock,
     /// 'E' — in a failed transaction block (error occurred after BEGIN).
     Failed,
+}
+
+/// A consumer offset commit deferred until its transaction commits.
+#[derive(Debug)]
+pub struct PendingOffsetCommit {
+    pub database_id: DatabaseId,
+    pub tenant_id: u64,
+    pub stream: String,
+    pub group: String,
+    pub partition_id: u32,
+    pub offset: CdcOffset,
 }
 
 /// Server-side cursor state.
@@ -97,6 +114,10 @@ pub struct ConnSession {
     /// Buffered write tasks accumulated between BEGIN and COMMIT.
     /// Dispatched atomically on COMMIT, discarded on ROLLBACK.
     pub tx_buffer: Vec<PhysicalTask>,
+    /// Descriptor lease scopes retained per buffered task. This vector stays
+    /// aligned with `tx_buffer`; a statement scope is shared by every task it
+    /// buffers, keeping descriptor admission alive until transaction cleanup.
+    pub tx_lease_scopes: Vec<Option<Arc<QueryLeaseScope>>>,
     /// Snapshot LSN captured at BEGIN for snapshot isolation.
     /// All reads within the transaction see data as of this LSN.
     /// Concurrent writes after this point are invisible to the transaction.
@@ -140,22 +161,21 @@ pub struct ConnSession {
     /// AND rewind each staged vShard's two Data-Plane staging overlays (value/TTL
     /// and GRAPH) to their saved journal markers. See [`SavepointEntry`].
     pub savepoints: Vec<SavepointEntry>,
-    /// Pending consumer offset commits deferred until COMMIT.
-    /// Each entry: (tenant_id, stream_name, group_name, partition_id, lsn).
-    /// Flushed atomically on COMMIT, discarded on ROLLBACK.
-    pub pending_offset_commits: Vec<(u64, String, String, u32, u64)>,
+    /// Pending consumer offset commits deferred until COMMIT. Flushed
+    /// atomically on COMMIT and discarded on ROLLBACK.
+    pub pending_offset_commits: Vec<PendingOffsetCommit>,
     /// Server-side cursors: name → (cached result rows as JSON strings, current position).
     pub cursors: HashMap<String, CursorState>,
     /// LIVE SELECT subscriptions: active change stream subscriptions for this connection.
-    /// Each subscription receives filtered change events from the broadcast channel.
-    /// Drained between queries to deliver pgwire NotificationResponse messages.
-    pub live_subscriptions: Vec<(String, crate::control::change_stream::Subscription)>,
-    /// Active LISTEN subscriptions for this session: (channel, session_id, receiver).
+    /// Each subscription retains its last accepted publication cursor so
+    /// notification delivery can reject gaps and epoch rotations.
+    pub live_subscriptions: Vec<super::live::LiveSubscription>,
+    /// Active LISTEN subscriptions for this session, each bound to its immutable database.
     /// Drained between queries to deliver pgwire NotificationResponse messages.
     pub listen_handles: Vec<crate::control::notify_bus::ListenHandle>,
     /// NOTIFY messages buffered inside an open transaction (COMMIT fires them).
-    /// Each entry is (channel, payload).
-    pub pending_notifies: Vec<(String, String)>,
+    /// Each entry captures (database_id, channel, payload) at NOTIFY time.
+    pub pending_notifies: Vec<(DatabaseId, String, String)>,
     /// Pending pgwire NOTICE messages queued during query execution.
     /// Drained between query and response delivery so the client receives a
     /// `NoticeResponse` for warnings raised by the response shaper (e.g. an
@@ -250,6 +270,7 @@ impl ConnSession {
             effective_tenant_id: None,
             identity: None,
             tx_buffer: Vec::new(),
+            tx_lease_scopes: Vec::new(),
             tx_snapshot_lsn: None,
             tx_snapshot_epoch: None,
             tx_id: None,

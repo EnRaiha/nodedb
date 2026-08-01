@@ -12,7 +12,7 @@
 //! {"id": 1, "method": "query", "params": {"sql": "SELECT * FROM users"}}
 //! {"id": 2, "method": "ping"}
 //! {"id": 3, "method": "live", "params": {"sql": "LIVE SELECT * FROM orders"}}
-//! {"id": 4, "method": "auth", "params": {"session_id": "abc", "last_lsn": 42}}
+//! {"id": 4, "method": "auth", "params": {"session_id": "abc", "cursor": "v1:..."}}
 //!
 //! // Response
 //! {"id": 1, "result": [...]}
@@ -35,7 +35,6 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::http::auth::{AppState, ResolvedIdentity};
 use crate::control::server::shared::authorization::authorize_database;
 use crate::control::server::shared::{ConnectionFutureOutcome, isolate_connection_future};
-use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
 use super::process_message::{MessageContext, process_message};
@@ -156,31 +155,34 @@ async fn handle_ws_connection(
         }
     }));
 
-    // Session ID is set only after successful auth inside process_message.
-    let mut authenticated_session_id: Option<String> = None;
-
     // Connection-scoped live-subscription tasks. Dropping this set on
     // connection exit aborts every forwarder, which drops each captured
     // `Subscription` so `active_subscriptions` returns to 0.
     let mut live_set = LiveSubscriptionSet::new();
+    // Resume forwarding is deliberately separate from LIVE SELECT forwarding.
+    let mut resume_set = LiveSubscriptionSet::new();
+    let mut resume_authenticated = false;
 
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             Message::Text(text) => {
                 let context = MessageContext {
-                    shared: &shared,
+                    shared: Arc::clone(&shared),
                     query_ctx: &state.query_ctx,
                     identity: &identity,
                     database_id,
                     trace_id,
                     live_tx: &live_tx,
                 };
-                let (response, auth_session) = process_message(context, &text, &mut live_set).await;
-
-                // Record session_id only after process_message confirms auth.
-                if let Some(sid) = auth_session {
-                    authenticated_session_id = Some(sid);
-                }
+                let (response, authenticated) = process_message(
+                    context,
+                    &text,
+                    &mut live_set,
+                    &mut resume_set,
+                    resume_authenticated,
+                )
+                .await;
+                resume_authenticated |= authenticated;
 
                 if let Err(e) = live_tx.send(response).await {
                     debug!("response channel closed: {e}; dropping connection");
@@ -201,48 +203,15 @@ async fn handle_ws_connection(
         }
     }
 
-    // Save session's last-seen LSN for reconnection replay.
-    if let Some(sid) = &authenticated_session_id {
-        save_ws_session(&shared, sid);
-    }
-
-    // Drop the live-subscription set BEFORE closing the channel. Aborting
+    // Drop connection-scoped sets BEFORE closing the channel. Aborting
     // each forwarder drops its `Subscription`, whose `Drop` decrements
     // `active_subscriptions`, so leaked counters can't outlive the socket.
+    drop(resume_set);
     drop(live_set);
 
     drop(live_tx);
     sender.finish().await;
     debug!("WebSocket RPC connection closed");
-}
-
-/// Save a WS session's last-seen LSN with bounded LRU eviction.
-pub fn save_ws_session(shared: &SharedState, session_id: &str) {
-    let current_lsn = shared.change_stream.last_lsn();
-    let mut sessions = shared
-        .ws_sessions
-        .write()
-        .unwrap_or_else(|p| p.into_inner());
-
-    // Evict oldest sessions (by LSN) if at capacity.
-    while sessions.len() >= shared.tuning.network.max_ws_sessions {
-        if let Some(oldest_key) = sessions
-            .iter()
-            .min_by_key(|(_, lsn)| **lsn)
-            .map(|(k, _)| k.clone())
-        {
-            sessions.remove(&oldest_key);
-        } else {
-            break;
-        }
-    }
-
-    sessions.insert(session_id.to_string(), current_lsn);
-    debug!(
-        session_id,
-        last_lsn = current_lsn,
-        "WS session saved for reconnect"
-    );
 }
 
 #[cfg(test)]

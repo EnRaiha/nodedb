@@ -9,6 +9,15 @@
 pub use nodedb_types::id::ShapeId;
 pub use nodedb_types::sync::shape::{ShapeDefinition, ShapeType};
 
+use nodedb_types::DatabaseId;
+
+/// Authenticated tenant and database boundary for shape subscriptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShapeScope {
+    pub tenant_id: u64,
+    pub database_id: DatabaseId,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

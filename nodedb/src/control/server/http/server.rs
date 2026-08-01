@@ -43,7 +43,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use tracing::info;
 
 use super::version::stamp_content_type;
@@ -115,6 +115,12 @@ fn build_router(state: AppState) -> Router {
             "/v1/collections/{name}/crdt/apply",
             post(routes::crdt::crdt_apply).layer(DefaultBodyLimit::max(
                 routes::crdt::CRDT_HTTP_BODY_MAX_BYTES,
+            )),
+        )
+        .route(
+            "/v1/functions/{name}/wasm",
+            put(routes::wasm_upload::upload_wasm).layer(DefaultBodyLimit::max(
+                routes::wasm_upload::MAX_WASM_MODULE_BYTES,
             )),
         )
         .route("/v1/cdc/{collection}/poll", get(routes::cdc::poll_changes))
@@ -237,10 +243,11 @@ pub async fn run(
     tls_settings: Option<&crate::config::server::TlsSettings>,
     bus: crate::control::shutdown::ShutdownBus,
 ) -> crate::Result<()> {
-    let drain_guard = bus.register_task(
+    // HTTP graceful shutdown may retain active connections for up to five
+    // seconds, so it must remain a barrier before later shutdown phases.
+    let drain_guard = bus.register_critical_task(
         crate::control::shutdown::ShutdownPhase::DrainingListeners,
         "http",
-        None,
     );
     let mut shutdown_rx = bus.handle().flat_watch().raw_receiver();
 
@@ -250,6 +257,8 @@ pub async fn run(
     let state = AppState {
         shared,
         auth_mode,
+        // Share the coordinator that owns this listener's drain guard.
+        shutdown_bus: bus.clone(),
         query_ctx,
     };
     let router = build_router(state);
@@ -307,16 +316,23 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use axum::Router;
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
+    use axum::extract::DefaultBodyLimit;
     use axum::http::{Method, Request, StatusCode};
-    use axum::routing::{get, post};
+    use axum::routing::{get, post, put};
     use tower::ServiceExt;
+
+    use crate::control::server::http::routes;
 
     /// Build a stub router with the same path registrations as the real
     /// server but using trivial `StatusCode::OK` handlers. Used to assert
     /// the route table itself.
     fn stub_router() -> Router {
         async fn ok() -> StatusCode {
+            StatusCode::OK
+        }
+
+        async fn wasm_upload(_: Bytes) -> StatusCode {
             StatusCode::OK
         }
 
@@ -339,6 +355,12 @@ mod tests {
             .route("/v1/auth/exchange-key", post(ok))
             .route("/v1/auth/session", post(ok).delete(ok))
             .route("/v1/collections/{name}/crdt/apply", post(ok))
+            .route(
+                "/v1/functions/{name}/wasm",
+                put(wasm_upload).layer(DefaultBodyLimit::max(
+                    routes::wasm_upload::MAX_WASM_MODULE_BYTES,
+                )),
+            )
             .route("/v1/ws", get(ok))
             .route("/v1/streams/{stream}/poll", get(ok))
             .route("/v1/streams/{stream}/events", get(ok))
@@ -417,6 +439,10 @@ mod tests {
             status_for(&r, Method::POST, "/v1/collections/mycoll/crdt/apply").await,
             StatusCode::OK
         );
+        assert_eq!(
+            status_for(&r, Method::PUT, "/v1/functions/my_func/wasm").await,
+            StatusCode::OK
+        );
         assert_eq!(status_for(&r, Method::GET, "/v1/ws").await, StatusCode::OK);
         assert_eq!(
             status_for(&r, Method::GET, "/v1/streams/mystream/poll").await,
@@ -426,6 +452,22 @@ mod tests {
             status_for(&r, Method::GET, "/v1/streams/mystream/events").await,
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn wasm_upload_route_rejects_oversized_bodies() {
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/v1/functions/my_func/wasm")
+            .body(Body::from(vec![
+                0;
+                routes::wasm_upload::MAX_WASM_MODULE_BYTES
+                    + 1
+            ]))
+            .expect("request");
+
+        let response = stub_router().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

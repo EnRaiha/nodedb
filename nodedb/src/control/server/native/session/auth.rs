@@ -6,7 +6,9 @@
 
 use nodedb_types::protocol::{NativeResponse, RequestFields};
 
+use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::admission::ConnectionPermit;
+use crate::control::server::shared::authorization::authorize_database;
 
 use super::NativeSession;
 use super::dispatch;
@@ -48,12 +50,67 @@ impl NativeSession {
         .await
         {
             Ok((identity, warning)) => {
+                // Bind the requested database before acquiring any scoped
+                // admission capacity. An absent or empty name uses the
+                // authenticated identity's default, then the system default.
+                let requested_database = match fields {
+                    RequestFields::Text(f) => f.database.as_deref().filter(|name| !name.is_empty()),
+                    _ => None,
+                };
+                let catalog = self.state.credentials.catalog();
+                let db_id = match requested_database {
+                    Some(name) => match catalog.get_database_id_by_name(name) {
+                        Ok(Some(db_id)) => db_id,
+                        Ok(None) => {
+                            return NativeResponse::error(
+                                seq,
+                                "3D000",
+                                "selected database does not exist",
+                            );
+                        }
+                        Err(_) => {
+                            return NativeResponse::error(
+                                seq,
+                                "XX000",
+                                "database catalog lookup failed",
+                            );
+                        }
+                    },
+                    None => identity
+                        .default_database
+                        .unwrap_or(nodedb_types::DatabaseId::DEFAULT),
+                };
+
+                // Name lookup only validates the reverse catalog index. Confirm
+                // the descriptor exists for both explicit and default/fallback
+                // selections before authorization, admission, or session state.
+                match catalog.get_database(db_id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return NativeResponse::error(
+                            seq,
+                            "3D000",
+                            "selected database does not exist",
+                        );
+                    }
+                    Err(_) => {
+                        return NativeResponse::error(
+                            seq,
+                            "XX000",
+                            "database catalog lookup failed",
+                        );
+                    }
+                }
+
+                // A selected database must be authorized before it can consume
+                // database- or tenant-scoped capacity or mutate session state.
+                let audit = ArcAuditEmitter(std::sync::Arc::clone(&self.state.audit));
+                if authorize_database(&identity, db_id, &audit).is_err() {
+                    return NativeResponse::error(seq, "42501", "permission denied for database");
+                }
+
                 // Phase 2 admission: acquire per-database and per-tenant permits
-                // now that we know the identity. The database scope is the
-                // identity's default database (or DEFAULT if none is set).
-                let db_id = identity
-                    .default_database
-                    .unwrap_or(nodedb_types::DatabaseId::DEFAULT);
+                // only after authentication and database authorization succeed.
                 let tenant_id = identity.tenant_id;
 
                 let db_permit = match self.admission_registry.try_acquire_database(db_id) {
@@ -104,6 +161,11 @@ impl NativeSession {
                     tenant_id,
                 });
 
+                // Auth succeeds only once the selected database is persisted
+                // for every subsequent SQL and direct native operation.
+                self.sessions.ensure_session(self.peer_addr);
+                self.sessions.set_current_database(self.peer_addr, db_id);
+
                 let mut resp = NativeResponse::auth_ok(
                     seq,
                     identity.username.clone(),
@@ -112,9 +174,13 @@ impl NativeSession {
                 if let Some(w) = warning {
                     resp.warnings.push(w);
                 }
-                self.auth_context = Some(super::super::super::session_auth::build_auth_context(
-                    &identity,
-                ));
+                let mut auth_context =
+                    super::super::super::session_auth::build_auth_context(&identity);
+                // The selected database may differ from the identity default.
+                // Keep RLS `$auth.database_id` aligned with the database bound
+                // to this native connection.
+                auth_context.database_id = Some(db_id);
+                self.auth_context = Some(auth_context);
                 self.cleanup.publish_identity(identity.clone());
                 self.identity = Some(identity);
                 resp

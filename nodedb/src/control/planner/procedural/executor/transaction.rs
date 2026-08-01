@@ -9,6 +9,17 @@
 
 use nodedb_physical::physical_task::PhysicalTask;
 
+use crate::control::lease::QueryLeaseScope;
+
+/// Lease scope retained for one planned statement in a procedure transaction.
+///
+/// `task_start` lets savepoint rollback drop scopes for every statement it
+/// discards without requiring individual tasks to own a scope.
+struct BufferedStatementScope {
+    task_start: usize,
+    scope: QueryLeaseScope,
+}
+
 /// Buffered transaction context for stored procedure execution.
 ///
 /// DML statements inside a procedure body are collected here until
@@ -18,6 +29,9 @@ use nodedb_physical::physical_task::PhysicalTask;
 pub struct ProcedureTransactionCtx {
     /// Buffered DML tasks awaiting COMMIT.
     buffer: Vec<PhysicalTask>,
+    /// Descriptor lease scopes, one per planned statement, retained until its
+    /// tasks have finished COMMIT dispatch or the statement is discarded.
+    statement_scopes: Vec<BufferedStatementScope>,
     /// Savepoint stack: (name, buffer_position_at_savepoint_time).
     savepoints: Vec<(String, usize)>,
 }
@@ -26,24 +40,51 @@ impl ProcedureTransactionCtx {
     pub fn new() -> Self {
         Self {
             buffer: Vec::new(),
+            statement_scopes: Vec::new(),
             savepoints: Vec::new(),
         }
     }
 
-    /// Buffer a DML task for later COMMIT.
+    /// Buffer all tasks planned for one statement and retain its descriptor
+    /// leases until those tasks are dispatched at COMMIT.
+    pub fn buffer_statement(&mut self, tasks: Vec<PhysicalTask>, scope: QueryLeaseScope) {
+        let task_start = self.buffer.len();
+        self.buffer.extend(tasks);
+        self.statement_scopes
+            .push(BufferedStatementScope { task_start, scope });
+    }
+
+    /// Buffer a task without a lease scope. Kept as a task-only test helper.
     pub fn buffer_task(&mut self, task: PhysicalTask) {
-        self.buffer.push(task);
+        self.buffer_task_with_empty_scope(task);
     }
 
-    /// Take all buffered tasks (on COMMIT). Clears the buffer and savepoint stack.
-    pub fn take_buffered_tasks(&mut self) -> Vec<PhysicalTask> {
+    fn buffer_task_with_empty_scope(&mut self, task: PhysicalTask) {
+        self.buffer_statement(vec![task], QueryLeaseScope::empty());
+    }
+
+    /// Take all buffered tasks and their owned scopes (on COMMIT). The caller
+    /// must keep the scopes alive until every WAL append and dispatch finishes.
+    pub fn take_buffered(&mut self) -> (Vec<PhysicalTask>, Vec<QueryLeaseScope>) {
         self.savepoints.clear();
-        std::mem::take(&mut self.buffer)
+        let scopes = std::mem::take(&mut self.statement_scopes)
+            .into_iter()
+            .map(|statement| statement.scope)
+            .collect();
+        (std::mem::take(&mut self.buffer), scopes)
     }
 
-    /// Discard all buffered tasks (on ROLLBACK). Clears the savepoint stack.
+    /// Take tasks only. Kept for existing task-oriented tests; it intentionally
+    /// drops the associated scopes when the returned tasks are taken.
+    pub fn take_buffered_tasks(&mut self) -> Vec<PhysicalTask> {
+        self.take_buffered().0
+    }
+
+    /// Discard all buffered tasks and their descriptor lease scopes (on
+    /// ROLLBACK). Clears the savepoint stack.
     pub fn rollback(&mut self) {
         self.buffer.clear();
+        self.statement_scopes.clear();
         self.savepoints.clear();
     }
 
@@ -67,6 +108,10 @@ impl ProcedureTransactionCtx {
         match pos {
             Some(p) => {
                 self.buffer.truncate(p);
+                // Savepoints occur between statements, so every discarded
+                // statement starts at or after the saved task position.
+                self.statement_scopes
+                    .retain(|statement| statement.task_start < p);
                 // Remove savepoints created after this one.
                 if let Some(idx) = self.savepoints.iter().position(|(n, _)| n == name) {
                     self.savepoints.truncate(idx + 1);
@@ -136,6 +181,22 @@ mod tests {
     }
 
     #[test]
+    fn rollback_and_commit_take_owned_statement_scopes() {
+        let mut ctx = ProcedureTransactionCtx::new();
+        ctx.buffer_statement(vec![dummy_task("a")], QueryLeaseScope::empty());
+        assert_eq!(ctx.statement_scopes.len(), 1);
+
+        ctx.rollback();
+        assert!(ctx.statement_scopes.is_empty());
+
+        ctx.buffer_statement(vec![dummy_task("b")], QueryLeaseScope::empty());
+        let (tasks, scopes) = ctx.take_buffered();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(scopes.len(), 1);
+        assert!(ctx.statement_scopes.is_empty());
+    }
+
+    #[test]
     fn savepoint_and_rollback_to() {
         let mut ctx = ProcedureTransactionCtx::new();
         ctx.buffer_task(dummy_task("a"));
@@ -144,6 +205,7 @@ mod tests {
         ctx.buffer_task(dummy_task("c"));
 
         ctx.rollback_to("sp1").unwrap();
+        assert_eq!(ctx.statement_scopes.len(), 1);
         let tasks = ctx.take_buffered_tasks();
         assert_eq!(tasks.len(), 1); // Only "a" remains
     }

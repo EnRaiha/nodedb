@@ -15,6 +15,7 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
 
@@ -24,6 +25,7 @@ use super::super::super::result::{DdlError, DdlResult};
 pub fn show_functions(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let tenant_id = identity.tenant_id.as_u64();
 
@@ -40,7 +42,7 @@ pub fn show_functions(
 
     // User-defined functions from catalog.
     let catalog = state.credentials.catalog();
-    if let Ok(functions) = catalog.load_functions_for_tenant(tenant_id) {
+    if let Ok(functions) = catalog.load_functions_in_database(database_id, tenant_id) {
         for func in &functions {
             let params_str = func
                 .parameters

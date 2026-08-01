@@ -6,7 +6,10 @@ use nodedb_types::DatabaseId;
 use crate::control::security::audit::{
     AuditEmitContext, AuditEmitter, AuditEvent, NoopAuditEmitter,
 };
-use crate::control::security::identity::{AuthenticatedIdentity, Permission, Role};
+use crate::control::security::catalog::SystemCatalog;
+use crate::control::security::identity::{
+    AuthenticatedIdentity, Permission, Role, role_grants_permission,
+};
 use crate::control::security::permission::PermissionStore;
 use crate::control::security::role::RoleStore;
 use crate::control::target_identity::bare_collection_name;
@@ -35,6 +38,78 @@ pub fn authorize_database(
             database_id.as_u64()
         ),
     )
+}
+
+/// Authorize a database-scoped permission before mutating its catalog.
+///
+/// Database grants use the catalog's persisted privilege names. Built-in and
+/// database-scoped roles are evaluated against the requested database, so a
+/// role for another database cannot authorize this operation.
+pub fn authorize_database_permission(
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    permission: Permission,
+    catalog: &SystemCatalog,
+    emitter: &dyn AuditEmitter,
+) -> Result<(), AuthorizationError> {
+    authorize_database(identity, database_id, emitter)?;
+
+    let scoped_identity = identity_for_database(identity, database_id);
+    if scoped_identity
+        .roles
+        .iter()
+        .any(|role| role_grants_permission(role, permission))
+    {
+        return Ok(());
+    }
+
+    let privilege = match permission {
+        Permission::Create => "CREATE_COLLECTION",
+        Permission::Read => "SELECT",
+        Permission::Write
+        | Permission::Drop
+        | Permission::Alter
+        | Permission::Admin
+        | Permission::Monitor
+        | Permission::Execute
+        | Permission::Backup => {
+            return deny_database(
+                identity,
+                database_id,
+                emitter,
+                format!(
+                    "permission denied: database grants do not support {:?} on database {}",
+                    permission,
+                    database_id.as_u64()
+                ),
+            );
+        }
+    };
+
+    match catalog.has_database_grant(database_id, identity.user_id, privilege) {
+        Ok(true) => Ok(()),
+        Ok(false) => deny_database(
+            identity,
+            database_id,
+            emitter,
+            format!(
+                "permission denied: user '{}' lacks {:?} permission on database {}",
+                identity.username,
+                permission,
+                database_id.as_u64()
+            ),
+        ),
+        Err(error) => deny_database(
+            identity,
+            database_id,
+            emitter,
+            format!(
+                "permission denied: unable to verify {:?} permission on database {}: {error}",
+                permission,
+                database_id.as_u64()
+            ),
+        ),
+    }
 }
 
 /// Authorize one collection operation before work that precedes physical planning.
@@ -266,17 +341,37 @@ fn deny<T>(
     emitter: &dyn AuditEmitter,
     detail: String,
 ) -> Result<T, AuthorizationError> {
+    emit_denial(identity, None, emitter, &detail);
+    Err(AuthorizationError::new(identity.tenant_id, detail))
+}
+
+fn deny_database<T>(
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    emitter: &dyn AuditEmitter,
+    detail: String,
+) -> Result<T, AuthorizationError> {
+    emit_denial(identity, Some(database_id), emitter, &detail);
+    Err(AuthorizationError::new(identity.tenant_id, detail))
+}
+
+fn emit_denial(
+    identity: &AuthenticatedIdentity,
+    database_id: Option<DatabaseId>,
+    emitter: &dyn AuditEmitter,
+    detail: &str,
+) {
     emitter.emit(
         AuditEvent::PermissionDenied,
         &identity.username,
-        &detail,
-        AuditEmitContext::new(
-            Some(identity.tenant_id),
-            &identity.user_id.to_string(),
-            &identity.username,
-        ),
+        detail,
+        AuditEmitContext {
+            tenant_id: Some(identity.tenant_id),
+            database_id,
+            auth_user_id: &identity.user_id.to_string(),
+            auth_user_name: &identity.username,
+        },
     );
-    Err(AuthorizationError::new(identity.tenant_id, detail))
 }
 
 #[cfg(test)]

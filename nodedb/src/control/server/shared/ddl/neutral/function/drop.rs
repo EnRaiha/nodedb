@@ -3,11 +3,10 @@
 //! `DROP FUNCTION [IF EXISTS]` DDL handler.
 //!
 //! Ported from the pgwire `ddl::function::drop` handler. The catalog path
-//! (`propose_catalog_entry` + `log_index == 0` local-delete fallback,
-//! dependency-block check, WASM binary cleanup, dependency delete, Lite
-//! definition-sync broadcast, and the `audit_record` call) is preserved
-//! verbatim; only the result construction changed from pgwire `Response` /
-//! `PgWireError` to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! (`propose_catalog_entry` + local applier fallback, dependency-block check,
+//! replicated dependency deletion, Lite definition-sync broadcast, and the `audit_record`
+//! call) is preserved verbatim; only the result construction changed from
+//! pgwire `Response` / `PgWireError` to protocol-neutral result types.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -28,12 +27,15 @@ pub fn drop_function(
 
     let (name, if_exists) = parse_drop_function(parts)?;
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 
     // Check if function exists.
     let func_exists = catalog
-        .get_function(tenant_id, &name)
+        .get_function_in_database(database_id, tenant_id, &name)
         .map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: format!("catalog read: {e}"),
@@ -54,7 +56,7 @@ pub fn drop_function(
 
     // Check dependencies: block DROP if other objects depend on this function.
     let dependents = catalog
-        .find_dependents(tenant_id, "function", &name)
+        .find_dependents(database_id, tenant_id, "function", &name)
         .map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: format!("dependency check: {e}"),
@@ -73,18 +75,12 @@ pub fn drop_function(
         });
     }
 
-    // If the function is a WASM function, clean up the stored binary.
-    if let Ok(Some(func)) = catalog.get_function(tenant_id, &name)
-        && let Some(ref hash) = func.wasm_hash
-    {
-        let _ = crate::control::planner::wasm::store::delete_wasm_binary(catalog, hash);
-    }
-
-    // Delete function definition + dependencies + ownership.
+    // Delete function definition (including its dependencies) + ownership.
     // Replicate the deletion through the metadata raft group;
     // followers' applier clears their block cache and deletes
     // the record from their local redb.
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteFunction {
+        database_id,
         tenant_id,
         name: name.clone(),
     };
@@ -93,20 +89,14 @@ pub fn drop_function(
             sqlstate: "XX000".to_string(),
             message: format!("metadata propose: {e}"),
         })?;
-    if log_index == 0 {
-        catalog
-            .delete_function(tenant_id, &name)
-            .map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog write: {e}"),
-            })?;
-    }
-    let _ = catalog.delete_dependencies("function", tenant_id, &name);
+    crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, log_index);
 
     // Broadcast deletion to connected Lite sessions.
     {
         use nodedb_types::sync::wire::DefinitionSyncMsg;
         let msg = DefinitionSyncMsg {
+            tenant_id,
+            database_id: database_id.as_u64(),
             definition_type: "function".into(),
             name: name.clone(),
             action: "delete".into(),

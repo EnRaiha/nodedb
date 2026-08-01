@@ -203,9 +203,12 @@ pub(crate) async fn reclaim_collection_storage(
             // Broadcast only after every core reclaimed the old incarnation.
             // Saturated per-session channels may drop the notification; offline
             // replay remains the fallback.
-            shared
-                .crdt_sync_delivery
-                .broadcast_collection_purged(tenant_id, name, purge_lsn);
+            shared.crdt_sync_delivery.broadcast_collection_purged(
+                tenant_id,
+                DatabaseId::new(database_id),
+                name,
+                purge_lsn,
+            );
 
             // A prior failed attempt may have left a durable entry; a
             // succeeding purge clears it, then releases CREATE waiters.

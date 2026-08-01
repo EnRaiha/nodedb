@@ -65,7 +65,7 @@ pub async fn validate_typeguard(
 
     // Scan all documents.
     let scan_sql = format!("SELECT * FROM {}", ::nodedb_types::quote_ident(&coll_name));
-    let (tasks, _output_schema) =
+    let (tasks, _output_schema, _lease_scope) =
         crate::control::server::shared::ddl::neutral::planning::plan_authorized_sql(
             state,
             identity,

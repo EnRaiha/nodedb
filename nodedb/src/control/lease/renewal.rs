@@ -226,23 +226,23 @@ fn lookup_current_version(shared: &SharedState, id: &DescriptorId) -> Option<u64
     let catalog = shared.credentials.catalog();
     match id.kind {
         DescriptorKind::Collection => catalog
-            .get_collection(DatabaseId::DEFAULT, id.tenant_id, &id.name)
+            .get_collection(DatabaseId::new(id.database_id), id.tenant_id, &id.name)
             .ok()
             .flatten()
             .filter(|c| c.is_active)
             .map(|c| c.descriptor_version.max(1)),
         DescriptorKind::Function => catalog
-            .get_function(id.tenant_id, &id.name)
+            .get_function_in_database(DatabaseId::new(id.database_id), id.tenant_id, &id.name)
             .ok()
             .flatten()
             .map(|f| f.descriptor_version.max(1)),
         DescriptorKind::Procedure => catalog
-            .get_procedure(id.tenant_id, &id.name)
+            .get_procedure_in_database(DatabaseId::new(id.database_id), id.tenant_id, &id.name)
             .ok()
             .flatten()
             .map(|p| p.descriptor_version.max(1)),
         DescriptorKind::Trigger => catalog
-            .get_trigger(id.tenant_id, &id.name)
+            .get_trigger_in_database(DatabaseId::new(id.database_id), id.tenant_id, &id.name)
             .ok()
             .flatten()
             .map(|t| t.descriptor_version.max(1)),
@@ -309,7 +309,7 @@ mod tests {
 
     fn make_lease(node_id: u64, expires_wall_ns: u64) -> DescriptorLease {
         DescriptorLease {
-            descriptor_id: DescriptorId::new(1, DescriptorKind::Collection, "x".to_string()),
+            descriptor_id: DescriptorId::new(0, 1, DescriptorKind::Collection, "x".to_string()),
             version: 1,
             node_id,
             expires_at: Hlc::new(expires_wall_ns, 0),
@@ -377,10 +377,10 @@ mod tests {
         // Lease 3: OTHER node, 10s remaining → skipped (wrong node).
         // Lease 4: this node, already expired → near expiry, picked.
         let mut leases = HashMap::new();
-        let id_a = DescriptorId::new(1, DescriptorKind::Collection, "a".to_string());
-        let id_b = DescriptorId::new(1, DescriptorKind::Collection, "b".to_string());
-        let id_c = DescriptorId::new(1, DescriptorKind::Collection, "c".to_string());
-        let id_d = DescriptorId::new(1, DescriptorKind::Collection, "d".to_string());
+        let id_a = DescriptorId::new(0, 1, DescriptorKind::Collection, "a".to_string());
+        let id_b = DescriptorId::new(0, 1, DescriptorKind::Collection, "b".to_string());
+        let id_c = DescriptorId::new(0, 1, DescriptorKind::Collection, "c".to_string());
+        let id_d = DescriptorId::new(0, 1, DescriptorKind::Collection, "d".to_string());
         leases.insert(
             (id_a.clone(), 1),
             make_lease(1, now_ns + 50 * 1_000_000_000),

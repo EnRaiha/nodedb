@@ -6,4 +6,4 @@
 mod entry;
 mod format;
 
-pub use entry::copy_to_file;
+pub use entry::{CopyToOptions, copy_to_file};

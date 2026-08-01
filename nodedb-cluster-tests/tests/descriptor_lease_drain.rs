@@ -27,7 +27,7 @@ const WAIT_BUDGET: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(20);
 
 fn coll_id(name: &str) -> DescriptorId {
-    DescriptorId::new(TENANT, DescriptorKind::Collection, name.to_string())
+    DescriptorId::new(0, TENANT, DescriptorKind::Collection, name.to_string())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -260,27 +260,19 @@ async fn ddl_waits_for_existing_lease_to_release() {
     );
 
     wait_for(
-        "collection stamped v2 on every node",
+        "collection stamped v2 and drain cleared on every node",
         WAIT_BUDGET,
         POLL,
         || {
-            cluster
-                .nodes
-                .iter()
-                .all(|n| n.collection_descriptor(TENANT, "drainable").map(|s| s.0) == Some(2))
+            cluster.nodes.iter().all(|node| {
+                node.collection_descriptor(TENANT, "drainable")
+                    .map(|stored| stored.0)
+                    == Some(2)
+                    && !node.has_drain_for(&coll_id("drainable"), 1)
+            })
         },
     )
     .await;
-
-    // Drain should have cleared on every node (implicit clear on
-    // successful Put* apply).
-    for node in &cluster.nodes {
-        assert!(
-            !node.has_drain_for(&coll_id("drainable"), 1),
-            "node {} still has drain entry after DDL committed",
-            node.node_id
-        );
-    }
 
     let _ = shared; // Keep the earlier binding alive to silence warnings.
     cluster.shutdown().await;

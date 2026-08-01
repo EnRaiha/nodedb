@@ -81,13 +81,18 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<(), DdlError> {
     let query_ctx = crate::control::planner::context::QueryContext::for_state(state);
-    let (mut tasks, _output_schema) = query_ctx
-        .plan_sql(sql, tenant_id, database_id)
+    let (mut tasks, _output_schema, versions) = query_ctx
+        .plan_sql_and_versions(sql, tenant_id, database_id)
         .await
         .map_err(|error| ddl_err("XX000", error.to_string()))?;
 
+    // Extraction marks catalog state and allocates surrogates. Reject an
+    // unauthorized original DML task set before either side effect can occur.
+    let _preauthorized_tasks = authorize_final_task_set(state, identity, &tasks)?;
+
     // The final set includes implicit graph-edge writes and must be authorized
-    // before Calvin classification, transaction staging, or local dispatch.
+    // before descriptor admission, Calvin classification, transaction staging,
+    // or local dispatch.
     crate::control::planner::implicit_edges::append_implicit_edge_tasks(
         state,
         &mut tasks,
@@ -99,6 +104,15 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
     .map_err(|error| ddl_err("XX000", error.to_string()))?;
 
     let authorized_tasks = authorize_final_task_set(state, identity, &tasks)?;
+    // Admission follows final authorization so an implicit-edge target denied
+    // by policy does not consume a descriptor lease. The scope remains live
+    // through expansion's successors, transaction staging, and dispatch below.
+    let plan_lease_scope =
+        Arc::new(state.acquire_plan_lease_scope(&versions).map_err(|error| {
+            let (_, sqlstate, message) =
+                crate::control::server::pgwire::types::error_to_sqlstate(&error);
+            ddl_err(sqlstate, message)
+        })?);
 
     if state.sequencer_inbox.get().is_some()
         && matches!(
@@ -123,6 +137,7 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
         return Ok(());
     }
 
+    let statement_buffer_start = txn_ctx.sessions.buffered_task_count(txn_ctx.session_id);
     for (task, initial_authorized) in tasks.into_iter().zip(authorized_tasks.into_tasks()) {
         let routed = route_in_tx_write(
             state,
@@ -142,6 +157,19 @@ pub(in crate::control::server::shared::ddl::neutral::collection) async fn plan_a
             },
         )
         .await;
+
+        if txn_ctx.sessions.buffered_task_count(txn_ctx.session_id) > statement_buffer_start
+            && !txn_ctx.sessions.attach_tx_lease_scope_since(
+                txn_ctx.session_id,
+                statement_buffer_start,
+                Arc::clone(&plan_lease_scope),
+            )
+        {
+            return Err(ddl_err(
+                "XX000",
+                "internal error: failed to retain descriptor leases for buffered transaction tasks",
+            ));
+        }
 
         let task = match routed {
             Ok(InTxnRoute::Read(task)) => *task,

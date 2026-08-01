@@ -72,6 +72,7 @@ pub(super) async fn emit_sql_stream(
         limit,
         stream: mut rows_stream,
         projection,
+        lease_scope: _lease_scope,
     } = sql_stream;
 
     let mut emitted: usize = 0;
@@ -207,6 +208,7 @@ mod tests {
                 limit,
                 stream,
                 projection: None,
+                lease_scope: None,
             };
             emit_sql_stream(&mut conn, sql_stream, FrameFormat::MessagePack)
                 .await

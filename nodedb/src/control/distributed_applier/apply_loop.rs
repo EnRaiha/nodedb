@@ -129,7 +129,11 @@ pub async fn run_apply_loop(
                                 log_index: entry.index,
                                 applied_key,
                             },
-                            array,
+                            crate::control::array_sync::ArrayOpTarget {
+                                tenant_id: TenantId::new(replicated.tenant_id),
+                                database_id: DatabaseId::new(replicated.database_id),
+                                array,
+                            },
                             op_bytes,
                             provenance.as_deref(),
                         )
@@ -157,6 +161,8 @@ pub async fn run_apply_loop(
                                 applied_key,
                             },
                             crate::control::array_sync::raft_apply::ArraySchemaPayload {
+                                tenant_id: TenantId::new(replicated.tenant_id),
+                                database_id: DatabaseId::new(replicated.database_id),
                                 array,
                                 snapshot_payload,
                                 schema_hlc_bytes,

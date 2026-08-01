@@ -49,7 +49,7 @@ impl TestClusterNode {
     pub fn has_trigger(&self, tenant_id: u64, name: &str) -> bool {
         self.shared
             .trigger_registry
-            .list_for_tenant(tenant_id)
+            .list_for_tenant(nodedb_types::DatabaseId::DEFAULT, tenant_id)
             .iter()
             .any(|t| t.name == name)
     }
@@ -80,13 +80,24 @@ impl TestClusterNode {
     /// Check whether a scheduled job with the given name exists in
     /// this node's in-memory `schedule_registry`.
     pub fn has_schedule(&self, tenant_id: u64, name: &str) -> bool {
-        self.shared.schedule_registry.get(tenant_id, name).is_some()
+        self.shared
+            .schedule_registry
+            .get(nodedb_types::DatabaseId::DEFAULT, tenant_id, name)
+            .is_some()
     }
 
     /// Check whether a change stream with the given name exists in
     /// this node's in-memory `stream_registry`.
-    pub fn has_change_stream(&self, tenant_id: u64, name: &str) -> bool {
-        self.shared.stream_registry.get(tenant_id, name).is_some()
+    pub fn has_change_stream(
+        &self,
+        database_id: nodedb_types::DatabaseId,
+        tenant_id: u64,
+        name: &str,
+    ) -> bool {
+        self.shared
+            .stream_registry
+            .get(database_id, tenant_id, name)
+            .is_some()
     }
 
     /// Check whether a user exists and is active in this node's

@@ -21,10 +21,10 @@ impl CoreLoop {
         schema_hash: u64,
         prefix_bits: u8,
     ) -> Response {
-        // Verify-or-register against the in-memory catalog. Persistence
-        // into `_system.arrays` is owned by the Control-Plane DDL path
-        // (`SystemCatalog::put_array`), not the Data Plane — redb is
-        // Control-Plane-only.
+        // Verify the Control-Plane-owned catalog when an authorized DDL has
+        // installed an entry. The Data Plane never registers entries itself:
+        // planning and raw engine opening must not create an in-memory catalog
+        // side effect.
         {
             let cat = match self.array_catalog.read() {
                 Ok(g) => g,
@@ -37,19 +37,27 @@ impl CoreLoop {
                     );
                 }
             };
-            if let Some(existing) = cat.lookup_by_name(&array_id.name) {
-                if existing.schema_hash != schema_hash {
+            if let Some(existing) = cat.lookup_by_id(array_id) {
+                if existing.schema_hash != schema_hash || existing.prefix_bits != prefix_bits {
                     return self.response_error(
                         task,
                         ErrorCode::Unsupported {
                             detail: format!(
-                                "array '{}' already registered with different schema hash ({:#x} != {:#x})",
-                                array_id.name, existing.schema_hash, schema_hash
+                                "array '{}' catalog identity differs (schema {:#x}/{:#x}, prefix {}/{})",
+                                array_id.name,
+                                existing.schema_hash,
+                                schema_hash,
+                                existing.prefix_bits,
+                                prefix_bits
                             ),
                         },
                     );
                 }
             } else {
+                // The Data Plane may reconstruct its in-memory mirror during
+                // WAL recovery and direct already-admitted execution. It never
+                // persists catalog state here; client authorization and the
+                // durable transition remain Control-Plane responsibilities.
                 drop(cat);
                 let entry = ArrayCatalogEntry {
                     array_id: array_id.clone(),
@@ -62,7 +70,7 @@ impl CoreLoop {
                     minimum_audit_retain_ms: None,
                 };
                 let mut cat = match self.array_catalog.write() {
-                    Ok(g) => g,
+                    Ok(guard) => guard,
                     Err(_) => {
                         return self.response_error(
                             task,
@@ -72,14 +80,13 @@ impl CoreLoop {
                         );
                     }
                 };
-                // Double-check under the write lock.
-                if cat.lookup_by_name(&array_id.name).is_none()
-                    && let Err(e) = cat.register(entry)
+                if cat.lookup_by_id(array_id).is_none()
+                    && let Err(error) = cat.register(entry)
                 {
                     return self.response_error(
                         task,
                         ErrorCode::Internal {
-                            detail: format!("array catalog register: {e}"),
+                            detail: format!("array catalog register: {error}"),
                         },
                     );
                 }
@@ -100,6 +107,21 @@ impl CoreLoop {
                 );
             }
         };
+
+        // CREATE authorization requires that neither durable nor in-memory
+        // catalog contained this identity before its transition was installed.
+        // Therefore a deterministic tombstone here can only be the unpurged
+        // residue of an already-finalized prior DROP; remove it before opening
+        // the replacement store. An incomplete DROP still has catalog state
+        // and is rejected by `apply_authorized_ddl` before it can dispatch.
+        if let Err(e) = self.array_engine.purge_finalized_drop_before_open(array_id) {
+            return self.response_error(
+                task,
+                ErrorCode::Internal {
+                    detail: format!("array finalized-drop purge: {e}"),
+                },
+            );
+        }
 
         if let Err(e) =
             self.array_engine
@@ -128,6 +150,6 @@ impl CoreLoop {
 fn now_epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
 }

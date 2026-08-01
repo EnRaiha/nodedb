@@ -37,8 +37,23 @@ pub fn db_qualified(database_id: crate::types::DatabaseId, collection: &str) -> 
     }
 }
 
+/// Whether conversion produces executable work or metadata used only for
+/// authorization and response shaping.
+///
+/// Metadata conversion must never allocate durable identity or mutate planner
+/// owned state. Its physical tasks are descriptive only and must not cross the
+/// dispatch boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanningPurpose {
+    Execute,
+    Metadata,
+}
+
 /// Conversion context holding optional references needed during plan conversion.
 pub struct ConvertContext {
+    /// Execution conversion may allocate identities and apply converter-owned
+    /// catalog changes. Metadata conversion is strictly side-effect-free.
+    pub purpose: PlanningPurpose,
     pub retention_registry: Option<Arc<RetentionPolicyRegistry>>,
     /// Array DDL/DML targets — when `None`, array statements fail with a
     /// deterministic error so converters used by sub-planners (which do
@@ -119,6 +134,50 @@ pub struct ConvertContext {
 }
 
 impl ConvertContext {
+    pub fn is_metadata(&self) -> bool {
+        self.purpose == PlanningPurpose::Metadata
+    }
+
+    /// Resolve an existing surrogate without creating a mapping while planning
+    /// metadata. Execute planning retains the allocating assignment behavior.
+    pub fn surrogate_for_pk(
+        &self,
+        collection: &str,
+        pk_bytes: &[u8],
+    ) -> crate::Result<nodedb_types::Surrogate> {
+        let Some(assigner) = self.surrogate_assigner.as_ref() else {
+            return Ok(nodedb_types::Surrogate::ZERO);
+        };
+        if self.is_metadata() {
+            return Ok(assigner
+                .lookup(self.database_id, self.tenant_id, collection, pk_bytes)?
+                .unwrap_or(nodedb_types::Surrogate::ZERO));
+        }
+        assigner.assign(self.database_id, self.tenant_id, collection, pk_bytes)
+    }
+
+    /// Allocate a new surrogate only while producing executable work.
+    /// Metadata plans use a zero placeholder because no fresh identity exists.
+    pub fn fresh_surrogate(&self, collection: &str) -> crate::Result<nodedb_types::Surrogate> {
+        if self.is_metadata() {
+            return Ok(nodedb_types::Surrogate::ZERO);
+        }
+        match self.surrogate_assigner.as_ref() {
+            Some(assigner) => assigner.assign_fresh(self.database_id, self.tenant_id, collection),
+            None => Ok(nodedb_types::Surrogate::ZERO),
+        }
+    }
+
+    /// Reject converter paths whose conversion itself persists catalog state.
+    pub fn require_execute(&self, operation: &str) -> crate::Result<()> {
+        if self.is_metadata() {
+            return Err(crate::Error::PlanError {
+                detail: format!("{operation} is not available during metadata planning"),
+            });
+        }
+        Ok(())
+    }
+
     /// Build the deployment-neutral subset shared with `nodedb-physical`'s
     /// converter helpers. Cheap: 3 `Copy` fields + an `Arc` clone.
     pub fn shared(&self) -> nodedb_physical::SharedConvertContext {
@@ -186,4 +245,84 @@ pub(super) fn convert_one(
 ) -> crate::Result<Vec<PhysicalTask>> {
     let mut visitor = super::visitor::ConvertVisitor { tenant_id, ctx };
     nodedb_sql::dispatch(&mut visitor, plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConvertContext, PlanningPurpose};
+    use std::sync::{Arc, RwLock};
+
+    use crate::control::security::credential::CredentialStore;
+    use crate::control::surrogate::SurrogateAssigner;
+    use crate::control::surrogate::registry::SurrogateRegistry;
+    use crate::control::surrogate::wal_appender::{NoopWalAppender, SurrogateWalAppender};
+    use crate::types::{DatabaseId, TenantId};
+
+    fn context(purpose: PlanningPurpose, assigner: Arc<SurrogateAssigner>) -> ConvertContext {
+        ConvertContext {
+            purpose,
+            retention_registry: None,
+            array_catalog: None,
+            credentials: None,
+            wal: None,
+            surrogate_assigner: Some(assigner),
+            cluster_enabled: false,
+            bitemporal_retention_registry: None,
+            max_vector_dim: 0,
+            database_id: DatabaseId::DEFAULT,
+            tenant_id: TenantId::new(1),
+            force_shuffle_join: false,
+            shuffle_num_parts: 0,
+            force_shuffle_agg: false,
+            shuffle_agg_num_parts: 0,
+            broadcast_threshold_bytes: 0,
+            shuffle_agg_threshold: 0,
+        }
+    }
+
+    #[test]
+    fn metadata_surrogate_planning_never_creates_a_mapping_or_advances_counter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let credentials = Arc::new(
+            CredentialStore::open(&dir.path().join("system.redb")).expect("credential store"),
+        );
+        let registry = Arc::new(RwLock::new(SurrogateRegistry::new()));
+        let wal: Arc<dyn SurrogateWalAppender> = Arc::new(NoopWalAppender);
+        let assigner = Arc::new(SurrogateAssigner::new(
+            Arc::clone(&registry),
+            credentials,
+            wal,
+        ));
+        let metadata = context(PlanningPurpose::Metadata, Arc::clone(&assigner));
+
+        assert_eq!(
+            metadata
+                .surrogate_for_pk("users", b"new-user")
+                .unwrap()
+                .as_u32(),
+            0
+        );
+        assert_eq!(metadata.fresh_surrogate("users").unwrap().as_u32(), 0);
+        assert_eq!(
+            assigner
+                .lookup(DatabaseId::DEFAULT, TenantId::new(1), "users", b"new-user")
+                .unwrap(),
+            None
+        );
+        assert_eq!(registry.read().expect("registry").current_hwm(), 0);
+
+        let execute = context(PlanningPurpose::Execute, Arc::clone(&assigner));
+        let allocated = execute.surrogate_for_pk("users", b"new-user").unwrap();
+        assert_ne!(allocated.as_u32(), 0);
+        assert_eq!(
+            assigner
+                .lookup(DatabaseId::DEFAULT, TenantId::new(1), "users", b"new-user")
+                .unwrap(),
+            Some(allocated)
+        );
+        assert_eq!(
+            registry.read().expect("registry").current_hwm(),
+            allocated.as_u32()
+        );
+    }
 }

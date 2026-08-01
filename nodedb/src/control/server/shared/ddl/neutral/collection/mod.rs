@@ -24,7 +24,7 @@ pub mod vector_metadata;
 
 pub use alter::dispatch_alter_collection;
 pub use copy_from::{CopyFromOptions, copy_from_file};
-pub use copy_to::copy_to_file;
+pub use copy_to::{CopyToOptions, copy_to_file};
 pub use create::{CreateCollectionRequest, create_collection, create_table};
 pub use describe::{describe_collection, show_collections};
 pub use dml::{insert_document, upsert_document};

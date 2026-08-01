@@ -105,8 +105,13 @@ pub(super) fn ndjson_body_stream(
     stream: ResultStream,
     limit: usize,
     projection: Option<OutputSchema>,
+    lease_scope: crate::control::lease::QueryLeaseScope,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
+        // The body owns this scope for its complete polling lifetime. Dropping
+        // the body on completion or client disconnect releases descriptors only
+        // after the ResultStream is no longer reachable.
+        let _lease_scope = lease_scope;
         let mut emitted: usize = 0;
         let mut batches = stream;
         while emitted < limit {
@@ -197,7 +202,13 @@ mod tests {
         let batches: Vec<crate::Result<RowBatch>> =
             vec![batch(0, 1000), batch(1000, 1000), batch(2000, 500)];
         let stream: ResultStream = Box::pin(futures::stream::iter(batches));
-        let lines = collect_lines(ndjson_body_stream(stream, usize::MAX, None)).await;
+        let lines = collect_lines(ndjson_body_stream(
+            stream,
+            usize::MAX,
+            None,
+            crate::control::lease::QueryLeaseScope::empty(),
+        ))
+        .await;
         assert_eq!(lines.len(), 2500, "all rows must stream as NDJSON lines");
     }
 
@@ -205,7 +216,13 @@ mod tests {
     async fn global_limit_caps_emitted_rows() {
         let batches: Vec<crate::Result<RowBatch>> = vec![batch(0, 1000), batch(1000, 1000)];
         let stream: ResultStream = Box::pin(futures::stream::iter(batches));
-        let lines = collect_lines(ndjson_body_stream(stream, 1500, None)).await;
+        let lines = collect_lines(ndjson_body_stream(
+            stream,
+            1500,
+            None,
+            crate::control::lease::QueryLeaseScope::empty(),
+        ))
+        .await;
         assert_eq!(lines.len(), 1500, "global take-N must cap the line count");
     }
 
@@ -218,7 +235,13 @@ mod tests {
             }),
         ];
         let stream: ResultStream = Box::pin(futures::stream::iter(batches));
-        let lines = collect_lines(ndjson_body_stream(stream, usize::MAX, None)).await;
+        let lines = collect_lines(ndjson_body_stream(
+            stream,
+            usize::MAX,
+            None,
+            crate::control::lease::QueryLeaseScope::empty(),
+        ))
+        .await;
         assert_eq!(lines.len(), 11, "10 rows + 1 in-band error line");
         let last: serde_json::Value =
             sonic_rs::from_str(lines.last().expect("error line")).expect("json error line");

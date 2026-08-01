@@ -96,7 +96,7 @@ pub(crate) async fn apply_array_cell_write(
     // A follower must have the array open on the Data Plane before a Put/Delete
     // can land. Idempotent on the Data Plane side (re-open with the same schema
     // hash returns Ok).
-    if let Err(e) = ensure_array_open(state, &array_id, vshard, tenant_id).await {
+    if let Err(e) = ensure_array_open(state, &array_id, vshard, tenant_id, database_id).await {
         warn!(
             group_id, index = log_index, array = %array_id.name, error = %e,
             "apply_array_cell_write: ensure_array_open failed"

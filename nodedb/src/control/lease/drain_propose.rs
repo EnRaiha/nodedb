@@ -135,9 +135,9 @@ pub fn drain_for_ddl(
     }
 }
 
-/// Wait until `metadata_cache.leases` has no entries on `id` at
-/// `version <= up_to_version`. Polls every [`POLL_INTERVAL`] until
-/// the deadline.
+/// Wait until `metadata_cache.leases` and in-flight admission reservations
+/// have no entries on `id` at `version <= up_to_version`. Polls every
+/// [`POLL_INTERVAL`] until the deadline.
 pub(crate) fn poll_leases_drained(
     shared: &SharedState,
     id: &DescriptorId,
@@ -163,18 +163,27 @@ pub(crate) fn poll_leases_drained(
     }
 }
 
-/// Count leases on `id` at `version <= up_to_version` currently in
-/// the metadata cache. `0` means the drain target has cleared.
+/// Count metadata leases and admission reservations on `id` at
+/// `version <= up_to_version`. `0` means the drain target has cleared. The
+/// exact nonzero diagnostic count is not significant, so saturate rather than
+/// risking arithmetic overflow.
 fn count_matching_leases(shared: &SharedState, id: &DescriptorId, up_to_version: u64) -> usize {
     let cache = shared
         .metadata_cache
         .read()
         .unwrap_or_else(|p| p.into_inner());
-    cache
+    let metadata_holds = cache
         .leases
         .iter()
         .filter(|((lid, _), l)| lid == id && l.version <= up_to_version)
-        .count()
+        .count();
+    drop(cache);
+
+    if shared.lease_refcount.current_at_or_below(id, up_to_version) == 0 {
+        metadata_holds
+    } else {
+        metadata_holds.saturating_add(1)
+    }
 }
 
 /// Encode + propose a drain variant through the shared
@@ -227,6 +236,13 @@ fn apply_drain_locally(shared: &SharedState, entry: &MetadataEntry) {
             up_to_version,
             expires_at,
         } => {
+            // Shares plan admission's gate: either an admission completes with
+            // a refcount/lease before this start installs, or this drain wins
+            // and subsequent admission fails closed.
+            let _admission_gate = shared
+                .lease_admission_gate
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             shared
                 .lease_drain
                 .install_start(descriptor_id.clone(), *up_to_version, *expires_at);
@@ -252,36 +268,44 @@ fn apply_drain_locally(shared: &SharedState, entry: &MetadataEntry) {
 pub fn descriptor_id_for_implicit_clear(entry: &CatalogEntry) -> Option<DescriptorId> {
     match entry {
         CatalogEntry::PutCollection(stored) => Some(DescriptorId::new(
+            stored.database_id.as_u64(),
             stored.tenant_id,
             DescriptorKind::Collection,
             stored.name.clone(),
         )),
         CatalogEntry::PutCollectionIfAbsent(stored) => Some(DescriptorId::new(
+            stored.database_id.as_u64(),
             stored.tenant_id,
             DescriptorKind::Collection,
             stored.name.clone(),
         )),
         CatalogEntry::PutMaterializedView(stored) => Some(DescriptorId::new(
+            DatabaseId::DEFAULT.as_u64(),
             stored.tenant_id,
             DescriptorKind::MaterializedView,
             stored.name.clone(),
         )),
         CatalogEntry::PutFunction(stored) => Some(DescriptorId::new(
+            stored.database_id.as_u64(),
             stored.tenant_id,
             DescriptorKind::Function,
             stored.name.clone(),
         )),
         CatalogEntry::PutProcedure(stored) => Some(DescriptorId::new(
+            stored.database_id.as_u64(),
             stored.tenant_id,
             DescriptorKind::Procedure,
             stored.name.clone(),
         )),
         CatalogEntry::PutTrigger(stored) => Some(DescriptorId::new(
+            stored.database_id.as_u64(),
             stored.tenant_id,
             DescriptorKind::Trigger,
             stored.name.clone(),
         )),
+
         CatalogEntry::PutSequence(stored) => Some(DescriptorId::new(
+            DatabaseId::DEFAULT.as_u64(),
             stored.tenant_id,
             DescriptorKind::Sequence,
             stored.name.clone(),
@@ -309,13 +333,14 @@ pub fn descriptor_id_and_prior_version(
     match entry {
         CatalogEntry::PutCollection(stored) => {
             let prior = catalog
-                .get_collection(DatabaseId::DEFAULT, stored.tenant_id, &stored.name)
+                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|c| c.descriptor_version)
                 .unwrap_or(0);
             Some((
                 DescriptorId::new(
+                    stored.database_id.as_u64(),
                     stored.tenant_id,
                     DescriptorKind::Collection,
                     stored.name.clone(),
@@ -325,13 +350,14 @@ pub fn descriptor_id_and_prior_version(
         }
         CatalogEntry::PutCollectionIfAbsent(stored) => {
             let prior = catalog
-                .get_collection(DatabaseId::DEFAULT, stored.tenant_id, &stored.name)
+                .get_collection(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|c| c.descriptor_version)
                 .unwrap_or(0);
             Some((
                 DescriptorId::new(
+                    stored.database_id.as_u64(),
                     stored.tenant_id,
                     DescriptorKind::Collection,
                     stored.name.clone(),
@@ -348,6 +374,7 @@ pub fn descriptor_id_and_prior_version(
                 .unwrap_or(0);
             Some((
                 DescriptorId::new(
+                    DatabaseId::DEFAULT.as_u64(),
                     stored.tenant_id,
                     DescriptorKind::MaterializedView,
                     stored.name.clone(),
@@ -357,13 +384,14 @@ pub fn descriptor_id_and_prior_version(
         }
         CatalogEntry::PutFunction(stored) => {
             let prior = catalog
-                .get_function(stored.tenant_id, &stored.name)
+                .get_function_in_database(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|f| f.descriptor_version)
                 .unwrap_or(0);
             Some((
                 DescriptorId::new(
+                    stored.database_id.as_u64(),
                     stored.tenant_id,
                     DescriptorKind::Function,
                     stored.name.clone(),
@@ -373,13 +401,14 @@ pub fn descriptor_id_and_prior_version(
         }
         CatalogEntry::PutProcedure(stored) => {
             let prior = catalog
-                .get_procedure(stored.tenant_id, &stored.name)
+                .get_procedure_in_database(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|p| p.descriptor_version)
                 .unwrap_or(0);
             Some((
                 DescriptorId::new(
+                    stored.database_id.as_u64(),
                     stored.tenant_id,
                     DescriptorKind::Procedure,
                     stored.name.clone(),
@@ -389,13 +418,14 @@ pub fn descriptor_id_and_prior_version(
         }
         CatalogEntry::PutTrigger(stored) => {
             let prior = catalog
-                .get_trigger(stored.tenant_id, &stored.name)
+                .get_trigger_in_database(stored.database_id, stored.tenant_id, &stored.name)
                 .ok()
                 .flatten()
                 .map(|t| t.descriptor_version)
                 .unwrap_or(0);
             Some((
                 DescriptorId::new(
+                    stored.database_id.as_u64(),
                     stored.tenant_id,
                     DescriptorKind::Trigger,
                     stored.name.clone(),
@@ -412,6 +442,7 @@ pub fn descriptor_id_and_prior_version(
                 .unwrap_or(0);
             Some((
                 DescriptorId::new(
+                    DatabaseId::DEFAULT.as_u64(),
                     stored.tenant_id,
                     DescriptorKind::Sequence,
                     stored.name.clone(),
@@ -420,5 +451,154 @@ pub fn descriptor_id_and_prior_version(
             ))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::security::catalog::procedure_types::ProcedureRoutability;
+    use crate::control::security::catalog::trigger_types::{
+        TriggerBatchMode, TriggerEvents, TriggerExecutionMode, TriggerGranularity, TriggerSecurity,
+        TriggerTiming,
+    };
+    use crate::control::security::catalog::{
+        FunctionLanguage, FunctionSecurity, FunctionVolatility, StoredCollection, StoredFunction,
+        StoredProcedure, StoredTrigger,
+    };
+    use crate::wal::WalManager;
+
+    #[tokio::test]
+    async fn in_flight_admission_reservation_blocks_drain_count() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("drain-count.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        state.lease_refcount.increment(&descriptor, 1);
+        assert_eq!(count_matching_leases(&state, &descriptor, 1), 1);
+        state.lease_refcount.decrement(&descriptor, 1);
+        assert_eq!(count_matching_leases(&state, &descriptor, 1), 0);
+    }
+
+    #[tokio::test]
+    async fn newer_admission_reservation_does_not_block_older_drain() {
+        let directory = tempfile::tempdir().expect("create drain count test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("drain-count.wal"))
+                .expect("open drain count test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("construct drain count state");
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+
+        state.lease_refcount.increment(&descriptor, 2);
+        assert_eq!(count_matching_leases(&state, &descriptor, 1), 0);
+        state.lease_refcount.decrement(&descriptor, 2);
+    }
+
+    fn function(database_id: DatabaseId) -> StoredFunction {
+        StoredFunction {
+            tenant_id: 41,
+            database_id,
+            name: "same_name".into(),
+            parameters: vec![],
+            return_type: "INT".into(),
+            body_sql: "1".into(),
+            compiled_body_sql: None,
+            volatility: FunctionVolatility::Immutable,
+            security: FunctionSecurity::Invoker,
+            language: FunctionLanguage::Sql,
+            wasm_hash: None,
+            wasm_module: None,
+            dependencies: vec![],
+            wasm_fuel: 1_000_000,
+            wasm_memory: 16 * 1024 * 1024,
+            owner: "tester".into(),
+            created_at: 0,
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+        }
+    }
+
+    fn procedure(database_id: DatabaseId) -> StoredProcedure {
+        StoredProcedure {
+            tenant_id: 41,
+            database_id,
+            name: "same_name".into(),
+            parameters: vec![],
+            body_sql: "BEGIN END".into(),
+            max_iterations: 1_000_000,
+            timeout_secs: 60,
+            routability: ProcedureRoutability::MultiCollection,
+            owner: "tester".into(),
+            created_at: 0,
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+        }
+    }
+
+    fn trigger(database_id: DatabaseId) -> StoredTrigger {
+        StoredTrigger {
+            tenant_id: 41,
+            database_id,
+            name: "same_name".into(),
+            collection: "orders".into(),
+            timing: TriggerTiming::After,
+            events: TriggerEvents {
+                on_insert: true,
+                on_update: false,
+                on_delete: false,
+            },
+            granularity: TriggerGranularity::Row,
+            when_condition: None,
+            body_sql: "BEGIN END".into(),
+            priority: 0,
+            enabled: true,
+            execution_mode: TriggerExecutionMode::Async,
+            security: TriggerSecurity::Invoker,
+            batch_mode: TriggerBatchMode::BatchSafe,
+            owner: "tester".into(),
+            created_at: 0,
+            descriptor_version: 0,
+            modification_hlc: nodedb_types::Hlc::ZERO,
+        }
+    }
+
+    #[test]
+    fn routine_descriptor_ids_preserve_selected_database() {
+        let database_id = DatabaseId::new(73);
+        let entries = [
+            CatalogEntry::PutFunction(Box::new(function(database_id))),
+            CatalogEntry::PutProcedure(Box::new(procedure(database_id))),
+            CatalogEntry::PutTrigger(Box::new(trigger(database_id))),
+        ];
+
+        for entry in entries {
+            let id = descriptor_id_for_implicit_clear(&entry).expect("routine descriptor id");
+            assert_eq!(id.database_id, database_id.as_u64());
+            assert_eq!(id.tenant_id, 41);
+            assert_eq!(id.name, "same_name");
+        }
+    }
+
+    #[test]
+    fn implicit_clear_collection_id_preserves_non_default_database() {
+        let mut stored = StoredCollection::new(41, "orders", "owner");
+        stored.database_id = DatabaseId::new(73);
+        let entry = CatalogEntry::PutCollection(Box::new(stored));
+
+        let id = descriptor_id_for_implicit_clear(&entry).expect("collection descriptor id");
+        assert_eq!(id.database_id, 73);
+        assert_eq!(id.tenant_id, 41);
+        assert_eq!(id.kind, DescriptorKind::Collection);
+        assert_eq!(id.name, "orders");
     }
 }

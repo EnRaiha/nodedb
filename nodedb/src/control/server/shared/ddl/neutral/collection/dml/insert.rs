@@ -44,6 +44,7 @@ pub async fn insert_document(
     if let Some(result) = fire_instead_triggers(
         state,
         identity,
+        database_id,
         tenant_id,
         &parsed.coll_name,
         &parsed.fields,
@@ -58,6 +59,7 @@ pub async fn insert_document(
     let fields = match fire_before_triggers(
         state,
         identity,
+        database_id,
         tenant_id,
         &parsed.coll_name,
         &parsed.fields,
@@ -216,8 +218,15 @@ pub async fn insert_document(
     }
 
     // Fire SYNC AFTER INSERT triggers.
-    if let Some(err) =
-        fire_sync_after_triggers(state, identity, tenant_id, &parsed.coll_name, &fields).await
+    if let Some(err) = fire_sync_after_triggers(
+        state,
+        identity,
+        database_id,
+        tenant_id,
+        &parsed.coll_name,
+        &fields,
+    )
+    .await
     {
         return Some(err);
     }

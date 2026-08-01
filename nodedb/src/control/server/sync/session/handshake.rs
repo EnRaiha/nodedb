@@ -58,6 +58,10 @@ impl SyncSession {
         current_server_clock: HashMap<String, u64>,
         shared: Option<&Arc<SharedState>>,
     ) -> Option<SyncFrame> {
+        // A handshake is an authentication boundary, not an additive update to
+        // a prior one. Clear the prior binding before examining this attempt so
+        // every failure leaves the connection unable to use its old identity.
+        self.clear_handshake_binding();
         self.last_activity = Instant::now();
 
         // Wire format compatibility check: reject incompatible clients early.
@@ -271,6 +275,33 @@ impl SyncSession {
         }
     }
 
+    /// Clear all state derived from a successful handshake or from the
+    /// candidate currently being authenticated. Connection lifetime, activity,
+    /// rate-limiting, and telemetry counters deliberately survive.
+    pub(super) fn clear_handshake_binding(&mut self) {
+        self.tenant_id = None;
+        self.username = None;
+        self.identity = None;
+        self.authenticated = false;
+        self.client_clock.clear();
+        self.server_clock.clear();
+        self.subscribed_shapes.clear();
+        self.last_seen_lsn = 0;
+        self.producer_id = 0;
+        self.accepted_epoch = 0;
+        self.delta_signing_key = None;
+        self.device_metadata = DeviceMetadata::default();
+        self.tracked_collections.clear();
+        self.announced_collections.clear();
+    }
+
+    /// Build a bounded, generic rejection for a Handshake frame whose body
+    /// could not be decoded. The fixed message intentionally exposes no
+    /// decoder or payload details to the peer.
+    pub(super) fn malformed_handshake_reject_frame(&self) -> Option<SyncFrame> {
+        self.build_reject_frame(&HashMap::new(), "malformed handshake", false)
+    }
+
     /// Build a failed HandshakeAck rejection frame: `success=false`, the
     /// supplied `message` in the `error` field, and the given `fork_detected`
     /// flag. Shared by [`Self::fork_reject_frame`] and
@@ -298,7 +329,7 @@ impl SyncSession {
     /// Build a fork-detected rejection frame (`fork_detected=true`): the client
     /// treats the session as a permanent fork and wipes its local state.
     fn fork_reject_frame(
-        &self,
+        &mut self,
         server_clock: &HashMap<String, u64>,
         message: &str,
     ) -> Option<SyncFrame> {
@@ -306,6 +337,7 @@ impl SyncSession {
             session = %self.session_id,
             "FORK DETECTED: {message}"
         );
+        self.clear_handshake_binding();
         self.build_reject_frame(server_clock, message, true)
     }
 
@@ -316,7 +348,7 @@ impl SyncSession {
     /// the client retries the handshake rather than treating the session as a
     /// permanent fork and wiping its local state.
     fn transient_reject_frame(
-        &self,
+        &mut self,
         server_clock: &HashMap<String, u64>,
         message: &str,
     ) -> Option<SyncFrame> {
@@ -324,6 +356,7 @@ impl SyncSession {
             session = %self.session_id,
             "sync handshake transient error (retryable): {message}"
         );
+        self.clear_handshake_binding();
         self.build_reject_frame(server_clock, message, false)
     }
 
@@ -473,12 +506,15 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use nodedb_types::sync::wire::{HandshakeAckMsg, HandshakeMsg};
+    use nodedb_types::sync::wire::{
+        DeltaPushMsg, DeltaRejectMsg, HandshakeAckMsg, HandshakeMsg, SyncFrame, SyncMessageType,
+    };
 
     use crate::bridge::dispatch::Dispatcher;
     use crate::control::security::catalog::SystemCatalog;
     use crate::control::security::jwt::{JwtConfig, JwtValidator};
     use crate::control::server::sync::session::state::SyncSession;
+    use crate::control::server::sync::wire::CompensationHint;
     use crate::control::state::SharedState;
     use crate::control::sync_producer::registry::SyncProducerRegistry;
     use crate::wal::WalManager;
@@ -631,5 +667,231 @@ mod tests {
             "epoch 3 is stale vs {}",
             loaded.current_epoch
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_handshake_clears_binding_and_denies_following_delta() {
+        let (shared, _dir) = trust_state();
+        let validator = JwtValidator::new(JwtConfig::default());
+        let mut session = SyncSession::new("malformed-handshake-session".into());
+
+        // Establish a real production-backed identity, then stage the
+        // identity-bound state a prior authenticated Lite handshake can hold.
+        let valid_handshake = make_handshake(crate::version::WIRE_FORMAT_VERSION);
+        let valid_frame = session
+            .handle_handshake(&valid_handshake, &validator, HashMap::new(), Some(&shared))
+            .expect("valid handshake response");
+        let valid_ack: HandshakeAckMsg = valid_frame.decode_body().expect("decode valid ack");
+        assert!(valid_ack.success);
+        assert!(session.authenticated);
+        assert!(session.identity.is_some());
+
+        session
+            .client_clock
+            .insert("orders".into(), HashMap::from([("peer-1".into(), 4)]));
+        session.server_clock.insert("orders".into(), 8);
+        session.subscribed_shapes.push("orders-shape".into());
+        session.last_seen_lsn = 8;
+        session.producer_id = 42;
+        session.accepted_epoch = 7;
+        session.delta_signing_key = Some([9; 32]);
+        session.device_metadata.remote_addr = "127.0.0.1:1234".into();
+        session.device_metadata.peer_id = 99;
+        session.track_collection(1, "orders");
+        session.announced_collections.insert("orders".into());
+
+        // Round-trip through the framing codec so this is a CRC-valid
+        // Handshake frame whose MessagePack body simply has the wrong shape.
+        let malformed_wire = SyncFrame::try_encode(
+            SyncMessageType::Handshake,
+            &"not a handshake message".to_string(),
+        )
+        .expect("encode malformed handshake body")
+        .to_bytes();
+        let malformed_frame =
+            SyncFrame::from_bytes(&malformed_wire).expect("CRC-valid malformed handshake frame");
+        let response = session
+            .process_frame(
+                &malformed_frame,
+                &validator,
+                Some(&shared.rls),
+                None,
+                None,
+                Some(&shared),
+            )
+            .expect("malformed handshake rejection");
+
+        assert_eq!(response.msg_type, SyncMessageType::HandshakeAck);
+        let ack: HandshakeAckMsg = response.decode_body().expect("decode malformed ack");
+        assert!(!ack.success);
+        assert!(!ack.fork_detected);
+        assert_eq!(ack.error.as_deref(), Some("malformed handshake"));
+        assert!(!session.authenticated);
+        assert!(session.tenant_id.is_none());
+        assert!(session.username.is_none());
+        assert!(session.identity.is_none());
+        assert!(session.client_clock.is_empty());
+        assert!(session.server_clock.is_empty());
+        assert!(session.subscribed_shapes.is_empty());
+        assert_eq!(session.last_seen_lsn, 0);
+        assert_eq!(session.producer_id, 0);
+        assert_eq!(session.accepted_epoch, 0);
+        assert!(session.delta_signing_key.is_none());
+        assert!(session.device_metadata.client_version.is_empty());
+        assert!(session.device_metadata.remote_addr.is_empty());
+        assert_eq!(session.device_metadata.peer_id, 0);
+        assert!(session.tracked_collections.is_empty());
+        assert!(session.announced_collections.is_empty());
+
+        let delta = DeltaPushMsg {
+            collection: "orders".into(),
+            document_id: "order-1".into(),
+            delta: nodedb_types::json_to_msgpack(&serde_json::json!({"status": "active"}))
+                .expect("encode valid delta"),
+            peer_id: 1,
+            mutation_id: 17,
+            device_id: 0,
+            delta_signature: [0; 32],
+            checksum: 0,
+            device_valid_time_ms: None,
+            producer_id: 42,
+            epoch: 7,
+            seq: 1,
+        };
+        let delta_frame =
+            SyncFrame::try_encode(SyncMessageType::DeltaPush, &delta).expect("encode delta frame");
+        let response = session
+            .process_frame(
+                &delta_frame,
+                &validator,
+                Some(&shared.rls),
+                None,
+                None,
+                Some(&shared),
+            )
+            .expect("permission denial response");
+        assert_eq!(response.msg_type, SyncMessageType::DeltaReject);
+        let reject: DeltaRejectMsg = response.decode_body().expect("decode delta rejection");
+        assert_eq!(
+            reject.compensation,
+            Some(CompensationHint::PermissionDenied)
+        );
+        assert_eq!(session.mutations_processed, 0);
+    }
+
+    #[tokio::test]
+    async fn stale_lite_rehandshake_clears_trust_binding_before_delta_dispatch() {
+        // Keep the WAL and Data-Plane endpoints alive for the complete
+        // SharedState lifetime, as the production-backed path requires.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("sync-fencing.wal")).expect("open WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut shared = SharedState::new(dispatcher, Arc::clone(&wal)).expect("shared state");
+        shared
+            .credentials
+            .bootstrap_trust_superuser("nodedb")
+            .expect("bootstrap trust superuser");
+        let registry = Arc::new(open_registry(dir.path()));
+        Arc::get_mut(&mut shared)
+            .expect("SharedState has a single owner while configuring test")
+            .producer_registry = Some(registry);
+
+        let validator = JwtValidator::new(JwtConfig::default());
+        let mut high_epoch_session = SyncSession::new("high-epoch-session".into());
+        let mut high_epoch_msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
+        high_epoch_msg.lite_id = "fenced-lite-id".into();
+        high_epoch_msg.epoch = 9;
+        let high_epoch_frame = high_epoch_session
+            .handle_handshake(&high_epoch_msg, &validator, HashMap::new(), Some(&shared))
+            .expect("high epoch handshake response");
+        let high_epoch_ack: HandshakeAckMsg = high_epoch_frame.decode_body().expect("decode ack");
+        assert!(high_epoch_ack.success, "higher epoch must be accepted");
+        assert!(high_epoch_session.authenticated);
+        assert_ne!(high_epoch_session.producer_id, 0);
+        assert_eq!(high_epoch_session.accepted_epoch, 9);
+
+        // Seed identity-bound state that a prior successful handshake can
+        // accumulate. The next handshake attempt must not retain any of it.
+        high_epoch_session
+            .client_clock
+            .insert("orders".into(), HashMap::from([("peer-1".into(), 4)]));
+        high_epoch_session.server_clock.insert("orders".into(), 8);
+        high_epoch_session
+            .subscribed_shapes
+            .push("orders-shape".into());
+        high_epoch_session.last_seen_lsn = 8;
+        high_epoch_session.track_collection(1, "orders");
+        high_epoch_session
+            .announced_collections
+            .insert("orders".into());
+
+        // This new handshake attempt stages the configured trust identity
+        // before the registry discovers that this LiteId's epoch is stale.
+        let mut stale_msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
+        stale_msg.lite_id = "fenced-lite-id".into();
+        stale_msg.epoch = 3;
+        let stale_frame = high_epoch_session
+            .handle_handshake(&stale_msg, &validator, HashMap::new(), Some(&shared))
+            .expect("stale handshake response");
+        let stale_ack: HandshakeAckMsg = stale_frame.decode_body().expect("decode stale ack");
+
+        assert!(!stale_ack.success);
+        assert!(stale_ack.fork_detected);
+        assert!(!high_epoch_session.authenticated);
+        assert!(high_epoch_session.tenant_id.is_none());
+        assert!(high_epoch_session.username.is_none());
+        assert!(high_epoch_session.identity.is_none());
+        assert!(high_epoch_session.client_clock.is_empty());
+        assert!(high_epoch_session.server_clock.is_empty());
+        assert!(high_epoch_session.subscribed_shapes.is_empty());
+        assert_eq!(high_epoch_session.last_seen_lsn, 0);
+        assert_eq!(high_epoch_session.producer_id, 0);
+        assert_eq!(high_epoch_session.accepted_epoch, 0);
+        assert!(high_epoch_session.delta_signing_key.is_none());
+        assert!(high_epoch_session.device_metadata.client_version.is_empty());
+        assert!(high_epoch_session.device_metadata.remote_addr.is_empty());
+        assert_eq!(high_epoch_session.device_metadata.peer_id, 0);
+        assert!(high_epoch_session.tracked_collections.is_empty());
+        assert!(high_epoch_session.announced_collections.is_empty());
+
+        // The configured trust identity is a superuser, so this would be
+        // authorized and provisionally ACKed if the stale handshake retained
+        // its staged identity. The production dispatch gate must deny it.
+        let delta = DeltaPushMsg {
+            collection: "orders".into(),
+            document_id: "order-1".into(),
+            delta: nodedb_types::json_to_msgpack(&serde_json::json!({"status": "active"}))
+                .expect("encode valid delta"),
+            peer_id: 1,
+            mutation_id: 17,
+            device_id: 0,
+            delta_signature: [0; 32],
+            checksum: 0,
+            device_valid_time_ms: None,
+            producer_id: 0,
+            epoch: 0,
+            seq: 0,
+        };
+        let delta_frame =
+            SyncFrame::try_encode(SyncMessageType::DeltaPush, &delta).expect("encode delta frame");
+        let response = high_epoch_session
+            .process_frame(
+                &delta_frame,
+                &validator,
+                Some(&shared.rls),
+                None,
+                None,
+                Some(&shared),
+            )
+            .expect("permission denial response");
+        assert_eq!(response.msg_type, SyncMessageType::DeltaReject);
+        let reject: DeltaRejectMsg = response.decode_body().expect("decode delta rejection");
+        assert_eq!(
+            reject.compensation,
+            Some(CompensationHint::PermissionDenied)
+        );
+        assert_eq!(high_epoch_session.mutations_processed, 0);
     }
 }

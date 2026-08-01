@@ -111,7 +111,14 @@ fn live_subscription_drain_receives_events() {
     let notifications = store.drain_live_notifications(addr);
     assert_eq!(notifications.len(), 1);
     assert_eq!(notifications[0].0, "live_orders");
-    assert_eq!(notifications[0].1, "INSERT:o42");
+    // The payload keeps the `OPERATION:document_id` prefix and appends an
+    // opaque `;cursor=<token>` suffix clients persist as a delivery position.
+    // The token itself is not asserted here — it is covered where it is built.
+    assert!(
+        notifications[0].1.starts_with("INSERT:o42;cursor="),
+        "unexpected live payload: {}",
+        notifications[0].1
+    );
 }
 
 #[test]

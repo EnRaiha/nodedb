@@ -30,6 +30,7 @@ fn err(sqlstate: &str, message: String) -> DdlError {
 pub async fn create_materialized_view(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     source: &str,
     query_sql: &str,
@@ -48,7 +49,7 @@ pub async fn create_materialized_view(
     // below — no `PutMaterializedView` proposal, no target collection, and no
     // `ON` source-collection existence check (those are periodic-only).
     if refresh_mode.eq_ignore_ascii_case("STREAMING") {
-        return create_streaming_mv(state, identity, &name, &query_sql).await;
+        return create_streaming_mv(state, identity, database_id, &name, &query_sql).await;
     }
 
     // Metadata Raft serializes clustered DDL. Without it, hold an exclusive
@@ -58,7 +59,7 @@ pub async fn create_materialized_view(
         Some(
             state
                 .quiesce
-                .acquire_lifecycle(0, tenant_id.as_u64(), &name)
+                .acquire_lifecycle(database_id.as_u64(), tenant_id.as_u64(), &name)
                 .await,
         )
     } else {
@@ -68,7 +69,7 @@ pub async fn create_materialized_view(
     // Validate source collection exists.
     {
         let catalog = state.credentials.catalog();
-        match catalog.get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &source) {
+        match catalog.get_collection(database_id, tenant_id.as_u64(), &source) {
             Ok(Some(_)) => {}
             _ => {
                 return Err(err(
@@ -92,7 +93,7 @@ pub async fn create_materialized_view(
             ));
         }
         if catalog
-            .get_collection(DatabaseId::DEFAULT, tenant_id.as_u64(), &name)
+            .get_collection(database_id, tenant_id.as_u64(), &name)
             .map_err(|error| err("XX000", error.to_string()))?
             .is_some()
         {
@@ -167,7 +168,7 @@ pub async fn create_materialized_view(
         primary: nodedb_types::PrimaryEngine::Document,
         vector_primary: None,
         partition_strategy: nodedb_types::PartitionStrategy::CollectionHomed,
-        database_id: nodedb_types::DatabaseId::DEFAULT,
+        database_id,
         cloned_from: None,
         clone_status: nodedb_types::CloneStatus::default(),
         has_implicit_edges: false,
@@ -204,6 +205,7 @@ pub async fn create_materialized_view(
 async fn create_streaming_mv(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     name: &str,
     query_sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
@@ -218,7 +220,7 @@ async fn create_streaming_mv(
     // Verify the source change stream exists.
     if state
         .stream_registry
-        .get(tenant_id, &parsed.source_stream)
+        .get(database_id, tenant_id, &parsed.source_stream)
         .is_none()
     {
         return Err(err(
@@ -228,7 +230,11 @@ async fn create_streaming_mv(
     }
 
     // Reject a duplicate streaming MV.
-    if state.mv_registry.get_def(tenant_id, name).is_some() {
+    if state
+        .mv_registry
+        .get_def(database_id, tenant_id, name)
+        .is_some()
+    {
         return Err(err(
             "42710",
             format!("streaming MV '{name}' already exists"),
@@ -242,6 +248,7 @@ async fn create_streaming_mv(
 
     let source_stream = parsed.source_stream.clone();
     let def = crate::event::streaming_mv::types::StreamingMvDef {
+        database_id,
         tenant_id,
         name: name.to_string(),
         source_stream: parsed.source_stream,
@@ -252,17 +259,32 @@ async fn create_streaming_mv(
         created_at: now,
     };
 
-    let catalog = state.credentials.catalog();
-    catalog
-        .put_streaming_mv(&def)
-        .map_err(|e| err("XX000", format!("catalog write: {e}")))?;
-
-    state.mv_registry.register(def);
+    let entry = crate::control::catalog_entry::CatalogEntry::PutStreamingMaterializedView(
+        Box::new(def.clone()),
+    );
+    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
+        .map_err(|error| err("XX000", format!("metadata propose: {error}")))?;
+    crate::control::catalog_entry::apply::local::apply_locally_if_needed(state, &entry, log_index);
+    if log_index == 0 {
+        state.permissions.install_replicated_owner(
+            &crate::control::security::catalog::StoredOwner {
+                database_id: database_id.as_u64(),
+                object_type: crate::control::security::catalog::auth_types::object_type::STREAMING_MATERIALIZED_VIEW
+                    .to_string(),
+                object_name: name.to_string(),
+                tenant_id,
+                owner_username: identity.username.clone(),
+            },
+        );
+        state.mv_registry.register(def);
+    }
 
     // Backfill: replay events already in the source stream's buffer so the MV
     // bootstraps with historical data instead of only future events.
-    if let Some(mv_state) = state.mv_registry.get_state(tenant_id, name)
-        && let Some(buffer) = state.cdc_router.get_buffer(tenant_id, &source_stream)
+    if let Some(mv_state) = state.mv_registry.get_state(database_id, tenant_id, name)
+        && let Some(buffer) = state
+            .cdc_router
+            .get_buffer(database_id, tenant_id, &source_stream)
     {
         crate::event::streaming_mv::processor::backfill_from_buffer(&mv_state, &buffer);
     }

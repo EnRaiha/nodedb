@@ -50,52 +50,54 @@ impl SyncSession {
         shared: Option<&Arc<SharedState>>,
     ) -> Option<SyncFrame> {
         match frame.msg_type {
-            SyncMessageType::Handshake => {
-                let msg: HandshakeMsg = frame.decode_body()?;
-                self.handle_handshake(&msg, jwt_validator, self.server_clock.clone(), shared)
-            }
+            SyncMessageType::Handshake => match frame.decode_body::<HandshakeMsg>() {
+                Some(msg) => {
+                    self.handle_handshake(&msg, jwt_validator, self.server_clock.clone(), shared)
+                }
+                None => {
+                    // A malformed handshake is an authentication-boundary
+                    // failure. It must revoke any prior identity before the
+                    // terminal failure ack is returned to the listener.
+                    self.clear_handshake_binding();
+                    self.malformed_handshake_reject_frame()
+                }
+            },
             SyncMessageType::DeltaPush => {
                 let msg: DeltaPushMsg = frame.decode_body()?;
-                self.handle_delta_push(&msg, rls_store, audit_log, dlq)
+                if let Some(shared) = shared {
+                    // Authorize before session bookkeeping or a provisional ACK.
+                    // `authorize_delta_write` emits denial audit records through
+                    // `shared.audit`, so it must run before that mutex is locked.
+                    // The Data-Plane finalizer repeats this check to cover a
+                    // permission revocation between admission and dispatch.
+                    if super::super::async_dispatch::authorize_delta_write(
+                        shared,
+                        self.identity.as_ref(),
+                        &msg.collection,
+                    )
+                    .is_err()
+                    {
+                        return super::super::async_dispatch::permission_denied_delta_reject(&msg);
+                    }
+
+                    // Only an authorized DeltaPush needs the handler's audit/DLQ
+                    // state. Keeping these guards scoped to this synchronous call
+                    // avoids the audit-emitter self-deadlock and never spans await.
+                    let mut audit = shared.audit.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut dlq = shared.sync_dlq.lock().unwrap_or_else(|p| p.into_inner());
+                    self.handle_delta_push(&msg, rls_store, Some(&mut audit), Some(&mut dlq))
+                } else {
+                    self.handle_delta_push(&msg, rls_store, audit_log, dlq)
+                }
             }
             SyncMessageType::VectorClockSync => {
                 let msg: VectorClockSyncMsg = frame.decode_body()?;
                 self.handle_vector_clock_sync(&msg)
             }
-            SyncMessageType::ShapeSubscribe => {
-                let msg: super::super::shape::handler::ShapeSubscribeMsg = frame.decode_body()?;
-                let tenant_id = self.tenant_id.map(|t| t.as_u64()).unwrap_or(0);
-                let current_lsn = self.server_clock.values().copied().max().unwrap_or(0);
-                // Record the subscription so CollectionPurged broadcast
-                // notifies this session when the shape's source
-                // collection is hard-deleted. Graph shapes have no
-                // single source collection; skip tracking for those.
-                if let Some(coll) = msg.shape.collection() {
-                    self.track_collection(tenant_id, coll);
-                }
-                // Route to the persistent registry when SharedState is present;
-                // fall back to a throwaway registry for the permissive/test path.
-                if let Some(s) = shared {
-                    super::super::shape::handler::handle_subscribe(
-                        &self.session_id,
-                        tenant_id,
-                        &msg,
-                        &s.shape_registry,
-                        current_lsn,
-                        |_shape, _lsn| super::super::shape::handler::ShapeSnapshotData::empty(),
-                    )
-                } else {
-                    let registry = super::super::shape::registry::ShapeRegistry::new();
-                    super::super::shape::handler::handle_subscribe(
-                        &self.session_id,
-                        tenant_id,
-                        &msg,
-                        &registry,
-                        current_lsn,
-                        |_shape, _lsn| super::super::shape::handler::ShapeSnapshotData::empty(),
-                    )
-                }
-            }
+            // Shape subscriptions are authorized and dispatched exclusively by
+            // the asynchronous SharedState path in the session loop. This
+            // synchronous fallback intentionally has no authority.
+            SyncMessageType::ShapeSubscribe => None,
             SyncMessageType::ShapeUnsubscribe => {
                 let msg: super::super::shape::handler::ShapeUnsubscribeMsg = frame.decode_body()?;
                 if let Some(s) = shared {

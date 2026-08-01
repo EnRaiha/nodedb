@@ -9,7 +9,7 @@ use tracing::warn;
 use super::common::{
     AppliedPosition, ArrayWriteSubmit, ensure_array_open, submit_array_write, vshard_for_array_op,
 };
-use crate::control::array_sync::OriginApplyEngine;
+use crate::control::array_sync::{ArrayOpTarget, OriginApplyEngine};
 use crate::control::distributed_applier::{AppliedWrite, ProposeTracker};
 use crate::control::state::SharedState;
 
@@ -26,16 +26,20 @@ pub(crate) async fn apply_array_op(
     state: &Arc<SharedState>,
     tracker: &Arc<ProposeTracker>,
     pos: AppliedPosition,
-    array: &str,
+    target: ArrayOpTarget<'_>,
     op_bytes: &[u8],
     provenance_bytes: Option<&[u8]>,
 ) -> bool {
+    let ArrayOpTarget {
+        tenant_id,
+        database_id,
+        array,
+    } = target;
     let AppliedPosition {
         group_id,
         log_index,
         applied_key,
     } = pos;
-    use crate::types::TenantId;
     use nodedb_array::sync::op_codec;
 
     // Decode the replicated provenance so the epoch fence runs on this replica
@@ -84,7 +88,12 @@ pub(crate) async fn apply_array_op(
         Arc::clone(&state.array_sync_schemas),
         Arc::clone(&state.array_sync_op_log),
     );
-    if engine.already_seen(&op.header.array, op.header.hlc) {
+    if engine.already_seen_in_database(
+        database_id,
+        tenant_id.as_u64(),
+        &op.header.array,
+        op.header.hlc,
+    ) {
         // Deduplicated before the funnel: no write happened on this apply, so
         // there is no version to publish.
         tracker.complete(
@@ -97,19 +106,19 @@ pub(crate) async fn apply_array_op(
     }
 
     // Compute vshard for dispatch.
-    let vshard = vshard_for_array_op(state, &op);
+    let vshard = vshard_for_array_op(state, tenant_id, database_id, &op);
 
     // Build Data Plane plan.
     use nodedb_array::sync::op::ArrayOpKind;
     use nodedb_physical::physical_plan::ArrayOp as DataArrayOp;
 
-    let tenant_id = TenantId::new(0); // array ops are tenant-0 at the sync layer
-    let array_id = nodedb_array::types::ArrayId::new(tenant_id, &op.header.array);
+    let array_id =
+        nodedb_array::types::ArrayId::in_database(tenant_id, database_id, &op.header.array);
 
     // Ensure the Data Plane has opened this array before we try to Put/Delete.
     // The Data Plane `ArrayEngine` requires an explicit `OpenArray` dispatch
     // before any write; the catalog entry carries all required schema info.
-    if let Err(e) = ensure_array_open(state, &array_id, vshard, tenant_id).await {
+    if let Err(e) = ensure_array_open(state, &array_id, vshard, tenant_id, database_id).await {
         warn!(
             group_id, index = log_index, array = %array, error = %e,
             "apply_array_op: ensure_array_open failed"
@@ -185,11 +194,7 @@ pub(crate) async fn apply_array_op(
         state,
         ArrayWriteSubmit {
             tenant_id,
-            // Array ops route by name and carry no database on the sync wire;
-            // the apply path scopes them to the default database, and the redo
-            // record must be appended under that same scope or replay lands it
-            // in the wrong catalog namespace.
-            database_id: crate::types::DatabaseId::DEFAULT,
+            database_id,
             vshard,
             plan,
             event_source: crate::event::EventSource::CrdtSync,
@@ -204,7 +209,8 @@ pub(crate) async fn apply_array_op(
     match result {
         Ok(applied) => {
             // Record applied — authoritative idempotency entry.
-            if let Err(e) = engine.record_applied(&op) {
+            if let Err(e) = engine.record_applied_in_database(database_id, tenant_id.as_u64(), &op)
+            {
                 tracing::error!(
                     group_id, index = log_index, array = %op.header.array,
                     error = %e,

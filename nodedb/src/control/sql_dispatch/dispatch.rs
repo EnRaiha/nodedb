@@ -28,19 +28,44 @@ pub async fn dispatch_sql(
     sql: &str,
 ) -> Option<crate::Result<DispatchOutcome>> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    // ── PUBLISH TO <topic> <payload> ─────────────────────────────────────────
-    if nodedb_types::starts_with_ascii_case_insensitive(trimmed, "PUBLISH TO ") {
-        return Some(handle_publish(state, identity, trimmed).await);
+    if !nodedb_types::starts_with_ascii_case_insensitive(trimmed, "PUBLISH TO ") {
+        return None;
     }
+    let database_id = match identity.default_database {
+        Some(database_id) => database_id,
+        None => {
+            return Some(Err(crate::Error::BadRequest {
+                detail: "PUBLISH requires an active database".into(),
+            }));
+        }
+    };
+    Some(handle_publish(state, identity, database_id, trimmed).await)
+}
 
-    // Not a handled NodeDB extension — caller should use plan_sql.
-    None
+/// Dispatch a SQL extension in the caller-selected database.
+///
+/// Protocol handlers that carry session database state must call this variant
+/// so a `USE DATABASE` selection is not replaced by the identity default.
+pub async fn dispatch_sql_in_database(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
+    sql: &str,
+) -> crate::Result<Option<DispatchOutcome>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if nodedb_types::starts_with_ascii_case_insensitive(trimmed, "PUBLISH TO ") {
+        return handle_publish(state, identity, database_id, trimmed)
+            .await
+            .map(Some);
+    }
+    Ok(None)
 }
 
 /// Handle `PUBLISH TO <topic> <payload>` without pgwire coupling.
 async fn handle_publish(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: crate::types::DatabaseId,
     sql: &str,
 ) -> crate::Result<DispatchOutcome> {
     let prefix = "PUBLISH TO ";
@@ -57,16 +82,40 @@ async fn handle_publish(
             .ok_or_else(|| crate::Error::BadRequest {
                 detail: "expected payload after topic name in PUBLISH TO".into(),
             })?;
-    let topic_name = topic_name.to_lowercase();
+    let topic_name = nodedb_sql::reserved::check_identifier(topic_name).map_err(|error| {
+        crate::Error::BadRequest {
+            detail: error.to_string(),
+        }
+    })?;
 
     let payload = parse_payload(payload_part.trim())?;
 
     let tenant_id = identity.tenant_id.as_u64();
     let tenant = identity.tenant_id;
+    let emitter =
+        crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
+    crate::control::server::shared::authorization::authorize_collection(
+        identity,
+        database_id,
+        &format!("topic:{topic_name}"),
+        crate::control::security::identity::Permission::Write,
+        &state.permissions,
+        &state.roles,
+        &emitter,
+    )
+    .map_err(crate::Error::from)?;
 
     use crate::event::topic::publish::PublishError;
 
-    match crate::event::topic::publish::publish_to_topic(state, tenant_id, &topic_name, &payload) {
+    match crate::event::topic::publish::publish_to_topic(
+        state,
+        database_id,
+        tenant_id,
+        &topic_name,
+        &payload,
+    )
+    .await
+    {
         Ok(_seq) => Ok(DispatchOutcome {
             rows_affected: 1,
             rows: Vec::new(),
@@ -74,6 +123,7 @@ async fn handle_publish(
         Err(PublishError::RemoteHome { leader_node, .. }) => {
             crate::event::topic::publish::publish_remote(
                 state,
+                database_id,
                 tenant_id,
                 &topic_name,
                 &payload,
@@ -92,9 +142,11 @@ async fn handle_publish(
             tenant_id: tenant,
             collection: t,
         }),
-        Err(PublishError::RemoteError(e)) => Err(crate::Error::Dispatch {
-            detail: format!("remote publish to '{topic_name}' failed: {e}"),
-        }),
+        Err(PublishError::Persistence(e)) | Err(PublishError::RemoteError(e)) => {
+            Err(crate::Error::Dispatch {
+                detail: format!("publish to '{topic_name}' failed: {e}"),
+            })
+        }
     }
 }
 
@@ -112,25 +164,23 @@ fn parse_payload(input: &str) -> crate::Result<String> {
     if !input.starts_with('\'') {
         return Ok(input.to_string());
     }
-    let bytes = input.as_bytes();
+    let mut chars = input[1..].chars().peekable();
     let mut out = String::with_capacity(input.len());
-    let mut i = 1;
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
                 out.push('\'');
-                i += 2;
                 continue;
             }
-            if i + 1 != bytes.len() {
+            if chars.next().is_some() {
                 return Err(crate::Error::BadRequest {
                     detail: "PUBLISH TO payload has trailing tokens after closing quote".into(),
                 });
             }
             return Ok(out);
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        out.push(ch);
     }
     Err(crate::Error::BadRequest {
         detail: "PUBLISH TO payload has unterminated string literal".into(),
@@ -150,6 +200,12 @@ mod tests {
     fn escaped_quote_unescaped() {
         assert_eq!(parse_payload("'it''s'").unwrap(), "it's");
         assert_eq!(parse_payload("''''").unwrap(), "'");
+    }
+
+    #[test]
+    fn quoted_utf8_and_doubled_quotes_are_exact() {
+        assert_eq!(parse_payload("'café 東京'").unwrap(), "café 東京");
+        assert_eq!(parse_payload("'東京''駅'").unwrap(), "東京'駅");
     }
 
     #[test]

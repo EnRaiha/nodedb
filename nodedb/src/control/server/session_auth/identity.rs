@@ -116,10 +116,12 @@ pub fn verify_api_key_identity(
     };
     let effective = owner_set.intersect(&key_set);
 
-    let identity =
+    let mut identity =
         state
             .api_keys
             .to_identity(&key_record, user.roles, user.is_superuser, effective);
+    identity.default_database =
+        (user.default_database_id != 0).then(|| DatabaseId::new(user.default_database_id));
 
     state.audit_record(
         AuditEvent::AuthSuccess,
@@ -145,4 +147,63 @@ pub fn trust_identity(state: &SharedState, username: &str) -> Option<Authenticat
 pub fn configured_trust_identity(state: &SharedState) -> Option<AuthenticatedIdentity> {
     let username = state.credentials.configured_trust_superuser().ok()??;
     stored_user_identity(state, &username, AuthMethod::Trust)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::security::apikey::CreateKeyParams;
+    use crate::control::security::identity::Role;
+    use crate::wal::WalManager;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn api_key_identity_uses_owner_default_and_key_database_scope() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("construct shared state");
+        let owner_default = DatabaseId::new(71);
+        let key_database = DatabaseId::new(72);
+        let user_id = state
+            .credentials
+            .create_service_account(
+                "api-owner",
+                TenantId::new(1),
+                vec![Role::ReadWrite],
+                vec![owner_default, key_database],
+            )
+            .expect("create service account");
+        let stored = state
+            .credentials
+            .prepare_set_default_database("api-owner", owner_default.as_u64())
+            .expect("set owner default database");
+        state.credentials.install_replicated_user(&stored, None);
+        let token = state
+            .api_keys
+            .create_key(
+                CreateKeyParams {
+                    username: "api-owner",
+                    user_id,
+                    tenant_id: TenantId::new(1),
+                    expires_secs: 0,
+                    scope: vec![],
+                    accessible_databases: vec![key_database],
+                },
+                None,
+            )
+            .expect("create API key");
+
+        let identity =
+            verify_api_key_identity(&state, &token, "127.0.0.1", "native").expect("verify API key");
+
+        assert_eq!(identity.default_database, Some(owner_default));
+        assert!(identity.accessible_databases.contains(key_database));
+        assert!(!identity.accessible_databases.contains(owner_default));
+    }
 }

@@ -21,6 +21,7 @@
 use std::collections::HashSet;
 
 use crate::control::security::catalog::SystemCatalog;
+use crate::types::DatabaseId;
 
 use super::{change_streams, materialized_views, rls, schedules, sequences, triggers};
 
@@ -31,6 +32,7 @@ pub enum DependentKind {
     Trigger,
     RlsPolicy,
     MaterializedView,
+    StreamingMaterializedView,
     ChangeStream,
     Schedule,
 }
@@ -42,6 +44,7 @@ impl DependentKind {
             Self::Trigger => "trigger",
             Self::RlsPolicy => "rls_policy",
             Self::MaterializedView => "materialized_view",
+            Self::StreamingMaterializedView => "streaming_materialized_view",
             Self::ChangeStream => "change_stream",
             Self::Schedule => "schedule",
         }
@@ -64,6 +67,7 @@ pub struct Dependent {
 /// the same subgraphs.
 pub fn collect_dependents(
     catalog: &SystemCatalog,
+    database_id: DatabaseId,
     tenant_id: u64,
     root_collection: &str,
     visited: &mut HashSet<(DependentKind, String)>,
@@ -78,7 +82,7 @@ pub fn collect_dependents(
             });
         }
     }
-    for name in triggers::find_triggers_on(catalog, tenant_id, root_collection)? {
+    for name in triggers::find_triggers_on(catalog, database_id, tenant_id, root_collection)? {
         if visited.insert((DependentKind::Trigger, name.clone())) {
             out.push(Dependent {
                 kind: DependentKind::Trigger,
@@ -102,7 +106,22 @@ pub fn collect_dependents(
             });
         }
     }
-    for name in change_streams::find_change_streams_on(catalog, tenant_id, root_collection)? {
+    for name in materialized_views::find_streaming_mvs_sourcing(
+        catalog,
+        database_id,
+        tenant_id,
+        root_collection,
+    )? {
+        if visited.insert((DependentKind::StreamingMaterializedView, name.clone())) {
+            out.push(Dependent {
+                kind: DependentKind::StreamingMaterializedView,
+                name,
+            });
+        }
+    }
+    for name in
+        change_streams::find_change_streams_on(catalog, database_id, tenant_id, root_collection)?
+    {
         if visited.insert((DependentKind::ChangeStream, name.clone())) {
             out.push(Dependent {
                 kind: DependentKind::ChangeStream,
@@ -110,7 +129,9 @@ pub fn collect_dependents(
             });
         }
     }
-    for name in schedules::find_schedules_referencing(catalog, tenant_id, root_collection)? {
+    for name in
+        schedules::find_schedules_referencing(catalog, database_id, tenant_id, root_collection)?
+    {
         if visited.insert((DependentKind::Schedule, name.clone())) {
             out.push(Dependent {
                 kind: DependentKind::Schedule,
@@ -155,7 +176,7 @@ mod tests {
     fn empty_catalog_has_no_dependents() {
         let (c, _t) = cat();
         let mut visited = HashSet::new();
-        let deps = collect_dependents(&c, 1, "users", &mut visited).unwrap();
+        let deps = collect_dependents(&c, DatabaseId::DEFAULT, 1, "users", &mut visited).unwrap();
         assert!(deps.is_empty());
     }
 
@@ -167,12 +188,96 @@ mod tests {
             .unwrap();
 
         let mut visited = HashSet::new();
-        let first = collect_dependents(&c, 1, "users", &mut visited).unwrap();
+        let first = collect_dependents(&c, DatabaseId::DEFAULT, 1, "users", &mut visited).unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].kind, DependentKind::Sequence);
 
-        let second = collect_dependents(&c, 1, "users", &mut visited).unwrap();
+        let second = collect_dependents(&c, DatabaseId::DEFAULT, 1, "users", &mut visited).unwrap();
         assert!(second.is_empty(), "visited set must suppress re-emission");
+    }
+
+    #[test]
+    fn streaming_mvs_are_database_scoped_in_collection_cascades() {
+        use crate::control::security::catalog::StoredMaterializedView;
+        use crate::event::cdc::stream_def::{
+            ChangeStreamDef, CompactionConfig, LateDataPolicy, OpFilter, RetentionConfig,
+            StreamFormat,
+        };
+        use crate::event::kafka::KafkaDeliveryConfig;
+        use crate::event::streaming_mv::StreamingMvDef;
+        use crate::event::webhook::WebhookConfig;
+
+        let (catalog, _tmp) = cat();
+        for database_id in [DatabaseId::new(1), DatabaseId::new(2)] {
+            catalog
+                .put_change_stream(&ChangeStreamDef {
+                    database_id,
+                    tenant_id: 7,
+                    name: "orders_stream".into(),
+                    collection: "orders".into(),
+                    op_filter: OpFilter::all(),
+                    format: StreamFormat::Json,
+                    retention: RetentionConfig::default(),
+                    compaction: CompactionConfig::default(),
+                    webhook: WebhookConfig::default(),
+                    late_data: LateDataPolicy::default(),
+                    kafka: KafkaDeliveryConfig::default(),
+                    owner: "admin".into(),
+                    created_at: 0,
+                })
+                .unwrap();
+            catalog
+                .put_streaming_mv(&StreamingMvDef {
+                    database_id,
+                    tenant_id: 7,
+                    name: "orders_summary".into(),
+                    source_stream: "orders_stream".into(),
+                    group_by_columns: Vec::new(),
+                    aggregates: Vec::new(),
+                    filter_expr: None,
+                    owner: "admin".into(),
+                    created_at: 0,
+                })
+                .unwrap();
+        }
+
+        // Periodic and streaming MVs live in separate catalogs and may share a
+        // name. The cascade must retain both instead of collapsing them in the
+        // visited set.
+        catalog
+            .put_materialized_view(&StoredMaterializedView {
+                tenant_id: 7,
+                name: "orders_summary".into(),
+                source: "orders".into(),
+                query_sql: "SELECT 1".into(),
+                refresh_mode: "auto".into(),
+                owner: "admin".into(),
+                created_at: 0,
+                descriptor_version: 0,
+                modification_hlc: Default::default(),
+            })
+            .unwrap();
+
+        let mut visited = HashSet::new();
+        let deps =
+            collect_dependents(&catalog, DatabaseId::new(1), 7, "orders", &mut visited).unwrap();
+        assert_eq!(
+            deps,
+            vec![
+                Dependent {
+                    kind: DependentKind::MaterializedView,
+                    name: "orders_summary".into(),
+                },
+                Dependent {
+                    kind: DependentKind::StreamingMaterializedView,
+                    name: "orders_summary".into(),
+                },
+                Dependent {
+                    kind: DependentKind::ChangeStream,
+                    name: "orders_stream".into(),
+                },
+            ]
+        );
     }
 
     #[test]

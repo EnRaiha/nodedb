@@ -313,6 +313,8 @@ fn array_routing(op: &ArrayOp) -> PlanRouting {
         ArrayOp::OpenArray { .. }
         | ArrayOp::Compact { .. }
         | ArrayOp::DropArray { .. }
+        | ArrayOp::RestoreArrayDrop { .. }
+        | ArrayOp::PurgeArrayDrop { .. }
         | ArrayOp::Slice { .. }
         | ArrayOp::Project { .. }
         | ArrayOp::Aggregate { .. }

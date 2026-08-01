@@ -38,8 +38,8 @@ use crate::types::Lsn;
 use crate::wal::WalManager;
 
 use super::consumer_helpers::{
-    accumulate_data_event, dispatch_event, drain_and_skip_stale, drain_ring_buffer,
-    flush_watermark, maybe_flush_watermark, record_event,
+    RingDrainOutcome, accumulate_data_event, dispatch_event, dispatch_event_actions,
+    drain_and_skip_stale, drain_ring_buffer, flush_watermark, maybe_flush_watermark, record_event,
 };
 
 /// Initial sleep when the ring buffer is empty. Adaptive backoff ramps
@@ -66,10 +66,22 @@ enum ConsumerMode {
     WalCatchup,
 }
 
+/// Select the only safe post-drain mode. A gap event has already been
+/// consumed from the SPSC ring, so Normal mode may not observe or dispatch it.
+fn normal_drain_next_mode(outcome: &RingDrainOutcome) -> ConsumerMode {
+    match outcome {
+        RingDrainOutcome::Contiguous { .. } => ConsumerMode::Normal,
+        RingDrainOutcome::Gap { .. } => ConsumerMode::WalCatchup,
+    }
+}
+
 /// Configuration for spawning a consumer.
 pub struct ConsumerConfig {
     pub rx: EventConsumerRx,
     pub shutdown: watch::Receiver<bool>,
+    /// The node-wide shutdown coordinator. WAL recovery failure is unsafe to
+    /// continue through, so the consumer initiates this canonical bus.
+    pub shutdown_bus: crate::control::shutdown::ShutdownBus,
     pub wal: Arc<WalManager>,
     pub watermark_store: Arc<WatermarkStore>,
     pub shared_state: Arc<SharedState>,
@@ -92,13 +104,20 @@ impl ConsumerHandle {
         self.join_handle.abort();
     }
 
+    /// Await natural task termination without taking ownership of the handle.
+    /// This permits the shutdown supervisor to retain abort ownership until
+    /// the configured deadline expires.
+    pub async fn wait_for_exit(&mut self) {
+        let _ = (&mut self.join_handle).await;
+    }
+
     /// Abort the task and await its termination, consuming the handle so the
     /// task future (and every `Arc` it held) is definitely dropped by the
     /// time this returns. Used in shutdown paths that must observe `Drop`
     /// side effects before reopening resources (e.g. redb file locks).
-    pub async fn abort_and_join(self) {
+    pub async fn abort_and_join(mut self) {
         self.join_handle.abort();
-        let _ = self.join_handle.await;
+        let _ = (&mut self.join_handle).await;
     }
 
     pub fn events_processed(&self) -> u64 {
@@ -129,6 +148,7 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
     let ConsumerConfig {
         mut rx,
         mut shutdown,
+        shutdown_bus,
         wal,
         watermark_store,
         shared_state,
@@ -180,13 +200,22 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
 
         match mode {
             ConsumerMode::Normal => {
-                let events = drain_ring_buffer(
+                let drain = drain_ring_buffer(
                     &mut rx,
                     &metrics,
                     core_id,
                     &mut last_sequence,
                     &mut last_lsn,
                 );
+                let next_mode = normal_drain_next_mode(&drain);
+                let (events, gap_event) = match drain {
+                    RingDrainOutcome::Contiguous { events } => (events, None),
+                    RingDrainOutcome::Gap {
+                        events,
+                        first_gap_event,
+                        ..
+                    } => (events, Some(first_gap_event)),
+                };
                 let batch_count = events.len();
 
                 if batch_count > 0 {
@@ -208,7 +237,28 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
                     slab_account.release_pinned(batch_payload_bytes);
 
                     trace!(core_id, batch_count, "event batch processed");
+                }
 
+                if let Some(first_gap_event) = gap_event {
+                    // This event has been removed from the SPSC ring but is not
+                    // safe to record or dispatch. WAL catchup starts from the
+                    // prior complete LSN and must reconstruct the withheld
+                    // preceding record as well as the gap event.
+                    warn!(
+                        core_id,
+                        gap_sequence = first_gap_event.sequence,
+                        gap_lsn = first_gap_event.lsn.as_u64(),
+                        safe_sequence = last_sequence,
+                        safe_lsn = last_lsn.as_u64(),
+                        "ring sequence gap consumed; entering WAL catchup before event side effects"
+                    );
+                    mode = next_mode;
+                    debug_assert_eq!(mode, ConsumerMode::WalCatchup);
+                    metrics.record_wal_catchup_enter();
+                    continue;
+                }
+
+                if batch_count > 0 {
                     if slab_account.is_shed() {
                         info!(core_id, "slab budget shed — entering WAL catchup mode");
                         slab_account.reset();
@@ -316,24 +366,28 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
                     }
                     Err(e) => {
                         wal_retry_count += 1;
-                        if wal_retry_count > MAX_WAL_RETRIES {
-                            tracing::error!(
+                        if wal_retry_count >= MAX_WAL_RETRIES {
+                            fail_stop_wal_catchup(
                                 core_id,
-                                error = %e,
-                                retries = MAX_WAL_RETRIES,
-                                "WAL catchup failed after max retries, returning to Normal mode"
+                                &e,
+                                wal_retry_count,
+                                last_lsn,
+                                &shared_state,
+                                &shutdown_bus,
                             );
-                        } else {
-                            warn!(
-                                core_id,
-                                error = %e,
-                                retry = wal_retry_count,
-                                max_retries = MAX_WAL_RETRIES,
-                                "WAL catchup replay failed, retrying after delay"
-                            );
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                            continue;
+                            // Do not return to Normal or flush an uncertain
+                            // watermark: no later event side effects may run.
+                            break;
                         }
+                        warn!(
+                            core_id,
+                            error = %e,
+                            retry = wal_retry_count,
+                            max_retries = MAX_WAL_RETRIES,
+                            "WAL catchup replay failed, retrying after delay"
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
                     }
                 }
 
@@ -372,14 +426,45 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
     );
 }
 
-/// Process a batch of Normal-mode events: CDC, permission cache, streaming MVs,
-/// CRDT sync, and AFTER trigger dispatch.
+/// Fail-stop after bounded WAL recovery failures.
 ///
-/// Row and statement trigger dispatch is per-event via [`dispatch_triggers`] —
-/// the SINGLE per-event path is the sole owner of AFTER-ROW trigger firing, so
-/// a per-row `WriteEvent` fires its trigger exactly once. This mirrors the
-/// WAL-catchup path (`dispatch_event` → `dispatch_triggers`) so both consumer
-/// modes fire the same number of triggers for the same events.
+/// `last_safe_lsn` is deliberately only observed for audit/logging; this path
+/// never mutates or flushes it. Continuing without a recoverable WAL prefix
+/// would permit later event side effects to overtake missing writes.
+fn fail_stop_wal_catchup(
+    core_id: usize,
+    error: &impl std::fmt::Display,
+    retries: u32,
+    last_safe_lsn: Lsn,
+    shared_state: &SharedState,
+    shutdown_bus: &crate::control::shutdown::ShutdownBus,
+) {
+    tracing::error!(
+        core_id,
+        error = %error,
+        retries,
+        last_safe_lsn = last_safe_lsn.as_u64(),
+        "WAL catchup failed after max retries; initiating fail-stop shutdown"
+    );
+    shared_state.audit_record(
+        crate::control::security::audit::AuditEvent::AdminAction,
+        None,
+        "event_plane",
+        &format!(
+            "event consumer core {core_id} WAL catchup failed after {retries} retries at safe LSN {}: {error}",
+            last_safe_lsn.as_u64()
+        ),
+    );
+    drop(shutdown_bus.initiate());
+}
+
+/// Process a batch of Normal-mode events: CDC, permission cache, streaming MVs,
+/// CRDT sync, and awaited AFTER/DEFINE EVENT trigger actions.
+///
+/// Row/statement and DEFINE EVENT processing is per-event via
+/// [`dispatch_event_actions`]. The normal batch and WAL-catchup
+/// (`dispatch_event` → `dispatch_event_actions`) paths therefore execute the
+/// same action processor exactly once for every data `WriteEvent`.
 async fn process_normal_batch(
     events: &[super::types::WriteEvent],
     shared_state: &Arc<SharedState>,
@@ -397,11 +482,12 @@ async fn process_normal_batch(
         // DML audit: record to audit log before dispatching triggers.
         super::audit_dml::audit_dml_event(event, shared_state);
 
+        // Await every AFTER/DEFINE EVENT action before advancing the Event
+        // Plane's data watermark or publishing non-trigger side effects.
+        dispatch_event_actions(event, shared_state, retry_queue).await;
+
         // Non-trigger side effects (watermark, CDC, permission cache, MVs, CRDT).
         accumulate_data_event(event, shared_state, cdc_router);
-
-        // AFTER trigger dispatch — the single per-event path, fired exactly once.
-        super::trigger::dispatcher::dispatch_triggers(event, shared_state, retry_queue).await;
     }
 }
 
@@ -439,9 +525,11 @@ async fn process_retry_queue(
 mod tests {
     use super::*;
     use crate::event::bus::create_event_bus_with_capacity;
-    use crate::event::consumer_helpers::detect_sequence_gap;
+    use crate::event::consumer_helpers::{
+        RingDrainOutcome, detect_sequence_gap, drain_ring_buffer,
+    };
     use crate::event::types::{EventSource, RowId, WriteOp};
-    use crate::types::{TenantId, VShardId};
+    use crate::types::{DatabaseId, TenantId, VShardId};
 
     fn make_event(seq: u64) -> super::super::types::WriteEvent {
         super::super::types::WriteEvent {
@@ -450,6 +538,7 @@ mod tests {
             op: WriteOp::Insert,
             row_id: RowId::new("row-1"),
             lsn: Lsn::new(seq * 10),
+            database_id: DatabaseId::new(7),
             tenant_id: TenantId::new(1),
             vshard_id: VShardId::new(0),
             source: EventSource::User,
@@ -477,6 +566,160 @@ mod tests {
         assert_eq!(metrics.events_dropped.load(Ordering::Relaxed), 3);
     }
 
+    #[test]
+    fn gap_event_is_withheld_for_wal_catchup_and_normal_transitions() {
+        let (mut producers, mut consumers) = create_event_bus_with_capacity(1, 16);
+        producers[0].emit(make_event(1));
+        producers[0].emit(make_event(2));
+        producers[0].emit(make_event(4));
+
+        let metrics = CoreMetrics::new();
+        let mut rx = consumers.remove(0);
+        let mut last_sequence = 0;
+        let mut last_lsn = Lsn::ZERO;
+        let outcome = drain_ring_buffer(&mut rx, &metrics, 0, &mut last_sequence, &mut last_lsn);
+
+        assert_eq!(normal_drain_next_mode(&outcome), ConsumerMode::WalCatchup);
+        let RingDrainOutcome::Gap {
+            events,
+            first_gap_event,
+            initial_safe_lsn,
+            initial_safe_sequence,
+        } = outcome
+        else {
+            panic!("a sequence gap must force WAL catchup");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        // The last observed record (sequence 2) is withheld with the gap;
+        // the earlier completed record remains safe for Normal-mode dispatch.
+        assert_eq!(first_gap_event.sequence, 4);
+        assert_eq!(initial_safe_sequence, 0);
+        assert_eq!(initial_safe_lsn, Lsn::ZERO);
+        assert_eq!(last_sequence, 1);
+        assert_eq!(last_lsn, Lsn::new(10));
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.last_processed_lsn.load(Ordering::Relaxed), 10);
+        assert_eq!(metrics.events_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(rx.try_recv().map(|event| event.sequence), None);
+    }
+
+    #[test]
+    fn gap_within_wal_record_withholds_its_contiguous_sibling() {
+        let (mut producers, mut consumers) = create_event_bus_with_capacity(1, 16);
+        let mut first_sibling = make_event(2);
+        first_sibling.lsn = Lsn::new(100);
+        let mut gap_sibling = make_event(4);
+        gap_sibling.lsn = Lsn::new(100);
+        producers[0].emit(first_sibling);
+        producers[0].emit(gap_sibling);
+
+        let metrics = CoreMetrics::new();
+        let mut rx = consumers.remove(0);
+        let mut last_sequence = 1;
+        let mut last_lsn = Lsn::new(90);
+        let outcome = drain_ring_buffer(&mut rx, &metrics, 0, &mut last_sequence, &mut last_lsn);
+
+        let RingDrainOutcome::Gap {
+            events,
+            first_gap_event,
+            initial_safe_lsn,
+            initial_safe_sequence,
+        } = outcome
+        else {
+            panic!("a sequence gap must force WAL catchup");
+        };
+        assert_eq!(initial_safe_lsn, Lsn::new(90));
+        assert_eq!(initial_safe_sequence, 1);
+        assert!(events.is_empty());
+        assert_eq!(first_gap_event.sequence, 4);
+        assert_eq!(first_gap_event.lsn, Lsn::new(100));
+        // The first sibling at LSN 100 is withheld with the gap sibling. The
+        // replay start must therefore not skip the whole record.
+        assert_eq!(last_sequence, 1);
+        assert_eq!(last_lsn, Lsn::new(90));
+        let replay_start = last_lsn.next();
+        assert_eq!(replay_start, Lsn::new(91));
+        assert!(
+            replay_start <= first_gap_event.lsn,
+            "replay must include the withheld record"
+        );
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn gap_at_newer_lsn_withholds_preceding_observed_record() {
+        let (mut producers, mut consumers) = create_event_bus_with_capacity(1, 16);
+        let mut preceding_record_sibling = make_event(2);
+        preceding_record_sibling.lsn = Lsn::new(100);
+        let mut first_post_gap_event = make_event(4);
+        first_post_gap_event.lsn = Lsn::new(101);
+        producers[0].emit(preceding_record_sibling);
+        producers[0].emit(first_post_gap_event);
+
+        let metrics = CoreMetrics::new();
+        let mut rx = consumers.remove(0);
+        let mut last_sequence = 1;
+        let mut last_lsn = Lsn::new(90);
+        let outcome = drain_ring_buffer(&mut rx, &metrics, 0, &mut last_sequence, &mut last_lsn);
+
+        let RingDrainOutcome::Gap {
+            events,
+            first_gap_event,
+            initial_safe_lsn,
+            initial_safe_sequence,
+        } = outcome
+        else {
+            panic!("a sequence gap must force WAL catchup");
+        };
+        assert_eq!(initial_safe_lsn, Lsn::new(90));
+        assert_eq!(initial_safe_sequence, 1);
+        // Sequence 3 at LSN 100 is missing, so the observed sequence-2
+        // sibling cannot be dispatched as a complete durable record.
+        assert!(events.is_empty());
+        assert_eq!(first_gap_event.sequence, 4);
+        assert_eq!(first_gap_event.lsn, Lsn::new(101));
+        // Roll back to the preceding safe durable LSN: replay begins before
+        // LSN 100 and recovers its missing sibling as well as the gap event.
+        assert_eq!(last_sequence, 1);
+        assert_eq!(last_lsn, Lsn::new(90));
+        assert!(last_lsn.next() <= Lsn::new(100));
+
+        use std::sync::atomic::Ordering;
+        assert_eq!(metrics.events_processed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn max_wal_replay_failure_initiates_shutdown_without_advancing_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_wal, watermark_store, shared_state, _trigger_dlq, _cdc_router) =
+            crate::event::test_utils::event_test_deps(&dir);
+        watermark_store.save(0, Lsn::new(10)).unwrap();
+        let (shutdown_bus, _) =
+            crate::control::shutdown::ShutdownBus::new(Arc::clone(&shared_state.shutdown));
+
+        fail_stop_wal_catchup(
+            0,
+            &"replay unavailable",
+            10,
+            Lsn::new(10),
+            &shared_state,
+            &shutdown_bus,
+        );
+
+        assert!(shared_state.shutdown.is_shutdown());
+        assert_eq!(watermark_store.load(0).unwrap(), Lsn::new(10));
+    }
+
     #[tokio::test]
     async fn consumer_processes_and_persists_watermark() {
         let (mut producers, consumers) = create_event_bus_with_capacity(1, 64);
@@ -485,6 +728,8 @@ mod tests {
             crate::event::test_utils::event_test_deps(&dir);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let shutdown_watch = Arc::new(crate::control::shutdown::ShutdownWatch::new());
+        let (shutdown_bus, _) = crate::control::shutdown::ShutdownBus::new(shutdown_watch);
 
         // Emit events.
         for i in 1..=5 {
@@ -494,6 +739,7 @@ mod tests {
         let handle = spawn_consumer(ConsumerConfig {
             rx: consumers.into_iter().next().unwrap(),
             shutdown: shutdown_rx,
+            shutdown_bus,
             wal,
             watermark_store: Arc::clone(&watermark_store),
             shared_state,

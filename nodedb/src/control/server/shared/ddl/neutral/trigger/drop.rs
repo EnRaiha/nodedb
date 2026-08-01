@@ -3,27 +3,31 @@
 //! Protocol-neutral `DROP TRIGGER` and `ALTER TRIGGER ... ENABLE/DISABLE/OWNER`
 //! DDL handlers.
 //!
-//! Ported from the pgwire `ddl::trigger::drop` handler. `drop_trigger` keeps its
-//! original `propose_catalog_entry` + `log_index == 0` local-delete fallback;
-//! `alter_trigger` / `alter_trigger_owner` keep their original direct
-//! `catalog.put_trigger` + in-memory registry writes (no metadata propose). The
-//! definition-sync broadcast and `audit_record` calls are preserved verbatim;
-//! only the result construction changed from pgwire `Response` / `PgWireError`
-//! to the protocol-neutral [`DdlResult`] / [`DdlError`].
+//! Every trigger definition mutation is committed as a `CatalogEntry`, so the
+//! selected database scope, descriptor stamp, owner row, and registry state are
+//! applied consistently on every node.
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
+use super::super::super::catalog::propose_and_apply;
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::auth_support::{require_tenant_admin, status};
+use super::create::emit_trigger_put;
 
 /// Existence check used by the `DROP TRIGGER IF EXISTS` guard in the neutral
 /// router. Mirrors the pgwire `exists::trigger_exists` helper: `false` when the
 /// catalog is unavailable or the read errors.
 pub fn trigger_exists(state: &SharedState, identity: &AuthenticatedIdentity, name: &str) -> bool {
     let catalog = state.credentials.catalog();
-    let tid = identity.tenant_id.as_u64();
-    matches!(catalog.get_trigger(tid, name), Ok(Some(_)))
+    let tenant_id = identity.tenant_id.as_u64();
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
+    matches!(
+        catalog.get_trigger_in_database(database_id, tenant_id, name),
+        Ok(Some(_))
+    )
 }
 
 /// Handle `DROP TRIGGER [IF EXISTS] <name>`
@@ -36,13 +40,16 @@ pub fn drop_trigger(
 
     let (name, if_exists) = parse_drop_trigger(parts)?;
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
     let catalog = state.credentials.catalog();
 
     // Check existence before proposing (so `IF EXISTS` + missing
     // trigger returns a clean success without touching raft).
     let exists_before = catalog
-        .get_trigger(tenant_id, &name)
+        .get_trigger_in_database(database_id, tenant_id, &name)
         .map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: format!("catalog read: {e}"),
@@ -59,28 +66,26 @@ pub fn drop_trigger(
     }
 
     let entry = crate::control::catalog_entry::CatalogEntry::DeleteTrigger {
+        database_id,
         tenant_id,
         name: name.clone(),
     };
-    let log_index = crate::control::metadata_proposer::propose_catalog_entry(state, &entry)
-        .map_err(|e| DdlError {
-            sqlstate: "XX000".to_string(),
-            message: format!("metadata propose: {e}"),
-        })?;
+    let log_index = propose_and_apply(state, &entry)?;
     if log_index == 0 {
-        catalog
-            .delete_trigger(tenant_id, &name)
-            .map_err(|e| DdlError {
-                sqlstate: "XX000".to_string(),
-                message: format!("catalog write: {e}"),
-            })?;
-        state.trigger_registry.unregister(tenant_id, &name);
+        crate::control::catalog_entry::post_apply::trigger::delete(
+            database_id,
+            tenant_id,
+            name.clone(),
+            state,
+        );
     }
 
     // Broadcast deletion to connected Lite sessions.
     {
         use nodedb_types::sync::wire::DefinitionSyncMsg;
         let msg = DefinitionSyncMsg {
+            tenant_id,
+            database_id: database_id.as_u64(),
             definition_type: "trigger".into(),
             name: name.clone(),
             action: "delete".into(),
@@ -128,10 +133,13 @@ pub fn alter_trigger(
     };
 
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
     let catalog = state.credentials.catalog();
 
     let mut trigger = catalog
-        .get_trigger(tenant_id, name)
+        .get_trigger_in_database(database_id, tenant_id, name)
         .map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: e.to_string(),
@@ -142,13 +150,12 @@ pub fn alter_trigger(
         })?;
 
     trigger.enabled = enabled;
-    catalog.put_trigger(&trigger).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: e.to_string(),
-    })?;
-
-    // Update in-memory registry.
-    state.trigger_registry.set_enabled(tenant_id, name, enabled);
+    let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(trigger.clone()));
+    let log_index = propose_and_apply(state, &entry)?;
+    if log_index == 0 {
+        crate::control::catalog_entry::post_apply::trigger::put(trigger.clone(), state);
+    }
+    emit_trigger_put(state, &trigger);
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
@@ -176,10 +183,13 @@ fn alter_trigger_owner(
         .to_string();
 
     let tenant_id = identity.tenant_id.as_u64();
+    let database_id = identity
+        .default_database
+        .unwrap_or(crate::types::DatabaseId::DEFAULT);
     let catalog = state.credentials.catalog();
 
     let mut trigger = catalog
-        .get_trigger(tenant_id, name)
+        .get_trigger_in_database(database_id, tenant_id, name)
         .map_err(|e| DdlError {
             sqlstate: "XX000".to_string(),
             message: e.to_string(),
@@ -189,15 +199,23 @@ fn alter_trigger_owner(
             message: format!("trigger '{name}' does not exist"),
         })?;
 
+    // Do not mutate a definition until the target principal is known to
+    // exist. The tenant-admin gate in `alter_trigger` authorizes the transfer.
+    if state.credentials.get_user(&new_owner).is_none() {
+        return Err(DdlError {
+            sqlstate: "42704".to_string(),
+            message: format!("user '{new_owner}' not found"),
+        });
+    }
+
     let old_owner = trigger.owner.clone();
     trigger.owner = new_owner.clone();
-    catalog.put_trigger(&trigger).map_err(|e| DdlError {
-        sqlstate: "XX000".to_string(),
-        message: e.to_string(),
-    })?;
-
-    // Re-register with updated owner in the in-memory registry.
-    state.trigger_registry.register(trigger);
+    let entry = crate::control::catalog_entry::CatalogEntry::PutTrigger(Box::new(trigger.clone()));
+    let log_index = propose_and_apply(state, &entry)?;
+    if log_index == 0 {
+        crate::control::catalog_entry::post_apply::trigger::put(trigger.clone(), state);
+    }
+    emit_trigger_put(state, &trigger);
 
     state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,

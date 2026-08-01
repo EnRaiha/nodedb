@@ -114,7 +114,7 @@ mod tests {
 
     fn make_lease(node_id: u64, name: &str) -> DescriptorLease {
         DescriptorLease {
-            descriptor_id: DescriptorId::new(1, DescriptorKind::Collection, name.to_string()),
+            descriptor_id: DescriptorId::new(0, 1, DescriptorKind::Collection, name.to_string()),
             version: 1,
             node_id,
             expires_at: Hlc::new(u64::MAX, 0),
@@ -129,8 +129,8 @@ mod tests {
         // by walking a HashMap directly.
         let mut map: std::collections::HashMap<(DescriptorId, u64), DescriptorLease> =
             std::collections::HashMap::new();
-        let a = DescriptorId::new(1, DescriptorKind::Collection, "a".to_string());
-        let b = DescriptorId::new(1, DescriptorKind::Collection, "b".to_string());
+        let a = DescriptorId::new(0, 1, DescriptorKind::Collection, "a".to_string());
+        let b = DescriptorId::new(0, 1, DescriptorKind::Collection, "b".to_string());
         map.insert((a.clone(), 1), make_lease(1, "a"));
         map.insert((b.clone(), 1), make_lease(1, "b"));
         map.insert((a.clone(), 2), make_lease(2, "a")); // other node

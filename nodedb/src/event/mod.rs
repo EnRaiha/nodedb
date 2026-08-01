@@ -31,5 +31,5 @@ pub mod watermark_tracker;
 pub mod webhook;
 
 pub use bus::{EventProducer, create_event_bus};
-pub use plane::EventPlane;
+pub use plane::{EventPlane, EventPlaneConfig};
 pub use types::{EventSource, WriteEvent, WriteOp, deserialize_event_payload};

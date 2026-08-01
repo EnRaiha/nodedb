@@ -75,6 +75,7 @@ pub fn drop_alert(
     // Emit CRDT tombstone delta.
     {
         let delta = crate::event::crdt_sync::types::OutboundDelta {
+            database_id,
             collection: ALERT_RULES_CRDT_COLLECTION.into(),
             document_id: name.clone(),
             payload: Vec::new(),
@@ -84,7 +85,7 @@ pub fn drop_alert(
             peer_id: state.node_id,
             sequence: 0,
         };
-        state.crdt_sync_delivery.enqueue(tenant_id, delta);
+        state.crdt_sync_delivery.enqueue(delta);
     }
 
     // Clean up hysteresis state.

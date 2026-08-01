@@ -21,13 +21,14 @@ use super::stream_def::LateDataPolicy;
 use crate::control::metrics::system::SystemMetrics;
 use crate::event::types::WriteEvent;
 use crate::event::watermark_tracker::WatermarkTracker;
+use crate::types::DatabaseId;
 
 /// Manages per-stream buffers and routes events to matching streams.
 pub struct CdcRouter {
     /// Stream registry (shared with DDL handlers).
     registry: Arc<StreamRegistry>,
-    /// Per-stream retention buffers, keyed by `(tenant_id, stream_name)`.
-    buffers: std::sync::RwLock<HashMap<(u64, String), Arc<StreamBuffer>>>,
+    /// Per-stream retention buffers, keyed by `(database_id, tenant_id, stream_name)`.
+    buffers: std::sync::RwLock<HashMap<(DatabaseId, u64, String), Arc<StreamBuffer>>>,
     /// Per-stream drop rate tracker — emits `warn!` when threshold is crossed.
     lag_warner: CdcLagWarner,
     /// System metrics for per-stream Prometheus counters. `None` in unit tests
@@ -57,9 +58,16 @@ impl CdcRouter {
     /// Called from the Event Plane consumer for every event (after trigger dispatch).
     /// `watermark_tracker` is used to enforce late-data policies.
     pub fn route_event(&self, event: &WriteEvent, watermark_tracker: &WatermarkTracker) {
-        let matching = self
-            .registry
-            .find_matching(event.tenant_id.as_u64(), &event.collection);
+        // Heartbeats advance Event Plane watermarks only; a synthetic heartbeat
+        // has no database owner and must never enter a database-scoped stream.
+        if !event.op.is_data_event() {
+            return;
+        }
+        let matching = self.registry.find_matching(
+            event.database_id,
+            event.tenant_id.as_u64(),
+            &event.collection,
+        );
 
         if matching.is_empty() {
             return;
@@ -106,6 +114,7 @@ impl CdcRouter {
             event_time: now_ms,
             lsn: event.lsn.as_u64(),
             tenant_id: event.tenant_id.as_u64(),
+            database_id: event.database_id,
             new_value: new_value.clone(),
             old_value: old_value.clone(),
             schema_version: 0,
@@ -141,10 +150,15 @@ impl CdcRouter {
                 }
             }
 
-            let buffer = self.get_or_create_buffer(def.tenant_id, &def.name, &def.retention);
+            let buffer = self.get_or_create_buffer(
+                def.database_id,
+                def.tenant_id,
+                &def.name,
+                &def.retention,
+            );
             let evictions = buffer.push(Arc::clone(&cdc_event));
             if evictions > 0 {
-                let oldest_lsn = buffer.earliest_lsn().unwrap_or(0);
+                let oldest_lsn = buffer.earliest_offset().map_or(0, |offset| offset.lsn);
                 self.lag_warner
                     .record_drops(def.tenant_id, &def.name, evictions, oldest_lsn);
                 if let Some(m) = &self.metrics {
@@ -164,6 +178,7 @@ impl CdcRouter {
                             event_time: now_ms,
                             lsn: event.lsn.as_u64(),
                             tenant_id: event.tenant_id.as_u64(),
+                            database_id: event.database_id,
                             new_value: new_value.clone(),
                             old_value: None,
                             schema_version: 0,
@@ -175,7 +190,7 @@ impl CdcRouter {
                     .clone();
                 let correction_evictions = buffer.push(correction);
                 if correction_evictions > 0 {
-                    let oldest_lsn = buffer.earliest_lsn().unwrap_or(0);
+                    let oldest_lsn = buffer.earliest_offset().map_or(0, |offset| offset.lsn);
                     self.lag_warner.record_drops(
                         def.tenant_id,
                         &def.name,
@@ -206,11 +221,12 @@ impl CdcRouter {
     /// Get or create a buffer for a stream.
     fn get_or_create_buffer(
         &self,
+        database_id: DatabaseId,
         tenant_id: u64,
         stream_name: &str,
         retention: &super::stream_def::RetentionConfig,
     ) -> Arc<StreamBuffer> {
-        let key = (tenant_id, stream_name.to_string());
+        let key = (database_id, tenant_id, stream_name.to_string());
 
         // Fast path: read lock.
         {
@@ -236,23 +252,29 @@ impl CdcRouter {
     /// Ensure a buffer exists for a given key (stream or topic). Creates if missing.
     pub fn ensure_buffer(
         &self,
+        database_id: DatabaseId,
         tenant_id: u64,
         name: &str,
         retention: &super::stream_def::RetentionConfig,
     ) -> Arc<StreamBuffer> {
-        self.get_or_create_buffer(tenant_id, name, retention)
+        self.get_or_create_buffer(database_id, tenant_id, name, retention)
     }
 
     /// Get a buffer for a stream (if it exists). Used by consumers to poll events.
-    pub fn get_buffer(&self, tenant_id: u64, stream_name: &str) -> Option<Arc<StreamBuffer>> {
-        let key = (tenant_id, stream_name.to_string());
+    pub fn get_buffer(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+        stream_name: &str,
+    ) -> Option<Arc<StreamBuffer>> {
+        let key = (database_id, tenant_id, stream_name.to_string());
         let buffers = self.buffers.read().unwrap_or_else(|p| p.into_inner());
         buffers.get(&key).cloned()
     }
 
     /// Remove a buffer when a stream is dropped.
-    pub fn remove_buffer(&self, tenant_id: u64, stream_name: &str) {
-        let key = (tenant_id, stream_name.to_string());
+    pub fn remove_buffer(&self, database_id: DatabaseId, tenant_id: u64, stream_name: &str) {
+        let key = (database_id, tenant_id, stream_name.to_string());
         let mut buffers = self.buffers.write().unwrap_or_else(|p| p.into_inner());
         buffers.remove(&key);
         self.lag_warner.remove_stream(tenant_id, stream_name);
@@ -263,14 +285,15 @@ impl CdcRouter {
         let buffers = self.buffers.read().unwrap_or_else(|p| p.into_inner());
         buffers
             .iter()
-            .map(|((tid, name), buf)| BufferStats {
+            .map(|((database_id, tid, name), buf)| BufferStats {
+                database_id: *database_id,
                 tenant_id: *tid,
                 stream_name: name.clone(),
                 buffered_events: buf.len(),
                 total_pushed: buf.total_pushed(),
                 total_evicted: buf.total_evicted(),
-                earliest_lsn: buf.earliest_lsn(),
-                latest_lsn: buf.latest_lsn(),
+                earliest_offset: buf.earliest_offset(),
+                latest_offset: buf.latest_offset(),
             })
             .collect()
     }
@@ -278,13 +301,14 @@ impl CdcRouter {
 
 /// Buffer statistics for observability.
 pub struct BufferStats {
+    pub database_id: DatabaseId,
     pub tenant_id: u64,
     pub stream_name: String,
     pub buffered_events: usize,
     pub total_pushed: u64,
     pub total_evicted: u64,
-    pub earliest_lsn: Option<u64>,
-    pub latest_lsn: Option<u64>,
+    pub earliest_offset: Option<super::offset::CdcOffset>,
+    pub latest_offset: Option<super::offset::CdcOffset>,
 }
 
 /// Deserialize bytes (MessagePack or JSON) to serde_json::Value.
@@ -297,6 +321,7 @@ fn deserialize_to_json(bytes: &[u8]) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::cdc::CdcOffset;
     use crate::event::cdc::stream_def::*;
     use crate::event::types::{EventSource, RowId, WriteOp};
     use crate::event::watermark_tracker::WatermarkTracker;
@@ -313,6 +338,7 @@ mod tests {
             op: WriteOp::Insert,
             row_id: RowId::new(format!("row-{seq}")),
             lsn: Lsn::new(seq * 10),
+            database_id: DatabaseId::new(7),
             tenant_id: TenantId::new(1),
             vshard_id: VShardId::new(0),
             source: EventSource::User,
@@ -331,6 +357,7 @@ mod tests {
 
     fn sample_def(name: &str, collection: &str) -> ChangeStreamDef {
         ChangeStreamDef {
+            database_id: DatabaseId::new(7),
             tenant_id: 1,
             name: name.into(),
             collection: collection.into(),
@@ -358,9 +385,11 @@ mod tests {
         let wt = test_tracker();
         router.route_event(&make_write_event("orders", 1), &wt);
 
-        let buf = router.get_buffer(1, "orders_stream").unwrap();
+        let buf = router
+            .get_buffer(DatabaseId::new(7), 1, "orders_stream")
+            .unwrap();
         assert_eq!(buf.len(), 1);
-        let events = buf.read_from_lsn(0, 10);
+        let events = buf.read_from(CdcOffset::ZERO, 10);
         assert_eq!(events[0].collection, "orders");
     }
 
@@ -373,7 +402,11 @@ mod tests {
         let wt = test_tracker();
         router.route_event(&make_write_event("users", 1), &wt);
 
-        assert!(router.get_buffer(1, "orders_stream").is_none());
+        assert!(
+            router
+                .get_buffer(DatabaseId::new(7), 1, "orders_stream")
+                .is_none()
+        );
     }
 
     #[test]
@@ -386,7 +419,9 @@ mod tests {
         router.route_event(&make_write_event("orders", 1), &wt);
         router.route_event(&make_write_event("users", 2), &wt);
 
-        let buf = router.get_buffer(1, "all_changes").unwrap();
+        let buf = router
+            .get_buffer(DatabaseId::new(7), 1, "all_changes")
+            .unwrap();
         assert_eq!(buf.len(), 2);
     }
 
@@ -413,8 +448,28 @@ mod tests {
         };
         router.route_event(&delete_event, &wt);
 
-        let buf = router.get_buffer(1, "inserts_only").unwrap();
+        let buf = router
+            .get_buffer(DatabaseId::new(7), 1, "inserts_only")
+            .unwrap();
         assert_eq!(buf.len(), 1); // Only the insert.
+    }
+
+    #[test]
+    fn heartbeat_never_enters_database_scoped_stream() {
+        let registry = Arc::new(StreamRegistry::new());
+        registry.register(sample_def("orders_stream", "_heartbeat"));
+        let router = CdcRouter::new(registry);
+        let heartbeat = WriteEvent {
+            op: WriteOp::Heartbeat,
+            ..make_write_event("_heartbeat", 1)
+        };
+
+        router.route_event(&heartbeat, &test_tracker());
+        assert!(
+            router
+                .get_buffer(DatabaseId::new(7), 1, "orders_stream")
+                .is_none()
+        );
     }
 
     #[test]
@@ -425,9 +480,9 @@ mod tests {
 
         let wt = test_tracker();
         router.route_event(&make_write_event("orders", 1), &wt);
-        assert!(router.get_buffer(1, "s1").is_some());
+        assert!(router.get_buffer(DatabaseId::new(7), 1, "s1").is_some());
 
-        router.remove_buffer(1, "s1");
-        assert!(router.get_buffer(1, "s1").is_none());
+        router.remove_buffer(DatabaseId::new(7), 1, "s1");
+        assert!(router.get_buffer(DatabaseId::new(7), 1, "s1").is_none());
     }
 }

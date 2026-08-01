@@ -43,6 +43,7 @@ fn err(sqlstate: &str, message: String) -> DdlError {
 pub async fn refresh_materialized_view(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let name = parse_refresh_target(sql)?;
@@ -63,7 +64,7 @@ pub async fn refresh_materialized_view(
     };
 
     // 1) Run the stored SELECT and collect every row.
-    let rows = execute_select(state, identity, &view.query_sql).await?;
+    let rows = execute_select(state, identity, database_id, &view.query_sql).await?;
 
     // 2) Clear the target so rows no longer selected by the SELECT
     //    (narrowed WHERE, dropped JOIN match, deleted source row,
@@ -71,6 +72,7 @@ pub async fn refresh_materialized_view(
     dispatch_sql(
         state,
         identity,
+        database_id,
         &format!("DELETE FROM {}", ::nodedb_types::quote_ident(&view.name)),
     )
     .await?;
@@ -91,7 +93,7 @@ pub async fn refresh_materialized_view(
             );
         }
         let insert_sql = build_insert_sql(&view.name, &row)?;
-        dispatch_sql(state, identity, &insert_sql).await?;
+        dispatch_sql(state, identity, database_id, &insert_sql).await?;
     }
 
     tracing::info!(
@@ -113,14 +115,15 @@ pub async fn refresh_materialized_view(
 async fn execute_select(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, DdlError> {
-    let (tasks, _output_schema) =
+    let (tasks, _output_schema, _lease_scope) =
         crate::control::server::shared::ddl::neutral::planning::plan_authorized_sql(
             state,
             identity,
             sql,
-            DatabaseId::DEFAULT,
+            database_id,
         )
         .await
         .map_err(|error| DdlError {
@@ -233,14 +236,15 @@ fn json_value_to_sql_literal(v: &serde_json::Value) -> Result<String, DdlError> 
 async fn dispatch_sql(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<(), DdlError> {
-    let (tasks, _output_schema) =
+    let (tasks, _output_schema, _lease_scope) =
         crate::control::server::shared::ddl::neutral::planning::plan_authorized_sql(
             state,
             identity,
             sql,
-            DatabaseId::DEFAULT,
+            database_id,
         )
         .await
         .map_err(|error| DdlError {

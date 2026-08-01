@@ -17,6 +17,7 @@ use nodedb::control::cascade::{
 };
 use nodedb::control::security::catalog::rls::StoredRlsPolicy;
 use nodedb::event::cdc::stream_def::ChangeStreamDef;
+use nodedb::types::DatabaseId;
 
 use catalog_integrity_helpers::{
     TENANT, make_catalog, make_mv_sourced, make_schedule, make_sequence, make_stream, make_trigger,
@@ -55,6 +56,7 @@ fn put_targeted_stream(
 ) {
     let mut s: ChangeStreamDef = make_stream(name);
     s.collection = target.to_string();
+    s.database_id = DatabaseId::DEFAULT;
     catalog.put_change_stream(&s).unwrap();
 }
 
@@ -114,7 +116,8 @@ fn orchestrator_enumerates_every_kind() {
     put_targeted_schedule(&catalog, "sch_orders_hourly", "orders");
 
     let mut visited = HashSet::new();
-    let deps = collect_dependents(&catalog, TENANT, "users", &mut visited).unwrap();
+    let deps =
+        collect_dependents(&catalog, DatabaseId::DEFAULT, TENANT, "users", &mut visited).unwrap();
 
     // Expect exactly the 8 user-scoped dependents, sorted by
     // (kind, name).
@@ -157,7 +160,13 @@ fn per_kind_finders_match_orchestrator() {
         vec!["books_id_seq"]
     );
     assert_eq!(
-        find_triggers_on(&catalog, TENANT, "books").unwrap(),
+        find_triggers_on(
+            &catalog,
+            nodedb::types::DatabaseId::DEFAULT,
+            TENANT,
+            "books"
+        )
+        .unwrap(),
         vec!["t_books_ins"]
     );
     assert_eq!(
@@ -169,11 +178,11 @@ fn per_kind_finders_match_orchestrator() {
         vec!["mv_books"]
     );
     assert_eq!(
-        find_change_streams_on(&catalog, TENANT, "books").unwrap(),
+        find_change_streams_on(&catalog, DatabaseId::DEFAULT, TENANT, "books").unwrap(),
         vec!["cs_books"]
     );
     assert_eq!(
-        find_schedules_referencing(&catalog, TENANT, "books").unwrap(),
+        find_schedules_referencing(&catalog, DatabaseId::DEFAULT, TENANT, "books").unwrap(),
         vec!["sch_books"]
     );
 }
@@ -182,7 +191,14 @@ fn per_kind_finders_match_orchestrator() {
 fn empty_catalog_has_no_dependents() {
     let (_tmp, catalog) = make_catalog();
     let mut visited = HashSet::new();
-    let deps = collect_dependents(&catalog, TENANT, "anything", &mut visited).unwrap();
+    let deps = collect_dependents(
+        &catalog,
+        DatabaseId::DEFAULT,
+        TENANT,
+        "anything",
+        &mut visited,
+    )
+    .unwrap();
     assert!(deps.is_empty());
 }
 
@@ -194,12 +210,14 @@ fn visited_set_suppresses_duplicates_across_calls() {
         .unwrap();
 
     let mut visited = HashSet::new();
-    let first = collect_dependents(&catalog, TENANT, "users", &mut visited).unwrap();
+    let first =
+        collect_dependents(&catalog, DatabaseId::DEFAULT, TENANT, "users", &mut visited).unwrap();
     assert_eq!(first.len(), 1);
 
     // Second call with the same visited set emits nothing — the
     // sequence has already been reported to the caller.
-    let second = collect_dependents(&catalog, TENANT, "users", &mut visited).unwrap();
+    let second =
+        collect_dependents(&catalog, DatabaseId::DEFAULT, TENANT, "users", &mut visited).unwrap();
     assert!(
         second.is_empty(),
         "orchestrator must not re-emit a dependent already in visited set"
@@ -228,7 +246,8 @@ fn cross_tenant_dependents_are_ignored() {
     catalog.put_trigger(&other_trig).unwrap();
 
     let mut visited = HashSet::new();
-    let deps = collect_dependents(&catalog, TENANT, "users", &mut visited).unwrap();
+    let deps =
+        collect_dependents(&catalog, DatabaseId::DEFAULT, TENANT, "users", &mut visited).unwrap();
     // Exactly the two tenant-1 dependents — not duplicates from tenant 2.
     assert_eq!(deps.len(), 2);
 }
@@ -279,7 +298,8 @@ fn dependents_error_variant_carries_structured_payload() {
         .unwrap();
 
     let mut visited = HashSet::new();
-    let deps = collect_dependents(&catalog, TENANT, "logs", &mut visited).unwrap();
+    let deps =
+        collect_dependents(&catalog, DatabaseId::DEFAULT, TENANT, "logs", &mut visited).unwrap();
     let err = dependents_error(TENANT, "logs", &deps);
     match err {
         nodedb::Error::DependentObjectsExist {
