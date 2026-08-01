@@ -212,8 +212,22 @@ pub async fn insert_document(
                 changed = true;
             }
         }
-        if changed {
-            let _ = catalog.put_collection(database_id, &coll);
+        // Learned fields are part of the replicated descriptor, so they go out
+        // through the metadata path with a stamped version. A bare
+        // `put_collection` here left the local record at the same version as
+        // the replicated entry but with different bytes, which wedges the
+        // metadata apply loop on the next restart.
+        if changed
+            && let Err(e) = crate::control::catalog_entry::persist_collection_replicated(
+                state,
+                database_id,
+                &coll,
+            )
+        {
+            return Some(Err(ddl_err(
+                "XX000",
+                format!("record inferred schema fields: {e}"),
+            )));
         }
     }
 

@@ -118,7 +118,15 @@ pub fn define_field(
                     coll.fields.push((field_name.clone(), resolved_type));
                 }
 
-                if let Err(e) = catalog.put_collection(database_id, &coll) {
+                // Replicated path, not a bare local write: the descriptor is
+                // replicated catalog state, and an in-place local mutation
+                // both diverges peers and breaks the version/bytes invariant
+                // the metadata applier enforces on replay after a restart.
+                if let Err(e) = crate::control::catalog_entry::persist_collection_replicated(
+                    state,
+                    database_id,
+                    &coll,
+                ) {
                     return Err(err("XX000", &format!("save collection: {e}")));
                 }
             }
@@ -213,7 +221,15 @@ pub fn define_event(
             Ok(Some(mut coll)) => {
                 coll.event_defs.retain(|e| e.name != event_name);
                 coll.event_defs.push(def);
-                if let Err(e) = catalog.put_collection(database_id, &coll) {
+                // Replicated path, not a bare local write: the descriptor is
+                // replicated catalog state, and an in-place local mutation
+                // both diverges peers and breaks the version/bytes invariant
+                // the metadata applier enforces on replay after a restart.
+                if let Err(e) = crate::control::catalog_entry::persist_collection_replicated(
+                    state,
+                    database_id,
+                    &coll,
+                ) {
                     return Err(err("XX000", &format!("save collection: {e}")));
                 }
             }

@@ -34,6 +34,7 @@ pub mod codec;
 pub mod descriptor_stamp;
 pub mod descriptor_validate;
 pub mod entry;
+pub mod persist_collection;
 pub mod post_apply;
 
 #[cfg(test)]
@@ -41,3 +42,4 @@ mod tests;
 
 pub use codec::{decode, encode};
 pub use entry::CatalogEntry;
+pub use persist_collection::persist_collection_replicated;
