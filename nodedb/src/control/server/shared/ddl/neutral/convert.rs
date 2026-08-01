@@ -24,6 +24,7 @@ use std::time::Duration;
 use sonic_rs;
 
 use crate::bridge::envelope::PhysicalPlan;
+use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::sync_dispatch::{
     SystemReason, SystemTask, dispatch_system,
@@ -159,8 +160,7 @@ pub async fn convert_collection(
         coll.type_guards.clear();
     }
 
-    catalog
-        .put_collection(database_id, &coll)
+    persist_collection_replicated(state, database_id, &coll)
         .map_err(|e| err("XX000", &e.to_string()))?;
 
     tracing::info!(

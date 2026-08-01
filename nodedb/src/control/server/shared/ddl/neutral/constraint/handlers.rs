@@ -10,6 +10,7 @@
 
 use nodedb_types::DatabaseId;
 
+use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::catalog::types::StateTransitionDef;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
@@ -73,8 +74,7 @@ pub fn add_state_constraint(
     }
 
     coll.state_constraints.push(def);
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", &e.to_string()))?;
 
     state.schema_version.bump();
@@ -133,8 +133,7 @@ pub fn add_transition_check(
     }
 
     coll.transition_checks.push(def);
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", &e.to_string()))?;
 
     state.schema_version.bump();
@@ -220,8 +219,7 @@ pub fn add_check_constraint(
     }
 
     coll.check_constraints.push(def);
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", &e.to_string()))?;
 
     state.schema_version.bump();
@@ -277,8 +275,7 @@ pub fn drop_constraint(
         ));
     }
 
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", &e.to_string()))?;
 
     state.schema_version.bump();

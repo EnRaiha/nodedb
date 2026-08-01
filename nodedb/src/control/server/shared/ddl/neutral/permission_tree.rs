@@ -22,6 +22,7 @@
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use nodedb_types::DatabaseId;
 
+use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::permission_tree::types::PermissionTreeDef;
 use crate::control::state::SharedState;
@@ -94,8 +95,7 @@ pub async fn set_permission_tree(
     let def_json = sonic_rs::to_string(&def)
         .map_err(|e| err("XX000", format!("serialize PERMISSION_TREE: {e}")))?;
     coll.permission_tree_def = Some(def_json);
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", e.to_string()))?;
 
     // Update in-memory cache.
@@ -140,8 +140,7 @@ pub async fn drop_permission_tree(
         .ok_or_else(|| err("42P01", format!("collection '{collection}' does not exist")))?;
 
     coll.permission_tree_def = None;
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", e.to_string()))?;
 
     // Update in-memory cache.

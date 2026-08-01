@@ -102,12 +102,8 @@ pub fn create_timeseries(
         declared_primary_key: None,
     };
 
-    {
-        let catalog = state.credentials.catalog();
-        catalog
-            .put_collection(database_id, &coll)
-            .map_err(|e| ddl_err("XX000", e.to_string()))?;
-    }
+    crate::control::catalog_entry::persist_collection_replicated(state, database_id, &coll)
+        .map_err(|e| ddl_err("XX000", e.to_string()))?;
 
     // Initialize partition registry for this timeseries collection.
     if let Some(registries) = state.timeseries_registries() {

@@ -34,6 +34,7 @@ use nodedb_types::DatabaseId;
 
 use serde_json::{Map, Value as JsonValue};
 
+use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
@@ -99,8 +100,7 @@ pub fn create_typeguard(
     }
 
     coll.type_guards = guards;
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", &e.to_string()))?;
 
     state.schema_version.bump();
@@ -152,8 +152,7 @@ pub fn alter_typeguard_add(
     }
 
     coll.type_guards.push(guard);
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", &e.to_string()))?;
 
     state.schema_version.bump();
@@ -195,8 +194,7 @@ pub fn alter_typeguard_drop(
         ));
     }
 
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", &e.to_string()))?;
 
     state.schema_version.bump();
@@ -255,8 +253,7 @@ pub fn drop_typeguard(
     }
 
     coll.type_guards.clear();
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", &e.to_string()))?;
 
     state.schema_version.bump();

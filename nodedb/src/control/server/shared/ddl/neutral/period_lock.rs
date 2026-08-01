@@ -21,6 +21,7 @@
 
 use nodedb_types::DatabaseId;
 
+use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::catalog::PeriodLockDef;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -104,8 +105,7 @@ pub fn add_period_lock(
 
     coll.period_lock = Some(def);
 
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", e.to_string()))?;
 
     state.schema_version.bump();
@@ -145,8 +145,7 @@ pub fn drop_period_lock(
 
     coll.period_lock = None;
 
-    catalog
-        .put_collection(DatabaseId::DEFAULT, &coll)
+    persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
         .map_err(|e| err("XX000", e.to_string()))?;
 
     state.schema_version.bump();

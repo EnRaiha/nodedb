@@ -4,6 +4,7 @@
 
 use nodedb_types::DatabaseId;
 
+use crate::control::catalog_entry::persist_collection_replicated;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
@@ -60,8 +61,7 @@ pub fn alter_timeseries(
             }
         }
 
-        catalog
-            .put_collection(DatabaseId::DEFAULT, &coll)
+        persist_collection_replicated(state, DatabaseId::DEFAULT, &coll)
             .map_err(|e| ddl_err("XX000", e.to_string()))?;
     }
 
