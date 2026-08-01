@@ -147,12 +147,23 @@ impl CrdtState {
     /// Includes operation history, current state, and internal caches.
     /// Use this to decide when to trigger `compact_history()`.
     ///
-    /// The proxy is a full snapshot export, so it is measured once per version
-    /// rather than once per call: a document nobody is writing cannot have
-    /// changed size. Compaction discards the measurement along with the
-    /// document it described.
+    /// Cheap enough to call on the write path. The underlying proxy is a
+    /// snapshot export, which costs O(document), so it is used to calibrate a
+    /// bytes-per-operation ratio and the answer comes from the oplog's
+    /// operation counter — a real export runs only when the document has
+    /// halved or doubled since it was last measured. Exact for a document that
+    /// has not changed since then, an interpolation otherwise.
+    ///
+    /// Compaction discards the measurement along with the document it
+    /// described.
     pub fn estimated_memory_bytes(&self) -> usize {
         self.doc.estimated_bytes()
+    }
+
+    /// Real snapshot exports performed to answer `estimated_memory_bytes`.
+    #[cfg(test)]
+    pub(crate) fn export_count_for_test(&self) -> usize {
+        self.doc.export_count()
     }
 }
 
