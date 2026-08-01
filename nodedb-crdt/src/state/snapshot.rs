@@ -7,7 +7,9 @@ use loro::LoroDoc;
 use crate::error::{CrdtError, Result};
 
 use super::core::CrdtState;
-use super::import_admission::{CrdtImportLimits, ImportAdmission, admit_import};
+use super::import_admission::{
+    CrdtImportLimits, ImportAdmission, admit_import, admit_local_import,
+};
 
 impl CrdtState {
     /// Export the current state as bytes for sync.
@@ -22,6 +24,35 @@ impl CrdtState {
     /// Returns the same [`ImportAdmission`] as [`Self::import_with_limits`].
     pub fn import(&self, data: &[u8]) -> Result<ImportAdmission> {
         self.import_with_limits(data, CrdtImportLimits::default())
+    }
+
+    /// Import bytes this process produced itself — a snapshot read back from
+    /// durable storage, or a shallow snapshot taken during compaction.
+    ///
+    /// Keeps every structural check [`Self::import`] performs: metadata is
+    /// decoded with Loro's authenticated decoder, and per-peer ranges that
+    /// regress are rejected before any state mutation. What it drops is the
+    /// size ceilings, which bound how much work an untrusted peer may cause
+    /// and have no meaning for bytes this library just wrote.
+    ///
+    /// Without this split the ceilings apply to reloading as well as to
+    /// receiving, and since `export_snapshot` has no bound at all, a document a
+    /// healthy process wrote can exceed what the same binary will re-import.
+    /// Past that point the document neither opens nor compacts — compaction
+    /// being the operation that would bring it back under the limit.
+    ///
+    /// This is not a way to raise the peer limits: `import_with_limits` is the
+    /// knob for that, and bytes off the wire must go through it.
+    pub fn import_local(&self, data: &[u8]) -> Result<ImportAdmission> {
+        let admission = admit_local_import(data, &self.doc.oplog_vv())?;
+        let status = self
+            .doc
+            .import(data)
+            .map_err(|e| CrdtError::DeltaApplyFailed(e.to_string()))?;
+        if status.pending.is_some() {
+            return Err(CrdtError::ImportPendingDependencies);
+        }
+        Ok(admission)
     }
 
     /// Import remote updates after bounded authenticated metadata admission.
@@ -87,9 +118,10 @@ impl CrdtState {
         new_doc
             .set_peer_id(self.peer_id)
             .map_err(|e| CrdtError::Loro(format!("failed to set peer_id on compacted doc: {e}")))?;
-        // This snapshot is generated locally, but it remains finite and goes
-        // through the same metadata/range admission before import.
-        admit_import(&snapshot, &new_doc.oplog_vv(), CrdtImportLimits::default())?;
+        // Locally generated: it keeps the metadata and range checks but not
+        // the peer size ceilings, which would otherwise make compaction
+        // impossible for exactly the documents that need it most.
+        admit_local_import(&snapshot, &new_doc.oplog_vv())?;
         new_doc
             .import(&snapshot)
             .map_err(|e| CrdtError::Loro(format!("shallow snapshot import: {e}")))?;
@@ -145,6 +177,46 @@ mod tests {
             },
         );
         assert!(matches!(result, Err(CrdtError::ImportTooLarge { .. })));
+        assert_eq!(state.frontier(), before);
+    }
+
+    #[test]
+    fn local_import_admits_what_the_peer_ceilings_would_reject() {
+        let delta = source_delta();
+        let capped = CrdtState::new(1).expect("capped state");
+        let tight = CrdtImportLimits {
+            max_bytes: delta.len(),
+            max_encoded_operations: 0,
+            max_new_operations: 0,
+        };
+        assert!(
+            matches!(
+                capped.import_with_limits(&delta, tight),
+                Err(CrdtError::ImportOperationLimitExceeded { .. })
+            ),
+            "the peer path must stay capped"
+        );
+
+        let local = CrdtState::new(1).expect("local state");
+        local.import_local(&delta).expect("local import");
+        assert!(
+            local.row_exists("docs", "row"),
+            "bytes this process wrote must be reloadable whatever the peer ceilings are; a \
+             document large enough to trip them can otherwise neither be opened nor compacted"
+        );
+    }
+
+    #[test]
+    fn local_import_still_rejects_malformed_metadata() {
+        let state = CrdtState::new(1).expect("state");
+        let before = state.frontier();
+        assert!(
+            matches!(
+                state.import_local(&[0xff]),
+                Err(CrdtError::ImportMalformed { .. })
+            ),
+            "dropping the size ceilings must not drop the structural checks"
+        );
         assert_eq!(state.frontier(), before);
     }
 
