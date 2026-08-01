@@ -365,12 +365,12 @@ mod tests {
         // the owning replica refuses and what the merge discards as a replay.
         let vv = rekeyed.oplog_version_vector();
         assert_eq!(
-            vv.get(&OLD_PEER.into()).copied().unwrap_or(0),
+            vv.get(&OLD_PEER).copied().unwrap_or(0),
             0,
             "no operation may remain attributed to the abandoned peer"
         );
         assert!(
-            vv.get(&NEW_PEER.into()).copied().unwrap_or(0) > 0,
+            vv.get(&NEW_PEER).copied().unwrap_or(0) > 0,
             "the new peer must own the rebuilt operations"
         );
     }

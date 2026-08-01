@@ -73,6 +73,10 @@ impl TestClusterNode {
         config: &ClusterSpawnConfig,
         data_dir_path_override: Option<PathBuf>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Every cluster node funnels through here, so installing tracing at
+        // this one point means no test has to opt in to see server-side logs.
+        crate::test_tracing::init();
+
         let tuning = &config.tuning;
         let graph_tuning = &config.graph_tuning;
         let query_tuning = &config.query_tuning;

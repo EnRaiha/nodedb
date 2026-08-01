@@ -411,13 +411,28 @@ impl CrashHarness {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 // `tokio_postgres::Error` renders as a bare "db error"; the
-                // server's message only lives on the DbError payload.
-                Err(e) => panic!(
-                    "exec: {e}{}",
-                    e.as_db_error()
-                        .map(|db| format!(" — {}: {}", db.code().code(), db.message()))
-                        .unwrap_or_default()
-                ),
+                // server's message only lives on the DbError payload. The
+                // server log tail comes along because the interesting failures
+                // here are server-side (stalled apply, failed recovery) and the
+                // harness's tempdir is gone by the time anyone reads the panic.
+                Err(e) => {
+                    let log = self.server_log();
+                    let tail: String = log
+                        .lines()
+                        .rev()
+                        .take(60)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    panic!(
+                        "exec: {e}{}\n--- server log (last 60 lines) ---\n{tail}",
+                        e.as_db_error()
+                            .map(|db| format!(" — {}: {}", db.code().code(), db.message()))
+                            .unwrap_or_default()
+                    )
+                }
             }
         }
     }

@@ -10,6 +10,7 @@ pub mod occ_shuffle;
 pub mod pgwire_auth_helpers;
 pub mod pgwire_harness;
 pub mod sync_client;
+pub mod test_tracing;
 pub mod tx_batch_helpers;
 
 use nodedb::event::cdc::event::CdcEvent;

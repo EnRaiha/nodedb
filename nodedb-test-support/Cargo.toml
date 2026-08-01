@@ -35,3 +35,4 @@ bytes = { workspace = true }
 futures = { workspace = true }
 smallvec = { workspace = true }
 uuid = { workspace = true }
+tracing-subscriber = { workspace = true }

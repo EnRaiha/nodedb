@@ -70,9 +70,10 @@ FORBIDDEN = (
 # Only its declaration is exempt; imports and calls remain forbidden.
 ALLOWED_DEFINITIONS = {
     (
-        "control/server/sync/raft_dispatch.rs",
+        "control/server/sync/raft_dispatch/response.rs",
         "dispatch_trusted_internal_sync_response",
     ),
+    ("control/server/sync/raft_dispatch/propose.rs", "propose_sync_write"),
 }
 
 # Narrow implementation seams that sit in mixed transport/helper modules. The
@@ -80,14 +81,19 @@ ALLOWED_DEFINITIONS = {
 # capability; no other occurrence in these files is exempt.
 ALLOWED_REFERENCES = {
     (
-        "control/server/sync/raft_dispatch.rs",
+        "control/server/sync/raft_dispatch/response.rs",
         "dispatch_to_data_plane_with_source",
     ),
     (
         "control/server/native/dispatch/transaction.rs",
         "dispatch_trusted_internal_write_to_data_plane",
     ),
-    ("control/server/sync/raft_dispatch.rs", "into_physical_task"),
+    ("control/server/sync/raft_dispatch/response.rs", "into_physical_task"),
+    ("control/server/sync/raft_dispatch/write.rs", "into_physical_task"),
+    (
+        "control/server/sync/raft_dispatch/mod.rs",
+        "dispatch_trusted_internal_sync_response",
+    ),
     ("control/server/pgwire/handler/dispatch.rs", "into_physical_task"),
     ("control/server/pgwire/handler/submit.rs", "into_physical_task"),
     (
@@ -98,7 +104,8 @@ ALLOWED_REFERENCES = {
     ("control/array_sync/inbound_propose.rs", "into_scope"),
     ("control/array_sync/snapshot_assembly.rs", "into_scope"),
     ("control/server/native/dispatch/sql_loop.rs", "into_physical_task"),
-    ("control/server/sync/raft_dispatch.rs", "propose_sync_write"),
+    ("control/server/sync/raft_dispatch/response.rs", "propose_sync_write"),
+    ("control/server/sync/raft_dispatch/write.rs", "propose_sync_write"),
     (
         "control/server/pgwire/handler/dispatch.rs",
         "propose_replicated_entry",
@@ -231,7 +238,7 @@ def self_test() -> None:
         "control/example.rs",
         "pub(crate) async fn dispatch_to_data_plane() {}",
     )
-    allowed = "control/server/sync/raft_dispatch.rs"
+    allowed = "control/server/sync/raft_dispatch/response.rs"
     assert not violations(
         allowed,
         "pub async fn dispatch_trusted_internal_sync_response() {}",

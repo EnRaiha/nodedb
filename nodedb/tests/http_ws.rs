@@ -444,17 +444,43 @@ async fn ws_live_lag_notifies_client_to_reset() {
         }
     }
 
-    let reset = tokio::time::timeout(Duration::from_secs(3), async {
-        for _ in 0..300 {
-            let message = next_ws_json(&mut ws, "LIVE SELECT lag reset").await;
+    // Drain until the reset arrives, bounded by total time rather than by a
+    // message count: how many buffered notifications precede the lag notice
+    // depends on socket and forwarder buffering, which varies with machine
+    // load, so a fixed read budget fails on a busy host while the behaviour is
+    // correct. Reads are not individually timed here for the same reason — a
+    // stall mid-stream is only a failure if the whole drain overruns.
+    let mut drained = 0usize;
+    let mut last_seen: Option<serde_json::Value> = None;
+    let reset = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let Some(message) = ws.next().await else {
+                return Err(format!(
+                    "WS stream ended after {drained} notifications without reset_required \
+                     (last: {last_seen:?})"
+                ));
+            };
+            let message = match message {
+                Ok(Message::Text(text)) => serde_json::from_str::<serde_json::Value>(&text)
+                    .unwrap_or_else(|e| panic!("invalid JSON in live notification: {e}")),
+                Ok(other) => panic!("expected Text frame in live stream, got {other:?}"),
+                Err(e) => return Err(format!("WS error after {drained} notifications: {e}")),
+            };
             if message["method"] == "reset_required" {
-                return message;
+                return Ok(message);
             }
+            drained += 1;
+            last_seen = Some(message);
         }
-        panic!("LIVE SELECT did not report reset_required after bounded lag");
     })
     .await
-    .expect("bounded wait for LIVE SELECT lag reset");
+    .unwrap_or_else(|_| {
+        panic!(
+            "LIVE SELECT never reported reset_required: drained {drained} notifications \
+             (last: {last_seen:?})"
+        )
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(reset["params"]["subscription_id"], subscription_id);
     assert_eq!(reset["params"]["reason"], "change stream lagged");
 }

@@ -92,9 +92,16 @@ async fn start_listener(server: &TestServer) -> SocketAddr {
         },
         ..Default::default()
     };
-    let state = start_sync_listener(config, Some(std::sync::Arc::clone(&server.shared)))
-        .await
-        .expect("start sync listener");
+    let (shutdown_bus, _shutdown_handle) = nodedb::control::shutdown::ShutdownBus::new(
+        std::sync::Arc::new(nodedb::control::shutdown::ShutdownWatch::new()),
+    );
+    let state = start_sync_listener(
+        config,
+        Some(std::sync::Arc::clone(&server.shared)),
+        shutdown_bus,
+    )
+    .await
+    .expect("start sync listener");
     state.config.listen_addr
 }
 

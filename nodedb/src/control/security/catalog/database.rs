@@ -261,10 +261,28 @@ mod tests {
         assert_eq!(cat.get_database_hwm().unwrap(), 9999);
     }
 
+    /// Opening a catalog must leave the default database resolvable.
+    ///
+    /// Every fail-closed database lookup — the native handshake among them —
+    /// refuses a session whose database is absent, so a freshly opened catalog
+    /// that had not bootstrapped answered every new native session with
+    /// `3D000 selected database does not exist`.
     #[test]
-    fn bootstrap_inserts_default_if_empty() {
+    fn open_bootstraps_the_default_database() {
         let (_dir, cat) = open_catalog();
+        assert!(!cat.databases_is_empty().unwrap());
+        let desc = cat.get_database(DatabaseId::DEFAULT).unwrap().unwrap();
+        assert_eq!(desc.name, "default");
+        assert_eq!(desc.id, DatabaseId::DEFAULT);
+    }
+
+    #[test]
+    fn bootstrap_inserts_default_into_an_empty_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = SystemCatalog::open(&dir.path().join("system.redb")).unwrap();
+        cat.delete_database(DatabaseId::DEFAULT).unwrap();
         assert!(cat.databases_is_empty().unwrap());
+
         cat.bootstrap_default_database().unwrap();
         assert!(!cat.databases_is_empty().unwrap());
         let desc = cat.get_database(DatabaseId::DEFAULT).unwrap().unwrap();

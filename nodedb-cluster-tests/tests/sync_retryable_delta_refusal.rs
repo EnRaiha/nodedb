@@ -142,9 +142,16 @@ async fn cluster_with_sync_client() -> (TestCluster, SyncTestClient) {
         listen_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         ..Default::default()
     };
-    let state = start_sync_listener(cfg, Some(std::sync::Arc::clone(&cluster.nodes[0].shared)))
-        .await
-        .expect("start sync listener");
+    let (shutdown_bus, _shutdown_handle) = nodedb::control::shutdown::ShutdownBus::new(
+        std::sync::Arc::new(nodedb::control::shutdown::ShutdownWatch::new()),
+    );
+    let state = start_sync_listener(
+        cfg,
+        Some(std::sync::Arc::clone(&cluster.nodes[0].shared)),
+        shutdown_bus,
+    )
+    .await
+    .expect("start sync listener");
     let client = SyncTestClient::connect(state.config.listen_addr)
         .await
         .expect("sync handshake with node 0");
