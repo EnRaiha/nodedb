@@ -183,13 +183,13 @@ fn read_registry(
             continue;
         }
         let meta = read_partition_meta(&meta_path, kek)?;
-        registry.import(vec![(
-            meta.min_ts,
-            PartitionEntry {
-                meta,
-                dir_name: dir_name.to_string(),
-            },
-        )]);
+        // `insert_partition`, not `import`: two committed partitions can share a
+        // min_ts, and filing both under it would make one unreachable to every
+        // query even though its rows are on disk.
+        registry.insert_partition(PartitionEntry {
+            meta,
+            dir_name: dir_name.to_string(),
+        });
     }
     Ok(registry)
 }

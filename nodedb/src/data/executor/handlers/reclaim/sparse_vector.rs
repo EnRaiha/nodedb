@@ -85,7 +85,8 @@ pub fn reclaim_sparse_vector_checkpoints(
             Ok(Some(m)) => m,
             Ok(None) => continue,
             Err(error) => {
-                return Err(ReclaimError::SparseManifest {
+                return Err(ReclaimError::Manifest {
+                    engine: "sparse-vector",
                     path: core_dir.join("MANIFEST"),
                     detail: error.to_string(),
                 });

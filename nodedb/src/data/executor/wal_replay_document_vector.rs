@@ -201,10 +201,44 @@ impl CoreLoop {
 
 /// True when `payload` is a KV put or KV batch-put record (both share
 /// `RecordType::Put` with document writes but lead with a discriminator).
+///
+/// Each record class has three decodable arities — the current
+/// surrogate-carrying shape plus the two that predate it — and all of them must
+/// be recognized here, or a KV value would be handed to the document decoder.
 fn is_kv_put_record(payload: &[u8]) -> bool {
+    if let Ok((disc, _c, _k, _v, _ttl, _expire, _surrogate)) =
+        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32)>(payload)
+        && disc == "kv_put"
+    {
+        return true;
+    }
+    if let Ok((disc, _c, _k, _v, _ttl, _expire)) =
+        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(payload)
+        && disc == "kv_put"
+    {
+        return true;
+    }
     if let Ok((disc, _c, _k, _v, _ttl)) =
         zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(payload)
         && disc == "kv_put"
+    {
+        return true;
+    }
+    if let Ok((disc, _c, _e, _ttl, _expire, _surrogates)) = zerompk::from_msgpack::<(
+        &str,
+        String,
+        Vec<(Vec<u8>, Vec<u8>)>,
+        u64,
+        Option<u64>,
+        Vec<u32>,
+    )>(payload)
+        && disc == "kv_batch_put"
+    {
+        return true;
+    }
+    if let Ok((disc, _c, _e, _ttl, _expire)) =
+        zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64, u64)>(payload)
+        && disc == "kv_batch_put"
     {
         return true;
     }

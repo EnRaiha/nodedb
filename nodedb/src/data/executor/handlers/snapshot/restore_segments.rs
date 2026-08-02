@@ -6,8 +6,34 @@
 //! Split from `restore.rs` to keep each file under the 500-line limit.
 //! All methods are `pub(super)` — called only from `restore.rs`.
 
+use std::path::Path;
+
 use crate::data::executor::core_loop::CoreLoop;
 use crate::types::TsFlushedCollectionBlob;
+
+/// The partition commit marker. A partition directory without it is treated as
+/// absent by the boot registry, so it must be the LAST file written.
+const PARTITION_META: &str = "partition.meta";
+
+/// Write one restored partition file durably inside `dir`.
+///
+/// Routed through the shared WAL helper so the `write → sync_data → rename →
+/// fsync_dir` ordering matches the partition writer's own and cannot drift.
+fn durable_write_into(dir: &Path, filename: &str, bytes: &[u8]) -> crate::Result<()> {
+    let dst = dir.join(filename);
+    let tmp = dir.join(format!("{filename}.restore-part"));
+    nodedb_wal::segment::atomic_write_fsync(&tmp, &dst, bytes).map_err(|e| crate::Error::Storage {
+        engine: "timeseries".into(),
+        detail: format!("restore: durable write {}: {e}", dst.display()),
+    })
+}
+
+fn fsync_dir(dir: &Path) -> crate::Result<()> {
+    nodedb_wal::segment::fsync_directory(dir).map_err(|e| crate::Error::Storage {
+        engine: "timeseries".into(),
+        detail: format!("restore: fsync {}: {e}", dir.display()),
+    })
+}
 
 impl CoreLoop {
     /// Restore flushed on-disk timeseries segment directories from snapshot blobs.
@@ -113,16 +139,60 @@ impl CoreLoop {
                     }
                 }
 
-                // Under replace_mode, wipe any stale partition directory so a
-                // changed file layout cannot leave orphaned segment files behind.
-                if replace_mode && partition_dir.exists() {
-                    std::fs::remove_dir_all(&partition_dir)?;
+                // Stage the whole partition beside its final name, then swap it
+                // in with a rename. The live directory is never destroyed
+                // before the replacement is durable, so a crash at any point
+                // leaves one COMPLETE partition rather than neither.
+                //
+                // Neither scratch name starts with `ts-`, which is the prefix
+                // the boot registry scan and the orphan sweeper key on — a
+                // half-finished restore is therefore invisible to both rather
+                // than being adopted as a partition.
+                let staging_dir =
+                    segment_dir.join(format!(".restore-stage-{}", part_blob.dir_name));
+                let backup_dir =
+                    segment_dir.join(format!(".restore-backup-{}", part_blob.dir_name));
+                for scratch in [&staging_dir, &backup_dir] {
+                    if scratch.exists() {
+                        // Remains of a restore that crashed mid-swap.
+                        std::fs::remove_dir_all(scratch)?;
+                    }
                 }
+                std::fs::create_dir_all(&staging_dir)?;
 
-                // Create the partition directory and write all captured files.
-                std::fs::create_dir_all(&partition_dir)?;
+                // Segment files first; `partition.meta` is the commit point and
+                // must not become visible before the columns it describes.
                 for (filename, bytes) in &part_blob.files {
-                    std::fs::write(partition_dir.join(filename), bytes)?;
+                    if filename.as_str() == PARTITION_META {
+                        continue;
+                    }
+                    durable_write_into(&staging_dir, filename, bytes)?;
+                }
+                if let Some((_, bytes)) = part_blob
+                    .files
+                    .iter()
+                    .find(|(filename, _)| filename.as_str() == PARTITION_META)
+                {
+                    durable_write_into(&staging_dir, PARTITION_META, bytes)?;
+                }
+                fsync_dir(&staging_dir)?;
+
+                if partition_dir.exists() {
+                    nodedb_wal::segment::atomic_swap_dirs_fsync(
+                        &partition_dir,
+                        &backup_dir,
+                        &staging_dir,
+                    )
+                    .map_err(|e| crate::Error::Storage {
+                        engine: "timeseries".into(),
+                        detail: format!("restore: swap partition {}: {e}", partition_dir.display()),
+                    })?;
+                    // The new partition is durably named; the old one is now
+                    // pure garbage.
+                    std::fs::remove_dir_all(&backup_dir)?;
+                } else {
+                    std::fs::rename(&staging_dir, &partition_dir)?;
+                    fsync_dir(&segment_dir)?;
                 }
 
                 // Register the restored partition in ts_registries, mirroring
@@ -139,7 +209,10 @@ impl CoreLoop {
                     meta,
                     dir_name: part_blob.dir_name.clone(),
                 };
-                registry.import(vec![(pe.meta.min_ts, pe)]);
+                // `insert_partition`, not `import`: partitions sharing a min_ts
+                // must both stay reachable. Re-registering the same directory
+                // is idempotent, which is what a repeated restore does.
+                registry.insert_partition(pe);
             }
         }
         Ok(())
@@ -249,5 +322,148 @@ impl CoreLoop {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
+    use crate::types::TsFlushedPartitionBlob;
+    use nodedb_bridge::buffer::RingBuffer;
+
+    fn open_core(dir: &std::path::Path) -> CoreLoop {
+        let hlc = Arc::new(nodedb_types::OrdinalClock::new());
+        let (req_tx, req_rx) = RingBuffer::channel::<BridgeRequest>(64);
+        let (resp_tx, resp_rx) = RingBuffer::channel::<BridgeResponse>(64);
+        drop(req_tx);
+        drop(resp_rx);
+        CoreLoop::open(0, req_rx, resp_tx, dir, hlc).expect("CoreLoop::open")
+    }
+
+    fn partition_meta(min_ts: i64) -> nodedb_types::timeseries::PartitionMeta {
+        nodedb_types::timeseries::PartitionMeta {
+            min_ts,
+            max_ts: min_ts + 1,
+            row_count: 1,
+            size_bytes: 1,
+            schema_version: 1,
+            state: nodedb_types::timeseries::PartitionState::Sealed,
+            interval_ms: 0,
+            last_flushed_wal_lsn: 7,
+            column_stats: std::collections::HashMap::new(),
+            max_system_ts: 0,
+        }
+    }
+
+    fn blob(dir_name: &str, min_ts: i64) -> TsFlushedCollectionBlob {
+        let meta = partition_meta(min_ts);
+        let meta_bytes = zerompk::to_msgpack_vec(&meta).expect("encode meta");
+        TsFlushedCollectionBlob {
+            collection_key: "0:0:metrics".to_string(),
+            partitions: vec![TsFlushedPartitionBlob {
+                dir_name: dir_name.to_string(),
+                meta_bytes,
+                // Deliberately meta-first so an in-order write would publish
+                // the commit marker before the column it describes.
+                files: vec![
+                    (PARTITION_META.to_string(), b"new-meta".to_vec()),
+                    ("value.col".to_string(), b"new-col".to_vec()),
+                ],
+            }],
+        }
+    }
+
+    fn ts_dir(root: &std::path::Path) -> std::path::PathBuf {
+        super::super::super::timeseries::paths::ts_collection_dir(root, 0, 0, "metrics")
+    }
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The restore must land as a whole-directory swap: the previous
+    /// partition's files are gone, the snapshot's files are all present, and no
+    /// staging/backup scratch survives to be mistaken for a partition.
+    #[test]
+    fn replace_swaps_partition_atomically_and_leaves_no_scratch() {
+        let root = TempDir::new().expect("tempdir");
+        let mut core = open_core(root.path());
+
+        let segment_dir = ts_dir(root.path());
+        let partition_dir = segment_dir.join("ts-1_2");
+        std::fs::create_dir_all(&partition_dir).expect("mkdir");
+        std::fs::write(partition_dir.join("stale.col"), b"old").expect("write stale");
+        std::fs::write(partition_dir.join(PARTITION_META), b"old-meta").expect("write old meta");
+
+        // Remains of an earlier restore that died mid-swap.
+        let leftover = segment_dir.join(".restore-stage-ts-1_2");
+        std::fs::create_dir_all(&leftover).expect("mkdir leftover");
+        std::fs::write(leftover.join("junk"), b"junk").expect("write junk");
+
+        core.restore_flushed_ts_segments(&[blob("ts-1_2", 1)], true)
+            .expect("restore");
+
+        assert_eq!(
+            names(&partition_dir),
+            vec![PARTITION_META.to_string(), "value.col".to_string()],
+            "the swapped-in partition must hold exactly the snapshot's files"
+        );
+        assert_eq!(
+            std::fs::read(partition_dir.join("value.col")).expect("read col"),
+            b"new-col"
+        );
+        assert_eq!(
+            std::fs::read(partition_dir.join(PARTITION_META)).expect("read meta"),
+            b"new-meta"
+        );
+        assert_eq!(
+            names(&segment_dir),
+            vec!["ts-1_2".to_string()],
+            "no staging or backup directory may survive a successful restore"
+        );
+    }
+
+    /// A restore into a collection with no existing partition still commits
+    /// through staging + rename, and the boot-visible directory only appears
+    /// once every file inside it is written.
+    #[test]
+    fn fresh_restore_publishes_a_complete_partition() {
+        let root = TempDir::new().expect("tempdir");
+        let mut core = open_core(root.path());
+
+        core.restore_flushed_ts_segments(&[blob("ts-5_6", 5)], false)
+            .expect("restore");
+
+        let partition_dir = ts_dir(root.path()).join("ts-5_6");
+        assert_eq!(
+            names(&partition_dir),
+            vec![PARTITION_META.to_string(), "value.col".to_string()]
+        );
+        // No `.restore-part` tmp file may be left inside the published dir.
+        assert!(
+            !names(&partition_dir)
+                .iter()
+                .any(|n| n.ends_with(".restore-part")),
+            "atomic write tmp files must be renamed away"
+        );
+
+        let key = (
+            nodedb_types::DatabaseId::new(0),
+            crate::types::TenantId::new(0),
+            "metrics".to_string(),
+        );
+        let registry = core.ts_registries.get(&key).expect("registry registered");
+        assert_eq!(registry.get(5).expect("partition entry").dir_name, "ts-5_6");
     }
 }

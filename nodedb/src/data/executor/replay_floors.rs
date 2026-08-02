@@ -57,12 +57,10 @@
 //!   precisely because ids are not stable across restarts, and replay uses the
 //!   same `add_node_label` / `remove_node_label` entry points as the live
 //!   handler.
-//! * The array engine — `ArrayPut` / `ArrayDelete` replay through
-//!   `put_cells` / `delete_cells`, which write into a map keyed by the encoded
-//!   coordinate inside the tile version named by the record's OWN
-//!   `system_from_ms` (never the local clock — `recovery.rs` states this as an
-//!   invariant). A record whose cell is already in a restored segment therefore
-//!   writes the identical version back rather than appending a second one.
+//! * The array engine — it carries its own per-array floor rather than one
+//!   here: each array's manifest records the `durable_lsn` its flushed segments
+//!   reach, and `replay_array_wal` gates on that. A shared engine-wide field
+//!   would be wrong for it, since arrays flush independently of one another.
 
 use crate::types::Lsn;
 

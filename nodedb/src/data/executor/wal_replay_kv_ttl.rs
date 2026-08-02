@@ -85,6 +85,7 @@ mod tests {
             b"payload",
             5_000,
             Some(6_000),
+            1,
         )
         .expect("encode kv_put with absolute expiry");
 
@@ -122,6 +123,7 @@ mod tests {
             &entries,
             5_000,
             Some(6_000),
+            &[1, 2],
         )
         .expect("encode kv_batch_put with absolute expiry");
 
@@ -150,11 +152,11 @@ mod tests {
         }
     }
 
-    // ── Production WAL-append path emits the extended shape with a plausible
-    //    instant, and preserves the historical shape for non-TTL writes ──
+    // ── Production WAL-append path emits a plausible instant, and no instant
+    //    at all for non-TTL writes ──
 
     #[test]
-    fn production_wal_append_emits_six_element_shape_for_ttl_put() {
+    fn production_wal_append_emits_a_resolved_instant_for_a_ttl_put() {
         let observed_now_ms = crate::engine::kv::current_ms();
 
         let dir = tempfile::tempdir().expect("wal tempdir");
@@ -190,16 +192,22 @@ mod tests {
             .iter()
             .find(|r| r.header.tenant_id == TID)
             .expect("one record");
-        let (disc, _collection, _key, _value, ttl_ms, expire_at_ms) =
-            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(&record.payload)
-                .expect("six-element kv_put shape");
+        let (disc, _collection, _key, _value, ttl_ms, expire_at_ms, surrogate) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32)>(
+                &record.payload,
+            )
+            .expect("current kv_put shape");
         assert_eq!(disc, "kv_put");
         assert_eq!(ttl_ms, 5_000);
-        assert_eq!(expire_at_ms, resolved + 5_000);
+        assert_eq!(expire_at_ms, Some(resolved + 5_000));
+        assert_eq!(
+            surrogate, 1,
+            "the append path must journal the plan's surrogate, not drop it"
+        );
     }
 
     #[test]
-    fn production_wal_append_emits_five_element_shape_for_no_ttl_put() {
+    fn production_wal_append_carries_no_instant_for_a_no_ttl_put() {
         let dir = tempfile::tempdir().expect("wal tempdir");
         let wal = WalManager::open_for_testing(&dir.path().join("wal")).expect("open wal");
         let plan = PhysicalPlan::Kv(KvOp::Put {
@@ -225,9 +233,12 @@ mod tests {
         wal.sync().expect("wal sync");
         let records = wal.replay().expect("wal replay read");
         let record = &records[0];
-        // Historical five-element shape must still decode.
-        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&record.payload)
-            .expect("five-element kv_put shape for a non-TTL write");
+        let (_disc, _collection, _key, _value, _ttl_ms, expire_at_ms, _surrogate) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32)>(
+                &record.payload,
+            )
+            .expect("current kv_put shape for a non-TTL write");
+        assert_eq!(expire_at_ms, None);
     }
 
     // ── Live apply installs the Control-Plane-resolved instant verbatim ──

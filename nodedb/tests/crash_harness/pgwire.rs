@@ -44,6 +44,18 @@ fn is_retryable_schema_change(e: &tokio_postgres::Error) -> bool {
         .is_some_and(|db| db.message().contains("retryable schema change"))
 }
 
+/// Substring of the `calvin-submit` internal error text
+/// (`control/planner/calvin/submit.rs`) surfaced verbatim over pgwire as a
+/// generic `XX000` `DbError` — the same text ILP logs and drops the
+/// connection on (`control/server/ilp_listener.rs`). See
+/// [`CrashHarness::wait_for_calvin_ready`] for why this needs its own probe
+/// instead of relying on `simple_query_ready`'s existing retry of the same
+/// condition.
+fn is_no_sequencer_leader_error(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error()
+        .is_some_and(|db| db.message().contains("no sequencer leader elected yet"))
+}
+
 impl CrashHarness {
     /// Open a fresh pgwire connection, run one statement, and return the
     /// resulting messages. Panics on connect/exec error.
@@ -119,6 +131,87 @@ impl CrashHarness {
                     let reports = super::diagnostics::faultbox_report_section(self.data_dir());
                     panic!(
                         "exec: {e}{}{}\n{reports}{tail}",
+                        e.as_db_error()
+                            .map(|db| format!(" — {}: {}", db.code().code(), db.message()))
+                            .unwrap_or_default(),
+                        self.keep_data_dir_note(),
+                    )
+                }
+            }
+        }
+    }
+
+    /// Block until the Calvin sequencer group has elected a leader and can
+    /// actually serve a Calvin-routed write — not merely until `/healthz`
+    /// reports ready.
+    ///
+    /// `/healthz` is a one-shot boot-phase latch (`control/startup/health.rs`)
+    /// that flips to OK at `GatewayEnable`; the Calvin sequencer is
+    /// deliberately not a data group in that readiness gate, so a write can
+    /// still hit `calvin-submit: no sequencer leader elected yet; cannot
+    /// submit cross-shard transaction` after `/healthz` is already green.
+    /// pgwire callers never see that race because `simple_query_ready`
+    /// above already retries this exact condition — but ILP has no such
+    /// retry (`handle_ilp_connection` in `control/server/ilp_listener.rs`
+    /// logs the error and drops the connection), so an ILP line sent into
+    /// that window is silently dropped with no client-visible signal at
+    /// all. A caller that is about to drive ILP must wait for this
+    /// separately, before sending its first line.
+    ///
+    /// Proves readiness the same way a real client would: by sending an
+    /// actual Calvin-routed write and observing whether it succeeds, not by
+    /// peeking at server-internal state. The probe write lands in
+    /// `__crash_harness_calvin_probe`, a throwaway collection scoped to
+    /// this call and never referenced by any caller's own assertions, so it
+    /// cannot perturb a row count a test checks elsewhere.
+    pub async fn wait_for_calvin_ready(&self, timeout: Duration) {
+        self.exec(
+            "CREATE COLLECTION __crash_harness_calvin_probe \
+             COLUMNS (id TEXT, ts BIGINT TIME_KEY, v FLOAT) \
+             WITH (engine='timeseries')",
+        )
+        .await;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (client, connection) =
+                tokio_postgres::connect(&self.pgwire_conn_str(), tokio_postgres::NoTls)
+                    .await
+                    .expect("connect for calvin readiness probe");
+            let conn_handle = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let result = client
+                .simple_query(
+                    "INSERT INTO __crash_harness_calvin_probe (id, ts, v) \
+                     VALUES ('probe', 0, 0.0)",
+                )
+                .await;
+            drop(client);
+            let _ = conn_handle.await;
+            match result {
+                Ok(_) => return,
+                Err(e) if is_no_sequencer_leader_error(&e) && Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) if is_no_sequencer_leader_error(&e) => {
+                    let tail = super::diagnostics::log_tail_section(&self.server_log());
+                    let reports = super::diagnostics::faultbox_report_section(self.data_dir());
+                    panic!(
+                        "the Calvin sequencer never elected a leader within {timeout:?} — a \
+                         write routed through it still failed with \"no sequencer leader \
+                         elected yet\" this long after boot: {e}{}{}\n{reports}{tail}",
+                        e.as_db_error()
+                            .map(|db| format!(" — {}: {}", db.code().code(), db.message()))
+                            .unwrap_or_default(),
+                        self.keep_data_dir_note(),
+                    )
+                }
+                Err(e) => {
+                    let tail = super::diagnostics::log_tail_section(&self.server_log());
+                    let reports = super::diagnostics::faultbox_report_section(self.data_dir());
+                    panic!(
+                        "calvin readiness probe failed with an error other than the \
+                         sequencer-election race it exists to wait out: {e}{}{}\n{reports}{tail}",
                         e.as_db_error()
                             .map(|db| format!(" — {}: {}", db.code().code(), db.message()))
                             .unwrap_or_default(),

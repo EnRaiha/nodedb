@@ -3,24 +3,20 @@
 //! Pins whether `DROP COLLECTION` actually unlinks a vector/spatial
 //! collection's index checkpoint files, or only appears to.
 //!
-//! The write path shards checkpoints per Data Plane core:
-//! `vector_ckpt_dir()` / `spatial_ckpt_dir()`
-//! (`src/data/executor/vector_checkpoint.rs`, `spatial_checkpoint.rs`) both
-//! resolve to `{data_dir}/{vector,spatial}-ckpt/core-{core_id}/...`. The
-//! reclaim helpers invoked by `DROP COLLECTION`
-//! (`src/data/executor/handlers/reclaim/vector.rs`,
-//! `reclaim/spatial.rs`) instead `read_dir` the FLAT
-//! `{data_dir}/{vector,spatial}-ckpt` directory — one level above the
-//! `core-N` subdirectories the write path actually uses. If that mismatch is
-//! real, `read_dir` on the flat directory only ever yields `core-N` entries,
-//! which have no file extension and are filtered out by the `.ckpt`/`.tmp`
-//! extension check before a single `remove_file` is attempted: the reclaim
-//! call still returns success, but nothing was ever deleted.
+//! The write path shards checkpoints per Data Plane core and publishes each
+//! core's files as a generation:
+//! `{data_dir}/{vector,spatial}-ckpt/core-{core_id}/gen-{n}/...`, with a
+//! sibling `MANIFEST` naming the live generation. The reclaim helpers invoked
+//! by `DROP COLLECTION` have to walk that same shape — every core, then that
+//! core's live generation. A reclaim that reads the wrong level finds only
+//! directory entries, filters them out on the `.ckpt` extension check, and
+//! returns success having deleted nothing: the dropped collection's index then
+//! reloads at every subsequent boot.
 //!
 //! This test forces the server down a single core (the harness always sets
-//! `NODEDB_DATA_PLANE_CORES=1`), so the checkpoint lands at
-//! `vector-ckpt/core-0/...`, then proves whether the dropped collection's
-//! checkpoint file is still there after `DROP COLLECTION` and a restart.
+//! `NODEDB_DATA_PLANE_CORES=1`), then proves whether the dropped collection's
+//! checkpoint file is still anywhere under the engine's checkpoint root after
+//! `DROP COLLECTION` and a restart.
 //!
 //! A SHORT checkpoint interval is used here — the opposite of most crash
 //! tests in this file family, which push the interval out to make a

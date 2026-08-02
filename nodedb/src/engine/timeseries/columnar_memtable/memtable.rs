@@ -82,10 +82,10 @@ impl ColumnarMemtable {
     /// the ceiling lives at the record boundary in the live ingest handler's
     /// admission gate, never here. NOTE: if a structured-`TimeseriesWalBatch`
     /// ingest producer is ever added, its replay must gain that same
-    /// record-boundary flush AND move the `ts_max_ingested_lsn` advance in
-    /// `replay_timeseries_wal` to AFTER a successful dispatch (it is currently
-    /// pre-advanced to the in-flight record), or a mid-record replay flush
-    /// would stamp the partition with the wrong LSN.
+    /// record-boundary flush, or a mid-record replay flush would stamp the
+    /// partition with an LSN covering rows it does not hold.
+    /// `replay_timeseries_wal` advances `ts_max_ingested_lsn` only AFTER a
+    /// record is applied, which is what keeps that stamp honest.
     pub fn ingest_metric(&mut self, series_id: SeriesId, sample: MetricSample) -> IngestResult {
         // Push to timestamp column.
         if let ColumnData::Timestamp(ref mut v) = self.columns[self.schema.timestamp_idx] {

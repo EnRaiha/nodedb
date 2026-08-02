@@ -25,10 +25,17 @@ impl ArrayEngine {
             Some(p) => p,
             None => return Ok(false),
         };
+        // Take the output name from the store's monotonic allocator, the same
+        // one the flush path draws from, so a later flush can never be handed
+        // the compacted segment's name and rename over a live file. A merge
+        // that then fails only burns the number; a gap in the sequence costs
+        // nothing, a reused number costs the segment.
+        let output_id = self.store_mut(id)?.allocate_segment_id();
         let store = self.store(id)?;
         let out = CompactionMerger::run(
             store,
             &plan.inputs,
+            output_id,
             plan.output_level,
             audit_retain_ms,
             now_ms,

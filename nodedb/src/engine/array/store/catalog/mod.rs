@@ -64,11 +64,19 @@ pub enum ArrayStoreError {
 
 impl ArrayStore {
     /// Open or create the array store. Loads the manifest if present;
-    /// mmap's every referenced segment and validates schema_hash.
+    /// opens every referenced segment and validates schema_hash.
+    ///
+    /// `kek` is a constructor input rather than a later `set_kek` call because
+    /// the segments named by the manifest are opened right here: an at-rest
+    /// encrypted (`SEGA`) segment opened without the key is a typed error, so
+    /// installing the key afterwards would make every array that had ever
+    /// flushed unopenable — and the WAL backing those cells is already gone,
+    /// truncated by the checkpoint that the flush advanced.
     pub fn open(
         root: PathBuf,
         schema: Arc<ArraySchema>,
         schema_hash: u64,
+        kek: Option<WalEncryptionKey>,
     ) -> Result<Self, ArrayStoreError> {
         std::fs::create_dir_all(&root).map_err(|e| ArrayStoreError::Io {
             detail: format!("mkdir {root:?}: {e}"),
@@ -87,7 +95,7 @@ impl ArrayStore {
                 &segment_path(&root, &seg.id),
                 seg.id.clone(),
                 schema_hash,
-                None,
+                kek.as_ref(),
             )?;
             if let Some(seq) = parse_segment_seq(&seg.id) {
                 max_seq = max_seq.max(seq);
@@ -102,15 +110,19 @@ impl ArrayStore {
             memtable: Memtable::new(),
             segments,
             next_segment_seq: max_seq + 1,
-            kek: None,
+            kek,
         })
     }
 
-    /// Install the at-rest encryption key for SEGA segment envelopes.
+    /// Install the at-rest encryption key on an already-open store.
     ///
-    /// Call this once from the `ArrayEngine` after opening the WAL key.
-    /// All subsequent `SegmentHandle::open` calls (install, replace) will
-    /// use AES-256-GCM decryption.
+    /// This covers key installation that happens *after* a store is open, so
+    /// it applies to segments opened from here on — flushes, installs, and
+    /// replacements. Handles opened before this call keep their existing
+    /// backing, which is correct: those files were written without the key and
+    /// re-opening them with one would (rightly) be rejected as plaintext.
+    /// Segments named by the manifest at open time take the key through
+    /// [`ArrayStore::open`] instead.
     pub fn set_kek(&mut self, kek: WalEncryptionKey) {
         self.kek = Some(kek);
     }

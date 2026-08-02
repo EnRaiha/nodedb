@@ -83,7 +83,8 @@ pub async fn execute_restore(
     for core_id in 0..manifest.num_cores {
         let core_snap =
             load_core_snapshot(snapshot_store, prefix, core_id, Some(encryption_key)).await?;
-        let (docs, vectors) = restore_core_state(data_dir, core_id, &core_snap)?;
+        let (docs, vectors) =
+            restore_core_state(data_dir, core_id, &core_snap, manifest.meta.end_lsn)?;
         total_docs += docs;
         total_vectors += vectors;
 
@@ -140,6 +141,7 @@ fn restore_core_state(
     data_dir: &Path,
     core_id: usize,
     snap: &CoreSnapshot,
+    snapshot_lsn: Lsn,
 ) -> crate::Result<(u64, u64)> {
     let sparse_path = data_dir.join(format!("sparse/core-{core_id}.redb"));
     if let Some(parent) = sparse_path.parent() {
@@ -157,8 +159,8 @@ fn restore_core_state(
     let edge_store = crate::engine::graph::edge_store::store::EdgeStore::open(&graph_path)?;
     restore_edge_data(&edge_store, &snap.edges)?;
 
-    let vectors = restore_vector_checkpoints(data_dir, core_id, &snap.hnsw_indexes)?;
-    restore_crdt_checkpoints(data_dir, core_id, &snap.crdt_snapshots)?;
+    let vectors = restore_vector_checkpoints(data_dir, core_id, &snap.hnsw_indexes, snapshot_lsn)?;
+    restore_crdt_checkpoints(data_dir, core_id, &snap.crdt_snapshots, snapshot_lsn)?;
 
     Ok((snap.sparse_documents.len() as u64, vectors))
 }
@@ -206,14 +208,26 @@ fn restore_vector_checkpoints(
     data_dir: &Path,
     core_id: usize,
     hnsw_indexes: &[crate::data::snapshot::HnswSnapshot],
+    snapshot_lsn: Lsn,
 ) -> crate::Result<u64> {
     if hnsw_indexes.is_empty() {
         return Ok(0);
     }
 
+    // The restored set REPLACES whatever this core had checkpointed, so it is
+    // published as a new generation rather than written over the live one: the
+    // manifest swing is what makes the whole set visible at once, and it is what
+    // stops an index the snapshot does not carry from surviving the restore.
     let ckpt_dir = crate::data::executor::vector_checkpoint::vector_ckpt_dir(data_dir, core_id);
     // no-objectstore: HNSW checkpoints are mmap'd locally for query hot path.
     std::fs::create_dir_all(&ckpt_dir).map_err(crate::Error::Io)?;
+    let generation = crate::data::executor::vector_checkpoint::next_generation(&ckpt_dir)?;
+    let gen_dir =
+        crate::data::executor::vector_checkpoint::vector_ckpt_gen_dir(&ckpt_dir, generation);
+    if gen_dir.exists() {
+        std::fs::remove_dir_all(&gen_dir).map_err(crate::Error::Io)?;
+    }
+    std::fs::create_dir_all(&gen_dir).map_err(crate::Error::Io)?;
 
     let mut total_vectors = 0u64;
     for idx in hnsw_indexes {
@@ -221,12 +235,17 @@ fn restore_vector_checkpoints(
             "{}:{}:{}:emb",
             idx.database_id, idx.tenant_id, idx.collection
         );
-        let ckpt_path = ckpt_dir.join(format!("{key}.ckpt"));
-        let tmp_path = ckpt_dir.join(format!("{key}.ckpt.tmp"));
-        nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &idx.checkpoint_bytes)
+        let ckpt_path = gen_dir.join(format!("{key}.ckpt"));
+        let tmp_path = gen_dir.join(format!("{key}.ckpt.tmp"));
+        nodedb_wal::segment::write_checkpoint_framed(&tmp_path, &ckpt_path, &idx.checkpoint_bytes)
             .map_err(crate::Error::Wal)?;
         total_vectors += 1;
     }
+    crate::data::executor::vector_checkpoint::publish_vector_generation(
+        &ckpt_dir,
+        generation,
+        snapshot_lsn,
+    )?;
 
     info!(
         collections = hnsw_indexes.len(),
@@ -239,14 +258,24 @@ fn restore_crdt_checkpoints(
     data_dir: &Path,
     core_id: usize,
     crdt_snapshots: &[crate::data::snapshot::CrdtSnapshot],
+    snapshot_lsn: Lsn,
 ) -> crate::Result<()> {
     if crdt_snapshots.is_empty() {
         return Ok(());
     }
 
+    // Published as a new generation, for the same reason the vector half is:
+    // the restored set replaces what this core held, and the manifest swing is
+    // what makes the whole set visible at once.
     let ckpt_dir = crate::data::executor::crdt_checkpoint::crdt_ckpt_dir(data_dir, core_id);
     // no-objectstore: CRDT state lands in a local engine-owned directory.
     std::fs::create_dir_all(&ckpt_dir).map_err(crate::Error::Io)?;
+    let generation = crate::data::executor::crdt_checkpoint::next_generation(&ckpt_dir)?;
+    let gen_dir = crate::data::executor::crdt_checkpoint::crdt_ckpt_gen_dir(&ckpt_dir, generation);
+    if gen_dir.exists() {
+        std::fs::remove_dir_all(&gen_dir).map_err(crate::Error::Io)?;
+    }
+    std::fs::create_dir_all(&gen_dir).map_err(crate::Error::Io)?;
 
     for snap in crdt_snapshots {
         let fname = crate::data::executor::crdt_checkpoint::crdt_ckpt_filename(
@@ -254,11 +283,16 @@ fn restore_crdt_checkpoints(
             snap.tenant_id,
             &snap.collection,
         );
-        let ckpt_path = ckpt_dir.join(&fname);
-        let tmp_path = ckpt_dir.join(format!("{fname}.tmp"));
+        let ckpt_path = gen_dir.join(&fname);
+        let tmp_path = gen_dir.join(format!("{fname}.tmp"));
         nodedb_wal::segment::atomic_write_fsync(&tmp_path, &ckpt_path, &snap.snapshot_bytes)
             .map_err(crate::Error::Wal)?;
     }
+    crate::data::executor::crdt_checkpoint::publish_crdt_generation(
+        &ckpt_dir,
+        generation,
+        snapshot_lsn,
+    )?;
 
     info!(tenants = crdt_snapshots.len(), "CRDT checkpoints restored");
     Ok(())

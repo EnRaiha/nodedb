@@ -300,12 +300,14 @@ impl CoreLoop {
                 record_surrogates,
             )) = decode_batch_record(&record.payload)
             else {
-                tracing::warn!(
-                    core = self.core_id,
-                    lsn = record.header.lsn,
-                    "skipping malformed TimeseriesBatch WAL record"
+                crate::data::executor::replay_abort::abort_replay(
+                    "timeseries",
+                    "decode_batch",
+                    self.core_id,
+                    record.header.lsn,
+                    "TimeseriesBatch payload matched none of the columnar / timeseries \
+                     record shapes",
                 );
-                continue;
             };
 
             let tenant_id = record.header.tenant_id;
@@ -335,13 +337,6 @@ impl CoreLoop {
                     skipped += 1;
                     continue;
                 }
-            }
-
-            // Track the max WAL LSN ingested per collection for flush metadata.
-            if let Some(entry) = self.ts_max_ingested_lsn.get_mut(&key) {
-                *entry = (*entry).max(record_lsn);
-            } else {
-                self.ts_max_ingested_lsn.insert(key.clone(), record_lsn);
             }
 
             let accepted = match kind.as_deref() {
@@ -396,6 +391,24 @@ impl CoreLoop {
             if accepted == 0 {
                 continue;
             }
+
+            // Track the max WAL LSN ingested per collection for flush metadata,
+            // AFTER the record has been applied — never before.
+            //
+            // `flush_ts_collection` stamps the partition it writes with this
+            // scalar, and the stamp claims "every record at or below N is
+            // WHOLLY on disk". Replaying a record can itself fire the
+            // record-boundary flush in the ingest handler (a full tag
+            // dictionary is resolved by flushing first, then taking the record
+            // whole). Advancing the scalar to the in-flight record before that
+            // dispatch stamped the partition with a record it holds NONE of, so
+            // a crash there lost the record outright: the next replay skipped it
+            // against a stamp no partition had earned. Advancing after the
+            // apply keeps the stamp at the last record the memtable fully
+            // absorbed, which is exactly what the flush can honestly claim.
+            let entry = self.ts_max_ingested_lsn.entry(key).or_insert(0);
+            *entry = (*entry).max(record_lsn);
+
             replayed += accepted;
         }
 
@@ -470,6 +483,85 @@ mod tests {
         // with `value_from_msgpack`. `zerompk::to_msgpack_vec(&Value)` would emit
         // a tagged `[variant, payload]` array that the plain reader mis-parses.
         nodedb_types::value_to_msgpack(&nodedb_types::Value::Object(obj)).expect("encode row")
+    }
+
+    /// A `TimeseriesBatch`-typed WAL record carrying one ILP line, in the
+    /// format-preserving five-element timeseries tuple, at `lsn`.
+    fn ilp_wal_record(collection: &str, lsn: u64, tenant_id: u64, line: &str) -> WalRecord {
+        let payload = zerompk::to_msgpack_vec(&(
+            "timeseries".to_string(),
+            collection.to_string(),
+            line.as_bytes().to_vec(),
+            Option::<SyncProvenance>::None,
+            "ilp".to_string(),
+        ))
+        .expect("encode timeseries tuple");
+        WalRecord::new(WalRecordArgs {
+            record_type: RecordType::TimeseriesBatch as u32,
+            lsn,
+            tenant_id,
+            vshard_id: 0,
+            database_id: 0,
+            payload,
+            encryption_key: None,
+            preamble_bytes: None,
+        })
+        .expect("wal record")
+    }
+
+    /// A flush fired from INSIDE replay may only claim the records whose rows it
+    /// actually holds.
+    ///
+    /// Replaying a record can itself fire the ingest handler's record-boundary
+    /// flush — a full tag dictionary is resolved by flushing first, then taking
+    /// the record whole. The partition that flush writes contains everything up
+    /// to the PREVIOUS record and nothing of the in-flight one, so its stamp
+    /// must name the previous record. Stamping it with the in-flight record
+    /// makes boot replay skip a record no partition holds: the rows are gone.
+    ///
+    /// This fails if the `ts_max_ingested_lsn` advance moves back ahead of the
+    /// apply.
+    #[test]
+    fn a_replay_flush_is_stamped_with_the_last_fully_applied_record() {
+        let mut h = make_core();
+        // One tag value fits; the second record's new host has no headroom, so
+        // replaying it flushes at the record boundary before any of its rows
+        // land.
+        h.core.ts_tuning.max_tag_cardinality = 1;
+
+        let records = vec![
+            ilp_wal_record("metrics_stamp", 10, 7, "metrics_stamp,host=h0 value=1i"),
+            ilp_wal_record("metrics_stamp", 11, 7, "metrics_stamp,host=h1 value=2i"),
+        ];
+        h.core
+            .replay_timeseries_wal(&records, 1, &nodedb_wal::TombstoneSet::new());
+
+        let key = (
+            DatabaseId::new(0),
+            TenantId::new(7),
+            "metrics_stamp".to_string(),
+        );
+        let registry = h
+            .core
+            .ts_registries
+            .get(&key)
+            .expect("the record-boundary flush registered a partition");
+        let stamps: Vec<u64> = registry
+            .iter()
+            .map(|(_, entry)| entry.meta.last_flushed_wal_lsn)
+            .collect();
+        assert_eq!(
+            stamps,
+            vec![10],
+            "the partition holds record 10 and none of record 11, so it may \
+             claim only record 10"
+        );
+        assert_eq!(
+            h.core.ts_max_ingested_lsn.get(&key).copied(),
+            Some(11),
+            "record 11 is applied by the end of replay, so the collection's \
+             max ingested LSN must have reached it"
+        );
     }
 
     /// A `TimeseriesBatch`-typed WAL record carrying a map-shaped

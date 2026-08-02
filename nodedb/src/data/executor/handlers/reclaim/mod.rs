@@ -8,17 +8,18 @@
 //! been evicted but before the JSON summary is built, so the handler
 //! picks up per-file byte counts for the `bytes_reclaimed` metric.
 //!
-//! Engines whose persistent state is either shared-redb (document,
-//! document-strict, FTS, graph edges) or per-tenant / in-memory only
-//! (KV, CRDT) are documented inline in the parent handler — no
-//! separate file unlinks are required. The modules here cover the
-//! engines that write per-collection checkpoint or partition files
-//! under `{data_dir}/...`.
+//! Engines whose persistent state is shared-redb (document,
+//! document-strict, FTS, graph edges) or in-memory only (the KV hash
+//! index) are documented inline in the parent handler — no separate
+//! file unlinks are required. The modules here cover the engines that
+//! write per-collection checkpoint or partition files under
+//! `{data_dir}/...`.
 
 use std::path::PathBuf;
 
 use thiserror::Error;
 
+pub mod crdt;
 pub mod sparse_vector;
 pub mod spatial;
 pub mod timeseries;
@@ -35,8 +36,16 @@ pub enum ReclaimError {
         #[source]
         source: std::io::Error,
     },
-    #[error("sparse-vector manifest at '{}' is unreadable: {detail}", path.display())]
-    SparseManifest { path: PathBuf, detail: String },
+    /// A checkpoint manifest could not be read, so the live generation — and
+    /// therefore the set of files this collection still owns — is unknown.
+    /// Fail-closed: releasing the barrier here would let a same-name CREATE
+    /// proceed while the predecessor's files stay reachable.
+    #[error("{engine} manifest at '{}' is unreadable: {detail}", path.display())]
+    Manifest {
+        engine: &'static str,
+        path: PathBuf,
+        detail: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ReclaimError>;

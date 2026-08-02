@@ -15,6 +15,7 @@ mod graph_label_checkpoint;
 pub mod handlers;
 pub(crate) mod kv_checkpoint;
 pub(super) mod msgpack_utils;
+pub(crate) mod replay_abort;
 pub(crate) mod replay_floors;
 pub mod response_codec;
 mod scan_normalize;

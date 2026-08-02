@@ -10,6 +10,9 @@
 //! `wal_replay_kv_field.rs`. The `kv_register_index` / `kv_drop_index`
 //! secondary-index replay lives in `wal_replay_kv_index.rs`.
 //!
+//! The absolute-overwrite `kv_put` / `kv_batch_put` arms live in `kv_put.rs`,
+//! which also documents why those records carry the row surrogate.
+//!
 //! Split by engine concern: `kv` (`replay_kv_wal`), CRDT record decoders
 //! (`crdt`, `crdt_list`, and `crdt_doc`) coordinated by `crdt_ordered` into
 //! one global-LSN replay stream, and `array` (`ensure_array_open_for_replay` +
@@ -21,3 +24,4 @@ mod crdt_doc;
 mod crdt_list;
 mod crdt_ordered;
 mod kv;
+pub(in crate::data::executor) mod kv_put;

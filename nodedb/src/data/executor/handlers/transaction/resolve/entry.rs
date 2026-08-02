@@ -503,22 +503,16 @@ mod tests {
         })
     }
 
-    /// Decode a six-element `kv_put` redo payload.
-    fn decode_kv_put6(payload: &[u8]) -> (String, Vec<u8>, Vec<u8>, u64, u64) {
-        let (disc, collection, key, value, ttl_ms, expire_at_ms) =
-            zerompk::from_msgpack::<(String, String, Vec<u8>, Vec<u8>, u64, u64)>(payload)
-                .expect("decode 6-element kv_put");
+    /// Decode a `kv_put` redo payload in the shape resolve emits.
+    #[allow(clippy::type_complexity)]
+    fn decode_kv_put(payload: &[u8]) -> (String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32) {
+        let (disc, collection, key, value, ttl_ms, expire_at_ms, surrogate) =
+            zerompk::from_msgpack::<(String, String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32)>(
+                payload,
+            )
+            .expect("decode kv_put");
         assert_eq!(disc, "kv_put");
-        (collection, key, value, ttl_ms, expire_at_ms)
-    }
-
-    /// Decode a five-element `kv_put` redo payload.
-    fn decode_kv_put5(payload: &[u8]) -> (String, Vec<u8>, Vec<u8>, u64) {
-        let (disc, collection, key, value, ttl_ms) =
-            zerompk::from_msgpack::<(String, String, Vec<u8>, Vec<u8>, u64)>(payload)
-                .expect("decode 5-element kv_put");
-        assert_eq!(disc, "kv_put");
-        (collection, key, value, ttl_ms)
+        (collection, key, value, ttl_ms, expire_at_ms, surrogate)
     }
 
     #[test]
@@ -561,7 +555,8 @@ mod tests {
         assert_eq!(redo.ops.len(), 1, "one staged KV row -> one sub-record");
         assert_eq!(redo.ops[0].record_type, RecordType::Put as u32);
 
-        let (collection, key, value, _ttl) = decode_kv_put5(&redo.ops[0].payload);
+        let (collection, key, value, _ttl, _expire, _surrogate) =
+            decode_kv_put(&redo.ops[0].payload);
         assert_eq!(collection, "counters");
         assert_eq!(key, b"c");
         // The emitted value is the overlay's absolute post-image, and it decodes
@@ -575,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn put_with_ttl_resolves_to_six_element_absolute_expiry() {
+    fn put_with_ttl_resolves_to_an_absolute_expiry() {
         let (mut core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(2);
@@ -599,16 +594,26 @@ mod tests {
         assert_eq!(redo.ops.len(), 1);
         assert_eq!(redo.ops[0].record_type, RecordType::Put as u32);
 
-        let (collection, key, value, ttl_ms, got_expire) = decode_kv_put6(&redo.ops[0].payload);
+        let (collection, key, value, ttl_ms, got_expire, surrogate) =
+            decode_kv_put(&redo.ops[0].payload);
         assert_eq!(collection, "sessions");
         assert_eq!(key, b"s1");
         assert_eq!(value, b"v1");
         assert_eq!(ttl_ms, 0, "relative ttl_ms is vestigial and set to 0");
-        assert_eq!(got_expire, expire_at, "absolute expiry carried verbatim");
+        assert_eq!(
+            got_expire,
+            Some(expire_at),
+            "absolute expiry carried verbatim"
+        );
+        assert_eq!(
+            surrogate, 7,
+            "the redo record must carry the overlay's surrogate so replay \
+             restores the same identity the live write bound"
+        );
     }
 
     #[test]
-    fn put_without_ttl_resolves_to_five_element_form() {
+    fn put_without_ttl_resolves_without_an_expiry_instant() {
         let (mut core, _dir) = make_core();
         let task = make_task();
         let txn = TxnId::new(3);
@@ -620,20 +625,14 @@ mod tests {
         let redo = decode_redo(&resp);
         assert_eq!(redo.ops.len(), 1);
 
-        // The six-element decode must reject the payload (strict array length),
-        // proving the five-element form was emitted.
-        assert!(
-            zerompk::from_msgpack::<(String, String, Vec<u8>, Vec<u8>, u64, u64)>(
-                &redo.ops[0].payload
-            )
-            .is_err(),
-            "no-TTL put must emit the five-element form"
-        );
-        let (collection, key, value, ttl_ms) = decode_kv_put5(&redo.ops[0].payload);
+        let (collection, key, value, ttl_ms, expire_at_ms, surrogate) =
+            decode_kv_put(&redo.ops[0].payload);
         assert_eq!(collection, "kvc");
         assert_eq!(key, b"k9");
         assert_eq!(value, b"body");
         assert_eq!(ttl_ms, 0);
+        assert_eq!(expire_at_ms, None, "no-TTL put carries no expiry instant");
+        assert_eq!(surrogate, 9);
     }
 
     #[test]

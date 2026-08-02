@@ -17,10 +17,39 @@ impl PartitionRegistry {
     }
 
     /// Import persisted registry state.
+    ///
+    /// Callers that already hold a key issued by this registry (re-import of an
+    /// export) use this. Anything registering a NEWLY written partition must go
+    /// through [`PartitionRegistry::insert_partition`], which cannot displace a
+    /// partition that happens to share a start timestamp.
     pub fn import(&mut self, entries: Vec<(i64, PartitionEntry)>) {
         for (start, entry) in entries {
             self.partitions.insert(start, entry);
         }
+    }
+
+    /// Register a newly written partition, returning the key it was filed under.
+    ///
+    /// The map key is a handle ordered by start timestamp; nothing resolves a
+    /// partition by computing a boundary from it — every consumer either
+    /// iterates the map or reuses a key the map handed back. Two partitions can
+    /// legitimately share a `min_ts` (late or duplicate-timestamp ingest), so
+    /// filing strictly under `min_ts` would silently drop one of them while its
+    /// rows sit on disk and a checkpoint has already reported them durable. A
+    /// colliding partition takes the next free slot instead.
+    ///
+    /// Re-registering the SAME directory is idempotent — that is a restore or a
+    /// boot rescan seeing a partition it already knows, not a second partition.
+    pub fn insert_partition(&mut self, entry: PartitionEntry) -> i64 {
+        let mut key = entry.meta.min_ts;
+        while let Some(existing) = self.partitions.get(&key) {
+            if existing.dir_name == entry.dir_name || key == i64::MAX {
+                break;
+            }
+            key += 1;
+        }
+        self.partitions.insert(key, entry);
+        key
     }
 
     /// Persist the registry to a JSON file (atomic via write + rename).

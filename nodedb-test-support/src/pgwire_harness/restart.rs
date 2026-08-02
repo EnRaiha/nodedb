@@ -200,7 +200,11 @@ impl TestServer {
             s.governor = init_test_memory_governor();
         }
         let shared = shared;
-        nodedb::bootstrap::credentials::replay_surrogate_wal(&shared, &wal_records);
+        nodedb::bootstrap::credentials::replay_surrogate_wal(
+            &shared,
+            &wal_records,
+            &replay_tombstones,
+        );
         // Restore in-memory synonym registry from the persisted catalog.
         let catalog = shared.credentials.catalog();
         if let Err(e) = shared.synonym_registry.reload_from_catalog(catalog) {

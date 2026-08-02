@@ -16,6 +16,10 @@ pub(crate) struct DataPlaneBootstrap {
     pub(crate) dispatcher: Dispatcher,
     pub(crate) wal: Arc<nodedb::wal::WalManager>,
     pub(crate) wal_records: Arc<[nodedb_wal::WalRecord]>,
+    /// Collection tombstones recovered alongside the WAL tail. Shared with the
+    /// surrogate-replay pass so a dropped collection's `(pk → surrogate)` binds
+    /// are not resurrected into the catalog.
+    pub(crate) replay_tombstones: Arc<nodedb_wal::TombstoneSet>,
     pub(crate) num_cores: usize,
     pub(crate) event_consumers: Vec<nodedb::event::bus::EventConsumerRx>,
     pub(crate) system_metrics: Arc<nodedb::control::metrics::SystemMetrics>,
@@ -164,6 +168,7 @@ pub(crate) async fn bootstrap_data_plane(
         dispatcher,
         wal,
         wal_records,
+        replay_tombstones: Arc::new(replay_tombstones),
         num_cores,
         event_consumers,
         system_metrics,

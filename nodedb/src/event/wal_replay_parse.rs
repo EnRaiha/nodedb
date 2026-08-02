@@ -25,6 +25,61 @@ use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
 /// the label-delta payload placed on whichever side its `WriteOp` implies.
 type LabelEventFields = (WriteOp, Option<Arc<[u8]>>, Option<Arc<[u8]>>);
 
+/// The `(collection, key, value)` an event needs out of a `kv_put` record, in
+/// whichever of its three decodable arities the record was written.
+fn decode_kv_put_event_fields(payload: &[u8]) -> Option<(String, Vec<u8>, Vec<u8>)> {
+    if let Ok((disc, collection, key, value, _ttl, _expire, _surrogate)) =
+        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32)>(payload)
+        && disc == "kv_put"
+    {
+        return Some((collection, key, value));
+    }
+    if let Ok((disc, collection, key, value, _ttl, _expire)) =
+        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(payload)
+        && disc == "kv_put"
+    {
+        return Some((collection, key, value));
+    }
+    if let Ok((disc, collection, key, value, _ttl)) =
+        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(payload)
+        && disc == "kv_put"
+    {
+        return Some((collection, key, value));
+    }
+    None
+}
+
+/// The `(collection, entries)` an event needs out of a `kv_batch_put` record,
+/// in whichever of its three decodable arities the record was written.
+#[allow(clippy::type_complexity)]
+fn decode_kv_batch_put_event_fields(payload: &[u8]) -> Option<(String, Vec<(Vec<u8>, Vec<u8>)>)> {
+    if let Ok((disc, collection, entries, _ttl, _expire, _surrogates)) = zerompk::from_msgpack::<(
+        &str,
+        String,
+        Vec<(Vec<u8>, Vec<u8>)>,
+        u64,
+        Option<u64>,
+        Vec<u32>,
+    )>(payload)
+        && disc == "kv_batch_put"
+    {
+        return Some((collection, entries));
+    }
+    if let Ok((disc, collection, entries, _ttl, _expire)) =
+        zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64, u64)>(payload)
+        && disc == "kv_batch_put"
+    {
+        return Some((collection, entries));
+    }
+    if let Ok((disc, collection, entries, _ttl)) =
+        zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(payload)
+        && disc == "kv_batch_put"
+    {
+        return Some((collection, entries));
+    }
+    None
+}
+
 /// Parse a `RecordType::Put` payload. May be a document put, KV put, or
 /// graph edge put — distinguished by the MessagePack structure.
 pub(super) fn parse_put_record(
@@ -35,11 +90,11 @@ pub(super) fn parse_put_record(
     lsn: Lsn,
     sequence: &mut u64,
 ) -> Option<WriteEvent> {
-    // Try KV put first: ("kv_put", collection, key, value, ttl_ms)
-    if let Ok((disc, collection, key, value, _ttl_ms)) =
-        zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(payload)
-        && disc == "kv_put"
-    {
+    // Try KV put first. Three arities decode: the current
+    // `("kv_put", collection, key, value, ttl_ms, expire_at_ms, surrogate)` and
+    // the two that predate the carried surrogate. The event stream keys on the
+    // raw KV key, so only `collection`, `key`, and `value` are read out.
+    if let Some((collection, key, value)) = decode_kv_put_event_fields(payload) {
         *sequence += 1;
         let key_str = String::from_utf8_lossy(&key);
         let (system_time_ms, valid_time_ms) =
@@ -66,11 +121,8 @@ pub(super) fn parse_put_record(
         });
     }
 
-    // Try KV batch put: ("kv_batch_put", collection, entries, ttl_ms)
-    if let Ok((disc, collection, entries, _ttl_ms)) =
-        zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(payload)
-        && disc == "kv_batch_put"
-    {
+    // Try KV batch put — same three-arity story as the point put above.
+    if let Some((collection, entries)) = decode_kv_batch_put_event_fields(payload) {
         // Emit one event for the batch (BulkInsert).
         *sequence += 1;
         return Some(WriteEvent {

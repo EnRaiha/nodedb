@@ -138,6 +138,7 @@ async fn server_main() -> anyhow::Result<()> {
         dispatcher,
         wal,
         wal_records,
+        replay_tombstones,
         num_cores,
         event_consumers,
         system_metrics,
@@ -170,7 +171,14 @@ async fn server_main() -> anyhow::Result<()> {
         },
     )?;
 
-    post_open::run(&shared, &wal_records, &config, &catalog_gate).await?;
+    post_open::run(
+        &shared,
+        &wal_records,
+        &replay_tombstones,
+        &config,
+        &catalog_gate,
+    )
+    .await?;
 
     let (shutdown_rx, shutdown_bus, _loop_registry_shutdown) =
         shutdown_wiring::wire_shutdown_bus(&shared, &system_metrics);

@@ -92,7 +92,13 @@ fn kill_restart_recovers_all_bindings_and_hwm() {
     ));
 
     let records = wal.replay().unwrap();
-    let stats = replay_surrogate_records(&records, &catalog, &registry).unwrap();
+    let stats = replay_surrogate_records(
+        &records,
+        &catalog,
+        &registry,
+        &nodedb_wal::TombstoneSet::new(),
+    )
+    .unwrap();
     assert_eq!(
         stats.binds,
         expected.len(),
@@ -192,7 +198,13 @@ fn kill_restart_after_hwm_flush_threshold_recovers_via_alloc_record() {
     ));
 
     let records = wal.replay().unwrap();
-    let stats = replay_surrogate_records(&records, &catalog, &registry).unwrap();
+    let stats = replay_surrogate_records(
+        &records,
+        &catalog,
+        &registry,
+        &nodedb_wal::TombstoneSet::new(),
+    )
+    .unwrap();
     assert!(stats.allocs >= 1, "expected ≥1 SurrogateAlloc in WAL");
     assert_eq!(stats.binds, total);
 

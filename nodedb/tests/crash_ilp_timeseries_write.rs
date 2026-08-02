@@ -22,6 +22,17 @@
 //! reflected in a `COUNT(*)`) could be mistaken for data loss after the
 //! crash. Proving the read path works BEFORE any crash is involved isolates
 //! the post-crash assertion to durability alone.
+//!
+//! ILP itself has no retry for a transient `no sequencer leader elected
+//! yet` error on the Calvin submit path — `handle_ilp_connection`
+//! (`control/server/ilp_listener.rs`) just logs it and drops the
+//! connection, unlike the pgwire path, which retries the same condition
+//! (`crash_harness::pgwire::simple_query_ready`). That is a real
+//! server-side gap, not something this test file should paper over
+//! silently: both tests below call `CrashHarness::wait_for_calvin_ready`
+//! after `wait_ready` and before their first ILP line specifically to work
+//! around it, so a write into that startup window is never mistaken for
+//! the durability bug this file exists to probe.
 
 mod crash_harness;
 
@@ -106,6 +117,11 @@ async fn ilp_write_visible_to_readers_survives_kill_9() {
     let spawned_at = Instant::now();
     h.spawn();
     h.wait_ready(Duration::from_secs(20));
+    // `/healthz` (just polled above) reports ready before the Calvin
+    // sequencer has necessarily elected a leader, and the ILP write below
+    // has no retry for that race — see the file-level doc comment. Wait for
+    // an actual Calvin-routed write to succeed before sending any ILP line.
+    h.wait_for_calvin_ready(Duration::from_secs(20)).await;
 
     h.exec(
         "CREATE COLLECTION crash_ilp_ts \
@@ -242,6 +258,9 @@ async fn many_calvin_writes_survive_immediate_kill_9() {
     let spawned_at = Instant::now();
     h.spawn();
     h.wait_ready(Duration::from_secs(20));
+    // Same rationale as the single-write test above: `/healthz` does not
+    // imply Calvin has a leader yet, and ILP has no retry for that race.
+    h.wait_for_calvin_ready(Duration::from_secs(20)).await;
 
     h.exec(&format!(
         "CREATE COLLECTION {BULK_COLLECTION} \

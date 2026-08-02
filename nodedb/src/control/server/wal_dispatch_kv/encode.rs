@@ -13,29 +13,45 @@ fn encode<T: zerompk::ToMessagePack>(context: &str, value: &T) -> crate::Result<
     })
 }
 
-/// Encode a `kv_put` WAL payload in the shape the KV replay path decodes.
+/// Encode a `kv_put` WAL payload in the shape the KV replay path decodes:
+/// `("kv_put", collection, key, value, ttl_ms, expire_at_ms, surrogate)`.
 ///
-/// With `expire_at_ms = None` this produces the historical five-element tuple
-/// `("kv_put", collection, key, value, ttl_ms)` byte-for-byte, so the autocommit
-/// path's on-disk format is unchanged. With `Some(instant)` it appends the
-/// resolved absolute expiry as a sixth element — an additive, trailing field a
-/// redo sub-record uses to carry the exact expiry instant, so replay need not
-/// recompute `now_ms + ttl_ms` (which would drift). Payloads without the sixth
-/// element remain valid; the relative `ttl_ms` is always retained.
+/// `expire_at_ms` is the absolute instant the Control Plane resolved, carried
+/// verbatim so replay need not recompute `now_ms + ttl_ms` (which would drift
+/// the expiry forward by the crash-to-restart delay); `None` means the write
+/// carried no TTL. `surrogate` is the row's stable cross-engine identity.
+///
+/// The surrogate travels in the record because replay runs on a Data Plane core
+/// with no Control Plane catalog handle: without it a replayed row lands with
+/// identity `0`, which `KvEngine::key_for_surrogate` cannot resolve and which
+/// the clone-snapshot visibility rule reads as "always visible". The KV
+/// checkpoint already persists real surrogates, so a crash would otherwise
+/// leave one table holding both kinds of row.
+///
+/// This seven-element shape is the only one written. Two shorter shapes remain
+/// decodable on replay because a WAL tail written before the surrogate was
+/// carried can still be retained across the upgrade; zerompk's strict
+/// array-length check means the three never alias.
 pub(crate) fn encode_kv_put(
     collection: &str,
     key: &[u8],
     value: &[u8],
     ttl_ms: u64,
     expire_at_ms: Option<u64>,
+    surrogate: u32,
 ) -> crate::Result<Vec<u8>> {
-    match expire_at_ms {
-        None => encode("put", &("kv_put", collection, key, value, ttl_ms)),
-        Some(expire_at_ms) => encode(
-            "put",
-            &("kv_put", collection, key, value, ttl_ms, expire_at_ms),
+    encode(
+        "put",
+        &(
+            "kv_put",
+            collection,
+            key,
+            value,
+            ttl_ms,
+            expire_at_ms,
+            surrogate,
         ),
-    }
+    )
 }
 
 /// Encode a `kv_insert_on_conflict_update` WAL payload in the shape the KV
@@ -234,29 +250,32 @@ pub(crate) fn encode_kv_delete(collection: &str, keys: &[Vec<u8>]) -> crate::Res
     encode("delete", &("kv_delete", collection, keys))
 }
 
-/// Encode a `kv_batch_put` WAL payload in the shape the KV replay path decodes.
+/// Encode a `kv_batch_put` WAL payload in the shape the KV replay path decodes:
+/// `("kv_batch_put", collection, entries, ttl_ms, expire_at_ms, surrogates)`.
 ///
-/// With `expire_at_ms = None` this produces the historical four-element tuple
-/// `("kv_batch_put", collection, entries, ttl_ms)` byte-for-byte. With
-/// `Some(instant)` it appends the resolved absolute expiry as a fifth element
-/// — the same additive, trailing-field convention `encode_kv_put` uses — so
-/// replay installs the exact instant the Control Plane resolved instead of
-/// recomputing `now_ms + ttl_ms` at replay time (which would drift by the
-/// crash-to-restart delay). zerompk's strict array-length check means the two
-/// shapes never alias.
+/// `surrogates` is positional against `entries` — one stable cross-engine
+/// identity per entry, for the same reason [`encode_kv_put`] carries one. The
+/// two shorter shapes stay decodable on replay for a tail written before the
+/// surrogates were carried; zerompk's strict array-length check means the three
+/// never alias.
 pub(crate) fn encode_kv_batch_put(
     collection: &str,
     entries: &[(Vec<u8>, Vec<u8>)],
     ttl_ms: u64,
     expire_at_ms: Option<u64>,
+    surrogates: &[u32],
 ) -> crate::Result<Vec<u8>> {
-    match expire_at_ms {
-        None => encode("batch put", &("kv_batch_put", collection, entries, ttl_ms)),
-        Some(expire_at_ms) => encode(
-            "batch put",
-            &("kv_batch_put", collection, entries, ttl_ms, expire_at_ms),
+    encode(
+        "batch put",
+        &(
+            "kv_batch_put",
+            collection,
+            entries,
+            ttl_ms,
+            expire_at_ms,
+            surrogates,
         ),
-    }
+    )
 }
 
 /// Encode a `kv_expire` WAL payload: `("kv_expire", collection, key, ttl_ms,
@@ -420,64 +439,89 @@ mod tests {
     };
 
     #[test]
-    fn kv_put_without_expire_at_matches_historical_shape() {
-        let entry = encode_kv_put("users", b"k1", b"v1", 5_000, None).unwrap();
+    fn kv_put_carries_the_row_surrogate() {
+        let entry = encode_kv_put("users", b"k1", b"v1", 5_000, None, 77).unwrap();
 
-        // Byte-identical to the historical five-element tuple encoding.
-        let expected =
-            zerompk::to_msgpack_vec(&("kv_put", "users", b"k1", b"v1", 5_000u64)).unwrap();
-        assert_eq!(entry, expected);
-
-        // Decodes with the KV replay path's five-element tuple.
-        let (disc, collection, key, value, ttl_ms) =
-            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&entry).unwrap();
+        let (disc, collection, key, value, ttl_ms, expire_at_ms, surrogate) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32)>(
+                &entry,
+            )
+            .unwrap();
         assert_eq!(disc, "kv_put");
         assert_eq!(collection, "users");
         assert_eq!(key, b"k1");
         assert_eq!(value, b"v1");
         assert_eq!(ttl_ms, 5_000);
-    }
+        assert_eq!(expire_at_ms, None);
+        assert_eq!(
+            surrogate, 77,
+            "the row's cross-engine identity must survive a crash, not be \
+             re-derived as zero on replay"
+        );
 
-    #[test]
-    fn kv_put_with_expire_at_carries_absolute_instant() {
-        let entry = encode_kv_put("users", b"k1", b"v1", 5_000, Some(1_700_000_000_000)).unwrap();
-
-        // The six-element tuple carries the resolved absolute expiry.
-        let (disc, collection, key, value, ttl_ms, expire_at_ms) =
-            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(&entry).unwrap();
-        assert_eq!(disc, "kv_put");
-        assert_eq!(collection, "users");
-        assert_eq!(key, b"k1");
-        assert_eq!(value, b"v1");
-        assert_eq!(ttl_ms, 5_000);
-        assert_eq!(expire_at_ms, 1_700_000_000_000);
-
-        // The historical five-element decode rejects the extended payload
-        // (strict array-length check), so the two shapes never alias.
+        // Neither pre-surrogate shape may alias the current one — replay tries
+        // all three and must never mistake one for another.
+        assert!(zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&entry).is_err());
         assert!(
-            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&entry).is_err(),
-            "extended payload must not decode as the five-element tuple"
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(&entry).is_err()
         );
     }
 
     #[test]
-    fn kv_batch_put_without_expire_at_matches_historical_shape() {
+    fn kv_put_with_expire_at_carries_absolute_instant() {
+        let entry =
+            encode_kv_put("users", b"k1", b"v1", 5_000, Some(1_700_000_000_000), 9).unwrap();
+
+        let (disc, collection, key, value, ttl_ms, expire_at_ms, surrogate) =
+            zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, Option<u64>, u32)>(
+                &entry,
+            )
+            .unwrap();
+        assert_eq!(disc, "kv_put");
+        assert_eq!(collection, "users");
+        assert_eq!(key, b"k1");
+        assert_eq!(value, b"v1");
+        assert_eq!(ttl_ms, 5_000);
+        assert_eq!(expire_at_ms, Some(1_700_000_000_000));
+        assert_eq!(surrogate, 9);
+    }
+
+    #[test]
+    fn kv_batch_put_carries_one_surrogate_per_entry() {
         let entries = vec![
             (b"k1".to_vec(), b"v1".to_vec()),
             (b"k2".to_vec(), b"v2".to_vec()),
         ];
-        let entry = encode_kv_batch_put("users", &entries, 5_000, None).unwrap();
+        let entry = encode_kv_batch_put("users", &entries, 5_000, None, &[3, 4]).unwrap();
 
-        let expected =
-            zerompk::to_msgpack_vec(&("kv_batch_put", "users", &entries, 5_000u64)).unwrap();
-        assert_eq!(entry, expected);
-
-        let (disc, collection, decoded_entries, ttl_ms) =
-            zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(&entry).unwrap();
+        let (disc, collection, decoded_entries, ttl_ms, expire_at_ms, surrogates) =
+            zerompk::from_msgpack::<(
+                &str,
+                String,
+                Vec<(Vec<u8>, Vec<u8>)>,
+                u64,
+                Option<u64>,
+                Vec<u32>,
+            )>(&entry)
+            .unwrap();
         assert_eq!(disc, "kv_batch_put");
         assert_eq!(collection, "users");
         assert_eq!(decoded_entries, entries);
         assert_eq!(ttl_ms, 5_000);
+        assert_eq!(expire_at_ms, None);
+        assert_eq!(
+            surrogates,
+            vec![3, 4],
+            "surrogates are positional against entries"
+        );
+
+        assert!(
+            zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(&entry).is_err()
+        );
+        assert!(
+            zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64, u64)>(&entry)
+                .is_err()
+        );
     }
 
     #[test]
@@ -486,21 +530,25 @@ mod tests {
             (b"k1".to_vec(), b"v1".to_vec()),
             (b"k2".to_vec(), b"v2".to_vec()),
         ];
-        let entry = encode_kv_batch_put("users", &entries, 5_000, Some(1_700_000_000_000)).unwrap();
+        let entry = encode_kv_batch_put("users", &entries, 5_000, Some(1_700_000_000_000), &[3, 4])
+            .unwrap();
 
-        let (disc, collection, decoded_entries, ttl_ms, expire_at_ms) =
-            zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64, u64)>(&entry)
-                .unwrap();
+        let (disc, collection, decoded_entries, ttl_ms, expire_at_ms, surrogates) =
+            zerompk::from_msgpack::<(
+                &str,
+                String,
+                Vec<(Vec<u8>, Vec<u8>)>,
+                u64,
+                Option<u64>,
+                Vec<u32>,
+            )>(&entry)
+            .unwrap();
         assert_eq!(disc, "kv_batch_put");
         assert_eq!(collection, "users");
         assert_eq!(decoded_entries, entries);
         assert_eq!(ttl_ms, 5_000);
-        assert_eq!(expire_at_ms, 1_700_000_000_000);
-
-        assert!(
-            zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(&entry).is_err(),
-            "extended payload must not decode as the four-element tuple"
-        );
+        assert_eq!(expire_at_ms, Some(1_700_000_000_000));
+        assert_eq!(surrogates, vec![3, 4]);
     }
 
     #[test]

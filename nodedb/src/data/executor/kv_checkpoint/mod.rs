@@ -21,7 +21,7 @@
 //!
 //! The per-core directory is required because `data_dir` is shared across cores
 //! and each core only owns the collections routed to its vShards. Filenames
-//! mirror the CRDT checkpoint scheme (`crdt_checkpoint.rs`): the collection is
+//! mirror the CRDT checkpoint scheme (`crdt_checkpoint/`): the collection is
 //! hex-encoded so the `-coll-` separator can never collide with a name
 //! containing `-`, `/` or `:`.
 //!

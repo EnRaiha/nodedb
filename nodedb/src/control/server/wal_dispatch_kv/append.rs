@@ -82,30 +82,32 @@ pub fn wal_append_kv_op(
             key,
             value,
             ttl_ms,
-            surrogate: _,
-        } => {
-            let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
-            resolved_now_ms = now_ms;
-            let entry = encode_kv_put(collection, key, value, *ttl_ms, expire_at_ms)?;
-            Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
+            surrogate,
         }
-        KvOp::Insert {
+        | KvOp::Insert {
             collection,
             key,
             value,
             ttl_ms,
-            surrogate: _,
+            surrogate,
         }
         | KvOp::InsertIfAbsent {
             collection,
             key,
             value,
             ttl_ms,
-            surrogate: _,
+            surrogate,
         } => {
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
-            let entry = encode_kv_put(collection, key, value, *ttl_ms, expire_at_ms)?;
+            let entry = encode_kv_put(
+                collection,
+                key,
+                value,
+                *ttl_ms,
+                expire_at_ms,
+                surrogate.as_u32(),
+            )?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::InsertOnConflictUpdate {
@@ -136,11 +138,12 @@ pub fn wal_append_kv_op(
             collection,
             entries,
             ttl_ms,
-            surrogates: _,
+            surrogates,
         } => {
             let (now_ms, expire_at_ms) = resolve_expiry(*ttl_ms, now_override);
             resolved_now_ms = now_ms;
-            let entry = encode_kv_batch_put(collection, entries, *ttl_ms, expire_at_ms)?;
+            let raw: Vec<u32> = surrogates.iter().map(|s| s.as_u32()).collect();
+            let entry = encode_kv_batch_put(collection, entries, *ttl_ms, expire_at_ms, &raw)?;
             Some(wal.append_put(tenant_id, vshard_id, database_id, &entry)?)
         }
         KvOp::Expire {

@@ -18,6 +18,7 @@
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request};
 use crate::data::executor::core_loop::CoreLoop;
+use crate::data::executor::replay_abort::abort_replay;
 use crate::data::executor::task::{ExecutionTask, TaskState};
 use crate::types::{DatabaseId, ReadConsistency};
 use nodedb_physical::physical_plan::TextOp;
@@ -110,16 +111,13 @@ impl CoreLoop {
             if is_fts_index {
                 let payload = match FtsIndexPayload::from_bytes(&record.payload) {
                     Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            core = self.core_id,
-                            lsn = record_lsn,
-                            error = %e,
-                            "WAL FTS replay: failed to decode FtsIndexPayload; skipping"
-                        );
-                        skipped += 1;
-                        continue;
-                    }
+                    Err(e) => abort_replay(
+                        "fts",
+                        "decode_index",
+                        self.core_id,
+                        record_lsn,
+                        &format!("FtsIndexPayload could not be decoded: {e}"),
+                    ),
                 };
 
                 if tombstones.is_tombstoned(
@@ -135,16 +133,16 @@ impl CoreLoop {
                 // Re-derive surrogate from the hex doc_id stored in the WAL.
                 let surrogate = match u32::from_str_radix(&payload.doc_id, 16) {
                     Ok(raw) => Surrogate::new(raw),
-                    Err(_) => {
-                        tracing::warn!(
-                            core = self.core_id,
-                            lsn = record_lsn,
-                            doc_id = %payload.doc_id,
-                            "WAL FTS replay: doc_id is not a valid hex surrogate; skipping"
-                        );
-                        skipped += 1;
-                        continue;
-                    }
+                    Err(e) => abort_replay(
+                        "fts",
+                        "doc_id",
+                        self.core_id,
+                        record_lsn,
+                        &format!(
+                            "doc_id '{}' is not the hex surrogate the index path writes: {e}",
+                            payload.doc_id
+                        ),
+                    ),
                 };
 
                 let prov = payload.provenance.clone();
@@ -175,30 +173,29 @@ impl CoreLoop {
                 );
 
                 if response.status != crate::bridge::envelope::Status::Ok {
-                    tracing::warn!(
-                        core = self.core_id,
-                        collection = %payload.collection,
-                        lsn = record_lsn,
-                        "WAL FTS replay: FtsIndex handler returned error; skipping"
+                    abort_replay(
+                        "fts",
+                        "index_handler",
+                        self.core_id,
+                        record_lsn,
+                        &format!(
+                            "the FtsIndexDoc handler rejected a committed write into '{}'",
+                            payload.collection
+                        ),
                     );
-                    skipped += 1;
-                    continue;
                 }
                 indexed += 1;
             } else {
                 // FtsDelete
                 let payload = match FtsDeletePayload::from_bytes(&record.payload) {
                     Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            core = self.core_id,
-                            lsn = record_lsn,
-                            error = %e,
-                            "WAL FTS replay: failed to decode FtsDeletePayload; skipping"
-                        );
-                        skipped += 1;
-                        continue;
-                    }
+                    Err(e) => abort_replay(
+                        "fts",
+                        "decode_delete",
+                        self.core_id,
+                        record_lsn,
+                        &format!("FtsDeletePayload could not be decoded: {e}"),
+                    ),
                 };
 
                 if tombstones.is_tombstoned(
@@ -213,16 +210,16 @@ impl CoreLoop {
 
                 let surrogate = match u32::from_str_radix(&payload.doc_id, 16) {
                     Ok(raw) => Surrogate::new(raw),
-                    Err(_) => {
-                        tracing::warn!(
-                            core = self.core_id,
-                            lsn = record_lsn,
-                            doc_id = %payload.doc_id,
-                            "WAL FTS replay: doc_id is not a valid hex surrogate; skipping"
-                        );
-                        skipped += 1;
-                        continue;
-                    }
+                    Err(e) => abort_replay(
+                        "fts",
+                        "doc_id",
+                        self.core_id,
+                        record_lsn,
+                        &format!(
+                            "doc_id '{}' is not the hex surrogate the index path writes: {e}",
+                            payload.doc_id
+                        ),
+                    ),
                 };
 
                 let prov = payload.provenance.clone();
@@ -251,14 +248,16 @@ impl CoreLoop {
                 );
 
                 if response.status != crate::bridge::envelope::Status::Ok {
-                    tracing::warn!(
-                        core = self.core_id,
-                        collection = %payload.collection,
-                        lsn = record_lsn,
-                        "WAL FTS replay: FtsDelete handler returned error; skipping"
+                    abort_replay(
+                        "fts",
+                        "delete_handler",
+                        self.core_id,
+                        record_lsn,
+                        &format!(
+                            "the FtsDeleteDoc handler rejected a committed delete in '{}'",
+                            payload.collection
+                        ),
                     );
-                    skipped += 1;
-                    continue;
                 }
                 deleted += 1;
             }

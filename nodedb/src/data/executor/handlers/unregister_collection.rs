@@ -375,9 +375,13 @@ impl CoreLoop {
         // ── Persistent on-disk unlinks (per-engine reclaim) ──────────────────
         //
         // Engines whose state is in shared redb (document, document-
-        // strict, FTS, graph edges) already reclaimed above; engines
-        // with no per-collection persistent file (KV hash index,
-        // CRDT — per-tenant checkpoint) are N/A.
+        // strict, FTS, graph edges) already reclaimed above; the KV
+        // hash index has no per-collection persistent file at all.
+        // The CRDT checkpoint DOES write one file per collection, so
+        // it is reclaimed here like the others — clearing the tenant's
+        // rows above does not remove the file, and a file left in the
+        // live generation re-imports the dropped collection's Loro
+        // state at every boot.
         // Shared on-disk L1 files are keyed by (database, tenant, collection),
         // not by core. Only the homing core reclaims them so concurrent cores
         // in the all-cores fan-out cannot race `remove_dir_all`/`unlink` on the
@@ -417,6 +421,19 @@ impl CoreLoop {
                 collection,
                 || {
                     reclaim::sparse_vector::reclaim_sparse_vector_checkpoints(
+                        &self.data_dir,
+                        db_raw,
+                        tid_raw,
+                        collection,
+                    )
+                },
+            )?);
+            l1.merge(retry_reclaim(
+                "CRDT checkpoints",
+                tid_raw,
+                collection,
+                || {
+                    reclaim::crdt::reclaim_crdt_checkpoints(
                         &self.data_dir,
                         db_raw,
                         tid_raw,

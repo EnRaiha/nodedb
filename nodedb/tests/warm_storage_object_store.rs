@@ -317,24 +317,34 @@ async fn snapshot_bytes_roundtrip_write_and_restore() {
     );
 
     // ── Verify HNSW checkpoint file ──────────────────────────────────────────
-    let ckpt_dir = data_dir.join("vector-ckpt").join("core-0");
+    // A restore publishes its files as a GENERATION and swings the manifest, so
+    // the first restore into a fresh data dir lands in `gen-0`. The payload is
+    // checkpoint-framed (magic + CRC + length header), so the index bytes are
+    // the tail of the file rather than the whole of it.
+    let ckpt_dir = data_dir.join("vector-ckpt").join("core-0").join("gen-0");
     let hnsw_ckpt = ckpt_dir.join("0:1:embeddings:emb.ckpt");
     assert!(
         hnsw_ckpt.exists(),
         "HNSW checkpoint file must exist after restore"
     );
     let on_disk = std::fs::read(&hnsw_ckpt).unwrap();
-    assert_eq!(on_disk, hnsw_bytes, "HNSW checkpoint bytes must match");
+    assert!(
+        on_disk.ends_with(&hnsw_bytes),
+        "HNSW checkpoint payload must match the snapshot's bytes"
+    );
 
     // ── Verify CRDT checkpoint file ──────────────────────────────────────────
-    // CRDT checkpoints are per-collection, per-database and per-core:
-    // `crdt-ckpt/core-{id}/db-{dbid}-tenant-{tid}-coll-{hex(collection)}.ckpt`.
+    // CRDT checkpoints are per-collection, per-database and per-core, published
+    // as a generation:
+    // `crdt-ckpt/core-{id}/gen-{n}/db-{dbid}-tenant-{tid}-coll-{hex(collection)}.ckpt`.
     // The hex encoding mirrors the engine's filename scheme (collection bytes,
-    // lowercase).
+    // lowercase), and the payload is a raw Loro snapshot (self-checksumming, so
+    // it carries no extra frame).
     let crdt_coll_hex: String = "testcoll".bytes().map(|b| format!("{b:02x}")).collect();
     let crdt_ckpt = data_dir
         .join("crdt-ckpt")
         .join("core-0")
+        .join("gen-0")
         .join(format!("db-0-tenant-1-coll-{crdt_coll_hex}.ckpt"));
     assert!(
         crdt_ckpt.exists(),

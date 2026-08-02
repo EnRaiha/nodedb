@@ -55,17 +55,19 @@
 //! advanced with an empty write because doing so would rewrite every array's
 //! manifest on every cycle to record a claim nothing reads back.
 //!
-//! ## Why no replay floor
+//! ## Why the floor is the manifest, not `replay_floors.rs`
 //!
-//! `replay_array_wal` re-applies every retained `ArrayPut` / `ArrayDelete`
-//! through `put_cells` / `delete_cells`, and those are absolute writes keyed by
-//! `(tile, coord)` — `TileBuffer::push_raw` inserts into a map keyed by the
-//! encoded coord, and the tile id already carries `system_from_ms`, which the
-//! WAL payload supplies rather than the local clock (`recovery.rs` states this
-//! as an invariant). Re-applying a record whose cell is already in a restored
-//! segment therefore writes the identical version back, and the ceiling resolver
-//! sees one value, not two. A floor would gate records for no reason — see
-//! `replay_floors.rs`.
+//! Arrays flush independently of one another, so the "already durable through"
+//! watermark is per-array and already recorded: it is the `durable_lsn` this
+//! flush stamps into each array's manifest. `replay_array_wal` skips every
+//! record at or below it.
+//!
+//! Re-applying such a record would usually be merely redundant — the writes are
+//! absolute and keyed by `(tile, coord)` with `system_from_ms` taken from the
+//! WAL payload, so it writes the identical version back. It is not redundant
+//! after a bitemporal audit purge: the purge physically removes a superseded
+//! tile-version from the flushed segment, and a still-retained `ArrayPut` below
+//! the watermark would re-materialise exactly the version the purge erased.
 
 use nodedb_array::types::ArrayId;
 use tracing::{info, warn};

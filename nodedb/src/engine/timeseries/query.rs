@@ -168,63 +168,58 @@ impl<'a> TimeseriesQueryEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::timeseries::bucket::{BucketConfig, BucketManager};
     use crate::engine::timeseries::gorilla::GorillaEncoder;
+    use crate::engine::timeseries::reader::encode_tseg_header;
     use crate::engine::timeseries::segment_index::SegmentIndex;
-    use nodedb_types::timeseries::{FlushedKind, FlushedSeries};
+    use nodedb_types::timeseries::SegmentRef;
     use tempfile::TempDir;
 
-    fn setup_test_data(dir: &TempDir) -> (SegmentIndex, DictionaryRegistry) {
-        let config = BucketConfig {
-            l1_dir: dir.path().join("l1"),
-            l2_dir: dir.path().join("l2"),
-            ..Default::default()
-        };
-        let mut mgr = BucketManager::new(config);
+    /// Write one metric segment in the on-disk TSEG layout the reader expects:
+    /// header, kind byte, sample count, block length, Gorilla block.
+    fn write_metric_segment(l1_dir: &Path, filename: &str, block: &[u8], sample_count: u64) -> u64 {
+        let mut buf = Vec::new();
+        encode_tseg_header(&mut buf);
+        buf.push(0x01); // kind = metric
+        buf.extend_from_slice(&sample_count.to_le_bytes());
+        buf.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        buf.extend_from_slice(block);
 
-        // Create metric segments for series 1.
+        std::fs::create_dir_all(l1_dir).unwrap();
+        std::fs::write(l1_dir.join(filename), &buf).unwrap();
+        buf.len() as u64
+    }
+
+    fn setup_test_data(dir: &TempDir) -> (SegmentIndex, DictionaryRegistry) {
+        let l1_dir = dir.path().join("l1");
+
+        // Two metric segments for series 1, covering adjacent time ranges.
         let mut enc1 = GorillaEncoder::new();
         for i in 0..50 {
             enc1.encode(1000 + i * 100, 10.0 + i as f64 * 0.5);
         }
-
         let mut enc2 = GorillaEncoder::new();
         for i in 0..50 {
             enc2.encode(6000 + i * 100, 50.0 + i as f64 * 0.3);
         }
 
-        let flushed = vec![
-            FlushedSeries {
-                series_id: 1,
-                kind: FlushedKind::Metric {
-                    gorilla_block: enc1.finish(),
-                    sample_count: 50,
+        let mut idx = SegmentIndex::new();
+        for (filename, block, min_ts, max_ts) in [
+            ("ts-seg-1.seg", enc1.finish(), 1000i64, 5900i64),
+            ("ts-seg-2.seg", enc2.finish(), 6000, 10900),
+        ] {
+            let size_bytes = write_metric_segment(&l1_dir, filename, &block, 50);
+            idx.add(
+                1,
+                SegmentRef {
+                    path: filename.to_string(),
+                    min_ts,
+                    max_ts,
+                    kind: SegmentKind::Metric,
+                    size_bytes,
+                    created_at_ms: 0,
                 },
-                min_ts: 1000,
-                max_ts: 5900,
-            },
-            FlushedSeries {
-                series_id: 1,
-                kind: FlushedKind::Metric {
-                    gorilla_block: enc2.finish(),
-                    sample_count: 50,
-                },
-                min_ts: 6000,
-                max_ts: 10900,
-            },
-        ];
-
-        mgr.flush_to_l1(flushed, None).unwrap();
-
-        // Clone the segment index (we need it after mgr is consumed).
-        let idx = {
-            let mut idx = SegmentIndex::new();
-            // Re-read from disk to get accurate segment refs.
-            for seg in mgr.segment_index().query(1, &TimeRange::new(0, i64::MAX)) {
-                idx.add(1, seg.clone());
-            }
-            idx
-        };
+            );
+        }
 
         (idx, DictionaryRegistry::new())
     }

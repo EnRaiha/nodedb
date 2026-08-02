@@ -99,11 +99,16 @@ impl SegmentFooter {
         })
     }
 
-    /// Write the footer to a file.
+    /// Append the footer to an existing segment file, durably.
+    ///
+    /// `File::flush` is a no-op on `File` — it only drains a userspace buffer,
+    /// of which there is none — so it never made the footer survive power loss.
+    /// The footer is the marker that makes a segment readable at all, so it
+    /// must reach stable storage before this returns.
     pub fn write_to(&self, path: &Path) -> crate::Result<()> {
         let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
         file.write_all(&self.to_bytes())?;
-        file.flush()?;
+        file.sync_all()?;
         Ok(())
     }
 
@@ -136,6 +141,10 @@ impl SegmentFooter {
 /// Local plaintext files remain supported only when `key` is absent. Encrypted
 /// files are a current authenticated envelope whose plaintext is
 /// `[data || footer]`; the footer is never exposed outside the AEAD payload.
+///
+/// Published through the shared atomic helper: `File::create` + `write_all` +
+/// `flush` left `path` naming a truncated or partial segment across a crash,
+/// and `flush` on a `File` provides no durability at all.
 pub fn write_encrypted_segment(
     path: &Path,
     data: &[u8],
@@ -146,10 +155,13 @@ pub fn write_encrypted_segment(
         Some(key) => encrypt_untrusted_segment_bytes(data, footer, key)?,
         None => plaintext_segment_bytes(data, footer)?,
     };
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(&bytes)?;
-    file.flush()?;
-    Ok(())
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".seg-tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    nodedb_wal::segment::atomic_write_fsync(&tmp, path, &bytes).map_err(|e| crate::Error::Storage {
+        engine: "segment".into(),
+        detail: format!("publish segment {}: {e}", path.display()),
+    })
 }
 
 /// Encrypt a segment for an untrusted or object-store boundary.
@@ -374,6 +386,26 @@ mod tests {
         let bytes = footer.to_bytes();
         let parsed = SegmentFooter::from_bytes(&bytes).unwrap();
         assert_eq!(parsed.created_by[..4], *b"this");
+    }
+
+    /// The segment is published by rename, so the destination is never left
+    /// truncated and the staging file never survives.
+    #[test]
+    fn write_publishes_atomically_and_leaves_no_staging_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.seg");
+        let footer = SegmentFooter::new("n", 1, Lsn::new(1), Lsn::new(2));
+
+        write_encrypted_segment(&path, b"first version, longer", &footer, None).unwrap();
+        write_encrypted_segment(&path, b"second", &footer, None).unwrap();
+
+        assert_eq!(read_encrypted_segment(&path, None).unwrap(), b"second");
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        assert_eq!(entries, vec!["plain.seg".to_string()]);
     }
 
     #[test]

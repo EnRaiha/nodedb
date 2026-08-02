@@ -20,7 +20,6 @@
 //! preserves Hilbert ordering for the next compaction pass.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 
 use nodedb_array::ArrayResult;
 use nodedb_array::query::retention::encode_coord_key;
@@ -56,9 +55,18 @@ pub struct CompactionOutput {
 pub struct CompactionMerger;
 
 impl CompactionMerger {
-    /// Merge `inputs` into one new segment at `output_level`. `flush_lsn`
-    /// on the new ref is the max of the inputs' lsns (no new WAL writes
-    /// happen during compaction — recovery already covers the inputs).
+    /// Merge `inputs` into one new segment named `output_id` at
+    /// `output_level`. `flush_lsn` on the new ref is the max of the inputs'
+    /// lsns (no new WAL writes happen during compaction — recovery already
+    /// covers the inputs).
+    ///
+    /// `output_id` MUST come from [`ArrayStore::allocate_segment_id`], the
+    /// store's single monotonic allocator. Deriving a name here instead —
+    /// e.g. `max(input seq) + 1` — hands back a number the allocator has not
+    /// consumed, so the next flush allocates the same name and renames its
+    /// segment over the live compacted one, leaving the manifest naming a
+    /// single file at two levels. Allocation happens in the caller because
+    /// merging only needs a shared borrow of the store.
     ///
     /// When `audit_retain_ms` is `Some(w)`, out-of-horizon tile versions
     /// (those with `system_from_ms < now_ms - w`) are collapsed into a
@@ -68,6 +76,7 @@ impl CompactionMerger {
     pub fn run(
         store: &ArrayStore,
         inputs: &[String],
+        output_id: String,
         output_level: u8,
         audit_retain_ms: Option<i64>,
         now_ms: i64,
@@ -110,8 +119,7 @@ impl CompactionMerger {
         };
 
         let kek = store.kek().cloned();
-        let id = next_segment_id_for_compaction(store, inputs);
-        let seg_path = store.root().join(&id);
+        let seg_path = store.root().join(&output_id);
         let writer_bytes =
             build_segment_bytes(&schema, schema_hash, kek.as_ref(), merged.into_iter())?;
         write_atomic(&seg_path, &writer_bytes).map_err(|e| CompactionError::Io {
@@ -134,7 +142,7 @@ impl CompactionMerger {
             (mn, mx, reader.tile_count() as u32)
         };
         let segment_ref = SegmentRef {
-            id,
+            id: output_id,
             level: output_level,
             min_tile,
             max_tile,
@@ -255,41 +263,23 @@ fn apply_retention(
     Ok(out)
 }
 
-fn next_segment_id_for_compaction(_store: &ArrayStore, inputs: &[String]) -> String {
-    // Allocate the next sequence number above any input's. We can't
-    // mutably borrow the store here, so derive a fresh id from the
-    // largest input sequence number — collision-free because the
-    // engine's allocator monotonically advances at every flush.
-    let mut max_seq: u64 = 0;
-    for id in inputs {
-        if let Some((stem, _)) = id.split_once('.')
-            && let Ok(n) = stem.parse::<u64>()
-        {
-            max_seq = max_seq.max(n);
-        }
-    }
-    // Compaction outputs sort after any future flush by reusing the
-    // monotonic engine allocator's space (max input seq + 1).
-    let combined = max_seq.saturating_add(1);
-    format!("{combined:010}.ndas")
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Write a merged segment durably: data fsynced before the rename, parent
+/// directory fsynced after it.
+///
+/// Routed through `nodedb_wal::segment::atomic_write_fsync` — the same helper
+/// the flush path uses — so the ordering cannot drift between the two callers
+/// and a failed directory fsync is reported instead of swallowed. Compaction
+/// unlinks its inputs once the manifest names this file, so a rename that
+/// reaches disk ahead of the data pages would leave the merged cells with no
+/// surviving copy.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), nodedb_wal::WalError> {
     let mut tmp = path.to_path_buf();
-    tmp.set_extension("ndas.tmp");
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    if let Some(dir) = path.parent()
-        && let Ok(d) = std::fs::File::open(dir)
-    {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    tmp.set_extension(format!("{ext}.tmp"));
+    nodedb_wal::segment::atomic_write_fsync(&tmp, path, bytes)
 }
 
 fn build_segment_bytes(
@@ -464,6 +454,51 @@ mod tests {
         assert_eq!(m.segments.len(), 1);
         // All 4 tile versions (distinct system_from_ms) must survive.
         assert_eq!(m.segments[0].tile_count, 4);
+    }
+
+    /// The compacted segment's name must come out of the store's monotonic
+    /// allocator, not from the input names. Deriving `max(input seq) + 1`
+    /// yields a number the allocator has not consumed, so the very next flush
+    /// allocates the same name and its `rename` lands on top of the live
+    /// compacted file — the manifest then names one file at two levels and the
+    /// merged cells are gone until a restart re-derives the counter.
+    #[test]
+    fn compaction_output_name_is_never_handed_out_to_a_later_flush() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = ArrayEngineConfig::new(dir.path().to_path_buf());
+        cfg.flush_cell_threshold = 1;
+        let mut e = ArrayEngine::new(cfg).unwrap();
+        e.open_array(aid(), schema(), 0x1).unwrap();
+        // Four auto-flushes → four L0 segments → the picker fires.
+        for i in 0..4 {
+            put_one(&mut e, i, 0, i, (i as u64) + 1);
+        }
+        assert!(e.maybe_compact(&aid(), None, 0).unwrap());
+
+        let (root, compacted_id) = {
+            let store = e.store(&aid()).unwrap();
+            let m = store.manifest();
+            assert_eq!(m.segments.len(), 1);
+            (store.root().to_path_buf(), m.segments[0].id.clone())
+        };
+        let compacted_bytes = std::fs::read(root.join(&compacted_id)).unwrap();
+
+        // The next flush must not be able to claim that name.
+        put_one(&mut e, 5, 0, 5, 5);
+
+        let m = e.store(&aid()).unwrap().manifest();
+        let ids: Vec<&str> = m.segments.iter().map(|s| s.id.as_str()).collect();
+        let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "manifest names the same segment file twice: {ids:?}"
+        );
+        assert_eq!(
+            std::fs::read(root.join(&compacted_id)).unwrap(),
+            compacted_bytes,
+            "the flush overwrote the live compacted segment {compacted_id}"
+        );
     }
 
     #[test]

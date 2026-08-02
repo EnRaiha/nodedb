@@ -385,7 +385,9 @@ mod tests {
     use super::*;
     use crate::bridge::dispatch::{BridgeRequest, BridgeResponse};
     use crate::bridge::envelope::{PhysicalPlan, Status};
-    use crate::data::executor::vector_checkpoint::vector_ckpt_dir;
+    use crate::data::executor::vector_checkpoint::{
+        read_vector_manifest_at, vector_ckpt_dir, vector_ckpt_gen_dir,
+    };
     use nodedb_bridge::buffer::RingBuffer;
     use nodedb_physical::physical_plan::MetaOp;
 
@@ -447,11 +449,16 @@ mod tests {
         );
         assert_eq!(response.status, Status::Ok, "restore must succeed");
 
-        // The checkpoint file must exist on disk immediately — no periodic
-        // timer tick has run.
+        // The checkpoint file must be PUBLISHED on disk immediately — no
+        // periodic timer tick has run. Published means named by the manifest:
+        // a generation nothing points at is not durable state.
         let ckpt_dir = vector_ckpt_dir(&core.data_dir, core.core_id);
-        let entries: Vec<_> = std::fs::read_dir(&ckpt_dir)
-            .expect("checkpoint dir must exist synchronously")
+        let manifest = read_vector_manifest_at(&ckpt_dir)
+            .expect("the manifest must be readable")
+            .expect("the restore must have published a generation synchronously");
+        let gen_dir = vector_ckpt_gen_dir(&ckpt_dir, manifest.generation);
+        let entries: Vec<_> = std::fs::read_dir(&gen_dir)
+            .expect("the live generation dir must exist synchronously")
             .flatten()
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("ckpt"))
             .collect();

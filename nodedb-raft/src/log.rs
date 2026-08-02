@@ -100,23 +100,44 @@ impl<S: LogStorage> RaftLog<S> {
     /// - If an existing entry conflicts with a new one (same index, different
     ///   terms), delete the existing entry and all that follow it.
     /// - Append any new entries not already in the log.
+    ///
+    /// Persistence happens BEFORE the in-memory log is mutated. The response to
+    /// an `AppendEntries` RPC reports `last_index()` from the in-memory log, and
+    /// the leader treats that number as "durably held by this peer" — it counts
+    /// toward quorum on success and rewinds `next_index` past it on failure. If
+    /// the in-memory log were advanced first and the storage write then failed,
+    /// this node would report entries it does not hold, the leader would never
+    /// resend them, and they would disappear on restart. Mutating memory only
+    /// after storage has accepted the write makes that state unreachable: a
+    /// failed persist leaves `last_index()` covering exactly what is on disk.
     pub fn append_entries(&mut self, _prev_index: u64, entries: &[LogEntry]) -> Result<()> {
-        for entry in entries {
-            if let Some(existing) = self.entry_at(entry.index) {
-                if existing.term != entry.term {
-                    // Conflict: truncate from this index onward.
-                    self.truncate_from(entry.index);
-                    self.entries.push(entry.clone());
-                }
-                // Same term = already present, skip.
-            } else {
-                self.entries.push(entry.clone());
-            }
+        if entries.is_empty() {
+            return Ok(());
         }
 
-        // Persist.
-        if !entries.is_empty() {
-            self.storage.append(entries)?;
+        // Locate the first conflicting index (same index, different term) without
+        // mutating anything — detection must not be destructive, because the
+        // durable writes below may still fail.
+        let conflict = entries
+            .iter()
+            .find(|e| matches!(self.entry_at(e.index), Some(existing) if existing.term != e.term))
+            .map(|e| e.index);
+
+        if let Some(index) = conflict {
+            self.truncate_from(index)?;
+        }
+        self.storage.append(entries)?;
+
+        for entry in entries {
+            if entry.index <= self.snapshot_index {
+                // Already covered by the snapshot; pushing it would break the
+                // `entries[0].index == snapshot_index + 1` offset invariant.
+                continue;
+            }
+            if self.entry_at(entry.index).is_none() {
+                self.entries.push(entry.clone());
+            }
+            // Same index AND same term = already present, nothing to do.
         }
         Ok(())
     }
@@ -129,13 +150,19 @@ impl<S: LogStorage> RaftLog<S> {
     }
 
     /// Truncate entries from `index` onward (inclusive).
-    fn truncate_from(&mut self, index: u64) {
+    ///
+    /// The storage truncation is applied first and its failure is propagated.
+    /// Dropping the suffix in memory while storage still holds it would make
+    /// this node ack the overwriting entries while a restart resurrects the
+    /// stale suffix underneath them.
+    fn truncate_from(&mut self, index: u64) -> Result<()> {
         if index <= self.snapshot_index {
-            return;
+            return Ok(());
         }
+        self.storage.truncate(index)?;
         let offset = (index - self.snapshot_index - 1) as usize;
         self.entries.truncate(offset);
-        let _ = self.storage.truncate(index);
+        Ok(())
     }
 
     /// Apply a snapshot: discard all entries up to `last_included_index`.
@@ -249,5 +276,127 @@ mod tests {
 
         // Range query into compacted region fails.
         assert!(log.entries_range(3, 8).is_err());
+    }
+
+    /// A `LogStorage` whose `append` / `truncate` can be armed to fail, so the
+    /// in-memory log's reaction to a durability failure is observable.
+    #[derive(Default)]
+    struct FlakyStorage {
+        inner: MemStorage,
+        fail_append: bool,
+        fail_truncate: bool,
+    }
+
+    impl LogStorage for FlakyStorage {
+        fn append(&mut self, entries: &[LogEntry]) -> Result<()> {
+            if self.fail_append {
+                return Err(RaftError::Storage {
+                    detail: "injected append failure".into(),
+                });
+            }
+            self.inner.append(entries)
+        }
+
+        fn truncate(&mut self, index: u64) -> Result<()> {
+            if self.fail_truncate {
+                return Err(RaftError::Storage {
+                    detail: "injected truncate failure".into(),
+                });
+            }
+            self.inner.truncate(index)
+        }
+
+        fn load_entries_after(&self, snapshot_index: u64) -> Result<Vec<LogEntry>> {
+            self.inner.load_entries_after(snapshot_index)
+        }
+
+        fn compact(&mut self, index: u64, term: u64) -> Result<()> {
+            self.inner.compact(index, term)
+        }
+
+        fn snapshot_metadata(&self) -> (u64, u64) {
+            self.inner.snapshot_metadata()
+        }
+
+        fn save_hard_state(&mut self, state: &crate::state::HardState) -> Result<()> {
+            self.inner.save_hard_state(state)
+        }
+
+        fn load_hard_state(&self) -> Result<crate::state::HardState> {
+            self.inner.load_hard_state()
+        }
+
+        fn save_applied_index(&mut self, index: u64) -> Result<()> {
+            self.inner.save_applied_index(index)
+        }
+
+        fn load_applied_index(&self) -> Result<u64> {
+            self.inner.load_applied_index()
+        }
+    }
+
+    /// A failed persist must leave `last_index()` covering only what storage
+    /// holds — otherwise the AppendEntries response advertises entries that
+    /// vanish on restart.
+    #[test]
+    fn failed_persist_does_not_advance_last_index() {
+        let mut log = RaftLog::new(FlakyStorage::default());
+        log.append(make_entry(1, 1)).expect("first append");
+        assert_eq!(log.last_index(), 1);
+
+        log.storage_mut().fail_append = true;
+        let err = log.append_entries(1, &[make_entry(1, 2), make_entry(1, 3)]);
+        assert!(err.is_err(), "storage failure must propagate");
+        assert_eq!(
+            log.last_index(),
+            1,
+            "in-memory log must not cover unpersisted entries"
+        );
+        assert!(log.entry_at(2).is_none());
+
+        // Storage recovered: the leader's resend now lands for real.
+        log.storage_mut().fail_append = false;
+        log.append_entries(1, &[make_entry(1, 2), make_entry(1, 3)])
+            .expect("resend after recovery");
+        assert_eq!(log.last_index(), 3);
+    }
+
+    /// A failed truncate must leave the conflicting suffix in memory, matching
+    /// what storage still holds, and must not append the overwriting entries.
+    #[test]
+    fn failed_truncate_keeps_memory_and_storage_in_sync() {
+        let mut log = RaftLog::new(FlakyStorage::default());
+        for i in 1..=3 {
+            log.append(make_entry(1, i)).expect("seed append");
+        }
+
+        log.storage_mut().fail_truncate = true;
+        let err = log.append_entries(1, &[make_entry(2, 2), make_entry(2, 3)]);
+        assert!(err.is_err(), "truncate failure must propagate");
+        assert_eq!(log.last_index(), 3);
+        assert_eq!(log.term_at(2), Some(1), "old suffix must survive");
+        assert_eq!(log.term_at(3), Some(1));
+
+        let persisted = log.storage().load_entries_after(0).expect("load");
+        assert_eq!(persisted.len(), 3);
+        assert!(persisted.iter().all(|e| e.term == 1));
+    }
+
+    /// The successful conflict path still overwrites in both places.
+    #[test]
+    fn successful_truncate_persists_the_overwrite() {
+        let mut log = RaftLog::new(FlakyStorage::default());
+        for i in 1..=3 {
+            log.append(make_entry(1, i)).expect("seed append");
+        }
+
+        log.append_entries(1, &[make_entry(2, 2), make_entry(2, 3), make_entry(2, 4)])
+            .expect("overwrite");
+        assert_eq!(log.last_index(), 4);
+
+        let persisted = log.storage().load_entries_after(0).expect("load");
+        assert_eq!(persisted.len(), 4);
+        assert_eq!(persisted[1].term, 2);
+        assert_eq!(persisted[3].index, 4);
     }
 }

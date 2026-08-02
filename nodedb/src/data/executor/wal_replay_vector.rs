@@ -3,6 +3,7 @@
 //! WAL replay for vector engine startup recovery.
 
 use crate::bridge::envelope::{PhysicalPlan, Priority, Request};
+use crate::data::executor::replay_abort::abort_replay;
 use crate::data::executor::task::{ExecutionTask, TaskState};
 use crate::types::{DatabaseId, ReadConsistency};
 
@@ -152,14 +153,21 @@ impl CoreLoop {
                         continue;
                     }
                     if vector.len() != dim {
-                        tracing::warn!(
-                            core = self.core_id,
-                            %collection,
-                            expected = dim,
-                            actual = vector.len(),
-                            "skipping WAL vector record: dimension mismatch"
+                        // `dim` and the vector both come out of the SAME
+                        // payload, so a disagreement is not a schema change the
+                        // record predates — it is a record whose two halves
+                        // cannot both be what the writer wrote.
+                        abort_replay(
+                            "vector",
+                            "dim",
+                            self.core_id,
+                            record_lsn,
+                            &format!(
+                                "record for '{collection}' declares dim {dim} but carries {} \
+                                 components",
+                                vector.len()
+                            ),
                         );
-                        continue;
                     }
                     // Checkpoint watermark gate: a restored checkpoint already
                     // contains every write at or below its `checkpoint_wal_lsn`.
@@ -215,14 +223,16 @@ impl CoreLoop {
                         },
                     );
                     if response.status != crate::bridge::envelope::Status::Ok {
-                        tracing::warn!(
-                            core = self.core_id,
-                            %collection,
-                            lsn = record_lsn,
-                            "WAL vector replay: insert handler returned error; skipping"
+                        abort_replay(
+                            "vector",
+                            "insert_handler",
+                            self.core_id,
+                            record_lsn,
+                            &format!(
+                                "the vector insert handler rejected a committed write into \
+                                 '{collection}'"
+                            ),
                         );
-                        skipped += 1;
-                        continue;
                     }
                     // Advance the (possibly freshly created) collection's
                     // watermark so the next checkpoint records this replayed
@@ -241,14 +251,21 @@ impl CoreLoop {
                         continue;
                     }
                     if vector.len() != dim {
-                        tracing::warn!(
-                            core = self.core_id,
-                            %collection,
-                            expected = dim,
-                            actual = vector.len(),
-                            "skipping WAL vector record: dimension mismatch"
+                        // `dim` and the vector both come out of the SAME
+                        // payload, so a disagreement is not a schema change the
+                        // record predates — it is a record whose two halves
+                        // cannot both be what the writer wrote.
+                        abort_replay(
+                            "vector",
+                            "dim",
+                            self.core_id,
+                            record_lsn,
+                            &format!(
+                                "record for '{collection}' declares dim {dim} but carries {} \
+                                 components",
+                                vector.len()
+                            ),
                         );
-                        continue;
                     }
                     let index_key = CoreLoop::vector_index_key(
                         database_id,
@@ -279,6 +296,13 @@ impl CoreLoop {
                         .vector_collections
                         .entry(index_key)
                         .or_insert_with(|| VectorCollection::new(dim, params));
+                    // Unlike the record-internal check above, this compares the
+                    // record against a LIVE index whose width the collection
+                    // may legitimately have changed since the record was
+                    // written (an index rebuilt at a new dimension). The record
+                    // is genuinely inapplicable to the current index rather
+                    // than malformed, so this stays a skip: aborting here would
+                    // wedge the boot on a retained pre-rebuild tail.
                     if index.dim() != dim {
                         tracing::warn!(
                             core = self.core_id,
@@ -305,14 +329,21 @@ impl CoreLoop {
                         continue;
                     }
                     if vector.len() != dim {
-                        tracing::warn!(
-                            core = self.core_id,
-                            %collection,
-                            expected = dim,
-                            actual = vector.len(),
-                            "skipping WAL vector record: dimension mismatch"
+                        // `dim` and the vector both come out of the SAME
+                        // payload, so a disagreement is not a schema change the
+                        // record predates — it is a record whose two halves
+                        // cannot both be what the writer wrote.
+                        abort_replay(
+                            "vector",
+                            "dim",
+                            self.core_id,
+                            record_lsn,
+                            &format!(
+                                "record for '{collection}' declares dim {dim} but carries {} \
+                                 components",
+                                vector.len()
+                            ),
                         );
-                        continue;
                     }
                     let index_key =
                         CoreLoop::vector_index_key(database_id, tenant_id, &collection, "");
@@ -339,6 +370,13 @@ impl CoreLoop {
                         .vector_collections
                         .entry(index_key)
                         .or_insert_with(|| VectorCollection::new(dim, params));
+                    // Unlike the record-internal check above, this compares the
+                    // record against a LIVE index whose width the collection
+                    // may legitimately have changed since the record was
+                    // written (an index rebuilt at a new dimension). The record
+                    // is genuinely inapplicable to the current index rather
+                    // than malformed, so this stays a skip: aborting here would
+                    // wedge the boot on a retained pre-rebuild tail.
                     if index.dim() != dim {
                         tracing::warn!(
                             core = self.core_id,

@@ -61,7 +61,8 @@ fn assert_durable_checkpoint_writer(rel: &str) {
 
 #[test]
 fn vector_checkpoint_writes_are_durable() {
-    assert_durable_checkpoint_writer("nodedb/src/data/executor/vector_checkpoint.rs");
+    assert_durable_checkpoint_writer("nodedb/src/data/executor/vector_checkpoint/write.rs");
+    assert_durable_checkpoint_writer("nodedb/src/data/executor/vector_checkpoint/publish.rs");
 }
 
 #[test]
@@ -118,7 +119,7 @@ fn timeseries_partition_writes_are_durable() {
 
 #[test]
 fn spatial_checkpoint_writes_are_durable() {
-    assert_durable_checkpoint_writer("nodedb/src/data/executor/spatial_checkpoint.rs");
+    assert_durable_checkpoint_writer("nodedb/src/data/executor/spatial_checkpoint/write.rs");
 }
 
 #[test]
@@ -160,6 +161,7 @@ fn crdt_checkpoint_writes_are_durable() {
     assert_durable_checkpoint_writer(
         "nodedb/src/data/executor/handlers/control/checkpoint_crdt.rs",
     );
+    assert_durable_checkpoint_writer("nodedb/src/data/executor/crdt_checkpoint/publish.rs");
 }
 
 /// The CRC-framing wrapper must not bypass the durable write path: it has to
@@ -264,9 +266,10 @@ fn timeseries_ddl_partition_swap_is_durable() {
 #[test]
 fn checkpoint_reads_drop_page_cache() {
     for rel in [
-        "nodedb/src/data/executor/vector_checkpoint.rs",
+        "nodedb/src/data/executor/vector_checkpoint/load.rs",
         "nodedb/src/data/executor/sparse_vector_checkpoint/load.rs",
-        "nodedb/src/data/executor/spatial_checkpoint.rs",
+        "nodedb/src/data/executor/spatial_checkpoint/load.rs",
+        "nodedb/src/data/executor/crdt_checkpoint/load.rs",
         "nodedb/src/data/executor/kv_checkpoint/load.rs",
         "nodedb/src/data/executor/sync_hwm_checkpoint/load.rs",
         "nodedb/src/data/executor/columnar_checkpoint/load.rs",

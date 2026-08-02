@@ -19,8 +19,6 @@
 //! no ceiling tile is emitted, the segment is removed from the manifest
 //! entirely rather than writing an empty file.
 
-use std::io::Write;
-
 use nodedb_array::ArrayError;
 use nodedb_array::segment::reader::TilePayload;
 use nodedb_array::segment::writer::SegmentWriter;
@@ -263,25 +261,23 @@ fn update_bounds(min: &mut Option<TileId>, max: &mut Option<TileId>, id: TileId)
     *max = Some(max.map_or(id, |m| m.max(id)));
 }
 
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Write a rewritten segment durably: data fsynced before the rename, parent
+/// directory fsynced after it.
+///
+/// Routed through `nodedb_wal::segment::atomic_write_fsync` — the same helper
+/// the flush and compaction paths use — so the ordering cannot drift between
+/// call sites and a failed directory fsync is reported instead of swallowed.
+/// Purge unlinks the source segment once the manifest names this file, so a
+/// rename that reaches disk ahead of the data pages would leave the surviving
+/// tiles with no other copy.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), nodedb_wal::WalError> {
     let mut tmp = path.to_path_buf();
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().into_owned())
         .unwrap_or_default();
     tmp.set_extension(format!("{ext}.tmp"));
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    if let Some(dir) = path.parent()
-        && let Ok(d) = std::fs::File::open(dir)
-    {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    nodedb_wal::segment::atomic_write_fsync(&tmp, path, bytes)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

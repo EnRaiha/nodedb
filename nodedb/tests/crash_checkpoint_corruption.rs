@@ -44,16 +44,14 @@ fn corrupt_vector_checkpoint_fails_boot() {
 
     // The harness spawns with NODEDB_DATA_PLANE_CORES=1, so the sole core is
     // core-0 and its vector checkpoint directory is
-    // `{data_dir}/vector-ckpt/core-0/`. The filename must parse as
-    // `{db}:{tid}:{coll}` or the loader skips it as an unparseable name; `0:0`
-    // parse as the db/tenant ids and `corrupt_coll` is the collection key.
+    // `{data_dir}/vector-ckpt/core-0/`. The MANIFEST there names the live
+    // generation and is the only thing that makes any checkpoint reachable, so
+    // corrupting it is corrupting the checkpoint: the loader cannot tell which
+    // generation is durable, and the WAL below it may already be truncated.
     let ckpt_dir = h.data_dir().join("vector-ckpt").join("core-0");
     std::fs::create_dir_all(&ckpt_dir).expect("create vector checkpoint dir");
-    std::fs::write(
-        ckpt_dir.join("0:0:corrupt_coll.ckpt"),
-        corrupt_framed_checkpoint(),
-    )
-    .expect("write corrupt vector checkpoint");
+    std::fs::write(ckpt_dir.join("MANIFEST"), corrupt_framed_checkpoint())
+        .expect("write corrupt vector checkpoint manifest");
 
     // Boot must fail-stop: loader Err -> panic in the data-core thread ->
     // dropped `replay_done` sender -> cluster-ready abort -> non-zero exit.

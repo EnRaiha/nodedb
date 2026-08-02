@@ -4,6 +4,7 @@
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::core_loop::write_index::KeyRepr;
+use crate::data::executor::wal_replay::kv_put::KvReplayRecord;
 
 impl CoreLoop {
     /// Whether a KV WAL record must NOT be re-applied during boot replay.
@@ -86,160 +87,26 @@ impl CoreLoop {
             let record_lsn = record.header.lsn;
             let tombstones = &tombstones.for_database(database_id);
 
-            // Try to detect KV records by discriminator prefix in the payload.
+            crate::fail_point!("replay::kv_mid_pass");
+
             if is_put {
-                // kv_put with absolute expiry (redo sub-record):
-                //   ("kv_put", collection, key, value, ttl_ms, expire_at_ms)
-                //
-                // zerompk enforces a strict array length, so this six-element
-                // tuple decodes ONLY the extended shape and never the historical
-                // five-element one below (and vice versa). When present, the
-                // resolved absolute instant is installed verbatim instead of
-                // recomputing `now_ms + ttl_ms`, which would drift the expiry
-                // forward by the crash-to-restart delay.
-                if let Ok((disc, collection, key, value, ttl_ms, expire_at_ms)) =
-                    zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64, u64)>(
-                        &record.payload,
-                    )
-                    && disc == "kv_put"
-                {
-                    if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
-                        continue;
-                    }
-                    self.kv_engine.put_with_absolute_expiry(
-                        crate::engine::kv::KvPutParams {
-                            database_id,
-                            tenant_id,
-                            collection: &collection,
-                            key: &key,
-                            value: &value,
-                            ttl_ms,
-                            now_ms,
-                            surrogate: nodedb_types::Surrogate::ZERO,
-                        },
-                        expire_at_ms,
-                    );
-                    self.note_replay_write_lsn(
-                        database_id,
-                        tenant_id,
-                        &collection,
-                        Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
-                        record_lsn,
-                    );
-                    puts += 1;
+                // Absolute-overwrite puts — see `kv_put.rs` for the record
+                // shapes and why the surrogate travels in the record.
+                let kv_record = KvReplayRecord {
+                    payload: &record.payload,
+                    tenant_id,
+                    database_id,
+                    now_ms,
+                    record_lsn,
+                };
+
+                if let Some(applied) = self.try_replay_kv_put(&kv_record, tombstones) {
+                    puts += applied;
                     continue;
                 }
 
-                // kv_put: ("kv_put", collection, key, value, ttl_ms)
-                if let Ok((disc, collection, key, value, ttl_ms)) =
-                    zerompk::from_msgpack::<(&str, String, Vec<u8>, Vec<u8>, u64)>(&record.payload)
-                    && disc == "kv_put"
-                {
-                    if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
-                        continue;
-                    }
-                    self.kv_engine.put(crate::engine::kv::KvPutParams {
-                        database_id,
-                        tenant_id,
-                        collection: &collection,
-                        key: &key,
-                        value: &value,
-                        ttl_ms,
-                        now_ms,
-                        surrogate: nodedb_types::Surrogate::ZERO,
-                    });
-                    self.note_replay_write_lsn(
-                        database_id,
-                        tenant_id,
-                        &collection,
-                        Some(KeyRepr::KvKey(Box::from(key.as_slice()))),
-                        record_lsn,
-                    );
-                    puts += 1;
-                    continue;
-                }
-
-                // kv_batch_put with absolute expiry (redo sub-record):
-                //   ("kv_batch_put", collection, entries, ttl_ms, expire_at_ms)
-                //
-                // Same rationale as the six-element `kv_put` arm above: zerompk's
-                // strict array-length check means this five-element tuple decodes
-                // ONLY the extended shape, never the historical four-element one
-                // below (and vice versa). The resolved absolute instant is
-                // installed verbatim on every entry instead of recomputing
-                // `now_ms + ttl_ms`, which would drift the expiry forward by the
-                // crash-to-restart delay.
-                if let Ok((disc, collection, entries, ttl_ms, expire_at_ms)) =
-                    zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64, u64)>(
-                        &record.payload,
-                    )
-                    && disc == "kv_batch_put"
-                {
-                    if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
-                        continue;
-                    }
-                    let surrogates = vec![nodedb_types::Surrogate::ZERO; entries.len()];
-                    self.kv_engine.batch_put_with_absolute_expiry(
-                        crate::engine::kv::KvBatchPutParams {
-                            database_id,
-                            tenant_id,
-                            collection: &collection,
-                            entries: &entries,
-                            ttl_ms,
-                            now_ms,
-                            surrogates: &surrogates,
-                        },
-                        expire_at_ms,
-                    );
-                    for (entry_key, _entry_value) in &entries {
-                        self.note_replay_write_lsn(
-                            database_id,
-                            tenant_id,
-                            &collection,
-                            Some(KeyRepr::KvKey(Box::from(entry_key.as_slice()))),
-                            record_lsn,
-                        );
-                    }
-                    puts += entries.len();
-                    continue;
-                }
-
-                // kv_batch_put: ("kv_batch_put", collection, entries, ttl_ms)
-                if let Ok((disc, collection, entries, ttl_ms)) =
-                    zerompk::from_msgpack::<(&str, String, Vec<(Vec<u8>, Vec<u8>)>, u64)>(
-                        &record.payload,
-                    )
-                    && disc == "kv_batch_put"
-                {
-                    if self.skip_kv_replay_record(tombstones, tenant_id, &collection, record_lsn) {
-                        continue;
-                    }
-                    // Same as the `kv_put` replay arm above: this local WAL
-                    // record does not carry the surrogate (it lives in the
-                    // separately-durable, redb-backed surrogate catalog, not
-                    // this per-core WAL), so replay passes `Surrogate::ZERO`
-                    // for every entry, matching single-`Put` replay exactly.
-                    let surrogates = vec![nodedb_types::Surrogate::ZERO; entries.len()];
-                    self.kv_engine
-                        .batch_put(crate::engine::kv::KvBatchPutParams {
-                            database_id,
-                            tenant_id,
-                            collection: &collection,
-                            entries: &entries,
-                            ttl_ms,
-                            now_ms,
-                            surrogates: &surrogates,
-                        });
-                    for (entry_key, _entry_value) in &entries {
-                        self.note_replay_write_lsn(
-                            database_id,
-                            tenant_id,
-                            &collection,
-                            Some(KeyRepr::KvKey(Box::from(entry_key.as_slice()))),
-                            record_lsn,
-                        );
-                    }
-                    puts += entries.len();
+                if let Some(applied) = self.try_replay_kv_batch_put(&kv_record, tombstones) {
+                    puts += applied;
                     continue;
                 }
 

@@ -5,6 +5,22 @@
 //! Both the production data-plane runtime (`crate::data::runtime`) and the
 //! integration-test core-loop runner call this ONE method so the replay
 //! sequence never drifts between them.
+//!
+//! ## Crash injection
+//!
+//! Recovery is only idempotent if a crash PART WAY THROUGH it is, so the
+//! sequence carries fail points a crash harness can arm through
+//! `NODEDB_FAILPOINTS` (feature `failpoints`; `abort` kills the process the way
+//! a real crash would):
+//!
+//! * `replay::before_engine_passes` — nothing applied yet.
+//! * `replay::between_engine_passes` — one engine's pass complete, the next
+//!   not started.
+//! * `replay::kv_mid_pass` — part way through a single engine's records.
+//! * `replay::between_standalone_and_redo` — every engine arm done, the
+//!   redo-only document / graph arms not yet run.
+//! * `replay::before_sync_hwm_pass` — every engine arm is done but the sync
+//!   idempotency gate has not been rebuilt.
 
 use nodedb_wal::{TombstoneSet, WalRecord};
 use tracing::{error, info};
@@ -24,49 +40,20 @@ impl CoreLoop {
             return;
         }
         let core_id = self.core_id;
-        self.replay_vector_wal(records, num_cores, tombstones);
-        // Direct-upsert / sparse / multi-vector writes. Runs after
-        // `replay_vector_wal` so any `VectorParams` for a collection are
-        // registered, and after the checkpoints loaded above so the
-        // per-collection watermark gates re-application.
-        self.replay_vector_extended_wal(records, num_cores, tombstones);
-        // Runs after `replay_vector_wal` so the `VectorParams` records
-        // emitted by `CREATE VECTOR INDEX` have registered per-collection
-        // index params before secondary vector indexes are rebuilt from
-        // document `Put` records.
-        self.replay_document_vector_wal(records, num_cores, tombstones);
-        self.replay_kv_wal(records, num_cores, tombstones);
-        self.replay_timeseries_wal(records, num_cores, tombstones);
-        self.replay_array_wal(records, num_cores, tombstones);
-        // CRDT deltas and document/list intents share Loro state, so replay
-        // their standalone WAL records together in global LSN order. CRDT has
-        // no TransactionRedo subrecords; its admission-boundary writes are
-        // independently durable standalone records.
-        self.replay_crdt_wal_ordered(records, num_cores, tombstones);
-        self.replay_fts_wal(records, num_cores, tombstones);
-        self.replay_spatial_wal(records, num_cores, tombstones);
-        // Graph node labels have no redb-backed durability (unlike
-        // edges, rebuilt into the CSR from the `EdgeStore` before this
-        // replay sequence runs) — a WAL record is their only durable
-        // backing, so they get their own standalone replay pass here.
-        self.replay_graph_node_label_wal(records, num_cores);
 
-        // Replay committed-transaction redo groups LAST among the
-        // engine replays: each `TransactionRedo` record is decomposed
-        // into per-op records fed back through the same per-engine
-        // replay paths above. Running last guarantees collection-level
-        // state those establish — notably the `VectorParams` a
-        // `CREATE VECTOR INDEX` wrote as a standalone record, which the
-        // vector and document arms need before rebuilding an HNSW index
-        // — is already in place. Every redo op is an absolute overwrite
-        // or a watermark-gated append, so ordering after the standalone
-        // replays (and after the checkpoint restores above) is safe.
+        crate::fail_point!("replay::before_engine_passes");
+
+        // Every engine-bearing record class — standalone (autocommit) records
+        // and the sub-records of committed `TransactionRedo` groups alike —
+        // replays here in ONE globally LSN-ordered pass. Splitting the two
+        // classes into separate passes inverts LSN order for any key written
+        // both inside a transaction and by a later autocommit, and because redo
+        // ops are absolute overwrites the older post-image would win.
         //
-        // Fatal on error, for the same reason the sync-HWM replay below is: a
-        // redo group that cannot be reconstituted is a committed transaction
-        // that cannot be applied, and continuing would open the database with
-        // a hole in the replayed suffix.
-        if let Err(e) = self.replay_transaction_redo_wal(records, num_cores, tombstones) {
+        // Fatal on error: a redo group that cannot be reconstituted is a
+        // committed transaction that cannot be applied, and continuing would
+        // open the database with a hole in the replayed suffix.
+        if let Err(e) = self.replay_engines_in_lsn_order(records, num_cores, tombstones) {
             error!(
                 core_id,
                 error = %e,
@@ -75,6 +62,8 @@ impl CoreLoop {
             );
             std::process::exit(1);
         }
+
+        crate::fail_point!("replay::before_sync_hwm_pass");
 
         // Reconstruct sync HWM maps from SyncSeqAdvance records so
         // post-restart deduplication is correct. Fatal on error —

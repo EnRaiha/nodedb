@@ -192,27 +192,32 @@ fn reclaim_handlers_are_idempotent_on_missing_files() {
     reclaim::timeseries::reclaim_timeseries_partitions(base, 0, TENANT, "x").unwrap();
 }
 
-/// The reclaim handlers don't touch other tenants' or other
-/// collections' files — the isolation guarantee the pgwire handler
-/// relies on when scoping the unlink to `(tenant, collection)`.
+/// Reclaim never unlinks a file it cannot prove is reachable. A checkpoint
+/// directory with no published generation (no manifest) holds only debris from
+/// a cycle that never committed — nothing a boot could restore — so the pass
+/// must report success and touch nothing, leaving the debris to the write
+/// path's own generation cleanup.
+///
+/// Per-collection and per-tenant scoping WITHIN a published generation is
+/// covered by the unit tests next to each reclaim handler, which can build a
+/// live generation through the engine's own manifest writer instead of
+/// hand-rolling the on-disk layout here.
 #[test]
-fn reclaim_is_scoped_to_tenant_and_collection() {
+fn reclaim_leaves_unpublished_checkpoint_debris_alone() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
-    // Checkpoints live under a PER-CORE subdirectory, which is what the write
-    // path produces; a flat fixture here would test a layout that never occurs.
-    let vec_dir = base.join("vector-ckpt").join("core-0");
+    let vec_dir = base.join("vector-ckpt").join("core-0").join("gen-0");
     std::fs::create_dir_all(&vec_dir).unwrap();
     std::fs::write(vec_dir.join("0:1:users.ckpt"), b"a").unwrap();
     std::fs::write(vec_dir.join("0:1:orders.ckpt"), b"b").unwrap();
-    std::fs::write(vec_dir.join("0:2:users.ckpt"), b"c").unwrap();
 
     let stats = reclaim::vector::reclaim_vector_checkpoints(base, 0, 1, "users").unwrap();
-    assert_eq!(stats.files_unlinked, 1);
-    assert!(!vec_dir.join("0:1:users.ckpt").exists());
-    // Siblings untouched.
+    assert_eq!(
+        stats.files_unlinked, 0,
+        "with no manifest there is no live generation, so nothing is reclaimable"
+    );
+    assert!(vec_dir.join("0:1:users.ckpt").exists());
     assert!(vec_dir.join("0:1:orders.ckpt").exists());
-    assert!(vec_dir.join("0:2:users.ckpt").exists());
 }
 
 fn _cat_ref_witness(_cat: &SystemCatalog) {}

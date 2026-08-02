@@ -8,7 +8,8 @@
 //!
 //! Each WAL record type has a known payload format (see `wal_dispatch.rs`):
 //! - `Put`: `(collection, document_id, value)` for documents,
-//!   `("kv_put", collection, key, value, ttl_ms)` for KV,
+//!   `("kv_put", collection, key, value, ttl_ms, expire_at_ms, surrogate)` for
+//!   KV (two shorter pre-surrogate arities also decode),
 //!   `(collection, src_id, label, dst_id, properties)` for graph edges
 //! - `Delete`: `(collection, document_id)` for documents,
 //!   `("kv_delete", collection, keys)` for KV,

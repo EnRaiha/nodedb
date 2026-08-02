@@ -16,6 +16,7 @@ use nodedb::control::state::SharedState;
 pub(crate) async fn run(
     shared: &Arc<SharedState>,
     wal_records: &Arc<[nodedb_wal::WalRecord]>,
+    replay_tombstones: &nodedb_wal::TombstoneSet,
     config: &ServerConfig,
     catalog_gate: &ReadyGate,
 ) -> anyhow::Result<()> {
@@ -23,7 +24,7 @@ pub(crate) async fn run(
     catalog_gate.fire();
 
     // Replay surrogate WAL records into the in-memory registry.
-    bootstrap::credentials::replay_surrogate_wal(shared, wal_records);
+    bootstrap::credentials::replay_surrogate_wal(shared, wal_records, replay_tombstones);
 
     // Recover any in-progress MOVE TENANT operations from the journal.
     // This runs synchronously before accepting connections so that

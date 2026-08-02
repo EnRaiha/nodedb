@@ -113,10 +113,10 @@ impl ArrayEngine {
                 detail: format!("array {id:?} has an unpurged drop tombstone at {tombstone:?}"),
             });
         }
-        let mut store = ArrayStore::open(dir, schema, schema_hash)?;
-        if let Some(kek) = &self.cfg.kek {
-            store.set_kek(kek.clone());
-        }
+        // The key goes in through the constructor: `ArrayStore::open` opens
+        // every segment the manifest names, and an encrypted segment opened
+        // without it is a typed error.
+        let store = ArrayStore::open(dir, schema, schema_hash, self.cfg.kek.clone())?;
         self.arrays.insert(id, store);
         Ok(())
     }

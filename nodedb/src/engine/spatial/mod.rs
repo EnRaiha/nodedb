@@ -2,7 +2,7 @@
 
 // Re-export shared spatial engine from nodedb-spatial crate.
 // Origin's spatial handlers (data/executor/handlers/spatial.rs) and
-// checkpoint logic (data/executor/spatial_checkpoint.rs) use these directly.
+// checkpoint logic (data/executor/spatial_checkpoint/) use these directly.
 pub use nodedb_spatial::GeohashIndex;
 pub use nodedb_spatial::RTree;
 pub use nodedb_spatial::RTreeEntry;

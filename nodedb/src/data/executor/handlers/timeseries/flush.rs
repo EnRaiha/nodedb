@@ -6,6 +6,7 @@
 //! this writes — lives in `data::executor::timeseries_checkpoint`.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::handlers::transaction::undo::UndoEntry;
@@ -64,7 +65,6 @@ impl CoreLoop {
         );
         let writer = ColumnarSegmentWriter::new(&segment_dir);
         let view = mt.flush_view();
-        let partition_name = format!("ts-{}_{}", view.min_ts, view.max_ts);
 
         // Use the max ingested WAL LSN for this collection so the partition
         // records which WAL records have been flushed. Read before the write and
@@ -86,6 +86,8 @@ impl CoreLoop {
         // record on replay, the record's own LSN loses the rows not yet
         // flushed — so no caller may introduce one.
         let flush_wal_lsn = self.ts_max_ingested_lsn.get(&key).copied().unwrap_or(0);
+        let partition_name =
+            unique_partition_name(&segment_dir, view.min_ts, view.max_ts, flush_wal_lsn)?;
         let ts_kek = self.segment_keks.ts_segment_kek.as_ref();
         let meta = writer
             .write_partition(&partition_name, &view, 0, flush_wal_lsn, ts_kek)
@@ -134,7 +136,9 @@ impl CoreLoop {
             meta: reg_meta,
             dir_name: partition_name,
         };
-        registry.import(vec![(drain.min_ts, pe)]);
+        // `insert_partition`, not `import`: two flushes can share a min_ts, and
+        // filing both under it would drop one from the registry.
+        registry.insert_partition(pe);
 
         // Fire continuous aggregate hook.
         let refreshed =
@@ -266,5 +270,101 @@ impl CoreLoop {
         if let Ok(token) = gov.try_reserve(db_id, tid, nodedb_mem::EngineId::Timeseries, bytes) {
             self.columnar_memtable_mem.insert(key, token);
         }
+    }
+}
+
+/// Pick a partition directory name that no existing partition owns.
+///
+/// The timestamp span alone is NOT an identity: late or duplicate-timestamp
+/// ingest makes two flushes span the same `(min_ts, max_ts)`, and
+/// `write_partition` rewrites each file in place — so a name collision replaces
+/// rows a checkpoint has already reported durable. The flush LSN separates the
+/// ordinary case; the probe closes the remainder, since the LSN can repeat when
+/// a flush drains rows that arrived under an already-stamped record.
+///
+/// The `ts-` prefix is load-bearing: the boot registry scan and the orphan
+/// sweeper both key on it.
+fn unique_partition_name(
+    segment_dir: &Path,
+    min_ts: i64,
+    max_ts: i64,
+    flush_wal_lsn: u64,
+) -> crate::Result<String> {
+    let base = format!("ts-{min_ts}_{max_ts}-{flush_wal_lsn:016x}");
+    if !name_taken(segment_dir, &base)? {
+        return Ok(base);
+    }
+    for suffix in 1u32..=u32::MAX {
+        let candidate = format!("{base}-{suffix}");
+        if !name_taken(segment_dir, &candidate)? {
+            return Ok(candidate);
+        }
+    }
+    // Handing back a taken name would rewrite a partition a checkpoint has
+    // already reported durable — the exact defect the probe exists to prevent —
+    // so the flush fails and retries instead. Its rows stay in the memtable and
+    // the WAL behind them stays.
+    Err(crate::Error::Storage {
+        engine: "timeseries".into(),
+        detail: format!("no free partition directory name remains for {base}"),
+    })
+}
+
+/// Whether `name` already names an entry under `segment_dir`.
+///
+/// `try_exists`, not `exists`: the latter reports a permission or I/O failure as
+/// "absent", and treating an unreadable directory as free would hand the flush a
+/// name whose files `write_partition` then rewrites in place.
+fn name_taken(segment_dir: &Path, name: &str) -> crate::Result<bool> {
+    segment_dir
+        .join(name)
+        .try_exists()
+        .map_err(|e| crate::Error::Storage {
+            engine: "timeseries".into(),
+            detail: format!("probe partition directory {name}: {e}"),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unique_partition_name;
+
+    #[test]
+    fn distinct_spans_get_distinct_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = unique_partition_name(dir.path(), 1, 2, 10).expect("name");
+        let b = unique_partition_name(dir.path(), 3, 4, 11).expect("name");
+        assert_ne!(a, b);
+        assert!(a.starts_with("ts-"), "boot scan keys on the ts- prefix");
+    }
+
+    /// The defect this guards: a second flush spanning the same timestamps and
+    /// carrying the same flush LSN must not target the first flush's directory,
+    /// whose files `write_partition` would rewrite in place.
+    #[test]
+    fn identical_span_and_lsn_does_not_reuse_a_live_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let first = unique_partition_name(dir.path(), 100, 100, 42).expect("name");
+        std::fs::create_dir_all(dir.path().join(&first)).expect("mkdir");
+
+        let second = unique_partition_name(dir.path(), 100, 100, 42).expect("name");
+        assert_ne!(first, second);
+        std::fs::create_dir_all(dir.path().join(&second)).expect("mkdir");
+
+        let third = unique_partition_name(dir.path(), 100, 100, 42).expect("name");
+        assert_ne!(third, first);
+        assert_ne!(third, second);
+    }
+
+    #[test]
+    fn a_different_lsn_alone_separates_the_span() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = unique_partition_name(dir.path(), 100, 100, 42).expect("name");
+        std::fs::create_dir_all(dir.path().join(&first)).expect("mkdir");
+        let second = unique_partition_name(dir.path(), 100, 100, 43).expect("name");
+        assert_ne!(first, second);
+        // The LSN alone separated them, so no probe suffix was appended.
+        assert_eq!(second, format!("ts-100_100-{:016x}", 43u64));
     }
 }

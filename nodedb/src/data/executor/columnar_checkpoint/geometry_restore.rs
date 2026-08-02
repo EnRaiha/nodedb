@@ -9,7 +9,7 @@
 //! of the insert: `execute_columnar_insert` calls
 //! `index_columnar_geometry_columns`, which populates `CoreLoop::spatial_indexes`
 //! and `spatial_doc_map`. Those two maps have their own checkpoint
-//! (`spatial_checkpoint.rs`), and before the columnar replay floor existed they
+//! (`spatial_checkpoint/`), and before the columnar replay floor existed they
 //! also had a second, unconditional source: full WAL replay re-ran every insert
 //! and therefore re-ran the indexing.
 //!
