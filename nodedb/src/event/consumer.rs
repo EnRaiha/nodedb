@@ -19,7 +19,10 @@
 //!   WAL are NEVER read simultaneously (prevents "thundering WAL" spiral).
 //!   The consumer also boots directly into this mode (see `consumer_loop`)
 //!   to replay any WAL suffix past the persisted watermark before serving
-//!   the ring buffer, closing the restart delivery gap.
+//!   the ring buffer, closing the restart delivery gap. If that suffix is no
+//!   longer in the WAL — truncated away, or unreachable because the watermark
+//!   itself was lost — the node fail-stops rather than resume from a position
+//!   it cannot prove it reached.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -331,7 +334,15 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
                     num_cores,
                     last_sequence,
                 )
-                .or_else(|_| {
+                .or_else(|e| {
+                    // The sequential arm is a fallback for readers that cannot
+                    // see the bytes (mmap misses O_DIRECT writes to the active
+                    // segment), not for a log that no longer holds the records.
+                    // Both arms read the same directory, so retrying a deleted
+                    // suffix only re-derives the same answer.
+                    if is_retained_floor_violation(&e) {
+                        return Err(e);
+                    }
                     super::wal_replay::replay_wal_to_events(
                         &wal,
                         last_lsn.next(),
@@ -364,12 +375,36 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
                             debug!(core_id, "WAL catchup: no new events");
                         }
                     }
+                    Err(e) if is_retained_floor_violation(&e) => {
+                        // The WAL no longer holds the suffix this consumer has
+                        // to replay, so the events between the watermark and
+                        // the retained floor were never dispatched and can
+                        // never be reconstructed: their CDC rows, trigger
+                        // fires, and streaming-MV updates are already lost.
+                        // Retrying cannot heal that, and returning to Normal
+                        // mode would resume from a watermark that claims
+                        // delivery which never happened — divergence that
+                        // spreads silently into every downstream consumer.
+                        // Stop the node instead, while an operator can still
+                        // see where the log begins and restore from a snapshot.
+                        fail_stop_wal_catchup(
+                            core_id,
+                            &e,
+                            "the WAL no longer retains the suffix this consumer must replay",
+                            wal_retry_count,
+                            last_lsn,
+                            &shared_state,
+                            &shutdown_bus,
+                        );
+                        break;
+                    }
                     Err(e) => {
                         wal_retry_count += 1;
                         if wal_retry_count >= MAX_WAL_RETRIES {
                             fail_stop_wal_catchup(
                                 core_id,
                                 &e,
+                                "WAL catchup replay kept failing",
                                 wal_retry_count,
                                 last_lsn,
                                 &shared_state,
@@ -426,7 +461,24 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
     );
 }
 
-/// Fail-stop after bounded WAL recovery failures.
+/// Is this the WAL reporting that the requested replay suffix was already
+/// truncated away?
+///
+/// Every other replay failure is potentially transient (a partially written
+/// active segment, a reader that cannot see O_DIRECT bytes); this one is not,
+/// so the consumer routes it past the retry loop straight to fail-stop.
+fn is_retained_floor_violation(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Wal(nodedb_wal::WalError::ReplayBelowRetainedFloor { .. })
+    )
+}
+
+/// Fail-stop on an unrecoverable WAL catchup failure.
+///
+/// `reason` states which failure class stopped the node; `attempts` is how many
+/// replay attempts preceded it (zero for a failure that is unrecoverable on the
+/// first observation and never retried).
 ///
 /// `last_safe_lsn` is deliberately only observed for audit/logging; this path
 /// never mutates or flushes it. Continuing without a recoverable WAL prefix
@@ -434,7 +486,8 @@ async fn consumer_loop(config: ConsumerConfig, metrics: Arc<CoreMetrics>) {
 fn fail_stop_wal_catchup(
     core_id: usize,
     error: &impl std::fmt::Display,
-    retries: u32,
+    reason: &'static str,
+    attempts: u32,
     last_safe_lsn: Lsn,
     shared_state: &SharedState,
     shutdown_bus: &crate::control::shutdown::ShutdownBus,
@@ -442,16 +495,17 @@ fn fail_stop_wal_catchup(
     tracing::error!(
         core_id,
         error = %error,
-        retries,
+        reason,
+        attempts,
         last_safe_lsn = last_safe_lsn.as_u64(),
-        "WAL catchup failed after max retries; initiating fail-stop shutdown"
+        "WAL catchup cannot complete; initiating fail-stop shutdown"
     );
     shared_state.audit_record(
         crate::control::security::audit::AuditEvent::AdminAction,
         None,
         "event_plane",
         &format!(
-            "event consumer core {core_id} WAL catchup failed after {retries} retries at safe LSN {}: {error}",
+            "event consumer core {core_id} WAL catchup stopped after {attempts} attempts at safe LSN {} ({reason}): {error}",
             last_safe_lsn.as_u64()
         ),
     );
@@ -710,6 +764,7 @@ mod tests {
         fail_stop_wal_catchup(
             0,
             &"replay unavailable",
+            "WAL catchup replay kept failing",
             10,
             Lsn::new(10),
             &shared_state,
@@ -718,6 +773,23 @@ mod tests {
 
         assert!(shared_state.shutdown.is_shutdown());
         assert_eq!(watermark_store.load(0).unwrap(), Lsn::new(10));
+    }
+
+    /// A truncated-away suffix is routed past the retry loop: it is not
+    /// transient, and continuing would advance the watermark past events that
+    /// were never dispatched.
+    #[test]
+    fn truncated_suffix_is_recognised_as_unrecoverable() {
+        assert!(is_retained_floor_violation(&crate::Error::Wal(
+            nodedb_wal::WalError::ReplayBelowRetainedFloor {
+                from_lsn: 10,
+                retained_floor_lsn: 4096,
+                earliest_segment: "wal-00000000000000004096.seg".to_string(),
+            }
+        )));
+        assert!(!is_retained_floor_violation(&crate::Error::Wal(
+            nodedb_wal::WalError::Sealed
+        )));
     }
 
     #[tokio::test]

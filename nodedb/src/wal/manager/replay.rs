@@ -80,6 +80,14 @@ impl WalManager {
     }
 
     /// Replay committed records from the WAL starting at `from_lsn`.
+    ///
+    /// A `from_lsn` below the earliest LSN the WAL still retains fails with
+    /// [`nodedb_wal::WalError::ReplayBelowRetainedFloor`] rather than returning
+    /// the shorter suffix that survived truncation. A caller recovering from a
+    /// persisted position must treat that as unrecoverable: the records it is
+    /// asking for are gone, and a short answer is indistinguishable from a
+    /// complete one. The same applies to [`Self::replay_mmap_from`],
+    /// [`Self::replay_from_limit`], and [`Self::replay_mmap_from_limit`].
     pub fn replay_from(&self, from_lsn: Lsn) -> crate::Result<Vec<WalRecord>> {
         let wal = self.wal.lock().unwrap_or_else(|p| p.into_inner());
         let records = wal

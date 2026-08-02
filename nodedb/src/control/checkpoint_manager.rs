@@ -80,11 +80,12 @@ impl Default for CheckpointManagerConfig {
 /// The engines are not the only consumer of the WAL. Each Event Plane consumer
 /// recovers from exactly one place — the WAL suffix above its persisted
 /// watermark — and that watermark is flushed lazily, so it always trails the
-/// engines. `WalManager::replay_from` filters by `lsn >= from_lsn` with no gap
-/// detection, so once a segment below a consumer's watermark is unlinked the
-/// consumer silently resumes at whatever floor survives and logs a clean
-/// catchup. Every CDC row, trigger fire, and streaming-MV update for the
-/// acknowledged writes in that gap is then lost with nothing to report it.
+/// engines. Once a segment below a consumer's watermark is unlinked, that
+/// suffix is gone: every CDC row, trigger fire, and streaming-MV update for the
+/// acknowledged writes in it is unrecoverable. Replay now refuses a request
+/// below the retained floor rather than returning the shorter suffix that
+/// survives, so the loss is loud instead of silent — but refusing is only an
+/// alarm. This floor is what keeps it from happening.
 ///
 /// `event_watermarks` is therefore folded in exactly as each core's engine LSN
 /// is, with the same conservatism: one entry per core, and a core that has
@@ -545,9 +546,9 @@ mod tests {
     }
 
     /// The Event Plane binds truncation when it trails the engines. Its
-    /// consumers recover ONLY from the WAL above their persisted watermark, and
-    /// `replay_from` detects no gap — so truncating at the engine minimum would
-    /// silently drop every CDC row, trigger fire and MV update in between.
+    /// consumers recover ONLY from the WAL above their persisted watermark, so
+    /// truncating at the engine minimum would drop every CDC row, trigger fire
+    /// and MV update in between — unrecoverably, whether or not replay notices.
     #[test]
     fn event_plane_behind_the_engines_clamps_truncation_to_it() {
         assert_eq!(

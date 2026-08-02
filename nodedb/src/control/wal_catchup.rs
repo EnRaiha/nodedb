@@ -99,6 +99,29 @@ async fn run_catchup_cycle(shared: &SharedState) -> CatchupResult {
         .replay_from_limit(Lsn::new(catchup_lsn + 1), PAGE_SIZE)
     {
         Ok(r) => r,
+        // The cursor points below the earliest LSN the WAL still retains, so
+        // the batches in between were truncated before this task could
+        // re-dispatch them. It cannot get them back, but leaving the cursor
+        // where it is would wedge the task on the same failure forever and
+        // strand every batch above the floor as well. Re-anchor to the floor
+        // and say plainly what was skipped — the WAL layer has already filed a
+        // report at the detection site.
+        Err(crate::Error::Wal(nodedb_wal::WalError::ReplayBelowRetainedFloor {
+            retained_floor_lsn,
+            ..
+        })) => {
+            tracing::error!(
+                cursor_lsn = catchup_lsn,
+                retained_floor_lsn,
+                skipped_lsns = retained_floor_lsn.saturating_sub(catchup_lsn + 1),
+                "WAL catch-up cursor is below the retained WAL floor; timeseries batches in the \
+                 truncated range can no longer be re-dispatched"
+            );
+            shared
+                .wal_catchup_lsn
+                .store(retained_floor_lsn.saturating_sub(1), Ordering::Release);
+            return CatchupResult::Idle;
+        }
         Err(e) => {
             debug!(error = %e, lsn = catchup_lsn, "WAL catch-up replay failed");
             return CatchupResult::Idle;
