@@ -192,6 +192,31 @@ impl CrashHarness {
         self
     }
 
+    /// Set (or replace) a server env override in place, between spawns.
+    ///
+    /// [`CrashHarness::with_env`] is builder-style and pins the value for the
+    /// whole life of the harness — right for tuning knobs the recovery half
+    /// must inherit from the crash half. A crash-during-recovery test needs the
+    /// opposite: `NODEDB_FAILPOINTS` armed for exactly ONE boot. Left armed,
+    /// every later `reopen` aborts at the same point and recovery never gets to
+    /// run to completion, so the test could never observe the state it exists
+    /// to check.
+    pub fn set_env(&mut self, key: &str, value: &str) {
+        match self.extra_env.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = value.to_string(),
+            None => self.extra_env.push((key.to_string(), value.to_string())),
+        }
+    }
+
+    /// Drop a previously-set env override so subsequent spawns boot without it.
+    ///
+    /// The test process itself never exports the vars this harness sets, so
+    /// removing the override here really does leave the child with the variable
+    /// unset rather than falling back to an inherited value.
+    pub fn clear_env(&mut self, key: &str) {
+        self.extra_env.retain(|(k, _)| k != key);
+    }
+
     /// The data directory this server was started against.
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir_path
