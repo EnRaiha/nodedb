@@ -112,7 +112,7 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
         )?;
         let spatial_put_payload =
             encode_spatial_put_payload(&collection, &field, surrogate, &geometry, &prov)?;
-        wal_append_spatial_put(
+        let wal_lsn = wal_append_spatial_put(
             &self.shared.wal,
             tenant_id,
             vshard,
@@ -136,7 +136,7 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             vshard,
             plan,
         )?;
-        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized, Some(wal_lsn)).await
     }
 
     async fn dispatch_delete(
@@ -165,7 +165,7 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
 
         let spatial_delete_payload =
             encode_spatial_delete_payload(&collection, &field, surrogate, &prov);
-        wal_append_spatial_delete(
+        let wal_lsn = wal_append_spatial_delete(
             &self.shared.wal,
             tenant_id,
             vshard,
@@ -188,7 +188,7 @@ impl<'a> SpatialDispatcher for SharedStateSpatialDispatcher<'a> {
             vshard,
             plan,
         )?;
-        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized, Some(wal_lsn)).await
     }
 
     fn assign_surrogate(

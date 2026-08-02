@@ -105,7 +105,7 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
         // Allocate WAL LSN on the Control Plane before dispatching to the
         // Data Plane. Sync path MUST write to WAL; non-sync path already does
         // this via `wal_append_if_write_with_creds` in the main dispatch.
-        wal_append_vector_put(
+        let wal_lsn = wal_append_vector_put(
             &self.shared.wal,
             tenant_id,
             vshard,
@@ -138,7 +138,7 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
             vshard,
             plan,
         )?;
-        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized, Some(wal_lsn)).await
     }
 
     async fn dispatch_delete(
@@ -168,7 +168,7 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
 
         // Allocate WAL LSN on the Control Plane before dispatching to the
         // Data Plane.
-        wal_append_vector_delete_by_surrogate(
+        let wal_lsn = wal_append_vector_delete_by_surrogate(
             &self.shared.wal,
             tenant_id,
             vshard,
@@ -196,7 +196,7 @@ impl<'a> VectorDispatcher for SharedStateVectorDispatcher<'a> {
             vshard,
             plan,
         )?;
-        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized, Some(wal_lsn)).await
     }
 
     fn assign_surrogate(

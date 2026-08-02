@@ -40,33 +40,6 @@ pub async fn dispatch_authorized_to_data_plane(
     .await
 }
 
-/// Dispatch a capability-bearing external task with an explicit event source.
-pub(crate) async fn dispatch_authorized_to_data_plane_with_source(
-    shared: &SharedState,
-    authorized: AuthorizedTask,
-    trace_id: TraceId,
-    event_source: crate::event::EventSource,
-) -> crate::Result<Response> {
-    let task = authorized.into_physical_task();
-    dispatch_to_data_plane_inner(
-        shared,
-        DataPlaneDispatch {
-            tenant_id: task.tenant_id,
-            database_id: task.database_id,
-            vshard_id: task.vshard_id,
-            plan: task.plan,
-            trace_id,
-            event_source,
-            txn_id: task.txn_id,
-            durability: WalDurability::CallerSupplied {
-                wal_lsn: None,
-                resolved_now_ms: None,
-            },
-        },
-    )
-    .await
-}
-
 /// Dispatch a capability-bearing external autocommit write.
 pub async fn dispatch_authorized_autocommit_write(
     shared: &SharedState,
@@ -83,6 +56,36 @@ pub async fn dispatch_authorized_autocommit_write(
             plan: task.plan,
             trace_id,
             event_source: crate::event::EventSource::User,
+            txn_id: task.txn_id,
+            durability: WalDurability::AppendHere { now_override: None },
+        },
+    )
+    .await
+}
+
+/// Dispatch a capability-bearing external autocommit write with an explicit
+/// event source.
+///
+/// Same durability contract as [`dispatch_authorized_autocommit_write`] — the
+/// funnel mints the redo under the write-admission guard and the durable-at-ack
+/// barrier covers it — but the write is tagged with the caller's event source so
+/// a synced write does not re-fire AFTER triggers on the receiving node.
+pub(crate) async fn dispatch_authorized_autocommit_write_with_source(
+    shared: &SharedState,
+    authorized: AuthorizedTask,
+    trace_id: TraceId,
+    event_source: crate::event::EventSource,
+) -> crate::Result<Response> {
+    let task = authorized.into_physical_task();
+    dispatch_to_data_plane_inner(
+        shared,
+        DataPlaneDispatch {
+            tenant_id: task.tenant_id,
+            database_id: task.database_id,
+            vshard_id: task.vshard_id,
+            plan: task.plan,
+            trace_id,
+            event_source,
             txn_id: task.txn_id,
             durability: WalDurability::AppendHere { now_override: None },
         },
@@ -344,4 +347,160 @@ async fn dispatch_to_data_plane_inner(
     )
     .await
     .map(|outcome| outcome.response)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use nodedb_array::types::ArrayId;
+    use nodedb_physical::physical_plan::ArrayOp;
+    use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+
+    use super::dispatch_authorized_autocommit_write_with_source;
+    use crate::bridge::dispatch::{BridgeResponse, CoreChannelDataSide, Dispatcher};
+    use crate::bridge::envelope::{Payload, Status};
+    use crate::control::state::SharedState;
+    use crate::engine::array::wal::ArrayPutCell;
+    use crate::types::{DatabaseId, Lsn, TenantId, VShardId};
+    use crate::wal::WalManager;
+
+    const ARRAY: &str = "grid";
+
+    fn fixture() -> (Arc<SharedState>, CoreChannelDataSide, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("temporary WAL directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("autocommit.wal"))
+                .expect("test WAL"),
+        );
+        let (dispatcher, mut sides) = Dispatcher::new(1, 64);
+        let side = sides.pop().expect("one data side");
+        let state = SharedState::new(dispatcher, wal).expect("shared state");
+        (state, side, directory)
+    }
+
+    fn array_put_task(tenant_id: TenantId) -> PhysicalTask {
+        // An empty cell batch is a valid encoding; what this exercises is the
+        // durability handling of the plan shape, not the cells.
+        let cells: Vec<ArrayPutCell> = Vec::new();
+        PhysicalTask {
+            tenant_id,
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::from_collection_in_database(DatabaseId::DEFAULT, ARRAY),
+            plan: crate::bridge::envelope::PhysicalPlan::Array(ArrayOp::Put {
+                array_id: ArrayId::in_database(tenant_id, DatabaseId::DEFAULT, ARRAY),
+                cells_msgpack: zerompk::to_msgpack_vec(&cells).expect("encode cells"),
+                wal_lsn: 0,
+                provenance: None,
+            }),
+            post_set_op: PostSetOp::None,
+            txn_id: None,
+        }
+    }
+
+    /// Answer one request, returning the plan's stamped LSN to the caller.
+    async fn respond_once_capturing_lsn(
+        state: Arc<SharedState>,
+        mut side: CoreChannelDataSide,
+        stamped: Arc<std::sync::Mutex<Option<u64>>>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut handled = false;
+        while !handled && Instant::now() < deadline {
+            if let Ok(request) = side.request_rx.try_pop() {
+                if let crate::bridge::envelope::PhysicalPlan::Array(ArrayOp::Put {
+                    wal_lsn, ..
+                }) = &request.inner.plan
+                {
+                    *stamped.lock().expect("stamped lock") = Some(*wal_lsn);
+                }
+                side.response_tx
+                    .try_push(BridgeResponse {
+                        inner: crate::bridge::envelope::Response {
+                            request_id: request.inner.request_id,
+                            status: Status::Ok,
+                            attempt: 1,
+                            partial: false,
+                            payload: Payload::empty(),
+                            watermark_lsn: Lsn::ZERO,
+                            error_code: None,
+                            read_set_valid: None,
+                            read_version_lsn: Lsn::ZERO,
+                            write_set: Vec::new(),
+                        },
+                    })
+                    .expect("fake data-plane response queue has capacity");
+                handled = true;
+            }
+            state.poll_and_route_responses();
+            tokio::task::yield_now().await;
+        }
+        assert!(handled, "fake data plane received the dispatched request");
+        state.poll_and_route_responses();
+    }
+
+    /// The array sync inbound path acks its peer off this dispatch and nothing
+    /// upstream appends a redo for it, so the funnel must own the record: mint
+    /// it, stamp it into the plan (the array engine versions its tiles from the
+    /// LSN carried there, and replay stamps the same version off the record
+    /// header — a zero would make the two disagree), and hold the reply behind
+    /// the durable-at-ack barrier.
+    #[tokio::test]
+    async fn an_autocommit_write_mints_stamps_and_fsyncs_its_own_redo() {
+        let (state, side, _directory) = fixture();
+        let tenant_id = TenantId::new(1);
+        let task = array_put_task(tenant_id);
+        let identity =
+            crate::control::security::identity::AuthenticatedIdentity::new_internal_service(
+                1,
+                "array-durability-test",
+                tenant_id,
+                Vec::new(),
+                true,
+                None,
+                crate::control::security::identity::AuthenticatedIdentity::default_database_set(
+                    true,
+                ),
+            );
+        let authorized = crate::control::server::shared::authorization::authorize_task_set(
+            &identity,
+            std::slice::from_ref(&task),
+            &state.permissions,
+            &state.roles,
+            &crate::control::security::audit::NoopAuditEmitter,
+        )
+        .expect("authorize test task")
+        .into_tasks()
+        .into_iter()
+        .next()
+        .expect("one authorized task");
+
+        let stamped = Arc::new(std::sync::Mutex::new(None));
+        let responder = tokio::spawn(respond_once_capturing_lsn(
+            Arc::clone(&state),
+            side,
+            Arc::clone(&stamped),
+        ));
+        let response = dispatch_authorized_autocommit_write_with_source(
+            &state,
+            authorized,
+            crate::types::TraceId::ZERO,
+            crate::event::EventSource::CrdtSync,
+        )
+        .await
+        .expect("autocommit array write succeeds");
+        responder.await.expect("responder completes");
+
+        assert_eq!(response.status, Status::Ok);
+        let stamped = stamped.lock().expect("stamped lock").expect("an array put");
+        assert!(
+            stamped > 0,
+            "the plan the Data Plane executes must carry the minted LSN, not a zero"
+        );
+        assert!(
+            state.wal.durable_through() >= stamped,
+            "the minted redo must be fsync-durable before the write is acknowledged"
+        );
+    }
 }

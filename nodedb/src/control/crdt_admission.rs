@@ -1146,6 +1146,7 @@ mod tests {
             authorized,
             Duration::from_millis(10),
             EventSource::User,
+            None,
         )
         .await;
         assert!(matches!(

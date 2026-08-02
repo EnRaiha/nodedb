@@ -9,7 +9,7 @@ use crate::control::server::shared::authorization::AuthorizedTask;
 use crate::control::state::SharedState;
 use crate::control::wal_replication::to_replicated_entry;
 use crate::event::EventSource;
-use crate::types::VShardId;
+use crate::types::{Lsn, VShardId};
 
 use super::admission_guard::reject_unadmitted_crdt_apply;
 use super::outcome::SyncDispatchOutcome;
@@ -56,7 +56,10 @@ pub async fn dispatch_sync_bytes(
             trimmed_ops: outcome.trimmed_ops,
         });
     }
-    dispatch_write_replicated(state, collection, authorized, timeout, event_source)
+    // The CRDT delta path mints no redo of its own before this call — the
+    // admitted-apply path and the Raft entry own its durability — so it supplies
+    // no LSN.
+    dispatch_write_replicated(state, collection, authorized, timeout, event_source, None)
         .await
         .map(SyncDispatchOutcome::untrimmed)
 }
@@ -77,6 +80,12 @@ pub async fn dispatch_sync_bytes(
 ///   plan has no replicated form), so the write goes straight to the local Data
 ///   Plane and the tenant write-HLC is advanced on success.
 ///
+/// `wal_lsn` names the redo record the caller appended for this write before
+/// calling, or `None` when it appended none. The single-node path waits on it
+/// before returning: the sync handlers turn this return value straight into the
+/// peer's "applied" ack, and a peer that reads that retires the batch forever.
+/// The Raft path does not need it — the committed entry is the durable record.
+///
 /// Returns the apply-payload bytes the caller can map to its own success shape.
 pub async fn dispatch_write_replicated(
     state: &SharedState,
@@ -84,6 +93,7 @@ pub async fn dispatch_write_replicated(
     authorized: AuthorizedTask,
     timeout: Duration,
     event_source: EventSource,
+    wal_lsn: Option<Lsn>,
 ) -> crate::Result<Vec<u8>> {
     let task = authorized.into_physical_task();
     let tenant_id = task.tenant_id;
@@ -154,8 +164,91 @@ pub async fn dispatch_write_replicated(
         });
     }
 
+    // Durable-at-ack barrier for the single-node path. The system-task dispatch
+    // above hands the plan to the Data Plane directly, so the Control-Plane write
+    // funnel's own barrier never runs for it; the record the caller appended is
+    // still only buffered at this point. Every engine that reaches here rebuilds
+    // its state by WAL replay alone, so returning without this fsync acks a write
+    // a `kill -9` erases — and the peer, having seen "applied", never re-sends it.
+    if let Some(lsn) = wal_lsn {
+        state.wal.wait_durable(lsn).await?;
+    }
+
     // Mirror `dispatch_system_with_source`: advance the tenant write-HLC on the
     // success path (the Response-returning core leaves this to the caller).
     state.advance_tenant_write_hlc(tenant_id.as_u64());
     Ok(resp.payload.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::super::durability_test_support::{
+        COLLECTION, append_buffered_record, authorized_write, fixture, respond_once,
+    };
+    use super::dispatch_write_replicated;
+    use crate::event::EventSource;
+
+    /// The timeseries and columnar sync handlers append their redo and then ack
+    /// their peer off this return value. The single-node branch hands the plan
+    /// to the Data Plane directly, so the write funnel's own barrier never runs
+    /// for it — without the wait below the record is still only buffered when
+    /// the peer is told "applied", and it never re-sends.
+    #[tokio::test]
+    async fn a_supplied_lsn_is_fsync_durable_before_the_payload_returns() {
+        let (state, side, _directory) = fixture();
+        let lsn = append_buffered_record(&state);
+        assert!(
+            state.wal.durable_through() < lsn.as_u64(),
+            "the append must only buffer, or this test proves nothing"
+        );
+        let authorized = authorized_write(&state);
+
+        let responder = tokio::spawn(respond_once(Arc::clone(&state), side));
+        dispatch_write_replicated(
+            &state,
+            COLLECTION,
+            authorized,
+            Duration::from_secs(5),
+            EventSource::CrdtSync,
+            Some(lsn),
+        )
+        .await
+        .expect("replicated sync dispatch succeeds");
+        responder.await.expect("responder completes");
+
+        assert!(
+            state.wal.durable_through() >= lsn.as_u64(),
+            "the supplied redo must be fsync-durable before the peer is acked"
+        );
+    }
+
+    /// A caller that appended nothing has nothing to wait on, which is what
+    /// makes the assertion above a statement about the threaded LSN.
+    #[tokio::test]
+    async fn no_supplied_lsn_leaves_an_unrelated_buffered_record_alone() {
+        let (state, side, _directory) = fixture();
+        let lsn = append_buffered_record(&state);
+        let authorized = authorized_write(&state);
+
+        let responder = tokio::spawn(respond_once(Arc::clone(&state), side));
+        dispatch_write_replicated(
+            &state,
+            COLLECTION,
+            authorized,
+            Duration::from_secs(5),
+            EventSource::CrdtSync,
+            None,
+        )
+        .await
+        .expect("replicated sync dispatch succeeds");
+        responder.await.expect("responder completes");
+
+        assert!(
+            state.wal.durable_through() < lsn.as_u64(),
+            "nothing appended by this dispatch means nothing to fsync"
+        );
+    }
 }

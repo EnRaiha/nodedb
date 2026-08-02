@@ -182,6 +182,44 @@ impl DomainContext for ReplayRecordUnapplied<'_> {
     }
 }
 
+/// A write whose redo record the Control-Plane funnel was supposed to mint
+/// reached the client acknowledgement with no durable LSN to wait on.
+pub(super) struct WriteAckedWithoutDurability {
+    /// Engine whose every write-class op is expected to mint a WAL redo on
+    /// this path (`kv`, `vector`, `graph`, ...).
+    pub engine: &'static str,
+}
+
+impl DomainContext for WriteAckedWithoutDurability {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.write_acked_without_durability"
+    }
+
+    fn grouping_key(&self) -> String {
+        // The engine names the bug: a missing redo arm is a property of the
+        // engine's WAL-append classifier, not of the row that happened to hit
+        // it. Anything finer would file one report per acknowledged write.
+        format!("engine={}", self.engine)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "engine": self.engine,
+            "why_fatal": "the funnel appended this write's redo itself, so a missing LSN \
+                          means no record was minted at all — the durable-at-ack barrier \
+                          is skipped and the client is told the write committed. This \
+                          engine's state survives a restart only by WAL replay, so a \
+                          'kill -9' after the ack loses an acknowledged write with no \
+                          error anywhere",
+            "operator_action": "inspect the named engine's arm in the Control-Plane WAL \
+                                 append dispatch: a write-class op filed under the \
+                                 'no durable record' group mints nothing. Either give it \
+                                 a redo record or move the engine out of the set the \
+                                 barrier holds to this invariant",
+        })
+    }
+}
+
 /// A Calvin cross-shard transaction's completion wait timed out with no
 /// signal for why the transaction never completed.
 pub(super) struct CalvinCompletionTimeout {

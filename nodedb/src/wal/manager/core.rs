@@ -53,6 +53,16 @@ impl WalManager {
         self.encryption_ring.is_some()
     }
 
+    /// Highest LSN the WAL is known to be fsync-durable through.
+    ///
+    /// An append only buffers its record, so this is what separates a write
+    /// that survives a `kill -9` from one that does not: a caller holding
+    /// `lsn` is durable exactly when this is `>= lsn.as_u64()`. Advanced only
+    /// by a successful group-commit fsync in [`WalManager::wait_durable`].
+    pub fn durable_through(&self) -> u64 {
+        self.durable_lsn.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Return the stable in-memory root for per-user CRDT signing keys.
     /// The root is persisted only as WAL-key-wrapped ciphertext and is
     /// rewrapped on rotation, so offline signatures survive chained key

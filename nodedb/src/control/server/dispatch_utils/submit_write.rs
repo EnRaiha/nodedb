@@ -176,6 +176,18 @@ pub(crate) async fn submit_write(
     let post_apply = wal_dispatch::plan_post_apply_redo(&plan);
     let appends_here = matches!(&durability, WalDurability::AppendHere { .. });
 
+    // Durable-at-ack obligation, also computed before `plan` moves. `Some` only
+    // for a write whose redo record THIS funnel is required to mint; a caller
+    // that appended upstream (or declared durability owned elsewhere) is not
+    // held to it, because the LSN it does or does not supply is its own
+    // contract. See `durability_barrier` for why this is narrower than
+    // "write-class plan with no LSN".
+    let funnel_redo_engine = if appends_here {
+        super::durability_barrier::funnel_minted_redo_engine(&plan)
+    } else {
+        None
+    };
+
     // Write-admission gate: every write-class plan whose ordering is not already
     // final passes here. An uncontended point write takes the fast path holding
     // its per-vShard deterministic locks; a contended or bulk write is submitted
@@ -466,14 +478,21 @@ pub(crate) async fn submit_write(
     // the shared WAL; one group-commit fsync coalesces concurrent writers (see
     // `WalManager::wait_durable`), and it runs here — after the admission guards
     // are released — so it never serializes same-key throughput. Reads / control
-    // ops / trigger / staged-write dispatch carry no LSN and skip the barrier.
+    // ops / trigger / staged-write dispatch carry no LSN and skip the barrier;
+    // `durability_barrier` decides which of those skips are legitimate and makes
+    // the rest loud instead of letting them ack a write nothing can recover.
     if response.status == Status::Ok {
         let durable_target = match (wal_lsn, post_apply_lsn) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
-        if let Some(lsn) = durable_target {
-            rollback_ddl!(shared.wal.wait_durable(lsn).await);
+        match durable_target {
+            Some(lsn) => rollback_ddl!(shared.wal.wait_durable(lsn).await),
+            // Nothing to fsync. Legitimate for most plans, but if this funnel
+            // was the one required to mint the record, the ack below promises
+            // durability the engine cannot deliver — silent until a `kill -9`
+            // proves it, hence the check.
+            None => super::durability_barrier::assert_durable_before_ack(funnel_redo_engine),
         }
     }
 

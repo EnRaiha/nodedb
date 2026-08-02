@@ -192,7 +192,7 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
 
         // WAL append — surrogates are persisted so followers never mint their
         // own divergent ids.
-        let wal_lsn = wal_append_columnar(
+        let appended_lsn = wal_append_columnar(
             &self.shared.wal,
             tenant_id,
             vshard,
@@ -203,8 +203,8 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
                 provenance: Some(&prov),
                 surrogates: &surrogates,
             },
-        )?
-        .map(|lsn| lsn.as_u64());
+        )?;
+        let wal_lsn = appended_lsn.map(|lsn| lsn.as_u64());
 
         let plan = PhysicalPlan::Columnar(ColumnarOp::Insert {
             collection: collection.clone(),
@@ -226,7 +226,7 @@ impl<'a> ColumnarDispatcher for SharedStateColumnarDispatcher<'a> {
             vshard,
             plan,
         )?;
-        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized, appended_lsn).await
     }
 }
 

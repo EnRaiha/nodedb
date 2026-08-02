@@ -5,6 +5,8 @@
 
 pub mod admission_guard;
 pub mod authorize;
+#[cfg(test)]
+mod durability_test_support;
 pub mod outcome;
 pub mod propose;
 pub mod response;

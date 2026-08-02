@@ -208,8 +208,15 @@ impl OriginArrayInbound {
             ))
         })?;
 
+        // This is the only durability this op will ever get: nothing appended a
+        // redo for it upstream (no Raft entry on this path), and the reply below
+        // tells the peer the op is applied — after which it never re-sends. The
+        // write must therefore own its record: the funnel appends it under the
+        // write-admission guard, stamps the minted LSN into the plan so the tile
+        // version matches what replay will stamp from the record header, and
+        // holds the ack behind the durable-at-ack barrier.
         let response =
-            match crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane_with_source(
+            match crate::control::server::dispatch_utils::dispatch_authorized_autocommit_write_with_source(
                 self.shared(),
                 authorized,
                 TraceId::ZERO,

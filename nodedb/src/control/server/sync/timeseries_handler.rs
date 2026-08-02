@@ -92,7 +92,7 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
 
         // Allocate a WAL LSN on the Control Plane before dispatching to the
         // Data Plane. This is the canonical LSN for dedup tracking.
-        let wal_lsn = wal_append_timeseries(
+        let appended_lsn = wal_append_timeseries(
             &self.shared.wal,
             TimeseriesWalAppendContext {
                 tenant_id,
@@ -103,8 +103,8 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             &payload_bytes,
             Some(&prov),
             Some(&self.shared.credentials),
-        )?
-        .map(|lsn| lsn.as_u64());
+        )?;
+        let wal_lsn = appended_lsn.map(|lsn| lsn.as_u64());
 
         let plan = PhysicalPlan::Timeseries(TimeseriesOp::Ingest {
             collection: collection.clone(),
@@ -129,6 +129,7 @@ impl<'a> TimeseriesDispatcher for SharedStateTimeseriesDispatcher<'a> {
             authorized,
             std::time::Duration::from_secs(self.shared.tuning.network.default_deadline_secs),
             crate::event::EventSource::CrdtSync,
+            appended_lsn,
         )
         .await
     }

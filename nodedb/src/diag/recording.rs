@@ -160,6 +160,24 @@ pub fn replay_record_unapplied(
     .emit();
 }
 
+/// Report an acknowledged write whose redo record the Control-Plane funnel was
+/// supposed to mint but did not.
+///
+/// Called only from the durable-at-ack barrier in `submit_write`, the one place
+/// that knows both what the plan required and what was actually appended. Not
+/// re-emitted anywhere above it, so a workload hammering the same unclassified
+/// op files one report with a growing occurrence count rather than one per row.
+pub fn write_acked_without_durability(engine: &'static str) {
+    let ctx = context::WriteAckedWithoutDurability { engine };
+    let _ = Capture::new(
+        EventKind::InvariantViolation,
+        "write acknowledged with no durable redo record",
+    )
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}
+
 /// Report a Calvin cross-shard transaction whose completion wait timed out.
 ///
 /// Called from the completion-timeout arm of

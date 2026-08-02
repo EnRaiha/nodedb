@@ -104,7 +104,7 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
             &surrogate_hex,
             &text,
         );
-        wal_append_fts_index(
+        let wal_lsn = wal_append_fts_index(
             &self.shared.wal,
             tenant_id,
             vshard,
@@ -127,7 +127,7 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
             vshard,
             plan,
         )?;
-        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized, Some(wal_lsn)).await
     }
 
     async fn dispatch_delete(
@@ -155,7 +155,7 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
         let surrogate_hex = crate::engine::document::store::surrogate_to_doc_id(surrogate);
         let fts_delete_payload =
             nodedb_wal::record::FtsDeletePayload::new(prov.clone(), &collection, &surrogate_hex);
-        wal_append_fts_delete(
+        let wal_lsn = wal_append_fts_delete(
             &self.shared.wal,
             tenant_id,
             vshard,
@@ -177,7 +177,7 @@ impl<'a> FtsDispatcher for SharedStateFtsDispatcher<'a> {
             vshard,
             plan,
         )?;
-        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized).await
+        super::raft_dispatch::dispatch_sync_payload(self.shared, authorized, Some(wal_lsn)).await
     }
 
     fn assign_surrogate(
