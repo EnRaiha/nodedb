@@ -28,6 +28,12 @@ impl CoreLoop {
     /// to key the inverted index. `document_id` is the hex-encoded form of
     /// the surrogate (the redb storage key).
     ///
+    /// On `Err` the caller MUST drop `txn` without committing. Every
+    /// side-effect this writes — row body, inverted index, secondary and
+    /// versioned indexes — goes into `txn`, so abandoning it is what keeps
+    /// them one all-or-nothing unit. Committing after an error would publish
+    /// a row whose indexes are missing entries nothing later re-derives.
+    ///
     /// Returns a [`PointPutOutcome`] capturing the prior stored bytes (present
     /// when this put replaced an existing row) plus the bitemporal system time
     /// and versioned index tuples written, so a transactional caller can build
@@ -295,9 +301,25 @@ impl CoreLoop {
             // Shared extraction: the DELETE-rollback re-index path recomputes
             // the exact same text from the restored body via this helper.
             let text_content = crate::data::executor::fts_text::extract_fts_text(&doc);
-            if index_text
-                && !text_content.is_empty()
-                && let Err(e) = self.inverted.index_document_in_txn(
+            // Empty text is NOT skipped: an update that strips a document of
+            // every indexable word must take it out of the index, and only
+            // the index side knows whether a prior version put it in.
+            if index_text {
+                // The index write lands in the CALLER'S transaction — the very
+                // one the row body was written into above (the inverted index
+                // is opened on `sparse.db()`, so both are the same redb
+                // database). Propagating therefore makes row + index one
+                // all-or-nothing durable unit: every caller returns before
+                // `txn.commit()`, redb rolls the uncommitted transaction back
+                // on drop, and neither the row nor its postings land.
+                //
+                // Swallowing it would be permanent, not transient: this path
+                // emits no `FtsIndex` WAL record, so replay cannot re-derive
+                // the missing postings; the next write to the document indexes
+                // only the NEW text; and no query can tell the gap apart from a
+                // document that genuinely does not match. The row would stay
+                // invisible to full-text search until a manual reindex.
+                if let Err(e) = self.inverted.index_document_in_txn(
                     txn,
                     crate::engine::sparse::inverted::IndexDocScope {
                         database_id,
@@ -306,9 +328,15 @@ impl CoreLoop {
                         surrogate,
                     },
                     &text_content,
-                )
-            {
-                warn!(core = self.core_id, %collection, %document_id, error = %e, "inverted index update failed");
+                ) {
+                    // Recorded here, at the detection site, and never
+                    // re-emitted as the error propagates: a log line is gone at
+                    // the next restart, the capture is an fsync'd report that
+                    // survives it and names which collection's index refused.
+                    crate::diag::fts_index_update_failed(&e, collection, surrogate.as_u32());
+                    warn!(core = self.core_id, %collection, %document_id, error = %e, "inverted index update failed; rejecting the write");
+                    return Err(e);
+                }
             }
 
             match self
@@ -453,5 +481,218 @@ impl CoreLoop {
             spatial_inserts,
             stats_prior,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use redb::TableDefinition;
+
+    use crate::bridge::envelope::{Priority, Request, Status};
+    use crate::data::executor::core_loop::CoreLoop;
+    use crate::data::executor::core_loop::tests::make_core_with_dir;
+    use crate::data::executor::handlers::point::apply_put::PointPutParams;
+    use crate::data::executor::task::ExecutionTask;
+    use crate::engine::document::store::surrogate_to_doc_id;
+    use crate::engine::sparse::fts_redb::tables::DOC_LENGTHS;
+    use crate::types::{DatabaseId, ReadConsistency, RequestId, TenantId, TraceId, VShardId};
+    use nodedb_physical::physical_plan::{DocumentOp, PhysicalPlan};
+    use nodedb_types::Surrogate;
+    use std::time::{Duration, Instant};
+
+    const TID: u64 = 1;
+    const COLL: &str = "articles";
+    const SURROGATE: Surrogate = Surrogate(7);
+    /// Raw JSON body — `doc_format::decode_document`'s JSON fallback accepts
+    /// it, and its single string field is what `extract_fts_text` feeds the
+    /// inverted index, so this document has real text to index.
+    const BODY: &[u8] = br#"{"title":"alpha bravo charlie"}"#;
+
+    /// A table sharing `DOC_LENGTHS`'s redb name but with incompatible
+    /// key/value types.
+    ///
+    /// Installing it is how these tests obtain a deterministic, structural
+    /// inverted-index failure with no mock layer: the very first thing
+    /// `index_document_in_txn` does is open `DOC_LENGTHS`, which then fails
+    /// with a table-type mismatch on every attempt.
+    const POISONED_DOC_LENGTHS: TableDefinition<u64, u64> =
+        TableDefinition::new("text.doc_lengths");
+
+    /// Swap the real `DOC_LENGTHS` table for the type-mismatched one so every
+    /// subsequent inverted-index write fails.
+    fn poison_inverted_index(core: &CoreLoop) {
+        let db = core.sparse.db().clone();
+        let txn = db.begin_write().unwrap();
+        txn.delete_table(DOC_LENGTHS).unwrap();
+        txn.open_table(POISONED_DOC_LENGTHS).unwrap();
+        txn.commit().unwrap();
+    }
+
+    fn point_put_task(row_key: &str) -> ExecutionTask {
+        ExecutionTask::new(Request {
+            request_id: RequestId::new(1),
+            tenant_id: TenantId::new(TID),
+            database_id: DatabaseId::DEFAULT,
+            vshard_id: VShardId::new(0),
+            plan: PhysicalPlan::Document(DocumentOp::PointPut {
+                collection: COLL.into(),
+                document_id: row_key.into(),
+                value: BODY.to_vec(),
+                surrogate: SURROGATE,
+                pk_bytes: Vec::new(),
+            }),
+            deadline: Instant::now() + Duration::from_secs(5),
+            priority: Priority::Normal,
+            trace_id: TraceId::ZERO,
+            consistency: ReadConsistency::Strong,
+            idempotency_key: None,
+            event_source: crate::event::EventSource::User,
+            user_roles: Vec::new(),
+            user_id: None,
+            statement_digest: None,
+            txn_id: None,
+            wal_lsn: None,
+            resolved_now_ms: None,
+            admission: crate::bridge::envelope::Admission::Admitted,
+        })
+    }
+
+    fn stored_row(core: &CoreLoop, row_key: &str) -> Option<Vec<u8>> {
+        core.sparse
+            .get(DatabaseId::DEFAULT.as_u64(), TID, COLL, row_key)
+            .unwrap()
+    }
+
+    /// Control: with a healthy index the write commits AND the document is
+    /// counted into the corpus. Without this, a passing failure test could not
+    /// distinguish "the poison caused the rejection" from "this document was
+    /// never writable in the first place".
+    #[test]
+    fn healthy_index_commits_the_row_and_indexes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let row_key = surrogate_to_doc_id(SURROGATE);
+
+        let task = point_put_task(&row_key);
+        let resp = core.execute_point_put(&task, TID, COLL, &row_key, SURROGATE, BODY);
+
+        assert_eq!(resp.status, Status::Ok);
+        assert!(stored_row(&core, &row_key).is_some(), "row must be stored");
+        let (doc_count, _avg_len) = core
+            .inverted
+            .corpus_stats(DatabaseId::DEFAULT.as_u64(), TenantId::new(TID), COLL)
+            .unwrap();
+        assert_eq!(doc_count, 1, "the committed row must be in the FTS corpus");
+    }
+
+    /// The defect this guards: an inverted-index failure used to be logged and
+    /// stepped over, leaving a committed row that full-text search could never
+    /// see and that nothing — not WAL replay, not the next write — would ever
+    /// re-index. The write must now be rejected outright, with no row left
+    /// behind in the store or in the read-through document cache.
+    #[test]
+    fn index_failure_rejects_the_write_and_leaves_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let row_key = surrogate_to_doc_id(SURROGATE);
+        poison_inverted_index(&core);
+
+        let task = point_put_task(&row_key);
+        let resp = core.execute_point_put(&task, TID, COLL, &row_key, SURROGATE, BODY);
+
+        assert_eq!(
+            resp.status,
+            Status::Error,
+            "the client must be told the write failed, not receive a silent ack"
+        );
+        assert!(
+            stored_row(&core, &row_key).is_none(),
+            "the rejected write must leave no committed row — a stored row whose \
+             index update failed is invisible to full-text search forever"
+        );
+        assert!(
+            core.doc_cache
+                .get(DatabaseId::DEFAULT.as_u64(), TID, COLL, &row_key)
+                .is_none(),
+            "the rejected write must not populate the document cache either, or \
+             reads would serve a row that is not in durable storage"
+        );
+    }
+
+    /// The same guarantee stated at the helper level, because every caller of
+    /// `apply_point_put` (autocommit put/insert, upsert, batch write, merge,
+    /// transactional sub-plan, WAL redo) depends on it: the error surfaces
+    /// instead of being absorbed, so the caller's transaction is dropped
+    /// un-committed and the row never lands.
+    #[test]
+    fn apply_point_put_propagates_index_failure_instead_of_absorbing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let row_key = surrogate_to_doc_id(SURROGATE);
+        poison_inverted_index(&core);
+
+        let txn = core.sparse.begin_write().unwrap();
+        let result = core.apply_point_put(
+            &txn,
+            PointPutParams {
+                database_id: DatabaseId::DEFAULT.as_u64(),
+                tid: TID,
+                collection: COLL,
+                document_id: &row_key,
+                surrogate: SURROGATE,
+                value: BODY,
+                index_text: true,
+                user_roles: &[],
+                enforce: true,
+                wal_lsn: None,
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "an inverted-index failure must propagate to the caller"
+        );
+        // Dropping the transaction un-committed is exactly what every caller
+        // does on this error, and it is what makes row + index one unit.
+        drop(txn);
+        assert!(
+            stored_row(&core, &row_key).is_none(),
+            "aborting the shared transaction must roll the row body back too"
+        );
+    }
+
+    /// `index_text: false` (CRDT-sync materialization, which receives its text
+    /// through a separate FTS frame) must stay unaffected: it never calls the
+    /// index at all, so a broken index cannot block it.
+    #[test]
+    fn index_text_disabled_is_unaffected_by_a_broken_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut core, _tx, _rx) = make_core_with_dir(dir.path());
+        let row_key = surrogate_to_doc_id(SURROGATE);
+        poison_inverted_index(&core);
+
+        let txn = core.sparse.begin_write().unwrap();
+        let result = core.apply_point_put(
+            &txn,
+            PointPutParams {
+                database_id: DatabaseId::DEFAULT.as_u64(),
+                tid: TID,
+                collection: COLL,
+                document_id: &row_key,
+                surrogate: SURROGATE,
+                value: BODY,
+                index_text: false,
+                user_roles: &[],
+                enforce: true,
+                wal_lsn: None,
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "a put that does not index must not be gated"
+        );
+        txn.commit().unwrap();
+        assert!(stored_row(&core, &row_key).is_some());
     }
 }

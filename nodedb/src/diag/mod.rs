@@ -14,6 +14,7 @@ mod recording;
 
 pub use context::IlpFlushOutcome;
 pub use recording::{
-    calvin_completion_timeout, entry_kind, ilp_invalid_utf8_drop, ilp_line_read_drop,
-    metadata_apply_wedged, replay_record_unapplied, write_acked_without_durability,
+    calvin_completion_timeout, entry_kind, fts_index_update_failed, ilp_invalid_utf8_drop,
+    ilp_line_read_drop, metadata_apply_wedged, replay_record_unapplied,
+    write_acked_without_durability,
 };

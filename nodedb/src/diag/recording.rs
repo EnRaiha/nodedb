@@ -178,6 +178,32 @@ pub fn write_acked_without_durability(engine: &'static str) {
     .emit();
 }
 
+/// Report a document write rejected because its inverted-index update failed.
+///
+/// Called from the one site that detects it: the point-put apply path's
+/// `index_document_in_txn` error arm. The error propagates from there, so the
+/// caller's write transaction — which carries both the row and the index
+/// entry — is dropped un-committed and neither half is durable. The report
+/// exists because that rejection is invisible in the write's error message:
+/// the client learns the write failed, not that the collection's full-text
+/// index is what failed it.
+pub fn fts_index_update_failed(err: &crate::Error, collection: &str, surrogate: u32) {
+    let class = error_class(err);
+    let ctx = context::FtsIndexUpdateFailed {
+        collection,
+        surrogate,
+        error_class: &class,
+    };
+    let _ = Capture::new(
+        EventKind::Error,
+        "document write rejected: full-text index update failed",
+    )
+    .error_chain(error_chain_of(err))
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}
+
 /// Report a Calvin cross-shard transaction whose completion wait timed out.
 ///
 /// Called from the completion-timeout arm of

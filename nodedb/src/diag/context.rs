@@ -220,6 +220,55 @@ impl DomainContext for WriteAckedWithoutDurability {
     }
 }
 
+/// A document write was rejected because its full-text index update failed.
+///
+/// The row and the index share one write transaction, so the rejection is
+/// clean — neither half is durable. What the report captures is that a
+/// collection's inverted index is refusing writes at all, which no query will
+/// ever surface: clients see failing writes, not a diagnosis.
+pub(super) struct FtsIndexUpdateFailed<'a> {
+    /// Collection whose inverted index rejected the document's terms.
+    pub collection: &'a str,
+    /// Global surrogate identity of the document that failed to index.
+    pub surrogate: u32,
+    /// Stable class of the failure, as the index layer described it.
+    pub error_class: &'a str,
+}
+
+impl DomainContext for FtsIndexUpdateFailed<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb.fts_index_update_failed"
+    }
+
+    fn grouping_key(&self) -> String {
+        // The collection and the stable class of the error name the bug. The
+        // surrogate is the occurrence: a bulk load hitting the same index
+        // failure would otherwise file one report per row and bury the single
+        // fact that matters — this collection's index is refusing writes.
+        format!("collection={};cause={}", self.collection, self.error_class)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "collection": self.collection,
+            "surrogate": self.surrogate,
+            "error_class": self.error_class,
+            "why_fatal": "the inverted index shares the row's write transaction, so the \
+                          failure aborts the whole write and the client is told the write \
+                          did not happen — nothing is silently half-applied. It is filed \
+                          anyway because a structural cause makes EVERY write to this \
+                          collection fail from here on, and the only symptom the operator \
+                          sees is writes being refused with no indication that the index \
+                          is what refused them",
+            "operator_action": "read the error class: a transient cause (redb contention, \
+                                 a full disk) clears once the resource does, while a \
+                                 structural one (a corrupt or type-mismatched FTS table) \
+                                 will re-fail on every write until the collection's index \
+                                 is rebuilt",
+        })
+    }
+}
+
 /// A Calvin cross-shard transaction's completion wait timed out with no
 /// signal for why the transaction never completed.
 pub(super) struct CalvinCompletionTimeout {
