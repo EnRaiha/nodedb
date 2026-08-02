@@ -199,7 +199,9 @@ fn reclaim_handlers_are_idempotent_on_missing_files() {
 fn reclaim_is_scoped_to_tenant_and_collection() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path();
-    let vec_dir = base.join("vector-ckpt");
+    // Checkpoints live under a PER-CORE subdirectory, which is what the write
+    // path produces; a flat fixture here would test a layout that never occurs.
+    let vec_dir = base.join("vector-ckpt").join("core-0");
     std::fs::create_dir_all(&vec_dir).unwrap();
     std::fs::write(vec_dir.join("0:1:users.ckpt"), b"a").unwrap();
     std::fs::write(vec_dir.join("0:1:orders.ckpt"), b"b").unwrap();

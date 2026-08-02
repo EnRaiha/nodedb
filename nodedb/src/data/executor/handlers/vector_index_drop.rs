@@ -61,6 +61,7 @@ impl CoreLoop {
         // the next boot with the user having been told it was gone.
         if let Err(e) = super::reclaim::vector::reclaim_vector_index_checkpoint(
             &self.data_dir,
+            self.core_id,
             db.as_u64(),
             tenant.as_u64(),
             collection,
