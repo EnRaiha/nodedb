@@ -223,14 +223,20 @@ pub fn clone_database(
             });
             coll.clone_status = nodedb_types::CloneStatus::Shadowed;
             coll.descriptor_version = 0;
-            if let Err(e) = catalog.put_collection(target_db_id, &coll) {
-                tracing::warn!(
-                    target_db_id = target_db_id.as_u64(),
-                    collection = %coll.name,
-                    error = %e,
-                    "clone: failed to stamp shadow collection descriptor"
-                );
-            }
+            // Fatal, not a warning: an unstamped descriptor means the clone is
+            // reported as created while one of the source's collections simply
+            // does not resolve in it, and nothing later re-stamps it. Surfacing
+            // the failure is the only way the caller learns the clone is
+            // incomplete.
+            catalog.put_collection(target_db_id, &coll).map_err(|e| {
+                ddl_err(
+                    "XX000",
+                    format!(
+                        "clone: stamping shadow descriptor for collection '{}' failed: {e}",
+                        coll.name
+                    ),
+                )
+            })?;
         }
     }
 
