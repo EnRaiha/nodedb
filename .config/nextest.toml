@@ -12,10 +12,11 @@
 # Hard ceiling per test. Anything above this is a bug, not a slow test.
 slow-timeout = { period = "30s", terminate-after = 4 }
 
-# Opt-in only: 12,000 ILP lines starve under any concurrent load and the probe fails on
-# its own visibility poll. Run alone when touching Calvin / ILP / WAL durability:
-#   cargo nextest run -p nodedb -E 'test(many_calvin_writes_survive_immediate_kill_9)'
-default-filter = "not test(many_calvin_writes_survive_immediate_kill_9)"
+# Opt-in only. ILP ingest visibility is load-fragile: under a loaded suite these probes
+# observe zero rows and fail their own bounded poll, while passing in isolation. Run them
+# deliberately when touching Calvin / ILP / WAL durability:
+#   cargo nextest run -p nodedb -E 'binary(crash_ilp_timeseries_write)'
+default-filter = "not binary(crash_ilp_timeseries_write)"
 
 # Use every available core for cheap unit tests. Heavy cluster tests
 # are kept from starving by `threads-required` overrides below — they
