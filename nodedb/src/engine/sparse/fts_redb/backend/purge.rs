@@ -14,7 +14,9 @@ use redb::ReadableTable;
 
 use super::core::RedbFtsBackend;
 use super::shared::{MAX_COLLECTION, MAX_SUBKEY, redb_err};
-use crate::engine::sparse::fts_redb::tables::{DOC_LENGTHS, INDEX_META, POSTINGS, SEGMENTS, STATS};
+use crate::engine::sparse::fts_redb::tables::{
+    DOC_LENGTHS, DOC_TERMS, INDEX_META, POSTINGS, SEGMENTS, STATS,
+};
 
 pub(super) fn collection(
     backend: &RedbFtsBackend,
@@ -43,21 +45,12 @@ pub(super) fn collection(
         }
     }
 
-    {
-        // DOC_LENGTHS is keyed by (u64, u64, &str, u32) — use numeric range bounds.
-        let mut table = write_txn
-            .open_table(DOC_LENGTHS)
-            .map_err(|e| redb_err("open doc_lengths", e))?;
-        let surrogates: Vec<u32> = table
-            .range((database_id, tid, coll, 0u32)..=(database_id, tid, coll, u32::MAX))
-            .map_err(|e| redb_err("doc_lengths range", e))?
-            .filter_map(|r| r.ok().map(|(k, _)| k.value().3))
-            .collect();
-        removed += surrogates.len();
-        for s in surrogates {
-            let _ = table.remove((database_id, tid, coll, s));
-        }
-    }
+    // DOC_LENGTHS and DOC_TERMS are keyed by (u64, u64, &str, u32) — use
+    // numeric range bounds. Both are per-document rows for this collection and
+    // must go together: a surviving term set would name posting lists that no
+    // longer exist.
+    removed += drop_surrogate_quad_collection(&write_txn, DOC_LENGTHS, database_id, tid, coll)?;
+    removed += drop_surrogate_quad_collection(&write_txn, DOC_TERMS, database_id, tid, coll)?;
 
     {
         let mut table = write_txn
@@ -109,7 +102,8 @@ pub(super) fn tenant(backend: &RedbFtsBackend, database_id: u64, tid: u64) -> cr
     let mut removed = 0;
 
     removed += drop_str_quad_range(&write_txn, POSTINGS, database_id, tid)?;
-    removed += drop_doc_lengths_tenant(&write_txn, database_id, tid)?;
+    removed += drop_surrogate_quad_tenant(&write_txn, DOC_LENGTHS, database_id, tid)?;
+    removed += drop_surrogate_quad_tenant(&write_txn, DOC_TERMS, database_id, tid)?;
     let _ = drop_str_quad_range(&write_txn, INDEX_META, database_id, tid)?;
 
     {
@@ -162,19 +156,44 @@ fn drop_str_quad_range(
     Ok(n)
 }
 
-/// Delete every `(database_id, tid, *, *)` row from DOC_LENGTHS
-/// (keyed by `(u64, u64, &str, u32)`).
-fn drop_doc_lengths_tenant(
+/// Delete every `(database_id, tid, coll, *)` row from a per-document table
+/// keyed by `(u64, u64, &str, u32)` (DOC_LENGTHS, DOC_TERMS).
+fn drop_surrogate_quad_collection(
     txn: &redb::WriteTransaction,
+    def: redb::TableDefinition<(u64, u64, &str, u32), &[u8]>,
+    database_id: u64,
+    tid: u64,
+    coll: &str,
+) -> crate::Result<usize> {
+    let mut table = txn
+        .open_table(def)
+        .map_err(|e| redb_err("open surrogate-keyed table", e))?;
+    let surrogates: Vec<u32> = table
+        .range((database_id, tid, coll, 0u32)..=(database_id, tid, coll, u32::MAX))
+        .map_err(|e| redb_err("surrogate-keyed collection range", e))?
+        .filter_map(|r| r.ok().map(|(k, _)| k.value().3))
+        .collect();
+    let n = surrogates.len();
+    for s in surrogates {
+        let _ = table.remove((database_id, tid, coll, s));
+    }
+    Ok(n)
+}
+
+/// Delete every `(database_id, tid, *, *)` row from a per-document table
+/// keyed by `(u64, u64, &str, u32)` (DOC_LENGTHS, DOC_TERMS).
+fn drop_surrogate_quad_tenant(
+    txn: &redb::WriteTransaction,
+    def: redb::TableDefinition<(u64, u64, &str, u32), &[u8]>,
     database_id: u64,
     tid: u64,
 ) -> crate::Result<usize> {
     let mut table = txn
-        .open_table(DOC_LENGTHS)
-        .map_err(|e| redb_err("open doc_lengths", e))?;
+        .open_table(def)
+        .map_err(|e| redb_err("open surrogate-keyed table", e))?;
     let keys: Vec<(String, u32)> = table
         .range((database_id, tid, "", 0u32)..=(database_id, tid, MAX_COLLECTION, u32::MAX))
-        .map_err(|e| redb_err("doc_lengths tenant range", e))?
+        .map_err(|e| redb_err("surrogate-keyed tenant range", e))?
         .filter_map(|r| {
             r.ok().map(|(k, _)| {
                 let (_, _, c, s) = k.value();

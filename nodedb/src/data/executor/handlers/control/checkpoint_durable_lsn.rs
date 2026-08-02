@@ -23,7 +23,7 @@
 //! with state on this core and NO contributor is full-text search, and it needs
 //! none: `InvertedIndex` is not flushed at all, because it is not memory-only.
 //! Both of its write paths (`index_document`, `index_document_in_txn`) write
-//! POSTINGS / DOC_LENGTHS / STATS straight into the same redb `Database` the
+//! POSTINGS / DOC_LENGTHS / DOC_TERMS / STATS straight into the same redb `Database` the
 //! `sparse` engine commits to — bypassing the LSM memtable precisely so the
 //! index is atomic with the document write. redb commits durably, so an FTS
 //! write at or below the watermark is already on stable storage in a store that

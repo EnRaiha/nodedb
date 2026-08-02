@@ -16,7 +16,9 @@ use nodedb_types::Surrogate;
 
 use super::segments::CompactCommit;
 use super::shared::redb_err;
-use crate::engine::sparse::fts_redb::tables::{DOC_LENGTHS, INDEX_META, POSTINGS, SEGMENTS, STATS};
+use crate::engine::sparse::fts_redb::tables::{
+    DOC_LENGTHS, DOC_TERMS, INDEX_META, POSTINGS, SEGMENTS, STATS,
+};
 use crate::storage::quarantine::QuarantineRegistry;
 
 /// Redb-backed FTS backend.
@@ -42,6 +44,9 @@ impl RedbFtsBackend {
             write_txn
                 .open_table(DOC_LENGTHS)
                 .map_err(|e| redb_err("create doc_lengths table", e))?;
+            write_txn
+                .open_table(DOC_TERMS)
+                .map_err(|e| redb_err("create doc_terms table", e))?;
             write_txn
                 .open_table(INDEX_META)
                 .map_err(|e| redb_err("create index_meta table", e))?;

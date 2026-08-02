@@ -20,6 +20,19 @@ pub const POSTINGS: TableDefinition<(u64, u64, &str, &str), &[u8]> =
 pub const DOC_LENGTHS: TableDefinition<(u64, u64, &str, u32), &[u8]> =
     TableDefinition::new("text.doc_lengths");
 
+/// Per-document indexed term set: key =
+/// `(database_id, tenant_id, collection, surrogate)`, value =
+/// MessagePack-encoded `Vec<String>` holding the distinct analyzed terms the
+/// document currently contributes a posting to.
+///
+/// This is what makes a re-index able to SUBTRACT. A re-index only sees the
+/// new text's terms; without a record of the previous version's terms it
+/// cannot tell which posting lists the document must be dropped from, so
+/// words removed by an update keep matching the document forever. Keyed
+/// exactly like `DOC_LENGTHS` so both are read in the same lookup pattern.
+pub const DOC_TERMS: TableDefinition<(u64, u64, &str, u32), &[u8]> =
+    TableDefinition::new("text.doc_terms");
+
 /// Index metadata blobs: key = `(database_id, tenant_id, collection, sub_key)`,
 /// value = opaque blob. Sub-keys: `"docmap"`, `"fieldnorms"`, `"analyzer"`,
 /// `"language"`.

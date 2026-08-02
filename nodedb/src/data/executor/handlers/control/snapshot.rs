@@ -316,7 +316,8 @@ impl CoreLoop {
     /// 10. Flush spatial R-tree indexes to disk.
     /// 11. redb sparse engine is already ACID — no action needed. Neither is the
     ///     full-text `inverted` index, for the same reason and in the same
-    ///     store: both its write paths commit POSTINGS / DOC_LENGTHS / STATS
+    ///     store: both its write paths commit POSTINGS / DOC_LENGTHS /
+    ///     DOC_TERMS / STATS
     ///     into that redb `Database`, so it has nothing memory-only to flush.
     /// 12. Graph EDGES are committed to the redb edge store at apply time and
     ///     rebuilt into the CSR on startup — no action needed. Their node

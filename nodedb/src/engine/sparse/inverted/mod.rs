@@ -16,8 +16,10 @@
 mod compaction;
 mod core;
 mod corpus_stats;
+mod doc_terms;
 mod errors;
 mod indexing;
+mod removal;
 mod search;
 mod synonyms;
 
