@@ -106,10 +106,48 @@ pub(super) fn build_group_setup(
     // `Verdict`. Bounded to match the scheduler completion channel capacity.
     let (calvin_verdict_tx, calvin_verdict_rx) = mpsc::channel(512);
     let calvin_completion_registry = CalvinCompletionRegistry::new(calvin_verdict_tx);
-    let sequencer_state_machine = Arc::new(Mutex::new(SequencerStateMachine::new(
-        std::collections::HashMap::new(),
-        Arc::clone(&calvin_completion_registry),
-    )));
+    // Escalation for an unrecoverable sequencer epoch regression: a NEW
+    // committed entry re-minted an epoch this replica already consumed, so the
+    // state machine halts rather than alias committed transaction identities.
+    //
+    // The escalation is scoped to what was actually lost. Sequencing stops —
+    // the service sheds queued submissions so Calvin writers fail fast instead
+    // of hanging — while reads, metadata, and every non-Calvin write path keep
+    // serving. Stopping the process instead would turn a subsystem fault into a
+    // full outage (on a single-node deployment, total unavailability), which is
+    // a strictly worse failure than the one being escalated, and it destroys the
+    // running node an operator needs in order to diagnose the divergence. The
+    // marker makes the degradation visible on the health surfaces so this can
+    // never pass for a healthy node.
+    //
+    // Held weakly — `SharedState` reaches this state machine through the
+    // compactor closure, and a strong capture here would close that into a
+    // reference cycle that pins `SharedState` forever.
+    let shared_for_halt = Arc::downgrade(shared);
+    let node_id_for_halt = handle.node_id;
+    let unrecoverable_hook: nodedb_cluster::calvin::UnrecoverableEpochHook =
+        Arc::new(move |halt: nodedb_cluster::calvin::SequencerHalt| {
+            tracing::error!(
+                node_id = node_id_for_halt,
+                expected_epoch = halt.expected_epoch,
+                found_epoch = halt.found_epoch,
+                txns_in_batch = halt.txns_in_batch,
+                raft_index = halt.raft_index,
+                "sequencer epoch regression is unrecoverable; this node has stopped sequencing \
+                 and is reporting itself degraded. Every non-Calvin path keeps serving; \
+                 operator intervention is required to resume sequencing."
+            );
+            if let Some(shared) = shared_for_halt.upgrade() {
+                shared.sequencer_halt.record(halt);
+            }
+        });
+    let sequencer_state_machine = Arc::new(Mutex::new(
+        SequencerStateMachine::new(
+            std::collections::HashMap::new(),
+            Arc::clone(&calvin_completion_registry),
+        )
+        .with_unrecoverable_hook(unrecoverable_hook),
+    ));
     let calvin_read_result_senders =
         Arc::new(Mutex::new(BTreeMap::<u32, Sender<ReadResultEvent>>::new()));
 

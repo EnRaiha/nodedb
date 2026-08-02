@@ -21,14 +21,21 @@ fn magnitude_bucket(n: u64) -> u64 {
     }
 }
 
-/// A hole in the sequencer's epoch sequence: `apply` received an epoch past
-/// what `last_applied_epoch` expected, so the entire batch between them was
-/// never fanned out to any vshard.
+/// A break in the sequencer's epoch sequence: `apply` received an epoch that
+/// was not the one `last_applied_epoch` required.
+///
+/// `direction` names which way the two views diverged, and the two directions
+/// are different bugs. `"ahead"`: entries are missing on this replica, so the
+/// epochs between the two were never fanned out here (the arriving batch itself
+/// still is). `"behind"`: an already-consumed epoch was proposed a second time,
+/// so its transactions carry identities that alias committed history — the
+/// state machine halts rather than apply or drop them.
 pub(super) struct SequencerEpochGap {
     pub epoch_expected: u64,
     pub epoch_found: u64,
     pub gap: u64,
-    pub txns_in_dropped_batch: usize,
+    pub direction: &'static str,
+    pub txns_in_batch: usize,
     pub raft_index: u64,
 }
 
@@ -38,10 +45,12 @@ impl DomainContext for SequencerEpochGap {
     }
 
     fn grouping_key(&self) -> String {
-        // How many epochs went missing distinguishes one skipped entry from
-        // a replica that fell far behind; the exact epoch numbers are the
-        // occurrence and would split one bug into one group per gap.
-        format!("gap~{}", magnitude_bucket(self.gap))
+        // Direction names the bug — a replica that fell behind and a leader
+        // that re-minted a committed epoch have nothing in common. How many
+        // epochs the break spans then separates one skipped entry from a
+        // replica far adrift; the exact epoch numbers are the occurrence and
+        // would split one bug into one group per hit.
+        format!("{}~{}", self.direction, magnitude_bucket(self.gap))
     }
 
     fn to_json(&self) -> Value {
@@ -49,16 +58,22 @@ impl DomainContext for SequencerEpochGap {
             "epoch_expected": self.epoch_expected,
             "epoch_found": self.epoch_found,
             "gap": self.gap,
-            "txns_in_dropped_batch": self.txns_in_dropped_batch,
+            "direction": self.direction,
+            "txns_in_batch": self.txns_in_batch,
             "raft_index": self.raft_index,
-            "why_fatal": "the state machine skips the whole batch rather than fan it out \
-                          under the wrong epoch, so every transaction in it is dropped and \
-                          any completion waiter already registered for one of its positions \
-                          never resolves until its own deadline elapses",
-            "operator_action": "the scheduler must replay this vshard's log from the Raft \
-                                 log to recover the skipped epoch's transactions; check why \
-                                 this replica missed entries between epoch_expected and \
-                                 epoch_found",
+            "why_fatal": "'ahead': the epochs between expected and found were never fanned \
+                          out on this replica, so any completion waiter registered for one \
+                          of their positions never resolves until its own deadline elapses. \
+                          'behind': the arriving batch re-uses an epoch already consumed \
+                          here, so its (epoch, position) identities alias committed ones — \
+                          the state machine halts instead of aliasing live lock-table and \
+                          completion entries or silently discarding committed writes",
+            "operator_action": "'ahead': the scheduler must replay the sequencer Raft log to \
+                                 recover the skipped epochs' transactions; check why this \
+                                 replica missed entries between epoch_expected and \
+                                 epoch_found. 'behind': a leader minted an epoch at or below \
+                                 committed history — check that its epoch seed was derived \
+                                 from a fully replayed sequencer log before it proposed",
         })
     }
 }
@@ -135,17 +150,43 @@ mod tests {
             epoch_expected: 10,
             epoch_found: 12,
             gap: 2,
-            txns_in_dropped_batch: 5,
+            direction: "ahead",
+            txns_in_batch: 5,
             raft_index: 100,
         };
         let far = SequencerEpochGap {
             epoch_expected: 9000,
             epoch_found: 9002,
             gap: 2,
-            txns_in_dropped_batch: 40,
+            direction: "ahead",
+            txns_in_batch: 40,
             raft_index: 90_000,
         };
         assert_eq!(near.grouping_key(), far.grouping_key());
+    }
+
+    /// A replica that fell behind and a leader that re-minted a committed epoch
+    /// are different bugs with different fixes, so they must never share a group
+    /// even when the magnitude of the break happens to match.
+    #[test]
+    fn epoch_gap_grouping_separates_the_two_divergence_directions() {
+        let ahead = SequencerEpochGap {
+            epoch_expected: 10,
+            epoch_found: 12,
+            gap: 2,
+            direction: "ahead",
+            txns_in_batch: 5,
+            raft_index: 100,
+        };
+        let behind = SequencerEpochGap {
+            epoch_expected: 12,
+            epoch_found: 10,
+            gap: 2,
+            direction: "behind",
+            txns_in_batch: 5,
+            raft_index: 100,
+        };
+        assert_ne!(ahead.grouping_key(), behind.grouping_key());
     }
 
     #[test]

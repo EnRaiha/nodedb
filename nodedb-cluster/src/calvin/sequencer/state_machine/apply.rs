@@ -1,249 +1,27 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Calvin sequencer Raft state machine.
+//! The sequencer state machine's apply path.
 //!
-//! [`SequencerStateMachine`] is called on every replica (including the leader)
-//! when a `SequencerEntry` is committed to the Raft log. It:
+//! Runs on every replica (including the leader) as `SequencerEntry` records
+//! commit to the sequencer Raft group: decode, check the epoch ordering (see
+//! [`crate::calvin::sequencer::epoch_guard`]), fan the batch out to the
+//! per-vShard scheduler channels, and advance the watermarks.
 //!
-//! 1. Decodes the `SequencerEntry` from the raw log bytes.
-//! 2. Checks epoch monotonicity to detect log gaps (a gap means the apply path
-//!    is broken and the node should not fan out — it logs an error and skips).
-//! 3. Fans the `EpochBatch` out to per-vshard output channels. Uses `try_send`
-//!    so the apply loop is never blocked. A full channel logs and drops — the
-//!    scheduler's log-replay path will catch up.
-//! 4. Advances `last_applied_epoch`.
-//!
-//! The `last_applied_epoch` counter is kept in memory only. On node restart the
-//! sequencer group's Raft log is replayed from the beginning (or from the
-//! latest snapshot), and the counter is rebuilt monotonically. This is safe
-//! because the state machine is deterministic.
+//! Synchronous throughout — it runs on the Raft tick thread, so it must never
+//! block or do I/O.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
-use crate::calvin::CalvinCompletionRegistry;
 use crate::calvin::sequencer::entry::SequencerEntry;
+use crate::calvin::sequencer::epoch_guard::{EpochCheck, SequencerHalt, classify};
 use crate::calvin::types::SchedulerInput;
 
-/// Atomic counters for the sequencer state machine apply path.
-pub struct StateMachineMetrics {
-    /// Total epoch batches successfully applied.
-    pub epochs_applied: AtomicU64,
-    /// Total transactions fanned out to vshard channels.
-    pub txns_fanned_out: AtomicU64,
-    /// Transactions dropped because the vshard channel was full.
-    pub txns_dropped_backpressure: AtomicU64,
-    /// Epochs skipped because of a gap in the epoch sequence.
-    pub epochs_skipped_gap: AtomicU64,
-}
-
-impl StateMachineMetrics {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            epochs_applied: AtomicU64::new(0),
-            txns_fanned_out: AtomicU64::new(0),
-            txns_dropped_backpressure: AtomicU64::new(0),
-            epochs_skipped_gap: AtomicU64::new(0),
-        })
-    }
-}
-
-impl Default for StateMachineMetrics {
-    fn default() -> Self {
-        Self {
-            epochs_applied: AtomicU64::new(0),
-            txns_fanned_out: AtomicU64::new(0),
-            txns_dropped_backpressure: AtomicU64::new(0),
-            epochs_skipped_gap: AtomicU64::new(0),
-        }
-    }
-}
-
-/// The Calvin sequencer Raft state machine.
-///
-/// One instance per replica (including leader). Applied on every `CommitApplier`
-/// callback for the sequencer Raft group.
-pub struct SequencerStateMachine {
-    /// Last successfully applied epoch. Used for gap detection.
-    /// The first valid epoch is 0; `last_applied_epoch = u64::MAX` means nothing
-    /// has been applied yet (using `u64::MAX` avoids a separate `Option` and
-    /// makes the "nothing applied" state explicit).
-    last_applied_epoch: u64,
-    /// Raft log index of the last committed entry applied on this replica.
-    /// `NOT_YET_APPLIED` means nothing has been applied yet. Advanced for EVERY
-    /// applied entry (not just `EpochBatch`), so it is a safe upper bound for the
-    /// scheduler's catch-up `read_committed_entries(lo, hi)` range.
-    last_committed_index: u64,
-    /// Per-vshard output channels. The scheduler subscribes on the other end.
-    vshard_senders: HashMap<u32, mpsc::Sender<SchedulerInput>>,
-    /// Per-vShard "catch up from this Raft index" bookkeeping.
-    ///
-    /// When a fan-out `try_send` to a vShard's scheduler channel fails (Full or
-    /// Closed), the input for that vShard was dropped. The current entry's Raft
-    /// index is recorded here with MIN-COLLAPSE (the smallest dropped index per
-    /// vShard wins), so the scheduler-side drain replays the sequencer Raft log
-    /// from the earliest miss forward. Bounded by the number of hosted vShards —
-    /// a vShard contributes at most one entry until its catch-up is drained.
-    catch_up_from: Mutex<HashMap<u32, u64>>,
-    pub metrics: Arc<StateMachineMetrics>,
-    completion_registry: Arc<CalvinCompletionRegistry>,
-}
-
-const NOT_YET_APPLIED: u64 = u64::MAX;
+use super::core::SequencerStateMachine;
 
 impl SequencerStateMachine {
-    /// Construct a fresh state machine with no applied epochs.
-    pub fn new(
-        vshard_senders: HashMap<u32, mpsc::Sender<SchedulerInput>>,
-        completion_registry: Arc<CalvinCompletionRegistry>,
-    ) -> Self {
-        Self {
-            last_applied_epoch: NOT_YET_APPLIED,
-            last_committed_index: NOT_YET_APPLIED,
-            vshard_senders,
-            catch_up_from: Mutex::new(HashMap::new()),
-            metrics: StateMachineMetrics::new(),
-            completion_registry,
-        }
-    }
-
-    /// The last epoch number that was successfully applied, or `None` if no
-    /// epoch has been applied yet.
-    pub fn last_applied_epoch(&self) -> Option<u64> {
-        if self.last_applied_epoch == NOT_YET_APPLIED {
-            None
-        } else {
-            Some(self.last_applied_epoch)
-        }
-    }
-
-    /// The epoch number that the next proposal should use.
-    pub fn next_epoch(&self) -> u64 {
-        if self.last_applied_epoch == NOT_YET_APPLIED {
-            0
-        } else {
-            self.last_applied_epoch + 1
-        }
-    }
-
-    /// Register (or replace) the output sender for a vshard.
-    ///
-    /// Call this when a scheduler subscribes for a vshard hosted on this node.
-    pub fn set_vshard_sender(&mut self, vshard: u32, sender: mpsc::Sender<SchedulerInput>) {
-        self.vshard_senders.insert(vshard, sender);
-    }
-
-    /// Remove the output sender for a vshard (e.g. when a vshard is migrated
-    /// away from this node).
-    pub fn remove_vshard_sender(&mut self, vshard: u32) {
-        self.vshard_senders.remove(&vshard);
-    }
-
-    /// The highest epoch number that has been committed and applied on this
-    /// replica, or `None` if no epoch has been applied yet.
-    ///
-    /// Used by the Calvin scheduler's rebuild path: the scheduler captures
-    /// this value before processing the Raft log to determine the upper bound
-    /// of the rebuild range (`E+1 ..= current_committed_epoch`).
-    pub fn current_committed_epoch(&self) -> Option<u64> {
-        self.last_applied_epoch()
-    }
-
-    /// The Raft log index of the highest committed entry applied on this replica,
-    /// or `None` if nothing has been applied yet.
-    ///
-    /// Advanced for EVERY applied entry (not just `EpochBatch`), so the scheduler
-    /// can use it as a safe upper bound (`hi`) for the catch-up replay range
-    /// `read_committed_entries(SEQUENCER_GROUP, lo ..= hi)`.
-    pub fn current_committed_index(&self) -> Option<u64> {
-        if self.last_committed_index == NOT_YET_APPLIED {
-            None
-        } else {
-            Some(self.last_committed_index)
-        }
-    }
-
-    /// Record that a fan-out to `vshard` was dropped at Raft index `index`.
-    ///
-    /// Min-collapse: the smallest dropped index per vShard is retained, so the
-    /// scheduler-side drain replays from the earliest miss forward. O(1), no I/O.
-    fn record_catch_up(&self, vshard: u32, index: u64) {
-        let mut map = self.catch_up_from.lock().unwrap_or_else(|p| p.into_inner());
-        map.entry(vshard)
-            .and_modify(|i| *i = (*i).min(index))
-            .or_insert(index);
-    }
-
-    /// Take (remove and return) the catch-up-from Raft index for `vshard`.
-    ///
-    /// Contract: TAKE semantics — the entry is cleared, so the scheduler-side
-    /// drain consumes each recorded miss exactly once. Returns `None` when no
-    /// drop is pending for the vShard. The next drop re-records a fresh index.
-    pub fn take_catch_up_from(&self, vshard: u32) -> Option<u64> {
-        let mut map = self.catch_up_from.lock().unwrap_or_else(|p| p.into_inner());
-        map.remove(&vshard)
-    }
-
-    /// Arm a catch-up for `vshard` from `index` (min-collapse), so the
-    /// scheduler-side drain replays committed sequencer entries from there.
-    ///
-    /// Called when a scheduler subscribes for a vShard: the sequencer may have
-    /// already committed (and fanned out to a then-absent sender — silently
-    /// skipped) epochs for this vShard before the scheduler existed. A fresh
-    /// node has nothing durably applied to rebuild from, so it would otherwise
-    /// consider itself caught up and never replay those txns. Arming from the
-    /// first available committed index makes the drain replay every committed
-    /// entry for this vShard applied before subscription (idempotent: the
-    /// scheduler's in-flight guard and Reserve/Release no-ops absorb re-apply).
-    pub fn arm_catch_up_from(&self, vshard: u32, index: u64) {
-        self.record_catch_up(vshard, index);
-    }
-
-    /// Read (WITHOUT removing) the catch-up-from Raft index for `vshard`.
-    ///
-    /// The scheduler drain peeks rather than takes so a replay that cannot
-    /// complete this tick (committed index not yet known, transient log-read
-    /// fault) leaves the entry armed for the next tick instead of silently
-    /// dropping it — the loss the old take-then-early-return had.
-    pub fn peek_catch_up_from(&self, vshard: u32) -> Option<u64> {
-        let map = self.catch_up_from.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(&vshard).copied()
-    }
-
-    /// Clear `vshard`'s catch-up entry only if its recorded index is `<= up_to`.
-    ///
-    /// Called after a successful replay of `lo ..= up_to`: the recorded miss is
-    /// now covered, so clear it — unless a concurrent drop has already lowered
-    /// the entry to an index the just-finished replay did not cover (only
-    /// possible for an index `<= up_to` given min-collapse, hence the guard is a
-    /// belt-and-braces no-op in that case). A newer drop recorded at an index
-    /// `> up_to` is preserved for the next drain.
-    pub fn clear_catch_up_up_to(&self, vshard: u32, up_to: u64) {
-        let mut map = self.catch_up_from.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(&idx) = map.get(&vshard)
-            && idx <= up_to
-        {
-            map.remove(&vshard);
-        }
-    }
-
-    /// The smallest armed catch-up index across ALL vShards, or `None` when no
-    /// catch-up is pending.
-    ///
-    /// The sequencer-group log compactor floors its compaction index at this
-    /// value so a dropped/undelivered fan-out is always replayable from the
-    /// retained log — the hold-down the scheduler-side drain's `LogCompacted`
-    /// arm depends on. Only hosted vShards ever arm a catch-up, so this never
-    /// pins compaction on a vShard this node does not serve.
-    pub fn min_catch_up_from(&self) -> Option<u64> {
-        let map = self.catch_up_from.lock().unwrap_or_else(|p| p.into_inner());
-        map.values().copied().min()
-    }
-
     /// Apply a committed Raft log entry.
     ///
     /// Decodes the `SequencerEntry`, checks epoch monotonicity, fans out to
@@ -255,6 +33,38 @@ impl SequencerStateMachine {
     ///
     /// This method is synchronous (no `.await`). It MUST NOT block or do I/O.
     pub fn apply(&mut self, index: u64, data: &[u8]) {
+        // RE-DELIVERY IS NORMAL, NOT DIVERGENCE.
+        //
+        // Raft collects committed entries from the applied watermark forward,
+        // and that watermark only advances once the applier has run. Any commit
+        // that lands while a batch is still being applied therefore re-collects
+        // the entries already in flight, and the node meets them a second time.
+        // A restart is where this actually bites: the whole retained sequencer
+        // log replays in one long apply, and a single `Verdict` / reservation
+        // proposal landing during it re-delivers every epoch batch in the
+        // replayed prefix.
+        //
+        // Every effect below already ran for this index, so a re-delivery is a
+        // no-op. It is emphatically NOT an epoch regression: judging it by the
+        // epoch alone reads ordinary restart traffic as a committed epoch being
+        // re-minted and halts a replica that is perfectly healthy. The Raft
+        // index is what separates the two — a genuine regression arrives at an
+        // index this replica has NEVER applied, carrying an epoch it already
+        // consumed, and is still caught below.
+        //
+        // `current_committed_index()` (not the raw field) is deliberate: a
+        // freshly constructed state machine has applied nothing, so nothing is
+        // "already applied" and a full replay from the top runs in full.
+        if self
+            .current_committed_index()
+            .is_some_and(|applied| index <= applied)
+        {
+            self.metrics
+                .entries_redelivered
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         // Advance the committed-index watermark for EVERY committed entry, even
         // ones that fail to decode or are skipped as gaps — the entry is durably
         // committed at `index` regardless, so it is a safe replay upper bound.
@@ -276,28 +86,88 @@ impl SequencerStateMachine {
                     txn.tx_class.restore_derived();
                 }
 
-                let expected = self.next_epoch();
-                if batch.epoch != expected {
+                // A halted state machine has already diverged from the log;
+                // resuming fan-out mid-divergence is how a detected fault turns
+                // into corrupted lock-table and completion state.
+                if self.halted {
                     error!(
                         epoch = batch.epoch,
-                        expected,
-                        "sequencer state machine: epoch gap detected; \
-                         this node may have missed entries. Skipping batch."
+                        raft_index = index,
+                        "sequencer state machine is halted on an epoch regression; \
+                         refusing to apply further epoch batches"
                     );
-                    self.metrics
-                        .epochs_skipped_gap
-                        .fetch_add(1, Ordering::Relaxed);
-                    crate::diag::sequencer_epoch_gap(
-                        expected,
-                        batch.epoch,
-                        batch.txns.len(),
-                        index,
-                    );
-                    // Advance anyway to the received epoch so we don't
-                    // permanently stall on a gap. The scheduler will need to
-                    // replay from the Raft log to recover.
-                    self.last_applied_epoch = batch.epoch;
                     return;
+                }
+
+                let expected = self.next_epoch();
+                let check = classify(expected, batch.epoch);
+                match check {
+                    EpochCheck::InOrder => {}
+                    // Entries are missing on THIS replica, but the batch in
+                    // hand is intact and self-describing. Dropping it would
+                    // add fresh data loss on top of the entries already
+                    // missed, so it is fanned out and the hole is reported —
+                    // the scheduler recovers the missed range by replaying the
+                    // sequencer Raft log.
+                    EpochCheck::Ahead => {
+                        error!(
+                            epoch = batch.epoch,
+                            expected,
+                            raft_index = index,
+                            "sequencer state machine: epoch gap detected; this node missed \
+                             entries. Fanning out the batch in hand; the skipped epochs must \
+                             be recovered by log replay."
+                        );
+                        self.metrics
+                            .epochs_skipped_gap
+                            .fetch_add(1, Ordering::Relaxed);
+                        crate::diag::sequencer_epoch_gap(
+                            expected,
+                            batch.epoch,
+                            check.direction(),
+                            batch.txns.len(),
+                            index,
+                        );
+                    }
+                    // A NEW log entry (an index never applied here — the
+                    // re-delivery guard at the top of `apply` already returned
+                    // for the ones that were) carrying an already-consumed
+                    // epoch. Every `(epoch, position)` in this batch aliases one
+                    // that has already run here, so fanning it out would collide
+                    // with live lock-table and completion entries — and dropping
+                    // it would silently discard committed writes. Neither is
+                    // acceptable: halt and escalate.
+                    EpochCheck::Behind => {
+                        error!(
+                            epoch = batch.epoch,
+                            expected,
+                            raft_index = index,
+                            txns = batch.txns.len(),
+                            "sequencer state machine: epoch regression; a committed epoch was \
+                             proposed a second time. Halting the sequencer state machine \
+                             rather than aliasing committed transaction identities."
+                        );
+                        self.metrics
+                            .epochs_refused_regression
+                            .fetch_add(1, Ordering::Relaxed);
+                        crate::diag::sequencer_epoch_gap(
+                            expected,
+                            batch.epoch,
+                            check.direction(),
+                            batch.txns.len(),
+                            index,
+                        );
+                        self.halted = true;
+                        if let Some(hook) = self.unrecoverable_hook.as_ref() {
+                            hook(SequencerHalt {
+                                expected_epoch: expected,
+                                found_epoch: batch.epoch,
+                                txns_in_batch: batch.txns.len(),
+                                raft_index: index,
+                            });
+                        }
+                        return;
+                    }
                 }
 
                 let mut fanned_out = 0u64;
@@ -514,7 +384,11 @@ impl SequencerStateMachine {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use super::*;
+    use crate::calvin::CalvinCompletionRegistry;
     use crate::calvin::types::{
         EngineKeySet, EpochBatch, ReadWriteSet, SequencedTxn, SortedVec, TxClass,
     };
@@ -609,11 +483,14 @@ mod tests {
         assert_eq!(sm.metrics.epochs_applied.load(Ordering::Relaxed), 1);
     }
 
+    /// A forward gap still trips the detector — but the batch in hand is intact,
+    /// so it is fanned out rather than dropped. Only the epochs BETWEEN the two
+    /// went missing, and those are recovered by log replay.
     #[test]
-    fn gap_detection_rejects_out_of_order_epochs() {
+    fn forward_gap_is_detected_and_the_batch_in_hand_is_still_fanned_out() {
         let (mut batch, va, vb) = make_batch_with_two_vshards();
-        let (tx_a, _) = mpsc::channel(64);
-        let (tx_b, _) = mpsc::channel(64);
+        let (tx_a, mut rx_a) = mpsc::channel(64);
+        let (tx_b, mut rx_b) = mpsc::channel(64);
         let mut senders = HashMap::new();
         senders.insert(va, tx_a);
         senders.insert(vb, tx_b);
@@ -625,6 +502,8 @@ mod tests {
         });
         sm.apply(1, &data0);
         assert_eq!(sm.last_applied_epoch(), Some(0));
+        assert!(rx_a.try_recv().is_ok());
+        assert!(rx_b.try_recv().is_ok());
 
         // Apply epoch 2 (skip epoch 1 → gap).
         batch.epoch = 2;
@@ -634,9 +513,236 @@ mod tests {
         let data2 = encode_entry(&SequencerEntry::EpochBatch { batch });
         sm.apply(2, &data2);
 
+        // The detector fired...
         assert_eq!(sm.metrics.epochs_skipped_gap.load(Ordering::Relaxed), 1);
-        // Epoch advances to 2 to avoid permanent stall.
+        // ...and the epoch advanced to the one received.
         assert_eq!(sm.last_applied_epoch(), Some(2));
+        // ...but epoch 2's transactions were NOT dropped: dropping them would
+        // add fresh loss on top of the entries this replica already missed.
+        assert!(
+            rx_a.try_recv().is_ok(),
+            "the intact batch must still reach vshard A"
+        );
+        assert!(
+            rx_b.try_recv().is_ok(),
+            "the intact batch must still reach vshard B"
+        );
+        // A forward gap is recoverable, so it must NOT halt the state machine.
+        assert!(!sm.is_halted());
+        assert_eq!(
+            sm.metrics.epochs_refused_regression.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// An already-consumed epoch arriving a second time is the restart-collision
+    /// shape: its `(epoch, position)` identities alias committed ones, so it can
+    /// neither be applied nor silently dropped. The state machine halts and
+    /// escalates to the host's fail-stop hook.
+    #[test]
+    fn epoch_regression_halts_and_escalates_instead_of_dropping_the_batch() {
+        let (mut batch, va, vb) = make_batch_with_two_vshards();
+        let (tx_a, mut rx_a) = mpsc::channel(64);
+        let (tx_b, mut rx_b) = mpsc::channel(64);
+        let mut senders = HashMap::new();
+        senders.insert(va, tx_a);
+        senders.insert(vb, tx_b);
+
+        let halts: Arc<std::sync::Mutex<Vec<SequencerHalt>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&halts);
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached())
+            .with_unrecoverable_hook(Arc::new(move |halt| {
+                sink.lock().unwrap_or_else(|p| p.into_inner()).push(halt);
+            }));
+
+        // Committed history: epochs 0 and 1.
+        for epoch in 0..=1u64 {
+            batch.epoch = epoch;
+            for txn in &mut batch.txns {
+                txn.epoch = epoch;
+            }
+            let data = encode_entry(&SequencerEntry::EpochBatch {
+                batch: batch.clone(),
+            });
+            sm.apply(epoch + 1, &data);
+        }
+        assert_eq!(sm.next_epoch(), 2);
+        while rx_a.try_recv().is_ok() {}
+        while rx_b.try_recv().is_ok() {}
+
+        // A restarted leader re-mints epoch 0 and proposes it after that history.
+        batch.epoch = 0;
+        for txn in &mut batch.txns {
+            txn.epoch = 0;
+        }
+        let duplicate = encode_entry(&SequencerEntry::EpochBatch {
+            batch: batch.clone(),
+        });
+        sm.apply(3, &duplicate);
+
+        assert!(sm.is_halted(), "an epoch regression must halt the replica");
+        assert_eq!(
+            sm.metrics.epochs_refused_regression.load(Ordering::Relaxed),
+            1
+        );
+        // Not counted as a forward gap — the two are different bugs.
+        assert_eq!(sm.metrics.epochs_skipped_gap.load(Ordering::Relaxed), 0);
+        // Colliding identities must never reach a scheduler.
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
+
+        // The host was told, with the facts it needs to fail loudly.
+        let recorded = halts.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(
+            recorded,
+            vec![SequencerHalt {
+                expected_epoch: 2,
+                found_epoch: 0,
+                txns_in_batch: 1,
+                raft_index: 3,
+            }]
+        );
+
+        // Once halted, further epoch batches are refused rather than half-applied.
+        batch.epoch = 2;
+        for txn in &mut batch.txns {
+            txn.epoch = 2;
+        }
+        let after = encode_entry(&SequencerEntry::EpochBatch { batch });
+        sm.apply(4, &after);
+        assert!(rx_a.try_recv().is_err());
+        assert_eq!(sm.metrics.epochs_applied.load(Ordering::Relaxed), 2);
+        // The committed-index watermark still advances: the entry IS committed
+        // at that index regardless of this replica refusing to act on it.
+        assert_eq!(sm.current_committed_index(), Some(4));
+        // Exactly one escalation — the halt is latched, not re-fired per entry.
+        assert_eq!(halts.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+    }
+
+    /// Re-delivery of an already-applied entry is what a restart replay
+    /// overlapping a concurrent proposal produces: Raft re-collects from the
+    /// applied watermark, so the epochs already in flight arrive a second time.
+    /// That must be an idempotent no-op — no second fan-out, no epoch movement,
+    /// and above all no halt, because halting here takes a healthy node out on
+    /// ordinary restart traffic.
+    #[test]
+    fn epoch_redelivered_after_restart_is_a_no_op_and_does_not_halt() {
+        let (mut batch, va, vb) = make_batch_with_two_vshards();
+        let (tx_a, mut rx_a) = mpsc::channel(64);
+        let (tx_b, mut rx_b) = mpsc::channel(64);
+        let mut senders = HashMap::new();
+        senders.insert(va, tx_a);
+        senders.insert(vb, tx_b);
+
+        let halts: Arc<std::sync::Mutex<Vec<SequencerHalt>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&halts);
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached())
+            .with_unrecoverable_hook(Arc::new(move |halt| {
+                sink.lock().unwrap_or_else(|p| p.into_inner()).push(halt);
+            }));
+
+        // Restart replay of a retained log holding epochs 0..=2 at indexes 1..=3.
+        for epoch in 0..=2u64 {
+            batch.epoch = epoch;
+            for txn in &mut batch.txns {
+                txn.epoch = epoch;
+            }
+            let data = encode_entry(&SequencerEntry::EpochBatch {
+                batch: batch.clone(),
+            });
+            sm.apply(epoch + 1, &data);
+        }
+        assert_eq!(sm.last_applied_epoch(), Some(2));
+        while rx_a.try_recv().is_ok() {}
+        while rx_b.try_recv().is_ok() {}
+
+        // The SAME committed prefix arrives again — every index already applied.
+        for epoch in 0..=2u64 {
+            batch.epoch = epoch;
+            for txn in &mut batch.txns {
+                txn.epoch = epoch;
+            }
+            let data = encode_entry(&SequencerEntry::EpochBatch {
+                batch: batch.clone(),
+            });
+            sm.apply(epoch + 1, &data);
+        }
+
+        assert!(
+            !sm.is_halted(),
+            "a re-delivered committed entry is normal Raft behaviour, not a regression"
+        );
+        assert!(halts.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+        assert_eq!(
+            sm.metrics.epochs_refused_regression.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(sm.metrics.entries_redelivered.load(Ordering::Relaxed), 3);
+        // No second fan-out: the schedulers already ran these positions, and a
+        // duplicate delivery would re-enter them under identities in flight.
+        assert!(rx_a.try_recv().is_err());
+        assert!(rx_b.try_recv().is_err());
+        // Watermarks are unmoved — neither advanced nor rewound.
+        assert_eq!(sm.last_applied_epoch(), Some(2));
+        assert_eq!(sm.current_committed_index(), Some(3));
+        assert_eq!(sm.metrics.epochs_applied.load(Ordering::Relaxed), 3);
+
+        // The node is still sequencing: the next genuinely new entry applies.
+        batch.epoch = 3;
+        for txn in &mut batch.txns {
+            txn.epoch = 3;
+        }
+        let data = encode_entry(&SequencerEntry::EpochBatch { batch });
+        sm.apply(4, &data);
+        assert_eq!(sm.last_applied_epoch(), Some(3));
+        assert!(rx_a.try_recv().is_ok());
+    }
+
+    /// The re-delivery guard must not swallow the fault it sits in front of: a
+    /// NEW log entry re-minting a consumed epoch is still unrecoverable.
+    #[test]
+    fn regression_at_a_new_index_still_halts_after_a_redelivery() {
+        let (mut batch, va, vb) = make_batch_with_two_vshards();
+        let (tx_a, _rx_a) = mpsc::channel(64);
+        let (tx_b, _rx_b) = mpsc::channel(64);
+        let mut senders = HashMap::new();
+        senders.insert(va, tx_a);
+        senders.insert(vb, tx_b);
+        let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
+
+        for epoch in 0..=1u64 {
+            batch.epoch = epoch;
+            for txn in &mut batch.txns {
+                txn.epoch = epoch;
+            }
+            let data = encode_entry(&SequencerEntry::EpochBatch {
+                batch: batch.clone(),
+            });
+            sm.apply(epoch + 1, &data);
+        }
+
+        // A benign re-delivery of index 1 first — absorbed, no halt.
+        batch.epoch = 0;
+        for txn in &mut batch.txns {
+            txn.epoch = 0;
+        }
+        let replayed = encode_entry(&SequencerEntry::EpochBatch {
+            batch: batch.clone(),
+        });
+        sm.apply(1, &replayed);
+        assert!(!sm.is_halted());
+
+        // A restarted leader re-minting epoch 0 lands at a NEW index. Same
+        // epoch, different meaning — this one must halt.
+        let duplicate = encode_entry(&SequencerEntry::EpochBatch { batch });
+        sm.apply(3, &duplicate);
+        assert!(sm.is_halted());
+        assert_eq!(
+            sm.metrics.epochs_refused_regression.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -770,20 +876,23 @@ mod tests {
         senders.insert(vb, tx_b);
         let mut sm = SequencerStateMachine::new(senders, CalvinCompletionRegistry::new_detached());
 
-        // First drop for vshard A at a HIGH Raft index.
+        // First drop for vshard A at Raft index 4.
         let data0 = encode_entry(&SequencerEntry::EpochBatch {
             batch: batch.clone(),
         });
-        sm.apply(10, &data0);
+        sm.apply(4, &data0);
 
-        // Second drop for the SAME vshard at a LOWER Raft index → min-collapse.
+        // Second drop for the SAME vshard at a LATER Raft index. Min-collapse
+        // must keep the EARLIER index — replay has to start at the first miss,
+        // not the most recent one. (Raft delivers indexes in increasing order,
+        // so a later drop is always the higher index.)
         let mut batch1 = batch.clone();
         batch1.epoch = 1;
         for txn in &mut batch1.txns {
             txn.epoch = 1;
         }
         let data1 = encode_entry(&SequencerEntry::EpochBatch { batch: batch1 });
-        sm.apply(4, &data1);
+        sm.apply(10, &data1);
 
         // The recorded catch-up index is the SMALLEST dropped index (4), and the
         // repeated drops for one vShard did not grow the map (a single entry that

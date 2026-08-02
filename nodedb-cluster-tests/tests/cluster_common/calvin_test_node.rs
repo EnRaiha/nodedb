@@ -167,12 +167,6 @@ impl CalvinTestNode {
         std::sync::Arc<SequencerMetrics>,
         tokio::task::JoinHandle<()>,
     ) {
-        let starting_epoch = self
-            .state_machine
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .next_epoch();
-
         // Pair the registry's verdict signal channel with the service's
         // receiver so a completed vote tally would reach the leader's propose
         // arm (inert for now — nothing reads the verdict).
@@ -188,7 +182,10 @@ impl CalvinTestNode {
                 inbox: inbox_receiver,
                 reservations: reservation_receiver,
             },
-            starting_epoch,
+            // The service derives its own epoch seed once the sequencer group
+            // has replayed its log, so it takes the state machine rather than a
+            // pre-read epoch that could predate replay.
+            self.state_machine.clone(),
             CalvinCompletionRegistry::new(verdict_tx),
             verdict_rx,
         );

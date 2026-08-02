@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod entry;
+pub mod epoch_guard;
 pub mod error;
 pub mod inbox;
 pub mod metrics;
@@ -13,6 +14,7 @@ pub mod validator;
 
 pub use config::{SEQUENCER_GROUP_ID, SequencerConfig};
 pub use entry::SequencerEntry;
+pub use epoch_guard::{EpochCheck, SequencerHalt, UnrecoverableEpochHook};
 pub use error::SequencerError;
 pub use inbox::{AdmittedTx, Inbox, InboxReceiver, RejectedTx, new_inbox};
 pub use metrics::{ConflictKey, SequencerMetrics};

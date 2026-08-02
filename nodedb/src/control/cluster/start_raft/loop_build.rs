@@ -141,10 +141,13 @@ pub(super) fn build_raft_loop(
             inbox: sequencer_inbox_rx,
             reservations: reservation_inbox_rx,
         },
-        sequencer_state_machine
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .next_epoch(),
+        // The state machine, NOT a starting epoch read here: at this point in
+        // startup the Raft loop below has not been spawned, so nothing has
+        // replayed the sequencer group's committed log into it and its epoch
+        // counter still reads 0 on every restart. The service derives its seed
+        // lazily on the first leader tick that finds the group replayed —
+        // see `SequencerService::ensure_epoch_seeded`.
+        Arc::clone(&sequencer_state_machine),
         Arc::clone(&calvin_completion_registry),
         calvin_verdict_rx,
     );

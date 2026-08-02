@@ -189,6 +189,46 @@ impl SystemCatalog {
         Ok(out)
     }
 
+    /// The highest surrogate any live binding refers to, or `0` when there are
+    /// none.
+    ///
+    /// This is the allocator's boot floor of last resort. The `surrogate_hwm`
+    /// singleton is flushed lazily (batched by op count and elapsed time), so a
+    /// crash can leave it stale; the WAL's `SurrogateAlloc` / `SurrogateBind`
+    /// records normally cover the gap, but nothing contributes a "surrogate
+    /// durable through" floor to WAL truncation, so a checkpoint can truncate
+    /// past those records while the singleton still lags. Seeding from the
+    /// singleton alone would then re-issue surrogates already bound to live
+    /// rows — cross-engine identity corruption, since every engine keys its
+    /// indexes on the surrogate.
+    ///
+    /// Derived from the bindings themselves, the floor cannot go backwards: a
+    /// surrogate is written here before it is ever observable, and rows are
+    /// removed only when their identity genuinely dies with them.
+    ///
+    /// Cost is one full scan of the forward table, paid once at boot. The
+    /// reverse table cannot answer this more cheaply: its key orders by
+    /// `(database, tenant, collection, surrogate)`, so its last key is the
+    /// largest surrogate of the last collection, not the largest overall.
+    pub fn max_bound_surrogate(&self) -> crate::Result<Surrogate> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| catalog_err("surrogate_pk max txn", e))?;
+        let table = txn
+            .open_table(SURROGATE_PK_V3)
+            .map_err(|e| catalog_err("open surrogate_pk", e))?;
+        let mut max = 0u32;
+        let iter = table
+            .iter()
+            .map_err(|e| catalog_err("iter surrogate_pk", e))?;
+        for row in iter {
+            let (_k, v) = row.map_err(|e| catalog_err("iter surrogate_pk row", e))?;
+            max = max.max(v.value());
+        }
+        Ok(Surrogate::new(max))
+    }
+
     /// Bulk-delete every surrogate binding for a `(database_id, tenant_id,
     /// collection)` triple. Drains both forward and reverse tables. Idempotent.
     pub fn delete_all_surrogates_for_collection(
@@ -377,6 +417,86 @@ impl SystemCatalog {
         }
         txn.commit()
             .map_err(|e| catalog_err("migrate_surrogate_pk_v3 commit", e))
+    }
+}
+
+#[cfg(test)]
+mod max_bound_surrogate_tests {
+    use super::*;
+    use crate::control::security::catalog::SystemCatalog;
+
+    fn open() -> (tempfile::TempDir, SystemCatalog) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cat = SystemCatalog::open(&dir.path().join("system.redb")).expect("open catalog");
+        (dir, cat)
+    }
+
+    #[test]
+    fn fresh_catalog_has_no_floor() {
+        let (_dir, cat) = open();
+        assert_eq!(cat.max_bound_surrogate().unwrap(), Surrogate::ZERO);
+    }
+
+    /// The floor must be the maximum across every database, tenant, and
+    /// collection — not the last one in key order, which is what a naive
+    /// reverse-table probe would return.
+    #[test]
+    fn floor_is_the_global_maximum_across_every_scope() {
+        let (_dir, cat) = open();
+        cat.put_surrogate(
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            "zzz_last_in_key_order",
+            b"a",
+            Surrogate::new(3),
+        )
+        .unwrap();
+        cat.put_surrogate(
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            "aaa_first_in_key_order",
+            b"b",
+            Surrogate::new(9_000),
+        )
+        .unwrap();
+        cat.put_surrogate(
+            DatabaseId::new(7),
+            TenantId::new(2),
+            "other_db",
+            b"c",
+            Surrogate::new(41),
+        )
+        .unwrap();
+
+        assert_eq!(cat.max_bound_surrogate().unwrap(), Surrogate::new(9_000));
+    }
+
+    /// The whole point of the floor: a stale `surrogate_hwm` singleton must
+    /// never let the allocator start below a surrogate a live row already
+    /// holds.
+    #[test]
+    fn floor_outranks_a_stale_hwm_singleton() {
+        let (_dir, cat) = open();
+        cat.put_surrogate(
+            DatabaseId::DEFAULT,
+            TenantId::new(1),
+            "users",
+            b"alice",
+            Surrogate::new(500),
+        )
+        .unwrap();
+        // The singleton lags because its flush is batched.
+        cat.put_surrogate_hwm(100).unwrap();
+
+        let seed = cat
+            .get_surrogate_hwm()
+            .unwrap()
+            .max(cat.max_bound_surrogate().unwrap().as_u32());
+        assert_eq!(
+            seed, 500,
+            "seeding from the singleton alone would re-issue 101..=500, \
+             every one of which is already bound to a live row"
+        );
     }
 }
 

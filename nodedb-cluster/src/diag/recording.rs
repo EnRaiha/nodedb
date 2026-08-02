@@ -14,29 +14,36 @@ use faultbox::{Capture, EventKind};
 
 use super::context::{self, DroppedTxn};
 
-/// Report an epoch gap that made `apply` skip an entire batch.
+/// Report a break in the sequencer's epoch sequence.
 ///
-/// Called from the one site that detects this: `apply`'s epoch-mismatch
-/// check, before it force-sets `last_applied_epoch` and returns. There is no
-/// live error object at this point — the gap is a state-machine invariant
+/// Called from the one site that detects this: `apply`'s epoch-ordering check.
+/// `direction` is the classification that site made (`"ahead"` — entries
+/// missing on this replica; `"behind"` — an already-consumed epoch proposed
+/// again), which decides both the report's wording and its grouping. There is
+/// no live error object at this point — the break is a state-machine invariant
 /// check, not a propagated failure — so no `error_chain` is attached.
 pub fn sequencer_epoch_gap(
     epoch_expected: u64,
     epoch_found: u64,
-    txns_in_dropped_batch: usize,
+    direction: &'static str,
+    txns_in_batch: usize,
     raft_index: u64,
 ) {
-    let gap = epoch_found.saturating_sub(epoch_expected);
+    // Absolute distance: `found` is below `expected` in the "behind" case, and
+    // a saturating subtraction one way round would report every regression as
+    // a zero-width break.
+    let gap = epoch_found.abs_diff(epoch_expected);
     let ctx = context::SequencerEpochGap {
         epoch_expected,
         epoch_found,
         gap,
-        txns_in_dropped_batch,
+        direction,
+        txns_in_batch,
         raft_index,
     };
     let _ = Capture::new(
         EventKind::InvariantViolation,
-        "Calvin sequencer: epoch gap detected; batch skipped without fan-out",
+        "Calvin sequencer: epoch sequence break detected",
     )
     .domain(&ctx)
     .with_backtrace()

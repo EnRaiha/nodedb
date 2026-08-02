@@ -12,7 +12,8 @@
 pub fn sequencer_epoch_gap(
     _epoch_expected: u64,
     _epoch_found: u64,
-    _txns_in_dropped_batch: usize,
+    _direction: &'static str,
+    _txns_in_batch: usize,
     _raft_index: u64,
 ) {
 }

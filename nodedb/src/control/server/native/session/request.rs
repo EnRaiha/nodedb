@@ -39,7 +39,12 @@ impl NativeSession {
             // A permanently wedged metadata applier happens after a clean boot,
             // so the startup gate still reads Ok. Report Failed anyway — both
             // status surfaces must agree that this node cannot serve.
-            let native_status = if self.state.metadata_apply_wedge.is_wedged() {
+            // A halted sequencer is the same shape of after-boot degradation as
+            // a wedged applier: the node still serves, but a whole class of
+            // writes no longer completes. Both surfaces must say so.
+            let native_status = if self.state.metadata_apply_wedge.is_wedged()
+                || self.state.sequencer_halt.is_halted()
+            {
                 crate::control::startup::health::NativeStatus::Failed
             } else {
                 let health = crate::control::startup::health::observe(&self.state.startup);

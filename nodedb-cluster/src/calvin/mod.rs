@@ -8,9 +8,10 @@ pub mod types;
 pub use completion::{AttemptOutcome, CalvinCompletionRegistry, TxnId};
 pub use completion_verdict::VerdictSignal;
 pub use sequencer::{
-    AdmittedTx, ConflictKey, Inbox, InboxReceiver, RejectedTx, ReservationInbox,
+    AdmittedTx, ConflictKey, EpochCheck, Inbox, InboxReceiver, RejectedTx, ReservationInbox,
     ReservationInboxReceiver, ReservationRequest, SEQUENCER_GROUP_ID, SequencerConfig,
-    SequencerEntry, SequencerError, SequencerMetrics, SequencerReceivers, SequencerService,
-    SequencerStateMachine, new_inbox, new_reservation_inbox, validate_batch,
+    SequencerEntry, SequencerError, SequencerHalt, SequencerMetrics, SequencerReceivers,
+    SequencerService, SequencerStateMachine, UnrecoverableEpochHook, new_inbox,
+    new_reservation_inbox, validate_batch,
 };
 pub use types::{EngineKeySet, EpochBatch, ReadWriteSet, SequencedTxn, SortedVec, TxClass};

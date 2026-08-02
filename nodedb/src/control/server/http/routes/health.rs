@@ -74,6 +74,24 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
     }
 
+    // A halted sequencer leaves the node serving everything that does not route
+    // through Calvin, so the startup gate and every read path still look fine.
+    // Report it anyway: silently dropping a whole write class is exactly what an
+    // operator needs told, and it is the reason nothing takes this node out of
+    // rotation on its own.
+    if let Some(halt) = state.shared.sequencer_halt.report() {
+        let body = json!({
+            "status": "degraded",
+            "reason": "sequencer_halted",
+            "node_id": state.shared.node_id,
+            "expected_epoch": halt.expected_epoch,
+            "found_epoch": halt.found_epoch,
+            "txns_in_batch": halt.txns_in_batch,
+            "raft_index": halt.raft_index,
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
+    }
+
     let health = crate::control::startup::health::observe(&state.shared.startup);
     let (status, body) = crate::control::startup::health::to_http_response(&health);
     (status, axum::Json(body))

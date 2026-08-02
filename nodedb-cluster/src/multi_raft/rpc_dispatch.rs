@@ -171,6 +171,19 @@ impl MultiRaft {
         self.groups.get(&group_id).map(|n| n.last_applied())
     }
 
+    /// Highest index present in a group's local log — committed or not — or
+    /// `None` if the group is not mounted here.
+    ///
+    /// Read alongside [`Self::last_applied`] to answer "has this node applied
+    /// everything its log holds?". That question needs the LOG TIP, not
+    /// `commit_index`: a node that has just won an election observes its own
+    /// `commit_index` still behind its log until its term's no-op commits, yet
+    /// every entry already in a leader's log commits moments later — so only
+    /// the tip bounds what the node is about to be responsible for.
+    pub fn last_log_index(&self, group_id: u64) -> Option<u64> {
+        self.groups.get(&group_id).map(|n| n.last_log_index())
+    }
+
     /// `(group_id, last_applied)` pairs for every locally-mounted
     /// group. Cheap O(groups) snapshot — groups are few (one
     /// metadata + handful of vshard groups per node).

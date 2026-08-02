@@ -215,7 +215,15 @@ pub(super) fn run(
             let catalog = credentials.catalog();
             let hwm = catalog.get_surrogate_hwm()?;
             let reserve_index = catalog.get_surrogate_reserve_index()?;
-            SurrogateRegistry::from_persisted(hwm, reserve_index)
+            // The singleton is flushed lazily and no engine contributes a
+            // "surrogate durable through" floor to WAL truncation, so a
+            // checkpoint can truncate the `SurrogateAlloc` / `SurrogateBind`
+            // records that would have covered a stale singleton. Take the
+            // highest surrogate any live binding refers to as a floor the
+            // allocator can never start below — re-issuing one already bound to
+            // a live row would corrupt cross-engine identity.
+            let bound_floor = catalog.max_bound_surrogate()?.as_u32();
+            SurrogateRegistry::from_persisted(hwm.max(bound_floor), reserve_index)
         };
         Arc::new(std::sync::RwLock::new(initial))
     };

@@ -49,12 +49,17 @@ impl SharedState {
             // metadata-log replay skips already-applied reservations rather
             // than double-counting `G`.
             let catalog = credentials.catalog();
+            // The catalog-derived floor mirrors the production bootstrap: the
+            // singleton is flushed lazily, so the highest surrogate any live
+            // binding refers to is the value the allocator can never start
+            // below.
             if let Ok(hwm) = catalog.get_surrogate_hwm()
                 && let Ok(reserve_index) = catalog.get_surrogate_reserve_index()
+                && let Ok(bound_floor) = catalog.max_bound_surrogate()
                 && let Ok(mut reg) = registry.write()
             {
                 *reg = crate::control::surrogate::SurrogateRegistry::from_persisted(
-                    hwm,
+                    hwm.max(bound_floor.as_u32()),
                     reserve_index,
                 );
             }
@@ -149,6 +154,7 @@ impl SharedState {
             metadata_ddl_applied_token: std::sync::atomic::AtomicU64::new(0),
             metadata_ddl_token_seq: std::sync::atomic::AtomicU64::new(1),
             metadata_apply_wedge: std::sync::Arc::default(),
+            sequencer_halt: std::sync::Arc::default(),
             metadata_raft: std::sync::OnceLock::new(),
             propose_tracker: std::sync::OnceLock::new(),
             raft_proposer: std::sync::OnceLock::new(),

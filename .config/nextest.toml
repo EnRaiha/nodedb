@@ -12,10 +12,15 @@
 # Hard ceiling per test. Anything above this is a bug, not a slow test.
 slow-timeout = { period = "30s", terminate-after = 4 }
 
-# Opt-in only. ILP ingest visibility is load-fragile: under a loaded suite these probes
-# observe zero rows and fail their own bounded poll, while passing in isolation. Run them
-# deliberately when touching Calvin / ILP / WAL durability:
-#   cargo nextest run -p nodedb -E 'binary(crash_ilp_timeseries_write)'
+# Opt-in only. These ILP probes pass in ~9s in isolation but still observe zero rows and
+# fail their own bounded poll under a loaded suite — even the bulk one, which already
+# claims every slot via `load-sensitive`. Whether that is an ingest-starvation property
+# worth fixing or just a saturated test box is unresolved; until it is, a gate that flips
+# on machine load is worse than no gate. Run them deliberately when touching
+# Calvin / ILP / WAL durability:
+#   cargo nextest run -p nodedb --ignore-default-filter -E 'binary(crash_ilp_timeseries_write)'
+# (`-E` alone does NOT override `default-filter` — without `--ignore-default-filter` the
+# run silently selects zero tests and looks like a pass.)
 default-filter = "not binary(crash_ilp_timeseries_write)"
 
 # Use every available core for cheap unit tests. Heavy cluster tests
@@ -179,7 +184,6 @@ not (
     or test(ollp_implicit_edge_update_moves_edge_cross_node)
     or test(learner_caught_up_via_real_install_snapshot)
     or test(native_implicit_edge_delete_cleans_reverse_cross_node)
-    or test(many_calvin_writes_survive_immediate_kill_9)
 )
 """
 

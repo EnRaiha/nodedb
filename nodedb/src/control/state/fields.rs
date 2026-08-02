@@ -123,6 +123,11 @@ pub struct SharedState {
     /// cannot clear. The readiness probe reads it so a wedged node stops
     /// reporting itself healthy while every query dies on a lease timeout.
     pub metadata_apply_wedge: Arc<crate::control::cluster::metadata_applier::MetadataApplyWedge>,
+    /// Set once when the Calvin sequencer state machine halts on an epoch
+    /// regression. Every non-Calvin path keeps serving, so the node stays up —
+    /// the health surfaces read this to make the lost capability visible rather
+    /// than letting it look like an ordinary node.
+    pub sequencer_halt: Arc<crate::control::cluster::SequencerHaltMarker>,
     /// Handle for proposing to the metadata raft group. Set by `start_raft`; None in single-node mode.
     pub metadata_raft: OnceLock<Arc<dyn crate::control::metadata_proposer::MetadataRaftHandle>>,
     /// Propose tracker for distributed writes; absent in single-node mode.
