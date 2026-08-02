@@ -41,7 +41,7 @@
 //! a general "I restored a checkpoint" marker, and adding one where replay is
 //! already idempotent gates records for no reason.
 //!
-//! Four checkpointed engines deliberately have no field here:
+//! Six checkpointed engines deliberately have no field here:
 //!
 //! * Sparse vector — `SparseVectorPut` is an upsert keyed by `doc_id` and
 //!   `SparseVectorDelete` is a no-op against an absent document, so a record
@@ -61,6 +61,46 @@
 //!   here: each array's manifest records the `durable_lsn` its flushed segments
 //!   reach, and `replay_array_wal` gates on that. A shared engine-wide field
 //!   would be wrong for it, since arrays flush independently of one another.
+//! * Full-text search — `FtsIndex` rewrites the surrogate's posting, length and
+//!   stats entries wholesale, deriving the corpus-counter deltas from the prior
+//!   doc-length row read in the same write transaction, so a re-applied record
+//!   lands on the state it already produced; `FtsDelete` decrements only when a
+//!   prior length existed. See `wal_replay_fts.rs`, which proves it.
+//! * Spatial — `SpatialPut` overwrites the surrogate's document body and
+//!   replaces (rather than appends) its R-tree entry, guarded by the docmap the
+//!   entry is always written with; `SpatialDelete` removes an absent entry as a
+//!   no-op. See `wal_replay_spatial.rs`, which proves it.
+//!
+//! ## Why there is no general applied-LSN replay cursor
+//!
+//! A single durable "replay reached LSN X" cursor would look like it subsumes
+//! all of the above. It does not, and it cannot be made correct here.
+//!
+//! The reason is that replay is not one write. A record's effect lands in
+//! whichever engines it touches — a redb transaction, an in-memory HNSW graph,
+//! an mmap'd tile segment — and no cursor write can be made atomic with all of
+//! them at once. A cursor persisted before an engine absorbed the record skips
+//! it forever on the next boot; persisted after, it is exactly the per-engine
+//! floor already recorded here, only coarser: one engine's slow flush would
+//! hold the shared cursor back for every other engine.
+//!
+//! What makes a cursor unnecessary is a property replay already holds: **WAL
+//! replay never advances a DURABLE gate ahead of the state it describes.** Every
+//! floor and watermark in this file is set from a checkpoint at boot or by a
+//! completed flush — never by the act of replaying — and every durable side
+//! effect replay itself performs is an overwrite keyed by identity (a surrogate
+//! or a coordinate), not an accumulation. So a crash in the middle of replay
+//! leaves nothing to reconcile: the in-memory work is simply gone, the durable
+//! work is exactly what a repeat of it would produce, and the next boot restarts
+//! from the same floors and converges on the same state. That is what makes
+//! replay resumable, and it is a stronger guarantee than a cursor could give,
+//! because it does not depend on a write ordering that spans engines.
+//!
+//! The obligation this places on new code is the one the per-engine notes
+//! above discharge: an engine whose replay is a DELTA against current state, or
+//! whose replay writes durable state non-idempotently, must gate itself — with
+//! a floor here, or with a per-collection watermark it carries itself. It must
+//! not assume a cursor will cover it.
 
 use crate::types::Lsn;
 
