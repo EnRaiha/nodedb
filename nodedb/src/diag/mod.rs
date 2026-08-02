@@ -12,9 +12,9 @@
 mod context;
 mod recording;
 
-pub use context::IlpFlushOutcome;
+pub use context::{IlpFlushOutcome, LostResponseWrite};
 pub use recording::{
-    calvin_completion_timeout, entry_kind, fts_index_update_failed, ilp_invalid_utf8_drop,
-    ilp_line_read_drop, metadata_apply_wedged, replay_record_unapplied,
-    write_acked_without_durability,
+    calvin_completion_timeout, data_plane_response_lost, data_plane_responses_lost, entry_kind,
+    fts_index_update_failed, ilp_invalid_utf8_drop, ilp_line_read_drop, metadata_apply_wedged,
+    replay_record_unapplied, write_acked_without_durability,
 };

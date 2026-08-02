@@ -135,9 +135,9 @@ impl CoreLoop {
                         },
                     ),
                 };
-                let _ = self
-                    .response_tx
-                    .try_push(crate::bridge::dispatch::BridgeResponse { inner: response });
+                // The transaction was dropped un-committed above, so a lost
+                // response costs the caller its error message, not its write.
+                self.send_response(response, crate::diag::LostResponseWrite::RolledBack);
             }
             return count;
         }
@@ -188,9 +188,13 @@ impl CoreLoop {
                 self.idempotency_order.push_back(key);
             }
 
-            let _ = self
-                .response_tx
-                .try_push(crate::bridge::dispatch::BridgeResponse { inner: response });
+            // A committed batch whose response is lost is the ambiguous case:
+            // the row is durable and the caller will see only a deadline.
+            let write = match &commit_result {
+                Ok(()) => crate::diag::LostResponseWrite::Committed,
+                Err(_) => crate::diag::LostResponseWrite::RolledBack,
+            };
+            self.send_response(response, write);
         }
 
         if commit_result.is_ok() {

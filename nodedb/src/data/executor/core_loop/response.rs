@@ -11,6 +11,35 @@ use super::super::task::ExecutionTask;
 use super::CoreLoop;
 
 impl CoreLoop {
+    /// Hand a finished response back to the Control Plane, or report its loss.
+    ///
+    /// The response ring is bounded, so a Control Plane that has stopped
+    /// draining it can refuse the push. Discarding the response quietly is what
+    /// makes that unrecoverable: the caller blocks until its deadline and then
+    /// reports a timeout, and when `write` says the batch had already committed
+    /// that timeout names a write which IS durable. A client that retries on
+    /// timeout then double-applies it; one that compensates erases a committed
+    /// row. Neither can tell, so the drop is recorded where it is detected —
+    /// this is the only place that still knows what happened to the write.
+    pub(in crate::data::executor) fn send_response(
+        &mut self,
+        response: Response,
+        write: crate::diag::LostResponseWrite,
+    ) {
+        if let Err(e) = self
+            .response_tx
+            .try_push(crate::bridge::dispatch::BridgeResponse { inner: response })
+        {
+            tracing::error!(
+                core = self.core_id,
+                error = %e,
+                write = ?write,
+                "failed to send response — caller can only learn a deadline"
+            );
+            crate::diag::data_plane_response_lost(self.core_id, write);
+        }
+    }
+
     pub(in crate::data::executor) fn response_ok(&self, task: &ExecutionTask) -> Response {
         Response {
             request_id: task.request_id(),
@@ -204,5 +233,56 @@ impl CoreLoop {
         for engine in self.crdt_engines.values_mut() {
             engine.clear_apply_candidates();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{make_core_with_dir, make_default_task};
+    use crate::diag::{LostResponseWrite, data_plane_responses_lost};
+
+    /// The happy path this helper must not regress: a response the ring accepts
+    /// reaches the Control Plane unchanged and records nothing.
+    #[test]
+    fn a_deliverable_response_is_handed_over_and_reports_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut core, _req_tx, mut resp_rx) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+        let response = core.response_ok(&task);
+        let before = data_plane_responses_lost();
+
+        core.send_response(response, LostResponseWrite::Committed);
+
+        let delivered = resp_rx.try_pop().expect("response delivered");
+        assert_eq!(delivered.inner.request_id, task.request_id());
+        assert_eq!(data_plane_responses_lost(), before);
+    }
+
+    /// The defect: a full response ring used to swallow the response with
+    /// `let _ =`, so a committed batch write became a client-side deadline with
+    /// no trace anywhere that the outcome was ambiguous. The drop is still
+    /// unavoidable — the ring is bounded — but it must never be silent.
+    #[test]
+    fn a_refused_response_is_counted_rather_than_swallowed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Never drained, so the ring saturates and then refuses.
+        let (mut core, _req_tx, _resp_rx) = make_core_with_dir(dir.path());
+        let task = make_default_task();
+        // Comfortably past the ring's capacity, so the last push below is
+        // guaranteed to be refused regardless of the configured depth.
+        for _ in 0..256 {
+            let filler = core.response_ok(&task);
+            core.send_response(filler, LostResponseWrite::Committed);
+        }
+        let before = data_plane_responses_lost();
+
+        let overflow = core.response_ok(&task);
+        core.send_response(overflow, LostResponseWrite::Committed);
+
+        assert_eq!(
+            data_plane_responses_lost(),
+            before + 1,
+            "a response the ring refused must be reported, not discarded"
+        );
     }
 }
