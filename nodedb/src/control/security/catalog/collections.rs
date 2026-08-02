@@ -22,6 +22,71 @@ use redb::{ReadableTable, ReadableTableMetadata};
 
 use super::types::{COLLECTIONS, COLLECTIONS_LEGACY, StoredCollection, SystemCatalog, catalog_err};
 
+/// Union inferred ingest fields into a collection's schema projection.
+///
+/// Existing field order and types win; only absent inferred names are
+/// appended. Bitemporal collections always expose their reserved BIGINT
+/// fields exactly once. Returns `true` when the projection changed.
+///
+/// Deliberately pure: a collection descriptor is replicated catalog state, so
+/// the merged record has to reach storage through the replicated metadata path
+/// (see `catalog_entry::persist_collection`) rather than a local write. Mutating
+/// the persisted record in place would leave this node's copy at descriptor
+/// version N no longer byte-equal to the replicated entry at version N, and
+/// replaying that entry after a restart would wedge the metadata applier.
+pub fn merge_inferred_fields(
+    collection: &mut StoredCollection,
+    inferred_fields: &[(String, String)],
+) -> bool {
+    let mut changed = false;
+    for (field, field_type) in inferred_fields {
+        // Reserved bitemporal columns are schema-owned. Never let an ingest
+        // projection supply their type or add a duplicate; normalization below
+        // owns them entirely.
+        if collection.bitemporal
+            && [TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL].contains(&field.as_str())
+        {
+            continue;
+        }
+        if !collection
+            .fields
+            .iter()
+            .any(|(existing, _)| existing == field)
+        {
+            collection.fields.push((field.clone(), field_type.clone()));
+            changed = true;
+        }
+    }
+    if collection.bitemporal {
+        for reserved in [TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL] {
+            let mut retained = false;
+            let before = collection.fields.len();
+            collection.fields.retain_mut(|(field, field_type)| {
+                if field != reserved {
+                    return true;
+                }
+                if retained {
+                    return false;
+                }
+                retained = true;
+                if field_type != "BIGINT" {
+                    *field_type = "BIGINT".to_owned();
+                    changed = true;
+                }
+                true
+            });
+            changed |= collection.fields.len() != before;
+            if !retained {
+                collection
+                    .fields
+                    .push((reserved.to_owned(), "BIGINT".to_owned()));
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 impl SystemCatalog {
     /// Store a collection record.
     pub fn put_collection(
@@ -45,103 +110,6 @@ impl SystemCatalog {
                 .map_err(|e| catalog_err("insert collection", e))?;
         }
         write_txn.commit().map_err(|e| catalog_err("commit", e))
-    }
-
-    /// Atomically merge inferred fields into an existing collection projection.
-    ///
-    /// This is intentionally a single redb write transaction: direct ingest
-    /// acknowledgements may race on different cores, and a get/put sequence
-    /// would lose one schema expansion. Existing field order and types win;
-    /// only absent inferred names are appended. Bitemporal collections always
-    /// expose their reserved BIGINT fields exactly once in the projection.
-    /// Returns `false` when the collection is absent or already contains every
-    /// required field, and `true` when the stored projection changed.
-    pub fn merge_collection_fields(
-        &self,
-        database_id: DatabaseId,
-        tenant_id: u64,
-        name: &str,
-        inferred_fields: &[(String, String)],
-    ) -> crate::Result<bool> {
-        let inner_key = format!("{tenant_id}:{name}");
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| catalog_err("merge collection fields write txn", e))?;
-        let changed = {
-            let mut table = write_txn
-                .open_table(COLLECTIONS)
-                .map_err(|e| catalog_err("merge collection fields open", e))?;
-            let existing = table
-                .get((database_id.as_u64(), inner_key.as_str()))
-                .map_err(|e| catalog_err("merge collection fields get", e))?
-                .map(|value| value.value().to_vec());
-            match existing {
-                None => false,
-                Some(bytes) => {
-                    let mut collection: StoredCollection = zerompk::from_msgpack(&bytes)
-                        .map_err(|e| catalog_err("merge collection fields deserialize", e))?;
-                    let mut changed = false;
-                    for (field, field_type) in inferred_fields {
-                        // Reserved bitemporal columns are schema-owned. Never
-                        // let an ingest projection supply their type or add a
-                        // duplicate; normalization below owns them entirely.
-                        if collection.bitemporal
-                            && [TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL].contains(&field.as_str())
-                        {
-                            continue;
-                        }
-                        if !collection
-                            .fields
-                            .iter()
-                            .any(|(existing, _)| existing == field)
-                        {
-                            collection.fields.push((field.clone(), field_type.clone()));
-                            changed = true;
-                        }
-                    }
-                    if collection.bitemporal {
-                        for reserved in [TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL] {
-                            let mut retained = false;
-                            let before = collection.fields.len();
-                            collection.fields.retain_mut(|(field, field_type)| {
-                                if field != reserved {
-                                    return true;
-                                }
-                                if retained {
-                                    return false;
-                                }
-                                retained = true;
-                                if field_type != "BIGINT" {
-                                    *field_type = "BIGINT".to_owned();
-                                    changed = true;
-                                }
-                                true
-                            });
-                            changed |= collection.fields.len() != before;
-                            if !retained {
-                                collection
-                                    .fields
-                                    .push((reserved.to_owned(), "BIGINT".to_owned()));
-                                changed = true;
-                            }
-                        }
-                    }
-                    if changed {
-                        let bytes = zerompk::to_msgpack_vec(&collection)
-                            .map_err(|e| catalog_err("merge collection fields serialize", e))?;
-                        table
-                            .insert((database_id.as_u64(), inner_key.as_str()), bytes.as_slice())
-                            .map_err(|e| catalog_err("merge collection fields insert", e))?;
-                    }
-                    changed
-                }
-            }
-        };
-        write_txn
-            .commit()
-            .map_err(|e| catalog_err("merge collection fields commit", e))?;
-        Ok(changed)
     }
 
     /// Insert a collection only when its catalog key is absent.
@@ -473,47 +441,26 @@ mod tests {
     }
 
     #[test]
-    fn merge_collection_fields_unions_disjoint_updates_without_reordering() {
-        let (_dir, cat) = open_catalog();
+    fn merge_inferred_fields_unions_disjoint_updates_without_reordering() {
         let mut coll = make_coll(1, "metrics");
         coll.fields = vec![("existing".to_owned(), "VARCHAR".to_owned())];
-        cat.put_collection(DatabaseId::DEFAULT, &coll).unwrap();
 
-        assert!(
-            cat.merge_collection_fields(
-                DatabaseId::DEFAULT,
-                1,
-                "metrics",
-                &[("first".to_owned(), "BIGINT".to_owned())],
-            )
-            .unwrap()
-        );
-        assert!(
-            cat.merge_collection_fields(
-                DatabaseId::DEFAULT,
-                1,
-                "metrics",
-                &[("second".to_owned(), "FLOAT".to_owned())],
-            )
-            .unwrap()
-        );
-        assert!(
-            !cat.merge_collection_fields(
-                DatabaseId::DEFAULT,
-                1,
-                "metrics",
-                &[("first".to_owned(), "BOOLEAN".to_owned())],
-            )
-            .unwrap()
-        );
+        assert!(merge_inferred_fields(
+            &mut coll,
+            &[("first".to_owned(), "BIGINT".to_owned())]
+        ));
+        assert!(merge_inferred_fields(
+            &mut coll,
+            &[("second".to_owned(), "FLOAT".to_owned())]
+        ));
+        // A known name never re-types an existing column, and reports no change.
+        assert!(!merge_inferred_fields(
+            &mut coll,
+            &[("first".to_owned(), "BOOLEAN".to_owned())]
+        ));
 
-        let fields = cat
-            .get_collection(DatabaseId::DEFAULT, 1, "metrics")
-            .unwrap()
-            .unwrap()
-            .fields;
         assert_eq!(
-            fields,
+            coll.fields,
             vec![
                 ("existing".to_owned(), "VARCHAR".to_owned()),
                 ("first".to_owned(), "BIGINT".to_owned()),
@@ -523,42 +470,29 @@ mod tests {
     }
 
     #[test]
-    fn merge_collection_fields_adds_bitemporal_reserved_fields_once() {
-        let (_dir, cat) = open_catalog();
+    fn merge_inferred_fields_adds_bitemporal_reserved_fields_once() {
         let mut coll = make_coll(1, "audit");
         coll.bitemporal = true;
         coll.fields = vec![(TS_SYSTEM.to_owned(), "BIGINT".to_owned())];
-        cat.put_collection(DatabaseId::DEFAULT, &coll).unwrap();
 
-        assert!(
-            cat.merge_collection_fields(
-                DatabaseId::DEFAULT,
-                1,
-                "audit",
-                &[("value".to_owned(), "FLOAT".to_owned())],
-            )
-            .unwrap()
-        );
-        assert!(
-            !cat.merge_collection_fields(DatabaseId::DEFAULT, 1, "audit", &[])
-                .unwrap()
-        );
-        let fields = cat
-            .get_collection(DatabaseId::DEFAULT, 1, "audit")
-            .unwrap()
-            .unwrap()
-            .fields;
+        assert!(merge_inferred_fields(
+            &mut coll,
+            &[("value".to_owned(), "FLOAT".to_owned())]
+        ));
+        assert!(!merge_inferred_fields(&mut coll, &[]));
         for reserved in [TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL] {
             assert_eq!(
-                fields.iter().filter(|(field, _)| field == reserved).count(),
+                coll.fields
+                    .iter()
+                    .filter(|(field, _)| field == reserved)
+                    .count(),
                 1
             );
         }
     }
 
     #[test]
-    fn merge_collection_fields_normalizes_bitemporal_reserved_types_and_duplicates() {
-        let (_dir, cat) = open_catalog();
+    fn merge_inferred_fields_normalizes_bitemporal_reserved_types_and_duplicates() {
         let mut coll = make_coll(1, "audit-normalized");
         coll.bitemporal = true;
         coll.fields = vec![
@@ -566,33 +500,25 @@ mod tests {
             (TS_SYSTEM.to_owned(), "FLOAT".to_owned()),
             ("value".to_owned(), "FLOAT".to_owned()),
         ];
-        cat.put_collection(DatabaseId::DEFAULT, &coll).unwrap();
 
-        assert!(
-            cat.merge_collection_fields(
-                DatabaseId::DEFAULT,
-                1,
-                "audit-normalized",
-                &[
-                    (TS_VALID_FROM.to_owned(), "VARCHAR".to_owned()),
-                    (TS_VALID_UNTIL.to_owned(), "BOOLEAN".to_owned()),
-                ],
-            )
-            .unwrap()
-        );
+        assert!(merge_inferred_fields(
+            &mut coll,
+            &[
+                (TS_VALID_FROM.to_owned(), "VARCHAR".to_owned()),
+                (TS_VALID_UNTIL.to_owned(), "BOOLEAN".to_owned()),
+            ]
+        ));
 
-        let fields = cat
-            .get_collection(DatabaseId::DEFAULT, 1, "audit-normalized")
-            .unwrap()
-            .unwrap()
-            .fields;
         for reserved in [TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL] {
             assert_eq!(
-                fields.iter().filter(|(field, _)| field == reserved).count(),
+                coll.fields
+                    .iter()
+                    .filter(|(field, _)| field == reserved)
+                    .count(),
                 1
             );
             assert_eq!(
-                fields.iter().find(|(field, _)| field == reserved),
+                coll.fields.iter().find(|(field, _)| field == reserved),
                 Some(&(reserved.to_owned(), "BIGINT".to_owned()))
             );
         }

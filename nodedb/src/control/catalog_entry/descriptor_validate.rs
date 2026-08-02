@@ -387,6 +387,57 @@ mod tests {
     }
 
     #[test]
+    fn validate_treats_existing_if_absent_create_as_applied() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        seed_prior(catalog, "orders", 1);
+        let mut retry = StoredCollection::new(1, "orders", "tester");
+        retry.descriptor_version = 1;
+        // An if-absent create for a descriptor that exists is a no-op whatever
+        // the payload says — it never compares versions at all.
+        assert!(matches!(
+            validate(
+                &CatalogEntry::PutCollectionIfAbsent(Box::new(retry)),
+                catalog
+            ),
+            Ok(ValidationOutcome::AlreadyApplied)
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_locally_accreted_fields_at_same_version() {
+        let (store, _tmp) = make_catalog();
+        let catalog = store.catalog();
+        let mut persisted = StoredCollection::new(1, "metrics", "tester");
+        persisted.descriptor_version = 1;
+        persisted.fields = vec![
+            ("host".to_owned(), "VARCHAR".to_owned()),
+            ("cpu".to_owned(), "FLOAT".to_owned()),
+        ];
+        catalog
+            .put_collection(DatabaseId::DEFAULT, &persisted)
+            .expect("seed persisted collection");
+
+        // The replicated entry at version 1 carried only `host`. A local write
+        // that appended `cpu` without advancing the version makes the two
+        // disagree about what version 1 means, which is a genuine divergence
+        // and must stay an error — any schema projection an ingest path infers
+        // has to travel as its own descriptor version instead.
+        let mut replicated = persisted.clone();
+        replicated.fields = vec![("host".to_owned(), "VARCHAR".to_owned())];
+        let err = validate(&CatalogEntry::PutCollection(Box::new(replicated)), catalog)
+            .expect_err("locally mutated payload at the same version must be rejected");
+        assert!(matches!(
+            err,
+            crate::Error::DescriptorVersionAnomaly {
+                carried: 1,
+                prior: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn validate_rejects_divergent_payload_at_same_version() {
         let (store, _tmp) = make_catalog();
         let catalog = store.catalog();

@@ -11,7 +11,10 @@ use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::response_shape::types::describe_plan;
-use crate::control::server::shared::authorization::{authorize_database, authorize_task_set};
+use crate::control::server::shared::authorization::authorize_database;
+use crate::control::server::shared::plan_admission::{
+    PlanAdmissionRequest, plan_authorize_and_admit,
+};
 
 use super::super::super::auth::{ApiError, AppState, resolve_auth};
 use super::super::super::types::{HttpQueryRequest, HttpQueryResponse};
@@ -86,61 +89,29 @@ pub async fn query(
     auth_ctx.database_id = Some(database_id);
     let clean_sql =
         crate::control::server::session_auth::extract_and_apply_on_deny(sql, &mut auth_ctx);
-    let perm_cache = state.shared.permission_cache.read().await;
-    let sec = crate::control::planner::context::PlanSecurityContext {
+    // Planning and lease admission run as one retried unit so a descriptor
+    // drain starting between them is absorbed rather than surfaced. The scope
+    // is retained through every dispatch and response-shaping operation below.
+    let admission = plan_authorize_and_admit(PlanAdmissionRequest {
+        state: &state.shared,
+        query_ctx: &state.query_ctx,
         identity: &identity,
-        auth: &auth_ctx,
-        rls_store: &state.shared.rls,
-        permissions: &state.shared.permissions,
-        roles: &state.shared.roles,
-        permission_cache: Some(&*perm_cache),
-    };
-    let (mut tasks, output_schema, versions, _) = state
-        .query_ctx
-        .plan_sql_with_rls_and_versions(&clean_sql, tenant_id, database_id, &sec, false)
-        .await
-        .map_err(|e| ApiError::BadRequest(format!("SQL planning failed: {e}")))?;
-
-    // Implicit-edge extraction marks catalog state and allocates surrogates,
-    // so the original planned tasks must be authorized first.
-    let _preauthorized_tasks = authorize_task_set(
-        &identity,
-        &tasks,
-        &state.shared.permissions,
-        &state.shared.roles,
-        &emitter,
-    )
-    .map_err(crate::Error::from)?;
-
-    crate::control::planner::implicit_edges::append_implicit_edge_tasks(
-        &state.shared,
-        &mut tasks,
+        auth_ctx: &auth_ctx,
+        sql: &clean_sql,
         tenant_id,
         database_id,
-        crate::types::TraceId::ZERO,
-    )
+        trace_id: crate::types::TraceId::ZERO,
+    })
     .await
     .map_err(ApiError::from)?;
-
-    let authorized_tasks = authorize_task_set(
-        &identity,
-        &tasks,
-        &state.shared.permissions,
-        &state.shared.roles,
-        &emitter,
-    )
-    .map_err(crate::Error::from)?
-    .into_tasks();
+    let tasks = admission.tasks;
+    let output_schema = admission.output_schema;
+    let authorized_tasks = admission.authorized_tasks.into_tasks();
+    let _lease_scope = admission.lease_scope;
 
     if tasks.is_empty() {
         return Ok(axum::Json(HttpQueryResponse::ok(vec![])));
     }
-
-    // Acquire only after authorization, and retain the scope through every
-    // dispatch and response-shaping operation below.
-    let _lease_scope = Arc::clone(&state.shared)
-        .acquire_plan_lease_scope(&versions)
-        .map_err(ApiError::from)?;
 
     // Track active request for quota accounting.
     let _request = state.shared.tenant_request_guard(tenant_id);

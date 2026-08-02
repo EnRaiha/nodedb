@@ -21,7 +21,9 @@ use super::super::plan::{describe_plan, payload_to_response};
 use super::super::shape_encode;
 use super::result_shaping::ResultShaping;
 use super::set_ops;
+use super::setup_error::StatementSetupError;
 use super::streaming::StreamSelectContext;
+use crate::control::server::shared::retry::retry_on_schema_change;
 
 struct DispatchTaskContext<'a> {
     plan_lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
@@ -42,9 +44,62 @@ impl NodeDbPgHandler {
         params: &[nodedb_sql::ParamValue],
         shaping: ResultShaping<'_>,
     ) -> PgWireResult<Vec<Response>> {
-        let (mut tasks, output_schema, versions, auth_ctx) = self
-            .plan_statement_to_tasks(identity, sql, tenant_id, session_id, params)
-            .await?;
+        // Planning records the descriptor versions; the leases that pin them are
+        // only acquired at the end of this block. A descriptor drain starting in
+        // between fails the acquisition, so the whole setup — plan, authorize,
+        // expand implicit edges, authorize again, admit — runs as ONE retried
+        // unit under a single budget. Every step is safe to re-run: planning is
+        // pure, the edge-bearing catalog flag is a read-then-conditional-write,
+        // endpoint surrogates resolve get-or-create against a stable key, and a
+        // failed admission rolls its own refcounts back.
+        let edge_database_id = self
+            .sessions
+            .get_current_database(session_id)
+            .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        let (tasks, output_schema, auth_ctx, plan_lease_scope) =
+            retry_on_schema_change(move || async move {
+                let (mut tasks, output_schema, versions, auth_ctx) = self
+                    .plan_statement_to_tasks(identity, sql, tenant_id, session_id, params)
+                    .await?;
+
+                // Extraction marks catalog state and allocates surrogates.
+                // Authorize the original planned tasks before it can perform
+                // either side effect.
+                let _preauthorized_tasks = self
+                    .authorize_tasks(identity, &tasks)
+                    .map_err(StatementSetupError::from)?;
+
+                // Implicit graph-edge extraction: a schemaless document carrying
+                // `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task, homed
+                // and surrogate-resolved per endpoint so it routes through the
+                // same classify/Calvin/single-shard path as an explicit edge.
+                crate::control::planner::implicit_edges::append_implicit_edge_tasks(
+                    &self.state,
+                    &mut tasks,
+                    tenant_id,
+                    edge_database_id,
+                    crate::types::TraceId::ZERO,
+                )
+                .await
+                .map_err(StatementSetupError::from)?;
+
+                // The final task set must be authorized before any clone
+                // interception, orchestration, staging, or dispatch path can
+                // observe it. Descriptor admission follows this check so an
+                // implicit-edge denial consumes no descriptor lease.
+                let _authorized_tasks = self
+                    .authorize_tasks(identity, &tasks)
+                    .map_err(StatementSetupError::from)?;
+                let plan_lease_scope = self
+                    .state
+                    .acquire_plan_lease_scope(&versions)
+                    .map_err(StatementSetupError::from)?;
+
+                Ok::<_, StatementSetupError>((tasks, output_schema, auth_ctx, plan_lease_scope))
+            })
+            .await
+            .map_err(PgWireError::from)?;
+        let plan_lease_scope = Arc::new(plan_lease_scope);
 
         if tasks.is_empty() {
             return Ok(vec![Response::Execution(Tag::new("OK"))]);
@@ -54,51 +109,6 @@ impl NodeDbPgHandler {
         // phase) wins; otherwise use the planner's fresh output schema for this
         // statement.
         let effective_schema = shaping.projection.or(Some(&output_schema));
-
-        // Extraction marks catalog state and allocates surrogates. Authorize
-        // the original planned tasks before it can perform either side effect.
-        let _preauthorized_tasks = self.authorize_tasks(identity, &tasks)?;
-
-        // Implicit graph-edge extraction: a schemaless document carrying
-        // `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task, homed and
-        // surrogate-resolved per endpoint so it routes through the same
-        // classify/Calvin/single-shard path as an explicit edge.
-        let edge_database_id = self
-            .sessions
-            .get_current_database(session_id)
-            .unwrap_or(crate::types::DatabaseId::DEFAULT);
-        crate::control::planner::implicit_edges::append_implicit_edge_tasks(
-            &self.state,
-            &mut tasks,
-            tenant_id,
-            edge_database_id,
-            crate::types::TraceId::ZERO,
-        )
-        .await
-        .map_err(|e| {
-            let (severity, code, message) = error_to_sqlstate(&e);
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                severity.to_owned(),
-                code.to_owned(),
-                message,
-            )))
-        })?;
-
-        // The final task set must be authorized before any clone interception,
-        // orchestration, staging, or dispatch path can observe it. Descriptor
-        // admission follows this check so an implicit-edge denial consumes no
-        // descriptor lease.
-        let _authorized_tasks = self.authorize_tasks(identity, &tasks)?;
-        let plan_lease_scope = Arc::new(self.state.acquire_plan_lease_scope(&versions).map_err(
-            |e| {
-                let (severity, code, message) = error_to_sqlstate(&e);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            },
-        )?);
 
         // Clone CoW read-path interception: for Shadowed/Materializing clones,
         // augment tasks with source-database reads and merge results.

@@ -119,6 +119,10 @@ pub struct SharedState {
     pub metadata_ddl_applied_token: AtomicU64,
     /// Per-node uniqueness component for descriptor-preparation lease tokens.
     pub metadata_ddl_token_seq: AtomicU64,
+    /// Set once when the metadata applier halts on a failure that re-delivery
+    /// cannot clear. The readiness probe reads it so a wedged node stops
+    /// reporting itself healthy while every query dies on a lease timeout.
+    pub metadata_apply_wedge: Arc<crate::control::cluster::metadata_applier::MetadataApplyWedge>,
     /// Handle for proposing to the metadata raft group. Set by `start_raft`; None in single-node mode.
     pub metadata_raft: OnceLock<Arc<dyn crate::control::metadata_proposer::MetadataRaftHandle>>,
     /// Propose tracker for distributed writes; absent in single-node mode.

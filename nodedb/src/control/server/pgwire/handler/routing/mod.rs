@@ -22,4 +22,5 @@ mod planning;
 mod pre_dispatch;
 pub(in crate::control::server::pgwire::handler) mod result_shaping;
 mod set_ops;
+pub(in crate::control::server::pgwire::handler) mod setup_error;
 mod streaming;

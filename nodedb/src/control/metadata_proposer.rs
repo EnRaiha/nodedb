@@ -245,7 +245,14 @@ pub(crate) fn acquire_ddl_prepare_lease<'a>(
                 }
                 None => break,
                 Some(_) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
+                    // Reached from async tasks (ILP batch flush ->
+                    // `propose_catalog_entry`), so hand the worker back to
+                    // tokio rather than parking it: the lease owner this
+                    // polls for is released by a raft apply that needs a
+                    // worker to make progress.
+                    tokio::task::block_in_place(|| {
+                        std::thread::sleep(Duration::from_millis(10));
+                    });
                 }
                 Some(_) => {
                     return Err(Error::Config {

@@ -36,8 +36,15 @@ impl NativeSession {
 
         // Status requires no auth — returns current startup phase.
         if op == OpCode::Status {
-            let health = crate::control::startup::health::observe(&self.state.startup);
-            let native_status = crate::control::startup::health::to_native_status(&health);
+            // A permanently wedged metadata applier happens after a clean boot,
+            // so the startup gate still reads Ok. Report Failed anyway — both
+            // status surfaces must agree that this node cannot serve.
+            let native_status = if self.state.metadata_apply_wedge.is_wedged() {
+                crate::control::startup::health::NativeStatus::Failed
+            } else {
+                let health = crate::control::startup::health::observe(&self.state.startup);
+                crate::control::startup::health::to_native_status(&health)
+            };
             return SqlOutcome::Response(Box::new(NativeResponse::status_row(
                 seq,
                 native_status.to_string(),

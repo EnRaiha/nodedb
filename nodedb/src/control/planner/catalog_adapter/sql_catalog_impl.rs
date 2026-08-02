@@ -100,11 +100,12 @@ impl SqlCatalog for OriginCatalog {
         // `RetryableSchemaChanged` so the pgwire handler's
         // retry loop re-plans. Without this check the planner
         // would compile a plan against a version that's about
-        // to be retired, and the post-plan lease acquisition
-        // would either hit a "drain in progress" error (which
-        // is too late to retry) or (worse) succeed on first
+        // to be retired, and only the post-plan lease acquisition
+        // would notice — or (worse) it would succeed on first
         // holder because the drain finished just before the
-        // refcount check.
+        // refcount check. Catching it here keeps the common case
+        // cheap; the acquisition sits inside the same retry unit
+        // for the drain that starts after this read.
         //
         // Leases themselves are NOT acquired here anymore.
         // The handler calls

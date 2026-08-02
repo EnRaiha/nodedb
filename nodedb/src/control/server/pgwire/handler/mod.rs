@@ -14,7 +14,6 @@ mod listen_notify_exec;
 mod live_select;
 mod plan;
 pub mod prepared;
-mod retry;
 mod returning;
 mod routing;
 mod session_cmds;

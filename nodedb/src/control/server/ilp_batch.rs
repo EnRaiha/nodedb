@@ -227,9 +227,15 @@ async fn flush_ilp_batch_inner(
     // Timeseries owns authoritative schema. Catalog fields are a rebuildable
     // control-plane projection; update failures are loud but cannot turn an
     // already committed Calvin write into a retryable client failure.
-    let catalog = state.credentials.catalog();
+    //
+    // The merge goes through the replicated metadata path, never a local
+    // catalog write: the projection lives inside the replicated collection
+    // descriptor, and mutating that record in place would leave this node's
+    // copy no longer byte-equal to the replicated entry at the same descriptor
+    // version — which wedges the metadata applier on the next replay.
     for group in groups {
-        match catalog.merge_collection_fields(
+        match crate::control::catalog_entry::merge_collection_fields_replicated(
+            state,
             database_id,
             tenant_id.as_u64(),
             &group.measurement,

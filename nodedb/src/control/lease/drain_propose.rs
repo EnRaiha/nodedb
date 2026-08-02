@@ -35,6 +35,7 @@
 
 use nodedb_types::DatabaseId;
 use std::time::{Duration, Instant};
+use tokio::runtime::RuntimeFlavor;
 
 use nodedb_cluster::{DescriptorId, DescriptorKind, MetadataEntry, encode_entry};
 use nodedb_types::Hlc;
@@ -138,7 +139,44 @@ pub fn drain_for_ddl(
 /// Wait until `metadata_cache.leases` and in-flight admission reservations
 /// have no entries on `id` at `version <= up_to_version`. Polls every
 /// [`POLL_INTERVAL`] until the deadline.
+///
+/// Stays sync on purpose. The replicated-DDL layer this sits under
+/// (`metadata_proposer`) is deliberately synchronous because pgwire DDL
+/// handlers are sync, so an `async fn` here would have to ripple through
+/// every catalog-DDL call site and would strand the genuinely sync callers
+/// (GC sweeper, clone materializer, backup restore).
+///
+/// It is nonetheless reached from async tasks — e.g. the ILP batch flush
+/// path runs `persist_collection_replicated` -> `propose_catalog_entry` ->
+/// here from a tokio worker. Parking that worker for the whole drain can
+/// delay the very lease-release and raft-apply work the drain is waiting
+/// on, so the wait is handed back to tokio for its duration, exactly as
+/// the sibling apply wait in `propose_drain` does.
 pub(crate) fn poll_leases_drained(
+    shared: &SharedState,
+    id: &DescriptorId,
+    up_to_version: u64,
+    max_wait: Duration,
+) -> Result<(), Error> {
+    // `block_in_place` panics on the current-thread runtime and buys
+    // nothing without a worker pool to hand the parked work to, so it is
+    // used only where it is both legal and meaningful. Off a multi-thread
+    // runtime the loop blocks the calling thread, which is what a sync
+    // caller already expects.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| {
+                wait_for_lease_drain(shared, id, up_to_version, max_wait)
+            })
+        }
+        _ => wait_for_lease_drain(shared, id, up_to_version, max_wait),
+    }
+}
+
+/// The drain wait loop itself. Split out so the convergence condition and
+/// deadline handling are identical on both the `block_in_place` and the
+/// plain-sync path above.
+fn wait_for_lease_drain(
     shared: &SharedState,
     id: &DescriptorId,
     up_to_version: u64,

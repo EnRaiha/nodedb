@@ -77,6 +77,7 @@ pub use collection_constraints::{
     BalancedConstraintDef, CheckConstraintDef, EventDefinition, FieldDefinition, LegalHold,
     MaterializedSumDef, PeriodLockDef, StateTransitionDef, TransitionCheckDef, TransitionRule,
 };
+pub use collections::merge_inferred_fields;
 pub use constraint_translate::collection_constraints;
 pub use custom_types::{CompositeField, CustomTypeDef, StoredCustomType};
 pub use database_grants::DatabaseGrant;

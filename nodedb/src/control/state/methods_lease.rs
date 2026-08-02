@@ -56,6 +56,12 @@ impl SharedState {
     /// gate is released, so the metadata applier can install a queued drain
     /// while a grant is waiting for raft. Any error rolls back the whole
     /// attempted admission; callers never receive a partial or unleased scope.
+    ///
+    /// A rejection caused by an active drain surfaces as
+    /// `Error::RetryableSchemaChanged`, so client-facing callers can wrap this
+    /// call and their planning call in one `retry_on_schema_change` unit and
+    /// absorb a drain that starts between them. Every other failure keeps its
+    /// own type and is terminal.
     pub fn acquire_plan_lease_scope(
         &self,
         version_set: &crate::control::planner::descriptor_set::DescriptorVersionSet,
@@ -208,6 +214,54 @@ mod tests {
         versions.record(descriptor.clone(), 1);
         assert!(state.acquire_plan_lease_scope(&versions).is_err());
         assert_eq!(state.lease_refcount.current(&descriptor), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_rejection_is_typed_retryable() {
+        use crate::control::server::shared::retry::RetryableSchemaChange;
+
+        let (state, _directory) = test_state();
+        let descriptor = id("draining");
+        install_drain(&state, descriptor.clone(), 1);
+
+        let mut versions = DescriptorVersionSet::new();
+        versions.record(descriptor.clone(), 1);
+        let error = state
+            .acquire_plan_lease_scope(&versions)
+            .err()
+            .expect("drain rejects admission");
+        let retryable = error
+            .retryable_descriptor()
+            .expect("drain rejection must be retryable");
+        assert!(
+            retryable.contains("draining"),
+            "descriptor identity lost: {retryable}"
+        );
+        assert_eq!(state.lease_refcount.current(&descriptor), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_without_drain_is_not_retryable() {
+        use crate::control::server::shared::retry::RetryableSchemaChange;
+
+        let (state, _directory) = test_state();
+        let descriptor = id("healthy");
+        let mut versions = DescriptorVersionSet::new();
+        versions.record(descriptor.clone(), 1);
+
+        // No drain installed: admission succeeds, so nothing is reclassified
+        // as a retryable schema change.
+        let scope = state
+            .acquire_plan_lease_scope(&versions)
+            .expect("admission succeeds without a drain");
+        assert_eq!(scope.len(), 1);
+        assert!(
+            crate::Error::Config {
+                detail: "unrelated lease failure".into(),
+            }
+            .retryable_descriptor()
+            .is_none()
+        );
     }
 
     #[tokio::test]

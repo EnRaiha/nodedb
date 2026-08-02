@@ -13,7 +13,10 @@ use crate::control::planner::calvin::{
     dispatch_authorized_tasks_to_calvin,
 };
 use crate::control::security::audit::ArcAuditEmitter;
-use crate::control::server::shared::authorization::{authorize_database, authorize_task_set};
+use crate::control::server::shared::authorization::authorize_database;
+use crate::control::server::shared::plan_admission::{
+    PlanAdmissionRequest, plan_authorize_and_admit,
+};
 use crate::control::server::shared::session::TransactionState;
 
 use super::sql_admin::{handle_explain, handle_set_sql, handle_show_sql, is_session_show};
@@ -218,16 +221,6 @@ async fn execute_planned(
     let clean_sql =
         crate::control::server::session_auth::extract_and_apply_on_deny(sql, &mut auth_ctx);
 
-    let perm_cache = ctx.state.permission_cache.read().await;
-    let sec = crate::control::planner::context::PlanSecurityContext {
-        identity: ctx.identity,
-        auth: &auth_ctx,
-        rls_store: &ctx.state.rls,
-        permissions: &ctx.state.permissions,
-        roles: &ctx.state.roles,
-        permission_cache: Some(&*perm_cache),
-    };
-
     // Forward every per-session planning GUC (vector-dim quota, force-shuffle
     // join/agg overrides + partition counts, broadcast / shuffle-aggregate cost
     // thresholds) into the shared query context before planning — the same
@@ -242,70 +235,39 @@ async fn execute_planned(
         ctx.tenant_id(),
     );
 
-    let (mut tasks, output_schema, versions, _) = match ctx
-        .query_ctx
-        .plan_sql_with_rls_and_versions(&clean_sql, ctx.tenant_id(), database_id, &sec, false)
-        .await
+    // Planning, authorization, implicit-edge extraction (pgwire parity: a
+    // schemaless document carrying `_from`/`_to` is mirrored as a
+    // `GraphOp::EdgePut` task so the classify/Calvin/single-shard logic below
+    // routes it like an explicit edge) and lease admission run as ONE retried
+    // unit, so a descriptor drain starting between the planner's catalog read
+    // and the lease acquisition is absorbed rather than surfaced. Admission
+    // still follows authorization inside the unit, so denied requests consume
+    // no descriptor lease. The scope stays alive through all dispatch and
+    // response shaping below.
+    let admission = match plan_authorize_and_admit(PlanAdmissionRequest {
+        state: ctx.state,
+        query_ctx: ctx.query_ctx,
+        identity: ctx.identity,
+        auth_ctx: &auth_ctx,
+        sql: &clean_sql,
+        tenant_id: ctx.tenant_id(),
+        database_id,
+        trace_id: TraceId::ZERO,
+    })
+    .await
     {
-        Ok(t) => t,
-        Err(e) => return resp(error_to_native(seq, &e)),
+        Ok(admission) => admission,
+        Err(error) => return resp(error_to_native(seq, &error)),
     };
+
+    let mut tasks = admission.tasks;
+    let output_schema = admission.output_schema;
+    let mut authorized_tasks = admission.authorized_tasks;
+    let mut lease_scope = Some(admission.lease_scope);
 
     if tasks.is_empty() {
         return resp(NativeResponse::status_row(seq, "OK"));
     }
-
-    // Authorize the caller-supplied plan before implicit-edge extraction.
-    // Extraction marks catalog state and allocates surrogates, so a denied
-    // original document task must not reach it.
-    let emitter = ArcAuditEmitter(Arc::clone(&ctx.state.audit));
-    if let Err(error) = authorize_task_set(
-        ctx.identity,
-        &tasks,
-        &ctx.state.permissions,
-        &ctx.state.roles,
-        &emitter,
-    ) {
-        return resp(error_to_native(seq, &crate::Error::from(error)));
-    }
-
-    // Implicit graph-edge extraction (pgwire parity): a schemaless document
-    // carrying `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task so the
-    // classify/Calvin/single-shard logic below routes it like an explicit edge.
-    if let Err(e) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
-        ctx.state,
-        &mut tasks,
-        ctx.tenant_id(),
-        database_id,
-        TraceId::ZERO,
-    )
-    .await
-    {
-        return resp(error_to_native(seq, &e));
-    }
-
-    drop(perm_cache);
-    let emitter = ArcAuditEmitter(Arc::clone(&ctx.state.audit));
-    let mut authorized_tasks = match authorize_task_set(
-        ctx.identity,
-        &tasks,
-        &ctx.state.permissions,
-        &ctx.state.roles,
-        &emitter,
-    ) {
-        Ok(authorized) => authorized,
-        Err(error) => return resp(error_to_native(seq, &crate::Error::from(error))),
-    };
-
-    // Admission follows authorization so denied requests cannot consume
-    // descriptor leases. Keep the scope alive through all dispatch and response
-    // shaping below.
-    let mut lease_scope = Some(
-        match Arc::clone(ctx.state).acquire_plan_lease_scope(&versions) {
-            Ok(scope) => scope,
-            Err(error) => return resp(error_to_native(seq, &error)),
-        },
-    );
 
     // Implicit-edge DELETE/UPDATE routing gate (native-protocol parity with
     // pgwire). See `edge_recon_gate` for the full invariant and guard

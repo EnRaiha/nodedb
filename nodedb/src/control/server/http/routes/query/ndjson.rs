@@ -10,7 +10,10 @@ use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::response_shape::types::describe_plan;
-use crate::control::server::shared::authorization::{authorize_database, authorize_task_set};
+use crate::control::server::shared::authorization::authorize_database;
+use crate::control::server::shared::plan_admission::{
+    PlanAdmissionRequest, plan_authorize_and_admit,
+};
 
 use super::super::super::auth::{ApiError, AppState, resolve_auth};
 use super::super::query_stream::{ndjson_body_stream, try_open_stream};
@@ -71,69 +74,33 @@ pub async fn query_ndjson(
     // The request-selected database is authoritative for RLS variables while
     // retaining verified JWT/session enrichment from authentication.
     auth_ctx.database_id = Some(database_id);
-    let perm_cache = state.shared.permission_cache.read().await;
-    let sec = crate::control::planner::context::PlanSecurityContext {
+    // Planning and lease admission run as one retried unit so a descriptor
+    // drain starting between them is absorbed rather than surfaced. Admission
+    // still follows authorization inside the unit, so denied requests never
+    // acquire a descriptor lease. A lazy body takes ownership of the scope
+    // below; the materialized path retains it lexically through all dispatch
+    // and NDJSON shaping.
+    let admission = match plan_authorize_and_admit(PlanAdmissionRequest {
+        state: &state.shared,
+        query_ctx,
         identity: &identity,
-        auth: &auth_ctx,
-        rls_store: &state.shared.rls,
-        permissions: &state.shared.permissions,
-        roles: &state.shared.roles,
-        permission_cache: Some(&*perm_cache),
-    };
-    let (mut tasks, output_schema, versions, _) = match query_ctx
-        .plan_sql_with_rls_and_versions(sql, tenant_id, database_id, &sec, false)
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    };
-
-    // Implicit-edge extraction marks catalog state and allocates surrogates,
-    // so reject unauthorized original tasks before it can run.
-    if let Err(error) = authorize_task_set(
-        &identity,
-        &tasks,
-        &state.shared.permissions,
-        &state.shared.roles,
-        &emitter,
-    ) {
-        return ApiError::from(crate::Error::from(error)).into_response();
-    }
-
-    if let Err(error) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
-        &state.shared,
-        &mut tasks,
+        auth_ctx: &auth_ctx,
+        sql,
         tenant_id,
         database_id,
-        crate::types::TraceId::ZERO,
-    )
+        trace_id: crate::types::TraceId::ZERO,
+    })
     .await
     {
-        return ApiError::from(error).into_response();
-    }
+        Ok(admission) => admission,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    let tasks = admission.tasks;
+    let output_schema = admission.output_schema;
+    let authorized_tasks = admission.authorized_tasks.into_tasks();
+    let mut lease_scope = Some(admission.lease_scope);
 
     let trace_id = crate::control::trace_context::generate_trace_id();
-
-    let authorized_tasks = match authorize_task_set(
-        &identity,
-        &tasks,
-        &state.shared.permissions,
-        &state.shared.roles,
-        &emitter,
-    ) {
-        Ok(authorized) => authorized.into_tasks(),
-        Err(error) => return ApiError::from(crate::Error::from(error)).into_response(),
-    };
-
-    // Admission follows authorization so denied requests never acquire a
-    // descriptor lease. A lazy body takes ownership below; the materialized
-    // path retains it lexically through all dispatch and NDJSON shaping.
-    let mut lease_scope = Some(
-        match Arc::clone(&state.shared).acquire_plan_lease_scope(&versions) {
-            Ok(scope) => scope,
-            Err(error) => return ApiError::from(error).into_response(),
-        },
-    );
 
     let _request = state.shared.tenant_request_guard(tenant_id);
 

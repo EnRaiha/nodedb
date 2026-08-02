@@ -20,10 +20,11 @@
 //!
 //! **Drain interaction**: if the descriptor is being drained at
 //! the version we read, `acquire_descriptor_lease` returns
-//! `Err::Config { "drain in progress" }`. We translate that to
-//! `SqlCatalogError::RetryableSchemaChanged`, which the pgwire
-//! handler catches and retries the whole plan (up to the retry
-//! budget). On any other lease-acquire failure we log and
+//! `Err::RetryableSchemaChanged`. We surface that as
+//! `SqlCatalogError::RetryableSchemaChanged`, which the statement
+//! entry points catch and retry (up to the retry budget) together
+//! with the post-planning lease acquisition, which can observe the
+//! same drain. On any other lease-acquire failure we log and
 //! proceed with the descriptor we read — lease acquisition is
 //! best-effort; the planner's primary job is still to produce
 //! a plan, and a transient lease glitch should not break user

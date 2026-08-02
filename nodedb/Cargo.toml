@@ -159,6 +159,10 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Named again here (same published version, unified by Cargo) so crash-harness
+# integration tests can act as a reader: list and inspect reports the running
+# server filed, without depending on the binary's own `faultbox::init` call.
+faultbox = { workspace = true }
 tempfile = "3"
 tokio-postgres = { workspace = true }
 proptest = "1"

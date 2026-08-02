@@ -3,7 +3,7 @@
 //! Top-level `apply_host_side_effects` dispatcher and the
 //! `impl MetadataApplier for MetadataCommitApplier` trait entry point.
 
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use nodedb_cluster::{MetadataApplier, MetadataEntry, RoutingChange, decode_entry};
 
@@ -258,6 +258,33 @@ impl MetadataCommitApplier {
 
         self.apply_catalog_ddl(entry, raft_index)
     }
+
+    /// Publish a permanent apply failure on the node-wide readiness marker.
+    ///
+    /// Best-effort by construction: unit-test appliers are built without a
+    /// `SharedState`, and a node that has already torn its shared state down
+    /// has nothing left to report readiness to. The structured faultbox report
+    /// and the error log at the call site are unconditional, so the failure is
+    /// never lost when this cannot land.
+    fn record_permanent_wedge(
+        &self,
+        error: &crate::Error,
+        entry: &MetadataEntry,
+        raft_index: u64,
+        last_applied_watermark: u64,
+    ) {
+        let Some(shared) = self.shared.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        shared
+            .metadata_apply_wedge
+            .record(super::wedge::WedgeReport {
+                raft_index,
+                last_applied_watermark,
+                entry_kind: crate::diag::entry_kind(entry),
+                error: error.to_string(),
+            });
+    }
 }
 
 impl MetadataApplier for MetadataCommitApplier {
@@ -301,13 +328,38 @@ impl MetadataApplier for MetadataCommitApplier {
             // 2. Host side effects (redb writeback + async post-apply). A
             //    durable failure halts the watermark at the last good index.
             if let Err(e) = self.apply_host_side_effects(&entry, *index) {
-                warn!(
-                    index = *index,
-                    last_applied = last,
-                    error = %e,
-                    "metadata apply: durable host-side effect failed; not advancing \
-                     watermark — Raft will re-deliver and retry"
-                );
+                // Both classes stop the batch — skipping a committed metadata
+                // entry is silent divergence from the quorum and is strictly
+                // worse than halting. What differs is whether waiting for a
+                // re-delivery is an honest plan.
+                let class = super::wedge::classify(&e);
+                // A deterministic failure here re-fails on every re-delivery and
+                // wedges this node's applier forever while /healthz stays green,
+                // so it is filed as a structured report — not just a log line —
+                // at the one site that detects it.
+                crate::diag::metadata_apply_wedged(&e, &entry, *index, last, class.is_permanent());
+                if class.is_permanent() {
+                    // Retrying cannot help, so the node must stop advertising
+                    // readiness rather than serve queries that will all die on
+                    // an unrelated-looking descriptor-lease timeout.
+                    self.record_permanent_wedge(&e, &entry, *index, last);
+                    error!(
+                        index = *index,
+                        last_applied = last,
+                        error = %e,
+                        "metadata apply: PERMANENT host-side effect failure; watermark halted \
+                         and this node is no longer ready — re-delivery cannot clear this, \
+                         operator intervention is required"
+                    );
+                } else {
+                    error!(
+                        index = *index,
+                        last_applied = last,
+                        error = %e,
+                        "metadata apply: durable host-side effect failed; not advancing \
+                         watermark — Raft will re-deliver and retry"
+                    );
+                }
                 break;
             }
             last = *index;

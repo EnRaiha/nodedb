@@ -57,6 +57,23 @@ pub async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
             return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
         }
     }
+    // A permanently wedged metadata applier is invisible to the startup gate:
+    // the node booted cleanly and only stopped making progress afterwards. It
+    // must fail readiness anyway, or it keeps taking traffic that can only end
+    // in a descriptor-lease timeout naming nothing about the real cause.
+    if let Some(report) = state.shared.metadata_apply_wedge.report() {
+        let body = json!({
+            "status": "failed",
+            "reason": "metadata_apply_wedged",
+            "node_id": state.shared.node_id,
+            "raft_index": report.raft_index,
+            "last_applied_watermark": report.last_applied_watermark,
+            "entry_kind": report.entry_kind,
+            "error": report.error,
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body));
+    }
+
     let health = crate::control::startup::health::observe(&state.shared.startup);
     let (status, body) = crate::control::startup::health::to_http_response(&health);
     (status, axum::Json(body))

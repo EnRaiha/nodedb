@@ -206,6 +206,7 @@ impl SharedState {
             metadata_ddl_owner: std::sync::Mutex::new(None),
             metadata_ddl_applied_token: std::sync::atomic::AtomicU64::new(0),
             metadata_ddl_token_seq: std::sync::atomic::AtomicU64::new(1),
+            metadata_apply_wedge: std::sync::Arc::default(),
             metadata_raft: std::sync::OnceLock::new(),
             propose_tracker: std::sync::OnceLock::new(),
             raft_proposer: std::sync::OnceLock::new(),

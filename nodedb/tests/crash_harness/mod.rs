@@ -21,8 +21,19 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
+// `pub` so a crash test can read faultbox reports directly (see
+// `crash_metadata_applier_wedge.rs`), not just via the panic-path
+// diagnostics this module already wires into `pgwire.rs`.
+pub mod diagnostics;
+pub mod ilp_client;
 mod pgwire;
 pub mod resp_client;
+
+// Only `crash_ilp_timeseries_write.rs` names `Session` directly; every other
+// crash-test binary pulls in this module too, so the re-export is unused
+// there.
+#[allow(unused_imports)]
+pub use pgwire::Session;
 #[path = "../support/mod.rs"]
 mod support;
 
@@ -78,7 +89,15 @@ pub fn wait_for_healthz(port: u16, timeout: Duration) -> bool {
 /// same data directory to exercise WAL replay.
 pub struct CrashHarness {
     bin: &'static str,
-    tempdir: tempfile::TempDir,
+    /// `None` only in the instant between `Drop` taking it out to decide
+    /// whether to retain it (see the `Drop` impl) — always `Some` otherwise.
+    tempdir: Option<tempfile::TempDir>,
+    /// Cached from `tempdir.path()` at construction so callers don't need to
+    /// unwrap the `Option` above for the common case of just reading the path.
+    data_dir_path: std::path::PathBuf,
+    /// Number of times `spawn()` has been called on this harness, used to
+    /// mark each boot's lines in the server log unambiguously.
+    boot_count: u32,
     pub http_port: u16,
     pub pgwire_port: u16,
     pub native_port: u16,
@@ -89,6 +108,11 @@ pub struct CrashHarness {
     pub sync_port: u16,
     /// The RESP port. Always allocated, like the other ports, to avoid a bind collision.
     pub resp_port: u16,
+    /// The ILP (InfluxDB Line Protocol) port. Always allocated, like the
+    /// other ports, to avoid a bind collision, and always exported to the
+    /// spawned process so `reopen` reuses the same port a pre-crash ILP
+    /// connection was made against.
+    pub ilp_port: u16,
     child: Option<std::process::Child>,
     /// Extra server env applied on EVERY spawn, including `reopen`. A test that
     /// tunes the server (short checkpoint interval, small WAL segments) needs
@@ -121,16 +145,20 @@ impl CrashHarness {
     }
 
     fn from_tempdir(tempdir: tempfile::TempDir) -> CrashHarness {
+        let data_dir_path = tempdir.path().to_path_buf();
         // Probed once, against the directory the server will actually write to.
-        let wal_direct_io = support::direct_io::wal_direct_io_override(tempdir.path());
+        let wal_direct_io = support::direct_io::wal_direct_io_override(&data_dir_path);
         CrashHarness {
             bin: env!("CARGO_BIN_EXE_nodedb"),
-            tempdir,
+            tempdir: Some(tempdir),
+            data_dir_path,
+            boot_count: 0,
             http_port: free_port(),
             pgwire_port: free_port(),
             native_port: free_port(),
             sync_port: free_port(),
             resp_port: free_port(),
+            ilp_port: free_port(),
             child: None,
             extra_env: Vec::new(),
             wal_direct_io,
@@ -166,7 +194,14 @@ impl CrashHarness {
 
     /// The data directory this server was started against.
     pub fn data_dir(&self) -> &std::path::Path {
-        self.tempdir.path()
+        &self.data_dir_path
+    }
+
+    /// A note appended to diagnostic panics stating where the data
+    /// directory is retained, or empty when `NODEDB_TEST_KEEP_DATA_DIR` is
+    /// unset. See [`diagnostics::keep_data_dir_note`].
+    pub(crate) fn keep_data_dir_note(&self) -> String {
+        diagnostics::keep_data_dir_note(&self.data_dir_path)
     }
 
     /// File names of the WAL segments currently on disk, sorted.
@@ -195,7 +230,7 @@ impl CrashHarness {
     /// directory and ports.
     /// Path the server's stdout/stderr is appended to across every spawn.
     pub fn server_log_path(&self) -> std::path::PathBuf {
-        self.tempdir.path().join("server.log")
+        self.data_dir_path.join("server.log")
     }
 
     /// The server output captured so far, or empty if nothing was written.
@@ -225,13 +260,17 @@ impl CrashHarness {
             cmd.env("NODEDB_WAL_DIRECT_IO", value);
         }
         let child = cmd
-            .env("NODEDB_DATA_DIR", self.tempdir.path())
+            .env("NODEDB_DATA_DIR", &self.data_dir_path)
             .env("NODEDB_DATA_PLANE_CORES", "1")
             .env("NODEDB_PORT_HTTP", self.http_port.to_string())
             .env("NODEDB_PORT_PGWIRE", self.pgwire_port.to_string())
             .env("NODEDB_PORT_NATIVE", self.native_port.to_string())
             .env("NODEDB_PORT_SYNC", self.sync_port.to_string())
             .env("NODEDB_PORT_RESP", self.resp_port.to_string())
+            // Unset by default (`config/server/env/host_ports.rs`), which
+            // leaves the ILP listener disabled — a test that drives ILP must
+            // set this to enable it, same as a real deployment opting in.
+            .env("NODEDB_PORT_ILP", self.ilp_port.to_string())
             // Pin the superuser password so the test can authenticate. Without
             // this the binary auto-generates a random password into
             // `<data_dir>/.superuser_password` (default auth mode is Password),
@@ -252,6 +291,12 @@ impl CrashHarness {
             .stderr(std::process::Stdio::from(log_err))
             .spawn()
             .expect("failed to spawn nodedb binary");
+        self.boot_count += 1;
+        // Mark which boot these log lines belong to before the child has had
+        // a chance to write its own first line — the log accumulates across
+        // `spawn()`/`reopen()` in one file, so a tail dump is otherwise
+        // ambiguous about which boot each line came from.
+        diagnostics::mark_boot(&self.server_log_path(), self.boot_count, child.id());
         self.child = Some(child);
     }
 
@@ -353,21 +398,25 @@ impl CrashHarness {
                     let lines: Vec<&str> = log.lines().collect();
                     // Both ends matter: boot decides whether the subsystem
                     // under test even came up, the tail shows what it was
-                    // doing when the wait expired.
-                    let excerpt = if lines.len() <= 400 {
+                    // doing when the wait expired. Budget (and so the head/tail
+                    // split) comes from `NODEDB_TEST_LOG_TAIL_LINES`.
+                    let budget = diagnostics::tail_line_count();
+                    let half = budget / 2;
+                    let excerpt = if lines.len() <= budget {
                         lines.join("\n")
                     } else {
                         format!(
                             "{}\n… {} lines elided …\n{}",
-                            lines[..30].join("\n"),
-                            lines.len() - 60,
-                            lines[lines.len() - 30..].join("\n")
+                            lines[..half].join("\n"),
+                            lines.len() - 2 * half,
+                            lines[lines.len() - half..].join("\n")
                         )
                     };
                     panic!(
                         "server was still alive after {timeout:?} — the injected fail point never \
                          fired, so this test proves NOTHING about crashing at that point.\n\
-                         Server output ({} lines):\n{excerpt}",
+                         {}Server output ({} lines):\n{excerpt}",
+                        self.keep_data_dir_note(),
                         lines.len()
                     );
                 }
@@ -398,5 +447,20 @@ impl Drop for CrashHarness {
         if self.child.is_some() {
             self.kill_9();
         }
+        // `tempdir` is always `Some` here except during this very drop, so
+        // `take()` always succeeds.
+        if let Some(dir) = self.tempdir.take()
+            && diagnostics::keep_data_dir_requested()
+        {
+            // `keep()` consumes the guard without deleting the directory, so
+            // the retained data survives past this drop.
+            let kept = dir.keep();
+            eprintln!(
+                "\n\n=== NODEDB_TEST_KEEP_DATA_DIR: data directory retained at {} ===\n\n",
+                kept.display()
+            );
+        }
+        // else: `dir` drops here and removes the directory, same as today's
+        // default behavior.
     }
 }

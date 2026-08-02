@@ -42,4 +42,4 @@ mod tests;
 
 pub use codec::{decode, encode};
 pub use entry::CatalogEntry;
-pub use persist_collection::persist_collection_replicated;
+pub use persist_collection::{merge_collection_fields_replicated, persist_collection_replicated};

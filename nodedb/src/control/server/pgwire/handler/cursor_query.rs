@@ -6,11 +6,12 @@
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::pgwire::types::error_to_sqlstate;
+use crate::control::server::shared::retry::retry_on_schema_change;
 use crate::control::server::shared::session::SessionId;
 use crate::types::TraceId;
 
 use super::core::NodeDbPgHandler;
+use super::routing::setup_error::StatementSetupError;
 
 impl NodeDbPgHandler {
     /// Execute a SELECT query and return results as JSON strings for cursor storage.
@@ -36,42 +37,47 @@ impl NodeDbPgHandler {
         let mut auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
         // Cursor plans must resolve RLS variables in the selected database context.
         auth_ctx.database_id = Some(database_id);
-        let perm_cache = self.state.permission_cache.read().await;
-        let sec = crate::control::planner::context::PlanSecurityContext {
-            identity,
-            auth: &auth_ctx,
-            rls_store: &self.state.rls,
-            permissions: &self.state.permissions,
-            roles: &self.state.roles,
-            permission_cache: Some(&*perm_cache),
-        };
-        let (tasks, _output_schema, versions, _) = query_ctx
-            .plan_sql_with_rls_and_versions(sql, tenant_id, database_id, &sec, false)
-            .await
-            .map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_owned(),
-                    "42000".to_owned(),
-                    e.to_string(),
-                )))
-            })?;
 
-        let authorized_tasks = self.authorize_tasks(identity, &tasks)?.into_tasks();
+        // Borrowed so each retry attempt re-reads permission state without
+        // moving the planning context out of the retried closure.
+        let auth_ctx = &auth_ctx;
+        let query_ctx = &query_ctx;
 
-        // Acquire after the explicit authorization boundary so rejected cursor
-        // declarations do not consume descriptor leases. The scope remains
-        // live while every cursor-materialization task is dispatched.
-        let _lease_scope = self
-            .state
-            .acquire_plan_lease_scope(&versions)
-            .map_err(|error| {
-                let (severity, code, message) = error_to_sqlstate(&error);
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?;
+        // Planning records the descriptor versions and the lease that pins them
+        // is acquired afterwards, so both run as ONE retried unit: a descriptor
+        // drain starting in between is absorbed instead of failing the DECLARE.
+        // Admission still follows the explicit authorization boundary, so a
+        // rejected cursor declaration consumes no descriptor lease. The scope
+        // remains live while every cursor-materialization task is dispatched.
+        let (authorized_tasks, _lease_scope) = retry_on_schema_change(move || async move {
+            let perm_cache = self.state.permission_cache.read().await;
+            let sec = crate::control::planner::context::PlanSecurityContext {
+                identity,
+                auth: auth_ctx,
+                rls_store: &self.state.rls,
+                permissions: &self.state.permissions,
+                roles: &self.state.roles,
+                permission_cache: Some(&*perm_cache),
+            };
+            let (tasks, _output_schema, versions, _) = query_ctx
+                .plan_sql_with_rls_and_versions(sql, tenant_id, database_id, &sec, false)
+                .await
+                .map_err(StatementSetupError::from)?;
+            drop(perm_cache);
+
+            let authorized_tasks = self
+                .authorize_tasks(identity, &tasks)
+                .map_err(StatementSetupError::from)?
+                .into_tasks();
+
+            let lease_scope = self
+                .state
+                .acquire_plan_lease_scope(&versions)
+                .map_err(StatementSetupError::from)?;
+            Ok::<_, StatementSetupError>((authorized_tasks, lease_scope))
+        })
+        .await
+        .map_err(PgWireError::from)?;
 
         let mut rows = Vec::new();
         for authorized in authorized_tasks {

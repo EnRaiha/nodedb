@@ -7,7 +7,10 @@ use std::sync::Arc;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::shared::authorization::{authorize_database, authorize_task_set};
+use crate::control::server::shared::authorization::authorize_database;
+use crate::control::server::shared::plan_admission::{
+    PlanAdmissionRequest, plan_authorize_and_admit,
+};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId};
 
@@ -36,50 +39,24 @@ pub async fn execute_sql(
     auth_ctx.database_id = Some(database_id);
     let clean_sql =
         crate::control::server::session_auth::extract_and_apply_on_deny(sql, &mut auth_ctx);
-    let permission_cache = shared.permission_cache.read().await;
-    let security = crate::control::planner::context::PlanSecurityContext {
+    // Planning and lease admission run as one retried unit so a descriptor
+    // drain starting between them is absorbed rather than surfaced. The scope
+    // is retained through every orchestrated or Data-Plane execution and
+    // response decode below.
+    let admission = plan_authorize_and_admit(PlanAdmissionRequest {
+        state: shared,
+        query_ctx,
         identity,
-        auth: &auth_ctx,
-        rls_store: &shared.rls,
-        permissions: &shared.permissions,
-        roles: &shared.roles,
-        permission_cache: Some(&*permission_cache),
-    };
-    let (mut tasks, _output_schema, versions, _) = query_ctx
-        .plan_sql_with_rls_and_versions(&clean_sql, tenant_id, database_id, &security, false)
-        .await?;
-    drop(permission_cache);
-
-    // Extraction can mark the catalog and allocate surrogates. Authorize the
-    // original tasks first so denied requests have no implicit-edge side effects.
-    let _preauthorized_tasks = authorize_task_set(
-        identity,
-        &tasks,
-        &shared.permissions,
-        &shared.roles,
-        &emitter,
-    )?;
-
-    crate::control::planner::implicit_edges::append_implicit_edge_tasks(
-        shared,
-        &mut tasks,
+        auth_ctx: &auth_ctx,
+        sql: &clean_sql,
         tenant_id,
         database_id,
         trace_id,
-    )
+    })
     .await?;
-    let authorized_tasks = authorize_task_set(
-        identity,
-        &tasks,
-        &shared.permissions,
-        &shared.roles,
-        &emitter,
-    )?
-    .into_tasks();
-
-    // Authorization must precede admission; retain the scope through every
-    // orchestrated or Data-Plane execution and response decode below.
-    let _lease_scope = Arc::clone(shared).acquire_plan_lease_scope(&versions)?;
+    let tasks = admission.tasks;
+    let authorized_tasks = admission.authorized_tasks.into_tasks();
+    let _lease_scope = admission.lease_scope;
 
     let _request = shared.tenant_request_guard(tenant_id);
 

@@ -67,11 +67,24 @@ impl<'a> StatementExecutor<'a> {
         // occurs before this internal path buffers, WAL-appends, or dispatches.
         // Stored procedures are trusted internal execution, so this deliberately
         // does not add user authorization beyond their existing semantics.
+        //
+        // Planning and lease admission run as ONE retried unit: the lease that
+        // pins the planned descriptor version is acquired after the catalog
+        // read, so a descriptor drain starting in between would otherwise fail
+        // the whole procedure. Re-planning is pure, and admission fails closed
+        // before granting anything, so an absorbed attempt reads nothing.
         let ctx = crate::control::planner::context::QueryContext::for_state(self.state);
-        let (tasks, _output_schema, versions) = ctx
-            .plan_sql_and_versions(&bound_sql, self.tenant_id, self.database_id)
+        let ctx = &ctx;
+        let bound_sql = &bound_sql;
+        let (tasks, lease_scope) =
+            crate::control::server::shared::retry::retry_on_schema_change(move || async move {
+                let (tasks, _output_schema, versions) = ctx
+                    .plan_sql_and_versions(bound_sql, self.tenant_id, self.database_id)
+                    .await?;
+                let lease_scope = self.state.acquire_plan_lease_scope(&versions)?;
+                Ok::<_, crate::Error>((tasks, lease_scope))
+            })
             .await?;
-        let lease_scope = self.state.acquire_plan_lease_scope(&versions)?;
 
         if let Some(ref tx_ctx) = self.tx_ctx {
             let mut guard = tx_ctx.lock().unwrap_or_else(|p| p.into_inner());
@@ -117,7 +130,7 @@ impl<'a> StatementExecutor<'a> {
                                 node_id,
                                 origin,
                                 task.vshard_id.as_u32(),
-                                &bound_sql,
+                                bound_sql,
                             )?;
                             continue;
                         }

@@ -121,8 +121,22 @@ pub async fn submit_and_await_calvin_with_timeout(
     let completion_rx = registry.register_completion(TxnId::new(epoch, position), participants);
     let outcome = tokio::time::timeout(timeout, completion_rx)
         .await
-        .map_err(|_| Error::Internal {
-            detail: "timed out waiting for Calvin transaction completion".to_owned(),
+        .map_err(|_| {
+            let err = Error::Internal {
+                detail: "timed out waiting for Calvin transaction completion".to_owned(),
+            };
+            // This timeout is the only signal a silently-never-completed
+            // Calvin write ever produces; file it as a structured report at
+            // the one site that detects it, since the error alone gives an
+            // operator no clue which transaction or participant stalled.
+            crate::diag::calvin_completion_timeout(
+                &err,
+                epoch,
+                position,
+                participants,
+                timeout.as_secs(),
+            );
+            err
         })?
         .map_err(|_| Error::Internal {
             detail: "Calvin completion channel closed".to_owned(),

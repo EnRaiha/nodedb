@@ -109,6 +109,14 @@ pub(crate) fn acquire_lease_after_admission(
 }
 
 /// Reject an acquisition covered by an active descriptor drain.
+///
+/// A drain is a short barrier the DDL path runs before committing the next
+/// `descriptor_version`, so an acquisition that lands inside it is not a
+/// configuration fault — it is the same transient schema-change race the
+/// planner already reports as [`Error::RetryableSchemaChanged`]. Typing it
+/// that way is what lets the statement-level retry budget absorb the drain
+/// instead of surfacing it to the client. The decision itself is unchanged:
+/// this still fails closed, before any lease is granted.
 pub(crate) fn ensure_not_draining(
     shared: &SharedState,
     descriptor_id: &DescriptorId,
@@ -119,13 +127,21 @@ pub(crate) fn ensure_not_draining(
         .lease_drain
         .is_draining(descriptor_id, version, now_wall_ns)
     {
-        return Err(Error::Config {
-            detail: format!(
-                "descriptor lease drain in progress: {descriptor_id:?} at version {version}"
-            ),
-        });
+        return Err(drain_in_progress_error(descriptor_id, version));
     }
     Ok(())
+}
+
+/// Build the retryable error for an acquisition covered by an active drain.
+///
+/// The full descriptor identity and the requested version stay in the message
+/// so a retry-budget exhaustion is still diagnosable from the client error.
+fn drain_in_progress_error(descriptor_id: &DescriptorId, version: u64) -> Error {
+    Error::RetryableSchemaChanged {
+        descriptor: format!(
+            "{descriptor_id:?} at version {version} (descriptor lease drain in progress)"
+        ),
+    }
 }
 
 /// Unconditionally propose a fresh lease grant, skipping the
@@ -252,6 +268,23 @@ mod tests {
         let now = Hlc::new(0, 0);
         let expires = compute_expires_at(now, Duration::from_secs(0));
         assert_eq!(expires, Hlc::new(0, 0));
+    }
+
+    #[test]
+    fn drain_rejection_is_typed_retryable_and_keeps_descriptor_identity() {
+        use nodedb_cluster::DescriptorKind;
+
+        let descriptor = DescriptorId::new(0, 1, DescriptorKind::Collection, "orders".to_string());
+        match drain_in_progress_error(&descriptor, 7) {
+            Error::RetryableSchemaChanged { descriptor: detail } => {
+                assert!(
+                    detail.contains("orders"),
+                    "descriptor identity lost: {detail}"
+                );
+                assert!(detail.contains("version 7"), "version lost: {detail}");
+            }
+            other => panic!("expected RetryableSchemaChanged, got {other:?}"),
+        }
     }
 
     #[test]

@@ -5,16 +5,16 @@
 use std::sync::Arc;
 
 use pgwire::api::results::Tag;
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::error::{ErrorInfo, PgWireError};
 
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
 
-use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
 use super::catalog::current_descriptor_version;
+use super::setup_error::StatementSetupError;
 
 impl NodeDbPgHandler {
     /// Plan a SQL statement to physical tasks, handling session auth, RETURNING
@@ -25,6 +25,12 @@ impl NodeDbPgHandler {
     /// physical plans without driving the dispatch loop. Returns the ready-to-
     /// dispatch task list and the descriptor versions to admit after execution
     /// has expanded and authorized every implicit task.
+    ///
+    /// Errors stay typed ([`StatementSetupError`]) rather than pre-rendered:
+    /// the caller wraps this call and the later lease acquisition in ONE retry
+    /// unit, which needs to tell a descriptor-drain race apart from a terminal
+    /// failure. Retrying is the caller's job — this function makes exactly one
+    /// planning attempt so the budget is never nested.
     pub(in crate::control::server::pgwire::handler) async fn plan_statement_to_tasks(
         &self,
         identity: &AuthenticatedIdentity,
@@ -32,12 +38,15 @@ impl NodeDbPgHandler {
         tenant_id: TenantId,
         session_id: SessionId,
         params: &[nodedb_sql::ParamValue],
-    ) -> PgWireResult<(
-        Vec<PhysicalTask>,
-        crate::control::server::response_shape::schema::OutputSchema,
-        crate::control::planner::descriptor_set::DescriptorVersionSet,
-        crate::control::security::auth_context::AuthContext,
-    )> {
+    ) -> Result<
+        (
+            Vec<PhysicalTask>,
+            crate::control::server::response_shape::schema::OutputSchema,
+            crate::control::planner::descriptor_set::DescriptorVersionSet,
+            crate::control::security::auth_context::AuthContext,
+        ),
+        StatementSetupError,
+    > {
         // Resolve opaque session handle if SET LOCAL nodedb.auth_session is set.
         // Network provenance is immutable accept-time metadata; all mutable
         // session state remains keyed by the collision-free SessionId.
@@ -47,11 +56,11 @@ impl NodeDbPgHandler {
                 .connection_metadata(connection_id)
                 .map(|metadata| metadata.peer_addr)
                 .ok_or_else(|| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "FATAL".to_owned(),
-                        "XX000".to_owned(),
-                        "connection session metadata is unavailable".to_owned(),
-                    )))
+                    StatementSetupError::protocol(
+                        "FATAL",
+                        "XX000",
+                        "connection session metadata is unavailable",
+                    )
                 })?,
             SessionId::LegacySocket(peer_addr) => peer_addr,
         };
@@ -72,13 +81,12 @@ impl NodeDbPgHandler {
             {
                 ResolveOutcome::Resolved(cached) => *cached,
                 ResolveOutcome::RateLimited => {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "FATAL".to_owned(),
-                        "53300".to_owned(),
+                    return Err(StatementSetupError::protocol(
+                        "FATAL",
+                        "53300",
                         "session handle resolve rate limit exceeded on this \
-                         connection — closing"
-                            .to_owned(),
-                    ))));
+                         connection — closing",
+                    ));
                 }
                 ResolveOutcome::Miss => {
                     crate::control::server::session_auth::build_auth_context_with_session(
@@ -102,15 +110,7 @@ impl NodeDbPgHandler {
 
         // Strip RETURNING clause before DataFusion planning.
         let (clean_sql, returning_spec) = super::super::returning::strip_returning(&clean_sql)
-            .map_err(|e| {
-                use super::super::super::types::error_to_sqlstate;
-                let (severity, code, message) = error_to_sqlstate(&e);
-                pgwire::error::PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-                    severity.to_owned(),
-                    code.to_owned(),
-                    message,
-                )))
-            })?;
+            .map_err(StatementSetupError::from)?;
         let has_returning = returning_spec.is_some();
 
         // Forward every per-session planning GUC (vector-dim quota, force-shuffle
@@ -143,11 +143,13 @@ impl NodeDbPgHandler {
             database_id,
             &auth_ctx,
         )
-        .await?;
+        .await
+        .map_err(StatementSetupError::from)?;
 
         // Validate enum-typed column values for INSERT/UPDATE before planning.
         self.enforce_enum_labels_if_needed(&clean_sql, tenant_id, database_id)
-            .await?;
+            .await
+            .map_err(StatementSetupError::from)?;
 
         // Check plan cache before full planning. The cache key is
         // `(sql_hash, schema_version)` and does NOT vary by session knob, so it
@@ -190,48 +192,32 @@ impl NodeDbPgHandler {
                     &sec,
                 )
                 .await
-                .map_err(|e| {
-                    let (severity, code, message) = error_to_sqlstate(&e);
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        severity.to_owned(),
-                        code.to_owned(),
-                        message,
-                    )))
-                })?;
+                .map_err(StatementSetupError::from)?;
             (tasks, output_schema, versions)
         } else if let Some((tasks, versions, output_schema)) = cached_tasks {
             (tasks, output_schema, versions)
         } else {
-            let (planned, output_schema, versions, cache_eligibility) =
-                super::super::retry::retry_on_schema_change(|| async {
-                    let perm_cache = self.state.permission_cache.read().await;
-                    let sec = crate::control::planner::context::PlanSecurityContext {
-                        identity,
-                        auth: &auth_ctx,
-                        rls_store: &self.state.rls,
-                        permissions: &self.state.permissions,
-                        roles: &self.state.roles,
-                        permission_cache: Some(&*perm_cache),
-                    };
-                    self.query_ctx
-                        .plan_sql_with_rls_and_versions(
-                            &clean_sql,
-                            tenant_id,
-                            database_id,
-                            &sec,
-                            has_returning,
-                        )
-                        .await
-                })
-                .await
-                .map_err(|e| {
-                    let (severity, code, message) = error_to_sqlstate(&e);
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        severity.to_owned(),
-                        code.to_owned(),
-                        message,
-                    )))
-                })?;
+            let (planned, output_schema, versions, cache_eligibility) = {
+                let perm_cache = self.state.permission_cache.read().await;
+                let sec = crate::control::planner::context::PlanSecurityContext {
+                    identity,
+                    auth: &auth_ctx,
+                    rls_store: &self.state.rls,
+                    permissions: &self.state.permissions,
+                    roles: &self.state.roles,
+                    permission_cache: Some(&*perm_cache),
+                };
+                self.query_ctx
+                    .plan_sql_with_rls_and_versions(
+                        &clean_sql,
+                        tenant_id,
+                        database_id,
+                        &sec,
+                        has_returning,
+                    )
+                    .await
+                    .map_err(StatementSetupError::from)?
+            };
 
             // Strategy overrides and data-dependent identity lowering are not
             // represented by the cache key. Document point plans resolve a
@@ -267,7 +253,9 @@ impl NodeDbPgHandler {
         // implicit edges. Expansion can mark catalog state and allocate
         // surrogates, while descriptor admission must wait until the expanded
         // task set has received final authorization in the execute path.
-        let _preauthorized_tasks = self.authorize_tasks(identity, &tasks)?;
+        let _preauthorized_tasks = self
+            .authorize_tasks(identity, &tasks)
+            .map_err(StatementSetupError::from)?;
 
         Ok((tasks, output_schema, versions, auth_ctx))
     }

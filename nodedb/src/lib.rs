@@ -16,6 +16,7 @@ pub mod config;
 pub mod control;
 pub mod ctl;
 pub mod data;
+pub mod diag;
 pub mod engine;
 pub mod error;
 mod error_from;
