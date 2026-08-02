@@ -3,9 +3,10 @@
 //! ILP batch preflight, authorization, and dispatch.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use tracing::warn;
+use tokio::sync::Semaphore;
+use tracing::{debug, warn};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::planner::calvin::{
@@ -159,7 +160,7 @@ fn preflight_ilp_batch(
 
 /// Dispatch an authorized, strictly parsed ILP batch to the Data Plane.
 pub(super) async fn flush_ilp_batch(
-    state: &SharedState,
+    state: &Arc<SharedState>,
     context: &AuthenticatedIlpContext,
     batch: &str,
 ) -> crate::Result<u64> {
@@ -169,7 +170,7 @@ pub(super) async fn flush_ilp_batch(
 /// Strictly parse, authorize, and atomically ingest canonical ILP produced by
 /// another authenticated external transport such as OTLP.
 pub(crate) async fn flush_authenticated_ilp_batch(
-    state: &SharedState,
+    state: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     batch: &str,
@@ -196,9 +197,80 @@ pub(crate) async fn flush_authenticated_ilp_batch(
     flush_ilp_batch_inner(state, identity, database_id, groups).await
 }
 
+/// At most one schema-projection merge is ever in flight, process-wide.
+///
+/// The merge is a replicated catalog DDL, and every catalog DDL already
+/// serializes on `SharedState::metadata_ddl_lock`. A second concurrent merge
+/// could therefore only park a second blocking-pool thread on a lock that
+/// admits one holder, so one permit is both the useful and the safe bound —
+/// ingest can never grow the blocking pool no matter how many ILP connections
+/// or OTLP requests are live.
+static SCHEMA_PROJECTION_SLOT: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
+
+/// Merge the ingest-inferred schema projection for `groups` off the caller's
+/// task.
+///
+/// `merge_collection_fields_replicated` is a fully synchronous replicated DDL:
+/// it takes the metadata DDL preparation lock, acquires the distributed
+/// preparation lease, drains prior-version descriptor leases and waits for the
+/// local apply — a chain whose bounds are tens of seconds. Running it inline on
+/// the ingest task is what starved ILP: `handle_ilp_connection` awaits the
+/// flush inside its `select!`, so for the whole of that chain the connection
+/// polls neither the socket-read branch nor the coalescing timer, and no
+/// subsequent batch is dispatched at all.
+///
+/// It is therefore run on the blocking pool and deliberately NOT awaited. That
+/// costs no durability: the Calvin write above is already committed, and the
+/// projection is rebuildable and self-healing — every ILP batch re-supplies its
+/// measurement's full field set, so a merge skipped because the slot was busy
+/// is re-attempted by the next batch. Failures stay loud in the log, exactly as
+/// they were when this ran inline.
+fn spawn_schema_projection_merge(
+    state: &Arc<SharedState>,
+    database_id: DatabaseId,
+    tenant_id: TenantId,
+    groups: Vec<IlpMeasurementBatch>,
+) {
+    // Bound the permit to `'static` explicitly: it is moved into the blocking
+    // task and must outlive this frame.
+    let slot: &'static Semaphore = &SCHEMA_PROJECTION_SLOT;
+    let Ok(permit) = slot.try_acquire() else {
+        debug!(
+            measurements = groups.len(),
+            "skipping ILP catalog schema projection: a merge is already in flight"
+        );
+        return;
+    };
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        // Held for the whole merge so the next batch's `try_acquire` observes
+        // a busy slot rather than queueing another blocking thread.
+        let _permit = permit;
+        for group in groups {
+            match crate::control::catalog_entry::merge_collection_fields_replicated(
+                &state,
+                database_id,
+                tenant_id.as_u64(),
+                &group.measurement,
+                &group.catalog_fields,
+            ) {
+                Ok(_) => {}
+                // This is a rebuildable control-plane projection. The data
+                // commit is already durable, so logging is required but
+                // retrying the client request would risk a duplicate write.
+                Err(error) => warn!(
+                    collection = %group.measurement,
+                    error = %error,
+                    "failed to merge ILP catalog schema projection after committed Calvin write"
+                ),
+            }
+        }
+    });
+}
+
 /// Inner dispatch logic for ILP batch (separated for clean quota bookkeeping).
 async fn flush_ilp_batch_inner(
-    state: &SharedState,
+    state: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
     database_id: DatabaseId,
     groups: Vec<IlpMeasurementBatch>,
@@ -232,26 +304,9 @@ async fn flush_ilp_batch_inner(
     // catalog write: the projection lives inside the replicated collection
     // descriptor, and mutating that record in place would leave this node's
     // copy no longer byte-equal to the replicated entry at the same descriptor
-    // version — which wedges the metadata applier on the next replay.
-    for group in groups {
-        match crate::control::catalog_entry::merge_collection_fields_replicated(
-            state,
-            database_id,
-            tenant_id.as_u64(),
-            &group.measurement,
-            &group.catalog_fields,
-        ) {
-            Ok(_) => {}
-            // This is a rebuildable control-plane projection. The data commit is
-            // already durable, so logging is required but retrying the client
-            // request would risk a duplicate write.
-            Err(error) => warn!(
-                collection = %group.measurement,
-                error = %error,
-                "failed to merge ILP catalog schema projection after committed Calvin write"
-            ),
-        }
-    }
+    // version — which wedges the metadata applier on the next replay. That path
+    // is synchronous and slow, so it runs off this task entirely.
+    spawn_schema_projection_merge(state, database_id, tenant_id, groups);
     Ok(total_rows)
 }
 
@@ -424,7 +479,7 @@ mod tests {
                 .expect("open ILP batch test WAL"),
         );
         let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
-        let state = SharedState::new(dispatcher, wal).expect("construct ILP batch state");
+        let state = Arc::new(SharedState::new(dispatcher, wal).expect("construct ILP batch state"));
         let database_id = DatabaseId::new(7);
 
         let error = flush_authenticated_ilp_batch(
@@ -638,6 +693,24 @@ mod tests {
         .expect("the explicitly bound non-default database is authorized");
 
         assert_eq!(groups[0].measurement, "cpu");
+    }
+
+    #[test]
+    fn schema_projection_slot_admits_exactly_one_merge_at_a_time() {
+        // The bound that keeps ingest from queueing blocking-pool threads
+        // behind a metadata DDL lock that admits a single holder.
+        let first = super::SCHEMA_PROJECTION_SLOT
+            .try_acquire()
+            .expect("the first merge takes the only slot");
+        assert!(
+            super::SCHEMA_PROJECTION_SLOT.try_acquire().is_err(),
+            "a second concurrent merge must be refused, not queued"
+        );
+        drop(first);
+        assert!(
+            super::SCHEMA_PROJECTION_SLOT.try_acquire().is_ok(),
+            "the slot must be reusable once the in-flight merge finishes"
+        );
     }
 
     #[test]

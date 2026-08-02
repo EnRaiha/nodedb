@@ -12,7 +12,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 
 /// Maximum byte length of a single ILP line. Lines exceeding this are
 /// rejected and the connection is dropped to prevent memory exhaustion.
@@ -33,8 +33,14 @@ use crate::types::TenantId;
 
 #[path = "ilp_batch.rs"]
 mod ilp_batch;
+#[path = "ilp_drop.rs"]
+mod ilp_drop;
+#[path = "ilp_line_read.rs"]
+mod ilp_line_read;
 pub(crate) use ilp_batch::flush_authenticated_ilp_batch;
 use ilp_batch::{IlpRateEstimator, flush_ilp_batch};
+use ilp_drop::{IlpDropCause, terminate_with_buffered_flush};
+use ilp_line_read::read_bounded_ilp_line;
 
 /// ILP TCP listener.
 pub struct IlpListener {
@@ -201,7 +207,7 @@ impl IlpListener {
 async fn handle_ilp_connection(
     mut stream: ConnStream,
     peer: SocketAddr,
-    state: &SharedState,
+    state: &Arc<SharedState>,
     auth_mode: &AuthMode,
 ) -> crate::Result<()> {
     // The native Hello/Auth prelude must finish before line parsing, tenant
@@ -265,10 +271,21 @@ async fn handle_ilp_connection(
 
                         let line = match std::str::from_utf8(line_bytes) {
                             Ok(s) => s,
+                            // The framing is broken and cannot be resynchronized, so the
+                            // connection still ends here — but the lines already accepted
+                            // into `batch` are dispatched first and the termination is
+                            // recorded, because ILP acks nothing and the client would
+                            // otherwise have no way to learn they were discarded.
                             Err(_) => {
-                                return Err(crate::Error::BadRequest {
-                                    detail: "ILP payload is not valid UTF-8".into(),
-                                });
+                                return Err(terminate_with_buffered_flush(
+                                    state,
+                                    &authenticated_context,
+                                    peer,
+                                    IlpDropCause::InvalidUtf8,
+                                    &batch,
+                                    line_count,
+                                )
+                                .await);
                             }
                         };
 
@@ -335,9 +352,18 @@ async fn handle_ilp_connection(
                             limit = MAX_ILP_LINE_BYTES,
                             "ILP line read failed — rejecting connection"
                         );
-                        return Err(crate::Error::BadRequest {
-                            detail: "ILP line rejected".into(),
-                        });
+                        // Same contract as the decode failure above: the connection
+                        // ends, but not before the accepted lines are dispatched and
+                        // the loss surface is recorded.
+                        return Err(terminate_with_buffered_flush(
+                            state,
+                            &authenticated_context,
+                            peer,
+                            IlpDropCause::LineReadFailed,
+                            &batch,
+                            line_count,
+                        )
+                        .await);
                     }
                 }
             }
@@ -443,61 +469,4 @@ fn start_tenant_connection(state: &SharedState, tenant_id: TenantId) -> crate::R
     }
     tenants.connection_start(tenant_id);
     Ok(())
-}
-
-/// Read one ILP line without allowing `BufReader` to allocate beyond the
-/// configured line limit while it searches for a newline.
-async fn read_bounded_ilp_line<R>(
-    reader: &mut R,
-    line_buf: &mut Vec<u8>,
-    max_line_bytes: usize,
-) -> std::io::Result<bool>
-where
-    R: AsyncBufRead + Unpin,
-{
-    loop {
-        let (consumed, complete) = {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                return Ok(!line_buf.is_empty());
-            }
-            let consumed = available
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(available.len(), |position| position + 1);
-            if consumed > max_line_bytes.saturating_sub(line_buf.len()) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ILP line exceeds maximum length",
-                ));
-            }
-            line_buf.extend_from_slice(&available[..consumed]);
-            (
-                consumed,
-                consumed < available.len() || available[consumed - 1] == b'\n',
-            )
-        };
-        reader.consume(consumed);
-        if complete {
-            return Ok(true);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use tokio::io::BufReader;
-
-    use super::read_bounded_ilp_line;
-
-    #[tokio::test]
-    async fn bounded_line_reader_rejects_before_copying_an_oversized_line() {
-        let mut reader = BufReader::new(std::io::Cursor::new(b"12345\n".to_vec()));
-        let mut line = Vec::new();
-
-        let result = read_bounded_ilp_line(&mut reader, &mut line, 4).await;
-
-        assert!(result.is_err());
-        assert!(line.is_empty());
-    }
 }

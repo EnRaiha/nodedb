@@ -69,6 +69,97 @@ pub fn metadata_apply_wedged(
     .emit();
 }
 
+/// Report an ILP connection terminated by an undecodable line while it still
+/// held accepted lines.
+///
+/// Called from the invalid-UTF-8 arm of the ILP connection loop, the only
+/// place that cause is detected. The sibling read-failure arm is a different
+/// root cause (a broken socket or an over-length line, not malformed content)
+/// and files its own report.
+pub fn ilp_invalid_utf8_drop(
+    peer: &str,
+    database_id: u64,
+    buffered_lines: u64,
+    outcome: context::IlpFlushOutcome,
+) {
+    record_ilp_drop("invalid_utf8", peer, database_id, buffered_lines, outcome);
+}
+
+/// Report an ILP connection terminated by a failed or over-length line read
+/// while it still held accepted lines.
+///
+/// Called from the read-error arm of the ILP connection loop, the only place
+/// that cause is detected.
+pub fn ilp_line_read_drop(
+    peer: &str,
+    database_id: u64,
+    buffered_lines: u64,
+    outcome: context::IlpFlushOutcome,
+) {
+    record_ilp_drop(
+        "line_read_failed",
+        peer,
+        database_id,
+        buffered_lines,
+        outcome,
+    );
+}
+
+/// Shared emit for the two ILP termination causes. Private so the only entry
+/// points remain the one-per-cause functions above — a shared *public* entry
+/// point would invite a third caller reporting a cause it did not detect.
+fn record_ilp_drop(
+    cause: &'static str,
+    peer: &str,
+    database_id: u64,
+    buffered_lines: u64,
+    outcome: context::IlpFlushOutcome,
+) {
+    let ctx = context::IlpAcceptedLinesDropped {
+        cause,
+        peer,
+        database_id,
+        buffered_lines,
+        outcome,
+    };
+    let _ = Capture::new(
+        EventKind::Error,
+        "ILP connection terminated holding lines the client can never learn the fate of",
+    )
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}
+
+/// Report a committed, CRC-valid WAL record that startup replay could not
+/// apply.
+///
+/// Called only from `replay_abort`, the one place recovery decides a record is
+/// unapplyable, so a WAL tail that fails identically on every core files one
+/// report with a growing occurrence count rather than one per core.
+pub fn replay_record_unapplied(
+    engine: &str,
+    stage: &str,
+    core_id: usize,
+    record_lsn: u64,
+    detail: &str,
+) {
+    let ctx = context::ReplayRecordUnapplied {
+        engine,
+        stage,
+        core_id,
+        record_lsn,
+        detail,
+    };
+    let _ = Capture::new(
+        EventKind::Corruption,
+        "WAL replay: a committed record could not be applied",
+    )
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}
+
 /// Report a Calvin cross-shard transaction whose completion wait timed out.
 ///
 /// Called from the completion-timeout arm of
