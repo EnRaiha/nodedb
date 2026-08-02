@@ -26,6 +26,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use tokio::runtime::RuntimeFlavor;
+
 use nodedb_cluster::{METADATA_GROUP_ID, MetadataEntry, WaitOutcome, encode_entry};
 
 #[cfg(test)]
@@ -264,6 +266,35 @@ pub(crate) fn acquire_ddl_prepare_lease<'a>(
     }
 }
 
+/// Take the local DDL preparation lock, handing the wait back to tokio when
+/// the caller is on a multi-thread worker.
+///
+/// The holder keeps this lock across the distributed preparation lease, the
+/// descriptor drain and the local apply wait — each already wrapped in
+/// `block_in_place`, but that only tells tokio about the waits *inside* the
+/// lock, never about the wait *for* it. A bare `lock()` on a worker therefore
+/// removes that worker from the runtime silently, including from the raft
+/// apply work the current holder needs in order to finish, which turns
+/// contention into a self-sustaining stall.
+///
+/// `block_in_place` is a passthrough outside a multi-thread worker (plain sync
+/// callers, blocking-pool threads) and panics on the current-thread runtime,
+/// so it is applied only where it is both legal and meaningful — mirroring
+/// `lease::drain_propose::poll_leases_drained`.
+fn lock_ddl_preparation(shared: &SharedState) -> Result<std::sync::MutexGuard<'_, ()>, Error> {
+    let acquire = || {
+        shared.metadata_ddl_lock.lock().map_err(|_| Error::Config {
+            detail: "metadata DDL preparation lock poisoned".into(),
+        })
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(acquire)
+        }
+        _ => acquire(),
+    }
+}
+
 /// Propose a `CatalogEntry` and block until the local applied-index
 /// watcher confirms the entry has been applied on this node.
 ///
@@ -311,9 +342,7 @@ pub fn propose_catalog_entry_with_timeout(
 
     // Serialize preparation through local apply confirmation. Without this,
     // concurrent proposers can both observe persisted version N and emit N+1.
-    let _local_ddl_guard = shared.metadata_ddl_lock.lock().map_err(|_| Error::Config {
-        detail: "metadata DDL preparation lock poisoned".into(),
-    })?;
+    let _local_ddl_guard = lock_ddl_preparation(shared)?;
     let distributed_ddl_guard = acquire_ddl_prepare_lease(shared, handle.as_ref())?;
 
     // Drain for Put* variants that carry descriptor_version.
