@@ -35,6 +35,15 @@ pub fn segment_lsn_gap(
 }
 
 #[inline]
+pub fn replay_below_retained_floor(
+    _err: &WalError,
+    _path: &Path,
+    _from_lsn: u64,
+    _retained_floor_lsn: u64,
+) {
+}
+
+#[inline]
 pub fn durability_lost(_err: &WalError, _detail: &str) {}
 
 #[inline]

@@ -129,6 +129,47 @@ impl DomainContext for SegmentLsnGap<'_> {
     }
 }
 
+/// A replay whose requested suffix starts below what the WAL still retains.
+pub(super) struct ReplayBelowRetainedFloor<'a> {
+    pub path: &'a Path,
+    pub from_lsn: u64,
+    pub retained_floor_lsn: u64,
+}
+
+impl DomainContext for ReplayBelowRetainedFloor<'_> {
+    fn domain_kind(&self) -> &'static str {
+        "nodedb_wal.replay_below_retained_floor"
+    }
+
+    fn grouping_key(&self) -> String {
+        // How far past the floor the request reached separates a watermark that
+        // slipped by one checkpoint from one that was lost entirely. The LSNs
+        // and the surviving segment's name are per-occurrence.
+        format!(
+            "missing_lsns~{}",
+            magnitude_bucket(self.retained_floor_lsn.saturating_sub(self.from_lsn))
+        )
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "requested_from_lsn": self.from_lsn,
+            "retained_floor_lsn": self.retained_floor_lsn,
+            "missing_lsns": self.retained_floor_lsn.saturating_sub(self.from_lsn),
+            "earliest_segment_path": self.path.display().to_string(),
+            "earliest_segment_file": file_name(self.path),
+            "why_fatal": "the requested suffix was truncated, so filtering the surviving \
+                          records by LSN would return a shorter suffix that looks exactly like \
+                          a complete one; a consumer would advance its watermark past records \
+                          it never received and lose every effect keyed on them",
+            "operator_action": "checkpoint truncation is expected to hold at or below every \
+                                consumer's persisted watermark — a request below the floor means \
+                                that hold was not applied or a consumer watermark was lost or \
+                                reset; the truncated records cannot be recovered from this WAL",
+        })
+    }
+}
+
 /// A writer that a failed fsync put into its terminal state.
 pub(super) struct DurabilityLost<'a> {
     pub detail: &'a str,

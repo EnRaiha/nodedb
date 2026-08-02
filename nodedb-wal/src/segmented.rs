@@ -25,8 +25,8 @@ use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
 use crate::segment::{
-    DEFAULT_SEGMENT_TARGET_SIZE, SegmentContinuity, SegmentMeta, TruncateResult, discover_segments,
-    segment_path, truncate_segments,
+    DEFAULT_SEGMENT_TARGET_SIZE, SegmentContinuity, SegmentMeta, TruncateResult,
+    check_retained_floor, discover_segments, segment_path, truncate_segments,
 };
 use crate::writer::{WalWriter, WalWriterConfig};
 
@@ -242,12 +242,20 @@ impl SegmentedWal {
     ///
     /// Used when recovering from a checkpoint — records before the checkpoint
     /// LSN have already been applied from the snapshot.
+    ///
+    /// Fails with [`WalError::ReplayBelowRetainedFloor`] when `from_lsn` names
+    /// an LSN truncation has already deleted, rather than returning the shorter
+    /// suffix that survives. Delegating to `replay_from_limit_dir` keeps that
+    /// check — and the per-segment continuity and torn-tail checks — in one
+    /// place instead of replaying everything and filtering afterwards.
     pub fn replay_from(&self, from_lsn: u64) -> Result<Vec<WalRecord>> {
-        let all = self.replay()?;
-        Ok(all
-            .into_iter()
-            .filter(|r| r.header.lsn >= from_lsn)
-            .collect())
+        Ok(replay_from_limit_dir(
+            &self.wal_dir,
+            from_lsn,
+            usize::MAX,
+            self.encryption_ring.as_ref(),
+        )?
+        .0)
     }
 
     /// Paginated replay (delegates to standalone `replay_from_limit_dir`).
@@ -363,6 +371,10 @@ pub fn replay_all_segments(wal_dir: &Path, keys: Option<&KeyRing>) -> Result<Vec
 ///
 /// Records are returned as plaintext. See [`replay_all_segments`] for why
 /// `keys` is mandatory.
+///
+/// A `from_lsn` below the earliest LSN the directory still retains fails with
+/// [`WalError::ReplayBelowRetainedFloor`] instead of returning the surviving
+/// (shorter) suffix.
 pub fn replay_from_limit_dir(
     wal_dir: &Path,
     from_lsn: u64,
@@ -370,6 +382,10 @@ pub fn replay_from_limit_dir(
     keys: Option<&KeyRing>,
 ) -> Result<(Vec<WalRecord>, bool)> {
     let segments = discover_segments(wal_dir)?;
+    // Before any record is read: the answer to "is the requested suffix still
+    // here?" is in the segment set, and once records start flowing back a short
+    // result is indistinguishable from a complete one.
+    check_retained_floor(&segments, from_lsn)?;
     let mut records = Vec::with_capacity(max_records.min(4096));
     let mut continuity = SegmentContinuity::new();
 
@@ -559,6 +575,93 @@ mod tests {
         assert_eq!(records.len(), 5);
         assert_eq!(records[0].header.lsn, 6);
         assert_eq!(records[4].header.lsn, 10);
+    }
+
+    /// Build a WAL with several segments, truncate its prefix away, and report
+    /// the earliest LSN that survives.
+    fn truncated_wal(wal_dir: &Path) -> (SegmentedWal, u64) {
+        let config = SegmentedWalConfig {
+            wal_dir: wal_dir.to_path_buf(),
+            segment_target_size: 100,
+            writer_config: WalWriterConfig {
+                use_direct_io: false,
+                ..Default::default()
+            },
+        };
+
+        let mut wal = SegmentedWal::open(config).expect("open");
+        for i in 0..40u32 {
+            wal.append(
+                RecordType::Put as u32,
+                1,
+                0,
+                0,
+                format!("record-{i:04}").as_bytes(),
+            )
+            .expect("append");
+            wal.sync().expect("sync");
+        }
+
+        let result = wal.truncate_before(20).expect("truncate");
+        assert!(
+            result.segments_deleted > 0,
+            "the test needs a truncated prefix to have a floor above LSN 1"
+        );
+
+        let floor = wal.list_segments().expect("list")[0].first_lsn;
+        assert!(floor > 1, "expected the retained floor to have moved up");
+        (wal, floor)
+    }
+
+    #[test]
+    fn replay_from_the_retained_floor_returns_the_whole_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, floor) = truncated_wal(&dir.path().join("wal"));
+
+        let records = wal.replay_from(floor).expect("floor is fully retained");
+        assert_eq!(records[0].header.lsn, floor);
+        assert_eq!(records.last().unwrap().header.lsn, 40);
+        assert_eq!(records.len() as u64, 40 - floor + 1);
+    }
+
+    /// The off-by-one guard: the floor itself is the first retained LSN, so a
+    /// request starting exactly there is complete, not short.
+    #[test]
+    fn replay_from_exactly_the_floor_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, floor) = truncated_wal(&dir.path().join("wal"));
+
+        assert!(wal.replay_from(floor).is_ok());
+        // One below is the first request that cannot be served.
+        assert!(wal.replay_from(floor - 1).is_err());
+    }
+
+    #[test]
+    fn replay_below_the_retained_floor_is_a_typed_error_naming_both_lsns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, floor) = truncated_wal(&dir.path().join("wal"));
+
+        match wal.replay_from(1) {
+            Err(WalError::ReplayBelowRetainedFloor {
+                from_lsn,
+                retained_floor_lsn,
+                ..
+            }) => {
+                assert_eq!(from_lsn, 1);
+                assert_eq!(retained_floor_lsn, floor);
+            }
+            other => panic!("expected a retained-floor violation, got {other:?}"),
+        }
+
+        // The paginated variant answers the same way: a bounded read must not
+        // be the way a caller gets a silently short suffix either.
+        assert!(matches!(
+            wal.replay_from_limit(1, 5),
+            Err(WalError::ReplayBelowRetainedFloor { .. })
+        ));
+
+        // Full replay names no particular record and is unaffected.
+        assert!(wal.replay().is_ok());
     }
 
     #[test]

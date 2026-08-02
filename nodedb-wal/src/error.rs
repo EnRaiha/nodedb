@@ -162,6 +162,32 @@ pub enum WalError {
         expected_lsn: u64,
         found_lsn: u64,
     },
+
+    /// A replay was asked for the suffix starting at `from_lsn`, but the WAL
+    /// no longer retains it: checkpoint truncation has already deleted every
+    /// segment below `retained_floor_lsn`.
+    ///
+    /// Filtering the surviving records by `lsn >= from_lsn` would hand the
+    /// caller a *shorter* suffix that is indistinguishable from a complete
+    /// one — no hole, no gap between surviving segments, just fewer records
+    /// than the caller's own bookkeeping says it must observe. A consumer that
+    /// treats that as complete advances its watermark past records it never
+    /// saw, and every effect keyed on them (change data capture, triggers,
+    /// streaming materialized views) is lost with nothing recorded anywhere.
+    ///
+    /// Truncation is supposed to hold below every consumer's watermark, so
+    /// this is a broken invariant rather than an expected outcome; the error
+    /// exists so a residual violation is loud instead of silent.
+    #[error(
+        "WAL replay requested from LSN {from_lsn}, but the earliest retained LSN is \
+         {retained_floor_lsn} ({earliest_segment}) — LSNs {from_lsn}..{retained_floor_lsn} were \
+         truncated and can never be replayed"
+    )]
+    ReplayBelowRetainedFloor {
+        from_lsn: u64,
+        retained_floor_lsn: u64,
+        earliest_segment: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, WalError>;

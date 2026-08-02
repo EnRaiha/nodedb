@@ -95,6 +95,32 @@ pub fn segment_lsn_gap(
     .emit();
 }
 
+/// Report a replay whose requested suffix starts below the retained floor.
+///
+/// Nothing is preserved: the evidence is the segments that are *no longer*
+/// there, and the earliest surviving one is named in the report so an operator
+/// can see where the log now begins.
+pub fn replay_below_retained_floor(
+    err: &WalError,
+    path: &Path,
+    from_lsn: u64,
+    retained_floor_lsn: u64,
+) {
+    let ctx = context::ReplayBelowRetainedFloor {
+        path,
+        from_lsn,
+        retained_floor_lsn,
+    };
+    let _ = Capture::new(
+        EventKind::InvariantViolation,
+        "WAL replay asked for a suffix that truncation already deleted",
+    )
+    .error_chain(error_chain_of(err))
+    .domain(&ctx)
+    .with_backtrace()
+    .emit();
+}
+
 /// Report a writer entering its terminal state after a failed fsync.
 ///
 /// Called from the one transition into that state, not from the checks that

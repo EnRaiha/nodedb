@@ -32,11 +32,11 @@ mod inert;
 #[cfg(all(feature = "diagnostics", not(target_arch = "wasm32")))]
 pub use recording::{
     durability_lost, encrypted_record_without_key, mid_file_corruption, out_of_space,
-    segment_lsn_gap,
+    replay_below_retained_floor, segment_lsn_gap,
 };
 
 #[cfg(not(all(feature = "diagnostics", not(target_arch = "wasm32"))))]
 pub use inert::{
     durability_lost, encrypted_record_without_key, mid_file_corruption, out_of_space,
-    segment_lsn_gap,
+    replay_below_retained_floor, segment_lsn_gap,
 };

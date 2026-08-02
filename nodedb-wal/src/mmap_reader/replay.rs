@@ -6,15 +6,17 @@
 //! where the log really ends (not at a hole with committed records behind it),
 //! and no segment has gone missing from between the ones that survive. The
 //! first is [`crate::torn_tail::verify_committed_prefix`], the second is
-//! [`SegmentContinuity`]; both are applied here so the Event Plane's catchup
-//! path cannot observe a silently shortened log.
+//! [`SegmentContinuity`]. A replay that starts mid-log needs a third: the
+//! records it asks for must still be retained at all, which
+//! [`check_retained_floor`] decides. All three are applied here so the Event
+//! Plane's catchup path cannot observe a silently shortened log.
 
 use std::path::Path;
 
 use crate::crypto::KeyRing;
 use crate::error::{Result, WalError};
 use crate::record::WalRecord;
-use crate::segment::{SegmentContinuity, SegmentMeta};
+use crate::segment::{SegmentContinuity, SegmentMeta, check_retained_floor};
 
 use super::reader::MmapWalReader;
 
@@ -52,6 +54,9 @@ pub fn replay_segments_mmap(
     keys: Option<&KeyRing>,
 ) -> Result<Vec<WalRecord>> {
     let segments = crate::segment::discover_segments(wal_dir)?;
+    // Judged on the full segment set, before the live tail is chosen: the tail
+    // is selected *using* `from_lsn`, so it can never contradict it.
+    check_retained_floor(&segments, from_lsn)?;
     let live = filter_segments_by_lsn(&segments, from_lsn);
 
     if live.len() < PARALLEL_SEGMENT_THRESHOLD {
@@ -197,6 +202,7 @@ pub fn replay_segments_mmap_limit(
     keys: Option<&KeyRing>,
 ) -> Result<(Vec<WalRecord>, bool)> {
     let segments = crate::segment::discover_segments(wal_dir)?;
+    check_retained_floor(&segments, from_lsn)?;
     let live = filter_segments_by_lsn(&segments, from_lsn);
     let mut records = Vec::with_capacity(max_records.min(4096));
     let mut continuity = SegmentContinuity::new();
@@ -254,5 +260,61 @@ mod tests {
         // Replay from lsn1 — all 3.
         let all = replay_segments_mmap(&wal_dir, lsn1, None).unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    /// The mmap catchup path is the Event Plane's primary recovery arm, so it
+    /// must refuse a truncated-away suffix exactly as the sequential one does —
+    /// including passing the boundary case where the request starts on the
+    /// retained floor itself.
+    #[test]
+    fn replay_mmap_below_the_retained_floor_is_rejected() {
+        use crate::error::WalError;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+
+        let config = crate::segmented::SegmentedWalConfig {
+            wal_dir: wal_dir.clone(),
+            segment_target_size: 100,
+            writer_config: crate::writer::WalWriterConfig {
+                use_direct_io: false,
+                ..Default::default()
+            },
+        };
+        let mut wal = crate::segmented::SegmentedWal::open(config).unwrap();
+        for i in 0..40u32 {
+            wal.append(
+                RecordType::Put as u32,
+                1,
+                0,
+                0,
+                format!("record-{i:04}").as_bytes(),
+            )
+            .unwrap();
+            wal.sync().unwrap();
+        }
+        assert!(wal.truncate_before(20).unwrap().segments_deleted > 0);
+        let floor = wal.list_segments().unwrap()[0].first_lsn;
+        assert!(floor > 1);
+
+        let records = replay_segments_mmap(&wal_dir, floor, None).expect("floor is retained");
+        assert_eq!(records[0].header.lsn, floor);
+
+        match replay_segments_mmap(&wal_dir, floor - 1, None) {
+            Err(WalError::ReplayBelowRetainedFloor {
+                from_lsn,
+                retained_floor_lsn,
+                ..
+            }) => {
+                assert_eq!(from_lsn, floor - 1);
+                assert_eq!(retained_floor_lsn, floor);
+            }
+            other => panic!("expected a retained-floor violation, got {other:?}"),
+        }
+
+        assert!(matches!(
+            replay_segments_mmap_limit(&wal_dir, 1, 5, None),
+            Err(WalError::ReplayBelowRetainedFloor { .. })
+        ));
     }
 }
