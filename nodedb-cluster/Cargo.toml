@@ -12,6 +12,14 @@ documentation = "https://docs.rs/nodedb-cluster"
 keywords = ["cluster", "distributed", "vshard", "quic", "replication"]
 categories = ["network-programming", "database-implementations"]
 
+[features]
+default = []
+# Silent data-loss sites (epoch gaps, backpressure drops) report through the
+# `faultbox` black-box recorder. Inert until the host application calls
+# `faultbox::init`; a no-op on wasm32 regardless. Off by default so the crate
+# stays dependency-light for embedders that report failures their own way.
+diagnostics = ["dep:faultbox"]
+
 [dependencies]
 # Workspace crates
 nodedb-raft = { workspace = true }
@@ -45,6 +53,8 @@ uuid = { workspace = true }
 # Authenticated frame envelope (origin + anti-replay MAC) for Raft RPCs.
 hmac = { workspace = true }
 sha2 = { workspace = true }
+
+faultbox = { workspace = true, optional = true }
 
 # Persistence
 redb = { workspace = true }

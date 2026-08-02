@@ -4439,6 +4439,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "crc32c",
+ "faultbox",
  "futures",
  "getrandom 0.3.4",
  "hmac 0.12.1",

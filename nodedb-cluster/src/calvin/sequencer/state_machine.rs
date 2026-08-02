@@ -287,6 +287,12 @@ impl SequencerStateMachine {
                     self.metrics
                         .epochs_skipped_gap
                         .fetch_add(1, Ordering::Relaxed);
+                    crate::diag::sequencer_epoch_gap(
+                        expected,
+                        batch.epoch,
+                        batch.txns.len(),
+                        index,
+                    );
                     // Advance anyway to the received epoch so we don't
                     // permanently stall on a gap. The scheduler will need to
                     // replay from the Raft log to recover.
@@ -296,6 +302,11 @@ impl SequencerStateMachine {
 
                 let mut fanned_out = 0u64;
                 let mut dropped = 0u64;
+                // Collected for a single end-of-call diagnostics report,
+                // never emitted per-txn — a sustained backpressure storm can
+                // drop many positions in one apply() call and per-txn
+                // emission would report-storm.
+                let mut drop_pairs: Vec<(u32, &'static str)> = Vec::new();
 
                 // Per-vShard count of how many of this epoch's positions target
                 // each vShard. Delivered to each scheduler so it knows how many
@@ -349,6 +360,7 @@ impl SequencerStateMachine {
                                     );
                                     self.record_catch_up(vshard, index);
                                     dropped += 1;
+                                    drop_pairs.push((vshard, "full"));
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
                                     warn!(
@@ -359,12 +371,17 @@ impl SequencerStateMachine {
                                     );
                                     self.record_catch_up(vshard, index);
                                     dropped += 1;
+                                    drop_pairs.push((vshard, "closed"));
                                 }
                             }
                         }
                         // If no sender registered for this vshard, silently skip —
                         // this node may not host that vshard.
                     }
+                }
+
+                if dropped > 0 {
+                    crate::diag::sequencer_backpressure_drop(batch.epoch, dropped, &drop_pairs);
                 }
 
                 self.metrics
