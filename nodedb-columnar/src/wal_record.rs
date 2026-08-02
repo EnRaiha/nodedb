@@ -2,7 +2,7 @@
 
 //! WAL record types for columnar operations.
 //!
-//! Each mutation (INSERT, DELETE, compaction commit) produces a WAL record
+//! Each mutation (INSERT, DELETE, memtable flush) produces a WAL record
 //! that is written before the mutation is applied. On crash recovery, WAL
 //! records are replayed to reconstruct the memtable, delete bitmaps, and
 //! segment metadata.
@@ -46,20 +46,6 @@ pub enum ColumnarWalRecord {
         row_indices: Vec<u32>,
     },
 
-    /// A compaction was committed: old segments replaced with new ones.
-    ///
-    /// This is the atomic commit point of the 3-phase compaction protocol.
-    /// On replay:
-    /// - If new segments exist on disk: complete the metadata swap.
-    /// - If new segments don't exist: the compaction was interrupted before
-    ///   writing; discard and treat old segments as authoritative.
-    #[serde(rename = "compaction_commit")]
-    CompactionCommit {
-        collection: String,
-        old_segment_ids: Vec<u64>,
-        new_segment_ids: Vec<u64>,
-    },
-
     /// The memtable was flushed to a new segment.
     ///
     /// On replay, if the segment file exists, update metadata to include it.
@@ -79,7 +65,6 @@ impl ColumnarWalRecord {
         match self {
             Self::InsertRow { collection, .. }
             | Self::DeleteRows { collection, .. }
-            | Self::CompactionCommit { collection, .. }
             | Self::MemtableFlushed { collection, .. } => collection,
         }
     }
@@ -369,11 +354,6 @@ mod tests {
                 collection: "test".into(),
                 segment_id: 0,
                 row_indices: vec![5, 10, 15],
-            },
-            ColumnarWalRecord::CompactionCommit {
-                collection: "test".into(),
-                old_segment_ids: vec![0, 1],
-                new_segment_ids: vec![2],
             },
             ColumnarWalRecord::MemtableFlushed {
                 collection: "test".into(),

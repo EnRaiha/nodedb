@@ -282,28 +282,48 @@ fn flush_clears_surrogate_table() {
     assert!(engine.memtable_surrogates().is_empty());
 }
 
+/// Every WAL record a mutation can produce must be one the replay path can
+/// act on. A segment-rewrite ("compaction commit") record has no producer and
+/// no replay handler, so the mutation engine must never emit one.
 #[test]
-fn should_compact_threshold() {
+fn mutations_only_emit_replayable_wal_records() {
     let mut engine = MutationEngine::new("test".into(), test_schema());
 
-    // Insert and flush to create a real segment.
+    let mut records = Vec::new();
     for i in 0..10 {
-        engine
-            .insert(&[
-                Value::Integer(i),
-                Value::String(format!("u{i}")),
-                Value::Null,
-            ])
-            .expect("insert");
+        records.extend(
+            engine
+                .insert(&[
+                    Value::Integer(i),
+                    Value::String(format!("u{i}")),
+                    Value::Null,
+                ])
+                .expect("insert")
+                .wal_records,
+        );
     }
-    engine.on_memtable_flushed(1).expect("flush");
-
-    // Delete 3 out of 10 rows = 30% > 20% threshold.
+    records.extend(engine.on_memtable_flushed(1).expect("flush").wal_records);
     for i in 0..3 {
-        engine.delete(&Value::Integer(i)).expect("delete");
+        records.extend(
+            engine
+                .delete(&Value::Integer(i))
+                .expect("delete")
+                .wal_records,
+        );
     }
 
-    assert!(engine.should_compact(1, 10));
+    assert!(!records.is_empty());
+    for rec in &records {
+        assert!(
+            matches!(
+                rec,
+                ColumnarWalRecord::InsertRow { .. }
+                    | ColumnarWalRecord::DeleteRows { .. }
+                    | ColumnarWalRecord::MemtableFlushed { .. }
+            ),
+            "unexpected WAL record shape: {rec:?}"
+        );
+    }
 }
 
 #[test]

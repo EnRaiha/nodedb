@@ -57,17 +57,15 @@ impl DeleteBitmap {
         self.inner.is_empty()
     }
 
-    /// Delete ratio: deleted_count / total_rows. Used to trigger compaction.
+    /// Delete ratio: deleted_count / total_rows.
+    ///
+    /// Reported as a segment-health statistic. Segments are never rewritten,
+    /// so nothing acts on this ratio.
     pub fn delete_ratio(&self, total_rows: u64) -> f64 {
         if total_rows == 0 {
             return 0.0;
         }
         self.inner.len() as f64 / total_rows as f64
-    }
-
-    /// Whether this segment should be compacted (delete ratio > threshold).
-    pub fn should_compact(&self, total_rows: u64, threshold: f64) -> bool {
-        self.delete_ratio(total_rows) > threshold
     }
 
     /// Check whether an entire block is fully deleted.
@@ -128,8 +126,10 @@ impl DeleteBitmap {
         self.inner.remove(row_idx)
     }
 
-    /// Merge another bitmap into this one (union). Used during compaction
-    /// to combine delete bitmaps from multiple source segments.
+    /// Merge another bitmap into this one (union).
+    ///
+    /// Used when two views of the same segment's tombstones must be combined
+    /// (for example a restored bitmap and one accumulated since the restore).
     pub fn merge(&mut self, other: &DeleteBitmap) {
         self.inner |= &other.inner;
     }
@@ -180,17 +180,15 @@ mod tests {
     }
 
     #[test]
-    fn delete_ratio_and_compaction() {
+    fn delete_ratio_reports_fraction_deleted() {
         let mut bm = DeleteBitmap::new();
         for i in 0..30 {
             bm.mark_deleted(i);
         }
         // 30 deleted out of 100 total = 0.3
         assert!((bm.delete_ratio(100) - 0.3).abs() < 0.001);
-        // Default threshold 0.2 → should compact.
-        assert!(bm.should_compact(100, 0.2));
-        // Threshold 0.5 → should not compact.
-        assert!(!bm.should_compact(100, 0.5));
+        // A zero-row segment must not divide by zero.
+        assert_eq!(DeleteBitmap::new().delete_ratio(0), 0.0);
     }
 
     #[test]

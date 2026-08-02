@@ -16,11 +16,11 @@
 
 pub(crate) mod encrypt;
 
-pub mod compaction;
 pub mod delete_bitmap;
 pub mod error;
 pub mod filter;
 pub mod format;
+pub mod materialize_rows;
 pub mod memtable;
 pub mod mutation;
 pub mod pk_index;
@@ -29,7 +29,6 @@ pub mod reader;
 pub mod wal_record;
 pub mod writer;
 
-pub use compaction::{compact_segments, materialize_segment_live_rows};
 pub use delete_bitmap::DeleteBitmap;
 pub use error::ColumnarError;
 pub use filter::{
@@ -41,6 +40,7 @@ pub use format::{
     BLOCK_SIZE, BlockStats, BloomFilter, ColumnMeta, MAGIC, SegmentFooter, SegmentHeader,
     VERSION_MAJOR, VERSION_MINOR,
 };
+pub use materialize_rows::materialize_segment_live_rows;
 pub use memtable::{ColumnarMemtable, IngestValue, MemtableRowIter};
 pub use mutation::{ColumnDataSnapshot, ColumnarEngineSnapshot, MutationEngine};
 pub use pk_index::PkIndex;

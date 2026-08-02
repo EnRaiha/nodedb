@@ -275,13 +275,6 @@ impl MutationEngine {
         self.next_segment_id
     }
 
-    /// Whether a segment should be compacted based on its delete ratio.
-    pub fn should_compact(&self, segment_id: u64, total_rows: u64) -> bool {
-        self.delete_bitmaps
-            .get(&segment_id)
-            .is_some_and(|bm| bm.should_compact(total_rows, 0.2))
-    }
-
     /// Encode a PK value as index bytes. Exposed for callers that need
     /// to probe the PK index (e.g. `ON CONFLICT DO UPDATE` routing).
     pub fn encode_pk_from_row(&self, values: &[Value]) -> Result<Vec<u8>, ColumnarError> {

@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Post-write coordination: memtable flush + compaction commit.
-
-use std::collections::HashMap;
+//! Post-write coordination: memtable flush.
 
 use crate::error::ColumnarError;
 use crate::pk_index::RowLocation;
@@ -52,40 +50,5 @@ impl MutationEngine {
         Ok(MutationResult {
             wal_records: vec![wal],
         })
-    }
-
-    /// Notify the engine that compaction completed.
-    ///
-    /// Remaps PK index entries and removes old delete bitmaps.
-    pub fn on_compaction_complete(
-        &mut self,
-        old_segment_ids: &[u64],
-        new_segment_id: u64,
-        row_mapping: &HashMap<(u64, u32), u32>,
-    ) -> MutationResult {
-        // Remap PK index for each old segment.
-        for &old_seg in old_segment_ids {
-            self.pk_index.remap_segment(old_seg, |old_row| {
-                row_mapping
-                    .get(&(old_seg, old_row))
-                    .map(|&new_row| RowLocation {
-                        segment_id: new_segment_id,
-                        row_index: new_row,
-                    })
-            });
-
-            // Remove old delete bitmap.
-            self.delete_bitmaps.remove(&old_seg);
-        }
-
-        let wal = ColumnarWalRecord::CompactionCommit {
-            collection: self.collection.clone(),
-            old_segment_ids: old_segment_ids.to_vec(),
-            new_segment_ids: vec![new_segment_id],
-        };
-
-        MutationResult {
-            wal_records: vec![wal],
-        }
     }
 }
