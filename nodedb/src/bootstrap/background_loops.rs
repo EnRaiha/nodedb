@@ -238,11 +238,15 @@ pub fn spawn_background_loops(
         },
     );
 
-    // Checkpoint manager.
+    // Checkpoint manager. It is handed the Event Plane's watermark store
+    // because WAL truncation is bounded by the consumers' persisted progress as
+    // much as by the engines': a consumer recovers only from the WAL above its
+    // watermark, and nothing detects a gap if that suffix is deleted.
     let shared_ckpt = Arc::clone(shared);
     let shutdown_rx_ckpt = shutdown_rx.clone();
     crate::control::checkpoint_manager::spawn_checkpoint_task(
         shared_ckpt,
+        Arc::clone(event_plane.watermark_store()),
         num_cores,
         config.checkpoint.to_manager_config(),
         shutdown_rx_ckpt,
