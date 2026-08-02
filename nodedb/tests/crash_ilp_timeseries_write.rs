@@ -192,3 +192,170 @@ async fn ilp_write_visible_to_readers_survives_kill_9() {
          kill -9 + WAL replay (got {recovered:?})"
     );
 }
+
+const BULK_COLLECTION: &str = "crash_ilp_ts_bulk";
+const BULK_ILP_PASSWORD: &str = "crash-ilp-ts-bulk-secret-1";
+
+/// Number of ILP lines sent by [`many_calvin_writes_survive_immediate_kill_9`].
+///
+/// `handle_ilp_connection` (`control/server/ilp_listener.rs`) flushes a batch
+/// once it hits an adaptive line-count target: 100 lines at low observed
+/// rate, 1,000 at medium rate, up to a hard-coded maximum of 10,000 lines at
+/// the highest rate tier (`IlpRateEstimator::suggest_batch_params`,
+/// `control/server/ilp_batch.rs`). That maximum is a compile-time constant,
+/// not something the client can influence, so any line count above it forces
+/// at least two size-triggered flushes no matter how fast or slow this test's
+/// single-line `send_line` loop happens to run — unlike relying on the
+/// 50/100ms timer windows, which depend on send timing and would make the
+/// "spans multiple flushes" property a race instead of a guarantee. 12,000 is
+/// comfortably above that 10,000-line ceiling.
+const BULK_LINE_COUNT: u64 = 12_000;
+
+/// Generous but bounded: sending 12,000 individual ILP lines, each its own
+/// `write` + `flush` syscall pair over loopback, plus waiting for all of them
+/// to become visible through pgwire, takes far longer than the single-write
+/// `ilp_write_visible_to_readers_survives_kill_9` above. The checkpoint
+/// interval is still pushed out to an hour (`no_incidental_checkpoint`), so
+/// this bound exists only to catch a hung test, not to protect against an
+/// incidental checkpoint.
+const MAX_BULK_TEST_WALL_CLOCK: Duration = Duration::from_secs(180);
+
+/// Sharper measurement of the same question as
+/// `ilp_write_visible_to_readers_survives_kill_9`, but built to close that
+/// test's two weaknesses: a single write, and an uncontrolled window between
+/// "write visible" and "kill". Here, thousands of Calvin-routed writes are
+/// sent — guaranteed (see [`BULK_LINE_COUNT`]) to span multiple independent
+/// ILP batch flushes, each its own `TimeseriesIngest` Calvin submission — and
+/// the kill happens on the exact poll that first observes every one of them
+/// visible, with nothing else run in between.
+///
+/// If claim A2 is right (Calvin-routed writes are acknowledged/visible before
+/// their WAL record is fsynced), this test FAILS: some prefix or scatter of
+/// the rows that were visible pre-crash will be missing after reopen, because
+/// only `wal.wait_durable` fsyncs and nothing on the `RouteToCalvin` path
+/// calls it. If A2 is wrong — durability is established by some other means
+/// before a row becomes visible to a reader — this test PASSES. Both
+/// outcomes are informative; this test does not assume which one is true.
+#[tokio::test(flavor = "multi_thread")]
+async fn many_calvin_writes_survive_immediate_kill_9() {
+    let mut h = no_incidental_checkpoint();
+    let spawned_at = Instant::now();
+    h.spawn();
+    h.wait_ready(Duration::from_secs(20));
+
+    h.exec(&format!(
+        "CREATE COLLECTION {BULK_COLLECTION} \
+         COLUMNS (id TEXT, ts BIGINT TIME_KEY, metric TEXT, value FLOAT) \
+         WITH (engine='timeseries')"
+    ))
+    .await;
+    h.exec(&format!(
+        "CREATE USER crash_ilp_bulk_user PASSWORD '{BULK_ILP_PASSWORD}'"
+    ))
+    .await;
+    h.exec("GRANT ROLE readwrite TO crash_ilp_bulk_user").await;
+
+    let ilp_addr: std::net::SocketAddr = format!("127.0.0.1:{}", h.ilp_port)
+        .parse()
+        .expect("loopback ILP address must parse");
+    let mut ilp_stream =
+        ilp_client::connect_and_auth(ilp_addr, "crash_ilp_bulk_user", BULK_ILP_PASSWORD).await;
+
+    // Distinct nanosecond timestamps per line so every one of the
+    // `BULK_LINE_COUNT` writes is its own row rather than colliding on the
+    // engine's (partition, ts) identity.
+    let base_ts_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_nanos();
+    for i in 0..BULK_LINE_COUNT {
+        let ts_ns = base_ts_ns + u128::from(i);
+        ilp_client::send_line(
+            &mut ilp_stream,
+            &format!("{BULK_COLLECTION},metric=cpu value=42.5 {ts_ns}"),
+        )
+        .await;
+    }
+
+    // Visibility is the only completion signal ILP gives a caller — see
+    // `wait_for_count`'s doc comment. This poll observing `BULK_LINE_COUNT`
+    // is the exact event the kill below must follow with nothing else in
+    // between.
+    let pre_crash_session = h.connect().await;
+    wait_for_count(
+        &pre_crash_session,
+        BULK_COLLECTION,
+        &BULK_LINE_COUNT.to_string(),
+        Duration::from_secs(60),
+    )
+    .await;
+    drop(pre_crash_session);
+    // Same rationale as the single-write test above: hold the ILP connection
+    // open until every line it sent is confirmed visible, so closing it
+    // cannot race the server's own batch flush.
+    drop(ilp_stream);
+
+    assert!(
+        spawned_at.elapsed() < MAX_BULK_TEST_WALL_CLOCK,
+        "test ran long enough that an incidental checkpoint cycle becomes possible \
+         even with the interval pushed out; tighten the test or the bound"
+    );
+
+    // Do NOT insert any other write or query here. The poll above just
+    // observed every one of the BULK_LINE_COUNT writes visible to a reader;
+    // issuing any other write on this shared WAL before the kill risks an
+    // incidental fsync (group commit, WAL rollover, etc.) that would durably
+    // rescue these records for a reason unrelated to the question this test
+    // asks. The kill must follow the poll with nothing else in between.
+    h.kill_9();
+    h.reopen();
+
+    // Check for a wedged applier BEFORE asking whether the rows survived, so
+    // a wedge (a hung/degraded apply loop) and plain data loss never look
+    // like the same failure. `nodedb.metadata_apply_wedged` fires from the
+    // metadata Raft applier's own apply loop during boot replay — independent
+    // of any query this test issues — and `nodedb.calvin_completion_timeout`
+    // fires when a Calvin write's completion ack never arrives. Either one
+    // present here means the row-count assertion below (if it also fails)
+    // is not evidence about claim A2's fsync-before-ack ordering; it would
+    // be evidence of a different, unrelated bug.
+    let reports = crash_harness::diagnostics::faultbox_reports(h.data_dir());
+    let wedge_indicators: Vec<String> = reports
+        .iter()
+        .filter(|g| {
+            matches!(
+                g.first.domain_kind.as_deref(),
+                Some("nodedb.metadata_apply_wedged") | Some("nodedb.calvin_completion_timeout")
+            )
+        })
+        .map(faultbox::reader::Group::summary)
+        .collect();
+    assert!(
+        wedge_indicators.is_empty(),
+        "the server filed a wedged-applier / Calvin-completion-timeout report after reopen — \
+         a stalled apply loop or a lost completion ack, not claim A2's fsync-before-ack \
+         ordering, would explain any missing rows below: {wedge_indicators:?} \
+         (all faultbox reports: {:?})",
+        reports
+            .iter()
+            .map(faultbox::reader::Group::summary)
+            .collect::<Vec<_>>(),
+    );
+
+    let post_crash_session = h.connect().await;
+    let recovered = wait_for_count(
+        &post_crash_session,
+        BULK_COLLECTION,
+        &BULK_LINE_COUNT.to_string(),
+        Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(
+        recovered,
+        vec![BULK_LINE_COUNT.to_string()],
+        "{BULK_LINE_COUNT} Calvin-routed ILP writes that were visible to a pgwire reader before \
+         the crash did not all survive kill -9 + WAL replay (got {recovered:?} of \
+         {BULK_LINE_COUNT}); this means at least one write completed/became visible before its \
+         WAL record was fsynced"
+    );
+}
