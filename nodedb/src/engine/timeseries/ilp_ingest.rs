@@ -7,12 +7,11 @@
 //! `ilp_schema` module.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 use super::columnar_memtable::{ColumnType, ColumnValue, ColumnarMemtable};
 use super::ilp::{FieldValue, IlpLine};
 use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
-use nodedb_types::timeseries::{IngestResult, SeriesId, SeriesKey};
+use nodedb_types::timeseries::{IngestResult, SeriesCatalog, SeriesKey};
 
 pub use super::ilp_schema::{ensure_bitemporal_columns, evolve_schema, infer_schema};
 
@@ -34,17 +33,10 @@ pub struct BitempStamps {
 pub fn ingest_batch(
     memtable: &mut ColumnarMemtable,
     lines: &[IlpLine<'_>],
-    series_keys: &mut HashMap<SeriesId, SeriesKey>,
+    catalog: &mut SeriesCatalog,
     default_timestamp_ms: i64,
 ) -> (usize, usize) {
-    ingest_batch_with_lvc(
-        memtable,
-        lines,
-        series_keys,
-        default_timestamp_ms,
-        None,
-        None,
-    )
+    ingest_batch_with_lvc(memtable, lines, catalog, default_timestamp_ms, None, None)
 }
 
 /// Ingest a batch of ILP lines with optional last-value cache update.
@@ -56,7 +48,7 @@ pub fn ingest_batch(
 pub fn ingest_batch_with_lvc(
     memtable: &mut ColumnarMemtable,
     lines: &[IlpLine<'_>],
-    series_keys: &mut HashMap<SeriesId, SeriesKey>,
+    catalog: &mut SeriesCatalog,
     default_timestamp_ms: i64,
     mut lvc: Option<&mut super::last_value_cache::LastValueCache>,
     bitemporal: Option<BitempStamps>,
@@ -73,8 +65,21 @@ pub fn ingest_batch_with_lvc(
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect();
         let key = SeriesKey::new(line.measurement.as_ref(), tags);
-        let series_id = key.to_series_id(0);
-        series_keys.entry(series_id).or_insert(key);
+        // Resolve through the catalog, never `to_series_id(0)` directly. The
+        // natural hash can collide, and both consumers of the ID below
+        // (`memtable.ingest_row` row-count stats and the last-value cache) key
+        // on it — a collision taken at face value silently folds one series'
+        // rows and last value into an unrelated series.
+        let resolved = catalog.resolve_detailed(&key);
+        let series_id = resolved.id;
+        if resolved.newly_registered && resolved.rehash_attempt > 0 {
+            tracing::warn!(
+                metric = %key.metric,
+                series_id,
+                rehash_attempt = resolved.rehash_attempt,
+                "SeriesId hash collision resolved by rehash"
+            );
+        }
 
         // Resolve timestamp.
         let ts_ms = line
@@ -306,10 +311,10 @@ mod tests {
         }
 
         let mut mt = ColumnarMemtable::new(schema, default_config());
-        let mut keys = HashMap::new();
+        let mut catalog = SeriesCatalog::new();
         let stamps = Some(BitempStamps { system_ms: 5_000 });
         let (accepted, rejected) =
-            ingest_batch_with_lvc(&mut mt, &lines, &mut keys, 0, None, stamps);
+            ingest_batch_with_lvc(&mut mt, &lines, &mut catalog, 0, None, stamps);
         assert_eq!((accepted, rejected), (1, 0));
 
         // Inspect the memtable row to verify the three reserved slots
@@ -358,13 +363,37 @@ mod tests {
         let schema = infer_schema(&lines);
 
         let mut mt = ColumnarMemtable::new(schema, default_config());
-        let mut series_keys = HashMap::new();
+        let mut catalog = SeriesCatalog::new();
 
-        let (accepted, rejected) = ingest_batch(&mut mt, &lines, &mut series_keys, 0);
+        let (accepted, rejected) = ingest_batch(&mut mt, &lines, &mut catalog, 0);
         assert_eq!(accepted, 3);
         assert_eq!(rejected, 0);
         assert_eq!(mt.row_count(), 3);
-        assert_eq!(series_keys.len(), 2); // server01 and server02
+        assert_eq!(catalog.len(), 2); // server01 and server02
+    }
+
+    #[test]
+    fn ingest_resolves_series_through_the_catalog() {
+        // Ingest must take its SeriesId from the catalog, so a hash collision is
+        // rehashed away instead of folding two series' row counts and last
+        // values into one. The uncontended case is the natural hash.
+        let input = "cpu,host=server01 usage=0.64 1434055562000000000\n\
+                     cpu,host=server02 usage=0.55 1434055563000000000";
+        let lines = parse_batch(input).expect("valid ILP batch").into_lines();
+        let schema = infer_schema(&lines);
+
+        let mut mt = ColumnarMemtable::new(schema, default_config());
+        let mut catalog = SeriesCatalog::new();
+        ingest_batch(&mut mt, &lines, &mut catalog, 0);
+
+        let s1 = SeriesKey::new("cpu", vec![("host".into(), "server01".into())]);
+        let s2 = SeriesKey::new("cpu", vec![("host".into(), "server02".into())]);
+        assert_eq!(catalog.get(s1.to_series_id(0)), Some(&s1));
+        assert_eq!(catalog.get(s2.to_series_id(0)), Some(&s2));
+
+        // A second batch reuses the registrations rather than re-minting IDs.
+        ingest_batch(&mut mt, &lines, &mut catalog, 0);
+        assert_eq!(catalog.len(), 2);
     }
 
     #[test]
@@ -374,8 +403,8 @@ mod tests {
         let schema = infer_schema(&lines);
 
         let mut mt = ColumnarMemtable::new(schema, default_config());
-        let mut series_keys = HashMap::new();
-        ingest_batch(&mut mt, &lines, &mut series_keys, 0);
+        let mut catalog = SeriesCatalog::new();
+        ingest_batch(&mut mt, &lines, &mut catalog, 0);
 
         let ts = mt.column(0).as_timestamps()[0];
         assert_eq!(ts, 1_704_067_200_000); // ms
@@ -388,9 +417,9 @@ mod tests {
         let schema = infer_schema(&lines);
 
         let mut mt = ColumnarMemtable::new(schema, default_config());
-        let mut series_keys = HashMap::new();
+        let mut catalog = SeriesCatalog::new();
         let default_ts = 9999;
-        ingest_batch(&mut mt, &lines, &mut series_keys, default_ts);
+        ingest_batch(&mut mt, &lines, &mut catalog, default_ts);
 
         let ts = mt.column(0).as_timestamps()[0];
         assert_eq!(ts, 9999);
@@ -403,8 +432,8 @@ mod tests {
         let schema = infer_schema(&lines);
 
         let mut mt = ColumnarMemtable::new(schema, default_config());
-        let mut series_keys = HashMap::new();
-        ingest_batch(&mut mt, &lines, &mut series_keys, 0);
+        let mut catalog = SeriesCatalog::new();
+        ingest_batch(&mut mt, &lines, &mut catalog, 0);
         assert_eq!(mt.row_count(), 1);
     }
 
@@ -421,8 +450,8 @@ mod tests {
 
         // Ingest and verify the string value is recoverable.
         let mut mt = ColumnarMemtable::new(schema.clone(), default_config());
-        let mut series_keys = HashMap::new();
-        ingest_batch(&mut mt, &lines, &mut series_keys, 0);
+        let mut catalog = SeriesCatalog::new();
+        ingest_batch(&mut mt, &lines, &mut catalog, 0);
         assert_eq!(mt.row_count(), 1);
 
         // Find qname column index and resolve symbol.

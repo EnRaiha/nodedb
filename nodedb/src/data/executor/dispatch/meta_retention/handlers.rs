@@ -146,8 +146,20 @@ impl CoreLoop {
 
         if let Some(lvc) = self.ts_last_value_caches.get_mut(&ts_key) {
             let evicted = lvc.evict_older_than(cutoff);
-            if evicted > 0 {
-                tracing::debug!(collection, evicted, "evicted stale LVC entries");
+            if !evicted.is_empty() {
+                tracing::debug!(
+                    collection,
+                    evicted = evicted.len(),
+                    "evicted stale LVC entries"
+                );
+                // Drop the same series from the catalog. Leaving them behind
+                // would let it accumulate every series the collection ever saw
+                // while the cache it exists to serve has already released them.
+                if let Some(catalog) = self.ts_series_catalogs.get_mut(&ts_key) {
+                    for id in evicted {
+                        catalog.forget(id);
+                    }
+                }
             }
         }
 

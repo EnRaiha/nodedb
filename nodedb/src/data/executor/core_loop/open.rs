@@ -123,6 +123,7 @@ impl CoreLoop {
             ts_max_ingested_lsn: HashMap::new(),
             last_ts_ingest: None,
             ts_last_value_caches: HashMap::new(),
+            ts_series_catalogs: HashMap::new(),
             ts_registries: HashMap::new(),
             continuous_agg_mgr:
                 crate::engine::timeseries::continuous_agg::ContinuousAggregateManager::new(),

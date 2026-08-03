@@ -7,8 +7,6 @@
 //! `execute_ilp_ingest`, so the record-boundary admission gate below covers
 //! them all. The checks the gate runs live in the sibling `admission` module.
 
-use std::collections::HashMap;
-
 use crate::bridge::envelope::{ErrorCode, Payload, Response, Status};
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::response_codec;
@@ -268,9 +266,9 @@ impl CoreLoop {
             None
         };
         let lvc = self.ts_last_value_caches.get_mut(&key);
-        let mut series_keys = HashMap::new();
+        let catalog = self.ts_series_catalogs.entry(key.clone()).or_default();
         let (accepted, rejected) =
-            ilp_ingest::ingest_batch_with_lvc(mt, &lines, &mut series_keys, now_ms, lvc, stamps);
+            ilp_ingest::ingest_batch_with_lvc(mt, &lines, catalog, now_ms, lvc, stamps);
 
         if rejected > 0 {
             tracing::warn!(

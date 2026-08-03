@@ -20,7 +20,7 @@ pub use partition::{
     FlushedKind, FlushedSeries, IntervalParseError, PartitionInterval, PartitionMeta,
     PartitionState, SegmentKind, SegmentRef,
 };
-pub use series::{BatteryState, LiteId, SeriesCatalog, SeriesId, SeriesKey};
+pub use series::{BatteryState, LiteId, ResolvedSeries, SeriesCatalog, SeriesId, SeriesKey};
 pub use sync::{LogWalBatch, TimeseriesDelta, TimeseriesWalBatch};
 
 #[cfg(test)]

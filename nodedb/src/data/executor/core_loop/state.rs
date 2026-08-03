@@ -281,6 +281,17 @@ pub struct CoreLoop {
         crate::engine::timeseries::last_value_cache::LastValueCache,
     >,
 
+    /// Per-collection series catalogs — the only source of `SeriesId`.
+    ///
+    /// The catalog resolves hash collisions, so two distinct `SeriesKey`s never
+    /// share an ID. It must live beside `ts_last_value_caches` and be torn down
+    /// with it: those two plus the memtable's per-series row counts are the only
+    /// consumers of `SeriesId`, they are all in-memory and per-collection, and a
+    /// catalog that outlived them would hand out IDs for series they no longer
+    /// hold. Key: (DatabaseId, TenantId, collection).
+    pub(in crate::data::executor) ts_series_catalogs:
+        HashMap<(DatabaseId, TenantId, String), nodedb_types::timeseries::SeriesCatalog>,
+
     /// Per-collection timeseries partition registries for this core.
     /// Key: (DatabaseId, TenantId, collection).
     pub(in crate::data::executor) ts_registries: HashMap<

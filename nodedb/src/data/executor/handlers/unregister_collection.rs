@@ -332,6 +332,7 @@ impl CoreLoop {
             self.ts_registries.remove(&key);
             self.ts_max_ingested_lsn.remove(&key);
             self.ts_last_value_caches.remove(&key);
+            self.ts_series_catalogs.remove(&key);
             r
         };
 
