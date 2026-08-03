@@ -13,6 +13,7 @@
 //!   The Ceiling resolver walks to earlier versions if the latest one
 //!   doesn't satisfy the predicate.
 
+use redb::ReadableDatabase;
 use std::collections::HashMap;
 
 use nodedb_types::{DatabaseId, TenantId, ms_to_ordinal_upper};

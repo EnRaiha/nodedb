@@ -7,7 +7,7 @@
 //! `ArrayCatalogEntry` via `ArrayId`'s tenant field — a second-level
 //! tenant prefix would only duplicate that information).
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use crate::control::array_catalog::ArrayCatalogEntry;
 
@@ -281,32 +281,40 @@ impl SystemCatalog {
             .db
             .begin_read()
             .map_err(|e| catalog_err("read txn", e))?;
-        let table = read_txn
-            .open_table(ARRAYS)
-            .map_err(|e| catalog_err("open arrays", e))?;
-        let mut rows = std::collections::HashMap::new();
-        let iter = table.iter().map_err(|e| catalog_err("iter arrays", e))?;
-        for row in iter {
-            let (key, value) = row.map_err(|e| catalog_err("iter row", e))?;
-            let entry: ArrayCatalogEntry =
-                zerompk::from_msgpack(value.value()).map_err(|e| catalog_err("deser array", e))?;
-            let is_v2 = key.value().starts_with('\0');
-            if !is_v2 && !matching_legacy_entry(&entry, entry.array_id.tenant_id, key.value()) {
-                continue;
-            }
-            let identity = array_identity(&entry);
-            match rows.entry(identity) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert((is_v2, entry));
-                }
-                std::collections::hash_map::Entry::Occupied(mut slot) if is_v2 && !slot.get().0 => {
-                    slot.insert((true, entry));
-                }
-                std::collections::hash_map::Entry::Occupied(_) => {}
-            }
-        }
-        Ok(rows.into_values().map(|(_, entry)| entry).collect())
+        load_all_arrays_in(&read_txn)
     }
+}
+
+/// Body of [`SystemCatalog::load_all_arrays`], over an already-open read
+/// transaction so the read-only catalog handle can reuse it verbatim.
+pub(super) fn load_all_arrays_in(
+    read_txn: &redb::ReadTransaction,
+) -> crate::Result<Vec<ArrayCatalogEntry>> {
+    let table = read_txn
+        .open_table(ARRAYS)
+        .map_err(|e| catalog_err("open arrays", e))?;
+    let mut rows = std::collections::HashMap::new();
+    let iter = table.iter().map_err(|e| catalog_err("iter arrays", e))?;
+    for row in iter {
+        let (key, value) = row.map_err(|e| catalog_err("iter row", e))?;
+        let entry: ArrayCatalogEntry =
+            zerompk::from_msgpack(value.value()).map_err(|e| catalog_err("deser array", e))?;
+        let is_v2 = key.value().starts_with('\0');
+        if !is_v2 && !matching_legacy_entry(&entry, entry.array_id.tenant_id, key.value()) {
+            continue;
+        }
+        let identity = array_identity(&entry);
+        match rows.entry(identity) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert((is_v2, entry));
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) if is_v2 && !slot.get().0 => {
+                slot.insert((true, entry));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+        }
+    }
+    Ok(rows.into_values().map(|(_, entry)| entry).collect())
 }
 
 #[cfg(test)]

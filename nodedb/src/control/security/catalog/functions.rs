@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use nodedb_types::id::DatabaseId;
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::dependencies::{DependencyList, dep_key, legacy_dep_key};
 use super::function_types::StoredFunction;

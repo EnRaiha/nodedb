@@ -3,6 +3,7 @@
 //! LSM segment blobs against `SEGMENTS`
 //! keyed by `(database_id, tenant_id, collection, segment_id)`.
 
+use redb::ReadableDatabase;
 use redb::ReadableTable as _;
 
 use super::core::RedbFtsBackend;

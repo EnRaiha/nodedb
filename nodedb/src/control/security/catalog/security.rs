@@ -6,6 +6,7 @@ use super::types::{
     API_KEYS, OWNERS, PERMISSIONS, ROLES, StoredApiKey, StoredOwner, StoredPermission, StoredRole,
     SystemCatalog, catalog_err, owner_key,
 };
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     // ── API Key operations ──────────────────────────────────────────

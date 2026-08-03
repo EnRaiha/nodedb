@@ -18,6 +18,7 @@
 //! A separate redb table is used so cursor writes never interfere with
 //! op-log reads.
 
+use redb::ReadableDatabase;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 

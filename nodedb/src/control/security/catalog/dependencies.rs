@@ -7,6 +7,7 @@
 
 use super::types::{DEPENDENCIES, SystemCatalog, catalog_err};
 use nodedb_types::id::DatabaseId;
+use redb::ReadableDatabase;
 use std::collections::HashMap;
 
 /// A single dependency edge: the source object references the target.

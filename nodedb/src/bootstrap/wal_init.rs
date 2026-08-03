@@ -108,8 +108,9 @@ fn load_tombstones(
     let catalog_path = config.catalog_path();
     let mut set = nodedb_wal::extract_tombstones(wal_records)
         .map_err(|error| anyhow::anyhow!("extract WAL tombstones: {error}"))?;
-    let catalog = crate::control::security::catalog::SystemCatalog::open(&catalog_path)
-        .map_err(|error| anyhow::anyhow!("open catalog for WAL tombstones: {error}"))?;
+    let Some(catalog) = crate::bootstrap::catalog_open::CatalogForRead::open(&catalog_path) else {
+        return Ok(set);
+    };
     let persisted = catalog
         .load_wal_tombstones()
         .map_err(|error| anyhow::anyhow!("load persisted WAL tombstones: {error}"))?;

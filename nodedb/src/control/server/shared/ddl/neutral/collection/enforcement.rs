@@ -13,12 +13,11 @@
 //! and `register::dispatch_register_from_stored_inner` (both also relocated) used
 //! this module, so it moved with them in full.
 
+use crate::bootstrap::constraint_reconcile::CollectionSource;
 use nodedb_types::DatabaseId;
 use sonic_rs;
 
-use crate::control::security::catalog::{
-    BalancedConstraintDef, StoredCollection, types::SystemCatalog,
-};
+use crate::control::security::catalog::{BalancedConstraintDef, StoredCollection};
 
 /// Parse `BALANCED ON (group_key = col, debit = 'DEBIT',
 /// credit = 'CREDIT', amount = col)` from the uppercase SQL
@@ -111,14 +110,14 @@ pub fn parse_balanced_clause_from_raw(
 /// from their `materialized_sums` definitions. These are placed
 /// on the SOURCE collection's `EnforcementOptions` so the Data
 /// Plane fires the trigger on INSERT.
-pub fn find_materialized_sum_bindings(
-    catalog: &SystemCatalog,
+pub fn find_materialized_sum_bindings<S: CollectionSource + ?Sized>(
+    catalog: &S,
     tenant_id: u64,
     collection_name: &str,
     database_id: DatabaseId,
 ) -> Vec<nodedb_physical::physical_plan::MaterializedSumBinding> {
     let all_collections = catalog
-        .load_collections_for_tenant(database_id, tenant_id)
+        .collections_for_tenant(database_id, tenant_id)
         .unwrap_or_default();
 
     let mut bindings = Vec::new();

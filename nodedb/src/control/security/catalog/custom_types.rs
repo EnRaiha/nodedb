@@ -5,6 +5,7 @@
 //! Persists `CREATE TYPE` definitions (enum and composite) via the
 //! `_system.custom_types` redb table. Key: `"{tenant_id}:{name}"`.
 
+use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 
 use super::types::{CUSTOM_TYPES, SystemCatalog, catalog_err};

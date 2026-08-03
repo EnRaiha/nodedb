@@ -4,6 +4,7 @@
 
 use super::sequence_types::{SequenceState, StoredSequence};
 use super::types::{SEQUENCE_STATE, SEQUENCES, SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     /// Store a sequence definition.

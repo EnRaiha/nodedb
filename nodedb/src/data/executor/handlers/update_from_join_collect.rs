@@ -11,6 +11,7 @@
 //! diverge on which rows match or what post-image each carries (mirrors how
 //! `collect_merge_plan` is shared between the MERGE resolve and apply passes).
 
+use redb::ReadableDatabase;
 use std::collections::HashMap;
 
 use nodedb_types::columnar::StrictSchema;

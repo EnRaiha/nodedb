@@ -2,6 +2,7 @@
 
 //! Synonym group metadata operations for the system catalog.
 
+use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 
 use super::types::{SYNONYM_GROUPS, SystemCatalog, catalog_err};

@@ -18,7 +18,7 @@
 
 use nodedb_types::DatabaseId;
 use nodedb_types::columnar::schema::{TS_SYSTEM, TS_VALID_FROM, TS_VALID_UNTIL};
-use redb::{ReadableTable, ReadableTableMetadata};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 use super::types::{COLLECTIONS, COLLECTIONS_LEGACY, StoredCollection, SystemCatalog, catalog_err};
 
@@ -156,34 +156,11 @@ impl SystemCatalog {
         database_id: DatabaseId,
         tenant_id: u64,
     ) -> crate::Result<Vec<StoredCollection>> {
-        let prefix = format!("{tenant_id}:");
-        let db_id = database_id.as_u64();
         let read_txn = self
             .db
             .begin_read()
             .map_err(|e| catalog_err("read txn", e))?;
-        let table = read_txn
-            .open_table(COLLECTIONS)
-            .map_err(|e| catalog_err("open collections", e))?;
-        let mut colls = Vec::new();
-        // Range over all entries with matching database_id prefix.
-        let range_start = (db_id, "");
-        let range_end = (db_id + 1, "");
-        for entry in table
-            .range(range_start..range_end)
-            .map_err(|e| catalog_err("range collections", e))?
-        {
-            let (key, value) = entry.map_err(|e| catalog_err("read collection", e))?;
-            let (_, inner) = key.value();
-            if inner.starts_with(&prefix) {
-                let coll: StoredCollection = zerompk::from_msgpack(value.value())
-                    .map_err(|e| catalog_err("deser collection", e))?;
-                if coll.is_active {
-                    colls.push(coll);
-                }
-            }
-        }
-        Ok(colls)
+        load_collections_for_tenant_in(&read_txn, database_id, tenant_id)
     }
 
     /// Load every soft-deleted collection across all tenants within a database.
@@ -230,29 +207,11 @@ impl SystemCatalog {
         database_id: DatabaseId,
         predicate: impl Fn(&StoredCollection) -> bool,
     ) -> crate::Result<Vec<StoredCollection>> {
-        let db_id = database_id.as_u64();
         let read_txn = self
             .db
             .begin_read()
             .map_err(|e| catalog_err("read txn", e))?;
-        let table = read_txn
-            .open_table(COLLECTIONS)
-            .map_err(|e| catalog_err("open collections", e))?;
-        let mut colls = Vec::new();
-        let range_start = (db_id, "");
-        let range_end = (db_id + 1, "");
-        for entry in table
-            .range(range_start..range_end)
-            .map_err(|e| catalog_err("range collections filter", e))?
-        {
-            let (_, value) = entry.map_err(|e| catalog_err("read collection", e))?;
-            let coll: StoredCollection = zerompk::from_msgpack(value.value())
-                .map_err(|e| catalog_err("deser collection", e))?;
-            if predicate(&coll) {
-                colls.push(coll);
-            }
-        }
-        Ok(colls)
+        scan_collections_filtered_in(&read_txn, database_id, predicate)
     }
 
     /// Hard-delete a collection row. Returns `true` if a row was
@@ -384,6 +343,68 @@ impl SystemCatalog {
             .commit()
             .map_err(|e| catalog_err("migrate_collections commit", e))
     }
+}
+
+/// Body of [`SystemCatalog::load_collections_for_tenant`], over an already-open
+/// read transaction so the read-only catalog handle can reuse it verbatim.
+pub(super) fn load_collections_for_tenant_in(
+    read_txn: &redb::ReadTransaction,
+    database_id: DatabaseId,
+    tenant_id: u64,
+) -> crate::Result<Vec<StoredCollection>> {
+    let prefix = format!("{tenant_id}:");
+    let db_id = database_id.as_u64();
+    let table = read_txn
+        .open_table(COLLECTIONS)
+        .map_err(|e| catalog_err("open collections", e))?;
+    let mut colls = Vec::new();
+    // Range over all entries with matching database_id prefix.
+    let range_start = (db_id, "");
+    let range_end = (db_id + 1, "");
+    for entry in table
+        .range(range_start..range_end)
+        .map_err(|e| catalog_err("range collections", e))?
+    {
+        let (key, value) = entry.map_err(|e| catalog_err("read collection", e))?;
+        let (_, inner) = key.value();
+        if inner.starts_with(&prefix) {
+            let coll: StoredCollection = zerompk::from_msgpack(value.value())
+                .map_err(|e| catalog_err("deser collection", e))?;
+            if coll.is_active {
+                colls.push(coll);
+            }
+        }
+    }
+    Ok(colls)
+}
+
+/// Body of [`SystemCatalog::load_all_collections`] / `scan_collections_filtered`,
+/// over an already-open read transaction so the read-only catalog handle can
+/// reuse it verbatim.
+pub(super) fn scan_collections_filtered_in(
+    read_txn: &redb::ReadTransaction,
+    database_id: DatabaseId,
+    predicate: impl Fn(&StoredCollection) -> bool,
+) -> crate::Result<Vec<StoredCollection>> {
+    let db_id = database_id.as_u64();
+    let table = read_txn
+        .open_table(COLLECTIONS)
+        .map_err(|e| catalog_err("open collections", e))?;
+    let mut colls = Vec::new();
+    let range_start = (db_id, "");
+    let range_end = (db_id + 1, "");
+    for entry in table
+        .range(range_start..range_end)
+        .map_err(|e| catalog_err("range collections filter", e))?
+    {
+        let (_, value) = entry.map_err(|e| catalog_err("read collection", e))?;
+        let coll: StoredCollection =
+            zerompk::from_msgpack(value.value()).map_err(|e| catalog_err("deser collection", e))?;
+        if predicate(&coll) {
+            colls.push(coll);
+        }
+    }
+    Ok(colls)
 }
 
 #[cfg(test)]

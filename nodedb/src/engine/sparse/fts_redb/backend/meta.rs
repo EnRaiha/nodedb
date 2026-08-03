@@ -6,6 +6,7 @@
 use super::core::RedbFtsBackend;
 use super::shared::redb_err;
 use crate::engine::sparse::fts_redb::tables::INDEX_META;
+use redb::ReadableDatabase;
 
 pub(super) fn read(
     backend: &RedbFtsBackend,

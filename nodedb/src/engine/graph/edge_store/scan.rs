@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use nodedb_types::{DatabaseId, TenantId};
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::store::{
     BaseKey, EDGES, Edge, EdgeRecord, EdgeStore, REVERSE_EDGES, TenantBaseKey, redb_err,

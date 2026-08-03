@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::warn;
 
 /// redb table: entry_id (u64) → MessagePack-serialized DlqEntry.

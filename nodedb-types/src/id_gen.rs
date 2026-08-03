@@ -7,7 +7,7 @@
 //! All IDs are represented as strings for JSON compatibility.
 //! UUID v7 and ULID are time-sortable (lexicographic order = chronological order).
 
-use rand::Rng;
+use rand::RngExt;
 
 use crate::id::{IdError, IdType};
 
@@ -45,7 +45,7 @@ pub fn uuid_version(s: &str) -> u8 {
 /// 128-bit: 48-bit timestamp (ms) + 80-bit random. Crockford Base32 encoded.
 /// Time-sortable: lexicographic order = chronological order.
 pub fn ulid() -> String {
-    ulid::Ulid::new().to_string()
+    ulid::Ulid::generate().to_string()
 }
 
 /// Validate whether a string is a valid ULID.

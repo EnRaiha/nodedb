@@ -383,7 +383,7 @@ pub fn issue_leaf_for_sans(
         .map_err(|e| ClusterError::Transport {
             detail: format!("issue node cert: {e}"),
         })?;
-    use rand::RngCore;
+    use rand::Rng;
     let mut cluster_secret = [0u8; 32];
     rand::rng().fill_bytes(&mut cluster_secret);
     let spki_pin = crate::transport::peer_identity_verifier::spki_pin_from_cert_der(cert.as_ref())

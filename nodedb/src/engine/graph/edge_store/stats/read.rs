@@ -19,6 +19,7 @@
 //! whose latest qualifying version at `ts` is not a sentinel. This is the same
 //! ceiling-resolution logic used by `ceiling_resolve_edge`, applied in aggregate.
 
+use redb::ReadableDatabase;
 use std::collections::HashMap;
 
 use nodedb_types::TenantId;

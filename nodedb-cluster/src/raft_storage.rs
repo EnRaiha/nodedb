@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::{debug, info};
 
 use nodedb_raft::message::LogEntry;

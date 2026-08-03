@@ -3,6 +3,7 @@
 //! Auth user catalog operations (redb persistence for JIT-provisioned users).
 
 use super::types::{AUTH_USERS, StoredAuthUser, SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     /// Insert or update a JIT-provisioned auth user.

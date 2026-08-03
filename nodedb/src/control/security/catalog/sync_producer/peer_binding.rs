@@ -15,6 +15,7 @@
 //! so a peer id reused across collections, which cannot collide, is not refused.
 
 use crate::control::security::catalog::types::{SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 /// Durable owner of each Loro peer id.
 ///

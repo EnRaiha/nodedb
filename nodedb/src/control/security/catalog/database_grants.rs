@@ -9,7 +9,7 @@
 //! enumerate all privileges for one user without secondary indexes.
 
 use nodedb_types::id::DatabaseId;
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{DATABASE_GRANTS, SystemCatalog, catalog_err};
 

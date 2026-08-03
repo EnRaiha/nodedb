@@ -3,6 +3,7 @@
 //! Blacklist catalog operations (redb persistence).
 
 use super::types::{BLACKLIST, StoredBlacklistEntry, SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     /// Insert or update a blacklist entry.

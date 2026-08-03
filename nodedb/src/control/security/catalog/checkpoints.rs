@@ -3,6 +3,7 @@
 //! Checkpoint metadata operations for the system catalog.
 
 use super::types::{CHECKPOINTS, CheckpointRecord, SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     /// Store a checkpoint record.

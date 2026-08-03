@@ -48,7 +48,7 @@ impl MacKey {
 
     /// A cryptographically random fresh key. Use at cluster bootstrap.
     pub fn random() -> Self {
-        use rand::RngCore;
+        use rand::Rng;
         let mut out = [0u8; MAC_LEN];
         rand::rng().fill_bytes(&mut out);
         Self(out)

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::ServerConfig;
+use crate::bootstrap::catalog_open::CatalogForRead;
 use crate::bridge::dispatch::{CoreChannelDataSide, Dispatcher};
 use crate::bridge::quiesce::CollectionQuiesce;
 use crate::control::array_catalog::ArrayCatalog;
@@ -27,8 +28,8 @@ pub fn load_array_catalog(
 ) -> crate::control::array_catalog::ArrayCatalogHandle {
     let array_catalog = ArrayCatalog::handle();
     let catalog_path = config.catalog_path();
-    match crate::control::security::catalog::SystemCatalog::open(&catalog_path) {
-        Ok(catalog) => match catalog.load_all_arrays() {
+    if let Some(catalog) = CatalogForRead::open(&catalog_path) {
+        match catalog.load_all_arrays() {
             Ok(entries) => {
                 let mut guard = array_catalog
                     .write()
@@ -42,9 +43,6 @@ pub fn load_array_catalog(
             Err(e) => {
                 tracing::warn!(error = %e, "failed to load _system.arrays at startup");
             }
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "could not open system catalog to load arrays");
         }
     }
     array_catalog
@@ -68,12 +66,8 @@ pub fn load_doc_config_registry(
     config: &ServerConfig,
 ) -> Vec<crate::data::executor::core_loop::DocConfigSeedEntry> {
     let catalog_path = config.catalog_path();
-    let catalog = match crate::control::security::catalog::SystemCatalog::open(&catalog_path) {
-        Ok(catalog) => catalog,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not open system catalog to seed doc_configs");
-            return Vec::new();
-        }
+    let Some(catalog) = CatalogForRead::open(&catalog_path) else {
+        return Vec::new();
     };
 
     let all = match crate::bootstrap::constraint_reconcile::load_collections(&catalog) {
@@ -112,12 +106,8 @@ pub fn load_vector_index_param_seed(
     config: &ServerConfig,
 ) -> Vec<nodedb_types::StoredVectorIndexParams> {
     let catalog_path = config.catalog_path();
-    let catalog = match crate::control::security::catalog::SystemCatalog::open(&catalog_path) {
-        Ok(catalog) => catalog,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not open system catalog to seed vector index params");
-            return Vec::new();
-        }
+    let Some(catalog) = CatalogForRead::open(&catalog_path) else {
+        return Vec::new();
     };
     match catalog.list_all_vector_index_params() {
         Ok(entries) => entries,
@@ -156,12 +146,8 @@ pub fn load_columnar_schema_seed(
     nodedb_types::columnar::ColumnarSchema,
 )> {
     let catalog_path = config.catalog_path();
-    let catalog = match crate::control::security::catalog::SystemCatalog::open(&catalog_path) {
-        Ok(catalog) => catalog,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not open system catalog to seed columnar schemas");
-            return Vec::new();
-        }
+    let Some(catalog) = CatalogForRead::open(&catalog_path) else {
+        return Vec::new();
     };
 
     let all = match crate::bootstrap::constraint_reconcile::load_collections(&catalog) {

@@ -12,7 +12,7 @@
 //! truncated past retention (i.e. no replay will ever observe the
 //! shadow-worthy writes again).
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{SystemCatalog, WAL_TOMBSTONES, catalog_err};
 
@@ -57,24 +57,7 @@ impl SystemCatalog {
             .db
             .begin_read()
             .map_err(|e| catalog_err("load_wal_tombstones read txn", e))?;
-        let table = read_txn
-            .open_table(WAL_TOMBSTONES)
-            .map_err(|e| catalog_err("open wal_tombstones", e))?;
-        let mut set = nodedb_wal::TombstoneSet::new();
-        for entry in table
-            .range::<(u64, u64, &str)>(..)
-            .map_err(|e| catalog_err("range wal_tombstones", e))?
-        {
-            let (key, value) = entry.map_err(|e| catalog_err("read wal_tombstone", e))?;
-            let (database_id, tenant_id, collection) = key.value();
-            set.insert(
-                database_id,
-                tenant_id,
-                collection.to_string(),
-                value.value(),
-            );
-        }
-        Ok(set)
+        load_wal_tombstones_in(&read_txn)
     }
 
     /// GC tombstones whose `purge_lsn < min_retained_lsn`. Intended to be
@@ -118,6 +101,31 @@ impl SystemCatalog {
             .map_err(|e| catalog_err("gc commit wal_tombstones", e))?;
         Ok(removed)
     }
+}
+
+/// Body of [`SystemCatalog::load_wal_tombstones`], over an already-open read
+/// transaction so the read-only catalog handle can reuse it verbatim.
+pub(super) fn load_wal_tombstones_in(
+    read_txn: &redb::ReadTransaction,
+) -> crate::Result<nodedb_wal::TombstoneSet> {
+    let table = read_txn
+        .open_table(WAL_TOMBSTONES)
+        .map_err(|e| catalog_err("open wal_tombstones", e))?;
+    let mut set = nodedb_wal::TombstoneSet::new();
+    for entry in table
+        .range::<(u64, u64, &str)>(..)
+        .map_err(|e| catalog_err("range wal_tombstones", e))?
+    {
+        let (key, value) = entry.map_err(|e| catalog_err("read wal_tombstone", e))?;
+        let (database_id, tenant_id, collection) = key.value();
+        set.insert(
+            database_id,
+            tenant_id,
+            collection.to_string(),
+            value.value(),
+        );
+    }
+    Ok(set)
 }
 
 #[cfg(test)]

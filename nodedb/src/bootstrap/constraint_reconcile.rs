@@ -25,7 +25,9 @@ use std::time::Duration;
 use nodedb_types::{DatabaseId, TenantId};
 use tracing::{debug, warn};
 
-use crate::control::security::catalog::{StoredCollection, SystemCatalog, collection_constraints};
+use crate::control::security::catalog::{
+    ReadOnlySystemCatalog, StoredCollection, SystemCatalog, collection_constraints,
+};
 use crate::control::state::SharedState;
 use crate::control::wal_replication::{
     ConstraintChangeOp, ReplicatedEntry, ReplicatedWrite, propose_replicated_entry,
@@ -185,8 +187,52 @@ pub async fn reconcile_once(
 /// Load every collection across every database the node owns, tagged with its
 /// owning [`DatabaseId`]. `StoredCollection` does not carry its database id, so
 /// it is paired here from the enumeration that produced it.
-pub(crate) fn load_collections(
-    catalog: &SystemCatalog,
+/// The two catalog reads [`load_collections`] needs, so it can run against
+/// either a read-write [`SystemCatalog`] or a [`ReadOnlySystemCatalog`].
+pub trait CollectionSource {
+    fn list_database_ids(&self) -> crate::Result<Vec<DatabaseId>>;
+    fn collections_in(&self, database_id: DatabaseId) -> crate::Result<Vec<StoredCollection>>;
+    fn collections_for_tenant(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+    ) -> crate::Result<Vec<StoredCollection>>;
+}
+
+impl CollectionSource for SystemCatalog {
+    fn list_database_ids(&self) -> crate::Result<Vec<DatabaseId>> {
+        Ok(self.list_databases()?.into_iter().map(|db| db.id).collect())
+    }
+    fn collections_in(&self, database_id: DatabaseId) -> crate::Result<Vec<StoredCollection>> {
+        self.load_all_collections(database_id)
+    }
+    fn collections_for_tenant(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+    ) -> crate::Result<Vec<StoredCollection>> {
+        self.load_collections_for_tenant(database_id, tenant_id)
+    }
+}
+
+impl CollectionSource for ReadOnlySystemCatalog {
+    fn list_database_ids(&self) -> crate::Result<Vec<DatabaseId>> {
+        Ok(self.list_databases()?.into_iter().map(|db| db.id).collect())
+    }
+    fn collections_in(&self, database_id: DatabaseId) -> crate::Result<Vec<StoredCollection>> {
+        self.load_all_collections(database_id)
+    }
+    fn collections_for_tenant(
+        &self,
+        database_id: DatabaseId,
+        tenant_id: u64,
+    ) -> crate::Result<Vec<StoredCollection>> {
+        self.load_collections_for_tenant(database_id, tenant_id)
+    }
+}
+
+pub(crate) fn load_collections<S: CollectionSource + ?Sized>(
+    catalog: &S,
 ) -> crate::Result<Vec<(DatabaseId, StoredCollection)>> {
     // Always enumerate the default database, then any explicitly-created ones.
     // Collections created without a `CREATE DATABASE` live under
@@ -195,14 +241,14 @@ pub(crate) fn load_collections(
     // default id for the same reason. Routing solely through `list_databases()`
     // would silently deliver nothing for those collections.
     let mut db_ids: Vec<DatabaseId> = vec![DatabaseId::DEFAULT];
-    for db in catalog.list_databases()? {
-        if db.id != DatabaseId::DEFAULT {
-            db_ids.push(db.id);
+    for id in catalog.list_database_ids()? {
+        if id != DatabaseId::DEFAULT {
+            db_ids.push(id);
         }
     }
     let mut out = Vec::new();
     for db_id in db_ids {
-        for stored in catalog.load_all_collections(db_id)? {
+        for stored in catalog.collections_in(db_id)? {
             out.push((db_id, stored));
         }
     }

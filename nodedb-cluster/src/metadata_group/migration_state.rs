@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use redb::ReadableDatabase;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

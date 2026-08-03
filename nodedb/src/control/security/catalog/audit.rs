@@ -2,7 +2,7 @@
 
 //! Audit log operations for the system catalog.
 
-use redb::ReadableTableMetadata;
+use redb::{ReadableDatabase, ReadableTableMetadata};
 
 use super::types::{AUDIT_LOG, StoredAuditEntry, SystemCatalog, catalog_err};
 

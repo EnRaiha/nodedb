@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{CONSUMER_GROUPS, SystemCatalog, catalog_err};
 use crate::event::cdc::consumer_group::ConsumerGroupDef;

@@ -8,6 +8,7 @@
 //! in sync on every failure and success event.
 
 use super::types::{LOCKOUT_STATE, SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 /// Re-export the table definition so `system_catalog.rs` can open it during
 /// catalog initialization without reaching into `types` directly.

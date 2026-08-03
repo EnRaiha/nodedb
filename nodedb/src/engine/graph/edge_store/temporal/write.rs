@@ -3,7 +3,7 @@
 //! Bitemporal write paths on `EdgeStore`:
 //! `put_edge_versioned`, `soft_delete_edge`, `gdpr_erase_edge`.
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::keys::{
     EdgeRef, GDPR_ERASURE_SENTINEL, TOMBSTONE_SENTINEL, edge_version_prefix, is_sentinel,

@@ -11,7 +11,7 @@
 //! Conversions: [`StoredRlsPolicy::from_runtime`] for serialization,
 //! [`StoredRlsPolicy::to_runtime`] for replay on apply / boot.
 
-use redb::TableDefinition;
+use redb::{ReadableDatabase, TableDefinition};
 
 use crate::control::security::deny::DenyMode;
 use crate::control::security::predicate::{PolicyMode, RlsPredicate};

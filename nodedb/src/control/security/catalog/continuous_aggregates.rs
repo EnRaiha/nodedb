@@ -3,6 +3,7 @@
 //! Continuous-aggregate metadata operations for the system catalog.
 
 use super::types::{CONTINUOUS_AGGREGATES, StoredContinuousAggregate, SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     /// Store a continuous-aggregate record.

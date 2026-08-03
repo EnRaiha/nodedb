@@ -9,6 +9,7 @@
 
 use crate::data::executor::core_loop::CoreLoop;
 use crate::data::executor::doc_format;
+use redb::ReadableDatabase;
 
 impl CoreLoop {
     /// Build the source join map `join_val → source document`.

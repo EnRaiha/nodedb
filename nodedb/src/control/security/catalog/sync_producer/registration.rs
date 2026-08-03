@@ -7,6 +7,7 @@
 //! crash-safety, matching the pattern used by every other `_system.*` table.
 
 use crate::control::security::catalog::types::{SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 /// Per-Lite-client producer registration rows.
 ///

@@ -7,6 +7,7 @@
 //! or missing root fails closed on restart instead of silently deriving
 //! different keys.
 
+use redb::ReadableDatabase;
 use sha2::{Digest as _, Sha256};
 
 use crate::control::security::catalog::types::{SystemCatalog, catalog_err};

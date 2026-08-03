@@ -3,6 +3,8 @@
 //! Ghost stub refcount persistence — survives restarts so ghost
 //! edges aren't counted twice after a crash.
 
+use redb::ReadableDatabase;
+
 use crate::error::Result;
 use crate::ghost::GhostTable;
 

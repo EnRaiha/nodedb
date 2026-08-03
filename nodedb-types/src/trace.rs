@@ -10,7 +10,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 // ── TraceId ──────────────────────────────────────────────────────────────────

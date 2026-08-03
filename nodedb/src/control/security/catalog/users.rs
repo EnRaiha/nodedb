@@ -3,6 +3,7 @@
 //! User CRUD operations for the system catalog.
 
 use super::types::{METADATA, StoredUser, SystemCatalog, USERS, catalog_err};
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     /// Load all active users from the catalog.

@@ -2,6 +2,7 @@
 
 //! Schedule metadata operations for the system catalog.
 
+use redb::ReadableDatabase;
 use std::collections::HashMap;
 
 use nodedb_types::id::DatabaseId;

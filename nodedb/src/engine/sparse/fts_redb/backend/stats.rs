@@ -3,7 +3,7 @@
 //! Corpus statistics against the dedicated `STATS` table
 //! keyed by `(database_id, tenant_id, collection)`.
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::core::RedbFtsBackend;
 use super::shared::redb_err;

@@ -15,6 +15,7 @@
 //! Phase 3: Walk source rows that had no target match.  Evaluate WHEN NOT
 //!   MATCHED arms in order; apply the first whose extra_predicate is satisfied.
 
+use redb::ReadableDatabase;
 use tracing::debug;
 
 use super::merge_helpers::{

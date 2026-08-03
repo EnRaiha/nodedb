@@ -4,6 +4,7 @@
 use super::trigger_types::StoredTrigger;
 use super::types::{SystemCatalog, TRIGGERS, catalog_err};
 use nodedb_types::id::DatabaseId;
+use redb::ReadableDatabase;
 use std::collections::HashMap;
 
 impl SystemCatalog {

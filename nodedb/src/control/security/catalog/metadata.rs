@@ -2,7 +2,7 @@
 
 //! Metadata counter and tenant operations for the system catalog.
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::tenant_id_hwm::{HWM_KEY, TENANT_ID_HWM};
 use super::types::{

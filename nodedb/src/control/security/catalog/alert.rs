@@ -4,6 +4,7 @@
 
 use super::types::{ALERT_RULES, SystemCatalog, catalog_err};
 use crate::event::alert::types::AlertDef;
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     /// Store an alert rule definition.

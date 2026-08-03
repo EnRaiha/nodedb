@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use nodedb_array::sync::hlc::Hlc;
 use nodedb_array::sync::snapshot::{SnapshotSink, TileSnapshot, decode_snapshot, encode_snapshot};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::warn;
 
 /// Legacy name-only table. It is read only for DEFAULT-database fallback.

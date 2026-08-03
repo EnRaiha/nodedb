@@ -85,8 +85,8 @@ faultbox = { version = "0.1" }
 serde = { version = "1", features = ["derive"] }
 
 # Memory
-tikv-jemallocator = "0.6"
-tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = "0.7"
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 
 # System
 libc = "0.2"
@@ -95,11 +95,14 @@ libc = "0.2"
 crc32c = "0.6"
 
 # Crypto
+# Pinned to the digest 0.10 generation: `rsa` (JWT RS256) has no release on
+# digest 0.11, so sha2 0.11 / hmac 0.13 / aes-gcm 0.11 / p256 0.14 cannot be
+# adopted until it does.
 hmac = "0.12"
 hkdf = "0.12"
 subtle = "2"
-base64 = "0.22"
-getrandom = { version = "0.3", features = ["std"] }
+base64 = "0.23"
+getrandom = { version = "0.4", features = ["std"] }
 aes-gcm = "0.10"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
@@ -116,16 +119,17 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
 
 # HTTP client (JWKS fetch)
-reqwest = { version = "0.12", default-features = false, features = [
-  "rustls-tls",
+reqwest = { version = "0.13", default-features = false, features = [
+  "rustls",
   "json",
+  "query",
 ] }
 
 # Hashing
 sha2 = { version = "0.10", features = ["oid"] }
 
 # WASM runtime
-wasmtime = { version = "45", default-features = false, features = [
+wasmtime = { version = "47", default-features = false, features = [
   "cranelift",
   "runtime",
 ] }
@@ -135,17 +139,17 @@ memmap2 = "0.9"
 
 # Cold storage
 parquet = "59"
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 bytes = "1"
 
 # io_uring
 io-uring = "0.7"
 
 # CRDTs
-loro = "=1.13.0"
+loro = "=1.13.9"
 
 # Kafka bridge
-rdkafka = { version = "0.36", features = ["cmake-build"] }
+rdkafka = { version = "0.39", features = ["cmake-build"] }
 
 # zlib: rdkafka-sys (and other transitive C deps) link libz dynamically by
 # default, which makes the release binary depend on libz.so.1 at runtime and
@@ -158,7 +162,7 @@ libz-sys = { version = "1", features = ["static"] }
 regex = "1"
 
 # Protobuf + compression (Prometheus remote write/read, OTLP)
-prost = "0.13"
+prost = "0.14"
 snap = "1"
 flate2 = "1"
 tonic = "0.14"
@@ -167,7 +171,7 @@ tonic = "0.14"
 arrow = { version = "59", default-features = false, features = ["ipc"] }
 
 # Config & serialization
-toml = "0.8"
+toml = "1"
 anyhow = "1"
 serde_json = "1"
 sonic-rs = "0.5"
@@ -175,7 +179,7 @@ chrono = { version = "0.4", features = ["std"], default-features = false }
 
 # MessagePack
 rmpv = "1"
-zerompk = { version = "0.6", features = ["std", "derive"] }
+zerompk = { version = "0.7", features = ["std", "derive"] }
 
 # Bitmap
 roaring = "0.11"
@@ -193,10 +197,10 @@ bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
 
 # WebSocket
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 
 # Storage
-redb = "2"
+redb = "4"
 
 # Temp files (external sort spill)
 tempfile = "3"
@@ -216,15 +220,15 @@ memchr = "2.7"
 lexical-core = "1"
 
 # Random
-rand = "0.9"
+rand = "0.10"
 
 # ID types
 uuid = { version = "1", features = ["v4", "v7", "serde", "js"] }
 
 # Inline-allocated small vectors
 smallvec = { version = "1", features = ["serde"] }
-ulid = "1"
-nanoid = "0.4"
+ulid = "3"
+nanoid = "0.5"
 
 # Arbitrary-precision decimal
 rust_decimal = { version = "1", features = ["serde-with-str"] }
@@ -239,18 +243,20 @@ nexar = "0.1"
 h3o = "0.10"
 
 # Linear algebra (SVD, matrix ops for OPQ Procrustes rotation)
-nalgebra = "0.33"
+nalgebra = "0.35"
 
 # Compression
 zstd = "0.13"
-lz4_flex = { version = "0.11", default-features = false, features = [
+# `alloc`, not `std`: the codec crate must stay usable from the wasm builds.
+lz4_flex = { version = "0.14", default-features = false, features = [
   "safe-encode",
   "safe-decode",
+  "alloc",
 ] }
 pco = "1"
 
 # PostgreSQL wire protocol
-pgwire = { version = "0.38", default-features = false, features = [
+pgwire = { version = "0.40", default-features = false, features = [
   "server-api-aws-lc-rs",
 ] }
 postgres-types = "0.2"
@@ -264,7 +270,7 @@ async-stream = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 
 # TLS
 tokio-rustls = { version = "0.26", default-features = false, features = [

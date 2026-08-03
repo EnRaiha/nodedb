@@ -13,7 +13,7 @@
 //!   for orphan-protection checks at DROP DATABASE time.
 
 use nodedb_types::DatabaseId;
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{
     CLONE_COPYUPS, CLONE_KV_TOMBSTONES, CLONE_LINEAGE, CLONE_TOMBSTONES, SystemCatalog, catalog_err,

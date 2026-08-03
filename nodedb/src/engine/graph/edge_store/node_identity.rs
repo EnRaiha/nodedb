@@ -13,7 +13,7 @@
 //! removal.
 
 use nodedb_types::{DatabaseId, TenantId};
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::store::{EdgeStore, NODE_SURROGATES, redb_err};
 

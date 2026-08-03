@@ -5,7 +5,7 @@
 //! Keyed by `provider_name` (string). Stores issuer, JWKS URI, audience, and
 //! claim-mapping rules used by the OIDC verify path.
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::tables::OIDC_PROVIDERS;
 use super::types::{SystemCatalog, catalog_err};

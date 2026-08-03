@@ -2,6 +2,7 @@
 
 //! Node-level cascade: soft-delete every edge incident on a node.
 
+use redb::ReadableDatabase;
 use std::collections::HashMap;
 
 use super::store::{BaseKey, EDGES, EdgeStore, redb_err};

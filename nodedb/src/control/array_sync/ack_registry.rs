@@ -13,7 +13,7 @@ use std::sync::Arc;
 use nodedb_array::sync::ack::AckVector;
 use nodedb_array::sync::hlc::Hlc;
 use nodedb_array::sync::replica_id::ReplicaId;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::warn;
 
 use crate::types::DatabaseId;

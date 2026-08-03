@@ -2,6 +2,7 @@
 
 //! Streaming MV metadata operations for the system catalog.
 
+use redb::ReadableDatabase;
 use std::collections::HashMap;
 
 use crate::event::streaming_mv::StreamingMvDef;

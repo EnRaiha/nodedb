@@ -75,7 +75,7 @@ impl AuthConfig {
 }
 
 fn generate_superuser_password() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut rng = rand::rng();
     (0..24)

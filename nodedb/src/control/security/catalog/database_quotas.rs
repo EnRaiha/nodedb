@@ -9,7 +9,7 @@
 //! accepts the default of "no global limit".
 
 use nodedb_types::{DatabaseId, QuotaRecord};
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{DATABASE_QUOTAS, SystemCatalog, catalog_err};
 

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::consumer_groups::decode_consumer_group;

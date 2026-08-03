@@ -11,6 +11,7 @@ use super::types::catalog_err;
 use crate::control::server::shared::ddl::neutral::tenant::move_tenant::journal::{
     MOVE_TENANT_JOURNAL, MoveTenantJournalEntry,
 };
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     /// Load the journal entry for `tenant_id`, if one exists.

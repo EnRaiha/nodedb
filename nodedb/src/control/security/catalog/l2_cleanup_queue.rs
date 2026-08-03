@@ -15,7 +15,7 @@
 //!
 //! Surface: `SystemCatalog::{enqueue,list,update_attempt,remove}_l2_cleanup`.
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{L2_CLEANUP_QUEUE, SystemCatalog, catalog_err};
 

@@ -23,6 +23,7 @@
 //! handlers can all depend on a protocol-neutral home instead of reaching
 //! across the pgwire boundary.
 
+use crate::bootstrap::constraint_reconcile::CollectionSource;
 use crate::control::security::catalog::StoredCollection;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
@@ -201,8 +202,8 @@ fn build_timeseries_schema(
 ///   path): seeds every core's `doc_configs` synchronously, before WAL
 ///   redo replay runs, so strict collections re-encode Binary Tuple
 ///   instead of falling through to the raw-MessagePack fallback.
-pub(crate) fn build_doc_config_from_stored(
-    catalog: &crate::control::security::catalog::SystemCatalog,
+pub(crate) fn build_doc_config_from_stored<S: CollectionSource + ?Sized>(
+    catalog: &S,
     tenant_id: crate::types::TenantId,
     coll: &StoredCollection,
     indexes: &[nodedb_physical::physical_plan::RegisteredIndex],

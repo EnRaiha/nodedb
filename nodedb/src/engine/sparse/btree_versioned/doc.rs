@@ -2,7 +2,7 @@
 
 //! Document-level operations on the versioned document table.
 
-use redb::{ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::key::{
     coll_prefix, coll_prefix_end, doc_prefix, doc_prefix_end, format_sys_from, versioned_doc_key,

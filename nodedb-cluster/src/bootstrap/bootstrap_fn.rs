@@ -103,7 +103,7 @@ pub(super) fn bootstrap(
 
 /// Generate a unique cluster ID (random u64).
 fn generate_cluster_id() -> u64 {
-    use rand::Rng;
+    use rand::RngExt;
     rand::rng().random::<u64>()
 }
 

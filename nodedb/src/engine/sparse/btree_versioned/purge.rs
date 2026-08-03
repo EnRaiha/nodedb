@@ -8,7 +8,7 @@
 //! the Ceiling read for any future `AS OF` cutoff still sees the row's
 //! terminal state.
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::doc::DOCUMENTS_VERSIONED;
 use super::index::INDEXES_VERSIONED;

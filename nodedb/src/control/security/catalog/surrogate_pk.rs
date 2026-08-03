@@ -21,7 +21,7 @@
 //! already non-empty.
 
 use nodedb_types::{DatabaseId, Surrogate, TenantId};
-use redb::{ReadableTable, ReadableTableMetadata};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 #[allow(unused_imports)] // SURROGATE_PK_REV_LEGACY is used only in #[cfg(test)] helpers
 use super::types::{

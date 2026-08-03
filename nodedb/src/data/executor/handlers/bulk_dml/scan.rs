@@ -2,6 +2,7 @@
 
 use crate::bridge::scan_filter::ScanFilter;
 use crate::data::executor::core_loop::CoreLoop;
+use redb::ReadableDatabase;
 
 impl CoreLoop {
     /// Scan documents in a collection matching the given filters.

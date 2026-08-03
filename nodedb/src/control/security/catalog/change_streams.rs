@@ -5,6 +5,7 @@
 use super::types::{CHANGE_STREAMS, SystemCatalog, catalog_err};
 use crate::event::cdc::stream_def::ChangeStreamDef;
 use crate::types::DatabaseId;
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     /// Store a change stream definition.

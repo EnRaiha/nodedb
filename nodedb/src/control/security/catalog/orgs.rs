@@ -3,6 +3,7 @@
 //! Organization catalog operations (redb persistence).
 
 use super::types::{ORG_MEMBERS, ORGS, SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 /// Serializable organization record for redb storage.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]

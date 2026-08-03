@@ -2,6 +2,8 @@
 
 //! Topology and routing-table save / load.
 
+use redb::ReadableDatabase;
+
 use crate::error::{ClusterError, Result};
 use crate::routing::RoutingTable;
 use crate::topology::ClusterTopology;

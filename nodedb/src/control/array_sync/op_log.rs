@@ -16,7 +16,7 @@ use nodedb_array::sync::hlc::Hlc;
 use nodedb_array::sync::op::ArrayOp;
 use nodedb_array::sync::op_codec;
 use nodedb_array::sync::op_log::{OpIter, OpLog};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::warn;
 
 use crate::types::DatabaseId;

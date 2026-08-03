@@ -10,6 +10,7 @@
 
 use super::index_record::StoredIndexRecord;
 use super::types::{INDEX_REGISTRY, SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 /// Key of one index record.
 fn index_key(database_id: u64, tenant_id: u64, name: &str) -> String {

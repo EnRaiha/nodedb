@@ -6,6 +6,7 @@
 //! Key format: `"{tenant_id}:{collection}:{column}"`.
 
 use nodedb_types::VectorModelEntry;
+use redb::ReadableDatabase;
 
 use super::types::{SystemCatalog, VECTOR_MODEL_METADATA, catalog_err};
 

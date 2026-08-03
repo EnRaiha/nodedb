@@ -5,7 +5,7 @@
 //! Index key: `"{database_id}:{tenant}:{coll}:{field}:{value}:{doc_id}\x00{sys_from:020}"`.
 //! Value: single byte (`0x00` live, `0xFF` tombstone).
 
-use redb::TableDefinition;
+use redb::{ReadableDatabase, TableDefinition};
 
 use super::key::format_sys_from;
 use super::value::{TAG_LIVE, TAG_TOMBSTONE, VersionedIndexEntry};

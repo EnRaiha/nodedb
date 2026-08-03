@@ -8,7 +8,7 @@
 //! the check is skipped.
 
 use nodedb_types::{DatabaseId, QuotaRecord, TenantId};
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::database_quotas::GlobalQuotaCeiling;
 use super::types::{SystemCatalog, TENANT_QUOTAS, catalog_err};

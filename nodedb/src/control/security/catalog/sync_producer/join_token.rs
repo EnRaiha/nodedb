@@ -6,6 +6,7 @@
 //! restarts mid-enrollment resumes with the same view of every token.
 
 use crate::control::security::catalog::types::{SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 /// Durable apply-side image of Raft-replicated join-token lifecycle state.
 pub const JOIN_TOKEN_STATES: redb::TableDefinition<&[u8], &[u8]> =

@@ -7,6 +7,8 @@
 //! after the first bootstrap requires a coordinated cluster-wide migration;
 //! the format version guard in `migration.rs` gates upgrades.
 
+use redb::ReadableDatabase;
+
 use crate::catalog::core::ClusterCatalog;
 use crate::catalog::schema::{METADATA_TABLE, catalog_err};
 use crate::error::Result;

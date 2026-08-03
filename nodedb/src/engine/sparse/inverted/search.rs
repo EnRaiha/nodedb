@@ -3,6 +3,7 @@
 //! Search paths for the inverted index: BM25, phrase, fuzzy, and the
 //! highlighting/offset helpers used by the SQL projection layer.
 
+use redb::ReadableDatabase;
 use tracing::debug;
 
 use nodedb_fts::FtsSearchParams;

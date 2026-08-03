@@ -3,6 +3,7 @@
 //! Raft-replicated enrollment exceptions, keyed by certificate SPKI.
 
 use crate::control::security::catalog::types::{SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 /// Active Raft-replicated enrollment exceptions, keyed by certificate SPKI.
 pub const ENROLLMENT_PREAUTHORIZATIONS: redb::TableDefinition<&[u8], u64> =

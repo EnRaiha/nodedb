@@ -13,7 +13,7 @@ use nodedb_array::sync::HlcGenerator;
 use nodedb_array::sync::hlc::Hlc;
 use nodedb_array::sync::replica_id::ReplicaId;
 use nodedb_array::sync::schema_crdt::SchemaDoc;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use tracing::warn;
 
 use crate::Error;

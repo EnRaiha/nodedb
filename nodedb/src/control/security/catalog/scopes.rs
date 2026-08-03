@@ -3,6 +3,7 @@
 //! Scope catalog operations (redb persistence).
 
 use super::types::{SCOPE_GRANTS, SCOPES, SystemCatalog, catalog_err};
+use redb::ReadableDatabase;
 
 /// Serializable scope definition for redb storage.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]

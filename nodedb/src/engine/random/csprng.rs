@@ -6,7 +6,7 @@
 //! When a seed is provided, the same seed + same data produces the same result.
 //! When no seed is provided, uses OS entropy.
 
-use rand::Rng;
+use rand::RngExt;
 use rand::rngs::StdRng;
 
 /// Seedable random number generator.
@@ -22,7 +22,7 @@ impl SeedableRng {
     pub fn from_entropy() -> Self {
         use rand::SeedableRng as _;
         Self {
-            inner: StdRng::from_os_rng(),
+            inner: StdRng::from_rng(&mut rand::rng()),
         }
     }
 

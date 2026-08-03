@@ -2,6 +2,7 @@
 
 //! Table scanning and import/export methods for `SparseEngine`.
 
+use redb::ReadableDatabase;
 use tracing::debug;
 
 use super::btree::{DOCUMENTS, INDEXES, SparseEngine, coll_prefix, redb_err, tenant_prefix};

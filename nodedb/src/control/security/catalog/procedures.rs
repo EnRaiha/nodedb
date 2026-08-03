@@ -4,6 +4,7 @@
 use super::procedure_types::StoredProcedure;
 use super::types::{PROCEDURES, SystemCatalog, catalog_err};
 use nodedb_types::id::DatabaseId;
+use redb::ReadableDatabase;
 use std::collections::HashMap;
 
 impl SystemCatalog {

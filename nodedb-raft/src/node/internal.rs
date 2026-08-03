@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use rand::Rng;
+use rand::RngExt;
 use tracing::{debug, info};
 
 use crate::error::RaftError;

@@ -23,7 +23,7 @@
 //! Surface: `SystemCatalog::{enqueue,load,record_attempt,remove}_pending_reclaim`.
 //! Structure mirrors `l2_cleanup_queue.rs`.
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{PENDING_RECLAIM, SystemCatalog, catalog_err};
 

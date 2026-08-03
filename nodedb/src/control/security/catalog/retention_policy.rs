@@ -4,6 +4,7 @@
 
 use super::types::{RETENTION_POLICIES, SystemCatalog, catalog_err};
 use crate::engine::timeseries::retention_policy::RetentionPolicyDef;
+use redb::ReadableDatabase;
 
 impl SystemCatalog {
     /// Store a retention policy definition.

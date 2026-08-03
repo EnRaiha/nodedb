@@ -27,7 +27,7 @@ impl ProbeScheduler {
     /// Construct a scheduler with a non-deterministic seed. Production.
     pub fn new() -> Self {
         Self {
-            rng: SmallRng::from_os_rng(),
+            rng: SmallRng::from_rng(&mut rand::rng()),
             queue: Vec::new(),
         }
     }

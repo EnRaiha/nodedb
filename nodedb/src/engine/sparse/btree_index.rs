@@ -5,7 +5,7 @@
 //! Index key format: `"{database_id}:{tenant_id}:{collection}:{field}:{value}:{document_id}"`.
 //! Extracted from `btree.rs` — document CRUD stays there, index ops live here.
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 use tracing::debug;
 
 use super::btree::{DOCUMENTS, INDEXES, SparseEngine, coll_prefix, redb_err};

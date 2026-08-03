@@ -15,7 +15,7 @@
 //! mutations together.
 
 use nodedb_types::{DatabaseId, Lsn, MirrorLagRecord};
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use super::types::{MIRROR_COLLECTION_MAP, MIRROR_LAG, SystemCatalog, catalog_err};
 

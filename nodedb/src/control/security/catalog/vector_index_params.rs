@@ -6,6 +6,7 @@
 //! `_system.vector_index_params`. Key format: `"{tenant_id}:{collection}:{field_name}"`.
 
 use nodedb_types::StoredVectorIndexParams;
+use redb::ReadableDatabase;
 
 use super::types::{SystemCatalog, VECTOR_INDEX_PARAMS, catalog_err};
 
@@ -94,22 +95,30 @@ impl SystemCatalog {
             .db
             .begin_read()
             .map_err(|e| catalog_err("read txn", e))?;
-        let table = read_txn
-            .open_table(VECTOR_INDEX_PARAMS)
-            .map_err(|e| catalog_err("open vector_index_params", e))?;
-
-        let mut entries = Vec::new();
-        for item in table
-            .range::<&str>(..)
-            .map_err(|e| catalog_err("range vector index params", e))?
-        {
-            let (_, value) = item.map_err(|e| catalog_err("read vector index params", e))?;
-            let entry: StoredVectorIndexParams = zerompk::from_msgpack(value.value())
-                .map_err(|e| catalog_err("deser vector index params", e))?;
-            entries.push(entry);
-        }
-        Ok(entries)
+        list_all_vector_index_params_in(&read_txn)
     }
+}
+
+/// Body of [`SystemCatalog::list_all_vector_index_params`], over an already-open
+/// read transaction so the read-only catalog handle can reuse it verbatim.
+pub(super) fn list_all_vector_index_params_in(
+    read_txn: &redb::ReadTransaction,
+) -> crate::Result<Vec<StoredVectorIndexParams>> {
+    let table = read_txn
+        .open_table(VECTOR_INDEX_PARAMS)
+        .map_err(|e| catalog_err("open vector_index_params", e))?;
+
+    let mut entries = Vec::new();
+    for item in table
+        .range::<&str>(..)
+        .map_err(|e| catalog_err("range vector index params", e))?
+    {
+        let (_, value) = item.map_err(|e| catalog_err("read vector index params", e))?;
+        let entry: StoredVectorIndexParams = zerompk::from_msgpack(value.value())
+            .map_err(|e| catalog_err("deser vector index params", e))?;
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 fn vector_index_params_key(tenant_id: u64, collection: &str, field_name: &str) -> String {

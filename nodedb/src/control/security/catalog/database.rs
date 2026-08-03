@@ -8,7 +8,7 @@
 //! two directions can never drift.
 
 use nodedb_types::DatabaseId;
-use redb::{ReadableTable, ReadableTableMetadata};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 use super::database_types::DatabaseDescriptor;
 use super::types::{DATABASE_HWM, DATABASES, DATABASES_BY_NAME, SystemCatalog, catalog_err};
@@ -221,19 +221,27 @@ impl SystemCatalog {
             .db
             .begin_read()
             .map_err(|e| catalog_err("list_databases read txn", e))?;
-        let table = txn
-            .open_table(DATABASES)
-            .map_err(|e| catalog_err("open databases list", e))?;
-        let mut out = Vec::new();
-        let iter = table.iter().map_err(|e| catalog_err("iter databases", e))?;
-        for row in iter {
-            let (_, v) = row.map_err(|e| catalog_err("iter databases row", e))?;
-            let desc: DatabaseDescriptor = zerompk::from_msgpack(v.value())
-                .map_err(|e| catalog_err("deser list_databases row", e))?;
-            out.push(desc);
-        }
-        Ok(out)
+        list_databases_in(&txn)
     }
+}
+
+/// Body of [`SystemCatalog::list_databases`], over an already-open read
+/// transaction so the read-only catalog handle can reuse it verbatim.
+pub(super) fn list_databases_in(
+    txn: &redb::ReadTransaction,
+) -> crate::Result<Vec<DatabaseDescriptor>> {
+    let table = txn
+        .open_table(DATABASES)
+        .map_err(|e| catalog_err("open databases list", e))?;
+    let mut out = Vec::new();
+    let iter = table.iter().map_err(|e| catalog_err("iter databases", e))?;
+    for row in iter {
+        let (_, v) = row.map_err(|e| catalog_err("iter databases row", e))?;
+        let desc: DatabaseDescriptor = zerompk::from_msgpack(v.value())
+            .map_err(|e| catalog_err("deser list_databases row", e))?;
+        out.push(desc);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

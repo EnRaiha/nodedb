@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 
 /// Redb table for column statistics.

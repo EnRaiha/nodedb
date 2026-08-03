@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::Database;
+use redb::{Database, ReadableDatabase};
 use tracing::info;
 
 use super::types::*;
@@ -271,30 +271,33 @@ mod tests {
     }
 
     #[test]
-    fn reopening_a_bootstrapped_catalog_does_not_mutate_the_file() {
-        // `SystemCatalog::open` must be byte-idempotent on an
-        // already-bootstrapped catalog: opening it to *read* must not
-        // rewrite `system.redb`. Today `open` unconditionally runs a
-        // write transaction (iterating BOOTSTRAP_TABLES) and commits it,
-        // so redb writes a fresh meta page / reclaims pages on every
-        // boot — the file's bytes (and md5, and size) change even when
-        // nothing else does. That is the "system.redb silently modified
-        // during a broken boot" symptom: a boot that then fails its
-        // integrity check has still mutated persistent catalog state, so
-        // operators can't verify a backup by hash or trust "did the
-        // upgrade touch my catalog?". `open` should probe the registry
-        // with a read transaction and only escalate to a write txn if a
-        // table is actually missing.
+    fn reading_a_bootstrapped_catalog_does_not_mutate_the_file() {
+        // A boot that only *reads* the catalog must not rewrite
+        // `system.redb`: operators verify a catalog (or a backup of one)
+        // by hash, and a boot that later fails its integrity check must
+        // not already have mutated persistent catalog state on its way
+        // out.
+        //
+        // This cannot be delivered by a read-write handle. redb commits
+        // its allocator state table when a `Database` drops (so the next
+        // open can skip a full repair), which stamps the god byte at
+        // offset 9 regardless of whether the caller wrote anything. The
+        // read-only handle wraps `redb::ReadOnlyDatabase`, which never
+        // writes — so read-only boots take that, and this test pins the
+        // guarantee to it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("system.redb");
 
-        // First open: bootstrap happens here, file reaches steady state.
+        // Bootstrap once so the file reaches steady state.
         drop(SystemCatalog::open(&path).unwrap());
         let before = std::fs::read(&path).unwrap();
 
-        // Second open of the same, fully-bootstrapped catalog — a pure
-        // "bring the catalog up to read it" boot. Must not touch a byte.
-        drop(SystemCatalog::open(&path).unwrap());
+        // A pure "bring the catalog up to read it" boot. Must not touch a byte.
+        let catalog = super::super::ReadOnlySystemCatalog::open(&path)
+            .expect("cleanly-closed catalog opens read-only")
+            .expect("catalog file exists");
+        catalog.list_databases().unwrap();
+        drop(catalog);
         let after = std::fs::read(&path).unwrap();
 
         let first_diff = before
@@ -305,15 +308,35 @@ mod tests {
             .unwrap_or_else(|| "len".to_string());
         assert!(
             before == after,
-            "re-opening an already-bootstrapped catalog rewrote system.redb \
-             (len {} → {}, first differing offset: {first_diff}): `open` runs \
-             an unconditional write transaction + commit, so redb stamps a \
-             fresh meta/commit page on every boot. Opening the catalog to \
-             read it must not mutate it — probe the bootstrap registry \
-             read-only and only open a write transaction when a table is \
-             genuinely absent.",
+            "a read-only catalog open rewrote system.redb (len {} → {}, \
+             first differing offset: {first_diff}): read-only boots must \
+             leave the file byte-identical so it stays verifiable by hash.",
             before.len(),
             after.len(),
+        );
+    }
+
+    #[test]
+    fn read_write_open_reports_repair_needed_state_to_read_only_callers() {
+        // The read-only handle refuses a catalog that was not cleanly
+        // closed rather than silently repairing it (repair writes). A
+        // cleanly-closed catalog must open read-only.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("system.redb");
+        drop(SystemCatalog::open(&path).unwrap());
+
+        assert!(
+            super::super::ReadOnlySystemCatalog::open(&path)
+                .expect("clean catalog opens read-only")
+                .is_some()
+        );
+
+        // No file at all is "nothing to load", not an error.
+        let missing = dir.path().join("absent.redb");
+        assert!(
+            super::super::ReadOnlySystemCatalog::open(&missing)
+                .unwrap()
+                .is_none()
         );
     }
 

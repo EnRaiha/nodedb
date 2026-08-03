@@ -9,6 +9,7 @@
 
 use std::path::Path;
 
+use redb::ReadableDatabase;
 use tracing::info;
 
 use crate::error::Result;

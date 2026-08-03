@@ -60,7 +60,7 @@ fn write_wal(path: &std::path::Path, writer_id: usize) -> Vec<u64> {
 }
 
 fn truncate_within_last_window(path: &std::path::Path, rng: &mut StdRng) -> u64 {
-    use rand::Rng as _;
+    use rand::RngExt as _;
 
     let file_len = std::fs::metadata(path).unwrap().len();
     if file_len == 0 {

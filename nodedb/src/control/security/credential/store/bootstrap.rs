@@ -2,7 +2,7 @@
 
 //! Durable bootstrap of the configured superuser.
 
-use rand::Rng;
+use rand::RngExt;
 
 use crate::control::security::identity::Role;
 use crate::control::security::time::now_secs;
