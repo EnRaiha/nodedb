@@ -28,10 +28,16 @@ impl SeriesKey {
         }
     }
 
-    /// Compute the SeriesId for this key with an optional collision salt.
-    pub fn to_series_id(&self, salt: u64) -> SeriesId {
+    /// Compute the SeriesId for this key at a given rehash attempt.
+    ///
+    /// `rehash_attempt` is a plain collision-resolution counter — attempt 0 is
+    /// the natural hash, and `SeriesCatalog::resolve` increments it until it
+    /// lands on a free slot. It is NOT a cryptographic salt: the hash is
+    /// `DefaultHasher`, the value is stored in the clear beside the key, and it
+    /// carries no secrecy or uniqueness guarantee.
+    pub fn to_series_id(&self, rehash_attempt: u64) -> SeriesId {
         let mut hasher = DefaultHasher::new();
-        salt.hash(&mut hasher);
+        rehash_attempt.hash(&mut hasher);
         self.metric.hash(&mut hasher);
         for (k, v) in &self.tags {
             k.hash(&mut hasher);
@@ -44,11 +50,11 @@ impl SeriesKey {
 /// Persistent catalog that maps SeriesId → SeriesKey with collision detection.
 ///
 /// On insert, if the SeriesId already maps to a *different* SeriesKey, the
-/// catalog rehashes with incrementing salts until it finds a free slot.
-/// This is one lookup per new series (not per row).
+/// catalog rehashes with an incrementing attempt counter until it finds a free
+/// slot. This is one lookup per new series (not per row).
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SeriesCatalog {
-    /// SeriesId → (SeriesKey, salt used to produce this ID).
+    /// SeriesId → (SeriesKey, rehash attempt that produced this ID).
     entries: HashMap<SeriesId, (SeriesKey, u64)>,
 }
 
@@ -61,19 +67,19 @@ impl SeriesCatalog {
     ///
     /// Returns the SeriesId (potentially rehashed if the natural hash collided).
     pub fn resolve(&mut self, key: &SeriesKey) -> SeriesId {
-        let mut salt = 0u64;
+        let mut rehash_attempt = 0u64;
         loop {
-            let id = key.to_series_id(salt);
+            let id = key.to_series_id(rehash_attempt);
             match self.entries.get(&id) {
                 None => {
-                    self.entries.insert(id, (key.clone(), salt));
+                    self.entries.insert(id, (key.clone(), rehash_attempt));
                     return id;
                 }
                 Some((existing_key, _)) if existing_key == key => {
                     return id;
                 }
                 Some(_) => {
-                    salt += 1;
+                    rehash_attempt += 1;
                 }
             }
         }
