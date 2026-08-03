@@ -1,0 +1,26 @@
+# CodeQL scope for this repository.
+#
+# Test code is excluded from analysis, not from review: a fixture password or a
+# canned key in a test is the fixture, and reporting each one as a critical
+# hard-coded credential buries the finding that would actually matter. Anything
+# excluded here must be code that never ships in the server binary.
+#
+# NOTE this file cannot exclude inline `#[cfg(test)] mod tests` blocks — path
+# filters do not see cfg attributes, and Rust convention puts unit tests in the
+# same file as the code they test. Those alerts are dismissed per-alert with
+# GitHub's "used in tests" reason instead.
+
+name: NodeDB CodeQL config
+
+paths-ignore:
+  # Integration tests: every crate's `tests/` directory.
+  - "**/tests/**"
+  # Benchmarks — fixture data, never linked into the server.
+  - "**/benches/**"
+  # Fuzz targets: deliberately malformed inputs and seed corpora.
+  - "**/fuzz/**"
+  # A crate whose entire purpose is building test fixtures (harnesses, seeded
+  # superusers). It is a dev-dependency and is never part of a release build.
+  - "nodedb-test-support/**"
+  # Vendored/generated: not ours to fix, and re-flagged on every regeneration.
+  - "**/target/**"
