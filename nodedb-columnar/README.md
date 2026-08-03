@@ -2,7 +2,7 @@
 
 > Compressed columnar segment format
 
-NDBS-format segments with versioned footer and CRC32C, per-column codec selection, 1024-row blocks with statistics for predicate pushdown, and roaring delete bitmaps. Shared by the columnar / timeseries / spatial engines.
+NDBS-format segments with versioned footer and CRC32C, per-column codec selection, 1024-row blocks with statistics for predicate pushdown, roaring delete bitmaps, and single-segment compaction for embedded deployments. Shared by the columnar / timeseries / spatial engines.
 
 ## Status
 

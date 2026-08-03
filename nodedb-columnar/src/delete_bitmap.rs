@@ -59,13 +59,18 @@ impl DeleteBitmap {
 
     /// Delete ratio: deleted_count / total_rows.
     ///
-    /// Reported as a segment-health statistic. Segments are never rewritten,
-    /// so nothing acts on this ratio.
+    /// Reported as a segment-health statistic on Origin, where segments are
+    /// never rewritten. Embedded deployments act on it via [`Self::should_compact`].
     pub fn delete_ratio(&self, total_rows: u64) -> f64 {
         if total_rows == 0 {
             return 0.0;
         }
         self.inner.len() as f64 / total_rows as f64
+    }
+
+    /// Whether this segment should be compacted (delete ratio > threshold).
+    pub fn should_compact(&self, total_rows: u64, threshold: f64) -> bool {
+        self.delete_ratio(total_rows) > threshold
     }
 
     /// Check whether an entire block is fully deleted.
@@ -189,6 +194,10 @@ mod tests {
         assert!((bm.delete_ratio(100) - 0.3).abs() < 0.001);
         // A zero-row segment must not divide by zero.
         assert_eq!(DeleteBitmap::new().delete_ratio(0), 0.0);
+        // Default threshold 0.2 → should compact.
+        assert!(bm.should_compact(100, 0.2));
+        // Threshold 0.5 → should not compact.
+        assert!(!bm.should_compact(100, 0.5));
     }
 
     #[test]

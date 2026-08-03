@@ -16,6 +16,7 @@
 
 pub(crate) mod encrypt;
 
+pub mod compaction;
 pub mod delete_bitmap;
 pub mod error;
 pub mod filter;
@@ -29,6 +30,7 @@ pub mod reader;
 pub mod wal_record;
 pub mod writer;
 
+pub use compaction::{CompactionResult, DEFAULT_DELETE_RATIO_THRESHOLD, compact_segment};
 pub use delete_bitmap::DeleteBitmap;
 pub use error::ColumnarError;
 pub use filter::{

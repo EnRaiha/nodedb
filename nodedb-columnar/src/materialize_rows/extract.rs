@@ -13,7 +13,7 @@ use crate::reader::DecodedColumn;
 /// contains bytes that cannot be decoded as MessagePack — this indicates
 /// segment corruption rather than a missing value, so `Value::Null` would
 /// silently hide the problem.
-pub(super) fn extract_row_value(
+pub(crate) fn extract_row_value(
     col: &DecodedColumn,
     row_idx: usize,
     col_type: &nodedb_types::columnar::ColumnType,
