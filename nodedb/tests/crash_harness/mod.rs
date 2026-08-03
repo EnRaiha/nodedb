@@ -29,11 +29,11 @@ pub mod ilp_client;
 mod pgwire;
 pub mod resp_client;
 
-// Only `crash_ilp_timeseries_write.rs` names `Session` directly; every other
-// crash-test binary pulls in this module too, so the re-export is unused
-// there.
+// Only `crash_ilp_timeseries_write.rs` names `Session` and
+// `RetryableSchemaChange` directly; every other crash-test binary pulls in this
+// module too, so the re-exports are unused there.
 #[allow(unused_imports)]
-pub use pgwire::Session;
+pub use pgwire::{RetryableSchemaChange, Session};
 #[path = "../support/mod.rs"]
 mod support;
 

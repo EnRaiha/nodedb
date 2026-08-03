@@ -90,17 +90,35 @@ async fn wait_for_count(
     timeout: Duration,
 ) -> Vec<String> {
     let deadline = Instant::now() + timeout;
+    // Assigned by both arms of the match below before the deadline check reads
+    // it, so no placeholder initial value is needed.
+    let mut last: Result<Vec<String>, &str>;
     loop {
-        let rows = session
-            .query_col_idx(&format!("SELECT COUNT(*) FROM {collection}"), 0)
-            .await;
-        if rows.first().map(|v| v.as_str()) == Some(expected) {
-            return rows;
+        // A descriptor-lease drain is exactly the "not settled yet" condition
+        // this loop exists to wait out, and it is common right after `reopen()`
+        // while boot replay re-establishes descriptors. Panicking on it inside
+        // the loop would abandon the remaining budget over a condition the
+        // server explicitly asks clients to retry, so absorb it here and let
+        // this deadline — not the session helper's much shorter one — decide
+        // when the wait has genuinely failed.
+        match session
+            .try_query_col_idx(&format!("SELECT COUNT(*) FROM {collection}"), 0)
+            .await
+        {
+            Ok(rows) => {
+                if rows.first().map(|v| v.as_str()) == Some(expected) {
+                    return rows;
+                }
+                last = Ok(rows);
+            }
+            Err(crash_harness::RetryableSchemaChange) => {
+                last = Err("retryable schema change still unresolved");
+            }
         }
         if Instant::now() >= deadline {
             panic!(
                 "SELECT COUNT(*) FROM {collection} never reached {expected} within {timeout:?}; \
-                 last observed: {rows:?}"
+                 last observed: {last:?}"
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

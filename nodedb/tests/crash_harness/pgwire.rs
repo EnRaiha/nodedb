@@ -39,6 +39,16 @@ const SCHEMA_CHANGE_RETRY_BACKOFF: Duration = Duration::from_millis(150);
 /// unrelated internal errors, so the message text — which is the error
 /// type's own stable Display string, not free-form prose — is the only
 /// durable signal available.
+/// The server was still reporting `RetryableSchemaChanged` when the
+/// client-side retry budget ran out.
+///
+/// Deliberately carries no payload: it exists so a caller with its own longer
+/// deadline can tell "the descriptor drain has not settled yet" apart from a
+/// real error, and every real error still panics at the call site with the full
+/// server log and faultbox report attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryableSchemaChange;
+
 fn is_retryable_schema_change(e: &tokio_postgres::Error) -> bool {
     e.as_db_error()
         .is_some_and(|db| db.message().contains("retryable schema change"))
@@ -306,12 +316,45 @@ impl Session<'_> {
     /// does (see [`is_retryable_schema_change`] and its budget constants) —
     /// this is the helper the tests' tight polling loops actually use, so
     /// it needs the same client-retry behavior, not just the one-shot path.
+    ///
+    /// Panics once that budget is exhausted. A caller that runs this inside
+    /// its own bounded poll should use [`Self::try_query_col_idx`] instead:
+    /// this helper's ~750ms budget is far shorter than a typical poll
+    /// deadline, so panicking here would abort a poll that still had seconds
+    /// of budget left for exactly the condition the server told it to retry.
     pub async fn query_col_idx(&self, sql: &str, idx: usize) -> Vec<String> {
+        match self.try_query_col_idx(sql, idx).await {
+            Ok(rows) => rows,
+            Err(RetryableSchemaChange) => {
+                let tail = super::diagnostics::log_tail_section(&self.harness.server_log());
+                let reports = super::diagnostics::faultbox_report_section(self.harness.data_dir());
+                panic!(
+                    "query on session: retryable schema change never cleared within \
+                     {SCHEMA_CHANGE_RETRY_ATTEMPTS} attempts{}\n{reports}{tail}",
+                    self.harness.keep_data_dir_note(),
+                )
+            }
+        }
+    }
+
+    /// [`Self::query_col_idx`] that reports an unresolved retryable schema
+    /// change to the caller instead of panicking on it.
+    ///
+    /// The server's own contract says a client observing this condition
+    /// retries the statement — it is the descriptor-lease-drain race, not a
+    /// distinct failure. A poll loop that owns a longer deadline is the right
+    /// place to absorb it, so this returns [`RetryableSchemaChange`] and lets
+    /// the caller decide. Every other error still panics: those are real.
+    pub async fn try_query_col_idx(
+        &self,
+        sql: &str,
+        idx: usize,
+    ) -> Result<Vec<String>, RetryableSchemaChange> {
         let mut schema_change_attempts = 0usize;
         loop {
             match self.client.simple_query(sql).await {
                 Ok(messages) => {
-                    return messages
+                    return Ok(messages
                         .iter()
                         .filter_map(|m| match m {
                             tokio_postgres::SimpleQueryMessage::Row(row) => {
@@ -319,7 +362,7 @@ impl Session<'_> {
                             }
                             _ => None,
                         })
-                        .collect();
+                        .collect());
                 }
                 Err(e)
                     if is_retryable_schema_change(&e)
@@ -328,23 +371,13 @@ impl Session<'_> {
                     schema_change_attempts += 1;
                     tokio::time::sleep(SCHEMA_CHANGE_RETRY_BACKOFF).await;
                 }
+                // Hand the still-unresolved drain back to the caller. Callers
+                // polling on their own deadline retry; `query_col_idx` panics.
+                Err(e) if is_retryable_schema_change(&e) => return Err(RetryableSchemaChange),
                 // Same rationale as `simple_query_ready`'s error branches: the
                 // interesting failures here are server-side, and the harness's
                 // tempdir is gone by the time anyone reads the panic (unless
                 // `NODEDB_TEST_KEEP_DATA_DIR` says otherwise).
-                Err(e) if is_retryable_schema_change(&e) => {
-                    let tail = super::diagnostics::log_tail_section(&self.harness.server_log());
-                    let reports =
-                        super::diagnostics::faultbox_report_section(self.harness.data_dir());
-                    panic!(
-                        "query on session: retryable schema change never cleared within \
-                         {SCHEMA_CHANGE_RETRY_ATTEMPTS} attempts: {e}{}{}\n{reports}{tail}",
-                        e.as_db_error()
-                            .map(|db| format!(" — {}: {}", db.code().code(), db.message()))
-                            .unwrap_or_default(),
-                        self.harness.keep_data_dir_note(),
-                    )
-                }
                 Err(e) => {
                     let tail = super::diagnostics::log_tail_section(&self.harness.server_log());
                     let reports =
