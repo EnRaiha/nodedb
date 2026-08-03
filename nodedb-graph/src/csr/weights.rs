@@ -184,6 +184,80 @@ impl CsrIndex {
         self.iter_out_edges_weighted(self.local(node))
             .map(move |(lid, dst, w)| (lid, dst.raw(self.partition_tag), w))
     }
+
+    /// Iterate inbound edges of a node with weights: `(label_id, src_id, weight)`.
+    ///
+    /// Yields from both dense CSR and buffer, excluding deleted edges.
+    /// Weights are 1.0 for unweighted graphs.
+    pub fn iter_in_edges_weighted(
+        &self,
+        node: LocalNodeId,
+    ) -> impl Iterator<Item = (u32, LocalNodeId, f64)> + '_ {
+        let node = node.raw(self.partition_tag);
+        let tag = self.partition_tag;
+        let idx = node as usize;
+        let dense_start = if idx + 1 < self.in_offsets.len() {
+            self.in_offsets[idx] as usize
+        } else {
+            0
+        };
+        let dense_end = if idx + 1 < self.in_offsets.len() {
+            self.in_offsets[idx + 1] as usize
+        } else {
+            0
+        };
+        let dense = (dense_start..dense_end)
+            .filter_map(move |i| {
+                let label = self.in_labels[i];
+                let source = self.in_targets[i];
+                let collection = self.in_collections.get(i).copied().unwrap_or(0);
+                if self
+                    .deleted_edges
+                    .contains(&(source, label, node, collection))
+                {
+                    None
+                } else {
+                    Some((label, source, self.in_edge_weight(i)))
+                }
+            })
+            .collect::<Vec<_>>();
+        let buffer = if idx < self.buffer_in.len() {
+            self.buffer_in[idx]
+                .iter()
+                .enumerate()
+                .map(|(buffer_index, &(label, source))| {
+                    let weight = if self.has_weights {
+                        self.buffer_in_weights[idx]
+                            .get(buffer_index)
+                            .copied()
+                            .unwrap_or(1.0)
+                    } else {
+                        1.0
+                    };
+                    (label, source, weight)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        dense
+            .into_iter()
+            .chain(buffer)
+            .map(move |(label, source, weight)| (label, LocalNodeId::new(source, tag), weight))
+    }
+
+    /// Raw u32 variant of [`Self::iter_in_edges_weighted`]. In-partition
+    /// algorithm use only; callers crossing partition boundaries must use the
+    /// tagged [`LocalNodeId`] API.
+    pub fn iter_in_edges_weighted_raw(
+        &self,
+        node: u32,
+    ) -> impl Iterator<Item = (u32, u32, f64)> + '_ {
+        self.iter_in_edges_weighted(self.local(node))
+            .map(move |(label, source, weight)| {
+                (label, source.raw(self.partition_tag), weight)
+            })
+    }
 }
 
 /// Extract the `"weight"` property from MessagePack-encoded edge properties.
@@ -288,6 +362,33 @@ mod tests {
         let weights: Vec<f64> = edges.iter().map(|e| e.2).collect();
         assert!(weights.contains(&2.5));
         assert!(weights.contains(&7.0));
+    }
+
+    #[test]
+    fn iter_in_edges_weighted_raw_handles_dense_buffer_defaults_and_deletes() {
+        let mut csr = CsrIndex::new();
+        csr.add_edge_weighted("a", "R", "c", 2.5).unwrap();
+        csr.add_edge_weighted("b", "R", "c", 7.0).unwrap();
+        csr.compact().expect("no governor, cannot fail");
+        csr.add_edge("d", "R", "c").unwrap();
+        csr.add_edge_weighted("e", "R", "c", 4.0).unwrap();
+        let c = csr.node_id_raw("c").unwrap();
+
+        let mut mixed: Vec<_> = csr.iter_in_edges_weighted_raw(c).collect();
+        mixed.sort_by_key(|edge| edge.1);
+        assert_eq!(
+            mixed.iter().map(|edge| edge.2).collect::<Vec<_>>(),
+            vec![2.5, 7.0, 1.0, 4.0]
+        );
+
+        csr.remove_edge("a", "R", "c");
+        csr.remove_edge("d", "R", "c");
+        let mut remaining: Vec<_> = csr.iter_in_edges_weighted_raw(c).collect();
+        remaining.sort_by_key(|edge| edge.1);
+        assert_eq!(
+            remaining.iter().map(|edge| edge.2).collect::<Vec<_>>(),
+            vec![7.0, 4.0]
+        );
     }
 
     #[test]
