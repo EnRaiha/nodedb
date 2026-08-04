@@ -71,6 +71,26 @@ impl<'a> RequestAuthScope<'a> {
         RequestAuthScopeBuilder::new(identity, scope_grants)
     }
 
+    /// Resolve a scope pinned to a specific `database_id`, bypassing
+    /// `identity.default_database` / session-database precedence.
+    ///
+    /// This is the common case at dispatch call sites that already know
+    /// exactly which database the physical task must target (RESP, which
+    /// always pins `DatabaseId::DEFAULT`; user-issued DDL/DML dispatch, which
+    /// already resolved `database_id` upstream) — each such call site was
+    /// independently writing `builder(..).with_session_database(Some(db)).build()`,
+    /// which is exactly the kind of duplication that let the task/`$auth.*`
+    /// database drift this type exists to prevent creep back in a second time.
+    pub fn for_database(
+        identity: &'a AuthenticatedIdentity,
+        scope_grants: &'a ScopeGrantStore,
+        database_id: DatabaseId,
+    ) -> Self {
+        Self::builder(identity, scope_grants)
+            .with_session_database(Some(database_id))
+            .build()
+    }
+
     /// Assemble a `RequestAuthScope` from its already-resolved parts.
     ///
     /// Only [`RequestAuthScopeBuilder::build`] may call this — it is the
