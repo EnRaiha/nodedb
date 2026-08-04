@@ -58,14 +58,17 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
         .as_deref()
         .is_some_and(|direction| direction.eq_ignore_ascii_case("both"));
 
-    // Precompute traversal degrees and dangling mask for SIMD dangling sum.
-    let degrees: Vec<usize> = (0..n)
-        .map(|i| {
-            let node = i as u32;
-            csr.out_degree_raw(node) + if both { csr.in_degree_raw(node) } else { 0 }
-        })
+    // A compacted CSR can be traversed directly as immutable slices. Pull
+    // workers own disjoint destination ranges and share no mutable graph state.
+    // Live buffered graphs fall back to the iterator-based serial scatter path.
+    let dense_in = csr.compacted_in_adjacency_raw();
+    let dense_out = csr.compacted_out_adjacency_raw();
+    let pull_available = dense_in.is_some() && (!both || dense_out.is_some());
+    let degrees: Vec<usize> = (0..n as u32)
+        .map(|node| csr.out_degree_raw(node) + if both { csr.in_degree_raw(node) } else { 0 })
         .collect();
     let is_dangling: Vec<bool> = degrees.iter().map(|&degree| degree == 0).collect();
+    let mut contributions = vec![0.0f64; n];
 
     for iter in 1..=max_iter {
         // ── SIMD: dangling node rank sum ──
@@ -75,33 +78,43 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
         // the (1 - damping) teleport budget plus the damped dangling mass.
         let redistributed = (1.0 - damping) + damping * dangling_sum;
 
-        match &personalization {
-            // ── SIMD: broadcast fill next_rank with the uniform base rank ──
-            None => simd::simd_fill_f64(&mut next_rank, redistributed / n as f64),
-            // PPR: each node's base rank is its seed share of the redistributed
-            // mass. Per-node base, so the SIMD broadcast fill does not apply.
-            Some(p) => {
-                for (slot, &seed) in next_rank.iter_mut().zip(p.iter()) {
-                    *slot = redistributed * seed;
+        for (node, contribution) in contributions.iter_mut().enumerate() {
+            *contribution = if degrees[node] == 0 {
+                0.0
+            } else {
+                damping * rank[node] / degrees[node] as f64
+            };
+        }
+        if pull_available {
+            pull_rank_iteration(
+                dense_in.expect("pull availability checked"),
+                both.then_some(dense_out.expect("BOTH pull requires outbound CSR")),
+                &contributions,
+                &mut next_rank,
+                redistributed,
+                personalization.as_deref(),
+            );
+        } else {
+            match &personalization {
+                None => simd::simd_fill_f64(&mut next_rank, redistributed / n as f64),
+                Some(seeds) => {
+                    for (slot, seed) in next_rank.iter_mut().zip(seeds) {
+                        *slot = redistributed * seed;
+                    }
                 }
             }
-        }
-
-        // ── Scatter: distribute rank contributions via outbound edges ──
-        // This is inherently scatter (random write) — not SIMD-able per se,
-        // but the fill + dangling_sum above are the dominant SIMD wins.
-        for u in 0..n {
-            let degree = degrees[u];
-            if degree == 0 {
-                continue;
-            }
-            let contrib = damping * rank[u] / degree as f64;
-            for (_lid, dst) in csr.iter_out_edges_raw(u as u32) {
-                next_rank[dst as usize] += contrib;
-            }
-            if both {
-                for (_lid, src) in csr.iter_in_edges_raw(u as u32) {
-                    next_rank[src as usize] += contrib;
+            for node in 0..n {
+                if degrees[node] == 0 {
+                    continue;
+                }
+                let contribution = contributions[node];
+                for (_, destination) in csr.iter_out_edges_raw(node as u32) {
+                    next_rank[destination as usize] += contribution;
+                }
+                if both {
+                    for (_, source) in csr.iter_in_edges_raw(node as u32) {
+                        next_rank[source as usize] += contribution;
+                    }
                 }
             }
         }
@@ -130,6 +143,128 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
         batch.push_node_f64(csr.node_name_raw(node_id as u32).to_string(), r);
     }
     batch
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static ACTIVE_PULL_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PullWorkerPermits(usize);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PullWorkerPermits {
+    fn drop(&mut self) {
+        ACTIVE_PULL_WORKERS.fetch_sub(self.0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reserve_pull_workers(requested: usize) -> PullWorkerPermits {
+    const MAX_PROCESS_WORKERS: usize = 31;
+    let mut active = ACTIVE_PULL_WORKERS.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let granted = requested.min(MAX_PROCESS_WORKERS.saturating_sub(active));
+        match ACTIVE_PULL_WORKERS.compare_exchange_weak(
+            active,
+            active + granted,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return PullWorkerPermits(granted),
+            Err(observed) => active = observed,
+        }
+    }
+}
+
+fn pull_rank_iteration(
+    inbound: (&[u32], &[u32]),
+    outbound: Option<(&[u32], &[u32])>,
+    contributions: &[f64],
+    next_rank: &mut [f64],
+    redistributed: f64,
+    personalization: Option<&[f64]>,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        pull_rank_range(
+            inbound,
+            outbound,
+            contributions,
+            next_rank,
+            0,
+            redistributed,
+            personalization,
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let desired_workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(32)
+            .min(next_rank.len().max(1));
+        let permits = reserve_pull_workers(desired_workers.saturating_sub(1));
+        let workers = permits.0;
+        if workers <= 1 {
+            pull_rank_range(
+                inbound,
+                outbound,
+                contributions,
+                next_rank,
+                0,
+                redistributed,
+                personalization,
+            );
+            return;
+        }
+        let chunk_size = next_rank.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (chunk_index, chunk) in next_rank.chunks_mut(chunk_size).enumerate() {
+                let start = chunk_index * chunk_size;
+                scope.spawn(move || {
+                    pull_rank_range(
+                        inbound,
+                        outbound,
+                        contributions,
+                        chunk,
+                        start,
+                        redistributed,
+                        personalization,
+                    );
+                });
+            }
+        });
+    }
+}
+
+fn pull_rank_range(
+    inbound: (&[u32], &[u32]),
+    outbound: Option<(&[u32], &[u32])>,
+    contributions: &[f64],
+    output: &mut [f64],
+    start: usize,
+    redistributed: f64,
+    personalization: Option<&[f64]>,
+) {
+    let (in_offsets, in_targets) = inbound;
+    for (offset, slot) in output.iter_mut().enumerate() {
+        let node = start + offset;
+        let base = personalization.map_or(redistributed / contributions.len() as f64, |seeds| {
+            redistributed * seeds[node]
+        });
+        let mut rank = base;
+        for &neighbor in &in_targets[in_offsets[node] as usize..in_offsets[node + 1] as usize] {
+            rank += contributions[neighbor as usize];
+        }
+        if let Some((out_offsets, out_targets)) = outbound {
+            for &neighbor in
+                &out_targets[out_offsets[node] as usize..out_offsets[node + 1] as usize]
+            {
+                rank += contributions[neighbor as usize];
+            }
+        }
+        *slot = rank;
+    }
 }
 
 /// Build the normalized per-node seed distribution for Personalized PageRank.
@@ -203,10 +338,65 @@ mod tests {
                 ..Default::default()
             },
         );
-        let rows: Vec<serde_json::Value> = serde_json::from_slice(&batch.to_json().unwrap()).unwrap();
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&batch.to_json().unwrap()).unwrap();
         assert_eq!(rows.len(), 2);
         assert!((rows[0]["rank"].as_f64().unwrap() - 0.5).abs() < 1e-12);
         assert!((rows[1]["rank"].as_f64().unwrap() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compacted_pull_matches_buffered_scatter_for_both_personalized() {
+        use std::collections::HashMap;
+
+        fn graph(compact: bool) -> CsrIndex {
+            let mut csr = CsrIndex::new();
+            csr.add_edge("a", "L", "b").unwrap();
+            csr.add_edge("a", "L", "c").unwrap();
+            csr.add_edge("c", "L", "b").unwrap();
+            csr.add_node("d").unwrap();
+            if compact {
+                csr.compact().unwrap();
+            }
+            csr
+        }
+
+        let mut seeds = HashMap::new();
+        seeds.insert("a".to_string(), 2.0);
+        seeds.insert("d".to_string(), 1.0);
+        let params = AlgoParams {
+            direction: Some("both".to_string()),
+            max_iterations: Some(20),
+            tolerance: Some(f64::MIN_POSITIVE),
+            personalization_vector: Some(seeds),
+            ..Default::default()
+        };
+        let ranks = |csr: &CsrIndex| {
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_slice(&run(csr, &params).to_json().unwrap()).unwrap();
+            rows.into_iter()
+                .map(|row| {
+                    (
+                        row["node_id"].as_str().unwrap().to_string(),
+                        row["rank"].as_f64().unwrap(),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        };
+
+        let pull = ranks(&graph(true));
+        let scatter = ranks(&graph(false));
+        assert_eq!(
+            pull.keys().collect::<std::collections::BTreeSet<_>>(),
+            scatter.keys().collect()
+        );
+        for (node, pull_rank) in pull {
+            let scatter_rank = scatter[&node];
+            assert!(
+                (pull_rank - scatter_rank).abs() < 1e-12,
+                "{node}: pull={pull_rank}, scatter={scatter_rank}"
+            );
+        }
     }
 
     #[test]

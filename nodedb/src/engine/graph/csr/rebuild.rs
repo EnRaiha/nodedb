@@ -24,7 +24,6 @@ pub fn rebuild_sharded_from_store_as_of(
     system_as_of: Option<i64>,
 ) -> crate::Result<ShardedCsrIndex> {
     let mut sharded = ShardedCsrIndex::new();
-    let all_edges = store.scan_all_edges_decoded(system_as_of)?;
     let node_surrogates = store.scan_all_node_surrogates()?;
 
     // First pass: materialize every explicitly registered node, including
@@ -38,39 +37,25 @@ pub fn rebuild_sharded_from_store_as_of(
             })?;
     }
 
-    // Materialize all edge endpoints before edge insertion.
-    // EdgeRecord is (DatabaseId, TenantId, collection, src, label, dst, props).
-    for (db, tid, _collection, src, _label, dst, _props) in &all_edges {
-        let partition = sharded.get_or_create(*db, *tid);
-        partition
-            .add_node(src)
-            .map_err(|e| crate::Error::Internal {
-                detail: format!("CSR rebuild (add src node): {e}"),
-            })?;
-        partition
-            .add_node(dst)
-            .map_err(|e| crate::Error::Internal {
-                detail: format!("CSR rebuild (add dst node): {e}"),
-            })?;
-    }
-
-    // Second pass: insert edges into their tenant's partition, tagged with
-    // the collection they belong to. All collections' edges live in the same
-    // per-tenant partition (nodes are shared), but each edge carries its
-    // collection id so collection-scoped MATCH / RAG reads never cross
-    // collection boundaries.
-    for (db, tid, collection, src, label, dst, props) in &all_edges {
-        let partition = sharded.get_or_create(*db, *tid);
-        let weight = extract_weight_from_properties(props);
-        let res = if weight != 1.0 {
-            partition.add_edge_weighted_in_collection(src, label, dst, collection, weight)
-        } else {
-            partition.add_edge_in_collection(src, label, dst, collection)
-        };
-        res.map_err(|e| crate::Error::Internal {
-            detail: format!("CSR rebuild: {e}"),
-        })?;
-    }
+    // Insert each edge once. CsrIndex edge insertion interns missing endpoints,
+    // so a separate endpoint pass only repeats two hash lookups per edge.
+    // Consuming the decoded records also releases their strings/properties as
+    // rebuilding progresses instead of retaining the full vector until compact.
+    store.for_each_edge_decoded(
+        system_as_of,
+        |(db, tid, collection, src, label, dst, props)| {
+            let partition = sharded.get_or_create(db, tid);
+            let weight = extract_weight_from_properties(&props);
+            let result = if weight != 1.0 {
+                partition.add_edge_weighted_in_collection(&src, &label, &dst, &collection, weight)
+            } else {
+                partition.add_edge_in_collection(&src, &label, &dst, &collection)
+            };
+            result.map_err(|error| crate::Error::Internal {
+                detail: format!("CSR rebuild: {error}"),
+            })
+        },
+    )?;
 
     // Third pass: restore each node's global identity. Without this the rebuilt
     // index knows the graph's shape but binds no surrogate, so every
@@ -182,12 +167,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = EdgeStore::open(&dir.path().join("graph.redb")).unwrap();
         store
-            .import_node_surrogates(&[(
-                DB,
-                tenant(),
-                "isolated".to_string(),
-                99,
-            )])
+            .import_node_surrogates(&[(DB, tenant(), "isolated".to_string(), 99)])
             .unwrap();
 
         let csr = rebuild_from_store(&store).unwrap();
@@ -214,6 +194,28 @@ mod tests {
         let csr = rebuild_from_store(&store).unwrap();
         assert!(csr.contains_node("a") && csr.contains_node("b"));
         assert_eq!(csr.node_surrogate("a"), None);
+    }
+
+    #[test]
+    fn rebuild_includes_an_edge_resurrected_after_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EdgeStore::open(&dir.path().join("graph.redb")).unwrap();
+        let edge = EdgeRef::new(DB, tenant(), "people", "a", "knows", "b");
+        store
+            .put_edge_versioned(edge, b"v1", 100, 100, i64::MAX)
+            .unwrap();
+        store.soft_delete_edge(edge, 200).unwrap();
+        store
+            .put_edge_versioned(edge, b"v3", 300, 300, i64::MAX)
+            .unwrap();
+
+        let csr = rebuild_from_store(&store).unwrap();
+        let a = csr.node_id_raw("a").unwrap();
+        let b = csr.node_id_raw("b").unwrap();
+        assert!(
+            csr.iter_out_edges_raw(a)
+                .any(|(_, destination)| destination == b)
+        );
     }
 
     /// A cascade delete takes the node's binding with it, and leaves the

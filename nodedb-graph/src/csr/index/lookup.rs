@@ -410,6 +410,26 @@ impl CsrIndex {
         self.dense_iter_in(node)
     }
 
+    /// Borrow the compacted outbound CSR offsets and targets.
+    ///
+    /// Returns `None` while mutable buffered/deleted edges exist because those
+    /// are merged by the iterator APIs but are absent from the dense arrays.
+    pub fn compacted_out_adjacency_raw(&self) -> Option<(&[u32], &[u32])> {
+        let compacted = self.buffer_out.iter().all(Vec::is_empty)
+            && self.buffer_in.iter().all(Vec::is_empty)
+            && self.deleted_edges.is_empty();
+        compacted.then_some((&self.out_offsets, &self.out_targets))
+    }
+
+    /// Borrow the compacted inbound CSR offsets and targets. See
+    /// [`Self::compacted_out_adjacency_raw`].
+    pub fn compacted_in_adjacency_raw(&self) -> Option<(&[u32], &[u32])> {
+        let compacted = self.buffer_out.iter().all(Vec::is_empty)
+            && self.buffer_in.iter().all(Vec::is_empty)
+            && self.deleted_edges.is_empty();
+        compacted.then_some((&self.in_offsets, &self.in_targets))
+    }
+
     /// Raw out-degree by dense index.
     pub fn out_degree_raw(&self, node: u32) -> usize {
         self.dense_iter_out(node).count()
@@ -445,5 +465,29 @@ impl CsrIndex {
     /// Raw dense index lookup by name. In-partition algorithm use only.
     pub fn node_id_raw(&self, name: &str) -> Option<u32> {
         self.node_to_id.get(name).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compacted_adjacency_slices_are_available_only_without_mutations() {
+        let mut csr = CsrIndex::new();
+        csr.add_edge("a", "L", "b").unwrap();
+        assert!(csr.compacted_out_adjacency_raw().is_none());
+        assert!(csr.compacted_in_adjacency_raw().is_none());
+
+        csr.compact().unwrap();
+        let (out_offsets, out_targets) = csr.compacted_out_adjacency_raw().unwrap();
+        assert_eq!(out_offsets, &[0, 1, 1]);
+        assert_eq!(out_targets, &[1]);
+        let (in_offsets, in_targets) = csr.compacted_in_adjacency_raw().unwrap();
+        assert_eq!(in_offsets, &[0, 0, 1]);
+        assert_eq!(in_targets, &[0]);
+
+        csr.add_edge("b", "L", "a").unwrap();
+        assert!(csr.compacted_out_adjacency_raw().is_none());
     }
 }

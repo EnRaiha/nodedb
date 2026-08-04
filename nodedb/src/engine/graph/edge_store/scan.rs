@@ -2,7 +2,7 @@
 
 //! Current-state scan + Ceiling-backed lookups and raw insert (snapshot restore).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use nodedb_types::{DatabaseId, TenantId};
 use redb::{ReadableDatabase, ReadableTable};
@@ -13,6 +13,28 @@ use super::store::{
 use super::temporal::{
     EdgeRef, EdgeValuePayload, is_sentinel, parse_versioned_edge_key, versioned_edge_key,
 };
+
+fn emit_streamed_edge(
+    current: &mut Option<(TenantBaseKey, Option<Vec<u8>>)>,
+    visit: &mut impl FnMut(EdgeRecord) -> crate::Result<()>,
+) -> crate::Result<()> {
+    let Some(((db, tenant, collection, source, label, destination), properties)) = current.take()
+    else {
+        return Ok(());
+    };
+    if let Some(properties) = properties {
+        visit((
+            DatabaseId::new(db),
+            TenantId::new(tenant),
+            collection,
+            source,
+            label,
+            destination,
+            properties,
+        ))?;
+    }
+    Ok(())
+}
 
 impl EdgeStore {
     /// Scan every raw forward record belonging to a tenant
@@ -51,6 +73,24 @@ impl EdgeStore {
         &self,
         system_as_of: Option<i64>,
     ) -> crate::Result<Vec<EdgeRecord>> {
+        let mut out = Vec::new();
+        self.for_each_edge_decoded(system_as_of, |edge| {
+            out.push(edge);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Stream every current-state forward edge in storage-key order.
+    ///
+    /// Versioned keys are ordered by `(database, tenant, base edge, system
+    /// ordinal)`, so only one base edge's temporal state is retained at a time.
+    /// This avoids materializing a graph-sized hash table during CSR rebuild.
+    pub fn for_each_edge_decoded(
+        &self,
+        system_as_of: Option<i64>,
+        mut visit: impl FnMut(EdgeRecord) -> crate::Result<()>,
+    ) -> crate::Result<()> {
         let cutoff = system_as_of.unwrap_or(i64::MAX);
         let read_txn = self
             .db
@@ -59,65 +99,40 @@ impl EdgeStore {
         let table = read_txn
             .open_table(EDGES)
             .map_err(|e| redb_err("open edges", e))?;
-
-        let mut latest: HashMap<TenantBaseKey, (i64, Vec<u8>)> = HashMap::new();
-        let mut tombstoned: HashSet<TenantBaseKey> = HashSet::new();
+        let mut current: Option<(TenantBaseKey, Option<Vec<u8>>)> = None;
 
         for entry in table.iter().map_err(|e| redb_err("iter", e))? {
-            let (k, v) = entry.map_err(|e| redb_err("iter entry", e))?;
-            let (db, t, composite) = k.value();
-            let Some((coll, src, label, dst, sys)) = parse_versioned_edge_key(composite) else {
+            let (key, value) = entry.map_err(|e| redb_err("iter entry", e))?;
+            let (db, tenant, composite) = key.value();
+            let Some((collection, source, label, destination, system_from)) =
+                parse_versioned_edge_key(composite)
+            else {
                 continue;
             };
-            if sys > cutoff {
+            if system_from > cutoff {
                 continue;
             }
             let base: TenantBaseKey = (
                 db,
-                t,
-                coll.to_string(),
-                src.to_string(),
+                tenant,
+                collection.to_string(),
+                source.to_string(),
                 label.to_string(),
-                dst.to_string(),
+                destination.to_string(),
             );
-            let bytes = v.value();
-            if is_sentinel(bytes) {
-                match latest.get(&base) {
-                    Some((cur_sys, _)) if *cur_sys > sys => {}
-                    _ => {
-                        latest.remove(&base);
-                        tombstoned.insert(base);
-                    }
-                }
-                continue;
-            }
-            if tombstoned.contains(&base) {
-                continue;
-            }
-            match latest.get(&base) {
-                Some((cur_sys, _)) if *cur_sys >= sys => {}
-                _ => match EdgeValuePayload::decode(bytes) {
-                    Ok(payload) => {
-                        latest.insert(base, (sys, payload.properties));
-                    }
-                    Err(_) => continue,
-                },
-            }
-        }
 
-        let mut out = Vec::with_capacity(latest.len());
-        for ((db, t, coll, src, label, dst), (_sys, props)) in latest {
-            out.push((
-                DatabaseId::new(db),
-                TenantId::new(t),
-                coll,
-                src,
-                label,
-                dst,
-                props,
-            ));
+            if current.as_ref().is_some_and(|(active, _)| *active != base) {
+                emit_streamed_edge(&mut current, &mut visit)?;
+            }
+            let state = current.get_or_insert_with(|| (base, None));
+            let bytes = value.value();
+            if is_sentinel(bytes) {
+                state.1 = None;
+            } else if let Ok(payload) = EdgeValuePayload::decode(bytes) {
+                state.1 = Some(payload.properties);
+            }
         }
-        Ok(out)
+        emit_streamed_edge(&mut current, &mut visit)
     }
 
     /// Insert a raw edge record (for snapshot restore). Takes the tenant +
@@ -386,6 +401,30 @@ mod tests {
         assert!(
             at_350.is_empty(),
             "tombstoned at 300 — must be empty at 350"
+        );
+    }
+
+    #[test]
+    fn scan_all_edges_decoded_allows_resurrection_after_tombstone() {
+        let (store, _dir) = make_store();
+        store
+            .put_edge_versioned(e("a", "L", "b"), b"v1", 100, 100, i64::MAX)
+            .unwrap();
+        store.soft_delete_edge(e("a", "L", "b"), 200).unwrap();
+        store
+            .put_edge_versioned(e("a", "L", "b"), b"v3", 300, 300, i64::MAX)
+            .unwrap();
+
+        let at_150 = store.scan_all_edges_decoded(Some(150)).unwrap();
+        assert_eq!(at_150[0].6, b"v1".to_vec());
+        assert!(store.scan_all_edges_decoded(Some(250)).unwrap().is_empty());
+        let at_350 = store.scan_all_edges_decoded(Some(350)).unwrap();
+        assert_eq!(at_350[0].6, b"v3".to_vec());
+        assert_eq!(
+            store
+                .ceiling_resolve_edge(e("a", "L", "b"), 350, None)
+                .unwrap(),
+            Some(b"v3".to_vec())
         );
     }
 
