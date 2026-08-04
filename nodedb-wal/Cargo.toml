@@ -43,14 +43,23 @@ io-uring = { workspace = true, optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 memmap2 = { workspace = true }
 
-# `getrandom` reaches this crate twice and neither copy picks a backend on its
-# own for `wasm32-unknown-unknown`: 0.3 arrives directly and via sonic-rs/rand,
-# 0.2 via aes-gcm's `rand_core`. Naming both here with their JS-backed features
-# lets Cargo's feature unification apply them to the transitive copies, which is
-# the same approach the WASM bindings crate already uses. Without this the crate
-# does not compile for the target at all, despite carrying wasm32 code paths.
+# `getrandom` reaches this crate several times and no copy picks a backend on its
+# own for `wasm32-unknown-unknown`: the workspace version arrives directly, 0.3
+# via sonic-rs/rand, 0.2 via aes-gcm's `rand_core`. Naming each here with its
+# JS-backed feature lets Cargo's feature unification apply them to the
+# transitive copies, which is the same approach the WASM bindings crate already
+# uses. Without this the crate does not compile for the target at all, despite
+# carrying wasm32 code paths.
+#
+# The unaliased entry tracks the workspace version rather than pinning one:
+# pinning it here means a workspace bump leaves this entry naming a version the
+# graph has moved off, so the copy actually resolved never gets the feature —
+# and, because both then sit under the same extern name, the target stops
+# building entirely. The aliases exist only for the older majors that arrive
+# transitively and have no workspace entry to track.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom = { workspace = true, features = ["wasm_js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 [dev-dependencies]
