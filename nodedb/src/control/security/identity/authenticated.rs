@@ -54,6 +54,18 @@ pub struct AuthenticatedIdentity {
 #[derive(Debug, Clone)]
 pub struct IdentityAuthority {
     pub is_superuser: bool,
+    /// Whether this identity is server-owned work (triggers, Raft apply,
+    /// CRDT sync, scheduler, WAL replay) rather than an external client.
+    ///
+    /// This is deliberately *not* derived from `auth_method == AuthMethod::Trust`.
+    /// `new_internal_service` sets `AuthMethod::Trust`, but so do
+    /// `trust_identity` and `configured_trust_identity`
+    /// (`control/server/session_auth/identity.rs`) for real external clients
+    /// connecting under trust-auth mode. Exempting on `auth_method == Trust`
+    /// would silently exempt every trust-mode external client from blacklist
+    /// and rate-limit enforcement — a security hole. Only the
+    /// `new_internal_service` constructor may set this `true`.
+    pub is_internal_service: bool,
 }
 
 impl std::ops::Deref for AuthenticatedIdentity {
@@ -98,6 +110,7 @@ impl AuthenticatedIdentity {
             roles,
             authority: IdentityAuthority {
                 is_superuser: false,
+                is_internal_service: false,
             },
             default_database,
             accessible_databases,
@@ -114,6 +127,7 @@ impl AuthenticatedIdentity {
             roles: principal.roles,
             authority: IdentityAuthority {
                 is_superuser: principal.is_superuser,
+                is_internal_service: false,
             },
             default_database: principal.default_database,
             accessible_databases: principal.accessible_databases,
@@ -139,7 +153,10 @@ impl AuthenticatedIdentity {
             tenant_id,
             auth_method: AuthMethod::Trust,
             roles,
-            authority: IdentityAuthority { is_superuser },
+            authority: IdentityAuthority {
+                is_superuser,
+                is_internal_service: true,
+            },
             default_database,
             accessible_databases,
         }
@@ -148,6 +165,18 @@ impl AuthenticatedIdentity {
     /// Whether this server-issued identity has catalog/internal superuser authority.
     pub fn is_superuser(&self) -> bool {
         self.authority.is_superuser
+    }
+
+    /// Whether this identity represents server-owned work (triggers, Raft
+    /// apply, CRDT sync, scheduler, replay) rather than an external client.
+    ///
+    /// Unforgeable the same way `is_superuser` is: the flag lives on the
+    /// private `IdentityAuthority`, exposed only through this read-only
+    /// accessor, and only [`Self::new_internal_service`] can set it `true`.
+    /// See [`IdentityAuthority::is_internal_service`] for why this must not
+    /// be derived from `auth_method == AuthMethod::Trust`.
+    pub fn is_internal_service(&self) -> bool {
+        self.authority.is_internal_service
     }
 
     /// Check if this identity has a specific role.

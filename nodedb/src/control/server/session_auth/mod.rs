@@ -9,12 +9,16 @@
 //! - [`context`] — build and enrich `AuthContext` from an identity, plus
 //!   per-query `ON DENY` extraction.
 //! - [`guards`] — post-identity blacklist and rate-limit checks.
+//! - [`admission`] — the composed entry point over `guards`: internal-service
+//!   exemption, blacklist, account status, and rate limit, in order.
 
+pub mod admission;
 pub mod context;
 pub mod guards;
 pub mod identity;
 pub mod native;
 
+pub use admission::check_request_admission;
 pub use context::{
     apply_per_query_on_deny, build_auth_context, enrich_auth_context_with_scopes,
     extract_and_apply_on_deny, extract_on_deny, session_on_deny_override,
