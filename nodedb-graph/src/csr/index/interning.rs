@@ -2,8 +2,6 @@
 
 //! Node / label string↔id interning and the node-label bitset.
 
-use std::collections::hash_map::Entry;
-
 use super::types::CsrIndex;
 
 impl CsrIndex {
@@ -15,35 +13,34 @@ impl CsrIndex {
     /// and deterministic — a silent `u32` wrap would reproduce the same class
     /// of bug as the label-overflow issue this crate fixed previously.
     pub(crate) fn ensure_node(&mut self, node: &str) -> Result<u32, crate::GraphError> {
-        match self.node_to_id.entry(node.to_string()) {
-            Entry::Occupied(e) => Ok(*e.get()),
-            Entry::Vacant(e) => {
-                let len = self.id_to_node.len();
-                if len >= crate::MAX_NODES_PER_CSR {
-                    return Err(crate::GraphError::NodeOverflow { used: len });
-                }
-                let id = len as u32;
-                e.insert(id);
-                self.id_to_node.push(node.to_string());
-                // Extend dense offsets (new node has 0 edges in dense part).
-                self.out_offsets
-                    .push(*self.out_offsets.last().unwrap_or(&0));
-                self.in_offsets.push(*self.in_offsets.last().unwrap_or(&0));
-                // Extend buffer and access tracking.
-                self.buffer_out.push(Vec::new());
-                self.buffer_in.push(Vec::new());
-                self.buffer_out_weights.push(Vec::new());
-                self.buffer_in_weights.push(Vec::new());
-                self.buffer_out_collections.push(Vec::new());
-                self.buffer_in_collections.push(Vec::new());
-                self.node_label_bits.push(0);
-                // Surrogate is populated later by the EdgePut handler; start
-                // with the ZERO sentinel so unset nodes are never in a bitmap.
-                self.node_surrogates.push(0);
-                self.access_counts.push(std::cell::Cell::new(0));
-                Ok(id)
-            }
+        if let Some(&id) = self.node_to_id.get(node) {
+            return Ok(id);
         }
+        let len = self.id_to_node.len();
+        if len >= crate::MAX_NODES_PER_CSR {
+            return Err(crate::GraphError::NodeOverflow { used: len });
+        }
+        let id = len as u32;
+        let owned = node.to_string();
+        self.node_to_id.insert(owned.clone(), id);
+        self.id_to_node.push(owned);
+        // Extend dense offsets (new node has 0 edges in dense part).
+        self.out_offsets
+            .push(*self.out_offsets.last().unwrap_or(&0));
+        self.in_offsets.push(*self.in_offsets.last().unwrap_or(&0));
+        // Extend buffer and access tracking.
+        self.buffer_out.push(Vec::new());
+        self.buffer_in.push(Vec::new());
+        self.buffer_out_weights.push(Vec::new());
+        self.buffer_in_weights.push(Vec::new());
+        self.buffer_out_collections.push(Vec::new());
+        self.buffer_in_collections.push(Vec::new());
+        self.node_label_bits.push(0);
+        // Surrogate is populated later by the EdgePut handler; start
+        // with the ZERO sentinel so unset nodes are never in a bitmap.
+        self.node_surrogates.push(0);
+        self.access_counts.push(std::cell::Cell::new(0));
+        Ok(id)
     }
 
     /// Get or create a dense ID for a label.
@@ -55,19 +52,18 @@ impl CsrIndex {
     /// Result is propagated so the ceiling failure mode is typed and
     /// loud rather than a silent cast.
     pub(crate) fn ensure_label(&mut self, label: &str) -> Result<u32, crate::GraphError> {
-        match self.label_to_id.entry(label.to_string()) {
-            Entry::Occupied(e) => Ok(*e.get()),
-            Entry::Vacant(e) => {
-                let len = self.id_to_label.len();
-                if len >= crate::MAX_EDGE_LABELS {
-                    return Err(crate::GraphError::LabelOverflow { used: len });
-                }
-                let id = len as u32;
-                e.insert(id);
-                self.id_to_label.push(label.to_string());
-                Ok(id)
-            }
+        if let Some(&id) = self.label_to_id.get(label) {
+            return Ok(id);
         }
+        let len = self.id_to_label.len();
+        if len >= crate::MAX_EDGE_LABELS {
+            return Err(crate::GraphError::LabelOverflow { used: len });
+        }
+        let id = len as u32;
+        let owned = label.to_string();
+        self.label_to_id.insert(owned.clone(), id);
+        self.id_to_label.push(owned);
+        Ok(id)
     }
 
     /// Get or create a dense id for a collection name.
@@ -76,15 +72,14 @@ impl CsrIndex {
     /// collections in a partition is bounded by DDL and far below any `u32`
     /// concern. `""` (the unscoped sentinel) interns like any other name.
     pub(crate) fn ensure_collection(&mut self, collection: &str) -> u32 {
-        match self.collection_to_id.entry(collection.to_string()) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let id = self.id_to_collection.len() as u32;
-                e.insert(id);
-                self.id_to_collection.push(collection.to_string());
-                id
-            }
+        if let Some(&id) = self.collection_to_id.get(collection) {
+            return id;
         }
+        let id = self.id_to_collection.len() as u32;
+        let owned = collection.to_string();
+        self.collection_to_id.insert(owned.clone(), id);
+        self.id_to_collection.push(owned);
+        id
     }
 
     /// Look up the dense collection id for a collection name, if interned.
