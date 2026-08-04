@@ -47,18 +47,25 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> Result<AlgoResultBatch, crate
         .as_deref()
         .is_some_and(|direction| direction.eq_ignore_ascii_case("both"));
 
-    // Dijkstra requires finite, non-negative edge weights. Pre-scan to fail
-    // fast rather than silently producing invalid distances.
+    let compacted_out = csr.compacted_out_weighted_adjacency_raw();
+    let compacted_in = both
+        .then(|| csr.compacted_in_weighted_adjacency_raw())
+        .flatten();
+    let use_compacted = compacted_out.is_some() && (!both || compacted_in.is_some());
+
+    // Dijkstra requires finite, non-negative edge weights. Validate direct
+    // compacted weight slices without allocating per-node edge vectors.
     if csr.has_weights() {
-        for node in 0..n {
-            for (_lid, _dst, weight) in csr.iter_out_edges_weighted_raw(node as u32) {
-                if !weight.is_finite() || weight < 0.0 {
-                    return Err(crate::Error::BadRequest {
-                        detail: format!(
-                            "SSSP (Dijkstra) requires finite non-negative edge weights, found {weight} on edge from '{}'",
-                            csr.node_name_raw(node as u32)
-                        ),
-                    });
+        if let Some((offsets, _targets, Some(weights))) = compacted_out {
+            for node in 0..n {
+                for &weight in &weights[offsets[node] as usize..offsets[node + 1] as usize] {
+                    validate_weight(csr, node, weight)?;
+                }
+            }
+        } else {
+            for node in 0..n {
+                for (_label, _destination, weight) in csr.iter_out_edges_weighted_raw(node as u32) {
+                    validate_weight(csr, node, weight)?;
                 }
             }
         }
@@ -78,13 +85,23 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> Result<AlgoResultBatch, crate
             continue;
         }
 
-        // Relax edges in the selected projection.
-        for (_lid, v, weight) in csr.iter_out_edges_weighted_raw(u) {
-            relax(v, weight, d, &mut dist, &mut heap);
-        }
-        if both {
-            for (_lid, v, weight) in csr.iter_in_edges_weighted_raw(u) {
-                relax(v, weight, d, &mut dist, &mut heap);
+        // Relax direct compacted slices when available. Mutable/deleted graphs
+        // retain the iterator fallback with identical semantics.
+        if use_compacted {
+            let (offsets, targets, weights) = compacted_out.expect("checked above");
+            relax_compacted(u, d, offsets, targets, weights, &mut dist, &mut heap);
+            if both {
+                let (offsets, targets, weights) = compacted_in.expect("checked above");
+                relax_compacted(u, d, offsets, targets, weights, &mut dist, &mut heap);
+            }
+        } else {
+            for (_label, destination, weight) in csr.iter_out_edges_weighted_raw(u) {
+                relax(destination, weight, d, &mut dist, &mut heap);
+            }
+            if both {
+                for (_label, source, weight) in csr.iter_in_edges_weighted_raw(u) {
+                    relax(source, weight, d, &mut dist, &mut heap);
+                }
             }
         }
     }
@@ -95,6 +112,40 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> Result<AlgoResultBatch, crate
         batch.push_node_f64(csr.node_name_raw(node as u32).to_string(), d);
     }
     Ok(batch)
+}
+
+fn validate_weight(csr: &CsrIndex, node: usize, weight: f64) -> Result<(), crate::Error> {
+    if weight.is_finite() && weight >= 0.0 {
+        return Ok(());
+    }
+    Err(crate::Error::BadRequest {
+        detail: format!(
+            "SSSP (Dijkstra) requires finite non-negative edge weights, found {weight} on edge from '{}'",
+            csr.node_name_raw(node as u32)
+        ),
+    })
+}
+
+fn relax_compacted(
+    node: u32,
+    distance: f64,
+    offsets: &[u32],
+    targets: &[u32],
+    weights: Option<&[f64]>,
+    distances: &mut [f64],
+    heap: &mut BinaryHeap<Reverse<(OrdF64, u32)>>,
+) {
+    let start = offsets[node as usize] as usize;
+    let end = offsets[node as usize + 1] as usize;
+    for edge in start..end {
+        relax(
+            targets[edge],
+            weights.map_or(1.0, |weights| weights[edge]),
+            distance,
+            distances,
+            heap,
+        );
+    }
 }
 
 fn relax(

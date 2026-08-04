@@ -2,7 +2,6 @@
 
 //! Product-owned embedded Graphalytics runner support.
 
-use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -255,22 +254,7 @@ fn bfs_depths(csr: &nodedb_graph::CsrIndex, source: &str) -> anyhow::Result<Vec<
     let start = csr
         .node_id_raw(source)
         .ok_or_else(|| anyhow::anyhow!("source vertex {source} is absent"))?;
-    let mut depths = vec![-1; csr.node_count()];
-    depths[start as usize] = 0;
-    let mut queue = VecDeque::from([start]);
-    while let Some(node) = queue.pop_front() {
-        let next_depth = depths[node as usize] + 1;
-        for (_, neighbor) in csr
-            .iter_out_edges_raw(node)
-            .chain(csr.iter_in_edges_raw(node))
-        {
-            if depths[neighbor as usize] == -1 {
-                depths[neighbor as usize] = next_depth;
-                queue.push_back(neighbor);
-            }
-        }
-    }
-    Ok(depths)
+    Ok(csr.bfs_both_distances_raw(start))
 }
 
 fn write_json_result(

@@ -254,9 +254,33 @@ impl CsrIndex {
         node: u32,
     ) -> impl Iterator<Item = (u32, u32, f64)> + '_ {
         self.iter_in_edges_weighted(self.local(node))
-            .map(move |(label, source, weight)| {
-                (label, source.raw(self.partition_tag), weight)
-            })
+            .map(move |(label, source, weight)| (label, source.raw(self.partition_tag), weight))
+    }
+
+    /// Borrow compacted outbound targets and their optional weight array.
+    /// `None` weights mean every edge has the default weight `1.0`.
+    pub fn compacted_out_weighted_adjacency_raw(&self) -> Option<(&[u32], &[u32], Option<&[f64]>)> {
+        let compacted = self.buffer_out.iter().all(Vec::is_empty)
+            && self.buffer_in.iter().all(Vec::is_empty)
+            && self.deleted_edges.is_empty();
+        compacted.then_some((
+            &self.out_offsets,
+            &self.out_targets,
+            self.out_weights.as_deref(),
+        ))
+    }
+
+    /// Borrow compacted inbound targets and their optional weight array.
+    /// See [`Self::compacted_out_weighted_adjacency_raw`].
+    pub fn compacted_in_weighted_adjacency_raw(&self) -> Option<(&[u32], &[u32], Option<&[f64]>)> {
+        let compacted = self.buffer_out.iter().all(Vec::is_empty)
+            && self.buffer_in.iter().all(Vec::is_empty)
+            && self.deleted_edges.is_empty();
+        compacted.then_some((
+            &self.in_offsets,
+            &self.in_targets,
+            self.in_weights.as_deref(),
+        ))
     }
 }
 

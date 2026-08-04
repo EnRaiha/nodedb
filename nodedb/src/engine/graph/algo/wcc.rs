@@ -25,20 +25,21 @@ pub fn run(csr: &CsrIndex) -> AlgoResultBatch {
 
     let mut uf = UnionFind::new(n);
 
-    // Single pass over all outbound edges. Since every edge (u, v) appears
-    // as an outbound edge from u, this covers all edges without needing
-    // inbound iteration.
-    for u in 0..n {
-        for (_lid, v) in csr.iter_out_edges_raw(u as u32) {
-            uf.union(u, v as usize);
+    // Every stored directed edge has exactly one outbound representation;
+    // treating that pair as undirected requires one union, not a second scan
+    // of the mirrored inbound index. Borrow compacted target slices directly
+    // when possible to avoid allocating a temporary neighbor Vec per node.
+    if let Some((offsets, targets)) = csr.compacted_out_adjacency_raw() {
+        for u in 0..n {
+            for &v in &targets[offsets[u] as usize..offsets[u + 1] as usize] {
+                uf.union(u, v as usize);
+            }
         }
-    }
-
-    // Also scan inbound edges to handle directed-only edges that might
-    // not appear in both CSR halves for WCC's undirected semantics.
-    for v in 0..n {
-        for (_lid, u) in csr.iter_in_edges_raw(v as u32) {
-            uf.union(u as usize, v);
+    } else {
+        for u in 0..n {
+            for (_lid, v) in csr.iter_out_edges_raw(u as u32) {
+                uf.union(u, v as usize);
+            }
         }
     }
 

@@ -23,6 +23,45 @@ use super::result::AlgoResultBatch;
 use crate::engine::graph::algo::GraphAlgorithm;
 use crate::engine::graph::csr::CsrIndex;
 
+#[cfg(not(target_arch = "wasm32"))]
+static ACTIVE_LCC_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+struct LccWorkerPermits(usize);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LccWorkerPermits {
+    fn reserve(requested: usize) -> Self {
+        use std::sync::atomic::Ordering;
+
+        const MAX_PROCESS_WORKERS: usize = 32;
+        let mut active = ACTIVE_LCC_WORKERS.load(Ordering::Acquire);
+        loop {
+            let granted = requested.min(MAX_PROCESS_WORKERS.saturating_sub(active));
+            match ACTIVE_LCC_WORKERS.compare_exchange_weak(
+                active,
+                active + granted,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Self(granted),
+                Err(updated) => active = updated,
+            }
+        }
+    }
+
+    fn workers(&self) -> usize {
+        self.0
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for LccWorkerPermits {
+    fn drop(&mut self) {
+        ACTIVE_LCC_WORKERS.fetch_sub(self.0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Default maximum neighbor count before switching to sampling approximation.
 /// Sourced from `GraphTuning::lcc_high_degree_threshold` at runtime.
 pub const DEFAULT_HIGH_DEGREE_THRESHOLD: usize = 2_000;
@@ -44,19 +83,45 @@ pub fn run(csr: &CsrIndex, high_degree_threshold: usize, sample_pairs: usize) ->
         return AlgoResultBatch::new(GraphAlgorithm::Lcc);
     }
 
-    let adjacency: Vec<Vec<u32>> = (0..n as u32)
-        .map(|node| {
-            let mut neighbors: HashSet<u32> = csr
-                .iter_out_edges_raw(node)
-                .map(|(_, neighbor)| neighbor)
-                .chain(csr.iter_in_edges_raw(node).map(|(_, neighbor)| neighbor))
-                .filter(|neighbor| *neighbor != node)
-                .collect();
-            let mut neighbors: Vec<u32> = neighbors.drain().collect();
-            neighbors.sort_unstable();
-            neighbors
-        })
-        .collect();
+    let adjacency: Vec<Vec<u32>> =
+        if let (Some((out_offsets, out_targets)), Some((in_offsets, in_targets))) = (
+            csr.compacted_out_adjacency_raw(),
+            csr.compacted_in_adjacency_raw(),
+        ) {
+            (0..n)
+                .map(|node| {
+                    let mut neighbors = Vec::with_capacity(
+                        out_offsets[node + 1] as usize - out_offsets[node] as usize
+                            + in_offsets[node + 1] as usize
+                            - in_offsets[node] as usize,
+                    );
+                    neighbors.extend_from_slice(
+                        &out_targets[out_offsets[node] as usize..out_offsets[node + 1] as usize],
+                    );
+                    neighbors.extend_from_slice(
+                        &in_targets[in_offsets[node] as usize..in_offsets[node + 1] as usize],
+                    );
+                    neighbors.retain(|neighbor| *neighbor != node as u32);
+                    neighbors.sort_unstable();
+                    neighbors.dedup();
+                    neighbors
+                })
+                .collect()
+        } else {
+            (0..n as u32)
+                .map(|node| {
+                    let mut neighbors: Vec<u32> = csr
+                        .iter_out_edges_raw(node)
+                        .map(|(_, neighbor)| neighbor)
+                        .chain(csr.iter_in_edges_raw(node).map(|(_, neighbor)| neighbor))
+                        .filter(|neighbor| *neighbor != node)
+                        .collect();
+                    neighbors.sort_unstable();
+                    neighbors.dedup();
+                    neighbors
+                })
+                .collect()
+        };
     let exact_triangles = adjacency
         .iter()
         .all(|neighbors| neighbors.len() <= high_degree_threshold)
@@ -73,7 +138,13 @@ pub fn run(csr: &CsrIndex, high_degree_threshold: usize, sample_pairs: usize) ->
                 2.0 * triangles[node] as f64 / (degree * (degree - 1)) as f64
             }
         } else {
-            compute_lcc(csr, &adjacency, node_id, high_degree_threshold, sample_pairs)
+            compute_lcc(
+                csr,
+                &adjacency,
+                node_id,
+                high_degree_threshold,
+                sample_pairs,
+            )
         };
         batch.push_node_f64(csr.node_name_raw(node as u32).to_string(), coeff);
     }
@@ -147,12 +218,14 @@ fn count_oriented_triangles(oriented: &[Vec<u32>]) -> Vec<usize> {
             .unwrap_or(usize::MAX)
             .max(1);
         let memory_bounded_workers = (COUNTER_BUDGET_BYTES / bytes_per_counter).max(1);
-        let workers = std::thread::available_parallelism()
+        let desired_workers = std::thread::available_parallelism()
             .map_or(1, usize::from)
             .min(MAX_WORKERS)
             .min(memory_bounded_workers)
             .min(oriented.len().max(1));
-        if workers == 1 {
+        let permits = LccWorkerPermits::reserve(desired_workers);
+        let workers = permits.workers();
+        if workers <= 1 {
             return count_oriented_triangle_range(oriented, 0, oriented.len());
         }
 
@@ -188,11 +261,7 @@ fn count_oriented_triangles(oriented: &[Vec<u32>]) -> Vec<usize> {
     }
 }
 
-fn count_oriented_triangle_range(
-    oriented: &[Vec<u32>],
-    start: usize,
-    end: usize,
-) -> Vec<usize> {
+fn count_oriented_triangle_range(oriented: &[Vec<u32>], start: usize, end: usize) -> Vec<usize> {
     let mut triangles = vec![0usize; oriented.len()];
     count_oriented_triangle_range_into(oriented, start, end, &mut triangles);
     triangles
@@ -371,6 +440,14 @@ mod tests {
         assert!(map["a"].abs() < 1e-9); // degree 1
         assert!(map["b"].abs() < 1e-9); // 2 neighbors (a,c) but no a-c edge
         assert!(map["c"].abs() < 1e-9); // degree 1
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn exhausted_worker_permits_fall_back_to_exact_triangle_counting() {
+        let oriented = vec![vec![1, 2], vec![2], vec![]];
+        let _held = LccWorkerPermits::reserve(32);
+        assert_eq!(count_oriented_triangles(&oriented), vec![1, 1, 1]);
     }
 
     #[test]

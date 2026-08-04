@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod bfs;
 pub mod bulk;
 mod compaction;
 pub(crate) mod dense_array;
