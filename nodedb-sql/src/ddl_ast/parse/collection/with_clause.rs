@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Parse the `WITH (...)` clause and `BALANCED ON (...)` clause in CREATE COLLECTION.
+//! Parse the `WITH ...` clause and `BALANCED ON (...)` clause in CREATE COLLECTION.
+//!
+//! Both spellings of the options clause are accepted: the parenthesised
+//! `WITH (engine='kv', ttl=...)` and the bare `WITH storage = 'kv', ttl = ...`.
+//! They mean the same thing, and a caller who writes the bare form is not
+//! asking for their options to be ignored — dropping them silently produced a
+//! collection on the wrong engine.
 
 use crate::parser::preprocess::lex::{
     find_ascii_case_insensitive, keyword_position_outside_literals,
@@ -20,7 +26,7 @@ pub(super) fn extract_with_options(body: &str) -> (Option<String>, Vec<(String, 
     // Skip "WITH" keyword.
     let after_with = &after_with["WITH".len()..].trim_start();
     if !after_with.starts_with('(') {
-        return (None, Vec::new());
+        return split_engine(parse_with_kvs(bare_options_clause(after_with)));
     }
 
     // Find the matching close paren for the WITH clause.
@@ -45,8 +51,11 @@ pub(super) fn extract_with_options(body: &str) -> (Option<String>, Vec<(String, 
     };
 
     let inner = &after_with[1..end];
-    let pairs = parse_with_kvs(inner);
+    split_engine(parse_with_kvs(inner))
+}
 
+/// Separate the `engine=` key from the rest of the parsed options.
+fn split_engine(pairs: Vec<(String, String)>) -> (Option<String>, Vec<(String, String)>) {
     let mut engine: Option<String> = None;
     let mut other: Vec<(String, String)> = Vec::new();
     for (k, v) in pairs {
@@ -57,6 +66,21 @@ pub(super) fn extract_with_options(body: &str) -> (Option<String>, Vec<(String, 
         }
     }
     (engine, other)
+}
+
+/// The extent of a bare (unparenthesised) `WITH` clause.
+///
+/// Without parentheses there is no closing token, so the clause runs to the end
+/// of the body or to the next clause that is parsed separately — a trailing
+/// `ENGINE = <name>` suffix or a `BALANCED ON (...)`. Keywords inside quoted
+/// values do not end it.
+fn bare_options_clause(after_with: &str) -> &str {
+    let end = ["ENGINE", "BALANCED"]
+        .into_iter()
+        .filter_map(|keyword| keyword_position_outside_literals(after_with, keyword))
+        .min()
+        .unwrap_or(after_with.len());
+    after_with[..end].trim_end_matches([',', ' ', '\t', '\n'])
 }
 
 /// Split the interior of `WITH (...)` into `(key, value)` pairs.
