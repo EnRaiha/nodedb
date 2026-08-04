@@ -6,6 +6,78 @@ use super::index::CsrIndex;
 use crate::GraphError;
 
 impl CsrIndex {
+    /// Compact a freshly built index directly from its mutation buffers.
+    ///
+    /// Initial rebuilds have no dense edges or deletions, so the general
+    /// merge path would allocate and populate a second graph-sized set of
+    /// per-node vectors only to flatten it immediately. This path flattens the
+    /// already deduplicated insertion buffers directly. If the index is not
+    /// fresh, it falls back to [`Self::compact`] to preserve mutation semantics.
+    pub fn compact_initial_build(&mut self) -> Result<(), GraphError> {
+        if !self.out_targets.is_empty()
+            || !self.in_targets.is_empty()
+            || !self.deleted_edges.is_empty()
+        {
+            return self.compact();
+        }
+
+        let n = self.id_to_node.len();
+        let governor = self.governor.as_ref();
+        let out = Self::build_dense(&self.buffer_out, &self.buffer_out_collections, governor)?;
+        let in_ = Self::build_dense(&self.buffer_in, &self.buffer_in_collections, governor)?;
+        let out_weights = self.has_weights.then(|| {
+            let mut weights = Vec::with_capacity(out.targets.len());
+            for (node, edges) in self.buffer_out.iter().enumerate() {
+                for edge in 0..edges.len() {
+                    weights.push(
+                        self.buffer_out_weights
+                            .get(node)
+                            .and_then(|node_weights| node_weights.get(edge))
+                            .copied()
+                            .unwrap_or(1.0),
+                    );
+                }
+            }
+            weights.into()
+        });
+        let in_weights = self.has_weights.then(|| {
+            let mut weights = Vec::with_capacity(in_.targets.len());
+            for (node, edges) in self.buffer_in.iter().enumerate() {
+                for edge in 0..edges.len() {
+                    weights.push(
+                        self.buffer_in_weights
+                            .get(node)
+                            .and_then(|node_weights| node_weights.get(edge))
+                            .copied()
+                            .unwrap_or(1.0),
+                    );
+                }
+            }
+            weights.into()
+        });
+
+        self.out_offsets = out.offsets;
+        self.out_targets = out.targets.into();
+        self.out_labels = out.labels.into();
+        self.out_collections = out.collections;
+        self.in_offsets = in_.offsets;
+        self.in_targets = in_.targets.into();
+        self.in_labels = in_.labels.into();
+        self.in_collections = in_.collections;
+        self.out_weights = out_weights;
+        self.in_weights = in_weights;
+
+        // Release the graph-sized per-node buffer allocations. Keep one empty
+        // slot per node so subsequent incremental mutations remain valid.
+        self.buffer_out = vec![Vec::new(); n];
+        self.buffer_in = vec![Vec::new(); n];
+        self.buffer_out_collections = vec![Vec::new(); n];
+        self.buffer_in_collections = vec![Vec::new(); n];
+        self.buffer_out_weights = vec![Vec::new(); n];
+        self.buffer_in_weights = vec![Vec::new(); n];
+        Ok(())
+    }
+
     /// Merge the mutable buffer into the dense CSR arrays.
     ///
     /// Called during idle periods. Rebuilds the contiguous offset/target/label
@@ -187,5 +259,87 @@ impl CsrIndex {
         }
         self.deleted_edges.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffered_index() -> CsrIndex {
+        let mut csr = CsrIndex::new();
+        csr.add_edge_in_collection("a", "L", "b", "one").unwrap();
+        csr.add_edge_weighted_in_collection("a", "W", "c", "two", 2.5)
+            .unwrap();
+        csr.add_edge_weighted_in_collection("b", "W", "c", "one", 3.5)
+            .unwrap();
+        csr.add_node("isolated").unwrap();
+        csr
+    }
+
+    #[test]
+    fn initial_build_compaction_matches_general_compaction() {
+        let mut fast = buffered_index();
+        let mut general = buffered_index();
+        fast.compact_initial_build().unwrap();
+        general.compact().unwrap();
+
+        assert_eq!(&*fast.out_offsets, &*general.out_offsets);
+        assert_eq!(&*fast.out_targets, &*general.out_targets);
+        assert_eq!(&*fast.out_labels, &*general.out_labels);
+        assert_eq!(fast.out_collections, general.out_collections);
+        assert_eq!(&*fast.in_offsets, &*general.in_offsets);
+        assert_eq!(&*fast.in_targets, &*general.in_targets);
+        assert_eq!(&*fast.in_labels, &*general.in_labels);
+        assert_eq!(fast.in_collections, general.in_collections);
+        assert_eq!(fast.out_weights.as_deref(), general.out_weights.as_deref());
+        assert_eq!(fast.in_weights.as_deref(), general.in_weights.as_deref());
+        assert_eq!(fast.node_count(), 4);
+    }
+
+    #[test]
+    fn initial_build_compaction_defaults_missing_weight_buffers() {
+        let mut fast = buffered_index();
+        let mut general = buffered_index();
+        for weights in &mut fast.buffer_out_weights {
+            weights.clear();
+        }
+        for weights in &mut fast.buffer_in_weights {
+            weights.clear();
+        }
+        for weights in &mut general.buffer_out_weights {
+            weights.clear();
+        }
+        for weights in &mut general.buffer_in_weights {
+            weights.clear();
+        }
+        fast.compact_initial_build().unwrap();
+        general.compact().unwrap();
+        assert_eq!(fast.out_weights.as_deref(), general.out_weights.as_deref());
+        assert_eq!(fast.in_weights.as_deref(), general.in_weights.as_deref());
+        assert_eq!(
+            fast.out_weights.as_deref().unwrap().len(),
+            fast.edge_count()
+        );
+    }
+
+    #[test]
+    fn initial_build_compaction_allows_incremental_mutation() {
+        let mut csr = buffered_index();
+        csr.compact_initial_build().unwrap();
+        csr.add_edge("c", "L", "a").unwrap();
+        assert_eq!(csr.edge_count(), 4);
+        csr.compact().unwrap();
+        assert_eq!(csr.edge_count(), 4);
+    }
+
+    #[test]
+    fn initial_build_compaction_falls_back_after_dense_mutation() {
+        let mut csr = buffered_index();
+        csr.compact().unwrap();
+        csr.add_edge("c", "L", "a").unwrap();
+        csr.compact_initial_build().unwrap();
+        assert_eq!(csr.edge_count(), 4);
+        assert!(csr.compacted_out_adjacency_raw().is_some());
     }
 }

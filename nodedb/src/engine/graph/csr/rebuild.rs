@@ -67,7 +67,7 @@ pub fn rebuild_sharded_from_store_as_of(
         }
     }
 
-    if let Err(e) = sharded.compact_all() {
+    if let Err(e) = sharded.compact_all_initial_builds() {
         tracing::warn!(
             layer = nodedb_types::diagnostic::DiagnosticLayer::Csr.as_str(),
             error = %e,

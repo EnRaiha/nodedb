@@ -147,6 +147,17 @@ impl ShardedCsrIndex {
         Ok(())
     }
 
+    /// Compact every partition through the fresh-build fast path.
+    ///
+    /// Rebuild callers use this after populating new empty partitions. A
+    /// partition that is not fresh safely falls back to general compaction.
+    pub fn compact_all_initial_builds(&mut self) -> Result<(), GraphError> {
+        for (_tid, part) in self.iter_mut() {
+            part.compact_initial_build()?;
+        }
+        Ok(())
+    }
+
     /// Replace an existing partition (or install a new one) with the
     /// given `CsrIndex`. Used by the rebuild path — after rebuilding a
     /// tenant's CSR from persistent edge storage, this installs it
