@@ -66,13 +66,14 @@ pub fn spawn_core(
             }
 
             // 2. Open engines.
-            let mut core = CoreLoop::open_with_array_catalog(
+            let mut core = CoreLoop::open_with_array_catalog_and_governor(
                 core_id,
                 request_rx,
                 response_tx,
                 &data_dir,
                 hlc,
                 array_catalog,
+                Some(Arc::clone(&governor)),
             )
             .expect("failed to open CoreLoop engines");
 

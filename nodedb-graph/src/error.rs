@@ -50,6 +50,11 @@ pub enum GraphError {
     )]
     NodeOverflow { used: usize },
 
+    /// The dense CSR edge-offset domain is exhausted. Each direction uses
+    /// `u32` offsets, so one partition cannot hold more than `u32::MAX` edges.
+    #[error("CSR edge offset space exhausted ({used}/{} edges)", u32::MAX)]
+    EdgeOverflow { used: usize },
+
     /// The memory governor rejected a reservation for a graph operation.
     ///
     /// Callers should apply backpressure and retry after memory is released.

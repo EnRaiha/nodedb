@@ -213,7 +213,13 @@ impl CsrIndex {
                 labels.push(lid);
                 out_collections.push(node_colls.and_then(|c| c.get(k)).copied().unwrap_or(0));
             }
-            offset += node_edges.len() as u32;
+            let node_edges =
+                u32::try_from(node_edges.len()).map_err(|_| GraphError::EdgeOverflow {
+                    used: node_edges.len(),
+                })?;
+            offset = offset
+                .checked_add(node_edges)
+                .ok_or(GraphError::EdgeOverflow { used: total })?;
         }
         offsets.push(offset);
 

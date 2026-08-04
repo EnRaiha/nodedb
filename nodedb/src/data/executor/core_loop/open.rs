@@ -57,12 +57,39 @@ impl CoreLoop {
         hlc: Arc<OrdinalClock>,
         array_catalog: ArrayCatalogHandle,
     ) -> crate::Result<Self> {
+        Self::open_with_array_catalog_and_governor(
+            core_id,
+            request_rx,
+            response_tx,
+            data_dir,
+            hlc,
+            array_catalog,
+            None,
+        )
+    }
+
+    pub(crate) fn open_with_array_catalog_and_governor(
+        core_id: usize,
+        request_rx: Consumer<BridgeRequest>,
+        response_tx: Producer<BridgeResponse>,
+        data_dir: &Path,
+        hlc: Arc<OrdinalClock>,
+        array_catalog: ArrayCatalogHandle,
+        governor: Option<Arc<nodedb_mem::MemoryGovernor>>,
+    ) -> crate::Result<Self> {
         let sparse_path = data_dir.join(format!("sparse/core-{core_id}.redb"));
         let sparse = SparseEngine::open(&sparse_path)?;
 
         let graph_path = data_dir.join(format!("graph/core-{core_id}.redb"));
         let edge_store = EdgeStore::open(&graph_path)?;
-        let csr = crate::engine::graph::csr::rebuild::rebuild_sharded_from_store(&edge_store)?;
+        let csr = if let Some(governor) = governor.as_ref() {
+            crate::engine::graph::csr::rebuild::rebuild_sharded_from_store_governed(
+                &edge_store,
+                Arc::clone(governor),
+            )?
+        } else {
+            crate::engine::graph::csr::rebuild::rebuild_sharded_from_store(&edge_store)?
+        };
 
         // Inverted index shares the sparse engine's redb database.
         let inverted = InvertedIndex::open(sparse.db().clone())?;
@@ -157,7 +184,7 @@ impl CoreLoop {
                 array_segment_kek: None,
                 ts_segment_kek: None,
             },
-            governor: None,
+            governor,
             maintenance_budget: None,
             spsc_read_depth: SPSC_READ_DEPTH_NORMAL,
             pressure_suspend_reads: false,

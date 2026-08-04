@@ -2,10 +2,13 @@
 
 //! Origin-specific CSR rebuild from EdgeStore.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 #[cfg(test)]
 use nodedb_graph::CsrIndex;
-use nodedb_graph::ShardedCsrIndex;
 use nodedb_graph::csr::weights::extract_weight_from_properties;
+use nodedb_graph::{CsrBulkBuilder, ShardedCsrIndex};
 #[cfg(test)]
 use nodedb_types::{DatabaseId, TenantId};
 
@@ -14,7 +17,16 @@ use crate::engine::graph::edge_store::EdgeStore;
 /// Rebuild the sharded CSR index from an EdgeStore at `system_as_of` (None =
 /// current state).
 pub fn rebuild_sharded_from_store(store: &EdgeStore) -> crate::Result<ShardedCsrIndex> {
-    rebuild_sharded_from_store_as_of(store, None)
+    rebuild_sharded_from_store_with_governor(store, None, None)
+}
+
+/// Rebuild the current durable graph while enforcing the graph engine's
+/// configured memory budget.
+pub fn rebuild_sharded_from_store_governed(
+    store: &EdgeStore,
+    governor: Arc<nodedb_mem::MemoryGovernor>,
+) -> crate::Result<ShardedCsrIndex> {
+    rebuild_sharded_from_store_with_governor(store, None, Some(governor))
 }
 
 /// Rebuild the sharded CSR index from an EdgeStore using a specific
@@ -23,58 +35,74 @@ pub fn rebuild_sharded_from_store_as_of(
     store: &EdgeStore,
     system_as_of: Option<i64>,
 ) -> crate::Result<ShardedCsrIndex> {
-    let mut sharded = ShardedCsrIndex::new();
-    let node_surrogates = store.scan_all_node_surrogates()?;
+    rebuild_sharded_from_store_with_governor(store, system_as_of, None)
+}
 
-    // First pass: materialize every explicitly registered node, including
-    // standalone vertices that do not occur as an edge endpoint.
+fn rebuild_sharded_from_store_with_governor(
+    store: &EdgeStore,
+    system_as_of: Option<i64>,
+    governor: Option<Arc<nodedb_mem::MemoryGovernor>>,
+) -> crate::Result<ShardedCsrIndex> {
+    let node_surrogates = store.scan_all_node_surrogates()?;
+    let mut builders: HashMap<(nodedb_types::DatabaseId, nodedb_types::TenantId), CsrBulkBuilder> =
+        HashMap::new();
+
+    // Register durable nodes first so standalone vertices survive and local-id
+    // assignment remains stable across rebuilds.
     for (db, tid, node, _) in &node_surrogates {
-        sharded
-            .get_or_create(*db, *tid)
-            .add_node(node)
-            .map_err(|e| crate::Error::Internal {
-                detail: format!("CSR rebuild (add registered node): {e}"),
+        builders
+            .entry((*db, *tid))
+            .or_insert_with(|| new_builder(governor.as_ref()))
+            .register_node(node)
+            .map_err(|error| crate::Error::Internal {
+                detail: format!("CSR rebuild (register node): {error}"),
             })?;
     }
 
-    // Insert each edge once. CsrIndex edge insertion interns missing endpoints,
-    // so a separate endpoint pass only repeats two hash lookups per edge.
-    // Consuming the decoded records also releases their strings/properties as
-    // rebuilding progresses instead of retaining the full vector until compact.
+    // The temporal scanner emits one resolved live record per complete edge
+    // identity. Intern it once into a compact temporary stream, then build exact
+    // dense arrays without mutation-buffer duplicate scans or compaction.
     store.for_each_edge_decoded(
         system_as_of,
         |(db, tid, collection, src, label, dst, props)| {
-            let partition = sharded.get_or_create(db, tid);
-            let weight = extract_weight_from_properties(&props);
-            let result = if weight != 1.0 {
-                partition.add_edge_weighted_in_collection(&src, &label, &dst, &collection, weight)
-            } else {
-                partition.add_edge_in_collection(&src, &label, &dst, &collection)
-            };
-            result.map_err(|error| crate::Error::Internal {
-                detail: format!("CSR rebuild: {error}"),
-            })
+            builders
+                .entry((db, tid))
+                .or_insert_with(|| new_builder(governor.as_ref()))
+                .push_unique_edge(
+                    &src,
+                    &label,
+                    &dst,
+                    &collection,
+                    extract_weight_from_properties(&props),
+                )
+                .map_err(|error| crate::Error::Internal {
+                    detail: format!("CSR rebuild (collect edge): {error}"),
+                })
         },
     )?;
 
-    // Third pass: restore each node's global identity. Without this the rebuilt
-    // index knows the graph's shape but binds no surrogate, so every
-    // cross-engine read — which meets the other engines on the surrogate — sees
-    // an empty graph side until live writes happen to rebind the nodes.
+    let mut sharded = ShardedCsrIndex::new();
+    for ((db, tid), builder) in builders {
+        let partition = builder.finish().map_err(|error| crate::Error::Internal {
+            detail: format!("CSR rebuild (dense build): {error}"),
+        })?;
+        sharded.install_partition(db, tid, partition);
+    }
+
+    // Restore each node's global identity after dense construction.
     for (db, tid, node, raw) in node_surrogates {
         if let Some(partition) = sharded.partition_mut(db, tid) {
             partition.set_node_surrogate(&node, nodedb_types::Surrogate::new(raw));
         }
     }
-
-    if let Err(e) = sharded.compact_all_initial_builds() {
-        tracing::warn!(
-            layer = nodedb_types::diagnostic::DiagnosticLayer::Csr.as_str(),
-            error = %e,
-            "CSR compaction rejected by memory governor during rebuild; skipping"
-        );
-    }
     Ok(sharded)
+}
+
+fn new_builder(governor: Option<&Arc<nodedb_mem::MemoryGovernor>>) -> CsrBulkBuilder {
+    governor
+        .cloned()
+        .map(CsrBulkBuilder::with_governor)
+        .unwrap_or_default()
 }
 
 /// Test shim: collapse the sharded rebuild into a single `CsrIndex`.
@@ -194,6 +222,81 @@ mod tests {
         let csr = rebuild_from_store(&store).unwrap();
         assert!(csr.contains_node("a") && csr.contains_node("b"));
         assert_eq!(csr.node_surrogate("a"), None);
+    }
+
+    #[test]
+    fn governed_rebuild_surfaces_dense_allocation_rejection() {
+        use nodedb_mem::{EngineId, GovernorConfig, MemoryGovernor};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = EdgeStore::open(&dir.path().join("graph.redb")).unwrap();
+        store
+            .put_edge_versioned(
+                EdgeRef::new(DB, tenant(), "people", "a", "knows", "b"),
+                b"{}",
+                100,
+                100,
+                i64::MAX,
+            )
+            .unwrap();
+        let governor = Arc::new(
+            MemoryGovernor::new(GovernorConfig {
+                global_ceiling: 16,
+                engine_limits: HashMap::from([(EngineId::Graph, 16)]),
+            })
+            .unwrap(),
+        );
+
+        let error = match rebuild_sharded_from_store_governed(&store, governor) {
+            Err(error) => error,
+            Ok(_) => panic!("expected governed rebuild rejection"),
+        };
+        assert!(error.to_string().contains("memory budget"));
+    }
+
+    #[test]
+    fn bulk_rebuild_preserves_collections_weights_and_incremental_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EdgeStore::open(&dir.path().join("graph.redb")).unwrap();
+        let mut weight = Vec::new();
+        nodedb_query::msgpack_scan::write_map_header(&mut weight, 1);
+        nodedb_query::msgpack_scan::write_kv_f64(&mut weight, "weight", 2.5);
+        for collection in ["people", "archive"] {
+            store
+                .put_edge_versioned(
+                    EdgeRef::new(DB, tenant(), collection, "a", "knows", "b"),
+                    &weight,
+                    100,
+                    100,
+                    i64::MAX,
+                )
+                .unwrap();
+        }
+
+        let mut csr = rebuild_from_store(&store).unwrap();
+        let a = csr.node_id_raw("a").unwrap();
+        let b = csr.node_id_raw("b").unwrap();
+        for collection in ["people", "archive"] {
+            let collection = csr.collection_id(collection).unwrap();
+            assert_eq!(
+                csr.iter_out_edges_raw_in(a, collection)
+                    .filter(|(_, destination)| *destination == b)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            csr.iter_out_edges_weighted_raw(a)
+                .filter(|(_, destination, weight)| *destination == b && *weight == 2.5)
+                .count(),
+            2
+        );
+
+        csr.add_edge_in_collection("b", "knows", "c", "people")
+            .unwrap();
+        csr.compact().unwrap();
+        assert!(csr.contains_node("c"));
+        assert_eq!(csr.edge_count(), 3);
     }
 
     #[test]

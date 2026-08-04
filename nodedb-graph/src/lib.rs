@@ -25,7 +25,7 @@ pub mod traversal_surrogate;
 
 pub use bfs_params::BfsParams;
 pub use csr::extract_weight_from_properties;
-pub use csr::{CsrIndex, Direction, LocalNodeId};
+pub use csr::{CsrBulkBuilder, CsrIndex, Direction, LocalNodeId};
 pub use csr::{DegreeHistogram, GraphStatistics, LabelStats};
 pub use error::{GraphError, MAX_EDGE_LABELS, MAX_NODES_PER_CSR};
 pub use overlay_delta::GraphOverlayDelta;
