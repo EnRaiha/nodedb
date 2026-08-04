@@ -59,6 +59,16 @@ impl VerifiedJwtClaims {
     pub(crate) fn claims(&self) -> &JwtClaims {
         &self.0
     }
+
+    /// Test-only constructor: wraps already-"verified" claims without going
+    /// through JWKS signature verification. Exists so callers elsewhere in
+    /// the crate (e.g. `request_scope::builder` tests) can exercise the
+    /// verified-JWT construction path without standing up a full JWKS
+    /// registry.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(claims: JwtClaims) -> Self {
+        Self(claims)
+    }
 }
 
 impl JwksRegistry {

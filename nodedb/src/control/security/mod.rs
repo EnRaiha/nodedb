@@ -35,6 +35,7 @@ pub mod predicate_parser;
 pub mod random;
 pub mod ratelimit;
 pub mod redaction;
+pub mod request_scope;
 pub mod risk;
 pub mod rls;
 pub mod role;
