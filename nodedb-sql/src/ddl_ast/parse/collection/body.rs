@@ -131,6 +131,69 @@ pub(super) fn parse_collection_body(trimmed: &str, name: &str) -> Result<Collect
 mod tests {
     use super::*;
 
+    /// The options clause without parentheses means what it says. Ignoring it
+    /// silently sent the statement to the default engine instead of the one it
+    /// named.
+    #[test]
+    fn bare_with_clause_yields_its_options() {
+        let (_, _, options, ..) = parse_collection_body(
+            "CREATE COLLECTION t (id INT PRIMARY KEY) WITH storage = 'kv'",
+            "t",
+        )
+        .expect("collection body should parse");
+        assert_eq!(
+            options,
+            vec![("storage".to_string(), "kv".to_string())],
+            "the bare WITH clause must be parsed, not dropped"
+        );
+    }
+
+    /// Several bare options, and a value carrying its own spaces and quotes.
+    #[test]
+    fn bare_with_clause_yields_every_option() {
+        let (_, _, options, ..) = parse_collection_body(
+            "CREATE COLLECTION t (id INT PRIMARY KEY) WITH storage = 'kv', ttl = INTERVAL '1h'",
+            "t",
+        )
+        .expect("collection body should parse");
+        assert_eq!(
+            options.len(),
+            2,
+            "every pair in the clause must survive, got: {options:?}"
+        );
+        assert_eq!(options[0], ("storage".to_string(), "kv".to_string()));
+        assert_eq!(options[1].0, "ttl");
+    }
+
+    /// `engine=` is lifted out of a bare clause exactly as it is from a
+    /// parenthesised one.
+    #[test]
+    fn bare_with_clause_yields_the_engine() {
+        let (engine, ..) = parse_collection_body(
+            "CREATE COLLECTION t (id INT PRIMARY KEY) WITH engine = 'timeseries'",
+            "t",
+        )
+        .expect("collection body should parse");
+        assert_eq!(engine, Some("timeseries".to_string()));
+    }
+
+    /// A trailing `ENGINE = <name>` suffix is its own clause and ends the bare
+    /// options clause rather than being swallowed as an option value.
+    #[test]
+    fn bare_with_clause_stops_at_an_engine_suffix() {
+        let (engine, _, options, ..) = parse_collection_body(
+            "CREATE COLLECTION t (id INT PRIMARY KEY) WITH storage = 'kv' ENGINE = kv",
+            "t",
+        )
+        .expect("collection body should parse");
+        assert_eq!(engine, Some("kv".to_string()));
+        assert_eq!(
+            options,
+            vec![("storage".to_string(), "kv".to_string())],
+            "the suffix must not leak into the options, got: {options:?}"
+        );
+    }
+
     #[test]
     fn collection_body_after_unicode_comment_preserves_original_offsets() {
         let (engine, columns, ..) = parse_collection_body(
