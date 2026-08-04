@@ -75,3 +75,9 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# zerompk is pinned to our own fork at an exact rev while the derived codecs'
+# `inline(always)` fix is unreleased upstream — it folds whole codec trees into
+# one function and makes large plan enums cost minutes to compile. Drop this
+# entry together with the git source in Cargo.toml once the fix ships to
+# crates.io.
+allow-git = ["https://github.com/farhan-syah/zerompk"]
