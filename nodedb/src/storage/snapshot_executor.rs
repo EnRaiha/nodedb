@@ -225,8 +225,10 @@ fn restore_vector_checkpoints(
     let gen_dir =
         crate::data::executor::vector_checkpoint::vector_ckpt_gen_dir(&ckpt_dir, generation);
     if gen_dir.exists() {
+        // no-objectstore: stale local generation dir is cleared in place before reuse.
         std::fs::remove_dir_all(&gen_dir).map_err(crate::Error::Io)?;
     }
+    // no-objectstore: HNSW checkpoints are mmap'd locally for query hot path.
     std::fs::create_dir_all(&gen_dir).map_err(crate::Error::Io)?;
 
     let mut total_vectors = 0u64;
@@ -273,8 +275,10 @@ fn restore_crdt_checkpoints(
     let generation = crate::data::executor::crdt_checkpoint::next_generation(&ckpt_dir)?;
     let gen_dir = crate::data::executor::crdt_checkpoint::crdt_ckpt_gen_dir(&ckpt_dir, generation);
     if gen_dir.exists() {
+        // no-objectstore: stale local generation dir is cleared in place before reuse.
         std::fs::remove_dir_all(&gen_dir).map_err(crate::Error::Io)?;
     }
+    // no-objectstore: CRDT state lands in a local engine-owned directory.
     std::fs::create_dir_all(&gen_dir).map_err(crate::Error::Io)?;
 
     for snap in crdt_snapshots {
