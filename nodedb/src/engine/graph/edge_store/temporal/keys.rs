@@ -115,10 +115,31 @@ pub fn versioned_edge_key(
             detail: format!("versioned_edge_key: negative system_from={system_from}"),
         });
     }
-    Ok(format!(
-        "{collection}\x00{src}\x00{label}\x00{dst}\x00{system_from:0width$}",
-        width = SYSTEM_TIME_WIDTH
-    ))
+    let mut key = String::with_capacity(
+        collection.len() + src.len() + label.len() + dst.len() + 4 + SYSTEM_TIME_WIDTH,
+    );
+    key.push_str(collection);
+    key.push('\x00');
+    key.push_str(src);
+    key.push('\x00');
+    key.push_str(label);
+    key.push('\x00');
+    key.push_str(dst);
+    key.push('\x00');
+
+    let mut suffix = [b'0'; SYSTEM_TIME_WIDTH];
+    let mut value = system_from as u64;
+    let mut cursor = SYSTEM_TIME_WIDTH;
+    loop {
+        cursor -= 1;
+        suffix[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    key.push_str(std::str::from_utf8(&suffix).expect("decimal digits are valid UTF-8"));
+    Ok(key)
 }
 
 /// Build the version-range prefix for a base edge.
@@ -150,6 +171,26 @@ mod tests {
         let k = versioned_edge_key("c", "a", "L", "b", 42).unwrap();
         assert!(k.ends_with("\x0000000000000000000042"));
         assert_eq!(k.len(), "c\x00a\x00L\x00b\x00".len() + SYSTEM_TIME_WIDTH);
+    }
+
+    #[test]
+    fn version_key_supports_system_time_domain_boundaries() {
+        for system_from in [0, i64::MAX] {
+            let key = versioned_edge_key("c", "a", "L", "b", system_from).unwrap();
+            assert_eq!(key.len(), "c\x00a\x00L\x00b\x00".len() + SYSTEM_TIME_WIDTH);
+            assert_eq!(parse_versioned_edge_key(&key).unwrap().4, system_from);
+        }
+    }
+
+    #[test]
+    fn version_key_matches_fixed_width_reference_encoding() {
+        for system_from in [0, 1, 42, 1_700_000_000_000, i64::MAX] {
+            let expected = format!("c\x00src\x00L\x00dst\x00{system_from:020}");
+            assert_eq!(
+                versioned_edge_key("c", "src", "L", "dst", system_from).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]

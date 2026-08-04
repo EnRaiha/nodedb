@@ -23,7 +23,7 @@ const TENANT: TenantId = TenantId::new(1);
 const COLLECTION: &str = "graphalytics";
 const LABEL: &str = "edge";
 const SOURCE: &str = "6";
-const BATCH_SIZE: usize = 20_000_000;
+const BATCH_SIZE: usize = 10_000_000;
 const OPERATION_TIMEOUT_SECONDS: f64 = 300.0;
 const EDGE_STORE_CACHE_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
@@ -138,47 +138,117 @@ fn import_vertices(store: &EdgeStore, path: &Path) -> anyhow::Result<()> {
 }
 
 fn import_edges(store: &EdgeStore, path: &Path) -> anyhow::Result<()> {
-    let reader = BufReader::with_capacity(1 << 20, File::open(path)?);
-    let mut batch: Vec<EdgeImportRecord> = Vec::with_capacity(BATCH_SIZE);
-    let mut system_from = 1i64;
-    for line in reader.lines() {
-        let line = line?;
-        let mut fields = line.split_whitespace();
-        let source = fields.next().ok_or_else(|| anyhow::anyhow!("missing edge source"))?;
-        let destination = fields.next().ok_or_else(|| anyhow::anyhow!("missing edge destination"))?;
-        let weight: f64 = fields
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("missing edge weight"))?
-            .parse()?;
-        if !weight.is_finite() || weight < 0.0 {
-            anyhow::bail!("invalid edge weight {weight}");
-        }
-        if fields.next().is_some() {
-            anyhow::bail!("edge has extra fields: {line}");
-        }
+    import_edges_with_batch_size(store, path, BATCH_SIZE)
+}
 
-        let mut properties = Vec::with_capacity(18);
-        nodedb_query::msgpack_scan::write_map_header(&mut properties, 1);
-        nodedb_query::msgpack_scan::write_kv_f64(&mut properties, "weight", weight);
-        let value = EdgeValuePayload::new(0, i64::MAX, properties).encode()?;
-        batch.push((
-            DATABASE,
-            TENANT,
-            versioned_edge_key(COLLECTION, source, LABEL, destination, system_from)?,
-            versioned_edge_key(COLLECTION, destination, LABEL, source, system_from)?,
-            value,
-        ));
-        system_from += 1;
-        if batch.len() == BATCH_SIZE {
-            store.import_edge_pairs_deferred(&mut batch)?;
-            batch.clear();
+fn import_edges_with_batch_size(
+    store: &EdgeStore,
+    path: &Path,
+    batch_size: usize,
+) -> anyhow::Result<()> {
+    enum ImportMessage {
+        Batch(Vec<EdgeImportRecord>),
+        Finish,
+    }
+
+    assert!(batch_size > 0, "edge import batch size must be positive");
+    std::thread::scope(|scope| {
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel(1);
+        let (reuse_tx, reuse_rx) = std::sync::mpsc::sync_channel(1);
+        let importer = scope.spawn(move || -> anyhow::Result<()> {
+            while let Ok(message) = work_rx.recv() {
+                match message {
+                    ImportMessage::Batch(mut batch) => {
+                        store.import_edge_pairs_deferred(&mut batch)?;
+                        batch.clear();
+                        // One returned buffer is enough to keep the producer
+                        // pipelined. Drop extras instead of blocking after the
+                        // producer has submitted its final partial batch.
+                        let _ = reuse_tx.try_send(batch);
+                    }
+                    ImportMessage::Finish => {
+                        store.flush_deferred_imports()?;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(())
+        });
+
+        let producer = (|| -> anyhow::Result<()> {
+            let reader = BufReader::with_capacity(1 << 20, File::open(path)?);
+            let mut batch: Vec<EdgeImportRecord> = Vec::with_capacity(batch_size);
+            let mut spare = Some(Vec::with_capacity(batch_size));
+            let mut last_system_from = 0i64;
+            for line in reader.lines() {
+                let line = line?;
+                let mut fields = line.split_whitespace();
+                let source = fields
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing edge source"))?;
+                let destination = fields
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing edge destination"))?;
+                let weight: f64 = fields
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing edge weight"))?
+                    .parse()?;
+                if !weight.is_finite() || weight < 0.0 {
+                    anyhow::bail!("invalid edge weight {weight}");
+                }
+                if fields.next().is_some() {
+                    anyhow::bail!("edge has extra fields: {line}");
+                }
+
+                let system_from = last_system_from.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!("dataset exceeds the nonnegative i64 edge-version domain")
+                })?;
+                last_system_from = system_from;
+                let mut properties = Vec::with_capacity(18);
+                nodedb_query::msgpack_scan::write_map_header(&mut properties, 1);
+                nodedb_query::msgpack_scan::write_kv_f64(&mut properties, "weight", weight);
+                let value = EdgeValuePayload::new(0, i64::MAX, properties).encode()?;
+                batch.push((
+                    DATABASE,
+                    TENANT,
+                    versioned_edge_key(COLLECTION, source, LABEL, destination, system_from)?,
+                    versioned_edge_key(COLLECTION, destination, LABEL, source, system_from)?,
+                    value,
+                ));
+                if batch.len() == batch_size {
+                    work_tx
+                        .send(ImportMessage::Batch(batch))
+                        .map_err(|_| anyhow::anyhow!("edge import worker stopped"))?;
+                    batch = if let Some(spare) = spare.take() {
+                        spare
+                    } else {
+                        reuse_rx
+                            .recv()
+                            .map_err(|_| anyhow::anyhow!("edge import worker stopped"))?
+                    };
+                }
+            }
+            if !batch.is_empty() {
+                work_tx
+                    .send(ImportMessage::Batch(batch))
+                    .map_err(|_| anyhow::anyhow!("edge import worker stopped"))?;
+            }
+            work_tx
+                .send(ImportMessage::Finish)
+                .map_err(|_| anyhow::anyhow!("edge import worker stopped"))?;
+            Ok(())
+        })();
+        drop(work_tx);
+
+        let imported = importer
+            .join()
+            .map_err(|_| anyhow::anyhow!("edge import worker panicked"))?;
+        match (producer, imported) {
+            (_, Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
         }
-    }
-    if !batch.is_empty() {
-        store.import_edge_pairs_deferred(&mut batch)?;
-    }
-    store.flush_deferred_imports()?;
-    Ok(())
+    })
 }
 
 fn bfs_depths(csr: &nodedb_graph::CsrIndex, source: &str) -> anyhow::Result<Vec<i64>> {
@@ -241,4 +311,51 @@ fn write_depths(
         writeln!(writer, "{} {depth}", csr.node_name_raw(node as u32))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipelined_edge_import_crosses_batches_and_reopens_durably() {
+        let dir = tempfile::tempdir().unwrap();
+        for (case, contents, expected) in [
+            ("exact", "1 2 1.0\n2 3 2.0\n3 4 3.0\n4 1 4.0\n", 4),
+            (
+                "partial",
+                "1 2 1.0\n2 3 2.0\n3 4 3.0\n4 5 4.0\n5 1 5.0\n",
+                5,
+            ),
+        ] {
+            let input = dir.path().join(format!("{case}.e"));
+            fs::write(&input, contents).unwrap();
+            let database = dir.path().join(format!("{case}.redb"));
+            {
+                let store = EdgeStore::open(&database).unwrap();
+                import_edges_with_batch_size(&store, &input, 2).unwrap();
+            }
+
+            let reopened = EdgeStore::open(&database).unwrap();
+            let edges = reopened.scan_all_edges_decoded(None).unwrap();
+            assert_eq!(edges.len(), expected);
+            assert_eq!(
+                reopened
+                    .neighbors_in(0, TENANT, COLLECTION, "1", Some(LABEL))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn pipelined_edge_import_returns_after_producer_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("invalid.e");
+        fs::write(&input, "1 2 1.0\n2 3 2.0\nmalformed\n").unwrap();
+        let store = EdgeStore::open(&dir.path().join("invalid.redb")).unwrap();
+        let error = import_edges_with_batch_size(&store, &input, 2).unwrap_err();
+        assert!(error.to_string().contains("missing edge destination"));
+    }
 }
