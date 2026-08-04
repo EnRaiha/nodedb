@@ -7,6 +7,64 @@ NodeDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.5.0] - 2026-08-04
+
+A security and durability release. It closes silent-failure paths in the WAL, replay, checkpoint, and sync layers, enforces authorization uniformly across transports, and makes expression errors, declared column widths, and affected-row counts report the truth instead of a plausible-looking wrong answer.
+
+### ⚠️ Breaking changes
+
+- **A 0.4.0 data directory cannot be opened by 0.5.0** — a dump/reload is required. The catalog store moved to redb 4, whose format refuses older files, and the at-rest encryption envelope was rebuilt around single-use keys.
+- **The WAL opens with `O_DIRECT` by default.** A filesystem that rejects direct I/O now fails startup instead of silently running buffered; opt out with `NODEDB_WAL_DIRECT_IO=false`.
+- **ILP ingest requires authentication** before line-protocol bytes are accepted.
+- **`GRAPH TRAVERSE` / `PATH` / `NEIGHBORS` require `IN '<collection>'`**, and are denied on collections carrying a row policy. CSR snapshot format bumped to v3; graph checkpoints rebuild.
+- **Division by zero raises SQLSTATE `22012` and unregistered functions raise `42883`**, instead of folding to NULL.
+- **Integer and float values outside a declared column width are rejected on write.**
+- **Positional `INSERT` / `UPSERT` binds to the declared column order**; excess values are rejected, and positional insert into a KV collection is refused.
+- **Affected-row counts report the real count** — no-op writes now return 0, not 1.
+- **Sync wire protocol changed** — new `RowPush` message, acks carry an outcome enum, and CRDT peer ids are per-collection and bound to their first producer. Upgrade Lite clients with the server.
+- **`nodedb-wal`** — readers and replay functions take a key ring and return plaintext; `GroupCommitter` is removed in favor of a shared writer lock; the double-write-buffer slot format changed.
+- **`nodedb-client`** — `PoolConfig::default` removed, `ConnectionBuilder::build` is fallible, and trust auth no longer defaults to `admin`.
+- **Triggers reject `SECURITY INVOKER`**, and `Monitor` no longer grants read access.
+- **HTTP and sync listeners bind at boot**, so a port conflict is fatal. `cluster.insecure_transport` now requires a loopback or private bind address.
+- **New settings** — `ports.sync` (9090), `NODEDB_WAL_DIRECT_IO`, `server.native_crash_dumps`, `auth.jwt.max_token_lifetime_secs`.
+- **Dependency majors** — redb 2→4, rand 0.9→0.10, arrow/parquet 58→59, wasmtime 45→47, reqwest 0.12→0.13, prost 0.13→0.14, toml 0.8→1.
+
+### Added
+
+- **Structured failure reports** — fsync'd diagnostics filed where a fault is detected: WAL corruption, lost durability, dropped events, and wedged appliers. Optional `native_crash_dumps` captures a minidump on native faults.
+- **Torn-tail and segment-continuity verification** in WAL replay, plus a fail-point framework for crash-injection tests.
+- **Unified index registry** — `DROP INDEX` resolves and tears down any index kind uniformly.
+- **pgwire** — binary-format parameters including `NUMERIC` / `TIMESTAMP` / `TIMESTAMPTZ`, and `$N` type inference from both SQL text and the catalog.
+- **SQL** — `SEARCH ... USING VECTOR` in subquery position; post-aggregate `ORDER BY` with `NULLS FIRST` / `LAST`; float and short-integer column types; declared `TIME_KEY` honored instead of inferred.
+- **CRDT** — peer-id rekey, per-row bounded export, and local snapshot imports admitted without untrusted-peer ceilings.
+
+### Fixed
+
+- Replay no longer returns a silently truncated suffix below the retained floor; checkpoint truncation is bounded by consumer watermarks, and a failed apply aborts the boot instead of leaving a hole.
+- A failed fsync stops the writer instead of acknowledging data that no longer exists; segment rollover can no longer wedge the WAL; resume no longer reuses LSNs; replay decrypts before decoding.
+- Re-delivered Raft entries are no longer applied twice.
+- Full-text search retracts postings for terms an update removed, and a failed index update rejects the write.
+- Descriptor mutations replicate, so the metadata applier no longer wedges while health stays green.
+- ILP no longer stalls during replicated DDL, and reports lines lost on disconnect.
+- `DROP COLLECTION` reclaims per-core vector and spatial checkpoints.
+- Timeseries series-id collisions no longer merge unrelated series.
+- CRDT applies refuse causally-pending imports instead of reporting success; retryable sync refusals are no longer acked as terminal.
+- Join `LIMIT` applies after post-join `WHERE`; same-named join columns no longer collapse into one value; outer `ORDER BY` / `OFFSET` / `DISTINCT` / `LIMIT` apply over subquery and CTE bodies; search hits return user primary keys.
+- Vector segment backings are validated at attach, and export failures are reported instead of writing truncated vectors.
+
+### Security
+
+- Authentication and authorization are enforced uniformly across every transport and engine. Internal paths that could reach storage without the checks their public equivalents applied now route through a single authorization and row-policy chokepoint, with CI gates that fail the build if a new path bypasses it.
+- Untrusted input is bounded at every decode boundary, and objects read from external storage are authenticated before use.
+- Identity and scope are bound at their source: ingest connections, external identity authorities, policy administration, and unauthenticated cluster transport.
+- Static analysis, secret scanning, and continuous fuzzing of the decoder surface run in CI, alongside a documented threat model.
+
+### Removed
+
+- `GroupCommitter` from `nodedb-wal`, the columnar segment-rewrite protocol and its WAL record, and `cargo-vet`.
+
+---
+
 ## [0.4.0] - 2026-07-20
 
 NodeDB 0.4.0 is a substantial distributed-correctness and durability release. It adds cross-shard transactional execution and distributed query/graph processing, extends temporal and sparse-vector SQL, and hardens replication, recovery, indexing, authentication, and sync across the storage engines.
@@ -206,6 +264,7 @@ NodeDB 0.4.0 is a substantial distributed-correctness and durability release. It
 
 ---
 
+[0.5.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.5.0
 [0.4.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.4.0
 [0.3.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.3.0
 [0.2.0]: https://github.com/NodeDB-Lab/nodedb/releases/tag/v0.2.0

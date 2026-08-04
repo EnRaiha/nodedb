@@ -214,9 +214,11 @@ cargo nextest run --all-features
 
 ## Release Status
 
-NodeDB Origin is in **public beta**; the current release is **v0.4.0 (2026-07-19)**. All eight engines are feature-complete and covered by tests. The wire protocols (pgwire, HTTP, native MessagePack, RESP, ILP, WebSocket) are stable — clients written against 0.1.0 will keep working through 1.0.
+NodeDB Origin is in **public beta**; the current release is **v0.5.0 (2026-08-04)**. All eight engines are feature-complete and covered by tests. The query-facing wire protocols (pgwire, HTTP, native MessagePack, RESP) are stable — clients written against 0.1.0 will keep working through 1.0. The CRDT sync protocol and ILP ingest are still moving: 0.5.0 changes the sync frame and requires authentication on ILP connections, so upgrade NodeDB Lite and ingest clients together with the server.
 
-**v0.4.0 — Beta (today).** Build new products on it. The public surface (SQL dialect, wire protocols, configuration) is stable; expect internal changes (storage layout, on-disk format, replication internals) between minor releases. Patch and minor bumps land as needed — 0.2, 0.3, and 0.4 shipped as the work demanded. The beta period is deliberately for real workloads to surface edge cases we can't manufacture in-house.
+v0.5.0 ships as server binaries and Docker images; the crates.io publication follows separately, so `cargo add` still resolves 0.4.0 for now. Library users who need the 0.5.0 fixes today can depend on the `v0.5.0` tag by git.
+
+**v0.5.0 — Beta (today).** Build new products on it. The public surface (SQL dialect, query wire protocols, configuration) is stable; expect internal changes (storage layout, on-disk format, replication internals) between minor releases — a 0.4.0 data directory needs a dump/reload to move to 0.5.0. Patch and minor bumps land as needed — 0.2 through 0.5 shipped as the work demanded. The beta period is deliberately for real workloads to surface edge cases we can't manufacture in-house.
 
 **v1.0.0 — Production-ready (target: after the beta hardening period).** What 1.0 guarantees:
 

@@ -10,8 +10,8 @@ While NodeDB is pre-1.0, security fixes are issued **only against the latest rel
 
 | Version  | Supported          |
 | -------- | ------------------ |
-| 0.4.x    | :white_check_mark: |
-| <= 0.3.x | :x:                |
+| 0.5.x    | :white_check_mark: |
+| <= 0.4.x | :x:                |
 
 Always run the latest release; it contains every prior security fix along with other bug fixes.
 
