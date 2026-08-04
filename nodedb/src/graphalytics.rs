@@ -24,6 +24,7 @@ const COLLECTION: &str = "graphalytics";
 const LABEL: &str = "edge";
 const SOURCE: &str = "6";
 const BATCH_SIZE: usize = 50_000;
+const OPERATION_TIMEOUT_SECONDS: f64 = 300.0;
 
 pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(output)?;
@@ -41,14 +42,14 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
     let store = EdgeStore::open(database)?;
     import_vertices(&store, &vertices)?;
     import_edges(&store, &edges)?;
-    let load_seconds = load_start.elapsed().as_secs_f64();
+    let load_seconds = checked_elapsed(load_start, "load")?;
 
     let prepare_start = Instant::now();
     let sharded = rebuild_sharded_from_store(&store)?;
     let csr = sharded
         .partition(DATABASE, TENANT)
         .ok_or_else(|| anyhow::anyhow!("Graphalytics partition was not rebuilt"))?;
-    let prepare_seconds = prepare_start.elapsed().as_secs_f64();
+    let prepare_seconds = checked_elapsed(prepare_start, "prepare")?;
 
     let params = AlgoParams {
         source_node: Some(SOURCE.to_string()),
@@ -62,32 +63,32 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
 
     let start = Instant::now();
     let result = pagerank::run(csr, &params);
-    timings.insert("PR".into(), json!(start.elapsed().as_secs_f64()));
+    timings.insert("PR".into(), json!(checked_elapsed(start, "PR")?));
     write_json_result(output, dataset_name, "PR", result.to_json()?, "rank")?;
 
     let start = Instant::now();
     let result = wcc::run(csr);
-    timings.insert("WCC".into(), json!(start.elapsed().as_secs_f64()));
+    timings.insert("WCC".into(), json!(checked_elapsed(start, "WCC")?));
     write_json_result(output, dataset_name, "WCC", result.to_json()?, "component_id")?;
 
     let start = Instant::now();
     let depths = bfs_depths(csr, SOURCE)?;
-    timings.insert("BFS".into(), json!(start.elapsed().as_secs_f64()));
+    timings.insert("BFS".into(), json!(checked_elapsed(start, "BFS")?));
     write_depths(output, dataset_name, csr, &depths)?;
 
     let start = Instant::now();
     let result = lcc::run(csr, usize::MAX, usize::MAX);
-    timings.insert("LCC".into(), json!(start.elapsed().as_secs_f64()));
+    timings.insert("LCC".into(), json!(checked_elapsed(start, "LCC")?));
     write_json_result(output, dataset_name, "LCC", result.to_json()?, "coefficient")?;
 
     let start = Instant::now();
     let result = sssp::run(csr, &params)?;
-    timings.insert("SSSP".into(), json!(start.elapsed().as_secs_f64()));
+    timings.insert("SSSP".into(), json!(checked_elapsed(start, "SSSP")?));
     write_json_result(output, dataset_name, "SSSP", result.to_json()?, "distance")?;
 
     let start = Instant::now();
     let result = label_propagation::run(csr, &params);
-    timings.insert("CDLP".into(), json!(start.elapsed().as_secs_f64()));
+    timings.insert("CDLP".into(), json!(checked_elapsed(start, "CDLP")?));
     write_json_result(output, dataset_name, "CDLP", result.to_json()?, "community_id")?;
 
     let summary = json!({
@@ -99,6 +100,16 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
     });
     fs::write(output.join("summary.json"), serde_json::to_vec_pretty(&summary)?)?;
     Ok(())
+}
+
+fn checked_elapsed(start: Instant, operation: &str) -> anyhow::Result<f64> {
+    let seconds = start.elapsed().as_secs_f64();
+    if seconds > OPERATION_TIMEOUT_SECONDS {
+        anyhow::bail!(
+            "{operation} exceeded the {OPERATION_TIMEOUT_SECONDS:.0}-second operation timeout"
+        );
+    }
+    Ok(seconds)
 }
 
 fn import_vertices(store: &EdgeStore, path: &Path) -> anyhow::Result<()> {
