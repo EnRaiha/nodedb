@@ -82,7 +82,7 @@ ALLOWED_DEFINITIONS = {
 ALLOWED_REFERENCES = {
     (
         "control/server/sync/raft_dispatch/response.rs",
-        "dispatch_to_data_plane_with_source",
+        "dispatch_trusted_internal_write_to_data_plane",
     ),
     (
         "control/server/native/dispatch/transaction.rs",
