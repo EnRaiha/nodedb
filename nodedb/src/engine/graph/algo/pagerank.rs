@@ -53,9 +53,19 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
     };
     let mut next_rank = vec![0.0f64; n];
 
-    // Precompute out-degrees and dangling mask for SIMD dangling sum.
-    let out_degrees: Vec<usize> = (0..n).map(|i| csr.out_degree_raw(i as u32)).collect();
-    let is_dangling: Vec<bool> = out_degrees.iter().map(|&d| d == 0).collect();
+    let both = params
+        .direction
+        .as_deref()
+        .is_some_and(|direction| direction.eq_ignore_ascii_case("both"));
+
+    // Precompute traversal degrees and dangling mask for SIMD dangling sum.
+    let degrees: Vec<usize> = (0..n)
+        .map(|i| {
+            let node = i as u32;
+            csr.out_degree_raw(node) + if both { csr.in_degree_raw(node) } else { 0 }
+        })
+        .collect();
+    let is_dangling: Vec<bool> = degrees.iter().map(|&degree| degree == 0).collect();
 
     for iter in 1..=max_iter {
         // ── SIMD: dangling node rank sum ──
@@ -81,13 +91,18 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
         // This is inherently scatter (random write) — not SIMD-able per se,
         // but the fill + dangling_sum above are the dominant SIMD wins.
         for u in 0..n {
-            let deg = out_degrees[u];
-            if deg == 0 {
+            let degree = degrees[u];
+            if degree == 0 {
                 continue;
             }
-            let contrib = damping * rank[u] / deg as f64;
+            let contrib = damping * rank[u] / degree as f64;
             for (_lid, dst) in csr.iter_out_edges_raw(u as u32) {
                 next_rank[dst as usize] += contrib;
+            }
+            if both {
+                for (_lid, src) in csr.iter_in_edges_raw(u as u32) {
+                    next_rank[src as usize] += contrib;
+                }
             }
         }
 
@@ -172,6 +187,26 @@ mod tests {
             let rank = row["rank"].as_f64().unwrap();
             assert!((rank - 1.0 / 3.0).abs() < 1e-6, "rank {rank} != 1/3");
         }
+    }
+
+    #[test]
+    fn pagerank_both_treats_a_single_stored_edge_as_undirected() {
+        let mut csr = CsrIndex::new();
+        csr.add_edge("a", "L", "b").unwrap();
+        csr.compact().expect("no governor, cannot fail");
+        let batch = run(
+            &csr,
+            &AlgoParams {
+                direction: Some("both".to_string()),
+                max_iterations: Some(10),
+                tolerance: Some(f64::MIN_POSITIVE),
+                ..Default::default()
+            },
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&batch.to_json().unwrap()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!((rows[0]["rank"].as_f64().unwrap() - 0.5).abs() < 1e-12);
+        assert!((rows[1]["rank"].as_f64().unwrap() - 0.5).abs() < 1e-12);
     }
 
     #[test]

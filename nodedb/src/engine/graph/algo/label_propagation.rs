@@ -2,9 +2,9 @@
 
 //! Community Detection — Label Propagation Algorithm (LPA) on the CSR index.
 //!
-//! Each node adopts the most frequent label among its neighbors (ties broken
-//! by smallest label for determinism). Iteration order is randomized with a
-//! deterministic seed to avoid wave propagation artifacts.
+//! Each node adopts the most frequent label among its neighbors using
+//! synchronous iterations. Ties are broken by the smallest original numeric
+//! node identifier when available, then by node name for determinism.
 //!
 //! Performance target: 633K vertices / 34M edges in < 15s for 10 iterations.
 
@@ -32,26 +32,12 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
     // Initialize: each node is its own community.
     let mut labels: Vec<u32> = (0..n as u32).collect();
 
-    // Deterministic node ordering — shuffled via Fisher-Yates with a
-    // simple LCG PRNG seeded from node count (deterministic across runs
-    // for the same graph). Randomized iteration order is critical:
-    // sequential order causes wave propagation where early nodes dominate.
-    let mut order: Vec<usize> = (0..n).collect();
-
     for iter in 1..=max_iter {
-        // Shuffle order with deterministic seed (iteration-dependent so
-        // each iteration processes in a different order).
-        shuffle_deterministic(
-            &mut order,
-            (n as u64).wrapping_mul(iter as u64).wrapping_add(42),
-        );
-
+        let mut next_labels = labels.clone();
         let mut changed = 0usize;
 
-        for &node in &order {
+        for (node, next_label) in next_labels.iter_mut().enumerate() {
             let node_id = node as u32;
-
-            // Count neighbor labels (both directions for undirected community detection).
             let mut label_counts: HashMap<u32, u32> = HashMap::new();
 
             for (_lid, neighbor) in csr.iter_out_edges_raw(node_id) {
@@ -61,34 +47,27 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
                 *label_counts.entry(labels[neighbor as usize]).or_insert(0) += 1;
             }
 
-            if label_counts.is_empty() {
-                continue; // Isolated node keeps its own label.
-            }
-
-            // Find the most frequent label. Ties broken by smallest label ID
-            // for determinism.
             let Some(&max_count) = label_counts.values().max() else {
                 continue;
             };
-            let Some(best_label) = label_counts
-                .iter()
-                .filter(|&(_, count)| *count == max_count)
-                .map(|(&label, _)| label)
-                .min()
-            else {
-                continue;
-            };
+            let best_label = label_counts
+                .into_iter()
+                .filter(|(_, count)| *count == max_count)
+                .map(|(label, _)| label)
+                .min_by(|left, right| compare_labels(csr, *left, *right))
+                .expect("at least one label has the maximum count");
 
             if labels[node] != best_label {
-                labels[node] = best_label;
+                *next_label = best_label;
                 changed += 1;
             }
         }
 
+        labels = next_labels;
         reporter.report_iteration(iter, Some(changed as f64));
 
         if changed == 0 {
-            break; // Converged — no label changes.
+            break;
         }
     }
 
@@ -97,25 +76,19 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
     // Build result.
     let mut batch = AlgoResultBatch::new(GraphAlgorithm::LabelPropagation);
     for (node, &label) in labels.iter().enumerate() {
-        batch.push_node_i64(csr.node_name_raw(node as u32).to_string(), label as i64);
+        let label_name = csr.node_name_raw(label);
+        let community = label_name.parse::<i64>().unwrap_or(label as i64);
+        batch.push_node_i64(csr.node_name_raw(node as u32).to_string(), community);
     }
     batch
 }
 
-/// Fisher-Yates shuffle with a simple LCG PRNG for deterministic ordering.
-///
-/// Uses a 64-bit linear congruential generator (Knuth's constants).
-/// Not cryptographic — deterministic is the goal.
-fn shuffle_deterministic(order: &mut [usize], seed: u64) {
-    let mut state = seed | 1; // Ensure non-zero.
-    let n = order.len();
-    for i in (1..n).rev() {
-        // LCG step.
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
-        let j = (state >> 33) as usize % (i + 1);
-        order.swap(i, j);
+fn compare_labels(csr: &CsrIndex, left: u32, right: u32) -> std::cmp::Ordering {
+    let left_name = csr.node_name_raw(left);
+    let right_name = csr.node_name_raw(right);
+    match (left_name.parse::<u64>(), right_name.parse::<u64>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left_name.cmp(right_name),
     }
 }
 
@@ -147,6 +120,24 @@ mod tests {
 
         assert_eq!(communities[0], communities[1]);
         assert_eq!(communities[1], communities[2]);
+    }
+
+    #[test]
+    fn label_prop_breaks_ties_by_original_numeric_vertex_id() {
+        let mut csr = CsrIndex::new();
+        csr.add_edge("10", "L", "6").unwrap();
+        csr.add_edge("10", "L", "41").unwrap();
+        csr.compact().expect("no governor, cannot fail");
+        let batch = run(
+            &csr,
+            &AlgoParams {
+                max_iterations: Some(1),
+                ..Default::default()
+            },
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&batch.to_json().unwrap()).unwrap();
+        let center = rows.iter().find(|row| row["node_id"] == "10").unwrap();
+        assert_eq!(center["community_id"].as_i64(), Some(6));
     }
 
     #[test]
@@ -233,19 +224,5 @@ mod tests {
         let r1 = run(&csr, &params).to_json().unwrap();
         let r2 = run(&csr, &params).to_json().unwrap();
         assert_eq!(r1, r2);
-    }
-
-    #[test]
-    fn shuffle_deterministic_produces_permutation() {
-        let mut order: Vec<usize> = (0..10).collect();
-        shuffle_deterministic(&mut order, 12345);
-
-        // Should still contain all elements.
-        let mut sorted = order.clone();
-        sorted.sort();
-        assert_eq!(sorted, (0..10).collect::<Vec<_>>());
-
-        // Should be different from identity (overwhelmingly likely for n=10).
-        assert_ne!(order, (0..10).collect::<Vec<_>>());
     }
 }

@@ -12,6 +12,7 @@ pub mod temporal;
 
 pub use cascade::EdgeRestore;
 pub use node_identity::NodeSurrogateRecord;
+pub use snapshot::EdgeSnapshotRecord;
 pub use stats::CollectionStats;
 pub use store::{Direction, Edge, EdgeRecord, EdgeStore};
 pub use temporal::{

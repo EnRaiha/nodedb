@@ -21,6 +21,36 @@ use super::store::{EdgeStore, NODE_SURROGATES, redb_err};
 pub type NodeSurrogateRecord = (DatabaseId, TenantId, String, u32);
 
 impl EdgeStore {
+    /// Import a batch of durable node identities in one transaction.
+    ///
+    /// Besides restoring cross-engine identity, explicit rows preserve
+    /// standalone vertices when the CSR is rebuilt from the edge store.
+    pub fn import_node_surrogates(&self, nodes: &[NodeSurrogateRecord]) -> crate::Result<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| redb_err("begin node import", e))?;
+        {
+            let mut table = write_txn
+                .open_table(NODE_SURROGATES)
+                .map_err(|e| redb_err("open node_surrogates", e))?;
+            for (db, tid, node, surrogate) in nodes {
+                if *surrogate == 0 {
+                    return Err(crate::Error::BadRequest {
+                        detail: format!("node {node:?} has reserved zero surrogate"),
+                    });
+                }
+                table
+                    .insert((db.as_u64(), tid.as_u64(), node.as_str()), *surrogate)
+                    .map_err(|e| redb_err("insert node surrogate", e))?;
+            }
+        }
+        write_txn
+            .commit()
+            .map_err(|e| redb_err("commit node import", e))?;
+        Ok(())
+    }
+
     /// Every node identity binding in this store, for CSR rebuild.
     ///
     /// One pass over a table with one row per node — the rebuild already walks
@@ -110,6 +140,24 @@ mod tests {
             "knows",
             dst,
         )
+    }
+
+    #[test]
+    fn imports_node_surrogates_in_one_batch() {
+        let (store, _dir) = make_store();
+        let tenant = TenantId::new(1);
+        store
+            .import_node_surrogates(&[
+                (DatabaseId::DEFAULT, tenant, "a".to_string(), 10),
+                (DatabaseId::DEFAULT, tenant, "isolated".to_string(), 20),
+            ])
+            .unwrap();
+
+        let mut out = store.scan_all_node_surrogates().unwrap();
+        out.sort_by(|left, right| left.2.cmp(&right.2));
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].2.as_str(), out[0].3), ("a", 10));
+        assert_eq!((out[1].2.as_str(), out[1].3), ("isolated", 20));
     }
 
     #[test]

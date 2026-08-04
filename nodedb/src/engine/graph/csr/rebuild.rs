@@ -25,9 +25,20 @@ pub fn rebuild_sharded_from_store_as_of(
 ) -> crate::Result<ShardedCsrIndex> {
     let mut sharded = ShardedCsrIndex::new();
     let all_edges = store.scan_all_edges_decoded(system_as_of)?;
+    let node_surrogates = store.scan_all_node_surrogates()?;
 
-    // First pass: materialize every (database, tenant, node) so isolated
-    // endpoints get stable node ids before edge insertion.
+    // First pass: materialize every explicitly registered node, including
+    // standalone vertices that do not occur as an edge endpoint.
+    for (db, tid, node, _) in &node_surrogates {
+        sharded
+            .get_or_create(*db, *tid)
+            .add_node(node)
+            .map_err(|e| crate::Error::Internal {
+                detail: format!("CSR rebuild (add registered node): {e}"),
+            })?;
+    }
+
+    // Materialize all edge endpoints before edge insertion.
     // EdgeRecord is (DatabaseId, TenantId, collection, src, label, dst, props).
     for (db, tid, _collection, src, _label, dst, _props) in &all_edges {
         let partition = sharded.get_or_create(*db, *tid);
@@ -65,11 +76,7 @@ pub fn rebuild_sharded_from_store_as_of(
     // index knows the graph's shape but binds no surrogate, so every
     // cross-engine read — which meets the other engines on the surrogate — sees
     // an empty graph side until live writes happen to rebind the nodes.
-    // A binding whose partition holds no edges at all is skipped rather than
-    // vivifying an empty partition: `set_node_surrogate` is a no-op for a name
-    // the rebuild never interned, so the only effect would be a partition that
-    // exists solely to be empty.
-    for (db, tid, node, raw) in store.scan_all_node_surrogates()? {
+    for (db, tid, node, raw) in node_surrogates {
         if let Some(partition) = sharded.partition_mut(db, tid) {
             partition.set_node_surrogate(&node, nodedb_types::Surrogate::new(raw));
         }
@@ -168,6 +175,24 @@ mod tests {
             "the neighbour must be intersectable with another engine's bitmap"
         );
         assert_eq!(hops.unaddressable, 0);
+    }
+
+    #[test]
+    fn explicit_node_binding_preserves_a_standalone_vertex() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EdgeStore::open(&dir.path().join("graph.redb")).unwrap();
+        store
+            .import_node_surrogates(&[(
+                DB,
+                tenant(),
+                "isolated".to_string(),
+                99,
+            )])
+            .unwrap();
+
+        let csr = rebuild_from_store(&store).unwrap();
+        assert!(csr.contains_node("isolated"));
+        assert_eq!(csr.node_surrogate("isolated"), Some(Surrogate::new(99)));
     }
 
     /// A store written before the identity table existed rebuilds normally —

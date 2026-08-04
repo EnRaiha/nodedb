@@ -42,15 +42,20 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> Result<AlgoResultBatch, crate
             detail: format!("source node '{source}' not found in graph"),
         })?;
 
-    // Dijkstra requires non-negative edge weights. Pre-scan for negatives
-    // to fail fast with a clear error rather than silently producing wrong results.
+    let both = params
+        .direction
+        .as_deref()
+        .is_some_and(|direction| direction.eq_ignore_ascii_case("both"));
+
+    // Dijkstra requires finite, non-negative edge weights. Pre-scan to fail
+    // fast rather than silently producing invalid distances.
     if csr.has_weights() {
         for node in 0..n {
-            for (_lid, _dst, w) in csr.iter_out_edges_weighted_raw(node as u32) {
-                if w < 0.0 {
+            for (_lid, _dst, weight) in csr.iter_out_edges_weighted_raw(node as u32) {
+                if !weight.is_finite() || weight < 0.0 {
                     return Err(crate::Error::BadRequest {
                         detail: format!(
-                            "SSSP (Dijkstra) requires non-negative edge weights, found {w} on edge from '{}'",
+                            "SSSP (Dijkstra) requires finite non-negative edge weights, found {weight} on edge from '{}'",
                             csr.node_name_raw(node as u32)
                         ),
                     });
@@ -73,12 +78,13 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> Result<AlgoResultBatch, crate
             continue;
         }
 
-        // Relax outbound edges.
+        // Relax edges in the selected projection.
         for (_lid, v, weight) in csr.iter_out_edges_weighted_raw(u) {
-            let new_dist = d + weight;
-            if new_dist < dist[v as usize] {
-                dist[v as usize] = new_dist;
-                heap.push(Reverse((OrdF64(new_dist), v)));
+            relax(v, weight, d, &mut dist, &mut heap);
+        }
+        if both {
+            for (_lid, v, weight) in csr.iter_in_edges_weighted_raw(u) {
+                relax(v, weight, d, &mut dist, &mut heap);
             }
         }
     }
@@ -89,6 +95,20 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> Result<AlgoResultBatch, crate
         batch.push_node_f64(csr.node_name_raw(node as u32).to_string(), d);
     }
     Ok(batch)
+}
+
+fn relax(
+    node: u32,
+    weight: f64,
+    distance: f64,
+    distances: &mut [f64],
+    heap: &mut BinaryHeap<Reverse<(OrdF64, u32)>>,
+) {
+    let candidate = distance + weight;
+    if candidate < distances[node as usize] {
+        distances[node as usize] = candidate;
+        heap.push(Reverse((OrdF64(candidate), node)));
+    }
 }
 
 /// Newtype wrapper for f64 that implements `Ord` for use in `BinaryHeap`.
@@ -156,6 +176,23 @@ mod tests {
         assert_eq!(dists["a"], 0.0);
         assert_eq!(dists["b"], 2.0);
         assert_eq!(dists["c"], 5.0); // via b (2+3) < direct (10)
+    }
+
+    #[test]
+    fn sssp_both_traverses_a_stored_edge_in_reverse() {
+        let mut csr = CsrIndex::new();
+        csr.add_edge_weighted("a", "R", "b", 2.5).unwrap();
+        csr.compact().expect("no governor, cannot fail");
+        let batch = run(
+            &csr,
+            &AlgoParams {
+                source_node: Some("b".into()),
+                direction: Some("both".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(parse_results(&batch)["a"], 2.5);
     }
 
     #[test]
