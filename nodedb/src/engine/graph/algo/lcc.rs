@@ -57,11 +57,24 @@ pub fn run(csr: &CsrIndex, high_degree_threshold: usize, sample_pairs: usize) ->
             neighbors
         })
         .collect();
+    let exact_triangles = adjacency
+        .iter()
+        .all(|neighbors| neighbors.len() <= high_degree_threshold)
+        .then(|| count_all_triangles_exact(&adjacency));
     let mut batch = AlgoResultBatch::new(GraphAlgorithm::Lcc);
 
     for node in 0..n {
         let node_id = node as u32;
-        let coeff = compute_lcc(csr, &adjacency, node_id, high_degree_threshold, sample_pairs);
+        let coeff = if let Some(triangles) = &exact_triangles {
+            let degree = adjacency[node].len();
+            if degree < 2 {
+                0.0
+            } else {
+                2.0 * triangles[node] as f64 / (degree * (degree - 1)) as f64
+            }
+        } else {
+            compute_lcc(csr, &adjacency, node_id, high_degree_threshold, sample_pairs)
+        };
         batch.push_node_f64(csr.node_name_raw(node as u32).to_string(), coeff);
     }
 
@@ -95,6 +108,114 @@ fn compute_lcc(
     // Since we count each triangle once (unordered pair), and the denominator
     // is k*(k-1)/2 pairs, LCC = triangles / possible_pairs.
     triangles as f64 / possible_pairs as f64
+}
+
+fn count_all_triangles_exact(adjacency: &[Vec<u32>]) -> Vec<usize> {
+    let degrees: Vec<usize> = adjacency.iter().map(Vec::len).collect();
+    let oriented: Vec<Vec<u32>> = adjacency
+        .iter()
+        .enumerate()
+        .map(|(node, neighbors)| {
+            neighbors
+                .iter()
+                .copied()
+                .filter(|neighbor| {
+                    let neighbor = *neighbor as usize;
+                    (degrees[node], node) < (degrees[neighbor], neighbor)
+                })
+                .collect()
+        })
+        .collect();
+    count_oriented_triangles(&oriented)
+}
+
+fn count_oriented_triangles(oriented: &[Vec<u32>]) -> Vec<usize> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return count_oriented_triangle_range(oriented, 0, oriented.len());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const MAX_WORKERS: usize = 32;
+        const COUNTER_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+        let bytes_per_counter = oriented
+            .len()
+            .checked_mul(std::mem::size_of::<usize>())
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let memory_bounded_workers = (COUNTER_BUDGET_BYTES / bytes_per_counter).max(1);
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_WORKERS)
+            .min(memory_bounded_workers)
+            .min(oriented.len().max(1));
+        if workers == 1 {
+            return count_oriented_triangle_range(oriented, 0, oriented.len());
+        }
+
+        const CHUNK_SIZE: usize = 64;
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    let next = &next;
+                    scope.spawn(move || {
+                        let mut local = vec![0usize; oriented.len()];
+                        loop {
+                            let start = next.fetch_add(CHUNK_SIZE, Ordering::Relaxed);
+                            if start >= oriented.len() {
+                                break;
+                            }
+                            let end = (start + CHUNK_SIZE).min(oriented.len());
+                            count_oriented_triangle_range_into(oriented, start, end, &mut local);
+                        }
+                        local
+                    })
+                })
+                .collect();
+            let mut totals = vec![0usize; oriented.len()];
+            for handle in handles {
+                let local = handle.join().expect("LCC worker panicked");
+                for (total, count) in totals.iter_mut().zip(local) {
+                    *total += count;
+                }
+            }
+            totals
+        })
+    }
+}
+
+fn count_oriented_triangle_range(
+    oriented: &[Vec<u32>],
+    start: usize,
+    end: usize,
+) -> Vec<usize> {
+    let mut triangles = vec![0usize; oriented.len()];
+    count_oriented_triangle_range_into(oriented, start, end, &mut triangles);
+    triangles
+}
+
+fn count_oriented_triangle_range_into(
+    oriented: &[Vec<u32>],
+    start: usize,
+    end: usize,
+    triangles: &mut [usize],
+) {
+    for left in start..end {
+        let middle_neighbors = &oriented[left];
+        for &middle in middle_neighbors {
+            for &right in &oriented[middle as usize] {
+                if middle_neighbors.binary_search(&right).is_ok() {
+                    triangles[left] += 1;
+                    triangles[middle as usize] += 1;
+                    triangles[right as usize] += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Count induced neighbor edges exactly using sorted contiguous adjacency.

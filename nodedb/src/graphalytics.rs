@@ -23,7 +23,7 @@ const TENANT: TenantId = TenantId::new(1);
 const COLLECTION: &str = "graphalytics";
 const LABEL: &str = "edge";
 const SOURCE: &str = "6";
-const BATCH_SIZE: usize = 10_000_000;
+const BATCH_SIZE: usize = 20_000_000;
 const OPERATION_TIMEOUT_SECONDS: f64 = 300.0;
 const EDGE_STORE_CACHE_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
