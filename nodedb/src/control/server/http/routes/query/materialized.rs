@@ -16,7 +16,7 @@ use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
 };
 
-use super::super::super::auth::{ApiError, AppState, resolve_auth};
+use super::super::super::auth::{ApiError, AppState, build_request_scope, resolve_auth_parts};
 use super::super::super::types::{HttpQueryRequest, HttpQueryResponse};
 use super::super::result_shape::{
     HttpShaped, ddl_results_to_json, passthrough_json_row, shape_http_payload,
@@ -37,7 +37,7 @@ pub async fn query(
     State(state): State<AppState>,
     axum::Json(body): axum::Json<HttpQueryRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (identity, mut auth_ctx) = resolve_auth(&headers, &state, "http")?;
+    let (identity, verified_jwt) = resolve_auth_parts(&headers, &state, "http")?;
     let database_id = resolve_database_id(&headers, &db_param, &state)?;
     let trace_id = crate::control::trace_context::extract_from_headers(&headers);
     let emitter = ArcAuditEmitter(Arc::clone(&state.shared.audit));
@@ -85,21 +85,28 @@ pub async fn query(
         })?;
 
     // The request-selected database is authoritative for RLS variables while
-    // retaining verified JWT/session enrichment from authentication.
-    auth_ctx.database_id = Some(database_id);
-    let clean_sql =
-        crate::control::server::session_auth::extract_and_apply_on_deny(sql, &mut auth_ctx);
+    // retaining verified JWT/session enrichment from authentication: passing
+    // it as the session database makes `scope.database_id()` resolve to
+    // exactly `database_id`, and the verified JWT (when this request
+    // authenticated via JWT bearer) reproduces the same claim-derived
+    // enrichment `resolve_auth` would have given an `AuthContext`.
+    let scope = build_request_scope(
+        &identity,
+        verified_jwt.as_ref(),
+        &headers,
+        &state,
+        database_id,
+    );
+    let (clean_sql, scope) =
+        crate::control::server::session_auth::apply_per_query_on_deny(sql, scope);
     // Planning and lease admission run as one retried unit so a descriptor
     // drain starting between them is absorbed rather than surfaced. The scope
     // is retained through every dispatch and response-shaping operation below.
     let admission = plan_authorize_and_admit(PlanAdmissionRequest {
         state: &state.shared,
         query_ctx: &state.query_ctx,
-        identity: &identity,
-        auth_ctx: &auth_ctx,
+        scope: &scope,
         sql: &clean_sql,
-        tenant_id,
-        database_id,
         trace_id: crate::types::TraceId::ZERO,
     })
     .await

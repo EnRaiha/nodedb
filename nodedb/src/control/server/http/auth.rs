@@ -139,45 +139,62 @@ pub fn resolve_auth(
 > {
     use crate::control::security::auth_context::{AuthContext, generate_session_id};
 
-    // Check for JWT Bearer to get rich AuthContext.
+    let (identity, verified_jwt) = resolve_auth_parts(headers, state, peer_addr)?;
+    let auth_ctx = match &verified_jwt {
+        Some(claims) => AuthContext::from_verified_jwt(claims, &identity, generate_session_id()),
+        None => session_auth::build_auth_context(&identity),
+    };
+    let auth_ctx = apply_on_deny_header(headers, auth_ctx);
+    Ok((identity, auth_ctx))
+}
+
+/// Resolve identity plus the raw ingredients a caller needs to build a
+/// [`RequestAuthScope`](crate::control::security::request_scope::RequestAuthScope)
+/// directly, instead of a pre-assembled `AuthContext`: the verified JWT
+/// claims when authentication went through a JWT bearer token (so
+/// `RequestAuthScope::builder().with_verified_jwt()` reproduces the exact
+/// claim-derived enrichment `resolve_auth` gives `AuthContext::from_verified_jwt`),
+/// or `None` for API key / trust / password auth.
+pub(crate) fn resolve_auth_parts(
+    headers: &HeaderMap,
+    state: &AppState,
+    peer_addr: &str,
+) -> Result<
+    (
+        AuthenticatedIdentity,
+        Option<crate::control::security::jwks::registry::VerifiedJwtClaims>,
+    ),
+    ApiError,
+> {
     if let Some(auth_header) = headers.get("authorization")
         && let Ok(auth_str) = auth_header.to_str()
         && let Some(token) = auth_str.strip_prefix("Bearer ")
     {
         let token = token.trim();
         if let Some((identity, verified_claims)) = try_validate_jwt(state, token) {
-            let auth_ctx =
-                AuthContext::from_verified_jwt(&verified_claims, &identity, generate_session_id());
-            let auth_ctx = apply_on_deny_header(headers, auth_ctx);
-            return Ok((identity, auth_ctx));
+            return Ok((identity, Some(verified_claims)));
         }
     }
 
-    // Fallback: resolve identity normally and build basic AuthContext.
     let identity = resolve_identity(headers, state, peer_addr)?;
-    let auth_ctx = apply_on_deny_header(headers, session_auth::build_auth_context(&identity));
-    Ok((identity, auth_ctx))
+    Ok((identity, None))
 }
 
-/// Check `X-On-Deny` header and set the bounded presentation-only override.
+/// Parse the `X-On-Deny` header into a `DenyMode`, if present and valid.
 ///
 /// HTTP accepts only the trimmed, case-insensitive tokens `SILENT` and `ERROR`.
 /// `ERROR` always uses this server-owned generic RLS response; DDL's richer
 /// `ON DENY ERROR` syntax must not let an HTTP client control response content.
-fn apply_on_deny_header(
+pub(crate) fn on_deny_header_mode(
     headers: &HeaderMap,
-    mut auth_ctx: crate::control::security::auth_context::AuthContext,
-) -> crate::control::security::auth_context::AuthContext {
+) -> Option<crate::control::security::deny::DenyMode> {
     use crate::control::security::deny::{DenyCodes, DenyError, DenyMode};
 
-    let Some(value) = headers
+    let value = headers
         .get("x-on-deny")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return auth_ctx;
-    };
+        .and_then(|value| value.to_str().ok())?;
 
-    let mode = if value.trim().eq_ignore_ascii_case("SILENT") {
+    if value.trim().eq_ignore_ascii_case("SILENT") {
         Some(DenyMode::Silent)
     } else if value.trim().eq_ignore_ascii_case("ERROR") {
         Some(DenyMode::Error(DenyError {
@@ -187,9 +204,41 @@ fn apply_on_deny_header(
         }))
     } else {
         None
-    };
+    }
+}
 
-    if let Some(mode) = mode {
+/// Build a request-scoped
+/// [`RequestAuthScope`](crate::control::security::request_scope::RequestAuthScope)
+/// for an HTTP request already bound to `database_id`, from the identity and
+/// verified JWT resolved earlier in the same handler via
+/// [`resolve_auth_parts`].
+///
+/// Collapses the construction dance every HTTP query route needs identically:
+/// session database, `X-On-Deny` header, and (when present) verified-JWT
+/// enrichment.
+pub(crate) fn build_request_scope<'a>(
+    identity: &'a AuthenticatedIdentity,
+    verified_jwt: Option<&'a crate::control::security::jwks::registry::VerifiedJwtClaims>,
+    headers: &HeaderMap,
+    state: &'a AppState,
+    database_id: crate::types::DatabaseId,
+) -> crate::control::security::request_scope::RequestAuthScope<'a> {
+    crate::control::security::request_scope::RequestAuthScope::builder(
+        identity,
+        &state.shared.scope_grants,
+    )
+    .with_session_database(Some(database_id))
+    .with_on_deny(on_deny_header_mode(headers))
+    .with_optional_verified_jwt(verified_jwt)
+    .build()
+}
+
+/// Apply [`on_deny_header_mode`] to an already-built `AuthContext`.
+fn apply_on_deny_header(
+    headers: &HeaderMap,
+    mut auth_ctx: crate::control::security::auth_context::AuthContext,
+) -> crate::control::security::auth_context::AuthContext {
+    if let Some(mode) = on_deny_header_mode(headers) {
         auth_ctx.on_deny_override = Some(mode);
     }
     auth_ctx

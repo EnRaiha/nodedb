@@ -13,6 +13,7 @@ use crate::control::planner::calvin::{
     dispatch_authorized_tasks_to_calvin,
 };
 use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::authorization::authorize_database;
 use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
@@ -216,10 +217,26 @@ async fn execute_planned(
     database_id: crate::types::DatabaseId,
     allow_stream: bool,
 ) -> SqlOutcome {
+    // Resolve the request-scoped auth contract. `database_id` is already the
+    // resolved database this whole statement is gated and dispatched under
+    // (computed once in `handle_sql_inner` via `ctx.database_id()`); passing
+    // it as the session database here — rather than re-deriving from
+    // `ctx.sessions` with different fallback precedence — guarantees
+    // `scope.database_id()` agrees with every other use of `database_id` in
+    // this handler instead of drifting from it. The session id already
+    // established at Auth time carries over so `$auth.session_id` stays
+    // stable across requests on this connection. Building the scope here
+    // (rather than reusing `ctx.auth_context` verbatim) also runs
+    // scope-grant enrichment, which the prior per-connection AuthContext
+    // never did.
+    let scope = RequestAuthScope::builder(ctx.identity, &ctx.state.scope_grants)
+        .with_session_database(Some(database_id))
+        .with_session_id(ctx.auth_context.session_id.clone())
+        .build();
+
     // Extract per-query ON DENY override (e.g., SELECT ... ON DENY ERROR 'CODE' MESSAGE '...').
-    let mut auth_ctx = ctx.auth_context.clone();
-    let clean_sql =
-        crate::control::server::session_auth::extract_and_apply_on_deny(sql, &mut auth_ctx);
+    let (clean_sql, scope) =
+        crate::control::server::session_auth::apply_per_query_on_deny(sql, scope);
 
     // Forward every per-session planning GUC (vector-dim quota, force-shuffle
     // join/agg overrides + partition counts, broadcast / shuffle-aggregate cost
@@ -247,11 +264,8 @@ async fn execute_planned(
     let admission = match plan_authorize_and_admit(PlanAdmissionRequest {
         state: ctx.state,
         query_ctx: ctx.query_ctx,
-        identity: ctx.identity,
-        auth_ctx: &auth_ctx,
+        scope: &scope,
         sql: &clean_sql,
-        tenant_id: ctx.tenant_id(),
-        database_id,
         trace_id: TraceId::ZERO,
     })
     .await

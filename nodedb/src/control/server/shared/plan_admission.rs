@@ -22,13 +22,12 @@ use nodedb_physical::physical_task::PhysicalTask;
 use crate::control::planner::context::{PlanSecurityContext, QueryContext};
 use crate::control::planner::descriptor_set::DescriptorVersionSet;
 use crate::control::security::audit::ArcAuditEmitter;
-use crate::control::security::auth_context::AuthContext;
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::shared::authorization::{AuthorizedTaskSet, authorize_task_set};
 use crate::control::server::shared::retry::retry_on_schema_change;
 use crate::control::state::SharedState;
-use crate::types::{DatabaseId, TenantId, TraceId};
+use crate::types::TraceId;
 
 /// Everything a statement needs before dispatch can begin.
 pub struct PlanAdmission {
@@ -48,12 +47,12 @@ pub struct PlanAdmission {
 pub struct PlanAdmissionRequest<'a> {
     pub state: &'a Arc<SharedState>,
     pub query_ctx: &'a QueryContext,
-    pub identity: &'a AuthenticatedIdentity,
-    pub auth_ctx: &'a AuthContext,
+    /// The resolved, request-scoped auth contract: identity, enriched
+    /// `AuthContext`, tenant, and database all bundled and guaranteed to
+    /// agree with each other. See [`RequestAuthScope`].
+    pub scope: &'a RequestAuthScope<'a>,
     /// SQL with any per-query `ON DENY` override already stripped.
     pub sql: &'a str,
-    pub tenant_id: TenantId,
-    pub database_id: DatabaseId,
     pub trace_id: TraceId,
 }
 
@@ -74,11 +73,11 @@ async fn plan_authorize_and_admit_once(
 ) -> crate::Result<PlanAdmission> {
     let state = request.state;
     let query_ctx = request.query_ctx;
-    let identity = request.identity;
-    let auth_ctx = request.auth_ctx;
+    let identity = request.scope.identity();
+    let auth_ctx = request.scope.auth();
     let sql = request.sql;
-    let tenant_id = request.tenant_id;
-    let database_id = request.database_id;
+    let tenant_id = request.scope.tenant_id();
+    let database_id = request.scope.database_id();
     let trace_id = request.trace_id;
 
     // Re-read per attempt: a retry must plan against the catalog and permission

@@ -74,6 +74,16 @@ impl<'a> RequestAuthScopeBuilder<'a> {
         self
     }
 
+    /// Same as [`Self::with_verified_jwt`], but accepts the `Option` a caller
+    /// typically has in hand (e.g. from
+    /// [`resolve_auth_parts`](crate::control::server::http::auth::resolve_auth_parts))
+    /// instead of requiring an `if let Some(..) = ..` reassignment at every
+    /// call site.
+    pub fn with_optional_verified_jwt(mut self, claims: Option<&'a VerifiedJwtClaims>) -> Self {
+        self.verified_jwt = claims;
+        self
+    }
+
     /// The opaque session identifier to stamp on the resulting context.
     /// Defaults to a freshly generated one via `generate_session_id()`.
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {

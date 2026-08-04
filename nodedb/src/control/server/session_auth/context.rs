@@ -62,8 +62,26 @@ pub fn extract_and_apply_on_deny(
     sql: &str,
     auth_ctx: &mut crate::control::security::auth_context::AuthContext,
 ) -> String {
+    let (clean_sql, mode) = extract_on_deny(sql);
+    if let Some(mode) = mode {
+        auth_ctx.on_deny_override = Some(mode);
+    }
+    clean_sql
+}
+
+/// Extract a per-query `ON DENY` clause from SQL without an `AuthContext` to
+/// mutate.
+///
+/// Parses: `SELECT ... ON DENY ERROR 'CODE' MESSAGE '...'`
+/// Returns the SQL with the clause stripped (unchanged if none was found or
+/// parseable) alongside the parsed override, if any. Callers that hold a
+/// [`RequestAuthScope`](crate::control::security::request_scope::RequestAuthScope)
+/// rather than a mutable `AuthContext` apply the override via
+/// `RequestAuthScope::with_on_deny_override` instead of mutating a field
+/// directly.
+pub fn extract_on_deny(sql: &str) -> (String, Option<crate::control::security::deny::DenyMode>) {
     let Some(idx) = rfind_ascii_case_insensitive(sql, "on deny ") else {
-        return sql.to_string();
+        return (sql.to_string(), None);
     };
 
     // Only strip ON DENY from SELECT/WITH queries (not CREATE RLS POLICY).
@@ -75,16 +93,34 @@ pub fn extract_and_apply_on_deny(
             .get(.."with".len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("with"))
     {
-        return sql.to_string();
+        return (sql.to_string(), None);
     }
 
     let on_deny_part = &sql[idx + "on deny ".len()..];
     let parts: Vec<&str> = on_deny_part.split_whitespace().collect();
     match crate::control::security::deny::parse_on_deny(&parts) {
-        Ok(mode) => {
-            auth_ctx.on_deny_override = Some(mode);
-            sql[..idx].trim_end().to_string()
-        }
-        Err(_) => sql.to_string(),
+        Ok(mode) => (sql[..idx].trim_end().to_string(), Some(mode)),
+        Err(_) => (sql.to_string(), None),
     }
+}
+
+/// [`extract_on_deny`] followed by applying the extracted override (if any)
+/// to `scope`. Per-query `ON DENY` always wins over any header- or
+/// session-level override already baked into `scope`, since it is applied
+/// last, after `scope` was built.
+///
+/// Returns the cleaned SQL alongside the (possibly overridden) scope.
+pub fn apply_per_query_on_deny<'a>(
+    sql: &str,
+    scope: crate::control::security::request_scope::RequestAuthScope<'a>,
+) -> (
+    String,
+    crate::control::security::request_scope::RequestAuthScope<'a>,
+) {
+    let (clean_sql, mode) = extract_on_deny(sql);
+    let scope = match mode {
+        Some(mode) => scope.with_on_deny_override(Some(mode)),
+        None => scope,
+    };
+    (clean_sql, scope)
 }

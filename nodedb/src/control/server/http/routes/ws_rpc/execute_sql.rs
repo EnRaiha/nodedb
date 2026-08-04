@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::authorization::authorize_database;
 use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
@@ -34,11 +35,14 @@ pub async fn execute_sql(
     // Quota enforcement — reject before planning or dispatch.
     shared.check_tenant_quota(tenant_id)?;
 
-    let mut auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
-    // The RPC-selected database is authoritative for RLS variables.
-    auth_ctx.database_id = Some(database_id);
-    let clean_sql =
-        crate::control::server::session_auth::extract_and_apply_on_deny(sql, &mut auth_ctx);
+    // The RPC-selected database is authoritative for RLS variables — passed
+    // as the session database so `scope.database_id()` resolves to exactly
+    // `database_id` rather than falling back through `identity`'s default.
+    let scope = RequestAuthScope::builder(identity, &shared.scope_grants)
+        .with_session_database(Some(database_id))
+        .build();
+    let (clean_sql, scope) =
+        crate::control::server::session_auth::apply_per_query_on_deny(sql, scope);
     // Planning and lease admission run as one retried unit so a descriptor
     // drain starting between them is absorbed rather than surfaced. The scope
     // is retained through every orchestrated or Data-Plane execution and
@@ -46,11 +50,8 @@ pub async fn execute_sql(
     let admission = plan_authorize_and_admit(PlanAdmissionRequest {
         state: shared,
         query_ctx,
-        identity,
-        auth_ctx: &auth_ctx,
+        scope: &scope,
         sql: &clean_sql,
-        tenant_id,
-        database_id,
         trace_id,
     })
     .await?;

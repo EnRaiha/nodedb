@@ -15,7 +15,7 @@ use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
 };
 
-use super::super::super::auth::{ApiError, AppState, resolve_auth};
+use super::super::super::auth::{ApiError, AppState, build_request_scope, resolve_auth_parts};
 use super::super::query_stream::{ndjson_body_stream, try_open_stream};
 use super::super::result_shape::{HttpShaped, passthrough_to_ndjson, shape_http_payload};
 use super::{DatabaseQueryParam, resolve_database_id};
@@ -35,7 +35,7 @@ pub async fn query_ndjson(
 ) -> impl IntoResponse {
     use axum::response::Response;
 
-    let (identity, mut auth_ctx) = match resolve_auth(&headers, &state, "http") {
+    let (identity, verified_jwt) = match resolve_auth_parts(&headers, &state, "http") {
         Ok(auth) => auth,
         Err(e) => return e.into_response(),
     };
@@ -72,8 +72,21 @@ pub async fn query_ndjson(
     let query_ctx = &state.query_ctx;
 
     // The request-selected database is authoritative for RLS variables while
-    // retaining verified JWT/session enrichment from authentication.
-    auth_ctx.database_id = Some(database_id);
+    // retaining verified JWT/session enrichment from authentication: passing
+    // it as the session database makes `scope.database_id()` resolve to
+    // exactly `database_id`, and the verified JWT (when this request
+    // authenticated via JWT bearer) reproduces the same claim-derived
+    // enrichment `resolve_auth` would have given an `AuthContext`.
+    //
+    // NDJSON does not extract a per-query `ON DENY` clause (unlike the
+    // materialized `/v1/query` route) — that is pre-existing behavior.
+    let scope = build_request_scope(
+        &identity,
+        verified_jwt.as_ref(),
+        &headers,
+        &state,
+        database_id,
+    );
     // Planning and lease admission run as one retried unit so a descriptor
     // drain starting between them is absorbed rather than surfaced. Admission
     // still follows authorization inside the unit, so denied requests never
@@ -83,11 +96,8 @@ pub async fn query_ndjson(
     let admission = match plan_authorize_and_admit(PlanAdmissionRequest {
         state: &state.shared,
         query_ctx,
-        identity: &identity,
-        auth_ctx: &auth_ctx,
+        scope: &scope,
         sql,
-        tenant_id,
-        database_id,
         trace_id: crate::types::TraceId::ZERO,
     })
     .await
