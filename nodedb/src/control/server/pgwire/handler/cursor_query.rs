@@ -34,13 +34,20 @@ impl NodeDbPgHandler {
             .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
 
-        let mut auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
-        // Cursor plans must resolve RLS variables in the selected database context.
-        auth_ctx.database_id = Some(database_id);
+        // Cursor plans must resolve RLS variables in the selected database
+        // context — `for_database` builds the identity-derived `AuthContext`
+        // and stamps `database_id` through the single lockstep path, plus
+        // (new here) runs scope-grant enrichment so a cursor's
+        // `$auth.scope_status(...)` resolves like every other query path.
+        let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+            identity,
+            &self.state.scope_grants,
+            database_id,
+        );
 
         // Borrowed so each retry attempt re-reads permission state without
         // moving the planning context out of the retried closure.
-        let auth_ctx = &auth_ctx;
+        let auth_ctx = scope.auth();
         let query_ctx = &query_ctx;
 
         // Planning records the descriptor versions and the lease that pins them

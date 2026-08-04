@@ -7,7 +7,9 @@ use std::sync::Arc;
 use pgwire::api::results::Tag;
 use pgwire::error::{ErrorInfo, PgWireError};
 
+use crate::control::security::auth_context::AuthContext;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
@@ -43,13 +45,10 @@ impl NodeDbPgHandler {
             Vec<PhysicalTask>,
             crate::control::server::response_shape::schema::OutputSchema,
             crate::control::planner::descriptor_set::DescriptorVersionSet,
-            crate::control::security::auth_context::AuthContext,
+            AuthContext,
         ),
         StatementSetupError,
     > {
-        // Resolve opaque session handle if SET LOCAL nodedb.auth_session is set.
-        // Network provenance is immutable accept-time metadata; all mutable
-        // session state remains keyed by the collision-free SessionId.
         let peer_addr = match session_id {
             SessionId::Connection(connection_id) => self
                 .sessions
@@ -69,7 +68,21 @@ impl NodeDbPgHandler {
             &peer_addr,
         );
         let conn_key = format!("{session_id:?}");
-        let mut auth_ctx = if let Some(handle) = self
+
+        // Resolve the request database ONCE, up front, so every downstream
+        // consumer — the scope's own `auth.database_id`, constraint/enum
+        // enforcement, plan-cache keying, and the planner itself — reads the
+        // exact same value instead of each re-querying session state
+        // independently and risking drift.
+        let database_id = self
+            .sessions
+            .get_current_database(session_id)
+            .unwrap_or(crate::types::DatabaseId::DEFAULT);
+
+        // Resolve opaque session handle if SET LOCAL nodedb.auth_session is set.
+        // Network provenance is immutable accept-time metadata; all mutable
+        // session state remains keyed by the collision-free SessionId.
+        let base_auth_ctx = if let Some(handle) = self
             .sessions
             .get_parameter(session_id, "nodedb.auth_session")
         {
@@ -104,9 +117,22 @@ impl NodeDbPgHandler {
             )
         };
 
-        // Extract per-query ON DENY override.
-        let clean_sql =
-            crate::control::server::session_auth::extract_and_apply_on_deny(sql, &mut auth_ctx);
+        // Adopt whichever `AuthContext` was resolved above — freshly built
+        // from the session, or a pooled handle's cached context — into the
+        // request-scoped contract. This re-stamps `database_id` through the
+        // same single path every other transport's `RequestAuthScope`
+        // resolution uses, and (new for the pooled-handle case) runs
+        // scope-grant enrichment, which a cached context never received
+        // after the moment it was created.
+        let scope = RequestAuthScope::builder(identity, &self.state.scope_grants)
+            .with_session_database(Some(database_id))
+            .with_adopted_auth_context(base_auth_ctx)
+            .build();
+
+        // Extract per-query ON DENY override. Per-query always wins over the
+        // session-level override already baked into `scope`.
+        let (clean_sql, scope) =
+            crate::control::server::session_auth::apply_per_query_on_deny(sql, scope);
 
         // Strip RETURNING clause before DataFusion planning.
         let (clean_sql, returning_spec) = super::super::returning::strip_returning(&clean_sql)
@@ -127,13 +153,10 @@ impl NodeDbPgHandler {
                 tenant_id,
             );
 
-        let database_id = self
-            .sessions
-            .get_current_database(session_id)
-            .unwrap_or(crate::types::DatabaseId::DEFAULT);
-        // A resolved opaque auth-session can predate `USE DATABASE`; the
-        // selected database for this statement is authoritative for RLS.
-        auth_ctx.database_id = Some(database_id);
+        // The database resolved once above, at the top of this function, is
+        // authoritative for both `PhysicalTask::database_id` and
+        // `$auth.database_id` — `scope` already carries both in lockstep.
+        let database_id = scope.database_id();
 
         // Enforce general CHECK constraints for INSERT/UPDATE before planning.
         self.enforce_check_constraints_if_needed(
@@ -141,7 +164,7 @@ impl NodeDbPgHandler {
             identity,
             tenant_id,
             database_id,
-            &auth_ctx,
+            scope.auth(),
         )
         .await
         .map_err(StatementSetupError::from)?;
@@ -176,7 +199,7 @@ impl NodeDbPgHandler {
             let perm_cache = self.state.permission_cache.read().await;
             let sec = crate::control::planner::context::PlanSecurityContext {
                 identity,
-                auth: &auth_ctx,
+                auth: scope.auth(),
                 rls_store: &self.state.rls,
                 permissions: &self.state.permissions,
                 roles: &self.state.roles,
@@ -201,7 +224,7 @@ impl NodeDbPgHandler {
                 let perm_cache = self.state.permission_cache.read().await;
                 let sec = crate::control::planner::context::PlanSecurityContext {
                     identity,
-                    auth: &auth_ctx,
+                    auth: scope.auth(),
                     rls_store: &self.state.rls,
                     permissions: &self.state.permissions,
                     roles: &self.state.roles,
@@ -257,7 +280,11 @@ impl NodeDbPgHandler {
             .authorize_tasks(identity, &tasks)
             .map_err(StatementSetupError::from)?;
 
-        Ok((tasks, output_schema, versions, auth_ctx))
+        // The caller (`execute_planned_sql_inner`) only needs the resolved
+        // `AuthContext` by value from here on (e.g. for trigger OLD-row RLS,
+        // keyed by the task's own `database_id` rather than this scope's) —
+        // `scope` itself does not need to outlive this function.
+        Ok((tasks, output_schema, versions, scope.auth().clone()))
     }
 }
 

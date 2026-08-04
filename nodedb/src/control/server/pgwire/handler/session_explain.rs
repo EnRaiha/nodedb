@@ -67,13 +67,18 @@ impl NodeDbPgHandler {
             .get_current_database(session_id)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let tenant_id = identity.tenant_id;
-        let mut auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
-        // EXPLAIN must resolve RLS variables in the selected database context.
-        auth_ctx.database_id = Some(database_id);
+        // EXPLAIN must resolve RLS variables in the selected database
+        // context — `for_database` stamps `database_id` through the single
+        // lockstep path and runs scope-grant enrichment.
+        let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+            identity,
+            &self.state.scope_grants,
+            database_id,
+        );
         let perm_cache = self.state.permission_cache.read().await;
         let sec = crate::control::planner::context::PlanSecurityContext {
             identity,
-            auth: &auth_ctx,
+            auth: scope.auth(),
             rls_store: &self.state.rls,
             permissions: &self.state.permissions,
             roles: &self.state.roles,

@@ -37,7 +37,7 @@ pub(super) async fn probe_row_in_target(
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
-    let plan = with_caller_rls(state, identity, tenant_id, plan)?;
+    let plan = with_caller_rls(state, identity, tenant_id, db_id, plan)?;
     let vshard_id = VShardId::from_collection_in_database(db_id, collection_qualified);
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, db_id, plan).await?;
     Ok(!resp.payload.is_empty() && resp.status == Status::Ok)
@@ -64,7 +64,7 @@ pub(super) async fn fetch_source_row(
         system_time: nodedb_types::SystemTimeScope::Current,
         valid_at_ms: None,
     });
-    let plan = with_caller_rls(state, identity, tenant_id, plan)?;
+    let plan = with_caller_rls(state, identity, tenant_id, source_db_id, plan)?;
     let vshard_id = VShardId::from_collection_in_database(source_db_id, source_coll_qualified);
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, source_db_id, plan).await?;
     if resp.payload.is_empty() || resp.status != Status::Ok {
@@ -93,7 +93,7 @@ pub(super) async fn probe_kv_key_in_target(
         // delegated to source, so no isolation ceiling applies.
         surrogate_ceiling: None,
     });
-    let plan = with_caller_rls(state, identity, tenant_id, plan)?;
+    let plan = with_caller_rls(state, identity, tenant_id, db_id, plan)?;
     let vshard_id = VShardId::from_collection_in_database(db_id, collection_qualified);
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, db_id, plan).await?;
     Ok(!resp.payload.is_empty() && resp.status == Status::Ok)
@@ -119,7 +119,7 @@ pub(super) async fn fetch_kv_source_value(
         // a missed source row would silently drop data on the clone.
         surrogate_ceiling: None,
     });
-    let plan = with_caller_rls(state, identity, tenant_id, plan)?;
+    let plan = with_caller_rls(state, identity, tenant_id, source_db_id, plan)?;
     let vshard_id = VShardId::from_collection_in_database(source_db_id, source_coll_qualified);
     let resp = dispatch_data_plane_raw(state, tenant_id, vshard_id, source_db_id, plan).await?;
     if resp.payload.is_empty() || resp.status != Status::Ok {
@@ -135,18 +135,29 @@ pub(super) async fn fetch_kv_source_value(
 /// clone would launder policy-excluded rows into readable ones. Presence probes
 /// carry the same filters so a row the caller cannot see is not reported as
 /// present either.
+///
+/// `database_id` is the database the probe plan actually targets (the
+/// source database for copy-up reads, the clone's own database for presence
+/// probes) — `RequestAuthScope::for_database` stamps it into `$auth.database_id`
+/// in lockstep with the scalar so a database-scoped RLS predicate evaluates
+/// against the database this probe reads, not the caller's session default.
 fn with_caller_rls(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     tenant_id: TenantId,
+    database_id: DatabaseId,
     mut plan: PhysicalPlan,
 ) -> crate::Result<PhysicalPlan> {
-    let auth_ctx = crate::control::server::session_auth::context::build_auth_context(identity);
+    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+        identity,
+        &state.scope_grants,
+        database_id,
+    );
     crate::control::planner::rls_injection::inject_rls_for_single_plan(
         tenant_id.as_u64(),
         &mut plan,
         &state.rls,
-        &auth_ctx,
+        scope.auth(),
     )?;
     Ok(plan)
 }

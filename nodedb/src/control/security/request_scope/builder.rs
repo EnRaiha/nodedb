@@ -31,6 +31,7 @@ pub struct RequestAuthScopeBuilder<'a> {
     on_deny: Option<DenyMode>,
     verified_jwt: Option<&'a VerifiedJwtClaims>,
     session_id: Option<String>,
+    adopted_auth_context: Option<AuthContext>,
 }
 
 impl<'a> RequestAuthScopeBuilder<'a> {
@@ -48,6 +49,7 @@ impl<'a> RequestAuthScopeBuilder<'a> {
             on_deny: None,
             verified_jwt: None,
             session_id: None,
+            adopted_auth_context: None,
         }
     }
 
@@ -91,6 +93,37 @@ impl<'a> RequestAuthScopeBuilder<'a> {
         self
     }
 
+    /// Adopt an already-built `AuthContext` instead of constructing one from
+    /// `identity` (or a verified JWT) inside [`Self::build`].
+    ///
+    /// The one sanctioned caller is pgwire's pooled opaque session-handle
+    /// path (`SET LOCAL nodedb.auth_session = '<handle>'`):
+    /// `SessionHandleStore::resolve` hands back a whole cached `AuthContext`
+    /// from a prior authentication, not the raw identity/JWT ingredients
+    /// [`Self::build`] normally starts from. Discarding that cached context
+    /// and rebuilding one from `identity` would silently drop whatever the
+    /// pooled request's context carried (email, org membership, groups,
+    /// metadata, ...) and answer `$auth.*` for the wrong principal.
+    ///
+    /// Note the scope's `identity` remains the *connection's* authenticated
+    /// identity while the adopted context describes the *pooled request's*
+    /// principal. That split is deliberate: the connection identity governs
+    /// RBAC and tenant scoping, the adopted context governs `$auth.*`
+    /// substitution and audit attribution.
+    ///
+    /// Adopting it keeps that identity intact while still routing it through
+    /// the exact same [`Self::build`] tail every other construction path
+    /// gets: database stamping (so `database_id` and `auth.database_id`
+    /// still cannot drift apart, even on this path) and scope-grant
+    /// enrichment (so a pooled session's `$auth.scope_status(...)` resolves
+    /// instead of fail-closed-denying, which it did before this existed —
+    /// a cached context is enriched only at the moment it is created, never
+    /// again while pooled).
+    pub fn with_adopted_auth_context(mut self, ctx: AuthContext) -> Self {
+        self.adopted_auth_context = Some(ctx);
+        self
+    }
+
     /// Resolve the scope. Infallible: database precedence resolution cannot
     /// fail, and JWT verification already happened upstream of this builder
     /// (see [`Self::with_verified_jwt`]).
@@ -98,24 +131,33 @@ impl<'a> RequestAuthScopeBuilder<'a> {
     /// Order of operations:
     /// 1. Resolve the database once: session database -> identity's default
     ///    database -> [`DatabaseId::DEFAULT`].
-    /// 2. Build the `AuthContext` from the verified JWT if supplied, else
+    /// 2. Take the adopted `AuthContext` if [`Self::with_adopted_auth_context`]
+    ///    supplied one; else build it from the verified JWT if supplied, else
     ///    from `identity` alone.
     /// 3. Stamp `auth.database_id` with the resolved database.
     /// 4. Apply the `on_deny` override, if any.
     /// 5. Enrich `auth` with scope-grant status via
     ///    [`enrich_auth_context_with_scopes`] — the entire reason
-    ///    `scope_grants` is a required argument.
+    ///    `scope_grants` is a required argument. This step runs even for an
+    ///    adopted context, since a pooled `AuthContext` was enriched only
+    ///    once, at handle-creation time, and may be stale.
     pub fn build(self) -> RequestAuthScope<'a> {
         let resolved_db = self
             .session_database
             .or(self.identity.default_database)
             .unwrap_or(DatabaseId::DEFAULT);
 
-        let session_id = self.session_id.unwrap_or_else(generate_session_id);
-
-        let mut auth = match self.verified_jwt {
-            Some(claims) => AuthContext::from_verified_jwt(claims, self.identity, session_id),
-            None => AuthContext::from_identity(self.identity, session_id),
+        let mut auth = match self.adopted_auth_context {
+            Some(adopted) => adopted,
+            None => {
+                let session_id = self.session_id.unwrap_or_else(generate_session_id);
+                match self.verified_jwt {
+                    Some(claims) => {
+                        AuthContext::from_verified_jwt(claims, self.identity, session_id)
+                    }
+                    None => AuthContext::from_identity(self.identity, session_id),
+                }
+            }
         };
 
         auth.database_id = Some(resolved_db);
@@ -267,5 +309,56 @@ mod tests {
 
         assert!(!scope.auth().is_superuser());
         assert_eq!(scope.auth().roles, vec!["readwrite"]);
+    }
+
+    #[test]
+    fn adopted_auth_context_is_restamped_with_scope_database() {
+        let identity = test_identity();
+        let grants = ScopeGrantStore::new();
+        // Simulate a pooled session's cached `AuthContext`, resolved for a
+        // different database than the one this request is scoped to.
+        let mut pooled = AuthContext::from_identity(&identity, "s_pooled".into());
+        pooled.database_id = Some(DatabaseId::new(1));
+        pooled.email = Some("pooled@example.com".into());
+
+        let scope = RequestAuthScope::builder(&identity, &grants)
+            .with_session_database(Some(DatabaseId::new(2)))
+            .with_adopted_auth_context(pooled)
+            .build();
+
+        // The adopted identity detail survives...
+        assert_eq!(scope.auth().email, Some("pooled@example.com".into()));
+        // ...but database_id is re-stamped to this request's scope, in
+        // lockstep on both fields, not the value baked into the pooled
+        // context at handle-creation time.
+        assert_eq!(scope.database_id(), DatabaseId::new(2));
+        assert_eq!(scope.auth().database_id, Some(DatabaseId::new(2)));
+    }
+
+    #[test]
+    fn adopted_auth_context_still_runs_scope_enrichment() {
+        let identity = test_identity();
+        let grants = ScopeGrantStore::new();
+        grants
+            .grant(ScopeGrantParams {
+                scope_name: "pro:all",
+                grantee_type: "user",
+                grantee_id: "42",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
+            .unwrap();
+        let pooled = AuthContext::from_identity(&identity, "s_pooled".into());
+
+        let scope = RequestAuthScope::builder(&identity, &grants)
+            .with_adopted_auth_context(pooled)
+            .build();
+
+        assert_eq!(
+            scope.auth().metadata.get("scope_status.pro:all"),
+            Some(&"active".to_string())
+        );
     }
 }

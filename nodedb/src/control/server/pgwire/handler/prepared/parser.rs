@@ -200,13 +200,18 @@ impl NodeDbQueryParser {
         let sql_for_planning = substitute_placeholders_with_null(&sql_without_returning);
         let query_ctx =
             crate::control::planner::context::QueryContext::for_state_with_lease(&self.state);
-        let mut auth_ctx = crate::control::server::session_auth::build_auth_context(identity);
-        // Parse plans against this selected database, including RLS variables.
-        auth_ctx.database_id = Some(database_id);
+        // Parse plans against this selected database, including RLS
+        // variables — `for_database` stamps `database_id` through the single
+        // lockstep path and runs scope-grant enrichment.
+        let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+            identity,
+            &self.state.scope_grants,
+            database_id,
+        );
         let permission_cache = self.state.permission_cache.read().await;
         let security = crate::control::planner::context::PlanSecurityContext {
             identity,
-            auth: &auth_ctx,
+            auth: scope.auth(),
             rls_store: &self.state.rls,
             permissions: &self.state.permissions,
             roles: &self.state.roles,
