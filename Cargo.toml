@@ -179,7 +179,13 @@ chrono = { version = "0.4", features = ["std"], default-features = false }
 
 # MessagePack
 rmpv = "1"
-zerompk = { version = "0.7", features = ["std", "derive"] }
+# Fork pending upstream nuskey8/zerompk#61: the derived codecs are
+# `inline(always)`, which folds whole codec trees into one function and makes
+# large plan enums cost minutes to compile. Drop the git source once released.
+zerompk = { version = "0.7", git = "https://github.com/farhan-syah/zerompk", rev = "bb3156cf17b399b0dc2dd90895133a169a29cac0", features = [
+  "std",
+  "derive",
+] }
 
 # Bitmap
 roaring = "0.11"
