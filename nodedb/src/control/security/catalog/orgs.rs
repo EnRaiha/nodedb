@@ -3,7 +3,9 @@
 //! Organization catalog operations (redb persistence).
 
 use super::types::{ORG_MEMBERS, ORGS, SystemCatalog, catalog_err};
-use redb::ReadableDatabase;
+// `ReadableTable` brings `range` into scope for the write-transaction `Table`
+// used by the bulk membership delete; read-only tables get it inherently.
+use redb::{ReadableDatabase, ReadableTable};
 
 /// Serializable organization record for redb storage.
 #[derive(Debug, Clone, zerompk::ToMessagePack, zerompk::FromMessagePack)]
@@ -156,6 +158,50 @@ impl SystemCatalog {
                 .remove(key.as_str())
                 .map_err(|e| catalog_err("remove member", e))?
                 .is_some()
+        };
+        write_txn
+            .commit()
+            .map_err(|e| catalog_err("member commit", e))?;
+        Ok(removed)
+    }
+
+    /// Delete every membership record belonging to `org_id`. Used when the
+    /// org itself is dropped, so its memberships don't outlive it in the
+    /// catalog.
+    ///
+    /// Keys are `"{org_id}:{user_id}"` but this scans the *entire*
+    /// `org_members` table and filters by prefix rather than bounding the
+    /// range — O(all memberships in the catalog), not O(org's memberships).
+    /// Acceptable because org drop is a rare admin operation, never on the
+    /// request path; do not assume this is cheap if reused elsewhere.
+    pub fn delete_members_for_org(&self, org_id: &str) -> crate::Result<usize> {
+        let prefix = format!("{org_id}:");
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| catalog_err("member write txn", e))?;
+        let removed = {
+            let mut table = write_txn
+                .open_table(ORG_MEMBERS)
+                .map_err(|e| catalog_err("open org_members", e))?;
+            let keys: Vec<String> = table
+                .range::<&str>(..)
+                .map_err(|e| catalog_err("range members", e))?
+                .filter_map(|item| item.ok())
+                .map(|(k, _)| k.value().to_string())
+                .filter(|k| k.starts_with(&prefix))
+                .collect();
+            let mut count = 0usize;
+            for key in &keys {
+                if table
+                    .remove(key.as_str())
+                    .map_err(|e| catalog_err("remove member", e))?
+                    .is_some()
+                {
+                    count += 1;
+                }
+            }
+            count
         };
         write_txn
             .commit()

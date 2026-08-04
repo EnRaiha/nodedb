@@ -11,8 +11,14 @@ use std::sync::RwLock;
 
 use tracing::info;
 
-use crate::control::security::catalog::{StoredOrg, StoredOrgMember, SystemCatalog};
+use super::member_index::MemberIndex;
+use crate::control::security::catalog::{StoredOrg, SystemCatalog};
 use crate::control::security::time::now_secs;
+
+// `OrgMemberRecord` is defined in the `pub(crate)` `member_index` module but
+// appears in `OrgStore`'s public API (`members_of`) — re-export it here so
+// it is reachable via `org::store::OrgMemberRecord`.
+pub use super::member_index::OrgMemberRecord;
 
 /// In-memory organization record.
 #[derive(Debug, Clone)]
@@ -58,40 +64,13 @@ impl OrgRecord {
     }
 }
 
-/// In-memory org membership record.
-#[derive(Debug, Clone)]
-pub struct OrgMemberRecord {
-    pub auth_user_id: String,
-    pub org_id: String,
-    pub role: String,
-    pub joined_at: u64,
-}
-
-impl OrgMemberRecord {
-    fn from_stored(s: &StoredOrgMember) -> Self {
-        Self {
-            auth_user_id: s.auth_user_id.clone(),
-            org_id: s.org_id.clone(),
-            role: s.role.clone(),
-            joined_at: s.joined_at,
-        }
-    }
-
-    fn to_stored(&self) -> StoredOrgMember {
-        StoredOrgMember {
-            auth_user_id: self.auth_user_id.clone(),
-            org_id: self.org_id.clone(),
-            role: self.role.clone(),
-            joined_at: self.joined_at,
-        }
-    }
-}
-
 /// Thread-safe organization store.
 pub struct OrgStore {
     orgs: RwLock<HashMap<String, OrgRecord>>,
-    /// Key: `"{org_id}:{user_id}"` → membership.
-    members: RwLock<HashMap<String, OrgMemberRecord>>,
+    /// Forward (`org:user` → membership) and reverse (`user` → org ids)
+    /// membership index, behind one lock so the two views can never be
+    /// observed out of sync by a concurrent reader.
+    members: RwLock<MemberIndex>,
     catalog: Option<SystemCatalog>,
 }
 
@@ -99,7 +78,7 @@ impl OrgStore {
     pub fn new() -> Self {
         Self {
             orgs: RwLock::new(HashMap::new()),
-            members: RwLock::new(HashMap::new()),
+            members: RwLock::new(MemberIndex::new()),
             catalog: None,
         }
     }
@@ -110,13 +89,18 @@ impl OrgStore {
         for s in &stored_orgs {
             orgs.insert(s.org_id.clone(), OrgRecord::from_stored(s));
         }
-        // Load members for all orgs on startup.
-        let mut members = HashMap::new();
+        // Load members for all orgs on startup. This is the ONLY place the
+        // in-memory member index is populated from durable state, so it is
+        // also the only place the reverse (user -> orgs) index gets built —
+        // every insert below goes through `MemberIndex::insert`, which keeps
+        // both maps in lockstep. If this rebuild is ever skipped, the
+        // reverse index is silently empty after a restart even though
+        // `members` looks fully populated.
+        let mut members = MemberIndex::new();
         for org_id in orgs.keys() {
             if let Ok(stored_members) = catalog.load_members_for_org(org_id) {
                 for sm in &stored_members {
-                    let key = Self::member_key(&sm.org_id, &sm.auth_user_id);
-                    members.insert(key, OrgMemberRecord::from_stored(sm));
+                    members.insert(OrgMemberRecord::from_stored(sm));
                 }
             }
         }
@@ -222,10 +206,18 @@ impl OrgStore {
         }
     }
 
-    /// Drop an organization.
+    /// Drop an organization and every membership it owns, in both the
+    /// catalog and the in-memory forward/reverse index. A dropped org that
+    /// left its memberships behind would leak stale org ids out of
+    /// `orgs_for_user` for every former member.
     pub fn drop_org(&self, org_id: &str) -> crate::Result<bool> {
         if let Some(ref catalog) = self.catalog {
+            catalog.delete_members_for_org(org_id)?;
             catalog.delete_org(org_id)?;
+        }
+        {
+            let mut members = self.members.write().unwrap_or_else(|p| p.into_inner());
+            members.remove_org(org_id);
         }
         let mut orgs = self.orgs.write().unwrap_or_else(|p| p.into_inner());
         Ok(orgs.remove(org_id).is_some())
@@ -242,10 +234,6 @@ impl OrgStore {
 
     // ── Membership ──────────────────────────────────────────────────
 
-    fn member_key(org_id: &str, user_id: &str) -> String {
-        format!("{org_id}:{user_id}")
-    }
-
     /// Add a member to an organization.
     pub fn add_member(&self, org_id: &str, user_id: &str, role: &str) -> crate::Result<()> {
         let record = OrgMemberRecord {
@@ -259,9 +247,8 @@ impl OrgStore {
             catalog.put_org_member(&record.to_stored())?;
         }
 
-        let key = Self::member_key(org_id, user_id);
         let mut members = self.members.write().unwrap_or_else(|p| p.into_inner());
-        members.insert(key, record);
+        members.insert(record);
         Ok(())
     }
 
@@ -270,31 +257,21 @@ impl OrgStore {
         if let Some(ref catalog) = self.catalog {
             catalog.delete_org_member(org_id, user_id)?;
         }
-        let key = Self::member_key(org_id, user_id);
         let mut members = self.members.write().unwrap_or_else(|p| p.into_inner());
-        Ok(members.remove(&key).is_some())
+        Ok(members.remove(org_id, user_id))
     }
 
     /// List members of an organization.
     pub fn members_of(&self, org_id: &str) -> Vec<OrgMemberRecord> {
-        let prefix = format!("{org_id}:");
         let members = self.members.read().unwrap_or_else(|p| p.into_inner());
-        members
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, v)| v.clone())
-            .collect()
+        members.members_of(org_id)
     }
 
-    /// List all orgs a user belongs to.
+    /// List all orgs a user belongs to — O(orgs the user is in) via the
+    /// reverse index, read-lock only.
     pub fn orgs_for_user(&self, user_id: &str) -> Vec<String> {
-        let suffix = format!(":{user_id}");
         let members = self.members.read().unwrap_or_else(|p| p.into_inner());
-        members
-            .iter()
-            .filter(|(k, _)| k.ends_with(&suffix))
-            .map(|(_, v)| v.org_id.clone())
-            .collect()
+        members.orgs_for_user(user_id)
     }
 
     /// JIT org creation: create org if it doesn't exist.
@@ -365,5 +342,101 @@ mod tests {
         store.ensure_org("acme", 1).unwrap();
         store.ensure_org("acme", 1).unwrap(); // No error.
         assert_eq!(store.count(), 1);
+    }
+
+    #[test]
+    fn orgs_for_user_returns_exactly_users_orgs() {
+        let store = OrgStore::new();
+        store.create_org("acme", "Acme", 1).unwrap();
+        store.create_org("globex", "Globex", 1).unwrap();
+        store.add_member("acme", "user_1", "member").unwrap();
+
+        assert_eq!(store.orgs_for_user("user_1"), vec!["acme"]);
+        assert!(store.orgs_for_user("nobody").is_empty());
+    }
+
+    #[test]
+    fn orgs_for_user_multiple_orgs() {
+        let store = OrgStore::new();
+        store.create_org("acme", "Acme", 1).unwrap();
+        store.create_org("globex", "Globex", 1).unwrap();
+        store.create_org("initech", "Initech", 1).unwrap();
+        store.add_member("acme", "user_1", "member").unwrap();
+        store.add_member("globex", "user_1", "admin").unwrap();
+
+        let mut orgs = store.orgs_for_user("user_1");
+        orgs.sort();
+        assert_eq!(orgs, vec!["acme", "globex"]);
+        // Not a member of initech.
+        assert!(
+            !store
+                .orgs_for_user("user_1")
+                .contains(&"initech".to_string())
+        );
+    }
+
+    #[test]
+    fn removing_membership_drops_it_from_reverse_index() {
+        let store = OrgStore::new();
+        store.create_org("acme", "Acme", 1).unwrap();
+        store.add_member("acme", "user_1", "member").unwrap();
+        assert_eq!(store.orgs_for_user("user_1"), vec!["acme"]);
+
+        store.remove_member("acme", "user_1").unwrap();
+        assert!(store.orgs_for_user("user_1").is_empty());
+    }
+
+    #[test]
+    fn dropping_org_drops_its_memberships_from_reverse_index() {
+        let store = OrgStore::new();
+        store.create_org("acme", "Acme", 1).unwrap();
+        store.create_org("globex", "Globex", 1).unwrap();
+        store.add_member("acme", "user_1", "member").unwrap();
+        store.add_member("globex", "user_1", "admin").unwrap();
+
+        store.drop_org("acme").unwrap();
+
+        assert_eq!(store.orgs_for_user("user_1"), vec!["globex"]);
+        assert!(store.members_of("acme").is_empty());
+    }
+
+    #[test]
+    fn reload_from_catalog_rebuilds_reverse_index() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let db_path = dir.path().join("orgs.redb");
+
+        {
+            let catalog = SystemCatalog::open(&db_path).expect("open catalog");
+            let store = OrgStore::open(catalog).expect("open store");
+            store.create_org("acme", "Acme", 1).unwrap();
+            store.add_member("acme", "user_1", "member").unwrap();
+            store.add_member("acme", "user_2", "admin").unwrap();
+        }
+
+        // Fresh OrgStore over the same catalog simulates a process restart:
+        // `members` is repopulated from disk, and the reverse index MUST be
+        // rebuilt alongside it, not left empty.
+        let catalog = SystemCatalog::open(&db_path).expect("reopen catalog");
+        let reloaded = OrgStore::open(catalog).expect("reopen store");
+
+        assert_eq!(reloaded.orgs_for_user("user_1"), vec!["acme"]);
+        assert_eq!(reloaded.orgs_for_user("user_2"), vec!["acme"]);
+        assert_eq!(reloaded.members_of("acme").len(), 2);
+    }
+
+    #[test]
+    fn two_users_in_same_org_do_not_leak_into_each_other() {
+        let store = OrgStore::new();
+        store.create_org("acme", "Acme", 1).unwrap();
+        store.add_member("acme", "user_1", "member").unwrap();
+        store.add_member("acme", "user_2", "admin").unwrap();
+
+        assert_eq!(store.orgs_for_user("user_1"), vec!["acme"]);
+        assert_eq!(store.orgs_for_user("user_2"), vec!["acme"]);
+
+        store.remove_member("acme", "user_1").unwrap();
+        assert!(store.orgs_for_user("user_1").is_empty());
+        // user_2's membership is untouched.
+        assert_eq!(store.orgs_for_user("user_2"), vec!["acme"]);
     }
 }
