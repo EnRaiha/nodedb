@@ -102,6 +102,33 @@ jobs:
     name: Test
     # Free ARM64 runner — see the lint job for rationale.
     runs-on: ubuntu-24.04-arm
+    env:
+      # Test threads get 2 MiB of stack by default, which is not enough for this
+      # workspace's unoptimized test binaries on aarch64.
+      #
+      # The `ci` profile inherits `dev`, so it builds at opt-level 0, and an
+      # unoptimized frame is far larger than an optimized one — every local
+      # temporary gets its own stack slot instead of a register. Measured on the
+      # bounded-JSON decoder at its own MAX_JSON_DEPTH of 64: ~0.5 KiB of stack
+      # per nesting level at opt-level 1, but ~12 KiB at opt-level 0 on x86_64
+      # and enough on aarch64 to need between 2 and 3 MiB for the same document.
+      # That lands just past the 2 MiB default and the thread dies with
+      # "fatal runtime error: stack overflow" (SIGABRT) rather than a test
+      # failure. The in-process server tests overflow the same way on the deeper
+      # planner and dispatch paths.
+      #
+      # This is a property of unoptimized builds only — it does not reach a
+      # release binary. At opt-level 3 the same 64-deep document parses inside
+      # 2 MiB with room to spare, and sonic-rs rejects deeper input on its own
+      # recursion limit before stack depth becomes the binding constraint.
+      #
+      # RUST_MIN_STACK is the one knob that covers every thread class involved:
+      # libtest's per-test threads, tokio's worker threads, and tokio's blocking
+      # pool all spawn without an explicit stack size and so inherit it. 32 MiB
+      # matches the margin `nodedb-test-support`'s CoreLoop runner already found
+      # necessary for deep initialization in debug builds. Thread stacks are
+      # reserved lazily, so this costs address space rather than memory.
+      RUST_MIN_STACK: "33554432"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Reclaim disk and record resources
