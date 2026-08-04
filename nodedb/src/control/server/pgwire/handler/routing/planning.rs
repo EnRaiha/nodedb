@@ -82,7 +82,7 @@ impl NodeDbPgHandler {
         // Resolve opaque session handle if SET LOCAL nodedb.auth_session is set.
         // Network provenance is immutable accept-time metadata; all mutable
         // session state remains keyed by the collision-free SessionId.
-        let base_auth_ctx = if let Some(handle) = self
+        let adopted_auth_ctx = if let Some(handle) = self
             .sessions
             .get_parameter(session_id, "nodedb.auth_session")
         {
@@ -92,7 +92,7 @@ impl NodeDbPgHandler {
                 .session_handles
                 .resolve(&handle, &conn_key, &caller_fp)
             {
-                ResolveOutcome::Resolved(cached) => *cached,
+                ResolveOutcome::Resolved(cached) => Some(*cached),
                 ResolveOutcome::RateLimited => {
                     return Err(StatementSetupError::protocol(
                         "FATAL",
@@ -101,33 +101,33 @@ impl NodeDbPgHandler {
                          connection — closing",
                     ));
                 }
-                ResolveOutcome::Miss => {
-                    crate::control::server::session_auth::build_auth_context_with_session(
-                        identity,
-                        &self.sessions,
-                        session_id,
-                    )
-                }
+                ResolveOutcome::Miss => None,
             }
         } else {
-            crate::control::server::session_auth::build_auth_context_with_session(
-                identity,
-                &self.sessions,
-                session_id,
-            )
+            None
         };
 
-        // Adopt whichever `AuthContext` was resolved above — freshly built
-        // from the session, or a pooled handle's cached context — into the
-        // request-scoped contract. This re-stamps `database_id` through the
-        // same single path every other transport's `RequestAuthScope`
-        // resolution uses, and (new for the pooled-handle case) runs
-        // scope-grant enrichment, which a cached context never received
-        // after the moment it was created.
-        let scope = RequestAuthScope::builder(identity, &self.state.scope_grants)
+        // Session-level `ON DENY` override lives only in session parameters —
+        // the one piece of the old `build_auth_context_with_session` this
+        // builder chain cannot absorb via `with_session_database` alone.
+        let session_on_deny = crate::control::server::session_auth::session_on_deny_override(
+            &self.sessions,
+            session_id,
+        );
+
+        // Adopt the pooled handle's cached context when present, else let the
+        // builder construct a fresh one from `identity`. Either way this
+        // re-stamps `database_id` through the same single path every other
+        // transport's `RequestAuthScope` resolution uses, and (new for the
+        // pooled-handle case) runs scope-grant enrichment, which a cached
+        // context never received after the moment it was created.
+        let mut scope_builder = RequestAuthScope::builder(identity, &self.state.scope_grants)
             .with_session_database(Some(database_id))
-            .with_adopted_auth_context(base_auth_ctx)
-            .build();
+            .with_on_deny(session_on_deny);
+        if let Some(adopted) = adopted_auth_ctx {
+            scope_builder = scope_builder.with_adopted_auth_context(adopted);
+        }
+        let scope = scope_builder.build();
 
         // Extract per-query ON DENY override. Per-query always wins over the
         // session-level override already baked into `scope`.

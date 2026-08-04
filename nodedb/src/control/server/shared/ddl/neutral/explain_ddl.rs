@@ -16,6 +16,7 @@
 use serde_json::{Map, Value as JsonValue};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
 
@@ -72,12 +73,12 @@ pub fn explain_permission(
         identity.clone()
     };
 
-    let auth_ctx = crate::control::server::session_auth::build_auth_context(&target_identity);
+    let scope = RequestAuthScope::builder(&target_identity, &state.scope_grants).build();
     let explanation = crate::control::security::explain::explain_permission(
         perm,
         collection,
         &target_identity,
-        &auth_ctx,
+        scope.auth(),
         state,
     );
 
@@ -211,13 +212,13 @@ pub fn assert_visible(
             nodedb_types::id::DatabaseId::DEFAULT,
         ]),
     );
-    let auth_ctx = crate::control::server::session_auth::build_auth_context(&target_identity);
+    let scope = RequestAuthScope::builder(&target_identity, &state.scope_grants).build();
 
     // Check if RLS policies would filter this user.
     let rls_bytes = state.rls.combined_read_predicate_with_auth(
         target_identity.tenant_id.as_u64(),
         collection,
-        &auth_ctx,
+        scope.auth(),
     );
 
     let visible = rls_bytes.is_some_and(|b| b.is_empty()); // No filters = visible.

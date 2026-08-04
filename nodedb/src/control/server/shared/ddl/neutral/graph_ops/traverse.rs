@@ -6,6 +6,7 @@ use nodedb_sql::ddl_ast::GraphDirection;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
@@ -105,10 +106,10 @@ fn authorize_traversal(
     // traversal returns topology rather than row bodies — there is nothing for
     // a row filter to evaluate — and disclosing the shape of rows whose
     // contents are protected is the leak, so a read policy refuses outright.
-    let auth_ctx = crate::control::server::session_auth::context::build_auth_context(identity);
+    let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
     if state
         .rls
-        .combined_read_predicate_with_auth(identity.tenant_id.as_u64(), collection, &auth_ctx)
+        .combined_read_predicate_with_auth(identity.tenant_id.as_u64(), collection, scope.auth())
         .is_none_or(|filters| !filters.is_empty())
     {
         return Err(ddl_err(

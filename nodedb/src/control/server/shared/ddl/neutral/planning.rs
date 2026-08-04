@@ -10,6 +10,7 @@ use crate::control::lease::QueryLeaseScope;
 use crate::control::planner::context::{PlanSecurityContext, QueryContext};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::shared::authorization::{AuthorizedTaskSet, authorize_task_set};
 use crate::control::server::shared::ddl::result::DdlError;
@@ -28,13 +29,12 @@ pub async fn plan_authorized_sql(
     sql: &str,
     database_id: DatabaseId,
 ) -> Result<(AuthorizedTaskSet, OutputSchema, QueryLeaseScope), DdlError> {
-    let mut auth = crate::control::server::session_auth::build_auth_context(identity);
     // Internal DDL scans still plan in the caller-selected database context.
-    auth.database_id = Some(database_id);
+    let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
     let permission_cache = state.permission_cache.read().await;
     let sec = PlanSecurityContext {
         identity,
-        auth: &auth,
+        auth: scope.auth(),
         rls_store: &state.rls,
         permissions: &state.permissions,
         roles: &state.roles,

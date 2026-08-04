@@ -9,6 +9,7 @@
 use nodedb_types::DatabaseId;
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::session::DmlTxnCtx;
@@ -150,19 +151,14 @@ pub async fn upsert_document(
             other => format!("{other:?}"),
         });
     let old_fields = if let Some(ref pk) = pk_for_probe {
-        let mut auth = crate::control::server::session_auth::build_auth_context_with_session(
-            identity,
-            txn_ctx.sessions,
-            txn_ctx.session_id,
-        );
         // The neutral DDL entry point receives an explicit selected database;
         // keep `$auth.database_id` identical to the task being probed.
-        auth.database_id = Some(database_id);
+        let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
         let row = crate::control::trigger::dml_hook::fetch_old_row(
             state,
             identity,
             database_id,
-            &auth,
+            scope.auth(),
             &parsed.coll_name,
             pk,
         )

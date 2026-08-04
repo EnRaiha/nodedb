@@ -39,6 +39,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::broadcast::broadcast_to_all_cores;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::state::SharedState;
@@ -108,10 +109,10 @@ pub async fn create_graph_index(
     // one principal's filtered view would answer other principals' queries from
     // rows that were never indexed. Refuse instead of silently indexing a
     // subset.
-    let auth_ctx = crate::control::server::session_auth::context::build_auth_context(identity);
+    let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
     if state
         .rls
-        .combined_read_predicate_with_auth(tenant_id.as_u64(), &collection, &auth_ctx)
+        .combined_read_predicate_with_auth(tenant_id.as_u64(), &collection, scope.auth())
         .is_none_or(|filters| !filters.is_empty())
     {
         return Err(ddl_err(

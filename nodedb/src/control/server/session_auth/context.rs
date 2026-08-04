@@ -24,33 +24,22 @@ pub fn build_auth_context(identity: &AuthenticatedIdentity) -> AuthContext {
     ctx
 }
 
-/// Build an `AuthContext` with pgwire session overrides applied.
+/// Read the `SET LOCAL nodedb.on_deny = '...'` session parameter, parsed into
+/// a [`DenyMode`](crate::control::security::deny::DenyMode).
 ///
-/// Authorization identity always comes from the authenticated connection.
-/// Session parameters may tune denial behavior and select a validated opaque
-/// session handle, but raw JWT text is never decoded as an identity override.
-pub fn build_auth_context_with_session(
-    identity: &AuthenticatedIdentity,
+/// This is the one piece of `build_auth_context_with_session`'s old work that
+/// [`RequestAuthScope`](crate::control::security::request_scope::RequestAuthScope)
+/// cannot absorb by itself: unlike the session database (which every builder
+/// call site already threads through `with_session_database`), the
+/// session-level `ON DENY` override lives only in session parameters. Callers
+/// pass the result to `RequestAuthScopeBuilder::with_on_deny` instead of
+/// mutating an `AuthContext` field directly.
+pub fn session_on_deny_override(
     sessions: &crate::control::server::shared::session::SessionStore,
     session_id: impl Into<SessionId>,
-) -> AuthContext {
-    let session_id = session_id.into();
-    let mut ctx = build_auth_context(identity);
-
-    // Read ON DENY override from SET LOCAL nodedb.on_deny = '...'.
-    if let Some(on_deny_val) = sessions.get_parameter(session_id, "nodedb.on_deny")
-        && let Ok(mode) = crate::control::security::deny::parse_on_deny(&[&on_deny_val])
-    {
-        ctx.on_deny_override = Some(mode);
-    }
-
-    // The active session database overrides the per-user default so that
-    // `$auth.database_id` tracks `USE DATABASE` commands within a session.
-    if let Some(db) = sessions.get_current_database(session_id) {
-        ctx.database_id = Some(db);
-    }
-
-    ctx
+) -> Option<crate::control::security::deny::DenyMode> {
+    let on_deny_val = sessions.get_parameter(session_id, "nodedb.on_deny")?;
+    crate::control::security::deny::parse_on_deny(&[&on_deny_val]).ok()
 }
 
 /// Extract a per-query `ON DENY` clause from SQL and apply it to the auth context.
