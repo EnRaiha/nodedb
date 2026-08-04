@@ -44,11 +44,24 @@ pub fn run(csr: &CsrIndex, high_degree_threshold: usize, sample_pairs: usize) ->
         return AlgoResultBatch::new(GraphAlgorithm::Lcc);
     }
 
+    let adjacency: Vec<Vec<u32>> = (0..n as u32)
+        .map(|node| {
+            let mut neighbors: HashSet<u32> = csr
+                .iter_out_edges_raw(node)
+                .map(|(_, neighbor)| neighbor)
+                .chain(csr.iter_in_edges_raw(node).map(|(_, neighbor)| neighbor))
+                .filter(|neighbor| *neighbor != node)
+                .collect();
+            let mut neighbors: Vec<u32> = neighbors.drain().collect();
+            neighbors.sort_unstable();
+            neighbors
+        })
+        .collect();
     let mut batch = AlgoResultBatch::new(GraphAlgorithm::Lcc);
 
     for node in 0..n {
         let node_id = node as u32;
-        let coeff = compute_lcc(csr, node_id, high_degree_threshold, sample_pairs);
+        let coeff = compute_lcc(csr, &adjacency, node_id, high_degree_threshold, sample_pairs);
         batch.push_node_f64(csr.node_name_raw(node as u32).to_string(), coeff);
     }
 
@@ -58,37 +71,24 @@ pub fn run(csr: &CsrIndex, high_degree_threshold: usize, sample_pairs: usize) ->
 /// Compute LCC for a single node.
 fn compute_lcc(
     csr: &CsrIndex,
+    adjacency: &[Vec<u32>],
     node: u32,
     high_degree_threshold: usize,
     sample_pairs: usize,
 ) -> f64 {
-    // Collect undirected neighbor set (deduped).
-    let mut neighbor_set: HashSet<u32> = HashSet::new();
-    for (_lid, dst) in csr.iter_out_edges_raw(node) {
-        if dst != node {
-            neighbor_set.insert(dst);
-        }
-    }
-    for (_lid, src) in csr.iter_in_edges_raw(node) {
-        if src != node {
-            neighbor_set.insert(src);
-        }
-    }
-
-    let k = neighbor_set.len();
+    let neighbors = &adjacency[node as usize];
+    let k = neighbors.len();
     if k < 2 {
         return 0.0;
     }
 
-    let neighbors: Vec<u32> = neighbor_set.into_iter().collect();
     let possible_pairs = k * (k - 1) / 2;
 
     let triangles = if k > high_degree_threshold {
         // Approximate: sample random pairs.
-        count_triangles_sampled(csr, &neighbors, possible_pairs, sample_pairs)
+        count_triangles_sampled(csr, neighbors, possible_pairs, sample_pairs)
     } else {
-        // Exact: check all pairs.
-        count_triangles_exact(csr, &neighbors)
+        count_triangles_exact(adjacency, neighbors)
     };
 
     // LCC = 2 * triangles / (k * (k-1))
@@ -97,32 +97,19 @@ fn compute_lcc(
     triangles as f64 / possible_pairs as f64
 }
 
-/// Count triangles by checking all neighbor pairs (exact).
-fn count_triangles_exact(csr: &CsrIndex, neighbors: &[u32]) -> usize {
-    // Build a fast lookup set for neighbors.
-    let neighbor_set: HashSet<u32> = neighbors.iter().copied().collect();
+/// Count induced neighbor edges exactly using sorted contiguous adjacency.
+fn count_triangles_exact(adjacency: &[Vec<u32>], neighbors: &[u32]) -> usize {
     let mut triangles = 0;
-
-    for &u in neighbors {
-        // Collect u's undirected neighbors and check intersection with neighbor_set.
-        // Only check pairs where u < w to avoid double counting.
-        for (_lid, w) in csr.iter_out_edges_raw(u) {
-            if w > u && neighbor_set.contains(&w) {
+    for &left in neighbors {
+        for &right in adjacency[left as usize]
+            .iter()
+            .skip_while(|right| **right <= left)
+        {
+            if neighbors.binary_search(&right).is_ok() {
                 triangles += 1;
             }
         }
-        for (_lid, w) in csr.iter_in_edges_raw(u) {
-            if w > u && neighbor_set.contains(&w) {
-                // Avoid counting an edge both as out and in.
-                // Only count if the reverse (out) wasn't already counted.
-                let already_counted = csr.iter_out_edges_raw(u).any(|(_l, t)| t == w);
-                if !already_counted {
-                    triangles += 1;
-                }
-            }
-        }
     }
-
     triangles
 }
 

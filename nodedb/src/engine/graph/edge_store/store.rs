@@ -89,11 +89,31 @@ pub struct EdgeStore {
 impl EdgeStore {
     /// Open or create the edge store database at the given path.
     pub fn open(path: &Path) -> crate::Result<Self> {
+        Self::open_inner(path, None)
+    }
+
+    /// Open with an explicit redb page-cache budget.
+    ///
+    /// Bulk analytical imports can be substantially larger than redb's 1 GiB
+    /// default cache. Callers that own a bounded embedded workload may provide
+    /// a larger budget without changing the normal server default.
+    pub fn open_with_cache_size(path: &Path, cache_size: usize) -> crate::Result<Self> {
+        Self::open_inner(path, Some(cache_size))
+    }
+
+    fn open_inner(path: &Path, cache_size: Option<usize>) -> crate::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let db = Database::create(path).map_err(|e| redb_err("open", e))?;
+        let db = if let Some(cache_size) = cache_size {
+            let mut builder = Database::builder();
+            builder.set_cache_size(cache_size);
+            builder.create(path)
+        } else {
+            Database::create(path)
+        }
+        .map_err(|e| redb_err("open", e))?;
 
         let write_txn = db.begin_write().map_err(|e| redb_err("begin_write", e))?;
         {
@@ -125,6 +145,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("graph.redb");
         let _ = EdgeStore::open(&path).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn open_with_explicit_cache_creates_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("graph.redb");
+        let _store = EdgeStore::open_with_cache_size(&path, 8 * 1024 * 1024).unwrap();
         assert!(path.exists());
     }
 

@@ -15,7 +15,7 @@ use crate::engine::graph::algo::{label_propagation, lcc, pagerank, sssp, wcc};
 use crate::engine::graph::algo::params::AlgoParams;
 use crate::engine::graph::csr::rebuild::rebuild_sharded_from_store;
 use crate::engine::graph::edge_store::{
-    EdgeSnapshotRecord, EdgeStore, EdgeValuePayload, NodeSurrogateRecord, versioned_edge_key,
+    EdgeImportRecord, EdgeStore, EdgeValuePayload, NodeSurrogateRecord, versioned_edge_key,
 };
 
 const DATABASE: DatabaseId = DatabaseId::DEFAULT;
@@ -23,8 +23,9 @@ const TENANT: TenantId = TenantId::new(1);
 const COLLECTION: &str = "graphalytics";
 const LABEL: &str = "edge";
 const SOURCE: &str = "6";
-const BATCH_SIZE: usize = 50_000;
+const BATCH_SIZE: usize = 10_000_000;
 const OPERATION_TIMEOUT_SECONDS: f64 = 300.0;
+const EDGE_STORE_CACHE_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
 pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(output)?;
@@ -39,7 +40,7 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
     let edges = dataset.join(format!("{dataset_name}.e"));
 
     let load_start = Instant::now();
-    let store = EdgeStore::open(database)?;
+    let store = EdgeStore::open_with_cache_size(database, EDGE_STORE_CACHE_BYTES)?;
     import_vertices(&store, &vertices)?;
     import_edges(&store, &edges)?;
     let load_seconds = checked_elapsed(load_start, "load")?;
@@ -106,7 +107,7 @@ fn checked_elapsed(start: Instant, operation: &str) -> anyhow::Result<f64> {
     let seconds = start.elapsed().as_secs_f64();
     if seconds > OPERATION_TIMEOUT_SECONDS {
         anyhow::bail!(
-            "{operation} exceeded the {OPERATION_TIMEOUT_SECONDS:.0}-second operation timeout"
+            "{operation} took {seconds:.3}s and exceeded the {OPERATION_TIMEOUT_SECONDS:.0}-second operation timeout"
         );
     }
     Ok(seconds)
@@ -138,7 +139,7 @@ fn import_vertices(store: &EdgeStore, path: &Path) -> anyhow::Result<()> {
 
 fn import_edges(store: &EdgeStore, path: &Path) -> anyhow::Result<()> {
     let reader = BufReader::with_capacity(1 << 20, File::open(path)?);
-    let mut batch: Vec<EdgeSnapshotRecord> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: Vec<EdgeImportRecord> = Vec::with_capacity(BATCH_SIZE);
     let mut system_from = 1i64;
     for line in reader.lines() {
         let line = line?;
@@ -156,30 +157,27 @@ fn import_edges(store: &EdgeStore, path: &Path) -> anyhow::Result<()> {
             anyhow::bail!("edge has extra fields: {line}");
         }
 
-        let mut properties = Vec::new();
-        rmpv::encode::write_value(
-            &mut properties,
-            &rmpv::Value::Map(vec![(
-                rmpv::Value::from("weight"),
-                rmpv::Value::from(weight),
-            )]),
-        )?;
+        let mut properties = Vec::with_capacity(18);
+        nodedb_query::msgpack_scan::write_map_header(&mut properties, 1);
+        nodedb_query::msgpack_scan::write_kv_f64(&mut properties, "weight", weight);
         let value = EdgeValuePayload::new(0, i64::MAX, properties).encode()?;
         batch.push((
             DATABASE,
             TENANT,
             versioned_edge_key(COLLECTION, source, LABEL, destination, system_from)?,
+            versioned_edge_key(COLLECTION, destination, LABEL, source, system_from)?,
             value,
         ));
         system_from += 1;
         if batch.len() == BATCH_SIZE {
-            store.import_edges(&batch)?;
+            store.import_edge_pairs_deferred(&mut batch)?;
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        store.import_edges(&batch)?;
+        store.import_edge_pairs_deferred(&mut batch)?;
     }
+    store.flush_deferred_imports()?;
     Ok(())
 }
 

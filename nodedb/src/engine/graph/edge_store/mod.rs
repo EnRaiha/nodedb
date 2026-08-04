@@ -13,6 +13,8 @@ pub mod temporal;
 pub use cascade::EdgeRestore;
 pub use node_identity::NodeSurrogateRecord;
 pub use snapshot::EdgeSnapshotRecord;
+#[cfg(any(feature = "graphalytics-runner", test))]
+pub(crate) use snapshot::EdgeImportRecord;
 pub use stats::CollectionStats;
 pub use store::{Direction, Edge, EdgeRecord, EdgeStore};
 pub use temporal::{
