@@ -1086,9 +1086,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1114,6 +1116,30 @@ dependencies = [
  "opaque-debug",
  "polyval",
 ]
+
+[[package]]
+name = "glam"
+version = "0.30.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
+
+[[package]]
+name = "glam"
+version = "0.31.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "556f6b2ea90b8d15a74e0e7bb41671c9bdf38cd9f78c284d750b9ce58a2b5be7"
+
+[[package]]
+name = "glam"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f70749695b063ecbf6b62949ccccde2e733ec3ecbbd71d467dca4e5c6c97cca0"
+
+[[package]]
+name = "glam"
+version = "0.33.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360bd2cd76e0cd9032d42cf2922155cecea2685b0cfa4630c3246df030bcfd6"
 
 [[package]]
 name = "glob"
@@ -1897,9 +1923,9 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lz4_flex"
-version = "0.11.6"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 
 [[package]]
 name = "matrixmultiply"
@@ -1975,11 +2001,15 @@ dependencies = [
 
 [[package]]
 name = "nalgebra"
-version = "0.33.3"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d43ddcacf343185dfd6de2ee786d9e8b1c2301622afab66b6c73baf9882abfd"
+checksum = "adc43a60c217b0c6ff46e47f26911015ad8d2e5a8be1af668c67e370d99a4346"
 dependencies = [
  "approx",
+ "glam 0.30.10",
+ "glam 0.31.1",
+ "glam 0.32.1",
+ "glam 0.33.3",
  "matrixmultiply",
  "nalgebra-macros",
  "num-complex",
@@ -1991,9 +2021,9 @@ dependencies = [
 
 [[package]]
 name = "nalgebra-macros"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "254a5372af8fc138e36684761d3c0cdb758a4410e938babcff1c860ce14ddbfc"
+checksum = "973e7178a678cfd059ccec50887658d482ce16b0aa9da3888ddeab5cd5eb4889"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2002,16 +2032,16 @@ dependencies = [
 
 [[package]]
 name = "nanoid"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ffa00dec017b5b1a8b7cf5e2c008bfda1aa7e0697ac1508b491fdf2622fb4d8"
+checksum = "8628de41fe064cc3f0cf07f3d299ee3e73521adaff72278731d5c8cae3797873"
 dependencies = [
- "rand 0.8.7",
+ "rand 0.9.5",
 ]
 
 [[package]]
 name = "nodedb-codec"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "lz4_flex",
  "nalgebra",
@@ -2027,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-columnar"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "crc32c",
  "nodedb-codec",
@@ -2046,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-fts"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arc-swap",
  "crc32c",
@@ -2075,14 +2105,12 @@ dependencies = [
  "nodedb-strict",
  "nodedb-types",
  "nodedb-wal",
- "sonic-rs",
- "sonic-simd",
  "tempfile",
 ]
 
 [[package]]
 name = "nodedb-mem"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "libc",
  "nodedb-types",
@@ -2094,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-query"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "nodedb-fts",
  "nodedb-spatial",
@@ -2111,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-spatial"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "h3o",
  "nodedb-mem",
@@ -2127,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-sql"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "nodedb-query",
@@ -2141,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "nodedb-strict"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "nodedb-types",
@@ -2157,15 +2185,15 @@ dependencies = [
 
 [[package]]
 name = "nodedb-types"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "bytemuck",
  "crc32c",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "nanoid",
  "nodedb-codec",
- "rand 0.9.5",
+ "rand 0.10.2",
  "rkyv 0.8.17",
  "roaring",
  "rust_decimal",
@@ -2182,11 +2210,13 @@ dependencies = [
 
 [[package]]
 name = "nodedb-wal"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "crc32c",
+ "getrandom 0.2.17",
  "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hkdf",
  "libc",
  "memmap2",
@@ -2977,9 +3007,9 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safe_arch"
-version = "0.7.4"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
+checksum = "3a52ec151f024d703f9fd65abb7cbe81e7cdb39f18917a3a37e3014470dc7c59"
 dependencies = [
  "bytemuck",
 ]
@@ -3112,14 +3142,13 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "simba"
-version = "0.9.1"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c99284beb21666094ba2b75bbceda012e610f5479dfcc2d6e2426f53197ffd95"
+checksum = "834a9952211d4a60ff10ac1d20cc01640a75bdc0a0c688d62f359ea7d17459f3"
 dependencies = [
  "approx",
  "num-complex",
  "num-traits",
- "paste",
  "wide",
 ]
 
@@ -3179,6 +3208,8 @@ dependencies = [
 [[package]]
 name = "sonic-rs"
 version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d971cc77a245ccf1756dbd1a87c3e7f709c0191464096510d43eec056d0f2c4f"
 dependencies = [
  "ahash 0.8.12",
  "bumpalo",
@@ -3198,6 +3229,8 @@ dependencies = [
 [[package]]
 name = "sonic-simd"
 version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f99e664ecd2d85a68c87e3c7a3cfe691f647ea9e835de984aba4d54a41f817d4"
 dependencies = [
  "cfg-if",
 ]
@@ -3387,9 +3420,9 @@ dependencies = [
 
 [[package]]
 name = "tikv-jemalloc-ctl"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "661f1f6a57b3a36dc9174a2c10f19513b4866816e13425d3e418b11cc37bc24c"
+checksum = "3a184c43b8ab2f41df2733b55556e3f5f632f4aeaa205b1bb018f574b7f5f142"
 dependencies = [
  "libc",
  "paste",
@@ -3398,9 +3431,9 @@ dependencies = [
 
 [[package]]
 name = "tikv-jemalloc-sys"
-version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+version = "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+checksum = "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0"
 dependencies = [
  "cc",
  "libc",
@@ -3408,9 +3441,9 @@ dependencies = [
 
 [[package]]
 name = "tikv-jemallocator"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+checksum = "249f09e49ab1609436f34c776e84231bead18d6a955f119f939bdc1d847561bd"
 dependencies = [
  "libc",
  "tikv-jemalloc-sys",
@@ -3625,11 +3658,11 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "ulid"
-version = "1.2.1"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+checksum = "947dde63b6d514cc5e044edad4e0ca7261afd1099d16c83d942cb2b2f348689c"
 dependencies = [
- "rand 0.9.5",
+ "rand 0.10.2",
  "web-time",
 ]
 
@@ -3848,9 +3881,9 @@ dependencies = [
 
 [[package]]
 name = "wide"
-version = "0.7.33"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce5da8ecb62bcd8ec8b7ea19f69a51275e91299be594ea5cc6ef7819e16cd03"
+checksum = "be99e8317aa9f08e7d16e13033ca43faab59ab582b1d0feab7b385424c42f8b1"
 dependencies = [
  "bytemuck",
  "safe_arch",
@@ -4162,18 +4195,16 @@ dependencies = [
 
 [[package]]
 name = "zerompk"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5fdec1c176abb9ac7f1e1f40aa05c2c2a01984e895787b5f2e0b6c9c1ad7f20"
+version = "0.7.1"
+source = "git+https://github.com/farhan-syah/zerompk?rev=bb3156cf17b399b0dc2dd90895133a169a29cac0#bb3156cf17b399b0dc2dd90895133a169a29cac0"
 dependencies = [
  "zerompk_derive",
 ]
 
 [[package]]
 name = "zerompk_derive"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02586870c5f30b25cf5a2eae9ab9ba29d2023ca79ee267e3c13ad0ec57b24765"
+version = "0.7.1"
+source = "git+https://github.com/farhan-syah/zerompk?rev=bb3156cf17b399b0dc2dd90895133a169a29cac0#bb3156cf17b399b0dc2dd90895133a169a29cac0"
 dependencies = [
  "proc-macro2",
  "quote",

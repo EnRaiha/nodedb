@@ -102,7 +102,7 @@ fn exercise_readers(path: &Path, bytes: &[u8]) {
         return;
     }
 
-    if let Ok(mut reader) = WalReader::open(path) {
+    if let Ok(mut reader) = WalReader::open(path, None) {
         for _ in 0..MAX_RECORDS {
             match reader.next_record() {
                 Ok(Some(record)) => {
@@ -115,7 +115,7 @@ fn exercise_readers(path: &Path, bytes: &[u8]) {
         let _ = reader.segment_preamble();
     }
 
-    if let Ok(mut reader) = LazyWalReader::open(path) {
+    if let Ok(mut reader) = LazyWalReader::open(path, None) {
         for index in 0..MAX_RECORDS {
             let header = match reader.next_header() {
                 Ok(Some(header)) => header,
@@ -134,7 +134,7 @@ fn exercise_readers(path: &Path, bytes: &[u8]) {
     }
 
     #[cfg(target_os = "linux")]
-    if let Ok(mut reader) = MmapWalReader::open(path) {
+    if let Ok(mut reader) = MmapWalReader::open(path, None) {
         let _ = reader.len();
         let _ = reader.is_empty();
         let _ = reader.madvise_state();
