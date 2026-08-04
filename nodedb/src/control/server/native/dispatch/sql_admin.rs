@@ -132,7 +132,7 @@ pub(super) async fn handle_explain(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -
     let perm_cache = ctx.state.permission_cache.read().await;
     let sec = crate::control::planner::context::PlanSecurityContext {
         identity: ctx.identity,
-        auth: ctx.auth_context,
+        auth: ctx.auth_context(),
         rls_store: &ctx.state.rls,
         permissions: &ctx.state.permissions,
         roles: &ctx.state.roles,

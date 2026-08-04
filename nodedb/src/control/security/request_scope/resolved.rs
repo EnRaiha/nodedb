@@ -40,7 +40,7 @@ use super::builder::RequestAuthScopeBuilder;
 /// `RequestAuthScope` are [`RequestAuthScope::builder`] (which stamps both
 /// atomically) and [`RequestAuthScope::rebind_database`] (which re-stamps
 /// both atomically). There is no other path in or out.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RequestAuthScope<'a> {
     /// The session-lifetime identity this scope was resolved from.
     identity: &'a AuthenticatedIdentity,

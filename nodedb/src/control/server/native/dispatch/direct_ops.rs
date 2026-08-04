@@ -75,7 +75,7 @@ pub(crate) async fn handle_direct_op(
         tenant_id.as_u64(),
         &mut plan,
         &ctx.state.rls,
-        ctx.auth_context,
+        ctx.auth_context(),
     ) {
         return NativeResponse::error(seq, "42501", e.to_string());
     }

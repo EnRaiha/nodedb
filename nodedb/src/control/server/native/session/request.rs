@@ -107,22 +107,37 @@ impl NativeSession {
             }
         };
 
-        // Retain authenticated/session enrichment, but bind RLS to the database
-        // selected for this request (including a later `USE DATABASE`).
-        let mut auth_ctx = self
+        // Build the single request-scoped auth contract for this request:
+        // resolves `database_id` once (bound to the database selected for
+        // this request, including a later `USE DATABASE`) and stamps it into
+        // both the scalar consumed by dispatch and `$auth.database_id` in
+        // lockstep, then runs scope-grant enrichment so
+        // `$auth.scope_status('...')` resolves for every native opcode —
+        // not just the SQL path. Preserving the session's established
+        // `session_id` (rather than letting the builder generate a fresh
+        // one) keeps `$auth.session_id` stable across requests on this
+        // connection.
+        let session_id = self
             .auth_context
-            .clone()
-            .unwrap_or_else(|| super::super::super::session_auth::build_auth_context(identity));
-        auth_ctx.database_id = Some(
-            self.sessions
-                .get_current_database(self.peer_addr)
-                .unwrap_or(crate::types::DatabaseId::DEFAULT),
-        );
+            .as_ref()
+            .map(|ctx| ctx.session_id.clone())
+            .unwrap_or_else(crate::control::security::auth_context::generate_session_id);
+        let current_database = self
+            .sessions
+            .get_current_database(self.peer_addr)
+            .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        let scope = crate::control::security::request_scope::RequestAuthScope::builder(
+            identity,
+            &self.state.scope_grants,
+        )
+        .with_session_database(Some(current_database))
+        .with_session_id(session_id)
+        .build();
 
         let ctx = DispatchCtx {
             state: &self.state,
             identity,
-            auth_context: &auth_ctx,
+            scope,
             query_ctx: &self.query_ctx,
             sessions: &self.sessions,
             peer_addr: &self.peer_addr,
