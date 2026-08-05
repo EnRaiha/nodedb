@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 mod authorize;
+mod payload;
 mod snapshot;
 mod subscribe;
 

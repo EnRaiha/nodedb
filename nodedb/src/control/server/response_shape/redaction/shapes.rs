@@ -16,6 +16,7 @@
 //! - a scan envelope or flat row map — [`redact_envelope_row`]
 //! - a positional `RETURNING` payload — [`redact_rows_payload`]
 //! - stored bytes handed back verbatim — [`redact_stored_value_bytes`]
+//! - one stored document row's MessagePack bytes — [`redact_document_row_bytes`]
 //!
 //! [`redact_decoded_value`] dispatches over the first two for callers holding
 //! a decoded payload of unknown shape.
@@ -263,6 +264,58 @@ pub fn redact_stored_value_bytes(
     }
 }
 
+/// Redact one stored document row's MessagePack bytes in place, reporting
+/// whether the result is safe to deliver.
+///
+/// The device-sync surfaces hand the client the stored row bytes themselves:
+/// a shape snapshot is a msgpack array of `{id, data}` envelopes whose `data`
+/// value is the storage map verbatim, and a CRDT row push carries the same map
+/// as its payload. Neither reaches a decoded row map, so
+/// [`redact_envelope_row`] cannot see the fields, and
+/// [`redact_stored_value_bytes`] does not fit either — its non-map branch is
+/// the KV single-value form, and its failure mode is to clear the value, which
+/// in a snapshot envelope would leave a `data` key with no value at all and
+/// corrupt the frame.
+///
+/// Returns `false` when a rule covers this row's collection but the bytes
+/// could not be read or rewritten. The caller must then deliver nothing —
+/// these are the bytes that would have gone out unredacted, and on a sync
+/// surface they would be persisted on the device rather than merely displayed.
+/// Returns `true` in every other case, including when no rule applies at all,
+/// and the bytes are then left byte-identical rather than round-tripped.
+pub fn redact_document_row_bytes(
+    redaction: Option<&QueryRedaction>,
+    store: &RedactionStore,
+    row: &mut Vec<u8>,
+) -> bool {
+    let Some(resolved) = redaction else {
+        return true;
+    };
+    // An empty row is a delete tombstone on the row-push path; there is
+    // nothing stored in it to redact.
+    if row.is_empty() || !resolved.has_any_rule(store) {
+        return true;
+    }
+    let ctx = resolved.ctx(store);
+
+    let Ok(serde_json::Value::Object(fields)) = nodedb_types::json_from_msgpack(row) else {
+        return false;
+    };
+    let mut redacted = fields.clone();
+    ctx.store
+        .apply_flat_row(ctx.tenant_id, ctx.roles, ctx.collections, &mut redacted);
+    if redacted == fields {
+        return true;
+    }
+    match nodedb_types::json_to_msgpack(&serde_json::Value::Object(redacted)) {
+        Ok(bytes) => {
+            *row = bytes;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::control::security::redaction::{RedactionMode, RedactionPolicy, RedactionRule};
@@ -506,6 +559,92 @@ mod tests {
         redact_stored_value_bytes(Some(&redaction), &store, &mut value);
 
         assert!(value.is_empty());
+    }
+
+    /// The device-sync shape: the stored row map is shipped verbatim inside a
+    /// snapshot envelope, so the rule has to reach it at the byte level.
+    #[test]
+    fn document_row_bytes_are_masked_field_by_field() {
+        let store = store_with_mask("users", "support", "email", "***");
+        let redaction = redaction_for("users", "support");
+        let mut row = nodedb_types::json_to_msgpack(&serde_json::json!({
+            "id": "u1",
+            "email": "a@b.c",
+            "name": "Alice",
+        }))
+        .expect("encode stored row");
+
+        assert!(redact_document_row_bytes(
+            Some(&redaction),
+            &store,
+            &mut row
+        ));
+
+        let decoded = nodedb_types::json_from_msgpack(&row).expect("decode redacted row");
+        assert_eq!(decoded["email"], "***");
+        assert_eq!(decoded["name"], "Alice");
+        assert_eq!(decoded["id"], "u1");
+    }
+
+    /// A role the policy does not name, and a store with no policy at all,
+    /// both leave the stored bytes byte-identical — never a re-encoded round
+    /// trip that could perturb the wire shape.
+    #[test]
+    fn document_row_bytes_are_byte_identical_without_a_matching_rule() {
+        let store = store_with_mask("users", "support", "email", "***");
+        let original = nodedb_types::json_to_msgpack(&serde_json::json!({"email": "a@b.c"}))
+            .expect("encode stored row");
+
+        let mut unruled_role = original.clone();
+        assert!(redact_document_row_bytes(
+            Some(&redaction_for("users", "analyst")),
+            &store,
+            &mut unruled_role
+        ));
+        assert_eq!(unruled_role, original);
+
+        let mut no_policy = original.clone();
+        assert!(redact_document_row_bytes(
+            Some(&redaction_for("users", "support")),
+            &RedactionStore::new(),
+            &mut no_policy
+        ));
+        assert_eq!(no_policy, original);
+
+        let mut no_redaction = original.clone();
+        assert!(redact_document_row_bytes(None, &store, &mut no_redaction));
+        assert_eq!(no_redaction, original);
+    }
+
+    /// A row a rule covers but whose bytes cannot be read is refused, not
+    /// delivered: these are exactly the bytes that would otherwise reach the
+    /// device unredacted.
+    #[test]
+    fn unreadable_document_row_is_refused_when_a_rule_applies() {
+        let store = store_with_mask("users", "support", "email", "***");
+        let redaction = redaction_for("users", "support");
+        let mut row = vec![0xc1_u8];
+
+        assert!(!redact_document_row_bytes(
+            Some(&redaction),
+            &store,
+            &mut row
+        ));
+    }
+
+    /// A delete tombstone carries no stored row, so there is nothing to refuse.
+    #[test]
+    fn empty_document_row_is_deliverable() {
+        let store = store_with_mask("users", "support", "email", "***");
+        let redaction = redaction_for("users", "support");
+        let mut row = Vec::new();
+
+        assert!(redact_document_row_bytes(
+            Some(&redaction),
+            &store,
+            &mut row
+        ));
+        assert!(row.is_empty());
     }
 
     /// A rule naming a different column must not disturb an opaque value.

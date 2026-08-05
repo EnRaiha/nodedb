@@ -127,10 +127,18 @@ struct DocumentSnapshot<'a> {
 /// collection carrying a read policy refuses here rather than streaming
 /// unfiltered rows into a client's local replica — where the policy would have
 /// no further chance to apply.
+///
+/// Column redaction applies for the same reason, and is applied to the
+/// delivered payload here rather than left to the SELECT-path shaping core
+/// this dispatch never reaches — see [`super::payload`].
 async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotData> {
     use crate::bridge::envelope::PhysicalPlan;
     use crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity;
     use nodedb_physical::physical_plan::DocumentOp;
+
+    use super::payload::{
+        SnapshotPayload, finalize_snapshot, predicate_redacted_field, snapshot_redaction,
+    };
 
     let plan = PhysicalPlan::Document(DocumentOp::RangeScan {
         collection: req.collection.to_string(),
@@ -140,6 +148,25 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
         limit: 10_000,
         rls_filters: Vec::new(),
     });
+
+    // Resolved once for the whole snapshot, before `plan` is moved into the
+    // dispatch, and from the subscriber's own identity — every row of this
+    // payload is delivered under it.
+    let redaction = snapshot_redaction(req.shared, req.identity, req.database_id, &plan);
+
+    // A predicate that probes a redacted column discloses it through row
+    // presence no matter how the delivered cell is masked, so the subscription
+    // is refused rather than answered.
+    if let Some(field) = predicate_redacted_field(req.predicate, &redaction, &req.shared.redaction)
+    {
+        warn!(
+            shape_id = %req.shape_id,
+            collection = %req.collection,
+            field = %field,
+            "shape snapshot refused: the shape predicate filters on a redacted column"
+        );
+        return None;
+    }
 
     // The subscriber's own capability, not the system door: the scan is
     // authorized into a task, row-level security is applied to it, and that
@@ -165,11 +192,13 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
     )
     .await
     {
-        Ok(payload) => Some(filter_snapshot_by_predicate(
+        Ok(payload) => finalize_snapshot(SnapshotPayload {
             payload,
-            req.predicate,
-            req.shape_id,
-        )),
+            predicate: req.predicate,
+            shape_id: req.shape_id,
+            redaction: &redaction,
+            store: &req.shared.redaction,
+        }),
         Err(error) => {
             warn!(
                 shape_id = %req.shape_id,
@@ -177,74 +206,6 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
                 "shape snapshot query failed; sending no snapshot"
             );
             None
-        }
-    }
-}
-
-// ── Snapshot predicate filtering ──────────────────────────────────────────────
-
-/// Filter a raw snapshot payload by a shape predicate.
-///
-/// Decodes the msgpack document rows, evaluates each document's data bytes
-/// against the `MetadataFilter` decoded from `predicate_bytes`, and re-encodes
-/// only the matching rows. An empty predicate returns the payload unchanged.
-/// A predicate that fails to decode is logged as a warning and the entire
-/// snapshot is returned empty (fail-closed, consistent with delta routing).
-fn filter_snapshot_by_predicate(
-    payload: Vec<u8>,
-    predicate_bytes: &[u8],
-    shape_id: &str,
-) -> ShapeSnapshotData {
-    use crate::control::server::sync::shape::handler::decode_document_or_empty;
-    use crate::data::executor::response_codec::{
-        decode_raw_scan_to_docs, encode_raw_document_rows,
-    };
-    use nodedb_query::metadata_filter::matches_metadata_filter;
-    use nodedb_types::filter::MetadataFilter;
-
-    if predicate_bytes.is_empty() {
-        let doc_count = decode_raw_scan_to_docs(&payload).len();
-        return ShapeSnapshotData {
-            data: payload,
-            doc_count,
-        };
-    }
-
-    let filter = match zerompk::from_msgpack::<MetadataFilter>(predicate_bytes) {
-        Ok(f) => f,
-        Err(err) => {
-            warn!(
-                shape_id,
-                error = %err,
-                "shape snapshot: failed to decode predicate; sending empty snapshot"
-            );
-            return ShapeSnapshotData::empty();
-        }
-    };
-
-    let docs = decode_raw_scan_to_docs(&payload);
-    let mut matching: Vec<(String, Vec<u8>)> = Vec::new();
-
-    for (doc_id, data_bytes) in docs {
-        let doc_json = decode_document_or_empty(&data_bytes);
-        if matches_metadata_filter(&doc_json, &filter) {
-            matching.push((doc_id, data_bytes));
-        }
-    }
-
-    let doc_count = matching.len();
-    match encode_raw_document_rows(&matching) {
-        Ok(data) => ShapeSnapshotData { data, doc_count },
-        Err(err) => {
-            // Fail closed: a re-encode failure must not ship a header whose
-            // doc_count disagrees with its (empty) body. Drop the snapshot,
-            // matching the predicate-decode failure path above.
-            warn!(
-                shape_id,
-                error = %err,
-                "shape snapshot: failed to encode filtered rows; sending empty snapshot"
-            );
-            ShapeSnapshotData::empty()
         }
     }
 }
