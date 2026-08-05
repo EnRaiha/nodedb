@@ -135,10 +135,10 @@ impl RlsPolicyStore {
 
     /// Total policies across all collections.
     pub fn policy_count(&self) -> usize {
-        self.policies
-            .read()
-            .map(|g| g.values().map(|v| v.len()).sum())
-            .unwrap_or(0)
+        // Recover from a poisoned lock rather than reporting zero: this count
+        // feeds the recovery-check verifier, and a spurious 0 reads as "the
+        // registry lost every policy" and provokes a repair that isn't needed.
+        self.lock_read().values().map(|v| v.len()).sum()
     }
 
     /// Get all policies for a tenant+collection.
