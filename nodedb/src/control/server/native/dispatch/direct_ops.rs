@@ -4,21 +4,17 @@
 
 use nodedb_types::protocol::{NativeResponse, OpCode, TextFields};
 
-use crate::bridge::envelope::{Payload, PhysicalPlan, Response, Status};
+use crate::bridge::envelope::PhysicalPlan;
 use crate::control::planner::calvin::{
     CrossShardTxnMode, DispatchClass, TxnDispatchPosition, classify_dispatch,
     dispatch_authorized_tasks_to_calvin,
 };
-use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
-use crate::control::server::shared::session::staging_gate::{
-    InTxnRoute, StagingGateError, route_in_tx_write,
-};
-use crate::types::{Lsn, RequestId, TraceId};
+use crate::types::TraceId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use super::raw_dispatch::dispatch_authorized_single_task;
 use super::response::data_plane_response_to_native;
+use super::single_task::dispatch_single_task;
 use super::{DispatchCtx, error_to_native};
 
 /// Dispatch a direct Data Plane operation by opcode.
@@ -91,6 +87,19 @@ pub(crate) async fn handle_direct_op(
         .enabled
         .then(|| PlanMeteringInfo::extract(&plan));
 
+    // Whether the blanket metering call below (after the block) still needs
+    // to run. It does for every branch that dispatches directly (Control-
+    // Plane-orchestrated INSERT SELECT / MERGE / UPDATE FROM, and the
+    // implicit-edge MultiShard Calvin batch) — those never touch the
+    // in-transaction staging gate. It does NOT for a branch that routes
+    // through `dispatch_single_task`: that function now meters itself,
+    // correctly distinguishing a `Read`/`Staged` dispatch (real work,
+    // metered now) from a `Buffered` one (no dispatch yet, metered at COMMIT
+    // replay instead — see `session::commit::run_commit`); re-metering its
+    // response here with the ORIGINAL top-level plan would double-bill the
+    // former and wrongly bill the latter before its COMMIT/ROLLBACK is even
+    // known.
+    let mut needs_top_level_metering = true;
     // The rest of the dispatch logic has several early-return branches
     // (Control-Plane-orchestrated INSERT SELECT / MERGE / UPDATE FROM, the
     // no-edge fast path, and the multi/single-shard implicit-edge paths).
@@ -275,6 +284,7 @@ pub(crate) async fn handle_direct_op(
                 }
             };
             let _request = ctx.state.tenant_request_guard(tenant_id);
+            needs_top_level_metering = false;
             return dispatch_single_task(ctx, seq, task).await;
         }
 
@@ -313,6 +323,7 @@ pub(crate) async fn handle_direct_op(
             DispatchClass::SingleShard { .. } => {
                 // The document task is first; its response is the one returned to
                 // the caller. Edge tasks dispatch after it in order.
+                needs_top_level_metering = false;
                 let mut doc_response: Option<NativeResponse> = None;
                 let mut error: Option<NativeResponse> = None;
                 for task in authorized_tasks.into_tasks() {
@@ -333,12 +344,14 @@ pub(crate) async fn handle_direct_op(
     }
     .await;
 
-    // Metered only on the success path, once per call regardless of which
-    // branch above actually dispatched (Control-Plane-orchestrated INSERT
-    // SELECT / MERGE / UPDATE FROM, the no-edge fast path, or an
-    // implicit-edge multi/single-shard set). `response.rows`/`rows_affected`
-    // are already computed by the branch above, so this adds no extra decode.
-    if response.status != nodedb_types::protocol::ResponseStatus::Error
+    // Metered only on the success path, once per call, and only for a branch
+    // that dispatched directly rather than through `dispatch_single_task`
+    // (`needs_top_level_metering` — see its declaration above for why: that
+    // function now meters its own Read/Staged/Buffered routing correctly).
+    // `response.rows`/`rows_affected` are already computed by the branch
+    // above, so this adds no extra decode.
+    if needs_top_level_metering
+        && response.status != nodedb_types::protocol::ResponseStatus::Error
         && let Some(info) = &plan_metering_info
     {
         let rows = response
@@ -349,131 +362,4 @@ pub(crate) async fn handle_direct_op(
         meter_dispatch(ctx.state, &ctx.scope, info, rows);
     }
     response
-}
-
-/// Dispatch one plan via the gateway (when wired) or the local SPSC path,
-/// converting the Data-Plane response into a `NativeResponse`.
-///
-/// This is the exact single-plan dispatch the direct-op handler used before
-/// implicit-edge extraction; it is factored out so the no-edge fast path and
-/// the single-shard edge loop share one code path.
-///
-/// Routes through the same protocol-neutral in-transaction staging gate
-/// (`route_in_tx_write`) the SQL-planned dispatch loops (`sql_loop.rs`,
-/// pgwire's `execute_dml_hooks.rs`) already use. Outside a transaction block
-/// this is a no-op passthrough (`InTxnRoute::Read` with the task unchanged),
-/// so autocommit direct ops (including `KvBatchPut`) dispatch exactly as
-/// before. Inside a transaction block, a stageable write (e.g. `KvBatchPut`)
-/// is applied to the per-transaction overlay at statement time instead of
-/// hitting durable storage directly -- fixing the atomicity gap where a
-/// native direct-op write inside `BEGIN...COMMIT` used to commit immediately
-/// and survive `ROLLBACK`. A non-stageable write is buffered for COMMIT-time
-/// replay, matching the SQL path's deferral for the same plan shapes.
-async fn dispatch_single_task(
-    ctx: &DispatchCtx<'_>,
-    seq: u64,
-    authorized: crate::control::server::shared::authorization::AuthorizedTask,
-) -> NativeResponse {
-    // Authorization must precede the staging decision. Non-stageable writes
-    // are buffered without invoking the stage-dispatch closure, so authorizing
-    // only inside that closure would let an ungranted task reach trusted
-    // COMMIT replay. Consume the expanded-set capability here so every branch
-    // below originates from the final authorization decision.
-    let task = authorized.into_staging_task();
-
-    // Cloned before `route_in_tx_write` consumes `task`, so a staged write
-    // whose outcome carries a real affected-count/computed-value payload
-    // (e.g. `KvBatchPut`'s `{"inserted": n}`) can be shaped into the
-    // response the same way the non-staged branch below shapes it.
-    let plan_for_staged_response = task.plan.clone();
-
-    let task = match route_in_tx_write(
-        ctx.state,
-        ctx.sessions,
-        ctx.peer_addr.into(),
-        task,
-        |stage_task| {
-            dispatch_authorized_single_task(
-                ctx,
-                stage_task.tenant_id,
-                stage_task.vshard_id,
-                stage_task.plan,
-                stage_task.txn_id,
-            )
-        },
-    )
-    .await
-    {
-        Ok(InTxnRoute::Read(routed_task)) => *routed_task,
-        Ok(InTxnRoute::Buffered) => {
-            let mut r = NativeResponse::ok(seq);
-            r.rows_affected = Some(1);
-            return r;
-        }
-        Ok(InTxnRoute::Staged(outcome)) => {
-            let synthetic = Response {
-                request_id: RequestId::new(0),
-                status: Status::Ok,
-                attempt: 0,
-                partial: false,
-                payload: Payload::from_vec(outcome.payload),
-                watermark_lsn: Lsn::new(0),
-                error_code: None,
-                read_set_valid: None,
-                read_version_lsn: crate::types::Lsn::ZERO,
-                write_set: Vec::new(),
-            };
-            return data_plane_response_to_native(ctx, seq, &plan_for_staged_response, &synthetic);
-        }
-        Err(StagingGateError::Dispatch(e)) => return error_to_native(seq, &e),
-        Err(StagingGateError::Rejected { code }) => {
-            let (_, sqlstate, message) = match code {
-                Some(code) => error_code_to_sqlstate(&code),
-                None => ("ERROR", "XX000", "unknown data plane error".to_owned()),
-            };
-            return NativeResponse::error(seq, sqlstate, message);
-        }
-    };
-
-    let plan_for_response = task.plan.clone();
-    let task_vshard = task.vshard_id;
-    match dispatch_authorized_single_task(
-        ctx,
-        task.tenant_id,
-        task.vshard_id,
-        task.plan,
-        task.txn_id,
-    )
-    .await
-    {
-        Ok(resp) => {
-            // Track direct-op reads, including NotFound phantom observations,
-            // identically to native SQL and pgwire conflict detection.
-            let records_read = resp.status == Status::Ok
-                || resp.error_code.as_deref()
-                    == Some(&crate::bridge::envelope::ErrorCode::NotFound);
-            if records_read
-                && ctx.sessions.transaction_state(ctx.peer_addr)
-                    == crate::control::server::shared::session::TransactionState::InBlock
-            {
-                crate::control::server::shared::session::record_reads_for_response(
-                    ctx.state,
-                    ctx.sessions,
-                    ctx.peer_addr.into(),
-                    ctx.tenant_id(),
-                    crate::control::server::shared::session::ResponseReads {
-                        plan: &plan_for_response,
-                        watermarks: &[(task_vshard, resp.watermark_lsn)],
-                        read_version_lsn: resp.read_version_lsn,
-                        found: resp.status == Status::Ok,
-                        distributed_reads: &[],
-                        read_lsn_vshard: task_vshard,
-                    },
-                )
-                .await;
-            }
-            data_plane_response_to_native(ctx, seq, &plan_for_response, &resp)
-        }
-        Err(e) => error_to_native(seq, &e),
-    }
 }

@@ -20,6 +20,8 @@ use std::future::Future;
 
 use crate::bridge::envelope::{ErrorCode, PhysicalPlan, Response, Status};
 use crate::control::gateway::RouteDecision;
+use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::server::shared::metering::meter_staged_write;
 use crate::control::server::shared::sql::staging_predicates::{
     is_stageable_write, require_affected_count, staged_tag_kind,
 };
@@ -235,6 +237,34 @@ where
         return Err(StagingGateError::Rejected {
             code: resp.error_code.as_deref().cloned(),
         });
+    }
+
+    // Metered here, once the staging dispatch above has already succeeded.
+    // The per-transaction overlay write it just performed IS the real engine
+    // work a `Staged` in-transaction write does — COMMIT only decides
+    // whether that already-billed work becomes durable or is discarded by a
+    // ROLLBACK, not whether it happened. Every `Staged` route funnels
+    // through this one function — this file's own `route_in_tx_write` for a
+    // plain in-transaction point write, and `expander_stage::
+    // stage_and_aggregate`'s per-op staging for an in-transaction `MERGE` /
+    // `UPDATE ... FROM` / `INSERT ... SELECT` — so metering here covers all
+    // of them without duplicating the call in every caller's dispatch
+    // closure. Compare the sibling non-stageable `Buffered` route in
+    // `route_in_tx_write` above: that one performs no dispatch at all until
+    // COMMIT, so it is metered there instead
+    // (`session::commit::meter_committed_buffered_writes`).
+    //
+    // `sessions.identity` is `None` only for a session that reached this
+    // point (inside a transaction block, mid-write) with no identity ever
+    // recorded — not reachable in practice, since every path that can enter
+    // `InBlock` state authenticates first. Metering must never fail a
+    // request, so a missing identity just skips the (impossible) charge
+    // rather than panicking.
+    if let Some(identity) = sessions.identity(session_id) {
+        let scope = RequestAuthScope::builder(&identity, &state.scope_grants)
+            .with_session_database(Some(task.database_id))
+            .build();
+        meter_staged_write(state, &scope, &task.plan, &resp);
     }
 
     let kind = staged_tag_kind(&task.plan, resp.payload.as_ref());

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::bridge::envelope::PhysicalPlan;
+use crate::bridge::envelope::{PhysicalPlan, Response, Status};
 use crate::control::security::metering::counter::UsageEvent;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::plan_util::{extract_collection, plan_engine};
@@ -169,6 +169,63 @@ pub(crate) fn meter_dispatch(
         // Filled in by `UsageCounter::drain`, not the caller.
         timestamp_secs: 0,
     });
+}
+
+/// Meter an in-transaction `Staged` write's dispatch, called from inside the
+/// closure `route_in_tx_write` invokes to apply the write to the
+/// per-transaction overlay (`staging_gate::stage_write`).
+///
+/// The closure's raw dispatch [`Response`] is the only point a `Staged`
+/// write's outcome is observable at this granularity: `route_in_tx_write`
+/// reduces it to a [`StagedWriteOutcome`](crate::control::server::shared::session::staging_gate::StagedWriteOutcome)
+/// before returning, so a caller that only sees `InTxnRoute::Staged` can no
+/// longer recover the raw response. The overlay write this response reports
+/// is real engine work performed right now (not a preview) — it is COMMIT
+/// that decides durability, not billability, so this is metered here rather
+/// than at COMMIT-time replay. Compare [`meter_buffered_write`], the sibling
+/// call for the non-stageable `Buffered` route, which performs no dispatch
+/// at all until COMMIT and so must be metered there instead.
+///
+/// Only meters `Status::Ok` — a staged write's statement-time constraint
+/// rejection (`StagingGateError::Rejected`, decided by the caller right
+/// after this returns) performed no billable work. `rows: None`: the
+/// affected-count decode happens in `stage_write` after this closure
+/// returns, and duplicating it here solely for a row count would double the
+/// per-write decode cost on every staged statement.
+pub(crate) fn meter_staged_write(
+    state: &SharedState,
+    scope: &RequestAuthScope<'_>,
+    plan: &PhysicalPlan,
+    resp: &Response,
+) {
+    if resp.status != Status::Ok || !state.metering_config.enabled {
+        return;
+    }
+    let info = PlanMeteringInfo::extract(plan);
+    meter_dispatch(state, scope, &info, None);
+}
+
+/// Meter one non-stageable buffered write, replayed durably at COMMIT.
+///
+/// `InTxnRoute::Buffered` performs no dispatch at statement time — the task
+/// is only pushed onto the session's write buffer (`route_in_tx_write`) — so
+/// there is nothing to meter until [`session::commit::run_commit`] actually
+/// replays it. This keeps the billing/durability line honest: a ROLLBACK
+/// after a buffered write means the work never happened and must never be
+/// billed, so this must only ever be called after the buffered batch's
+/// COMMIT dispatch has already succeeded.
+///
+/// [`session::commit::run_commit`]: crate::control::server::shared::session::commit::run_commit
+pub(crate) fn meter_buffered_write(
+    state: &SharedState,
+    scope: &RequestAuthScope<'_>,
+    plan: &PhysicalPlan,
+) {
+    if !state.metering_config.enabled {
+        return;
+    }
+    let info = PlanMeteringInfo::extract(plan);
+    meter_dispatch(state, scope, &info, None);
 }
 
 /// A metering accumulator for a streaming response, live for the whole
@@ -521,5 +578,122 @@ mod tests {
         let events = state.usage_counter.drain();
         assert_eq!(events.len(), 1);
         assert!(events[0].tokens >= 1);
+    }
+
+    fn fake_response(status: Status) -> Response {
+        Response {
+            request_id: crate::types::RequestId::new(0),
+            status,
+            attempt: 0,
+            partial: false,
+            payload: crate::bridge::envelope::Payload::empty(),
+            watermark_lsn: crate::types::Lsn::new(0),
+            error_code: None,
+            read_set_valid: None,
+            read_version_lsn: crate::types::Lsn::ZERO,
+            write_set: Vec::new(),
+        }
+    }
+
+    /// A staged in-transaction write's overlay dispatch succeeded — this is
+    /// the real engine work `staging_gate::stage_write` performs, so it must
+    /// be billed regardless of what COMMIT later does with it.
+    #[test]
+    fn staged_write_records_on_ok_response() {
+        let (mut state, _dir) = test_state();
+        enable_metering(&mut state);
+        let identity = regular_identity(9);
+        let scope = scope_for(&identity, &state);
+
+        meter_staged_write(&state, &scope, &kv_get_plan(), &fake_response(Status::Ok));
+
+        let events = state.usage_counter.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].collection, "widgets");
+        assert_eq!(events[0].engine, "kv");
+    }
+
+    /// A staged write's overlay dispatch was rejected (a statement-time
+    /// constraint violation) — nothing durable happened, so nothing is
+    /// billed.
+    #[test]
+    fn staged_write_records_nothing_on_error_response() {
+        let (mut state, _dir) = test_state();
+        enable_metering(&mut state);
+        let identity = regular_identity(10);
+        let scope = scope_for(&identity, &state);
+
+        meter_staged_write(
+            &state,
+            &scope,
+            &kv_get_plan(),
+            &fake_response(Status::Error),
+        );
+
+        assert_eq!(state.usage_counter.total_tokens(), 0);
+    }
+
+    #[test]
+    fn staged_write_records_nothing_when_metering_disabled() {
+        let (state, _dir) = test_state();
+        assert!(!state.metering_config.enabled, "default config is disabled");
+        let identity = regular_identity(11);
+        let scope = scope_for(&identity, &state);
+
+        meter_staged_write(&state, &scope, &kv_get_plan(), &fake_response(Status::Ok));
+
+        assert_eq!(state.usage_counter.total_tokens(), 0);
+    }
+
+    /// A non-stageable buffered write, replayed durably at COMMIT — the
+    /// sibling of `meter_staged_write` for the route that performs no
+    /// dispatch until COMMIT. Callers must only invoke this after the
+    /// buffered batch's COMMIT dispatch has already succeeded; this test
+    /// pins that the call itself records unconditionally (the success gate
+    /// lives in the caller, `session::commit::run_commit`).
+    #[test]
+    fn buffered_write_records_when_called() {
+        let (mut state, _dir) = test_state();
+        enable_metering(&mut state);
+        let identity = regular_identity(12);
+        let scope = scope_for(&identity, &state);
+
+        meter_buffered_write(&state, &scope, &kv_get_plan());
+
+        let events = state.usage_counter.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].collection, "widgets");
+        assert_eq!(events[0].engine, "kv");
+    }
+
+    #[test]
+    fn buffered_write_records_nothing_when_metering_disabled() {
+        let (state, _dir) = test_state();
+        assert!(!state.metering_config.enabled, "default config is disabled");
+        let identity = regular_identity(13);
+        let scope = scope_for(&identity, &state);
+
+        meter_buffered_write(&state, &scope, &kv_get_plan());
+
+        assert_eq!(state.usage_counter.total_tokens(), 0);
+    }
+
+    /// Pins the ILP-ingest metering shape: `TimeseriesOp::Ingest` extracts
+    /// its `collection` and maps to the `timeseries` engine dimension, the
+    /// same way `ilp_batch::dispatch::flush_ilp_batch_inner` relies on
+    /// `PlanMeteringInfo::extract` to attribute each measurement group.
+    #[test]
+    fn timeseries_ingest_plan_extracts_collection_and_engine() {
+        let plan = PhysicalPlan::Timeseries(nodedb_physical::physical_plan::TimeseriesOp::Ingest {
+            collection: "cpu".into(),
+            payload: Vec::new(),
+            format: "ilp-msgpack".into(),
+            wal_lsn: None,
+            surrogates: Vec::new(),
+            provenance: None,
+        });
+        let info = PlanMeteringInfo::extract(&plan);
+        assert_eq!(info.collection.as_deref(), Some("cpu"));
+        assert_eq!(engine_tag_str(info.engine), "timeseries");
     }
 }

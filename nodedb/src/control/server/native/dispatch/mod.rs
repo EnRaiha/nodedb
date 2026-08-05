@@ -14,6 +14,7 @@ mod plan_builder;
 pub(crate) mod raw_dispatch;
 pub(crate) mod response;
 mod session_ops;
+mod single_task;
 mod sql;
 mod sql_admin;
 mod sql_gateway;
