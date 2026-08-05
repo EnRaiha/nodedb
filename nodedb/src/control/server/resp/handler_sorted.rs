@@ -7,8 +7,6 @@
 //! These commands operate on a sorted index (created via CREATE SORTED INDEX).
 //! The sorted index name is the RESP session's current collection (SELECT db).
 
-use sonic_rs;
-
 use crate::bridge::envelope::{PhysicalPlan, Status};
 use crate::control::state::SharedState;
 use nodedb_physical::physical_plan::KvOp;
@@ -17,7 +15,9 @@ use super::codec::RespValue;
 use super::command::RespCommand;
 use super::handler::{dispatch_kv, dispatch_kv_write};
 use super::payload::{payload_field_i64, payload_json};
+use super::redaction::resp_redaction;
 use super::session::RespSession;
+use crate::control::server::response_shape::redaction::redact_envelope_row;
 
 /// ZADD key score member [score member ...]
 ///
@@ -154,6 +154,9 @@ pub(super) async fn handle_zrange(
         return RespValue::err("ERR wrong number of arguments for 'zrange' command");
     }
 
+    // Resolved once for this command, before the dispatch whose rows it covers.
+    let redaction = resp_redaction(state, session);
+
     let start = cmd.arg_i64(0).unwrap_or(0);
     let stop = cmd.arg_i64(1).unwrap_or(-1);
 
@@ -173,10 +176,16 @@ pub(super) async fn handle_zrange(
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let rows: Vec<serde_json::Value> = match payload_json(&resp.payload) {
+            let mut rows: Vec<serde_json::Value> = match payload_json(&resp.payload) {
                 serde_json::Value::Array(rows) => rows,
                 _ => Vec::new(),
             };
+            // Each row is `{rank, key}`: `rank` is index metadata, `key` is the
+            // member's primary key — the same column a KV scan lists, so the
+            // same rule covers it here.
+            for row in &mut rows {
+                redact_envelope_row(redaction.as_ref(), &state.redaction, row);
+            }
             let total = rows.len() as i64;
 
             let actual_start = if start < 0 {
@@ -235,6 +244,9 @@ pub(super) async fn handle_zscore(
         return RespValue::err("ERR wrong number of arguments for 'zscore' command");
     };
 
+    // Resolved once for this command, before the dispatch whose value it covers.
+    let redaction = resp_redaction(state, session);
+
     let plan = PhysicalPlan::Kv(KvOp::SortedIndexScore {
         index_name: session.collection.clone(),
         primary_key: member.to_vec(),
@@ -242,11 +254,12 @@ pub(super) async fn handle_zscore(
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let payload_text =
-                crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-            if let Ok(json) = sonic_rs::from_str::<serde_json::Value>(&payload_text)
-                && let Some(serde_json::Value::String(score)) = json.get("score")
-            {
+            // The payload names its one cell `score`, which is also the field
+            // ZADD stores the ordering value under, so a rule on `score`
+            // covers this read the same way it covers a SELECT of that column.
+            let mut json = payload_json(&resp.payload);
+            redact_envelope_row(redaction.as_ref(), &state.redaction, &mut json);
+            if let Some(serde_json::Value::String(score)) = json.get("score") {
                 if score == "null" {
                     return RespValue::nil();
                 }

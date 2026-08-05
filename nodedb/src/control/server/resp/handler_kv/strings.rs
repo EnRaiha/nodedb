@@ -10,8 +10,10 @@ use super::super::codec::RespValue;
 use super::super::command::RespCommand;
 use super::super::handler::{dispatch_kv, dispatch_kv_write};
 use super::super::payload::{payload_field_i64, payload_json};
+use super::super::redaction::resp_redaction;
 use super::super::session::RespSession;
 use super::surrogate::resp_kv_surrogate;
+use crate::control::server::response_shape::redaction::redact_stored_value_bytes;
 
 pub(in crate::control::server::resp) async fn handle_get(
     cmd: &RespCommand,
@@ -22,6 +24,9 @@ pub(in crate::control::server::resp) async fn handle_get(
         return RespValue::err("ERR wrong number of arguments for 'get' command");
     };
 
+    // Resolved once for this command, before the dispatch whose value it covers.
+    let redaction = resp_redaction(state, session);
+
     let plan = PhysicalPlan::Kv(KvOp::Get {
         collection: session.collection.clone(),
         key: key.to_vec(),
@@ -31,7 +36,16 @@ pub(in crate::control::server::resp) async fn handle_get(
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok && !resp.payload.is_empty() => {
-            RespValue::bulk(resp.payload.to_vec())
+            // The Data Plane returns the stored bytes verbatim (`kv get` is a
+            // raw passthrough), so the masking hook is applied to those bytes
+            // rather than to a decoded row map.
+            let mut value = resp.payload.to_vec();
+            redact_stored_value_bytes(redaction.as_ref(), &state.redaction, &mut value);
+            if value.is_empty() {
+                RespValue::nil()
+            } else {
+                RespValue::bulk(value)
+            }
         }
         Ok(_) => RespValue::nil(),
         Err(e) => RespValue::from_error(&e),
@@ -196,6 +210,10 @@ pub(in crate::control::server::resp) async fn handle_getset(
     let key = cmd.args[0].clone();
     let new_value = cmd.args[1].clone();
 
+    // Resolved once for this command: GETSET returns the row's PREVIOUS stored
+    // value, which carries exactly the disclosure a GET of it would.
+    let redaction = resp_redaction(state, session);
+
     let surrogate = match resp_kv_surrogate(state, session, &key) {
         Ok(s) => s,
         Err(e) => return e,
@@ -211,10 +229,18 @@ pub(in crate::control::server::resp) async fn handle_getset(
         Ok(resp) => {
             if let Some(serde_json::Value::String(b64)) =
                 payload_json(&resp.payload).get("old_value")
-                && let Ok(data) =
+                && let Ok(mut data) =
                     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
             {
-                return RespValue::bulk(data);
+                // `old_value` is the stored bytes, base64-framed for transport
+                // only — redaction applies to the bytes inside the frame. An
+                // already-empty previous value still answers as it always did;
+                // only a value a rule emptied degrades to nil.
+                let was_empty = data.is_empty();
+                redact_stored_value_bytes(redaction.as_ref(), &state.redaction, &mut data);
+                if was_empty || !data.is_empty() {
+                    return RespValue::bulk(data);
+                }
             }
             RespValue::nil()
         }

@@ -12,7 +12,8 @@ use super::codec::RespValue;
 use super::command::RespCommand;
 // Re-export for sub-handlers that import via `super::handler::dispatch_kv` etc.
 pub(super) use super::gateway_dispatch::{dispatch_kv, dispatch_kv_write};
-use super::payload::{payload_field_i64, scan_keys};
+use super::payload::{payload_field_i64, redacted_scan_keys, scan_keys};
+use super::redaction::resp_redaction;
 use super::session::RespSession;
 
 /// Execute a RESP command and return the response.
@@ -267,6 +268,8 @@ async fn handle_persist(
 // ---------------------------------------------------------------------------
 
 async fn handle_scan(cmd: &RespCommand, session: &RespSession, state: &SharedState) -> RespValue {
+    // Resolved once for this command, before the dispatch whose rows it covers.
+    let redaction = resp_redaction(state, session);
     let cursor_str = cmd.arg_str(0).unwrap_or("0");
     let cursor = if cursor_str == "0" {
         Vec::new()
@@ -326,23 +329,27 @@ async fn handle_scan(cmd: &RespCommand, session: &RespSession, state: &SharedSta
     });
 
     match dispatch_kv(state, session, plan).await {
-        Ok(resp) if resp.status == Status::Ok => match scan_keys(&resp.payload) {
-            // Cursor "0" signals scan complete (no pagination in this path).
-            Some(keys) => RespValue::array(vec![
-                RespValue::bulk_str("0"),
-                RespValue::array(keys.into_iter().map(RespValue::bulk).collect()),
-            ]),
-            None => {
-                tracing::warn!("RESP SCAN: failed to decode KV scan payload");
-                RespValue::err("ERR scan result could not be decoded")
+        Ok(resp) if resp.status == Status::Ok => {
+            match redacted_scan_keys(&resp.payload, redaction.as_ref(), &state.redaction) {
+                // Cursor "0" signals scan complete (no pagination in this path).
+                Some(keys) => RespValue::array(vec![
+                    RespValue::bulk_str("0"),
+                    RespValue::array(keys.into_iter().map(RespValue::bulk).collect()),
+                ]),
+                None => {
+                    tracing::warn!("RESP SCAN: failed to decode KV scan payload");
+                    RespValue::err("ERR scan result could not be decoded")
+                }
             }
-        },
+        }
         Ok(_) => RespValue::array(vec![RespValue::bulk_str("0"), RespValue::array(vec![])]),
         Err(e) => RespValue::from_error(&e),
     }
 }
 
 async fn handle_keys(cmd: &RespCommand, session: &RespSession, state: &SharedState) -> RespValue {
+    // Resolved once for this command, before the dispatch whose rows it covers.
+    let redaction = resp_redaction(state, session);
     let pattern = cmd.arg_str(0).unwrap_or("*");
 
     let plan = PhysicalPlan::Kv(KvOp::Scan {
@@ -356,13 +363,15 @@ async fn handle_keys(cmd: &RespCommand, session: &RespSession, state: &SharedSta
     });
 
     match dispatch_kv(state, session, plan).await {
-        Ok(resp) if resp.status == Status::Ok => match scan_keys(&resp.payload) {
-            Some(keys) => RespValue::array(keys.into_iter().map(RespValue::bulk).collect()),
-            None => {
-                tracing::warn!("RESP KEYS: failed to decode KV scan payload");
-                RespValue::err("ERR keys result could not be decoded")
+        Ok(resp) if resp.status == Status::Ok => {
+            match redacted_scan_keys(&resp.payload, redaction.as_ref(), &state.redaction) {
+                Some(keys) => RespValue::array(keys.into_iter().map(RespValue::bulk).collect()),
+                None => {
+                    tracing::warn!("RESP KEYS: failed to decode KV scan payload");
+                    RespValue::err("ERR keys result could not be decoded")
+                }
             }
-        },
+        }
         Ok(_) => RespValue::array(vec![]),
         Err(e) => RespValue::from_error(&e),
     }

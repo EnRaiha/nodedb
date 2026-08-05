@@ -10,4 +10,4 @@ pub mod request;
 pub mod schema;
 pub mod types;
 
-pub use redaction::{redact_decoded_value, redact_envelope_row};
+pub use redaction::{redact_decoded_value, redact_envelope_row, redact_stored_value_bytes};

@@ -10,8 +10,25 @@ use super::super::codec::RespValue;
 use super::super::command::RespCommand;
 use super::super::handler::dispatch_kv_write;
 use super::super::payload::{payload_field_i64, payload_json};
+use super::super::redaction::resp_redaction;
 use super::super::session::RespSession;
 use super::surrogate::resp_kv_surrogate;
+
+/// Refuse a counter command whose result a redaction rule covers.
+///
+/// `INCR` / `DECR` / `INCRBY` / `DECRBY` / `INCRBYFLOAT` answer with the row's
+/// new stored value, which the KV engine holds as the single-value form — the
+/// column every SQL-side read of that row calls `value`. Masking the answer
+/// would report a number the key does not hold, so the command is refused
+/// instead, on the same fail-closed principle the planner applies to an
+/// aggregate over a redacted column. The refusal happens BEFORE dispatch, so
+/// the increment the caller could not observe is never performed either.
+fn refuse_if_counter_is_redacted(state: &SharedState, session: &RespSession) -> Option<RespValue> {
+    let redaction = resp_redaction(state, session)?;
+    redaction
+        .field_has_rule(&state.redaction, "value")
+        .then(|| RespValue::err("ERR the counter value is redacted for this role"))
+}
 
 /// INCR key / DECR key — increment/decrement by 1.
 ///
@@ -72,6 +89,9 @@ async fn dispatch_incr(
     key: Vec<u8>,
     delta: i64,
 ) -> RespValue {
+    if let Some(refusal) = refuse_if_counter_is_redacted(state, session) {
+        return refusal;
+    }
     let surrogate = match resp_kv_surrogate(state, session, &key) {
         Ok(s) => s,
         Err(e) => return e,
@@ -115,6 +135,10 @@ pub(in crate::control::server::resp) async fn handle_incrbyfloat(
         Ok(v) => v,
         Err(_) => return RespValue::err("ERR value is not a valid float"),
     };
+
+    if let Some(refusal) = refuse_if_counter_is_redacted(state, session) {
+        return refusal;
+    }
 
     let surrogate = match resp_kv_surrogate(state, session, &key) {
         Ok(s) => s,

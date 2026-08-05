@@ -14,6 +14,9 @@ use sonic_rs;
 use nodedb_sql::ddl_ast::statement::{CopyFormat, CopyToSource};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::redaction::RedactionStore;
+use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::server::response_shape::redaction::{QueryRedaction, redact_decoded_value};
 use crate::control::server::shared::ddl::result::{DdlError, DdlResult};
 use crate::control::state::SharedState;
 use crate::types::TraceId;
@@ -135,6 +138,13 @@ fn check_collection_exists(
 }
 
 /// Execute the SELECT SQL and collect the results as `serde_json::Value` rows.
+///
+/// The exported rows are the query's result rows, so they carry exactly the
+/// disclosure a `SELECT` of the same source would — and the same column
+/// redaction applies. The dispatched payloads never reach the named-projection
+/// shaping core (they are decoded and written to the file directly), so the
+/// masking hook is applied here, once per export, at the same level the other
+/// shape-bypassing transports apply it.
 async fn execute_and_collect(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -154,9 +164,29 @@ async fn execute_and_collect(
             message: format!("COPY TO: {}", error.message),
         })?;
 
+    let tasks = tasks.into_tasks();
+
+    // Resolved once per export from the planned tasks' own plans, never per
+    // task and never per row. Taking the sources from the plans rather than
+    // from the `COPY` target covers the `COPY (<query>) TO` form too, whose
+    // sources are whatever the query joins — the explicit target collection
+    // only names the table form.
+    //
+    // The scope is rebuilt with the identical derivation
+    // `plan_authorized_sql` used to plan and authorize these tasks
+    // (`RequestAuthScope::for_database` over the same identity and database),
+    // so the roles a row is redacted for cannot disagree with the roles it was
+    // authorized for.
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
+    let redaction = QueryRedaction::for_plans(
+        identity.tenant_id,
+        scope.auth(),
+        tasks.iter().map(|task| task.plan()),
+    );
+
     let mut all_rows: Vec<serde_json::Value> = Vec::new();
 
-    for task in tasks.into_tasks() {
+    for task in tasks {
         let resp = crate::control::server::dispatch_utils::dispatch_authorized_to_data_plane(
             state,
             task,
@@ -170,23 +200,36 @@ async fn execute_and_collect(
         }
 
         let json = crate::data::executor::response_codec::decode_payload_to_json(&resp.payload);
-        extract_json_rows(&json, &mut all_rows)?;
+        extract_json_rows(&json, &redaction, &state.redaction, &mut all_rows)?;
     }
 
     Ok(all_rows)
 }
 
-/// Parse a JSON string (array or single object) and append rows to `out`.
-fn extract_json_rows(json: &str, out: &mut Vec<serde_json::Value>) -> Result<(), DdlError> {
+/// Parse a JSON string (array or single object), redact it, and append the
+/// rows to `out`.
+///
+/// A dispatched scan decodes into one of the shapes
+/// [`redact_decoded_value`] dispatches over — an array of `{id, data}`
+/// document envelopes, an array of flat column maps (KV / columnar / aggregate
+/// results), or a single object — so redaction is applied to the decoded value
+/// as a whole, before it is split into rows and handed to the serializers.
+fn extract_json_rows(
+    json: &str,
+    redaction: &QueryRedaction,
+    store: &RedactionStore,
+    out: &mut Vec<serde_json::Value>,
+) -> Result<(), DdlError> {
     if json.is_empty() {
         return Ok(());
     }
-    let parsed: serde_json::Value = sonic_rs::from_str(json).map_err(|e| {
+    let mut parsed: serde_json::Value = sonic_rs::from_str(json).map_err(|e| {
         ddl_err(
             "XX000",
             format!("COPY TO: failed to decode result rows: {e}"),
         )
     })?;
+    redact_decoded_value(Some(redaction), store, &mut parsed);
     match parsed {
         serde_json::Value::Array(items) => {
             out.extend(items);
@@ -228,7 +271,96 @@ fn validate_path(path: &str) -> Result<(), DdlError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::control::security::redaction::{RedactionMode, RedactionPolicy, RedactionRule};
+    use crate::types::TenantId;
+
     use super::*;
+
+    fn store_with_mask(collection: &str, role: &str, field: &str) -> RedactionStore {
+        let store = RedactionStore::new();
+        store.create_policy(RedactionPolicy {
+            name: format!("{collection}_{role}_{field}"),
+            tenant_id: 1,
+            collection: collection.into(),
+            for_role: role.into(),
+            rules: vec![RedactionRule {
+                field: field.into(),
+                mode: RedactionMode::Mask("***".into()),
+            }],
+        });
+        store
+    }
+
+    fn redaction_for(collection: &str, role: &str) -> QueryRedaction {
+        QueryRedaction::new(
+            TenantId::new(1),
+            vec![role.to_string()],
+            vec![(String::new(), collection.to_string())],
+        )
+    }
+
+    fn collect(
+        json: &str,
+        redaction: &QueryRedaction,
+        store: &RedactionStore,
+    ) -> Vec<serde_json::Value> {
+        let mut rows = Vec::new();
+        extract_json_rows(json, redaction, store, &mut rows).expect("rows decode");
+        rows
+    }
+
+    /// A document scan decodes into `{id, data}` envelopes (see the Data-Plane
+    /// raw row encoder), so the ruled column lives one level down. Before the
+    /// fix these bytes were written to the export file in the clear.
+    #[test]
+    fn exported_document_envelope_rows_are_masked() {
+        let store = store_with_mask("users", "support", "email");
+        let json = r#"[{"id":"1","data":{"email":"a@b.c","name":"Alice"}}]"#;
+
+        let rows = collect(json, &redaction_for("users", "support"), &store);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["data"]["email"], "***");
+        assert_eq!(rows[0]["data"]["name"], "Alice");
+        assert_eq!(rows[0]["id"], "1");
+    }
+
+    /// A KV / columnar scan decodes into flat column maps instead — the same
+    /// hook has to reach those without an envelope to unwrap.
+    #[test]
+    fn exported_flat_rows_are_masked() {
+        let store = store_with_mask("users", "support", "email");
+        let json = r#"[{"key":"k1","email":"a@b.c"}]"#;
+
+        let rows = collect(json, &redaction_for("users", "support"), &store);
+
+        assert_eq!(rows[0]["email"], "***");
+        assert_eq!(rows[0]["key"], "k1");
+    }
+
+    /// A role the policy does not name exports the stored value.
+    #[test]
+    fn export_for_an_unruled_role_keeps_the_stored_value() {
+        let store = store_with_mask("users", "support", "email");
+        let json = r#"[{"id":"1","data":{"email":"a@b.c"}}]"#;
+
+        let rows = collect(json, &redaction_for("users", "analyst"), &store);
+
+        assert_eq!(rows[0]["data"]["email"], "a@b.c");
+    }
+
+    /// With no policy registered at all, the exported rows must be exactly
+    /// what the payload decoded to.
+    #[test]
+    fn export_without_any_policy_is_unchanged() {
+        let store = RedactionStore::new();
+        let json = r#"[{"id":"1","data":{"email":"a@b.c"}},{"id":"2","data":{"email":"d@e.f"}}]"#;
+        let expected: serde_json::Value = sonic_rs::from_str(json).expect("fixture parses");
+
+        let rows = collect(json, &redaction_for("users", "support"), &store);
+
+        assert_eq!(serde_json::Value::Array(rows), expected);
+    }
 
     #[test]
     fn generated_collection_scan_quotes_identifier() {

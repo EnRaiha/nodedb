@@ -12,7 +12,9 @@ use super::codec::RespValue;
 use super::command::RespCommand;
 use super::handler::{dispatch_kv, dispatch_kv_write};
 use super::payload::{payload_field_i64, payload_json};
+use super::redaction::resp_redaction;
 use super::session::RespSession;
+use crate::control::server::response_shape::redaction::redact_envelope_row;
 
 pub(super) async fn handle_hget(
     cmd: &RespCommand,
@@ -26,6 +28,9 @@ pub(super) async fn handle_hget(
     let key = cmd.args[0].clone();
     let field = cmd.arg_str(1).unwrap_or("").to_string();
 
+    // Resolved once for this command, before the dispatch whose field it covers.
+    let redaction = resp_redaction(state, session);
+
     let plan = PhysicalPlan::Kv(KvOp::FieldGet {
         collection: session.collection.clone(),
         key,
@@ -35,7 +40,10 @@ pub(super) async fn handle_hget(
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let json = payload_json(&resp.payload);
+            // A field-get payload is already a map keyed by the stored field
+            // names the rules name, so it is redacted exactly as a result row.
+            let mut json = payload_json(&resp.payload);
+            redact_envelope_row(redaction.as_ref(), &state.redaction, &mut json);
             match json.get(&field) {
                 Some(serde_json::Value::Null) | None => RespValue::nil(),
                 Some(serde_json::Value::String(s)) => RespValue::bulk_str(s),
@@ -62,6 +70,9 @@ pub(super) async fn handle_hmget(
         .filter_map(|a| std::str::from_utf8(a).ok().map(|s| s.to_string()))
         .collect();
 
+    // Resolved once for the whole command, not once per requested field.
+    let redaction = resp_redaction(state, session);
+
     let plan = PhysicalPlan::Kv(KvOp::FieldGet {
         collection: session.collection.clone(),
         key,
@@ -71,7 +82,9 @@ pub(super) async fn handle_hmget(
 
     match dispatch_kv(state, session, plan).await {
         Ok(resp) if resp.status == Status::Ok => {
-            let json = payload_json(&resp.payload);
+            // See `handle_hget`: the payload is a stored-field-keyed map.
+            let mut json = payload_json(&resp.payload);
+            redact_envelope_row(redaction.as_ref(), &state.redaction, &mut json);
             let items: Vec<RespValue> = fields
                 .iter()
                 .map(|f| match json.get(f) {

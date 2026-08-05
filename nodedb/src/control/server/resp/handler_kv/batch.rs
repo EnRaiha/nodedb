@@ -10,8 +10,10 @@ use super::super::codec::RespValue;
 use super::super::command::RespCommand;
 use super::super::handler::{dispatch_kv, dispatch_kv_write};
 use super::super::payload::payload_json;
+use super::super::redaction::resp_redaction;
 use super::super::session::RespSession;
 use super::surrogate::resp_kv_surrogate;
+use crate::control::server::response_shape::redaction::redact_stored_value_bytes;
 
 pub(in crate::control::server::resp) async fn handle_mget(
     cmd: &RespCommand,
@@ -21,6 +23,9 @@ pub(in crate::control::server::resp) async fn handle_mget(
     if cmd.argc() < 1 {
         return RespValue::err("ERR wrong number of arguments for 'mget' command");
     }
+
+    // Resolved once for the whole command, not once per returned value.
+    let redaction = resp_redaction(state, session);
 
     let plan = PhysicalPlan::Kv(KvOp::BatchGet {
         collection: session.collection.clone(),
@@ -42,7 +47,22 @@ pub(in crate::control::server::resp) async fn handle_mget(
                             &base64::engine::general_purpose::STANDARD,
                             &b64,
                         ) {
-                            Ok(data) => RespValue::bulk(data),
+                            // Each entry is one row's stored bytes, base64-framed
+                            // for transport only — the same masking GET applies
+                            // to a single row applies to each of these.
+                            Ok(mut data) => {
+                                let was_empty = data.is_empty();
+                                redact_stored_value_bytes(
+                                    redaction.as_ref(),
+                                    &state.redaction,
+                                    &mut data,
+                                );
+                                if was_empty || !data.is_empty() {
+                                    RespValue::bulk(data)
+                                } else {
+                                    RespValue::nil()
+                                }
+                            }
                             Err(_) => RespValue::nil(),
                         }
                     }
