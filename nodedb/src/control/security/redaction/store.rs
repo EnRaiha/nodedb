@@ -109,6 +109,33 @@ impl RedactionStore {
         }
     }
 
+    /// Clear all in-memory policies and reload from the catalog.
+    /// Used by the recovery verifier repair path.
+    pub fn clear_and_reload(
+        &self,
+        catalog: &crate::control::security::catalog::SystemCatalog,
+    ) -> crate::Result<()> {
+        let stored = catalog.load_all_redaction_policies()?;
+        // Hold the write lock across clear + reload. Releasing it between the
+        // two would let a concurrent reader observe an empty registry and
+        // deliver fields in the clear that a policy says to redact — a
+        // fail-open window for the width of the repair.
+        let mut policies = self.lock_write();
+        policies.clear();
+        for s in stored {
+            match s.to_runtime() {
+                Ok(policy) => {
+                    let key = policy_key(policy.tenant_id, &policy.collection, &policy.for_role);
+                    policies.insert(key, policy);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "redaction_store.clear_and_reload: skipping unparseable policy");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// List all redaction policies.
     pub fn list(&self) -> Vec<RedactionPolicy> {
         self.list_all_flat()

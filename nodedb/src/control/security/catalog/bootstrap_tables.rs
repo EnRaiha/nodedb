@@ -108,6 +108,7 @@ pub(super) const BOOTSTRAP_TABLES: &[BootstrapTable] = bootstrap_tables![
     "custom_types" => CUSTOM_TYPES,
     "wasm_modules" => WASM_MODULES,
     "rls_policies" => super::rls::RLS_POLICIES,
+    "redaction_policies" => super::redaction::REDACTION_POLICIES,
     // ── Event Plane ──
     "change_streams" => CHANGE_STREAMS,
     "consumer_groups" => CONSUMER_GROUPS,
