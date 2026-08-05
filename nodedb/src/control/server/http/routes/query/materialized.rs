@@ -10,6 +10,8 @@ use crate::bridge::envelope::Status;
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::server::response_shape::redaction::QueryRedaction;
+use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::authorization::authorize_database;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
@@ -186,12 +188,19 @@ pub async fn query(
                 append_response(
                     &mut result_rows,
                     resp,
-                    &plan_for_shape,
-                    plan_kind,
-                    &output_schema,
-                    &state,
-                    database_id,
-                    tenant_id,
+                    ShapedAppend {
+                        plan: &plan_for_shape,
+                        plan_kind,
+                        output_schema: &output_schema,
+                        state: &state,
+                        database_id,
+                        tenant_id,
+                        redaction: &QueryRedaction::for_plan(
+                            tenant_id,
+                            scope.auth(),
+                            &plan_for_shape,
+                        ),
+                    },
                 )?;
                 meter_task_dispatch(&state.shared, &scope, &plan_metering_info, rows_before, &result_rows);
                 continue;
@@ -227,12 +236,19 @@ pub async fn query(
                 append_response(
                     &mut result_rows,
                     resp,
-                    &plan_for_shape,
-                    plan_kind,
-                    &output_schema,
-                    &state,
-                    database_id,
-                    tenant_id,
+                    ShapedAppend {
+                        plan: &plan_for_shape,
+                        plan_kind,
+                        output_schema: &output_schema,
+                        state: &state,
+                        database_id,
+                        tenant_id,
+                        redaction: &QueryRedaction::for_plan(
+                            tenant_id,
+                            scope.auth(),
+                            &plan_for_shape,
+                        ),
+                    },
                 )?;
                 meter_task_dispatch(&state.shared, &scope, &plan_metering_info, rows_before, &result_rows);
                 continue;
@@ -269,12 +285,19 @@ pub async fn query(
                 append_response(
                     &mut result_rows,
                     resp,
-                    &plan_for_shape,
-                    plan_kind,
-                    &output_schema,
-                    &state,
-                    database_id,
-                    tenant_id,
+                    ShapedAppend {
+                        plan: &plan_for_shape,
+                        plan_kind,
+                        output_schema: &output_schema,
+                        state: &state,
+                        database_id,
+                        tenant_id,
+                        redaction: &QueryRedaction::for_plan(
+                            tenant_id,
+                            scope.auth(),
+                            &plan_for_shape,
+                        ),
+                    },
                 )?;
                 meter_task_dispatch(&state.shared, &scope, &plan_metering_info, rows_before, &result_rows);
                 continue;
@@ -284,6 +307,9 @@ pub async fn query(
             // protocol-neutral shaping core below.
             let plan_kind = describe_plan(&task.plan);
             let plan_for_shape = task.plan.clone();
+            // Resolved once for this task and reused for every payload it
+            // produced, rather than per payload.
+            let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &plan_for_shape);
 
             // Dispatch: prefer gateway when available (cluster-aware routing —
             // the gateway owns WAL durability on the target node), fall back to
@@ -323,15 +349,16 @@ pub async fn query(
                 if payload.is_empty() {
                     continue;
                 }
-                match shape_http_payload(
+                match shape_http_payload(MaterializedShapeRequest {
                     payload,
-                    &plan_for_shape,
+                    plan: &plan_for_shape,
                     plan_kind,
-                    Some(&output_schema),
-                    &state.shared,
+                    projection: Some(&output_schema),
+                    state: &state.shared,
                     database_id,
                     tenant_id,
-                ) {
+                    redaction: Some(redaction.ctx(&state.shared.redaction)),
+                }) {
                     Ok(HttpShaped::Rows(rows)) => result_rows.extend(rows),
                     Ok(HttpShaped::Passthrough) => result_rows.push(passthrough_json_row(payload)),
                     Err(e) => return Err(ApiError::Internal(e.message().to_string())),
@@ -384,16 +411,23 @@ fn meter_task_dispatch(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Everything one orchestrated task's response needs to be shaped and
+/// appended. Grouped so the append helper stays within the argument budget as
+/// it gained the per-statement redaction resolution.
+struct ShapedAppend<'a> {
+    plan: &'a crate::bridge::envelope::PhysicalPlan,
+    plan_kind: crate::control::server::response_shape::types::PlanKind,
+    output_schema: &'a crate::control::server::response_shape::schema::OutputSchema,
+    state: &'a AppState,
+    database_id: nodedb_types::DatabaseId,
+    tenant_id: crate::types::TenantId,
+    redaction: &'a QueryRedaction,
+}
+
 fn append_response(
     result_rows: &mut Vec<serde_json::Value>,
     response: crate::bridge::envelope::Response,
-    plan: &crate::bridge::envelope::PhysicalPlan,
-    plan_kind: crate::control::server::response_shape::types::PlanKind,
-    output_schema: &crate::control::server::response_shape::schema::OutputSchema,
-    state: &AppState,
-    database_id: nodedb_types::DatabaseId,
-    tenant_id: crate::types::TenantId,
+    append: ShapedAppend<'_>,
 ) -> Result<(), ApiError> {
     if response.status != Status::Ok {
         return Err(response_error(&response));
@@ -402,15 +436,16 @@ fn append_response(
     if payload.is_empty() {
         return Ok(());
     }
-    match shape_http_payload(
-        &payload,
-        plan,
-        plan_kind,
-        Some(output_schema),
-        &state.shared,
-        database_id,
-        tenant_id,
-    ) {
+    match shape_http_payload(MaterializedShapeRequest {
+        payload: &payload,
+        plan: append.plan,
+        plan_kind: append.plan_kind,
+        projection: Some(append.output_schema),
+        state: &append.state.shared,
+        database_id: append.database_id,
+        tenant_id: append.tenant_id,
+        redaction: Some(append.redaction.ctx(&append.state.shared.redaction)),
+    }) {
         Ok(HttpShaped::Rows(rows)) => result_rows.extend(rows),
         Ok(HttpShaped::Passthrough) => result_rows.push(passthrough_json_row(&payload)),
         Err(e) => return Err(ApiError::Internal(e.message().to_string())),

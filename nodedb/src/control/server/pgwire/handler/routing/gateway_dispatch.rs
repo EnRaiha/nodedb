@@ -18,6 +18,7 @@ use crate::control::gateway::GatewayErrorMap;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
+use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::types::{ReadConsistency, TenantId, TraceId};
@@ -64,6 +65,9 @@ pub(super) struct GatewayDispatchParams<'a> {
     pub(super) database_id: nodedb_types::id::DatabaseId,
     pub(super) projection: Option<&'a OutputSchema>,
     pub(super) result_formats: &'a [FieldFormat],
+    /// The requester's resolved context; its roles drive column-level
+    /// redaction of the forwarded rows.
+    pub(super) auth: &'a crate::control::security::auth_context::AuthContext,
 }
 
 impl NodeDbPgHandler {
@@ -137,7 +141,10 @@ impl NodeDbPgHandler {
             database_id,
             projection,
             result_formats,
+            auth,
         } = params;
+        // Resolved once for the whole forwarded task set, before the loop.
+        let redaction = QueryRedaction::for_plans(tenant_id, auth, tasks.iter().map(|t| &t.plan));
         let gateway = self.state.gateway.get().ok_or_else(|| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_owned(),
@@ -177,7 +184,12 @@ impl NodeDbPgHandler {
                 // would be billed multiple times.
                 let mut task_rows: Option<u64> = None;
                 for payload in &payloads {
-                    match compose::shape_payload_no_plan(payload, PlanKind::MultiRow, projection) {
+                    match compose::shape_payload_no_plan(
+                        payload,
+                        PlanKind::MultiRow,
+                        projection,
+                        Some(redaction.ctx(&self.state.redaction)),
+                    ) {
                         ShapeOutcome::Rows(shaped) => {
                             task_rows = Some(task_rows.unwrap_or(0) + shaped.rows.len() as u64);
                             let (response, notice) =

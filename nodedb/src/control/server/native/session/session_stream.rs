@@ -13,6 +13,7 @@ use nodedb_types::protocol::{NativeResponse, ResponseStatus};
 
 use crate::control::server::conn_stream::ConnStream;
 use crate::control::server::response_shape::compose::shape_decoded_rows;
+use crate::control::server::response_shape::redaction::RedactionCtx;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::data::executor::response_codec::decode_payload_to_json;
 
@@ -38,10 +39,11 @@ use super::dispatch::{self, SqlStream, to_native_columns_rows};
 fn decode_batch_to_columns_rows(
     json_text: &str,
     projection: Option<&OutputSchema>,
+    redaction: Option<RedactionCtx<'_>>,
 ) -> (Vec<String>, Vec<Vec<Value>>) {
     match sonic_rs::from_str::<serde_json::Value>(json_text) {
         Ok(decoded) => {
-            let shaped = shape_decoded_rows(&decoded, projection);
+            let shaped = shape_decoded_rows(&decoded, projection, redaction);
             to_native_columns_rows(&shaped)
         }
         Err(_) => (
@@ -66,12 +68,14 @@ pub(super) async fn emit_sql_stream(
     stream: &mut ConnStream,
     sql_stream: SqlStream,
     format: FrameFormat,
+    state: &crate::control::state::SharedState,
 ) -> crate::Result<()> {
     let SqlStream {
         seq,
         limit,
         stream: mut rows_stream,
         projection,
+        redaction,
         lease_scope: _lease_scope,
     } = sql_stream;
 
@@ -95,7 +99,14 @@ pub(super) async fn emit_sql_stream(
         last_lsn = batch.watermark_lsn.as_u64();
 
         let json_text = decode_payload_to_json(&batch.payload);
-        let (cols, mut batch_rows) = decode_batch_to_columns_rows(&json_text, projection.as_ref());
+        // The redaction inputs were resolved once when the stream opened; this
+        // only re-borrows them, so every batch — including the first — is
+        // shaped under the same policy.
+        let (cols, mut batch_rows) = decode_batch_to_columns_rows(
+            &json_text,
+            projection.as_ref(),
+            redaction.as_ref().map(|r| r.ctx(&state.redaction)),
+        );
         if batch_rows.is_empty() {
             continue;
         }
@@ -149,13 +160,32 @@ pub(super) async fn emit_sql_stream(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::security::redaction::{RedactionMode, RedactionPolicy, RedactionRule};
     use crate::control::server::payload_merge::encode_msgpack_array;
+    use crate::control::server::response_shape::redaction::QueryRedaction;
     use crate::control::server::result_stream::{ResultStream, RowBatch};
+    use crate::control::state::SharedState;
     use crate::types::Lsn;
+    use crate::wal::WalManager;
     use nodedb_types::protocol::{FRAME_HEADER_LEN, ResponseStatus};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    /// Minimum real shared state: the streaming emitter reads only
+    /// `state.redaction` from it.
+    fn shared_state() -> Arc<SharedState> {
+        let directory = tempfile::tempdir().expect("temporary WAL directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&directory.path().join("session-stream.wal"))
+                .expect("test WAL"),
+        );
+        let (dispatcher, _) = Dispatcher::new(1, 1);
+        SharedState::new(dispatcher, wal).expect("test shared state")
+    }
 
     /// A JSON-text array of `n` `{"id": i}` objects — `decode_payload_to_json`
     /// returns JSON-leading bytes as-is, exercising the array → rows decode.
@@ -196,6 +226,17 @@ mod tests {
     /// Drive `emit_sql_stream` over a loopback TCP pair and reassemble every
     /// frame on the client side, returning the decoded responses.
     async fn run_emit(batches: Vec<crate::Result<RowBatch>>, limit: usize) -> Vec<NativeResponse> {
+        run_emit_with_redaction(batches, limit, shared_state(), None).await
+    }
+
+    /// Drive `emit_sql_stream` over a loopback TCP pair against a given
+    /// shared state and redaction resolution.
+    async fn run_emit_with_redaction(
+        batches: Vec<crate::Result<RowBatch>>,
+        limit: usize,
+        state: Arc<SharedState>,
+        redaction: Option<QueryRedaction>,
+    ) -> Vec<NativeResponse> {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
 
@@ -208,11 +249,17 @@ mod tests {
                 limit,
                 stream,
                 projection: None,
+                redaction,
                 lease_scope: None,
             };
-            emit_sql_stream(&mut conn, sql_stream, FrameFormat::MessagePack)
-                .await
-                .expect("emit");
+            emit_sql_stream(
+                &mut conn,
+                sql_stream,
+                FrameFormat::MessagePack,
+                state.as_ref(),
+            )
+            .await
+            .expect("emit");
             // Keep the connection open until the client has drained all frames.
             conn.shutdown().await.ok();
         });
@@ -320,6 +367,52 @@ mod tests {
             "stream error → Error frame"
         );
         assert!(last.error.is_some(), "Error frame carries an error payload");
+    }
+
+    /// Redaction must be applied to EVERY streamed batch, the first included:
+    /// a batch shipped before the policy took effect is a leak that no later
+    /// batch can undo.
+    #[tokio::test]
+    async fn redaction_applies_to_every_streamed_batch() {
+        let state = shared_state();
+        state.redaction.create_policy(RedactionPolicy {
+            name: "mask_id".into(),
+            tenant_id: 1,
+            collection: "docs".into(),
+            for_role: "support".into(),
+            rules: vec![RedactionRule {
+                field: "id".into(),
+                mode: RedactionMode::Mask("***".into()),
+            }],
+        });
+        let redaction = QueryRedaction::new(
+            crate::types::TenantId::new(1),
+            vec!["support".to_string()],
+            vec![(String::new(), "docs".to_string())],
+        );
+
+        let frames = run_emit_with_redaction(
+            vec![batch(0, 3), batch(3, 3)],
+            usize::MAX,
+            state,
+            Some(redaction),
+        )
+        .await;
+
+        let cells: Vec<&Value> = frames
+            .iter()
+            .filter_map(|f| f.rows.as_ref())
+            .flatten()
+            .flatten()
+            .collect();
+        assert_eq!(cells.len(), 6, "every row must arrive");
+        for cell in cells {
+            assert_eq!(
+                cell,
+                &Value::String("***".into()),
+                "every batch, including the first, must be redacted"
+            );
+        }
     }
 
     #[tokio::test]

@@ -100,6 +100,7 @@ pub(super) async fn try_edge_recon_dispatch(
                 ctx.state,
                 database_id,
                 ctx.tenant_id(),
+                ctx.auth_context(),
             ))
         }
         Err(e) => resp(error_to_native(seq, &e)),

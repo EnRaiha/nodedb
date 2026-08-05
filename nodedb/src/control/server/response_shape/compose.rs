@@ -22,17 +22,17 @@
 
 use serde_json::{Map, Value as JsonValue};
 
-use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::response_translate::dispatch::translate_search_response;
-use crate::control::state::SharedState;
 use crate::data::executor::response_codec::{
     ArraySliceResponse, RowsPayload, decode_payload_to_json,
 };
+use nodedb_types::NodeDbError;
 use nodedb_types::columnar::schema::is_reserved_bitemporal_column;
-use nodedb_types::{DatabaseId, NodeDbError, TenantId};
 
 use super::kv::apply_kv_wrap;
 use super::project::push_flat_rows;
+use super::redaction::RedactionCtx;
+use super::request::MaterializedShapeRequest;
 use super::schema::OutputSchema;
 use super::types::{DdlColType, PlanKind, ShapedRows};
 
@@ -59,14 +59,19 @@ pub enum ShapeOutcome {
 /// translation, payload decode, scan-envelope unwrap, and (when
 /// `projection` names columns) SELECT-list column selection.
 pub fn shape_response_materialized(
-    payload: &[u8],
-    plan: &PhysicalPlan,
-    plan_kind: PlanKind,
-    projection: Option<&OutputSchema>,
-    state: &SharedState,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
+    request: MaterializedShapeRequest<'_>,
 ) -> Result<ShapeOutcome, NodeDbError> {
+    let MaterializedShapeRequest {
+        payload,
+        plan,
+        plan_kind,
+        projection,
+        state,
+        database_id,
+        tenant_id,
+        redaction,
+    } = request;
+
     match plan_kind {
         PlanKind::Execution | PlanKind::DmlResult(_) => return Ok(ShapeOutcome::Passthrough),
         PlanKind::ArraySlice
@@ -81,10 +86,10 @@ pub fn shape_response_materialized(
     let translated = translate_search_response(&wrapped, plan, state, database_id, tenant_id);
 
     let shaped = match plan_kind {
-        PlanKind::ArraySlice => shape_array_slice(&translated),
-        PlanKind::ReturningRows => shape_returning_rows(&translated),
+        PlanKind::ArraySlice => shape_array_slice(&translated, redaction),
+        PlanKind::ReturningRows => shape_returning_rows(&translated, redaction),
         PlanKind::SingleDocument | PlanKind::MultiRow => {
-            shape_generic_rows(&translated, projection)
+            shape_generic_rows(&translated, projection, redaction)
         }
         // Handled by the early return above; kept exhaustive (no catch-all,
         // no panic) so a future PlanKind desync degrades to passthrough
@@ -106,13 +111,14 @@ pub fn shape_payload_no_plan(
     payload: &[u8],
     plan_kind: PlanKind,
     projection: Option<&OutputSchema>,
+    redaction: Option<RedactionCtx<'_>>,
 ) -> ShapeOutcome {
     match plan_kind {
         PlanKind::Execution | PlanKind::DmlResult(_) => ShapeOutcome::Passthrough,
-        PlanKind::ArraySlice => ShapeOutcome::Rows(shape_array_slice(payload)),
-        PlanKind::ReturningRows => ShapeOutcome::Rows(shape_returning_rows(payload)),
+        PlanKind::ArraySlice => ShapeOutcome::Rows(shape_array_slice(payload, redaction)),
+        PlanKind::ReturningRows => ShapeOutcome::Rows(shape_returning_rows(payload, redaction)),
         PlanKind::SingleDocument | PlanKind::MultiRow => {
-            ShapeOutcome::Rows(shape_generic_rows(payload, projection))
+            ShapeOutcome::Rows(shape_generic_rows(payload, projection, redaction))
         }
     }
 }
@@ -124,8 +130,8 @@ pub fn shape_payload_no_plan(
 ///
 /// Array slices never carry a SELECT-list projection today (matching the
 /// pre-extraction behavior), so `shape_decoded_rows` is always called with
-/// `None` here.
-fn shape_array_slice(payload: &[u8]) -> ShapedRows {
+/// a `None` projection here — but redaction still applies to the cells.
+fn shape_array_slice(payload: &[u8], redaction: Option<RedactionCtx<'_>>) -> ShapedRows {
     if payload.is_empty() {
         return empty_shaped();
     }
@@ -141,7 +147,7 @@ fn shape_array_slice(payload: &[u8]) -> ShapedRows {
     let notice = truncated.then(|| TRUNCATED_BEFORE_HORIZON_NOTICE.to_string());
 
     let mut shaped = match sonic_rs::from_str::<JsonValue>(&rows_json) {
-        Ok(value) => shape_decoded_rows(&value, None),
+        Ok(value) => shape_decoded_rows(&value, None, redaction),
         Err(_) => empty_shaped(),
     };
     shaped.notice = notice;
@@ -151,7 +157,11 @@ fn shape_array_slice(payload: &[u8]) -> ShapedRows {
 /// Shape a DML-with-`RETURNING` response: decode the `RowsPayload` envelope
 /// (already TEXT-formatted cells), falling back to a single "result" column
 /// on a malformed payload.
-fn shape_returning_rows(payload: &[u8]) -> ShapedRows {
+///
+/// `RETURNING` delivers stored column values to the client just as a SELECT
+/// does, so the same redaction applies — the rows are built here rather than
+/// through `shape_decoded_rows`, so the hook runs on them directly.
+fn shape_returning_rows(payload: &[u8], redaction: Option<RedactionCtx<'_>>) -> ShapedRows {
     if payload.is_empty() {
         return single_result_column_empty();
     }
@@ -171,7 +181,7 @@ fn shape_returning_rows(payload: &[u8]) -> ShapedRows {
                     notice: None,
                 };
             }
-            let rows = rp
+            let mut rows: Vec<Map<String, JsonValue>> = rp
                 .rows
                 .iter()
                 .map(|row_vals| {
@@ -186,6 +196,7 @@ fn shape_returning_rows(payload: &[u8]) -> ShapedRows {
                     map
                 })
                 .collect();
+            redact_rows(redaction.as_ref(), &mut rows);
             let column_types = ShapedRows::text_types(rp.columns.len());
             ShapedRows {
                 columns: rp.columns,
@@ -211,13 +222,17 @@ fn shape_returning_rows(payload: &[u8]) -> ShapedRows {
 ///
 /// Non-JSON scalar payloads (undecodable envelope) fall back to a single
 /// "result" column, matching pgwire's single-row fallback.
-fn shape_generic_rows(payload: &[u8], projection: Option<&OutputSchema>) -> ShapedRows {
+fn shape_generic_rows(
+    payload: &[u8],
+    projection: Option<&OutputSchema>,
+    redaction: Option<RedactionCtx<'_>>,
+) -> ShapedRows {
     if payload.is_empty() {
         return empty_shaped();
     }
     let text = decode_payload_to_json(payload);
     match sonic_rs::from_str::<JsonValue>(&text) {
-        Ok(value) => shape_decoded_rows(&value, projection),
+        Ok(value) => shape_decoded_rows(&value, projection, redaction),
         Err(_) => single_result_row(text),
     }
 }
@@ -235,9 +250,23 @@ fn shape_generic_rows(payload: &[u8], projection: Option<&OutputSchema>) -> Shap
 /// `emit_sql_stream`) call directly, since a streamed scan batch has no plan
 /// to KV-wrap or vector-translate but still needs the same envelope-unwrap +
 /// projection logic applied per batch.
-pub fn shape_decoded_rows(decoded: &JsonValue, projection: Option<&OutputSchema>) -> ShapedRows {
+pub fn shape_decoded_rows(
+    decoded: &JsonValue,
+    projection: Option<&OutputSchema>,
+    redaction: Option<RedactionCtx<'_>>,
+) -> ShapedRows {
     let mut rows = Vec::new();
     push_flat_rows(decoded.clone(), &mut rows);
+
+    // Column-level redaction runs on the flat row maps, AFTER the scan
+    // envelope is unwrapped and BEFORE any projection or column derivation.
+    //
+    // After projection, `SELECT email AS contact` would have renamed the
+    // field out from under its rule; after column derivation, a
+    // `RedactionMode::Null` column would be missing from a `SELECT *` result
+    // instead of present and null. Both orderings deliver data the policy
+    // says to withhold, so the hook belongs exactly here.
+    redact_rows(redaction.as_ref(), &mut rows);
 
     match projection {
         Some(s) if !s.is_star && !s.columns.is_empty() => {
@@ -280,6 +309,20 @@ pub fn shape_decoded_rows(decoded: &JsonValue, projection: Option<&OutputSchema>
                 notice: None,
             }
         }
+    }
+}
+
+/// Apply the statement's column-level redaction policy to every flat row.
+///
+/// A `None` context means the producer has no requester identity in scope and
+/// therefore no roles to evaluate a policy against.
+fn redact_rows(redaction: Option<&RedactionCtx<'_>>, rows: &mut [Map<String, JsonValue>]) {
+    let Some(ctx) = redaction else {
+        return;
+    };
+    for row in rows.iter_mut() {
+        ctx.store
+            .apply_flat_row(ctx.tenant_id, ctx.roles, ctx.collections, row);
     }
 }
 
@@ -394,7 +437,10 @@ mod tests {
 
     use super::*;
     use crate::bridge::dispatch::Dispatcher;
+    use crate::bridge::envelope::PhysicalPlan;
     use crate::control::server::response_shape::types::describe_plan;
+    use crate::control::state::SharedState;
+    use nodedb_types::{DatabaseId, TenantId};
 
     fn preview_plan() -> PhysicalPlan {
         PhysicalPlan::Crdt(nodedb_physical::physical_plan::CrdtOp::PreviewApply {
@@ -436,15 +482,17 @@ mod tests {
         let (expected, payload) = preview_payload();
         let original_payload = payload.clone();
 
-        let materialized = shape_response_materialized(
-            &payload,
-            &plan,
-            kind,
-            None,
-            &shared_state(),
-            DatabaseId::new(1),
-            TenantId::new(1),
-        )
+        let state = shared_state();
+        let materialized = shape_response_materialized(MaterializedShapeRequest {
+            payload: &payload,
+            plan: &plan,
+            plan_kind: kind,
+            projection: None,
+            state: &state,
+            database_id: DatabaseId::new(1),
+            tenant_id: TenantId::new(1),
+            redaction: None,
+        })
         .expect("execution plan passthrough");
         assert!(matches!(materialized, ShapeOutcome::Passthrough));
         assert_eq!(
@@ -457,7 +505,7 @@ mod tests {
             expected
         );
 
-        let no_plan = shape_payload_no_plan(&payload, kind, None);
+        let no_plan = shape_payload_no_plan(&payload, kind, None, None);
         assert!(matches!(no_plan, ShapeOutcome::Passthrough));
         assert_eq!(
             payload, original_payload,
@@ -487,6 +535,178 @@ mod tests {
         assert_eq!(out.len(), 2, "both cells must survive the projection");
         assert_eq!(out.get("id"), Some(&JsonValue::String("w1".to_string())));
         assert_eq!(out.get("id_1"), Some(&JsonValue::String("b1".to_string())));
+    }
+
+    // ── Column-level redaction ──────────────────────────────────────────
+
+    use crate::control::security::redaction::{
+        RedactionMode, RedactionPolicy, RedactionRule, RedactionStore,
+    };
+    use crate::control::server::response_shape::schema::OutputColumn;
+
+    fn policy(collection: &str, role: &str, field: &str, mode: RedactionMode) -> RedactionPolicy {
+        RedactionPolicy {
+            name: format!("{collection}_{role}_{field}"),
+            tenant_id: 1,
+            collection: collection.into(),
+            for_role: role.into(),
+            rules: vec![RedactionRule {
+                field: field.into(),
+                mode,
+            }],
+        }
+    }
+
+    fn store_with(policies: Vec<RedactionPolicy>) -> RedactionStore {
+        let store = RedactionStore::new();
+        for p in policies {
+            store.create_policy(p);
+        }
+        store
+    }
+
+    fn ctx<'a>(
+        store: &'a RedactionStore,
+        roles: &'a [String],
+        collections: &'a [(String, String)],
+    ) -> RedactionCtx<'a> {
+        RedactionCtx {
+            store,
+            tenant_id: 1,
+            roles,
+            collections,
+        }
+    }
+
+    fn named_projection(pairs: &[(&str, &str)]) -> OutputSchema {
+        OutputSchema {
+            columns: pairs
+                .iter()
+                .map(|(lookup, display)| OutputColumn {
+                    display_name: (*display).to_string(),
+                    lookup_key: (*lookup).to_string(),
+                    ty: DdlColType::Text,
+                })
+                .collect(),
+            is_star: false,
+        }
+    }
+
+    fn one_row(fields: JsonValue) -> JsonValue {
+        JsonValue::Array(vec![fields])
+    }
+
+    /// A `Mask` rule redacts for the role that holds the policy.
+    #[test]
+    fn mask_rule_redacts_for_the_policy_role() {
+        let store = store_with(vec![policy(
+            "users",
+            "support",
+            "email",
+            RedactionMode::Mask("***".into()),
+        )]);
+        let roles = vec!["support".to_string()];
+        let sources = vec![(String::new(), "users".to_string())];
+        let decoded = one_row(serde_json::json!({"email": "a@b.c", "name": "Alice"}));
+
+        let shaped = shape_decoded_rows(&decoded, None, Some(ctx(&store, &roles, &sources)));
+        assert_eq!(shaped.rows[0]["email"], JsonValue::String("***".into()));
+        assert_eq!(shaped.rows[0]["name"], JsonValue::String("Alice".into()));
+    }
+
+    /// A role with no policy sees the value in the clear, and the rows are
+    /// otherwise identical to the unredacted shaping.
+    #[test]
+    fn role_without_a_policy_passes_rows_through_unchanged() {
+        let store = store_with(vec![policy(
+            "users",
+            "support",
+            "email",
+            RedactionMode::Mask("***".into()),
+        )]);
+        let roles = vec!["analyst".to_string()];
+        let sources = vec![(String::new(), "users".to_string())];
+        let decoded = one_row(serde_json::json!({"email": "a@b.c", "name": "Alice"}));
+
+        let baseline = shape_decoded_rows(&decoded, None, None);
+        let shaped = shape_decoded_rows(&decoded, None, Some(ctx(&store, &roles, &sources)));
+        assert_eq!(shaped.rows, baseline.rows);
+        assert_eq!(shaped.columns, baseline.columns);
+    }
+
+    /// `SELECT email AS contact` must still be redacted: the rule names the
+    /// stored field, and redaction runs before the projection renames it.
+    #[test]
+    fn select_alias_does_not_escape_the_rule() {
+        let store = store_with(vec![policy(
+            "users",
+            "support",
+            "email",
+            RedactionMode::Mask("***".into()),
+        )]);
+        let roles = vec!["support".to_string()];
+        let sources = vec![(String::new(), "users".to_string())];
+        let decoded = one_row(serde_json::json!({"email": "a@b.c"}));
+        let projection = named_projection(&[("email", "contact")]);
+
+        let shaped = shape_decoded_rows(
+            &decoded,
+            Some(&projection),
+            Some(ctx(&store, &roles, &sources)),
+        );
+        assert_eq!(shaped.columns, vec!["contact".to_string()]);
+        assert_eq!(shaped.rows[0]["contact"], JsonValue::String("***".into()));
+    }
+
+    /// Two joined collections both carry `id`, but only the left side has a
+    /// rule. Matching the bare name would redact the right side too.
+    #[test]
+    fn join_redacts_only_the_side_the_rule_belongs_to() {
+        let store = store_with(vec![policy(
+            "workspaces",
+            "support",
+            "id",
+            RedactionMode::Mask("***".into()),
+        )]);
+        let roles = vec!["support".to_string()];
+        let sources = vec![
+            ("w".to_string(), "workspaces".to_string()),
+            ("b".to_string(), "boards".to_string()),
+        ];
+        let decoded = one_row(serde_json::json!({"w.id": "w1", "b.id": "b1"}));
+        let projection = named_projection(&[("w.id", "id"), ("b.id", "id")]);
+
+        let shaped = shape_decoded_rows(
+            &decoded,
+            Some(&projection),
+            Some(ctx(&store, &roles, &sources)),
+        );
+        // `cell_keys` suffixes the duplicate display name.
+        assert_eq!(shaped.rows[0]["id"], JsonValue::String("***".into()));
+        assert_eq!(shaped.rows[0]["id_1"], JsonValue::String("b1".into()));
+    }
+
+    /// `RedactionMode::Null` must leave the column in a `SELECT *` result,
+    /// valued null — removing the key would drop it from the derived schema.
+    #[test]
+    fn star_keeps_a_null_redacted_column_in_the_schema() {
+        let store = store_with(vec![policy(
+            "users",
+            "support",
+            "email",
+            RedactionMode::Null,
+        )]);
+        let roles = vec!["support".to_string()];
+        let sources = vec![(String::new(), "users".to_string())];
+        let decoded = one_row(serde_json::json!({"id": "u1", "email": "a@b.c"}));
+
+        let shaped = shape_decoded_rows(&decoded, None, Some(ctx(&store, &roles, &sources)));
+        assert!(
+            shaped.columns.contains(&"email".to_string()),
+            "redacted column must stay in the derived SELECT * schema: {:?}",
+            shaped.columns
+        );
+        assert_eq!(shaped.rows[0]["email"], JsonValue::Null);
     }
 
     /// Duplicate-free projections still store cells under the display name

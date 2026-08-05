@@ -22,7 +22,7 @@ use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
-use super::planning::calvin_execution_response;
+use super::planning::{CalvinResponseCtx, calvin_execution_response};
 
 /// Meter one Calvin task's shaped response, once its response has already
 /// been synthesised successfully by `calvin_execution_response` — Calvin
@@ -63,6 +63,7 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         session_id: SessionId,
         result_formats: &[pgwire::api::results::FieldFormat],
+        auth: &crate::control::security::auth_context::AuthContext,
     ) -> PgWireResult<Vec<Response>> {
         let cross_shard_mode = self.sessions.cross_shard_txn_mode(session_id);
         let tx_state = self.sessions.transaction_state(session_id);
@@ -153,10 +154,13 @@ impl NodeDbPgHandler {
                 calvin_responses.push(calvin_execution_response(
                     task,
                     apply_resp.as_ref(),
-                    &self.state,
-                    tenant_id,
-                    database_id,
-                    result_formats,
+                    CalvinResponseCtx {
+                        state: &self.state,
+                        tenant_id,
+                        database_id,
+                        formats: result_formats,
+                        auth,
+                    },
                 )?);
                 meter_calvin_task(&self.state, identity, database_id, task);
             }
@@ -217,10 +221,13 @@ impl NodeDbPgHandler {
             calvin_responses.push(calvin_execution_response(
                 task,
                 outcome.apply_result.as_ref(),
-                &self.state,
-                tenant_id,
-                database_id,
-                result_formats,
+                CalvinResponseCtx {
+                    state: &self.state,
+                    tenant_id,
+                    database_id,
+                    formats: result_formats,
+                    auth,
+                },
             )?);
             meter_calvin_task(&self.state, identity, database_id, task);
         }

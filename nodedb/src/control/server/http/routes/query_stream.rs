@@ -15,6 +15,8 @@
 //! itself never errors, so the response stays `Content-Type:
 //! application/x-ndjson` and 200.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use futures::StreamExt;
 
@@ -25,6 +27,7 @@ use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::exchange::gather::gather_all_cores_stream_authorized;
 use crate::control::server::exchange::streamable::streamable_gather_child;
 use crate::control::server::response_shape::compose::shape_decoded_rows;
+use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::result_stream::ResultStream;
 use crate::control::server::shared::authorization::authorize_task_set;
@@ -93,6 +96,23 @@ pub(super) async fn try_open_stream(
     Ok(Some((stream, limit)))
 }
 
+/// Everything [`ndjson_body_stream`] needs to build one response body.
+pub(super) struct NdjsonBody {
+    pub stream: ResultStream,
+    /// Global take-N across the whole union.
+    pub limit: usize,
+    pub projection: Option<OutputSchema>,
+    /// The statement's redaction inputs, resolved ONCE before the first batch
+    /// is pulled. Re-resolving per batch would risk the first NDJSON lines
+    /// going out unredacted.
+    pub redaction: Option<QueryRedaction>,
+    /// Owned so the body, which outlives the handler frame, can reach the
+    /// redaction policy store for every batch.
+    pub state: Arc<crate::control::state::SharedState>,
+    pub lease_scope: crate::control::lease::QueryLeaseScope,
+    pub meter_guard: Option<DetachedMeterGuard>,
+}
+
 /// Build a lazy NDJSON byte stream from a [`ResultStream`].
 ///
 /// Each [`RowBatch`] payload is a standalone msgpack array; it is decoded to a
@@ -103,12 +123,17 @@ pub(super) async fn try_open_stream(
 ///
 /// [`RowBatch`]: crate::control::server::result_stream::RowBatch
 pub(super) fn ndjson_body_stream(
-    stream: ResultStream,
-    limit: usize,
-    projection: Option<OutputSchema>,
-    lease_scope: crate::control::lease::QueryLeaseScope,
-    meter_guard: Option<DetachedMeterGuard>,
+    body: NdjsonBody,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
+    let NdjsonBody {
+        stream,
+        limit,
+        projection,
+        redaction,
+        state,
+        lease_scope,
+        meter_guard,
+    } = body;
     async_stream::stream! {
         // The body owns this scope for its complete polling lifetime. Dropping
         // the body on completion or client disconnect releases descriptors only
@@ -152,7 +177,13 @@ pub(super) fn ndjson_body_stream(
             // Row maps are keyed by `ShapedRows::cell_keys`, so each NDJSON
             // line serializes as-is; two output columns sharing a name emit
             // `{"id": …, "id_1": …}` rather than collapsing to one cell.
-            let shaped = shape_decoded_rows(&value, projection.as_ref());
+            // Only re-borrows the once-resolved inputs, so the very first
+            // batch is redacted under the same policy as the last.
+            let shaped = shape_decoded_rows(
+                &value,
+                projection.as_ref(),
+                redaction.as_ref().map(|r| r.ctx(&state.redaction)),
+            );
             for row in shaped.rows {
                 if emitted >= limit {
                     break;
@@ -190,6 +221,20 @@ mod tests {
         serde_json::Value::Array(items).to_string().into_bytes()
     }
 
+    /// Minimum real shared state: the body reads only `state.redaction`.
+    fn test_state() -> Arc<SharedState> {
+        use crate::bridge::dispatch::Dispatcher;
+        use crate::wal::WalManager;
+
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("query-stream.wal"))
+                .expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 1);
+        SharedState::new(dispatcher, wal).expect("construct shared state")
+    }
+
     fn batch(start: usize, n: usize) -> crate::Result<RowBatch> {
         Ok(RowBatch {
             payload: json_object_batch(start, n),
@@ -219,13 +264,15 @@ mod tests {
         let batches: Vec<crate::Result<RowBatch>> =
             vec![batch(0, 1000), batch(1000, 1000), batch(2000, 500)];
         let stream: ResultStream = Box::pin(futures::stream::iter(batches));
-        let lines = collect_lines(ndjson_body_stream(
+        let lines = collect_lines(ndjson_body_stream(NdjsonBody {
             stream,
-            usize::MAX,
-            None,
-            crate::control::lease::QueryLeaseScope::empty(),
-            None,
-        ))
+            limit: usize::MAX,
+            projection: None,
+            redaction: None,
+            state: test_state(),
+            lease_scope: crate::control::lease::QueryLeaseScope::empty(),
+            meter_guard: None,
+        }))
         .await;
         assert_eq!(lines.len(), 2500, "all rows must stream as NDJSON lines");
     }
@@ -234,13 +281,15 @@ mod tests {
     async fn global_limit_caps_emitted_rows() {
         let batches: Vec<crate::Result<RowBatch>> = vec![batch(0, 1000), batch(1000, 1000)];
         let stream: ResultStream = Box::pin(futures::stream::iter(batches));
-        let lines = collect_lines(ndjson_body_stream(
+        let lines = collect_lines(ndjson_body_stream(NdjsonBody {
             stream,
-            1500,
-            None,
-            crate::control::lease::QueryLeaseScope::empty(),
-            None,
-        ))
+            limit: 1500,
+            projection: None,
+            redaction: None,
+            state: test_state(),
+            lease_scope: crate::control::lease::QueryLeaseScope::empty(),
+            meter_guard: None,
+        }))
         .await;
         assert_eq!(lines.len(), 1500, "global take-N must cap the line count");
     }
@@ -254,13 +303,15 @@ mod tests {
             }),
         ];
         let stream: ResultStream = Box::pin(futures::stream::iter(batches));
-        let lines = collect_lines(ndjson_body_stream(
+        let lines = collect_lines(ndjson_body_stream(NdjsonBody {
             stream,
-            usize::MAX,
-            None,
-            crate::control::lease::QueryLeaseScope::empty(),
-            None,
-        ))
+            limit: usize::MAX,
+            projection: None,
+            redaction: None,
+            state: test_state(),
+            lease_scope: crate::control::lease::QueryLeaseScope::empty(),
+            meter_guard: None,
+        }))
         .await;
         assert_eq!(lines.len(), 11, "10 rows + 1 in-band error line");
         let last: serde_json::Value =
@@ -331,13 +382,15 @@ mod tests {
         // pending row count — alive until end of scope. An inner block drops
         // the real value.
         {
-            let body = ndjson_body_stream(
+            let body = ndjson_body_stream(NdjsonBody {
                 stream,
-                usize::MAX,
-                None,
-                crate::control::lease::QueryLeaseScope::empty(),
-                Some(guard),
-            );
+                limit: usize::MAX,
+                projection: None,
+                redaction: None,
+                state: Arc::clone(&state),
+                lease_scope: crate::control::lease::QueryLeaseScope::empty(),
+                meter_guard: Some(guard),
+            });
             futures::pin_mut!(body);
             for _ in 0..3 {
                 body.next()

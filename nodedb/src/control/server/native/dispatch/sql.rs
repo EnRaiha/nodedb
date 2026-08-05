@@ -337,6 +337,7 @@ async fn execute_planned(
                             ctx.state,
                             database_id,
                             ctx.tenant_id(),
+                            ctx.auth_context(),
                         ))
                     }
                     Err(e) => resp(error_to_native(seq, &e)),

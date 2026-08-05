@@ -13,6 +13,8 @@ use nodedb_types::value::Value;
 
 use crate::bridge::envelope::{Response, Status};
 use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
+use crate::control::server::response_shape::redaction::QueryRedaction;
+use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
@@ -158,15 +160,21 @@ pub(super) async fn run_dispatch_loop(
                 if matches!(outcome.kind, StagedTagKind::RawPayload) && !outcome.payload.is_empty()
                 {
                     let plan_kind = describe_plan(&plan_for_staged_response);
-                    match shape_response_materialized(
-                        &outcome.payload,
-                        &plan_for_staged_response,
-                        plan_kind,
-                        output_schema,
-                        ctx.state,
-                        database_id,
+                    let redaction = QueryRedaction::for_plan(
                         ctx.tenant_id(),
-                    ) {
+                        ctx.auth_context(),
+                        &plan_for_staged_response,
+                    );
+                    match shape_response_materialized(MaterializedShapeRequest {
+                        payload: &outcome.payload,
+                        plan: &plan_for_staged_response,
+                        plan_kind,
+                        projection: output_schema,
+                        state: ctx.state,
+                        database_id,
+                        tenant_id: ctx.tenant_id(),
+                        redaction: Some(redaction.ctx(&ctx.state.redaction)),
+                    }) {
                         Ok(ShapeOutcome::Rows(mut shaped)) => {
                             if let Some(notice) = shaped.notice.take() {
                                 warnings.push(notice);
@@ -279,15 +287,18 @@ pub(super) async fn run_dispatch_loop(
             // of work per dispatched task, as before.
             total_affected += 1;
         } else {
-            match shape_response_materialized(
-                &task_resp.payload,
-                &plan_for_response,
+            let redaction =
+                QueryRedaction::for_plan(ctx.tenant_id(), ctx.auth_context(), &plan_for_response);
+            match shape_response_materialized(MaterializedShapeRequest {
+                payload: &task_resp.payload,
+                plan: &plan_for_response,
                 plan_kind,
-                output_schema,
-                ctx.state,
+                projection: output_schema,
+                state: ctx.state,
                 database_id,
-                ctx.tenant_id(),
-            ) {
+                tenant_id: ctx.tenant_id(),
+                redaction: Some(redaction.ctx(&ctx.state.redaction)),
+            }) {
                 Ok(ShapeOutcome::Rows(mut shaped)) => {
                     if let Some(notice) = shaped.notice.take() {
                         warnings.push(notice);

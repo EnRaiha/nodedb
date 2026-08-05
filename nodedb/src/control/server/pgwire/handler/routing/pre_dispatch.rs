@@ -9,11 +9,11 @@ use nodedb_physical::physical_task::PhysicalTask;
 
 use crate::control::planner::calvin::plan_needs_implicit_edge_recon;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 
 use super::planning::consistency_for_tasks;
+use super::result_shaping::ResultShaping;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
@@ -28,6 +28,7 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         session_id: SessionId,
         result_formats: &[FieldFormat],
+        auth: &crate::control::security::auth_context::AuthContext,
     ) -> PgWireResult<Option<Vec<Response>>> {
         let tx_state = self.sessions.transaction_state(session_id);
         if tx_state == crate::control::server::shared::session::TransactionState::InBlock
@@ -55,6 +56,7 @@ impl NodeDbPgHandler {
             identity,
             session_id,
             result_formats,
+            auth,
         )
         .await
         .map(Some)
@@ -70,9 +72,13 @@ impl NodeDbPgHandler {
         identity: &AuthenticatedIdentity,
         tenant_id: TenantId,
         session_id: SessionId,
-        projection: Option<&OutputSchema>,
-        result_formats: &[FieldFormat],
+        shaping: ResultShaping<'_>,
+        auth: &crate::control::security::auth_context::AuthContext,
     ) -> PgWireResult<Option<Vec<Response>>> {
+        let ResultShaping {
+            projection,
+            formats: result_formats,
+        } = shaping;
         let consistency = consistency_for_tasks(tasks);
         if has_orchestrated_dml(tasks) || !self.should_forward_via_gateway(tasks, consistency) {
             return Ok(None);
@@ -92,6 +98,7 @@ impl NodeDbPgHandler {
                 database_id,
                 projection,
                 result_formats,
+                auth,
             },
         )
         .await

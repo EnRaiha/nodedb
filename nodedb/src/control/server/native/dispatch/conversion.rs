@@ -105,10 +105,13 @@ pub(crate) fn calvin_native_response(
     state: &crate::control::state::SharedState,
     database_id: nodedb_types::DatabaseId,
     tenant_id: nodedb_types::TenantId,
+    auth: &crate::control::security::auth_context::AuthContext,
 ) -> NativeResponse {
     use crate::control::server::response_shape::compose::{
         ShapeOutcome, shape_response_materialized,
     };
+    use crate::control::server::response_shape::redaction::QueryRedaction;
+    use crate::control::server::response_shape::request::MaterializedShapeRequest;
     use crate::control::server::response_shape::types::{PlanKind, describe_plan};
 
     let returning_plan = plans
@@ -118,17 +121,20 @@ pub(crate) fn calvin_native_response(
         .iter()
         .find(|p| matches!(describe_plan(p), PlanKind::DmlResult(_)));
 
+    let redaction = returning_plan.map(|plan| QueryRedaction::for_plan(tenant_id, auth, plan));
     if let (Some(resp), Some(plan)) = (apply_result.as_ref(), returning_plan)
         && matches!(describe_plan(plan), PlanKind::ReturningRows)
-        && let Ok(ShapeOutcome::Rows(shaped)) = shape_response_materialized(
-            resp.payload.as_bytes(),
-            plan,
-            PlanKind::ReturningRows,
-            None,
-            state,
-            database_id,
-            tenant_id,
-        )
+        && let Ok(ShapeOutcome::Rows(shaped)) =
+            shape_response_materialized(MaterializedShapeRequest {
+                payload: resp.payload.as_bytes(),
+                plan,
+                plan_kind: PlanKind::ReturningRows,
+                projection: None,
+                state,
+                database_id,
+                tenant_id,
+                redaction: redaction.as_ref().map(|r| r.ctx(&state.redaction)),
+            })
     {
         let (cols, rows) = to_native_columns_rows(&shaped);
         let mut r = NativeResponse::ok(seq);

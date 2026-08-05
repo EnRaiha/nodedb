@@ -10,12 +10,9 @@
 //! (`Execution`, `DmlResult`) come back as [`HttpShaped::Passthrough`]; the
 //! caller keeps its existing raw decode/base64 fallback for those.
 
-use crate::bridge::envelope::PhysicalPlan;
 use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
-use crate::control::server::response_shape::schema::OutputSchema;
-use crate::control::server::response_shape::types::PlanKind;
-use crate::control::state::SharedState;
-use nodedb_types::{DatabaseId, NodeDbError, TenantId};
+use crate::control::server::response_shape::request::MaterializedShapeRequest;
+use nodedb_types::NodeDbError;
 
 /// Outcome of shaping one Data-Plane payload for an HTTP response.
 pub(super) enum HttpShaped {
@@ -30,23 +27,9 @@ pub(super) enum HttpShaped {
 /// Shape one Data-Plane payload for HTTP, mirroring the pgwire/native
 /// materialized-shaping call site.
 pub(super) fn shape_http_payload(
-    payload: &[u8],
-    plan: &PhysicalPlan,
-    plan_kind: PlanKind,
-    projection: Option<&OutputSchema>,
-    state: &SharedState,
-    database_id: DatabaseId,
-    tenant_id: TenantId,
+    request: MaterializedShapeRequest<'_>,
 ) -> Result<HttpShaped, NodeDbError> {
-    match shape_response_materialized(
-        payload,
-        plan,
-        plan_kind,
-        projection,
-        state,
-        database_id,
-        tenant_id,
-    )? {
+    match shape_response_materialized(request)? {
         // Each row map is already keyed by `ShapedRows::cell_keys`, so it
         // serializes to JSON as-is. When two output columns share a name the
         // later one carries a `_<n>` suffix (`SELECT w.id, b.id` →

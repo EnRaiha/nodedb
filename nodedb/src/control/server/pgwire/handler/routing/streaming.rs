@@ -17,6 +17,7 @@ use nodedb_physical::physical_plan::{ExchangeMode, ExchangeOp, PhysicalPlan, Que
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::shared::session::SessionId;
 
 use super::super::super::types::error_to_sqlstate;
@@ -27,6 +28,10 @@ use super::result_shaping::ResultShaping;
 
 pub(super) struct StreamSelectContext<'a> {
     pub(super) identity: &'a AuthenticatedIdentity,
+    /// The requester's resolved context — its roles drive column-level
+    /// redaction, which is Control-Plane-only and so must be captured here
+    /// rather than travel with the plan.
+    pub(super) auth: &'a crate::control::security::auth_context::AuthContext,
     pub(super) plan_kind: PlanKind,
     pub(super) session_id: SessionId,
     pub(super) shaping: ResultShaping<'a>,
@@ -55,6 +60,7 @@ impl NodeDbPgHandler {
     ) -> PgWireResult<Option<Response>> {
         let StreamSelectContext {
             identity,
+            auth,
             plan_kind,
             session_id,
             shaping,
@@ -135,6 +141,13 @@ impl NodeDbPgHandler {
         //   - named columns  -> lazy per-batch shaping + projection
         //   - `SELECT *`      -> materialize, then id-first column union
         //   - anything else   -> raw single-column envelope passthrough
+        //
+        // Column-level redaction is resolved ONCE here, from the scan plan the
+        // stream actually reads, and handed to every batch's shaping call
+        // below. Deriving it per batch would let an early batch ship before
+        // the policy was consulted.
+        let redaction = Some(QueryRedaction::for_plan(task.tenant_id, auth, &child_plan));
+
         let response = match shaping.projection {
             Some(s) if !s.is_star && !s.columns.is_empty() => {
                 stream_response::streaming_shaped_response(
@@ -143,10 +156,20 @@ impl NodeDbPgHandler {
                     s.clone(),
                     shaping.formats,
                     lease_scope,
+                    redaction,
+                    std::sync::Arc::clone(&state),
                 )
             }
-            Some(s) if s.is_star => stream_response::streaming_star_response(stream, limit).await,
-            _ => stream_response::streaming_multirow_response(stream, limit, lease_scope),
+            Some(s) if s.is_star => {
+                stream_response::streaming_star_response(stream, limit, redaction, &state).await
+            }
+            _ => stream_response::streaming_multirow_response(
+                stream,
+                limit,
+                lease_scope,
+                redaction,
+                std::sync::Arc::clone(&state),
+            ),
         };
 
         Ok(Some(response))

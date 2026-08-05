@@ -6,6 +6,8 @@ use nodedb_types::protocol::{NativeResponse, ResponseStatus};
 
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
 use crate::control::server::response_shape::compose::{ShapeOutcome, shape_response_materialized};
+use crate::control::server::response_shape::redaction::QueryRedaction;
+use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::types::describe_plan;
 
 use super::{DispatchCtx, shape_error_to_native, to_native_columns_rows};
@@ -33,15 +35,17 @@ pub(crate) fn data_plane_response_to_native(
         native.watermark_lsn = response.watermark_lsn.as_u64();
         return native;
     }
-    match shape_response_materialized(
-        &response.payload,
+    let redaction = QueryRedaction::for_plan(ctx.tenant_id(), ctx.auth_context(), plan);
+    match shape_response_materialized(MaterializedShapeRequest {
+        payload: &response.payload,
         plan,
-        describe_plan(plan),
-        None,
-        ctx.state,
-        ctx.database_id(),
-        ctx.tenant_id(),
-    ) {
+        plan_kind: describe_plan(plan),
+        projection: None,
+        state: ctx.state,
+        database_id: ctx.database_id(),
+        tenant_id: ctx.tenant_id(),
+        redaction: Some(redaction.ctx(&ctx.state.redaction)),
+    }) {
         Ok(ShapeOutcome::Rows(shaped)) => {
             let (columns, rows) = to_native_columns_rows(&shaped);
             NativeResponse {

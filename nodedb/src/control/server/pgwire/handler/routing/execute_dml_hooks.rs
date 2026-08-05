@@ -288,7 +288,16 @@ impl NodeDbPgHandler {
                     use crate::control::server::response_shape::compose::{
                         ShapeOutcome, shape_payload_no_plan,
                     };
-                    match shape_payload_no_plan(resp.payload.as_ref(), plan_kind, None) {
+                    use crate::control::server::response_shape::redaction::QueryRedaction;
+                    // A clone write can carry RETURNING rows, which deliver
+                    // stored column values just as a SELECT does.
+                    let redaction = QueryRedaction::for_plan(tenant_id, auth, &task.plan);
+                    match shape_payload_no_plan(
+                        resp.payload.as_ref(),
+                        plan_kind,
+                        None,
+                        Some(redaction.ctx(&self.state.redaction)),
+                    ) {
                         ShapeOutcome::Rows(shaped) => {
                             // Clone write-path DML result (PointUpdate/PointDelete):
                             // no client-requested result formats, so text.

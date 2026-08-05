@@ -9,6 +9,8 @@ use axum::response::IntoResponse;
 use crate::control::gateway::GatewayErrorMap;
 use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
+use crate::control::server::response_shape::redaction::QueryRedaction;
+use crate::control::server::response_shape::request::MaterializedShapeRequest;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::authorization::authorize_database;
 use crate::control::server::shared::metering::{
@@ -19,7 +21,7 @@ use crate::control::server::shared::plan_admission::{
 };
 
 use super::super::super::auth::{ApiError, AppState, build_request_scope, resolve_auth_parts};
-use super::super::query_stream::{ndjson_body_stream, try_open_stream};
+use super::super::query_stream::{NdjsonBody, ndjson_body_stream, try_open_stream};
 use super::super::result_shape::{HttpShaped, passthrough_to_ndjson, shape_http_payload};
 use super::{DatabaseQueryParam, resolve_database_id};
 
@@ -164,11 +166,20 @@ pub async fn query_ndjson(
             let mut response = Response::builder()
                 .header("Content-Type", "application/x-ndjson")
                 .body(axum::body::Body::from_stream(ndjson_body_stream(
-                    stream,
-                    limit,
-                    Some(output_schema.clone()),
-                    lease_scope,
-                    stream_meter_guard,
+                    NdjsonBody {
+                        stream,
+                        limit,
+                        projection: Some(output_schema.clone()),
+                        // `try_open_stream` only returns `Some` for a
+                        // single-task plan, so the first task IS the stream's
+                        // source; resolved here, once, before any line ships.
+                        redaction: tasks.first().map(|task| {
+                            QueryRedaction::for_plan(tenant_id, scope.auth(), &task.plan)
+                        }),
+                        state: Arc::clone(&state.shared),
+                        lease_scope,
+                        meter_guard: stream_meter_guard,
+                    },
                 )))
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "encoding error").into_response()
@@ -195,6 +206,8 @@ pub async fn query_ndjson(
         // protocol-neutral shaping core below.
         let plan_kind = describe_plan(&task.plan);
         let plan_for_shape = task.plan.clone();
+        // Resolved once per task, reused for every payload it produced.
+        let redaction = QueryRedaction::for_plan(tenant_id, scope.auth(), &plan_for_shape);
         let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
 
         let dispatch_result: crate::Result<Vec<Vec<u8>>> = if matches!(
@@ -270,15 +283,16 @@ pub async fn query_ndjson(
                     if payload.is_empty() {
                         continue;
                     }
-                    match shape_http_payload(
+                    match shape_http_payload(MaterializedShapeRequest {
                         payload,
-                        &plan_for_shape,
+                        plan: &plan_for_shape,
                         plan_kind,
-                        Some(&output_schema),
-                        &state.shared,
+                        projection: Some(&output_schema),
+                        state: &state.shared,
                         database_id,
                         tenant_id,
-                    ) {
+                        redaction: Some(redaction.ctx(&state.shared.redaction)),
+                    }) {
                         Ok(HttpShaped::Rows(rows)) => {
                             task_rows += rows.len() as u64;
                             for row in rows {

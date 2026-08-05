@@ -1,0 +1,399 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! The per-task dispatch loop for non-Calvin pgwire queries.
+//!
+//! Split out of `execute.rs`, which keeps the plan/authorize/admit entry
+//! points and hands the admitted task list here.
+
+use std::sync::Arc;
+
+use pgwire::api::results::Response;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::server::response_shape::compose::{self, ShapeOutcome};
+use crate::control::server::response_shape::redaction::QueryRedaction;
+use crate::control::server::response_shape::request::MaterializedShapeRequest;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
+use crate::control::server::shared::session::SessionId;
+use crate::types::TenantId;
+use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
+
+use super::super::super::types::{error_to_sqlstate, response_status_to_sqlstate, sqlstate_error};
+use super::super::core::NodeDbPgHandler;
+use super::super::plan::{describe_plan, payload_to_response};
+use super::super::shape_encode;
+use super::result_shaping::ResultShaping;
+use super::set_ops;
+use super::streaming::StreamSelectContext;
+
+pub(super) struct DispatchTaskContext<'a> {
+    pub(super) plan_lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
+    pub(super) tenant_id: TenantId,
+    pub(super) identity: &'a AuthenticatedIdentity,
+    pub(super) auth_ctx: &'a crate::control::security::auth_context::AuthContext,
+    pub(super) session_id: SessionId,
+    pub(super) shaping: ResultShaping<'a>,
+}
+
+impl NodeDbPgHandler {
+    /// Execute the per-task dispatch loop for non-Calvin queries.
+    pub(super) async fn dispatch_task_loop(
+        &self,
+        tasks: Vec<PhysicalTask>,
+        context: DispatchTaskContext<'_>,
+    ) -> PgWireResult<Vec<Response>> {
+        let DispatchTaskContext {
+            plan_lease_scope,
+            tenant_id,
+            identity,
+            auth_ctx,
+            session_id,
+            shaping,
+        } = context;
+        let projection = shaping.projection;
+        let result_formats = shaping.formats;
+        let needs_set_op = tasks.iter().any(|t| t.post_set_op != PostSetOp::None);
+        // A set-op merge blends rows from every branch into one result, so the
+        // union of the branches' sources governs redaction. Resolved before the
+        // loop consumes `tasks`.
+        let set_op_redaction = needs_set_op
+            .then(|| QueryRedaction::for_plans(tenant_id, auth_ctx, tasks.iter().map(|t| &t.plan)));
+        let mut dedup_payloads: Vec<Vec<u8>> = Vec::new();
+        let mut dedup_set_op = PostSetOp::None;
+        let mut responses = Vec::with_capacity(tasks.len());
+        // Checked once rather than per task — metering is disabled by
+        // default, so this keeps the per-task extraction below (which clones
+        // the collection name) a true no-op on the hot path for every
+        // deployment that hasn't turned it on.
+        let metering_enabled = self.state.metering_config.enabled;
+
+        for mut task in tasks {
+            if task.tenant_id != tenant_id {
+                tracing::error!(
+                    expected = %tenant_id,
+                    actual = %task.tenant_id,
+                    "SECURITY: task tenant_id mismatch — rejecting"
+                );
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "42501".to_owned(),
+                    "tenant isolation violation: task targets wrong tenant".to_owned(),
+                ))));
+            }
+
+            // ClusterArray plans are handled entirely on the Control Plane by the
+            // ArrayCoordinator — they must never reach the SPSC bridge or
+            // trigger/DML machinery. Intercept them here and short-circuit.
+            if matches!(
+                task.plan,
+                nodedb_physical::physical_plan::PhysicalPlan::ClusterArray(_)
+            ) {
+                let authorized = self
+                    .authorize_tasks(identity, std::slice::from_ref(&task))?
+                    .into_tasks()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_owned(),
+                            "XX000".to_owned(),
+                            "ClusterArray authorization returned no capability".to_owned(),
+                        )))
+                    })?;
+                let response = self
+                    .dispatch_cluster_array_task(
+                        authorized,
+                        projection,
+                        result_formats,
+                        session_id,
+                        auth_ctx,
+                    )
+                    .await?;
+                responses.push(response);
+                continue;
+            }
+
+            // In-transaction write-routing gate: protocol-neutral decision of
+            // read / buffer-for-COMMIT / stage-now-and-buffer, shared with
+            // every other dispatch loop (native, DSL/UPSERT). Moved to
+            // `execute_dml_hooks.rs` to keep this file under the size limit;
+            // behavior is unchanged.
+            match self
+                .route_task_in_txn(session_id, identity, task, Arc::clone(&plan_lease_scope))
+                .await?
+            {
+                super::execute_dml_hooks::TxnRouteOutcome::Proceed(routed_task) => {
+                    task = *routed_task;
+                }
+                super::execute_dml_hooks::TxnRouteOutcome::Handled(resp) => {
+                    responses.push(resp);
+                    continue;
+                }
+            }
+
+            let plan_kind = describe_plan(&task.plan);
+            let resp_post_set_op = task.post_set_op;
+            let task_database_id = task.database_id;
+            let task_vshard = task.vshard_id;
+            let plan_for_response = task.plan.clone();
+            // Extracted from the clone above, before dispatch — metering
+            // needs the collection/engine shape after this task's dispatch
+            // succeeds. Only covers the "normal dispatch" branch at the
+            // bottom of this loop; the streaming fast path
+            // (`maybe_stream_select`) and the `ClusterArray` short-circuit
+            // above dispatch through entirely separate code paths and are
+            // not metered here.
+            let plan_metering_info =
+                metering_enabled.then(|| PlanMeteringInfo::extract(&plan_for_response));
+
+            // Single-node pgwire streaming fast path (autocommit SELECT only).
+            // In-transaction reads skip streaming so the transaction id rides on
+            // the request and the data plane merges the transaction's own staged
+            // writes into the scan (read-your-own-writes); the streaming path
+            // builds per-core requests without the transaction id.
+            let in_transaction = self.sessions.transaction_state(session_id)
+                == crate::control::server::shared::session::TransactionState::InBlock;
+            if !in_transaction
+                && let Some(stream_response) = self
+                    .maybe_stream_select(
+                        &task,
+                        StreamSelectContext {
+                            identity,
+                            auth: auth_ctx,
+                            plan_kind,
+                            session_id,
+                            shaping: ResultShaping {
+                                projection,
+                                formats: result_formats,
+                            },
+                            lease_scope: Arc::clone(&plan_lease_scope),
+                        },
+                    )
+                    .await?
+            {
+                responses.push(stream_response);
+                continue;
+            }
+
+            // --- Pre-dispatch hooks: trigger interception + clone write-path
+            // interception (moved to execute_dml_hooks.rs to keep this file
+            // under the size limit; behavior is unchanged).
+            let (dml_info, old_row, truncate_restart_collection) = match self
+                .run_pre_dispatch_hooks(identity, auth_ctx, tenant_id, session_id, plan_kind, task)
+                .await?
+            {
+                super::execute_dml_hooks::PreDispatchOutcome::Handled(resp) => {
+                    responses.push(resp);
+                    continue;
+                }
+                super::execute_dml_hooks::PreDispatchOutcome::Proceed(proceed) => {
+                    let super::execute_dml_hooks::PreDispatchProceed {
+                        task: proceeding_task,
+                        dml_info,
+                        old_row,
+                        truncate_restart_collection,
+                    } = *proceed;
+                    task = proceeding_task;
+                    (dml_info, old_row, truncate_restart_collection)
+                }
+            };
+
+            // --- Normal dispatch ---
+            let user_id: Option<std::sync::Arc<str>> =
+                Some(std::sync::Arc::from(identity.username.as_str()));
+            let (resp, shard_watermarks, distributed_reads) = self
+                .dispatch_authorized_task_with_watermarks(task, user_id, identity)
+                .await
+                .map_err(|e| {
+                    let (severity, code, message) = error_to_sqlstate(&e);
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        severity.to_owned(),
+                        code.to_owned(),
+                        message,
+                    )))
+                })?;
+
+            // Track reads for snapshot-isolation / cross-shard conflict detection
+            // at the protocol-neutral layer. Recorded BEFORE the error
+            // short-circuit so an absent-key point read (a `NotFound` from the
+            // Data Plane) is still captured — a "not found" is a validatable
+            // phantom observation, not a no-op. Only successful reads and
+            // not-found reads record; a genuine dispatch failure does not.
+            let records_read = resp.status == crate::bridge::envelope::Status::Ok
+                || resp.error_code.as_deref()
+                    == Some(&crate::bridge::envelope::ErrorCode::NotFound);
+            if records_read
+                && self.sessions.transaction_state(session_id)
+                    == crate::control::server::shared::session::TransactionState::InBlock
+            {
+                let watermarks = if shard_watermarks.is_empty() {
+                    vec![(task_vshard, resp.watermark_lsn)]
+                } else {
+                    shard_watermarks
+                };
+                crate::control::server::shared::session::record_reads_for_response(
+                    &self.state,
+                    &self.sessions,
+                    session_id,
+                    identity.tenant_id,
+                    crate::control::server::shared::session::ResponseReads {
+                        plan: &plan_for_response,
+                        watermarks: &watermarks,
+                        read_version_lsn: resp.read_version_lsn,
+                        found: resp.status == crate::bridge::envelope::Status::Ok,
+                        distributed_reads: &distributed_reads,
+                        read_lsn_vshard: task_vshard,
+                    },
+                )
+                .await;
+            }
+
+            // Record the session's OWN committed write-version so a later
+            // transaction's read-set capture can be floored at it
+            // (read-your-writes floor for cross-shard OCC). A prior autocommit
+            // write must still floor a later transaction's read, so this records
+            // regardless of transaction state — the version is the write's
+            // committed per-collection `coll_write_lsn`, carried on
+            // `read_version_lsn` by the replicated-write dispatch path. Only
+            // successful writes with a non-zero version are recorded.
+            if resp.status == crate::bridge::envelope::Status::Ok
+                && resp.read_version_lsn > crate::types::Lsn::ZERO
+                && matches!(
+                    crate::control::security::identity::required_permission(&plan_for_response),
+                    crate::control::security::identity::Permission::Write
+                )
+                && let Some(collection) =
+                    crate::control::server::shared::plan_util::extract_collection(
+                        &plan_for_response,
+                    )
+            {
+                self.sessions.note_own_write(
+                    session_id,
+                    task_database_id,
+                    identity.tenant_id,
+                    collection,
+                    resp.read_version_lsn,
+                );
+            }
+
+            if let Some((severity, code, message)) =
+                response_status_to_sqlstate(resp.status, resp.error_code.as_deref())
+            {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    severity.to_owned(),
+                    code.to_owned(),
+                    message,
+                ))));
+            }
+
+            // --- TRUNCATE RESTART IDENTITY ---
+            if let Some(collection) = &truncate_restart_collection {
+                self.state
+                    .sequence_registry
+                    .restart_sequences_for_collection(tenant_id.as_u64(), collection);
+            }
+
+            // --- AFTER triggers ---
+            if let Some(ref info) = dml_info {
+                crate::control::trigger::dml_hook_fire::fire_post_dispatch_triggers(
+                    crate::control::trigger::dml_hook_fire::DispatchTriggerParams {
+                        state: &self.state,
+                        identity,
+                        database_id: task_database_id,
+                        tenant_id,
+                        info,
+                        old_row: &old_row,
+                        cascade_depth: 0,
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    let (severity, code, message) = error_to_sqlstate(&e);
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        severity.to_owned(),
+                        code.to_owned(),
+                        message,
+                    )))
+                })?;
+
+                self.state
+                    .dml_counter
+                    .record_dml(tenant_id.as_u64(), &info.collection);
+            }
+
+            // This task's own row count, for metering below — `None` for the
+            // set-op-deferred branch (its rows are only known after the
+            // later cross-task merge) and for `Passthrough` (no row payload
+            // to count); `meter_dispatch` charges one unit for `None`.
+            let mut task_rows: Option<u64> = None;
+            if needs_set_op && resp_post_set_op != PostSetOp::None {
+                dedup_payloads.push(resp.payload.to_vec());
+                if dedup_set_op == PostSetOp::None {
+                    dedup_set_op = resp_post_set_op;
+                }
+            } else {
+                let redaction = QueryRedaction::for_plan(tenant_id, auth_ctx, &plan_for_response);
+                match compose::shape_response_materialized(MaterializedShapeRequest {
+                    payload: &resp.payload,
+                    plan: &plan_for_response,
+                    plan_kind,
+                    projection,
+                    state: &self.state,
+                    database_id: task_database_id,
+                    tenant_id,
+                    redaction: Some(redaction.ctx(&self.state.redaction)),
+                })
+                .map_err(|e| sqlstate_error("XX000", e.message()))?
+                {
+                    ShapeOutcome::Rows(shaped) => {
+                        task_rows = Some(shaped.rows.len() as u64);
+                        let (response, notice) =
+                            shape_encode::shaped_query_response(shaped, result_formats);
+                        if let Some(n) = notice {
+                            self.sessions.push_notice(session_id, n);
+                        }
+                        responses.push(response);
+                    }
+                    ShapeOutcome::Passthrough => {
+                        let shaped = payload_to_response(&resp.payload, plan_kind)?;
+                        if let Some(notice) = shaped.notice {
+                            self.sessions.push_notice(session_id, notice);
+                        }
+                        responses.push(shaped.response);
+                    }
+                }
+            }
+
+            // Metered here, once per successfully dispatched task — every
+            // path reaching this point already passed the
+            // `response_status_to_sqlstate` error check above.
+            if let Some(info) = &plan_metering_info {
+                let scope = RequestAuthScope::builder(identity, self.state.auth_stores())
+                    .with_session_database(Some(task_database_id))
+                    .build();
+                meter_dispatch(&self.state, &scope, info, task_rows);
+            }
+        }
+
+        // Set operations: merge sub-query payloads.
+        if needs_set_op && !dedup_payloads.is_empty() {
+            let (response, notice) = set_ops::apply_set_ops(
+                &dedup_payloads,
+                dedup_set_op,
+                projection,
+                result_formats,
+                set_op_redaction
+                    .as_ref()
+                    .map(|r| r.ctx(&self.state.redaction)),
+            );
+            if let Some(n) = notice {
+                self.sessions.push_notice(session_id, n);
+            }
+            responses.push(response);
+        }
+
+        Ok(responses)
+    }
+}

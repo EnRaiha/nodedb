@@ -15,6 +15,7 @@ use nodedb_physical::physical_plan::{ClusterArrayOp, PhysicalPlan};
 
 use crate::control::server::dispatch_utils::publish_cluster_array_change_events;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
+use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::shared::session::SessionId;
 
@@ -40,6 +41,7 @@ impl NodeDbPgHandler {
         projection: Option<&OutputSchema>,
         result_formats: &[FieldFormat],
         session_id: SessionId,
+        auth: &crate::control::security::auth_context::AuthContext,
     ) -> PgWireResult<Response> {
         use crate::control::cluster::ClusterArrayExecutor;
         use std::sync::Arc;
@@ -109,7 +111,23 @@ impl NodeDbPgHandler {
             | ClusterArrayOp::Put { .. }
             | ClusterArrayOp::Delete { .. } => PlanKind::MultiRow,
         };
-        match compose::shape_payload_no_plan(&payload_bytes, cluster_plan_kind, projection) {
+        // This coordinator path never builds a `PhysicalPlan`, so the source
+        // collection comes straight off the op's array name. A single source
+        // means bare-key matching, which is what an array's cell rows carry.
+        let array_name = match &cluster_op {
+            ClusterArrayOp::Slice { array_id, .. }
+            | ClusterArrayOp::Agg { array_id, .. }
+            | ClusterArrayOp::Put { array_id, .. }
+            | ClusterArrayOp::Delete { array_id, .. } => array_id.name.clone(),
+        };
+        let redaction =
+            QueryRedaction::for_collections(tenant_id, auth, vec![(String::new(), array_name)]);
+        match compose::shape_payload_no_plan(
+            &payload_bytes,
+            cluster_plan_kind,
+            projection,
+            Some(redaction.ctx(&self.state.redaction)),
+        ) {
             ShapeOutcome::Rows(shaped) => {
                 let (response, notice) =
                     shape_encode::shaped_query_response(shaped, result_formats);

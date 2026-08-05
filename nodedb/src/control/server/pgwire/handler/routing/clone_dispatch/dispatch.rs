@@ -10,7 +10,7 @@
 //! Non-cloned databases and fully `Materialized` clones return `None` —
 //! zero overhead for the common path.
 
-use pgwire::api::results::{FieldFormat, Response};
+use pgwire::api::results::Response;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::clone::resolver::{
@@ -19,10 +19,11 @@ use crate::control::clone::resolver::{
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::pgwire::handler::plan::{PlanKind, multirow_payload_to_response};
+use crate::control::server::pgwire::handler::routing::result_shaping::ResultShaping;
 use crate::control::server::pgwire::handler::shape_encode;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::kv::apply_kv_wrap;
-use crate::control::server::response_shape::schema::OutputSchema;
+use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
@@ -77,9 +78,17 @@ impl NodeDbPgHandler {
         identity: &crate::control::security::identity::AuthenticatedIdentity,
         tenant_id: TenantId,
         session_id: SessionId,
-        projection: Option<&OutputSchema>,
-        result_formats: &[FieldFormat],
+        shaping: ResultShaping<'_>,
+        auth: &crate::control::security::auth_context::AuthContext,
     ) -> PgWireResult<Option<Vec<Response>>> {
+        let ResultShaping {
+            projection,
+            formats: result_formats,
+        } = shaping;
+        // Resolved before `resolve_read` consumes `tasks`. A clone read merges
+        // source-database rows into the target's, so both branches' sources
+        // govern redaction.
+        let redaction = QueryRedaction::for_plans(tenant_id, auth, tasks.iter().map(|t| &t.plan));
         // Compute query LSN and wall-ms for the resolver.
         //
         // If the first task carries a `system_as_of_ms` (i.e. the query was
@@ -128,7 +137,12 @@ impl NodeDbPgHandler {
                 );
                 let empty: Vec<u8> =
                     nodedb_types::json_to_msgpack(&serde_json::json!([])).unwrap_or_default();
-                match compose::shape_payload_no_plan(&empty, PlanKind::MultiRow, projection) {
+                match compose::shape_payload_no_plan(
+                    &empty,
+                    PlanKind::MultiRow,
+                    projection,
+                    Some(redaction.ctx(&self.state.redaction)),
+                ) {
                     ShapeOutcome::Rows(shaped) => {
                         let (response, notice) =
                             shape_encode::shaped_query_response(shaped, result_formats);
@@ -325,6 +339,7 @@ impl NodeDbPgHandler {
                         resp.payload.as_ref(),
                         PlanKind::MultiRow,
                         projection,
+                        Some(redaction.ctx(&self.state.redaction)),
                     ) {
                         ShapeOutcome::Rows(shaped) => {
                             let (response, notice) =

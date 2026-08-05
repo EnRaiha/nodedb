@@ -13,9 +13,11 @@ use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::server::response_shape::compose::shape_decoded_rows;
+use crate::control::server::response_shape::redaction::{QueryRedaction, redact_envelope_row};
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::DdlColType;
 use crate::control::server::result_stream::ResultStream;
+use crate::control::state::SharedState;
 use crate::data::executor::response_codec::decode_payload_to_json;
 
 use super::super::ddl_encode::col_type_to_field_with_format;
@@ -38,6 +40,8 @@ pub(crate) fn streaming_multirow_response(
     stream: ResultStream,
     limit: usize,
     lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
+    redaction: Option<QueryRedaction>,
+    state: Arc<SharedState>,
 ) -> Response {
     use futures::StreamExt;
 
@@ -71,10 +75,15 @@ pub(crate) fn streaming_multirow_response(
             if let Ok(serde_json::Value::Array(items)) =
                 sonic_rs::from_str::<serde_json::Value>(&text)
             {
-                for item in items {
+                for mut item in items {
                     if emitted >= limit {
                         break;
                     }
+                    // This shape delivers each row as one opaque JSON text
+                    // cell rather than named columns, so it never reaches the
+                    // shaping core — redact it here rather than let it be the
+                    // one streamed shape that bypasses policy.
+                    redact_envelope_row(redaction.as_ref(), &state.redaction, &mut item);
                     let mut encoder = DataRowEncoder::new(row_schema.clone());
                     encoder.encode_field(&item.to_string()).map_err(|e| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -108,6 +117,8 @@ pub(crate) fn streaming_shaped_response(
     schema_out: OutputSchema,
     formats: &[FieldFormat],
     lease_scope: Arc<crate::control::lease::QueryLeaseScope>,
+    redaction: Option<QueryRedaction>,
+    state: Arc<SharedState>,
 ) -> Response {
     use futures::StreamExt;
 
@@ -171,7 +182,13 @@ pub(crate) fn streaming_shaped_response(
                     format!("failed to decode streamed batch: {e}"),
                 )))
             })?;
-            let shaped = shape_decoded_rows(&value, Some(&schema_out));
+            // Resolved once before the first batch was pulled; this only
+            // re-borrows it, so no batch can slip out ahead of the policy.
+            let shaped = shape_decoded_rows(
+                &value,
+                Some(&schema_out),
+                redaction.as_ref().map(|r| r.ctx(&state.redaction)),
+            );
             for row in &shaped.rows {
                 if emitted >= limit {
                     break;
@@ -203,7 +220,12 @@ fn single_pgwire_error(err: PgWireError) -> Response {
 /// can only be known once every row is seen, so all batches are drained first,
 /// then the neutral shaping core derives the column union. Zero rows yield a
 /// single-column `result` empty response.
-pub(crate) async fn streaming_star_response(stream: ResultStream, limit: usize) -> Response {
+pub(crate) async fn streaming_star_response(
+    stream: ResultStream,
+    limit: usize,
+    redaction: Option<QueryRedaction>,
+    state: &SharedState,
+) -> Response {
     use futures::StreamExt;
 
     let mut values: Vec<serde_json::Value> = Vec::new();
@@ -260,7 +282,11 @@ pub(crate) async fn streaming_star_response(stream: ResultStream, limit: usize) 
         ));
     }
 
-    let shaped = shape_decoded_rows(&serde_json::Value::Array(values), None);
+    let shaped = shape_decoded_rows(
+        &serde_json::Value::Array(values),
+        None,
+        redaction.as_ref().map(|r| r.ctx(&state.redaction)),
+    );
     // `SELECT *` derives its columns from the rows and has no client-requested
     // per-column formats, so it always renders text.
     let (response, _notice) = shaped_query_response(shaped, &[]);

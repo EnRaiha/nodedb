@@ -9,6 +9,7 @@ use pgwire::api::results::{FieldFormat, Response};
 use nodedb_physical::physical_task::PostSetOp;
 
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
+use crate::control::server::response_shape::redaction::RedactionCtx;
 use crate::control::server::response_shape::schema::OutputSchema;
 
 use super::super::plan::{PlanKind, multirow_payload_to_response};
@@ -21,6 +22,7 @@ pub(super) fn apply_set_ops(
     dedup_set_op: PostSetOp,
     projection: Option<&OutputSchema>,
     result_formats: &[FieldFormat],
+    redaction: Option<RedactionCtx<'_>>,
 ) -> (Response, Option<String>) {
     let merged = match dedup_set_op {
         PostSetOp::Intersect | PostSetOp::IntersectAll => {
@@ -31,7 +33,7 @@ pub(super) fn apply_set_ops(
         }
         _ => dedup_union_payloads(dedup_payloads),
     };
-    match compose::shape_payload_no_plan(&merged, PlanKind::MultiRow, projection) {
+    match compose::shape_payload_no_plan(&merged, PlanKind::MultiRow, projection, redaction) {
         ShapeOutcome::Rows(shaped) => shape_encode::shaped_query_response(shaped, result_formats),
         ShapeOutcome::Passthrough => {
             let shaped = multirow_payload_to_response(&merged);

@@ -8,6 +8,7 @@ use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::server::response_shape::redaction::{QueryRedaction, redact_decoded_value};
 use crate::control::server::shared::authorization::authorize_database;
 use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::plan_admission::{
@@ -73,6 +74,13 @@ pub async fn execute_sql(
 
     let _request = shared.tenant_request_guard(tenant_id);
 
+    // Resolved once per request from the tasks' plans and the caller's own
+    // roles, then reused (never re-derived) at every RETURNING/result decode
+    // site below — an `InsertSelect`/`Merge`/`UpdateFromJoin` row and a plain
+    // dispatch row must be redacted by the same policy snapshot.
+    let redaction =
+        QueryRedaction::for_plans(tenant_id, scope.auth(), tasks.iter().map(|t| &t.plan));
+
     let mut results = Vec::new();
     // Checked once rather than per task — metering is disabled by default,
     // so this keeps the per-task extraction below (which clones the
@@ -105,7 +113,10 @@ pub async fn execute_sql(
                         let json =
                             crate::data::executor::response_codec::decode_payload_to_json(&payload);
                         match sonic_rs::from_str::<serde_json::Value>(&json) {
-                            Ok(v) => results.push(v),
+                            Ok(mut v) => {
+                                redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
+                                results.push(v);
+                            }
                             Err(_) => results.push(serde_json::Value::String(json)),
                         }
                     }
@@ -143,7 +154,10 @@ pub async fn execute_sql(
                         let json =
                             crate::data::executor::response_codec::decode_payload_to_json(&payload);
                         match sonic_rs::from_str::<serde_json::Value>(&json) {
-                            Ok(v) => results.push(v),
+                            Ok(mut v) => {
+                                redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
+                                results.push(v);
+                            }
                             Err(_) => results.push(serde_json::Value::String(json)),
                         }
                     }
@@ -185,7 +199,10 @@ pub async fn execute_sql(
                         let json =
                             crate::data::executor::response_codec::decode_payload_to_json(&payload);
                         match sonic_rs::from_str::<serde_json::Value>(&json) {
-                            Ok(v) => results.push(v),
+                            Ok(mut v) => {
+                                redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
+                                results.push(v);
+                            }
                             Err(_) => results.push(serde_json::Value::String(json)),
                         }
                     }
@@ -225,7 +242,10 @@ pub async fn execute_sql(
                         let json =
                             crate::data::executor::response_codec::decode_payload_to_json(&payload);
                         match sonic_rs::from_str::<serde_json::Value>(&json) {
-                            Ok(v) => results.push(v),
+                            Ok(mut v) => {
+                                redact_decoded_value(Some(&redaction), &shared.redaction, &mut v);
+                                results.push(v);
+                            }
                             Err(_) => results.push(serde_json::Value::String(json)),
                         }
                     }

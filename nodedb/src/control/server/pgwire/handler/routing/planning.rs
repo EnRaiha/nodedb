@@ -405,32 +405,52 @@ pub(super) fn inject_returning_spec(
 /// site that previously dropped those rows, surfacing a bare command tag
 /// instead. Every other task (and a RETURNING task with no carried payload)
 /// keeps the synthesised `Response::Execution` command tag.
+pub(super) struct CalvinResponseCtx<'a> {
+    pub(super) state: &'a crate::control::state::SharedState,
+    pub(super) tenant_id: TenantId,
+    pub(super) database_id: crate::types::DatabaseId,
+    pub(super) formats: &'a [pgwire::api::results::FieldFormat],
+    /// The requester's resolved context; its roles drive column-level
+    /// redaction of any RETURNING rows this batch surfaces.
+    pub(super) auth: &'a crate::control::security::auth_context::AuthContext,
+}
+
 pub(super) fn calvin_execution_response(
     task: &PhysicalTask,
     apply_resp: Option<&crate::bridge::envelope::Response>,
-    state: &crate::control::state::SharedState,
-    tenant_id: TenantId,
-    database_id: crate::types::DatabaseId,
-    formats: &[pgwire::api::results::FieldFormat],
+    ctx: CalvinResponseCtx<'_>,
 ) -> pgwire::error::PgWireResult<pgwire::api::results::Response> {
     use super::super::plan::{calvin_tag_for_plan, is_calvin_foldable};
     use crate::control::server::response_shape::compose::{
         ShapeOutcome, shape_response_materialized,
     };
+    use crate::control::server::response_shape::redaction::QueryRedaction;
+    use crate::control::server::response_shape::request::MaterializedShapeRequest;
     use crate::control::server::response_shape::types::{PlanKind, describe_plan};
+
+    let CalvinResponseCtx {
+        state,
+        tenant_id,
+        database_id,
+        formats,
+        auth,
+    } = ctx;
 
     // RETURNING path: shape the applied payload into DATA-ROWs, exactly as the
     // non-Calvin dispatch loop does for a RETURNING write.
+    let redaction = QueryRedaction::for_plan(tenant_id, auth, &task.plan);
     if let (PlanKind::ReturningRows, Some(resp)) = (describe_plan(&task.plan), apply_resp)
-        && let Ok(ShapeOutcome::Rows(shaped)) = shape_response_materialized(
-            resp.payload.as_bytes(),
-            &task.plan,
-            PlanKind::ReturningRows,
-            None,
-            state,
-            database_id,
-            tenant_id,
-        )
+        && let Ok(ShapeOutcome::Rows(shaped)) =
+            shape_response_materialized(MaterializedShapeRequest {
+                payload: resp.payload.as_bytes(),
+                plan: &task.plan,
+                plan_kind: PlanKind::ReturningRows,
+                projection: None,
+                state,
+                database_id,
+                tenant_id,
+                redaction: Some(redaction.ctx(&state.redaction)),
+            })
     {
         let (response, _notice) =
             super::super::shape_encode::shaped_query_response(shaped, formats);

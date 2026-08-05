@@ -20,6 +20,7 @@ use nodedb_types::protocol::NativeResponse;
 use crate::control::gateway::core::QueryContext;
 use crate::control::server::exchange::gather::gather_all_cores_stream_authorized;
 use crate::control::server::exchange::streamable::streamable_gather_child;
+use crate::control::server::response_shape::redaction::QueryRedaction;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::result_stream::ResultStream;
 use crate::control::server::shared::session::TransactionState;
@@ -69,6 +70,10 @@ pub(crate) struct SqlStream {
     /// each batch only needs decode + scan-envelope unwrap + this
     /// projection; no `apply_kv_wrap` / `translate_search_response` applies here.
     pub projection: Option<OutputSchema>,
+    /// The statement's column-level redaction inputs, resolved ONCE here.
+    /// Re-resolving them per batch would risk an early batch shipping rows a
+    /// later one would have redacted.
+    pub redaction: Option<QueryRedaction>,
     /// Descriptor leases acquired after planning. The session loop owns this
     /// stream, so retaining the scope here holds leases until final emission
     /// or connection teardown drops the stream.
@@ -161,6 +166,11 @@ pub(crate) async fn try_open_sql_stream(
         limit,
         stream,
         projection: output_schema.cloned(),
+        redaction: Some(QueryRedaction::for_plan(
+            ctx.tenant_id(),
+            ctx.auth_context(),
+            &child_plan,
+        )),
         lease_scope: None,
     }))
 }
