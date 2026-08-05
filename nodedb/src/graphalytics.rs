@@ -3,19 +3,21 @@
 //! Product-owned embedded Graphalytics runner support.
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::time::Instant;
 
 use nodedb_types::{DatabaseId, TenantId};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, json};
 
-use crate::engine::graph::algo::{label_propagation, lcc, pagerank, sssp, wcc};
 use crate::engine::graph::algo::params::AlgoParams;
+use crate::engine::graph::algo::{label_propagation, lcc, pagerank, sssp, wcc};
 use crate::engine::graph::csr::rebuild::rebuild_sharded_from_store;
 use crate::engine::graph::edge_store::{
     EdgeImportRecord, EdgeStore, EdgeValuePayload, NodeSurrogateRecord, versioned_edge_key,
 };
+use crate::graphalytics_diagnostics::LoadDiagnostics;
+use crate::graphalytics_output::{write_depths, write_json_result};
 
 const DATABASE: DatabaseId = DatabaseId::DEFAULT;
 const TENANT: TenantId = TenantId::new(1);
@@ -38,10 +40,24 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
     let vertices = dataset.join(format!("{dataset_name}.v"));
     let edges = dataset.join(format!("{dataset_name}.e"));
 
+    let diagnostics_path = LoadDiagnostics::enabled_path();
     let load_start = Instant::now();
+    let open_started = diagnostics_path.as_ref().map(|_| Instant::now());
     let store = EdgeStore::open_with_cache_size(database, EDGE_STORE_CACHE_BYTES)?;
-    import_vertices(&store, &vertices)?;
-    import_edges(&store, &edges)?;
+    let mut diagnostics = diagnostics_path
+        .as_ref()
+        .map(|_| LoadDiagnostics::default());
+    if let (Some(diagnostics), Some(open_started)) = (diagnostics.as_mut(), open_started) {
+        diagnostics.edge_store_open_seconds = open_started.elapsed().as_secs_f64();
+    }
+    if let Some(diagnostics) = diagnostics.as_mut() {
+        import_vertices::<true>(&store, &vertices, Some(diagnostics))?;
+        import_edges_profiled(&store, &edges, diagnostics)?;
+    } else {
+        import_vertices::<false>(&store, &vertices, None)?;
+        import_edges(&store, &edges)?;
+    }
+    let raw_load_seconds = load_start.elapsed().as_secs_f64();
     let load_seconds = checked_elapsed(load_start, "load")?;
 
     let prepare_start = Instant::now();
@@ -69,7 +85,13 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
     let start = Instant::now();
     let result = wcc::run(csr);
     timings.insert("WCC".into(), json!(checked_elapsed(start, "WCC")?));
-    write_json_result(output, dataset_name, "WCC", result.to_json()?, "component_id")?;
+    write_json_result(
+        output,
+        dataset_name,
+        "WCC",
+        result.to_json()?,
+        "component_id",
+    )?;
 
     let start = Instant::now();
     let depths = bfs_depths(csr, SOURCE)?;
@@ -79,7 +101,13 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
     let start = Instant::now();
     let result = lcc::run(csr, usize::MAX, usize::MAX);
     timings.insert("LCC".into(), json!(checked_elapsed(start, "LCC")?));
-    write_json_result(output, dataset_name, "LCC", result.to_json()?, "coefficient")?;
+    write_json_result(
+        output,
+        dataset_name,
+        "LCC",
+        result.to_json()?,
+        "coefficient",
+    )?;
 
     let start = Instant::now();
     let result = sssp::run(csr, &params)?;
@@ -89,7 +117,13 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
     let start = Instant::now();
     let result = label_propagation::run(csr, &params);
     timings.insert("CDLP".into(), json!(checked_elapsed(start, "CDLP")?));
-    write_json_result(output, dataset_name, "CDLP", result.to_json()?, "community_id")?;
+    write_json_result(
+        output,
+        dataset_name,
+        "CDLP",
+        result.to_json()?,
+        "community_id",
+    )?;
 
     let summary = json!({
         "system": "NodeDB Origin Embedded",
@@ -98,7 +132,22 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
         "prepare_seconds": prepare_seconds,
         "algorithms": timings,
     });
-    fs::write(output.join("summary.json"), serde_json::to_vec_pretty(&summary)?)?;
+    fs::write(
+        output.join("summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    // The canonical summary is already durable; an opt-in sidecar failure is
+    // deliberately reported afterward and never changes measured durations.
+    if let (Some(path), Some(diagnostics)) = (diagnostics_path.as_deref(), diagnostics.as_ref()) {
+        let database_bytes = fs::metadata(database).ok().map(|metadata| metadata.len());
+        diagnostics.write(
+            path,
+            dataset_name,
+            raw_load_seconds,
+            load_seconds,
+            database_bytes,
+        )?;
+    }
     Ok(())
 }
 
@@ -112,7 +161,12 @@ fn checked_elapsed(start: Instant, operation: &str) -> anyhow::Result<f64> {
     Ok(seconds)
 }
 
-fn import_vertices(store: &EdgeStore, path: &Path) -> anyhow::Result<()> {
+fn import_vertices<const PROFILED: bool>(
+    store: &EdgeStore,
+    path: &Path,
+    diagnostics: Option<&mut LoadDiagnostics>,
+) -> anyhow::Result<()> {
+    let started = PROFILED.then(Instant::now);
     let reader = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut batch: Vec<NodeSurrogateRecord> = Vec::with_capacity(BATCH_SIZE);
     let mut surrogate = 1u32;
@@ -133,32 +187,66 @@ fn import_vertices(store: &EdgeStore, path: &Path) -> anyhow::Result<()> {
     if !batch.is_empty() {
         store.import_node_surrogates(&batch)?;
     }
+    if PROFILED {
+        let diagnostics = diagnostics.expect("profiled vertex import requires diagnostics");
+        diagnostics.vertex_count = surrogate.saturating_sub(1) as usize;
+        diagnostics.vertex_parse_write_seconds = started
+            .expect("profiled vertex import has a clock")
+            .elapsed()
+            .as_secs_f64();
+    }
     Ok(())
 }
 
 fn import_edges(store: &EdgeStore, path: &Path) -> anyhow::Result<()> {
-    import_edges_with_batch_size(store, path, BATCH_SIZE)
+    import_edges_with_batch_size::<false>(store, path, BATCH_SIZE, None)
 }
 
-fn import_edges_with_batch_size(
+fn import_edges_profiled(
+    store: &EdgeStore,
+    path: &Path,
+    diagnostics: &mut LoadDiagnostics,
+) -> anyhow::Result<()> {
+    import_edges_with_batch_size::<true>(store, path, BATCH_SIZE, Some(diagnostics))
+}
+
+#[derive(Default)]
+struct EdgeImportMeasurements {
+    producer_wall_seconds: f64,
+    producer_active_seconds: f64,
+    edge_count: usize,
+    encoded_value_bytes: u64,
+    storage: crate::engine::graph::edge_store::snapshot::DeferredImportProfile,
+}
+
+fn import_edges_with_batch_size<const PROFILED: bool>(
     store: &EdgeStore,
     path: &Path,
     batch_size: usize,
+    diagnostics: Option<&mut LoadDiagnostics>,
 ) -> anyhow::Result<()> {
     enum ImportMessage {
         Batch(Vec<EdgeImportRecord>),
         Finish,
     }
 
+    debug_assert_eq!(PROFILED, diagnostics.is_some());
+    let pipeline_started = PROFILED.then(Instant::now);
     assert!(batch_size > 0, "edge import batch size must be positive");
-    std::thread::scope(|scope| {
+    let measurements = std::thread::scope(|scope| {
         let (work_tx, work_rx) = std::sync::mpsc::sync_channel(1);
         let (reuse_tx, reuse_rx) = std::sync::mpsc::sync_channel(1);
-        let importer = scope.spawn(move || -> anyhow::Result<()> {
+        let importer = scope.spawn(move || -> anyhow::Result<_> {
+            let mut storage =
+                crate::engine::graph::edge_store::snapshot::DeferredImportProfile::default();
             while let Ok(message) = work_rx.recv() {
                 match message {
                     ImportMessage::Batch(mut batch) => {
-                        store.import_edge_pairs_deferred(&mut batch)?;
+                        if PROFILED {
+                            storage.merge(store.import_edge_pairs_deferred_profiled(&mut batch)?);
+                        } else {
+                            store.import_edge_pairs_deferred(&mut batch)?;
+                        }
                         batch.clear();
                         // One returned buffer is enough to keep the producer
                         // pipelined. Drop extras instead of blocking after the
@@ -166,19 +254,26 @@ fn import_edges_with_batch_size(
                         let _ = reuse_tx.try_send(batch);
                     }
                     ImportMessage::Finish => {
-                        store.flush_deferred_imports()?;
-                        return Ok(());
+                        if PROFILED {
+                            storage.merge(store.flush_deferred_imports_profiled()?);
+                        } else {
+                            store.flush_deferred_imports()?;
+                        }
+                        return Ok(storage);
                     }
                 }
             }
-            Ok(())
+            Ok(storage)
         });
 
-        let producer = (|| -> anyhow::Result<()> {
+        let producer = (|| -> anyhow::Result<EdgeImportMeasurements> {
+            let producer_started = PROFILED.then(Instant::now);
             let reader = BufReader::with_capacity(1 << 20, File::open(path)?);
             let mut batch: Vec<EdgeImportRecord> = Vec::with_capacity(batch_size);
             let mut spare = Some(Vec::with_capacity(batch_size));
             let mut last_system_from = 0i64;
+            let mut measurements = EdgeImportMeasurements::default();
+            let mut batch_started = PROFILED.then(Instant::now);
             for line in reader.lines() {
                 let line = line?;
                 let mut fields = line.split_whitespace();
@@ -207,6 +302,10 @@ fn import_edges_with_batch_size(
                 nodedb_query::msgpack_scan::write_map_header(&mut properties, 1);
                 nodedb_query::msgpack_scan::write_kv_f64(&mut properties, "weight", weight);
                 let value = EdgeValuePayload::new(0, i64::MAX, properties).encode()?;
+                if PROFILED {
+                    measurements.edge_count += 1;
+                    measurements.encoded_value_bytes += value.len() as u64;
+                }
                 batch.push((
                     DATABASE,
                     TENANT,
@@ -215,6 +314,9 @@ fn import_edges_with_batch_size(
                     value,
                 ));
                 if batch.len() == batch_size {
+                    if let Some(started) = batch_started {
+                        measurements.producer_active_seconds += started.elapsed().as_secs_f64();
+                    }
                     work_tx
                         .send(ImportMessage::Batch(batch))
                         .map_err(|_| anyhow::anyhow!("edge import worker stopped"))?;
@@ -225,9 +327,13 @@ fn import_edges_with_batch_size(
                             .recv()
                             .map_err(|_| anyhow::anyhow!("edge import worker stopped"))?
                     };
+                    batch_started = PROFILED.then(Instant::now);
                 }
             }
             if !batch.is_empty() {
+                if let Some(started) = batch_started {
+                    measurements.producer_active_seconds += started.elapsed().as_secs_f64();
+                }
                 work_tx
                     .send(ImportMessage::Batch(batch))
                     .map_err(|_| anyhow::anyhow!("edge import worker stopped"))?;
@@ -235,7 +341,10 @@ fn import_edges_with_batch_size(
             work_tx
                 .send(ImportMessage::Finish)
                 .map_err(|_| anyhow::anyhow!("edge import worker stopped"))?;
-            Ok(())
+            if let Some(started) = producer_started {
+                measurements.producer_wall_seconds = started.elapsed().as_secs_f64();
+            }
+            Ok(measurements)
         })();
         drop(work_tx);
 
@@ -245,9 +354,22 @@ fn import_edges_with_batch_size(
         match (producer, imported) {
             (_, Err(error)) => Err(error),
             (Err(error), _) => Err(error),
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(mut measurements), Ok(storage)) => {
+                measurements.storage = storage;
+                Ok(measurements)
+            }
         }
-    })
+    })?;
+
+    if let (Some(diagnostics), Some(started)) = (diagnostics, pipeline_started) {
+        diagnostics.producer_wall_seconds = measurements.producer_wall_seconds;
+        diagnostics.producer_batch_active_seconds = measurements.producer_active_seconds;
+        diagnostics.pipeline_wall_seconds = started.elapsed().as_secs_f64();
+        diagnostics.edge_count = measurements.edge_count;
+        diagnostics.encoded_value_bytes = measurements.encoded_value_bytes;
+        diagnostics.deferred_import = measurements.storage;
+    }
+    Ok(())
 }
 
 fn bfs_depths(csr: &nodedb_graph::CsrIndex, source: &str) -> anyhow::Result<Vec<i64>> {
@@ -255,46 +377,6 @@ fn bfs_depths(csr: &nodedb_graph::CsrIndex, source: &str) -> anyhow::Result<Vec<
         .node_id_raw(source)
         .ok_or_else(|| anyhow::anyhow!("source vertex {source} is absent"))?;
     Ok(csr.bfs_both_distances_raw(start))
-}
-
-fn write_json_result(
-    output: &Path,
-    dataset: &str,
-    algorithm: &str,
-    bytes: Vec<u8>,
-    value_key: &str,
-) -> anyhow::Result<()> {
-    let rows: Vec<Value> = serde_json::from_slice(&bytes)?;
-    let mut writer = BufWriter::new(File::create(output.join(format!("{dataset}-{algorithm}")))?);
-    for row in rows {
-        let node = row["node_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("algorithm result lacks node_id"))?;
-        let value = &row[value_key];
-        if value.is_null() {
-            writeln!(writer, "{node} Infinity")?;
-        } else if let Some(number) = value.as_f64() {
-            writeln!(writer, "{node} {number}")?;
-        } else if let Some(number) = value.as_i64() {
-            writeln!(writer, "{node} {number}")?;
-        } else {
-            anyhow::bail!("algorithm result has invalid {value_key}: {value}");
-        }
-    }
-    Ok(())
-}
-
-fn write_depths(
-    output: &Path,
-    dataset: &str,
-    csr: &nodedb_graph::CsrIndex,
-    depths: &[i64],
-) -> anyhow::Result<()> {
-    let mut writer = BufWriter::new(File::create(output.join(format!("{dataset}-BFS")))?);
-    for (node, depth) in depths.iter().enumerate() {
-        writeln!(writer, "{} {depth}", csr.node_name_raw(node as u32))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -317,7 +399,7 @@ mod tests {
             let database = dir.path().join(format!("{case}.redb"));
             {
                 let store = EdgeStore::open(&database).unwrap();
-                import_edges_with_batch_size(&store, &input, 2).unwrap();
+                import_edges_with_batch_size::<false>(&store, &input, 2, None).unwrap();
             }
 
             let reopened = EdgeStore::open(&database).unwrap();
@@ -339,7 +421,7 @@ mod tests {
         let input = dir.path().join("invalid.e");
         fs::write(&input, "1 2 1.0\n2 3 2.0\nmalformed\n").unwrap();
         let store = EdgeStore::open(&dir.path().join("invalid.redb")).unwrap();
-        let error = import_edges_with_batch_size(&store, &input, 2).unwrap_err();
+        let error = import_edges_with_batch_size::<false>(&store, &input, 2, None).unwrap_err();
         assert!(error.to_string().contains("missing edge destination"));
     }
 }
