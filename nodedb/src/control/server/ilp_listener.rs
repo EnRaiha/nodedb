@@ -31,7 +31,7 @@ use crate::control::server::shared::{ConnectionFutureOutcome, isolate_connection
 use crate::control::state::SharedState;
 use crate::types::TenantId;
 
-#[path = "ilp_batch.rs"]
+#[path = "ilp_batch/mod.rs"]
 mod ilp_batch;
 #[path = "ilp_drop.rs"]
 mod ilp_drop;

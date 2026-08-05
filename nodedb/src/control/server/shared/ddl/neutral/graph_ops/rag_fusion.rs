@@ -122,15 +122,19 @@ pub async fn rag_fusion(
 
     // Only reached through `shared::ddl::dispatch`, which native/pgwire/HTTP
     // each call after their own single per-request admission gate.
-    let payload = user_dispatch::dispatch_for_identity(
+    let payload = user_dispatch::dispatch_for_identity(user_dispatch::DispatchRequest {
         state,
         identity,
         database_id,
-        &collection,
+        collection: &collection,
         plan,
-        Duration::from_secs(state.tuning.network.default_deadline_secs),
-        user_dispatch::RequestAdmission::AlreadyAdmitted,
-    )
+        timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+        admission: user_dispatch::RequestAdmission::AlreadyAdmitted,
+        // `AlreadyAdmitted` never reaches the blacklist check this door
+        // performs, and this handler has no session/peer info — see
+        // `DispatchRequest::peer_addr`.
+        peer_addr: "",
+    })
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;
 

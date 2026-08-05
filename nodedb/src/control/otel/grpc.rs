@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
@@ -45,13 +45,17 @@ pub async fn run(listen: SocketAddr, shared: Arc<SharedState>) -> std::io::Resul
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     info!(addr = %listen, "OTLP/gRPC receiver started");
-    axum::serve(listener, router)
-        .await
-        .map_err(std::io::Error::other)
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(std::io::Error::other)
 }
 
 async fn grpc_metrics(
     State(shared): State<Arc<SharedState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -63,7 +67,7 @@ async fn grpc_metrics(
     let Ok(req) = proto::ExportMetricsServiceRequest::decode(&payload[..]) else {
         return grpc_error(StatusCode::BAD_REQUEST, "invalid protobuf");
     };
-    match ingest_metrics(&shared, &identity, &req).await {
+    match ingest_metrics(&shared, &identity, &peer.to_string(), &req).await {
         Ok(_) => grpc_response(&proto::ExportMetricsServiceResponse {}),
         Err(error) => grpc_error(StatusCode::FORBIDDEN, &error.to_string()),
     }
@@ -71,6 +75,7 @@ async fn grpc_metrics(
 
 async fn grpc_traces(
     State(shared): State<Arc<SharedState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -82,7 +87,7 @@ async fn grpc_traces(
     let Ok(req) = proto::ExportTraceServiceRequest::decode(&payload[..]) else {
         return grpc_error(StatusCode::BAD_REQUEST, "invalid protobuf");
     };
-    match ingest_traces(&shared, &identity, &req).await {
+    match ingest_traces(&shared, &identity, &peer.to_string(), &req).await {
         Ok(_) => grpc_response(&proto::ExportTraceServiceResponse {}),
         Err(error) => grpc_error(StatusCode::FORBIDDEN, &error.to_string()),
     }
@@ -90,6 +95,7 @@ async fn grpc_traces(
 
 async fn grpc_logs(
     State(shared): State<Arc<SharedState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -101,7 +107,7 @@ async fn grpc_logs(
     let Ok(req) = proto::ExportLogsServiceRequest::decode(&payload[..]) else {
         return grpc_error(StatusCode::BAD_REQUEST, "invalid protobuf");
     };
-    match ingest_logs(&shared, &identity, &req).await {
+    match ingest_logs(&shared, &identity, &peer.to_string(), &req).await {
         Ok(_) => grpc_response(&proto::ExportLogsServiceResponse {}),
         Err(error) => grpc_error(StatusCode::FORBIDDEN, &error.to_string()),
     }

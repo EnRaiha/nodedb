@@ -33,19 +33,28 @@ pub(in crate::control::server::sync) async fn handle_shape_subscribe_async(
     let tenant_id = identity.tenant_id;
     let database_id = session.database_id();
 
-    // Blacklist only: this door carries an `AuthenticatedIdentity` but no
-    // `AuthContext`/`RequestAuthScope`, so the full request-admission gate
-    // (account status + rate limit) does not apply — shape subscription is
-    // not the per-query traffic the rate-limiter's cost table models.
-    // Blacklist + IP + account/org status still apply. Internal-service
-    // identities (replay, scheduler-driven resync) must never be blocked.
-    if !identity.is_internal_service()
-        && let Err(e) = crate::control::server::session_auth::check_blacklist(shared, identity, "")
-    {
+    // Blacklist + account status, no rate limit: shape subscription is not
+    // the per-query traffic the rate-limiter's cost table models, so
+    // charging it against a query rate limit would throttle legitimate
+    // offline-first sync traffic. A blacklisted or suspended/banned account
+    // must not be able to keep subscribing, though —
+    // `check_blacklist_and_status` runs that half of
+    // `check_request_admission`'s gate (plus the internal-service exemption
+    // every other transport gets) using the session's real remote address.
+    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+        identity,
+        &shared.scope_grants,
+        database_id,
+    );
+    if let Err(e) = crate::control::server::session_auth::check_blacklist_and_status(
+        shared,
+        &scope,
+        &session.device_metadata.remote_addr,
+    ) {
         warn!(
             tenant_id = tenant_id.as_u64(),
             error = %e,
-            "sync: shape subscribe rejected by blacklist"
+            "sync: shape subscribe rejected by blacklist or account status"
         );
         return None;
     }
@@ -70,6 +79,7 @@ pub(in crate::control::server::sync) async fn handle_shape_subscribe_async(
         identity,
         tenant_id,
         database_id,
+        peer_addr: &session.device_metadata.remote_addr,
     })
     .await?;
 
@@ -161,15 +171,22 @@ pub(in crate::control::server::sync) async fn handle_resync_request_async(
     let tenant_id = identity.tenant_id;
     let database_id = session.database_id();
 
-    // See `handle_shape_subscribe_async` above: blacklist only, no rate
-    // limit, with the same internal-service exemption.
-    if !identity.is_internal_service()
-        && let Err(e) = crate::control::server::session_auth::check_blacklist(shared, identity, "")
-    {
+    // See `handle_shape_subscribe_async` above: blacklist + account status,
+    // no rate limit, with the same internal-service exemption.
+    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+        identity,
+        &shared.scope_grants,
+        database_id,
+    );
+    if let Err(e) = crate::control::server::session_auth::check_blacklist_and_status(
+        shared,
+        &scope,
+        &session.device_metadata.remote_addr,
+    ) {
         warn!(
             tenant_id = tenant_id.as_u64(),
             error = %e,
-            "sync: resync request rejected by blacklist"
+            "sync: resync request rejected by blacklist or account status"
         );
         return None;
     }
@@ -192,6 +209,7 @@ pub(in crate::control::server::sync) async fn handle_resync_request_async(
         identity,
         tenant_id,
         database_id,
+        peer_addr: &session.device_metadata.remote_addr,
     })
     .await?;
 

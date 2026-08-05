@@ -33,6 +33,11 @@ pub(super) struct MessageContext<'a> {
     pub(super) database_id: DatabaseId,
     pub(super) trace_id: TraceId,
     pub(super) live_tx: &'a tokio::sync::mpsc::Sender<String>,
+    /// Real client socket address (`ip:port`), as extracted from the axum
+    /// `ConnectInfo<SocketAddr>` at upgrade time. Threaded through to
+    /// `execute_sql`'s admission gate so IP/CIDR blacklist checks apply to
+    /// this transport the same as pgwire/HTTP/native.
+    pub(super) peer_addr: &'a str,
 }
 
 struct ResumeContext<'a> {
@@ -57,6 +62,7 @@ pub(super) async fn process_message(
         database_id,
         trace_id,
         live_tx,
+        peer_addr,
     } = context;
     let req: serde_json::Value = match crate::util::bounded_json::from_str(text) {
         Ok(value) => value,
@@ -101,11 +107,20 @@ pub(super) async fn process_message(
             if sql.is_empty() {
                 return (error_response(id, "missing params.sql"), false);
             }
-            let response =
-                match execute_sql(&shared, query_ctx, identity, database_id, sql, trace_id).await {
-                    Ok(result) => serde_json::json!({"id": id, "result": result}).to_string(),
-                    Err(error) => ws_error_from_gateway(&id, &error),
-                };
+            let response = match execute_sql(
+                &shared,
+                query_ctx,
+                identity,
+                database_id,
+                sql,
+                trace_id,
+                peer_addr,
+            )
+            .await
+            {
+                Ok(result) => serde_json::json!({"id": id, "result": result}).to_string(),
+                Err(error) => ws_error_from_gateway(&id, &error),
+            };
             (response, false)
         }
         "live" => {

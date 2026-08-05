@@ -123,7 +123,12 @@ impl SyncSession {
                 .unwrap_or(0);
             self.device_metadata = DeviceMetadata {
                 client_version: msg.client_version.clone(),
-                remote_addr: String::new(),
+                // Preserve the accept-time TCP peer address set once in
+                // `handle_sync_session` before this handshake frame arrives —
+                // overwriting it with an empty string here silently defeats
+                // the IP half of `check_blacklist_and_status` for every delta
+                // this session pushes after a successful handshake.
+                remote_addr: std::mem::take(&mut self.device_metadata.remote_addr),
                 peer_id: 0,
             };
 
@@ -185,7 +190,9 @@ impl SyncSession {
                     .unwrap_or(0);
                 self.device_metadata = DeviceMetadata {
                     client_version: msg.client_version.clone(),
-                    remote_addr: String::new(),
+                    // See the trust-mode branch above: preserve the
+                    // accept-time TCP peer address rather than wiping it.
+                    remote_addr: std::mem::take(&mut self.device_metadata.remote_addr),
                     peer_id: 0,
                 };
 
@@ -290,7 +297,17 @@ impl SyncSession {
         self.producer_id = 0;
         self.accepted_epoch = 0;
         self.delta_signing_key = None;
-        self.device_metadata = DeviceMetadata::default();
+        // The peer address is a property of the accepted TCP connection, not
+        // of the authentication binding: it is stamped once before any frame
+        // is read and is the same address whether this handshake succeeds or
+        // fails. Clearing it here would leave the IP half of
+        // `check_blacklist_and_status` inert for the rest of the connection,
+        // so it survives alongside the other connection-lifetime state above.
+        // Everything genuinely derived from the handshake is reset.
+        self.device_metadata = DeviceMetadata {
+            remote_addr: std::mem::take(&mut self.device_metadata.remote_addr),
+            ..DeviceMetadata::default()
+        };
         self.tracked_collections.clear();
         self.announced_collections.clear();
     }
@@ -569,6 +586,31 @@ mod tests {
         assert!(identity.is_superuser);
     }
 
+    /// The accept-time TCP peer address (`handle_sync_session` sets
+    /// `session.device_metadata.remote_addr` once, before any frame is
+    /// processed) must survive a successful handshake. Without this, the IP
+    /// half of `check_blacklist_and_status` goes silently inert for every
+    /// delta a session pushes after authenticating.
+    #[tokio::test]
+    async fn successful_handshake_preserves_accept_time_remote_addr() {
+        let (state, _dir) = trust_state();
+        let mut session = SyncSession::new("test-session".into());
+        session.device_metadata.remote_addr = "203.0.113.9:4433".into();
+        let validator = JwtValidator::new(JwtConfig::default());
+        let msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
+
+        let frame = session
+            .handle_handshake(&msg, &validator, HashMap::new(), Some(&state))
+            .expect("handshake response");
+        let ack: HandshakeAckMsg = frame.decode_body().expect("decode handshake ack");
+
+        assert!(ack.success, "configured trust handshake should succeed");
+        assert_eq!(
+            session.device_metadata.remote_addr, "203.0.113.9:4433",
+            "a successful handshake must not wipe the real accept-time peer address"
+        );
+    }
+
     #[test]
     fn empty_token_without_configured_identity_fails_closed() {
         let mut session = SyncSession::new("test-session".into());
@@ -738,8 +780,11 @@ mod tests {
         assert_eq!(session.accepted_epoch, 0);
         assert!(session.delta_signing_key.is_none());
         assert!(session.device_metadata.client_version.is_empty());
-        assert!(session.device_metadata.remote_addr.is_empty());
         assert_eq!(session.device_metadata.peer_id, 0);
+        // The connection's peer address is not handshake binding state and
+        // deliberately survives, so the IP blacklist check keeps working on
+        // the rest of the connection.
+        assert_eq!(session.device_metadata.remote_addr, "127.0.0.1:1234");
         assert!(session.tracked_collections.is_empty());
         assert!(session.announced_collections.is_empty());
 
@@ -800,6 +845,8 @@ mod tests {
 
         let validator = JwtValidator::new(JwtConfig::default());
         let mut high_epoch_session = SyncSession::new("high-epoch-session".into());
+        // Stamped once at accept time, as `handle_sync_session` does.
+        high_epoch_session.device_metadata.remote_addr = "203.0.113.12:6666".into();
         let mut high_epoch_msg = make_handshake(crate::version::WIRE_FORMAT_VERSION);
         high_epoch_msg.lite_id = "fenced-lite-id".into();
         high_epoch_msg.epoch = 9;
@@ -851,8 +898,12 @@ mod tests {
         assert_eq!(high_epoch_session.accepted_epoch, 0);
         assert!(high_epoch_session.delta_signing_key.is_none());
         assert!(high_epoch_session.device_metadata.client_version.is_empty());
-        assert!(high_epoch_session.device_metadata.remote_addr.is_empty());
         assert_eq!(high_epoch_session.device_metadata.peer_id, 0);
+        // Connection-level, not binding-level: survives a rejected handshake.
+        assert_eq!(
+            high_epoch_session.device_metadata.remote_addr,
+            "203.0.113.12:6666"
+        );
         assert!(high_epoch_session.tracked_collections.is_empty());
         assert!(high_epoch_session.announced_collections.is_empty());
 

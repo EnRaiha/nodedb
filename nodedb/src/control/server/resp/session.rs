@@ -21,6 +21,13 @@ pub struct RespSession {
 
     /// Identity established by RESP AUTH. Data operations fail closed until set.
     pub identity: Option<AuthenticatedIdentity>,
+
+    /// Remote peer address of the TCP connection this session was accepted
+    /// on, formatted as `SocketAddr::to_string()` (e.g. `"127.0.0.1:54321"`)
+    /// to match the shape native/pgwire/HTTP pass. Set once at connection
+    /// accept in `listener::handle_connection`; used for IP-blacklist checks
+    /// in `check_request_admission`.
+    pub peer_addr: String,
 }
 
 impl Default for RespSession {
@@ -29,6 +36,7 @@ impl Default for RespSession {
             collection: "default".into(),
             tenant_id: TenantId::new(1),
             identity: None,
+            peer_addr: String::new(),
         }
     }
 }

@@ -291,10 +291,13 @@ async fn handle_crdt(
             shared,
             delta_msg,
             response,
-            session.identity.as_ref(),
-            session.delta_signing_key.as_ref(),
-            session.producer_id,
-            session.accepted_epoch,
+            crate::control::server::sync::async_dispatch::DeltaSessionContext {
+                identity: session.identity.as_ref(),
+                signing_key: session.delta_signing_key.as_ref(),
+                producer_id: session.producer_id,
+                epoch: session.accepted_epoch,
+                peer_addr: &session.device_metadata.remote_addr,
+            },
         )
         .await
     } else {

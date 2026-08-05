@@ -19,12 +19,13 @@
 //! {"id": 2, "result": "pong"}
 //! ```
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::task::JoinHandle;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures::{SinkExt, StreamExt};
@@ -47,11 +48,13 @@ use super::process_message::{MessageContext, process_message};
 /// "reject the first message" approach still pins a tenant inside the handler.
 pub async fn ws_handler(
     identity: ResolvedIdentity,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let identity = identity.0;
+    let peer_addr = peer.to_string();
     let database_id = match super::super::query::resolve_database_id(
         &headers,
         &super::super::query::DatabaseQueryParam::default(),
@@ -75,6 +78,7 @@ pub async fn ws_handler(
             identity,
             database_id,
             trace_id,
+            peer_addr,
         ))
         .await
         {
@@ -133,6 +137,7 @@ async fn handle_ws_connection(
     identity: crate::control::security::identity::AuthenticatedIdentity,
     database_id: DatabaseId,
     trace_id: nodedb_types::TraceId,
+    peer_addr: String,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let shared = Arc::clone(&state.shared);
@@ -173,6 +178,7 @@ async fn handle_ws_connection(
                     database_id,
                     trace_id,
                     live_tx: &live_tx,
+                    peer_addr: &peer_addr,
                 };
                 let (response, authenticated) = process_message(
                     context,

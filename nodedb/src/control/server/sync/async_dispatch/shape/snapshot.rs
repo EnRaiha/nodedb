@@ -25,6 +25,11 @@ pub(super) struct SnapshotRequest<'a> {
     pub identity: &'a AuthenticatedIdentity,
     pub tenant_id: TenantId,
     pub database_id: DatabaseId,
+    /// The sync session's real remote address (`session.device_metadata.remote_addr`),
+    /// threaded down to the one `RequestAdmission::NotYetAdmitted`
+    /// `dispatch_for_identity` call this snapshot path makes, for the
+    /// IP-blacklist half of `check_request_admission`.
+    pub peer_addr: &'a str,
 }
 
 /// Produce the initial snapshot payload for a shape definition.
@@ -46,6 +51,7 @@ pub(super) async fn take_shape_snapshot(req: SnapshotRequest<'_>) -> Option<Shap
         identity,
         tenant_id,
         database_id,
+        peer_addr,
     } = req;
 
     let _request = shared.tenant_request_guard(tenant_id);
@@ -61,6 +67,7 @@ pub(super) async fn take_shape_snapshot(req: SnapshotRequest<'_>) -> Option<Shap
                 predicate,
                 identity,
                 database_id,
+                peer_addr,
             })
             .await
         }
@@ -109,6 +116,7 @@ struct DocumentSnapshot<'a> {
     predicate: &'a [u8],
     identity: &'a AuthenticatedIdentity,
     database_id: DatabaseId,
+    peer_addr: &'a str,
 }
 
 /// Scan a document collection for the subscription's initial dataset.
@@ -139,18 +147,21 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
     //
     // Unlike the DDL/DSL passthrough handlers, this call is NOT reached
     // through `shared::ddl::dispatch` — `handle_shape_subscribe_async`
-    // deliberately runs only blacklist + quota before this point (shape
-    // subscription is not the per-query traffic the rate-limiter's cost
-    // table models), so this is the one place this request is ever admitted.
-    // `NotYetAdmitted` keeps it that way.
+    // deliberately runs only blacklist + account status + quota before this
+    // point (shape subscription is not the per-query traffic the
+    // rate-limiter's cost table models), so this is the one place this
+    // request is ever admitted. `NotYetAdmitted` keeps it that way.
     match dispatch_for_identity(
-        req.shared,
-        req.identity,
-        req.database_id,
-        req.collection,
-        plan,
-        Duration::from_secs(10),
-        crate::control::server::shared::ddl::user_dispatch::RequestAdmission::NotYetAdmitted,
+        crate::control::server::shared::ddl::user_dispatch::DispatchRequest {
+            state: req.shared,
+            identity: req.identity,
+            database_id: req.database_id,
+            collection: req.collection,
+            plan,
+            timeout: Duration::from_secs(10),
+            admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::NotYetAdmitted,
+            peer_addr: req.peer_addr,
+        },
     )
     .await
     {

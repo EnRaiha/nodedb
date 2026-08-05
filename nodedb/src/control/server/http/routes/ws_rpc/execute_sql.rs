@@ -27,6 +27,7 @@ pub async fn execute_sql(
     database_id: DatabaseId,
     sql: &str,
     trace_id: TraceId,
+    peer_addr: &str,
 ) -> crate::Result<serde_json::Value> {
     let tenant_id = identity.tenant_id;
     let emitter = ArcAuditEmitter(Arc::clone(&shared.audit));
@@ -47,7 +48,9 @@ pub async fn execute_sql(
     // shed before it is spent. WebSocket RPC has no HTTP response headers to
     // attach `X-RateLimit-*` to, so the rate-limit outcome is discarded on
     // success; a denial still fails the request closed via `?`.
-    crate::control::server::session_auth::check_request_admission(shared, &scope, "ws", "sql")?;
+    crate::control::server::session_auth::check_request_admission(
+        shared, &scope, peer_addr, "sql",
+    )?;
 
     let (clean_sql, scope) =
         crate::control::server::session_auth::apply_per_query_on_deny(sql, scope);
@@ -224,5 +227,115 @@ pub async fn execute_sql(
             .next()
             .unwrap_or(serde_json::Value::Null)),
         _ => Ok(serde_json::Value::Array(results)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::planner::context::QueryContext as PlannerQueryContext;
+    use crate::control::security::identity::{
+        AuthMethod, AuthenticatedIdentity, DatabaseSet, Role,
+    };
+    use crate::types::TenantId;
+    use crate::wal::WalManager;
+
+    use super::*;
+
+    /// Returns the state plus the backing `TempDir` guard — the caller must
+    /// keep the guard alive for as long as `state` is in use, mirroring
+    /// `session_auth::admission`'s test harness.
+    async fn test_state() -> (Arc<SharedState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("construct shared state");
+        (state, dir)
+    }
+
+    fn regular_identity(user_id: u64) -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_regular(
+            user_id,
+            "regular-user",
+            TenantId::new(1),
+            AuthMethod::ScramSha256,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::Some(smallvec::smallvec![DatabaseId::DEFAULT]),
+        )
+    }
+
+    /// Guards against the `peer_addr` thread regressing back to a hardcoded
+    /// placeholder (e.g. `"ws"`): a real client IP that has been
+    /// `BLACKLIST IP`'d must be rejected by `execute_sql`'s admission gate.
+    /// With a non-IP placeholder standing in for the peer address,
+    /// `normalize_peer_ip` can't parse it, `check_ip` silently matches
+    /// nothing, and this request would incorrectly succeed.
+    #[tokio::test]
+    async fn blacklisted_peer_ip_is_rejected() {
+        let (state, _dir) = test_state().await;
+        let identity = regular_identity(9101);
+        state
+            .blacklist
+            .blacklist_ip("203.0.113.0/24", "test ban", "admin", 0)
+            .expect("blacklist CIDR range");
+
+        let query_ctx = PlannerQueryContext::new();
+        let trace_id = TraceId::generate();
+
+        let result = execute_sql(
+            &state,
+            &query_ctx,
+            &identity,
+            DatabaseId::DEFAULT,
+            "SELECT 1",
+            trace_id,
+            "203.0.113.42:54321",
+        )
+        .await;
+
+        let error = result.expect_err("blacklisted peer IP must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("IP blacklisted"),
+            "expected an IP-blacklist rejection, got: {message}"
+        );
+    }
+
+    /// A peer address outside the blacklisted range must still be admitted
+    /// through the blacklist gate (it can fail later in planning/dispatch
+    /// for unrelated reasons, but not on the IP check).
+    #[tokio::test]
+    async fn non_blacklisted_peer_ip_passes_blacklist_gate() {
+        let (state, _dir) = test_state().await;
+        let identity = regular_identity(9102);
+        state
+            .blacklist
+            .blacklist_ip("203.0.113.0/24", "test ban", "admin", 0)
+            .expect("blacklist CIDR range");
+
+        let query_ctx = PlannerQueryContext::new();
+        let trace_id = TraceId::generate();
+
+        let result = execute_sql(
+            &state,
+            &query_ctx,
+            &identity,
+            DatabaseId::DEFAULT,
+            "SELECT 1",
+            trace_id,
+            "198.51.100.7:54321",
+        )
+        .await;
+
+        if let Err(error) = result {
+            let message = error.to_string();
+            assert!(
+                !message.contains("IP blacklisted"),
+                "peer outside the blacklisted range must not be rejected by the IP check, got: {message}"
+            );
+        }
     }
 }

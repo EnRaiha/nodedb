@@ -8,7 +8,7 @@ mod outcome;
 mod peer_identity;
 mod signature;
 
-pub(crate) use apply::{DeltaDispatchOutcome, apply_delta_and_finalize};
+pub(crate) use apply::{DeltaDispatchOutcome, DeltaSessionContext, apply_delta_and_finalize};
 pub(in crate::control::server::sync) use authorize::{
     authorize_delta_write, permission_denied_delta_reject,
 };

@@ -38,13 +38,19 @@ pub async fn query_last_values(
     // Only reached through `shared::ddl::dispatch`, which native/pgwire/HTTP
     // each call after their own single per-request admission gate.
     let payload = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
-        state,
-        identity,
-        database_id,
-        collection,
-        plan,
-        Duration::from_secs(5),
-        crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+        crate::control::server::shared::ddl::user_dispatch::DispatchRequest {
+            state,
+            identity,
+            database_id,
+            collection,
+            plan,
+            timeout: Duration::from_secs(5),
+            admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+            // `AlreadyAdmitted` never reaches the blacklist check this door
+            // performs, and this handler has no session/peer info — see
+            // `DispatchRequest::peer_addr`.
+            peer_addr: "",
+        },
     )
     .await
     .map_err(|e| ddl_err("XX000", format!("dispatch failed: {e}")))?;
@@ -97,13 +103,19 @@ pub async fn query_last_value(
     // Only reached through `shared::ddl::dispatch`, which native/pgwire/HTTP
     // each call after their own single per-request admission gate.
     let payload = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
-        state,
-        identity,
-        database_id,
-        collection,
-        plan,
-        Duration::from_secs(5),
-        crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+        crate::control::server::shared::ddl::user_dispatch::DispatchRequest {
+            state,
+            identity,
+            database_id,
+            collection,
+            plan,
+            timeout: Duration::from_secs(5),
+            admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+            // `AlreadyAdmitted` never reaches the blacklist check this door
+            // performs, and this handler has no session/peer info — see
+            // `DispatchRequest::peer_addr`.
+            peer_addr: "",
+        },
     )
     .await
     .map_err(|e| ddl_err("XX000", format!("dispatch failed: {e}")))?;

@@ -34,6 +34,7 @@ pub(crate) struct AuthenticatedIlpContext {
     database_id: DatabaseId,
     format: codec::FrameFormat,
     auth_seq: u64,
+    peer_addr: String,
 }
 
 impl AuthenticatedIlpContext {
@@ -43,6 +44,13 @@ impl AuthenticatedIlpContext {
 
     pub(crate) fn database_id(&self) -> DatabaseId {
         self.database_id
+    }
+
+    /// Remote peer address supplied to `authenticate_ilp_connection`, stored
+    /// so later per-batch admission checks (`check_request_admission`) have
+    /// a real address for the IP-blacklist half of the check.
+    pub(crate) fn peer_addr(&self) -> &str {
+        &self.peer_addr
     }
 }
 
@@ -184,6 +192,7 @@ where
         database_id,
         format,
         auth_seq: seq,
+        peer_addr: peer_addr.to_string(),
     })
 }
 

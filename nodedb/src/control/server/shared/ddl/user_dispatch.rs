@@ -33,7 +33,7 @@ use super::sync_dispatch::dispatch_authorized;
 /// directly, bypassing `shared::ddl::dispatch` entirely — the CDC-sync
 /// shape-subscription snapshot (`sync::async_dispatch::shape::snapshot`) —
 /// has no earlier admission call on its path (shape subscribe deliberately
-/// runs only blacklist + quota, not the full gate) and must pass
+/// runs only blacklist + account status + quota, not the full gate) and must pass
 /// [`RequestAdmission::NotYetAdmitted`] so this remains the one place that
 /// request is ever admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,21 +46,52 @@ pub(crate) enum RequestAdmission {
     NotYetAdmitted,
 }
 
+/// Parameters for [`dispatch_for_identity`].
+///
+/// Grouped into a struct rather than passed positionally because the
+/// argument count (state, identity, database, collection, plan, timeout,
+/// admission, peer address) exceeds what a positional call stays readable
+/// at.
+pub(crate) struct DispatchRequest<'a> {
+    pub state: &'a SharedState,
+    pub identity: &'a AuthenticatedIdentity,
+    pub database_id: DatabaseId,
+    pub collection: &'a str,
+    pub plan: PhysicalPlan,
+    pub timeout: Duration,
+    pub admission: RequestAdmission,
+    /// Remote peer address for the IP-blacklist half of
+    /// [`check_request_admission`](crate::control::server::session_auth::check_request_admission).
+    /// Only read when `admission` is [`RequestAdmission::NotYetAdmitted`] —
+    /// an `AlreadyAdmitted` caller's own transport already ran the full gate,
+    /// so this door never re-checks it and the value is provably unread.
+    pub peer_addr: &'a str,
+}
+
 /// Authorize `plan` for `identity`, apply row-level security, and dispatch it.
 ///
 /// Returns the Data-Plane payload. Authorization failures and policy refusals
 /// surface as typed errors before anything reaches storage.
-pub(crate) async fn dispatch_for_identity(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    database_id: DatabaseId,
-    collection: &str,
-    plan: PhysicalPlan,
-    timeout: Duration,
-    admission: RequestAdmission,
-) -> crate::Result<Vec<u8>> {
-    let authorized =
-        authorize_for_identity(state, identity, database_id, collection, plan, admission)?;
+pub(crate) async fn dispatch_for_identity(req: DispatchRequest<'_>) -> crate::Result<Vec<u8>> {
+    let DispatchRequest {
+        state,
+        identity,
+        database_id,
+        collection,
+        plan,
+        timeout,
+        admission,
+        peer_addr,
+    } = req;
+    let authorized = authorize_for_identity(
+        state,
+        identity,
+        database_id,
+        collection,
+        plan,
+        admission,
+        peer_addr,
+    )?;
     dispatch_authorized(state, authorized, collection, timeout).await
 }
 
@@ -85,23 +116,24 @@ fn authorize_for_identity(
     collection: &str,
     plan: PhysicalPlan,
     admission: RequestAdmission,
+    peer_addr: &str,
 ) -> crate::Result<AuthorizedTask> {
     let mut plan = plan;
     let scope = resolve_dispatch_scope(state, identity, database_id);
 
     // Request-admission gate: internal-service exemption, blacklist, account
     // status, then rate limit — before RLS injection and task authorization,
-    // so load is shed before it is spent. This door has no network peer
-    // address, so the peer address used for blacklist/audit purposes is the
-    // empty string; the IP blacklist check is a no-op in that case while the
-    // user/org/rate-limit checks still apply in full. Skipped when the
-    // caller's own transport entry already ran this gate for the request —
-    // see [`RequestAdmission`] for why both cases exist.
+    // so load is shed before it is spent. Skipped when the caller's own
+    // transport entry already ran this gate for the request — see
+    // [`RequestAdmission`] for why both cases exist. `peer_addr` is the
+    // caller-supplied real remote address for the one `NotYetAdmitted`
+    // caller (the CDC-sync shape-snapshot path); `AlreadyAdmitted` callers
+    // pass an empty string because this branch never runs for them.
     if admission == RequestAdmission::NotYetAdmitted {
         crate::control::server::session_auth::check_request_admission(
             state,
             &scope,
-            "",
+            peer_addr,
             operation_for_plan(&plan),
         )?;
     }
@@ -282,6 +314,7 @@ mod tests {
             "widgets",
             plan,
             RequestAdmission::NotYetAdmitted,
+            "127.0.0.1:9",
         )
         .expect("authorize task for identity");
 
@@ -333,6 +366,7 @@ mod tests {
             "widgets",
             trivial_kv_get_plan(),
             RequestAdmission::NotYetAdmitted,
+            "127.0.0.1:9",
         );
         assert!(
             denied.is_err(),
@@ -349,6 +383,7 @@ mod tests {
             "widgets",
             trivial_kv_get_plan(),
             RequestAdmission::AlreadyAdmitted,
+            "",
         );
         assert!(
             allowed.is_ok(),

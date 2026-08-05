@@ -45,6 +45,20 @@ impl DeltaDispatchOutcome {
     }
 }
 
+/// The handshake-bound session state a delta apply is evaluated against.
+///
+/// These travel together because they all describe the same authenticated sync
+/// session: the identity the delta is authorized as, the key its ops are signed
+/// with, its producer/epoch position, and the peer address the blacklist is
+/// checked against.
+pub(crate) struct DeltaSessionContext<'a> {
+    pub(crate) identity: Option<&'a AuthenticatedIdentity>,
+    pub(crate) signing_key: Option<&'a [u8; 32]>,
+    pub(crate) producer_id: u64,
+    pub(crate) epoch: u64,
+    pub(crate) peer_addr: &'a str,
+}
+
 /// Apply a CRDT delta on the Data Plane, converting the outcome into the final
 /// client frame.
 ///
@@ -57,11 +71,15 @@ pub(crate) async fn apply_delta_and_finalize(
     shared: &SharedState,
     delta_msg: &DeltaPushMsg,
     ack_frame: SyncFrame,
-    identity: Option<&AuthenticatedIdentity>,
-    session_signing_key: Option<&[u8; 32]>,
-    session_producer_id: u64,
-    session_epoch: u64,
+    session: DeltaSessionContext<'_>,
 ) -> DeltaDispatchOutcome {
+    let DeltaSessionContext {
+        identity,
+        signing_key: session_signing_key,
+        producer_id: session_producer_id,
+        epoch: session_epoch,
+        peer_addr,
+    } = session;
     use crate::bridge::envelope::PhysicalPlan;
     use nodedb_physical::physical_plan::CrdtOp;
 
@@ -82,16 +100,28 @@ pub(crate) async fn apply_delta_and_finalize(
         }
     };
 
-    // Blacklist only: this door carries an `AuthenticatedIdentity` but no
-    // `AuthContext`/`RequestAuthScope`, so the full request-admission gate
-    // (account status + rate limit) does not apply — CRDT delta sync is not
-    // the per-query traffic the rate-limiter's cost table models. Blacklist
-    // + IP + account/org status still apply. Internal-service identities
-    // (CRDT sync replay) must never be blocked.
-    if !identity.is_internal_service()
-        && let Err(e) = crate::control::server::session_auth::check_blacklist(shared, identity, "")
+    // Same binding the session's reads use: the principal's database, not the
+    // built-in default. A delta must land in the database its subscriber will
+    // read it back from.
+    let database_id = identity.default_database.unwrap_or(DatabaseId::DEFAULT);
+
+    // Blacklist + account status, no rate limit: CRDT delta sync is not the
+    // per-query traffic the rate-limiter's cost table models, so charging it
+    // against a query rate limit would throttle legitimate offline-first
+    // sync traffic. A blacklisted or suspended/banned account must not be
+    // able to keep pushing deltas, though — `check_blacklist_and_status`
+    // runs that half of `check_request_admission`'s gate (plus the
+    // internal-service exemption every other transport gets) using the sync
+    // session's real remote address.
+    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+        identity,
+        &shared.scope_grants,
+        database_id,
+    );
+    if let Err(e) =
+        crate::control::server::session_auth::check_blacklist_and_status(shared, &scope, peer_addr)
     {
-        warn!(error = %e, "sync: delta rejected by blacklist");
+        warn!(error = %e, "sync: delta rejected by blacklist or account status");
         return terminal_reject(
             delta_msg,
             "sender is blocked",
@@ -99,10 +129,6 @@ pub(crate) async fn apply_delta_and_finalize(
         );
     }
 
-    // Same binding the session's reads use: the principal's database, not the
-    // built-in default. A delta must land in the database its subscriber will
-    // read it back from.
-    let database_id = identity.default_database.unwrap_or(DatabaseId::DEFAULT);
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&shared.audit));
     let policy = crate::control::crdt_post_image_policy::ExternalCrdtPostImagePolicy::from_identity(
         tenant_id,

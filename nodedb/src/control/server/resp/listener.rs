@@ -177,7 +177,10 @@ async fn handle_connection(
 ) -> crate::Result<()> {
     debug!(%peer, "RESP connection accepted");
 
-    let mut session = RespSession::default();
+    let mut session = RespSession {
+        peer_addr: peer.to_string(),
+        ..RespSession::default()
+    };
     let mut parser = RespParser::new();
     let mut read_buf = [0u8; 8192];
     let mut write_buf = Vec::with_capacity(4096);

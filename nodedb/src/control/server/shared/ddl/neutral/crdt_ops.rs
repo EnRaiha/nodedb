@@ -80,13 +80,20 @@ pub async fn crdt_state(
     // which native/pgwire/HTTP each call after their own single per-request
     // admission gate — so this request was already admitted once.
     let result = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
-        state,
-        identity,
-        database_id,
-        collection,
-        plan,
-        Duration::from_secs(state.tuning.network.default_deadline_secs),
-        crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+        crate::control::server::shared::ddl::user_dispatch::DispatchRequest {
+            state,
+            identity,
+            database_id,
+            collection,
+            plan,
+            timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+            admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+            // `AlreadyAdmitted` never reaches the blacklist check this door
+            // performs — see `DispatchRequest::peer_addr` — so this handler
+            // (no session or peer info reaches it) has nothing honest to
+            // supply and the empty string is provably unread.
+            peer_addr: "",
+        },
     )
     .await
     .map_err(|e| DdlError {

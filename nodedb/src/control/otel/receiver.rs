@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
@@ -59,9 +59,12 @@ pub async fn run(config: OtelConfig, shared: Arc<SharedState>) -> std::io::Resul
 
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     info!(addr = %config.listen, "OTLP/HTTP receiver started");
-    axum::serve(listener, router)
-        .await
-        .map_err(std::io::Error::other)
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(std::io::Error::other)
 }
 
 /// POST `/v1/metrics` — OTLP metrics receiver.
@@ -70,6 +73,7 @@ pub async fn run(config: OtelConfig, shared: Arc<SharedState>) -> std::io::Resul
 /// Maps OTLP metric types (gauge, sum, histogram) to ILP for timeseries ingest.
 pub async fn receive_metrics(
     State(state): State<Arc<SharedState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -83,6 +87,7 @@ pub async fn receive_metrics(
         Err(e) => return (StatusCode::BAD_REQUEST, format!("decode error: {e}")),
     };
 
+    let peer_addr = peer.to_string();
     let mut accepted = 0u64;
     let mut rejected = 0u64;
 
@@ -97,7 +102,7 @@ pub async fn receive_metrics(
                 }
                 let payload = lines.join("\n");
 
-                match ingest_ilp(&state, &identity, &payload).await {
+                match ingest_ilp(&state, &identity, &peer_addr, &payload).await {
                     Ok(n) => accepted += n,
                     Err(_) => rejected += lines.len() as u64,
                 }
@@ -117,6 +122,7 @@ pub async fn receive_metrics(
 /// attributes, and status. Enables distributed trace querying via SQL.
 pub async fn receive_traces(
     State(state): State<Arc<SharedState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -130,7 +136,7 @@ pub async fn receive_traces(
         Err(e) => return (StatusCode::BAD_REQUEST, format!("decode error: {e}")),
     };
 
-    match ingest_traces(&state, &identity, &req).await {
+    match ingest_traces(&state, &identity, &peer.to_string(), &req).await {
         Ok(span_count) => (StatusCode::OK, format!("{{\"spans\":{span_count}}}")),
         Err(error) => (StatusCode::FORBIDDEN, error.to_string()),
     }
@@ -141,6 +147,7 @@ pub async fn receive_traces(
 /// Stores log records as timeseries rows with severity, body, timestamp, and trace correlation.
 pub async fn receive_logs(
     State(state): State<Arc<SharedState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -154,7 +161,7 @@ pub async fn receive_logs(
         Err(e) => return (StatusCode::BAD_REQUEST, format!("decode error: {e}")),
     };
 
-    match ingest_logs(&state, &identity, &req).await {
+    match ingest_logs(&state, &identity, &peer.to_string(), &req).await {
         Ok(log_count) => (StatusCode::OK, format!("{{\"logs\":{log_count}}}")),
         Err(error) => (StatusCode::FORBIDDEN, error.to_string()),
     }
@@ -166,6 +173,7 @@ pub async fn receive_logs(
 pub async fn ingest_metrics(
     shared: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
+    peer_addr: &str,
     req: &proto::ExportMetricsServiceRequest,
 ) -> crate::Result<u64> {
     let mut lines = Vec::new();
@@ -177,13 +185,14 @@ pub async fn ingest_metrics(
             }
         }
     }
-    ingest_ilp(shared, identity, &lines.join("\n")).await
+    ingest_ilp(shared, identity, peer_addr, &lines.join("\n")).await
 }
 
 /// Ingest an OTLP traces request into the timeseries engine.
 pub async fn ingest_traces(
     shared: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
+    peer_addr: &str,
     req: &proto::ExportTraceServiceRequest,
 ) -> crate::Result<u64> {
     let mut lines = Vec::new();
@@ -195,13 +204,14 @@ pub async fn ingest_traces(
             }
         }
     }
-    ingest_ilp(shared, identity, &lines.join("\n")).await
+    ingest_ilp(shared, identity, peer_addr, &lines.join("\n")).await
 }
 
 /// Ingest an OTLP logs request into the timeseries engine.
 pub async fn ingest_logs(
     shared: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
+    peer_addr: &str,
     req: &proto::ExportLogsServiceRequest,
 ) -> crate::Result<u64> {
     let mut lines = Vec::new();
@@ -213,7 +223,7 @@ pub async fn ingest_logs(
             }
         }
     }
-    ingest_ilp(shared, identity, &lines.join("\n")).await
+    ingest_ilp(shared, identity, peer_addr, &lines.join("\n")).await
 }
 
 // ── Conversion helpers ───────────────────────────────────────────────────
@@ -399,6 +409,7 @@ pub(super) async fn authenticate_otel(
 async fn ingest_ilp(
     shared: &Arc<SharedState>,
     identity: &AuthenticatedIdentity,
+    peer_addr: &str,
     payload: &str,
 ) -> Result<u64, crate::Error> {
     if payload.is_empty() {
@@ -408,6 +419,7 @@ async fn ingest_ilp(
         shared,
         identity,
         DatabaseId::DEFAULT,
+        peer_addr,
         payload,
     )
     .await

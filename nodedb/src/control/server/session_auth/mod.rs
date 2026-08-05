@@ -18,7 +18,7 @@ pub mod guards;
 pub mod identity;
 pub mod native;
 
-pub use admission::check_request_admission;
+pub use admission::{check_blacklist_and_status, check_request_admission};
 pub use context::{
     apply_per_query_on_deny, build_auth_context, enrich_auth_context_with_scopes,
     extract_and_apply_on_deny, extract_on_deny, session_on_deny_override,

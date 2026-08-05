@@ -74,13 +74,19 @@ pub async fn crdt_merge(
     // Only reached through `shared::ddl::dispatch`, which native/pgwire/HTTP
     // each call after their own single per-request admission gate.
     let source_bytes = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
-        state,
-        identity,
-        database_id,
-        collection,
-        source_plan,
-        Duration::from_secs(state.tuning.network.default_deadline_secs),
-        crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+        crate::control::server::shared::ddl::user_dispatch::DispatchRequest {
+            state,
+            identity,
+            database_id,
+            collection,
+            plan: source_plan,
+            timeout: Duration::from_secs(state.tuning.network.default_deadline_secs),
+            admission: crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
+            // `AlreadyAdmitted` never reaches the blacklist check this door
+            // performs, and this handler has no session/peer info — see
+            // `DispatchRequest::peer_addr`.
+            peer_addr: "",
+        },
     )
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;

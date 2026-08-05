@@ -127,10 +127,14 @@ fn authorize_resp_task(
     // status, then rate limit — before RLS injection and task authorization,
     // so load is shed before it is spent. Per this function's own doc below,
     // every RESP command reaches the Data Plane through here, so this one
-    // call covers the whole protocol. RESP tracks no per-connection peer
-    // address today, so the IP-blacklist half of the check is a no-op here;
-    // the user/org/account-status/rate-limit checks still apply in full.
-    crate::control::server::session_auth::check_request_admission(state, &scope, "", operation)?;
+    // call covers the whole protocol, including the IP-blacklist half via
+    // `session.peer_addr` (set at connection accept).
+    crate::control::server::session_auth::check_request_admission(
+        state,
+        &scope,
+        &session.peer_addr,
+        operation,
+    )?;
 
     // Row-level security is injected here, before the capability is minted, for
     // the same reason the native path injects before dispatch: the plan the
@@ -270,5 +274,66 @@ mod tests {
 
         assert_eq!(scope.database_id(), DatabaseId::DEFAULT);
         assert_eq!(scope.auth().database_id, Some(DatabaseId::DEFAULT));
+    }
+
+    /// RESP threads `session.peer_addr` (set at connection accept, see
+    /// `listener::handle_connection`) into `check_request_admission`, so a
+    /// `BLACKLIST IP` entry that matches the connection's real remote
+    /// address must reject the request — this is the regression that a
+    /// hardcoded `""` peer address made silently inert.
+    #[test]
+    fn blacklisted_peer_ip_rejects_resp_dispatch() {
+        use crate::bridge::dispatch::Dispatcher;
+        use crate::wal::WalManager;
+        use nodedb_physical::physical_plan::KvOp;
+
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = std::sync::Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("construct shared state");
+        state
+            .blacklist
+            .blacklist_ip("10.0.0.0/8", "test ip ban", "admin", 0)
+            .expect("blacklist CIDR range");
+
+        let identity = AuthenticatedIdentity::new_regular(
+            1,
+            "resp-user",
+            TenantId::new(1),
+            AuthMethod::Trust,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::All,
+        );
+        let mut session = RespSession {
+            peer_addr: "10.1.2.3:54321".into(),
+            ..RespSession::default()
+        };
+        session.identity = Some(identity);
+
+        let plan = PhysicalPlan::Kv(KvOp::Get {
+            collection: session.collection.clone(),
+            key: Vec::new(),
+            rls_filters: Vec::new(),
+            surrogate_ceiling: None,
+        });
+        let vshard =
+            VShardId::from_collection_in_database(DatabaseId::DEFAULT, &session.collection);
+
+        let result = authorize_resp_task(
+            &state,
+            &session,
+            plan,
+            vshard,
+            DatabaseId::DEFAULT,
+            "kv_get",
+        );
+        assert!(
+            result.is_err(),
+            "a RESP session whose real peer address falls inside a blacklisted CIDR range \
+             must be rejected"
+        );
     }
 }

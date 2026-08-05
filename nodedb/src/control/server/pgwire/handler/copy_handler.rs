@@ -50,6 +50,52 @@ impl NodeDbPgHandler {
         session_id: SessionId,
         intent: CopyIntent,
     ) -> PgWireResult<Response> {
+        // Blacklist + account status, no rate limit: backup/restore is
+        // admin-scoped bulk data movement, not the per-query traffic the
+        // rate-limiter's cost table models, so charging it against a query
+        // rate limit would throttle a legitimate restore. A blacklisted or
+        // suspended/banned account must not be able to run backup or
+        // restore, though — `check_blacklist_and_status` runs that half of
+        // `check_request_admission`'s gate (plus the internal-service
+        // exemption every other transport gets) using this connection's
+        // real peer address.
+        let peer_addr = match session_id {
+            SessionId::Connection(connection_id) => self
+                .sessions
+                .connection_metadata(connection_id)
+                .map(|metadata| metadata.peer_addr)
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_owned(),
+                        "XX000".to_owned(),
+                        "connection session metadata is unavailable".to_owned(),
+                    )))
+                })?,
+            SessionId::LegacySocket(peer_addr) => peer_addr,
+        };
+        let database_id = identity
+            .default_database
+            .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+            identity,
+            &self.state.scope_grants,
+            database_id,
+        );
+        crate::control::server::session_auth::check_blacklist_and_status(
+            &self.state,
+            &scope,
+            &peer_addr.to_string(),
+        )
+        .map_err(|e| {
+            let (severity, code, message) =
+                crate::control::server::pgwire::types::error_to_sqlstate(&e);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            )))
+        })?;
+
         // Backup and restore both operate on a whole tenant — authorize
         // against the tenant-scoped `Backup` permission. Superuser bypasses
         // the grant check; everyone else needs `GRANT BACKUP ON TENANT`.
@@ -217,6 +263,98 @@ fn internal(e: crate::Error) -> PgWireError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::config::auth::AuthMode;
+    use crate::control::security::identity::{AuthMethod, DatabaseSet, Role};
+    use crate::wal::WalManager;
+
+    fn test_handler() -> (NodeDbPgHandler, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new(dispatcher, wal).expect("construct shared state");
+        (NodeDbPgHandler::new(state, AuthMode::Trust), dir)
+    }
+
+    fn identity(user_id: u64) -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_regular(
+            user_id,
+            "copy-user",
+            TenantId::new(1),
+            AuthMethod::Trust,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::All,
+        )
+    }
+
+    /// The regression this admission check exists to prevent: before it
+    /// existed, `intent_to_response` ran no blacklist or account-status
+    /// check at all, so a blacklisted client could still run backup/restore.
+    #[tokio::test]
+    async fn intent_to_response_rejects_blacklisted_identity() {
+        let (handler, _dir) = test_handler();
+        let identity = identity(101);
+        handler
+            .state
+            .blacklist
+            .blacklist_user(&identity.user_id.to_string(), "test ban", "admin", 0)
+            .expect("blacklist user");
+
+        let result = handler
+            .intent_to_response(
+                &identity,
+                handler.session_id,
+                CopyIntent::BackupTenant { tenant_id: 1 },
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a blacklisted identity must be rejected before backup/restore runs"
+        );
+    }
+
+    /// A suspended JIT-provisioned account must not be able to run
+    /// backup/restore, even though this door skips the rate limiter.
+    #[tokio::test]
+    async fn intent_to_response_rejects_suspended_account() {
+        let (handler, _dir) = test_handler();
+        let identity = identity(102);
+        handler
+            .state
+            .auth_users
+            .upsert(crate::control::security::jit::auth_user::AuthUserRecord {
+                id: identity.user_id.to_string(),
+                username: identity.username.clone(),
+                email: String::new(),
+                tenant_id: identity.tenant_id.as_u64(),
+                provider: "test".into(),
+                first_seen: 0,
+                last_seen: 0,
+                is_active: false,
+                status: crate::control::security::auth_context::AuthStatus::Suspended,
+                is_external: true,
+                synced_claims: std::collections::HashMap::new(),
+            })
+            .expect("register suspended auth user");
+
+        let result = handler
+            .intent_to_response(
+                &identity,
+                handler.session_id,
+                CopyIntent::BackupTenant { tenant_id: 1 },
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a suspended account must be rejected before backup/restore runs"
+        );
+    }
 
     #[test]
     fn copy_fail_cancels_only_the_exact_pending_restore() {
