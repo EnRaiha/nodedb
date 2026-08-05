@@ -9,10 +9,13 @@
 //! Layout:
 //! - [`types`] — `RedactionPolicy`, `RedactionRule`, `RedactionMode` data
 //!   shapes.
-//! - [`store`] — `RedactionStore` in-memory CRUD + apply logic.
+//! - [`store`] — `RedactionStore` in-memory CRUD.
+//! - [`apply`] — the shared rule-application logic: whole-document and
+//!   per-SELECT-row.
 //! - [`replication`] — helpers used by the `CatalogEntry` applier to sync
 //!   replicated policies into the in-memory store.
 
+pub mod apply;
 pub mod replication;
 pub mod store;
 pub mod types;

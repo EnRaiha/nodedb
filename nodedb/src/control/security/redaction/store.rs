@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use super::types::{RedactionMode, RedactionPolicy, RedactionRule, policy_key};
+use super::apply::redacted_value;
+use super::types::{RedactionPolicy, RedactionRule, policy_key};
 
 /// Redaction policy store.
 pub struct RedactionStore {
@@ -91,17 +92,7 @@ impl RedactionStore {
                     if let Some(obj) = doc.as_object_mut()
                         && obj.contains_key(&rule.field)
                     {
-                        let redacted = match &rule.mode {
-                            RedactionMode::Mask(mask) => serde_json::Value::String(mask.clone()),
-                            RedactionMode::Hash => {
-                                let hashed = obj
-                                    .get(&rule.field)
-                                    .map(hash_value)
-                                    .unwrap_or_else(|| hash_value(&serde_json::Value::Null));
-                                serde_json::Value::String(hashed)
-                            }
-                            RedactionMode::Null => serde_json::Value::Null,
-                        };
+                        let redacted = redacted_value(&rule.mode, obj.get(&rule.field));
                         obj.insert(rule.field.clone(), redacted);
                     }
                 }
@@ -157,26 +148,11 @@ impl RedactionStore {
     }
 }
 
-/// SHA-256 hash for pseudonymization.
-///
-/// Hashes the raw scalar value, not its JSON-serialized form — a string
-/// field hashes its bytes directly (not `"quoted"`), matching what an
-/// operator expects `hash(email)` to mean.
-fn hash_value(value: &serde_json::Value) -> String {
-    use sha2::{Digest, Sha256};
-
-    let digest = match value {
-        serde_json::Value::String(s) => Sha256::digest(s.as_bytes()),
-        serde_json::Value::Null => Sha256::digest(b""),
-        other => Sha256::digest(other.to_string().as_bytes()),
-    };
-    format!("hash:{digest:x}")
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
+    use super::super::types::RedactionMode;
     use super::*;
 
     fn make_policy(
