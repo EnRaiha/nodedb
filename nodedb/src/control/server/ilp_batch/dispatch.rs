@@ -14,8 +14,10 @@ use crate::control::planner::calvin::{
 };
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::ilp_auth::AuthenticatedIlpContext;
 use crate::control::server::shared::authorization::authorize_task_set;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TenantId, VShardId};
 use nodedb_physical::physical_plan::TimeseriesOp;
@@ -57,11 +59,7 @@ pub(crate) async fn flush_authenticated_ilp_batch(
     // that half of `check_request_admission`'s gate (plus the
     // internal-service exemption every other transport gets) using the real
     // peer address of the ILP connection or OTLP HTTP/gRPC request.
-    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
-        identity,
-        &state.scope_grants,
-        database_id,
-    );
+    let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
     crate::control::server::session_auth::check_blacklist_and_status(state, &scope, peer_addr)?;
 
     let audit = ArcAuditEmitter(Arc::clone(&state.audit));
@@ -184,6 +182,26 @@ async fn flush_ilp_batch_inner(
         None,
     )
     .await?;
+
+    // Metered here, once the whole batch's atomic Calvin write has already
+    // committed: one usage event per measurement (= one dispatched
+    // `PhysicalTask`), each with that measurement's own row count. ILP is
+    // deliberately exempt from the query-cost RATE LIMITER
+    // (`check_blacklist_and_status` above skips it entirely — ILP's
+    // sustained high-volume traffic shape doesn't fit the query cost
+    // table), but that is orthogonal to metering: this is real,
+    // tenant-attributable write work and must be billed like any other.
+    // `tasks` and `groups` are built 1:1 from the same preflighted list
+    // (`build_ilp_calvin_tasks` iterates `groups` in order), so zipping
+    // them pairs each task with the row count it actually carried.
+    if state.metering_config.enabled {
+        let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
+        for (task, group) in tasks.iter().zip(groups.iter()) {
+            let info = PlanMeteringInfo::extract(&task.plan);
+            let rows = u64::try_from(group.raw_lines.len()).ok();
+            meter_dispatch(state, &scope, &info, rows);
+        }
+    }
 
     // Timeseries owns authoritative schema. Catalog fields are a rebuildable
     // control-plane projection; update failures are loud but cannot turn an

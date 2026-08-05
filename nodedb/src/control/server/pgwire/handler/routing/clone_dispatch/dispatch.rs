@@ -16,11 +16,14 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use crate::control::clone::resolver::{
     CloneReadParams, ResolveOutcome, filter_tombstoned_rows, resolve_read,
 };
+use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::pgwire::handler::plan::{PlanKind, multirow_payload_to_response};
 use crate::control::server::pgwire::handler::shape_encode;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
 use crate::control::server::response_shape::kv::apply_kv_wrap;
 use crate::control::server::response_shape::schema::OutputSchema;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::PhysicalTask;
@@ -29,6 +32,36 @@ use super::super::super::super::types::error_to_sqlstate;
 use super::super::super::core::NodeDbPgHandler;
 use super::merge::{filter_kv_tombstoned_rows, merge_msgpack_arrays, wrap_single_map_as_array};
 use super::temporal::extract_system_as_of_ms;
+
+/// Meter one clone-read sub-task (target-database or source-database half),
+/// once its dispatch above has already returned success.
+///
+/// Clone CoW reads bypass `dispatch_task_loop` entirely — `resolve_read`
+/// augments the task set with source-database reads and this function
+/// dispatches both halves directly via `dispatch_authorized_task` — so
+/// neither half is metered anywhere else. Mirrors
+/// `calvin_dispatch::meter_calvin_task` / `gateway_dispatch::meter_gateway_task`,
+/// the other doors that bypass the loop the same way.
+///
+/// `rows: None` — the target/source responses are merged and tombstone-
+/// filtered across several steps after dispatch before a final row count
+/// exists; decoding each raw payload solely to count rows here would
+/// duplicate that later work. `meter_dispatch` charges one unit for `None`,
+/// correct for the read that just happened.
+fn meter_clone_task(
+    state: &crate::control::state::SharedState,
+    identity: &AuthenticatedIdentity,
+    task: &PhysicalTask,
+) {
+    if !state.metering_config.enabled {
+        return;
+    }
+    let info = PlanMeteringInfo::extract(&task.plan);
+    let scope = RequestAuthScope::builder(identity, &state.scope_grants)
+        .with_session_database(Some(task.database_id))
+        .build();
+    meter_dispatch(state, &scope, &info, None);
+}
 
 impl NodeDbPgHandler {
     /// Intercept read tasks for cloned collections.
@@ -150,6 +183,7 @@ impl NodeDbPgHandler {
                                 message,
                             )))
                         })?;
+                    meter_clone_task(&self.state, identity, task);
                     responses.push(resp);
                 }
 
@@ -205,6 +239,7 @@ impl NodeDbPgHandler {
                                 message,
                             )))
                         })?;
+                    meter_clone_task(&self.state, identity, source_task);
 
                     // For KvOp::Get: inject the primary key field into the raw map response
                     // so that projection and column-name assertions work correctly.

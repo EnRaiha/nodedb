@@ -86,10 +86,13 @@ impl NodeDbPgHandler {
         self.dispatch_tasks_via_gateway(
             tasks.to_vec(),
             authorized_tasks,
-            tenant_id,
-            database_id,
-            projection,
-            result_formats,
+            super::gateway_dispatch::GatewayDispatchParams {
+                identity,
+                tenant_id,
+                database_id,
+                projection,
+                result_formats,
+            },
         )
         .await
         .map(Some)

@@ -11,6 +11,7 @@ use nodedb_types::sync::wire::{EngineKind, SyncProvenance, stream_id_for};
 
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 
@@ -296,6 +297,14 @@ pub(crate) async fn apply_delta_and_finalize(
         signing_required,
     });
 
+    // Extracted before `plan` is moved into `authorize_sync_task` below, and
+    // only when metering is enabled — the default is disabled, so this is a
+    // no-op on the hot path for every deployment that hasn't turned it on.
+    let plan_metering_info = shared
+        .metering_config
+        .enabled
+        .then(|| PlanMeteringInfo::extract(&plan));
+
     let vshard_id =
         crate::types::VShardId::from_collection_in_database(database_id, &delta_msg.collection);
     let authorized = super::super::super::raft_dispatch::authorize_sync_task(
@@ -326,6 +335,19 @@ pub(crate) async fn apply_delta_and_finalize(
         .as_ref()
         .map(|outcome| outcome.trimmed_ops)
         .unwrap_or(0);
+
+    // Metered only on the dispatch success path, with the real ops-written
+    // count — a failed dispatch (`dispatch_result.is_err()`) applied nothing
+    // durable. The identity here is the tenant's Lite/edge sync client, not
+    // an internal-service principal (`meter_dispatch` still gates on that
+    // itself as belt-and-suspenders), so this is real, tenant-attributable
+    // write work like any other CRDT apply.
+    if dispatch_result.is_ok()
+        && let Some(info) = &plan_metering_info
+    {
+        meter_dispatch(shared, &scope, info, Some(trimmed_ops));
+    }
+
     DeltaDispatchOutcome {
         frame: frame_for_dispatch(
             delta_msg,
