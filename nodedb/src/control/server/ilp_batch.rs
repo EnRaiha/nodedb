@@ -175,6 +175,18 @@ pub(crate) async fn flush_authenticated_ilp_batch(
     database_id: DatabaseId,
     batch: &str,
 ) -> crate::Result<u64> {
+    // Blacklist only: this door carries an `AuthenticatedIdentity` but no
+    // `AuthContext`/`RequestAuthScope`, so the full `check_request_admission`
+    // gate (account status + rate limit) does not apply here — ILP/OTLP
+    // ingest is not the per-query traffic the rate-limiter's cost table
+    // models. Blacklist + IP + account/org status still apply. Internal
+    // service identities (Raft apply, CRDT sync replay) must never be
+    // blocked, mirroring the exemption `check_request_admission` applies for
+    // every other transport.
+    if !identity.is_internal_service() {
+        crate::control::server::session_auth::check_blacklist(state, identity, "")?;
+    }
+
     let audit = ArcAuditEmitter(Arc::clone(&state.audit));
     let groups = preflight_ilp_batch(
         identity,

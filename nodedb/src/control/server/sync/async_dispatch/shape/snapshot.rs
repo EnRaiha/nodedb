@@ -136,6 +136,13 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
     // The subscriber's own capability, not the system door: the scan is
     // authorized into a task, row-level security is applied to it, and that
     // exact plan is what reaches storage.
+    //
+    // Unlike the DDL/DSL passthrough handlers, this call is NOT reached
+    // through `shared::ddl::dispatch` — `handle_shape_subscribe_async`
+    // deliberately runs only blacklist + quota before this point (shape
+    // subscription is not the per-query traffic the rate-limiter's cost
+    // table models), so this is the one place this request is ever admitted.
+    // `NotYetAdmitted` keeps it that way.
     match dispatch_for_identity(
         req.shared,
         req.identity,
@@ -143,6 +150,7 @@ async fn document_snapshot(req: DocumentSnapshot<'_>) -> Option<ShapeSnapshotDat
         req.collection,
         plan,
         Duration::from_secs(10),
+        crate::control::server::shared::ddl::user_dispatch::RequestAdmission::NotYetAdmitted,
     )
     .await
     {

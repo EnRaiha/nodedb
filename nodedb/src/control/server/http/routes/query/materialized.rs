@@ -45,6 +45,36 @@ pub async fn query(
 
     let sql = body.sql.as_str();
 
+    // The request-selected database is authoritative for RLS variables while
+    // retaining verified JWT/session enrichment from authentication: passing
+    // it as the session database makes `scope.database_id()` resolve to
+    // exactly `database_id`, and the verified JWT (when this request
+    // authenticated via JWT bearer) reproduces the same claim-derived
+    // enrichment `resolve_auth` would have given an `AuthContext`.
+    let scope = build_request_scope(
+        &identity,
+        verified_jwt.as_ref(),
+        &headers,
+        &state,
+        database_id,
+    );
+
+    // Request-admission gate: internal-service exemption, blacklist, account
+    // status, then rate limit — run exactly once per request, here, before it
+    // can branch to `shared::ddl::dispatch` below or fall through to
+    // DataFusion planning, so both DDL/DSL text and ordinary DML/SELECT
+    // statements are covered by this one call. `Some(result)` carries the
+    // rate-limit outcome this handler surfaces as `X-RateLimit-*` response
+    // headers below.
+    let rate_limit_result = crate::control::server::session_auth::check_request_admission(
+        &state.shared,
+        &scope,
+        "http",
+        "sql",
+    )?;
+    let rate_limit_headers =
+        super::super::super::rate_limit_headers::rate_limit_headers(&rate_limit_result);
+
     // HTTP is stateless — there is no BEGIN/COMMIT session concept over this
     // transport, so a session-less scope satisfies the DDL dispatch signature.
     // A fresh store reports "not in a transaction block" for any address, so
@@ -53,7 +83,10 @@ pub async fn query(
     let http_scope = crate::control::server::shared::session::DetachedTxnScope::new();
     let txn_ctx = http_scope.ctx();
 
-    // Try DDL commands first (same as pgwire handler).
+    // Try DDL commands first (same as pgwire handler). Now reached only after
+    // the single admission call above, so `shared::ddl::user_dispatch` (the
+    // DSL/DDL dispatch door some DDL/DSL statements fall through to) must not
+    // admit this request a second time.
     if let Some(result) = crate::control::server::shared::ddl::dispatch(
         &state.shared,
         &identity,
@@ -66,7 +99,10 @@ pub async fn query(
         return match result {
             Ok(results) => {
                 let json_rows = ddl_results_to_json(results);
-                Ok(axum::Json(HttpQueryResponse::ok(json_rows)))
+                Ok((
+                    rate_limit_headers,
+                    axum::Json(HttpQueryResponse::ok(json_rows)),
+                ))
             }
             Err(e) => Err(ddl_error_to_api(e)),
         };
@@ -84,19 +120,6 @@ pub async fn query(
             retry_after_secs: 1,
         })?;
 
-    // The request-selected database is authoritative for RLS variables while
-    // retaining verified JWT/session enrichment from authentication: passing
-    // it as the session database makes `scope.database_id()` resolve to
-    // exactly `database_id`, and the verified JWT (when this request
-    // authenticated via JWT bearer) reproduces the same claim-derived
-    // enrichment `resolve_auth` would have given an `AuthContext`.
-    let scope = build_request_scope(
-        &identity,
-        verified_jwt.as_ref(),
-        &headers,
-        &state,
-        database_id,
-    );
     let (clean_sql, scope) =
         crate::control::server::session_auth::apply_per_query_on_deny(sql, scope);
     // Planning and lease admission run as one retried unit so a descriptor
@@ -117,7 +140,10 @@ pub async fn query(
     let _lease_scope = admission.lease_scope;
 
     if tasks.is_empty() {
-        return Ok(axum::Json(HttpQueryResponse::ok(vec![])));
+        return Ok((
+            rate_limit_headers,
+            axum::Json(HttpQueryResponse::ok(vec![])),
+        ));
     }
 
     // Track active request for quota accounting.
@@ -298,7 +324,7 @@ pub async fn query(
             }
         }
 
-        Ok(axum::Json(HttpQueryResponse::ok(result_rows)))
+        Ok((rate_limit_headers, axum::Json(HttpQueryResponse::ok(result_rows))))
     }
     .await
 }

@@ -87,6 +87,23 @@ pub async fn query_ndjson(
         &state,
         database_id,
     );
+
+    // Request-admission gate: internal-service exemption, blacklist, account
+    // status, then rate limit — before any planning/dispatch, so load is
+    // shed before it is spent. `Some(result)` carries the rate-limit outcome
+    // this handler surfaces as `X-RateLimit-*` response headers below.
+    let rate_limit_result = match crate::control::server::session_auth::check_request_admission(
+        &state.shared,
+        &scope,
+        "http",
+        "sql",
+    ) {
+        Ok(result) => result,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
+    let rate_limit_headers =
+        super::super::super::rate_limit_headers::rate_limit_headers(&rate_limit_result);
+
     // Planning and lease admission run as one retried unit so a descriptor
     // drain starting between them is absorbed rather than surfaced. Admission
     // still follows authorization inside the unit, so denied requests never
@@ -126,7 +143,7 @@ pub async fn query_ndjson(
                 })
                 .into_response();
             };
-            return Response::builder()
+            let mut response = Response::builder()
                 .header("Content-Type", "application/x-ndjson")
                 .body(axum::body::Body::from_stream(ndjson_body_stream(
                     stream,
@@ -137,6 +154,8 @@ pub async fn query_ndjson(
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "encoding error").into_response()
                 });
+            response.headers_mut().extend(rate_limit_headers);
+            return response;
         }
         Ok(None) => {}
         Err(error) => return ApiError::from(error).into_response(),
@@ -251,8 +270,10 @@ pub async fn query_ndjson(
         }
     }
 
-    Response::builder()
+    let mut response = Response::builder()
         .header("Content-Type", "application/x-ndjson")
         .body(axum::body::Body::from(ndjson))
-        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "encoding error").into_response())
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "encoding error").into_response());
+    response.headers_mut().extend(rate_limit_headers);
+    response
 }

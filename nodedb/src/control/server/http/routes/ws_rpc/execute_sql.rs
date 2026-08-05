@@ -41,6 +41,14 @@ pub async fn execute_sql(
     let scope = RequestAuthScope::builder(identity, &shared.scope_grants)
         .with_session_database(Some(database_id))
         .build();
+
+    // Request-admission gate: internal-service exemption, blacklist, account
+    // status, then rate limit — before any planning/dispatch, so load is
+    // shed before it is spent. WebSocket RPC has no HTTP response headers to
+    // attach `X-RateLimit-*` to, so the rate-limit outcome is discarded on
+    // success; a denial still fails the request closed via `?`.
+    crate::control::server::session_auth::check_request_admission(shared, &scope, "ws", "sql")?;
+
     let (clean_sql, scope) =
         crate::control::server::session_auth::apply_per_query_on_deny(sql, scope);
     // Planning and lease admission run as one retried unit so a descriptor

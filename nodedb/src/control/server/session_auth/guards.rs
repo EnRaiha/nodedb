@@ -161,9 +161,10 @@ pub fn check_rate_limit(
     );
 
     if !result.allowed {
-        return Err(crate::Error::RejectedAuthz {
-            tenant_id: identity.tenant_id,
-            resource: format!("rate limited: retry after {}s", result.retry_after_secs),
+        return Err(crate::Error::RateExceeded {
+            gate: operation.to_string(),
+            detail: format!("rate limited for user {}", identity.user_id),
+            retry_after_ms: result.retry_after_secs.saturating_mul(1000),
         });
     }
 

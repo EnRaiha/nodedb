@@ -42,7 +42,7 @@ pub(super) async fn dispatch_kv(
     // resolve from the same value and cannot drift apart.
     let database_id = DatabaseId::DEFAULT;
     let vshard = VShardId::from_collection_in_database(database_id, &session.collection);
-    let authorized = authorize_resp_task(state, session, plan, vshard, database_id)?;
+    let authorized = authorize_resp_task(state, session, plan, vshard, database_id, "kv_get")?;
     match state.gateway.get() {
         Some(gw) => {
             let gw_ctx = QueryContext {
@@ -81,7 +81,7 @@ pub(super) async fn dispatch_kv_write(
     // through `authorize_resp_task` via `RequestAuthScope::builder`.
     let database_id = DatabaseId::DEFAULT;
     let vshard = VShardId::from_collection_in_database(database_id, &session.collection);
-    let authorized = authorize_resp_task(state, session, plan, vshard, database_id)?;
+    let authorized = authorize_resp_task(state, session, plan, vshard, database_id, "kv_put")?;
     match state.gateway.get() {
         Some(gw) => {
             let gw_ctx = QueryContext {
@@ -111,6 +111,7 @@ fn authorize_resp_task(
     mut plan: PhysicalPlan,
     vshard_id: VShardId,
     database_id: DatabaseId,
+    operation: &str,
 ) -> crate::Result<crate::control::server::shared::authorization::AuthorizedTask> {
     let identity = session
         .identity
@@ -121,6 +122,15 @@ fn authorize_resp_task(
         })?;
 
     let scope = resp_auth_scope(identity, &state.scope_grants, database_id);
+
+    // Request-admission gate: internal-service exemption, blacklist, account
+    // status, then rate limit — before RLS injection and task authorization,
+    // so load is shed before it is spent. Per this function's own doc below,
+    // every RESP command reaches the Data Plane through here, so this one
+    // call covers the whole protocol. RESP tracks no per-connection peer
+    // address today, so the IP-blacklist half of the check is a no-op here;
+    // the user/org/account-status/rate-limit checks still apply in full.
+    crate::control::server::session_auth::check_request_admission(state, &scope, "", operation)?;
 
     // Row-level security is injected here, before the capability is minted, for
     // the same reason the native path injects before dispatch: the plan the

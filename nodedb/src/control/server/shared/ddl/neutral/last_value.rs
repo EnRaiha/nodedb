@@ -35,6 +35,8 @@ pub async fn query_last_values(
         collection: collection.to_string(),
     });
 
+    // Only reached through `shared::ddl::dispatch`, which native/pgwire/HTTP
+    // each call after their own single per-request admission gate.
     let payload = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
         state,
         identity,
@@ -42,6 +44,7 @@ pub async fn query_last_values(
         collection,
         plan,
         Duration::from_secs(5),
+        crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
     )
     .await
     .map_err(|e| ddl_err("XX000", format!("dispatch failed: {e}")))?;
@@ -91,6 +94,8 @@ pub async fn query_last_value(
         series_id,
     });
 
+    // Only reached through `shared::ddl::dispatch`, which native/pgwire/HTTP
+    // each call after their own single per-request admission gate.
     let payload = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
         state,
         identity,
@@ -98,6 +103,7 @@ pub async fn query_last_value(
         collection,
         plan,
         Duration::from_secs(5),
+        crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
     )
     .await
     .map_err(|e| ddl_err("XX000", format!("dispatch failed: {e}")))?;

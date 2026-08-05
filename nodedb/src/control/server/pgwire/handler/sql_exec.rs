@@ -406,6 +406,16 @@ impl NodeDbPgHandler {
             self.state.database_metrics.record_qps(&desc.name);
         }
 
+        // Request-admission gate: internal-service exemption, blacklist,
+        // account status, then rate limit — run exactly once per statement,
+        // right here, before it can branch to `shared::ddl::dispatch` below
+        // or fall through to the DataFusion planner (`plan_statement_to_tasks`,
+        // which used to admit but no longer does — this call replaces it and
+        // is positioned earlier specifically so DDL/DSL text is covered too,
+        // not just the statements that reach the planner).
+        self.admit_statement(identity, session_id, database_id)
+            .await?;
+
         let txn_ctx = crate::control::server::shared::session::DmlTxnCtx {
             sessions: &self.sessions,
             session_id,

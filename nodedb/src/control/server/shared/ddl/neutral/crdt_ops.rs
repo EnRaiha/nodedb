@@ -76,6 +76,9 @@ pub async fn crdt_state(
     // Synchronous dispatch via the blocking bridge.
     // A CRDT state read is a read of the collection's rows, so it carries the
     // same authorization and row-level security as any other read of them.
+    // This handler is only ever reached through `shared::ddl::dispatch`,
+    // which native/pgwire/HTTP each call after their own single per-request
+    // admission gate — so this request was already admitted once.
     let result = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
         state,
         identity,
@@ -83,6 +86,7 @@ pub async fn crdt_state(
         collection,
         plan,
         Duration::from_secs(state.tuning.network.default_deadline_secs),
+        crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
     )
     .await
     .map_err(|e| DdlError {

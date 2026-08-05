@@ -33,6 +33,23 @@ pub(in crate::control::server::sync) async fn handle_shape_subscribe_async(
     let tenant_id = identity.tenant_id;
     let database_id = session.database_id();
 
+    // Blacklist only: this door carries an `AuthenticatedIdentity` but no
+    // `AuthContext`/`RequestAuthScope`, so the full request-admission gate
+    // (account status + rate limit) does not apply — shape subscription is
+    // not the per-query traffic the rate-limiter's cost table models.
+    // Blacklist + IP + account/org status still apply. Internal-service
+    // identities (replay, scheduler-driven resync) must never be blocked.
+    if !identity.is_internal_service()
+        && let Err(e) = crate::control::server::session_auth::check_blacklist(shared, identity, "")
+    {
+        warn!(
+            tenant_id = tenant_id.as_u64(),
+            error = %e,
+            "sync: shape subscribe rejected by blacklist"
+        );
+        return None;
+    }
+
     // Quota enforcement — reject before dispatch.
     if let Err(e) = shared.check_tenant_quota(tenant_id) {
         warn!(
@@ -143,6 +160,19 @@ pub(in crate::control::server::sync) async fn handle_resync_request_async(
     };
     let tenant_id = identity.tenant_id;
     let database_id = session.database_id();
+
+    // See `handle_shape_subscribe_async` above: blacklist only, no rate
+    // limit, with the same internal-service exemption.
+    if !identity.is_internal_service()
+        && let Err(e) = crate::control::server::session_auth::check_blacklist(shared, identity, "")
+    {
+        warn!(
+            tenant_id = tenant_id.as_u64(),
+            error = %e,
+            "sync: resync request rejected by blacklist"
+        );
+        return None;
+    }
 
     if let Err(e) = shared.check_tenant_quota(tenant_id) {
         warn!(

@@ -96,6 +96,20 @@ impl NodeDbPgHandler {
             return Ok(results.pop().unwrap_or(Response::EmptyQuery));
         }
 
+        // Request-admission gate: internal-service exemption, blacklist,
+        // account status, then rate limit. The DSL branch above already ran
+        // this (via `execute_sql` -> `execute_single_sql` -> `admit_statement`),
+        // so it must not run again here; every other statement on this
+        // extended-query (Bind/Execute) path reaches `execute_planned_sql_with_params`
+        // directly without going through `execute_sql` at all, so this is its
+        // only admission gate.
+        let database_id = self
+            .sessions
+            .get_current_database(session_id)
+            .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        self.admit_statement(&identity, session_id, database_id)
+            .await?;
+
         // When the statement declared typed result columns via Describe, the
         // client expects DataRow messages with one field per declared column
         // (the RowDescription was already sent by Describe). Build a neutral

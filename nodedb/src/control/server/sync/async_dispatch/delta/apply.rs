@@ -81,6 +81,24 @@ pub(crate) async fn apply_delta_and_finalize(
             return DeltaDispatchOutcome::refused(permission_denied_delta_reject(delta_msg));
         }
     };
+
+    // Blacklist only: this door carries an `AuthenticatedIdentity` but no
+    // `AuthContext`/`RequestAuthScope`, so the full request-admission gate
+    // (account status + rate limit) does not apply — CRDT delta sync is not
+    // the per-query traffic the rate-limiter's cost table models. Blacklist
+    // + IP + account/org status still apply. Internal-service identities
+    // (CRDT sync replay) must never be blocked.
+    if !identity.is_internal_service()
+        && let Err(e) = crate::control::server::session_auth::check_blacklist(shared, identity, "")
+    {
+        warn!(error = %e, "sync: delta rejected by blacklist");
+        return terminal_reject(
+            delta_msg,
+            "sender is blocked",
+            CompensationHint::PermissionDenied,
+        );
+    }
+
     // Same binding the session's reads use: the principal's database, not the
     // built-in default. A delta must land in the database its subscriber will
     // read it back from.

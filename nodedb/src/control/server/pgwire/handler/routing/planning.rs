@@ -11,7 +11,7 @@ use crate::control::security::auth_context::AuthContext;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::session::SessionId;
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::core::NodeDbPgHandler;
@@ -19,6 +19,54 @@ use super::catalog::current_descriptor_version;
 use super::setup_error::StatementSetupError;
 
 impl NodeDbPgHandler {
+    /// Run the request-admission gate exactly once for a pgwire statement.
+    ///
+    /// Called from `execute_single_sql` before it branches to
+    /// `shared::ddl::dispatch` or falls through to the DataFusion planner —
+    /// one call covers both DDL/DSL text and ordinary DML/SELECT statements,
+    /// so `plan_statement_to_tasks` (the planner's own entry point) must not
+    /// admit again.
+    pub(in crate::control::server::pgwire::handler) async fn admit_statement(
+        &self,
+        identity: &AuthenticatedIdentity,
+        session_id: SessionId,
+        database_id: DatabaseId,
+    ) -> pgwire::error::PgWireResult<()> {
+        let peer_addr = match session_id {
+            SessionId::Connection(connection_id) => self
+                .sessions
+                .connection_metadata(connection_id)
+                .map(|metadata| metadata.peer_addr)
+                .ok_or_else(|| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_owned(),
+                        "XX000".to_owned(),
+                        "connection session metadata is unavailable".to_owned(),
+                    )))
+                })?,
+            SessionId::LegacySocket(peer_addr) => peer_addr,
+        };
+        let scope = RequestAuthScope::builder(identity, &self.state.scope_grants)
+            .with_session_database(Some(database_id))
+            .build();
+        crate::control::server::session_auth::check_request_admission(
+            &self.state,
+            &scope,
+            &peer_addr.to_string(),
+            "sql",
+        )
+        .map_err(|e| {
+            let (severity, code, message) =
+                crate::control::server::pgwire::types::error_to_sqlstate(&e);
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                severity.to_owned(),
+                code.to_owned(),
+                message,
+            )))
+        })?;
+        Ok(())
+    }
+
     /// Plan a SQL statement to physical tasks, handling session auth, RETURNING
     /// strip, CHECK constraints, plan cache, and RETURNING injection.
     ///
@@ -128,6 +176,11 @@ impl NodeDbPgHandler {
             scope_builder = scope_builder.with_adopted_auth_context(adopted);
         }
         let scope = scope_builder.build();
+
+        // Request-admission already ran once for this statement in
+        // `execute_single_sql`, before it branched to `shared::ddl::dispatch`
+        // or fell through to this planner — that single call covers both DDL
+        // and the DataFusion path, so this function must not admit again.
 
         // Extract per-query ON DENY override. Per-query always wins over the
         // session-level override already baked into `scope`.

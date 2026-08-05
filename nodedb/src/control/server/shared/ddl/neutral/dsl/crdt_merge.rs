@@ -71,6 +71,8 @@ pub async fn crdt_merge(
         document_id: source_id.to_string(),
     });
 
+    // Only reached through `shared::ddl::dispatch`, which native/pgwire/HTTP
+    // each call after their own single per-request admission gate.
     let source_bytes = crate::control::server::shared::ddl::user_dispatch::dispatch_for_identity(
         state,
         identity,
@@ -78,6 +80,7 @@ pub async fn crdt_merge(
         collection,
         source_plan,
         Duration::from_secs(state.tuning.network.default_deadline_secs),
+        crate::control::server::shared::ddl::user_dispatch::RequestAdmission::AlreadyAdmitted,
     )
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;

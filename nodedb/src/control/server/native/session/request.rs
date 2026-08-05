@@ -134,6 +134,22 @@ impl NativeSession {
         .with_session_id(session_id)
         .build();
 
+        // Request-admission gate: internal-service exemption, blacklist,
+        // account status, then rate limit — run once per request, before any
+        // planning/catalog work or dispatch, so load is shed before it is
+        // spent. One call here covers every opcode reached below (Auth,
+        // Ping, and Status already returned above and never reach this
+        // point).
+        let operation = dispatch::admission_operation(op);
+        if let Err(e) = crate::control::server::session_auth::check_request_admission(
+            &self.state,
+            &scope,
+            &self.peer_addr.to_string(),
+            operation,
+        ) {
+            return SqlOutcome::Response(Box::new(dispatch::error_to_native(seq, &e)));
+        }
+
         let ctx = DispatchCtx {
             state: &self.state,
             identity,

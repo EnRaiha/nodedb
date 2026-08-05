@@ -120,6 +120,8 @@ pub async fn rag_fusion(
         bm25_field: params.bm25_field,
     });
 
+    // Only reached through `shared::ddl::dispatch`, which native/pgwire/HTTP
+    // each call after their own single per-request admission gate.
     let payload = user_dispatch::dispatch_for_identity(
         state,
         identity,
@@ -127,6 +129,7 @@ pub async fn rag_fusion(
         &collection,
         plan,
         Duration::from_secs(state.tuning.network.default_deadline_secs),
+        user_dispatch::RequestAdmission::AlreadyAdmitted,
     )
     .await
     .map_err(|e| ddl_err("XX000", e.to_string()))?;

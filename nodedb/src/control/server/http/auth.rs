@@ -362,6 +362,10 @@ impl From<crate::Error> for ApiError {
     fn from(e: crate::Error) -> Self {
         match &e {
             crate::Error::RejectedAuthz { .. } => Self::Forbidden(e.to_string()),
+            crate::Error::RateExceeded { retry_after_ms, .. } => Self::RateLimited {
+                message: e.to_string(),
+                retry_after_secs: retry_after_ms.div_ceil(1000).max(1),
+            },
             crate::Error::BadRequest { .. }
             | crate::Error::PlanError { .. }
             | crate::Error::Config { .. } => Self::BadRequest(e.to_string()),
