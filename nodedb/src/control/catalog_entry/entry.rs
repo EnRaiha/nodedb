@@ -10,7 +10,8 @@
 
 use crate::control::security::catalog::{
     StoredCollection, StoredContinuousAggregate, StoredCustomType, StoredIndexRecord,
-    StoredMaterializedView, StoredOidcProvider, StoredRlsPolicy, StoredSynonymGroup,
+    StoredMaterializedView, StoredOidcProvider, StoredRedactionPolicy, StoredRlsPolicy,
+    StoredSynonymGroup,
     auth_types::{
         StoredApiKey, StoredOwner, StoredPermission, StoredRole, StoredTenant, StoredUser,
     },
@@ -246,6 +247,19 @@ pub enum CatalogEntry {
         name: String,
     },
 
+    // ── Redaction policy ──────────────────────────────────────────
+    /// Upsert a redaction policy. The leader serializes the runtime
+    /// `RedactionPolicy` (flattened rule list) into the catalog-shape
+    /// `StoredRedactionPolicy` before proposing; followers re-hydrate
+    /// the runtime form via `to_runtime()` in post_apply.
+    PutRedactionPolicy(Box<StoredRedactionPolicy>),
+    /// Delete a single redaction policy by `(tenant_id, collection, for_role)`.
+    DeleteRedactionPolicy {
+        tenant_id: u64,
+        collection: String,
+        for_role: String,
+    },
+
     // ── Permission grant ───────────────────────────────────────────
     /// Upsert an explicit permission grant
     /// (`GRANT <perm> ON <target> TO <grantee>`). The catalog row is
@@ -437,6 +451,8 @@ impl CatalogEntry {
             Self::DeleteTenant { .. } => "delete_tenant",
             Self::PutRlsPolicy(_) => "put_rls_policy",
             Self::DeleteRlsPolicy { .. } => "delete_rls_policy",
+            Self::PutRedactionPolicy(_) => "put_redaction_policy",
+            Self::DeleteRedactionPolicy { .. } => "delete_redaction_policy",
             Self::PutPermission(_) => "put_permission",
             Self::DeletePermission { .. } => "delete_permission",
             Self::PutIndexRecord(_) => "put_index_record",

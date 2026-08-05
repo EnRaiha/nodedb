@@ -20,6 +20,7 @@ pub mod credential;
 pub mod diff;
 pub mod materialized_view;
 pub mod permissions;
+pub mod redaction_policy;
 pub mod retention_policy;
 pub mod rls_policy;
 pub mod roles;

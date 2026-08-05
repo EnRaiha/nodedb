@@ -27,6 +27,7 @@ pub mod materialized_view;
 pub mod owner;
 pub mod permission;
 pub mod procedure;
+pub mod redaction;
 pub mod rls;
 pub mod role;
 pub mod schedule;

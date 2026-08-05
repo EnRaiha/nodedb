@@ -39,6 +39,7 @@ use crate::control::state::SharedState;
 /// | PutContinuousAggregate / DeleteContinuousAggregate | ❌ no | CA definition is its own catalog object; runtime manager re-registers via MetaOp dispatch, never appears in a PhysicalPlan variant |
 /// | PutTenant / DeleteTenant                | ❌ no       | tenant identity does not affect plan shape |
 /// | PutRlsPolicy / DeleteRlsPolicy          | ❌ no       | `execute_sql` is only called from CDC path (no RLS injection via `inject_rls`); per-session pgwire cache has its own DDL invalidation |
+/// | PutRedactionPolicy / DeleteRedactionPolicy | ❌ no    | redaction rules are applied post-scan on the decoded document by role, so they are not baked into `PhysicalPlan` shape and need no gateway cache invalidation |
 /// | PutPermission / DeletePermission        | ❌ no       | permission checked at exec time |
 /// | PutOwner / DeleteOwner                  | ❌ no       | ownership does not affect plan shape |
 pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &Arc<SharedState>) {
@@ -184,6 +185,16 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         }
         CatalogEntry::DeleteRlsPolicy { .. } => {
             // no-op: same as PutRlsPolicy.
+        }
+
+        // ── Redaction policy: applied post-scan, not baked into plan shape ───
+        CatalogEntry::PutRedactionPolicy(_) => {
+            // no-op: redaction rules are applied post-scan on the decoded
+            // document by role, so they are not baked into `PhysicalPlan`
+            // shape and need no gateway cache invalidation.
+        }
+        CatalogEntry::DeleteRedactionPolicy { .. } => {
+            // no-op: same as PutRedactionPolicy.
         }
 
         // ── Permission / Owner: not baked into plan ───────────────────────────

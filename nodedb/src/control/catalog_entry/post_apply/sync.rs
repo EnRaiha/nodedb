@@ -20,7 +20,7 @@ use std::sync::Arc;
 use super::gateway_invalidation::invalidate_gateway_cache_for_entry;
 use super::{
     api_key, change_stream, collection, continuous_aggregate, custom_type, database, function,
-    materialized_view, owner, permission, procedure, rls, role, schedule, sequence,
+    materialized_view, owner, permission, procedure, redaction, rls, role, schedule, sequence,
     streaming_materialized_view, synonym_group, tenant, trigger, user,
 };
 use crate::control::catalog_entry::entry::CatalogEntry;
@@ -213,6 +213,21 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
                 *tenant_id,
                 collection.clone(),
                 name.clone(),
+                Arc::clone(shared),
+            );
+        }
+        CatalogEntry::PutRedactionPolicy(stored) => {
+            redaction::put((**stored).clone(), Arc::clone(shared));
+        }
+        CatalogEntry::DeleteRedactionPolicy {
+            tenant_id,
+            collection,
+            for_role,
+        } => {
+            redaction::delete(
+                *tenant_id,
+                collection.clone(),
+                for_role.clone(),
                 Arc::clone(shared),
             );
         }

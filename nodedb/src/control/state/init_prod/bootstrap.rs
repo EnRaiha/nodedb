@@ -21,6 +21,7 @@ use crate::control::security::buses::{SessionInvalidationBus, UserChangeBus};
 use crate::control::security::credential::CredentialStore;
 use crate::control::security::permission::PermissionStore;
 use crate::control::security::permission_tree::PermissionCache;
+use crate::control::security::redaction::RedactionStore;
 use crate::control::security::rls::RlsPolicyStore;
 use crate::control::security::role::RoleStore;
 use crate::control::security::sessions::SessionRegistry;
@@ -55,6 +56,7 @@ pub(super) struct ProdBootstrap {
     pub(super) mv_registry: Arc<crate::event::streaming_mv::MvRegistry>,
     pub(super) sequence_registry: Arc<crate::control::sequence::SequenceRegistry>,
     pub(super) rls_store: RlsPolicyStore,
+    pub(super) redaction_store: RedactionStore,
     pub(super) shared_audit: Arc<Mutex<AuditLog>>,
     pub(super) database_registry: crate::control::database::DatabaseRegistry,
     pub(super) surrogate_registry_handle: SurrogateRegistryHandle,
@@ -133,6 +135,7 @@ pub(super) fn run(
     let mv_registry = Arc::new(crate::event::streaming_mv::MvRegistry::new());
     let sequence_registry = Arc::new(crate::control::sequence::SequenceRegistry::new());
     let rls_store = RlsPolicyStore::new();
+    let redaction_store = RedactionStore::new();
     let mut audit_start_seq = 1u64;
     {
         let catalog = credentials.catalog();
@@ -181,6 +184,34 @@ pub(super) fn run(
                 }
             }
             Err(e) => tracing::warn!(error = %e, "failed to load RLS policies"),
+        }
+        match catalog.load_all_redaction_policies() {
+            Ok(stored) => {
+                let mut loaded = 0usize;
+                for s in &stored {
+                    match s.to_runtime() {
+                        Ok(p) => {
+                            redaction_store.install_replicated_policy(p);
+                            loaded += 1;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                name = %s.name,
+                                collection = %s.collection,
+                                error = %e,
+                                "boot replay: skipped invalid redaction policy"
+                            );
+                        }
+                    }
+                }
+                if loaded > 0 {
+                    tracing::info!(
+                        redaction_policies = loaded,
+                        "loaded redaction policies from catalog"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to load redaction policies"),
         }
         let max_seq = catalog.load_audit_max_seq()?;
         if max_seq > 0 {
@@ -302,6 +333,7 @@ pub(super) fn run(
         mv_registry,
         sequence_registry,
         rls_store,
+        redaction_store,
         shared_audit,
         database_registry,
         surrogate_registry_handle,

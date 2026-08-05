@@ -196,6 +196,9 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteTenant { .. }
         | CatalogEntry::PutRlsPolicy(_)
         | CatalogEntry::DeleteRlsPolicy { .. }
+        // Redaction policies carry no descriptor version, same as RLS.
+        | CatalogEntry::PutRedactionPolicy(_)
+        | CatalogEntry::DeleteRedactionPolicy { .. }
         | CatalogEntry::PutPermission(_)
         | CatalogEntry::DeletePermission { .. }
         | CatalogEntry::PutIndexRecord(_)

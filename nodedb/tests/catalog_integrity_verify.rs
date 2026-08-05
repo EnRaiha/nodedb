@@ -210,6 +210,8 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::DeleteTenant { .. } => VariantClass::Exempt,
         CatalogEntry::PutRlsPolicy(_) => VariantClass::Exempt,
         CatalogEntry::DeleteRlsPolicy { .. } => VariantClass::Exempt,
+        CatalogEntry::PutRedactionPolicy(_) => VariantClass::Exempt,
+        CatalogEntry::DeleteRedactionPolicy { .. } => VariantClass::Exempt,
 
         CatalogEntry::PutSynonymGroup(_) => VariantClass::Exempt,
         CatalogEntry::DeleteSynonymGroup { .. } => VariantClass::Exempt,

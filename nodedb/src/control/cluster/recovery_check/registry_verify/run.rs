@@ -15,7 +15,7 @@ use super::super::divergence::Divergence;
 use super::super::report::RegistryDivergenceCount;
 use super::{
     alert, api_keys, blacklist, change_stream, consumer_group, credential, materialized_view,
-    permissions, retention_policy, rls_policy, roles, schedule, triggers,
+    permissions, redaction_policy, retention_policy, rls_policy, roles, schedule, triggers,
 };
 
 /// Outcome of the registry pass.
@@ -91,6 +91,17 @@ pub fn verify_registries(
         || rls_policy::verify_rls_policies(&shared.rls, catalog),
         || rls_policy::repair_rls_policies(&shared.rls, catalog),
         || rls_policy::verify_rls_policies(&shared.rls, catalog),
+        &mut counts,
+        &mut initial_divergences,
+        &mut all_repairs_ok,
+    )?;
+
+    // ── redaction_policies ───────────────────────────────
+    run_one(
+        "redaction_policies",
+        || redaction_policy::verify_redaction_policies(&shared.redaction, catalog),
+        || redaction_policy::repair_redaction_policies(&shared.redaction, catalog),
+        || redaction_policy::verify_redaction_policies(&shared.redaction, catalog),
         &mut counts,
         &mut initial_divergences,
         &mut all_repairs_ok,

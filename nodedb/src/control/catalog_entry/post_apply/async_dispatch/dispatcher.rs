@@ -192,6 +192,9 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::DeleteTenant { .. }
         | CatalogEntry::PutRlsPolicy(_)
         | CatalogEntry::DeleteRlsPolicy { .. }
+        // Redaction policies: the real side effect happens in `sync.rs`.
+        | CatalogEntry::PutRedactionPolicy(_)
+        | CatalogEntry::DeleteRedactionPolicy { .. }
         | CatalogEntry::PutPermission(_)
         | CatalogEntry::DeletePermission { .. }
         | CatalogEntry::PutIndexRecord(_)

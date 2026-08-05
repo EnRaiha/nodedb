@@ -224,6 +224,8 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
         E::DeleteTenant { tenant_id, .. } => (tenant_id.to_string(), 0, String::new()),
         E::PutRlsPolicy(p) => (p.name.clone(), 0, String::new()),
         E::DeleteRlsPolicy { name, .. } => (name.clone(), 0, String::new()),
+        E::PutRedactionPolicy(p) => (p.name.clone(), 0, String::new()),
+        E::DeleteRedactionPolicy { for_role, .. } => (for_role.clone(), 0, String::new()),
         E::PutPermission(p) => (
             format!("{}@{}:{}", p.grantee, p.target, p.permission),
             0,

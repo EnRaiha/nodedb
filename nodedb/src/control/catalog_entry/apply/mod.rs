@@ -23,6 +23,7 @@ pub mod oidc_provider;
 pub mod owner;
 pub mod permission;
 pub mod procedure;
+pub mod redaction;
 pub mod rls;
 pub mod role;
 pub mod schedule;
@@ -187,6 +188,12 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
             collection,
             name,
         } => rls::delete(*tenant_id, collection, name, catalog),
+        CatalogEntry::PutRedactionPolicy(stored) => redaction::put(stored, catalog),
+        CatalogEntry::DeleteRedactionPolicy {
+            tenant_id,
+            collection,
+            for_role,
+        } => redaction::delete(*tenant_id, collection, for_role, catalog),
         CatalogEntry::PutPermission(stored) => permission::put(stored, catalog),
         CatalogEntry::DeletePermission {
             target,

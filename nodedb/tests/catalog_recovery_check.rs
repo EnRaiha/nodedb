@@ -226,6 +226,101 @@ async fn rls_policy_orphan_refuses_startup() {
     assert!(rls_count.detected > 0, "expected rls_policies divergence");
 }
 
+/// Redaction policy in redb but not in the in-memory store → MissingInRegistry.
+#[tokio::test]
+async fn redaction_policy_orphan_refuses_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, creds) = make_shared(dir.path());
+    let catalog = creds.catalog();
+
+    let stored = nodedb::control::security::catalog::redaction::StoredRedactionPolicy {
+        tenant_id: 1,
+        collection: "users".to_string(),
+        for_role: "support".to_string(),
+        name: "mask_pii".to_string(),
+        rules_json: "[]".to_string(),
+    };
+    catalog.put_redaction_policy(&stored).unwrap();
+    // Do NOT update shared.redaction — simulate load_from bug.
+
+    let result = verify_registries(&shared, catalog).unwrap();
+    let redaction_count = result
+        .counts
+        .get("redaction_policies")
+        .expect("redaction_policies entry");
+    assert!(
+        redaction_count.detected > 0,
+        "expected redaction_policies divergence"
+    );
+}
+
+/// Redaction policy value mismatch (rule count differs between redb and memory).
+#[tokio::test]
+async fn redaction_policy_value_mismatch_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, creds) = make_shared(dir.path());
+    let catalog = creds.catalog();
+
+    let stored = nodedb::control::security::catalog::redaction::StoredRedactionPolicy {
+        tenant_id: 1,
+        collection: "users".to_string(),
+        for_role: "support".to_string(),
+        name: "mask_pii".to_string(),
+        rules_json: r#"[{"field":"email","mode":{"Mask":"***"}}]"#.to_string(),
+    };
+    catalog.put_redaction_policy(&stored).unwrap();
+
+    // Insert into memory with zero rules — value mismatch (rule count differs).
+    let mut policy = stored.to_runtime().unwrap();
+    policy.rules.clear();
+    shared.redaction.install_replicated_policy(policy);
+
+    let result = verify_registries(&shared, catalog).unwrap();
+    let redaction = result
+        .counts
+        .get("redaction_policies")
+        .expect("redaction_policies");
+    assert!(
+        redaction.detected > 0,
+        "expected redaction value mismatch detected"
+    );
+}
+
+/// A policy whose rule list is the same length but redacts a field a different
+/// way is the divergence that matters most — a weakened mask still "looks
+/// right" by count. The verifier must compare rule content, not just arity.
+#[tokio::test]
+async fn redaction_policy_mode_change_detected_at_same_rule_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let (shared, creds) = make_shared(dir.path());
+    let catalog = creds.catalog();
+
+    let stored = nodedb::control::security::catalog::redaction::StoredRedactionPolicy {
+        tenant_id: 1,
+        collection: "users".to_string(),
+        for_role: "support".to_string(),
+        name: "mask_pii".to_string(),
+        rules_json: r#"[{"field":"email","mode":{"Mask":"***@***.com"}}]"#.to_string(),
+    };
+    catalog.put_redaction_policy(&stored).unwrap();
+
+    // Same field, same rule count — only the mask payload differs.
+    let mut policy = stored.to_runtime().unwrap();
+    policy.rules[0].mode =
+        nodedb::control::security::redaction::RedactionMode::Mask("*".to_string());
+    shared.redaction.install_replicated_policy(policy);
+
+    let result = verify_registries(&shared, catalog).unwrap();
+    let redaction = result
+        .counts
+        .get("redaction_policies")
+        .expect("redaction_policies");
+    assert!(
+        redaction.detected > 0,
+        "expected a value mismatch when only the redaction mode differs"
+    );
+}
+
 /// Blacklist entry in redb but not in memory → MissingInRegistry.
 #[tokio::test]
 async fn blacklist_ghost_refuses_startup() {
@@ -530,4 +625,56 @@ async fn repair_cycle_succeeds_for_schedules() {
         .map(|c| c.detected)
         .unwrap_or(0);
     assert_eq!(post_detected, 0, "after repair, schedule should be in sync");
+}
+
+/// Boot-load repopulation: a redaction policy written to the catalog before
+/// a fresh `SharedState::open` must be present in the in-memory
+/// `RedactionStore` immediately after boot — proving the
+/// `load_all_redaction_policies` replay wired into `init_prod::bootstrap`
+/// actually runs and installs policies rather than just compiling.
+#[tokio::test]
+async fn redaction_policy_survives_restart_via_boot_load() {
+    use nodedb::config::auth::AuthConfig;
+    use nodedb::control::security::catalog::redaction::StoredRedactionPolicy;
+    use nodedb::control::security::credential::store::CredentialStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let catalog_path = dir.path().join("system.redb");
+    let wal_path = dir.path().join("test.wal");
+
+    // Phase 1: write a redaction policy directly to the catalog, then close
+    // the credential store (redb only allows one writer handle at a time).
+    {
+        let credentials = CredentialStore::open(&catalog_path).unwrap();
+        let stored = StoredRedactionPolicy {
+            tenant_id: 1,
+            collection: "users".to_string(),
+            for_role: "support".to_string(),
+            name: "mask_pii".to_string(),
+            rules_json: "[]".to_string(),
+        };
+        credentials.catalog().put_redaction_policy(&stored).unwrap();
+    }
+
+    // Phase 2: open a fresh `SharedState` against the same catalog path —
+    // this runs `init_prod::bootstrap::run`, which must replay the policy
+    // into `redaction_store` before `SharedState::open` returns.
+    let wal = Arc::new(WalManager::open_for_testing(&wal_path).unwrap());
+    let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+    let shared = SharedState::open(
+        dispatcher,
+        wal,
+        &catalog_path,
+        &AuthConfig::default(),
+        Default::default(),
+        nodedb::bridge::quiesce::CollectionQuiesce::new(),
+        nodedb::control::array_catalog::ArrayCatalog::handle(),
+    )
+    .expect("shared_state reopen");
+
+    let loaded = shared.redaction.list_all_flat();
+    assert_eq!(loaded.len(), 1, "expected one redaction policy after boot");
+    assert_eq!(loaded[0].name, "mask_pii");
+    assert_eq!(loaded[0].collection, "users");
+    assert_eq!(loaded[0].for_role, "support");
 }
