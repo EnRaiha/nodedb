@@ -124,7 +124,7 @@ impl EdgeStore {
             if current.as_ref().is_some_and(|(active, _)| *active != base) {
                 emit_streamed_edge(&mut current, &mut visit)?;
             }
-            let state = current.get_or_insert_with(|| (base, None));
+            let state = current.get_or_insert((base, None));
             let bytes = value.value();
             if is_sentinel(bytes) {
                 state.1 = None;

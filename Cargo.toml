@@ -206,7 +206,7 @@ half = { version = "2", features = ["bytemuck"] }
 tokio-tungstenite = "0.30"
 
 # Storage
-redb = "4"
+redb = { git = "https://github.com/farhan-syah/redb", rev = "b4dcc4f39150c00868452d9314e8d52a989debe3" }
 
 # Temp files (external sort spill)
 tempfile = "3"

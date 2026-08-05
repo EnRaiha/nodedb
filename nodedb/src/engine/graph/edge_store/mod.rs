@@ -6,6 +6,7 @@ pub mod purge;
 pub mod query;
 pub mod scan;
 pub mod snapshot;
+mod sorted_restore;
 pub mod stats;
 pub mod store;
 pub mod temporal;
@@ -13,8 +14,9 @@ pub mod temporal;
 pub use cascade::EdgeRestore;
 pub use node_identity::NodeSurrogateRecord;
 pub use snapshot::EdgeSnapshotRecord;
-#[cfg(feature = "graphalytics-runner")]
-pub(crate) use snapshot::EdgeImportRecord;
+pub use sorted_restore::{
+    SortedEdgeRecord, SortedNodeRecord, SortedRestoreOptions, SortedStatsRecord,
+};
 pub use stats::CollectionStats;
 pub use store::{Direction, Edge, EdgeRecord, EdgeStore};
 pub use temporal::{

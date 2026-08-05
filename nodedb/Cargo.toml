@@ -16,11 +16,6 @@ description = "Local-first, real-time, edge-to-cloud hybrid database for multi-m
 name = "nodedb"
 path = "src/main.rs"
 
-[[bin]]
-name = "nodedb-graphalytics"
-path = "src/bin/nodedb-graphalytics.rs"
-required-features = ["graphalytics-runner"]
-
 [lib]
 name = "nodedb"
 path = "src/lib.rs"
@@ -187,7 +182,6 @@ io-uring = { workspace = true }
 
 [features]
 default = []
-graphalytics-runner = []
 # Enables crash-injection points used by recovery tests. Off by default; tests
 # that exercise the framework opt in via `--features failpoints`.
 failpoints = ["nodedb-types/failpoints", "nodedb-wal/failpoints"]

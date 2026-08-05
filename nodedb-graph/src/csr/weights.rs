@@ -9,6 +9,9 @@
 use super::index::CsrIndex;
 use crate::csr::LocalNodeId;
 
+/// Borrowed compacted adjacency arrays with optional parallel edge weights.
+pub type CompactedWeightedAdjacency<'a> = (&'a [u32], &'a [u32], Option<&'a [f64]>);
+
 impl CsrIndex {
     /// Enable weight tracking. Backfills existing buffer entries with 1.0.
     pub(crate) fn enable_weights(&mut self) {
@@ -259,7 +262,7 @@ impl CsrIndex {
 
     /// Borrow compacted outbound targets and their optional weight array.
     /// `None` weights mean every edge has the default weight `1.0`.
-    pub fn compacted_out_weighted_adjacency_raw(&self) -> Option<(&[u32], &[u32], Option<&[f64]>)> {
+    pub fn compacted_out_weighted_adjacency_raw(&self) -> Option<CompactedWeightedAdjacency<'_>> {
         let compacted = self.buffer_out.iter().all(Vec::is_empty)
             && self.buffer_in.iter().all(Vec::is_empty)
             && self.deleted_edges.is_empty();
@@ -272,7 +275,7 @@ impl CsrIndex {
 
     /// Borrow compacted inbound targets and their optional weight array.
     /// See [`Self::compacted_out_weighted_adjacency_raw`].
-    pub fn compacted_in_weighted_adjacency_raw(&self) -> Option<(&[u32], &[u32], Option<&[f64]>)> {
+    pub fn compacted_in_weighted_adjacency_raw(&self) -> Option<CompactedWeightedAdjacency<'_>> {
         let compacted = self.buffer_out.iter().all(Vec::is_empty)
             && self.buffer_in.iter().all(Vec::is_empty)
             && self.deleted_edges.is_empty();

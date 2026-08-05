@@ -24,12 +24,12 @@ pub(super) type TenantBaseKey = (u64, u64, String, String, String, String);
 ///
 /// Value is either an `EdgeValuePayload` (zerompk fixarray-3) or a single-byte
 /// sentinel (`TOMBSTONE_SENTINEL`, `GDPR_ERASURE_SENTINEL`).
-pub(super) const EDGES: TableDefinition<(u64, u64, &str), &[u8]> = TableDefinition::new("edges");
+pub(crate) const EDGES: TableDefinition<(u64, u64, &str), &[u8]> = TableDefinition::new("edges");
 
 /// Reverse edge index: same versioned key shape as `EDGES` but with
 /// `dst`/`src` swapped. Value is empty for live edges, or a sentinel for
 /// soft-deleted / erased edges (symmetry with forward).
-pub(super) const REVERSE_EDGES: TableDefinition<(u64, u64, &str), &[u8]> =
+pub(crate) const REVERSE_EDGES: TableDefinition<(u64, u64, &str), &[u8]> =
     TableDefinition::new("reverse_edges");
 
 /// Node identity table: `(db, tid, node_name)` → global surrogate.
@@ -40,7 +40,7 @@ pub(super) const REVERSE_EDGES: TableDefinition<(u64, u64, &str), &[u8]> =
 /// repopulate it, so every cross-engine read — which meets other engines on the
 /// surrogate — silently sees an empty graph side after a restart. One row per
 /// node, not per edge: identity belongs to the node.
-pub(super) const NODE_SURROGATES: TableDefinition<(u64, u64, &str), u32> =
+pub(crate) const NODE_SURROGATES: TableDefinition<(u64, u64, &str), u32> =
     TableDefinition::new("node_surrogates");
 
 pub(super) fn redb_err<E: std::fmt::Display>(ctx: &str, e: E) -> crate::Error {
