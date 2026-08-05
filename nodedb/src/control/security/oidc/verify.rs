@@ -18,6 +18,7 @@ use crate::control::security::identity::database_set::DatabaseSet;
 use crate::control::security::identity::{
     AuthenticatedIdentity, ExternalClaims, ExternalProviderBinding, identity_from_external_claims,
 };
+use crate::control::security::jwks::registry::VerifiedJwtClaims;
 use crate::control::security::jwt::JwtError;
 use crate::control::security::util::base64_url_decode;
 use crate::control::state::SharedState;
@@ -25,7 +26,8 @@ use crate::types::TenantId;
 
 use super::claim_mapping::apply_claim_mapping;
 
-/// Verify an OIDC bearer token and return an ephemeral `AuthenticatedIdentity`.
+/// Verify an OIDC bearer token and return an ephemeral `AuthenticatedIdentity`
+/// alongside the opaque proof of claim verification.
 ///
 /// Steps:
 /// 1. Decode header + payload (no signature) to extract `iss` and `aud`.
@@ -34,10 +36,17 @@ use super::claim_mapping::apply_claim_mapping;
 /// 4. Re-check the verified issuer and audience against the selected provider.
 /// 5. Apply claim-mapping rules to derive `default_database`, `accessible_databases`, `roles`.
 /// 6. Construct `AuthenticatedIdentity` with `auth_method = OidcBearer`.
+///
+/// The returned [`VerifiedJwtClaims`] lets callers enrich a downstream
+/// `AuthContext` (email, org, groups, permissions, metadata) via
+/// `AuthContext::from_verified_jwt` / `RequestAuthScopeBuilder::with_verified_jwt`
+/// — mirroring what the HTTP bearer-token path already does. Authority
+/// (superuser, tenant, roles) always comes from the `AuthenticatedIdentity`
+/// built here, never from the claims themselves.
 pub async fn verify_bearer_token(
     state: &SharedState,
     token: &str,
-) -> crate::Result<AuthenticatedIdentity> {
+) -> crate::Result<(AuthenticatedIdentity, VerifiedJwtClaims)> {
     // 1. Decode payload (no sig) to read `iss` and `aud`.
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -125,7 +134,7 @@ pub async fn verify_bearer_token(
         "OIDC login succeeded"
     );
 
-    Ok(identity_from_external_claims(
+    let identity = identity_from_external_claims(
         ExternalClaims {
             user_id: verified_claims.user_id,
             subject: &verified_claims.sub,
@@ -137,7 +146,9 @@ pub async fn verify_bearer_token(
             default_db,
             DatabaseSet::Some(accessible),
         ),
-    ))
+    );
+
+    Ok((identity, verified))
 }
 
 /// Select one catalog provider for the token's unverified issuer and audience.

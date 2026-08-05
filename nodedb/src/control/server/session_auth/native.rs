@@ -274,7 +274,14 @@ pub async fn authenticate(
                     detail: "missing 'token' for oidc_bearer auth".into(),
                 })?;
 
-            let identity =
+            // This dispatcher's `"oidc_bearer"` method string is unreachable from
+            // the native protocol: `dispatch::handle_auth` intercepts
+            // `ProtoAuth::OidcBearer` before building a JSON body for this
+            // function, and no other caller passes this method name. The
+            // verified-claims proof this returns is therefore discarded here
+            // rather than threaded further — the reachable OIDC path is
+            // `dispatch::handle_auth`.
+            let (identity, _verified_claims) =
                 crate::control::security::oidc::verify_bearer_token(state, token).await?;
 
             state.audit_record(

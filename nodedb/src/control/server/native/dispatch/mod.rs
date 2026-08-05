@@ -23,7 +23,7 @@ mod transaction;
 mod transaction_savepoint;
 
 pub(crate) use admission_op::admission_operation;
-pub(crate) use auth::{handle_auth, handle_ping};
+pub(crate) use auth::{NativeAuthOutcome, handle_auth, handle_ping};
 pub(crate) use conversion::{
     ddl_result_to_native, error_to_native, shape_error_to_native, to_native_columns_rows,
 };

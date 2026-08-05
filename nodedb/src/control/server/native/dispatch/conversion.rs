@@ -22,6 +22,13 @@ pub(crate) fn error_to_native(seq: u64, e: &crate::Error) -> NativeResponse {
         crate::Error::CollectionNotFound { collection, .. } => {
             ("42P01", format!("collection '{collection}' not found"))
         }
+        // Same SQLSTATE as the "not authenticated" responses in
+        // `session::request`: the client's stored bearer token expired
+        // mid-connection and it must re-authenticate with a fresh Auth frame.
+        crate::Error::SessionTokenExpired => (
+            "28000",
+            "OIDC bearer token expired; re-authenticate with a fresh Auth request".into(),
+        ),
         // A cross-shard Calvin OCC abort is a serialization failure (40001) —
         // the client should retry the whole transaction.
         crate::Error::CalvinSerializationConflict => (
@@ -189,4 +196,26 @@ pub(crate) fn to_native_columns_rows(shaped: &ShapedRows) -> (Vec<String>, Vec<V
         })
         .collect();
     (shaped.columns.clone(), rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nodedb_types::protocol::ResponseStatus;
+
+    /// A native session with a stored, now-expired OIDC token must surface
+    /// an authentication-shaped error (SQLSTATE `28000`, the same class as
+    /// "not authenticated") — not an internal error (`XX000`) — so the
+    /// client can tell a stale token from a server fault and knows to
+    /// re-authenticate rather than retry as-is.
+    #[test]
+    fn session_token_expired_maps_to_authentication_sqlstate() {
+        let response = error_to_native(1, &crate::Error::SessionTokenExpired);
+
+        assert_eq!(response.status, ResponseStatus::Error);
+        let error = response
+            .error
+            .expect("error responses must carry a payload");
+        assert_eq!(error.code, "28000");
+    }
 }

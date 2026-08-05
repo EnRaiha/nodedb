@@ -169,7 +169,7 @@ async fn catalog_provider_tenant_binding_overrides_signed_tenant_claim() {
         .expect("test state must remain uniquely owned")
         .jwks_registry = Some(Arc::new(registry));
 
-    let identity = verify_bearer_token(&state, &token)
+    let (identity, _claims) = verify_bearer_token(&state, &token)
         .await
         .expect("catalog-backed OIDC token must validate");
     assert_eq!(
@@ -444,7 +444,7 @@ async fn catalog_providers_with_shared_issuer_route_by_audience() {
         .expect("test state must remain uniquely owned")
         .jwks_registry = Some(Arc::new(registry));
 
-    let identity = verify_bearer_token(&state, &token)
+    let (identity, _claims) = verify_bearer_token(&state, &token)
         .await
         .expect("issuer and audience must select the tenant-b provider");
     assert_eq!(identity.tenant_id.as_u64(), 43);

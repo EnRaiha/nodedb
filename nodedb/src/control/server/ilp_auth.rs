@@ -207,10 +207,14 @@ async fn authenticate_request(
         .auth
         .as_ref()
         .ok_or(IlpAuthenticationError::AuthRequired)?;
-    let (identity, _) =
+    // ILP ingest has no RLS/`$auth.*` surface to enrich, so the verified-JWT
+    // proof `handle_auth` returns for OIDC bearer auth is discarded here —
+    // only the resulting identity (and its authority) matters for this path.
+    let identity =
         crate::control::server::native::dispatch::handle_auth(state, auth_mode, auth, peer_addr)
             .await
-            .map_err(|_| IlpAuthenticationError::AuthenticationFailed)?;
+            .map_err(|_| IlpAuthenticationError::AuthenticationFailed)?
+            .identity;
 
     let database_id = resolve_database(state, &identity, fields.database.as_deref())?;
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.audit));

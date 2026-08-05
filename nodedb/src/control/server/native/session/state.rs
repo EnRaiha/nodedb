@@ -63,6 +63,11 @@ pub struct NativeSession {
     pub(super) auth_mode: AuthMode,
     pub(super) identity: Option<AuthenticatedIdentity>,
     pub(super) auth_context: Option<crate::control::security::auth_context::AuthContext>,
+    /// Opaque proof of claim verification from an OIDC bearer auth frame.
+    /// `None` for every other auth method. Retained for the connection's
+    /// lifetime so each request can rebuild its `RequestAuthScope` with the
+    /// same claim-derived `$auth.*` enrichment the auth frame established.
+    pub(super) verified_jwt: Option<crate::control::security::jwks::registry::VerifiedJwtClaims>,
     pub(super) format: Option<FrameFormat>,
     pub(super) query_ctx: QueryContext,
     /// Connection-private mutable state retained by exact cleanup ownership.
@@ -96,6 +101,7 @@ impl NativeSession {
             auth_mode,
             identity: None,
             auth_context: None,
+            verified_jwt: None,
             format: None,
             query_ctx,
             sessions,

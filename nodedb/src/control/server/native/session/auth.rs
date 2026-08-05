@@ -49,7 +49,11 @@ impl NativeSession {
         )
         .await
         {
-            Ok((identity, warning)) => {
+            Ok(dispatch::NativeAuthOutcome {
+                identity,
+                warning,
+                verified_jwt,
+            }) => {
                 // Bind the requested database before acquiring any scoped
                 // admission capacity. An absent or empty name uses the
                 // authenticated identity's default, then the system default.
@@ -174,13 +178,33 @@ impl NativeSession {
                 if let Some(w) = warning {
                     resp.warnings.push(w);
                 }
-                let mut auth_context =
-                    super::super::super::session_auth::build_auth_context(&identity);
+                // OIDC bearer auth carries verified claims: build the initial
+                // `AuthContext` with claim-derived enrichment (email, org,
+                // groups, permissions, metadata) via `from_verified_jwt`, the
+                // same constructor HTTP's bearer-token path uses. Authority
+                // (superuser, tenant, roles) still comes from `identity`
+                // alone — `from_verified_jwt` never lets the token elevate.
+                // Every other auth method keeps the identity-only context.
+                let mut auth_context = match &verified_jwt {
+                    Some(claims) => {
+                        crate::control::security::auth_context::AuthContext::from_verified_jwt(
+                            claims,
+                            &identity,
+                            crate::control::security::auth_context::generate_session_id(),
+                        )
+                    }
+                    None => super::super::super::session_auth::build_auth_context(&identity),
+                };
                 // The selected database may differ from the identity default.
                 // Keep RLS `$auth.database_id` aligned with the database bound
                 // to this native connection.
                 auth_context.database_id = Some(db_id);
                 self.auth_context = Some(auth_context);
+                // Retained so every subsequent request on this connection can
+                // rebuild its per-request `RequestAuthScope` with the same
+                // claim-derived enrichment (see `session::request::handle_request`),
+                // not just the auth frame's own response.
+                self.verified_jwt = verified_jwt;
                 self.cleanup.publish_identity(identity.clone());
                 self.identity = Some(identity);
                 resp

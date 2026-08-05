@@ -71,6 +71,17 @@ impl VerifiedJwtClaims {
     }
 }
 
+/// Deliberately opaque: the wrapped claims carry the subject, audience, and
+/// whatever custom fields the provider issues, so a derived `Debug` would put
+/// them into any log line, panic message, or error report that formats a value
+/// containing one. `Debug` exists only so `Result<VerifiedJwtClaims, _>` can be
+/// unwrapped in tests; it intentionally reveals nothing.
+impl std::fmt::Debug for VerifiedJwtClaims {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedJwtClaims").finish_non_exhaustive()
+    }
+}
+
 impl JwksRegistry {
     /// Create and initialize the registry.
     ///
@@ -212,6 +223,31 @@ impl JwksRegistry {
     /// Check if any providers are configured.
     pub fn is_configured(&self) -> bool {
         !self.providers.is_empty()
+    }
+
+    /// Re-check the `exp` (and the rest of the time-claim envelope) of
+    /// previously verified claims against the current clock.
+    ///
+    /// `exp` is validated once, inside [`Self::verify_signature_and_time`],
+    /// at the moment a token is authenticated. A caller that retains a
+    /// [`VerifiedJwtClaims`] beyond that single check — e.g. a native
+    /// session, which keeps it for the connection's lifetime to re-derive
+    /// `$auth.*` enrichment on every request — must call this once per use
+    /// so a token that expires mid-connection is caught instead of being
+    /// re-applied indefinitely. Reuses [`validate_time_claims`] with this
+    /// registry's configured clock-skew tolerance — the exact comparison and
+    /// skew allowance the original authentication used.
+    pub(crate) fn check_not_expired(&self, verified: &VerifiedJwtClaims) -> Result<(), JwtError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        validate_time_claims(
+            verified.claims(),
+            now,
+            self.config.clock_skew_secs,
+            self.config.max_token_lifetime_secs,
+        )
     }
 
     // ── Internal pipeline ───────────────────────────────────────────────
@@ -459,4 +495,81 @@ struct JwtHeader {
 fn decode_jwt_header(encoded: &str) -> Result<JwtHeader, JwtError> {
     let bytes = base64_url_decode(encoded).ok_or(JwtError::DecodingError)?;
     crate::util::bounded_json::from_slice(&bytes).map_err(|_| JwtError::InvalidClaims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::auth::JwtAuthConfig;
+
+    fn claims(iat: u64, exp: u64) -> JwtClaims {
+        JwtClaims {
+            sub: "alice".into(),
+            tenant_id: 999,
+            roles: Vec::new(),
+            exp,
+            nbf: 0,
+            iat,
+            iss: String::new(),
+            aud: String::new(),
+            user_id: 1,
+            is_superuser: false,
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock must be after epoch")
+            .as_secs()
+    }
+
+    /// A native session retains `VerifiedJwtClaims` for the connection's
+    /// lifetime (see `native::session::request::handle_request`) and must
+    /// re-check `exp` on every request via this method, instead of trusting
+    /// the one-time check `verify_signature_and_time` ran at authentication.
+    /// A session whose stored claims have since expired must be rejected.
+    #[tokio::test]
+    async fn check_not_expired_rejects_claims_past_exp() {
+        let registry = JwksRegistry::init(JwtAuthConfig::default())
+            .await
+            .expect("registry with no configured providers must still initialize");
+        let now = now_secs();
+        let expired = VerifiedJwtClaims(claims(now - 2_000, now - 1_000));
+
+        assert_eq!(registry.check_not_expired(&expired), Err(JwtError::Expired));
+    }
+
+    /// A session whose stored claims have not expired keeps passing the
+    /// check request after request — no regression of the claim-enrichment
+    /// path this check now gates.
+    #[tokio::test]
+    async fn check_not_expired_accepts_claims_before_exp() {
+        let registry = JwksRegistry::init(JwtAuthConfig::default())
+            .await
+            .expect("registry with no configured providers must still initialize");
+        let now = now_secs();
+        let valid = VerifiedJwtClaims(claims(now - 10, now + 3_600));
+
+        assert_eq!(registry.check_not_expired(&valid), Ok(()));
+    }
+
+    /// `check_not_expired` must apply the registry's own configured clock
+    /// skew — the same tolerance `verify_signature_and_time` used at
+    /// authentication — not a hand-rolled or zero tolerance.
+    #[tokio::test]
+    async fn check_not_expired_honors_configured_clock_skew() {
+        let registry = JwksRegistry::init(JwtAuthConfig {
+            clock_skew_secs: 120,
+            ..JwtAuthConfig::default()
+        })
+        .await
+        .expect("registry with no configured providers must still initialize");
+        let now = now_secs();
+        // Expired 60s ago: within the 120s skew tolerance, so still accepted.
+        let just_expired = VerifiedJwtClaims(claims(now - 200, now - 60));
+
+        assert_eq!(registry.check_not_expired(&just_expired), Ok(()));
+    }
 }

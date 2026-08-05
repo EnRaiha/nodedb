@@ -235,7 +235,7 @@ async fn legacy_oidc_mapping_cannot_grant_superuser() {
         .expect("legacy provider fixture must persist");
     install_catalog_registry(&mut state).await;
 
-    let identity = verify_bearer_token(&state, &token)
+    let (identity, _claims) = verify_bearer_token(&state, &token)
         .await
         .expect("legacy mapping must retain non-privileged authentication");
     assert_eq!(identity.tenant_id.as_u64(), 42);
@@ -270,9 +270,10 @@ async fn authenticate_catalog_token(
     .await;
     install_catalog_registry(&mut state).await;
 
-    verify_bearer_token(&state, &token)
+    let (identity, _claims) = verify_bearer_token(&state, &token)
         .await
-        .expect("catalog-backed token must validate")
+        .expect("catalog-backed token must validate");
+    identity
 }
 
 fn assert_catalog_identity_has_only_mapped_authority(

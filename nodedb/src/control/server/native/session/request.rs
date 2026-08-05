@@ -107,6 +107,36 @@ impl NativeSession {
             }
         };
 
+        // The identity resolved above is session-lifetime and server-issued
+        // (tenant, roles, superuser) — it is never re-derived from the
+        // token. `verified_jwt`, in contrast, is the raw claim payload of an
+        // OIDC bearer token, retained only to re-derive claim-driven
+        // `$auth.*` enrichment on every request. `exp` on those claims was
+        // checked exactly once, at the Auth frame that established the
+        // session; a long-lived connection can otherwise keep re-applying a
+        // token whose lifetime is over. Re-check it here, immediately
+        // before the claims are consumed to build this request's scope, and
+        // fail closed rather than silently downgrading to an identity-only
+        // context (which would change query results / RLS grants with no
+        // signal to the caller that their token expired).
+        if let Some(verified) = self.verified_jwt.as_ref() {
+            let expired = match self.state.jwks_registry.as_ref() {
+                Some(registry) => registry.check_not_expired(verified).is_err(),
+                // `verified_jwt` is only ever populated via
+                // `verify_bearer_token`, which requires `jwks_registry` to
+                // be `Some` — reaching `None` here means that invariant
+                // broke. Treat it the same as an expired token: fail closed
+                // rather than serve claims nothing can re-validate.
+                None => true,
+            };
+            if expired {
+                return SqlOutcome::Response(Box::new(dispatch::error_to_native(
+                    seq,
+                    &crate::Error::SessionTokenExpired,
+                )));
+            }
+        }
+
         // Build the single request-scoped auth contract for this request:
         // resolves `database_id` once (bound to the database selected for
         // this request, including a later `USE DATABASE`) and stamps it into
@@ -126,12 +156,19 @@ impl NativeSession {
             .sessions
             .get_current_database(self.peer_addr)
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        // `verified_jwt` is `Some` only when this connection authenticated
+        // via an OIDC bearer token — it re-derives the same claim-derived
+        // `$auth.*` enrichment (email, org, groups, permissions, metadata)
+        // the auth frame established, on every request, not just the first.
+        // Authority still comes from `identity` alone; `with_optional_verified_jwt`
+        // never lets the token elevate it (see `AuthContext::from_verified_jwt`).
         let scope = crate::control::security::request_scope::RequestAuthScope::builder(
             identity,
             &self.state.scope_grants,
         )
         .with_session_database(Some(current_database))
         .with_session_id(session_id)
+        .with_optional_verified_jwt(self.verified_jwt.as_ref())
         .build();
 
         // Request-admission gate: internal-service exemption, blacklist,
