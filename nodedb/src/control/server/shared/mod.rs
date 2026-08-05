@@ -2,6 +2,7 @@
 pub mod authorization;
 pub mod check_constraint;
 pub mod ddl;
+pub mod metering;
 pub mod panic_isolation;
 pub mod plan_admission;
 pub mod plan_util;

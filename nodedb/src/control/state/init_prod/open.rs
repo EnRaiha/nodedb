@@ -270,6 +270,7 @@ impl SharedState {
                 metering_config.max_tracked_scopes,
             )),
             quota_manager: QuotaManager::with_bounds(metering_config.max_tracked_quota_grantees),
+            metering_config: metering_config.clone(),
             auth_api_keys: crate::control::security::auth_apikey::AuthApiKeyStore::new(),
             impersonation: crate::control::security::impersonation::ImpersonationStore::default(),
             emergency: crate::control::security::emergency::EmergencyState::default(),

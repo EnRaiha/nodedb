@@ -64,6 +64,11 @@ pub struct SharedState {
     pub usage_store: Arc<crate::control::security::metering::store::UsageStore>,
     /// Quota manager (enforcement against scope quotas).
     pub quota_manager: crate::control::security::metering::quota::QuotaManager,
+    /// Usage metering configuration (enabled flag, per-operation costs).
+    /// No `RwLock`/atomics — there is no live-mutation DDL for it, only the
+    /// bounds baked into `usage_store` / `quota_manager` at construction and
+    /// the `.enabled` / `.operation_costs` reads at dispatch time.
+    pub metering_config: crate::control::security::metering::config::MeteringConfig,
     /// Auth-scoped API keys (nda_ format, bound to auth_users).
     pub auth_api_keys: crate::control::security::auth_apikey::AuthApiKeyStore,
     /// Impersonation & delegation store.

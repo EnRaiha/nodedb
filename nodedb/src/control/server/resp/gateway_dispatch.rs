@@ -17,6 +17,7 @@ use crate::control::gateway::core::QueryContext;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::dispatch_utils;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, Lsn, RequestId, TraceId, VShardId};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -42,8 +43,19 @@ pub(super) async fn dispatch_kv(
     // resolve from the same value and cannot drift apart.
     let database_id = DatabaseId::DEFAULT;
     let vshard = VShardId::from_collection_in_database(database_id, &session.collection);
+    // Extracted before `plan` is moved into `authorize_resp_task`, which
+    // consumes it for RLS injection and task construction — metering needs
+    // the collection/engine shape after dispatch succeeds below, and by then
+    // the original plan is gone. Only the narrow metering shape is captured
+    // (see `PlanMeteringInfo`), not a full `plan.clone()`, and only when
+    // metering is enabled — the default is disabled, so this is a no-op on
+    // the hot RESP path for every deployment that hasn't turned it on.
+    let plan_metering_info = state
+        .metering_config
+        .enabled
+        .then(|| PlanMeteringInfo::extract(&plan));
     let authorized = authorize_resp_task(state, session, plan, vshard, database_id, "kv_get")?;
-    match state.gateway.get() {
+    let result = match state.gateway.get() {
         Some(gw) => {
             let gw_ctx = QueryContext {
                 tenant_id: session.tenant_id,
@@ -61,7 +73,13 @@ pub(super) async fn dispatch_kv(
         None => dispatch_utils::dispatch_authorized_to_data_plane(state, authorized, TraceId::ZERO)
             .await
             .map_err(map_busy_error),
+    };
+    if result.is_ok()
+        && let Some(info) = &plan_metering_info
+    {
+        meter_resp_dispatch(state, session, database_id, info);
     }
+    result
 }
 
 /// Dispatch a KV write operation through the gateway or the local Data Plane.
@@ -81,8 +99,14 @@ pub(super) async fn dispatch_kv_write(
     // through `authorize_resp_task` via `RequestAuthScope::builder`.
     let database_id = DatabaseId::DEFAULT;
     let vshard = VShardId::from_collection_in_database(database_id, &session.collection);
+    // See `dispatch_kv` above: extracted before `authorize_resp_task` moves
+    // `plan`, since metering needs the plan shape after dispatch succeeds.
+    let plan_metering_info = state
+        .metering_config
+        .enabled
+        .then(|| PlanMeteringInfo::extract(&plan));
     let authorized = authorize_resp_task(state, session, plan, vshard, database_id, "kv_put")?;
-    match state.gateway.get() {
+    let result = match state.gateway.get() {
         Some(gw) => {
             let gw_ctx = QueryContext {
                 tenant_id: session.tenant_id,
@@ -102,7 +126,44 @@ pub(super) async fn dispatch_kv_write(
                 .await
                 .map_err(map_busy_error)
         }
+    };
+    if result.is_ok()
+        && let Some(info) = &plan_metering_info
+    {
+        meter_resp_dispatch(state, session, database_id, info);
     }
+    result
+}
+
+/// Meter one completed RESP KV dispatch, once dispatch above has already
+/// returned success.
+///
+/// Recomputes the [`RequestAuthScope`] from `session.identity` rather than
+/// threading it out of `authorize_resp_task` — that keeps this a pure
+/// after-the-fact accounting step with no new state flowing through the
+/// dispatch path, and it is the same derivation `resp_auth_scope` already
+/// gives every caller in this file, so it cannot disagree with the scope
+/// `authorize_resp_task` used to authorize the request. `session.identity`
+/// is guaranteed `Some` here: `authorize_resp_task` already returned `Ok`
+/// on this call path, and it fails closed on a missing identity before this
+/// point is ever reached.
+///
+/// RESP ops are single-key, so the row count is known structurally without
+/// decoding the dispatch payload: `Some(1)` for both a hit and a miss — a
+/// miss still performed the lookup, and `meter_dispatch` charges at least
+/// one unit regardless, so this keeps that contract explicit rather than
+/// relying on the `rows: None` fallback to do it implicitly.
+fn meter_resp_dispatch(
+    state: &SharedState,
+    session: &RespSession,
+    database_id: DatabaseId,
+    info: &PlanMeteringInfo,
+) {
+    let Some(identity) = session.identity.as_ref() else {
+        return;
+    };
+    let scope = resp_auth_scope(identity, &state.scope_grants, database_id);
+    meter_dispatch(state, &scope, info, Some(1));
 }
 
 fn authorize_resp_task(
@@ -335,5 +396,169 @@ mod tests {
             "a RESP session whose real peer address falls inside a blacklisted CIDR range \
              must be rejected"
         );
+    }
+
+    /// Returns state plus the fake Data-Plane data-side and the backing
+    /// `TempDir` guard — the caller must keep the guard alive for as long as
+    /// `state` is in use.
+    fn metering_fixture() -> (
+        Arc<SharedState>,
+        crate::bridge::dispatch::CoreChannelDataSide,
+        tempfile::TempDir,
+    ) {
+        use crate::bridge::dispatch::Dispatcher;
+        use crate::wal::WalManager;
+
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
+        );
+        let (dispatcher, mut sides) = Dispatcher::new(1, 64);
+        let side = sides.pop().expect("one data side");
+        let state = SharedState::new(dispatcher, wal).expect("construct shared state");
+        (state, side, dir)
+    }
+
+    /// `metering_config` has no live-mutation path by design — reach in via
+    /// `Arc::get_mut` while the test is still the sole owner of the freshly
+    /// constructed state, before any clone escapes into a spawned responder
+    /// task. Same pattern as `metering::tests::enable_metering`.
+    fn enable_metering(state: &mut Arc<SharedState>) {
+        Arc::get_mut(state)
+            .expect("sole owner in test")
+            .metering_config
+            .enabled = true;
+    }
+
+    /// Fake Data-Plane responder: pops the one dispatched request off `side`
+    /// and answers it `Ok` with an empty payload, so `dispatch_kv` /
+    /// `dispatch_kv_write` complete their round trip without a real Data-Plane
+    /// core (mirrors the responder in `dispatch_utils::dispatch::tests`).
+    async fn respond_ok_once(
+        mut side: crate::bridge::dispatch::CoreChannelDataSide,
+        state: Arc<SharedState>,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut handled = false;
+        while !handled && std::time::Instant::now() < deadline {
+            if let Ok(request) = side.request_rx.try_pop() {
+                side.response_tx
+                    .try_push(crate::bridge::dispatch::BridgeResponse {
+                        inner: Response {
+                            request_id: request.inner.request_id,
+                            status: Status::Ok,
+                            attempt: 1,
+                            partial: false,
+                            payload: Payload::empty(),
+                            watermark_lsn: Lsn::new(0),
+                            error_code: None,
+                            read_set_valid: None,
+                            read_version_lsn: Lsn::ZERO,
+                            write_set: Vec::new(),
+                        },
+                    })
+                    .expect("fake data-plane response queue has capacity");
+                handled = true;
+            }
+            state.poll_and_route_responses();
+            tokio::task::yield_now().await;
+        }
+        assert!(handled, "fake data plane received the dispatched request");
+        state.poll_and_route_responses();
+    }
+
+    fn resp_session_with_identity(identity: AuthenticatedIdentity) -> RespSession {
+        let mut session = RespSession {
+            collection: "widgets".into(),
+            ..RespSession::default()
+        };
+        session.identity = Some(identity);
+        session
+    }
+
+    fn regular_identity(user_id: u64) -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_regular(
+            user_id,
+            "resp-user",
+            TenantId::new(1),
+            AuthMethod::Trust,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::All,
+        )
+    }
+
+    fn kv_get_plan(collection: &str) -> PhysicalPlan {
+        use nodedb_physical::physical_plan::KvOp;
+        PhysicalPlan::Kv(KvOp::Get {
+            collection: collection.into(),
+            key: Vec::new(),
+            rls_filters: Vec::new(),
+            surrogate_ceiling: None,
+        })
+    }
+
+    /// A successful RESP KV dispatch records exactly one usage event,
+    /// attributed to the RESP session's selected collection.
+    #[tokio::test]
+    async fn successful_kv_dispatch_records_one_event_for_session_collection() {
+        let (mut state, side, _dir) = metering_fixture();
+        enable_metering(&mut state);
+        let session = resp_session_with_identity(regular_identity(1));
+        let plan = kv_get_plan(&session.collection);
+
+        let responder = tokio::spawn(respond_ok_once(side, Arc::clone(&state)));
+        let result = dispatch_kv(&state, &session, plan).await;
+        responder.await.expect("responder completes");
+
+        assert!(result.is_ok(), "RESP KV dispatch must succeed");
+        let events = state.usage_counter.drain();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one usage event per dispatched task"
+        );
+        assert_eq!(events[0].collection, "widgets");
+        assert_eq!(events[0].engine, "kv");
+    }
+
+    /// A denied RESP dispatch — rejected before reaching the Data Plane —
+    /// performed no billable work and must record nothing.
+    #[tokio::test]
+    async fn denied_kv_dispatch_records_nothing() {
+        let (mut state, _side, _dir) = metering_fixture();
+        enable_metering(&mut state);
+        state
+            .blacklist
+            .blacklist_ip("10.0.0.0/8", "test ip ban", "admin", 0)
+            .expect("blacklist CIDR range");
+        let mut session = resp_session_with_identity(regular_identity(2));
+        session.peer_addr = "10.1.2.3:54321".into();
+        let plan = kv_get_plan(&session.collection);
+
+        let result = dispatch_kv(&state, &session, plan).await;
+
+        assert!(result.is_err(), "a blacklisted peer must be denied");
+        assert_eq!(state.usage_counter.total_tokens(), 0);
+    }
+
+    /// Metering disabled (the default) records nothing on a successful RESP
+    /// dispatch — proves this change is inert for the existing RESP suite.
+    #[tokio::test]
+    async fn metering_disabled_by_default_records_nothing_on_resp_success() {
+        let (state, side, _dir) = metering_fixture();
+        assert!(!state.metering_config.enabled, "default config is disabled");
+        let session = resp_session_with_identity(regular_identity(3));
+        let plan = kv_get_plan(&session.collection);
+
+        let responder = tokio::spawn(respond_ok_once(side, Arc::clone(&state)));
+        let result = dispatch_kv(&state, &session, plan).await;
+        responder.await.expect("responder completes");
+
+        assert!(
+            result.is_ok(),
+            "dispatch must still succeed with metering disabled"
+        );
+        assert_eq!(state.usage_counter.total_tokens(), 0);
     }
 }
