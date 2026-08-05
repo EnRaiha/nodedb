@@ -14,13 +14,41 @@ use crate::control::planner::calvin::{
     dispatch_authorized_tasks_to_calvin, is_dependent_predicate,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::session::{SessionId, TransactionState};
-use crate::types::TenantId;
+use crate::types::{DatabaseId, TenantId};
 use nodedb_physical::physical_task::PhysicalTask;
 
 use super::super::super::types::error_to_sqlstate;
 use super::super::core::NodeDbPgHandler;
 use super::planning::calvin_execution_response;
+
+/// Meter one Calvin task's shaped response, once its response has already
+/// been synthesised successfully by `calvin_execution_response` — Calvin
+/// applies the whole batch atomically, so by the time responses are being
+/// shaped every task in `tasks` has already committed.
+///
+/// `rows: None` — `calvin_execution_response` shapes a `pgwire` `Response`
+/// (a `Query` row stream or an `Execution` tag), not a decoded row count;
+/// decoding the stream solely to count rows here would consume it before the
+/// caller can stream it to the client. `meter_dispatch` charges one unit for
+/// `None`, correct for the write that just committed.
+fn meter_calvin_task(
+    state: &crate::control::state::SharedState,
+    identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
+    task: &PhysicalTask,
+) {
+    if !state.metering_config.enabled {
+        return;
+    }
+    let info = PlanMeteringInfo::extract(&task.plan);
+    let scope = RequestAuthScope::builder(identity, &state.scope_grants)
+        .with_session_database(Some(database_id))
+        .build();
+    meter_dispatch(state, &scope, &info, None);
+}
 
 impl NodeDbPgHandler {
     /// Drive Calvin strict multi-shard dispatch for the given task set.
@@ -130,6 +158,7 @@ impl NodeDbPgHandler {
                     database_id,
                     result_formats,
                 )?);
+                meter_calvin_task(&self.state, identity, database_id, task);
             }
             return Ok(calvin_responses);
         }
@@ -193,6 +222,7 @@ impl NodeDbPgHandler {
                 database_id,
                 result_formats,
             )?);
+            meter_calvin_task(&self.state, identity, database_id, task);
         }
         Ok(calvin_responses)
     }

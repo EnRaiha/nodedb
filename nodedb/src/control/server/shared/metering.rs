@@ -6,6 +6,8 @@
 //!
 //! [`PhysicalTask`]: nodedb_physical::physical_task::PhysicalTask
 
+use std::sync::Arc;
+
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::metering::counter::UsageEvent;
 use crate::control::security::request_scope::RequestAuthScope;
@@ -93,6 +95,21 @@ impl PlanMeteringInfo {
             operation: operation_for_plan(plan),
         }
     }
+
+    /// Build a metering shape directly, for dispatch doors with no
+    /// [`PhysicalPlan`] to extract from — e.g. whole-tenant backup/restore,
+    /// which operates on a tenant, not a single collection's plan.
+    pub(crate) fn for_collection(
+        collection: String,
+        engine: EngineTag,
+        operation: &'static str,
+    ) -> Self {
+        Self {
+            collection: Some(collection),
+            engine,
+            operation,
+        }
+    }
 }
 
 /// Meter one completed [`PhysicalTask`](nodedb_physical::physical_task::PhysicalTask)
@@ -152,6 +169,87 @@ pub(crate) fn meter_dispatch(
         // Filled in by `UsageCounter::drain`, not the caller.
         timestamp_secs: 0,
     });
+}
+
+/// A metering accumulator for a streaming response, live for the whole
+/// stream's lifetime and independent of how it ends.
+///
+/// The non-streaming [`meter_dispatch`] fires once, right after dispatch
+/// returns — but a streaming response (NDJSON, `ws_rpc` scan streams) writes
+/// rows to the client incrementally, and the client can disconnect before
+/// the last one. Billing must reflect rows the client actually received, not
+/// rows the plan would have produced had the stream run to completion. Rows
+/// are added as they are written via [`Self::add_rows`]; the accumulated
+/// total is recorded as a single usage event when this guard drops —
+/// whether that is normal stream completion, a mid-stream error, or an early
+/// client disconnect (dropping the response body future drops every local
+/// the stream generator holds, including this guard).
+pub(crate) struct DetachedMeterGuard {
+    state: Arc<SharedState>,
+    auth_user_id: String,
+    org_id: String,
+    tenant_id: u64,
+    collection: String,
+    engine: &'static str,
+    operation: &'static str,
+    rows: u64,
+}
+
+impl DetachedMeterGuard {
+    /// Build a guard for `info`, or `None` when nothing should be metered —
+    /// mirrors [`meter_dispatch`]'s own gating (disabled config, internal
+    /// service identity, no extractable collection) so a streaming caller
+    /// gets identical gating without duplicating the checks.
+    pub(crate) fn new(
+        state: &Arc<SharedState>,
+        scope: &RequestAuthScope<'_>,
+        info: &PlanMeteringInfo,
+    ) -> Option<Self> {
+        if !state.metering_config.enabled || scope.identity().is_internal_service() {
+            return None;
+        }
+        let collection = info.collection.clone()?;
+        Some(Self {
+            state: Arc::clone(state),
+            auth_user_id: scope.auth().id.clone(),
+            org_id: scope.auth().org_id.clone().unwrap_or_default(),
+            tenant_id: scope.tenant_id().as_u64(),
+            collection,
+            engine: engine_tag_str(info.engine),
+            operation: info.operation,
+            rows: 0,
+        })
+    }
+
+    /// Record that `n` more rows were actually written to the client.
+    pub(crate) fn add_rows(&mut self, n: u64) {
+        self.rows += n;
+    }
+}
+
+impl Drop for DetachedMeterGuard {
+    fn drop(&mut self) {
+        let operation_cost = self
+            .state
+            .metering_config
+            .operation_costs
+            .get(self.operation)
+            .copied()
+            .unwrap_or(1);
+        // Never charge zero: even a stream that closed before any row was
+        // written performed a lookup — see `meter_dispatch`'s identical rule.
+        let tokens = operation_cost.saturating_mul(self.rows.max(1));
+        self.state.usage_counter.record(&UsageEvent {
+            auth_user_id: self.auth_user_id.clone(),
+            org_id: self.org_id.clone(),
+            tenant_id: self.tenant_id,
+            collection: self.collection.clone(),
+            engine: self.engine.to_string(),
+            operation: self.operation.to_string(),
+            tokens,
+            timestamp_secs: 0,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -358,5 +456,70 @@ mod tests {
             "sql",
             "Meta ops with no cost-table counterpart fall back to \"sql\""
         );
+    }
+
+    #[test]
+    fn detached_guard_disabled_config_records_nothing() {
+        let (state, _dir) = test_state();
+        let identity = regular_identity(6);
+        let scope = scope_for(&identity, &state);
+
+        let guard =
+            DetachedMeterGuard::new(&state, &scope, &PlanMeteringInfo::extract(&kv_get_plan()));
+        assert!(guard.is_none(), "disabled config must not build a guard");
+        assert_eq!(state.usage_counter.total_tokens(), 0);
+    }
+
+    /// The whole point of the guard: a stream that writes some rows and then
+    /// drops early (client disconnect, mid-stream error) still bills exactly
+    /// what it wrote — not zero, and not what a full scan would have
+    /// produced. Dropping the guard mid-accumulation, without ever calling
+    /// a "finish" method, is the case that matters: it is what actually
+    /// happens when `async_stream::stream!`'s generator future is dropped.
+    #[test]
+    fn detached_guard_bills_rows_written_before_early_drop() {
+        let (mut state, _dir) = test_state();
+        enable_metering(&mut state);
+        let identity = regular_identity(7);
+        let scope = scope_for(&identity, &state);
+
+        {
+            let mut guard =
+                DetachedMeterGuard::new(&state, &scope, &PlanMeteringInfo::extract(&kv_get_plan()))
+                    .expect("metering enabled, collection present");
+            guard.add_rows(3);
+            guard.add_rows(4);
+            // Dropped here, mid-"stream", with no explicit finish call —
+            // simulates an early client disconnect after 7 rows were sent.
+        }
+
+        let events = state.usage_counter.drain();
+        assert_eq!(events.len(), 1, "exactly one event, recorded on drop");
+        assert_eq!(events[0].collection, "widgets");
+        assert_eq!(events[0].engine, "kv");
+        let expected_cost = state
+            .metering_config
+            .operation_costs
+            .get("kv_scan")
+            .copied()
+            .unwrap_or(1);
+        assert_eq!(events[0].tokens, expected_cost * 7);
+    }
+
+    #[test]
+    fn detached_guard_charges_one_unit_when_no_rows_were_ever_written() {
+        let (mut state, _dir) = test_state();
+        enable_metering(&mut state);
+        let identity = regular_identity(8);
+        let scope = scope_for(&identity, &state);
+
+        drop(
+            DetachedMeterGuard::new(&state, &scope, &PlanMeteringInfo::extract(&kv_get_plan()))
+                .expect("metering enabled, collection present"),
+        );
+
+        let events = state.usage_counter.drain();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].tokens >= 1);
     }
 }

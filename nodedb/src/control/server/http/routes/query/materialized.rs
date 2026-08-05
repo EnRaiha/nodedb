@@ -12,6 +12,7 @@ use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::authorization::authorize_database;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
 };
@@ -151,9 +152,20 @@ pub async fn query(
 
     // Execute each task via the SPSC bridge.
     let mut result_rows = Vec::new();
+    // Checked once rather than per task — metering is disabled by default,
+    // so this keeps the per-task extraction below (which clones the
+    // collection name) a true no-op on the hot path for every deployment
+    // that hasn't turned it on.
+    let metering_enabled = state.shared.metering_config.enabled;
 
     async {
         for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
+            // Extracted from `task.plan` before it's cloned/moved into any
+            // branch below — metering needs the collection/engine shape
+            // after this task's dispatch succeeds.
+            let plan_metering_info =
+                metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
+            let rows_before = result_rows.len();
             // `INSERT ... SELECT` is orchestrated on the Control Plane: the
             // source is scanned, each target row gets its OWN fresh, registered
             // surrogate, and the rows are written via an atomic `BatchInsert`.
@@ -181,6 +193,7 @@ pub async fn query(
                     database_id,
                     tenant_id,
                 )?;
+                meter_task_dispatch(&state.shared, &scope, &plan_metering_info, rows_before, &result_rows);
                 continue;
             }
 
@@ -221,6 +234,7 @@ pub async fn query(
                     database_id,
                     tenant_id,
                 )?;
+                meter_task_dispatch(&state.shared, &scope, &plan_metering_info, rows_before, &result_rows);
                 continue;
             }
 
@@ -262,6 +276,7 @@ pub async fn query(
                     database_id,
                     tenant_id,
                 )?;
+                meter_task_dispatch(&state.shared, &scope, &plan_metering_info, rows_before, &result_rows);
                 continue;
             }
 
@@ -322,6 +337,7 @@ pub async fn query(
                     Err(e) => return Err(ApiError::Internal(e.message().to_string())),
                 }
             }
+            meter_task_dispatch(&state.shared, &scope, &plan_metering_info, rows_before, &result_rows);
         }
 
         Ok((rate_limit_headers, axum::Json(HttpQueryResponse::ok(result_rows))))
@@ -349,6 +365,23 @@ fn response_error(response: &crate::bridge::envelope::Response) -> ApiError {
         .map(|code| format!("{code:?}"))
         .unwrap_or_else(|| "unknown error".into());
     ApiError::Internal(detail)
+}
+
+/// Meter one task's dispatch, once its rows (if any) have already been
+/// appended to `result_rows` — the row count is the delta since
+/// `rows_before`, so this must run after every append point for the task,
+/// never before.
+fn meter_task_dispatch(
+    state: &crate::control::state::SharedState,
+    scope: &crate::control::security::request_scope::RequestAuthScope<'_>,
+    info: &Option<PlanMeteringInfo>,
+    rows_before: usize,
+    result_rows: &[serde_json::Value],
+) {
+    if let Some(info) = info {
+        let task_rows = (result_rows.len() - rows_before) as u64;
+        meter_dispatch(state, scope, info, Some(task_rows));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

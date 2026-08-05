@@ -9,6 +9,7 @@ use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::authorization::authorize_database;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
 };
@@ -73,7 +74,18 @@ pub async fn execute_sql(
     let _request = shared.tenant_request_guard(tenant_id);
 
     let mut results = Vec::new();
+    // Checked once rather than per task — metering is disabled by default,
+    // so this keeps the per-task extraction below (which clones the
+    // collection name) a true no-op on the hot path for every deployment
+    // that hasn't turned it on.
+    let metering_enabled = shared.metering_config.enabled;
     for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
+        // Extracted from `task.plan` before it's cloned/moved into any
+        // branch below — metering needs the collection/engine shape after
+        // this task's dispatch succeeds. `results.len()` before dispatch
+        // gives this task's row-count baseline for the delta metered below.
+        let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
+        let rows_before = results.len();
         // `INSERT ... SELECT` is orchestrated on the Control Plane (fresh,
         // registered surrogate per target row + atomic `BatchInsert`), never
         // dispatched to the Data Plane as a single op.
@@ -100,6 +112,7 @@ pub async fn execute_sql(
                 }
                 Err(e) => return Err(e),
             }
+            meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
             continue;
         }
 
@@ -137,6 +150,7 @@ pub async fn execute_sql(
                 }
                 Err(e) => return Err(e),
             }
+            meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
             continue;
         }
 
@@ -178,6 +192,7 @@ pub async fn execute_sql(
                 }
                 Err(e) => return Err(e),
             }
+            meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
             continue;
         }
 
@@ -218,6 +233,7 @@ pub async fn execute_sql(
             }
             Err(e) => return Err(e),
         }
+        meter_task(shared, &scope, &plan_metering_info, rows_before, &results);
     }
 
     match results.len() {
@@ -227,6 +243,22 @@ pub async fn execute_sql(
             .next()
             .unwrap_or(serde_json::Value::Null)),
         _ => Ok(serde_json::Value::Array(results)),
+    }
+}
+
+/// Meter one task's dispatch, once its rows (if any) have already been
+/// pushed onto `results` — the row count is the delta since `rows_before`,
+/// so this must run after every push point for the task, never before.
+fn meter_task(
+    shared: &SharedState,
+    scope: &RequestAuthScope<'_>,
+    info: &Option<PlanMeteringInfo>,
+    rows_before: usize,
+    results: &[serde_json::Value],
+) {
+    if let Some(info) = info {
+        let task_rows = (results.len() - rows_before) as u64;
+        meter_dispatch(shared, scope, info, Some(task_rows));
     }
 }
 
@@ -337,5 +369,81 @@ mod tests {
                 "peer outside the blacklisted range must not be rejected by the IP check, got: {message}"
             );
         }
+    }
+
+    fn kv_get_plan() -> crate::bridge::envelope::PhysicalPlan {
+        crate::bridge::envelope::PhysicalPlan::Kv(nodedb_physical::physical_plan::KvOp::Get {
+            collection: "widgets".into(),
+            key: Vec::new(),
+            rls_filters: Vec::new(),
+            surrogate_ceiling: None,
+        })
+    }
+
+    fn scope_for<'a>(
+        identity: &'a AuthenticatedIdentity,
+        state: &'a SharedState,
+    ) -> RequestAuthScope<'a> {
+        RequestAuthScope::for_database(identity, &state.scope_grants, DatabaseId::DEFAULT)
+    }
+
+    /// `meter_task` is called unconditionally after every dispatch branch in
+    /// `execute_sql` (see the source above — always right after `results` is
+    /// updated, never on the `Err(e) => return Err(e)` arms), so covering it
+    /// directly here exercises the same enabled/disabled and row-count
+    /// behavior every call site relies on.
+    #[tokio::test]
+    async fn meter_task_disabled_by_default_records_nothing() {
+        let (state, _dir) = test_state().await;
+        assert!(!state.metering_config.enabled, "default is disabled");
+        let identity = regular_identity(9201);
+        let scope = scope_for(&identity, &state);
+        // `Some(...)` regardless of the disabled config, to prove
+        // `meter_dispatch`'s own internal enabled-check (not just the call
+        // site's `metering_enabled.then(...)` gate) protects this call.
+        let info = Some(PlanMeteringInfo::extract(&kv_get_plan()));
+        let results = vec![serde_json::Value::Null; 3];
+
+        meter_task(&state, &scope, &info, 0, &results);
+
+        assert_eq!(state.usage_counter.total_tokens(), 0);
+    }
+
+    #[tokio::test]
+    async fn meter_task_enabled_records_one_event_with_row_delta() {
+        let (mut state, _dir) = test_state().await;
+        std::sync::Arc::get_mut(&mut state)
+            .expect("sole owner in test")
+            .metering_config
+            .enabled = true;
+        let identity = regular_identity(9202);
+        let scope = scope_for(&identity, &state);
+        let info = metering_enabled_info(&state, &kv_get_plan());
+        let results = vec![serde_json::Value::Null; 5];
+
+        // rows_before = 2: this task contributed 3 of the 5 entries in `results`.
+        meter_task(&state, &scope, &info, 2, &results);
+
+        let events = state.usage_counter.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].collection, "widgets");
+        assert_eq!(events[0].engine, "kv");
+        let expected_cost = state
+            .metering_config
+            .operation_costs
+            .get("kv_scan")
+            .copied()
+            .unwrap_or(1);
+        assert_eq!(events[0].tokens, expected_cost * 3);
+    }
+
+    fn metering_enabled_info(
+        state: &SharedState,
+        plan: &crate::bridge::envelope::PhysicalPlan,
+    ) -> Option<PlanMeteringInfo> {
+        state
+            .metering_config
+            .enabled
+            .then(|| PlanMeteringInfo::extract(plan))
     }
 }

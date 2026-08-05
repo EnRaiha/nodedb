@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use crate::control::security::identity::AuthenticatedIdentity;
+
 #[derive(Debug)]
 pub struct RestorePending {
     pub tenant_id: u64,
@@ -23,16 +25,29 @@ pub struct RestorePending {
     /// Hard cap on accumulated bytes. The handler aborts the COPY IN
     /// once the limit would be exceeded.
     pub max_bytes: u64,
+    /// The identity that opened this COPY IN, carried from `intent_to_response`
+    /// through to `on_copy_done` — `on_copy_done` runs on a per-connection
+    /// `CopyHandler` with no identity of its own, and post-dispatch usage
+    /// metering needs the caller who requested the restore to attribute the
+    /// completed restore's usage to.
+    pub identity: AuthenticatedIdentity,
 }
 
 impl RestorePending {
-    pub fn new(tenant_id: u64, dry_run: bool, force: bool, max_bytes: u64) -> Self {
+    pub fn new(
+        tenant_id: u64,
+        dry_run: bool,
+        force: bool,
+        max_bytes: u64,
+        identity: AuthenticatedIdentity,
+    ) -> Self {
         Self {
             tenant_id,
             dry_run,
             force,
             bytes: Vec::new(),
             max_bytes,
+            identity,
         }
     }
 
@@ -92,11 +107,28 @@ pub enum AppendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::security::identity::{AuthMethod, DatabaseSet, Role};
+    use crate::types::TenantId;
+
+    fn test_identity() -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_regular(
+            1,
+            "restore-user",
+            TenantId::new(7),
+            AuthMethod::Trust,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::All,
+        )
+    }
 
     #[test]
     fn append_then_take() {
         let s = RestoreState::new();
-        s.begin(1, RestorePending::new(7, false, false, 1024));
+        s.begin(
+            1,
+            RestorePending::new(7, false, false, 1024, test_identity()),
+        );
         s.append(1, b"hello ").unwrap();
         s.append(1, b"world").unwrap();
         let p = s.take(1).unwrap();
@@ -114,7 +146,7 @@ mod tests {
     #[test]
     fn append_respects_cap() {
         let s = RestoreState::new();
-        s.begin(1, RestorePending::new(7, false, false, 4));
+        s.begin(1, RestorePending::new(7, false, false, 4, test_identity()));
         s.append(1, b"abc").unwrap();
         assert_eq!(s.append(1, b"de"), Err(AppendError::OverCap { cap: 4 }));
     }
@@ -122,7 +154,10 @@ mod tests {
     #[test]
     fn cancel_drops_state() {
         let s = RestoreState::new();
-        s.begin(1, RestorePending::new(7, false, false, 1024));
+        s.begin(
+            1,
+            RestorePending::new(7, false, false, 1024, test_identity()),
+        );
         s.cancel(1);
         assert_eq!(s.append(1, b"x"), Err(AppendError::NotPending));
     }

@@ -28,6 +28,7 @@ use crate::control::server::response_shape::compose::shape_decoded_rows;
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::result_stream::ResultStream;
 use crate::control::server::shared::authorization::authorize_task_set;
+use crate::control::server::shared::metering::DetachedMeterGuard;
 use crate::data::executor::response_codec::decode_payload_to_json;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
@@ -106,12 +107,19 @@ pub(super) fn ndjson_body_stream(
     limit: usize,
     projection: Option<OutputSchema>,
     lease_scope: crate::control::lease::QueryLeaseScope,
+    meter_guard: Option<DetachedMeterGuard>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
         // The body owns this scope for its complete polling lifetime. Dropping
         // the body on completion or client disconnect releases descriptors only
         // after the ResultStream is no longer reachable.
         let _lease_scope = lease_scope;
+        // Owned by this generator for its whole polling lifetime, exactly
+        // like `_lease_scope` above — whether the stream runs to completion,
+        // ends on a mid-stream error, or is dropped early by a disconnected
+        // client, this guard's `Drop` fires and bills exactly the rows
+        // accumulated into it via `add_rows` below, never more.
+        let mut meter_guard = meter_guard;
         let mut emitted: usize = 0;
         let mut batches = stream;
         while emitted < limit {
@@ -151,6 +159,14 @@ pub(super) fn ndjson_body_stream(
                 }
                 let line = format!("{}\n", serde_json::Value::Object(row));
                 emitted += 1;
+                // Incremented for the row this line actually carries, right
+                // before it is handed to the body sink below — a client that
+                // disconnects after this `yield` still received the line (it
+                // is queued to write), so counting here rather than after
+                // the `yield` cannot undercount a delivered row.
+                if let Some(guard) = meter_guard.as_mut() {
+                    guard.add_rows(1);
+                }
                 yield Ok(Bytes::from(line));
             }
         }
@@ -161,6 +177,7 @@ pub(super) fn ndjson_body_stream(
 mod tests {
     use super::*;
     use crate::control::server::result_stream::RowBatch;
+    use crate::control::state::SharedState;
     use crate::types::Lsn;
 
     /// A JSON-text array of `n` `{"id": i}` objects. `decode_payload_to_json`
@@ -207,6 +224,7 @@ mod tests {
             usize::MAX,
             None,
             crate::control::lease::QueryLeaseScope::empty(),
+            None,
         ))
         .await;
         assert_eq!(lines.len(), 2500, "all rows must stream as NDJSON lines");
@@ -221,6 +239,7 @@ mod tests {
             1500,
             None,
             crate::control::lease::QueryLeaseScope::empty(),
+            None,
         ))
         .await;
         assert_eq!(lines.len(), 1500, "global take-N must cap the line count");
@@ -240,11 +259,103 @@ mod tests {
             usize::MAX,
             None,
             crate::control::lease::QueryLeaseScope::empty(),
+            None,
         ))
         .await;
         assert_eq!(lines.len(), 11, "10 rows + 1 in-band error line");
         let last: serde_json::Value =
             sonic_rs::from_str(lines.last().expect("error line")).expect("json error line");
         assert!(last.get("error").is_some(), "final line is an error object");
+    }
+
+    /// The streaming metering contract: a client that disconnects mid-stream
+    /// must be billed for exactly the rows it received, never for the rows a
+    /// full scan would have produced. Polls only 3 of 2000 available rows,
+    /// then drops the stream without reaching the end of the generator —
+    /// exactly what happens when axum drops a response body because the
+    /// connected client went away.
+    #[tokio::test]
+    async fn early_client_disconnect_meters_only_rows_actually_sent() {
+        use crate::bridge::dispatch::Dispatcher;
+        use crate::control::security::identity::{
+            AuthMethod, AuthenticatedIdentity, DatabaseSet, Role,
+        };
+        use crate::control::security::request_scope::RequestAuthScope;
+        use crate::control::server::shared::metering::PlanMeteringInfo;
+        use crate::wal::WalManager;
+        use nodedb_physical::physical_plan::KvOp;
+
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = std::sync::Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct shared state");
+        std::sync::Arc::get_mut(&mut state)
+            .expect("sole owner in test")
+            .metering_config
+            .enabled = true;
+
+        let identity = AuthenticatedIdentity::new_regular(
+            1,
+            "stream-user",
+            crate::types::TenantId::new(1),
+            AuthMethod::Trust,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::All,
+        );
+        let scope = RequestAuthScope::for_database(
+            &identity,
+            &state.scope_grants,
+            crate::types::DatabaseId::DEFAULT,
+        );
+        // Collection/engine only matter for attribution, not for this test's
+        // assertion — any plan with an extractable collection works.
+        let plan = crate::bridge::envelope::PhysicalPlan::Kv(KvOp::Get {
+            collection: "widgets".into(),
+            key: Vec::new(),
+            rls_filters: Vec::new(),
+            surrogate_ceiling: None,
+        });
+        let info = PlanMeteringInfo::extract(&plan);
+        let guard = DetachedMeterGuard::new(&state, &scope, &info)
+            .expect("metering enabled and collection present");
+
+        let batches: Vec<crate::Result<RowBatch>> = vec![batch(0, 1000), batch(1000, 1000)];
+        let stream: ResultStream = Box::pin(futures::stream::iter(batches));
+        // The stream (and the guard it owns) must be dropped before draining,
+        // which is what a client disconnecting mid-response does. `pin_mut!`
+        // shadows the binding with a `Pin<&mut _>`, so `drop`ping that name
+        // would only release the borrow and leave the stream — and its
+        // pending row count — alive until end of scope. An inner block drops
+        // the real value.
+        {
+            let body = ndjson_body_stream(
+                stream,
+                usize::MAX,
+                None,
+                crate::control::lease::QueryLeaseScope::empty(),
+                Some(guard),
+            );
+            futures::pin_mut!(body);
+            for _ in 0..3 {
+                body.next()
+                    .await
+                    .expect("chunk available")
+                    .expect("chunk ok");
+            }
+        }
+
+        let events = state.usage_counter.drain();
+        assert_eq!(
+            events.len(),
+            1,
+            "dropping the stream mid-poll still records exactly one event"
+        );
+        assert_eq!(
+            events[0].tokens, 3,
+            "billed exactly the 3 rows actually sent to the client, not the 2000 planned"
+        );
     }
 }

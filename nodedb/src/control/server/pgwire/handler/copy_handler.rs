@@ -31,9 +31,12 @@ use crate::control::backup::CopyIntent;
 use crate::control::backup::state::AppendError;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::security::request_scope::RequestAuthScope;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::session::{ConnectionId, SessionId};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
+use nodedb_types::calvin::EngineTag;
 
 use super::core::NodeDbPgHandler;
 
@@ -125,6 +128,13 @@ impl NodeDbPgHandler {
                 let bytes = backup::backup_tenant(&self.state, tenant_id)
                     .await
                     .map_err(internal)?;
+                // Metered here, on the success path, before the response is
+                // built below — there is no `PhysicalPlan` for a whole-tenant
+                // backup, so the collection dimension is a synthetic
+                // `tenant:<id>` marker rather than a real collection name.
+                // `rows: None` — the backup produces a byte blob, not a row
+                // count; `meter_dispatch` charges one unit for `None`.
+                meter_backup_restore(&self.state, &scope, tenant_id, None);
                 let copy_data = Ok(CopyData::new(bytes));
                 let stream = stream::once(async move { copy_data });
                 Ok(Response::CopyOut(CopyResponse::new(0, 0, stream)))
@@ -145,7 +155,13 @@ impl NodeDbPgHandler {
                 };
                 self.restore_state.begin(
                     connection_id.get(),
-                    backup::RestorePending::new(tenant_id, dry_run, force, COPY_IN_CAP),
+                    backup::RestorePending::new(
+                        tenant_id,
+                        dry_run,
+                        force,
+                        COPY_IN_CAP,
+                        identity.clone(),
+                    ),
                 );
                 // Empty out-stream — server tells client "send me bytes".
                 let empty = stream::empty();
@@ -153,6 +169,28 @@ impl NodeDbPgHandler {
             }
         }
     }
+}
+
+/// Meter one completed whole-tenant backup or restore.
+///
+/// Shared by the backup branch of `intent_to_response` and
+/// `on_copy_done`'s restore completion below — both operate on a whole
+/// tenant rather than a `PhysicalPlan`-shaped single-collection dispatch, so
+/// this builds a [`PlanMeteringInfo`] directly via
+/// [`PlanMeteringInfo::for_collection`] instead of extracting one from a
+/// plan.
+fn meter_backup_restore(
+    state: &SharedState,
+    scope: &RequestAuthScope<'_>,
+    tenant_id: u64,
+    rows: Option<u64>,
+) {
+    if !state.metering_config.enabled {
+        return;
+    }
+    let info =
+        PlanMeteringInfo::for_collection(format!("tenant:{tenant_id}"), EngineTag::Meta, "sql");
+    meter_dispatch(state, scope, &info, rows);
 }
 
 /// CopyHandler shared by the factory's per-connection handler. Holds
@@ -223,6 +261,21 @@ impl CopyHandler for NodeDbCopyHandler {
         // client's COPY IN sink can complete.
         let rows =
             stats.documents + stats.kv_tables + stats.vectors + stats.timeseries + stats.edges;
+        // Metered on the success path, using the same `rows` count the
+        // command tag below reports — `pending.identity` is the caller who
+        // opened this COPY IN back in `intent_to_response`, carried through
+        // `RestorePending` since this per-connection `CopyHandler` has no
+        // identity of its own.
+        let database_id = pending
+            .identity
+            .default_database
+            .unwrap_or(crate::types::DatabaseId::DEFAULT);
+        let scope = RequestAuthScope::for_database(
+            &pending.identity,
+            &self.state.scope_grants,
+            database_id,
+        );
+        meter_backup_restore(&self.state, &scope, pending.tenant_id, Some(rows as u64));
         let tag = Tag::new("RESTORE TENANT").with_rows(rows);
         client
             .send(PgWireBackendMessage::CommandComplete(tag.into()))
@@ -363,11 +416,11 @@ mod tests {
         let second = ConnectionId::new(2).unwrap_or_else(|_| unreachable!());
         state.begin(
             first.get(),
-            backup::RestorePending::new(1, false, false, 16),
+            backup::RestorePending::new(1, false, false, 16, identity(1)),
         );
         state.begin(
             second.get(),
-            backup::RestorePending::new(1, false, false, 16),
+            backup::RestorePending::new(1, false, false, 16, identity(2)),
         );
 
         cancel_restore(&state, first);
@@ -377,5 +430,60 @@ mod tests {
             Err(AppendError::NotPending)
         );
         assert!(state.append(second.get(), b"x").is_ok());
+    }
+
+    /// `meter_backup_restore` is called unconditionally from both the backup
+    /// success arm of `intent_to_response` and the restore success tail of
+    /// `on_copy_done` — never from an error path in either (see the source
+    /// above: it runs after `?` has already propagated any failure) — so
+    /// covering it directly here exercises the same enabled/disabled and
+    /// row-count behavior every call site relies on.
+    #[test]
+    fn metering_disabled_by_default_records_nothing() {
+        let (handler, _dir) = test_handler();
+        assert!(
+            !handler.state.metering_config.enabled,
+            "default is disabled"
+        );
+        let user = identity(1);
+        let scope = RequestAuthScope::for_database(
+            &user,
+            &handler.state.scope_grants,
+            crate::types::DatabaseId::DEFAULT,
+        );
+
+        meter_backup_restore(&handler.state, &scope, 7, Some(42));
+
+        assert_eq!(handler.state.usage_counter.total_tokens(), 0);
+    }
+
+    #[test]
+    fn enabled_backup_restore_records_one_event_for_the_tenant() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let mut state = SharedState::new(dispatcher, wal).expect("construct shared state");
+        // Sole owner at this point — construction below is the only clone.
+        std::sync::Arc::get_mut(&mut state)
+            .expect("sole owner in test")
+            .metering_config
+            .enabled = true;
+        let handler = NodeDbPgHandler::new(state, AuthMode::Trust);
+        let user = identity(1);
+        let scope = RequestAuthScope::for_database(
+            &user,
+            &handler.state.scope_grants,
+            crate::types::DatabaseId::DEFAULT,
+        );
+
+        meter_backup_restore(&handler.state, &scope, 7, Some(42));
+
+        let events = handler.state.usage_counter.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].collection, "tenant:7");
+        assert_eq!(events[0].engine, "meta");
+        assert_eq!(events[0].tokens, 42);
     }
 }

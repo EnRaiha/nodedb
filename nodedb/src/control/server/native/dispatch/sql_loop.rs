@@ -16,6 +16,7 @@ use crate::control::server::response_shape::compose::{ShapeOutcome, shape_respon
 use crate::control::server::response_shape::schema::OutputSchema;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::session::expander_stage::{
     ExpanderOutcome, route_in_tx_expander,
 };
@@ -57,6 +58,11 @@ pub(super) async fn run_dispatch_loop(
     let mut warnings: Vec<String> = Vec::new();
     let mut last_lsn = 0u64;
     let mut total_affected = 0u64;
+    // Checked once rather than per task — metering is disabled by default, so
+    // this keeps the per-task extraction below (which clones the collection
+    // name) a true no-op on the hot path for every deployment that hasn't
+    // turned it on.
+    let metering_enabled = ctx.state.metering_config.enabled;
 
     for task in tasks {
         if task.tenant_id != ctx.tenant_id() {
@@ -73,6 +79,18 @@ pub(super) async fn run_dispatch_loop(
         // can be shaped into the response exactly like the non-staged branch
         // below shapes `task_resp.payload`.
         let plan_for_staged_response = task.plan.clone();
+        // Extracted from the same clone above, before `task` is moved into
+        // the routing call below — metering needs the collection/engine
+        // shape after this task's dispatch succeeds. Only covers the direct
+        // dispatch below (`InTxnRoute::Read`, i.e. autocommit writes/reads
+        // and in-transaction reads); `Buffered`/`Staged` tasks `continue`
+        // before reaching the metering call and are not billed here — a
+        // `Buffered` task performs no dispatch yet (replayed at COMMIT), and
+        // a `Staged` task's dispatch happens inside `route_in_tx_write`'s
+        // closure, whose response is consumed before returning `Staged` and
+        // is not observable at this loop level.
+        let plan_metering_info =
+            metering_enabled.then(|| PlanMeteringInfo::extract(&plan_for_staged_response));
 
         // In transaction: route through the protocol-neutral staging gate.
         // Reads (including in-transaction reads) come back as `Read` with
@@ -237,6 +255,10 @@ pub(super) async fn run_dispatch_loop(
 
         last_lsn = task_resp.watermark_lsn.as_u64();
 
+        // This task's own row count, for metering below — distinct from
+        // `total_affected`/`all_rows`, which accumulate across every task in
+        // the loop.
+        let mut task_rows: Option<u64> = None;
         let plan_kind = describe_plan(&plan_for_response);
         if let crate::control::server::response_shape::types::PlanKind::DmlResult(_) = plan_kind {
             // A count-bearing write reports the rows it actually touched. Adding
@@ -246,7 +268,10 @@ pub(super) async fn run_dispatch_loop(
             match crate::control::server::shared::sql::staging_predicates::require_affected_count(
                 &task_resp.payload,
             ) {
-                Ok(n) => total_affected += n,
+                Ok(n) => {
+                    total_affected += n;
+                    task_rows = Some(n);
+                }
                 Err(e) => return resp(error_to_native(seq, &e)),
             }
         } else if task_resp.payload.is_empty() {
@@ -271,6 +296,7 @@ pub(super) async fn run_dispatch_loop(
                     if !cols.is_empty() && all_columns.is_none() {
                         all_columns = Some(cols);
                     }
+                    task_rows = Some(rows.len() as u64);
                     all_rows.extend(rows);
                 }
                 Ok(ShapeOutcome::Passthrough) => {
@@ -278,6 +304,14 @@ pub(super) async fn run_dispatch_loop(
                 }
                 Err(e) => return resp(shape_error_to_native(seq, &e)),
             }
+        }
+
+        // Metered here, once per successfully dispatched task (see the scope
+        // note on `plan_metering_info` above for the tasks this does not
+        // cover) — `task_resp.status == Status::Error` returned above, so
+        // every path reaching here is the success path.
+        if let Some(info) = &plan_metering_info {
+            meter_dispatch(ctx.state, &ctx.scope, info, task_rows);
         }
     }
 

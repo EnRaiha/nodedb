@@ -5,6 +5,7 @@
 use nodedb_types::protocol::{NativeResponse, OpCode, TextFields};
 
 use crate::bridge::envelope::{Response, Status};
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 
 use super::raw_dispatch::dispatch_authorized_single_task;
 use super::response::data_plane_response_to_native;
@@ -58,6 +59,14 @@ pub(crate) async fn handle_graph_match(
     // staging overlay identically to every other direct-op read.
     let txn_id = ctx.sessions.tx_id(ctx.peer_addr);
     let plan_for_response = plan.clone();
+    // Extracted before `plan` moves into `dispatch_authorized_single_task`
+    // below — metering needs the collection/engine shape after dispatch
+    // succeeds, and only when metering is enabled (the default is disabled).
+    let plan_metering_info = ctx
+        .state
+        .metering_config
+        .enabled
+        .then(|| PlanMeteringInfo::extract(&plan));
     let _request = ctx.state.tenant_request_guard(tenant_id);
     let raw = dispatch_authorized_single_task(ctx, tenant_id, vshard_id, plan, txn_id).await;
 
@@ -105,5 +114,15 @@ pub(crate) async fn handle_graph_match(
             },
             Err(error) => return error_to_native(seq, &error),
         };
-    data_plane_response_to_native(ctx, seq, &plan_for_response, &unwrapped)
+    let native = data_plane_response_to_native(ctx, seq, &plan_for_response, &unwrapped);
+    // Metered only on the success path — `data_plane_response_to_native`
+    // above already decoded the row envelope to shape the response, so
+    // `native.rows` gives the real row count for free (no extra decode).
+    if native.status != nodedb_types::protocol::ResponseStatus::Error
+        && let Some(info) = &plan_metering_info
+    {
+        let rows = native.rows.as_ref().map(|rows| rows.len() as u64);
+        meter_dispatch(ctx.state, &ctx.scope, info, rows);
+    }
+    native
 }

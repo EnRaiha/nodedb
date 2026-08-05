@@ -11,6 +11,9 @@ use crate::control::gateway::core::QueryContext;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::server::response_shape::types::describe_plan;
 use crate::control::server::shared::authorization::authorize_database;
+use crate::control::server::shared::metering::{
+    DetachedMeterGuard, PlanMeteringInfo, meter_dispatch,
+};
 use crate::control::server::shared::plan_admission::{
     PlanAdmissionRequest, plan_authorize_and_admit,
 };
@@ -143,6 +146,21 @@ pub async fn query_ndjson(
                 })
                 .into_response();
             };
+            // Built only once the streaming path is confirmed taken — `tasks`
+            // is a single-task slice here (`try_open_stream` requires exactly
+            // one task to return `Some`). The streaming body below owns the
+            // resulting guard for its whole polling lifetime, so rows
+            // actually sent to the client (not rows planned) are what gets
+            // billed; see `DetachedMeterGuard`'s docs. `None` when metering
+            // is disabled (the default).
+            let stream_meter_guard = if state.shared.metering_config.enabled
+                && let [task] = tasks.as_slice()
+            {
+                let info = PlanMeteringInfo::extract(&task.plan);
+                DetachedMeterGuard::new(&state.shared, &scope, &info)
+            } else {
+                None
+            };
             let mut response = Response::builder()
                 .header("Content-Type", "application/x-ndjson")
                 .body(axum::body::Body::from_stream(ndjson_body_stream(
@@ -150,6 +168,7 @@ pub async fn query_ndjson(
                     limit,
                     Some(output_schema.clone()),
                     lease_scope,
+                    stream_meter_guard,
                 )))
                 .unwrap_or_else(|_| {
                     (StatusCode::INTERNAL_SERVER_ERROR, "encoding error").into_response()
@@ -163,11 +182,20 @@ pub async fn query_ndjson(
 
     let _lease_scope = lease_scope;
     let mut ndjson = String::new();
+    // Checked once rather than per task — metering is disabled by default,
+    // so this keeps the per-task extraction below (which clones the
+    // collection name) a true no-op on the hot path for every deployment
+    // that hasn't turned it on. This fallback path fully materializes the
+    // NDJSON body before returning it (unlike the true streaming path
+    // above), so there is no early-client-disconnect case to account for
+    // here — it meters like the materialized `/v1/query` route.
+    let metering_enabled = state.shared.metering_config.enabled;
     for (task, authorized_task) in tasks.into_iter().zip(authorized_tasks) {
         // Captured before dispatch moves `task.plan` — needed by the
         // protocol-neutral shaping core below.
         let plan_kind = describe_plan(&task.plan);
         let plan_for_shape = task.plan.clone();
+        let plan_metering_info = metering_enabled.then(|| PlanMeteringInfo::extract(&task.plan));
 
         let dispatch_result: crate::Result<Vec<Vec<u8>>> = if matches!(
             &task.plan,
@@ -233,6 +261,11 @@ pub async fn query_ndjson(
 
         match dispatch_result {
             Ok(payloads) => {
+                // This task's own row count, for metering below — the
+                // dispatch itself already succeeded here (that is this
+                // `match` arm), so a per-row shaping error doesn't change
+                // whether the task is billed, only how many rows it counts.
+                let mut task_rows: u64 = 0;
                 for payload in &payloads {
                     if payload.is_empty() {
                         continue;
@@ -247,12 +280,14 @@ pub async fn query_ndjson(
                         tenant_id,
                     ) {
                         Ok(HttpShaped::Rows(rows)) => {
+                            task_rows += rows.len() as u64;
                             for row in rows {
                                 ndjson.push_str(&row.to_string());
                                 ndjson.push('\n');
                             }
                         }
                         Ok(HttpShaped::Passthrough) => {
+                            task_rows += 1;
                             passthrough_to_ndjson(payload, &mut ndjson);
                         }
                         Err(e) => {
@@ -260,6 +295,9 @@ pub async fn query_ndjson(
                             ndjson.push('\n');
                         }
                     }
+                }
+                if let Some(info) = &plan_metering_info {
+                    meter_dispatch(&state.shared, &scope, info, Some(task_rows));
                 }
             }
             Err(e) => {

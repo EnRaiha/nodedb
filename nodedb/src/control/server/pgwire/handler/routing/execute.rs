@@ -10,7 +10,9 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::control::planner::calvin::{DispatchClass, classify_dispatch};
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::compose::{self, ShapeOutcome};
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::session::SessionId;
 use crate::types::TenantId;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -233,6 +235,11 @@ impl NodeDbPgHandler {
         let mut dedup_payloads: Vec<Vec<u8>> = Vec::new();
         let mut dedup_set_op = PostSetOp::None;
         let mut responses = Vec::with_capacity(tasks.len());
+        // Checked once rather than per task — metering is disabled by
+        // default, so this keeps the per-task extraction below (which clones
+        // the collection name) a true no-op on the hot path for every
+        // deployment that hasn't turned it on.
+        let metering_enabled = self.state.metering_config.enabled;
 
         for mut task in tasks {
             if task.tenant_id != tenant_id {
@@ -297,6 +304,15 @@ impl NodeDbPgHandler {
             let task_database_id = task.database_id;
             let task_vshard = task.vshard_id;
             let plan_for_response = task.plan.clone();
+            // Extracted from the clone above, before dispatch — metering
+            // needs the collection/engine shape after this task's dispatch
+            // succeeds. Only covers the "normal dispatch" branch at the
+            // bottom of this loop; the streaming fast path
+            // (`maybe_stream_select`) and the `ClusterArray` short-circuit
+            // above dispatch through entirely separate code paths and are
+            // not metered here.
+            let plan_metering_info =
+                metering_enabled.then(|| PlanMeteringInfo::extract(&plan_for_response));
 
             // Single-node pgwire streaming fast path (autocommit SELECT only).
             // In-transaction reads skip streaming so the transaction id rides on
@@ -472,6 +488,11 @@ impl NodeDbPgHandler {
                     .record_dml(tenant_id.as_u64(), &info.collection);
             }
 
+            // This task's own row count, for metering below — `None` for the
+            // set-op-deferred branch (its rows are only known after the
+            // later cross-task merge) and for `Passthrough` (no row payload
+            // to count); `meter_dispatch` charges one unit for `None`.
+            let mut task_rows: Option<u64> = None;
             if needs_set_op && resp_post_set_op != PostSetOp::None {
                 dedup_payloads.push(resp.payload.to_vec());
                 if dedup_set_op == PostSetOp::None {
@@ -490,6 +511,7 @@ impl NodeDbPgHandler {
                 .map_err(|e| sqlstate_error("XX000", e.message()))?
                 {
                     ShapeOutcome::Rows(shaped) => {
+                        task_rows = Some(shaped.rows.len() as u64);
                         let (response, notice) =
                             shape_encode::shaped_query_response(shaped, result_formats);
                         if let Some(n) = notice {
@@ -505,6 +527,16 @@ impl NodeDbPgHandler {
                         responses.push(shaped.response);
                     }
                 }
+            }
+
+            // Metered here, once per successfully dispatched task — every
+            // path reaching this point already passed the
+            // `response_status_to_sqlstate` error check above.
+            if let Some(info) = &plan_metering_info {
+                let scope = RequestAuthScope::builder(identity, &self.state.scope_grants)
+                    .with_session_database(Some(task_database_id))
+                    .build();
+                meter_dispatch(&self.state, &scope, info, task_rows);
             }
         }
 

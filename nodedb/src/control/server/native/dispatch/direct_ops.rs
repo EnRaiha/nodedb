@@ -10,6 +10,7 @@ use crate::control::planner::calvin::{
     dispatch_authorized_tasks_to_calvin,
 };
 use crate::control::server::shared::ddl::sqlstate::error_code_to_sqlstate;
+use crate::control::server::shared::metering::{PlanMeteringInfo, meter_dispatch};
 use crate::control::server::shared::session::staging_gate::{
     InTxnRoute, StagingGateError, route_in_tx_write,
 };
@@ -80,234 +81,274 @@ pub(crate) async fn handle_direct_op(
         return NativeResponse::error(seq, "42501", e.to_string());
     }
 
-    // `INSERT ... SELECT` is orchestrated on the Control Plane (fresh, registered
-    // surrogate per target row + atomic `BatchInsert`); it never reaches the
-    // Data Plane as a single op.
-    if matches!(
-        &plan,
-        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. })
-    ) {
-        let task = PhysicalTask {
-            tenant_id,
-            vshard_id,
-            database_id: ctx.database_id(),
-            plan: plan.clone(),
-            post_set_op: PostSetOp::None,
-            txn_id: None,
-        };
-        let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
-            Ok(authorized) => authorized,
-            Err(error) => return error_to_native(seq, &error),
-        };
-        let _request = ctx.state.tenant_request_guard(tenant_id);
-        let result =
-            crate::control::insert_select::run_authorized_insert_select(ctx.state, authorized)
-                .await;
-        return match result {
-            Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
-            Err(e) => error_to_native(seq, &e),
-        };
-    }
+    // Extracted before `plan` is moved/cloned into any of the branches below
+    // — metering needs the collection/engine shape after dispatch succeeds,
+    // and only when metering is enabled (the default is disabled, so this is
+    // a no-op on the hot path for every caller that hasn't turned it on).
+    let plan_metering_info = ctx
+        .state
+        .metering_config
+        .enabled
+        .then(|| PlanMeteringInfo::extract(&plan));
 
-    // Autocommit `MERGE` is orchestrated on the Control Plane (fresh, registered
-    // surrogate per NOT-MATCHED insert row + atomic apply); it never reaches the
-    // Data Plane as a single op.
-    if matches!(
-        &plan,
-        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Merge {
-            resolve_only: false,
-            resolved_inserts: None,
-            ..
-        })
-    ) {
-        let task = PhysicalTask {
-            tenant_id,
-            vshard_id,
-            database_id: ctx.database_id(),
-            plan: plan.clone(),
-            post_set_op: PostSetOp::None,
-            txn_id: None,
-        };
-        let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
-            Ok(authorized) => authorized,
-            Err(error) => return error_to_native(seq, &error),
-        };
-        let _request = ctx.state.tenant_request_guard(tenant_id);
-        let result =
-            crate::control::merge_orchestrator::run_authorized_merge(ctx.state, authorized).await;
-        return match result {
-            Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
-            Err(e) => error_to_native(seq, &e),
-        };
-    }
-
-    // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control Plane
-    // (source scanned on its own core + shipped into the plan); it never reaches
-    // the Data Plane as a single op reading a possibly-non-resident source.
-    if matches!(
-        &plan,
-        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
-            resolve_only: false,
-            source_rows: None,
-            ..
-        })
-    ) {
-        let task = PhysicalTask {
-            tenant_id,
-            vshard_id,
-            database_id: ctx.database_id(),
-            plan: plan.clone(),
-            post_set_op: PostSetOp::None,
-            txn_id: None,
-        };
-        let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
-            Ok(authorized) => authorized,
-            Err(error) => return error_to_native(seq, &error),
-        };
-        let _request = ctx.state.tenant_request_guard(tenant_id);
-        let result =
-            crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
-                ctx.state, authorized,
-            )
-            .await;
-        return match result {
-            Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
-            Err(e) => error_to_native(seq, &e),
-        };
-    }
-
-    // Stamp the connection's active transaction id (as the SQL path's
-    // `route_in_tx_write` does for in-transaction reads — see
-    // `staging_gate.rs::route_in_tx_write`) so the Data Plane can resolve this
-    // transaction's staging overlay for read-your-own-writes on direct-op
-    // reads (PointGet / RangeScan / VectorSearch) and give direct-op writes
-    // (KvBatchPut) a real transaction identity. `tx_id` is `None` outside a
-    // transaction block, so autocommit behavior is unchanged.
-    let txn_id = ctx.sessions.tx_id(ctx.peer_addr);
-
-    // Implicit graph-edge extraction (pgwire / native-SQL parity): a schemaless
-    // document carrying `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task.
-    // The common no-edge case leaves `tasks` at length 1 and runs the existing
-    // single-dispatch path byte-identically below; an edge-bearing insert
-    // augments the vec and routes through classify/Calvin like every other
-    // write surface.
-    let mut tasks = vec![PhysicalTask {
-        tenant_id,
-        vshard_id,
-        database_id: ctx.database_id(),
-        plan,
-        post_set_op: PostSetOp::None,
-        txn_id,
-    }];
-    // Implicit-edge extraction marks catalog state and allocates surrogates.
-    // Authorize the original direct-op task before those side effects.
-    let emitter =
-        crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&ctx.state.audit));
-    if let Err(error) = crate::control::server::shared::authorization::authorize_task_set(
-        ctx.identity,
-        &tasks,
-        &ctx.state.permissions,
-        &ctx.state.roles,
-        &emitter,
-    ) {
-        return error_to_native(seq, &crate::Error::from(error));
-    }
-
-    if let Err(e) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
-        ctx.state,
-        &mut tasks,
-        tenant_id,
-        ctx.database_id(),
-        TraceId::ZERO,
-    )
-    .await
-    {
-        return error_to_native(seq, &e);
-    }
-
-    // The expanded set is the dispatch authorization boundary. The no-edge
-    // path retains its existing per-task capability consumption below.
-    let authorized_tasks = match crate::control::server::shared::authorization::authorize_task_set(
-        ctx.identity,
-        &tasks,
-        &ctx.state.permissions,
-        &ctx.state.roles,
-        &emitter,
-    ) {
-        Ok(authorized) => authorized,
-        Err(error) => return error_to_native(seq, &crate::Error::from(error)),
-    };
-
-    if tasks.len() == 1 {
-        // No-edge fast path — behaviorally identical to the pre-migration
-        // single-plan dispatch. The local-path WAL append now lives inside
-        // `dispatch_single_task` so it is shared with the single-shard edge loop.
-        let task = match authorized_tasks.into_tasks().into_iter().next() {
-            Some(task) => task,
-            None => {
-                return NativeResponse::error(
-                    seq,
-                    "XX000",
-                    "authorization returned no task capability",
-                );
-            }
-        };
-        let _request = ctx.state.tenant_request_guard(tenant_id);
-        return dispatch_single_task(ctx, seq, task).await;
-    }
-
-    // Edge-bearing insert: route the augmented task set the same way native SQL
-    // does. A cross-shard set goes through the Calvin sequencer atomically (which
-    // owns its own replicated durability); a single-shard set dispatches each
-    // task sequentially (matching pgwire / native-SQL single-shard multi-task),
-    // returning the document task's response. Local WAL durability for the
-    // single-shard path is handled inside `dispatch_single_task`.
-    let _request = ctx.state.tenant_request_guard(tenant_id);
-    // Autocommit direct-ops dispatch: no session read-set to widen with.
-    match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
-        DispatchClass::MultiShard { .. } => {
-            match dispatch_authorized_tasks_to_calvin(
-                ctx.state,
-                authorized_tasks,
+    // The rest of the dispatch logic has several early-return branches
+    // (Control-Plane-orchestrated INSERT SELECT / MERGE / UPDATE FROM, the
+    // no-edge fast path, and the multi/single-shard implicit-edge paths).
+    // Wrapped in an async block (not the outer fn) so `return` inside each
+    // branch exits only this block, letting the metering call below run
+    // exactly once, after whichever branch actually dispatched, regardless
+    // of which one it was.
+    let response: NativeResponse = async {
+        // `INSERT ... SELECT` is orchestrated on the Control Plane (fresh, registered
+        // surrogate per target row + atomic `BatchInsert`); it never reaches the
+        // Data Plane as a single op.
+        if matches!(
+            &plan,
+            PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::InsertSelect { .. })
+        ) {
+            let task = PhysicalTask {
                 tenant_id,
-                CrossShardTxnMode::Strict,
-                TxnDispatchPosition::Autocommit,
-                &[],
-                None,
-            )
-            .await
-            {
-                // Edge-bearing INSERT: no RETURNING clause is possible here, so
-                // the applied Response (if any) carries no rows — report one
-                // row-affected per task.
-                Ok(_apply) => {
-                    let mut r = NativeResponse::ok(seq);
-                    r.rows_affected = Some(tasks.len() as u64);
-                    r
-                }
+                vshard_id,
+                database_id: ctx.database_id(),
+                plan: plan.clone(),
+                post_set_op: PostSetOp::None,
+                txn_id: None,
+            };
+            let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
+                Ok(authorized) => authorized,
+                Err(error) => return error_to_native(seq, &error),
+            };
+            let _request = ctx.state.tenant_request_guard(tenant_id);
+            let result =
+                crate::control::insert_select::run_authorized_insert_select(ctx.state, authorized)
+                    .await;
+            return match result {
+                Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
                 Err(e) => error_to_native(seq, &e),
-            }
+            };
         }
-        DispatchClass::SingleShard { .. } => {
-            // The document task is first; its response is the one returned to
-            // the caller. Edge tasks dispatch after it in order.
-            let mut doc_response: Option<NativeResponse> = None;
-            let mut error: Option<NativeResponse> = None;
-            for task in authorized_tasks.into_tasks() {
-                let resp = dispatch_single_task(ctx, seq, task).await;
-                if resp.status == nodedb_types::protocol::ResponseStatus::Error {
-                    error = Some(resp);
-                    break;
+
+        // Autocommit `MERGE` is orchestrated on the Control Plane (fresh, registered
+        // surrogate per NOT-MATCHED insert row + atomic apply); it never reaches the
+        // Data Plane as a single op.
+        if matches!(
+            &plan,
+            PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Merge {
+                resolve_only: false,
+                resolved_inserts: None,
+                ..
+            })
+        ) {
+            let task = PhysicalTask {
+                tenant_id,
+                vshard_id,
+                database_id: ctx.database_id(),
+                plan: plan.clone(),
+                post_set_op: PostSetOp::None,
+                txn_id: None,
+            };
+            let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
+                Ok(authorized) => authorized,
+                Err(error) => return error_to_native(seq, &error),
+            };
+            let _request = ctx.state.tenant_request_guard(tenant_id);
+            let result =
+                crate::control::merge_orchestrator::run_authorized_merge(ctx.state, authorized)
+                    .await;
+            return match result {
+                Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
+                Err(e) => error_to_native(seq, &e),
+            };
+        }
+
+        // Autocommit `UPDATE ... FROM <source>` is orchestrated on the Control Plane
+        // (source scanned on its own core + shipped into the plan); it never reaches
+        // the Data Plane as a single op reading a possibly-non-resident source.
+        if matches!(
+            &plan,
+            PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::UpdateFromJoin {
+                resolve_only: false,
+                source_rows: None,
+                ..
+            })
+        ) {
+            let task = PhysicalTask {
+                tenant_id,
+                vshard_id,
+                database_id: ctx.database_id(),
+                plan: plan.clone(),
+                post_set_op: PostSetOp::None,
+                txn_id: None,
+            };
+            let authorized = match super::sql_gateway::authorize_native_task(ctx, &task) {
+                Ok(authorized) => authorized,
+                Err(error) => return error_to_native(seq, &error),
+            };
+            let _request = ctx.state.tenant_request_guard(tenant_id);
+            let result =
+                crate::control::update_from_join_orchestrator::run_authorized_update_from_join(
+                    ctx.state, authorized,
+                )
+                .await;
+            return match result {
+                Ok(resp) => data_plane_response_to_native(ctx, seq, &plan, &resp),
+                Err(e) => error_to_native(seq, &e),
+            };
+        }
+
+        // Stamp the connection's active transaction id (as the SQL path's
+        // `route_in_tx_write` does for in-transaction reads — see
+        // `staging_gate.rs::route_in_tx_write`) so the Data Plane can resolve this
+        // transaction's staging overlay for read-your-own-writes on direct-op
+        // reads (PointGet / RangeScan / VectorSearch) and give direct-op writes
+        // (KvBatchPut) a real transaction identity. `tx_id` is `None` outside a
+        // transaction block, so autocommit behavior is unchanged.
+        let txn_id = ctx.sessions.tx_id(ctx.peer_addr);
+
+        // Implicit graph-edge extraction (pgwire / native-SQL parity): a schemaless
+        // document carrying `_from`/`_to` is mirrored as a `GraphOp::EdgePut` task.
+        // The common no-edge case leaves `tasks` at length 1 and runs the existing
+        // single-dispatch path byte-identically below; an edge-bearing insert
+        // augments the vec and routes through classify/Calvin like every other
+        // write surface.
+        let mut tasks = vec![PhysicalTask {
+            tenant_id,
+            vshard_id,
+            database_id: ctx.database_id(),
+            plan,
+            post_set_op: PostSetOp::None,
+            txn_id,
+        }];
+        // Implicit-edge extraction marks catalog state and allocates surrogates.
+        // Authorize the original direct-op task before those side effects.
+        let emitter = crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(
+            &ctx.state.audit,
+        ));
+        if let Err(error) = crate::control::server::shared::authorization::authorize_task_set(
+            ctx.identity,
+            &tasks,
+            &ctx.state.permissions,
+            &ctx.state.roles,
+            &emitter,
+        ) {
+            return error_to_native(seq, &crate::Error::from(error));
+        }
+
+        if let Err(e) = crate::control::planner::implicit_edges::append_implicit_edge_tasks(
+            ctx.state,
+            &mut tasks,
+            tenant_id,
+            ctx.database_id(),
+            TraceId::ZERO,
+        )
+        .await
+        {
+            return error_to_native(seq, &e);
+        }
+
+        // The expanded set is the dispatch authorization boundary. The no-edge
+        // path retains its existing per-task capability consumption below.
+        let authorized_tasks =
+            match crate::control::server::shared::authorization::authorize_task_set(
+                ctx.identity,
+                &tasks,
+                &ctx.state.permissions,
+                &ctx.state.roles,
+                &emitter,
+            ) {
+                Ok(authorized) => authorized,
+                Err(error) => return error_to_native(seq, &crate::Error::from(error)),
+            };
+
+        if tasks.len() == 1 {
+            // No-edge fast path — behaviorally identical to the pre-migration
+            // single-plan dispatch. The local-path WAL append now lives inside
+            // `dispatch_single_task` so it is shared with the single-shard edge loop.
+            let task = match authorized_tasks.into_tasks().into_iter().next() {
+                Some(task) => task,
+                None => {
+                    return NativeResponse::error(
+                        seq,
+                        "XX000",
+                        "authorization returned no task capability",
+                    );
                 }
-                if doc_response.is_none() {
-                    doc_response = Some(resp);
+            };
+            let _request = ctx.state.tenant_request_guard(tenant_id);
+            return dispatch_single_task(ctx, seq, task).await;
+        }
+
+        // Edge-bearing insert: route the augmented task set the same way native SQL
+        // does. A cross-shard set goes through the Calvin sequencer atomically (which
+        // owns its own replicated durability); a single-shard set dispatches each
+        // task sequentially (matching pgwire / native-SQL single-shard multi-task),
+        // returning the document task's response. Local WAL durability for the
+        // single-shard path is handled inside `dispatch_single_task`.
+        let _request = ctx.state.tenant_request_guard(tenant_id);
+        // Autocommit direct-ops dispatch: no session read-set to widen with.
+        match classify_dispatch(&tasks, &std::collections::BTreeSet::new()) {
+            DispatchClass::MultiShard { .. } => {
+                match dispatch_authorized_tasks_to_calvin(
+                    ctx.state,
+                    authorized_tasks,
+                    tenant_id,
+                    CrossShardTxnMode::Strict,
+                    TxnDispatchPosition::Autocommit,
+                    &[],
+                    None,
+                )
+                .await
+                {
+                    // Edge-bearing INSERT: no RETURNING clause is possible here, so
+                    // the applied Response (if any) carries no rows — report one
+                    // row-affected per task.
+                    Ok(_apply) => {
+                        let mut r = NativeResponse::ok(seq);
+                        r.rows_affected = Some(tasks.len() as u64);
+                        r
+                    }
+                    Err(e) => error_to_native(seq, &e),
                 }
             }
-            error
-                .or(doc_response)
-                .unwrap_or_else(|| NativeResponse::ok(seq))
+            DispatchClass::SingleShard { .. } => {
+                // The document task is first; its response is the one returned to
+                // the caller. Edge tasks dispatch after it in order.
+                let mut doc_response: Option<NativeResponse> = None;
+                let mut error: Option<NativeResponse> = None;
+                for task in authorized_tasks.into_tasks() {
+                    let resp = dispatch_single_task(ctx, seq, task).await;
+                    if resp.status == nodedb_types::protocol::ResponseStatus::Error {
+                        error = Some(resp);
+                        break;
+                    }
+                    if doc_response.is_none() {
+                        doc_response = Some(resp);
+                    }
+                }
+                error
+                    .or(doc_response)
+                    .unwrap_or_else(|| NativeResponse::ok(seq))
+            }
         }
     }
+    .await;
+
+    // Metered only on the success path, once per call regardless of which
+    // branch above actually dispatched (Control-Plane-orchestrated INSERT
+    // SELECT / MERGE / UPDATE FROM, the no-edge fast path, or an
+    // implicit-edge multi/single-shard set). `response.rows`/`rows_affected`
+    // are already computed by the branch above, so this adds no extra decode.
+    if response.status != nodedb_types::protocol::ResponseStatus::Error
+        && let Some(info) = &plan_metering_info
+    {
+        let rows = response
+            .rows
+            .as_ref()
+            .map(|rows| rows.len() as u64)
+            .or(response.rows_affected);
+        meter_dispatch(ctx.state, &ctx.scope, info, rows);
+    }
+    response
 }
 
 /// Dispatch one plan via the gateway (when wired) or the local SPSC path,
