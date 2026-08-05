@@ -7,11 +7,13 @@ use std::sync::Arc;
 use futures::SinkExt;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tracing::warn;
 
 use crate::control::server::sync::session::SyncSession;
 use crate::control::state::SharedState;
 
 use super::channels::{Flow, SessionChannels};
+use super::row_redaction::RowPushRedaction;
 
 type Ws = WebSocketStream<tokio::net::TcpStream>;
 
@@ -137,19 +139,35 @@ async fn pump_crdt_deltas(
         return Flow::Continue;
     };
 
+    // The delivery channel is only registered when `SharedState` is present,
+    // so a session with deltas to drain always has one.
+    let Some(state) = shared.as_ref() else {
+        return Flow::Continue;
+    };
+
+    // A row push carries a stored row post-image, so the subscriber's column
+    // redaction applies to it exactly as it would to the same row read over
+    // SQL. Resolved once for the whole drain — see `row_redaction`.
+    let Some(mut redaction) = RowPushRedaction::for_session(state, session) else {
+        warn!(
+            session = %session.session_id,
+            "sync: row push suppressed; the session has no established identity to \
+             evaluate column redaction against"
+        );
+        return Flow::Break;
+    };
+
     while let Ok(delta) = rx.try_recv() {
         // Announce the collection descriptor before its first delta so schema
         // strictly precedes data on the peer. Idempotent per session; a lookup
         // miss warns and proceeds without marking.
-        if let Some(shared) = shared.as_ref()
-            && let Some(schema_frame) = super::super::announce::build_collection_schema_frame(
-                shared,
-                session,
-                delta.tenant_id,
-                session.database_id(),
-                &delta.collection,
-            )
-        {
+        if let Some(schema_frame) = super::super::announce::build_collection_schema_frame(
+            state,
+            session,
+            delta.tenant_id,
+            session.database_id(),
+            &delta.collection,
+        ) {
             if ws
                 .send(Message::Binary(schema_frame.to_bytes().into()))
                 .await
@@ -162,13 +180,28 @@ async fn pump_crdt_deltas(
                 .insert(delta.collection.clone());
         }
 
+        // Redact the post-image before it goes out: the device persists what
+        // it receives, so an unredacted push leaves the protected value on the
+        // device permanently. A payload a rule covers but that cannot be
+        // rewritten is dropped rather than delivered.
+        let mut payload = delta.payload;
+        if !redaction.redact(&state.redaction, &delta.collection, &mut payload) {
+            warn!(
+                session = %session.session_id,
+                collection = %delta.collection,
+                "sync: row push dropped; a row covered by a redaction policy could not \
+                 be rewritten"
+            );
+            continue;
+        }
+
         // A row post-image, not a Loro delta — so this goes out as `RowPush`,
         // never `DeltaPush`. The two carry different encodings, and the peer
         // cannot tell them apart from the bytes alone.
         let push_msg = nodedb_types::sync::wire::RowPushMsg {
             collection: delta.collection,
             document_id: delta.document_id,
-            payload: delta.payload,
+            payload,
             op: match delta.op {
                 crate::event::crdt_sync::types::DeltaOp::Upsert => {
                     nodedb_types::sync::wire::RowOp::Upsert
