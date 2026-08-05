@@ -54,6 +54,16 @@ pub(crate) async fn handle_graph_match(
     ) {
         return NativeResponse::error(seq, "42501", error.to_string());
     }
+    // Refuse what column redaction cannot cover: a MATCH returns graph
+    // topology, which the result-path masking hook has no columns to rewrite.
+    if let Err(error) = crate::control::planner::redaction_refusal::refuse_unredactable_plan(
+        &plan,
+        tenant_id,
+        ctx.auth_context(),
+        &ctx.state.redaction,
+    ) {
+        return NativeResponse::error(seq, "0A000", error.to_string());
+    }
 
     // Stamp the active transaction id so MATCH reads resolve this connection's
     // staging overlay identically to every other direct-op read.

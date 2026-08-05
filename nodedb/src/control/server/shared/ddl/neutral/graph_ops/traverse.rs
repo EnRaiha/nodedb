@@ -121,6 +121,17 @@ fn authorize_traversal(
         ));
     }
 
+    // Column redaction is refused here for the same reason and on the same
+    // seam: the traversal returns topology, so there are no stored columns in
+    // its result for the redaction hook to mask.
+    crate::control::planner::redaction_refusal::refuse_unredactable_graph_collection(
+        collection,
+        identity.tenant_id,
+        scope.auth(),
+        &state.redaction,
+    )
+    .map_err(|error| ddl_err("0A000", error.to_string()))?;
+
     Ok(())
 }
 

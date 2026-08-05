@@ -159,6 +159,12 @@ fn with_caller_rls(
         &state.rls,
         scope.auth(),
     )?;
+    crate::control::planner::redaction_refusal::refuse_unredactable_plan(
+        &plan,
+        tenant_id,
+        scope.auth(),
+        &state.redaction,
+    )?;
     Ok(plan)
 }
 

@@ -7,6 +7,7 @@ pub mod context;
 pub mod descriptor_set;
 pub mod implicit_edges;
 pub mod procedural;
+pub mod redaction_refusal;
 pub mod rls_injection;
 pub mod sql_plan_convert;
 pub mod wasm;

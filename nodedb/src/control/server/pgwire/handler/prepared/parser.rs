@@ -213,6 +213,7 @@ impl NodeDbQueryParser {
             identity,
             auth: scope.auth(),
             rls_store: &self.state.rls,
+            redaction_store: &self.state.redaction,
             permissions: &self.state.permissions,
             roles: &self.state.roles,
             permission_cache: Some(&*permission_cache),

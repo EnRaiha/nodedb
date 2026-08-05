@@ -88,6 +88,7 @@ async fn plan_authorize_and_admit_once(
             identity,
             auth: auth_ctx,
             rls_store: &state.rls,
+            redaction_store: &state.redaction,
             permissions: &state.permissions,
             roles: &state.roles,
             permission_cache: Some(&*permission_cache),

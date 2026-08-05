@@ -74,6 +74,56 @@ impl RedactionStore {
             .unwrap_or_default()
     }
 
+    /// True when any of `roles` has a rule on `collection`.`field`.
+    ///
+    /// Allocation-free counterpart to [`RedactionStore::rules_for`] for the
+    /// planner's refusal pass, which asks this per aggregate argument per role
+    /// on the query path and must not clone the rule list to answer.
+    pub fn has_rule_for_field(
+        &self,
+        tenant_id: u64,
+        collection: &str,
+        roles: &[String],
+        field: &str,
+    ) -> bool {
+        let policies = self.lock_read();
+        roles.iter().any(|role| {
+            policies
+                .get(&policy_key(tenant_id, collection, role))
+                .is_some_and(|policy| policy.rules.iter().any(|rule| rule.field == field))
+        })
+    }
+
+    /// True when any of `roles` has at least one rule on `collection`.
+    pub fn has_any_rule_for_collection(
+        &self,
+        tenant_id: u64,
+        collection: &str,
+        roles: &[String],
+    ) -> bool {
+        let policies = self.lock_read();
+        roles.iter().any(|role| {
+            policies
+                .get(&policy_key(tenant_id, collection, role))
+                .is_some_and(|policy| !policy.rules.is_empty())
+        })
+    }
+
+    /// True when any of `roles` has at least one rule anywhere in `tenant_id`.
+    ///
+    /// The collection is not part of the question, so this scans the registry.
+    /// Reserved for callers that cannot name the collection a plan reads — an
+    /// unscoped graph pattern — and must therefore fail closed on the whole
+    /// tenant rather than on one collection.
+    pub fn has_any_rule_for_roles(&self, tenant_id: u64, roles: &[String]) -> bool {
+        let policies = self.lock_read();
+        policies.values().any(|policy| {
+            policy.tenant_id == tenant_id
+                && !policy.rules.is_empty()
+                && roles.contains(&policy.for_role)
+        })
+    }
+
     /// Apply redaction rules to a JSON document.
     ///
     /// Modifies the document in-place, replacing redacted field values.

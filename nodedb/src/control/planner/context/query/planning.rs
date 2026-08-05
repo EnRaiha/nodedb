@@ -340,6 +340,14 @@ impl QueryContext {
         // Inject RLS predicates.
         crate::control::planner::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
 
+        // Refuse what column redaction cannot cover (aggregates over a
+        // redacted column, graph traversals), before anything is dispatched.
+        crate::control::planner::redaction_refusal::refuse_unredactable_tasks(
+            &tasks,
+            sec.auth,
+            sec.redaction_store,
+        )?;
+
         // Inject permission tree filters (hierarchical ACL).
         if let Some(cache) = sec.permission_cache {
             crate::control::planner::rls_injection::inject_permission_tree(
@@ -482,6 +490,14 @@ impl QueryContext {
 
         // Inject RLS predicates.
         crate::control::planner::rls_injection::inject_rls(&mut tasks, sec.rls_store, sec.auth)?;
+
+        // Refuse what column redaction cannot cover (aggregates over a
+        // redacted column, graph traversals), before anything is dispatched.
+        crate::control::planner::redaction_refusal::refuse_unredactable_tasks(
+            &tasks,
+            sec.auth,
+            sec.redaction_store,
+        )?;
 
         if let Some(cache) = sec.permission_cache {
             crate::control::planner::rls_injection::inject_permission_tree(

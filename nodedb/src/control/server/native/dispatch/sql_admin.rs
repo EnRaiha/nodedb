@@ -134,6 +134,7 @@ pub(super) async fn handle_explain(ctx: &DispatchCtx<'_>, seq: u64, sql: &str) -
         identity: ctx.identity,
         auth: ctx.auth_context(),
         rls_store: &ctx.state.rls,
+        redaction_store: &ctx.state.redaction,
         permissions: &ctx.state.permissions,
         roles: &ctx.state.roles,
         permission_cache: Some(&*perm_cache),

@@ -36,6 +36,7 @@ pub async fn plan_authorized_sql(
         identity,
         auth: scope.auth(),
         rls_store: &state.rls,
+        redaction_store: &state.redaction,
         permissions: &state.permissions,
         roles: &state.roles,
         permission_cache: Some(&*permission_cache),

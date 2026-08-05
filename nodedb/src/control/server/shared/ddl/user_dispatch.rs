@@ -179,6 +179,12 @@ fn authorize_for_identity(
         &state.rls,
         scope.auth(),
     )?;
+    crate::control::planner::redaction_refusal::refuse_unredactable_plan(
+        &plan,
+        identity.tenant_id,
+        scope.auth(),
+        &state.redaction,
+    )?;
 
     let task = PhysicalTask {
         tenant_id: identity.tenant_id,

@@ -113,6 +113,28 @@ pub async fn match_query(
 
     let tenant_id = identity.tenant_id;
 
+    // A MATCH returns graph topology — node bindings and edge labels — which
+    // the result-path column-redaction hook has no stored columns to rewrite.
+    // Both dispatch shapes below send the same query bytes, so the refusal is
+    // applied here, once, before either runs. `query.collection` is already
+    // parsed, so the scoped check is used directly rather than re-decoding
+    // `query_bytes` back into a `MatchQuery` just to read it again.
+    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
+        identity,
+        state.auth_stores(),
+        database_id,
+    );
+    crate::control::planner::redaction_refusal::refuse_unredactable_graph_match_scoped(
+        query.collection.as_deref(),
+        tenant_id,
+        scope.auth(),
+        &state.redaction,
+    )
+    .map_err(|e| DdlError {
+        sqlstate: "0A000".to_string(),
+        message: e.to_string(),
+    })?;
+
     // Single-node mode: keep the direct path byte-identical — broadcast the `Match`
     // plan with `cluster_mode = false` to all local cores. The Data Plane emits
     // no frontier, so the unwrapped rows payload is exactly the prior bare-array

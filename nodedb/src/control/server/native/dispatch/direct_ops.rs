@@ -77,6 +77,17 @@ pub(crate) async fn handle_direct_op(
         return NativeResponse::error(seq, "42501", e.to_string());
     }
 
+    // Refuse what column redaction cannot cover (an aggregate over a redacted
+    // column, a graph traversal), before any orchestration observes the plan.
+    if let Err(e) = crate::control::planner::redaction_refusal::refuse_unredactable_plan(
+        &plan,
+        tenant_id,
+        ctx.auth_context(),
+        &ctx.state.redaction,
+    ) {
+        return NativeResponse::error(seq, "0A000", e.to_string());
+    }
+
     // Extracted before `plan` is moved/cloned into any of the branches below
     // — metering needs the collection/engine shape after dispatch succeeds,
     // and only when metering is enabled (the default is disabled, so this is

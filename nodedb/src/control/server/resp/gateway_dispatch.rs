@@ -212,6 +212,16 @@ fn authorize_resp_task(
         scope.auth(),
     )?;
 
+    // Reads whose results column redaction cannot rewrite (an aggregate over a
+    // redacted column, a graph traversal) are refused on the same seam, so the
+    // capability is never minted for a plan that would leak them.
+    crate::control::planner::redaction_refusal::refuse_unredactable_plan(
+        &plan,
+        session.tenant_id,
+        scope.auth(),
+        &state.redaction,
+    )?;
+
     let task = PhysicalTask {
         tenant_id: session.tenant_id,
         vshard_id,

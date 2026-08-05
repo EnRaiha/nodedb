@@ -325,6 +325,12 @@ pub async fn fetch_old_row(
         &state.rls,
         auth,
     )?;
+    crate::control::planner::redaction_refusal::refuse_unredactable_plan(
+        &plan,
+        tenant_id,
+        auth,
+        &state.redaction,
+    )?;
 
     let task = PhysicalTask {
         tenant_id,
