@@ -10,23 +10,24 @@ use crate::control::security::deny::DenyMode;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::jwks::registry::VerifiedJwtClaims;
 use crate::control::security::scope::enrichment::enrich_auth_context_with_scopes;
-use crate::control::security::scope::grant::ScopeGrantStore;
 
 use super::resolved::RequestAuthScope;
+use super::stores::AuthStores;
 
 /// Builder for [`RequestAuthScope`].
 ///
-/// `scope_grants` is a required constructor argument, not an optional
-/// builder method. Making enrichment opt-in would let a transport silently
-/// skip [`enrich_auth_context_with_scopes`]: without it, `$auth.metadata`
-/// never carries `scope_status.<name>`, so `$auth.scope_status()` resolves
-/// to `None` in RLS predicates — which is indistinguishable from "this user
-/// has no such scope" and fails closed (denies access) rather than erroring
-/// loudly. Requiring the store at construction makes that skip impossible
-/// to write by accident.
+/// `stores` is a required constructor argument, not an optional builder
+/// method. Making enrichment opt-in would let a transport silently skip
+/// [`enrich_auth_context_with_scopes`]: without it, `$auth.metadata` never
+/// carries `scope_status.<name>` / `quota_remaining.<name>` /
+/// `quota_pct.<name>`, so `$auth.scope_status()` / `$auth.quota_remaining()`
+/// / `$auth.quota_pct()` resolve to `None` in RLS predicates — which is
+/// indistinguishable from "this user has no such scope/quota" and fails
+/// closed (denies access) rather than erroring loudly. Requiring the stores
+/// at construction makes that skip impossible to write by accident.
 pub struct RequestAuthScopeBuilder<'a> {
     identity: &'a AuthenticatedIdentity,
-    scope_grants: &'a ScopeGrantStore,
+    stores: AuthStores<'a>,
     session_database: Option<DatabaseId>,
     on_deny: Option<DenyMode>,
     verified_jwt: Option<&'a VerifiedJwtClaims>,
@@ -37,14 +38,11 @@ pub struct RequestAuthScopeBuilder<'a> {
 impl<'a> RequestAuthScopeBuilder<'a> {
     /// Only [`RequestAuthScope::builder`](super::RequestAuthScope::builder)
     /// constructs a builder — callers reach this type through that entry
-    /// point so the required `scope_grants` argument can never be omitted.
-    pub(super) fn new(
-        identity: &'a AuthenticatedIdentity,
-        scope_grants: &'a ScopeGrantStore,
-    ) -> Self {
+    /// point so the required `stores` argument can never be omitted.
+    pub(super) fn new(identity: &'a AuthenticatedIdentity, stores: AuthStores<'a>) -> Self {
         Self {
             identity,
-            scope_grants,
+            stores,
             session_database: None,
             on_deny: None,
             verified_jwt: None,
@@ -136,11 +134,11 @@ impl<'a> RequestAuthScopeBuilder<'a> {
     ///    from `identity` alone.
     /// 3. Stamp `auth.database_id` with the resolved database.
     /// 4. Apply the `on_deny` override, if any.
-    /// 5. Enrich `auth` with scope-grant status via
-    ///    [`enrich_auth_context_with_scopes`] — the entire reason
-    ///    `scope_grants` is a required argument. This step runs even for an
-    ///    adopted context, since a pooled `AuthContext` was enriched only
-    ///    once, at handle-creation time, and may be stale.
+    /// 5. Enrich `auth` with scope-grant and quota status via
+    ///    [`enrich_auth_context_with_scopes`] — the entire reason `stores` is
+    ///    a required argument. This step runs even for an adopted context,
+    ///    since a pooled `AuthContext` was enriched only once, at
+    ///    handle-creation time, and may be stale.
     pub fn build(self) -> RequestAuthScope<'a> {
         let resolved_db = self
             .session_database
@@ -170,7 +168,13 @@ impl<'a> RequestAuthScopeBuilder<'a> {
         // taking `auth` mutably; clone the (small) org list up front rather
         // than restructuring the helper's signature.
         let org_ids = auth.org_ids.clone();
-        enrich_auth_context_with_scopes(&mut auth, self.scope_grants, &org_ids);
+        enrich_auth_context_with_scopes(
+            &mut auth,
+            self.stores.scope_grants,
+            self.stores.quota_manager,
+            &org_ids,
+            crate::control::security::time::now_secs(),
+        );
 
         RequestAuthScope::new(self.identity, auth, resolved_db)
     }
@@ -180,7 +184,8 @@ impl<'a> RequestAuthScopeBuilder<'a> {
 mod tests {
     use crate::control::security::identity::{AuthMethod, DatabaseSet, Role};
     use crate::control::security::jwt::JwtClaims;
-    use crate::control::security::scope::grant::ScopeGrantParams;
+    use crate::control::security::metering::quota::QuotaManager;
+    use crate::control::security::scope::grant::{ScopeGrantParams, ScopeGrantStore};
     use crate::types::TenantId;
     use std::collections::HashMap;
 
@@ -219,8 +224,10 @@ mod tests {
         let mut identity = test_identity();
         identity.default_database = Some(DatabaseId::new(7));
         let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let stores = AuthStores::new(&grants, &quotas);
 
-        let scope = RequestAuthScope::builder(&identity, &grants)
+        let scope = RequestAuthScope::builder(&identity, stores)
             .with_session_database(Some(DatabaseId::new(99)))
             .build();
 
@@ -232,8 +239,10 @@ mod tests {
         let mut identity = test_identity();
         identity.default_database = Some(DatabaseId::new(7));
         let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let stores = AuthStores::new(&grants, &quotas);
 
-        let scope = RequestAuthScope::builder(&identity, &grants).build();
+        let scope = RequestAuthScope::builder(&identity, stores).build();
 
         assert_eq!(scope.database_id(), DatabaseId::new(7));
     }
@@ -242,8 +251,10 @@ mod tests {
     fn falls_back_to_database_default_when_neither_present() {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let stores = AuthStores::new(&grants, &quotas);
 
-        let scope = RequestAuthScope::builder(&identity, &grants).build();
+        let scope = RequestAuthScope::builder(&identity, stores).build();
 
         assert_eq!(scope.database_id(), DatabaseId::DEFAULT);
     }
@@ -253,8 +264,10 @@ mod tests {
         let mut identity = test_identity();
         identity.default_database = Some(DatabaseId::new(3));
         let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let stores = AuthStores::new(&grants, &quotas);
 
-        let scope = RequestAuthScope::builder(&identity, &grants).build();
+        let scope = RequestAuthScope::builder(&identity, stores).build();
 
         assert_eq!(scope.auth().database_id, Some(scope.database_id()));
     }
@@ -263,8 +276,10 @@ mod tests {
     fn rebind_database_restamps_both_fields_together() {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let stores = AuthStores::new(&grants, &quotas);
 
-        let scope = RequestAuthScope::builder(&identity, &grants)
+        let scope = RequestAuthScope::builder(&identity, stores)
             .build()
             .rebind_database(DatabaseId::new(55));
 
@@ -276,6 +291,8 @@ mod tests {
     fn scope_enrichment_runs_during_build() {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let stores = AuthStores::new(&grants, &quotas);
         grants
             .grant(ScopeGrantParams {
                 scope_name: "pro:all",
@@ -288,7 +305,7 @@ mod tests {
             })
             .unwrap();
 
-        let scope = RequestAuthScope::builder(&identity, &grants).build();
+        let scope = RequestAuthScope::builder(&identity, stores).build();
 
         assert_eq!(
             scope.auth().metadata.get("scope_status.pro:all"),
@@ -297,13 +314,63 @@ mod tests {
     }
 
     #[test]
+    fn quota_metadata_present_after_build_for_held_scope_with_quota() {
+        use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
+
+        let identity = test_identity();
+        let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        grants
+            .grant(ScopeGrantParams {
+                scope_name: "pro:all",
+                grantee_type: "user",
+                grantee_id: "42",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
+            .unwrap();
+        quotas.define_quota(QuotaDefinition {
+            scope_name: "pro:all".into(),
+            max_tokens: 100,
+            period_secs: 86400,
+            enforcement: QuotaEnforcement::Hard,
+            warning_threshold: 0.8,
+        });
+        // `build()` reads quota state on the wall clock, and a quota period
+        // rolls over lazily on access — so seed the usage on that same clock,
+        // or the read lands past the period end and reports a fresh allowance.
+        quotas.record_usage(
+            "pro:all",
+            "42",
+            10,
+            crate::control::security::time::now_secs(),
+        );
+        let stores = AuthStores::new(&grants, &quotas);
+
+        let scope = RequestAuthScope::builder(&identity, stores).build();
+
+        assert_eq!(
+            scope.auth().metadata.get("quota_remaining.pro:all"),
+            Some(&"90".to_string())
+        );
+        assert_eq!(
+            scope.auth().metadata.get("quota_pct.pro:all"),
+            Some(&"0.1".to_string())
+        );
+    }
+
+    #[test]
     fn superuser_authority_is_not_forgeable_via_verified_jwt() {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let stores = AuthStores::new(&grants, &quotas);
         let claims = test_claims(true);
         let verified = VerifiedJwtClaims::new_for_test(claims);
 
-        let scope = RequestAuthScope::builder(&identity, &grants)
+        let scope = RequestAuthScope::builder(&identity, stores)
             .with_verified_jwt(&verified)
             .build();
 
@@ -315,13 +382,15 @@ mod tests {
     fn adopted_auth_context_is_restamped_with_scope_database() {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let stores = AuthStores::new(&grants, &quotas);
         // Simulate a pooled session's cached `AuthContext`, resolved for a
         // different database than the one this request is scoped to.
         let mut pooled = AuthContext::from_identity(&identity, "s_pooled".into());
         pooled.database_id = Some(DatabaseId::new(1));
         pooled.email = Some("pooled@example.com".into());
 
-        let scope = RequestAuthScope::builder(&identity, &grants)
+        let scope = RequestAuthScope::builder(&identity, stores)
             .with_session_database(Some(DatabaseId::new(2)))
             .with_adopted_auth_context(pooled)
             .build();
@@ -339,6 +408,8 @@ mod tests {
     fn adopted_auth_context_still_runs_scope_enrichment() {
         let identity = test_identity();
         let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let stores = AuthStores::new(&grants, &quotas);
         grants
             .grant(ScopeGrantParams {
                 scope_name: "pro:all",
@@ -352,7 +423,7 @@ mod tests {
             .unwrap();
         let pooled = AuthContext::from_identity(&identity, "s_pooled".into());
 
-        let scope = RequestAuthScope::builder(&identity, &grants)
+        let scope = RequestAuthScope::builder(&identity, stores)
             .with_adopted_auth_context(pooled)
             .build();
 

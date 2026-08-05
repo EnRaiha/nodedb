@@ -59,7 +59,7 @@ pub(crate) async fn flush_authenticated_ilp_batch(
     // that half of `check_request_admission`'s gate (plus the
     // internal-service exemption every other transport gets) using the real
     // peer address of the ILP connection or OTLP HTTP/gRPC request.
-    let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
     crate::control::server::session_auth::check_blacklist_and_status(state, &scope, peer_addr)?;
 
     let audit = ArcAuditEmitter(Arc::clone(&state.audit));
@@ -195,7 +195,7 @@ async fn flush_ilp_batch_inner(
     // (`build_ilp_calvin_tasks` iterates `groups` in order), so zipping
     // them pairs each task with the row count it actually carried.
     if state.metering_config.enabled {
-        let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
+        let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
         for (task, group) in tasks.iter().zip(groups.iter()) {
             let info = PlanMeteringInfo::extract(&task.plan);
             let rows = u64::try_from(group.raw_lines.len()).ok();

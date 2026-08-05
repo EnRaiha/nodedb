@@ -41,7 +41,7 @@ impl NodeDbPgHandler {
         // `$auth.scope_status(...)` resolves like every other query path.
         let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
             identity,
-            &self.state.scope_grants,
+            self.state.auth_stores(),
             database_id,
         );
 

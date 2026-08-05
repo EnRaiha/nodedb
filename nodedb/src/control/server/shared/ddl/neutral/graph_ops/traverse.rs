@@ -106,7 +106,7 @@ fn authorize_traversal(
     // traversal returns topology rather than row bodies — there is nothing for
     // a row filter to evaluate — and disclosing the shape of rows whose
     // contents are protected is the leak, so a read policy refuses outright.
-    let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
     if state
         .rls
         .combined_read_predicate_with_auth(identity.tenant_id.as_u64(), collection, scope.auth())

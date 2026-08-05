@@ -111,8 +111,8 @@ mod tests {
         }]);
 
         let quota_manager = QuotaManager::with_bounds(1);
-        quota_manager.record_usage("free", "g1", 1);
-        quota_manager.record_usage("free", "g2", 1); // Refused, cap of 1.
+        quota_manager.record_usage("free", "g1", 1, 0);
+        quota_manager.record_usage("free", "g2", 1, 0); // Refused, cap of 1.
 
         let mut out = String::new();
         render_prometheus(&usage_store, &quota_manager, &mut out);

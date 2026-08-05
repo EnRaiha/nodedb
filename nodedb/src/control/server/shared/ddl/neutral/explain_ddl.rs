@@ -73,7 +73,7 @@ pub fn explain_permission(
         identity.clone()
     };
 
-    let scope = RequestAuthScope::builder(&target_identity, &state.scope_grants).build();
+    let scope = RequestAuthScope::builder(&target_identity, state.auth_stores()).build();
     let explanation = crate::control::security::explain::explain_permission(
         perm,
         collection,
@@ -212,7 +212,7 @@ pub fn assert_visible(
             nodedb_types::id::DatabaseId::DEFAULT,
         ]),
     );
-    let scope = RequestAuthScope::builder(&target_identity, &state.scope_grants).build();
+    let scope = RequestAuthScope::builder(&target_identity, state.auth_stores()).build();
 
     // Check if RLS policies would filter this user.
     let rls_bytes = state.rls.combined_read_predicate_with_auth(

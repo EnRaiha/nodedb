@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 /// Default cap on the number of distinct `"{scope_name}:{grantee_id}"` keys
-/// tracked in `QuotaManager::usage`. This is a process-lifetime store with no
-/// caller currently invoking `reset_period()`, so it must be bounded; once at
+/// tracked in `QuotaManager::usage`. Lazy rollover (see
+/// [`QuotaManager::record_usage`] / [`QuotaManager::get_status`]) bounds
+/// usage *within* a scope's period, but the number of distinct grantee keys
+/// tracked *between* rollovers is unbounded without this cap; once at
 /// capacity, new grantee keys are refused (existing ones keep accumulating)
 /// and the refusal is surfaced via `dropped_usage_entries()` plus a one-time
 /// `tracing::warn!`.
@@ -64,6 +66,14 @@ pub struct QuotaManager {
     quotas: RwLock<HashMap<String, QuotaDefinition>>,
     /// "{scope_name}:{grantee_id}" → tokens used in current period.
     usage: RwLock<HashMap<String, u64>>,
+    /// scope_name → unix-seconds timestamp the current period started at.
+    /// Populated lazily by [`Self::rollover_if_due`] the first time it
+    /// observes a given scope, so a quota defined mid-period doesn't roll
+    /// over immediately on the next access. Bounded by the same admin-defined
+    /// scope namespace as `quotas` — a scope only gets an entry once a quota
+    /// is defined for it, and quota definitions are admin-authored, not
+    /// request-driven, so this cannot grow unboundedly from request traffic.
+    period_starts: RwLock<HashMap<String, u64>>,
     /// Cap on distinct keys in `usage`.
     max_tracked_grantees: usize,
     /// Count of new grantee keys refused because `usage` was at capacity.
@@ -82,6 +92,7 @@ impl QuotaManager {
         Self {
             quotas: RwLock::new(HashMap::new()),
             usage: RwLock::new(HashMap::new()),
+            period_starts: RwLock::new(HashMap::new()),
             max_tracked_grantees,
             dropped_usage_entries: AtomicU64::new(0),
             warned_capacity: AtomicBool::new(false),
@@ -102,11 +113,18 @@ impl QuotaManager {
 
     /// Record token usage against a quota.
     ///
+    /// `now_secs` rolls the scope's period over first (see
+    /// [`Self::rollover_if_due`]) so usage is always recorded against the
+    /// current period, never a stale one that should already have reset.
+    /// Callers must read the clock once, before taking any lock, and pass
+    /// the result in — this keeps every wall-clock read outside lock scope.
+    ///
     /// If `usage` is already at `max_tracked_grantees` and `grantee_id` is
     /// new for `scope_name`, the update is refused (rather than growing the
     /// map unboundedly) and surfaced via `dropped_usage_entries()` plus a
     /// one-time warning. Existing grantee keys always keep accumulating.
-    pub fn record_usage(&self, scope_name: &str, grantee_id: &str, tokens: u64) {
+    pub fn record_usage(&self, scope_name: &str, grantee_id: &str, tokens: u64, now_secs: u64) {
+        self.rollover_if_due(scope_name, now_secs);
         let key = format!("{scope_name}:{grantee_id}");
         let dropped = {
             let mut usage = self.usage.write().unwrap_or_else(|p| p.into_inner());
@@ -149,13 +167,18 @@ impl QuotaManager {
 
     /// Check if a request should be allowed based on quota.
     ///
+    /// `now_secs` rolls the scope's period over first — see
+    /// [`Self::record_usage`] for the clock-read contract this shares.
+    ///
     /// Returns `Ok(())` if allowed, `Err` with quota status if blocked.
     pub fn check_quota(
         &self,
         scope_name: &str,
         grantee_id: &str,
         additional_tokens: u64,
+        now_secs: u64,
     ) -> Result<(), QuotaStatus> {
+        self.rollover_if_due(scope_name, now_secs);
         let quotas = self.quotas.read().unwrap_or_else(|p| p.into_inner());
         let Some(quota) = quotas.get(scope_name) else {
             return Ok(()); // No quota defined → allow.
@@ -212,7 +235,18 @@ impl QuotaManager {
     }
 
     /// Get quota status for a user/org.
-    pub fn get_status(&self, scope_name: &str, grantee_id: &str) -> Option<QuotaStatus> {
+    ///
+    /// `now_secs` rolls the scope's period over first — see
+    /// [`Self::record_usage`] for the clock-read contract this shares. A
+    /// status read must never observe usage from a period that should
+    /// already have expired just because nothing happened to write to it.
+    pub fn get_status(
+        &self,
+        scope_name: &str,
+        grantee_id: &str,
+        now_secs: u64,
+    ) -> Option<QuotaStatus> {
+        self.rollover_if_due(scope_name, now_secs);
         let quotas = self.quotas.read().unwrap_or_else(|p| p.into_inner());
         let quota = quotas.get(scope_name)?;
 
@@ -250,6 +284,51 @@ impl QuotaManager {
         let mut usage = self.usage.write().unwrap_or_else(|p| p.into_inner());
         usage.retain(|k, _| !k.starts_with(&prefix));
     }
+
+    /// Roll `scope_name`'s usage period over if `now_secs` has crossed the
+    /// quota's `period_secs` boundary since the period last started.
+    ///
+    /// Lazy rollover on access — called from every `usage` reader/writer
+    /// ([`Self::record_usage`], [`Self::check_quota`], [`Self::get_status`])
+    /// instead of a periodic background sweep. A sweep can only fire on its
+    /// own tick interval, which silently rounds any `period_secs` shorter
+    /// than that interval up to the interval itself (a 10-second quota
+    /// resetting every 60 seconds gives six times the configured
+    /// allowance). Checking the boundary at the moment of access makes
+    /// every `period_secs` value exact, with no coupling to an interval at
+    /// all.
+    ///
+    /// No-op for a scope with no `QuotaDefinition` — there is no period to
+    /// roll over. The first observation of a defined scope anchors
+    /// `period_starts` at `now_secs` without rolling over, so a quota
+    /// defined mid-period doesn't reset immediately on its first access.
+    fn rollover_if_due(&self, scope_name: &str, now_secs: u64) {
+        let period_secs = {
+            let quotas = self.quotas.read().unwrap_or_else(|p| p.into_inner());
+            match quotas.get(scope_name) {
+                Some(quota) => quota.period_secs,
+                None => return,
+            }
+        };
+
+        let due = {
+            let mut starts = self
+                .period_starts
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            let start = *starts.entry(scope_name.to_string()).or_insert(now_secs);
+            if now_secs.saturating_sub(start) >= period_secs {
+                starts.insert(scope_name.to_string(), now_secs);
+                true
+            } else {
+                false
+            }
+        };
+
+        if due {
+            self.reset_period(scope_name);
+        }
+    }
 }
 
 impl Default for QuotaManager {
@@ -274,11 +353,11 @@ mod tests {
         });
 
         // Use 90 tokens.
-        mgr.record_usage("free", "u1", 90);
-        assert!(mgr.check_quota("free", "u1", 5).is_ok());
+        mgr.record_usage("free", "u1", 90, 1_000);
+        assert!(mgr.check_quota("free", "u1", 5, 1_000).is_ok());
 
         // Try to use 20 more → exceeds 100.
-        assert!(mgr.check_quota("free", "u1", 20).is_err());
+        assert!(mgr.check_quota("free", "u1", 20, 1_000).is_err());
     }
 
     #[test]
@@ -292,14 +371,14 @@ mod tests {
             warning_threshold: 0.8,
         });
 
-        mgr.record_usage("free", "u1", 200);
-        assert!(mgr.check_quota("free", "u1", 1).is_ok()); // Soft = allow.
+        mgr.record_usage("free", "u1", 200, 1_000);
+        assert!(mgr.check_quota("free", "u1", 1, 1_000).is_ok()); // Soft = allow.
     }
 
     #[test]
     fn no_quota_allows_all() {
         let mgr = QuotaManager::new();
-        assert!(mgr.check_quota("nonexistent", "u1", 999999).is_ok());
+        assert!(mgr.check_quota("nonexistent", "u1", 999999, 0).is_ok());
     }
 
     #[test]
@@ -312,9 +391,9 @@ mod tests {
             enforcement: QuotaEnforcement::Hard,
             warning_threshold: 0.8,
         });
-        mgr.record_usage("pro", "u1", 500);
+        mgr.record_usage("pro", "u1", 500, 1_000);
 
-        let status = mgr.get_status("pro", "u1").unwrap();
+        let status = mgr.get_status("pro", "u1", 1_000).unwrap();
         assert_eq!(status.used_tokens, 500);
         assert_eq!(status.remaining, 500);
         assert!(!status.exceeded);
@@ -324,35 +403,94 @@ mod tests {
     #[test]
     fn reset_period_clears() {
         let mgr = QuotaManager::new();
-        mgr.record_usage("free", "u1", 100);
+        mgr.record_usage("free", "u1", 100, 0);
         mgr.reset_period("free");
 
         let usage = mgr.usage.read().unwrap();
         assert!(!usage.contains_key("free:u1"));
     }
 
+    /// The defect this rollover design fixes: the old implementation only
+    /// reset on a periodic 60-second sweep, so any `period_secs` under 60
+    /// silently rounded up to the sweep interval — a 10-second period
+    /// resets at ~60s and the caller gets six times the configured
+    /// allowance. Lazy rollover checks the boundary on every access instead,
+    /// so a sub-60s period rolls over exactly when it elapses, not on the
+    /// next sweep tick. This test fails against a sweep-based
+    /// implementation with a 60-second tick: at `now=1_011` (11 seconds
+    /// after the period started at 1_000) a sweep would not have fired yet.
+    #[test]
+    fn lazy_rollover_is_exact_for_sub_sixty_second_periods() {
+        let mgr = QuotaManager::new();
+        mgr.define_quota(QuotaDefinition {
+            scope_name: "free".into(),
+            max_tokens: 100,
+            period_secs: 10,
+            enforcement: QuotaEnforcement::Hard,
+            warning_threshold: 0.8,
+        });
+
+        // First access establishes the period start — nothing has "elapsed"
+        // yet (0 seconds), so usage is untouched.
+        mgr.record_usage("free", "u1", 50, 1_000);
+        assert_eq!(*mgr.usage.read().unwrap().get("free:u1").unwrap(), 50);
+
+        // An access before period_secs has elapsed leaves usage untouched.
+        assert_eq!(mgr.get_status("free", "u1", 1_005).unwrap().used_tokens, 50);
+
+        // Once period_secs has elapsed since the period start, the very
+        // next access — whether a read or a write — rolls the period over
+        // before doing anything else.
+        assert_eq!(mgr.get_status("free", "u1", 1_011).unwrap().used_tokens, 0);
+    }
+
+    /// `record_usage` itself must also observe the rollover, not just
+    /// `get_status` — a write into an already-expired period must land in
+    /// the fresh one, not accumulate into the stale one.
+    #[test]
+    fn record_usage_rolls_over_before_recording() {
+        let mgr = QuotaManager::new();
+        mgr.define_quota(QuotaDefinition {
+            scope_name: "free".into(),
+            max_tokens: 100,
+            period_secs: 10,
+            enforcement: QuotaEnforcement::Hard,
+            warning_threshold: 0.8,
+        });
+
+        mgr.record_usage("free", "u1", 90, 1_000);
+        // Past the period boundary — this write must land in a fresh period.
+        mgr.record_usage("free", "u1", 5, 1_011);
+
+        assert_eq!(
+            mgr.get_status("free", "u1", 1_011).unwrap().used_tokens,
+            5,
+            "stale-period usage must not carry over into the new period"
+        );
+    }
+
     #[test]
     fn usage_map_is_bounded_and_overflow_is_observable() {
         let mgr = QuotaManager::with_bounds(2);
 
-        mgr.record_usage("free", "u1", 10);
-        mgr.record_usage("free", "u2", 10);
+        mgr.record_usage("free", "u1", 10, 0);
+        mgr.record_usage("free", "u2", 10, 0);
         assert_eq!(mgr.dropped_usage_entries(), 0);
         assert_eq!(mgr.usage.read().unwrap().len(), 2);
 
         // A third distinct grantee exceeds the cap of 2.
-        mgr.record_usage("free", "u3", 10);
+        mgr.record_usage("free", "u3", 10, 0);
         assert_eq!(mgr.dropped_usage_entries(), 1);
         assert_eq!(mgr.usage.read().unwrap().len(), 2); // Map did not grow.
         assert!(!mgr.usage.read().unwrap().contains_key("free:u3"));
 
         // Existing grantee keys keep updating past the cap being hit.
-        mgr.record_usage("free", "u1", 5);
+        mgr.record_usage("free", "u1", 5, 0);
         assert_eq!(*mgr.usage.read().unwrap().get("free:u1").unwrap(), 15);
         assert_eq!(mgr.dropped_usage_entries(), 1); // No new drop for an existing key.
 
         // Further distinct grantees keep incrementing the drop counter.
-        mgr.record_usage("free", "u4", 10);
+        mgr.record_usage("free", "u4", 10, 0);
         assert_eq!(mgr.dropped_usage_entries(), 2);
     }
 }

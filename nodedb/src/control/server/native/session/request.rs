@@ -164,7 +164,7 @@ impl NativeSession {
         // never lets the token elevate it (see `AuthContext::from_verified_jwt`).
         let scope = crate::control::security::request_scope::RequestAuthScope::builder(
             identity,
-            &self.state.scope_grants,
+            self.state.auth_stores(),
         )
         .with_session_database(Some(current_database))
         .with_session_id(session_id)

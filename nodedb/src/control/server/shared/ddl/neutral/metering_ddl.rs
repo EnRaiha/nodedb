@@ -136,6 +136,7 @@ pub fn show_quota(
     let grantee_id = user_filter.as_deref().unwrap_or("");
 
     let quotas = state.quota_manager.list_quotas();
+    let now_secs = crate::control::security::time::now_secs();
 
     let columns = vec![
         "scope".to_string(),
@@ -149,7 +150,11 @@ pub fn show_quota(
 
     let rows: Vec<Map<String, JsonValue>> = quotas
         .iter()
-        .filter_map(|q| state.quota_manager.get_status(&q.scope_name, grantee_id))
+        .filter_map(|q| {
+            state
+                .quota_manager
+                .get_status(&q.scope_name, grantee_id, now_secs)
+        })
         .map(|s| {
             let mut row = Map::new();
             row.insert("scope".to_string(), JsonValue::String(s.scope_name.clone()));

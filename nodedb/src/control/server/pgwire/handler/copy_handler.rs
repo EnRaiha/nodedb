@@ -81,7 +81,7 @@ impl NodeDbPgHandler {
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
             identity,
-            &self.state.scope_grants,
+            self.state.auth_stores(),
             database_id,
         );
         crate::control::server::session_auth::check_blacklist_and_status(
@@ -188,8 +188,12 @@ fn meter_backup_restore(
     if !state.metering_config.enabled {
         return;
     }
-    let info =
-        PlanMeteringInfo::for_collection(format!("tenant:{tenant_id}"), EngineTag::Meta, "sql");
+    let info = PlanMeteringInfo::for_collection(
+        format!("tenant:{tenant_id}"),
+        EngineTag::Meta,
+        "sql",
+        Permission::Backup,
+    );
     meter_dispatch(state, scope, &info, rows);
 }
 
@@ -272,7 +276,7 @@ impl CopyHandler for NodeDbCopyHandler {
             .unwrap_or(crate::types::DatabaseId::DEFAULT);
         let scope = RequestAuthScope::for_database(
             &pending.identity,
-            &self.state.scope_grants,
+            self.state.auth_stores(),
             database_id,
         );
         meter_backup_restore(&self.state, &scope, pending.tenant_id, Some(rows as u64));
@@ -448,7 +452,7 @@ mod tests {
         let user = identity(1);
         let scope = RequestAuthScope::for_database(
             &user,
-            &handler.state.scope_grants,
+            handler.state.auth_stores(),
             crate::types::DatabaseId::DEFAULT,
         );
 
@@ -474,7 +478,7 @@ mod tests {
         let user = identity(1);
         let scope = RequestAuthScope::for_database(
             &user,
-            &handler.state.scope_grants,
+            handler.state.auth_stores(),
             crate::types::DatabaseId::DEFAULT,
         );
 

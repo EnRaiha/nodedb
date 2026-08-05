@@ -211,14 +211,14 @@ fn authorize_for_identity(
 /// [`RequestAuthScope::database_id`]) and `$auth.database_id` (via
 /// [`RequestAuthScope::auth`]) are read from — split out from
 /// [`authorize_for_identity`] so that guarantee is directly unit-testable.
-/// Thin wrapper over [`RequestAuthScope::for_database`] that reads
-/// `scope_grants` off `state`.
+/// Thin wrapper over [`RequestAuthScope::for_database`] that reads the
+/// auth stores off `state`.
 fn resolve_dispatch_scope<'a>(
     state: &'a SharedState,
     identity: &'a AuthenticatedIdentity,
     database_id: DatabaseId,
 ) -> RequestAuthScope<'a> {
-    RequestAuthScope::for_database(identity, &state.scope_grants, database_id)
+    RequestAuthScope::for_database(identity, state.auth_stores(), database_id)
 }
 
 #[cfg(test)]

@@ -150,7 +150,7 @@ mod tests {
             .expect("blacklist user");
 
         let scope =
-            RequestAuthScope::for_database(&identity, &state.scope_grants, DatabaseId::DEFAULT);
+            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
 
         let result = check_request_admission(&state, &scope, "127.0.0.1", "point_get")
             .expect("internal-service identity must never be blocked");
@@ -170,7 +170,7 @@ mod tests {
             .expect("blacklist user");
 
         let scope =
-            RequestAuthScope::for_database(&identity, &state.scope_grants, DatabaseId::DEFAULT);
+            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
 
         let result = check_request_admission(&state, &scope, "127.0.0.1", "point_get");
         assert!(
@@ -200,7 +200,7 @@ mod tests {
             .expect("blacklist user");
 
         let scope =
-            RequestAuthScope::for_database(&identity, &state.scope_grants, DatabaseId::DEFAULT);
+            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
 
         let result = check_request_admission(&state, &scope, "127.0.0.1", "point_get");
         assert!(
@@ -222,7 +222,7 @@ mod tests {
             "s_test_suspended".into(),
         );
         ctx.status = AuthStatus::Suspended;
-        let scope = RequestAuthScope::builder(&identity, &state.scope_grants)
+        let scope = RequestAuthScope::builder(&identity, state.auth_stores())
             .with_session_database(Some(DatabaseId::DEFAULT))
             .with_adopted_auth_context(ctx)
             .build();
@@ -236,7 +236,7 @@ mod tests {
         let (state, _dir) = test_state().await;
         let identity = regular_identity(9005, AuthMethod::ScramSha256);
         let scope =
-            RequestAuthScope::for_database(&identity, &state.scope_grants, DatabaseId::DEFAULT);
+            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
 
         let result = check_request_admission(&state, &scope, "127.0.0.1", "point_get")
             .expect("non-blacklisted, active, unthrottled request must be admitted");
@@ -260,7 +260,7 @@ mod tests {
             .expect("blacklist user");
 
         let scope =
-            RequestAuthScope::for_database(&identity, &state.scope_grants, DatabaseId::DEFAULT);
+            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
 
         let result = check_blacklist_and_status(&state, &scope, "127.0.0.1:5432");
         assert!(
@@ -282,7 +282,7 @@ mod tests {
             .expect("blacklist CIDR range");
 
         let scope =
-            RequestAuthScope::for_database(&identity, &state.scope_grants, DatabaseId::DEFAULT);
+            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
 
         let allowed = check_blacklist_and_status(&state, &scope, "203.0.113.5:5432");
         assert!(
@@ -307,7 +307,7 @@ mod tests {
             "s_test_suspended_no_ratelimit".into(),
         );
         ctx.status = AuthStatus::Suspended;
-        let scope = RequestAuthScope::builder(&identity, &state.scope_grants)
+        let scope = RequestAuthScope::builder(&identity, state.auth_stores())
             .with_session_database(Some(DatabaseId::DEFAULT))
             .with_adopted_auth_context(ctx)
             .build();
@@ -329,7 +329,7 @@ mod tests {
             .expect("blacklist user");
 
         let scope =
-            RequestAuthScope::for_database(&identity, &state.scope_grants, DatabaseId::DEFAULT);
+            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
 
         let result = check_blacklist_and_status(&state, &scope, "127.0.0.1:5432");
         assert!(
@@ -343,7 +343,7 @@ mod tests {
         let (state, _dir) = test_state().await;
         let identity = regular_identity(9105, AuthMethod::ApiKey);
         let scope =
-            RequestAuthScope::for_database(&identity, &state.scope_grants, DatabaseId::DEFAULT);
+            RequestAuthScope::for_database(&identity, state.auth_stores(), DatabaseId::DEFAULT);
 
         let result = check_blacklist_and_status(&state, &scope, "127.0.0.1:5432");
         assert!(

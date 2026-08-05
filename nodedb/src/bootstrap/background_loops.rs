@@ -259,6 +259,12 @@ pub fn spawn_background_loops(
         60,
     );
 
+    // Quota period rollover is lazy — see `QuotaManager::rollover_if_due`.
+    // Every reader/writer of quota usage rolls the scope's period over on
+    // access, computed exactly from `period_start` and `period_secs`, so
+    // there is no background sweep to spawn here and no interval to couple
+    // a quota's `period_secs` to.
+
     // Background clone materializer sweep.
     // Automatically progresses cloned collections from Shadowed → Materialized
     // without requiring explicit DDL.  The foreground ALTER DATABASE MATERIALIZE

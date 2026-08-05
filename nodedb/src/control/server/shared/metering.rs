@@ -9,7 +9,10 @@
 use std::sync::Arc;
 
 use crate::bridge::envelope::{PhysicalPlan, Response, Status};
+use crate::control::security::auth_context::AuthContext;
+use crate::control::security::identity::{Permission, required_permission};
 use crate::control::security::metering::counter::UsageEvent;
+use crate::control::security::permission::parse_permission;
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::plan_util::{extract_collection, plan_engine};
 use crate::control::state::SharedState;
@@ -80,6 +83,15 @@ pub(crate) struct PlanMeteringInfo {
     collection: Option<String>,
     engine: EngineTag,
     operation: &'static str,
+    /// The [`Permission`] this dispatch required, per
+    /// [`required_permission`]. Carried alongside `operation` rather than
+    /// re-derived from it at charge time: `operation` is a coarse metering
+    /// cost-table key (several plan shapes can share one, e.g. every
+    /// `Columnar`/`Timeseries`/`Spatial` scan maps to `"document_scan"`),
+    /// so it is the wrong input for deciding which scopes a request needs —
+    /// `required_permission` already computes that correctly from the plan
+    /// itself, once, at extraction time.
+    permission: Permission,
 }
 
 impl PlanMeteringInfo {
@@ -93,6 +105,7 @@ impl PlanMeteringInfo {
             collection: extract_collection(plan).map(str::to_string),
             engine: plan_engine(plan),
             operation: operation_for_plan(plan),
+            permission: required_permission(plan),
         }
     }
 
@@ -103,11 +116,84 @@ impl PlanMeteringInfo {
         collection: String,
         engine: EngineTag,
         operation: &'static str,
+        permission: Permission,
     ) -> Self {
         Self {
             collection: Some(collection),
             engine,
             operation,
+            permission,
+        }
+    }
+}
+
+/// Does `scope_name`'s resolved grant set cover a `permission` operation on
+/// `collection`?
+///
+/// A quota is a meter on an entitlement: a request consumes an entitlement
+/// only if that entitlement actually covers the request. A grant covers the
+/// request when its permission matches and its collection either names
+/// `collection` exactly or is the codebase-wide `"*"` wildcard already used
+/// for "all collections" elsewhere (`CREATE CHANGE STREAM ... ON *`,
+/// retention policies, `KV SORTED INDEX ... *`) — `DEFINE SCOPE` grammar
+/// (`control::server::shared::ddl::neutral::scope_ddl::define`) stores
+/// whatever raw token follows `ON` verbatim, so an admin writing
+/// `... AS READ ON *` already produces a `"*"` collection in the resolved
+/// grant; this is that same convention, not a new one.
+///
+/// Grant permission strings are parsed via
+/// [`parse_permission`](crate::control::security::permission::parse_permission)
+/// — the same parser `GRANT`/catalog-grant code uses — rather than compared
+/// as raw strings, so `"select"`/`"insert"`/`"update"`/`"delete"` aliases
+/// resolve to the same [`Permission`] a `PhysicalPlan` requires.
+fn scope_covers_request(
+    state: &SharedState,
+    scope_name: &str,
+    permission: Permission,
+    collection: &str,
+) -> bool {
+    state
+        .scope_defs
+        .resolve(scope_name)
+        .into_iter()
+        .any(|(perm_str, coll)| {
+            parse_permission(&perm_str) == Some(permission) && (coll == "*" || coll == collection)
+        })
+}
+
+/// Charge `tokens` against every quota scope `grantee_id` holds that
+/// actually **covers** this request — not every scope `grantee_id` merely
+/// holds.
+///
+/// A held scope with no grant covering `info`'s `(permission, collection)`
+/// is left untouched: holding a `vector:heavy` entitlement must never debit
+/// its quota for an unrelated KV point-get, and holding more entitlements
+/// must never cost a caller more for the same request. See
+/// [`scope_covers_request`] for the coverage rule.
+///
+/// When two held scopes both cover this request, **both** are charged the
+/// full `tokens` amount — this is deliberate, not a bug to dedupe. A data
+/// cap and a feature cap are separate meters on the same billable event;
+/// each scope's `QuotaDefinition` (if any) is its own independent ledger,
+/// so an event covered by two entitlements debits both ledgers.
+/// `QuotaManager::record_usage` is a no-op bookkeeping call for any scope
+/// with no `QuotaDefinition` registered, so charging every *covering* scope
+/// unconditionally (rather than filtering to scopes with a defined quota
+/// first) costs nothing extra.
+fn charge_quota_for_held_scopes(
+    state: &SharedState,
+    auth: &AuthContext,
+    info: &PlanMeteringInfo,
+    collection: &str,
+    tokens: u64,
+    now_secs: u64,
+) {
+    let effective = state.scope_grants.effective_scopes(&auth.id, &auth.org_ids);
+    for scope_name in &effective {
+        if scope_covers_request(state, scope_name, info.permission, collection) {
+            state
+                .quota_manager
+                .record_usage(scope_name, &auth.id, tokens, now_secs);
         }
     }
 }
@@ -158,6 +244,8 @@ pub(crate) fn meter_dispatch(
     // Never charge zero: even a point-get miss performed a lookup.
     let tokens = operation_cost.saturating_mul(rows.unwrap_or(1).max(1));
 
+    let now_secs = crate::control::security::time::now_secs();
+    charge_quota_for_held_scopes(state, scope.auth(), info, collection, tokens, now_secs);
     state.usage_counter.record(&UsageEvent {
         auth_user_id: scope.auth().id.clone(),
         org_id: scope.auth().org_id.clone().unwrap_or_default(),
@@ -250,6 +338,16 @@ pub(crate) struct DetachedMeterGuard {
     engine: &'static str,
     operation: &'static str,
     rows: u64,
+    /// The quota scopes `auth_user_id` held **and that cover this request**
+    /// (see [`scope_covers_request`]) when this guard was built — filtered
+    /// once at construction rather than re-derived on drop, for the same
+    /// reason `meter_dispatch` derives them from the request-start `scope`:
+    /// consistent with the accepted as-of-request-start staleness this
+    /// metadata already carries. Coverage depends only on `info`'s
+    /// `(permission, collection)`, both fixed at construction, so filtering
+    /// here rather than on drop changes nothing about which scopes end up
+    /// charged.
+    quota_scopes: std::collections::HashSet<String>,
 }
 
 impl DetachedMeterGuard {
@@ -266,6 +364,15 @@ impl DetachedMeterGuard {
             return None;
         }
         let collection = info.collection.clone()?;
+        let held = state
+            .scope_grants
+            .effective_scopes(&scope.auth().id, &scope.auth().org_ids);
+        let quota_scopes = held
+            .into_iter()
+            .filter(|scope_name| {
+                scope_covers_request(state, scope_name, info.permission, &collection)
+            })
+            .collect();
         Some(Self {
             state: Arc::clone(state),
             auth_user_id: scope.auth().id.clone(),
@@ -275,6 +382,7 @@ impl DetachedMeterGuard {
             engine: engine_tag_str(info.engine),
             operation: info.operation,
             rows: 0,
+            quota_scopes,
         })
     }
 
@@ -296,6 +404,12 @@ impl Drop for DetachedMeterGuard {
         // Never charge zero: even a stream that closed before any row was
         // written performed a lookup — see `meter_dispatch`'s identical rule.
         let tokens = operation_cost.saturating_mul(self.rows.max(1));
+        let now_secs = crate::control::security::time::now_secs();
+        for scope_name in &self.quota_scopes {
+            self.state
+                .quota_manager
+                .record_usage(scope_name, &self.auth_user_id, tokens, now_secs);
+        }
         self.state.usage_counter.record(&UsageEvent {
             auth_user_id: self.auth_user_id.clone(),
             org_id: self.org_id.clone(),
@@ -391,14 +505,45 @@ mod tests {
         identity: &'a AuthenticatedIdentity,
         state: &'a SharedState,
     ) -> RequestAuthScope<'a> {
-        RequestAuthScope::for_database(identity, &state.scope_grants, DatabaseId::DEFAULT)
+        RequestAuthScope::for_database(identity, state.auth_stores(), DatabaseId::DEFAULT)
     }
 
     #[test]
     fn disabled_config_records_nothing() {
+        use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
+        use crate::control::security::scope::grant::ScopeGrantParams;
+
         let (state, _dir) = test_state();
         assert!(!state.metering_config.enabled, "default config is disabled");
         let identity = regular_identity(1);
+        state
+            .scope_defs
+            .define(
+                "pro:all",
+                vec![("read".into(), "widgets".into())],
+                vec![],
+                "admin",
+            )
+            .expect("define scope");
+        state
+            .scope_grants
+            .grant(ScopeGrantParams {
+                scope_name: "pro:all",
+                grantee_type: "user",
+                grantee_id: "1",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
+            .expect("grant scope");
+        state.quota_manager.define_quota(QuotaDefinition {
+            scope_name: "pro:all".into(),
+            max_tokens: 1000,
+            period_secs: 86400,
+            enforcement: QuotaEnforcement::Hard,
+            warning_threshold: 0.8,
+        });
         let scope = scope_for(&identity, &state);
 
         meter_dispatch(
@@ -409,6 +554,15 @@ mod tests {
         );
 
         assert_eq!(state.usage_counter.total_tokens(), 0);
+        assert_eq!(
+            state
+                .quota_manager
+                .get_status("pro:all", "1", 0)
+                .expect("quota defined")
+                .used_tokens,
+            0,
+            "metering disabled must not charge quota either"
+        );
     }
 
     #[test]
@@ -472,6 +626,316 @@ mod tests {
             .copied()
             .unwrap_or(1);
         assert_eq!(event.tokens, expected_cost * 3);
+    }
+
+    /// The core gap this module closes: `QuotaManager::record_usage` had no
+    /// caller before this change, so `$auth.quota_remaining(...)` always
+    /// resolved to `None`. A metered dispatch by an identity holding a scope
+    /// whose grants cover the request, with a quota defined, must charge
+    /// that quota by the same `tokens` value `UsageCounter::record` gets, so
+    /// the two accounting structures cannot drift.
+    #[test]
+    fn metered_dispatch_charges_quota_for_covering_held_scope() {
+        use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
+        use crate::control::security::scope::grant::ScopeGrantParams;
+
+        let (mut state, _dir) = test_state();
+        enable_metering(&mut state);
+        let identity = regular_identity(20);
+        state
+            .scope_defs
+            .define(
+                "pro:all",
+                vec![("read".into(), "widgets".into())],
+                vec![],
+                "admin",
+            )
+            .expect("define scope");
+        state
+            .scope_grants
+            .grant(ScopeGrantParams {
+                scope_name: "pro:all",
+                grantee_type: "user",
+                grantee_id: "20",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
+            .expect("grant scope");
+        state.quota_manager.define_quota(QuotaDefinition {
+            scope_name: "pro:all".into(),
+            max_tokens: 1000,
+            period_secs: 86400,
+            enforcement: QuotaEnforcement::Hard,
+            warning_threshold: 0.8,
+        });
+        let scope = scope_for(&identity, &state);
+
+        meter_dispatch(
+            &state,
+            &scope,
+            &PlanMeteringInfo::extract(&kv_get_plan()),
+            Some(3),
+        );
+
+        let expected_cost = state
+            .metering_config
+            .operation_costs
+            .get("kv_scan")
+            .copied()
+            .unwrap_or(1)
+            * 3;
+        let status = state
+            .quota_manager
+            .get_status("pro:all", "20", 0)
+            .expect("quota defined for held scope");
+        assert_eq!(status.used_tokens, expected_cost);
+    }
+
+    /// The defect this module now closes: a held scope whose grants do NOT
+    /// cover the request's `(permission, collection)` must not be charged —
+    /// holding a `vector:heavy` entitlement must never debit its quota for
+    /// an unrelated KV point-get, and holding more entitlements must never
+    /// cost a caller more for the same request.
+    #[test]
+    fn held_scope_not_covering_request_is_not_charged() {
+        use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
+        use crate::control::security::scope::grant::ScopeGrantParams;
+
+        let (mut state, _dir) = test_state();
+        enable_metering(&mut state);
+        let identity = regular_identity(21);
+        // Held scope grants only vector search on a different collection —
+        // it does not cover a KV `Get` on "widgets".
+        state
+            .scope_defs
+            .define(
+                "vector:heavy",
+                vec![("read".into(), "embeddings".into())],
+                vec![],
+                "admin",
+            )
+            .expect("define scope");
+        state
+            .scope_grants
+            .grant(ScopeGrantParams {
+                scope_name: "vector:heavy",
+                grantee_type: "user",
+                grantee_id: "21",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
+            .expect("grant scope");
+        state.quota_manager.define_quota(QuotaDefinition {
+            scope_name: "vector:heavy".into(),
+            max_tokens: 1000,
+            period_secs: 86400,
+            enforcement: QuotaEnforcement::Hard,
+            warning_threshold: 0.8,
+        });
+        let scope = scope_for(&identity, &state);
+
+        meter_dispatch(
+            &state,
+            &scope,
+            &PlanMeteringInfo::extract(&kv_get_plan()),
+            Some(3),
+        );
+
+        let status = state
+            .quota_manager
+            .get_status("vector:heavy", "21", 0)
+            .expect("quota defined for held scope");
+        assert_eq!(
+            status.used_tokens, 0,
+            "a held scope that does not cover the request must not be charged"
+        );
+    }
+
+    /// A wildcard `"*"` collection grant covers every collection — the same
+    /// convention `CREATE CHANGE STREAM ... ON *` and retention-policy DDL
+    /// already use elsewhere in the codebase.
+    #[test]
+    fn wildcard_collection_grant_is_charged() {
+        use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
+        use crate::control::security::scope::grant::ScopeGrantParams;
+
+        let (mut state, _dir) = test_state();
+        enable_metering(&mut state);
+        let identity = regular_identity(22);
+        state
+            .scope_defs
+            .define(
+                "all:read",
+                vec![("read".into(), "*".into())],
+                vec![],
+                "admin",
+            )
+            .expect("define scope");
+        state
+            .scope_grants
+            .grant(ScopeGrantParams {
+                scope_name: "all:read",
+                grantee_type: "user",
+                grantee_id: "22",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
+            .expect("grant scope");
+        state.quota_manager.define_quota(QuotaDefinition {
+            scope_name: "all:read".into(),
+            max_tokens: 1000,
+            period_secs: 86400,
+            enforcement: QuotaEnforcement::Hard,
+            warning_threshold: 0.8,
+        });
+        let scope = scope_for(&identity, &state);
+
+        meter_dispatch(
+            &state,
+            &scope,
+            &PlanMeteringInfo::extract(&kv_get_plan()),
+            Some(3),
+        );
+
+        let status = state
+            .quota_manager
+            .get_status("all:read", "22", 0)
+            .expect("quota defined for held scope");
+        assert!(
+            status.used_tokens > 0,
+            "a wildcard collection grant must cover any collection"
+        );
+    }
+
+    /// Two held scopes both covering the request are both charged the full
+    /// amount, independently — a data cap and a feature cap are separate
+    /// meters on the same billable event, not a single charge to dedupe.
+    #[test]
+    fn two_covering_scopes_are_both_charged_in_full() {
+        use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
+        use crate::control::security::scope::grant::ScopeGrantParams;
+
+        let (mut state, _dir) = test_state();
+        enable_metering(&mut state);
+        let identity = regular_identity(23);
+        for scope_name in ["data:cap", "feature:cap"] {
+            state
+                .scope_defs
+                .define(
+                    scope_name,
+                    vec![("read".into(), "widgets".into())],
+                    vec![],
+                    "admin",
+                )
+                .expect("define scope");
+            state
+                .scope_grants
+                .grant(ScopeGrantParams {
+                    scope_name,
+                    grantee_type: "user",
+                    grantee_id: "23",
+                    granted_by: "admin",
+                    expires_at: 0,
+                    grace_period_secs: 0,
+                    on_expire_action: "",
+                })
+                .expect("grant scope");
+            state.quota_manager.define_quota(QuotaDefinition {
+                scope_name: scope_name.into(),
+                max_tokens: 1000,
+                period_secs: 86400,
+                enforcement: QuotaEnforcement::Hard,
+                warning_threshold: 0.8,
+            });
+        }
+        let scope = scope_for(&identity, &state);
+
+        meter_dispatch(
+            &state,
+            &scope,
+            &PlanMeteringInfo::extract(&kv_get_plan()),
+            Some(3),
+        );
+
+        let expected_cost = state
+            .metering_config
+            .operation_costs
+            .get("kv_scan")
+            .copied()
+            .unwrap_or(1)
+            * 3;
+        for scope_name in ["data:cap", "feature:cap"] {
+            let status = state
+                .quota_manager
+                .get_status(scope_name, "23", 0)
+                .expect("quota defined for held scope");
+            assert_eq!(
+                status.used_tokens, expected_cost,
+                "scope '{scope_name}' must be charged the full amount independently"
+            );
+        }
+    }
+
+    /// No held scope covers the request → nothing is charged. This is the
+    /// correct outcome, not a gap: an identity with no entitlement for this
+    /// `(permission, collection)` pair has no meter to debit.
+    #[test]
+    fn no_covering_scope_charges_nothing() {
+        use crate::control::security::metering::quota::{QuotaDefinition, QuotaEnforcement};
+        use crate::control::security::scope::grant::ScopeGrantParams;
+
+        let (mut state, _dir) = test_state();
+        enable_metering(&mut state);
+        let identity = regular_identity(24);
+        // Held scope covers WRITE, not the READ this KV `Get` requires.
+        state
+            .scope_defs
+            .define(
+                "write:only",
+                vec![("write".into(), "widgets".into())],
+                vec![],
+                "admin",
+            )
+            .expect("define scope");
+        state
+            .scope_grants
+            .grant(ScopeGrantParams {
+                scope_name: "write:only",
+                grantee_type: "user",
+                grantee_id: "24",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+            })
+            .expect("grant scope");
+        state.quota_manager.define_quota(QuotaDefinition {
+            scope_name: "write:only".into(),
+            max_tokens: 1000,
+            period_secs: 86400,
+            enforcement: QuotaEnforcement::Hard,
+            warning_threshold: 0.8,
+        });
+        let scope = scope_for(&identity, &state);
+
+        meter_dispatch(
+            &state,
+            &scope,
+            &PlanMeteringInfo::extract(&kv_get_plan()),
+            Some(3),
+        );
+
+        let status = state
+            .quota_manager
+            .get_status("write:only", "24", 0)
+            .expect("quota defined for held scope");
+        assert_eq!(status.used_tokens, 0);
     }
 
     #[test]

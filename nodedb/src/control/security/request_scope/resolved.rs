@@ -21,10 +21,10 @@ use nodedb_types::DatabaseId;
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::deny::DenyMode;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::security::scope::grant::ScopeGrantStore;
 use crate::types::TenantId;
 
 use super::builder::RequestAuthScopeBuilder;
+use super::stores::AuthStores;
 
 /// A fully resolved, request-scoped authorization contract.
 ///
@@ -60,15 +60,15 @@ pub struct RequestAuthScope<'a> {
 impl<'a> RequestAuthScope<'a> {
     /// Start resolving a `RequestAuthScope` for `identity`.
     ///
-    /// `scope_grants` is a required argument (not an optional builder
-    /// method) so that scope enrichment cannot be silently skipped by a
-    /// transport that forgets to opt in — see
-    /// [`RequestAuthScopeBuilder`] for why that matters.
+    /// `stores` is a required argument (not an optional builder method) so
+    /// that scope/quota enrichment cannot be silently skipped by a transport
+    /// that forgets to opt in — see [`RequestAuthScopeBuilder`] for why that
+    /// matters.
     pub fn builder(
         identity: &'a AuthenticatedIdentity,
-        scope_grants: &'a ScopeGrantStore,
+        stores: AuthStores<'a>,
     ) -> RequestAuthScopeBuilder<'a> {
-        RequestAuthScopeBuilder::new(identity, scope_grants)
+        RequestAuthScopeBuilder::new(identity, stores)
     }
 
     /// Resolve a scope pinned to a specific `database_id`, bypassing
@@ -83,10 +83,10 @@ impl<'a> RequestAuthScope<'a> {
     /// database drift this type exists to prevent creep back in a second time.
     pub fn for_database(
         identity: &'a AuthenticatedIdentity,
-        scope_grants: &'a ScopeGrantStore,
+        stores: AuthStores<'a>,
         database_id: DatabaseId,
     ) -> Self {
-        Self::builder(identity, scope_grants)
+        Self::builder(identity, stores)
             .with_session_database(Some(database_id))
             .build()
     }

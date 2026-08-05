@@ -533,7 +533,7 @@ impl NodeDbPgHandler {
             // path reaching this point already passed the
             // `response_status_to_sqlstate` error check above.
             if let Some(info) = &plan_metering_info {
-                let scope = RequestAuthScope::builder(identity, &self.state.scope_grants)
+                let scope = RequestAuthScope::builder(identity, self.state.auth_stores())
                     .with_session_database(Some(task_database_id))
                     .build();
                 meter_dispatch(&self.state, &scope, info, task_rows);

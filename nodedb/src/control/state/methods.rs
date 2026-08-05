@@ -6,12 +6,21 @@ use std::sync::{Arc, Mutex};
 
 use tracing::warn;
 
+use crate::control::security::request_scope::AuthStores;
 use crate::control::security::tenant::QuotaCheck;
 use crate::types::TenantId;
 
 use super::SharedState;
 
 impl SharedState {
+    /// Bundle of the auth-adjacent stores every `RequestAuthScope`
+    /// construction needs (`scope_grants`, `quota_manager`), for callers
+    /// that build a scope from `&SharedState` directly rather than pulling
+    /// the two fields separately.
+    pub fn auth_stores(&self) -> AuthStores<'_> {
+        AuthStores::new(&self.scope_grants, &self.quota_manager)
+    }
+
     /// Sequenced Raft proposer for ordinary writes; absent outside cluster mode.
     pub(crate) fn async_raft_proposer(
         &self,

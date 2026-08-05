@@ -153,7 +153,7 @@ pub async fn upsert_document(
     let old_fields = if let Some(ref pk) = pk_for_probe {
         // The neutral DDL entry point receives an explicit selected database;
         // keep `$auth.database_id` identical to the task being probed.
-        let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
+        let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
         let row = crate::control::trigger::dml_hook::fetch_old_row(
             state,
             identity,

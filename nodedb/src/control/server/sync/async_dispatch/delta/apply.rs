@@ -116,7 +116,7 @@ pub(crate) async fn apply_delta_and_finalize(
     // session's real remote address.
     let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
         identity,
-        &shared.scope_grants,
+        shared.auth_stores(),
         database_id,
     );
     if let Err(e) =

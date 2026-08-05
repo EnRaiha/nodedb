@@ -72,7 +72,7 @@ impl NodeDbPgHandler {
         // lockstep path and runs scope-grant enrichment.
         let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
             identity,
-            &self.state.scope_grants,
+            self.state.auth_stores(),
             database_id,
         );
         let perm_cache = self.state.permission_cache.read().await;

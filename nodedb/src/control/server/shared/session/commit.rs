@@ -291,7 +291,7 @@ fn meter_committed_buffered_writes(
         if is_stageable_write(&task.plan) {
             continue;
         }
-        let scope = RequestAuthScope::builder(identity, &state.scope_grants)
+        let scope = RequestAuthScope::builder(identity, state.auth_stores())
             .with_session_database(Some(task.database_id))
             .build();
         meter_buffered_write(state, &scope, &task.plan);

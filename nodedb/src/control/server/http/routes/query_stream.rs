@@ -307,7 +307,7 @@ mod tests {
         );
         let scope = RequestAuthScope::for_database(
             &identity,
-            &state.scope_grants,
+            state.auth_stores(),
             crate::types::DatabaseId::DEFAULT,
         );
         // Collection/engine only matter for attribution, not for this test's

@@ -225,7 +225,7 @@ pub(crate) fn build_request_scope<'a>(
 ) -> crate::control::security::request_scope::RequestAuthScope<'a> {
     crate::control::security::request_scope::RequestAuthScope::builder(
         identity,
-        &state.shared.scope_grants,
+        state.shared.auth_stores(),
     )
     .with_session_database(Some(database_id))
     .with_on_deny(on_deny_header_mode(headers))

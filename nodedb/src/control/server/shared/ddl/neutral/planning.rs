@@ -30,7 +30,7 @@ pub async fn plan_authorized_sql(
     database_id: DatabaseId,
 ) -> Result<(AuthorizedTaskSet, OutputSchema, QueryLeaseScope), DdlError> {
     // Internal DDL scans still plan in the caller-selected database context.
-    let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
     let permission_cache = state.permission_cache.read().await;
     let sec = PlanSecurityContext {
         identity,

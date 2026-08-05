@@ -46,7 +46,7 @@ impl NodeDbPgHandler {
                 })?,
             SessionId::LegacySocket(peer_addr) => peer_addr,
         };
-        let scope = RequestAuthScope::builder(identity, &self.state.scope_grants)
+        let scope = RequestAuthScope::builder(identity, self.state.auth_stores())
             .with_session_database(Some(database_id))
             .build();
         crate::control::server::session_auth::check_request_admission(
@@ -169,7 +169,7 @@ impl NodeDbPgHandler {
         // transport's `RequestAuthScope` resolution uses, and (new for the
         // pooled-handle case) runs scope-grant enrichment, which a cached
         // context never received after the moment it was created.
-        let mut scope_builder = RequestAuthScope::builder(identity, &self.state.scope_grants)
+        let mut scope_builder = RequestAuthScope::builder(identity, self.state.auth_stores())
             .with_session_database(Some(database_id))
             .with_on_deny(session_on_deny);
         if let Some(adopted) = adopted_auth_ctx {

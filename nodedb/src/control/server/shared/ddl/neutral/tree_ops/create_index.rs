@@ -109,7 +109,7 @@ pub async fn create_graph_index(
     // one principal's filtered view would answer other principals' queries from
     // rows that were never indexed. Refuse instead of silently indexing a
     // subset.
-    let scope = RequestAuthScope::for_database(identity, &state.scope_grants, database_id);
+    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
     if state
         .rls
         .combined_read_predicate_with_auth(tenant_id.as_u64(), &collection, scope.auth())

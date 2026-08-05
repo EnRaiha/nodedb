@@ -150,7 +150,7 @@ fn with_caller_rls(
 ) -> crate::Result<PhysicalPlan> {
     let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
         identity,
-        &state.scope_grants,
+        state.auth_stores(),
         database_id,
     );
     crate::control::planner::rls_injection::inject_rls_for_single_plan(

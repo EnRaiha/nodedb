@@ -43,7 +43,7 @@ pub(in crate::control::server::sync) async fn handle_shape_subscribe_async(
     // every other transport gets) using the session's real remote address.
     let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
         identity,
-        &shared.scope_grants,
+        shared.auth_stores(),
         database_id,
     );
     if let Err(e) = crate::control::server::session_auth::check_blacklist_and_status(
@@ -175,7 +175,7 @@ pub(in crate::control::server::sync) async fn handle_resync_request_async(
     // no rate limit, with the same internal-service exemption.
     let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
         identity,
-        &shared.scope_grants,
+        shared.auth_stores(),
         database_id,
     );
     if let Err(e) = crate::control::server::session_auth::check_blacklist_and_status(

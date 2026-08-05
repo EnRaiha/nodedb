@@ -159,7 +159,7 @@ async fn native_request_scope_carries_verified_oidc_claim_enrichment() {
     let (state, identity, claims) =
         verify_via_catalog_provider(issuer, audience, jwks, &token).await;
 
-    let scope = RequestAuthScope::builder(&identity, &state.scope_grants)
+    let scope = RequestAuthScope::builder(&identity, state.auth_stores())
         .with_verified_jwt(&claims)
         .build();
     let auth = scope.auth();
@@ -195,7 +195,7 @@ async fn native_request_scope_does_not_forge_superuser_from_verified_oidc_claims
         "verify_bearer_token must never derive superuser authority from claims"
     );
 
-    let scope = RequestAuthScope::builder(&identity, &state.scope_grants)
+    let scope = RequestAuthScope::builder(&identity, state.auth_stores())
         .with_verified_jwt(&claims)
         .build();
 
@@ -222,11 +222,11 @@ async fn native_request_scope_session_id_stable_across_requests_with_verified_jw
 
     let session_id = "s_native_test_connection".to_string();
 
-    let first = RequestAuthScope::builder(&identity, &state.scope_grants)
+    let first = RequestAuthScope::builder(&identity, state.auth_stores())
         .with_session_id(session_id.clone())
         .with_verified_jwt(&claims)
         .build();
-    let second = RequestAuthScope::builder(&identity, &state.scope_grants)
+    let second = RequestAuthScope::builder(&identity, state.auth_stores())
         .with_session_id(session_id.clone())
         .with_verified_jwt(&claims)
         .build();

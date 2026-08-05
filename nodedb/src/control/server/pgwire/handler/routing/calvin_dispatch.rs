@@ -44,7 +44,7 @@ fn meter_calvin_task(
         return;
     }
     let info = PlanMeteringInfo::extract(&task.plan);
-    let scope = RequestAuthScope::builder(identity, &state.scope_grants)
+    let scope = RequestAuthScope::builder(identity, state.auth_stores())
         .with_session_database(Some(database_id))
         .build();
     meter_dispatch(state, &scope, &info, None);

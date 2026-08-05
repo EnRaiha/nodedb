@@ -162,7 +162,7 @@ fn meter_resp_dispatch(
     let Some(identity) = session.identity.as_ref() else {
         return;
     };
-    let scope = resp_auth_scope(identity, &state.scope_grants, database_id);
+    let scope = resp_auth_scope(identity, state.auth_stores(), database_id);
     meter_dispatch(state, &scope, info, Some(1));
 }
 
@@ -182,7 +182,7 @@ fn authorize_resp_task(
             resource: "RESP AUTH required before data access".into(),
         })?;
 
-    let scope = resp_auth_scope(identity, &state.scope_grants, database_id);
+    let scope = resp_auth_scope(identity, state.auth_stores(), database_id);
 
     // Request-admission gate: internal-service exemption, blacklist, account
     // status, then rate limit — before RLS injection and task authorization,
@@ -250,10 +250,10 @@ fn authorize_resp_task(
 /// unit-testable. Thin wrapper over [`RequestAuthScope::for_database`].
 fn resp_auth_scope<'a>(
     identity: &'a AuthenticatedIdentity,
-    scope_grants: &'a crate::control::security::scope::grant::ScopeGrantStore,
+    stores: crate::control::security::request_scope::AuthStores<'a>,
     database_id: DatabaseId,
 ) -> RequestAuthScope<'a> {
-    RequestAuthScope::for_database(identity, scope_grants, database_id)
+    RequestAuthScope::for_database(identity, stores, database_id)
 }
 
 /// Convert gateway `Vec<Vec<u8>>` payloads into a synthetic `Response`.
@@ -298,6 +298,8 @@ fn map_busy_error(e: crate::Error) -> crate::Error {
 #[cfg(test)]
 mod tests {
     use crate::control::security::identity::{AuthMethod, DatabaseSet, Role};
+    use crate::control::security::metering::quota::QuotaManager;
+    use crate::control::security::request_scope::AuthStores;
     use crate::control::security::scope::grant::ScopeGrantStore;
     use crate::types::TenantId;
 
@@ -330,8 +332,13 @@ mod tests {
         assert_ne!(identity.default_database, Some(DatabaseId::DEFAULT));
 
         let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
 
-        let scope = resp_auth_scope(&identity, &grants, DatabaseId::DEFAULT);
+        let scope = resp_auth_scope(
+            &identity,
+            AuthStores::new(&grants, &quotas),
+            DatabaseId::DEFAULT,
+        );
 
         assert_eq!(scope.database_id(), DatabaseId::DEFAULT);
         assert_eq!(scope.auth().database_id, Some(DatabaseId::DEFAULT));

@@ -261,7 +261,7 @@ where
     // request, so a missing identity just skips the (impossible) charge
     // rather than panicking.
     if let Some(identity) = sessions.identity(session_id) {
-        let scope = RequestAuthScope::builder(&identity, &state.scope_grants)
+        let scope = RequestAuthScope::builder(&identity, state.auth_stores())
             .with_session_database(Some(task.database_id))
             .build();
         meter_staged_write(state, &scope, &task.plan, &resp);

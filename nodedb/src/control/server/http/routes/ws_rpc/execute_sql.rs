@@ -40,7 +40,7 @@ pub async fn execute_sql(
     // The RPC-selected database is authoritative for RLS variables — passed
     // as the session database so `scope.database_id()` resolves to exactly
     // `database_id` rather than falling back through `identity`'s default.
-    let scope = RequestAuthScope::builder(identity, &shared.scope_grants)
+    let scope = RequestAuthScope::builder(identity, shared.auth_stores())
         .with_session_database(Some(database_id))
         .build();
 
@@ -384,7 +384,7 @@ mod tests {
         identity: &'a AuthenticatedIdentity,
         state: &'a SharedState,
     ) -> RequestAuthScope<'a> {
-        RequestAuthScope::for_database(identity, &state.scope_grants, DatabaseId::DEFAULT)
+        RequestAuthScope::for_database(identity, state.auth_stores(), DatabaseId::DEFAULT)
     }
 
     /// `meter_task` is called unconditionally after every dispatch branch in

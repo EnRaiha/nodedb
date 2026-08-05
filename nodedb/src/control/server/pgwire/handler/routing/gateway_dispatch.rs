@@ -47,7 +47,7 @@ fn meter_gateway_task(
         return;
     }
     let info = PlanMeteringInfo::extract(plan);
-    let scope = RequestAuthScope::builder(identity, &state.scope_grants)
+    let scope = RequestAuthScope::builder(identity, state.auth_stores())
         .with_session_database(Some(database_id))
         .build();
     meter_dispatch(state, &scope, &info, rows);

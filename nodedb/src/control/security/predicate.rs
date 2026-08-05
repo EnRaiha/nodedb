@@ -240,6 +240,51 @@ mod tests {
         assert_eq!(filters[0].value, nodedb_types::Value::String("123".into()));
     }
 
+    /// `$auth.quota_remaining('<scope>')` resolves through the same
+    /// pre-computed `metadata["quota_remaining.<scope>"]` mechanism
+    /// `scope_status` already uses — this test pins that seam directly
+    /// rather than through a full RLS policy, since the metadata is
+    /// populated by `enrich_auth_context_with_scopes`
+    /// (`control::security::scope::enrichment`), not by this module.
+    #[test]
+    fn quota_remaining_auth_func_resolves_from_metadata() {
+        let mut auth = make_auth();
+        auth.metadata
+            .insert("quota_remaining.pro:all".into(), "750".into());
+        let value = PredicateValue::AuthFunc {
+            func: "quota_remaining".into(),
+            args: vec!["pro:all".into()],
+        };
+        assert_eq!(value.resolve(&auth), Some(serde_json::json!("750")));
+    }
+
+    #[test]
+    fn quota_pct_auth_func_resolves_from_metadata() {
+        let mut auth = make_auth();
+        auth.metadata
+            .insert("quota_pct.pro:all".into(), "0.25".into());
+        let value = PredicateValue::AuthFunc {
+            func: "quota_pct".into(),
+            args: vec!["pro:all".into()],
+        };
+        assert_eq!(value.resolve(&auth), Some(serde_json::json!("0.25")));
+    }
+
+    /// Before enrichment writes the metadata key (or for a scope with no
+    /// quota defined), `quota_remaining`/`quota_pct` resolve to `None` —
+    /// which fails an RLS predicate closed rather than panicking. This is
+    /// the exact gap `enrich_auth_context_with_scopes` exists to close for
+    /// every held scope with a quota defined.
+    #[test]
+    fn quota_remaining_auth_func_fails_closed_when_metadata_absent() {
+        let auth = make_auth();
+        let value = PredicateValue::AuthFunc {
+            func: "quota_remaining".into(),
+            args: vec!["pro:all".into()],
+        };
+        assert_eq!(value.resolve(&auth), None);
+    }
+
     #[test]
     fn literal_comparison() {
         let pred = RlsPredicate::Compare {
