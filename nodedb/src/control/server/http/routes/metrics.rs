@@ -221,6 +221,14 @@ pub async fn metrics(
     // Auth observability: method-specific counters, duration histograms, anomaly detection.
     output.push_str(&state.shared.auth_metrics.to_prometheus());
 
+    // Metering capacity: dropped-entry counters, so a refused (i.e. never
+    // billed) usage record is observable without reading server logs.
+    crate::control::security::metering::metrics::render_prometheus(
+        &state.shared.usage_store,
+        &state.shared.quota_manager,
+        &mut output,
+    );
+
     if let Some(sequencer_metrics) = state.shared.sequencer_metrics.get() {
         output.push_str(&sequencer_metrics.render_prometheus());
     }

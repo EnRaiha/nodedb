@@ -25,6 +25,20 @@ pub struct MeteringConfig {
     /// Custom metering dimensions beyond the built-in ones.
     #[serde(default)]
     pub custom_dimensions: Vec<CustomDimension>,
+
+    /// Ring-buffer capacity for raw usage events retained by `UsageStore`.
+    #[serde(default = "default_max_usage_events")]
+    pub max_usage_events: usize,
+
+    /// Cap on distinct users/orgs/tenants tracked in `UsageStore`'s totals
+    /// maps before new entries are refused (existing entries keep updating).
+    #[serde(default = "default_max_tracked_scopes")]
+    pub max_tracked_scopes: usize,
+
+    /// Cap on distinct `"{scope}:{grantee}"` keys tracked by `QuotaManager`
+    /// before new entries are refused (existing entries keep updating).
+    #[serde(default = "default_max_tracked_quota_grantees")]
+    pub max_tracked_quota_grantees: usize,
 }
 
 /// A custom metering dimension.
@@ -41,12 +55,27 @@ impl Default for MeteringConfig {
             flush_interval_secs: default_flush_interval(),
             operation_costs: default_operation_costs(),
             custom_dimensions: Vec::new(),
+            max_usage_events: default_max_usage_events(),
+            max_tracked_scopes: default_max_tracked_scopes(),
+            max_tracked_quota_grantees: default_max_tracked_quota_grantees(),
         }
     }
 }
 
 fn default_flush_interval() -> u64 {
     60
+}
+
+fn default_max_usage_events() -> usize {
+    super::store::DEFAULT_MAX_EVENTS
+}
+
+fn default_max_tracked_scopes() -> usize {
+    super::store::DEFAULT_MAX_TRACKED_SCOPES
+}
+
+fn default_max_tracked_quota_grantees() -> usize {
+    super::quota::DEFAULT_MAX_TRACKED_GRANTEES
 }
 
 fn default_operation_costs() -> HashMap<String, u64> {

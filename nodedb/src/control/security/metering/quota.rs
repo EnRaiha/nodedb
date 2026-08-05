@@ -4,9 +4,18 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+/// Default cap on the number of distinct `"{scope_name}:{grantee_id}"` keys
+/// tracked in `QuotaManager::usage`. This is a process-lifetime store with no
+/// caller currently invoking `reset_period()`, so it must be bounded; once at
+/// capacity, new grantee keys are refused (existing ones keep accumulating)
+/// and the refusal is surfaced via `dropped_usage_entries()` plus a one-time
+/// `tracing::warn!`.
+pub const DEFAULT_MAX_TRACKED_GRANTEES: usize = 100_000;
 
 /// Quota enforcement mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,13 +64,27 @@ pub struct QuotaManager {
     quotas: RwLock<HashMap<String, QuotaDefinition>>,
     /// "{scope_name}:{grantee_id}" → tokens used in current period.
     usage: RwLock<HashMap<String, u64>>,
+    /// Cap on distinct keys in `usage`.
+    max_tracked_grantees: usize,
+    /// Count of new grantee keys refused because `usage` was at capacity.
+    dropped_usage_entries: AtomicU64,
+    /// Ensures the capacity warning is logged once, not once per dropped call.
+    warned_capacity: AtomicBool,
 }
 
 impl QuotaManager {
     pub fn new() -> Self {
+        Self::with_bounds(DEFAULT_MAX_TRACKED_GRANTEES)
+    }
+
+    /// Construct with an explicit cap on distinct `"{scope}:{grantee}"` keys.
+    pub fn with_bounds(max_tracked_grantees: usize) -> Self {
         Self {
             quotas: RwLock::new(HashMap::new()),
             usage: RwLock::new(HashMap::new()),
+            max_tracked_grantees,
+            dropped_usage_entries: AtomicU64::new(0),
+            warned_capacity: AtomicBool::new(false),
         }
     }
 
@@ -78,10 +101,50 @@ impl QuotaManager {
     }
 
     /// Record token usage against a quota.
+    ///
+    /// If `usage` is already at `max_tracked_grantees` and `grantee_id` is
+    /// new for `scope_name`, the update is refused (rather than growing the
+    /// map unboundedly) and surfaced via `dropped_usage_entries()` plus a
+    /// one-time warning. Existing grantee keys always keep accumulating.
     pub fn record_usage(&self, scope_name: &str, grantee_id: &str, tokens: u64) {
         let key = format!("{scope_name}:{grantee_id}");
-        let mut usage = self.usage.write().unwrap_or_else(|p| p.into_inner());
-        *usage.entry(key).or_insert(0) += tokens;
+        let dropped = {
+            let mut usage = self.usage.write().unwrap_or_else(|p| p.into_inner());
+            if let Some(v) = usage.get_mut(&key) {
+                *v += tokens;
+                false
+            } else if usage.len() < self.max_tracked_grantees {
+                usage.insert(key, tokens);
+                false
+            } else {
+                true
+            }
+        };
+
+        if dropped {
+            self.dropped_usage_entries.fetch_add(1, Ordering::Relaxed);
+            if !self.warned_capacity.swap(true, Ordering::Relaxed) {
+                warn!(
+                    scope = %scope_name,
+                    cap = self.max_tracked_grantees,
+                    "quota usage tracking at capacity — new grantee entries are no longer \
+                     being tracked (existing entries keep updating); see dropped_usage_entries()"
+                );
+            }
+        }
+    }
+
+    /// Count of new grantee keys refused since `usage` hit capacity.
+    pub fn dropped_usage_entries(&self) -> u64 {
+        self.dropped_usage_entries.load(Ordering::Relaxed)
+    }
+
+    /// The configured cap on distinct `"{scope}:{grantee}"` keys (see
+    /// `max_tracked_quota_grantees` on `MeteringConfig`). Exposed so
+    /// observability surfaces can report drop counts alongside the ceiling
+    /// that produced them.
+    pub fn max_tracked_grantees(&self) -> usize {
+        self.max_tracked_grantees
     }
 
     /// Check if a request should be allowed based on quota.
@@ -266,5 +329,30 @@ mod tests {
 
         let usage = mgr.usage.read().unwrap();
         assert!(!usage.contains_key("free:u1"));
+    }
+
+    #[test]
+    fn usage_map_is_bounded_and_overflow_is_observable() {
+        let mgr = QuotaManager::with_bounds(2);
+
+        mgr.record_usage("free", "u1", 10);
+        mgr.record_usage("free", "u2", 10);
+        assert_eq!(mgr.dropped_usage_entries(), 0);
+        assert_eq!(mgr.usage.read().unwrap().len(), 2);
+
+        // A third distinct grantee exceeds the cap of 2.
+        mgr.record_usage("free", "u3", 10);
+        assert_eq!(mgr.dropped_usage_entries(), 1);
+        assert_eq!(mgr.usage.read().unwrap().len(), 2); // Map did not grow.
+        assert!(!mgr.usage.read().unwrap().contains_key("free:u3"));
+
+        // Existing grantee keys keep updating past the cap being hit.
+        mgr.record_usage("free", "u1", 5);
+        assert_eq!(*mgr.usage.read().unwrap().get("free:u1").unwrap(), 15);
+        assert_eq!(mgr.dropped_usage_entries(), 1); // No new drop for an existing key.
+
+        // Further distinct grantees keep incrementing the drop counter.
+        mgr.record_usage("free", "u4", 10);
+        assert_eq!(mgr.dropped_usage_entries(), 2);
     }
 }

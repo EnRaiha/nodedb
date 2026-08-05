@@ -9,6 +9,11 @@ use nodedb_types::config::TuningConfig;
 
 use crate::bridge::dispatch::Dispatcher;
 use crate::control::request_tracker::RequestTracker;
+use crate::control::security::metering::config::MeteringConfig;
+use crate::control::security::metering::quota::QuotaManager;
+use crate::control::security::metering::store::UsageStore;
+use crate::control::security::ratelimit::config::RateLimitConfig;
+use crate::control::security::ratelimit::limiter::RateLimiter;
 use crate::control::security::tenant::{TenantIsolation, TenantQuota};
 use crate::control::server::sync::dlq::{DlqConfig, SyncDlq};
 use crate::wal::WalManager;
@@ -60,6 +65,25 @@ impl SharedState {
             uc_bus,
             bus_consumer_handle,
         } = super::bootstrap::run(&wal, catalog_path, auth_config)?;
+
+        // `auth_config.metering` is `None` unless the operator configured a
+        // `[metering]` section; fall back to `MeteringConfig::default()` so
+        // the effective bounds always match a real `MeteringConfig` value
+        // (same source `init.rs`'s test constructor pins to) instead of the
+        // separately-hardcoded `UsageStore`/`QuotaManager` `Default` impls.
+        let metering_defaults = MeteringConfig::default();
+        let metering_config = auth_config.metering.as_ref().unwrap_or(&metering_defaults);
+
+        // `auth_config.rate_limit` is `None` unless the operator configured a
+        // `[auth.rate_limit]` section; fall back to `RateLimitConfig::default()`
+        // (same source `init.rs`'s test constructor pins to) so the limiter's
+        // effective config always matches a real `RateLimitConfig` value
+        // instead of the separately-hardcoded `RateLimiter::default()` impl.
+        let rate_limit_defaults = RateLimitConfig::default();
+        let rate_limit_config = auth_config
+            .rate_limit
+            .as_ref()
+            .unwrap_or(&rate_limit_defaults);
 
         let state = Arc::new(Self {
             dispatcher: Mutex::new(dispatcher),
@@ -231,7 +255,7 @@ impl SharedState {
             orgs: crate::control::security::org::store::OrgStore::new(),
             scope_defs: crate::control::security::scope::store::ScopeStore::new(),
             scope_grants: crate::control::security::scope::grant::ScopeGrantStore::new(),
-            rate_limiter: crate::control::security::ratelimit::limiter::RateLimiter::default(),
+            rate_limiter: RateLimiter::new(rate_limit_config.clone()),
             session_handles:
                 crate::control::security::session_handle::SessionHandleStore::from_config(
                     &auth_config.session,
@@ -241,8 +265,11 @@ impl SharedState {
             usage_counter: Arc::new(
                 crate::control::security::metering::counter::UsageCounter::new(),
             ),
-            usage_store: Arc::new(crate::control::security::metering::store::UsageStore::default()),
-            quota_manager: crate::control::security::metering::quota::QuotaManager::new(),
+            usage_store: Arc::new(UsageStore::with_bounds(
+                metering_config.max_usage_events,
+                metering_config.max_tracked_scopes,
+            )),
+            quota_manager: QuotaManager::with_bounds(metering_config.max_tracked_quota_grantees),
             auth_api_keys: crate::control::security::auth_apikey::AuthApiKeyStore::new(),
             impersonation: crate::control::security::impersonation::ImpersonationStore::default(),
             emergency: crate::control::security::emergency::EmergencyState::default(),
@@ -365,5 +392,118 @@ impl SharedState {
         super::post_init::spawn_array_gc(&state);
 
         Ok(state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::security::ratelimit::limiter::LoginRateLimitOutcome;
+
+    /// Build a `SharedState` via the production `open()` path with a
+    /// caller-supplied `AuthConfig`, so tests can observe how operator
+    /// config actually threads through construction.
+    fn open_with_auth_config(
+        dir: &std::path::Path,
+        auth_config: &crate::config::auth::AuthConfig,
+    ) -> Arc<SharedState> {
+        let wal_dir = dir.join("wal");
+        std::fs::create_dir_all(&wal_dir).expect("create wal dir");
+        let wal = Arc::new(WalManager::open_for_testing(&wal_dir).expect("open wal"));
+        let (dispatcher, _) = crate::bridge::dispatch::Dispatcher::new(1, 16);
+        let catalog_path = dir.join("catalog.redb");
+        SharedState::open(
+            dispatcher,
+            wal,
+            &catalog_path,
+            auth_config,
+            TuningConfig::default(),
+            crate::bridge::quiesce::CollectionQuiesce::new(),
+            crate::control::array_catalog::ArrayCatalog::handle(),
+        )
+        .expect("open shared state")
+    }
+
+    #[test]
+    fn configured_rate_limit_is_applied_not_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `RateLimitConfig::default()` is `enabled: false` with `default_burst:
+        // 200` — a distinctive small, enabled burst here can only show up if
+        // this exact config was threaded into the constructed `RateLimiter`.
+        let auth_config = crate::config::auth::AuthConfig {
+            rate_limit: Some(RateLimitConfig {
+                enabled: true,
+                default_qps: 3,
+                default_burst: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let state = open_with_auth_config(dir.path(), &auth_config);
+
+        for i in 0..3 {
+            let r = state.rate_limiter.check("u1", &[], None, "point_get", None);
+            assert!(
+                r.allowed,
+                "request {i} should be allowed under configured burst=3"
+            );
+        }
+        let r = state.rate_limiter.check("u1", &[], None, "point_get", None);
+        assert!(
+            !r.allowed,
+            "4th request must be denied by the operator-configured burst=3, \
+             not the hardcoded RateLimitConfig::default() burst=200"
+        );
+    }
+
+    #[test]
+    fn unconfigured_rate_limit_falls_back_to_disabled_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_config = crate::config::auth::AuthConfig::default();
+        assert!(auth_config.rate_limit.is_none());
+
+        let state = open_with_auth_config(dir.path(), &auth_config);
+
+        // `RateLimitConfig::default()` has `enabled: false`, so every
+        // request is admitted regardless of volume.
+        for _ in 0..500 {
+            let r = state.rate_limiter.check("u1", &[], None, "point_get", None);
+            assert!(r.allowed);
+        }
+    }
+
+    #[test]
+    fn login_capacities_still_apply_after_configured_rate_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_config = crate::config::auth::AuthConfig {
+            rate_limit: Some(RateLimitConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state = open_with_auth_config(dir.path(), &auth_config);
+
+        // Mirrors `main_boot::shared_state`'s post-construction call.
+        state.rate_limiter.set_login_capacities(5, 100);
+
+        for _ in 0..5 {
+            assert!(matches!(
+                state.rate_limiter.check_login("10.0.0.9", "victim"),
+                LoginRateLimitOutcome::Allowed
+            ));
+            state
+                .rate_limiter
+                .record_login_failure("10.0.0.9", "victim");
+        }
+        assert!(
+            matches!(
+                state.rate_limiter.check_login("10.0.0.9", "victim"),
+                LoginRateLimitOutcome::IpExceeded { .. }
+            ),
+            "login brute-force capacities set via set_login_capacities must \
+             still apply after threading the configured RateLimitConfig"
+        );
     }
 }

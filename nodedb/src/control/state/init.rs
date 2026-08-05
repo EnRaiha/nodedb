@@ -12,7 +12,12 @@ use crate::control::request_tracker::RequestTracker;
 use crate::control::security::apikey::ApiKeyStore;
 use crate::control::security::audit::AuditLog;
 use crate::control::security::credential::CredentialStore;
+use crate::control::security::metering::config::MeteringConfig;
+use crate::control::security::metering::quota::QuotaManager;
+use crate::control::security::metering::store::UsageStore;
 use crate::control::security::permission::PermissionStore;
+use crate::control::security::ratelimit::config::RateLimitConfig;
+use crate::control::security::ratelimit::limiter::RateLimiter;
 use crate::control::security::rls::RlsPolicyStore;
 use crate::control::security::role::RoleStore;
 use crate::control::security::tenant::{TenantIsolation, TenantQuota};
@@ -127,6 +132,20 @@ impl SharedState {
             ),
         );
 
+        // No `AuthConfig` is available to this test/in-memory constructor —
+        // use `MeteringConfig::default()` explicitly (rather than the
+        // `UsageStore`/`QuotaManager` `Default` impls) so the effective
+        // bounds are pinned to the same config type the production
+        // constructor reads, and can't silently diverge from it.
+        let metering_config = MeteringConfig::default();
+
+        // No `AuthConfig` is available to this test/in-memory constructor —
+        // use `RateLimitConfig::default()` explicitly (rather than the
+        // `RateLimiter::default()` impl) so the limiter's config is pinned
+        // to the same config type the production constructor reads, and
+        // can't silently diverge from it.
+        let rate_limit_config = RateLimitConfig::default();
+
         let state = Arc::new(Self {
             dispatcher: Mutex::new(dispatcher),
             tracker: RequestTracker::new(),
@@ -178,7 +197,7 @@ impl SharedState {
             orgs: crate::control::security::org::store::OrgStore::new(),
             scope_defs: crate::control::security::scope::store::ScopeStore::new(),
             scope_grants: crate::control::security::scope::grant::ScopeGrantStore::new(),
-            rate_limiter: crate::control::security::ratelimit::limiter::RateLimiter::default(),
+            rate_limiter: RateLimiter::new(rate_limit_config),
             session_handles: crate::control::security::session_handle::SessionHandleStore::default(
             ),
             session_registry: test_session_registry,
@@ -186,8 +205,11 @@ impl SharedState {
             usage_counter: Arc::new(
                 crate::control::security::metering::counter::UsageCounter::new(),
             ),
-            usage_store: Arc::new(crate::control::security::metering::store::UsageStore::default()),
-            quota_manager: crate::control::security::metering::quota::QuotaManager::new(),
+            usage_store: Arc::new(UsageStore::with_bounds(
+                metering_config.max_usage_events,
+                metering_config.max_tracked_scopes,
+            )),
+            quota_manager: QuotaManager::with_bounds(metering_config.max_tracked_quota_grantees),
             auth_api_keys: crate::control::security::auth_apikey::AuthApiKeyStore::new(),
             impersonation: crate::control::security::impersonation::ImpersonationStore::default(),
             emergency: crate::control::security::emergency::EmergencyState::default(),
