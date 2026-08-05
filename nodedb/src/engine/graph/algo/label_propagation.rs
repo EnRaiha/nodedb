@@ -19,13 +19,30 @@ use crate::engine::graph::csr::CsrIndex;
 /// Returns an `AlgoResultBatch` with `(node_id, community_id)` rows.
 /// Community IDs are dense node IDs — the label that "won" for each node.
 pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
+    let communities = run_raw_with_progress(csr, params, true);
+    let mut batch = AlgoResultBatch::new(GraphAlgorithm::LabelPropagation);
+    for (node, community) in communities.into_iter().enumerate() {
+        batch.push_node_i64(csr.node_name_raw(node as u32).to_string(), community);
+    }
+    batch
+}
+
+/// Compute normalized dense community values in CSR node order without
+/// progress telemetry or result presentation. Numeric labels retain their
+/// numeric value; nonnumeric labels retain their dense ordinal.
+pub fn run_raw(csr: &CsrIndex, params: &AlgoParams) -> Vec<i64> {
+    run_raw_with_progress(csr, params, false)
+}
+
+fn run_raw_with_progress(csr: &CsrIndex, params: &AlgoParams, report_progress: bool) -> Vec<i64> {
     let n = csr.node_count();
     if n == 0 {
-        return AlgoResultBatch::new(GraphAlgorithm::LabelPropagation);
+        return Vec::new();
     }
 
     let max_iter = params.iterations(10);
-    let mut reporter = ProgressReporter::new(GraphAlgorithm::LabelPropagation, max_iter, None, n);
+    let mut reporter = report_progress
+        .then(|| ProgressReporter::new(GraphAlgorithm::LabelPropagation, max_iter, None, n));
 
     // Initialize: each node is its own community. `label_priority` hoists the
     // original numeric-ID tie order out of the hot iteration loop.
@@ -77,23 +94,27 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
         }
 
         std::mem::swap(&mut labels, &mut next_labels);
-        reporter.report_iteration(iter, Some(changed as f64));
+        if let Some(reporter) = reporter.as_mut() {
+            reporter.report_iteration(iter, Some(changed as f64));
+        }
 
         if changed == 0 {
             break;
         }
     }
 
-    reporter.finish();
-
-    // Build result.
-    let mut batch = AlgoResultBatch::new(GraphAlgorithm::LabelPropagation);
-    for (node, &label) in labels.iter().enumerate() {
-        let label_name = csr.node_name_raw(label);
-        let community = label_name.parse::<i64>().unwrap_or(label as i64);
-        batch.push_node_i64(csr.node_name_raw(node as u32).to_string(), community);
+    if let Some(reporter) = reporter {
+        reporter.finish();
     }
-    batch
+
+    labels
+        .into_iter()
+        .map(|label| {
+            csr.node_name_raw(label)
+                .parse::<i64>()
+                .unwrap_or(label as i64)
+        })
+        .collect()
 }
 
 fn label_priorities(csr: &CsrIndex, n: usize) -> Vec<u32> {
@@ -145,6 +166,30 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn raw_communities_match_adapter_and_numeric_priority() {
+        let mut csr = CsrIndex::new();
+        csr.add_edge("10", "L", "6").unwrap();
+        csr.add_edge("10", "L", "41").unwrap();
+        csr.compact().unwrap();
+        let params = AlgoParams {
+            max_iterations: Some(1),
+            ..Default::default()
+        };
+        let raw = run_raw(&csr, &params);
+        let center = csr.node_id_raw("10").unwrap() as usize;
+        assert_eq!(raw[center], 6);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&run(&csr, &params).to_json().unwrap()).unwrap();
+        for (node, community) in raw.into_iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|row| row["node_id"].as_str() == Some(csr.node_name_raw(node as u32)))
+                .unwrap();
+            assert_eq!(row["community_id"].as_i64(), Some(community));
+        }
+    }
 
     #[test]
     fn label_prop_triangle() {

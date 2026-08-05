@@ -78,9 +78,20 @@ pub const DEFAULT_SAMPLE_PAIRS: usize = 10_000;
 /// `high_degree_threshold` and `sample_pairs` are sourced from
 /// `GraphTuning::lcc_high_degree_threshold` and `GraphTuning::lcc_sample_pairs`.
 pub fn run(csr: &CsrIndex, high_degree_threshold: usize, sample_pairs: usize) -> AlgoResultBatch {
+    let coefficients = run_raw(csr, high_degree_threshold, sample_pairs);
+    let mut batch = AlgoResultBatch::new(GraphAlgorithm::Lcc);
+    for (node, coefficient) in coefficients.into_iter().enumerate() {
+        batch.push_node_f64(csr.node_name_raw(node as u32).to_string(), coefficient);
+    }
+    batch
+}
+
+/// Compute dense LCC coefficients in CSR node order. Neighbor collection,
+/// self-loop removal, sorting, and deduplication are part of this primitive.
+pub fn run_raw(csr: &CsrIndex, high_degree_threshold: usize, sample_pairs: usize) -> Vec<f64> {
     let n = csr.node_count();
     if n == 0 {
-        return AlgoResultBatch::new(GraphAlgorithm::Lcc);
+        return Vec::new();
     }
 
     let adjacency: Vec<Vec<u32>> =
@@ -126,8 +137,7 @@ pub fn run(csr: &CsrIndex, high_degree_threshold: usize, sample_pairs: usize) ->
         .iter()
         .all(|neighbors| neighbors.len() <= high_degree_threshold)
         .then(|| count_all_triangles_exact(&adjacency));
-    let mut batch = AlgoResultBatch::new(GraphAlgorithm::Lcc);
-
+    let mut coefficients = Vec::with_capacity(n);
     for node in 0..n {
         let node_id = node as u32;
         let coeff = if let Some(triangles) = &exact_triangles {
@@ -146,10 +156,10 @@ pub fn run(csr: &CsrIndex, high_degree_threshold: usize, sample_pairs: usize) ->
                 sample_pairs,
             )
         };
-        batch.push_node_f64(csr.node_name_raw(node as u32).to_string(), coeff);
+        coefficients.push(coeff);
     }
 
-    batch
+    coefficients
 }
 
 /// Compute LCC for a single node.
@@ -364,6 +374,29 @@ fn has_undirected_edge(csr: &CsrIndex, u: u32, w: u32, _neighbor_set: &HashSet<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_coefficients_match_adapter_values() {
+        let mut csr = CsrIndex::new();
+        csr.add_edge("a", "L", "b").unwrap();
+        csr.add_edge("b", "L", "c").unwrap();
+        csr.add_edge("c", "L", "a").unwrap();
+        csr.compact().unwrap();
+        let raw = run_raw(&csr, DEFAULT_HIGH_DEGREE_THRESHOLD, DEFAULT_SAMPLE_PAIRS);
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(
+            &run(&csr, DEFAULT_HIGH_DEGREE_THRESHOLD, DEFAULT_SAMPLE_PAIRS)
+                .to_json()
+                .unwrap(),
+        )
+        .unwrap();
+        for (node, coefficient) in raw.into_iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|row| row["node_id"].as_str() == Some(csr.node_name_raw(node as u32)))
+                .unwrap();
+            assert_eq!(row["coefficient"].as_f64(), Some(coefficient));
+        }
+    }
 
     #[test]
     fn lcc_triangle() {

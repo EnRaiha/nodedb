@@ -11,6 +11,7 @@ use nodedb_types::{DatabaseId, TenantId};
 use serde_json::{Map, json};
 
 use crate::engine::graph::algo::params::AlgoParams;
+use crate::engine::graph::algo::util::cmp_desc_nan_last;
 use crate::engine::graph::algo::{label_propagation, lcc, pagerank, sssp, wcc};
 use crate::engine::graph::csr::rebuild::rebuild_sharded_from_store;
 use crate::engine::graph::edge_store::{
@@ -78,13 +79,27 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
     let mut timings = Map::new();
 
     let start = Instant::now();
-    let result = pagerank::run(csr, &params);
+    let dense_ranks = pagerank::run_raw(csr, &params);
     timings.insert("PR".into(), json!(checked_elapsed(start, "PR")?));
+    let mut ranks: Vec<(usize, f64)> = dense_ranks.into_iter().enumerate().collect();
+    ranks.sort_by(|left, right| cmp_desc_nan_last(left.1, right.1));
+    let mut result = crate::engine::graph::algo::result::AlgoResultBatch::new(
+        crate::engine::graph::algo::GraphAlgorithm::PageRank,
+    );
+    for (node, rank) in ranks {
+        result.push_node_f64(csr.node_name_raw(node as u32).to_string(), rank);
+    }
     write_json_result(output, dataset_name, "PR", result.to_json()?, "rank")?;
 
     let start = Instant::now();
-    let result = wcc::run(csr);
+    let labels = wcc::run_raw(csr);
     timings.insert("WCC".into(), json!(checked_elapsed(start, "WCC")?));
+    let mut result = crate::engine::graph::algo::result::AlgoResultBatch::new(
+        crate::engine::graph::algo::GraphAlgorithm::Wcc,
+    );
+    for (node, label) in labels.into_iter().enumerate() {
+        result.push_node_i64(csr.node_name_raw(node as u32).to_string(), label as i64);
+    }
     write_json_result(
         output,
         dataset_name,
@@ -99,8 +114,14 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
     write_depths(output, dataset_name, csr, &depths)?;
 
     let start = Instant::now();
-    let result = lcc::run(csr, usize::MAX, usize::MAX);
+    let coefficients = lcc::run_raw(csr, usize::MAX, usize::MAX);
     timings.insert("LCC".into(), json!(checked_elapsed(start, "LCC")?));
+    let mut result = crate::engine::graph::algo::result::AlgoResultBatch::new(
+        crate::engine::graph::algo::GraphAlgorithm::Lcc,
+    );
+    for (node, coefficient) in coefficients.into_iter().enumerate() {
+        result.push_node_f64(csr.node_name_raw(node as u32).to_string(), coefficient);
+    }
     write_json_result(
         output,
         dataset_name,
@@ -109,14 +130,31 @@ pub fn run(dataset: &Path, output: &Path, database: &Path) -> anyhow::Result<()>
         "coefficient",
     )?;
 
+    // Weight validity is an input invariant, not part of the primitive timing.
+    sssp::validate_weights(csr)?;
     let start = Instant::now();
-    let result = sssp::run(csr, &params)?;
+    let source = csr
+        .node_id_raw(SOURCE)
+        .ok_or_else(|| anyhow::anyhow!("source vertex {SOURCE} is absent"))?;
+    let distances = sssp::run_raw_validated(csr, source, &params);
     timings.insert("SSSP".into(), json!(checked_elapsed(start, "SSSP")?));
+    let mut result = crate::engine::graph::algo::result::AlgoResultBatch::new(
+        crate::engine::graph::algo::GraphAlgorithm::Sssp,
+    );
+    for (node, distance) in distances.into_iter().enumerate() {
+        result.push_node_f64(csr.node_name_raw(node as u32).to_string(), distance);
+    }
     write_json_result(output, dataset_name, "SSSP", result.to_json()?, "distance")?;
 
     let start = Instant::now();
-    let result = label_propagation::run(csr, &params);
+    let communities = label_propagation::run_raw(csr, &params);
     timings.insert("CDLP".into(), json!(checked_elapsed(start, "CDLP")?));
+    let mut result = crate::engine::graph::algo::result::AlgoResultBatch::new(
+        crate::engine::graph::algo::GraphAlgorithm::LabelPropagation,
+    );
+    for (node, community) in communities.into_iter().enumerate() {
+        result.push_node_i64(csr.node_name_raw(node as u32).to_string(), community);
+    }
     write_json_result(
         output,
         dataset_name,

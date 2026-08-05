@@ -27,17 +27,34 @@ use crate::engine::graph::csr::CsrIndex;
 /// Returns an `AlgoResultBatch` with `(node_id, rank)` rows sorted by rank
 /// descending.
 pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
+    let ranks = run_raw_with_progress(csr, params, true);
+    let mut indexed: Vec<(usize, f64)> = ranks.into_iter().enumerate().collect();
+    indexed.sort_by(|a, b| cmp_desc_nan_last(a.1, b.1));
+
+    let mut batch = AlgoResultBatch::new(GraphAlgorithm::PageRank);
+    for (node_id, rank) in indexed {
+        batch.push_node_f64(csr.node_name_raw(node_id as u32).to_string(), rank);
+    }
+    batch
+}
+
+/// Compute dense PageRank values in CSR node order without telemetry or
+/// presentation work. Callers own sorting and node-name conversion.
+pub fn run_raw(csr: &CsrIndex, params: &AlgoParams) -> Vec<f64> {
+    run_raw_with_progress(csr, params, false)
+}
+
+fn run_raw_with_progress(csr: &CsrIndex, params: &AlgoParams, report_progress: bool) -> Vec<f64> {
     let n = csr.node_count();
     if n == 0 {
-        return AlgoResultBatch::new(GraphAlgorithm::PageRank);
+        return Vec::new();
     }
 
     let damping = params.damping_factor();
     let max_iter = params.iterations(20);
     let tolerance = params.convergence_tolerance();
-
-    let mut reporter =
-        ProgressReporter::new(GraphAlgorithm::PageRank, max_iter, Some(tolerance), n);
+    let mut reporter = report_progress
+        .then(|| ProgressReporter::new(GraphAlgorithm::PageRank, max_iter, Some(tolerance), n));
 
     // Personalization distribution for Personalized PageRank (PPR). `None`
     // recovers standard PageRank with a uniform 1/n teleport. When present,
@@ -125,24 +142,19 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> AlgoResultBatch {
         // Swap rank vectors (avoids allocation).
         std::mem::swap(&mut rank, &mut next_rank);
 
-        reporter.report_iteration(iter, Some(delta));
+        if let Some(reporter) = reporter.as_mut() {
+            reporter.report_iteration(iter, Some(delta));
+        }
 
         if delta < tolerance {
             break;
         }
     }
 
-    reporter.finish();
-
-    // Build result batch sorted by rank descending.
-    let mut indexed: Vec<(usize, f64)> = rank.into_iter().enumerate().collect();
-    indexed.sort_by(|a, b| cmp_desc_nan_last(a.1, b.1));
-
-    let mut batch = AlgoResultBatch::new(GraphAlgorithm::PageRank);
-    for (node_id, r) in indexed {
-        batch.push_node_f64(csr.node_name_raw(node_id as u32).to_string(), r);
+    if let Some(reporter) = reporter {
+        reporter.finish();
     }
-    batch
+    rank
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -306,6 +318,21 @@ mod tests {
         csr.add_edge("c", "L", "a").unwrap();
         csr.compact().expect("no governor, cannot fail");
         csr
+    }
+
+    #[test]
+    fn raw_ranks_match_adapter_values() {
+        let csr = triangle_csr();
+        let raw = run_raw(&csr, &AlgoParams::default());
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&run(&csr, &AlgoParams::default()).to_json().unwrap()).unwrap();
+        for (node, rank) in raw.into_iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|row| row["node_id"].as_str() == Some(csr.node_name_raw(node as u32)))
+                .unwrap();
+            assert_eq!(row["rank"].as_f64(), Some(rank));
+        }
     }
 
     #[test]

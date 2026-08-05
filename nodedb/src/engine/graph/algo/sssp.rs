@@ -42,34 +42,51 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> Result<AlgoResultBatch, crate
             detail: format!("source node '{source}' not found in graph"),
         })?;
 
+    validate_weights(csr)?;
+    let dist = run_raw_validated(csr, source_id, params);
+
+    let mut batch = AlgoResultBatch::new(GraphAlgorithm::Sssp);
+    for (node, distance) in dist.into_iter().enumerate() {
+        batch.push_node_f64(csr.node_name_raw(node as u32).to_string(), distance);
+    }
+    Ok(batch)
+}
+
+/// Validate every stored edge weight for Dijkstra before running the kernel.
+pub fn validate_weights(csr: &CsrIndex) -> Result<(), crate::Error> {
+    if !csr.has_weights() {
+        return Ok(());
+    }
+    let n = csr.node_count();
+    if let Some((offsets, _targets, Some(weights))) = csr.compacted_out_weighted_adjacency_raw() {
+        for node in 0..n {
+            for &weight in &weights[offsets[node] as usize..offsets[node + 1] as usize] {
+                validate_weight(csr, node, weight)?;
+            }
+        }
+    } else {
+        for node in 0..n {
+            for (_label, _destination, weight) in csr.iter_out_edges_weighted_raw(node as u32) {
+                validate_weight(csr, node, weight)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run Dijkstra from an already-resolved source after `validate_weights`.
+/// Returns dense distances in CSR node order without presentation conversion.
+pub fn run_raw_validated(csr: &CsrIndex, source_id: u32, params: &AlgoParams) -> Vec<f64> {
+    let n = csr.node_count();
     let both = params
         .direction
         .as_deref()
         .is_some_and(|direction| direction.eq_ignore_ascii_case("both"));
-
     let compacted_out = csr.compacted_out_weighted_adjacency_raw();
     let compacted_in = both
         .then(|| csr.compacted_in_weighted_adjacency_raw())
         .flatten();
     let use_compacted = compacted_out.is_some() && (!both || compacted_in.is_some());
-
-    // Dijkstra requires finite, non-negative edge weights. Validate direct
-    // compacted weight slices without allocating per-node edge vectors.
-    if csr.has_weights() {
-        if let Some((offsets, _targets, Some(weights))) = compacted_out {
-            for node in 0..n {
-                for &weight in &weights[offsets[node] as usize..offsets[node + 1] as usize] {
-                    validate_weight(csr, node, weight)?;
-                }
-            }
-        } else {
-            for node in 0..n {
-                for (_label, _destination, weight) in csr.iter_out_edges_weighted_raw(node as u32) {
-                    validate_weight(csr, node, weight)?;
-                }
-            }
-        }
-    }
 
     let mut dist = vec![f64::INFINITY; n];
     dist[source_id as usize] = 0.0;
@@ -106,12 +123,7 @@ pub fn run(csr: &CsrIndex, params: &AlgoParams) -> Result<AlgoResultBatch, crate
         }
     }
 
-    // Build result batch.
-    let mut batch = AlgoResultBatch::new(GraphAlgorithm::Sssp);
-    for (node, &d) in dist.iter().enumerate() {
-        batch.push_node_f64(csr.node_name_raw(node as u32).to_string(), d);
-    }
-    Ok(batch)
+    dist
 }
 
 fn validate_weight(csr: &CsrIndex, node: usize, weight: f64) -> Result<(), crate::Error> {
@@ -212,6 +224,21 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn validated_raw_distances_match_adapter_values() {
+        let csr = weighted_graph();
+        let params = AlgoParams {
+            source_node: Some("a".into()),
+            ..Default::default()
+        };
+        validate_weights(&csr).unwrap();
+        let raw = run_raw_validated(&csr, csr.node_id_raw("a").unwrap(), &params);
+        let adapter = parse_results(&run(&csr, &params).unwrap());
+        for (node, distance) in raw.into_iter().enumerate() {
+            assert_eq!(adapter[csr.node_name_raw(node as u32)], distance);
+        }
     }
 
     #[test]

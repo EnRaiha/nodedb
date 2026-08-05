@@ -18,9 +18,20 @@ use crate::engine::graph::csr::CsrIndex;
 /// Returns an `AlgoResultBatch` with `(node_id, component_id)` rows.
 /// Component IDs are the dense node ID of the component root (deterministic).
 pub fn run(csr: &CsrIndex) -> AlgoResultBatch {
+    let labels = run_raw(csr);
+    let mut batch = AlgoResultBatch::new(GraphAlgorithm::Wcc);
+    for (node, component) in labels.into_iter().enumerate() {
+        batch.push_node_i64(csr.node_name_raw(node as u32).to_string(), component as i64);
+    }
+    batch
+}
+
+/// Compute dense component-root labels in CSR node order without converting
+/// node names or constructing a presentation result.
+pub fn run_raw(csr: &CsrIndex) -> Vec<usize> {
     let n = csr.node_count();
     if n == 0 {
-        return AlgoResultBatch::new(GraphAlgorithm::Wcc);
+        return Vec::new();
     }
 
     let mut uf = UnionFind::new(n);
@@ -43,13 +54,7 @@ pub fn run(csr: &CsrIndex) -> AlgoResultBatch {
         }
     }
 
-    // Build result.
-    let mut batch = AlgoResultBatch::new(GraphAlgorithm::Wcc);
-    for node in 0..n {
-        let component = uf.find(node);
-        batch.push_node_i64(csr.node_name_raw(node as u32).to_string(), component as i64);
-    }
-    batch
+    (0..n).map(|node| uf.find(node)).collect()
 }
 
 /// Disjoint-set (Union-Find) with path compression and union-by-rank.
@@ -100,6 +105,24 @@ impl UnionFind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_labels_match_adapter_values() {
+        let mut csr = CsrIndex::new();
+        csr.add_edge("a", "L", "b").unwrap();
+        csr.add_node("isolated").unwrap();
+        csr.compact().unwrap();
+        let raw = run_raw(&csr);
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_slice(&run(&csr).to_json().unwrap()).unwrap();
+        for (node, label) in raw.into_iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|row| row["node_id"].as_str() == Some(csr.node_name_raw(node as u32)))
+                .unwrap();
+            assert_eq!(row["component_id"].as_i64(), Some(label as i64));
+        }
+    }
 
     #[test]
     fn wcc_single_component() {
