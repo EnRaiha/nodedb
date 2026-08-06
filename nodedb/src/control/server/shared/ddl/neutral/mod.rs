@@ -54,6 +54,7 @@ pub mod planning;
 pub mod procedure;
 pub mod query_functions;
 pub mod rate_gate;
+pub mod read_gate;
 pub mod redaction;
 pub mod retention_policy;
 pub mod rls;

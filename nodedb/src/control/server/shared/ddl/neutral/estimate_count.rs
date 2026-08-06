@@ -16,6 +16,7 @@ use crate::types::{DatabaseId, TraceId};
 use nodedb_physical::physical_plan::DocumentOp;
 
 use super::super::result::{DdlError, DdlResult};
+use super::read_gate::CollectionReadGate;
 
 /// Execute `SELECT ESTIMATE_COUNT('collection', 'field')`.
 pub async fn estimate_count(
@@ -37,6 +38,17 @@ pub async fn estimate_count(
             let coll = args[0].to_lowercase();
             let field = args[1].to_string();
             let tenant_id = identity.tenant_id;
+
+            // `coll` and `field` are caller arguments. `EstimateCount` answers
+            // from HLL statistics over every row and carries no filter slot, so
+            // a read policy cannot be honored and an estimate over rows the
+            // caller may not read is refused instead. A redacted column is
+            // refused on the same grounds: the cardinality of a masked column is
+            // not the cardinality being reported.
+            let gate = CollectionReadGate::open(state, identity, database_id, &coll)?;
+            gate.refuse_if_read_policy(&coll, "ESTIMATE_COUNT")?;
+            gate.refuse_if_field_redacted(&coll, &field, "the estimated count")?;
+
             let vshard = crate::types::VShardId::from_collection_in_database(database_id, &coll);
             let plan = PhysicalPlan::Document(DocumentOp::EstimateCount {
                 collection: coll,

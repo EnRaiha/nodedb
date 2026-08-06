@@ -1,215 +1,22 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Protocol-neutral handlers for atomic KV SQL functions: KV_INCR, KV_DECR,
-//! KV_INCR_FLOAT, KV_CAS, KV_GETSET.
-//!
-//! These are side-effecting operations that dispatch to the Data Plane via the
-//! SPSC bridge, so they cannot be pure DataFusion UDFs. Instead they're
-//! intercepted in the DDL router before DataFusion parsing. Each builds a
-//! single-text-column [`DdlResult`] carrying the Data Plane's JSON payload.
+//! Shared in-transaction dispatch path plus the SQL-text argument-parsing and
+//! response-shaping helpers reused across the KV DDL families in this
+//! directory (`handlers` here, and the sibling `kv_sorted_index`,
+//! `weighted_pick`, `rate_gate`, `transfer` modules).
 
 use serde_json::{Map, Value as JsonValue};
 
-use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::session::DmlTxnCtx;
 use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
-use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
+use nodedb_physical::physical_plan::PhysicalPlan;
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 
-use super::super::result::{DdlError, DdlResult};
-
-/// Handle `SELECT KV_INCR(collection, key, delta [, TTL => seconds])`
-///
-/// Returns `{"value": <new_value>}` as a single text column.
-pub async fn kv_incr(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    sql: &str,
-    negate: bool,
-    txn_ctx: &DmlTxnCtx<'_>,
-) -> Result<Vec<DdlResult>, DdlError> {
-    let func_name = if negate { "KV_DECR" } else { "KV_INCR" };
-    let args = parse_function_args(sql, func_name)?;
-
-    if args.len() < 3 {
-        return Err(ddl_err(
-            "42601",
-            format!("{func_name} requires at least 3 arguments: (collection, key, delta)"),
-        ));
-    }
-
-    let collection = unquote(&args[0]).to_lowercase();
-    let key = unquote(&args[1]);
-    let delta: i64 = parse_i64(&args[2], func_name)?;
-    let delta = if negate {
-        delta
-            .checked_neg()
-            .ok_or_else(|| ddl_err("22003", format!("{func_name}: delta overflow on negation")))?
-    } else {
-        delta
-    };
-
-    let ttl_ms = parse_optional_ttl(&args[3..])?;
-
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            DatabaseId::DEFAULT,
-            identity.tenant_id,
-            &collection,
-            key.as_bytes(),
-        )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
-    let plan = PhysicalPlan::Kv(KvOp::Incr {
-        collection,
-        key: key.as_bytes().to_vec(),
-        delta,
-        ttl_ms,
-        surrogate,
-    });
-
-    dispatch_and_respond(state, identity, vshard, plan, func_name, txn_ctx).await
-}
-
-/// Handle `SELECT KV_INCR_FLOAT(collection, key, delta)`
-///
-/// Returns `{"value": <new_value>}` as a single text column.
-pub async fn kv_incr_float(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    sql: &str,
-    txn_ctx: &DmlTxnCtx<'_>,
-) -> Result<Vec<DdlResult>, DdlError> {
-    let args = parse_function_args(sql, "KV_INCR_FLOAT")?;
-
-    if args.len() < 3 {
-        return Err(ddl_err(
-            "42601",
-            "KV_INCR_FLOAT requires 3 arguments: (collection, key, delta)",
-        ));
-    }
-
-    let collection = unquote(&args[0]).to_lowercase();
-    let key = unquote(&args[1]);
-    let delta: f64 = args[2].trim().parse().map_err(|_| {
-        ddl_err(
-            "42601",
-            format!("KV_INCR_FLOAT: delta must be a float, got '{}'", args[2]),
-        )
-    })?;
-
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            DatabaseId::DEFAULT,
-            identity.tenant_id,
-            &collection,
-            key.as_bytes(),
-        )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
-    let plan = PhysicalPlan::Kv(KvOp::IncrFloat {
-        collection,
-        key: key.as_bytes().to_vec(),
-        delta,
-        surrogate,
-    });
-
-    dispatch_and_respond(state, identity, vshard, plan, "KV_INCR_FLOAT", txn_ctx).await
-}
-
-/// Handle `SELECT KV_CAS(collection, key, expected, new_value)`
-///
-/// Returns `{"success": bool, "current_value": "<base64>"}` as a single text column.
-pub async fn kv_cas(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    sql: &str,
-    txn_ctx: &DmlTxnCtx<'_>,
-) -> Result<Vec<DdlResult>, DdlError> {
-    let args = parse_function_args(sql, "KV_CAS")?;
-
-    if args.len() < 4 {
-        return Err(ddl_err(
-            "42601",
-            "KV_CAS requires 4 arguments: (collection, key, expected, new_value)",
-        ));
-    }
-
-    let collection = unquote(&args[0]).to_lowercase();
-    let key = unquote(&args[1]);
-    let expected = unquote(&args[2]);
-    let new_value = unquote(&args[3]);
-
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            DatabaseId::DEFAULT,
-            identity.tenant_id,
-            &collection,
-            key.as_bytes(),
-        )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
-    let plan = PhysicalPlan::Kv(KvOp::Cas {
-        collection,
-        key: key.as_bytes().to_vec(),
-        expected: expected.into_bytes(),
-        new_value: new_value.into_bytes(),
-        surrogate,
-    });
-
-    dispatch_and_respond(state, identity, vshard, plan, "KV_CAS", txn_ctx).await
-}
-
-/// Handle `SELECT KV_GETSET(collection, key, new_value)`
-///
-/// Returns `{"old_value": "<base64>"}` as a single text column.
-pub async fn kv_getset(
-    state: &SharedState,
-    identity: &AuthenticatedIdentity,
-    sql: &str,
-    txn_ctx: &DmlTxnCtx<'_>,
-) -> Result<Vec<DdlResult>, DdlError> {
-    let args = parse_function_args(sql, "KV_GETSET")?;
-
-    if args.len() < 3 {
-        return Err(ddl_err(
-            "42601",
-            "KV_GETSET requires 3 arguments: (collection, key, new_value)",
-        ));
-    }
-
-    let collection = unquote(&args[0]).to_lowercase();
-    let key = unquote(&args[1]);
-    let new_value = unquote(&args[2]);
-
-    let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
-    let surrogate = state
-        .surrogate_assigner
-        .assign(
-            DatabaseId::DEFAULT,
-            identity.tenant_id,
-            &collection,
-            key.as_bytes(),
-        )
-        .map_err(|e| ddl_err("XX000", e.to_string()))?;
-    let plan = PhysicalPlan::Kv(KvOp::GetSet {
-        collection,
-        key: key.as_bytes().to_vec(),
-        new_value: new_value.into_bytes(),
-        surrogate,
-    });
-
-    dispatch_and_respond(state, identity, vshard, plan, "KV_GETSET", txn_ctx).await
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+use super::super::super::result::{DdlError, DdlResult};
+use super::super::read_gate::CollectionReadGate;
 
 /// Dispatch a KvOp through the protocol-neutral in-transaction staging gate
 /// and return the JSON response as a single text-column row keyed by the
@@ -227,16 +34,22 @@ pub async fn kv_getset(
 /// a following `SELECT KV_INCR(...)` on the same key in the same
 /// transaction chains off it.
 ///
-/// `pub(super)` so the sibling `transfer.rs` module reuses the identical
+/// `collections` names every collection the op touches, in the caller's own
+/// words rather than read back out of the plan: these `KvOp`s carry no
+/// collection the plan-classification helpers report, and `TRANSFER_ITEM`
+/// touches two. Each is authorized here before the op is routed anywhere.
+///
+/// Reused by the sibling `transfer.rs` module for the identical
 /// in-transaction routing for `TRANSFER` / `TRANSFER_ITEM` instead of the
 /// direct `dispatch_to_data_plane` call it used before those two `KvOp`s
 /// became stageable.
-pub(super) async fn dispatch_and_respond(
+pub(crate) async fn dispatch_and_respond(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
     vshard: VShardId,
     plan: PhysicalPlan,
     func_name: &str,
+    collections: &[&str],
     txn_ctx: &DmlTxnCtx<'_>,
 ) -> Result<Vec<DdlResult>, DdlError> {
     use crate::control::server::shared::session::staging_gate::{
@@ -245,6 +58,21 @@ pub(super) async fn dispatch_and_respond(
 
     let tenant_id = identity.tenant_id;
     let database_id = DatabaseId::DEFAULT;
+
+    // Every caller here names its collections in the SQL text and reaches the
+    // Data Plane through a hand-built `KvOp`, which carries no identity and is
+    // never authorized downstream. The op reports the value it replaced or
+    // computed, so it is a read as much as a write and needs both grants — and
+    // a cross-collection move needs them on each side, hence the slice.
+    // None of these `KvOp`s carries a filter slot for a row predicate to live
+    // in, so a read policy on the collection cannot be honored and the call
+    // fails closed rather than answering from rows the policy hides.
+    let gate = CollectionReadGate::for_request(state, identity, database_id);
+    for collection in collections {
+        gate.authorize(collection)?;
+        gate.authorize_permission(collection, Permission::Write)?;
+        gate.refuse_if_read_policy(collection, func_name)?;
+    }
 
     let task = PhysicalTask {
         tenant_id,
@@ -315,7 +143,7 @@ pub(super) async fn dispatch_and_respond(
 }
 
 /// Build a single-text-column row set carrying `text` under `col`.
-pub(super) fn single_text_col(col: &str, text: String) -> DdlResult {
+pub(crate) fn single_text_col(col: &str, text: String) -> DdlResult {
     let mut row = Map::new();
     row.insert(col.to_string(), JsonValue::String(text));
     DdlResult::Rows(ShapedRows {
@@ -329,7 +157,7 @@ pub(super) fn single_text_col(col: &str, text: String) -> DdlResult {
 /// Parse function arguments from `SELECT FUNC_NAME(arg1, arg2, ...)`.
 ///
 /// Handles quoted strings with commas inside them.
-pub(super) fn parse_function_args(sql: &str, _func_name: &str) -> Result<Vec<String>, DdlError> {
+pub(crate) fn parse_function_args(sql: &str, _func_name: &str) -> Result<Vec<String>, DdlError> {
     let start = sql
         .find('(')
         .ok_or_else(|| ddl_err("42601", "expected '(' in function call"))?;
@@ -348,7 +176,7 @@ pub(super) fn parse_function_args(sql: &str, _func_name: &str) -> Result<Vec<Str
 ///
 /// Handles SQL-standard escaped quotes: `''` inside a quoted string becomes `'`.
 /// Example: `'O''Reilly'` → `O'Reilly`.
-pub(super) fn split_args(s: &str) -> Vec<String> {
+pub(crate) fn split_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut in_quote = false;
@@ -386,7 +214,7 @@ pub(super) fn split_args(s: &str) -> Vec<String> {
 }
 
 /// Remove surrounding single quotes from a string argument.
-pub(super) fn unquote(s: &str) -> String {
+pub(crate) fn unquote(s: &str) -> String {
     let t = s.trim();
     if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
         t[1..t.len() - 1].to_string()
@@ -396,7 +224,7 @@ pub(super) fn unquote(s: &str) -> String {
 }
 
 /// Parse an i64 from a string argument.
-fn parse_i64(s: &str, func_name: &str) -> Result<i64, DdlError> {
+pub(crate) fn parse_i64(s: &str, func_name: &str) -> Result<i64, DdlError> {
     s.trim().parse().map_err(|_| {
         ddl_err(
             "42601",
@@ -408,7 +236,7 @@ fn parse_i64(s: &str, func_name: &str) -> Result<i64, DdlError> {
 /// Parse optional `TTL => seconds` from remaining args.
 ///
 /// Supports: `TTL => 86400` or just a bare number as the 4th arg.
-fn parse_optional_ttl(args: &[String]) -> Result<u64, DdlError> {
+pub(crate) fn parse_optional_ttl(args: &[String]) -> Result<u64, DdlError> {
     if args.is_empty() {
         return Ok(0);
     }
@@ -451,7 +279,7 @@ fn parse_ttl_seconds(s: &str) -> Result<u64, DdlError> {
 }
 
 /// Build a [`DdlError`] from an ANSI SQLSTATE code and a message.
-pub(super) fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
+pub(crate) fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError {
         sqlstate: sqlstate.to_string(),
         message: message.into(),

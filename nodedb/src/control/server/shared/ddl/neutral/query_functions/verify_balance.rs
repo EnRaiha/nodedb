@@ -14,7 +14,10 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::helpers::{clean_arg, err, extract_function_args, json_to_decimal, single_result};
+use super::super::read_gate::CollectionReadGate;
+use super::helpers::{
+    clean_arg, err, extract_function_args, json_to_decimal, single_result, unwrap_scan_docs,
+};
 
 /// `SELECT VERIFY_BALANCE('collection', 'column')`
 ///
@@ -35,6 +38,14 @@ pub async fn verify_balance(
     let collection = clean_arg(args[0]);
     let column = clean_arg(args[1]);
 
+    // Both scans below name collections the caller supplied or the catalog
+    // resolved from them, so each is authorized and row-filtered here. The
+    // reported discrepancy count is derived from `column` and from the source
+    // rows, so a redaction rule over either side is refused: a count computed
+    // from masked values would call a consistent ledger broken.
+    let gate = CollectionReadGate::open(state, identity, database_id, &collection)?;
+    gate.refuse_if_field_redacted(&collection, &column, "the balance verification")?;
+
     // Find the materialized sum definition.
     let catalog = state.credentials.catalog();
     let coll = catalog
@@ -53,22 +64,27 @@ pub async fn verify_balance(
         ));
     };
 
+    gate.authorize(&mat_def.source_collection)?;
+    gate.refuse_if_any_redaction(&mat_def.source_collection, "the balance verification")?;
+
     // Scan all target rows.
     let target_vshard = VShardId::from_collection_in_database(database_id, &collection);
-    let target_scan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
-        collection: collection.clone(),
-        limit: usize::MAX,
-        offset: 0,
-        sort_keys: Vec::new(),
-        filters: Vec::new(),
-        distinct: false,
-        projection: Vec::new(),
-        computed_columns: Vec::new(),
-        window_functions: Vec::new(),
-        system_time: nodedb_types::SystemTimeScope::Current,
-        valid_at_ms: None,
-        prefilter: None,
-    });
+    let mut target_scan =
+        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
+            collection: collection.clone(),
+            limit: usize::MAX,
+            offset: 0,
+            sort_keys: Vec::new(),
+            filters: Vec::new(),
+            distinct: false,
+            projection: Vec::new(),
+            computed_columns: Vec::new(),
+            window_functions: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+            prefilter: None,
+        });
+    gate.inject_rls(&mut target_scan)?;
     let target_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
@@ -83,24 +99,29 @@ pub async fn verify_balance(
         crate::data::executor::response_codec::decode_payload_to_json(&target_resp.payload);
     let target_docs: Vec<serde_json::Value> = sonic_rs::from_str(&target_json)
         .map_err(|e| err("22P02", &format!("invalid JSON in target scan: {e}")))?;
+    // Unwrap the `{"id", "data"}` scan envelope so matching reads the stored
+    // fields, not the wire wrapper.
+    let target_docs = unwrap_scan_docs(target_docs);
 
     // Scan all source rows.
     let source_vshard =
         VShardId::from_collection_in_database(database_id, &mat_def.source_collection);
-    let source_scan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
-        collection: mat_def.source_collection.clone(),
-        limit: usize::MAX,
-        offset: 0,
-        sort_keys: Vec::new(),
-        filters: Vec::new(),
-        distinct: false,
-        projection: Vec::new(),
-        computed_columns: Vec::new(),
-        window_functions: Vec::new(),
-        system_time: nodedb_types::SystemTimeScope::Current,
-        valid_at_ms: None,
-        prefilter: None,
-    });
+    let mut source_scan =
+        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
+            collection: mat_def.source_collection.clone(),
+            limit: usize::MAX,
+            offset: 0,
+            sort_keys: Vec::new(),
+            filters: Vec::new(),
+            distinct: false,
+            projection: Vec::new(),
+            computed_columns: Vec::new(),
+            window_functions: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+            prefilter: None,
+        });
+    gate.inject_rls(&mut source_scan)?;
     let source_resp = dispatch_utils::dispatch_to_data_plane(
         state,
         tenant_id,
@@ -115,6 +136,9 @@ pub async fn verify_balance(
         crate::data::executor::response_codec::decode_payload_to_json(&source_resp.payload);
     let source_docs: Vec<serde_json::Value> = sonic_rs::from_str(&source_json)
         .map_err(|e| err("22P02", &format!("invalid JSON in source scan: {e}")))?;
+    // Unwrap the `{"id", "data"}` scan envelope so matching and `value_expr`
+    // evaluation read the stored fields, not the wire wrapper.
+    let source_docs = unwrap_scan_docs(source_docs);
 
     // For each target row, recompute balance from source rows.
     let mut discrepancies = 0u64;
@@ -142,7 +166,7 @@ pub async fn verify_balance(
             if join_val != Some(doc_id) {
                 continue;
             }
-            let src_val = nodedb_types::Value::from(src_doc.clone());
+            let src_val = nodedb_types::Value::from(serde_json::Value::Object(src_doc.clone()));
             let delta =
                 serde_json::Value::from(mat_def.value_expr.eval(&src_val).map_err(|e| {
                     err(

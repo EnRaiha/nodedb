@@ -17,6 +17,7 @@ use crate::engine::graph::traversal_options::GraphTraversalOptions;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::read_gate::CollectionReadGate;
 use super::parse::{extract_function_args, extract_number_after, json_to_decimal};
 use super::support::ddl_err;
 
@@ -49,6 +50,34 @@ pub async fn tree_sum(
         .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_lowercase());
 
     let max_depth = extract_number_after(&upper, "MAX_DEPTH")?.unwrap_or(100);
+
+    // The set of collections this sum reads is resolved, and authorized, before
+    // any traversal runs. With the optional 4th argument it is the one
+    // collection named; without it the sum genuinely point-gets from every
+    // collection in the tenant, so every one of them is a read the caller must
+    // hold a grant for and the first denial ends the statement. Narrowing the
+    // sum to the subset a caller happens to be allowed would silently return a
+    // smaller total reported as the whole one.
+    let gate = CollectionReadGate::for_request(state, identity, database_id);
+    let collections_to_search: Vec<String> = if let Some(ref coll) = explicit_collection {
+        vec![coll.clone()]
+    } else {
+        state
+            .credentials
+            .catalog()
+            .load_collections_for_tenant(database_id, tenant_id.as_u64())
+            .unwrap_or_default()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
+    };
+    for coll_name in &collections_to_search {
+        gate.authorize(coll_name)?;
+        // The total is arithmetic over `sum_column`, so a redaction rule on it
+        // has no honest answer: masking the total would report a figure no tree
+        // sums to.
+        gate.refuse_if_field_redacted(coll_name, &sum_column, "the tree sum")?;
+    }
 
     // BFS traversal to get all descendant node IDs.
     let dir = crate::engine::graph::edge_store::Direction::Out;
@@ -101,19 +130,6 @@ pub async fn tree_sum(
     // Look up each node's document to extract the sum column value.
     // When the collection is specified (4th arg), this is O(N) point lookups.
     // Without it, we fall back to scanning all tenant collections (O(N×C)).
-    let collections_to_search: Vec<String> = if let Some(ref coll) = explicit_collection {
-        vec![coll.clone()]
-    } else {
-        state
-            .credentials
-            .catalog()
-            .load_collections_for_tenant(database_id, tenant_id.as_u64())
-            .unwrap_or_default()
-            .iter()
-            .map(|c| c.name.clone())
-            .collect()
-    };
-
     for node_id in &all_ids {
         for coll_name in &collections_to_search {
             let coll_vshard = VShardId::from_collection_in_database(database_id, coll_name);
@@ -123,7 +139,7 @@ pub async fn tree_sum(
                 .lookup(database_id, tenant_id, coll_name, &pk_bytes)
                 .map_err(|e| ddl_err("XX000", format!("surrogate lookup: {e}")))?
                 .unwrap_or(nodedb_types::Surrogate::ZERO);
-            let get_plan =
+            let mut get_plan =
                 PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
                     collection: coll_name.clone(),
                     document_id: node_id.clone(),
@@ -133,6 +149,7 @@ pub async fn tree_sum(
                     system_time: nodedb_types::SystemTimeScope::Current,
                     valid_at_ms: None,
                 });
+            gate.inject_rls(&mut get_plan)?;
             if let Ok(resp) = crate::control::server::dispatch_utils::dispatch_to_data_plane(
                 state,
                 tenant_id,

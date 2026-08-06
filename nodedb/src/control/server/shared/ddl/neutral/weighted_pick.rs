@@ -26,6 +26,7 @@ use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::KvOp;
 
 use super::super::result::{DdlError, DdlResult};
+use super::read_gate::CollectionReadGate;
 
 /// Handle `SELECT * FROM WEIGHTED_PICK('collection', weight => 'col', count => N, ...)`
 pub async fn weighted_pick(
@@ -87,8 +88,16 @@ pub async fn weighted_pick(
     let tenant_id = identity.tenant_id;
     let vshard = VShardId::from_collection_in_database(DatabaseId::DEFAULT, &collection);
 
+    // `collection` is a caller argument, so the scan it names is authorized and
+    // row-filtered here — a pick is a read of every row in the collection. The
+    // weight a row is drawn with, and reported with, is the stored weight
+    // column, so a redaction rule on it is refused rather than masked: a masked
+    // weight would change which row is drawn, not just how it prints.
+    let gate = CollectionReadGate::open(state, identity, DatabaseId::DEFAULT, &collection)?;
+    gate.refuse_if_field_redacted(&collection, &weight_col, "the sampling weight")?;
+
     // Step 1: Scan the collection to get all entries.
-    let entries = scan_all_entries(state, tenant_id, vshard, &collection).await?;
+    let entries = scan_all_entries(state, &gate, tenant_id, vshard, &collection).await?;
     if entries.is_empty() {
         return Ok(vec![empty_pick_rows()]);
     }
@@ -217,11 +226,12 @@ pub async fn weighted_pick(
 /// Scan all entries from a KV collection.
 async fn scan_all_entries(
     state: &SharedState,
+    gate: &CollectionReadGate<'_>,
     tenant_id: crate::types::TenantId,
     vshard: VShardId,
     collection: &str,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, DdlError> {
-    let plan = PhysicalPlan::Kv(KvOp::Scan {
+    let mut plan = PhysicalPlan::Kv(KvOp::Scan {
         collection: collection.to_string(),
         cursor: Vec::new(),
         count: 100_000,
@@ -230,6 +240,7 @@ async fn scan_all_entries(
         sort_keys: Vec::new(),
         surrogate_ceiling: None,
     });
+    gate.inject_rls(&mut plan)?;
 
     let resp = crate::control::server::dispatch_utils::dispatch_to_data_plane(
         state,

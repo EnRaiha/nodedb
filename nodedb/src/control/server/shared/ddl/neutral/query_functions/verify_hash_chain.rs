@@ -14,7 +14,8 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::helpers::{err, extract_function_args, single_result};
+use super::super::read_gate::CollectionReadGate;
+use super::helpers::{err, extract_function_args, single_result, unwrap_scan_doc_with_id};
 
 pub async fn verify_hash_chain(
     state: &SharedState,
@@ -34,9 +35,16 @@ pub async fn verify_hash_chain(
         .trim_matches('"')
         .to_lowercase();
 
+    // `collection` is a caller argument, so the scan it names is authorized and
+    // row-filtered here. Each link is recomputed over the whole document body,
+    // so any redaction rule on the collection is refused: hashing a masked row
+    // would report an intact chain as broken.
+    let gate = CollectionReadGate::open(state, identity, database_id, &collection)?;
+    gate.refuse_if_any_redaction(&collection, "the hash chain")?;
+
     // Scan all documents.
     let vshard = VShardId::from_collection_in_database(database_id, &collection);
-    let scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
+    let mut scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: collection.clone(),
         limit: usize::MAX,
         offset: 0,
@@ -50,6 +58,7 @@ pub async fn verify_hash_chain(
         valid_at_ms: None,
         prefilter: None,
     });
+    gate.inject_rls(&mut scan_plan)?;
 
     let scan_resp = dispatch_utils::dispatch_to_data_plane(
         state,
@@ -73,22 +82,28 @@ pub async fn verify_hash_chain(
     let mut valid = true;
     let mut broken_at: Option<usize> = None;
 
-    for (i, doc) in docs.iter().enumerate() {
-        let obj = match doc.as_object() {
-            Some(o) => o,
-            None => continue,
+    for (i, doc) in docs.into_iter().enumerate() {
+        // The raw document-scan codec wraps each row as `{"id": <doc PK>,
+        // "data": {..fields incl. _chain_hash..}}`. `doc_id` must be the
+        // *wrapper's* id — the same `document_id` the original INSERT fed
+        // into `compute_chain_hash` — not a same-named field inside the
+        // document body, which may not exist.
+        let (wrapper_id, obj) = unwrap_scan_doc_with_id(doc);
+        let doc_id = if !wrapper_id.is_empty() {
+            wrapper_id
+        } else {
+            obj.get("id")
+                .or_else(|| obj.get("_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
         };
-
-        let doc_id = obj
-            .get("id")
-            .or_else(|| obj.get("_id"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
 
         let stored_hash = obj
             .get("_chain_hash")
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
 
         if stored_hash.is_empty() {
             valid = false;
@@ -97,7 +112,7 @@ pub async fn verify_hash_chain(
         }
 
         // Recompute the hash from the document contents (without _chain_hash).
-        let mut doc_for_hash = doc.clone();
+        let mut doc_for_hash = serde_json::Value::Object(obj);
         if let Some(obj) = doc_for_hash.as_object_mut() {
             obj.remove("_chain_hash");
         }
@@ -105,7 +120,7 @@ pub async fn verify_hash_chain(
             .map_err(|e| err("XX000", &format!("failed to serialize document: {e}")))?;
 
         let expected = crate::data::executor::enforcement::hash_chain::compute_chain_hash(
-            &prev_hash, doc_id, &doc_bytes,
+            &prev_hash, &doc_id, &doc_bytes,
         );
 
         if expected != stored_hash {
@@ -114,7 +129,7 @@ pub async fn verify_hash_chain(
             break;
         }
 
-        prev_hash = stored_hash.to_string();
+        prev_hash = stored_hash;
         entries += 1;
     }
 

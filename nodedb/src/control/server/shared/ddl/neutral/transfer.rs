@@ -23,7 +23,7 @@ use crate::types::{DatabaseId, VShardId};
 use nodedb_physical::physical_plan::{KvOp, PhysicalPlan};
 
 use super::super::result::{DdlError, DdlResult};
-use super::kv_atomic::{dispatch_and_respond, parse_function_args};
+use super::kv_atomic::{dispatch_and_respond, parse_function_args, unquote};
 
 /// Handle `SELECT TRANSFER(collection, source_key, dest_key, field, amount)`
 pub async fn transfer(
@@ -90,7 +90,7 @@ pub async fn transfer(
         )
         .map_err(|e| ddl_err("XX000", e.to_string()))?;
     let plan = PhysicalPlan::Kv(KvOp::Transfer {
-        collection,
+        collection: collection.clone(),
         source_key: source_bytes,
         dest_key: dest_bytes,
         field,
@@ -99,7 +99,16 @@ pub async fn transfer(
         credit_surrogate,
     });
 
-    dispatch_and_respond(state, identity, vshard, plan, "TRANSFER", txn_ctx).await
+    dispatch_and_respond(
+        state,
+        identity,
+        vshard,
+        plan,
+        "TRANSFER",
+        &[collection.as_str()],
+        txn_ctx,
+    )
+    .await
 }
 
 /// Handle `SELECT TRANSFER_ITEM(source_collection, dest_collection, item_id, source_owner, dest_owner)`
@@ -157,26 +166,26 @@ pub async fn transfer_item(
     // Dispatch to Data Plane — verify + delete + insert is atomic. Routed
     // through the same in-transaction staging gate as `TRANSFER` (see above).
     let plan = PhysicalPlan::Kv(KvOp::TransferItem {
-        source_collection,
-        dest_collection,
+        source_collection: source_collection.clone(),
+        dest_collection: dest_collection.clone(),
         item_key: item_key.into_bytes(),
         dest_key: dest_bytes,
         surrogate,
     });
 
-    dispatch_and_respond(state, identity, vshard_src, plan, "TRANSFER_ITEM", txn_ctx).await
+    dispatch_and_respond(
+        state,
+        identity,
+        vshard_src,
+        plan,
+        "TRANSFER_ITEM",
+        &[source_collection.as_str(), dest_collection.as_str()],
+        txn_ctx,
+    )
+    .await
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
-
-fn unquote(s: &str) -> String {
-    let t = s.trim();
-    if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
-        t[1..t.len() - 1].to_string()
-    } else {
-        t.to_string()
-    }
-}
 
 fn ddl_err(sqlstate: &str, message: impl Into<String>) -> DdlError {
     DdlError {

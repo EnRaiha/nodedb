@@ -14,8 +14,10 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::read_gate::CollectionReadGate;
 use super::helpers::{
     clean_arg, err, extract_function_args, json_to_decimal, parse_timestamp_secs, single_result,
+    unwrap_scan_docs,
 };
 
 pub async fn balance_as_of(
@@ -40,6 +42,13 @@ pub async fn balance_as_of(
 
     let as_of_secs = parse_timestamp_secs(&as_of_str)?;
 
+    // `collection` is a caller argument, so the read it names is authorized and
+    // row-filtered here. The returned balance is arithmetic over `column`, so a
+    // redaction rule on that column has no honest answer — masking it would
+    // report a number no row holds.
+    let gate = CollectionReadGate::open(state, identity, database_id, &collection)?;
+    gate.refuse_if_field_redacted(&collection, &column, "the as-of balance")?;
+
     // Read current balance from the target document.
     let vshard = VShardId::from_collection_in_database(database_id, &collection);
     let pk_bytes = key.as_bytes().to_vec();
@@ -48,15 +57,17 @@ pub async fn balance_as_of(
         .lookup(database_id, tenant_id, &collection, &pk_bytes)
         .map_err(|e| err("XX000", &format!("surrogate lookup failed: {e}")))?
         .unwrap_or(nodedb_types::Surrogate::ZERO);
-    let get_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
-        collection: collection.clone(),
-        document_id: key.clone(),
-        surrogate,
-        pk_bytes,
-        rls_filters: Vec::new(),
-        system_time: nodedb_types::SystemTimeScope::Current,
-        valid_at_ms: None,
-    });
+    let mut get_plan =
+        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::PointGet {
+            collection: collection.clone(),
+            document_id: key.clone(),
+            surrogate,
+            pk_bytes,
+            rls_filters: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+        });
+    gate.inject_rls(&mut get_plan)?;
 
     let get_resp = dispatch_utils::dispatch_to_data_plane(
         state,
@@ -92,23 +103,33 @@ pub async fn balance_as_of(
         return Ok(single_result(&current_balance.to_string()));
     };
 
+    // The source collection is a second read, resolved from the catalog rather
+    // than the argument list, and it needs its own grant: a caller who may read
+    // the balance is not thereby entitled to the ledger it was summed from.
+    // `value_expr` can name any of its columns, so a redaction rule anywhere on
+    // it is refused rather than silently summed over hidden values.
+    gate.authorize(&mat_def.source_collection)?;
+    gate.refuse_if_any_redaction(&mat_def.source_collection, "the as-of balance")?;
+
     // Scan the source collection for rows where join_column = key AND created_at > as_of.
     let source_vshard =
         VShardId::from_collection_in_database(database_id, &mat_def.source_collection);
-    let source_scan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
-        collection: mat_def.source_collection.clone(),
-        limit: usize::MAX,
-        offset: 0,
-        sort_keys: Vec::new(),
-        filters: Vec::new(),
-        distinct: false,
-        projection: Vec::new(),
-        computed_columns: Vec::new(),
-        window_functions: Vec::new(),
-        system_time: nodedb_types::SystemTimeScope::Current,
-        valid_at_ms: None,
-        prefilter: None,
-    });
+    let mut source_scan =
+        PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
+            collection: mat_def.source_collection.clone(),
+            limit: usize::MAX,
+            offset: 0,
+            sort_keys: Vec::new(),
+            filters: Vec::new(),
+            distinct: false,
+            projection: Vec::new(),
+            computed_columns: Vec::new(),
+            window_functions: Vec::new(),
+            system_time: nodedb_types::SystemTimeScope::Current,
+            valid_at_ms: None,
+            prefilter: None,
+        });
+    gate.inject_rls(&mut source_scan)?;
 
     let source_resp = dispatch_utils::dispatch_to_data_plane(
         state,
@@ -125,22 +146,21 @@ pub async fn balance_as_of(
         crate::data::executor::response_codec::decode_payload_to_json(&source_resp.payload);
     let source_docs: Vec<serde_json::Value> = sonic_rs::from_str(&source_json)
         .map_err(|e| err("22P02", &format!("invalid JSON in source scan: {e}")))?;
+    // Unwrap the `{"id", "data"}` scan envelope so matching and `value_expr`
+    // evaluation read the stored fields, not the wire wrapper.
+    let source_docs = unwrap_scan_docs(source_docs);
 
     // Sum value_expr for source rows where join_column = key AND created_at > as_of.
     let mut recent_sum = rust_decimal::Decimal::ZERO;
-    for src_doc in &source_docs {
-        let obj = match src_doc.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
-
+    for obj in &source_docs {
         let join_val = obj.get(&mat_def.join_column).and_then(|v| v.as_str());
         if join_val != Some(&key) {
             continue;
         }
 
+        let src_doc = serde_json::Value::Object(obj.clone());
         let created_at = crate::data::executor::enforcement::retention::extract_created_at_secs(
-            &sonic_rs::to_vec(src_doc)
+            &sonic_rs::to_vec(&src_doc)
                 .map_err(|e| err("XX000", &format!("serialization failed: {e}")))?,
         );
         if let Some(ts) = created_at {

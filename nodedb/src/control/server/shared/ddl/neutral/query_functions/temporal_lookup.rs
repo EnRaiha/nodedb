@@ -13,7 +13,10 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::helpers::{clean_arg, empty_result, err, extract_function_args, single_result};
+use super::super::read_gate::CollectionReadGate;
+use super::helpers::{
+    clean_arg, empty_result, err, extract_function_args, single_result, unwrap_scan_docs,
+};
 
 pub async fn temporal_lookup(
     state: &SharedState,
@@ -36,9 +39,14 @@ pub async fn temporal_lookup(
     let key_column = clean_arg(args[3]);
     let time_column = clean_arg(args[4]);
 
+    // `table` came out of the caller's argument list, so the read it names is
+    // authorized, row-filtered, and redacted here — nothing downstream of the
+    // hand-built plan does any of it.
+    let gate = CollectionReadGate::open(state, identity, database_id, &table)?;
+
     // Scan the table.
     let vshard = VShardId::from_collection_in_database(database_id, &table);
-    let scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
+    let mut scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: table.clone(),
         limit: usize::MAX,
         offset: 0,
@@ -52,6 +60,7 @@ pub async fn temporal_lookup(
         valid_at_ms: None,
         prefilter: None,
     });
+    gate.inject_rls(&mut scan_plan)?;
 
     let scan_resp = dispatch_utils::dispatch_to_data_plane(
         state,
@@ -68,17 +77,16 @@ pub async fn temporal_lookup(
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
     let docs: Vec<serde_json::Value> = sonic_rs::from_str(&payload_json)
         .map_err(|e| err("22P02", &format!("invalid JSON in scan response: {e}")))?;
+    // The raw document-scan codec wraps each row as `{"id": .., "data": {..}}`;
+    // unwrap it so matching and redaction operate on the stored fields, not
+    // the wire wrapper.
+    let docs = unwrap_scan_docs(docs);
 
     // Find the row with latest time_column <= as_of for the given key.
-    let mut best_doc: Option<&serde_json::Value> = None;
+    let mut best_doc: Option<&serde_json::Map<String, serde_json::Value>> = None;
     let mut best_time = String::new();
 
-    for doc in &docs {
-        let obj = match doc.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
-
+    for obj in &docs {
         let key_val = obj.get(&key_column).and_then(|v| v.as_str());
         if key_val != Some(key_value.as_str()) {
             continue;
@@ -91,12 +99,23 @@ pub async fn temporal_lookup(
 
         if time_val > best_time.as_str() {
             best_time = time_val.to_string();
-            best_doc = Some(doc);
+            best_doc = Some(obj);
         }
     }
 
+    // The matched row is returned verbatim (as the stored fields, not the
+    // `{id, data}` wire wrapper), so it goes through the same column
+    // redaction a `SELECT` on this table would apply. Redaction runs on the
+    // chosen row rather than on the whole scan: the key / time columns are
+    // matched against their stored values, exactly as a `WHERE` clause is,
+    // and only the delivered row is rewritten.
     match best_doc {
-        Some(doc) => Ok(single_result(&doc.to_string())),
+        Some(obj) => {
+            let mut doc = serde_json::Value::Object(obj.clone());
+            let redaction = gate.redaction_for([table.as_str()]);
+            gate.redact(&redaction, &mut doc);
+            Ok(single_result(&doc.to_string()))
+        }
         None => Ok(empty_result()),
     }
 }

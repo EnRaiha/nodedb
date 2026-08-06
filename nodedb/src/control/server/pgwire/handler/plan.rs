@@ -109,7 +109,7 @@ pub(super) fn tag_from_staged(kind: StagedTagKind, affected: usize) -> Tag {
         StagedTagKind::UpdateFromJoin => Tag::new("UPDATE").with_rows(affected),
         // KV `Incr` / `IncrFloat` / `Cas` / `GetSet` never reach pgwire's
         // generic tag-rendering path today: their sole SQL surface (`SELECT
-        // KV_INCR(..)` and friends, in `ddl/neutral/kv_atomic.rs`) reads
+        // KV_INCR(..)` and friends, in `ddl/neutral/kv_atomic/`) reads
         // `StagedWriteOutcome::payload` directly and never calls
         // `tag_from_staged`. This arm exists only so the match stays
         // exhaustive against a new `PhysicalPlan::Kv` caller; it renders the

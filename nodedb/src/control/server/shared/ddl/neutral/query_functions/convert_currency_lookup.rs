@@ -14,7 +14,10 @@ use crate::control::state::SharedState;
 use crate::types::{DatabaseId, TraceId, VShardId};
 
 use super::super::super::result::{DdlError, DdlResult};
-use super::helpers::{clean_arg, err, extract_function_args, json_to_decimal, single_result};
+use super::super::read_gate::CollectionReadGate;
+use super::helpers::{
+    clean_arg, err, extract_function_args, json_to_decimal, single_result, unwrap_scan_docs,
+};
 
 /// Convenience currency conversion with rate table lookup.
 ///
@@ -57,12 +60,19 @@ pub async fn convert_currency_lookup(
         .parse()
         .map_err(|_| err("22023", &format!("cannot parse amount '{amount_str}'")))?;
 
+    // `rate_table` is a caller argument, so the read it names is authorized and
+    // row-filtered here. The converted amount is arithmetic over `rate_column`,
+    // so a redaction rule on that column is refused rather than answered with a
+    // figure derived from a value the caller may not see.
+    let gate = CollectionReadGate::open(state, identity, database_id, &rate_table)?;
+    gate.refuse_if_field_redacted(&rate_table, &rate_column, "the converted amount")?;
+
     // Build the composite key: "{from}/{to}" for the rate table lookup.
     let key_value = format!("{from_ccy}/{to_ccy}");
 
     // Scan rate table to find latest rate where key_column == key_value AND time_column <= as_of.
     let vshard = VShardId::from_collection_in_database(database_id, &rate_table);
-    let scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
+    let mut scan_plan = PhysicalPlan::Document(nodedb_physical::physical_plan::DocumentOp::Scan {
         collection: rate_table.clone(),
         limit: usize::MAX,
         offset: 0,
@@ -76,6 +86,7 @@ pub async fn convert_currency_lookup(
         valid_at_ms: None,
         prefilter: None,
     });
+    gate.inject_rls(&mut scan_plan)?;
 
     let scan_resp = dispatch_utils::dispatch_to_data_plane(
         state,
@@ -92,16 +103,15 @@ pub async fn convert_currency_lookup(
         crate::data::executor::response_codec::decode_payload_to_json(&scan_resp.payload);
     let docs: Vec<serde_json::Value> = sonic_rs::from_str(&payload_json)
         .map_err(|e| err("22P02", &format!("invalid JSON in rate table scan: {e}")))?;
+    // Unwrap the `{"id", "data"}` scan envelope so matching reads the stored
+    // fields, not the wire wrapper.
+    let docs = unwrap_scan_docs(docs);
 
     // Find latest row where key matches and time <= as_of.
     let mut best_rate: Option<rust_decimal::Decimal> = None;
     let mut best_time = String::new();
 
-    for doc in &docs {
-        let obj = match doc.as_object() {
-            Some(o) => o,
-            None => continue,
-        };
+    for obj in &docs {
         let key_val = obj.get(&key_column).and_then(|v| v.as_str()).unwrap_or("");
         if key_val != key_value {
             continue;
