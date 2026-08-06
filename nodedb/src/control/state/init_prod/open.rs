@@ -141,6 +141,14 @@ impl SharedState {
             escalation.hydrate_suspensions(&user.id, user.escalation_suspensions);
         }
 
+        // Scope grants are catalog-backed for the same reason: a grant — and
+        // the `WHEN` / `REQUIRE` conditions restricting it — has to survive a
+        // restart, and a memory-only store silently drops every grant the
+        // operator issued.
+        let scope_grants = crate::control::security::scope::grant::ScopeGrantStore::open(
+            credentials.catalog().clone(),
+        )?;
+
         let state = Arc::new(Self {
             dispatcher: Mutex::new(dispatcher),
             tracker: RequestTracker::new(),
@@ -310,7 +318,7 @@ impl SharedState {
             auth_users,
             orgs: crate::control::security::org::store::OrgStore::new(),
             scope_defs: crate::control::security::scope::store::ScopeStore::new(),
-            scope_grants: crate::control::security::scope::grant::ScopeGrantStore::new(),
+            scope_grants,
             rate_limiter: RateLimiter::new(rate_limit_config.clone()),
             session_handles:
                 crate::control::security::session_handle::SessionHandleStore::from_config(

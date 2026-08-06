@@ -56,7 +56,8 @@ impl<'a> RequestAuthScopeBuilder<'a> {
 
     /// The transport's real peer address for this request, in whatever shape
     /// its socket layer produced (`10.1.2.3:5432`, `[::1]:5432`, or a bare
-    /// address). Used to stamp `$auth.risk_score`.
+    /// address). Used to stamp `$auth.risk_score` and to evaluate a scope
+    /// grant's `REQUIRE IP` condition.
     ///
     /// Pass the genuine remote address or nothing at all — never a
     /// placeholder. Anything that does not parse as an address is discarded
@@ -157,7 +158,12 @@ impl<'a> RequestAuthScopeBuilder<'a> {
     ///    [`enrich_auth_context_with_scopes`] — the entire reason `stores` is
     ///    a required argument. This step runs even for an adopted context,
     ///    since a pooled `AuthContext` was enriched only once, at
-    ///    handle-creation time, and may be stale.
+    ///    handle-creation time, and may be stale. It is also where a
+    ///    conditional grant's `WHEN` / `REQUIRE` clauses are evaluated: this
+    ///    builder is the single place a grant meets the request it might
+    ///    apply to, holding both the `AuthContext` and the client address
+    ///    those conditions need, so a grant whose conditions fail is dropped
+    ///    here and contributes no scope.
     /// 6. Stamp `auth.risk_score` when risk scoring is enabled, the identity
     ///    is not an internal service, and [`Self::with_peer_addr`] supplied a
     ///    usable client address. Enforcement of the resulting decision lives
@@ -196,6 +202,7 @@ impl<'a> RequestAuthScopeBuilder<'a> {
             self.stores.scope_grants,
             self.stores.quota_manager,
             &org_ids,
+            self.client_ip.as_deref(),
             crate::control::security::time::now_secs(),
         );
 
@@ -220,10 +227,11 @@ impl<'a> RequestAuthScopeBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::control::security::conditional::GrantCondition;
     use crate::control::security::identity::{AuthMethod, DatabaseSet, Role};
     use crate::control::security::jwt::JwtClaims;
     use crate::control::security::metering::quota::QuotaManager;
-    use crate::control::security::risk::{RiskConfig, RiskScorer};
+    use crate::control::security::risk::{RiskConfig, RiskScorer, STEP_UP_REQUIRED};
     use crate::control::security::scope::grant::{ScopeGrantParams, ScopeGrantStore};
     use crate::types::TenantId;
     use std::collections::HashMap;
@@ -347,6 +355,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .unwrap();
 
@@ -375,6 +384,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .unwrap();
         quotas.define_quota(QuotaDefinition {
@@ -468,6 +478,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .unwrap();
         let pooled = AuthContext::from_identity(&identity, "s_pooled".into());
@@ -479,6 +490,100 @@ mod tests {
         assert_eq!(
             scope.auth().metadata.get("scope_status.pro:all"),
             Some(&"active".to_string())
+        );
+    }
+
+    // ── Conditional grants ──────────────────────────────────────────────
+
+    fn conditional_grant(grants: &ScopeGrantStore, conditions: Vec<GrantCondition>) {
+        grants
+            .grant(ScopeGrantParams {
+                scope_name: "pro:all",
+                grantee_type: "user",
+                grantee_id: "42",
+                granted_by: "admin",
+                expires_at: 0,
+                grace_period_secs: 0,
+                on_expire_action: "",
+                conditions,
+            })
+            .expect("grant");
+    }
+
+    /// The hook: an IP-restricted grant reaches `build` through the same
+    /// peer address risk scoring uses, and applies only from that network.
+    #[test]
+    fn ip_restricted_grant_applies_only_from_its_network() {
+        let identity = test_identity();
+        let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let scorer = RiskScorer::default();
+        conditional_grant(
+            &grants,
+            vec![GrantCondition::RequireIp {
+                allowed_cidrs: vec!["10.0.0.0/8".into()],
+            }],
+        );
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
+
+        let inside = RequestAuthScope::builder(&identity, stores)
+            .with_peer_addr("10.0.0.1:5432")
+            .build();
+        assert_eq!(
+            inside.auth().metadata.get("scope_status.pro:all"),
+            Some(&"active".to_string())
+        );
+
+        let outside = RequestAuthScope::builder(&identity, stores)
+            .with_peer_addr("203.0.113.9:5432")
+            .build();
+        assert!(
+            !outside.auth().metadata.contains_key("scope_status.pro:all"),
+            "a request from outside the permitted network must not get the scope"
+        );
+    }
+
+    /// Fail closed: a transport that supplied no usable peer address cannot
+    /// satisfy `REQUIRE IP`, so the grant is withheld rather than applied.
+    #[test]
+    fn ip_restricted_grant_is_withheld_without_a_peer_address() {
+        let identity = test_identity();
+        let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let scorer = RiskScorer::default();
+        conditional_grant(
+            &grants,
+            vec![GrantCondition::RequireIp {
+                allowed_cidrs: vec!["10.0.0.0/8".into()],
+            }],
+        );
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
+
+        let scope = RequestAuthScope::builder(&identity, stores).build();
+
+        assert!(!scope.auth().metadata.contains_key("scope_status.pro:all"));
+        assert_eq!(
+            scope.auth().metadata.get("scope_denied.pro:all"),
+            Some(&"client address unavailable for an IP-restricted grant".to_string())
+        );
+    }
+
+    /// An MFA-conditioned grant is withheld with the same reason string the
+    /// risk gate uses for its step-up band.
+    #[test]
+    fn mfa_conditioned_grant_reports_the_risk_step_up_reason() {
+        let identity = test_identity();
+        let grants = ScopeGrantStore::new();
+        let quotas = QuotaManager::new();
+        let scorer = RiskScorer::default();
+        conditional_grant(&grants, vec![GrantCondition::RequireMfa]);
+        let stores = AuthStores::new(&grants, &quotas, &scorer);
+
+        let scope = RequestAuthScope::builder(&identity, stores).build();
+
+        assert_eq!(
+            scope.auth().metadata.get("scope_denied.pro:all"),
+            Some(&STEP_UP_REQUIRED.to_string())
         );
     }
 

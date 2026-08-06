@@ -40,6 +40,15 @@ pub struct StoredScopeGrant {
     /// Action on expiry: "revoke_all", "grant:<scope_name>", or empty (just expire).
     #[msgpack(default)]
     pub on_expire_action: String,
+    /// JSON-serialized `Vec<GrantCondition>` (sonic_rs), empty when the
+    /// grant is unconditional.
+    ///
+    /// `GrantCondition` is a serde-only enum with struct variants, which
+    /// zerompk's derive cannot encode, so the list is flattened to one JSON
+    /// string and the record as a whole stays msgpack — the same shape
+    /// `StoredRedactionPolicy::rules_json` uses for the same reason.
+    #[msgpack(default)]
+    pub conditions_json: String,
 }
 
 impl SystemCatalog {

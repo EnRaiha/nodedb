@@ -150,6 +150,10 @@ fn execute_on_expire(store: &ScopeGrantStore, grant: &super::grant::ScopeGrant) 
             expires_at: 0, // Permanent (no expiry on the downgrade).
             grace_period_secs: 0,
             on_expire_action: "",
+            // The downgrade is a different, lesser scope; the expired
+            // grant's conditions described access to the scope being
+            // retired, so they are not carried over.
+            conditions: Vec::new(),
         }) {
             Ok(_) => {
                 info!(
@@ -199,6 +203,7 @@ mod tests {
                 expires_at: past,
                 grace_period_secs: 0,
                 on_expire_action: "revoke_all",
+                conditions: Vec::new(),
             })
             .unwrap();
 
@@ -225,6 +230,7 @@ mod tests {
                 expires_at: past,
                 grace_period_secs: 0,
                 on_expire_action: "grant:free:basic",
+                conditions: Vec::new(),
             })
             .unwrap();
 
@@ -249,6 +255,7 @@ mod tests {
                 expires_at: past,
                 grace_period_secs: 60,
                 on_expire_action: "revoke_all",
+                conditions: Vec::new(),
             })
             .unwrap();
 

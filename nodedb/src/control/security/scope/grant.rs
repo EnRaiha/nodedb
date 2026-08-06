@@ -7,9 +7,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::control::security::catalog::{StoredScopeGrant, SystemCatalog};
+use crate::control::security::conditional::GrantCondition;
 use crate::control::security::time::now_secs;
 
 /// In-memory scope grant record with time-bound support.
@@ -26,6 +27,13 @@ pub struct ScopeGrant {
     pub grace_period_secs: u64,
     /// Action on expiry: "revoke_all", "grant:<scope_name>", or "" (just expire).
     pub on_expire_action: String,
+    /// Conditions that must hold for this grant to contribute its scope to a
+    /// request. Empty = unconditional.
+    ///
+    /// Distinct from `expires_at` / `grace_period_secs`, which retire the
+    /// whole grant on a wall clock: a conditional grant stays granted and
+    /// simply does not apply to requests that fail its conditions.
+    pub conditions: Vec<GrantCondition>,
 }
 
 /// Status of a time-bound scope grant.
@@ -73,8 +81,23 @@ impl ScopeGrant {
         matches!(self.status(), ScopeStatus::Active | ScopeStatus::Grace)
     }
 
-    fn from_stored(s: &StoredScopeGrant) -> Self {
-        Self {
+    /// Rebuild a grant from its catalog record.
+    ///
+    /// Fails when the stored condition payload does not decode into known
+    /// [`GrantCondition`]s — a grant whose conditions cannot be read must
+    /// not be loaded as if it had none, so the caller drops it entirely.
+    fn from_stored(s: &StoredScopeGrant) -> crate::Result<Self> {
+        let conditions = if s.conditions_json.is_empty() {
+            Vec::new()
+        } else {
+            sonic_rs::from_str(&s.conditions_json).map_err(|e| crate::Error::BadRequest {
+                detail: format!(
+                    "scope grant '{}' for {} '{}' has undecodable conditions: {e}",
+                    s.scope_name, s.grantee_type, s.grantee_id
+                ),
+            })?
+        };
+        Ok(Self {
             scope_name: s.scope_name.clone(),
             grantee_type: s.grantee_type.clone(),
             grantee_id: s.grantee_id.clone(),
@@ -83,11 +106,19 @@ impl ScopeGrant {
             expires_at: s.expires_at,
             grace_period_secs: s.grace_period_secs,
             on_expire_action: s.on_expire_action.clone(),
-        }
+            conditions,
+        })
     }
 
-    fn to_stored(&self) -> StoredScopeGrant {
-        StoredScopeGrant {
+    fn to_stored(&self) -> crate::Result<StoredScopeGrant> {
+        let conditions_json = if self.conditions.is_empty() {
+            String::new()
+        } else {
+            sonic_rs::to_string(&self.conditions).map_err(|e| crate::Error::BadRequest {
+                detail: format!("cannot serialize scope grant conditions: {e}"),
+            })?
+        };
+        Ok(StoredScopeGrant {
             scope_name: self.scope_name.clone(),
             grantee_type: self.grantee_type.clone(),
             grantee_id: self.grantee_id.clone(),
@@ -96,7 +127,8 @@ impl ScopeGrant {
             expires_at: self.expires_at,
             grace_period_secs: self.grace_period_secs,
             on_expire_action: self.on_expire_action.clone(),
-        }
+            conditions_json,
+        })
     }
 }
 
@@ -119,6 +151,9 @@ pub struct ScopeGrantParams<'a> {
     pub grace_period_secs: u64,
     /// "revoke_all", "grant:<scope>", or "" (just expire).
     pub on_expire_action: &'a str,
+    /// Conditions parsed from the statement's `WHEN` / `REQUIRE` clauses.
+    /// Empty = unconditional.
+    pub conditions: Vec<GrantCondition>,
 }
 
 impl ScopeGrantStore {
@@ -133,8 +168,22 @@ impl ScopeGrantStore {
         let stored = catalog.load_all_scope_grants()?;
         let mut grants = HashMap::with_capacity(stored.len());
         for s in &stored {
-            let key = grant_key(&s.scope_name, &s.grantee_type, &s.grantee_id);
-            grants.insert(key, ScopeGrant::from_stored(s));
+            // A grant whose stored conditions cannot be decoded is dropped,
+            // not loaded unconditionally: an unreadable restriction has to
+            // deny, never widen.
+            match ScopeGrant::from_stored(s) {
+                Ok(grant) => {
+                    let key = grant_key(&s.scope_name, &s.grantee_type, &s.grantee_id);
+                    grants.insert(key, grant);
+                }
+                Err(e) => warn!(
+                    scope = %s.scope_name,
+                    grantee_type = %s.grantee_type,
+                    grantee_id = %s.grantee_id,
+                    error = %e,
+                    "scope grant dropped at load: conditions could not be decoded"
+                ),
+            }
         }
         if !grants.is_empty() {
             info!(count = grants.len(), "scope grants loaded from catalog");
@@ -155,6 +204,7 @@ impl ScopeGrantStore {
             expires_at,
             grace_period_secs,
             on_expire_action,
+            conditions,
         } = params;
 
         let record = ScopeGrant {
@@ -166,10 +216,11 @@ impl ScopeGrantStore {
             expires_at,
             grace_period_secs,
             on_expire_action: on_expire_action.into(),
+            conditions,
         };
 
         if let Some(ref catalog) = self.catalog {
-            catalog.put_scope_grant(&record.to_stored())?;
+            catalog.put_scope_grant(&record.to_stored()?)?;
         }
 
         let key = grant_key(scope_name, grantee_type, grantee_id);
@@ -248,7 +299,7 @@ impl ScopeGrantStore {
             let base = g.expires_at.max(now);
             g.expires_at = base + extend_secs;
             if let Some(ref catalog) = self.catalog {
-                let _ = catalog.put_scope_grant(&g.to_stored());
+                catalog.put_scope_grant(&g.to_stored()?)?;
             }
             info!(scope = %scope_name, grantee_type, grantee_id, new_expires = g.expires_at, "scope renewed");
             Ok(true)
@@ -269,29 +320,39 @@ impl ScopeGrantStore {
             .collect()
     }
 
-    /// Resolve effective scopes for a user.
+    /// Every unexpired grant a user holds, directly or through an org
+    /// membership.
+    ///
+    /// Grant *conditions* are not applied here — evaluating them needs the
+    /// request's `AuthContext` and client address, which this store does not
+    /// have. `enrich_auth_context_with_scopes` is the one place that pairs
+    /// these grants with a request and drops the ones whose conditions fail.
+    pub fn effective_grants(&self, user_id: &str, org_ids: &[String]) -> Vec<ScopeGrant> {
+        let grants = self.grants.read().unwrap_or_else(|p| p.into_inner());
+        grants
+            .values()
+            .filter(|g| {
+                g.is_effective()
+                    && ((g.grantee_type == "user" && g.grantee_id == user_id)
+                        || (g.grantee_type == "org" && org_ids.contains(&g.grantee_id)))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Resolve effective scope *names* for a user.
     ///
     /// Collects: user's direct scopes + org scopes for each org membership.
-    /// Filters out expired grants.
+    /// Filters out expired grants, but — like [`Self::effective_grants`], on
+    /// which it is built — not conditional ones: this answers "what has been
+    /// granted", which is what introspection (`SHOW MY SCOPES`, security
+    /// explain) and usage metering ask. "What applies to *this* request" is
+    /// answered per request by `enrich_auth_context_with_scopes`.
     pub fn effective_scopes(&self, user_id: &str, org_ids: &[String]) -> HashSet<String> {
-        let grants = self.grants.read().unwrap_or_else(|p| p.into_inner());
-        let mut effective = HashSet::new();
-
-        for g in grants.values() {
-            if !g.is_effective() {
-                continue; // Skip expired grants.
-            }
-            // Direct user grant.
-            if g.grantee_type == "user" && g.grantee_id == user_id {
-                effective.insert(g.scope_name.clone());
-            }
-            // Org grant (user inherits via membership).
-            if g.grantee_type == "org" && org_ids.contains(&g.grantee_id) {
-                effective.insert(g.scope_name.clone());
-            }
-        }
-
-        effective
+        self.effective_grants(user_id, org_ids)
+            .into_iter()
+            .map(|g| g.scope_name)
+            .collect()
     }
 
     /// Check if a user (directly or via orgs) has a specific scope.
@@ -340,6 +401,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .unwrap();
 
@@ -360,6 +422,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .unwrap();
 
@@ -381,6 +444,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .unwrap();
         store
@@ -392,6 +456,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .unwrap();
         store
@@ -403,6 +468,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .unwrap();
 
@@ -424,11 +490,80 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .unwrap();
         assert!(store.has_scope("u1", &[], "s1"));
 
         store.revoke("s1", "user", "u1").unwrap();
         assert!(!store.has_scope("u1", &[], "s1"));
+    }
+
+    fn stored(conditions_json: &str) -> StoredScopeGrant {
+        StoredScopeGrant {
+            scope_name: "pro:all".into(),
+            grantee_type: "user".into(),
+            grantee_id: "u1".into(),
+            granted_by: "admin".into(),
+            granted_at: 1_000,
+            expires_at: 0,
+            grace_period_secs: 0,
+            on_expire_action: String::new(),
+            conditions_json: conditions_json.into(),
+        }
+    }
+
+    /// The catalog record is what survives a restart, so conditions have to
+    /// make the round trip through it unchanged.
+    #[test]
+    fn conditions_round_trip_through_the_catalog_record() {
+        let conditions = vec![
+            GrantCondition::Temporal {
+                start_hour: 9,
+                end_hour: 17,
+                days: vec![1, 2, 3, 4, 5],
+            },
+            GrantCondition::RequireIp {
+                allowed_cidrs: vec!["10.0.0.0/8".into()],
+            },
+        ];
+        let grant = ScopeGrant {
+            scope_name: "pro:all".into(),
+            grantee_type: "user".into(),
+            grantee_id: "u1".into(),
+            granted_by: "admin".into(),
+            granted_at: 1_000,
+            expires_at: 0,
+            grace_period_secs: 0,
+            on_expire_action: String::new(),
+            conditions: conditions.clone(),
+        };
+
+        let restored =
+            ScopeGrant::from_stored(&grant.to_stored().expect("serialize")).expect("decode");
+
+        assert_eq!(restored.conditions, conditions);
+    }
+
+    #[test]
+    fn an_unconditional_grant_stores_no_condition_payload() {
+        let grant = ScopeGrant::from_stored(&stored("")).expect("decode");
+        assert!(grant.conditions.is_empty());
+        assert!(
+            grant
+                .to_stored()
+                .expect("serialize")
+                .conditions_json
+                .is_empty()
+        );
+    }
+
+    /// Fail closed on an unreadable restriction: a condition payload naming
+    /// something this build does not understand must not decode into an
+    /// unconditional grant. `ScopeGrantStore::open` drops such a grant.
+    #[test]
+    fn undecodable_conditions_are_rejected_rather_than_ignored() {
+        assert!(ScopeGrant::from_stored(&stored("[{\"RequireTelepathy\":{}}]")).is_err());
+        assert!(ScopeGrant::from_stored(&stored("not json at all")).is_err());
     }
 }

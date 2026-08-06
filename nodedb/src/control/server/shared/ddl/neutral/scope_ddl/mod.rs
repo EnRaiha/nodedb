@@ -8,6 +8,8 @@
 //! DROP SCOPE 'profile:read'
 //! GRANT SCOPE 'pro:all' TO ORG 'acme'
 //! GRANT SCOPE 'profile:read' TO USER 'user_42'
+//! GRANT SCOPE 'ops:all' TO USER 'user_42' WHEN BETWEEN '09:00' AND '17:00' ON WEEKDAYS
+//! GRANT SCOPE 'ops:all' TO USER 'user_42' REQUIRE MFA REQUIRE IP IN ('10.0.0.0/8')
 //! REVOKE SCOPE 'pro:all' FROM ORG 'acme'
 //! RENEW SCOPE 'pro:all' FOR ORG 'acme' EXTEND BY 30d
 //! SHOW SCOPES

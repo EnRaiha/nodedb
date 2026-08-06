@@ -12,6 +12,15 @@ use crate::control::security::auth_context::AuthContext;
 use super::config::RiskDecision;
 use super::scorer::RiskScorer;
 
+/// The one reason string for "this principal must authenticate more
+/// strongly before proceeding".
+///
+/// Shared with conditional scope grants: `GrantCondition::RequireMfa` and
+/// `GrantCondition::StepUpAuth` reach the same outcome as
+/// [`RiskDecision::StepUpMfa`], so they report it with this exact string
+/// rather than a second one clients would have to learn separately.
+pub const STEP_UP_REQUIRED: &str = "step-up authentication required";
+
 /// A refusal produced by the risk gate: the client-facing resource string
 /// and the detail recorded in the audit log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,8 +49,9 @@ impl RiskScorer {
     ///   own distinct reason telling the client that step-up is required —
     ///   rather than admitted, which would collapse the middle band into
     ///   `Allow` and leave `deny_threshold` as the only live knob. When a
-    ///   real step-up flow exists it replaces this refusal with a challenge;
-    ///   `GrantCondition::StepUpAuth` will want the same shape.
+    ///   real step-up flow exists it replaces this refusal with a challenge.
+    ///   `GrantCondition::RequireMfa` / `GrantCondition::StepUpAuth` report
+    ///   the same outcome through the same [`STEP_UP_REQUIRED`] string.
     pub fn refusal_for(&self, auth: &AuthContext) -> Option<RiskRefusal> {
         if !self.is_enabled() {
             return None;
@@ -61,7 +71,7 @@ impl RiskScorer {
         match self.decide(score) {
             RiskDecision::Allow => None,
             RiskDecision::StepUpMfa => Some(RiskRefusal {
-                resource: "step-up authentication required".into(),
+                resource: STEP_UP_REQUIRED.into(),
                 audit_detail: format!(
                     "risk score {score:.3} is in the step-up band \
                      ({} < score < {})",

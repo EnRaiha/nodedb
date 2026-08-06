@@ -535,6 +535,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .expect("grant scope");
         state.quota_manager.define_quota(QuotaDefinition {
@@ -661,6 +662,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .expect("grant scope");
         state.quota_manager.define_quota(QuotaDefinition {
@@ -727,6 +729,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .expect("grant scope");
         state.quota_manager.define_quota(QuotaDefinition {
@@ -785,6 +788,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .expect("grant scope");
         state.quota_manager.define_quota(QuotaDefinition {
@@ -844,6 +848,7 @@ mod tests {
                     expires_at: 0,
                     grace_period_secs: 0,
                     on_expire_action: "",
+                    conditions: Vec::new(),
                 })
                 .expect("grant scope");
             state.quota_manager.define_quota(QuotaDefinition {
@@ -913,6 +918,7 @@ mod tests {
                 expires_at: 0,
                 grace_period_secs: 0,
                 on_expire_action: "",
+                conditions: Vec::new(),
             })
             .expect("grant scope");
         state.quota_manager.define_quota(QuotaDefinition {

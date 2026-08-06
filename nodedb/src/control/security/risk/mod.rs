@@ -11,5 +11,5 @@ pub mod scorer;
 
 pub use address::client_ip_from_peer;
 pub use config::{RiskConfig, RiskDecision};
-pub use gate::RiskRefusal;
+pub use gate::{RiskRefusal, STEP_UP_REQUIRED};
 pub use scorer::RiskScorer;

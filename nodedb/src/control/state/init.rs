@@ -76,6 +76,16 @@ impl SharedState {
                 Arc::clone(&credentials),
                 wal_appender,
             ));
+            // Catalog-backed security stores, rebuilt for the same reason the
+            // surrogate watermark above is: this constructor's whole purpose
+            // is to resume a durable catalog, and a memory-only store here
+            // silently drops every auth-user status and scope grant the
+            // previous session persisted — so a restart fixture would report
+            // a clean slate rather than what was actually saved.
+            s.auth_users =
+                crate::control::security::jit::auth_user::AuthUserStore::open(catalog.clone())?;
+            s.scope_grants =
+                crate::control::security::scope::grant::ScopeGrantStore::open(catalog.clone())?;
             s.credentials = credentials;
             s.ep_topic_registry
                 .load_from_catalog(s.credentials.catalog())?;

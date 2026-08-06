@@ -5,6 +5,7 @@
 
 use serde_json::{Map, Value as JsonValue};
 
+use crate::control::security::conditional::{parse_conditions, render_conditions};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::security::scope::grant::ScopeGrantParams;
 use crate::control::server::response_shape::types::ShapedRows;
@@ -14,6 +15,13 @@ use super::super::super::result::{DdlError, DdlResult};
 use super::support::{err, status};
 
 /// GRANT SCOPE '<scope>' TO <ORG|USER|ROLE> '<id>'
+///     [EXPIRES '<unix ts>'] [GRACE PERIOD <duration>] [ON EXPIRE <action>]
+///     [WHEN BETWEEN '<start>' AND '<end>' [ON WEEKDAYS|WEEKENDS|ALL]]
+///     [REQUIRE MFA] [REQUIRE IP IN ('<cidr>', ...)]
+///     [REQUIRE STEP_UP [<seconds>]] [REQUIRE DEVICE_TRUST]
+///
+/// The expiry clauses retire the grant on a wall clock; the condition
+/// clauses leave it granted but decide, per request, whether it applies.
 pub fn grant_scope(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
@@ -44,6 +52,10 @@ pub fn grant_scope(
     let expires_at = parse_expires(parts);
     let grace_period_secs = parse_grace_period(parts);
     let on_expire_action = parse_on_expire(parts);
+    // Conditions come from the clause tail, after the grantee. A malformed
+    // condition is a syntax error, never a silently unconditional grant.
+    let conditions = parse_conditions(&parts[6..]).map_err(|e| err("42601", e.to_string()))?;
+    let rendered_conditions = render_conditions(&conditions);
 
     state
         .scope_grants
@@ -55,6 +67,7 @@ pub fn grant_scope(
             expires_at,
             grace_period_secs,
             on_expire_action: &on_expire_action,
+            conditions,
         })
         .map_err(|e| err("XX000", e.to_string()))?;
 
@@ -62,7 +75,10 @@ pub fn grant_scope(
         crate::control::security::audit::AuditEvent::AdminAction,
         Some(identity.tenant_id),
         &identity.username,
-        &format!("granted scope '{scope_name}' to {grantee_type} '{grantee_id}'"),
+        &format!(
+            "granted scope '{scope_name}' to {grantee_type} '{grantee_id}' \
+             with conditions: {rendered_conditions}"
+        ),
     );
 
     Ok(status("GRANT SCOPE"))
@@ -170,6 +186,7 @@ pub fn show_scope_grants(
         "grantee_id".to_string(),
         "status".to_string(),
         "expires_at".to_string(),
+        "conditions".to_string(),
         "granted_by".to_string(),
     ];
     let column_types = ShapedRows::text_types(columns.len());
@@ -198,6 +215,12 @@ pub fn show_scope_grants(
                 } else {
                     g.expires_at.to_string()
                 }),
+            );
+            // An operator debugging "why isn't this grant applying?" needs
+            // to see the conditions attached to it, not just its expiry.
+            row.insert(
+                "conditions".to_string(),
+                JsonValue::String(render_conditions(&g.conditions)),
             );
             row.insert(
                 "granted_by".to_string(),
