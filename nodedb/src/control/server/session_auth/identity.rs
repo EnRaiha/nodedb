@@ -7,6 +7,9 @@ use smallvec::SmallVec;
 
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::credential::record::UserRecord;
+use crate::control::security::escalation::{
+    AuthViolation, ViolationSubject, record_auth_violation,
+};
 use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity, DatabaseSet};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
@@ -22,11 +25,14 @@ pub fn resolve_certificate_identity(
 ) -> crate::Result<AuthenticatedIdentity> {
     // Map cert CN to username (direct mapping: CN = username).
     let identity = stored_user_identity(state, cn, AuthMethod::Certificate).ok_or_else(|| {
-        state.audit_record(
-            AuditEvent::AuthFailure,
-            None,
-            peer_addr,
-            &format!("mTLS auth failed: no user for cert CN '{cn}'"),
+        record_auth_violation(
+            state,
+            AuthViolation {
+                subject: ViolationSubject::Username(cn),
+                tenant_id: None,
+                source: peer_addr,
+                detail: &format!("mTLS auth failed: no user for cert CN '{cn}'"),
+            },
         );
         state.auth_metrics.record_auth_failure("certificate");
         crate::Error::RejectedAuthz {

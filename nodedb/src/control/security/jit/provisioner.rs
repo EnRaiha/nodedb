@@ -118,6 +118,7 @@ pub fn provision_from_jwt(
         status: AuthStatus::Active,
         is_external: true,
         synced_claims: extract_sync_claims(claims),
+        escalation_suspensions: 0,
     };
 
     store.upsert(record)?;

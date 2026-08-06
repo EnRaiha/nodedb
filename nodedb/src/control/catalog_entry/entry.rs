@@ -13,7 +13,8 @@ use crate::control::security::catalog::{
     StoredMaterializedView, StoredOidcProvider, StoredRedactionPolicy, StoredRlsPolicy,
     StoredSynonymGroup,
     auth_types::{
-        StoredApiKey, StoredOwner, StoredPermission, StoredRole, StoredTenant, StoredUser,
+        StoredApiKey, StoredAuthUser, StoredOwner, StoredPermission, StoredRole, StoredTenant,
+        StoredUser,
     },
     function_types::StoredFunction,
     procedure_types::StoredProcedure,
@@ -189,6 +190,18 @@ pub enum CatalogEntry {
     /// record and re-writes the redb row. Preserves the record for
     /// audit trails.
     RevokeApiKey { key_id: String },
+
+    // ── Auth user ──────────────────────────────────────────────────
+    /// Upsert an externally-authenticated (`_system.auth_users`) record.
+    /// Carries the full record, so followers install it verbatim.
+    ///
+    /// Proposed by auto-escalation when repeated violations turn into a
+    /// `Suspended` / `Banned` verdict. Unlike the DDL variants, the
+    /// originating node has already written and installed the record before
+    /// proposing: an enforcement decision must hold on the node that reached
+    /// it even if replication is unavailable. Applying it is therefore an
+    /// idempotent upsert on every node, including the proposer.
+    PutAuthUser(Box<StoredAuthUser>),
 
     // ── Materialized View ──────────────────────────────────────────
     /// Upsert a materialized view definition. The Data Plane
@@ -440,6 +453,7 @@ impl CatalogEntry {
             Self::DeleteRole { .. } => "delete_role",
             Self::PutApiKey(_) => "put_api_key",
             Self::RevokeApiKey { .. } => "revoke_api_key",
+            Self::PutAuthUser(_) => "put_auth_user",
             Self::PutMaterializedView(_) => "put_materialized_view",
             Self::DeleteMaterializedView { .. } => "delete_materialized_view",
             Self::PutStreamingMaterializedView(_) => "put_streaming_materialized_view",

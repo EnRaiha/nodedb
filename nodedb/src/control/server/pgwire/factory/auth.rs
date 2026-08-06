@@ -11,6 +11,9 @@ use pgwire::error::{PgWireError, PgWireResult};
 use crate::control::security::audit::AuditEvent;
 use crate::control::security::credential::CredentialStore;
 use crate::control::security::credential::store::ScramLookup;
+use crate::control::security::escalation::{
+    AuthViolation, ViolationSubject, record_auth_violation,
+};
 use crate::control::state::SharedState;
 
 /// Bridges NodeDB's CredentialStore to pgwire's `AuthSource` trait.
@@ -94,11 +97,18 @@ impl AuthSource for NodeDbAuthSource {
 
         // Check lockout before returning credentials.
         if self.credentials.check_lockout(username).is_err() {
-            self.state.audit_record(
-                AuditEvent::AuthFailure,
-                None,
-                source,
-                &format!("user '{username}' is locked out"),
+            // Audit only: a standing lockout refusing its own retries is the
+            // verdict being enforced, not a fresh credential failure. The
+            // failures that produced the lockout were counted where they
+            // happened, in the SASL-failure arm of the startup handler.
+            record_auth_violation(
+                &self.state,
+                AuthViolation {
+                    subject: ViolationSubject::AuditOnly,
+                    tenant_id: None,
+                    source,
+                    detail: &format!("user '{username}' is locked out"),
+                },
             );
             // Constant-time floor for lockout rejection.
             let deadline = auth_start + AUTH_FLOOR;
@@ -135,11 +145,14 @@ impl AuthSource for NodeDbAuthSource {
                 // failure there are not double-counted. That arm re-derives
                 // the rejection reason and counts only genuine credential
                 // failures. `get_password` only emits the audit record.
-                self.state.audit_record(
-                    AuditEvent::AuthFailure,
-                    None,
-                    source,
-                    &format!("SCRAM credential lookup rejected for user: {username}"),
+                record_auth_violation(
+                    &self.state,
+                    AuthViolation {
+                        subject: ViolationSubject::AuditOnly,
+                        tenant_id: None,
+                        source,
+                        detail: &format!("SCRAM credential lookup rejected for user: {username}"),
+                    },
                 );
                 Err(PgWireError::InvalidPassword(username.to_owned()))
             }

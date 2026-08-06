@@ -10,6 +10,7 @@
 //! never grows unboundedly.
 
 pub mod api_key;
+pub mod auth_user;
 pub mod change_stream;
 pub mod collection;
 pub mod continuous_aggregate;
@@ -152,6 +153,7 @@ fn apply_to_inner(entry: &CatalogEntry, catalog: &SystemCatalog) {
         CatalogEntry::DeleteRole { name } => role::delete(name, catalog),
         CatalogEntry::PutApiKey(stored) => api_key::put(stored, catalog),
         CatalogEntry::RevokeApiKey { key_id } => api_key::revoke(key_id, catalog),
+        CatalogEntry::PutAuthUser(stored) => auth_user::put(stored, catalog),
         CatalogEntry::PutMaterializedView(stored) => materialized_view::put(stored, catalog),
         CatalogEntry::DeleteMaterializedView { tenant_id, name } => {
             if let Err(error) = materialized_view::delete(*tenant_id, name, catalog) {

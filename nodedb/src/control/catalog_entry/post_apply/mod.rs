@@ -17,6 +17,7 @@
 
 // Per-family modules (existing).
 pub mod api_key;
+pub mod auth_user;
 pub mod change_stream;
 pub mod collection;
 pub mod continuous_aggregate;

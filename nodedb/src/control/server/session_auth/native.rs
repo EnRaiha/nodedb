@@ -13,6 +13,9 @@ use crate::control::security::audit::{
     ArcAuditEmitter, AuditEmitContext, AuditEmitter, AuditEvent,
 };
 use crate::control::security::credential::store::{AuthRejection, PasswordVerification};
+use crate::control::security::escalation::{
+    AuthViolation, ViolationSubject, record_auth_violation,
+};
 use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity};
 use crate::control::state::SharedState;
 use crate::types::TenantId;
@@ -57,11 +60,14 @@ pub async fn authenticate(
     match method {
         "trust" => {
             if *auth_mode != AuthMode::Trust {
-                state.audit_record(
-                    AuditEvent::AuthFailure,
-                    None,
-                    peer_addr,
-                    "trust auth rejected: server requires authentication",
+                record_auth_violation(
+                    state,
+                    AuthViolation {
+                        subject: ViolationSubject::AuditOnly,
+                        tenant_id: None,
+                        source: peer_addr,
+                        detail: "trust auth rejected: server requires authentication",
+                    },
                 );
                 return Err(crate::Error::RejectedAuthz {
                     tenant_id: TenantId::new(0),
@@ -80,11 +86,16 @@ pub async fn authenticate(
                 })
                 .ok_or_else(|| {
                     let username = requested_username.unwrap_or("<configured>");
-                    state.audit_record(
-                        AuditEvent::AuthFailure,
-                        None,
-                        peer_addr,
-                        &format!("native trust auth rejected: user '{username}' does not exist"),
+                    record_auth_violation(
+                        state,
+                        AuthViolation {
+                            subject: ViolationSubject::Username(username),
+                            tenant_id: None,
+                            source: peer_addr,
+                            detail: &format!(
+                                "native trust auth rejected: user '{username}' does not exist"
+                            ),
+                        },
                     );
                     crate::Error::RejectedAuthz {
                         tenant_id: TenantId::new(0),
@@ -170,6 +181,21 @@ pub async fn authenticate(
 
             // Check lockout (after rate-limit, before Argon2).
             if let Err(e) = state.credentials.check_lockout(username) {
+                // Audit only: a standing lockout refusing its own retries is
+                // the verdict being enforced, not a fresh credential failure.
+                // The failures that produced the lockout were counted where
+                // they happened, in the password-rejection arm below. Mirrors
+                // the pgwire lockout branch so a native-protocol rejection is
+                // as visible in the audit log as a pgwire one.
+                record_auth_violation(
+                    state,
+                    AuthViolation {
+                        subject: ViolationSubject::AuditOnly,
+                        tenant_id: None,
+                        source: peer_addr,
+                        detail: &format!("user '{username}' is locked out"),
+                    },
+                );
                 // Constant-time floor before returning lockout error.
                 enforce_auth_floor(auth_start).await;
                 return Err(e);
@@ -204,11 +230,14 @@ pub async fn authenticate(
                             .rate_limiter
                             .record_login_failure(&peer_ip_str, username);
                     }
-                    state.audit_record(
-                        AuditEvent::AuthFailure,
-                        None,
-                        peer_addr,
-                        &format!("native password auth failed: {username}"),
+                    record_auth_violation(
+                        state,
+                        AuthViolation {
+                            subject: ViolationSubject::Username(username),
+                            tenant_id: None,
+                            source: peer_addr,
+                            detail: &format!("native password auth failed: {username}"),
+                        },
                     );
                     state.auth_metrics.record_auth_failure("password");
                     // Argon2 already ran (≈AUTH_FLOOR elapsed); the sleep is
@@ -252,11 +281,14 @@ pub async fn authenticate(
 
             verify_api_key_identity(state, token, peer_addr, "native")
                 .ok_or_else(|| {
-                    state.audit_record(
-                        AuditEvent::AuthFailure,
-                        None,
-                        peer_addr,
-                        "native api_key auth failed: invalid token or owner not found",
+                    record_auth_violation(
+                        state,
+                        AuthViolation {
+                            subject: ViolationSubject::AuditOnly,
+                            tenant_id: None,
+                            source: peer_addr,
+                            detail: "native api_key auth failed: invalid token or owner not found",
+                        },
                     );
                     state.auth_metrics.record_auth_failure("api_key");
                     crate::Error::RejectedAuthz {

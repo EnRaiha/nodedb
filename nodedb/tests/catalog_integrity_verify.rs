@@ -203,6 +203,7 @@ fn classify(entry: &CatalogEntry) -> VariantClass {
         CatalogEntry::DeleteRole { .. } => VariantClass::Exempt,
         CatalogEntry::PutApiKey(_) => VariantClass::Exempt,
         CatalogEntry::RevokeApiKey { .. } => VariantClass::Exempt,
+        CatalogEntry::PutAuthUser(_) => VariantClass::Exempt,
         CatalogEntry::PutPermission(_) => VariantClass::Exempt,
         CatalogEntry::DeletePermission { .. } => VariantClass::Exempt,
         CatalogEntry::PutTenant(_) => VariantClass::Exempt,

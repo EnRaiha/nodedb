@@ -9,7 +9,9 @@
 use pgwire::api::ClientInfo;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
-use crate::control::security::audit::AuditEvent;
+use crate::control::security::escalation::{
+    AuthViolation, ViolationSubject, record_auth_violation,
+};
 use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity};
 use crate::control::server::session_auth::identity::stored_user_identity;
 
@@ -39,11 +41,14 @@ impl NodeDbPgHandler {
         }
 
         let source = client.socket_addr().to_string();
-        self.state.audit_record(
-            AuditEvent::AuthFailure,
-            None,
-            &source,
-            &format!("trust auth: user '{username}' does not exist"),
+        record_auth_violation(
+            &self.state,
+            AuthViolation {
+                subject: ViolationSubject::Username(username.as_str()),
+                tenant_id: None,
+                source: &source,
+                detail: &format!("trust auth: user '{username}' does not exist"),
+            },
         );
         Err(PgWireError::UserError(Box::new(ErrorInfo::new(
             "FATAL".to_owned(),

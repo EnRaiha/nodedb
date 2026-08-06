@@ -133,6 +133,7 @@ fn set_account_status(shared: &SharedState, status: AuthStatus) {
             status,
             is_external: true,
             synced_claims: Default::default(),
+            escalation_suspensions: 0,
         })
         .expect("upsert auth user record");
 }

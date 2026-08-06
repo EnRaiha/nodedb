@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use super::gateway_invalidation::invalidate_gateway_cache_for_entry;
 use super::{
-    api_key, change_stream, collection, continuous_aggregate, custom_type, database, function,
-    materialized_view, owner, permission, procedure, redaction, rls, role, schedule, sequence,
-    streaming_materialized_view, synonym_group, tenant, trigger, user,
+    api_key, auth_user, change_stream, collection, continuous_aggregate, custom_type, database,
+    function, materialized_view, owner, permission, procedure, redaction, rls, role, schedule,
+    sequence, streaming_materialized_view, synonym_group, tenant, trigger, user,
 };
 use crate::control::catalog_entry::entry::CatalogEntry;
 use crate::control::state::SharedState;
@@ -155,6 +155,9 @@ pub fn apply_post_apply_side_effects_sync(entry: &CatalogEntry, shared: &Arc<Sha
         }
         CatalogEntry::RevokeApiKey { key_id } => {
             api_key::revoke(key_id.clone(), Arc::clone(shared));
+        }
+        CatalogEntry::PutAuthUser(stored) => {
+            auth_user::put((**stored).clone(), Arc::clone(shared));
         }
         CatalogEntry::PutMaterializedView(stored) => {
             materialized_view::put((**stored).clone(), Arc::clone(shared));

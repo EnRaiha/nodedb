@@ -108,6 +108,28 @@ impl SharedState {
             auth_config.risk.clone().unwrap_or_default(),
         );
 
+        // `auth_config.escalation` is `None` unless the operator configured an
+        // `[auth.escalation]` section, and `EscalationConfig::default()` has
+        // `enabled = false`, so no account is auto-suspended either way. When
+        // it is configured the operator's thresholds reach the engine here —
+        // the one place they can, since `EscalationEngine` reads its config
+        // only at construction.
+        let escalation = crate::control::security::escalation::EscalationEngine::new(
+            auth_config.escalation.clone().unwrap_or_default(),
+        );
+
+        // Auth users are catalog-backed in production: an escalation verdict
+        // written to a record has to still be there after a restart, and a
+        // memory-only store would drop it.
+        let auth_users = crate::control::security::jit::auth_user::AuthUserStore::open(
+            credentials.catalog().clone(),
+        )?;
+        // Restore the suspend → ban ladder from the persisted records before
+        // any request is served.
+        for user in auth_users.list(false) {
+            escalation.hydrate_suspensions(&user.id, user.escalation_suspensions);
+        }
+
         let state = Arc::new(Self {
             dispatcher: Mutex::new(dispatcher),
             tracker: RequestTracker::new(),
@@ -274,7 +296,7 @@ impl SharedState {
             migration_tracker: None,
             rls: rls_store,
             blacklist,
-            auth_users: crate::control::security::jit::auth_user::AuthUserStore::new(),
+            auth_users,
             orgs: crate::control::security::org::store::OrgStore::new(),
             scope_defs: crate::control::security::scope::store::ScopeStore::new(),
             scope_grants: crate::control::security::scope::grant::ScopeGrantStore::new(),
@@ -284,7 +306,7 @@ impl SharedState {
                     &auth_config.session,
                 ),
             session_registry: prod_session_registry,
-            escalation: crate::control::security::escalation::EscalationEngine::default(),
+            escalation,
             usage_counter: Arc::new(
                 crate::control::security::metering::counter::UsageCounter::new(),
             ),

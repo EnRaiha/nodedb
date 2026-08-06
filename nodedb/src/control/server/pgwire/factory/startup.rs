@@ -13,6 +13,9 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use crate::control::security::audit::{ArcAuditEmitter, AuditEvent};
 use crate::control::security::credential::store::{AuthRejection, ScramLookup};
+use crate::control::security::escalation::{
+    AuthViolation, ViolationSubject, record_auth_violation,
+};
 use crate::control::state::SharedState;
 
 use super::super::handler::NodeDbPgHandler;
@@ -205,11 +208,24 @@ impl StartupHandler for AuthStartup {
                                 .rate_limiter
                                 .record_login_failure(&scram_ip_str, &username);
                         }
-                        state.audit_record(
-                            AuditEvent::AuthFailure,
-                            None,
-                            &source,
-                            &format!("SCRAM-SHA-256 auth failed: {username}"),
+                        // Escalation follows the same `counts` gate as the
+                        // lockout and brute-force counters: a rate-limited or
+                        // policy-rejected SASL failure says nothing about the
+                        // client's proof, so it is audited without being
+                        // counted against the account.
+                        let subject = if counts {
+                            ViolationSubject::Username(username.as_str())
+                        } else {
+                            ViolationSubject::AuditOnly
+                        };
+                        record_auth_violation(
+                            state,
+                            AuthViolation {
+                                subject,
+                                tenant_id: None,
+                                source: &source,
+                                detail: &format!("SCRAM-SHA-256 auth failed: {username}"),
+                            },
                         );
                     }
                     _ => {}

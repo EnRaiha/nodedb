@@ -20,6 +20,14 @@ pub struct StoredAuthUser {
     pub is_external: bool,
     #[msgpack(default)]
     pub synced_claims: std::collections::HashMap<String, String>,
+    /// How many times auto-escalation has suspended this account.
+    ///
+    /// Persisted so the suspend → ban ladder survives a restart: the rolling
+    /// violation counters behind it are process-local by design, but the rung
+    /// the account has already reached is an enforcement decision and must
+    /// not reset when the process does.
+    #[msgpack(default)]
+    pub escalation_suspensions: u32,
 }
 
 fn default_status() -> String {

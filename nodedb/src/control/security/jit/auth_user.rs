@@ -42,6 +42,8 @@ pub struct AuthUserRecord {
     pub is_external: bool,
     /// Last synced JWT claims.
     pub synced_claims: HashMap<String, String>,
+    /// How many times auto-escalation has suspended this account.
+    pub escalation_suspensions: u32,
 }
 
 impl AuthUserRecord {
@@ -58,6 +60,7 @@ impl AuthUserRecord {
             status: s.status.parse().unwrap_or_default(),
             is_external: s.is_external,
             synced_claims: s.synced_claims.clone(),
+            escalation_suspensions: s.escalation_suspensions,
         }
     }
 
@@ -74,8 +77,24 @@ impl AuthUserRecord {
             status: self.status.to_string(),
             is_external: self.is_external,
             synced_claims: self.synced_claims.clone(),
+            escalation_suspensions: self.escalation_suspensions,
         }
     }
+}
+
+/// An auto-escalation verdict to install on an auth-user record.
+pub struct EscalationVerdict {
+    /// Auth-user id — the stringified identity `user_id`, the same key
+    /// `check_blacklist` looks the status up under.
+    pub user_id: String,
+    /// Username, used when the record has to be created.
+    pub username: String,
+    /// Tenant, used when the record has to be created.
+    pub tenant_id: crate::types::TenantId,
+    /// Status the account is moved to.
+    pub status: AuthStatus,
+    /// Durable suspension count backing the ban ladder.
+    pub suspensions: u32,
 }
 
 /// Thread-safe auth user store.
@@ -138,6 +157,63 @@ impl AuthUserStore {
         let mut users = self.users.write();
         users.insert(record.id.clone(), record);
         Ok(())
+    }
+
+    /// Install a record replicated from another node: update the in-memory
+    /// cache only. The redb row was already written by the catalog applier,
+    /// so re-writing it here would be a redundant second write.
+    pub fn install_replicated(&self, stored: &StoredAuthUser) {
+        let record = AuthUserRecord::from_stored(stored);
+        let mut users = self.users.write();
+        users.insert(record.id.clone(), record);
+    }
+
+    /// Install an auto-escalation verdict, creating the record if this account
+    /// has never had one — an escalated account must be refusable on the next
+    /// request whether or not it was JIT-provisioned. Returns the persisted
+    /// form so the caller can replicate it.
+    pub fn apply_escalation(&self, verdict: EscalationVerdict) -> crate::Result<StoredAuthUser> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut users = self.users.write();
+        let record = users
+            .entry(verdict.user_id.clone())
+            .or_insert_with(|| AuthUserRecord {
+                id: verdict.user_id.clone(),
+                username: verdict.username,
+                email: String::new(),
+                tenant_id: verdict.tenant_id.as_u64(),
+                provider: "escalation".to_string(),
+                first_seen: now,
+                last_seen: now,
+                is_active: true,
+                status: AuthStatus::Active,
+                is_external: false,
+                synced_claims: HashMap::new(),
+                escalation_suspensions: 0,
+            });
+
+        record.status = verdict.status;
+        record.is_active = matches!(
+            verdict.status,
+            AuthStatus::Active | AuthStatus::Restricted | AuthStatus::ReadOnly
+        );
+        record.escalation_suspensions = record.escalation_suspensions.max(verdict.suspensions);
+
+        let stored = record.to_stored();
+        if let Some(ref catalog) = self.catalog {
+            catalog.put_auth_user(&stored)?;
+        }
+        info!(
+            user_id = %stored.id,
+            status = %verdict.status,
+            suspensions = stored.escalation_suspensions,
+            "auth user escalated"
+        );
+        Ok(stored)
     }
 
     /// Update the `last_seen` timestamp for a user.
@@ -270,6 +346,7 @@ mod tests {
             status: AuthStatus::Active,
             is_external: true,
             synced_claims: HashMap::new(),
+            escalation_suspensions: 0,
         }
     }
 

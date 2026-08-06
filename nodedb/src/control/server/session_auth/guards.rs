@@ -2,8 +2,10 @@
 
 //! Post-identity authorization guards: blacklist, risk, and rate-limit checks.
 
-use crate::control::security::audit::AuditEvent;
 use crate::control::security::auth_context::AuthContext;
+use crate::control::security::escalation::{
+    AuthViolation, ViolationSubject, record_auth_violation,
+};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::state::SharedState;
 
@@ -18,14 +20,17 @@ pub fn check_blacklist(
     // Check user blacklist.
     let user_id = identity.user_id.to_string();
     if let Some(entry) = state.blacklist.check_user(&user_id) {
-        state.audit_record(
-            AuditEvent::AuthFailure,
-            Some(identity.tenant_id),
-            peer_addr,
-            &format!(
-                "blacklisted user '{}' denied: {}",
-                identity.username, entry.reason
-            ),
+        record_auth_violation(
+            state,
+            AuthViolation {
+                subject: ViolationSubject::Identity(identity),
+                tenant_id: Some(identity.tenant_id),
+                source: peer_addr,
+                detail: &format!(
+                    "blacklisted user '{}' denied: {}",
+                    identity.username, entry.reason
+                ),
+            },
         );
         return Err(crate::Error::RejectedAuthz {
             tenant_id: identity.tenant_id,
@@ -35,11 +40,14 @@ pub fn check_blacklist(
 
     // Check IP blacklist.
     if let Some(entry) = state.blacklist.check_ip(peer_addr) {
-        state.audit_record(
-            AuditEvent::AuthFailure,
-            Some(identity.tenant_id),
-            peer_addr,
-            &format!("blacklisted IP '{peer_addr}' denied: {}", entry.reason),
+        record_auth_violation(
+            state,
+            AuthViolation {
+                subject: ViolationSubject::Identity(identity),
+                tenant_id: Some(identity.tenant_id),
+                source: peer_addr,
+                detail: &format!("blacklisted IP '{peer_addr}' denied: {}", entry.reason),
+            },
         );
         return Err(crate::Error::RejectedAuthz {
             tenant_id: identity.tenant_id,
@@ -55,14 +63,20 @@ pub fn check_blacklist(
             crate::control::security::auth_context::AuthStatus::Suspended
                 | crate::control::security::auth_context::AuthStatus::Banned
         ) {
-            state.audit_record(
-                AuditEvent::AuthFailure,
-                Some(identity.tenant_id),
-                peer_addr,
-                &format!(
-                    "auth user '{}' denied: account {}",
-                    identity.username, ctx_status
-                ),
+            // Audit only: this rejection *is* the standing verdict being
+            // enforced, so counting it would let a retry loop advance the
+            // ladder from its own refusals.
+            record_auth_violation(
+                state,
+                AuthViolation {
+                    subject: ViolationSubject::AuditOnly,
+                    tenant_id: Some(identity.tenant_id),
+                    source: peer_addr,
+                    detail: &format!(
+                        "auth user '{}' denied: account {}",
+                        identity.username, ctx_status
+                    ),
+                },
             );
             return Err(crate::Error::RejectedAuthz {
                 tenant_id: identity.tenant_id,
@@ -76,14 +90,19 @@ pub fn check_blacklist(
     let user_org_ids = state.orgs.orgs_for_user(&user_id);
     for org_id in &user_org_ids {
         if !state.orgs.is_active(org_id) {
-            state.audit_record(
-                AuditEvent::AuthFailure,
-                Some(identity.tenant_id),
-                peer_addr,
-                &format!(
-                    "org '{}' is not active — user '{}' blocked",
-                    org_id, identity.username
-                ),
+            // Audit only: the org's status, not the user's conduct, is what
+            // refuses this request.
+            record_auth_violation(
+                state,
+                AuthViolation {
+                    subject: ViolationSubject::AuditOnly,
+                    tenant_id: Some(identity.tenant_id),
+                    source: peer_addr,
+                    detail: &format!(
+                        "org '{}' is not active — user '{}' blocked",
+                        org_id, identity.username
+                    ),
+                },
             );
             return Err(crate::Error::RejectedAuthz {
                 tenant_id: identity.tenant_id,
@@ -119,21 +138,21 @@ pub fn check_risk(
         return Ok(());
     };
 
-    state.audit_record(
-        AuditEvent::AuthFailure,
-        Some(identity.tenant_id),
-        peer_addr,
-        &format!(
-            "risk gate refused user '{}': {}",
-            identity.username, refusal.audit_detail
-        ),
+    // A refusal here is exactly the repeated-violation signal auto-escalation
+    // consumes, so it goes through the shared recorder like every other
+    // rejection: one call, audit entry plus violation count.
+    record_auth_violation(
+        state,
+        AuthViolation {
+            subject: ViolationSubject::Identity(identity),
+            tenant_id: Some(identity.tenant_id),
+            source: peer_addr,
+            detail: &format!(
+                "risk gate refused user '{}': {}",
+                identity.username, refusal.audit_detail
+            ),
+        },
     );
-
-    // Escalation seam: a refusal here is exactly the repeated-violation
-    // signal `EscalationEngine` consumes, and wiring it is one line —
-    // `state.escalation.record_violation(&auth_ctx.id);` — placed right
-    // here, before the error is returned, so a user who keeps tripping the
-    // risk gate escalates to Suspended/Banned like any other violator.
 
     Err(crate::Error::RejectedAuthz {
         tenant_id: identity.tenant_id,

@@ -182,6 +182,8 @@ pub fn spawn_post_apply_async_side_effects(
         | CatalogEntry::DeleteRole { .. }
         | CatalogEntry::PutApiKey(_)
         | CatalogEntry::RevokeApiKey { .. }
+        // The auth-user cache install is synchronous, in `sync.rs`.
+        | CatalogEntry::PutAuthUser(_)
         | CatalogEntry::PutMaterializedView(_)
         | CatalogEntry::PutStreamingMaterializedView(_)
         | CatalogEntry::DeleteStreamingMaterializedView { .. }

@@ -396,6 +396,7 @@ mod tests {
                 status: crate::control::security::auth_context::AuthStatus::Suspended,
                 is_external: true,
                 synced_claims: std::collections::HashMap::new(),
+                escalation_suspensions: 0,
             })
             .expect("register suspended auth user");
 

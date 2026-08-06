@@ -35,6 +35,7 @@ use crate::control::state::SharedState;
 /// | PutUser / DropUser                      | ❌ no       | authz checked at exec time |
 /// | PutRole / DeleteRole                    | ❌ no       | same |
 /// | PutApiKey / RevokeApiKey                | ❌ no       | same |
+/// | PutAuthUser                             | ❌ no       | account status re-read at admission time |
 /// | PutMaterializedView / DeleteMaterializedView | ❌ no  | MV definition is its own catalog object; write-path `materialized_sum_sources` is set at collection-register time via PutCollection, not updated by PutMaterializedView independently |
 /// | PutContinuousAggregate / DeleteContinuousAggregate | ❌ no | CA definition is its own catalog object; runtime manager re-registers via MetaOp dispatch, never appears in a PhysicalPlan variant |
 /// | PutTenant / DeleteTenant                | ❌ no       | tenant identity does not affect plan shape |
@@ -139,6 +140,10 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         }
         CatalogEntry::RevokeApiKey { .. } => {
             // no-op: same as PutApiKey.
+        }
+        CatalogEntry::PutAuthUser(_) => {
+            // no-op: account status is re-read from the auth-user store on
+            // every request by the admission gate, never baked into a plan.
         }
 
         // ── Materialized view: MV definition is a separate catalog object ────

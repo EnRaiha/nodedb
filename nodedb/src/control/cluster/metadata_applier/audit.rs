@@ -209,6 +209,7 @@ pub(super) fn describe_entry(e: &catalog_entry::CatalogEntry) -> (String, u64, S
         E::DeleteRole { name, .. } => (name.clone(), 0, String::new()),
         E::PutApiKey(k) => (k.key_id.clone(), 0, String::new()),
         E::RevokeApiKey { key_id, .. } => (key_id.clone(), 0, String::new()),
+        E::PutAuthUser(u) => (u.id.clone(), 0, String::new()),
         E::PutMaterializedView(m) => (m.name.clone(), 0, String::new()),
         E::DeleteMaterializedView { name, .. } => (name.clone(), 0, String::new()),
         E::PutStreamingMaterializedView(m) => (m.name.clone(), 0, String::new()),

@@ -33,9 +33,9 @@ use super::guards::{check_blacklist, check_rate_limit, check_risk};
 /// 3. [`AuthContext::check_status`](crate::control::security::auth_context::AuthContext::check_status)
 ///    — account status (`Suspended` / `Banned`). This is *not* redundant with
 ///    the blacklist's auth-user status check: the blacklist reads the
-///    persistent `state.auth_users` store, whereas `AuthContext.status` is
-///    built `Active` and is only mutated in-session by the escalation engine
-///    onto a possibly-pooled context. Both must be checked.
+///    persistent `state.auth_users` store — where auto-escalation lands its
+///    verdicts — whereas `AuthContext.status` carries the status the session
+///    was built with, on a possibly-pooled context. Both must be checked.
 /// 4. [`check_risk`] — the adaptive-auth risk decision for the score the
 ///    scope was built with. Off unless the operator enabled `[auth.risk]`.
 ///    It runs after the cheap identity-shaped rejections and before the rate

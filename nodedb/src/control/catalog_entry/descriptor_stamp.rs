@@ -26,7 +26,7 @@
 //!
 //! Not every `CatalogEntry` variant carries descriptor version/HLC.
 //! `PutUser`, `PutRole`, `PutPermission`, `PutOwner`, `PutTenant`,
-//! `PutApiKey`, `PutRlsPolicy`, `PutSchedule`, `PutChangeStream`,
+//! `PutApiKey`, `PutAuthUser`, `PutRlsPolicy`, `PutSchedule`, `PutChangeStream`,
 //! `PutSequenceState`, and the `Delete*` / `Deactivate*` variants
 //! are returned unchanged. The helper is exhaustive on
 //! [`CatalogEntry`] so adding a new variant is a compile-time
@@ -191,6 +191,8 @@ pub fn stamp(entry: CatalogEntry, clock: &HlcClock, catalog: &SystemCatalog) -> 
         | CatalogEntry::DeleteRole { .. }
         | CatalogEntry::PutApiKey(_)
         | CatalogEntry::RevokeApiKey { .. }
+        // Auth-user records carry no descriptor version.
+        | CatalogEntry::PutAuthUser(_)
         | CatalogEntry::PutTenant(_)
         | CatalogEntry::PutTenantWithAdmin { .. }
         | CatalogEntry::DeleteTenant { .. }

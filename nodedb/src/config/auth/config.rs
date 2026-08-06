@@ -437,6 +437,13 @@ pub struct AuthConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<crate::control::security::risk::RiskConfig>,
 
+    /// Auto-escalation configuration (violation thresholds, rolling window,
+    /// tracked-user bound). Absent — and, when present, absent
+    /// `enabled = true` — leaves escalation off: violations are still
+    /// audited, but no account is suspended or banned automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<crate::control::security::escalation::EscalationConfig>,
+
     /// Opaque session handle configuration: fingerprint binding, resolve
     /// rate-limit, miss-spike detection.
     #[serde(default)]
@@ -465,6 +472,7 @@ impl Default for AuthConfig {
             metering: None,
             siem: None,
             risk: None,
+            escalation: None,
             session: SessionHandleConfig::default(),
         }
     }
