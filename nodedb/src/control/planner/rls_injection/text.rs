@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: BUSL-1.1
+
+//! RLS resolution for full-text-search operations.
+
+use nodedb_physical::physical_plan::TextOp;
+
+use super::context::RlsCtx;
+
+/// Exhaustive over [`TextOp`] so a new text operation forces a decision
+/// between injecting, refusing, and no-op.
+pub(super) fn inject_text(ctx: &RlsCtx<'_>, op: &mut TextOp) -> crate::Result<()> {
+    match op {
+        // Inject: the policy lands in the post-score / post-fusion slot the
+        // handler applies before the ranked hits are returned. The result may
+        // hold fewer than `top_k` rows, which is the intended effect.
+        TextOp::Search {
+            collection,
+            rls_filters,
+            ..
+        }
+        | TextOp::HybridSearch {
+            collection,
+            rls_filters,
+            ..
+        }
+        | TextOp::HybridSearchTriple {
+            collection,
+            rls_filters,
+            ..
+        } => ctx.set_post_filters(collection, rls_filters),
+
+        // Refuse: the score scan emits every document in the collection with a
+        // score column appended, and the phrase search emits every positional
+        // hit — neither carries a filter slot for the policy to occupy.
+        TextOp::BM25ScoreScan { collection, .. } | TextOp::PhraseSearch { collection, .. } => ctx
+            .refuse_if_policy(
+                collection,
+                "the search returns matched document rows through a response shape that carries \
+                 no row filter",
+            ),
+
+        // No-op: index writes and per-collection analyzer configuration.
+        TextOp::FtsIndexDoc { .. } | TextOp::FtsDeleteDoc { .. } | TextOp::SetTextConfig { .. } => {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nodedb_physical::physical_plan::TextOp;
+
+    use super::super::plan::test_support::{assert_refused, inject, store_with_read_policy};
+    use crate::bridge::envelope::PhysicalPlan;
+
+    /// A BM25 score scan returns every row of the collection with no slot for
+    /// the policy, so it is refused rather than silently over-returning.
+    #[test]
+    fn bm25_score_scan_is_refused_under_a_read_policy() {
+        let store = store_with_read_policy("articles");
+        let mut plan = PhysicalPlan::Text(TextOp::BM25ScoreScan {
+            collection: "articles".into(),
+            query: "rust".into(),
+            score_alias: "score".into(),
+            fuzzy: false,
+        });
+        assert_refused(inject(&mut plan, &store), "articles");
+    }
+
+    /// A BM25 search does carry the slot, so the policy is injected.
+    #[test]
+    fn search_receives_the_policy_filter() {
+        let store = store_with_read_policy("articles");
+        let mut plan = PhysicalPlan::Text(TextOp::Search {
+            collection: "articles".into(),
+            query: "rust".into(),
+            top_k: 10,
+            fuzzy: false,
+            prefilter: None,
+            rls_filters: Vec::new(),
+        });
+        assert!(inject(&mut plan, &store).is_ok());
+        match &plan {
+            PhysicalPlan::Text(TextOp::Search { rls_filters, .. }) => {
+                assert!(!rls_filters.is_empty(), "policy filter must be injected")
+            }
+            other => panic!("plan shape changed: {other:?}"),
+        }
+    }
+}

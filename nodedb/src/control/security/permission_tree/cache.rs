@@ -234,6 +234,15 @@ impl PermissionCache {
         !self.tree_defs.is_empty()
     }
 
+    /// Check if any permission tree definition is registered for this tenant.
+    ///
+    /// Used by plan-time enforcement for operations that name no collection:
+    /// they cannot be shown to avoid a governed collection, so the question
+    /// widens to the whole tenant.
+    pub fn has_tree_defs_for_tenant(&self, tenant_id: u64) -> bool {
+        self.tree_defs.keys().any(|(tid, _)| *tid == tenant_id)
+    }
+
     /// Check if any tree def for this tenant uses `collection` as its permission table.
     pub fn tree_defs_using_permission_table(&self, tenant_id: u64, collection: &str) -> bool {
         self.tree_defs
