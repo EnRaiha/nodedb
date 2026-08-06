@@ -15,7 +15,7 @@ use crate::event::types::WriteEvent;
 
 use super::registry::MvRegistry;
 use super::state::MvState;
-use super::types::AggFunction;
+use super::types::{AggDef, AggFunction};
 
 /// Process a WriteEvent against all streaming MVs sourced from a given stream.
 ///
@@ -110,7 +110,7 @@ fn update_mv(event: &CdcEvent, mv_state: &MvState) {
     let agg_values: Vec<f64> = mv_state
         .aggregates
         .iter()
-        .map(|agg| extract_agg_value(event, agg.function, &agg.input_expr))
+        .map(|agg| extract_agg_value(event, agg))
         .collect();
 
     mv_state.update_with_time(&group_key, &agg_values, event.event_time);
@@ -157,24 +157,15 @@ fn extract_group_key(event: &CdcEvent, group_by_columns: &[String]) -> String {
 /// Extract a numeric value for an aggregate function from the event.
 ///
 /// For COUNT, always returns 1.0 (each event counts as one).
-/// For SUM/MIN/MAX/AVG, parses the input expression as a field path
-/// and extracts the numeric value from new_value.
-fn extract_agg_value(event: &CdcEvent, func: AggFunction, input_expr: &str) -> f64 {
-    if func == AggFunction::Count {
+/// For SUM/MIN/MAX/AVG, the aggregate's source column — the same one the
+/// definition-time redaction refusal decides on — is read from new_value.
+fn extract_agg_value(event: &CdcEvent, agg: &AggDef) -> f64 {
+    if agg.function == AggFunction::Count {
         return 1.0; // Each event counts as one.
     }
-
-    // Parse input_expr as a field name (simple case).
-    // Supports: "field_name" or "doc_get(new_value, '$.field')".
-    let field_name = if input_expr.contains("doc_get") {
-        // Extract field path from doc_get(new_value, '$.field').
-        input_expr
-            .split("'$.")
-            .nth(1)
-            .and_then(|s| s.split('\'').next())
-            .unwrap_or(input_expr)
-    } else {
-        input_expr.trim()
+    let Some(field_name) = agg.source_field() else {
+        // An aggregate naming no column has nothing to read.
+        return f64::NAN; // NaN → skipped by GroupState::update.
     };
 
     // Look up the field in new_value.
@@ -193,7 +184,14 @@ fn extract_agg_value(event: &CdcEvent, func: AggFunction, input_expr: &str) -> f
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::streaming_mv::types::AggDef;
+
+    fn agg(function: AggFunction, input_expr: &str) -> AggDef {
+        AggDef {
+            output_name: "out".into(),
+            function,
+            input_expr: input_expr.into(),
+        }
+    }
 
     fn make_event(op: &str, total: f64) -> CdcEvent {
         CdcEvent {
@@ -239,13 +237,38 @@ mod tests {
     #[test]
     fn extract_agg_value_count() {
         let event = make_event("INSERT", 99.0);
-        assert_eq!(extract_agg_value(&event, AggFunction::Count, ""), 1.0);
+        assert_eq!(extract_agg_value(&event, &agg(AggFunction::Count, "")), 1.0);
     }
 
     #[test]
     fn extract_agg_value_sum() {
         let event = make_event("INSERT", 42.5);
-        assert_eq!(extract_agg_value(&event, AggFunction::Sum, "total"), 42.5);
+        assert_eq!(
+            extract_agg_value(&event, &agg(AggFunction::Sum, "total")),
+            42.5
+        );
+    }
+
+    /// A `doc_get` wrapper names the same stored column the plain form does, so
+    /// both the extraction and the definition-time refusal see one field name.
+    #[test]
+    fn extract_agg_value_reads_a_doc_get_wrapped_field() {
+        let event = make_event("INSERT", 7.5);
+        assert_eq!(
+            extract_agg_value(
+                &event,
+                &agg(AggFunction::Sum, "doc_get(new_value, '$.total')")
+            ),
+            7.5
+        );
+    }
+
+    /// A non-COUNT aggregate naming no column reads nothing, and must stay NaN
+    /// so `GroupState::update` skips it rather than counting it as a value.
+    #[test]
+    fn extract_agg_value_without_a_column_is_nan() {
+        let event = make_event("INSERT", 42.5);
+        assert!(extract_agg_value(&event, &agg(AggFunction::Sum, "  ")).is_nan());
     }
 
     #[test]

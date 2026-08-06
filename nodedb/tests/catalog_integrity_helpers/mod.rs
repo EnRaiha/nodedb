@@ -195,6 +195,7 @@ pub fn make_stream(name: &str) -> ChangeStreamDef {
         kafka: Default::default(),
         owner: ADMIN.into(),
         created_at: 0,
+        subscriber_roles: Vec::new(),
     }
 }
 

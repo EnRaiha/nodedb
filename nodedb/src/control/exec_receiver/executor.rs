@@ -338,6 +338,13 @@ impl LocalPlanExecutor {
                         });
                     }
                 };
+            // The events are handed to an authenticated peer node, not to a
+            // subscriber: this is an internal buffer read, and the requesting
+            // node applies its caller's column redaction at the delivery
+            // surface that asked for them (the stream SELECT, the HTTP poll,
+            // and the SSE endpoint each redact what `consume_remote` returns).
+            // Redaction policies are catalog state replicated to every node, so
+            // the rules are the same on both sides of this hop.
             return match crate::event::cdc::consume::consume_local_with_offsets(
                 &self.state,
                 &params,

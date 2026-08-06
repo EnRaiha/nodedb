@@ -175,6 +175,7 @@ mod tests {
             kafka: crate::event::kafka::KafkaDeliveryConfig::default(),
             owner: "admin".into(),
             created_at: 1000,
+            subscriber_roles: Vec::new(),
         }
     }
 

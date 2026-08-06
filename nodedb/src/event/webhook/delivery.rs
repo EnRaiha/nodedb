@@ -15,7 +15,9 @@ use sonic_rs;
 use tokio::sync::watch;
 use tracing::{debug, info, trace, warn};
 
+use crate::control::security::redaction::RedactionStore;
 use crate::control::state::SharedState;
+use crate::event::cdc::CdcSubscriberScope;
 use crate::event::cdc::event::CdcEvent;
 
 use super::types::WebhookConfig;
@@ -117,24 +119,40 @@ async fn delivery_loop(
                     "delivering webhook batch"
                 );
 
-                // POST each event individually (not batched — simpler retry semantics).
-                let mut delivered = 0u32;
-                for event in &consume_result.events {
-                    if deliver_event(&client, &config, event, &stream_name).await {
-                        delivered += 1;
-                    }
-                    // If delivery fails, we stop the batch here.
-                    // Next cycle will retry from the last committed offset.
-                    else {
-                        break;
-                    }
-                }
+                // The destination is subscribed on behalf of the principal that
+                // created the stream, whose roles the subscription record
+                // carries. Without that record there is no scope to evaluate a
+                // column redaction policy against, so nothing is delivered.
+                let Some(mut subscriber) =
+                    CdcSubscriberScope::for_stream(&state, database_id, tenant_id, &stream_name)
+                else {
+                    warn!(
+                        stream = %stream_name,
+                        "webhook delivery: change stream is not registered — \
+                         refusing to deliver events with no subscriber scope"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                };
 
-                // Commit offsets for successfully delivered events.
+                // POST each event individually (not batched — simpler retry semantics).
+                let delivered = deliver_batch(BatchDelivery {
+                    client: &client,
+                    config: &config,
+                    stream_name: &stream_name,
+                    store: &state.redaction,
+                    subscriber: &mut subscriber,
+                    events: &consume_result.events,
+                })
+                .await;
+
+                // Commit offsets for the events this cycle finished with.
                 if delivered > 0 {
                     // Commit the exact composite position of the last
-                    // successfully delivered event in each partition.
-                    let delivered_events = &consume_result.events[..delivered as usize];
+                    // processed event in each partition, taken from the batch
+                    // as consumed: an event withheld by a redaction rule is
+                    // finished with too, and must not be redelivered forever.
+                    let delivered_events = &consume_result.events[..delivered];
                     let mut partition_max = std::collections::HashMap::new();
                     for event in delivered_events {
                         let entry = partition_max
@@ -169,7 +187,7 @@ async fn delivery_loop(
                 }
 
                 // If we delivered everything, immediately try again (more may have arrived).
-                if delivered as usize == batch_size {
+                if delivered == batch_size {
                     tokio::task::yield_now().await;
                     continue;
                 }
@@ -195,6 +213,45 @@ async fn delivery_loop(
             _ = shutdown.changed() => {}
         }
     }
+}
+
+/// One batch delivery's inputs.
+struct BatchDelivery<'a> {
+    client: &'a reqwest::Client,
+    config: &'a WebhookConfig,
+    stream_name: &'a str,
+    store: &'a RedactionStore,
+    subscriber: &'a mut CdcSubscriberScope,
+    events: &'a [Arc<CdcEvent>],
+}
+
+/// POST a batch, redacting each event for the subscriber first.
+///
+/// Returns how many leading events of the batch this cycle finished with, which
+/// is what the offset commit advances over. An event a rule covers but whose
+/// payload could not be rewritten is skipped rather than POSTed in the clear,
+/// and still counts as finished so the cursor moves past it instead of
+/// redelivering it forever. Delivery stops at the first POST failure, so the
+/// next cycle retries from the last committed offset.
+async fn deliver_batch(delivery: BatchDelivery<'_>) -> usize {
+    let BatchDelivery {
+        client,
+        config,
+        stream_name,
+        store,
+        subscriber,
+        events,
+    } = delivery;
+    let mut finished = 0usize;
+    for event in events {
+        if let Some(event) = subscriber.apply(store, event)
+            && !deliver_event(client, config, &event, stream_name).await
+        {
+            break;
+        }
+        finished += 1;
+    }
+    finished
 }
 
 /// POST a single event to the webhook URL. Returns true on success.

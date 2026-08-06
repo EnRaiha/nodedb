@@ -42,6 +42,34 @@ pub struct AggDef {
     pub input_expr: String,
 }
 
+impl AggDef {
+    /// The stored column this aggregate reads from an event's `new_value`, or
+    /// `None` when it reads no column value.
+    ///
+    /// `COUNT` counts events and never looks at a column, and an empty input
+    /// expression (`COUNT(*)`) names none. Anything else is a field name,
+    /// written plainly or wrapped in `doc_get(new_value, '$.field')`.
+    ///
+    /// The processor extracts the aggregate input through this, and the
+    /// definition-time redaction refusal decides on it, so the column a rule is
+    /// matched against is the same one the MV would actually persist.
+    pub fn source_field(&self) -> Option<&str> {
+        if self.function == AggFunction::Count {
+            return None;
+        }
+        let field = if self.input_expr.contains("doc_get") {
+            self.input_expr
+                .split("'$.")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or(&self.input_expr)
+        } else {
+            self.input_expr.trim()
+        };
+        (!field.is_empty()).then_some(field)
+    }
+}
+
 /// Supported aggregate functions for streaming MVs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, zerompk::ToMessagePack, zerompk::FromMessagePack)]
 #[repr(u8)]

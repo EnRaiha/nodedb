@@ -37,6 +37,7 @@ fn stream_def(tenant: u64, name: &str, collection: &str) -> ChangeStreamDef {
         kafka: nodedb::event::kafka::KafkaDeliveryConfig::default(),
         owner: "admin".into(),
         created_at: 0,
+        subscriber_roles: Vec::new(),
     }
 }
 

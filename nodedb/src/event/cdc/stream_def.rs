@@ -199,6 +199,24 @@ pub struct ChangeStreamDef {
     pub owner: String,
     /// Creation timestamp (epoch seconds).
     pub created_at: u64,
+    /// Roles of the principal that created this subscription, captured at
+    /// `CREATE CHANGE STREAM` time.
+    ///
+    /// The Event-Plane delivery tasks this stream owns — the webhook POST and
+    /// the Kafka publish — push stored row values to a destination with no
+    /// request behind it, so there is no live identity to key a column
+    /// redaction policy on, and an identity may never be resolved across the
+    /// Data→Event bus. The subscriber's scope is therefore captured once, in
+    /// the Control Plane, and read back from this record at delivery.
+    ///
+    /// Empty for a definition written before the field existed, and for a
+    /// creator holding no roles. The two are indistinguishable, and no policy —
+    /// which is keyed on a role — matches an empty list, so delivery of a
+    /// collection some policy protects is refused rather than sent in the clear
+    /// (see `redaction::CdcSubscriberScope`). Streams over collections no policy
+    /// covers are unaffected.
+    #[msgpack(default)]
+    pub subscriber_roles: Vec<String>,
 }
 
 impl ChangeStreamDef {
@@ -245,6 +263,7 @@ mod tests {
             kafka: crate::event::kafka::KafkaDeliveryConfig::default(),
             owner: "admin".into(),
             created_at: 0,
+            subscriber_roles: Vec::new(),
         };
         assert!(def.matches_collection("orders"));
         assert!(def.matches_collection("users"));
@@ -267,6 +286,7 @@ mod tests {
             kafka: crate::event::kafka::KafkaDeliveryConfig::default(),
             owner: "admin".into(),
             created_at: 0,
+            subscriber_roles: Vec::new(),
         };
         assert!(def.matches_collection("orders"));
         assert!(!def.matches_collection("users"));

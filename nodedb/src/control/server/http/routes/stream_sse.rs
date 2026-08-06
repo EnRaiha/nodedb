@@ -23,8 +23,10 @@ use super::super::auth::{ApiError, AppState, ResolvedIdentity};
 use super::query::{DatabaseQueryParam, resolve_database_id};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::Permission;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
+use crate::event::cdc::CdcSubscriberScope;
 use crate::event::cdc::consume::{ConsumeError, ConsumeParams, consume_stream};
 
 /// Query parameters.
@@ -130,7 +132,20 @@ pub async fn stream_events(
         .map_err(ApiError::from)?;
     }
 
+    // Events carry the written row, so the subscriber's column redaction rules
+    // apply to them exactly as they do to a SELECT of the source collection.
+    // The roles belong to the request, not to any one batch, so they are
+    // resolved once here and moved into the long-lived SSE body.
+    let subscriber_tenant = identity.tenant_id();
+    let subscriber_roles =
+        RequestAuthScope::for_database(&identity.0, state.shared.auth_stores(), database_id)
+            .auth()
+            .roles
+            .clone();
+
     let stream = async_stream::stream! {
+        let mut subscriber = CdcSubscriberScope::new(subscriber_tenant, subscriber_roles);
+
         if group.is_empty() {
             yield Ok(Event::default()
                 .event("error")
@@ -168,7 +183,7 @@ pub async fn stream_events(
                 limit: 100,
             };
 
-            let result = match consume_stream(&state.shared, &consume_params) {
+            let mut result = match consume_stream(&state.shared, &consume_params) {
                 Ok(r) => r,
                 Err(ConsumeError::RemotePartition { leader_node, .. }) => {
                     match crate::event::cdc::consume::consume_remote(
@@ -199,6 +214,7 @@ pub async fn stream_events(
                     return; // _guard dropped here → leave() called.
                 }
             };
+            subscriber.retain_deliverable(&state.shared.redaction, &mut result.events);
             if !result.events.is_empty() {
                 for event in &result.events {
                     let json = sonic_rs::to_string(event).unwrap_or_default();

@@ -124,6 +124,45 @@ impl RedactionStore {
         })
     }
 
+    /// True when SOME role — any role at all — has at least one rule on
+    /// `collection` in `tenant_id`.
+    ///
+    /// The role-agnostic counterpart to
+    /// [`RedactionStore::has_any_rule_for_collection`], for the callers whose
+    /// question is about the collection rather than about one identity: a
+    /// subscriber whose entitlement cannot be established, and a definition-time
+    /// refusal that must hold for every future reader. The role is not part of
+    /// the question, so this scans the registry.
+    pub fn has_any_rule_for_collection_any_role(&self, tenant_id: u64, collection: &str) -> bool {
+        let policies = self.lock_read();
+        policies.values().any(|policy| {
+            policy.tenant_id == tenant_id
+                && policy.collection == collection
+                && !policy.rules.is_empty()
+        })
+    }
+
+    /// True when SOME role has a rule on `field`, in `collection` when one is
+    /// named and in any collection of `tenant_id` otherwise.
+    ///
+    /// `None` is for a caller that cannot name the collection its data comes
+    /// from — a wildcard change stream carries rows from every collection in the
+    /// tenant — and must therefore answer the tenant-wide question rather than
+    /// silently pass.
+    pub fn has_rule_for_field_any_role(
+        &self,
+        tenant_id: u64,
+        collection: Option<&str>,
+        field: &str,
+    ) -> bool {
+        let policies = self.lock_read();
+        policies.values().any(|policy| {
+            policy.tenant_id == tenant_id
+                && collection.is_none_or(|name| policy.collection == name)
+                && policy.rules.iter().any(|rule| rule.field == field)
+        })
+    }
+
     /// Apply redaction rules to a JSON document.
     ///
     /// Modifies the document in-place, replacing redacted field values.

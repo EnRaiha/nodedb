@@ -224,6 +224,7 @@ mod tests {
                     kafka: KafkaDeliveryConfig::default(),
                     owner: "admin".into(),
                     created_at: 0,
+                    subscriber_roles: Vec::new(),
                 })
                 .unwrap();
             catalog

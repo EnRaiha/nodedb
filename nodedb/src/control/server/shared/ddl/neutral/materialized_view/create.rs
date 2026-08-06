@@ -218,16 +218,31 @@ async fn create_streaming_mv(
     let tenant_id = identity.tenant_id.as_u64();
 
     // Verify the source change stream exists.
-    if state
+    let Some(source_def) = state
         .stream_registry
         .get(database_id, tenant_id, &parsed.source_stream)
-        .is_none()
-    {
+    else {
         return Err(err(
             "42704",
             format!("change stream '{}' does not exist", parsed.source_stream),
         ));
-    }
+    };
+
+    // The view's group key and aggregate state are written to storage from the
+    // stored columns of each event, where no result-path mask reaches them. A
+    // definition over a column some policy protects is refused here, before the
+    // definition is proposed, so nothing is ever maintained from it. A wildcard
+    // stream names no single source collection, so its columns are matched
+    // across the tenant instead of passing unchecked.
+    let source_collection = (!source_def.is_wildcard()).then_some(source_def.collection.as_str());
+    crate::control::planner::redaction_refusal::refuse_redacted_streaming_mv(
+        &state.redaction,
+        tenant_id,
+        source_collection,
+        &parsed.group_by_columns,
+        &parsed.aggregates,
+    )
+    .map_err(|error| err("42501", error.to_string()))?;
 
     // Reject a duplicate streaming MV.
     if state

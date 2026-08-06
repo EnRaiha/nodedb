@@ -21,6 +21,7 @@ use tracing::{debug, info, trace, warn};
 
 use super::config::KafkaDeliveryConfig;
 use crate::control::state::SharedState;
+use crate::event::cdc::CdcSubscriberScope;
 use crate::event::cdc::consume::{ConsumeParams, consume_local};
 
 /// Spawn a background Kafka producer task for a change stream.
@@ -92,6 +93,25 @@ pub fn spawn_kafka_task(
 
                     let batch_size = events.events.len();
 
+                    // The topic is subscribed on behalf of the principal that
+                    // created the stream, whose roles the subscription record
+                    // carries. Without that record there is no scope to
+                    // evaluate a column redaction policy against, so nothing
+                    // is published.
+                    let Some(mut subscriber) = CdcSubscriberScope::for_stream(
+                        &shared_state,
+                        database_id,
+                        tenant_id,
+                        &stream_name,
+                    ) else {
+                        warn!(
+                            stream = %stream_name,
+                            "Kafka publish: change stream is not registered — \
+                             refusing to publish events with no subscriber scope"
+                        );
+                        continue;
+                    };
+
                     // Begin transaction if configured.
                     if config.transactional
                         && let Err(e) = producer.begin_transaction()
@@ -101,8 +121,19 @@ pub fn spawn_kafka_task(
                     }
 
                     let mut published = 0u32;
+                    // Events the subscriber's rules cover but whose payload
+                    // cannot be rewritten are withheld rather than published in
+                    // the clear. They are still finished with, so the offset
+                    // commit advances past them instead of redelivering them
+                    // forever — hence a count separate from `published`, which
+                    // drives the Kafka transaction.
+                    let mut finished = 0u32;
                     for event in &events.events {
-                        let payload = match serialize_event(event, config.format) {
+                        let Some(event) = subscriber.apply(&shared_state.redaction, event) else {
+                            finished += 1;
+                            continue;
+                        };
+                        let payload = match serialize_event(&event, config.format) {
                             Ok(p) => p,
                             Err(e) => {
                                 warn!(error = %e, "failed to serialize event for Kafka");
@@ -116,7 +147,10 @@ pub fn spawn_kafka_task(
                             .payload(&payload);
 
                         match producer.send(record, Duration::from_secs(5)).await {
-                            Ok(_) => published += 1,
+                            Ok(_) => {
+                                published += 1;
+                                finished += 1;
+                            }
                             Err((e, _)) => {
                                 warn!(
                                     error = %e,
@@ -138,10 +172,11 @@ pub fn spawn_kafka_task(
                         continue;
                     }
 
-                    // Commit consumer offsets for successfully published events.
-                    if published > 0 {
+                    // Commit consumer offsets over the events this cycle
+                    // finished with, taken from the batch as consumed.
+                    if finished > 0 {
                         let mut tails = std::collections::HashMap::new();
-                        for event in events.events.iter().take(published as usize) {
+                        for event in events.events.iter().take(finished as usize) {
                             let entry = tails
                                 .entry(event.partition)
                                 .or_insert(crate::event::cdc::CdcOffset::ZERO);

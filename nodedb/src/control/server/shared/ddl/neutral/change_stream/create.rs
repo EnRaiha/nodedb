@@ -16,6 +16,7 @@
 //! ```
 
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::state::SharedState;
 use crate::event::cdc::stream_def::{
     ChangeStreamDef, CompactionConfig, LateDataPolicy, OpFilter, RetentionConfig, StreamFormat,
@@ -136,6 +137,17 @@ pub fn create_change_stream(
         })?
         .as_secs();
 
+    // Capture the creating principal's roles onto the subscription record.
+    // The webhook and Kafka delivery tasks this stream may own run on the
+    // Event Plane, where no request identity exists and none may be resolved
+    // across the Data→Event bus, so the scope their column redaction is keyed
+    // on has to be resolved here and carried by the definition itself.
+    let subscriber_roles =
+        RequestAuthScope::for_database(identity, state.auth_stores(), database_id)
+            .auth()
+            .roles
+            .clone();
+
     let def = ChangeStreamDef {
         database_id,
         tenant_id,
@@ -150,6 +162,7 @@ pub fn create_change_stream(
         kafka,
         owner: identity.username.clone(),
         created_at: now,
+        subscriber_roles,
     };
 
     let has_webhook = def.webhook.is_configured();

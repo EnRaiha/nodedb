@@ -102,6 +102,7 @@ fn make_stream_def(tenant_id: u64, name: &str) -> nodedb::event::cdc::stream_def
         kafka: Default::default(),
         owner: "admin".to_string(),
         created_at: 0,
+        subscriber_roles: Vec::new(),
     }
 }
 

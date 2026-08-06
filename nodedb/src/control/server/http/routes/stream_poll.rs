@@ -17,7 +17,9 @@ use super::super::auth::{ApiError, AppState, ResolvedIdentity};
 use super::query::{DatabaseQueryParam, resolve_database_id};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::Permission;
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::shared::authorization::authorize_collection;
+use crate::event::cdc::CdcSubscriberScope;
 use crate::event::cdc::consume::{ConsumeError, ConsumeParams, ConsumeResult, consume_stream};
 
 /// Query parameters.
@@ -150,7 +152,7 @@ pub async fn poll_stream(
         limit,
     };
 
-    let result = match consume_stream(&state.shared, &consume_params) {
+    let mut result = match consume_stream(&state.shared, &consume_params) {
         Ok(r) => r,
         Err(ConsumeError::RemotePartition { leader_node, .. }) => {
             // Forward to remote node.
@@ -185,6 +187,17 @@ pub async fn poll_stream(
                 .into_response();
         }
     };
+
+    // Events carry the written row, so the poller's column redaction rules
+    // apply to them exactly as they do to a SELECT of the source collection.
+    let mut subscriber = CdcSubscriberScope::new(
+        identity.tenant_id(),
+        RequestAuthScope::for_database(&identity.0, state.shared.auth_stores(), database_id)
+            .auth()
+            .roles
+            .clone(),
+    );
+    subscriber.retain_deliverable(&state.shared.redaction, &mut result.events);
 
     let events: Vec<serde_json::Value> = result
         .events

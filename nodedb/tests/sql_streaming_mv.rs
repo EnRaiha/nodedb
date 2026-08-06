@@ -124,3 +124,95 @@ async fn streaming_mv_incrementally_aggregates_source_writes() {
         "pending SUM(amount) must be 5; got {pending:?}"
     );
 }
+
+/// Install a mask on `collection`.`field` for a single role, exactly as the
+/// metadata applier does when a policy replicates.
+fn install_mask(server: &TestServer, collection: &str, field: &str) {
+    let stored = nodedb::control::security::catalog::redaction::StoredRedactionPolicy {
+        tenant_id: TENANT_ID,
+        collection: collection.to_string(),
+        for_role: "support".to_string(),
+        name: format!("mask_{collection}_{field}"),
+        rules_json: format!(r#"[{{"field":"{field}","mode":{{"Mask":"***"}}}}]"#),
+    };
+    server
+        .shared
+        .redaction
+        .install_replicated_policy(stored.to_runtime().expect("policy parses"));
+}
+
+/// A streaming MV keeps its group key and its aggregate state in storage the
+/// result-path mask never reaches, so a definition over a protected column
+/// would put that column's cleartext at rest — keyed by it, or accumulated from
+/// it. The DDL must be refused before the definition is proposed, and the
+/// refusal must stay per column: a rule elsewhere on the same collection cannot
+/// block a view that never reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_mv_over_a_redacted_column_is_refused() {
+    let server = TestServer::start().await;
+
+    server.exec("CREATE COLLECTION smv_pii").await.unwrap();
+    server
+        .exec("CREATE CHANGE STREAM smv_pii_changes ON smv_pii")
+        .await
+        .unwrap();
+    install_mask(&server, "smv_pii", "amount");
+
+    let grouped = server
+        .exec(
+            "CREATE MATERIALIZED VIEW smv_pii_by_amount ON smv_pii STREAMING AS \
+             SELECT amount, COUNT(*) AS cnt FROM smv_pii_changes GROUP BY amount",
+        )
+        .await
+        .expect_err("grouping by a redacted column must be refused");
+    assert!(
+        grouped.contains("amount") && grouped.contains("smv_pii"),
+        "the refusal must name the column and the collection; got {grouped}"
+    );
+
+    let aggregated = server
+        .exec(
+            "CREATE MATERIALIZED VIEW smv_pii_total ON smv_pii STREAMING AS \
+             SELECT status, SUM(amount) AS total FROM smv_pii_changes GROUP BY status",
+        )
+        .await
+        .expect_err("aggregating a redacted column must be refused");
+    assert!(
+        aggregated.contains("amount"),
+        "the refusal must name the aggregated column; got {aggregated}"
+    );
+
+    // A rule on `amount` must not block a view that groups by `status` and
+    // counts events: nothing it persists comes from the protected column.
+    server
+        .exec(
+            "CREATE MATERIALIZED VIEW smv_pii_by_status ON smv_pii STREAMING AS \
+             SELECT status, COUNT(*) AS cnt FROM smv_pii_changes GROUP BY status",
+        )
+        .await
+        .expect("a view reading no redacted column must still be created");
+    assert!(
+        server
+            .shared
+            .mv_registry
+            .get_def(
+                nodedb::types::DatabaseId::DEFAULT,
+                TENANT_ID,
+                "smv_pii_by_status"
+            )
+            .is_some(),
+        "the allowed view must be registered"
+    );
+    assert!(
+        server
+            .shared
+            .mv_registry
+            .get_def(
+                nodedb::types::DatabaseId::DEFAULT,
+                TENANT_ID,
+                "smv_pii_by_amount"
+            )
+            .is_none(),
+        "a refused view must never be proposed to the catalog"
+    );
+}

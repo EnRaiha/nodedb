@@ -23,9 +23,11 @@ use sonic_rs;
 
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
+use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::types::ShapedRows;
 use crate::control::server::shared::authorization::authorize_collection;
 use crate::control::state::SharedState;
+use crate::event::cdc::CdcSubscriberScope;
 use crate::event::cdc::consume::{ConsumeError, ConsumeParams, consume_stream};
 use crate::types::DatabaseId;
 
@@ -142,7 +144,7 @@ pub async fn select_from_stream(
         limit,
     };
 
-    let result = match consume_stream(state, &consume_params) {
+    let mut result = match consume_stream(state, &consume_params) {
         Ok(r) => r,
         Err(ConsumeError::RemotePartition { leader_node, .. }) => {
             match crate::event::cdc::consume::consume_remote(state, &consume_params, leader_node)
@@ -167,6 +169,19 @@ pub async fn select_from_stream(
             return Err(err("42704", e.to_string()));
         }
     };
+
+    // A stream event carries the written row, so the caller's column
+    // redaction rules apply to it exactly as they do to a SELECT of the
+    // source collection. The reader here is the authenticated caller, so the
+    // scope is its own resolved roles rather than the subscription's.
+    let mut subscriber = CdcSubscriberScope::new(
+        identity.tenant_id,
+        RequestAuthScope::for_database(identity, state.auth_stores(), database_id)
+            .auth()
+            .roles
+            .clone(),
+    );
+    subscriber.retain_deliverable(&state.redaction, &mut result.events);
 
     let columns = result_columns();
     let mut rows = Vec::with_capacity(result.events.len());
