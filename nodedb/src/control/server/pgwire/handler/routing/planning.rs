@@ -272,6 +272,20 @@ impl NodeDbPgHandler {
                 .map_err(StatementSetupError::from)?;
             (tasks, output_schema, versions)
         } else if let Some((tasks, versions, output_schema)) = cached_tasks {
+            // The fail-closed redaction refusal is a property of the CURRENT
+            // policy set, not of the compiled plan: a `CREATE REDACTION POLICY`
+            // issued after this statement was cached must refuse the cached
+            // aggregate on its very next execution. The per-session plan cache
+            // is keyed on collection descriptor versions, which a policy write
+            // does not (and should not) bump, so re-running the pass on every
+            // cache hit is what keeps the verdict live — exactly as the masking
+            // hook reads the store live at shaping time.
+            crate::control::planner::redaction_refusal::refuse_unredactable_tasks(
+                &tasks,
+                scope.auth(),
+                &self.state.redaction,
+            )
+            .map_err(StatementSetupError::from)?;
             (tasks, output_schema, versions)
         } else {
             let (planned, output_schema, versions, cache_eligibility) = {

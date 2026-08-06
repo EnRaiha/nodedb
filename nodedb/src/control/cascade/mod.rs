@@ -3,6 +3,7 @@
 pub mod change_streams;
 pub mod materialized_views;
 pub mod orchestrator;
+pub mod redaction;
 pub mod rls;
 pub mod schedules;
 pub mod sequences;

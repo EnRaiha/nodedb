@@ -2,6 +2,10 @@
 
 //! Strict parsing for RLS policy DDL.
 
+use super::policy_tokens::{
+    consume_keyword, is_identifier_char, parse_error, parse_identifier, parse_optional_tenant,
+    parse_optional_tenant_prefix, starts_keyword, starts_statement, statement_suffix,
+};
 use crate::ddl_ast::statement::{NodedbStatement, PolicyStmt};
 use crate::error::SqlError;
 
@@ -21,12 +25,6 @@ pub(super) fn try_parse(
     } else {
         None
     }
-}
-
-fn starts_statement(upper: &str, prefix: &str) -> bool {
-    upper
-        .strip_prefix(prefix)
-        .is_some_and(|rest| rest.is_empty() || rest.chars().next().is_some_and(char::is_whitespace))
 }
 
 fn parse_create(sql: &str) -> Result<NodedbStatement, SqlError> {
@@ -135,63 +133,6 @@ fn parse_create_suffix(input: &str) -> Result<(bool, Option<u64>, Option<String>
     Ok((restrictive, tenant_id_override, on_deny_raw))
 }
 
-fn parse_optional_tenant(input: &str) -> Result<Option<u64>, SqlError> {
-    let (tenant, rest) = parse_optional_tenant_prefix(input)?;
-    ensure_end(rest)?;
-    Ok(tenant)
-}
-
-fn parse_optional_tenant_prefix(input: &str) -> Result<(Option<u64>, &str), SqlError> {
-    let rest = input.trim_start();
-    if !starts_keyword(rest, "TENANT") {
-        return Ok((None, rest));
-    }
-    let after_tenant = consume_keyword(rest, "TENANT")?;
-    let end = after_tenant
-        .char_indices()
-        .find_map(|(index, ch)| (ch.is_whitespace() || ch == ';').then_some(index))
-        .unwrap_or(after_tenant.len());
-    let raw = &after_tenant[..end];
-    if raw.is_empty() {
-        return Err(parse_error("TENANT requires an unsigned integer ID"));
-    }
-    let tenant = raw
-        .parse::<u64>()
-        .map_err(|_| parse_error("TENANT requires an unsigned integer ID"))?;
-    Ok((Some(tenant), &after_tenant[end..]))
-}
-
-fn statement_suffix<'a>(sql: &'a str, prefix: &str) -> Result<&'a str, SqlError> {
-    let sql = sql.trim();
-    let matched = sql
-        .get(..prefix.len())
-        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
-        .ok_or_else(|| parse_error(format!("expected {prefix}")))?;
-    let rest = &sql[matched.len()..];
-    if !rest.chars().next().is_some_and(char::is_whitespace) {
-        return Err(parse_error(format!("expected tokens after {prefix}")));
-    }
-    Ok(rest.trim_start())
-}
-
-fn starts_keyword(input: &str, keyword: &str) -> bool {
-    input
-        .get(..keyword.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(keyword))
-        && !input[keyword.len()..]
-            .chars()
-            .next()
-            .is_some_and(is_identifier_char)
-}
-
-fn consume_keyword<'a>(input: &'a str, keyword: &str) -> Result<&'a str, SqlError> {
-    let input = input.trim_start();
-    if !starts_keyword(input, keyword) {
-        return Err(parse_error(format!("expected {keyword}")));
-    }
-    Ok(input[keyword.len()..].trim_start())
-}
-
 fn parse_keyword_value<'a>(
     input: &'a str,
     allowed: &[&str],
@@ -206,47 +147,6 @@ fn parse_keyword_value<'a>(
         return Err(parse_error("expected READ, WRITE, or ALL"));
     }
     Ok((normalized, &input[end..]))
-}
-
-fn parse_identifier(input: &str) -> Result<(String, &str), SqlError> {
-    let input = input.trim_start();
-    if let Some(mut rest) = input.strip_prefix('"') {
-        let mut value = String::new();
-        loop {
-            let Some(ch) = rest.chars().next() else {
-                return Err(parse_error("unterminated quoted identifier"));
-            };
-            rest = &rest[ch.len_utf8()..];
-            if ch == '"' {
-                if let Some(next) = rest.strip_prefix('"') {
-                    value.push('"');
-                    rest = next;
-                } else {
-                    if value.is_empty() || value.chars().any(char::is_control) {
-                        return Err(parse_error("invalid quoted identifier"));
-                    }
-                    return Ok((value, rest));
-                }
-            } else {
-                value.push(ch);
-            }
-        }
-    }
-
-    let end = input
-        .char_indices()
-        .find_map(|(index, ch)| (!is_identifier_char(ch)).then_some(index))
-        .unwrap_or(input.len());
-    let name = &input[..end];
-    if name.is_empty()
-        || !name
-            .chars()
-            .next()
-            .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
-    {
-        return Err(parse_error("invalid identifier"));
-    }
-    Ok((name.to_lowercase(), &input[end..]))
 }
 
 fn parse_parenthesized(input: &str) -> Result<(String, &str), SqlError> {
@@ -318,25 +218,6 @@ fn trim_statement_end(input: &str) -> Result<&str, SqlError> {
         return Err(parse_error("unterminated ON DENY quoted text"));
     }
     Ok(trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end())
-}
-
-fn ensure_end(input: &str) -> Result<(), SqlError> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() || trimmed == ";" {
-        Ok(())
-    } else {
-        Err(parse_error("unexpected trailing tokens in RLS statement"))
-    }
-}
-
-fn is_identifier_char(ch: char) -> bool {
-    ch == '_' || ch == '$' || ch.is_alphanumeric()
-}
-
-fn parse_error(detail: impl Into<String>) -> SqlError {
-    SqlError::Parse {
-        detail: detail.into(),
-    }
 }
 
 #[cfg(test)]

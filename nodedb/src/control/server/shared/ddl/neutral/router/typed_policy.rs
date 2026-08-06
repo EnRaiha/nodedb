@@ -12,6 +12,7 @@ use crate::types::DatabaseId;
 use super::super::super::result::{DdlError, DdlResult};
 use super::super::conflict_policy;
 use super::super::custom_type;
+use super::super::redaction::{self, CreateRedactionPolicyRequest};
 use super::super::retention_policy;
 use super::super::rls::{self, CreateRlsPolicyRequest};
 use super::super::synonym_group;
@@ -72,6 +73,50 @@ pub(super) async fn try_typed(
             collection,
             tenant_id_override,
         }) => Some(rls::show_rls_policies(
+            state,
+            identity,
+            collection.as_deref(),
+            *tenant_id_override,
+        )),
+
+        NodedbStatement::Policy(PolicyStmt::CreateRedactionPolicy {
+            name,
+            collection,
+            for_role,
+            rules,
+            if_not_exists,
+            tenant_id_override,
+        }) => Some(redaction::create_redaction_policy(
+            state,
+            identity,
+            &CreateRedactionPolicyRequest {
+                name,
+                collection,
+                for_role,
+                rules,
+                if_not_exists: *if_not_exists,
+                tenant_id_override: *tenant_id_override,
+            },
+        )),
+
+        NodedbStatement::Policy(PolicyStmt::DropRedactionPolicy {
+            collection,
+            for_role,
+            if_exists,
+            tenant_id_override,
+        }) => Some(redaction::drop_redaction_policy(
+            state,
+            identity,
+            collection,
+            for_role,
+            *if_exists,
+            *tenant_id_override,
+        )),
+
+        NodedbStatement::Policy(PolicyStmt::ShowRedactionPolicies {
+            collection,
+            tenant_id_override,
+        }) => Some(redaction::show_redaction_policies(
             state,
             identity,
             collection.as_deref(),

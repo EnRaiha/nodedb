@@ -228,6 +228,39 @@ impl RedactionStore {
         policies.values().cloned().collect()
     }
 
+    /// Every policy in `tenant_id`, sorted by `(collection, for_role)` so
+    /// `SHOW REDACTION POLICIES` renders in a stable order.
+    pub fn policies_for_tenant(&self, tenant_id: u64) -> Vec<RedactionPolicy> {
+        self.collect_sorted(|policy| policy.tenant_id == tenant_id)
+    }
+
+    /// Every policy on one `(tenant_id, collection)`, in the same order.
+    pub fn policies_for_collection(
+        &self,
+        tenant_id: u64,
+        collection: &str,
+    ) -> Vec<RedactionPolicy> {
+        self.collect_sorted(|policy| {
+            policy.tenant_id == tenant_id && policy.collection == collection
+        })
+    }
+
+    /// Clone every policy matching `keep`, sorted by `(collection, for_role)`.
+    fn collect_sorted(&self, keep: impl Fn(&RedactionPolicy) -> bool) -> Vec<RedactionPolicy> {
+        let policies = self.lock_read();
+        let mut out: Vec<RedactionPolicy> = policies
+            .values()
+            .filter(|policy| keep(policy))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.collection
+                .cmp(&b.collection)
+                .then_with(|| a.for_role.cmp(&b.for_role))
+        });
+        out
+    }
+
     /// Total policies across all tenants and collections.
     pub fn policy_count(&self) -> usize {
         // Recover from a poisoned lock rather than reporting zero: this count

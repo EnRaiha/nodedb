@@ -35,6 +35,7 @@ pub(super) fn purge_owned_for_tenant_teardown(
         })?;
         if kind == OwnerKind::Collection {
             purge_collection_rls_policies(state, catalog, tenant, &owner.object_name)?;
+            purge_collection_redaction_policies(state, catalog, tenant, &owner.object_name)?;
         }
         let entry = teardown_delete_entry(kind, tenant, &owner);
         let log_index = propose(state, &entry)?;
@@ -118,6 +119,41 @@ fn purge_collection_rls_policies(
             state
                 .rls
                 .install_replicated_drop_policy(tenant_id, collection, &policy.name);
+        }
+    }
+    Ok(())
+}
+
+/// Delete every column-redaction policy bound to `collection`.
+///
+/// The twin of [`purge_collection_rls_policies`]: a policy left behind would
+/// resurrect against a collection later re-created under the same name, since
+/// its key carries no collection generation.
+fn purge_collection_redaction_policies(
+    state: &SharedState,
+    catalog: &SystemCatalog,
+    tenant: TenantId,
+    collection: &str,
+) -> Result<(), DdlError> {
+    let tenant_id = tenant.as_u64();
+    let roles = crate::control::cascade::redaction::find_redaction_policies_on(
+        catalog, tenant_id, collection,
+    )
+    .map_err(|e| ddl_err(format!("load redaction policies: {e}")))?;
+    for for_role in roles {
+        let entry = CatalogEntry::DeleteRedactionPolicy {
+            tenant_id,
+            collection: collection.to_string(),
+            for_role: for_role.clone(),
+        };
+        let log_index = propose(state, &entry)?;
+        crate::control::catalog_entry::apply::local::apply_locally_if_needed(
+            state, &entry, log_index,
+        );
+        if log_index == 0 {
+            state
+                .redaction
+                .install_replicated_drop_policy(tenant_id, collection, &for_role);
         }
     }
     Ok(())

@@ -38,6 +38,46 @@ pub fn put(stored: StoredRedactionPolicy, shared: Arc<SharedState>) {
     }
 }
 
+/// Delete every redaction policy bound to a purged collection, from both the
+/// catalog and the in-memory registry.
+///
+/// A policy key carries no collection generation, so a survivor would apply
+/// again the moment a collection is re-created under the same name — masking
+/// (and refusing aggregates over) columns nobody asked to protect. Called from
+/// the shared `PurgeCollection` reclaim path, so it runs on every node and on
+/// the single-node inline purge alike.
+pub fn purge_for_collection(shared: &SharedState, tenant_id: u64, collection: &str) {
+    let catalog = shared.credentials.catalog();
+    let roles = match crate::control::cascade::redaction::find_redaction_policies_on(
+        catalog, tenant_id, collection,
+    ) {
+        Ok(roles) => roles,
+        Err(e) => {
+            warn!(
+                collection = %collection,
+                tenant = tenant_id,
+                error = %e,
+                "post_apply: redaction policy purge skipped (catalog read failed)"
+            );
+            return;
+        }
+    };
+    for for_role in roles {
+        if let Err(e) = catalog.delete_redaction_policy(tenant_id, collection, &for_role) {
+            warn!(
+                collection = %collection,
+                for_role = %for_role,
+                tenant = tenant_id,
+                error = %e,
+                "post_apply: redaction policy row delete failed on collection purge"
+            );
+        }
+        shared
+            .redaction
+            .install_replicated_drop_policy(tenant_id, collection, &for_role);
+    }
+}
+
 pub fn delete(tenant_id: u64, collection: String, for_role: String, shared: Arc<SharedState>) {
     let removed =
         shared

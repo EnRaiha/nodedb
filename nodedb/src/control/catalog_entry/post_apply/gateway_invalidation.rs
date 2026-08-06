@@ -39,7 +39,7 @@ use crate::control::state::SharedState;
 /// | PutContinuousAggregate / DeleteContinuousAggregate | ❌ no | CA definition is its own catalog object; runtime manager re-registers via MetaOp dispatch, never appears in a PhysicalPlan variant |
 /// | PutTenant / DeleteTenant                | ❌ no       | tenant identity does not affect plan shape |
 /// | PutRlsPolicy / DeleteRlsPolicy          | ❌ no       | `execute_sql` is only called from CDC path (no RLS injection via `inject_rls`); per-session pgwire cache has its own DDL invalidation |
-/// | PutRedactionPolicy / DeleteRedactionPolicy | ❌ no    | redaction rules are applied post-scan on the decoded document by role, so they are not baked into `PhysicalPlan` shape and need no gateway cache invalidation |
+/// | PutRedactionPolicy / DeleteRedactionPolicy | ❌ no    | redaction rules are applied post-scan on the decoded document by role, so they are not baked into `PhysicalPlan` shape; the fail-closed refusal is re-evaluated against the live store on every execution, so no cached plan goes stale either |
 /// | PutPermission / DeletePermission        | ❌ no       | permission checked at exec time |
 /// | PutOwner / DeleteOwner                  | ❌ no       | ownership does not affect plan shape |
 pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &Arc<SharedState>) {
@@ -191,7 +191,10 @@ pub(crate) fn invalidate_gateway_cache_for_entry(entry: &CatalogEntry, shared: &
         CatalogEntry::PutRedactionPolicy(_) => {
             // no-op: redaction rules are applied post-scan on the decoded
             // document by role, so they are not baked into `PhysicalPlan`
-            // shape and need no gateway cache invalidation.
+            // shape and need no gateway cache invalidation. The fail-closed
+            // refusal for the shapes masking cannot cover is likewise
+            // re-evaluated against the live store on every execution, cached
+            // plan or not, so no plan cache goes stale on a policy write.
         }
         CatalogEntry::DeleteRedactionPolicy { .. } => {
             // no-op: same as PutRedactionPolicy.

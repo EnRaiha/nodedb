@@ -18,6 +18,8 @@ mod index;
 mod maintenance;
 mod materialized_view;
 mod oidc_provider;
+mod policy_tokens;
+mod redaction;
 mod retention;
 mod rls;
 mod schedule;
