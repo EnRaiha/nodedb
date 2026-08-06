@@ -48,10 +48,11 @@ const ALLOWED: &[&str] = &[
     "control/server/shared/ddl/neutral/continuous_agg/show.rs",
     "control/server/shared/ddl/neutral/synonym_group/create.rs",
     "control/server/shared/ddl/neutral/synonym_group/drop.rs",
-    "control/server/shared/ddl/neutral/version_history/at_version.rs",
+    // `at_version.rs` and `diff.rs` are deliberately absent: they serve user
+    // reads, so they dispatch through the authorized path rather than the
+    // system door, which performs no authorization or RLS injection.
     "control/server/shared/ddl/neutral/version_history/checkpoint.rs",
     "control/server/shared/ddl/neutral/version_history/compact.rs",
-    "control/server/shared/ddl/neutral/version_history/diff.rs",
     // Tenant lifecycle.
     "control/server/shared/ddl/neutral/tenant/purge.rs",
     "control/server/shared/ddl/neutral/tenant/move_tenant/cutover.rs",
