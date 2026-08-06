@@ -50,13 +50,46 @@ fn try_validate_jwt(
     }
 }
 
-/// Resolve an authenticated identity from HTTP headers.
+/// Enforce the TLS policy for a resolved HTTP identity.
+///
+/// HTTP has no connection-scoped session object to hang this off, so it runs
+/// at the same place the identity appears: every route resolves its identity
+/// through [`resolve_identity`] or [`resolve_auth_parts`], and neither returns
+/// one that has not been through here. `transport` is the value the listener
+/// captured at accept (see [`transport`](super::transport)).
+fn enforce_transport_policy(
+    state: &AppState,
+    identity: &AuthenticatedIdentity,
+    transport: crate::control::security::tls_policy::TransportSecurity,
+    peer_addr: &str,
+) -> Result<(), ApiError> {
+    session_auth::check_transport_security(&state.shared, identity, transport, peer_addr)
+        .map_err(ApiError::from)
+}
+
+/// Resolve an authenticated identity from HTTP headers, then enforce the TLS
+/// policy against the connection it arrived on.
 ///
 /// Authentication order:
 /// 1. `Authorization: Bearer eyJ...` — JWT (if JwksRegistry configured)
 /// 2. `Authorization: Bearer ndb_...` — API key
 /// 3. Trust mode (no header required) — if configured
 pub fn resolve_identity(
+    headers: &HeaderMap,
+    state: &AppState,
+    peer_addr: &str,
+    transport: crate::control::security::tls_policy::TransportSecurity,
+) -> Result<AuthenticatedIdentity, ApiError> {
+    let identity = resolve_identity_unchecked(headers, state, peer_addr)?;
+    enforce_transport_policy(state, &identity, transport, peer_addr)?;
+    Ok(identity)
+}
+
+/// The credential half of [`resolve_identity`], without the transport check.
+///
+/// Private on purpose: an identity that has not been through
+/// [`enforce_transport_policy`] must not leave this module.
+fn resolve_identity_unchecked(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
@@ -130,6 +163,7 @@ pub fn resolve_auth(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
+    transport: crate::control::security::tls_policy::TransportSecurity,
 ) -> Result<
     (
         AuthenticatedIdentity,
@@ -139,7 +173,7 @@ pub fn resolve_auth(
 > {
     use crate::control::security::auth_context::{AuthContext, generate_session_id};
 
-    let (identity, verified_jwt) = resolve_auth_parts(headers, state, peer_addr)?;
+    let (identity, verified_jwt) = resolve_auth_parts(headers, state, peer_addr, transport)?;
     let auth_ctx = match &verified_jwt {
         Some(claims) => AuthContext::from_verified_jwt(claims, &identity, generate_session_id()),
         None => session_auth::build_auth_context(&identity),
@@ -159,6 +193,7 @@ pub(crate) fn resolve_auth_parts(
     headers: &HeaderMap,
     state: &AppState,
     peer_addr: &str,
+    transport: crate::control::security::tls_policy::TransportSecurity,
 ) -> Result<
     (
         AuthenticatedIdentity,
@@ -172,11 +207,14 @@ pub(crate) fn resolve_auth_parts(
     {
         let token = token.trim();
         if let Some((identity, verified_claims)) = try_validate_jwt(state, token) {
+            // The JWT path returns before `resolve_identity`, so it enforces
+            // the transport policy itself rather than inheriting it.
+            enforce_transport_policy(state, &identity, transport, peer_addr)?;
             return Ok((identity, Some(verified_claims)));
         }
     }
 
-    let identity = resolve_identity(headers, state, peer_addr)?;
+    let identity = resolve_identity(headers, state, peer_addr, transport)?;
     Ok((identity, None))
 }
 
@@ -326,7 +364,8 @@ impl FromRequestParts<AppState> for ResolvedIdentity {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let peer = super::peer::peer_addr_from_parts(parts)?;
-        let identity = resolve_identity(&parts.headers, state, &peer)?;
+        let transport = super::transport::transport_from_parts(parts)?;
+        let identity = resolve_identity(&parts.headers, state, &peer, transport)?;
         Ok(ResolvedIdentity(identity))
     }
 }
@@ -352,7 +391,8 @@ impl FromRequestParts<AppState> for ResolvedAuth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let peer = super::peer::peer_addr_from_parts(parts)?;
-        let (identity, auth_ctx) = resolve_auth(&parts.headers, state, &peer)?;
+        let transport = super::transport::transport_from_parts(parts)?;
+        let (identity, auth_ctx) = resolve_auth(&parts.headers, state, &peer, transport)?;
         Ok(ResolvedAuth(identity, auth_ctx))
     }
 }

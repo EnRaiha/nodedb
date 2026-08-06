@@ -106,6 +106,27 @@ impl SharedState {
         Ok(state)
     }
 
+    /// Create shared state whose TLS policy is built from `tls_policy_config`
+    /// instead of the disabled default (for tests that exercise transport
+    /// enforcement). Production wires the same configuration from
+    /// `[auth.tls_policy]`, through the same fallible parse: an unparseable
+    /// `min_tls_version` is an error here exactly as it is at startup.
+    pub fn new_with_tls_policy_config(
+        dispatcher: Dispatcher,
+        wal: Arc<WalManager>,
+        tls_policy_config: crate::control::security::tls_policy::TlsPolicyConfig,
+    ) -> crate::Result<Arc<Self>> {
+        let policy =
+            crate::control::security::tls_policy::TlsPolicy::from_config(&tls_policy_config)?;
+        let mut state = Self::new_inner(dispatcher, wal)?;
+        let s = Arc::get_mut(&mut state).ok_or_else(|| crate::Error::Internal {
+            detail: "shared state was already shared before the TLS policy could be installed"
+                .into(),
+        })?;
+        s.tls_policy = policy;
+        Ok(state)
+    }
+
     fn new_inner(dispatcher: Dispatcher, wal: Arc<WalManager>) -> crate::Result<Arc<Self>> {
         let shutdown = Arc::new(crate::control::shutdown::ShutdownWatch::new());
         let loop_registry = Arc::new(crate::control::shutdown::LoopRegistry::new());

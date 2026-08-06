@@ -8,7 +8,8 @@
 //!   the constant-time failure floor.
 //! - [`context`] — build and enrich `AuthContext` from an identity, plus
 //!   per-query `ON DENY` extraction.
-//! - [`guards`] — post-identity blacklist and rate-limit checks.
+//! - [`guards`] — post-identity blacklist, transport-security, and rate-limit
+//!   checks.
 //! - [`admission`] — the composed entry point over `guards`: internal-service
 //!   exemption, blacklist, account status, and rate limit, in order.
 
@@ -23,7 +24,7 @@ pub use context::{
     apply_per_query_on_deny, build_auth_context, enrich_auth_context_with_scopes,
     extract_and_apply_on_deny, extract_on_deny, session_on_deny_override,
 };
-pub use guards::{check_blacklist, check_rate_limit};
+pub use guards::{check_blacklist, check_rate_limit, check_transport_security};
 pub use identity::{
     configured_trust_identity, resolve_certificate_identity, trust_identity,
     verify_api_key_identity,

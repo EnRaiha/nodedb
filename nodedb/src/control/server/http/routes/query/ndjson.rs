@@ -22,6 +22,7 @@ use crate::control::server::shared::plan_admission::{
 
 use super::super::super::auth::{ApiError, AppState, build_request_scope, resolve_auth_parts};
 use super::super::super::peer::PeerAddr;
+use super::super::super::transport::ClientTransport;
 use super::super::query_stream::{NdjsonBody, ndjson_body_stream, try_open_stream};
 use super::super::result_shape::{HttpShaped, passthrough_to_ndjson, shape_http_payload};
 use super::{DatabaseQueryParam, resolve_database_id};
@@ -37,15 +38,17 @@ pub async fn query_ndjson(
     State(state): State<AppState>,
     headers: HeaderMap,
     peer: PeerAddr,
+    transport: ClientTransport,
     QueryParams(db_param): QueryParams<DatabaseQueryParam>,
     axum::Json(body): axum::Json<crate::control::server::http::types::HttpQueryStreamRequest>,
 ) -> impl IntoResponse {
     use axum::response::Response;
 
-    let (identity, verified_jwt) = match resolve_auth_parts(&headers, &state, peer.as_str()) {
-        Ok(auth) => auth,
-        Err(e) => return e.into_response(),
-    };
+    let (identity, verified_jwt) =
+        match resolve_auth_parts(&headers, &state, peer.as_str(), transport.security()) {
+            Ok(auth) => auth,
+            Err(e) => return e.into_response(),
+        };
     let database_id = match resolve_database_id(&headers, &db_param, &state) {
         Ok(id) => id,
         Err(e) => return e.into_response(),

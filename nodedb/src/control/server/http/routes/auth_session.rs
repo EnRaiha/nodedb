@@ -25,6 +25,7 @@ use crate::control::security::session_handle::ClientFingerprint;
 
 use super::super::admission::{admit, identity_database};
 use super::super::auth::{ApiError, AppState, resolve_auth};
+use super::super::transport::ClientTransport;
 use super::super::types::{HttpSessionResponse, HttpStatusOk};
 
 /// `POST /v1/auth/session` — Create an opaque session handle.
@@ -39,10 +40,11 @@ use super::super::types::{HttpSessionResponse, HttpStatusOk};
 pub async fn create_session(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    transport: ClientTransport,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let peer_str = peer.to_string();
-    let (identity, auth_ctx) = resolve_auth(&headers, &state, &peer_str)?;
+    let (identity, auth_ctx) = resolve_auth(&headers, &state, &peer_str, transport.security())?;
 
     // Creating server-side session state on the caller's behalf runs behind
     // the full gate — a blacklisted IP or suspended/banned account must not be
@@ -82,12 +84,17 @@ pub async fn create_session(
 pub async fn delete_session(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    transport: ClientTransport,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Auth check must come first — return 401/403 before touching session state.
     let peer_str = peer.to_string();
-    let identity =
-        crate::control::server::http::auth::resolve_identity(&headers, &state, &peer_str)?;
+    let identity = crate::control::server::http::auth::resolve_identity(
+        &headers,
+        &state,
+        &peer_str,
+        transport.security(),
+    )?;
     let rate_limit_headers = admit(
         &state,
         &identity,

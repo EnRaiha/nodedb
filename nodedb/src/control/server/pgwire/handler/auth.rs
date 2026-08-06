@@ -10,6 +10,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use crate::config::auth::AuthMode;
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::{AuthMethod, AuthenticatedIdentity};
+use crate::control::security::tls_policy::TransportSecurity;
 use crate::control::server::session_auth::identity::stored_user_identity;
 use crate::control::server::shared::authorization::{
     AuthorizationError, authorize_database, authorize_task_set,
@@ -75,6 +76,12 @@ pub(super) fn resolve_session_identity<C: ClientInfo>(
         }
     };
 
+    // Transport enforcement runs on the identity as authenticated, before the
+    // session tenant override is applied and before the identity is bound to
+    // the session store: a connection the TLS policy refuses must not leave a
+    // usable identity behind for teardown or DISCARD ALL to reconstruct.
+    check_client_transport(state, client, &authenticated_identity)?;
+
     let mut identity = authenticated_identity.clone();
     if let Some(effective) = sessions.get_effective_tenant_id(*session_id) {
         if identity.is_superuser {
@@ -91,6 +98,51 @@ pub(super) fn resolve_session_identity<C: ClientInfo>(
     sessions.set_identity(*session_id, identity.clone());
 
     Ok(identity)
+}
+
+/// Enforce the TLS policy for a pgwire connection.
+///
+/// The negotiated transport was captured in
+/// [`connection::run`](crate::control::server::pgwire::connection) right after
+/// pgwire's own SSL negotiation and stashed in the connection's typed
+/// session-extension store, which is the only per-connection carrier pgwire
+/// exposes that a client cannot write to. A connection with no stashed value
+/// never went through that path, so it fails closed rather than being treated
+/// as cleartext.
+fn check_client_transport<C: ClientInfo>(
+    state: &SharedState,
+    client: &C,
+    identity: &AuthenticatedIdentity,
+) -> PgWireResult<()> {
+    if !state.tls_policy.is_enforcing() {
+        return Ok(());
+    }
+
+    let transport = client
+        .session_extensions()
+        .get::<TransportSecurity>()
+        .map(|stashed| *stashed);
+    let source = client.socket_addr().to_string();
+
+    let refusal = match transport {
+        Some(transport) => crate::control::server::session_auth::check_transport_security(
+            state, identity, transport, &source,
+        )
+        .err(),
+        None => Some(crate::Error::RejectedAuthz {
+            tenant_id: identity.tenant_id,
+            resource: "connection transport could not be identified".into(),
+        }),
+    };
+
+    match refusal {
+        None => Ok(()),
+        Some(error) => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "FATAL".to_owned(),
+            "28000".to_owned(),
+            error.to_string(),
+        )))),
+    }
 }
 
 impl NodeDbPgHandler {

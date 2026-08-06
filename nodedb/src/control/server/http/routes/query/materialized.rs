@@ -21,6 +21,7 @@ use crate::control::server::shared::plan_admission::{
 
 use super::super::super::auth::{ApiError, AppState, build_request_scope, resolve_auth_parts};
 use super::super::super::peer::PeerAddr;
+use super::super::super::transport::ClientTransport;
 use super::super::super::types::{HttpQueryRequest, HttpQueryResponse};
 use super::super::result_shape::{
     HttpShaped, ddl_results_to_json, passthrough_json_row, shape_http_payload,
@@ -38,11 +39,13 @@ use super::{DatabaseQueryParam, resolve_database_id};
 pub async fn query(
     headers: HeaderMap,
     peer: PeerAddr,
+    transport: ClientTransport,
     QueryParams(db_param): QueryParams<DatabaseQueryParam>,
     State(state): State<AppState>,
     axum::Json(body): axum::Json<HttpQueryRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (identity, verified_jwt) = resolve_auth_parts(&headers, &state, peer.as_str())?;
+    let (identity, verified_jwt) =
+        resolve_auth_parts(&headers, &state, peer.as_str(), transport.security())?;
     let database_id = resolve_database_id(&headers, &db_param, &state)?;
     let trace_id = crate::control::trace_context::extract_from_headers(&headers);
     let emitter = ArcAuditEmitter(Arc::clone(&state.shared.audit));

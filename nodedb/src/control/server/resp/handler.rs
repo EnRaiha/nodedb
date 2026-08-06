@@ -155,6 +155,17 @@ fn handle_auth(cmd: &RespCommand, session: &mut RespSession, state: &SharedState
         crate::control::security::identity::AuthMethod::CleartextPassword,
     ) {
         Some(identity) => {
+            // The TLS policy runs before the identity is bound to the session:
+            // a refused connection must leave the session unauthenticated, so
+            // every data command keeps failing closed.
+            if let Err(e) = crate::control::server::session_auth::check_transport_security(
+                state,
+                &identity,
+                session.transport,
+                &session.peer_addr,
+            ) {
+                return RespValue::err(format!("NOPERM {e}"));
+            }
             session.tenant_id = identity.tenant_id;
             session.identity = Some(identity);
             state.auth_metrics.record_auth_success("resp_password");

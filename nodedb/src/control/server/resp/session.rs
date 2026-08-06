@@ -28,6 +28,12 @@ pub struct RespSession {
     /// accept in `listener::handle_connection`; used for IP-blacklist checks
     /// in `check_request_admission`.
     pub peer_addr: String,
+
+    /// What the connection negotiated, captured once at accept in
+    /// `listener::handle_connection` because the TLS session is unreachable
+    /// once the stream is borrowed for reads. AUTH hands it to the TLS-policy
+    /// guard together with the resolved identity.
+    pub transport: crate::control::security::tls_policy::TransportSecurity,
 }
 
 impl Default for RespSession {
@@ -37,6 +43,9 @@ impl Default for RespSession {
             tenant_id: TenantId::new(1),
             identity: None,
             peer_addr: String::new(),
+            // Fail-safe default for a session that was never bound to a
+            // socket: the listener overwrites it at accept.
+            transport: crate::control::security::tls_policy::TransportSecurity::Cleartext,
         }
     }
 }

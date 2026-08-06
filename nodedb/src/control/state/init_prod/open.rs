@@ -118,6 +118,17 @@ impl SharedState {
             auth_config.escalation.clone().unwrap_or_default(),
         );
 
+        // `auth_config.tls_policy` is `None` unless the operator configured an
+        // `[auth.tls_policy]` section, and `TlsPolicyConfig::default()` has
+        // `enabled = false`, so no connection is refused on transport grounds
+        // either way. When it *is* configured the operator's minimum version
+        // is parsed here — the one place it can be — and an unparseable value
+        // fails startup rather than being silently replaced by a default that
+        // enforces something else.
+        let tls_policy = crate::control::security::tls_policy::TlsPolicy::from_config(
+            &auth_config.tls_policy.clone().unwrap_or_default(),
+        )?;
+
         // Auth users are catalog-backed in production: an escalation verdict
         // written to a record has to still be there after a restart, and a
         // memory-only store would drop it.
@@ -323,7 +334,7 @@ impl SharedState {
             ceilings: crate::control::security::ceiling::CeilingStore::new(),
             redaction: redaction_store,
             risk_scorer,
-            tls_policy: crate::control::security::tls_policy::TlsPolicy::default(),
+            tls_policy,
             siem,
             jwks_registry: None,
             sync_dlq: Mutex::new(SyncDlq::new(DlqConfig::default())),

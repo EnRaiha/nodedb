@@ -17,9 +17,11 @@ use futures::{FutureExt, SinkExt, StreamExt};
 use pgwire::api::{ClientInfo, ErrorHandler, PgWireConnectionState};
 use pgwire::error::ErrorInfo;
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::tokio::server::{negotiate_tls, process_error, process_message};
+use pgwire::tokio::server::{MaybeTls, negotiate_tls, process_error, process_message};
 use tokio::net::TcpStream;
 use tracing::warn;
+
+use crate::control::security::tls_policy::TransportSecurity;
 
 use super::connection_identity::PgConnectionContext;
 use super::factory::NodeDbPgHandlerFactory;
@@ -33,6 +35,21 @@ const INTERNAL_ERROR_MESSAGE: &str = "internal server error";
 pub(crate) enum ConnectionOutcome {
     Closed,
     Panicked,
+}
+
+/// Read the negotiated transport out of the socket pgwire just produced.
+///
+/// `MaybeTls` is `#[non_exhaustive]`, so the catch-all arm is required; every
+/// non-TLS arm (plain TCP, Unix socket) is cleartext as far as the policy is
+/// concerned.
+fn transport_security_of(socket: &MaybeTls) -> TransportSecurity {
+    match socket {
+        MaybeTls::Tls(stream) => {
+            let (_, session) = stream.get_ref();
+            TransportSecurity::from_rustls(session)
+        }
+        _ => TransportSecurity::Cleartext,
+    }
 }
 
 fn recovery_is_safe(pending_output_len: usize) -> bool {
@@ -127,6 +144,15 @@ async fn run_inner(
     let Some(mut socket) = negotiated else {
         return Ok(());
     };
+    // pgwire owns the SSLRequest negotiation, so the handshake facts are only
+    // reachable here, between `negotiate_tls` returning and the framed socket
+    // being handed to the message loop. They are stashed in the connection's
+    // typed session-extension store — not `metadata`, which the startup
+    // handler fills from client-supplied startup parameters and a client could
+    // therefore forge — and read back at identity resolution.
+    socket
+        .session_extensions()
+        .insert(transport_security_of(socket.get_ref()));
     // Allocate the fixed recovery frame before entering any application-owned
     // handler construction or message dispatch. Panic recovery only takes this
     // prebuilt value and never formats a panic payload.

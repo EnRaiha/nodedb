@@ -11,6 +11,7 @@ use axum::response::IntoResponse;
 use crate::control::server::http::admission::{admit, identity_database};
 use crate::control::server::http::auth::{ApiError, AppState, resolve_identity};
 use crate::control::server::http::peer::PeerAddr;
+use crate::control::server::http::transport::ClientTransport;
 
 /// GET /v1/status
 ///
@@ -31,9 +32,10 @@ use crate::control::server::http::peer::PeerAddr;
 pub async fn status(
     headers: HeaderMap,
     peer: PeerAddr,
+    transport: ClientTransport,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let identity = resolve_identity(&headers, &state, peer.as_str())?;
+    let identity = resolve_identity(&headers, &state, peer.as_str(), transport.security())?;
 
     // Request-admission gate before any state is read: this endpoint reports
     // user, tenant, and cluster counts on behalf of the caller, so a

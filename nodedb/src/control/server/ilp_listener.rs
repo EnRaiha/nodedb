@@ -210,6 +210,11 @@ async fn handle_ilp_connection(
     state: &Arc<SharedState>,
     auth_mode: &AuthMode,
 ) -> crate::Result<()> {
+    // Captured before the Hello/Auth prelude borrows the stream and the
+    // ingest loop moves it into a `BufReader`, after which the TLS session is
+    // no longer reachable.
+    let transport = stream.transport_security();
+
     // The native Hello/Auth prelude must finish before line parsing, tenant
     // accounting, or any ingest side effect. Authentication failures consume
     // no ILP bytes and the dropped stream cannot enter the ingest loop.
@@ -223,6 +228,27 @@ async fn handle_ilp_connection(
     .map_err(|_| crate::Error::BadRequest {
         detail: "ILP authentication failed".into(),
     })?;
+    // The TLS policy is evaluated before any ingest capacity is acquired: the
+    // identity (and with it the superuser flag the cleartext carve-out needs)
+    // exists only now, and a refused connection must not hold a slot.
+    if crate::control::server::session_auth::check_transport_security(
+        state,
+        authenticated_context.identity(),
+        transport,
+        authenticated_context.peer_addr(),
+    )
+    .is_err()
+    {
+        crate::control::server::ilp_auth::write_ilp_auth_failure(
+            &mut stream,
+            &authenticated_context,
+        )
+        .await;
+        return Err(crate::Error::BadRequest {
+            detail: "ILP authentication failed".into(),
+        });
+    }
+
     let _admission = match IlpConnectionAdmission::acquire(state, &authenticated_context) {
         Ok(admission) => admission,
         Err(_) => {

@@ -179,6 +179,7 @@ async fn handle_connection(
 
     let mut session = RespSession {
         peer_addr: peer.to_string(),
+        transport: stream.transport_security(),
         ..RespSession::default()
     };
     let mut parser = RespParser::new();

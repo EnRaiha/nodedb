@@ -18,16 +18,19 @@ use axum::response::IntoResponse;
 use super::super::admission::{admit, identity_database};
 use super::super::auth::{ApiError, AppState, resolve_auth};
 use super::super::peer::PeerAddr;
+use super::super::transport::ClientTransport;
 use super::super::types::{HttpExchangeKeyRequest, HttpExchangeKeyResponse};
 
 /// `POST /v1/auth/exchange-key` — Exchange a JWT for an `nda_` API key.
 pub async fn exchange_key(
     headers: HeaderMap,
     peer: PeerAddr,
+    transport: ClientTransport,
     State(state): State<AppState>,
     axum::Json(body): axum::Json<HttpExchangeKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (identity, _auth_ctx) = resolve_auth(&headers, &state, peer.as_str())?;
+    let (identity, _auth_ctx) =
+        resolve_auth(&headers, &state, peer.as_str(), transport.security())?;
 
     // Minting a long-lived credential is work done on the caller's behalf, so
     // it runs behind the full gate: a blacklisted IP or a suspended/banned

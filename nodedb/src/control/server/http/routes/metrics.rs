@@ -9,6 +9,7 @@ use axum::response::IntoResponse;
 use super::super::admission::{admit_without_rate_limit, identity_database};
 use super::super::auth::{ApiError, AppState, resolve_identity};
 use super::super::peer::PeerAddr;
+use super::super::transport::ClientTransport;
 
 /// GET /metrics — Prometheus-format metrics.
 ///
@@ -16,9 +17,10 @@ use super::super::peer::PeerAddr;
 pub async fn metrics(
     headers: HeaderMap,
     peer: PeerAddr,
+    transport: ClientTransport,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let identity = resolve_identity(&headers, &state, peer.as_str())?;
+    let identity = resolve_identity(&headers, &state, peer.as_str(), transport.security())?;
 
     // Blacklist + account status, no rate limit: a Prometheus scrape runs on a
     // fixed interval and is not the per-query traffic the rate limiter's cost

@@ -58,6 +58,11 @@ impl NativeConnectionResources {
 ///    the connection's lifetime.
 pub struct NativeSession {
     pub(super) stream: ConnStream,
+    /// What the connection negotiated, captured at accept because the TLS
+    /// session is unreachable once the stream is borrowed for framing. The
+    /// auth frame hands it to the TLS-policy guard together with the resolved
+    /// identity.
+    pub(super) transport: crate::control::security::tls_policy::TransportSecurity,
     pub(super) peer_addr: SocketAddr,
     pub(super) state: Arc<SharedState>,
     pub(super) auth_mode: AuthMode,
@@ -94,8 +99,10 @@ impl NativeSession {
     ) -> Self {
         let query_ctx = QueryContext::for_state(&state);
         let NativeConnectionResources { sessions, cleanup } = resources;
+        let transport = stream.transport_security();
         Self {
             stream,
+            transport,
             peer_addr,
             state,
             auth_mode,

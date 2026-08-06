@@ -54,6 +54,20 @@ impl NativeSession {
                 warning,
                 verified_jwt,
             }) => {
+                // The TLS policy is evaluated here, before any capacity is
+                // acquired or session state is written: this is the first
+                // point where the connection's negotiated transport and the
+                // identity's superuser flag are both known, and a refused
+                // connection must not have consumed an admission slot.
+                if let Err(e) = crate::control::server::session_auth::check_transport_security(
+                    &self.state,
+                    &identity,
+                    self.transport,
+                    &self.peer_addr.to_string(),
+                ) {
+                    return NativeResponse::error(seq, "28000", format!("{e}"));
+                }
+
                 // Bind the requested database before acquiring any scoped
                 // admission capacity. An absent or empty name uses the
                 // authenticated identity's default, then the system default.

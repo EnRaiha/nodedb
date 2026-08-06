@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Post-identity authorization guards: blacklist, risk, and rate-limit checks.
+//! Post-identity authorization guards: blacklist, transport security, risk,
+//! and rate-limit checks.
 
 use crate::control::security::auth_context::AuthContext;
 use crate::control::security::escalation::{
     AuthViolation, ViolationSubject, record_auth_violation,
 };
 use crate::control::security::identity::AuthenticatedIdentity;
+use crate::control::security::tls_policy::TransportSecurity;
 use crate::control::state::SharedState;
 
 /// Check if a user is blacklisted. Returns `Err` if blocked.
@@ -112,6 +114,51 @@ pub fn check_blacklist(
     }
 
     Ok(())
+}
+
+/// Enforce the TLS policy for the connection an authenticated identity
+/// arrived on.
+///
+/// `transport` is what the connection negotiated, captured at accept by the
+/// listener that owns the socket and carried to here — the earliest point at
+/// which `is_superuser` is known, which the policy's cleartext carve-out needs.
+/// Every transport that can carry a client connection calls this once its
+/// identity is resolved.
+///
+/// Refusals use [`crate::Error::RejectedAuthz`], the same authorization
+/// rejection the blacklist, account-status, and risk guards raise, so clients
+/// see one consistent non-retryable code; the reason string names the
+/// transport fault. Returns `Ok(())` when enforcement is off — the default.
+pub fn check_transport_security(
+    state: &SharedState,
+    identity: &AuthenticatedIdentity,
+    transport: TransportSecurity,
+    peer_addr: &str,
+) -> crate::Result<()> {
+    let Err(refusal) = state
+        .tls_policy
+        .check_connection(transport, identity.is_superuser)
+    else {
+        return Ok(());
+    };
+
+    // A transport refusal is a repeated-violation signal like any other
+    // rejection on this path, so it goes through the shared recorder: one
+    // call, audit entry plus violation count.
+    record_auth_violation(
+        state,
+        AuthViolation {
+            subject: ViolationSubject::Identity(identity),
+            tenant_id: Some(identity.tenant_id),
+            source: peer_addr,
+            detail: &format!("TLS policy refused user '{}': {refusal}", identity.username),
+        },
+    );
+
+    Err(crate::Error::RejectedAuthz {
+        tenant_id: identity.tenant_id,
+        resource: refusal.to_string(),
+    })
 }
 
 /// Enforce the adaptive-auth risk decision for a request.
@@ -234,4 +281,258 @@ pub fn check_rate_limit(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use nodedb_types::DatabaseId;
+
+    use crate::bridge::dispatch::Dispatcher;
+    use crate::control::security::identity::{
+        AuthMethod, AuthenticatedIdentity, CatalogPrincipal, DatabaseSet, Role,
+    };
+    use crate::control::security::tls_policy::{TlsPolicyConfig, TlsVersion};
+    use crate::types::TenantId;
+    use crate::wal::WalManager;
+
+    use super::*;
+
+    /// Returns the state plus the backing `TempDir` guard — the caller must
+    /// keep the guard alive for as long as `state` is in use.
+    fn test_state(config: TlsPolicyConfig) -> (Arc<SharedState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+        let state = SharedState::new_with_tls_policy_config(dispatcher, wal, config)
+            .expect("construct shared state");
+        (state, dir)
+    }
+
+    fn tls_policy_config(enabled: bool, min: &str, reject_cleartext: bool) -> TlsPolicyConfig {
+        TlsPolicyConfig {
+            enabled,
+            min_tls_version: min.into(),
+            reject_cleartext,
+        }
+    }
+
+    fn regular_identity() -> AuthenticatedIdentity {
+        AuthenticatedIdentity::new_regular(
+            9301,
+            "regular-user",
+            TenantId::new(1),
+            AuthMethod::ScramSha256,
+            vec![Role::ReadWrite],
+            None,
+            DatabaseSet::Some(smallvec::smallvec![DatabaseId::DEFAULT]),
+        )
+    }
+
+    /// A real superuser — `new_regular` strips the superuser role by design,
+    /// so the carve-out can only be exercised through a catalog principal.
+    fn superuser_identity() -> AuthenticatedIdentity {
+        AuthenticatedIdentity::from_catalog_principal(CatalogPrincipal {
+            user_id: 9302,
+            username: "root".into(),
+            tenant_id: TenantId::new(1),
+            auth_method: AuthMethod::ScramSha256,
+            roles: vec![Role::Superuser],
+            is_superuser: true,
+            default_database: None,
+            accessible_databases: DatabaseSet::All,
+        })
+    }
+
+    fn rejection_reason(error: &crate::Error) -> String {
+        match error {
+            crate::Error::RejectedAuthz { resource, .. } => resource.clone(),
+            other => panic!("expected an authz rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cleartext_is_refused_when_the_policy_rejects_it() {
+        let (state, _dir) = test_state(tls_policy_config(true, "1.2", true));
+        let identity = regular_identity();
+
+        let error = check_transport_security(
+            &state,
+            &identity,
+            TransportSecurity::Cleartext,
+            "10.0.0.1:5432",
+        )
+        .expect_err("a plaintext connection must be refused");
+        assert_eq!(
+            rejection_reason(&error),
+            "cleartext connections rejected by TLS policy"
+        );
+    }
+
+    #[test]
+    fn cleartext_is_allowed_when_the_policy_does_not_reject_it() {
+        let (state, _dir) = test_state(tls_policy_config(true, "1.2", false));
+        let identity = regular_identity();
+
+        check_transport_security(
+            &state,
+            &identity,
+            TransportSecurity::Cleartext,
+            "10.0.0.1:5432",
+        )
+        .expect("a plaintext connection must be admitted when cleartext is permitted");
+    }
+
+    /// The carve-out, pinned end-to-end: `reject_cleartext` refuses the
+    /// regular identity and admits the superuser on the same connection.
+    #[test]
+    fn the_superuser_carve_out_covers_cleartext_only() {
+        let (state, _dir) = test_state(tls_policy_config(true, "1.3", true));
+
+        assert!(
+            check_transport_security(
+                &state,
+                &regular_identity(),
+                TransportSecurity::Cleartext,
+                "10.0.0.1:5432",
+            )
+            .is_err()
+        );
+        check_transport_security(
+            &state,
+            &superuser_identity(),
+            TransportSecurity::Cleartext,
+            "10.0.0.1:5432",
+        )
+        .expect("a superuser keeps a cleartext way in");
+
+        // ...but not below the minimum version.
+        let error = check_transport_security(
+            &state,
+            &superuser_identity(),
+            TransportSecurity::Tls(TlsVersion::Tls1_2),
+            "10.0.0.1:5432",
+        )
+        .expect_err("a superuser on an obsolete TLS version must still be refused");
+        assert_eq!(
+            rejection_reason(&error),
+            "TLS 1.2 is below the required minimum TLS 1.3"
+        );
+    }
+
+    #[test]
+    fn tls_below_the_minimum_is_refused_and_at_or_above_is_allowed() {
+        let (state, _dir) = test_state(tls_policy_config(true, "1.3", false));
+        let identity = regular_identity();
+
+        assert!(
+            check_transport_security(
+                &state,
+                &identity,
+                TransportSecurity::Tls(TlsVersion::Tls1_2),
+                "10.0.0.1:5432",
+            )
+            .is_err()
+        );
+        check_transport_security(
+            &state,
+            &identity,
+            TransportSecurity::Tls(TlsVersion::Tls1_3),
+            "10.0.0.1:5432",
+        )
+        .expect("a connection at the minimum must be admitted");
+    }
+
+    #[test]
+    fn an_unidentifiable_tls_connection_fails_closed() {
+        let (state, _dir) = test_state(tls_policy_config(true, "1.2", false));
+
+        let error = check_transport_security(
+            &state,
+            &regular_identity(),
+            TransportSecurity::TlsUnidentified,
+            "10.0.0.1:5432",
+        )
+        .expect_err("an unrankable TLS connection must not be admitted");
+        assert_eq!(
+            rejection_reason(&error),
+            "negotiated TLS version could not be identified"
+        );
+    }
+
+    /// The knob is not inert: the very same connection is refused or admitted
+    /// depending only on what the server config said, and nothing is enforced
+    /// at all while `enabled` is false.
+    #[test]
+    fn configured_policy_reaches_shared_state_and_changes_the_outcome() {
+        let identity = regular_identity();
+        let connection = TransportSecurity::Tls(TlsVersion::Tls1_2);
+
+        let (strict, _dir_a) = test_state(tls_policy_config(true, "1.3", true));
+        assert!(
+            check_transport_security(&strict, &identity, connection, "10.0.0.1:5432").is_err(),
+            "min_tls_version = 1.3 must refuse a TLS 1.2 connection"
+        );
+
+        let (relaxed, _dir_b) = test_state(tls_policy_config(true, "1.2", true));
+        assert!(
+            check_transport_security(&relaxed, &identity, connection, "10.0.0.1:5432").is_ok(),
+            "min_tls_version = 1.2 must admit the same connection"
+        );
+
+        let (disabled, _dir_c) = test_state(tls_policy_config(false, "1.3", true));
+        assert!(
+            check_transport_security(&disabled, &identity, connection, "10.0.0.1:5432").is_ok()
+        );
+        assert!(
+            check_transport_security(
+                &disabled,
+                &identity,
+                TransportSecurity::Cleartext,
+                "10.0.0.1:5432"
+            )
+            .is_ok(),
+            "a disabled policy must refuse nothing, including cleartext"
+        );
+    }
+
+    /// The out-of-the-box server enforces nothing, so no existing plaintext
+    /// deployment changes behaviour by upgrading.
+    #[test]
+    fn the_default_configuration_admits_plaintext() {
+        let (state, _dir) = test_state(TlsPolicyConfig::default());
+        assert!(
+            check_transport_security(
+                &state,
+                &regular_identity(),
+                TransportSecurity::Cleartext,
+                "10.0.0.1:5432",
+            )
+            .is_ok()
+        );
+    }
+
+    /// An unparseable minimum is a load-time failure, not a silent default:
+    /// state construction — which is what production startup runs — errors.
+    #[test]
+    fn an_unparseable_min_version_fails_state_construction() {
+        let dir = tempfile::tempdir().expect("create test directory");
+        let wal = Arc::new(
+            WalManager::open_for_testing(&dir.path().join("test.wal")).expect("open test WAL"),
+        );
+        let (dispatcher, _data_sides) = Dispatcher::new(1, 64);
+
+        let result = SharedState::new_with_tls_policy_config(
+            dispatcher,
+            wal,
+            tls_policy_config(true, "1.2 or better", true),
+        );
+        assert!(
+            matches!(result, Err(crate::Error::Config { .. })),
+            "an unparseable min_tls_version must fail startup"
+        );
+    }
 }

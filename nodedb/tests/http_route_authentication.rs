@@ -105,6 +105,7 @@ async fn http_trust_auth_uses_configured_durable_identity() {
         &axum::http::HeaderMap::new(),
         &app_state,
         "127.0.0.1:1",
+        nodedb::control::security::tls_policy::TransportSecurity::Cleartext,
     )
     .expect("configured HTTP trust identity");
 
@@ -134,6 +135,7 @@ async fn http_trust_auth_rejects_without_configured_identity() {
         &axum::http::HeaderMap::new(),
         &app_state,
         "127.0.0.1:1",
+        nodedb::control::security::tls_policy::TransportSecurity::Cleartext,
     );
 
     assert!(

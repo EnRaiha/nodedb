@@ -444,6 +444,14 @@ pub struct AuthConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub escalation: Option<crate::control::security::escalation::EscalationConfig>,
 
+    /// TLS enforcement configuration (minimum negotiated version, cleartext
+    /// rejection). Absent — and, when present, absent `enabled = true` —
+    /// leaves enforcement off: no connection is refused on transport grounds,
+    /// which is what every plaintext deployment depends on. An unparseable
+    /// `min_tls_version` fails startup rather than falling back to a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_policy: Option<crate::control::security::tls_policy::TlsPolicyConfig>,
+
     /// Opaque session handle configuration: fingerprint binding, resolve
     /// rate-limit, miss-spike detection.
     #[serde(default)]
@@ -473,6 +481,7 @@ impl Default for AuthConfig {
             siem: None,
             risk: None,
             escalation: None,
+            tls_policy: None,
             session: SessionHandleConfig::default(),
         }
     }

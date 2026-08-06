@@ -137,6 +137,9 @@ async-stream = { workspace = true }
 # HTTP API
 axum = { workspace = true }
 axum-server = { workspace = true }
+# `Layer`, to stamp each accepted connection's transport security onto the
+# requests served over it (see `control/server/http/tls_accept.rs`).
+tower = { workspace = true }
 
 # WebSocket (sync endpoint)
 tokio-tungstenite = { workspace = true }
@@ -170,7 +173,6 @@ nodedb-types = { workspace = true }
 reqwest = { workspace = true }
 nodedb-array = { workspace = true }
 nodedb-test-support = { workspace = true }
-tower = { workspace = true }
 rcgen = "0.13"
 zerompk = { workspace = true }
 loro = { workspace = true }

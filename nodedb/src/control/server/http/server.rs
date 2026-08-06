@@ -284,8 +284,17 @@ pub async fn run(
 
         // `into_std` keeps the socket in nonblocking mode, which is what
         // axum-server needs to hand it back to Tokio.
-        axum_server::from_tcp_rustls(listener.into_std()?, rustls_config)
+        //
+        // The acceptor is NodeDB's own rather than `from_tcp_rustls`'s: it
+        // wraps the same rustls handshake but reads the negotiated version off
+        // the accepted stream and stamps it onto every request served over
+        // that connection, which is the only point where the TLS session is
+        // still reachable.
+        axum_server::from_tcp(listener.into_std()?)
             .map_err(crate::Error::Io)?
+            .acceptor(super::tls_accept::TransportCapturingAcceptor::new(
+                rustls_config,
+            ))
             .handle(handle)
             .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
@@ -293,6 +302,13 @@ pub async fn run(
     } else {
         // Plain HTTP.
         info!(%local_addr, "HTTP API server listening");
+
+        // A plaintext listener has one fixed transport, so it is stamped on
+        // the router rather than per connection. Every request must carry the
+        // extension on both paths — routes fail closed without it.
+        let router = router.layer(axum::Extension(
+            crate::control::security::tls_policy::TransportSecurity::Cleartext,
+        ));
 
         // `with_connect_info` is required so routes that take
         // `ConnectInfo<SocketAddr>` (e.g. `/api/auth/session` for the

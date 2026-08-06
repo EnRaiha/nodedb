@@ -8,6 +8,8 @@
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
+use crate::control::security::tls_policy::TransportSecurity;
+
 /// A connection stream — either plain TCP or TLS-wrapped.
 pub enum ConnStream {
     Plain(TcpStream),
@@ -21,6 +23,24 @@ impl ConnStream {
 
     pub fn tls(stream: tokio_rustls::server::TlsStream<TcpStream>) -> Self {
         Self::Tls(Box::new(stream))
+    }
+
+    /// What this connection negotiated, for the TLS policy.
+    ///
+    /// Read once per connection right after accept, before the stream is
+    /// erased behind `AsyncRead + AsyncWrite` (or moved into a `BufReader`)
+    /// and the `rustls` session becomes unreachable. The listeners keep the
+    /// returned value on their session state and hand it to
+    /// [`check_transport_security`](crate::control::server::session_auth::check_transport_security)
+    /// once the identity is known.
+    pub fn transport_security(&self) -> TransportSecurity {
+        match self {
+            ConnStream::Plain(_) => TransportSecurity::Cleartext,
+            ConnStream::Tls(stream) => {
+                let (_, session) = stream.get_ref();
+                TransportSecurity::from_rustls(session)
+            }
+        }
     }
 }
 
