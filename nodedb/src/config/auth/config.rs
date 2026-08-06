@@ -424,6 +424,12 @@ pub struct AuthConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metering: Option<crate::control::security::metering::config::MeteringConfig>,
 
+    /// SIEM export configuration (webhook destination, HMAC secret, buffer
+    /// ceiling, flush cadence). Absent leaves the exporter unconfigured: no
+    /// events are buffered and no delivery loop is spawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub siem: Option<crate::control::security::siem::SiemConfig>,
+
     /// Opaque session handle configuration: fingerprint binding, resolve
     /// rate-limit, miss-spike detection.
     #[serde(default)]
@@ -450,6 +456,7 @@ impl Default for AuthConfig {
             jwt: None,
             rate_limit: None,
             metering: None,
+            siem: None,
             session: SessionHandleConfig::default(),
         }
     }

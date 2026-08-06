@@ -221,6 +221,11 @@ pub fn spawn_background_loops(
         },
     );
 
+    // SIEM export delivery. Ships the audit/auth events buffered by
+    // `audit_record_with_db_strict` to the configured webhook. No-op (and no
+    // task) when no SIEM destination is configured.
+    crate::control::security::siem::spawn_export_loop(shared);
+
     // Tenant memory estimation (30-second timer).
     let shared_mem = Arc::clone(shared);
     crate::control::shutdown::spawn_loop(

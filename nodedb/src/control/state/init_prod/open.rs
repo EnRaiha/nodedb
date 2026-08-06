@@ -86,12 +86,24 @@ impl SharedState {
             .as_ref()
             .unwrap_or(&rate_limit_defaults);
 
+        // `auth_config.siem` is `None` unless the operator configured an
+        // `[auth.siem]` section; the default leaves `destinations` empty and
+        // `webhook_url` blank, so `is_configured()` is false and the export
+        // path stays dormant. When it *is* configured the exporter shares the
+        // process-wide HTTP client rather than building its own pool.
+        let siem_config = auth_config.siem.clone().unwrap_or_default();
+        let http_client = Arc::new(reqwest::Client::new());
+        let siem = crate::control::security::siem::SiemExporter::with_client(
+            siem_config,
+            Arc::clone(&http_client),
+        );
+
         let state = Arc::new(Self {
             dispatcher: Mutex::new(dispatcher),
             tracker: RequestTracker::new(),
             wal,
             quiesce,
-            http_client: Arc::new(reqwest::Client::new()),
+            http_client,
             credentials: Arc::clone(&credentials),
             audit: shared_audit,
             api_keys,
@@ -280,7 +292,7 @@ impl SharedState {
             redaction: redaction_store,
             risk_scorer: crate::control::security::risk::RiskScorer::default(),
             tls_policy: crate::control::security::tls_policy::TlsPolicy::default(),
-            siem: crate::control::security::siem::SiemExporter::default(),
+            siem,
             jwks_registry: None,
             sync_dlq: Mutex::new(SyncDlq::new(DlqConfig::default())),
             audit_retention_days: auth_config.audit_retention_days,

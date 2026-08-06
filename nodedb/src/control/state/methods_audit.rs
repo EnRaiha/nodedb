@@ -60,6 +60,19 @@ impl SharedState {
 
         // Write to durable audit WAL — failure is a hard error.
         if let Some(ref entry) = entry {
+            // SIEM export. This is the single choke point every audit event
+            // passes through, so it is the only place the exporter has to be
+            // fed. `is_configured()` is checked first so an unconfigured
+            // exporter — the default — costs one atomic-free bool read and
+            // never clones the entry.
+            if self.siem.is_configured() {
+                if entry.event.is_auth_event() {
+                    self.siem.push_auth(entry.clone());
+                } else {
+                    self.siem.push_audit(entry.clone());
+                }
+            }
+
             let bytes =
                 zerompk::to_msgpack_vec(entry).map_err(|e| crate::Error::Serialization {
                     format: "msgpack".into(),

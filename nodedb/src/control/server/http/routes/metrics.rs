@@ -229,6 +229,10 @@ pub async fn metrics(
         &mut output,
     );
 
+    // SIEM export: buffer-overflow drops and webhook delivery failures, so an
+    // audit event that never reached the SIEM is visible without log scraping.
+    crate::control::security::siem::metrics::render_prometheus(&state.shared.siem, &mut output);
+
     if let Some(sequencer_metrics) = state.shared.sequencer_metrics.get() {
         output.push_str(&sequencer_metrics.render_prometheus());
     }
