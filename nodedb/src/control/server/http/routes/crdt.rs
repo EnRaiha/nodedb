@@ -16,6 +16,7 @@ use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::security::permission::PermissionStore;
 use crate::control::security::role::RoleStore;
 use crate::control::server::http::auth::{ApiError, AppState, resolve_identity};
+use crate::control::server::http::peer::PeerAddr;
 use crate::control::server::http::types::{HttpCrdtApplyRequest, HttpCrdtApplyResponse};
 use crate::control::server::shared::authorization::{
     AuthorizationError, authorize_collection, authorize_task_set,
@@ -42,11 +43,12 @@ pub const CRDT_HTTP_BODY_MAX_BYTES: usize = 2 * nodedb_crdt::DEFAULT_MAX_DELTA_B
 /// ```
 pub async fn crdt_apply(
     headers: HeaderMap,
+    peer: PeerAddr,
     State(state): State<AppState>,
     Path(collection): Path<String>,
     axum::Json(body): axum::Json<HttpCrdtApplyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let identity = resolve_identity(&headers, &state, "http")?;
+    let identity = resolve_identity(&headers, &state, peer.as_str())?;
 
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.shared.audit));
     preflight_crdt_apply(

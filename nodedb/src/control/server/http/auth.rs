@@ -214,14 +214,20 @@ pub(crate) fn on_deny_header_mode(
 /// [`resolve_auth_parts`].
 ///
 /// Collapses the construction dance every HTTP query route needs identically:
-/// session database, `X-On-Deny` header, and (when present) verified-JWT
-/// enrichment.
+/// session database, `X-On-Deny` header, the connection's real peer address,
+/// and (when present) verified-JWT enrichment.
+///
+/// `peer_addr` must be the accepted socket's address, from
+/// [`PeerAddr`](super::peer::PeerAddr) — the scope stamps `$auth.risk_score`
+/// from it, and a scope built without one is treated as unassessed and refused
+/// by the request-admission gate whenever risk scoring is enabled.
 pub(crate) fn build_request_scope<'a>(
     identity: &'a AuthenticatedIdentity,
     verified_jwt: Option<&'a crate::control::security::jwks::registry::VerifiedJwtClaims>,
     headers: &HeaderMap,
     state: &'a AppState,
     database_id: crate::types::DatabaseId,
+    peer_addr: &str,
 ) -> crate::control::security::request_scope::RequestAuthScope<'a> {
     crate::control::security::request_scope::RequestAuthScope::builder(
         identity,
@@ -230,6 +236,7 @@ pub(crate) fn build_request_scope<'a>(
     .with_session_database(Some(database_id))
     .with_on_deny(on_deny_header_mode(headers))
     .with_optional_verified_jwt(verified_jwt)
+    .with_peer_addr(peer_addr)
     .build()
 }
 
@@ -318,11 +325,7 @@ impl FromRequestParts<AppState> for ResolvedIdentity {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let peer = parts
-            .extensions
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .map(|ci| ci.0.to_string())
-            .unwrap_or_else(|| "http".to_string());
+        let peer = super::peer::peer_addr_from_parts(parts)?;
         let identity = resolve_identity(&parts.headers, state, &peer)?;
         Ok(ResolvedIdentity(identity))
     }
@@ -348,11 +351,7 @@ impl FromRequestParts<AppState> for ResolvedAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let peer = parts
-            .extensions
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .map(|ci| ci.0.to_string())
-            .unwrap_or_else(|| "http".to_string());
+        let peer = super::peer::peer_addr_from_parts(parts)?;
         let (identity, auth_ctx) = resolve_auth(&parts.headers, state, &peer)?;
         Ok(ResolvedAuth(identity, auth_ctx))
     }

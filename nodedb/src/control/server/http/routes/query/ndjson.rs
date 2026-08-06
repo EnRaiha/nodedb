@@ -21,6 +21,7 @@ use crate::control::server::shared::plan_admission::{
 };
 
 use super::super::super::auth::{ApiError, AppState, build_request_scope, resolve_auth_parts};
+use super::super::super::peer::PeerAddr;
 use super::super::query_stream::{NdjsonBody, ndjson_body_stream, try_open_stream};
 use super::super::result_shape::{HttpShaped, passthrough_to_ndjson, shape_http_payload};
 use super::{DatabaseQueryParam, resolve_database_id};
@@ -35,12 +36,13 @@ use super::{DatabaseQueryParam, resolve_database_id};
 pub async fn query_ndjson(
     State(state): State<AppState>,
     headers: HeaderMap,
+    peer: PeerAddr,
     QueryParams(db_param): QueryParams<DatabaseQueryParam>,
     axum::Json(body): axum::Json<crate::control::server::http::types::HttpQueryStreamRequest>,
 ) -> impl IntoResponse {
     use axum::response::Response;
 
-    let (identity, verified_jwt) = match resolve_auth_parts(&headers, &state, "http") {
+    let (identity, verified_jwt) = match resolve_auth_parts(&headers, &state, peer.as_str()) {
         Ok(auth) => auth,
         Err(e) => return e.into_response(),
     };
@@ -91,16 +93,19 @@ pub async fn query_ndjson(
         &headers,
         &state,
         database_id,
+        peer.as_str(),
     );
 
     // Request-admission gate: internal-service exemption, blacklist, account
     // status, then rate limit — before any planning/dispatch, so load is
     // shed before it is spent. `Some(result)` carries the rate-limit outcome
-    // this handler surfaces as `X-RateLimit-*` response headers below.
+    // this handler surfaces as `X-RateLimit-*` response headers below. The
+    // accepted socket's address is what makes the IP-blacklist and risk
+    // halves of that gate live on this route.
     let rate_limit_result = match crate::control::server::session_auth::check_request_admission(
         &state.shared,
         &scope,
-        "http",
+        peer.as_str(),
         "sql",
     ) {
         Ok(result) => result,

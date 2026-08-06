@@ -9,6 +9,7 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 
 use crate::control::server::http::auth::{ApiError, AppState, resolve_identity};
+use crate::control::server::http::peer::PeerAddr;
 
 /// GET /v1/status
 ///
@@ -28,9 +29,10 @@ use crate::control::server::http::auth::{ApiError, AppState, resolve_identity};
 /// ```
 pub async fn status(
     headers: HeaderMap,
+    peer: PeerAddr,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _identity = resolve_identity(&headers, &state, "http")?;
+    let _identity = resolve_identity(&headers, &state, peer.as_str())?;
 
     let wal_next_lsn = state.shared.wal.next_lsn().as_u64();
     let node_id = state.shared.node_id;

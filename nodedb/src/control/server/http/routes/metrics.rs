@@ -7,15 +7,17 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
 use super::super::auth::{ApiError, AppState, resolve_identity};
+use super::super::peer::PeerAddr;
 
 /// GET /metrics — Prometheus-format metrics.
 ///
 /// Requires monitor role or superuser.
 pub async fn metrics(
     headers: HeaderMap,
+    peer: PeerAddr,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let identity = resolve_identity(&headers, &state, "http")?;
+    let identity = resolve_identity(&headers, &state, peer.as_str())?;
 
     if !identity.is_superuser
         && !identity.has_role(&crate::control::security::identity::Role::Monitor)

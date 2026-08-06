@@ -40,7 +40,8 @@ pub async fn create_session(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (identity, auth_ctx) = resolve_auth(&headers, &state, "http")?;
+    let peer_str = peer.to_string();
+    let (identity, auth_ctx) = resolve_auth(&headers, &state, &peer_str)?;
 
     let fingerprint = ClientFingerprint::from_peer(identity.tenant_id, &peer);
     let handle = state.shared.session_handles.create(auth_ctx, fingerprint);

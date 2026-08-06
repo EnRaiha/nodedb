@@ -47,9 +47,8 @@ mod tests {
         );
     }
 
-    /// The HTTP query routes currently hand their guards the literal string
-    /// `"http"` rather than a real remote address. That must never be
-    /// scored as if it were an IP.
+    /// A transport label, an empty string, or a socket path is not a remote
+    /// address and must never be scored as if it were an IP.
     #[test]
     fn rejects_a_non_address_placeholder() {
         assert_eq!(client_ip_from_peer("http"), None);

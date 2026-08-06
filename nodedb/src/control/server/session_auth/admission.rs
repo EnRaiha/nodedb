@@ -381,8 +381,8 @@ mod tests {
     async fn unassessed_request_fails_closed_when_scoring_is_enabled() {
         let (state, _dir) = test_state_with_risk(risk_config(true, 1.0, 2.0)).await;
         let identity = regular_identity(9205, AuthMethod::ScramSha256);
-        // `"http"` is not an address — the HTTP query routes pass exactly
-        // this literal today.
+        // A transport label is not an address, so nothing can be scored
+        // from it.
         let scope = scoped(&state, &identity, "http");
 
         let error = check_request_admission(&state, &scope, "http", "point_get")

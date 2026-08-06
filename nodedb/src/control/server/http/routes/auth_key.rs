@@ -16,15 +16,17 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 
 use super::super::auth::{ApiError, AppState, resolve_auth};
+use super::super::peer::PeerAddr;
 use super::super::types::{HttpExchangeKeyRequest, HttpExchangeKeyResponse};
 
 /// `POST /v1/auth/exchange-key` — Exchange a JWT for an `nda_` API key.
 pub async fn exchange_key(
     headers: HeaderMap,
+    peer: PeerAddr,
     State(state): State<AppState>,
     axum::Json(body): axum::Json<HttpExchangeKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (identity, _auth_ctx) = resolve_auth(&headers, &state, "http")?;
+    let (identity, _auth_ctx) = resolve_auth(&headers, &state, peer.as_str())?;
 
     let auth_user_id = identity.user_id.to_string();
     let rate_limit_qps = body.rate_limit_qps.unwrap_or(0);

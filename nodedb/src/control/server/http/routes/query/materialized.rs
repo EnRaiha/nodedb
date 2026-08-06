@@ -20,6 +20,7 @@ use crate::control::server::shared::plan_admission::{
 };
 
 use super::super::super::auth::{ApiError, AppState, build_request_scope, resolve_auth_parts};
+use super::super::super::peer::PeerAddr;
 use super::super::super::types::{HttpQueryRequest, HttpQueryResponse};
 use super::super::result_shape::{
     HttpShaped, ddl_results_to_json, passthrough_json_row, shape_http_payload,
@@ -36,11 +37,12 @@ use super::{DatabaseQueryParam, resolve_database_id};
 /// - `?database=<name>` query parameter (fallback)
 pub async fn query(
     headers: HeaderMap,
+    peer: PeerAddr,
     QueryParams(db_param): QueryParams<DatabaseQueryParam>,
     State(state): State<AppState>,
     axum::Json(body): axum::Json<HttpQueryRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (identity, verified_jwt) = resolve_auth_parts(&headers, &state, "http")?;
+    let (identity, verified_jwt) = resolve_auth_parts(&headers, &state, peer.as_str())?;
     let database_id = resolve_database_id(&headers, &db_param, &state)?;
     let trace_id = crate::control::trace_context::extract_from_headers(&headers);
     let emitter = ArcAuditEmitter(Arc::clone(&state.shared.audit));
@@ -60,6 +62,7 @@ pub async fn query(
         &headers,
         &state,
         database_id,
+        peer.as_str(),
     );
 
     // Request-admission gate: internal-service exemption, blacklist, account
@@ -68,11 +71,12 @@ pub async fn query(
     // DataFusion planning, so both DDL/DSL text and ordinary DML/SELECT
     // statements are covered by this one call. `Some(result)` carries the
     // rate-limit outcome this handler surfaces as `X-RateLimit-*` response
-    // headers below.
+    // headers below. The accepted socket's address is what makes the
+    // IP-blacklist and risk halves of that gate live on this route.
     let rate_limit_result = crate::control::server::session_auth::check_request_admission(
         &state.shared,
         &scope,
-        "http",
+        peer.as_str(),
         "sql",
     )?;
     let rate_limit_headers =
