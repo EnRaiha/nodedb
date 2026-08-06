@@ -6,7 +6,6 @@ use nodedb_sql::ddl_ast::GraphDirection;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
-use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::state::SharedState;
 use crate::engine::graph::edge_store::Direction;
 use crate::engine::graph::traversal_options::GraphTraversalOptions;
@@ -16,8 +15,13 @@ use nodedb_physical::physical_plan::GraphOp;
 use nodedb_types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::refuse_gate::RefusingReadGate;
 use super::response::payload_to_rows;
 use super::support::ddl_err;
+
+/// Names the traversal family in the refusal a read policy raises: what the
+/// result carries instead of rows is graph topology.
+const TRAVERSAL_WHAT: &str = "graph traversal, which returns graph topology";
 
 fn to_engine_direction(d: GraphDirection) -> Direction {
     match d {
@@ -88,46 +92,21 @@ fn authorize_traversal(
     database_id: DatabaseId,
     collection: &str,
 ) -> Result<(), DdlError> {
-    let audit =
-        crate::control::security::audit::ArcAuditEmitter(std::sync::Arc::clone(&state.audit));
-    crate::control::server::shared::authorization::authorize_collection(
-        identity,
-        database_id,
-        collection,
-        crate::control::security::identity::Permission::Read,
-        &state.permissions,
-        &state.roles,
-        &audit,
-    )
-    .map_err(|error| ddl_err("42501", format!("permission denied: {}", error.resource())))?;
-
     // The traversal reaches the Data Plane through `broadcast_to_all_cores`,
-    // which never runs `inject_rls`, so the policy is consulted here. A
-    // traversal returns topology rather than row bodies — there is nothing for
-    // a row filter to evaluate — and disclosing the shape of rows whose
-    // contents are protected is the leak, so a read policy refuses outright.
-    let scope = RequestAuthScope::for_database(identity, state.auth_stores(), database_id);
-    if state
-        .rls
-        .combined_read_predicate_with_auth(identity.tenant_id.as_u64(), collection, scope.auth())
-        .is_none_or(|filters| !filters.is_empty())
-    {
-        return Err(ddl_err(
-            "0A000",
-            format!(
-                "RLS policies on '{collection}' are not supported with graph traversal: a \
-                 traversal returns graph topology, which the row filter cannot evaluate"
-            ),
-        ));
-    }
+    // which never runs `inject_rls`, so the RBAC check and the policy are both
+    // resolved here. A traversal returns topology rather than row bodies —
+    // there is nothing for a row filter to evaluate — and disclosing the shape
+    // of rows whose contents are protected is the leak, so a read policy
+    // refuses outright.
+    let gate = RefusingReadGate::open(state, identity, database_id, collection, TRAVERSAL_WHAT)?;
 
     // Column redaction is refused here for the same reason and on the same
     // seam: the traversal returns topology, so there are no stored columns in
     // its result for the redaction hook to mask.
     crate::control::planner::redaction_refusal::refuse_unredactable_graph_collection(
         collection,
-        identity.tenant_id,
-        scope.auth(),
+        gate.tenant_id(),
+        gate.auth(),
         &state.redaction,
     )
     .map_err(|error| ddl_err("0A000", error.to_string()))?;

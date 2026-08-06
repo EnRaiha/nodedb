@@ -29,6 +29,7 @@ use nodedb_types::DatabaseId;
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::planner::rls_injection::inject_rls_for_single_plan;
+use crate::control::security::auth_context::AuthContext;
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::security::request_scope::RequestAuthScope;
 use crate::control::server::response_shape::redaction::{QueryRedaction, redact_decoded_value};
@@ -93,6 +94,19 @@ impl<'a> CollectionReadGate<'a> {
     /// The tenant this gate is scoped to.
     pub fn tenant_id(&self) -> TenantId {
         self.scope.tenant_id()
+    }
+
+    /// The identity this gate authorizes for.
+    pub fn identity(&self) -> &AuthenticatedIdentity {
+        self.scope.identity()
+    }
+
+    /// The resolved `AuthContext` this gate authorizes, filters, and redacts
+    /// for — handed out so a handler's own refusal (a graph read's redaction
+    /// refusal, say) runs against the same principal rather than resolving a
+    /// second scope that could describe a different one.
+    pub fn auth(&self) -> &AuthContext {
+        self.scope.auth()
     }
 
     /// Fail closed unless the caller holds `Read` on `collection`.

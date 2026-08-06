@@ -19,6 +19,13 @@ use crate::types::{DatabaseId, TraceId, TxnId};
 use nodedb_physical::physical_plan::GraphOp;
 
 use super::super::result::{DdlError, DdlResult};
+use super::refuse_gate::RefusingReadGate;
+
+/// Names the MATCH shape in the refusal a read policy raises: a pattern match
+/// returns variable bindings over topology, with no row for a filter to apply
+/// to — and its own `WHERE` can probe a hidden row's fields one predicate at a
+/// time.
+const MATCH_WHAT: &str = "a pattern match, which returns bindings over graph topology";
 
 /// Returned when a MATCH could not be fully resolved within its expansion
 /// budget — either the cross-shard hop rounds or the variable-length paging
@@ -46,6 +53,29 @@ pub async fn match_query(
         sqlstate: "42601".to_string(),
         message: format!("MATCH parse error: {e}"),
     })?;
+
+    // Both dispatch shapes below reach the Data Plane without a single plan for
+    // the planner's authorization and RLS passes to inspect, so both are
+    // resolved here, on the pattern's own scope.
+    //
+    // A pattern scoped with `IN '<collection>'` asks the narrow question about
+    // that collection. An unscoped pattern may walk any collection the tenant
+    // holds, so the set it could touch is the set it must be granted: every
+    // active collection of the database, failing closed on the first denial.
+    // Requiring an explicit `IN` instead would refuse the unscoped form for
+    // every caller, including one already granted everything the pattern can
+    // reach; this keeps that caller's behavior exactly as it was and refuses
+    // only the caller who would otherwise walk a collection it cannot read.
+    // The RLS half mirrors it: the narrow question when the pattern names a
+    // collection, the tenant-wide one when it names none.
+    let gate = RefusingReadGate::for_request(state, identity, database_id);
+    match query.collection.as_deref() {
+        Some(collection) => gate.gate_collection(collection, MATCH_WHAT)?,
+        None => {
+            gate.authorize_every_collection()?;
+            gate.refuse_if_any_read_policy(MATCH_WHAT)?;
+        }
+    }
 
     // If the query targets a named collection via `IN '<collection>'`, gate
     // on catalog `is_active` (see `graph_ops::support::ensure_collection_active`,
@@ -118,16 +148,13 @@ pub async fn match_query(
     // Both dispatch shapes below send the same query bytes, so the refusal is
     // applied here, once, before either runs. `query.collection` is already
     // parsed, so the scoped check is used directly rather than re-decoding
-    // `query_bytes` back into a `MatchQuery` just to read it again.
-    let scope = crate::control::security::request_scope::RequestAuthScope::for_database(
-        identity,
-        state.auth_stores(),
-        database_id,
-    );
+    // `query_bytes` back into a `MatchQuery` just to read it again. The gate's
+    // own scope is reused so the redaction refusal, the RBAC check, and the RLS
+    // refusal all resolve against the same principal.
     crate::control::planner::redaction_refusal::refuse_unredactable_graph_match_scoped(
         query.collection.as_deref(),
         tenant_id,
-        scope.auth(),
+        gate.auth(),
         &state.redaction,
     )
     .map_err(|e| DdlError {

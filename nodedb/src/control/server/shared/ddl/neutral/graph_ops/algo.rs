@@ -16,10 +16,17 @@ use nodedb_physical::physical_plan::GraphOp;
 use nodedb_types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::refuse_gate::RefusingReadGate;
 use super::support::ddl_err;
 
 const MAX_ITERATIONS_CAP: usize = 1_000;
 const MAX_SAMPLE_CAP: usize = 1_000_000;
+
+/// Names the algorithm family in the refusal a read policy raises: an
+/// algorithm's result is derived from every row of the collection, including
+/// the ones the policy hides, and carries no row for a filter to apply to.
+const ALGO_WHAT: &str =
+    "a graph algorithm, which returns per-node scalars computed over every edge";
 
 /// `GRAPH ALGO` request fields, bundled from the parsed `GraphStmt::GraphAlgo`
 /// statement.
@@ -59,6 +66,15 @@ pub async fn algo(
         personalization,
     } = request;
     let algorithm = resolve_algorithm(algorithm_name)?;
+
+    // Every dispatch shape below — the single-node broadcast and both cluster
+    // coordinators — reaches the Data Plane without a single plan for the
+    // planner's authorization and RLS passes to inspect, so both are resolved
+    // here. The result is a rank / component id / count derived from every edge
+    // of the collection, so a read policy refuses rather than filters: there is
+    // no row in the payload for a filter to apply to, and the hidden rows have
+    // already contributed to the number.
+    RefusingReadGate::open(state, identity, database_id, &collection, ALGO_WHAT)?;
 
     let max_iterations = clamp_opt(max_iterations, "ITERATIONS", MAX_ITERATIONS_CAP)?;
     let sample_size = clamp_opt(sample_size, "SAMPLE", MAX_SAMPLE_CAP)?;

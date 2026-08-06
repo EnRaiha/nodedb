@@ -56,6 +56,7 @@ pub mod query_functions;
 pub mod rate_gate;
 pub mod read_gate;
 pub mod redaction;
+pub mod refuse_gate;
 pub mod retention_policy;
 pub mod rls;
 pub mod role;

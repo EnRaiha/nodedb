@@ -2,21 +2,24 @@
 
 //! SELECT DIFF(collection, 'doc-id', version_a, version_b)
 
-use std::time::Duration;
-
 use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
-use crate::control::server::shared::ddl::sync_dispatch::{
-    SystemReason, SystemTask, dispatch_system,
-};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::refuse_gate::RefusingReadGate;
+use super::dispatch::dispatch_authorized_read;
+
+/// Names the delta export in the refusal a read policy raises: the delta is the
+/// oplog the document's states were built from, returned as opaque bytes with
+/// no row for a filter to apply to — what `rls_injection::crdt` concludes for
+/// `CrdtOp::ExportDelta`.
+const DIFF_WHAT: &str = "a version diff, which returns the CRDT oplog delta between two versions";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError {
@@ -53,6 +56,13 @@ pub async fn select_diff(
     let version_b_name = &args[3];
     let tenant_id = identity.tenant_id;
 
+    // The delta is stored document content in oplog form, so it carries the
+    // collection's read grant, and a read policy refuses it: the bytes come
+    // back as one payload with no row a filter could be evaluated against. The
+    // checkpoint lookup below already discloses that a named version exists for
+    // this document, so the gate runs before it.
+    RefusingReadGate::open(state, identity, database_id, collection, DIFF_WHAT)?;
+
     // Resolve version names to VV JSON.
     let from_vv = super::at_version::resolve_checkpoint_vv(
         state,
@@ -62,25 +72,15 @@ pub async fn select_diff(
         version_a_name,
     )?;
 
-    // Export delta from version_a to current via Data Plane.
+    // Export delta from version_a to current through the authorized door —
+    // this is user SQL, so the plan that reaches storage is the one
+    // authorization approved.
     let plan = PhysicalPlan::Crdt(CrdtOp::ExportDelta {
         collection: collection.clone(),
         from_version_json: from_vv,
     });
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let delta_bytes = dispatch_system(
-        state,
-        SystemTask::new(
-            SystemReason::CatalogMaintenance,
-            tenant_id,
-            database_id,
-            collection,
-            plan,
-        ),
-        timeout,
-    )
-    .await
-    .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
+    let delta_bytes =
+        dispatch_authorized_read(state, identity, database_id, collection, plan).await?;
 
     let columns = vec![
         "from_version".to_string(),

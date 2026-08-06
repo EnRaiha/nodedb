@@ -8,8 +8,17 @@ use serde_json::{Map, Value as JsonValue};
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::{DdlColType, ShapedRows};
 use crate::control::state::SharedState;
+use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::refuse_gate::RefusingReadGate;
+
+/// Names the checkpoint listing in the refusal a read policy raises: each row
+/// is metadata *about* one document — that it exists, when it was checkpointed
+/// and by whom — and the listing carries no document row a filter could be
+/// evaluated against.
+const SHOW_VERSIONS_WHAT: &str =
+    "a checkpoint listing, which returns version metadata about a document";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError {
@@ -22,10 +31,23 @@ fn err(sqlstate: &str, message: String) -> DdlError {
 pub fn show_versions(
     state: &SharedState,
     identity: &AuthenticatedIdentity,
+    database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
     let (collection, doc_id, limit) = parse_show_versions(sql)?;
     let tenant_id = identity.tenant_id;
+
+    // The listing is read straight from the catalog, so nothing downstream
+    // authorizes it: a checkpoint name, its creator, and its timestamp all
+    // describe a document in `collection`, and disclosing them requires the
+    // same read grant the document itself does.
+    RefusingReadGate::open(
+        state,
+        identity,
+        database_id,
+        &collection,
+        SHOW_VERSIONS_WHAT,
+    )?;
 
     let catalog = state.credentials.catalog();
 

@@ -47,7 +47,15 @@ use crate::types::TraceId;
 use nodedb_physical::physical_plan::GraphOp;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::refuse_gate::RefusingReadGate;
 use super::support::ddl_err;
+
+/// Names the collection-scoped stats read in the refusal a read policy raises.
+const STATS_WHAT: &str = "graph statistics, which are counters over the collection's edges";
+
+/// …and the tenant-wide form, which cannot narrow itself to one collection.
+const STATS_TENANT_WIDE_WHAT: &str =
+    "graph statistics, which report counters for every collection holding edges";
 
 /// `SHOW GRAPH STATS ['<collection>'] [VERBOSE] [AS OF SYSTEM TIME <ms>]`.
 pub async fn show_graph_stats(
@@ -73,6 +81,19 @@ pub async fn show_graph_stats(
         verbose,
         as_of = ?as_of,
     );
+
+    // The counters reach the Data Plane through `broadcast_to_all_cores`, which
+    // never runs the planner's authorization or RLS passes, so both are
+    // resolved here. A counter carries no row for a filter to apply to, and it
+    // counts the edges of rows a policy hides, so a read policy refuses. The
+    // tenant-wide form names no collection to ask the narrow question about, so
+    // it asks the tenant-wide one — and narrows its rows to the collections the
+    // caller may actually read, below.
+    let gate = RefusingReadGate::for_request(state, identity, database_id);
+    match collection.as_deref() {
+        Some(name) => gate.gate_collection(name, STATS_WHAT)?,
+        None => gate.refuse_if_any_read_policy(STATS_TENANT_WIDE_WHAT)?,
+    }
 
     // Validate the collection exists if a name was supplied. We resolve
     // through the same catalog path used by SHOW COLLECTIONS / DESCRIBE,
@@ -107,9 +128,15 @@ pub async fn show_graph_stats(
     // Tenant-wide (no collection name given): drop rows for collections that
     // have been soft-deactivated (plain `DROP COLLECTION` without PURGE).
     // Their edges/CSR/stats are still physically present until a hard purge,
-    // but they must not surface in the merged tenant-wide result.
+    // but they must not surface in the merged tenant-wide result. Drop the
+    // rows the caller holds no `Read` grant on for the same reason: an edge
+    // count and a label name describe a collection this identity was never
+    // authorized to read, and the tenant-wide form has no single collection to
+    // refuse the whole request on.
     let aggregated = if collection.is_none() {
-        filter_active_collections(state, database_id, identity.tenant_id.as_u64(), aggregated)
+        let active =
+            filter_active_collections(state, database_id, identity.tenant_id.as_u64(), aggregated);
+        filter_readable_collections(&gate, active)
     } else {
         aggregated
     };
@@ -154,6 +181,21 @@ fn filter_active_collections(
         .collect();
     rows.into_iter()
         .filter(|r| active.contains(r.collection.as_str()))
+        .collect()
+}
+
+/// Drop `CollectionStats` rows for collections the caller holds no `Read`
+/// grant on.
+///
+/// Only the tenant-wide form needs this: the collection-scoped form already
+/// failed closed on the one collection it names. A caller granted every
+/// collection sees the identical row set it saw before.
+fn filter_readable_collections(
+    gate: &RefusingReadGate<'_>,
+    rows: Vec<CollectionStats>,
+) -> Vec<CollectionStats> {
+    rows.into_iter()
+        .filter(|row| gate.may_read(&row.collection))
         .collect()
 }
 

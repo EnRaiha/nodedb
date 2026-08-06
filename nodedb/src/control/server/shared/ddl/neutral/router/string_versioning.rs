@@ -44,7 +44,10 @@ pub(super) async fn try_string(
     }
     if upper.starts_with("SHOW VERSIONS OF ") {
         return Some(version_history::show_versions::show_versions(
-            state, identity, sql,
+            state,
+            identity,
+            database_id,
+            sql,
         ));
     }
     if upper.contains("AT VERSION") && upper.starts_with("SELECT") {

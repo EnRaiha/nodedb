@@ -2,22 +2,26 @@
 
 //! SELECT * FROM collection AT VERSION 'checkpoint' WHERE id = 'doc-id'
 
-use std::time::Duration;
-
 use nodedb_sql::parser::preprocess::lex::find_ascii_case_insensitive;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::bridge::envelope::PhysicalPlan;
 use crate::control::security::identity::AuthenticatedIdentity;
 use crate::control::server::response_shape::types::ShapedRows;
-use crate::control::server::shared::ddl::sync_dispatch::{
-    SystemReason, SystemTask, dispatch_system,
-};
 use crate::control::state::SharedState;
 use crate::types::DatabaseId;
 use nodedb_physical::physical_plan::CrdtOp;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::refuse_gate::RefusingReadGate;
+use super::dispatch::dispatch_authorized_read;
+
+/// Names the historical read in the refusal a read policy raises: the payload
+/// is the document's merged state at a version, which carries no row for a
+/// filter to apply to — exactly what `rls_injection::crdt` concludes for
+/// `CrdtOp::ReadAtVersion`.
+const AT_VERSION_WHAT: &str =
+    "a historical document read, which returns merged CRDT state at a version";
 
 fn err(sqlstate: &str, message: String) -> DdlError {
     DdlError {
@@ -36,6 +40,14 @@ pub async fn select_at_version(
     let (collection, checkpoint_name, doc_id) = parse_at_version(sql)?;
     let tenant_id = identity.tenant_id;
 
+    // The read returns the document's stored content, so it carries the same
+    // read grant a `SELECT` against the collection does — and a read policy
+    // refuses it, because the merged state comes back as one opaque payload
+    // with no row a filter could be evaluated against. The checkpoint lookup
+    // below already discloses that a named checkpoint exists for this document,
+    // so the gate runs before it.
+    RefusingReadGate::open(state, identity, database_id, &collection, AT_VERSION_WHAT)?;
+
     // Resolve checkpoint name to version vector.
     let vv_json = resolve_checkpoint_vv(
         state,
@@ -45,26 +57,14 @@ pub async fn select_at_version(
         &checkpoint_name,
     )?;
 
-    // Dispatch to Data Plane.
+    // Dispatch to the Data Plane through the authorized door — this is user
+    // SQL, so the plan that reaches storage is the one authorization approved.
     let plan = PhysicalPlan::Crdt(CrdtOp::ReadAtVersion {
         collection: collection.clone(),
         document_id: doc_id.clone(),
         version_vector_json: vv_json,
     });
-    let timeout = Duration::from_secs(state.tuning.network.default_deadline_secs);
-    let payload = dispatch_system(
-        state,
-        SystemTask::new(
-            SystemReason::CatalogMaintenance,
-            tenant_id,
-            database_id,
-            &collection,
-            plan,
-        ),
-        timeout,
-    )
-    .await
-    .map_err(|e| err("XX000", format!("dispatch: {e}")))?;
+    let payload = dispatch_authorized_read(state, identity, database_id, &collection, plan).await?;
 
     let text = String::from_utf8_lossy(&payload).into_owned();
 
