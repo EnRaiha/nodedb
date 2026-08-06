@@ -15,6 +15,11 @@
 //! returns fewer rows, while one whose plan carries no slot at all (a
 //! statistics estimate) fails closed instead of answering over rows the policy
 //! hides.
+//!
+//! `VERIFY_AUDIT_CHAIN` is the odd member of the family: it names no
+//! collection at all, reading the node-wide audit log instead. Neither gate
+//! applies to it, so it is checked here against the privilege the other
+//! node-wide audit readers require.
 
 mod common;
 
@@ -385,6 +390,76 @@ async fn tree_sum_without_a_read_grant_is_denied() {
     .await;
 
     assert_permission_denied("TREE_SUM", result);
+}
+
+/// `VERIFY_AUDIT_CHAIN` names no collection — it reads the node-wide audit
+/// log, whose entries belong to every tenant on the node. There is no grant to
+/// check and no filter to inject, so it is gated the way the other node-wide
+/// audit readers are: superuser only. The refusal must also land before the
+/// log is read, so no part of the chain leaks through the error text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verify_audit_chain_without_superuser_is_denied() {
+    let server = TestServer::start().await;
+    create_stranger(&server, "qfn_audit_stranger").await;
+
+    let result = run_as(
+        &server,
+        "qfn_audit_stranger",
+        "SELECT VERIFY_AUDIT_CHAIN(1, 100)",
+    )
+    .await;
+
+    match result {
+        Err(message) => {
+            assert!(
+                message.to_lowercase().contains("permission denied"),
+                "expected a permission denial, got: {message}"
+            );
+            for leaked in ["last_hash", "entries_checked", "broken_at_seq"] {
+                assert!(
+                    !message.contains(leaked),
+                    "the refusal disclosed chain state ({leaked}): {message}"
+                );
+            }
+        }
+        Ok(rows) => panic!("an unprivileged principal read the node-wide audit chain: {rows:?}"),
+    }
+}
+
+/// A collection read grant is not the relevant privilege: the audit log is not
+/// a collection, so a principal that may read its own tenant's data is still
+/// refused a report covering every tenant's entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verify_audit_chain_is_denied_to_a_plain_reader() {
+    let server = TestServer::start().await;
+    create_reader(&server, "qfn_audit_reader").await;
+
+    let result = run_as(
+        &server,
+        "qfn_audit_reader",
+        "SELECT VERIFY_AUDIT_CHAIN(1, 100)",
+    )
+    .await;
+
+    assert_permission_denied("VERIFY_AUDIT_CHAIN", result);
+}
+
+/// Regression guard: the gate must not shut out the principal the statement
+/// was always meant for. The harness connection is superuser.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verify_audit_chain_still_answers_a_superuser() {
+    let server = TestServer::start().await;
+
+    let rows = server
+        .query_text_joined("SELECT VERIFY_AUDIT_CHAIN(1, 100)")
+        .await
+        .expect("superuser was refused the audit chain");
+    let delivered = rows.join(" ");
+
+    assert!(
+        delivered.contains("valid") && delivered.contains("entries_checked"),
+        "the chain report should carry its verdict and entry count: {delivered}"
+    );
 }
 
 /// `KV_INCR` reports the value it computed, so it is a read as well as a write

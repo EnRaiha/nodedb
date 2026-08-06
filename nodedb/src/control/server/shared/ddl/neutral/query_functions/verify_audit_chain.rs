@@ -7,6 +7,9 @@
 //!
 //! **Note:** For complete chain verification, pass `from_seq=1`. Partial ranges
 //! validate chain integrity *within* the range but do not verify continuity from genesis.
+//!
+//! Superuser only, for the same reason `SHOW AUDIT LOG` is: the audit log is a
+//! single node-wide record covering every tenant on the node.
 
 use crate::control::security::audit::entry::hash_entry;
 use crate::control::security::identity::AuthenticatedIdentity;
@@ -22,15 +25,31 @@ use super::helpers::{clean_arg, err, extract_function_args, single_result};
 /// verifies the hash chain over the specified sequence range, and returns
 /// `{valid: true/false, entries: N, broken_at_seq: N}`.
 ///
-/// The audit chain is a single node-wide sequence, not scoped per database,
-/// so `database_id` is accepted for call-site uniformity with the other
-/// query functions but is not used to filter entries here.
+/// **Superuser only.** `AuditEntry` does carry a `tenant_id`, but the chain
+/// itself cannot be narrowed by it: entries from every tenant share one
+/// monotonic `seq` and one `last_hash`, so each entry's `prev_hash` links to
+/// whichever entry preceded it globally — commonly another tenant's. Dropping
+/// the other tenants' entries would break the very links being checked and
+/// report a false `valid: false` for any interleaved log. Since the answer is
+/// unavoidably node-wide, it is gated the way the other node-wide audit
+/// readers are (`SHOW AUDIT LOG`, `SHOW AUDIT WHERE`, `EXPORT AUDIT`): to a
+/// superuser, whose remit already spans every tenant.
+///
+/// `database_id` is accepted for call-site uniformity with the other query
+/// functions; the audit chain is not scoped per database either.
 pub async fn verify_audit_chain(
     state: &SharedState,
-    _identity: &AuthenticatedIdentity,
+    identity: &AuthenticatedIdentity,
     _database_id: DatabaseId,
     sql: &str,
 ) -> Result<Vec<DdlResult>, DdlError> {
+    if !identity.is_superuser {
+        return Err(err(
+            "42501",
+            "permission denied: only superuser can verify the audit chain",
+        ));
+    }
+
     let args = extract_function_args(sql, "VERIFY_AUDIT_CHAIN")?;
 
     let from_seq: u64 = if !args.is_empty() {

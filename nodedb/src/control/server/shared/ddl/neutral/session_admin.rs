@@ -21,11 +21,11 @@
 //! Named `session_admin` (not `session`) to avoid collision with the
 //! unrelated `shared::session` module (per-connection `SessionStore`).
 //!
-//! `VERIFY AUDIT CHAIN` (this file, space-separated, full-chain, superuser
-//! gate) is distinct from the already-migrated `SELECT
-//! VERIFY_AUDIT_CHAIN(from_seq, to_seq)` query function in
-//! `neutral::query_functions` (underscore-separated, ranged, no superuser
-//! gate) — the two never overlap textually.
+//! `VERIFY AUDIT CHAIN` (this file, space-separated, full-chain) is distinct
+//! from the `SELECT VERIFY_AUDIT_CHAIN(from_seq, to_seq)` query function in
+//! `neutral::query_functions` (underscore-separated, ranged) — the two never
+//! overlap textually. Both read the node-wide audit log and both require
+//! superuser.
 
 use serde_json::{Map, Value as JsonValue};
 
