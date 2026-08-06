@@ -25,16 +25,24 @@ pub enum IndexKind {
     Spatial,
     /// Sparse-vector inverted index (`CREATE SPARSE INDEX`).
     Sparse,
+    /// Order-statistic leaderboard index (`CREATE SORTED INDEX`).
+    ///
+    /// The only kind whose reads name the index instead of the collection —
+    /// `RANK` / `TOPK` / `RANGE` / `SORTED_COUNT` take an index name and
+    /// nothing else — so its record is what resolves those reads back to the
+    /// collection they must be authorized against.
+    Sorted,
 }
 
 impl IndexKind {
     /// Every kind, in the order `SHOW INDEXES` lists them.
-    pub const ALL: [IndexKind; 5] = [
+    pub const ALL: [IndexKind; 6] = [
         IndexKind::Secondary,
         IndexKind::Vector,
         IndexKind::FullText,
         IndexKind::Spatial,
         IndexKind::Sparse,
+        IndexKind::Sorted,
     ];
 
     /// The `object_type` this kind's ownership row is filed under. Ownership
@@ -46,6 +54,7 @@ impl IndexKind {
             Self::FullText => "fulltext_index",
             Self::Spatial => "spatial_index",
             Self::Sparse => "sparse_index",
+            Self::Sorted => "sorted_index",
         }
     }
 
@@ -57,14 +66,21 @@ impl IndexKind {
             Self::FullText => "fulltext",
             Self::Spatial => "spatial",
             Self::Sparse => "sparse",
+            Self::Sorted => "sorted",
         }
     }
 
     /// The keyword that qualifies this kind in `DROP <KIND> INDEX`.
     /// `None` for the unqualified `DROP INDEX` form.
+    ///
+    /// `Sorted` registers no qualifier: `DROP SORTED INDEX` is claimed by the
+    /// sorted-index statement family before the generic `DROP <KIND> INDEX`
+    /// parser ever sees it, so advertising the keyword here would only give
+    /// the same statement two parsers. The unqualified `DROP INDEX <name>`
+    /// still resolves a sorted index through the registry.
     pub fn drop_keyword(&self) -> Option<&'static str> {
         match self {
-            Self::Secondary => None,
+            Self::Secondary | Self::Sorted => None,
             Self::Vector => Some("VECTOR"),
             Self::FullText => Some("FULLTEXT"),
             Self::Spatial => Some("SPATIAL"),

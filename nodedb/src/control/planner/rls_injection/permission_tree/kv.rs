@@ -90,16 +90,22 @@ pub(super) fn apply_kv(ctx: &PermCtx<'_>, op: &mut KvOp) -> crate::Result<()> {
             ctx.authorize(dest_collection, PermTreeLevel::Write)
         }
 
-        // No-op: a sorted-index read is keyed by index name alone and carries
-        // no collection, so this pass has no `(tenant, collection)` pair to
-        // resolve a tree definition against — the same call the RLS pass made
-        // for these shapes. Enforcement for them belongs at the handler, which
-        // can resolve the index's owning collection.
+        // Refuse: a sorted-index read returns ranked keys, a rank, or a count
+        // taken from the rows of the collection the index was built over, and
+        // the reply carries no slot the subtree filter could go in. The plan
+        // names only the index, and this pass holds the permission cache
+        // rather than the catalog that binds an index name to its collection,
+        // so it asks the tenant-wide question — the same call the RLS pass
+        // makes for these shapes. The handler resolves the binding from the
+        // index registry and refuses on the owning collection.
         KvOp::SortedIndexRank { .. }
         | KvOp::SortedIndexTopK { .. }
         | KvOp::SortedIndexRange { .. }
         | KvOp::SortedIndexCount { .. }
-        | KvOp::SortedIndexScore { .. } => Ok(()),
+        | KvOp::SortedIndexScore { .. } => ctx.refuse_if_any_tree(
+            "a sorted-index read returns ranked keys, a rank, or a count taken from stored rows, \
+             and the plan names only the index",
+        ),
 
         // No-op: index DDL. It describes the collection rather than acting on
         // its rows, and is authorized as DDL rather than against a level.
@@ -150,16 +156,36 @@ mod tests {
         assert_refused(apply(&mut plan, &cache), "sessions");
     }
 
-    /// A sorted-index read names no collection, so this pass leaves it alone.
+    /// A sorted-index read names no collection, so a permission tree anywhere
+    /// in the tenant refuses it: its ranked keys come from stored rows and
+    /// carry no slot the subtree filter could go in.
     #[test]
-    fn sorted_index_read_is_untouched() {
+    fn sorted_index_read_is_refused_under_a_tree() {
         let cache = cache_with_tree("scores");
         let mut plan = PhysicalPlan::Kv(KvOp::SortedIndexTopK {
             index_name: "leaderboard".into(),
             k: 10,
         });
+        match apply(&mut plan, &cache) {
+            Err(crate::Error::PlanError { detail }) => {
+                assert!(detail.contains("sorted-index"), "got {detail}")
+            }
+            other => panic!("expected PlanError refusal, got {other:?}"),
+        }
+    }
+
+    /// With no tree in the tenant the read is untouched, so an authorized
+    /// caller sees exactly what it saw before.
+    #[test]
+    fn sorted_index_read_without_a_tree_is_untouched() {
+        use super::super::plan::test_support::apply_without_tree;
+
+        let mut plan = PhysicalPlan::Kv(KvOp::SortedIndexTopK {
+            index_name: "leaderboard".into(),
+            k: 10,
+        });
         let before = plan.clone();
-        assert!(apply(&mut plan, &cache).is_ok());
+        assert!(apply_without_tree(&mut plan).is_ok());
         assert_eq!(plan, before);
     }
 }

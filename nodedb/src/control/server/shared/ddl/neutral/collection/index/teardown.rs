@@ -12,6 +12,7 @@
 //! | fulltext  | the collection's analyzer / fuzzy binding (per collection) |
 //! | spatial   | none beyond the registry + ownership rows           |
 //! | sparse    | none beyond the registry + ownership rows           |
+//! | sorted    | an order-statistic tree on the core the index name routes to |
 //!
 //! Every failure here propagates. A teardown that logs and continues would
 //! report a successful drop over state that is still live — the same silent
@@ -43,6 +44,13 @@ pub(super) async fn teardown(
         // themselves. Removing the registry and ownership rows is the whole
         // teardown.
         IndexKind::Spatial | IndexKind::Sparse => Ok(()),
+        // A sorted index owns an order-statistic tree on the core its own
+        // name routes to — not the collection's — so its removal goes through
+        // the same route `DROP SORTED INDEX` uses.
+        IndexKind::Sorted => {
+            super::super::super::kv_sorted_index::drop_in_engine(state, tenant_id, &record.name)
+                .await
+        }
     }
 }
 

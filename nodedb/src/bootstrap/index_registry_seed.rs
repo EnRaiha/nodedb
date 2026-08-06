@@ -265,6 +265,10 @@ fn attribute_legacy(kind: IndexKind, name: &str, collection: &str) -> Option<Vec
             name.starts_with(&format!("{collection}_")).then(Vec::new)
         }
         IndexKind::Secondary | IndexKind::Vector => None,
+        // A sorted index has never had a legacy ownership row: the registry
+        // record its `CREATE SORTED INDEX` files is the only place it was ever
+        // recorded, so there is nothing here to attribute.
+        IndexKind::Sorted => None,
     }
 }
 

@@ -13,8 +13,13 @@ use crate::engine::graph::traversal_options::GraphTraversalOptions;
 use crate::types::DatabaseId;
 
 use super::super::super::result::{DdlError, DdlResult};
+use super::super::refuse_gate::RefusingReadGate;
 use super::parse::{extract_function_args, extract_number_after};
 use super::support::ddl_err;
+
+/// What the walk delivers instead of row bodies, for the refusal message.
+const CHILDREN_WHAT: &str =
+    "TREE_CHILDREN(), which returns node ids reached by the walk rather than rows";
 
 pub async fn tree_children(
     state: &SharedState,
@@ -40,6 +45,19 @@ pub async fn tree_children(
         .to_string();
 
     let max_depth = extract_number_after(&upper, "MAX_DEPTH")?.unwrap_or(100);
+
+    // The walk names an edge label, not a collection, and the same label can
+    // be written on edges of any collection in the tenant — so the set of
+    // collections whose node ids can come back is the whole tenant, and that
+    // is the set the caller must be granted. The first denial ends the
+    // statement rather than returning the subset the caller happens to be
+    // allowed, which would report a partial descendant set as the whole one.
+    // The RLS half asks the same tenant-wide question: the reply is node ids,
+    // which carry no row filter, so a read policy anywhere on this identity
+    // cannot be honored through this shape.
+    let gate = RefusingReadGate::for_request(state, identity, database_id);
+    gate.authorize_every_collection()?;
+    gate.refuse_if_any_read_policy(CHILDREN_WHAT)?;
 
     let dir = crate::engine::graph::edge_store::Direction::Out;
     let bfs_result = crate::control::server::graph_dispatch::cross_core_bfs_with_options(

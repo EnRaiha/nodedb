@@ -8,7 +8,7 @@
 //! not under a fixed database 0 the way the legacy per-kind ownership rows
 //! were filed.
 
-use super::index_record::StoredIndexRecord;
+use super::index_record::{IndexKind, StoredIndexRecord};
 use super::types::{INDEX_REGISTRY, SystemCatalog, catalog_err};
 use redb::ReadableDatabase;
 
@@ -66,6 +66,28 @@ impl SystemCatalog {
             Ok(None) => Ok(None),
             Err(e) => Err(catalog_err("get index record", e)),
         }
+    }
+
+    /// The collection an index of `kind` was built on.
+    ///
+    /// The registry is the only place an index name is bound to a collection,
+    /// so a read that names an index and nothing else — `TOPK(<index>, k)` and
+    /// its siblings — resolves the collection it must be authorized against
+    /// here. `None` when no such index exists, when it belongs to another
+    /// kind, or when its collection is soft-dropped: all three leave the read
+    /// with no collection to authorize, which is a refusal rather than an
+    /// unguarded read.
+    pub fn index_collection(
+        &self,
+        database_id: u64,
+        tenant_id: u64,
+        name: &str,
+        kind: IndexKind,
+    ) -> crate::Result<Option<String>> {
+        Ok(self
+            .get_index_record(database_id, tenant_id, name)?
+            .filter(|record| record.kind == kind && record.is_visible())
+            .map(|record| record.collection))
     }
 
     /// Remove one index record. Returns whether a record was present.
@@ -256,6 +278,45 @@ mod tests {
         assert_eq!(listed.len(), 1, "{listed:?}");
         assert_eq!(listed[0].name, "idx_a");
         assert_eq!(catalog.list_all_index_records().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn index_collection_resolves_only_the_matching_visible_kind() {
+        let (catalog, _tmp) = catalog();
+        catalog
+            .put_index_record(&record("board", "scores", IndexKind::Sorted))
+            .unwrap();
+
+        assert_eq!(
+            catalog
+                .index_collection(0, 1, "board", IndexKind::Sorted)
+                .unwrap(),
+            Some("scores".to_string())
+        );
+        // A different kind under the same name is not this index.
+        assert_eq!(
+            catalog
+                .index_collection(0, 1, "board", IndexKind::Vector)
+                .unwrap(),
+            None
+        );
+        // An unknown name resolves to nothing.
+        assert_eq!(
+            catalog
+                .index_collection(0, 1, "missing", IndexKind::Sorted)
+                .unwrap(),
+            None
+        );
+        // A soft-dropped collection hides its indexes from resolution.
+        catalog
+            .set_index_records_active_for_collection(0, 1, "scores", false)
+            .unwrap();
+        assert_eq!(
+            catalog
+                .index_collection(0, 1, "board", IndexKind::Sorted)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
