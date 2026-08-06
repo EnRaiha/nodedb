@@ -7,6 +7,7 @@ use axum::extract::State;
 use axum::response::Response;
 
 use super::super::super::auth::{AppState, ResolvedIdentity};
+use super::super::super::peer::PeerAddr;
 use super::guard::{ensure_debug_access, ok_json};
 
 #[derive(serde::Serialize)]
@@ -31,8 +32,12 @@ struct LeasesDebugResponse {
     active_drains: Vec<DrainRow>,
 }
 
-pub async fn leases_debug(identity: ResolvedIdentity, State(state): State<AppState>) -> Response {
-    if let Some(resp) = ensure_debug_access(&state, &identity) {
+pub async fn leases_debug(
+    identity: ResolvedIdentity,
+    peer: PeerAddr,
+    State(state): State<AppState>,
+) -> Response {
+    if let Some(resp) = ensure_debug_access(&state, &identity, peer.as_str()) {
         return resp;
     }
 

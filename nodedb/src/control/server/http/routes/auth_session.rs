@@ -23,6 +23,7 @@ use axum::response::IntoResponse;
 
 use crate::control::security::session_handle::ClientFingerprint;
 
+use super::super::admission::{admit, identity_database};
 use super::super::auth::{ApiError, AppState, resolve_auth};
 use super::super::types::{HttpSessionResponse, HttpStatusOk};
 
@@ -43,13 +44,28 @@ pub async fn create_session(
     let peer_str = peer.to_string();
     let (identity, auth_ctx) = resolve_auth(&headers, &state, &peer_str)?;
 
+    // Creating server-side session state on the caller's behalf runs behind
+    // the full gate — a blacklisted IP or suspended/banned account must not be
+    // able to cache an `AuthContext` for later pgwire reuse, and the rate
+    // limit bounds bulk handle creation from one principal.
+    let rate_limit_headers = admit(
+        &state,
+        &identity,
+        identity_database(&identity),
+        &peer_str,
+        "auth_session_create",
+    )?;
+
     let fingerprint = ClientFingerprint::from_peer(identity.tenant_id, &peer);
     let handle = state.shared.session_handles.create(auth_ctx, fingerprint);
 
-    Ok(axum::Json(HttpSessionResponse {
-        session_id: handle,
-        expires_in: 3600,
-    }))
+    Ok((
+        rate_limit_headers,
+        axum::Json(HttpSessionResponse {
+            session_id: handle,
+            expires_in: 3600,
+        }),
+    ))
 }
 
 /// `DELETE /v1/auth/session` — Invalidate a session handle.
@@ -69,10 +85,16 @@ pub async fn delete_session(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Auth check must come first — return 401/403 before touching session state.
-    let _identity = {
-        let peer_str = peer.to_string();
-        crate::control::server::http::auth::resolve_identity(&headers, &state, &peer_str)?
-    };
+    let peer_str = peer.to_string();
+    let identity =
+        crate::control::server::http::auth::resolve_identity(&headers, &state, &peer_str)?;
+    let rate_limit_headers = admit(
+        &state,
+        &identity,
+        identity_database(&identity),
+        &peer_str,
+        "auth_session_delete",
+    )?;
 
     let handle = headers
         .get("x-session-id")
@@ -84,5 +106,5 @@ pub async fn delete_session(
         return Err(ApiError::BadRequest("session handle not found".into()));
     }
 
-    Ok(axum::Json(HttpStatusOk::ok()))
+    Ok((rate_limit_headers, axum::Json(HttpStatusOk::ok())))
 }

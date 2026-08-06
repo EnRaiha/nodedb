@@ -14,7 +14,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde_json::json;
 
+use super::super::admission::{admit_without_rate_limit, identity_database};
 use super::super::auth::{ApiError, AppState, ResolvedIdentity};
+use super::super::peer::PeerAddr;
 
 /// GET /health/live — unconditional liveness probe.
 ///
@@ -138,8 +140,21 @@ pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 /// ```
 pub async fn drain(
     identity: ResolvedIdentity,
+    peer: PeerAddr,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // Blacklist + account status, no rate limit: a drain is a one-shot
+    // lifecycle action a preStop hook must never see throttled, but a
+    // blacklisted IP or suspended/banned account must not be able to take a
+    // node out of rotation. Runs before the role check so the refusal is on
+    // identity alone, as on every other transport.
+    admit_without_rate_limit(
+        &state,
+        &identity.0,
+        identity_database(&identity.0),
+        peer.as_str(),
+    )?;
+
     // State-changing administrative health actions require authenticated superuser authority.
     if !identity.0.is_superuser() {
         return Err(ApiError::Forbidden("superuser role required".into()));

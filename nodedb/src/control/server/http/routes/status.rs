@@ -8,6 +8,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 
+use crate::control::server::http::admission::{admit, identity_database};
 use crate::control::server::http::auth::{ApiError, AppState, resolve_identity};
 use crate::control::server::http::peer::PeerAddr;
 
@@ -32,7 +33,18 @@ pub async fn status(
     peer: PeerAddr,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _identity = resolve_identity(&headers, &state, peer.as_str())?;
+    let identity = resolve_identity(&headers, &state, peer.as_str())?;
+
+    // Request-admission gate before any state is read: this endpoint reports
+    // user, tenant, and cluster counts on behalf of the caller, so a
+    // blacklisted IP or suspended/banned account must not reach it.
+    let rate_limit_headers = admit(
+        &state,
+        &identity,
+        identity_database(&identity),
+        peer.as_str(),
+        "status",
+    )?;
 
     let wal_next_lsn = state.shared.wal.next_lsn().as_u64();
     let node_id = state.shared.node_id;
@@ -116,5 +128,5 @@ pub async fn status(
         );
     }
 
-    Ok(axum::Json(result))
+    Ok((rate_limit_headers, axum::Json(result)))
 }

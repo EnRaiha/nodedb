@@ -4,15 +4,29 @@
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 
 use crate::control::promql;
+use crate::control::server::http::admission::{admit, identity_database};
 use crate::control::server::http::auth::{AppState, ResolvedIdentity};
+use crate::control::server::http::peer::PeerAddr;
 
 pub async fn metadata(
-    _identity: ResolvedIdentity,
+    identity: ResolvedIdentity,
+    peer: PeerAddr,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+) -> Response {
+    let rate_limit_headers = match admit(
+        &state,
+        &identity.0,
+        identity_database(&identity.0),
+        peer.as_str(),
+        "promql_metadata",
+    ) {
+        Ok(headers) => headers,
+        Err(error) => return error.into_response(),
+    };
+
     let mut out = String::from(r#"{"status":"success","data":{"#);
     let mut first = true;
 
@@ -96,5 +110,11 @@ pub async fn metadata(
     }
 
     out.push_str("}}");
-    (StatusCode::OK, [("content-type", "application/json")], out)
+    (
+        StatusCode::OK,
+        rate_limit_headers,
+        [("content-type", "application/json")],
+        out,
+    )
+        .into_response()
 }

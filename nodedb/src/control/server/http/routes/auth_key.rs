@@ -15,6 +15,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 
+use super::super::admission::{admit, identity_database};
 use super::super::auth::{ApiError, AppState, resolve_auth};
 use super::super::peer::PeerAddr;
 use super::super::types::{HttpExchangeKeyRequest, HttpExchangeKeyResponse};
@@ -27,6 +28,18 @@ pub async fn exchange_key(
     axum::Json(body): axum::Json<HttpExchangeKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (identity, _auth_ctx) = resolve_auth(&headers, &state, peer.as_str())?;
+
+    // Minting a long-lived credential is work done on the caller's behalf, so
+    // it runs behind the full gate: a blacklisted IP or a suspended/banned
+    // account must not be able to issue itself an API key, and the rate limit
+    // bounds bulk key minting from one principal.
+    let rate_limit_headers = admit(
+        &state,
+        &identity,
+        identity_database(&identity),
+        peer.as_str(),
+        "auth_exchange_key",
+    )?;
 
     let auth_user_id = identity.user_id.to_string();
     let rate_limit_qps = body.rate_limit_qps.unwrap_or(0);
@@ -55,9 +68,12 @@ pub async fn exchange_key(
         &format!("JWT exchanged for auth API key for user '{auth_user_id}'"),
     );
 
-    Ok(axum::Json(HttpExchangeKeyResponse {
-        api_key: token,
-        auth_user_id,
-        expires_in,
-    }))
+    Ok((
+        rate_limit_headers,
+        axum::Json(HttpExchangeKeyResponse {
+            api_key: token,
+            auth_user_id,
+            expires_in,
+        }),
+    ))
 }

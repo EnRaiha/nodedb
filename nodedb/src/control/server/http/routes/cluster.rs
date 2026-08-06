@@ -15,16 +15,33 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use super::super::admission::{admit_without_rate_limit, identity_database};
 use super::super::auth::{AppState, ResolvedIdentity};
+use super::super::peer::PeerAddr;
 
 /// `GET /v1/cluster/status` — full observability snapshot.
 ///
 /// Requires authentication — cluster metadata (peer addresses, Raft group
 /// membership, shard topology) must not leak to unauthenticated callers.
+///
+/// Admitted through the blacklist/account-status door rather than the
+/// rate-limited one: this is an operator observability read that monitoring
+/// polls on a fixed interval, not per-query traffic the rate limiter's cost
+/// table models. A blacklisted IP or suspended/banned account is still refused.
 pub async fn cluster_status(
-    _identity: ResolvedIdentity,
+    identity: ResolvedIdentity,
+    peer: PeerAddr,
     State(state): State<AppState>,
 ) -> Response {
+    if let Err(error) = admit_without_rate_limit(
+        &state,
+        &identity.0,
+        identity_database(&identity.0),
+        peer.as_str(),
+    ) {
+        return error.into_response();
+    }
+
     match state.shared.cluster_observer.get() {
         Some(observer) => {
             let snap = observer.snapshot();

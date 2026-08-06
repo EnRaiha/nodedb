@@ -6,6 +6,7 @@
 //! Request: `{ "doc_id": "...", "delta": "hex_encoded_bytes" }`
 //! Response: `{ "status": "ok", "collection": "...", "doc_id": "..." }`
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
@@ -15,6 +16,7 @@ use crate::control::security::audit::{ArcAuditEmitter, AuditEmitter};
 use crate::control::security::identity::{AuthenticatedIdentity, Permission};
 use crate::control::security::permission::PermissionStore;
 use crate::control::security::role::RoleStore;
+use crate::control::server::http::admission::admit;
 use crate::control::server::http::auth::{ApiError, AppState, resolve_identity};
 use crate::control::server::http::peer::PeerAddr;
 use crate::control::server::http::types::{HttpCrdtApplyRequest, HttpCrdtApplyResponse};
@@ -41,14 +43,40 @@ pub const CRDT_HTTP_BODY_MAX_BYTES: usize = 2 * nodedb_crdt::DEFAULT_MAX_DELTA_B
 ///   "delta": "hex_encoded_delta_bytes"
 /// }
 /// ```
+///
+/// The request body arrives as raw [`Bytes`] rather than `axum::Json` so that
+/// nothing in it is parsed before the admission gate below has admitted the
+/// request — a refused caller must not get its delta decoded, its surrogate
+/// assigned, or its collection touched.
 pub async fn crdt_apply(
     headers: HeaderMap,
     peer: PeerAddr,
     State(state): State<AppState>,
     Path(collection): Path<String>,
-    axum::Json(body): axum::Json<HttpCrdtApplyRequest>,
+    raw_body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
     let identity = resolve_identity(&headers, &state, peer.as_str())?;
+
+    // Request-admission gate: internal-service exemption, blacklist, account
+    // status, risk, then rate limit — run first, before the body is parsed or
+    // the collection is authorized, so a blacklisted IP or a suspended/banned
+    // account is refused without spending any work. The rate-limited door is
+    // the right one here (unlike the sync transport's delta apply, which uses
+    // the blacklist-and-status door): a sync session is admitted once at
+    // handshake and then streams deltas that the per-query cost table does not
+    // model, whereas this is a discrete, session-less HTTP request that gets
+    // no other admission check and does have a response to carry
+    // `X-RateLimit-*` / `Retry-After` on.
+    let rate_limit_headers = admit(
+        &state,
+        &identity,
+        crate::types::DatabaseId::DEFAULT,
+        peer.as_str(),
+        "crdt_apply",
+    )?;
+
+    let body: HttpCrdtApplyRequest = sonic_rs::from_slice(&raw_body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid CRDT apply request body: {e}")))?;
 
     let audit = ArcAuditEmitter(std::sync::Arc::clone(&state.shared.audit));
     preflight_crdt_apply(
@@ -145,10 +173,10 @@ pub async fn crdt_apply(
 
     result.map_err(ApiError::from)?;
 
-    Ok(axum::Json(HttpCrdtApplyResponse::ok(
-        collection,
-        body.doc_id,
-    )))
+    Ok((
+        rate_limit_headers,
+        axum::Json(HttpCrdtApplyResponse::ok(collection, body.doc_id)),
+    ))
 }
 
 /// Authorize the fixed DEFAULT-database write before any CRDT apply work.

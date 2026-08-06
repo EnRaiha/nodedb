@@ -13,6 +13,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 
 use super::super::super::auth::{AppState, ResolvedIdentity};
+use super::super::super::peer::PeerAddr;
 use super::guard::{cluster_disabled, ensure_debug_access, json_response, ok_json};
 
 #[derive(serde::Serialize)]
@@ -24,10 +25,11 @@ struct RaftDebugResponse {
 
 pub async fn raft_debug(
     identity: ResolvedIdentity,
+    peer: PeerAddr,
     State(state): State<AppState>,
     Path(group_id): Path<u64>,
 ) -> Response {
-    if let Some(resp) = ensure_debug_access(&state, &identity) {
+    if let Some(resp) = ensure_debug_access(&state, &identity, peer.as_str()) {
         return resp;
     }
     let Some(status_fn) = state.shared.raft_status_fn.get() else {

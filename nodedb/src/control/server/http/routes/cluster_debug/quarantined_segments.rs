@@ -7,6 +7,7 @@ use axum::extract::State;
 use axum::response::Response;
 
 use super::super::super::auth::{AppState, ResolvedIdentity};
+use super::super::super::peer::PeerAddr;
 use super::guard::{ensure_debug_access, ok_json};
 
 /// Individual entry in the quarantine list.
@@ -29,9 +30,10 @@ struct QuarantinedSegmentsResponse {
 /// GET /v1/cluster/debug/quarantined-segments
 pub async fn quarantined_segments(
     identity: ResolvedIdentity,
+    peer: PeerAddr,
     State(state): State<AppState>,
 ) -> Response {
-    if let Some(resp) = ensure_debug_access(&state, &identity) {
+    if let Some(resp) = ensure_debug_access(&state, &identity, peer.as_str()) {
         return resp;
     }
 

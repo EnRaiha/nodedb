@@ -9,6 +9,7 @@ use axum::response::Response;
 use nodedb_cluster::{BreakerSnapshot, TransportPeerSnapshot};
 
 use super::super::super::auth::{AppState, ResolvedIdentity};
+use super::super::super::peer::PeerAddr;
 use super::guard::{cluster_disabled, ensure_debug_access, ok_json};
 
 #[derive(serde::Serialize)]
@@ -20,9 +21,10 @@ struct TransportDebugResponse {
 
 pub async fn transport_debug(
     identity: ResolvedIdentity,
+    peer: PeerAddr,
     State(state): State<AppState>,
 ) -> Response {
-    if let Some(resp) = ensure_debug_access(&state, &identity) {
+    if let Some(resp) = ensure_debug_access(&state, &identity, peer.as_str()) {
         return resp;
     }
     let Some(transport) = state.shared.cluster_transport.as_ref() else {

@@ -14,7 +14,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
 use serde::Deserialize;
 
+use super::super::admission::{admit, admit_without_rate_limit};
 use super::super::auth::{ApiError, AppState, ResolvedIdentity};
+use super::super::peer::PeerAddr;
 use super::query::{DatabaseQueryParam, resolve_database_id};
 use crate::control::change_stream::{ChangeCursor, ReplayError, ReplayStart, SequencedChangeEvent};
 use crate::control::security::audit::ArcAuditEmitter;
@@ -41,6 +43,7 @@ pub struct PollParams {
 
 pub async fn sse_stream(
     identity: ResolvedIdentity,
+    peer: PeerAddr,
     Path(collection): Path<String>,
     Query(params): Query<SseParams>,
     State(state): State<AppState>,
@@ -56,6 +59,12 @@ pub async fn sse_stream(
         },
         &state,
     )?;
+    // Blacklist + account status, no rate limit: an SSE stream is admitted
+    // once at open and then served for as long as it stays connected, so it
+    // is not the per-request traffic the rate limiter's cost table models.
+    // Runs before the collection authorization and before any subscription or
+    // snapshot is taken.
+    admit_without_rate_limit(&state, &identity.0, database_id, peer.as_str())?;
     authorize(&identity, &state, database_id, &collection)?;
     let cursor = parse_last_event_id(&headers)?;
     if cursor.is_some() && params.since_ms.is_some() {
@@ -102,6 +111,7 @@ pub async fn sse_stream(
 
 pub async fn poll_changes(
     identity: ResolvedIdentity,
+    peer: PeerAddr,
     Path(collection): Path<String>,
     Query(params): Query<PollParams>,
     State(state): State<AppState>,
@@ -122,6 +132,9 @@ pub async fn poll_changes(
         },
         &state,
     )?;
+    // Full gate: a poll is a discrete per-request read of the caller's change
+    // data, exactly the shape the rate limiter's cost table models.
+    let rate_limit_headers = admit(&state, &identity.0, database_id, peer.as_str(), "cdc_poll")?;
     authorize(&identity, &state, database_id, &collection)?;
     let cursor = params.cursor.as_deref().map(parse_cursor).transpose()?;
     if cursor.is_some() && params.since_ms.is_some() {
@@ -147,7 +160,11 @@ pub async fn poll_changes(
         .events
         .last()
         .map(|event| serde_json::json!({"cursor": event.cursor().to_string()}));
-    Ok(Json(serde_json::json!({ "changes": changes, "next_cursor": next_cursor, "has_more": has_more, "count": snapshot.events.len() })).into_response())
+    Ok((
+        rate_limit_headers,
+        Json(serde_json::json!({ "changes": changes, "next_cursor": next_cursor, "has_more": has_more, "count": snapshot.events.len() })),
+    )
+        .into_response())
 }
 
 fn reject_tenant_override(tenant_id: Option<u64>) -> Result<(), ApiError> {

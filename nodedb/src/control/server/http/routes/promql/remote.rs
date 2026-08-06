@@ -20,7 +20,9 @@ use crate::control::promql::remote_proto::{
     WriteRequest,
 };
 use crate::control::promql::{self, types::DEFAULT_LOOKBACK_MS};
+use crate::control::server::http::admission::admit_without_rate_limit;
 use crate::control::server::http::auth::{AppState, ResolvedIdentity};
+use crate::control::server::http::peer::PeerAddr;
 use crate::types::{DatabaseId, TraceId, VShardId};
 use nodedb_physical::physical_plan::{PhysicalPlan, TimeseriesOp};
 use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
@@ -31,16 +33,30 @@ use nodedb_physical::physical_task::{PhysicalTask, PostSetOp};
 /// Converts each `TimeSeries` to ILP lines and dispatches to the Data Plane.
 pub async fn remote_write(
     identity: ResolvedIdentity,
+    peer: PeerAddr,
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
+) -> Response {
     let tenant_id = identity.tenant_id();
+    // Blacklist + account status, no rate limit: remote write is bulk metric
+    // ingest, the same shape as ILP/OTLP, and not the per-query traffic the
+    // rate limiter's cost table models. It runs before the body is
+    // decompressed or decoded, so a refused sender costs nothing.
+    if let Err(error) =
+        admit_without_rate_limit(&state, &identity.0, DatabaseId::DEFAULT, peer.as_str())
+    {
+        return error.into_response();
+    }
+
     // Decompress snappy if Content-Encoding indicates it (Prometheus always sends snappy).
     let decompressed = if is_snappy(&headers) {
         match snap::raw::Decoder::new().decompress_vec(&body) {
             Ok(d) => d,
-            Err(e) => return (StatusCode::BAD_REQUEST, format!("snappy decode error: {e}")),
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("snappy decode error: {e}"))
+                    .into_response();
+            }
         }
     } else {
         body.to_vec()
@@ -53,7 +69,8 @@ pub async fn remote_write(
             return (
                 StatusCode::BAD_REQUEST,
                 format!("protobuf decode error: {e}"),
-            );
+            )
+                .into_response();
         }
     };
 
@@ -160,12 +177,13 @@ pub async fn remote_write(
 
     // Prometheus expects 204 No Content on success.
     if total_rejected == 0 {
-        (StatusCode::NO_CONTENT, String::new())
+        (StatusCode::NO_CONTENT, String::new()).into_response()
     } else {
         (
             StatusCode::OK,
             format!("{{\"accepted\":{total_accepted},\"rejected\":{total_rejected}}}"),
         )
+            .into_response()
     }
 }
 
@@ -174,11 +192,21 @@ pub async fn remote_write(
 /// Accepts: snappy-compressed protobuf `ReadRequest`.
 /// Returns: snappy-compressed protobuf `ReadResponse`.
 pub async fn remote_read(
-    _identity: ResolvedIdentity,
+    identity: ResolvedIdentity,
+    peer: PeerAddr,
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Same door as remote write and `/metrics`: this is the observability
+    // surface a Prometheus/Grafana deployment polls, not per-query traffic.
+    // Runs before the body is decompressed or decoded.
+    if let Err(error) =
+        admit_without_rate_limit(&state, &identity.0, DatabaseId::DEFAULT, peer.as_str())
+    {
+        return error.into_response();
+    }
+
     let decompressed = if is_snappy(&headers) {
         match snap::raw::Decoder::new().decompress_vec(&body) {
             Ok(d) => d,

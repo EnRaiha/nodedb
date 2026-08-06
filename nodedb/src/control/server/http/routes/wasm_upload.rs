@@ -14,7 +14,9 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
+use super::super::admission::admit_without_rate_limit;
 use super::super::auth::{ApiError, AppState, ResolvedIdentity, require_tenant_admin_for_database};
+use super::super::peer::PeerAddr;
 use crate::control::planner::wasm;
 
 /// Largest accepted raw WASM upload body (10 MiB).
@@ -29,6 +31,7 @@ pub const MAX_WASM_MODULE_BYTES: usize = 10 * 1024 * 1024;
 /// The binary replaces the previous one (if any) atomically.
 pub async fn upload_wasm(
     ResolvedIdentity(identity): ResolvedIdentity,
+    peer: PeerAddr,
     State(state): State<AppState>,
     Path(name): Path<String>,
     body: Bytes,
@@ -38,6 +41,12 @@ pub async fn upload_wasm(
     let database_id = identity
         .default_database
         .unwrap_or(crate::types::DatabaseId::DEFAULT);
+    // Blacklist + account status, no rate limit: a module upload is a bulk
+    // administrative transfer, not the per-query traffic the rate limiter's
+    // cost table models. It runs before the tenant-admin check and before any
+    // catalog, validation, or blob work, so a blacklisted IP or a
+    // suspended/banned account is refused without the module being read.
+    admit_without_rate_limit(&state, &identity, database_id, peer.as_str())?;
     require_tenant_admin_for_database(&identity, database_id)?;
     reject_oversized_body(&body)?;
 

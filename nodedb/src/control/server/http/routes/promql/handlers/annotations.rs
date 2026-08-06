@@ -4,19 +4,31 @@
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use sonic_rs;
 
 use crate::control::promql;
+use crate::control::server::http::admission::{admit_without_rate_limit, identity_database};
 use crate::control::server::http::auth::{AppState, ResolvedIdentity};
+use crate::control::server::http::peer::PeerAddr;
 
 use crate::control::server::http::routes::promql::helpers::{fetch_series_for_query, now_ms};
 
 pub async fn annotations(
-    _identity: ResolvedIdentity,
+    identity: ResolvedIdentity,
+    peer: PeerAddr,
     State(state): State<AppState>,
     axum::Json(body): axum::Json<serde_json::Value>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Err(error) = admit_without_rate_limit(
+        &state,
+        &identity.0,
+        identity_database(&identity.0),
+        peer.as_str(),
+    ) {
+        return error.into_response();
+    }
+
     let query = body
         .pointer("/annotation/query")
         .and_then(|v| v.as_str())
@@ -33,33 +45,21 @@ pub async fn annotations(
         .unwrap_or(now_ms());
 
     if query.is_empty() {
-        return (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            "[]".to_string(),
-        );
+        return empty_annotations();
     }
 
     let tokens = match promql::lexer::tokenize(query) {
         Ok(t) => t,
         Err(e) => {
             tracing::debug!(error = %e, query, "annotation query tokenize failed");
-            return (
-                StatusCode::OK,
-                [("content-type", "application/json")],
-                "[]".to_string(),
-            );
+            return empty_annotations();
         }
     };
     let expr = match promql::parse(&tokens) {
         Ok(e) => e,
         Err(e) => {
             tracing::debug!(error = %e, query, "annotation query parse failed");
-            return (
-                StatusCode::OK,
-                [("content-type", "application/json")],
-                "[]".to_string(),
-            );
+            return empty_annotations();
         }
     };
 
@@ -109,6 +109,19 @@ pub async fn annotations(
         [("content-type", "application/json")],
         sonic_rs::to_string(&result_annotations).unwrap_or_else(|_| "[]".into()),
     )
+        .into_response()
+}
+
+/// Grafana treats an unparseable or empty annotation query as "no
+/// annotations", not an error, so every such branch returns the same empty
+/// array body.
+fn empty_annotations() -> Response {
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        "[]".to_string(),
+    )
+        .into_response()
 }
 
 /// Parse a timestamp as epoch milliseconds or ISO 8601 (RFC 3339).

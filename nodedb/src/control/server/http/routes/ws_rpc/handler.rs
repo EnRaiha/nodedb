@@ -63,6 +63,20 @@ pub async fn ws_handler(
         Ok(database_id) => database_id,
         Err(error) => return error.into_response(),
     };
+    // Blacklist + account status, no rate limit, at the upgrade: every RPC on
+    // the socket runs the full gate itself (`execute_sql`), but a blacklisted
+    // or suspended/banned principal must not get as far as pinning a
+    // connection and its per-connection state. The upgrade is admitted once
+    // and is not per-query traffic, so the rate-limited door is not the one
+    // for it.
+    if let Err(error) = crate::control::server::http::admission::admit_without_rate_limit(
+        &state,
+        &identity,
+        database_id,
+        &peer_addr,
+    ) {
+        return error.into_response();
+    }
     let emitter = ArcAuditEmitter(Arc::clone(&state.shared.audit));
     if let Err(error) = authorize_database(&identity, database_id, &emitter) {
         return crate::control::server::http::auth::ApiError::Forbidden(

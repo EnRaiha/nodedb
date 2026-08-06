@@ -6,25 +6,46 @@
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use super::super::super::admission::{admit_without_rate_limit, identity_database};
 use super::super::super::auth::{AppState, ResolvedIdentity};
 
-/// Enforce both the superuser role and the
-/// `observability.debug_endpoints_enabled` config flag.
+/// Enforce the `observability.debug_endpoints_enabled` config flag, the
+/// request-admission gate, and the superuser role.
 ///
 /// Returns `None` when the caller is allowed. Returns `Some(Response)`
 /// pre-built with the correct status when the caller must be refused,
 /// letting the handler early-return with a single `?`-style check.
 ///
-/// The flag check is deliberately before the superuser check so a
-/// production deployment that left the flag off returns 404 for every
-/// caller (including unauthenticated probes) — the endpoints behave as
-/// if they don't exist, which is the usual ops hardening expectation.
-pub fn ensure_debug_access(state: &AppState, identity: &ResolvedIdentity) -> Option<Response> {
+/// The flag check is deliberately before everything else so a production
+/// deployment that left the flag off returns 404 for every caller (including
+/// unauthenticated probes) — the endpoints behave as if they don't exist,
+/// which is the usual ops hardening expectation.
+///
+/// Admission then runs before the superuser check, matching every other
+/// transport's ordering: a blacklisted or suspended/banned principal is
+/// refused on identity alone, without the endpoint first ruling on its role.
+/// The blacklist/account-status door is the right one — these are operator
+/// dumps polled by ops tooling, not per-query traffic the rate limiter's cost
+/// table models. `peer_addr` must be the accepted socket's address (from
+/// `PeerAddr`), or the IP-blacklist and risk halves of the gate match nothing.
+pub fn ensure_debug_access(
+    state: &AppState,
+    identity: &ResolvedIdentity,
+    peer_addr: &str,
+) -> Option<Response> {
     if !state.shared.debug_endpoints_enabled {
         return Some(json_response(
             StatusCode::NOT_FOUND,
             r#"{"error":"not found"}"#.to_string(),
         ));
+    }
+    if let Err(error) = admit_without_rate_limit(
+        state,
+        &identity.0,
+        identity_database(&identity.0),
+        peer_addr,
+    ) {
+        return Some(error.into_response());
     }
     if !identity.0.is_superuser {
         return Some(json_response(

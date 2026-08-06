@@ -13,7 +13,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
+use super::super::admission::admit;
 use super::super::auth::{ApiError, AppState, ResolvedIdentity};
+use super::super::peer::PeerAddr;
 use super::query::{DatabaseQueryParam, resolve_database_id};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::Permission;
@@ -64,6 +66,7 @@ pub struct PollResponse {
 /// `GET /v1/streams/{stream}/poll`
 pub async fn poll_stream(
     identity: ResolvedIdentity,
+    peer: PeerAddr,
     Path(stream_name): Path<String>,
     Query(params): Query<PollParams>,
     State(state): State<AppState>,
@@ -101,6 +104,19 @@ pub async fn poll_stream(
         &state,
     ) {
         Ok(database_id) => database_id,
+        Err(error) => return error.into_response(),
+    };
+    // Full gate before any registry lookup, authorization, or buffer read: a
+    // poll is a discrete per-request read of the caller's stream data, exactly
+    // the shape the rate limiter's cost table models.
+    let rate_limit_headers = match admit(
+        &state,
+        &identity.0,
+        database_id,
+        peer.as_str(),
+        "stream_poll",
+    ) {
+        Ok(headers) => headers,
         Err(error) => return error.into_response(),
     };
     let limit = params.limit.unwrap_or(100).min(10_000);
@@ -211,12 +227,15 @@ pub async fn poll_stream(
         .map(|(pid, offset)| (pid.to_string(), offset.token()))
         .collect();
 
-    Json(PollResponse {
-        events,
-        partition_offsets,
-        count,
-        evicted_since_last_poll: result.evicted_since_last_poll,
-        oldest_available_offset: result.oldest_available_offset.token(),
-    })
-    .into_response()
+    (
+        rate_limit_headers,
+        Json(PollResponse {
+            events,
+            partition_offsets,
+            count,
+            evicted_since_last_poll: result.evicted_since_last_poll,
+            oldest_available_offset: result.oldest_available_offset.token(),
+        }),
+    )
+        .into_response()
 }

@@ -19,7 +19,9 @@ use futures::stream::Stream;
 use serde::Deserialize;
 use sonic_rs;
 
+use super::super::admission::admit_without_rate_limit;
 use super::super::auth::{ApiError, AppState, ResolvedIdentity};
+use super::super::peer::PeerAddr;
 use super::query::{DatabaseQueryParam, resolve_database_id};
 use crate::control::security::audit::ArcAuditEmitter;
 use crate::control::security::identity::Permission;
@@ -69,6 +71,7 @@ impl Drop for ConsumerGuard {
 /// `GET /v1/streams/{stream}/events`
 pub async fn stream_events(
     identity: ResolvedIdentity,
+    peer: PeerAddr,
     Path(stream_name): Path<String>,
     Query(params): Query<SseParams>,
     State(state): State<AppState>,
@@ -94,6 +97,13 @@ pub async fn stream_events(
     )?;
     let stream_name = stream_name.to_lowercase();
     let partition = params.partition;
+
+    // Blacklist + account status, no rate limit: an SSE stream is admitted
+    // once at open and then served for as long as it stays connected, so it
+    // is not the per-request traffic the rate limiter's cost table models. It
+    // runs before authorization and before any consumer-group assignment is
+    // claimed.
+    admit_without_rate_limit(&state, &identity.0, database_id, peer.as_str())?;
 
     // Authorize the source collection before constructing the SSE body. This
     // ensures a denied request cannot claim a consumer-group assignment while

@@ -6,6 +6,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
+use super::super::admission::{admit_without_rate_limit, identity_database};
 use super::super::auth::{ApiError, AppState, resolve_identity};
 use super::super::peer::PeerAddr;
 
@@ -18,6 +19,18 @@ pub async fn metrics(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let identity = resolve_identity(&headers, &state, peer.as_str())?;
+
+    // Blacklist + account status, no rate limit: a Prometheus scrape runs on a
+    // fixed interval and is not the per-query traffic the rate limiter's cost
+    // table models, so metering it would only risk starving monitoring. A
+    // blacklisted IP or suspended/banned monitor account must still be refused
+    // before any internal counter is read.
+    admit_without_rate_limit(
+        &state,
+        &identity,
+        identity_database(&identity),
+        peer.as_str(),
+    )?;
 
     if !identity.is_superuser
         && !identity.has_role(&crate::control::security::identity::Role::Monitor)
